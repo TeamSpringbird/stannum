@@ -104,7 +104,7 @@ fn score_bound(
         heap_oid: heap_oid as u32,
         index_oid: index_oid as u32,
         query: query.to_owned(),
-        full: mode == 1,
+        full: mode == 1 || mode == 3,
         dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
         k1: bits(k1),
         b: bits(b),
@@ -116,7 +116,7 @@ fn score_bound(
             *slot = Some(build_corpus(key.clone(), k1, b, term_add, term_replace));
         }
         let corpus = slot.as_ref().expect("score corpus was just populated");
-        if mode == 2 {
+        if mode == 2 || mode == 3 {
             corpus.max
         } else {
             corpus.by_document.get(document).copied().unwrap_or(0.0)
@@ -475,6 +475,57 @@ pub(crate) unsafe fn find_matching_tin_index(
     matched
 }
 
+struct FullScoreBinding {
+    ctid: *const pg_sys::Var,
+    document: *mut pg_sys::Node,
+    support: pg_sys::Oid,
+    bound: pg_sys::Oid,
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn has_full_score(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+    unsafe {
+        if node.is_null() || (*node).type_ == pg_sys::NodeTag::T_Query {
+            return false;
+        }
+        let binding = &*context.cast::<FullScoreBinding>();
+        if (*node).type_ == pg_sys::NodeTag::T_FuncExpr {
+            let function = &*node.cast::<pg_sys::FuncExpr>();
+            // Earlier query clauses may already contain the rewritten scorer.
+            if function.funcid == binding.bound {
+                let mode = pg_sys::list_nth(function.args, 4).cast::<pg_sys::Const>();
+                if (*mode).xpr.type_ == pg_sys::NodeTag::T_Const
+                    && (*mode).constvalue.value() == 1
+                    && pg_sys::equal(pg_sys::list_nth(function.args, 0), binding.document.cast())
+                {
+                    return true;
+                }
+            } else if pg_sys::get_func_support(function.funcid) == binding.support
+                && CStr::from_ptr(pg_sys::get_func_name(function.funcid)).to_bytes()
+                    == b"full_score"
+            {
+                for position in 0..pg_sys::list_length(function.args) {
+                    let mut argument =
+                        pg_sys::list_nth(function.args, position).cast::<pg_sys::Node>();
+                    if (*argument).type_ == pg_sys::NodeTag::T_NamedArgExpr {
+                        let named = &*argument.cast::<pg_sys::NamedArgExpr>();
+                        if named.argnumber != 0 {
+                            continue;
+                        }
+                        argument = named.arg.cast();
+                    } else if position != 0 {
+                        continue;
+                    }
+                    if pg_sys::equal(argument.cast(), binding.ctid.cast()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        pg_sys::expression_tree_walker(node, Some(has_full_score), context)
+    }
+}
+
 #[pg_extern(immutable, parallel_unsafe)]
 fn score_support(request: Internal) -> Internal {
     let unhandled = || Internal::from(Some(pg_sys::Datum::from(0_usize)));
@@ -523,7 +574,19 @@ fn score_support(request: Internal) -> Internal {
         let mode = if fname.as_ref() == "full_score" {
             1
         } else if fname.as_ref() == "max_score" {
-            2
+            let mut binding = FullScoreBinding {
+                ctid,
+                document,
+                support: pg_sys::get_func_support((*request.fcall).funcid),
+                bound: lookup_score_bound(),
+            };
+            let full = pg_sys::query_tree_walker(
+                parse,
+                Some(has_full_score),
+                (&mut binding as *mut FullScoreBinding).cast(),
+                pg_sys::QTW_IGNORE_RC_SUBQUERIES as i32,
+            );
+            if full { 3 } else { 2 }
         } else {
             0
         };

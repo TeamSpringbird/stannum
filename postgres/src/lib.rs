@@ -251,6 +251,38 @@ mod tests {
     }
 
     #[pg_test]
+    fn full_score_normalization_matches_tin() {
+        Spi::run(
+            "CREATE TABLE lite_normalization (id int, body text);
+             INSERT INTO lite_normalization VALUES
+               (1, 'I love fuji apples and juicy mangoes'),
+               (2, 'Grape tasting notes from the orchard'),
+               (3, 'The best juicy fuji apple in town');
+             CREATE INDEX lite_normalization_idx ON lite_normalization USING tin (body)",
+        )
+        .unwrap();
+        for expression in [
+            "tin.full_score(ctid) / tin.max_score(ctid)",
+            "1::real / tin.max_score(ctid) * tin.full_score(ctid)",
+        ] {
+            let sql = format!(
+                "SELECT {expression} FROM lite_normalization
+                 WHERE body ==> 'apple OR grape' AND tin.max_score(ctid) > 0 ORDER BY id"
+            );
+            let scores = Spi::connect(|client| {
+                client
+                    .select(&sql, None, &[])
+                    .unwrap()
+                    .map(|row| row.get::<f32>(1).unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(scores.len(), 2);
+            assert!((scores[0] - 1.0).abs() < 0.000001);
+            assert!((scores[1] - 0.9398665).abs() < 0.000001);
+        }
+    }
+
+    #[pg_test]
     fn scoring_binds_to_expression_indexes() {
         Spi::run(
             "CREATE TABLE lite_expression_score (id int, s1 text, s2 text);
