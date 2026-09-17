@@ -1,0 +1,14 @@
+[package]
+name = "boldi-vigna"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Boldi-Vigna minimal interval semantics for positional query algebra"
+
+[dependencies]
+rustc-hash.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"

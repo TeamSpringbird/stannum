@@ -1,0 +1,7 @@
+.idea
+/target/
+/tmp/
+/private-regress/
+/postgres/tests/pg_regress/
+*.log
+.DS_Store

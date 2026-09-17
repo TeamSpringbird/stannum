@@ -1,0 +1,16 @@
+[package]
+name = "tinql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pest = { workspace = true }
+pest_derive = { workspace = true }
+thiserror.workspace = true
+rustc-hash.workspace = true
+regex-automata = "0.4"
+regex-syntax = "0.8"
+tokenizer = { path = "../tokenizer" }
+boldi-vigna = { path = "../boldi-vigna" }

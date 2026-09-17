@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["boldi-vigna", "postgres", "tinql", "tokenizer"]
+
+[workspace.package]
+version = "1.0.3"
+edition = "2024"
+authors = ["PlanetScale"]
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+hashbrown = "0.16.1"
+pest = "2"
+pest_derive = "2"
+regex-automata = "0.4"
+regex-syntax = "0.8"
+rustc-hash = "2.1.1"
+thiserror = "2.0.18"
+
+[profile.dev]
+panic = "unwind"
+split-debuginfo = "unpacked"
+
+[profile.release]
+lto = "fat"
+panic = "unwind"
+opt-level = 3
+codegen-units = 1

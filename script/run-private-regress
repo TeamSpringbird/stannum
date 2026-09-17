@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#
+# Run the official TIN test suite.
+#
+# This script is only useful if you have the private TIN source.  Set
+# TIN_PRIVATE_REPO to point to that directory.
+
+set -euo pipefail
+
+root_dir="$(cd "$(dirname "$0")/.." && pwd)"
+pg_version="${1:-pg18}"
+
+if [[ -z "${TIN_PRIVATE_REPO:-}" ]]; then
+  echo "TIN_PRIVATE_REPO must point to the directory where real TIN is checked out" >&2
+  exit 2
+fi
+
+case "$pg_version" in
+  pg17|pg18) ;;
+  *) echo "usage: $0 [pg17|pg18]" >&2; exit 2 ;;
+esac
+
+"$root_dir/script/materialize-private-regress"
+cd "$root_dir"
+cargo pgrx regress "$pg_version" \
+  --resetdb \
+  --package tin \
+  --no-default-features \
+  --features "$pg_version"

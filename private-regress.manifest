@@ -1,0 +1,30 @@
+# Private production regressions suitable for Lead.
+#
+# One test basename per line.  The materializer copies the corresponding
+# sql/<name>.sql and expected/<name>.out from the private repository. Keep plan,
+# WAL, recovery, lifecycle, admin, debug, and performance cases
+# out of this list.
+basic_term_and
+and_not_single
+and_not_terms
+backslash_token_search
+cmpfunc_varying_rhs
+copy_then_search
+cross_column_boolean
+delete_matching_term
+delete_search_visibility
+dml_abort_visibility
+insert_then_search
+sql_range_with_search
+ql_parse
+bm25_exact
+book_scoring
+highlight_udf
+highlight_phrase
+highlight_repeated_term
+highlight_query_part_labels
+highlight_fold_split_alignment
+highlight_nested_relation_undermark
+highlight_relation_witness_overmark
+highlight_ilike_filter
+or_near_highlight

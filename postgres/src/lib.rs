@@ -1,0 +1,326 @@
+use pgrx::pg_guard;
+
+::pgrx::pg_module_magic!(name);
+
+mod am;
+mod bm25;
+mod highlight;
+mod highlight_udfs;
+mod match_positions;
+mod operator;
+pub(crate) mod options;
+mod score;
+mod tf_bucket;
+mod udfs;
+
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    options::init();
+}
+
+#[cfg(test)]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+
+    #[must_use]
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        vec!["shared_preload_libraries=''"]
+    }
+}
+
+#[cfg(feature = "pg_test")]
+#[pgrx::pg_schema]
+mod tests {
+    use pgrx::Json;
+    use pgrx::prelude::*;
+
+    #[pg_test]
+    fn bitmap_index_rechecks_heap_pages_without_preloading() {
+        assert_eq!(
+            Spi::get_one::<String>("SHOW shared_preload_libraries").unwrap(),
+            Some(String::new())
+        );
+        Spi::run("CREATE TABLE lite_search (id int, body text)").unwrap();
+        Spi::run(
+            "INSERT INTO lite_search VALUES
+               (1, 'craft beer'), (2, 'wine'), (3, 'beer festival')",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX lite_search_idx ON lite_search USING tin (body)").unwrap();
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        let ids = Spi::get_one::<Vec<i32>>(
+            "SELECT array_agg(id ORDER BY id) FROM lite_search WHERE body ==> 'beer'",
+        )
+        .unwrap();
+        assert_eq!(ids, Some(vec![1, 3]));
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON)
+             SELECT id FROM lite_search WHERE body ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
+        assert_eq!(plan[0]["Plan"]["Lossy Heap Blocks"], 1);
+        assert_eq!(plan[0]["Plan"]["Plans"][0]["Index Name"], "lite_search_idx");
+    }
+
+    #[pg_test]
+    fn bitmap_scan_follows_heap_growth_and_truncate() {
+        Spi::run(
+            "CREATE TABLE lite_growth (id int, body text);
+             CREATE INDEX lite_growth_idx ON lite_growth USING tin (body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM lite_growth WHERE body ==> 'beer'").unwrap(),
+            Some(0)
+        );
+        Spi::run(
+            "INSERT INTO lite_growth
+               SELECT n, CASE WHEN n % 50 = 0 THEN 'beer' ELSE 'wine' END
+                         || repeat(' filler', 80)
+               FROM generate_series(1, 400) AS n;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM lite_growth WHERE body ==> 'beer'").unwrap(),
+            Some(8)
+        );
+        Spi::run(
+            "TRUNCATE lite_growth;
+             INSERT INTO lite_growth VALUES (1, 'beer'), (2, 'wine');",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM lite_growth WHERE body ==> 'beer'").unwrap(),
+            Some(1)
+        );
+    }
+
+    #[pg_test]
+    fn bitmap_scan_rechecks_partial_index_predicates_and_expressions() {
+        Spi::run(
+            "CREATE TABLE lite_partial (id int, body text, active boolean);
+             INSERT INTO lite_partial VALUES
+               (1, 'BEER', true), (2, 'wine', true),
+               (3, 'BEER', false), (4, NULL, true);
+             CREATE INDEX lite_partial_idx ON lite_partial
+               USING tin (lower(body)) WHERE active;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (FORMAT JSON)
+             SELECT id FROM lite_partial WHERE active AND lower(body) ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
+        assert_eq!(
+            plan[0]["Plan"]["Plans"][0]["Index Name"],
+            "lite_partial_idx"
+        );
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM lite_partial
+                 WHERE active AND lower(body) ==> 'beer'"
+            )
+            .unwrap(),
+            Some(vec![1])
+        );
+        Spi::run("UPDATE lite_partial SET active = true WHERE id = 3").unwrap();
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM lite_partial
+                 WHERE active AND lower(body) ==> 'beer'"
+            )
+            .unwrap(),
+            Some(vec![1, 3])
+        );
+    }
+
+    #[pg_test]
+    fn bitmap_union_rechecks_both_search_predicates() {
+        Spi::run(
+            "CREATE TABLE lite_union (id int, title text, body text);
+             INSERT INTO lite_union VALUES
+               (1, 'beer', 'wine'), (2, 'wine', 'beer'),
+               (3, 'beer', 'beer'), (4, 'wine', 'wine');
+             CREATE INDEX lite_union_title_idx ON lite_union USING tin (title);
+             CREATE INDEX lite_union_body_idx ON lite_union USING tin (body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (FORMAT JSON)
+             SELECT id FROM lite_union WHERE title ==> 'beer' OR body ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(plan[0]["Plan"]["Plans"][0]["Node Type"], "BitmapOr");
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM lite_union
+                 WHERE title ==> 'beer' OR body ==> 'beer'"
+            )
+            .unwrap(),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[pg_test]
+    fn heap_mvcc_owns_updates_and_deletes() {
+        Spi::run(
+            "CREATE TABLE lite_mvcc (id int, body text);
+             INSERT INTO lite_mvcc VALUES (1, 'old term'), (2, 'keep term');
+             CREATE INDEX lite_mvcc_idx ON lite_mvcc USING tin (body);
+             UPDATE lite_mvcc SET body = 'new term' WHERE id = 1;
+             DELETE FROM lite_mvcc WHERE id = 2;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM lite_mvcc WHERE body ==> 'old'").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM lite_mvcc WHERE body ==> 'new'").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM lite_mvcc WHERE body ==> 'keep'").unwrap(),
+            Some(0)
+        );
+        Spi::run("UPDATE lite_mvcc SET id = 3 WHERE id = 1").unwrap();
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>("SELECT array_agg(id) FROM lite_mvcc WHERE body ==> 'new'")
+                .unwrap(),
+            Some(vec![3])
+        );
+    }
+
+    #[pg_test]
+    fn scoring_rewrite_orders_matching_rows() {
+        Spi::run(
+            "CREATE TABLE lite_score (id int, body text);
+             INSERT INTO lite_score VALUES
+               (1, 'rare'), (2, 'rare rare rare'), (3, 'common');
+             CREATE INDEX lite_score_idx ON lite_score USING tin (body);",
+        )
+        .unwrap();
+        let ids = Spi::get_one::<Vec<i32>>(
+            "SELECT array_agg(id ORDER BY tin.full_score(ctid) DESC, id)
+             FROM lite_score WHERE body ==> 'rare'",
+        )
+        .unwrap();
+        assert_eq!(ids, Some(vec![2, 1]));
+    }
+
+    #[pg_test]
+    fn scoring_helpers_share_the_same_policy() {
+        Spi::run(
+            "CREATE TABLE lite_score_helpers (id int, body text);
+             INSERT INTO lite_score_helpers VALUES
+               (1, 'common rare'), (2, 'common'), (3, 'common');
+             CREATE INDEX lite_score_helpers_idx ON lite_score_helpers USING tin (body)",
+        )
+        .unwrap();
+        let full_max = Spi::get_one::<f32>(
+            "SELECT max(tin.full_score(ctid))
+             FROM lite_score_helpers WHERE body ==> 'rare^1.0'",
+        )
+        .unwrap()
+        .unwrap();
+        let reported = Spi::get_one::<f32>(
+            "SELECT tin.max_score(ctid)
+             FROM lite_score_helpers WHERE body ==> 'rare^1.0' LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reported, full_max);
+        let inspected = Spi::get_one::<Vec<String>>(
+            "SELECT array_agg(term ORDER BY term)
+             FROM tin.score_inspect('lite_score_helpers_idx', 'common OR rare', 0.5)",
+        )
+        .unwrap();
+        assert_eq!(inspected, Some(vec!["rare".to_owned()]));
+    }
+
+    #[pg_test]
+    fn scoring_binds_to_expression_indexes() {
+        Spi::run(
+            "CREATE TABLE lite_expression_score (id int, s1 text, s2 text);
+             INSERT INTO lite_expression_score VALUES
+               (1, 'hello', 'world 10'),
+               (2, 'hello hello', 'world 10'),
+               (3, 'unrelated', 'document');
+             INSERT INTO lite_expression_score
+               SELECT n, 'noise', n::text FROM generate_series(4, 30) AS n;
+             CREATE INDEX lite_expression_score_idx ON lite_expression_score
+               USING tin (((s1 || ' '::text) || s2));",
+        )
+        .unwrap();
+        let rows = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT id, tin.score(ctid) AS score
+                     FROM lite_expression_score
+                     WHERE (s1 || ' ' || s2) ==> 'hello world 10'
+                     ORDER BY score DESC, id LIMIT 5",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<i32>(1).unwrap().unwrap(),
+                        row.get::<f32>(2).unwrap().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [2, 1]);
+        assert!(rows[0].1 > rows[1].1);
+    }
+
+    #[pg_test]
+    fn highlighting_supports_explicit_and_implicit_queries() {
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT tin.highlight('Beer and wine', '[', ']', query => 'beer')"
+            )
+            .unwrap(),
+            Some("[Beer] and wine".into())
+        );
+        Spi::run(
+            "CREATE TABLE lite_highlight (id int, s1 text, s2 text);
+             INSERT INTO lite_highlight VALUES
+               (1, 'Beer', 'and wine'), (2, 'cider', 'only');
+             CREATE INDEX lite_highlight_idx ON lite_highlight
+               USING tin (((s1 || ' '::text) || s2));",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT tin.highlight(s1 || ' ' || s2)
+                 FROM lite_highlight
+                 WHERE (s1 || ' ' || s2) ==> 'beer'"
+            )
+            .unwrap(),
+            Some("<b>Beer</b> and wine".into())
+        );
+        let ansi = Spi::get_one::<String>(
+            "SELECT tin.highlight_ansi(s1 || ' ' || s2)
+             FROM lite_highlight
+             WHERE (s1 || ' ' || s2) ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ansi.contains("\x1b["));
+        assert!(ansi.contains("Beer"));
+    }
+}

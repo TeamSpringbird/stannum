@@ -1,0 +1,179 @@
+// ── Whitespace ──────────────────────────────────────────────────────
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+// ── Entry point ─────────────────────────────────────────────────────
+query = { SOI ~ or_expr ~ EOI }
+
+// ── Boolean tier ────────────────────────────────────────────────────
+or_expr = { and_expr ~ (kw_OR ~ and_expr)* }
+
+// and_expr allows both explicit AND and implicit juxtaposition.
+// Separators are captured so the Rust builder can distinguish them.
+and_expr    = { andnot_expr ~ (and_sep ~ andnot_expr)* }
+and_sep     = { kw_AND ~ !kw_NOT | implicit_sep }
+implicit_sep = { !kw_OR ~ !kw_AND ~ &atom_start }
+
+andnot_expr = { pos_expr ~ (andnot_sep ~ pos_expr)* }
+andnot_sep  = { kw_AND ~ kw_NOT ~ !(kw_ENCLOSES | kw_ENCLOSED | kw_OVERLAPPING) }
+
+// Alternatives disable implicit boolean insertion so whitespace can
+// separate list items unambiguously.
+alt_or_expr     = { alt_and_expr ~ (kw_OR ~ alt_and_expr)* }
+alt_and_expr    = { alt_andnot_expr ~ (kw_AND ~ !kw_NOT ~ alt_andnot_expr)* }
+alt_andnot_expr = { pos_expr ~ (andnot_sep ~ pos_expr)* }
+
+// What can start an atom (for implicit operator detection)
+atom_start = _{ "\"" | "(" | "[" | !WHITESPACE ~ !(")" | "]" | ":" | "~" | "^") ~ ANY }
+
+// ── Positional filter tier ──────────────────────────────────────────
+pos_expr   = { rel_expr ~ pos_filter? }
+pos_filter  = { kw_IN ~ (pos_first | pos_last | pos_middle | pos_between) }
+pos_first   = ${ kw_FIRST ~ WHITESPACE+ ~ integer ~ (pct | WHITESPACE+ ~ kw_WORDS) }
+pos_last    = ${ kw_LAST ~ WHITESPACE+ ~ integer ~ (pct | WHITESPACE+ ~ kw_WORDS) }
+pos_middle  = ${ kw_MIDDLE ~ WHITESPACE+ ~ integer ~ pct }
+pos_between = { kw_WORDS ~ integer ~ kw_TO ~ integer }
+pct        = @{ "%" }
+
+// ── Relation tier ───────────────────────────────────────────────────
+rel_expr = { span_expr ~ (rel_op ~ span_expr)? }
+rel_op   = {
+    kw_NOT ~ kw_ENCLOSES
+  | kw_NOT ~ kw_ENCLOSED ~ kw_BY
+  | kw_NOT ~ kw_OVERLAPPING
+  | kw_ENCLOSES
+  | kw_ENCLOSED ~ kw_BY
+  | kw_OVERLAPPING
+  | kw_BEFORE
+  | kw_AFTER
+}
+
+// ── Span tier ───────────────────────────────────────────────────────
+span_expr = { atom_expr ~ (span_op ~ atom_expr)* }
+span_op   = ${ (kw_THEN | kw_NEAR) ~ slash_int }
+slash_int = @{ "/" ~ ASCII_DIGIT+ }
+
+// ── Atom tier ───────────────────────────────────────────────────────
+atom_expr = { primary ~ (kw_WITHIN ~ integer)? }
+
+// ── Primary ─────────────────────────────────────────────────────────
+// NOT compound atomic — base contains recursive rules that need whitespace.
+// Boost adjacency is validated in the Rust builder via span positions.
+primary = { base ~ boost? }
+boost   = @{ "^" ~ number }
+
+base = {
+    grouped
+  | all_of
+  | at_least
+  | alternatives
+  | phrase
+  | matches_expr
+  | contains_expr
+  | word_primary
+}
+
+// ── CONTAINS (optional explicit term) ────────────────────────────────
+// `CONTAINS beer` is sugar for just `beer`. Compound atomic ($) so pest
+// does not auto-skip whitespace between keyword and term.
+contains_expr = ${ kw_CONTAINS ~ WHITESPACE+ ~ word_primary }
+
+grouped = { "(" ~ or_expr ~ ")" }
+
+// ── ALL OF ──────────────────────────────────────────────────────────
+all_of = { kw_ALL ~ kw_OF ~ alternatives }
+
+// ── AT LEAST ────────────────────────────────────────────────────────
+at_least       = { kw_AT ~ kw_LEAST ~ at_least_num ~ kw_OF ~ alternatives }
+at_least_num   = ${ integer ~ pct? }
+
+// ── Alternatives ────────────────────────────────────────────────────
+alternatives = { "[" ~ alt_or_expr* ~ "]" }
+
+// ── Phrase ──────────────────────────────────────────────────────────
+phrase      = ${ "\"" ~ phrase_body ~ "\"" ~ slop? }
+phrase_body = @{ phrase_char* }
+phrase_char = {
+    "\\" ~ ANY
+  | !("\"") ~ ANY
+}
+slop = @{ "~" ~ ASCII_DIGIT+ }
+
+// ── MATCHES (regex) ──────────────────────────────────────────────────
+// Compound atomic ($) so pest does not auto-skip whitespace between
+// the keyword and the pattern. The pattern runs until unescaped
+// whitespace; `\ ` embeds a literal space. Unescaped `)` and `]` end the
+// pattern unless they close a group or character class opened inside it,
+// so a parenthesized `(MATCHES ...)` or a `[MATCHES ...]` alternatives
+// element terminates cleanly while regex groups/classes still work.
+matches_expr    = ${ kw_MATCHES ~ WHITESPACE+ ~ matches_pattern }
+matches_pattern = @{ matches_atom+ }
+matches_atom    = {
+    "\\" ~ ANY
+  | matches_group
+  | matches_class
+  | !(WHITESPACE | ")" | "]") ~ ANY
+}
+matches_group = { "(" ~ matches_atom* ~ ")" }
+matches_class = { "[" ~ ("\\" ~ ANY | !("]" | WHITESPACE) ~ ANY)* ~ "]" }
+
+// ── Word-based primaries ────────────────────────────────────────────
+// Compound atomic ($) for fuzzy adjacency. Whitespace between word and
+// kw_TO must be explicit since $ suppresses automatic WHITESPACE.
+ws = _{ WHITESPACE+ }
+word_primary = ${
+    word ~ ws ~ kw_TO ~ ws ~ word
+  | word ~ fuzzy_suffix
+  | !keyword ~ word
+}
+fuzzy_suffix = @{ "~" ~ ASCII_DIGIT+ ~ (":" ~ ASCII_DIGIT+)? }
+
+// All top-level keywords. A bare keyword cannot be a search term — quote
+// it to search for the literal word (e.g. `"to"`, `"and"`).
+keyword = _{
+    kw_AND | kw_OR | kw_NOT
+  | kw_TO | kw_IN | kw_WITHIN
+  | kw_THEN | kw_NEAR
+  | kw_ALL | kw_AT
+  | kw_MATCHES | kw_CONTAINS
+  | kw_ENCLOSES | kw_ENCLOSED | kw_OVERLAPPING
+  | kw_BEFORE | kw_AFTER
+}
+
+// ── Word ────────────────────────────────────────────────────────────
+// `word` uses `term_cont` (maximally permissive — allows `/`, `\`, and `,`).
+// `kw_boundary` is used in keyword rules to stop at `/` and `\` so that
+// `THEN/5` parses as keyword + gap rather than one big word.
+word = @{ word_start ~ term_cont* }
+word_start    = { !WHITESPACE ~ !("(" | ")" | "[" | "]" | "\"" | "~" | "^") ~ ANY }
+term_cont     = { !WHITESPACE ~ !("(" | ")" | "[" | "]" | "\"" | "~" | "^") ~ ANY }
+kw_boundary   = { !WHITESPACE ~ !("(" | ")" | "[" | "]" | "\"" | "/" | "\\" | "~" | "^") ~ ANY }
+
+// ── Integer / Number ────────────────────────────────────────────────
+integer = @{ ASCII_DIGIT+ }
+number  = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
+
+// ── Keywords (case-sensitive, UPPER CASE only, with word boundary) ───
+kw_AND        = @{ "AND" ~ !kw_boundary }
+kw_OR         = @{ "OR" ~ !kw_boundary }
+kw_NOT        = @{ "NOT" ~ !kw_boundary }
+kw_THEN       = @{ "THEN" ~ !kw_boundary }
+kw_NEAR       = @{ "NEAR" ~ !kw_boundary }
+kw_CONTAINS   = @{ "CONTAINS" ~ !kw_boundary }
+kw_ENCLOSES   = @{ "ENCLOSES" ~ !kw_boundary }
+kw_ENCLOSED   = @{ "ENCLOSED" ~ !kw_boundary }
+kw_BY         = @{ "BY" ~ !kw_boundary }
+kw_OVERLAPPING = @{ "OVERLAPPING" ~ !kw_boundary }
+kw_BEFORE     = @{ "BEFORE" ~ !kw_boundary }
+kw_AFTER      = @{ "AFTER" ~ !kw_boundary }
+kw_IN         = @{ "IN" ~ !kw_boundary }
+kw_FIRST      = @{ "FIRST" ~ !kw_boundary }
+kw_LAST       = @{ "LAST" ~ !kw_boundary }
+kw_MIDDLE     = @{ "MIDDLE" ~ !kw_boundary }
+kw_WORDS      = @{ "WORDS" ~ !kw_boundary }
+kw_TO         = @{ "TO" ~ !kw_boundary }
+kw_WITHIN     = @{ "WITHIN" ~ !kw_boundary }
+kw_MATCHES    = @{ "MATCHES" ~ !kw_boundary }
+kw_ALL        = @{ "ALL" ~ !kw_boundary }
+kw_AT         = @{ "AT" ~ !kw_boundary }
+kw_LEAST      = @{ "LEAST" ~ !kw_boundary }
+kw_OF         = @{ "OF" ~ !kw_boundary }

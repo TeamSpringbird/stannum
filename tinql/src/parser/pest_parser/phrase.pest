@@ -1,0 +1,29 @@
+// Phrase content grammar — whitespace is significant, no implicit WHITESPACE rule.
+
+phrase_content = { SOI ~ phrase_element* ~ EOI }
+
+phrase_element = {
+    phrase_alternatives
+  | phrase_gap
+  | phrase_ws
+  | phrase_word
+}
+
+phrase_ws = _{ (" " | "\t" | "\r" | "\n")+ }
+
+phrase_gap = @{ "_"+ }
+
+// A phrase word: regular characters and escape sequences mixed together.
+// Unescaping is handled by the Rust builder.
+phrase_word = @{ (phrase_escape | phrase_word_char)+ }
+phrase_escape = { "\\" ~ ANY }
+phrase_word_char = {
+    !(" " | "\t" | "\r" | "\n" | "[" | "]" | "_" | "\\") ~ ANY
+}
+
+phrase_alternatives       = { "[" ~ phrase_alt_body ~ "]" }
+phrase_alt_body           = @{ phrase_alt_char* }
+phrase_alt_char           = {
+    "\\" ~ ANY
+  | !("]") ~ ANY
+}

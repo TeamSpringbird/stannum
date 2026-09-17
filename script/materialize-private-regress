@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# Copy test files over from the official TIN test suite.
+#
+# This script is only useful if you have the private TIN source.  Set
+# TIN_PRIVATE_REPO to point to that directory.
+
+set -euo pipefail
+
+root_dir="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ -z "${TIN_PRIVATE_REPO:-}" ]]; then
+  echo "TIN_PRIVATE_REPO must point to the directory where real TIN is checked out" >&2
+  exit 2
+fi
+
+source_dir="$TIN_PRIVATE_REPO/postgres/tests/pg_regress"
+dest_dir="$root_dir/postgres/tests/pg_regress"
+manifest="$root_dir/private-regress.manifest"
+
+if [[ ! -d "$source_dir" ]]; then
+  echo "private TIN regression suite unavailable: $source_dir" >&2
+  exit 2
+fi
+
+mkdir -p "$dest_dir/sql" "$dest_dir/expected"
+find "$dest_dir/sql" "$dest_dir/expected" "$dest_dir/results" \
+  -type f -delete 2>/dev/null || true
+sed -n '1,2p' "$source_dir/sql/setup.sql" > "$dest_dir/sql/setup.sql"
+sed -n '1,2p' "$source_dir/expected/setup.out" > "$dest_dir/expected/setup.out"
+missing=0
+while IFS= read -r test_name; do
+  [[ -z "$test_name" || "$test_name" == \#* ]] && continue
+  sql_source="$source_dir/sql/$test_name.sql"
+  expected_source="$source_dir/expected/$test_name.out"
+  if [[ ! -f "$sql_source" || ! -f "$expected_source" ]]; then
+    echo "private regression not present: $test_name" >&2
+    missing=1
+    continue
+  fi
+  cp "$sql_source" "$dest_dir/sql/$test_name.sql"
+  cp "$expected_source" "$dest_dir/expected/$test_name.out"
+done < "$manifest"
+
+if [[ "$missing" -ne 0 ]]; then
+  echo "materialized available tests, but the manifest needs reconciliation" >&2
+  exit 3
+fi
+
+echo "private regressions materialized under $dest_dir (gitignored and ready for cargo-pgrx)"
