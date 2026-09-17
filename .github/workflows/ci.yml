@@ -18,9 +18,9 @@ jobs:
       matrix:
         arch:
           - name: x86-64
-            runner: depot-ubuntu-24.04-8
+            runner: ubuntu-24.04
           - name: arm64
-            runner: depot-ubuntu-24.04-arm-8
+            runner: ubuntu-24.04-arm
         postgres: [17, 18]
 
     env:
