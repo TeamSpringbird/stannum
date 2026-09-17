@@ -320,6 +320,90 @@ mod tests {
     }
 
     #[pg_test]
+    fn scoring_and_inspection_respect_partial_index_predicates() {
+        Spi::run(
+            "CREATE TABLE lite_partial_score (id int, body text, active boolean);
+             INSERT INTO lite_partial_score VALUES
+               (1, 'beer', true), (2, 'wine', true),
+               (3, 'wine', NULL), (4, NULL, true);
+             INSERT INTO lite_partial_score
+               SELECT n, 'wine', false FROM generate_series(5, 104) AS n;
+             CREATE INDEX lite_partial_score_idx ON lite_partial_score
+               USING tin (body) WHERE active;
+             CREATE TABLE lite_partial_score_control AS
+               SELECT id, body FROM lite_partial_score WHERE active;
+             CREATE INDEX lite_partial_score_control_idx ON lite_partial_score_control
+               USING tin (body);",
+        )
+        .unwrap();
+        let partial = Spi::get_one::<f32>(
+            "SELECT tin.full_score(ctid) FROM lite_partial_score
+             WHERE active AND body ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap();
+        let control = Spi::get_one::<f32>(
+            "SELECT tin.full_score(ctid) FROM lite_partial_score_control
+             WHERE body ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(control > 0.0);
+        assert_eq!(partial, control);
+
+        // In the indexed population, beer occurs in half the documents and
+        // must be elided at the default dense ratio, despite the excluded rows.
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT count(*) FROM tin.score_inspect('lite_partial_score_idx', 'beer')"
+            )
+            .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            Spi::get_one::<f32>(
+                "SELECT tin.score(ctid) FROM lite_partial_score
+                 WHERE active AND body ==> 'beer'"
+            )
+            .unwrap(),
+            Some(0.0)
+        );
+    }
+
+    #[pg_test]
+    fn scoring_respects_partial_expression_index_predicates() {
+        Spi::run(
+            "CREATE TABLE lite_partial_expression (id int, body text, active boolean);
+             INSERT INTO lite_partial_expression VALUES
+               (1, 'BEER', true), (2, 'wine wine', true),
+               (3, 'BEER BEER', false), (4, 'excluded', false),
+               (5, 'excluded', NULL), (6, NULL, true);
+             CREATE INDEX lite_partial_expression_idx ON lite_partial_expression
+               USING tin (lower(body)) WHERE active OR id = 3;
+             CREATE TABLE lite_partial_expression_control AS
+               SELECT id, body FROM lite_partial_expression WHERE active OR id = 3;
+             CREATE INDEX lite_partial_expression_control_idx
+               ON lite_partial_expression_control USING tin (lower(body));",
+        )
+        .unwrap();
+        let partial = Spi::get_one::<Vec<f32>>(
+            "SELECT array_agg(tin.full_score(ctid) ORDER BY id)
+             FROM lite_partial_expression
+             WHERE (active OR id = 3) AND lower(body) ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap();
+        let control = Spi::get_one::<Vec<f32>>(
+            "SELECT array_agg(tin.full_score(ctid) ORDER BY id)
+             FROM lite_partial_expression_control WHERE lower(body) ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(control.len(), 2);
+        assert_eq!(partial, control);
+    }
+
+    #[pg_test]
     fn highlighting_supports_explicit_and_implicit_queries() {
         assert_eq!(
             Spi::get_one::<String>(

@@ -230,10 +230,11 @@ fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> 
             pgrx::error!("tin score relation no longer exists");
         }
         let qualified = pg_sys::quote_qualified_identifier(namespace, relname);
-        let expression_sql = format!(
+        let index_sql = format!(
             "SELECT CASE WHEN i.indkey[0] = 0 \
              THEN pg_catalog.pg_get_expr(i.indexprs, i.indrelid) \
-             ELSE pg_catalog.quote_ident(a.attname) END \
+             ELSE pg_catalog.quote_ident(a.attname) END, \
+             pg_catalog.pg_get_expr(i.indpred, i.indrelid) \
              FROM pg_catalog.pg_index i \
              LEFT JOIN pg_catalog.pg_attribute a \
                ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] \
@@ -241,13 +242,15 @@ fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> 
             index_oid.to_u32(),
             heap_oid.to_u32(),
         );
-        let expression = Spi::get_one::<String>(&expression_sql)
-            .unwrap_or_else(|error| {
-                pgrx::error!("tin score index expression lookup failed: {error}")
-            })
+        let (expression, predicate) = Spi::get_two::<String, String>(&index_sql)
+            .unwrap_or_else(|error| pgrx::error!("tin score index lookup failed: {error}"));
+        let expression = expression
             .unwrap_or_else(|| pgrx::error!("tin score index expression no longer exists"));
+        let predicate = predicate
+            .map(|predicate| format!(" AND ({predicate})"))
+            .unwrap_or_default();
         let sql = format!(
-            "SELECT ({expression})::text FROM {} WHERE ({expression}) IS NOT NULL",
+            "SELECT ({expression})::text FROM {} WHERE ({expression}) IS NOT NULL{predicate}",
             CStr::from_ptr(qualified).to_string_lossy(),
         );
         Spi::connect(|client| {
