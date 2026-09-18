@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [concurrent contention probe](concurrent-write-contention.md) measures
+reader/writer tails, sampled waits, and correctness during foreground maintenance.
+
 The [foreground write probe](foreground-writes.md) attributes insert latency to
 buffer appends, folds, and merges, establishing the next optimization baseline.
 
