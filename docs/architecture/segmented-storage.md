@@ -148,8 +148,9 @@ block-max` and the number of candidates actually scored. Phrase, positional,
 expansion, `NOT` and `AT LEAST` queries, and limits above 4,096 rows, score
 every candidate as before; so does a query over segments written before block
 bounds existed. Should the parent read past the limit (for example because
-top rows were deleted), the scan scores every candidate and continues from the
-same position.
+top rows were deleted), the scan scores every candidate and continues with the
+rows it has not emitted yet; documents indexed since the top k was built can
+rank into the completed ordering, so it is not resumed by position.
 
 ## Durability and maintenance
 

@@ -122,10 +122,14 @@ def percentile(values, fraction):
 
 
 def read_log(path):
-    """pgbench -l records: (script index, status or microseconds, completion epoch seconds, lag ms)."""
-    for line in path.read_text().splitlines():
+    """pgbench -l records: (script index, status or microseconds, completion epoch seconds, lag ms).
+    A run stopped early leaves one partial trailing record, which is dropped."""
+    lines = path.read_text().splitlines()
+    for number, line in enumerate(lines, 1):
         fields = line.split()
         if len(fields) < 6:
+            if number == len(lines):
+                break
             raise ValueError(f"Malformed pgbench record in {path}")
         stamp = int(fields[4]) + int(fields[5]) / 1e6
         lag = int(fields[6]) / 1000 if len(fields) >= 7 else None
