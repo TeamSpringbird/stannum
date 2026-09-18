@@ -2420,4 +2420,154 @@ mod tests {
         .0;
         assert!(plan_mentions(&plan, "indexed_query"), "{plan}");
     }
+
+    fn value(sql: &str) -> i64 {
+        Spi::get_one::<i64>(sql).unwrap().unwrap()
+    }
+
+    #[pg_test]
+    fn insert_defers_large_merges_and_cleanup_finishes_them() {
+        Spi::run(
+            "CREATE TABLE merge_budget(body text);
+             CREATE INDEX merge_budget_idx ON merge_budget USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.merge_tier_factor = 2;
+             SET LOCAL stannum.max_merge_docs = 4;
+             INSERT INTO merge_budget SELECT 'needle common' FROM generate_series(1,5);",
+        )
+        .unwrap();
+        // The fourth fold spends two documents merging singletons. Its
+        // four-document cascade would exceed the remaining budget of two.
+        assert_eq!(
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_budget_idx') WHERE kind = 'immutable'"
+            ),
+            2
+        );
+        Spi::run("INSERT INTO merge_budget SELECT 'needle common' FROM generate_series(6,33)")
+            .unwrap();
+        assert!(
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_budget_idx') WHERE kind = 'immutable'"
+            ) <= 4
+        );
+        assert!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('merge_budget_idx') WHERE kind = 'immutable'"
+            ) >= 8
+        );
+        // Exercise the same entry point as amvacuumcleanup without issuing
+        // VACUUM inside the pg_test transaction.
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'merge_budget_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        unsafe {
+            let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+            crate::storage::cleanup(index.as_ptr());
+        }
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('merge_budget_idx') WHERE kind = 'immutable'"
+            ),
+            1
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('merge_budget_idx')"),
+            33
+        );
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.verify_index('merge_budget_idx') WHERE severity = 'error'"
+            ),
+            0
+        );
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM merge_budget WHERE body ==> 'needle'"),
+            33
+        );
+    }
+
+    #[pg_test]
+    fn full_directory_merges_only_smallest_entries_even_with_zero_budget() {
+        Spi::run(
+            "CREATE TABLE merge_full(body text);
+             CREATE INDEX merge_full_idx ON merge_full USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.merge_tier_factor = 2;
+             SET LOCAL stannum.max_merge_docs = 0;
+             INSERT INTO merge_full SELECT 'needle' FROM generate_series(1,130);",
+        )
+        .unwrap();
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
+            ),
+            128
+        );
+        assert_eq!(
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
+            ),
+            2
+        );
+        assert_eq!(
+            value(
+                "SELECT count(DISTINCT generation) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
+            ),
+            128
+        );
+        Spi::run("SET LOCAL stannum.max_segments = 3; INSERT INTO merge_full VALUES ('needle')")
+            .unwrap();
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
+            ),
+            3
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('merge_full_idx')"),
+            131
+        );
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.verify_index('merge_full_idx') WHERE severity = 'error'"
+            ),
+            0
+        );
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM merge_full WHERE body ==> 'needle'"),
+            131
+        );
+    }
+
+    #[pg_test]
+    fn byte_cap_folds_oversized_documents_one_at_a_time() {
+        Spi::run(
+            "CREATE TABLE merge_bytes(body text);
+             CREATE INDEX merge_bytes_idx ON merge_bytes USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1000;
+             SET LOCAL stannum.write_buffer_bytes = 1024;
+             SET LOCAL stannum.max_merge_docs = 0;
+             INSERT INTO merge_bytes SELECT repeat('needle ', 3000) FROM generate_series(1,3);",
+        )
+        .unwrap();
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('merge_bytes_idx') WHERE kind = 'immutable'"
+            ),
+            2
+        );
+        assert_eq!(
+            value("SELECT max(docs) FROM stannum.segment_info('merge_bytes_idx')"),
+            1
+        );
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.verify_index('merge_bytes_idx') WHERE severity = 'error'"
+            ),
+            0
+        );
+    }
 }
