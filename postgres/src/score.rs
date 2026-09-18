@@ -1302,8 +1302,15 @@ fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> 
             index_oid.to_u32(),
             heap_oid.to_u32(),
         );
-        let (expression, predicate) = Spi::get_two::<String, String>(&index_sql)
-            .unwrap_or_else(|error| pgrx::error!("stannum score index lookup failed: {error}"));
+        // pgrx's Spi::get_two uses a mutable connection and assigns an XID.
+        // This catalog lookup must remain read-only for standby heap scoring.
+        let (expression, predicate) = Spi::connect(|client| {
+            client
+                .select(&index_sql, Some(1), &[])?
+                .first()
+                .get_two::<String, String>()
+        })
+        .unwrap_or_else(|error| pgrx::error!("stannum score index lookup failed: {error}"));
         let expression = expression
             .unwrap_or_else(|| pgrx::error!("stannum score index expression no longer exists"));
         let predicate = predicate

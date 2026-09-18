@@ -498,6 +498,9 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
         // worker may run it (as a join's inner side). An ordered scan
         // publishes scorer state to the score calls of its own backend.
         path.path.parallel_safe = (*rel).consider_parallel && private.ordering.is_none();
+        // This is a complete, worker-local path, never a partial path: giving
+        // each worker a full candidate list would duplicate rows/counts. A DSM
+        // cursor and partial aggregate protocol are required before changing it.
         path.path.parallel_workers = 0;
         // The relation's row estimate already reflects the clause's
         // selectivity through the operator's restriction function; the same
@@ -661,6 +664,8 @@ unsafe extern "C-unwind" fn upper_paths_hook(
         path.path.pathtarget = (*output_rel).reltarget;
         path.path.param_info = std::ptr::null_mut();
         path.path.parallel_safe = (*output_rel).consider_parallel;
+        path.path.parallel_aware = false;
+        path.path.parallel_workers = 0;
         path.path.rows = 1.0;
         let estimate = crate::selectivity::estimate_query(found.index_oid, &found.query)
             .unwrap_or(crate::selectivity::FALLBACK);
@@ -1336,6 +1341,17 @@ unsafe extern "C-unwind" fn explain(
             }
         }
         if (*es).analyze {
+            // Core instrumentation is copied from workers, but these private
+            // Rust counters are not. Do not report the idle leader's zero
+            // heap fetches as if they described work done in another process.
+            if !exec.started && !(*node).ss.ps.worker_instrument.is_null() {
+                pg_sys::ExplainPropertyText(
+                    c"Execution Counters".as_ptr(),
+                    c"Unavailable from parallel workers".as_ptr(),
+                    es,
+                );
+                return;
+            }
             if let Some(candidates) = exec.candidates {
                 pg_sys::ExplainPropertyInteger(
                     c"Candidates".as_ptr(),
