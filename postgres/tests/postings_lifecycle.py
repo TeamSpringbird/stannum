@@ -158,16 +158,48 @@ def main():
         verify('volatile_search')
         assert sql("SELECT count(*) FROM docs WHERE id=99998 AND body ==> 'needle';") == '1'
         assert sql('SELECT count(*) FROM volatile_docs;') == '0'
+        assert sql("SELECT pg_relation_size('volatile_search', 'init');") == str(2 * 8192)
+        assert sql("SELECT count(*) FROM stannum.segment_info('volatile_search');") == '0'
+        assert sql("SELECT pg_relation_size('volatile_search');") == str(2 * 8192)
+        assert sql("SELECT count(*) FROM volatile_docs WHERE body ==> 'needle';") == '0'
         sql("INSERT INTO volatile_docs VALUES('needle');")
         assert sql("SELECT count(*) FROM volatile_docs WHERE body ==> 'needle';") == '1'
+        sql("REINDEX INDEX volatile_search;")
+        verify('volatile_search')
+        unlogged_plan = json.loads(sql("EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM volatile_docs WHERE body ==> 'needle';"))
+        assert unlogged_plan[0]['Plan']['Custom Plan Provider'] == 'Stannum Text Search Scan', unlogged_plan
+        assert unlogged_plan[0]['Plan']['Actual Rows'] == 1, unlogged_plan
         sql("TRUNCATE docs; INSERT INTO docs VALUES(1,'needle',0);")
         check()
         assert sql("SELECT count(*) FROM docs WHERE body ==> 'needle';") == '1'
         stop(); start(); check()
+        # Committed relations let real workers execute the custom search/count
+        # plans; SPI pg_tests alone cannot establish worker launch behavior.
+        sql("CREATE TABLE worker_docs(id int, body text); INSERT INTO worker_docs SELECT n, CASE WHEN n%10=0 THEN 'needle' ELSE 'common' END FROM generate_series(1,10000) n; CREATE INDEX worker_search ON worker_docs USING stannum(body); ANALYZE worker_docs;")
+        def nodes(plan):
+            yield plan
+            for child in plan.get('Plans', []):
+                yield from nodes(child)
+        parallel_settings = "SET debug_parallel_query=on; SET max_parallel_workers_per_gather=2; SET min_parallel_table_scan_size=0; SET parallel_setup_cost=0; SET parallel_tuple_cost=0; SET enable_bitmapscan=off;"
+        worker_plans = []
+        for query, rows in [("SELECT * FROM worker_docs WHERE body ==> 'needle'", 1000), ("SELECT count(*) FROM worker_docs WHERE body ==> 'needle'", 1)]:
+            plan = json.loads(sql(parallel_settings + 'EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) ' + query))[0]['Plan']
+            assert plan['Actual Rows'] == rows, plan
+            worker_plans.append(plan)
+        # debug_parallel_query wraps safe non-partial paths in a single-copy
+        # Gather. Candidate cursors remain worker-local, never DSM-shared.
+        for plan, provider in zip(worker_plans, ('Stannum Text Search Scan', 'Stannum Count')):
+            assert any(node.get('Workers Launched', 0) > 0 for node in nodes(plan)), plan
+            custom_nodes = [node for node in nodes(plan) if node.get('Custom Plan Provider') == provider]
+            assert len(custom_nodes) == 1, plan
+            assert custom_nodes[0].get('Execution Counters') == 'Unavailable from parallel workers', custom_nodes[0]
+            assert 'Heap Fetches' not in custom_nodes[0] and 'Candidates' not in custom_nodes[0], custom_nodes[0]
+        assert sql(parallel_settings + "SELECT count(*) FROM worker_docs WHERE body ==> 'needle';") == '1000'
+        sql(tuned + "CREATE TABLE standby_churn(id int, body text); INSERT INTO standby_churn SELECT n, 'needle common' FROM generate_series(1,200) n; CREATE INDEX standby_churn_idx ON standby_churn USING stannum(body);")
         # Verify the conservative read path on an actual streaming standby.
         command(['pg_basebackup','-h',str(root),'-p','28928','-U','postgres','-D',str(standby),'-X','stream','-R','--checkpoint=fast'])
         with (standby/'postgresql.conf').open('a') as f:
-            f.write("\nport=28929\nhot_standby=on\n")
+            f.write("\nport=28929\nhot_standby=on\nmax_standby_streaming_delay=-1\nwal_receiver_status_interval=1s\n")
         command(['pg_ctl','-D',str(standby),'-l',str(root/'standby.log'),'-w','start'])
         standby_env=dict(env,PGPORT='28929')
         recovery=command(['psql','-X','-qAt','-c','SELECT pg_is_in_recovery();'],env=standby_env).strip()
@@ -178,11 +210,61 @@ def main():
         plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert plan[0]['Plan']['Lossy Heap Blocks'] == 1, plan
         assert plan[0]['Plan']['Actual Rows'] == 1, plan
+        standby_snapshot_checks = 0
+        def standby_sql(text):
+            return command(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=text, env=standby_env).strip()
+        for feedback in ('off', 'on'):
+            standby_sql(f"ALTER SYSTEM SET hot_standby_feedback={feedback}; SELECT pg_reload_conf();")
+            # Wait for replay of the preceding scenario before acquiring a new
+            # snapshot, then record its expected answer independently of Stannum.
+            target = sql('SELECT pg_current_wal_flush_lsn();')
+            deadline = time.monotonic() + 20
+            while standby_sql(f"SELECT pg_last_wal_replay_lsn() >= '{target}'::pg_lsn;") != 't':
+                assert time.monotonic() < deadline, 'standby failed to catch up'
+                time.sleep(.02)
+            expected = standby_sql("SELECT count(*) FROM standby_churn WHERE body LIKE '%needle%';")
+            reader_env = dict(standby_env, PGAPPNAME='stannum-standby-snapshot')
+            statements = ['BEGIN ISOLATION LEVEL REPEATABLE READ;']
+            for iteration in range(160):
+                statements.append(f"SET LOCAL stannum.enable_custom_scan={'on' if iteration%2 else 'off'}; SELECT count(*) FROM standby_churn WHERE body ==> 'needle'; SELECT pg_sleep(0.03);")
+            statements.append('COMMIT;')
+            reader_script = root / f'standby-reader-{feedback}.sql'
+            reader_script.write_text('\n'.join(statements))
+            reader = subprocess.Popen(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-f', str(reader_script)],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=reader_env)
+            deadline = time.monotonic() + 10
+            while standby_sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='stannum-standby-snapshot' AND wait_event='PgSleep';") != '1':
+                assert time.monotonic() < deadline, 'standby snapshot did not start'
+                time.sleep(.02)
+            if feedback == 'on':
+                deadline = time.monotonic() + 3
+                while sql('SELECT count(*) FROM pg_stat_replication WHERE backend_xmin IS NOT NULL;') == '0':
+                    assert time.monotonic() < deadline, 'standby feedback xmin not received'
+                    time.sleep(.02)
+            # Inserts force repeated folds, merges and reclamation. Updates and
+            # VACUUM also test heap recovery conflicts: with feedback off, replay
+            # may wait for this reader, rather than cancelling its old snapshot.
+            base = 10000 if feedback == 'off' else 20000
+            for iteration in range(16):
+                first = base + iteration * 30
+                sql(tuned + f"INSERT INTO standby_churn SELECT n, 'needle common' FROM generate_series({first}, {first+29}) n;")
+            sql("UPDATE standby_churn SET body='changed' WHERE id<=100;")
+            sql('VACUUM (INDEX_CLEANUP ON) standby_churn;')
+            out, err = reader.communicate(timeout=30)
+            assert reader.returncode == 0, (feedback, err)
+            counts = [line for line in out.splitlines() if line.isdigit()]
+            assert len(counts) == 160 and set(counts) == {expected}, (feedback, expected, counts)
+            standby_snapshot_checks += len(counts)
+            verify('standby_churn_idx')
+        ranked_plan = json.loads(standby_sql("EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) SELECT stannum.full_score(ctid) FROM docs WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC;"))
+        assert 'score_bound_indexed' not in json.dumps(ranked_plan), ranked_plan
+        assert 'score_bound' in json.dumps(ranked_plan), ranked_plan
+        assert standby_sql("SELECT stannum.full_score(ctid) > 0 FROM docs WHERE body ==> 'needle';") == 't'
         # A snapshot acquired during recovery retains the fallback after promotion.
         promotion_env = dict(standby_env, PGAPPNAME='stannum-promotion-check')
         promotion = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=promotion_env)
-        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL stannum.enable_custom_scan=off; SELECT count(*) FROM docs; SELECT pg_sleep(3); EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; SET LOCAL stannum.enable_custom_scan=on; SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle'; COMMIT;")
+        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL stannum.enable_custom_scan=off; SELECT count(*) FROM docs; SELECT pg_sleep(3); EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; SET LOCAL stannum.enable_custom_scan=on; SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle'; SELECT 'score:' || (stannum.full_score(ctid)>0)::text FROM docs WHERE body ==> 'needle'; COMMIT;")
         promotion.stdin.close(); promotion.stdin=None
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
@@ -195,8 +277,9 @@ def main():
         assert promotion.returncode == 0, err
         old_plan=json.loads(out[out.index('['):out.rindex(']')+1])
         assert old_plan[0]['Plan']['Lossy Heap Blocks'] == 1, old_plan
-        # The custom scan falls back to a heap scan for the same recovery snapshot.
+        # The same recovery snapshot retains heap fallback with custom scans enabled.
         assert 'custom:1' in out, out
+        assert 'score:true' in out, out
         new_plan=json.loads(command(['psql','-X','-qAt','-c',"SET stannum.enable_custom_scan=off; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert new_plan[0]['Plan']['Exact Heap Blocks'] == 1, new_plan
         assert new_plan[0]['Plan']['Lossy Heap Blocks'] == 0, new_plan
@@ -204,7 +287,7 @@ def main():
         assert custom_plan[0]['Plan']['Custom Plan Provider'] == 'Stannum Text Search Scan', custom_plan
         assert custom_plan[0]['Plan']['Actual Rows'] == 1, custom_plan
         verify(env=standby_env)
-        result={'status':'passed', 'concurrent_reader_checks':checks, 'verify_index_calls':verified, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','per-statement scorer state','verify_index after every phase']}
+        result={'status':'passed', 'concurrent_reader_checks':checks, 'verify_index_calls':verified, 'standby_snapshot_checks':standby_snapshot_checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset and indexed REINDEX','parallel worker execution','standby feedback on/off during folds and vacuum','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','per-statement scorer state','verify_index after every phase']}
         (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result)); print('Artifacts:',root)
     finally:

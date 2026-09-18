@@ -106,3 +106,7 @@ Start with the [documentation index](docs/README.md) for the current guides.
 Report issues in this repository with reproduction SQL, PostgreSQL version,
 expected results, and observed results. Preserve correctness evidence alongside
 performance changes; a faster query that changes the answer is not an improvement.
+
+Temporary and unlogged indexes support segmented scans; unlogged indexes reset
+to a valid empty index after a crash. Recovery snapshots retain heap fallback.
+See [recovery and parallel execution](docs/architecture/recovery-and-parallel.md).

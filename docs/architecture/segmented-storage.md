@@ -253,9 +253,9 @@ the table is the source of truth; `REINDEX` rebuilds from it.
   A partial index whose predicate is itself a `==>` clause is therefore not
   matched against the bound clause, and its predicate is not proven by the
   planner.
-- Standby/recovery reads and temporary or unlogged indexes use slower reference
+- Standby/recovery reads and legacy zero-page indexes use slower reference
   paths rather than the normal segmented search path.
-- Custom scans do not use parallel workers.
+- Unordered custom scans are worker-safe but do not split a scan across workers.
 - Fresh connections rebuild their own buffer index. Large buffers increase
   first-query latency; connection pooling amortizes that work.
 - Folding, merging, and VACUUM can hold up concurrent operations.
@@ -270,3 +270,6 @@ the table is the source of truth; `REINDEX` rebuilds from it.
 Use the tests listed in the [project README](../../README.md#validate-changes)
 when changing these paths. Performance evidence and its limitations are kept in
 [the benchmark summary](../benchmarks/README.md).
+
+See [recovery, relation persistence and parallel execution](recovery-and-parallel.md)
+for temporary/unlogged index support and the standby safety boundary.

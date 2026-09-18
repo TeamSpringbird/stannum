@@ -232,6 +232,27 @@ unsafe fn write_page(
     payload: &[u8],
 ) {
     unsafe {
+        if !is_permanent(index) {
+            // Temporary relations use local buffers; unlogged main forks use
+            // ordinary shared buffers. Neither needs WAL. Prepare the complete
+            // image before entering the no-error critical section.
+            let mut image = [0u64; PAGE_SIZE / std::mem::size_of::<u64>()];
+            let raw = image.as_mut_ptr().cast::<std::ffi::c_char>();
+            std::ptr::copy_nonoverlapping(pg_sys::BufferGetPage(buffer.0), raw, PAGE_SIZE);
+            if initialize {
+                pg_sys::PageInit(raw, PAGE_SIZE, SPECIAL_SIZE);
+            }
+            checked(layout::write(
+                std::slice::from_raw_parts_mut(raw.cast(), PAGE_SIZE),
+                kind,
+                payload,
+            ));
+            pg_sys::CritSectionCount += 1;
+            std::ptr::copy_nonoverlapping(raw, pg_sys::BufferGetPage(buffer.0), PAGE_SIZE);
+            pg_sys::MarkBufferDirty(buffer.0);
+            pg_sys::CritSectionCount -= 1;
+            return;
+        }
         let wal = pg_sys::GenericXLogStart(index);
         let raw = pg_sys::GenericXLogRegisterBuffer(
             wal,
@@ -259,7 +280,7 @@ fn is_permanent(index: pg_sys::Relation) -> bool {
     unsafe { (*(*index).rd_rel).relpersistence.to_ne_bytes()[0] == b'p' }
 }
 
-/// Zero-page (unlogged, temporary, or legacy) indexes keep the reference path.
+/// Legacy zero-page indexes keep the reference path until REINDEX.
 ///
 /// # Safety
 /// `index` is a live index relation held open by the caller.
@@ -1213,10 +1234,6 @@ unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
 /// The caller owns an empty relation locked for index construction.
 pub unsafe fn build_empty(index: pg_sys::Relation) {
     unsafe {
-        if !is_permanent(index) {
-            // The init-fork/unlogged lifecycle remains on the reference fallback.
-            return;
-        }
         if blocks(index) != 0 {
             pgrx::error!("Stannum index build requires an empty relation");
         }
@@ -1233,10 +1250,24 @@ pub unsafe fn build_empty(index: pg_sys::Relation) {
             &layout::chain_payload(NONE, &[]),
         );
         drop(head_buffer);
+        let meta = empty_meta(index);
+        write_page(
+            index,
+            &meta_buffer,
+            true,
+            KIND_META,
+            &checked(meta.encode()),
+        );
+    }
+}
+
+/// A fresh main/init fork always starts with a meta page and buffer head.
+unsafe fn empty_meta(index: pg_sys::Relation) -> Meta {
+    unsafe {
         let spec = crate::options::tokenizer_spec(index);
         let relnumber = u64::from((*index).rd_locator.relNumber.to_u32());
         let xid = u64::from(pg_sys::ReadNextTransactionId().into_inner());
-        let meta = Meta {
+        Meta {
             identity: (relnumber << 32) | xid,
             spec: crate::options::encode_spec(&spec),
             buffer: BufferState {
@@ -1251,14 +1282,57 @@ pub unsafe fn build_empty(index: pg_sys::Relation) {
             next_generation: 1,
             segments: Vec::new(),
             pending: Vec::new(),
-        };
-        write_page(
-            index,
-            &meta_buffer,
-            true,
-            KIND_META,
-            &checked(meta.encode()),
-        );
+        }
+    }
+}
+
+/// Build the crash-reset image for an unlogged index. PostgreSQL has already
+/// created the init fork. As with built-in AMs, WAL-log and fsync its contents
+/// even though subsequent main-fork mutations are unlogged.
+///
+/// # Safety
+/// The caller owns an unlogged index locked for construction.
+pub unsafe fn build_init_fork(index: pg_sys::Relation) {
+    unsafe {
+        let meta = checked(empty_meta(index).encode());
+        let head = layout::chain_payload(NONE, &[]);
+        let smgr = pg_sys::RelationGetSmgr(index);
+        for (block, kind, payload) in [
+            (0, KIND_META, meta.as_slice()),
+            (1, KIND_BUFFER, head.as_slice()),
+        ] {
+            // smgr may use direct I/O; ordinary Rust stack alignment is not
+            // sufficient for the server's I/O alignment requirement.
+            let raw = pg_sys::palloc_aligned(
+                PAGE_SIZE,
+                pg_sys::PG_IO_ALIGN_SIZE as usize,
+                pg_sys::MCXT_ALLOC_ZERO as i32,
+            )
+            .cast::<std::ffi::c_char>();
+            pg_sys::PageInit(raw, PAGE_SIZE, SPECIAL_SIZE);
+            checked(layout::write(
+                std::slice::from_raw_parts_mut(raw.cast(), PAGE_SIZE),
+                kind,
+                payload,
+            ));
+            pg_sys::PageSetChecksumInplace(raw, block);
+            pg_sys::smgrextend(
+                smgr,
+                pg_sys::ForkNumber::INIT_FORKNUM,
+                block,
+                raw.cast(),
+                true,
+            );
+            pg_sys::log_newpage(
+                &mut (*index).rd_locator,
+                pg_sys::ForkNumber::INIT_FORKNUM,
+                block,
+                raw,
+                true,
+            );
+            pg_sys::pfree(raw.cast());
+        }
+        pg_sys::smgrimmedsync(smgr, pg_sys::ForkNumber::INIT_FORKNUM);
     }
 }
 
@@ -1595,12 +1669,21 @@ pub unsafe fn cleanup(index: pg_sys::Relation) {
     }
 }
 
-/// Whether the index with this OID has LDP2 storage, for planner decisions.
+/// Whether the planner may use segmented execution for this index.
+/// Feedback settings do not prove this snapshot reached the primary before
+/// index VACUUM/reclamation. Generic WAL has no removal-conflict record, so
+/// recovery snapshots (including those surviving promotion) use heap scoring
+/// and scan fallbacks. Keep this shared by the custom-path and score planners.
 ///
 /// # Safety
 /// `oid` names an index relation that the caller may open.
 pub unsafe fn is_segmented(oid: pg_sys::Oid) -> bool {
     unsafe {
+        if pg_sys::RecoveryInProgress()
+            || (pg_sys::ActiveSnapshotSet() && (*pg_sys::GetActiveSnapshot()).takenDuringRecovery)
+        {
+            return false;
+        }
         let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as _);
         let segmented = present(index);
         pg_sys::index_close(index, pg_sys::AccessShareLock as _);

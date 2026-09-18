@@ -1107,7 +1107,7 @@ mod tests {
     }
 
     #[pg_test]
-    fn unlogged_indexes_use_the_reference_path() {
+    fn unlogged_indexes_have_physical_storage() {
         Spi::run(
             "CREATE UNLOGGED TABLE posting_unlogged(body text);
           INSERT INTO posting_unlogged VALUES ('beer');
@@ -1115,9 +1115,11 @@ mod tests {
           SET LOCAL enable_seqscan=off;",
         )
         .unwrap();
-        assert_eq!(
-            Spi::get_one::<i64>("SELECT pg_relation_size('posting_unlogged_idx')").unwrap(),
-            Some(0)
+        assert!(
+            Spi::get_one::<i64>("SELECT pg_relation_size('posting_unlogged_idx')")
+                .unwrap()
+                .unwrap()
+                >= 2 * 8192
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT count(*) FROM posting_unlogged WHERE body ==> 'beer'")
@@ -2419,5 +2421,116 @@ mod tests {
         .unwrap()
         .0;
         assert!(plan_mentions(&plan, "indexed_query"), "{plan}");
+    }
+
+    #[pg_test]
+    fn temporary_indexes_use_segments_local_buffers_and_all_scan_paths() {
+        Spi::run("SET LOCAL stannum.write_buffer_docs=4;
+            SET LOCAL stannum.merge_tier_factor=2; SET LOCAL stannum.max_segments=3;
+            CREATE TEMP TABLE local_search(id int, body text);
+            CREATE INDEX local_search_idx ON local_search USING stannum(body);
+            INSERT INTO local_search SELECT n, CASE WHEN n%5=0 THEN 'needle common' ELSE 'common' END
+              FROM generate_series(1,160) n;
+            UPDATE local_search SET body='needle' WHERE id%7=0;
+            DELETE FROM local_search WHERE id%11=0;
+            ANALYZE local_search;").unwrap();
+        assert!(Spi::get_one::<i64>("SELECT count(*) FROM stannum.segment_info('local_search_idx') WHERE kind='immutable'").unwrap().unwrap() > 0);
+        assert_clean("local_search_idx");
+        let expected = Spi::get_one::<Vec<i32>>(
+            "SELECT array_agg(id ORDER BY id) FROM local_search WHERE body LIKE '%needle%'",
+        )
+        .unwrap();
+        for custom in ["off", "on"] {
+            Spi::run(&format!(
+                "SET LOCAL enable_seqscan=off; SET LOCAL stannum.enable_custom_scan={custom}"
+            ))
+            .unwrap();
+            assert_eq!(
+                Spi::get_one::<Vec<i32>>(
+                    "SELECT array_agg(id ORDER BY id) FROM local_search WHERE body ==> 'needle'"
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        let plan = Spi::get_one::<Json>("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT * FROM local_search WHERE body ==> 'needle'").unwrap().unwrap().0;
+        assert_eq!(
+            plan[0]["Plan"]["Custom Plan Provider"],
+            "Stannum Text Search Scan"
+        );
+        assert!(plan[0]["Plan"]["Local Hit Blocks"].as_u64().unwrap() > 0);
+        let count = Spi::get_one::<Json>("EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM local_search WHERE body ==> 'needle'").unwrap().unwrap().0;
+        assert_eq!(count[0]["Plan"]["Custom Plan Provider"], "Stannum Count");
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM local_search WHERE body ==> 'needle'")
+                .unwrap(),
+            Some(expected.unwrap().len() as i64)
+        );
+        assert!(Spi::get_one::<f32>("SELECT stannum.full_score(ctid) FROM local_search WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC LIMIT 1").unwrap().unwrap() > 0.0);
+        let insert = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, WAL, FORMAT JSON) INSERT INTO local_search VALUES(999, 'needle')",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(insert[0]["Plan"]["WAL Records"], 0);
+        Spi::run("REINDEX INDEX local_search_idx").unwrap();
+        assert_clean("local_search_idx");
+    }
+
+    #[pg_test]
+    fn unlogged_indexes_have_valid_init_forks_and_segmented_main_forks() {
+        Spi::run(
+            "CREATE UNLOGGED TABLE unlogged_search(body text);
+            INSERT INTO unlogged_search VALUES('needle'), ('common');
+            CREATE INDEX unlogged_search_idx ON unlogged_search USING stannum(body);",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT pg_relation_size('unlogged_search_idx', 'init')").unwrap(),
+            Some(2 * 8192)
+        );
+        assert!(Spi::get_one::<i64>("SELECT count(*) FROM stannum.segment_info('unlogged_search_idx') WHERE kind='immutable'").unwrap().unwrap() > 0);
+        assert_clean("unlogged_search_idx");
+        Spi::run("SET LOCAL enable_seqscan=off; SET LOCAL stannum.enable_custom_scan=on").unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM unlogged_search WHERE body ==> 'needle'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(
+            plan[0]["Plan"]["Custom Plan Provider"],
+            "Stannum Text Search Scan"
+        );
+        assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(1.0));
+    }
+
+    #[pg_test]
+    fn unordered_search_and_count_are_correct_with_debug_parallel_query() {
+        Spi::run("CREATE TABLE worker_search(id int, body text);
+            INSERT INTO worker_search SELECT n, CASE WHEN n%10=0 THEN 'needle common' ELSE 'common' END FROM generate_series(1,2000) n;
+            CREATE INDEX worker_search_idx ON worker_search USING stannum(body);
+            ANALYZE worker_search; SET LOCAL debug_parallel_query=on;
+            SET LOCAL max_parallel_workers_per_gather=2; SET LOCAL min_parallel_table_scan_size=0;
+            SET LOCAL parallel_setup_cost=0; SET LOCAL parallel_tuple_cost=0;
+            SET LOCAL enable_seqscan=off;").unwrap();
+        for custom in ["off", "on"] {
+            Spi::run(&format!("SET LOCAL stannum.enable_custom_scan={custom}")).unwrap();
+            assert_eq!(
+                Spi::get_one::<i64>("SELECT count(*) FROM worker_search WHERE body ==> 'needle'")
+                    .unwrap(),
+                Some(200)
+            );
+            assert_eq!(
+                Spi::get_one::<i64>(
+                    "SELECT sum(id)::bigint FROM worker_search WHERE body ==> 'needle'"
+                )
+                .unwrap(),
+                Some(201000)
+            );
+            let plan = Spi::get_one::<Json>("EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM worker_search WHERE body ==> 'needle'").unwrap().unwrap().0;
+            assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(200.0));
+        }
     }
 }

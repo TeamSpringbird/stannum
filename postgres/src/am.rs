@@ -97,7 +97,9 @@ unsafe extern "C-unwind" fn build_callback(
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn ambuildempty(_index: pg_sys::Relation) {}
+unsafe extern "C-unwind" fn ambuildempty(index: pg_sys::Relation) {
+    unsafe { crate::storage::build_init_fork(index) };
+}
 
 #[pg_guard]
 #[expect(
@@ -166,7 +168,9 @@ unsafe extern "C-unwind" fn ambeginscan(
 }
 
 /// Selective retrieval needs a primary snapshot: generic WAL carries no
-/// index-VACUUM conflict information for standbys.
+/// index-VACUUM conflict information for standbys. hot_standby_feedback is
+/// asynchronous and cannot establish that the primary protected this snapshot;
+/// testing the local pending list is insufficient after runs have been reused.
 unsafe fn selective(scan: pg_sys::IndexScanDesc) -> bool {
     unsafe {
         !pg_sys::RecoveryInProgress()
