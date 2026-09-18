@@ -107,7 +107,7 @@ def main():
         # Small thresholds drive folds, merges, dead lists, segment rewrites
         # and page reclamation through the FSM. Results must stay exact and
         # the index must stop growing once freed pages are reused.
-        tuned = 'SET stannum.write_buffer_docs=4; SET stannum.max_segments=3;'
+        tuned = 'SET stannum.write_buffer_docs=4; SET stannum.max_segments=3; SET stannum.merge_tier_factor=2;'
         def check_folded():
             for term in ('needle', 'common', 'missing'):
                 differences = sql(f"""WITH actual AS MATERIALIZED (SELECT id FROM folded WHERE body ==> '{term}'),
@@ -133,6 +133,8 @@ def main():
                   ON CONFLICT DO NOTHING;""")
             sql('VACUUM (INDEX_CLEANUP ON) folded; VACUUM (INDEX_CLEANUP ON) folded;')
             check_folded()
+            segments = int(sql("SELECT count(*) FROM stannum.segment_info('folded_search') WHERE kind='immutable';"))
+            assert 1 <= segments <= 3, segments
         size_after_cycles = int(sql("SELECT pg_relation_size('folded_search');"))
         assert size_after_cycles <= 3 * size_after_first_cycle, (size_after_first_cycle, size_after_cycles)
 

@@ -72,6 +72,35 @@ current runner's `stannum` adapter does not run the original `tin`-named Lead
 binary; the historical comparison below used its archived harness. A new paired
 Lead-to-Stannum campaign still needs that adapter compatibility work.
 
+## Insert latency and merge stalls
+
+`benchmarks/insert_latency.py` measures the write path on a local server: it
+inserts short documents in batch statements through one session and records
+each statement's server-side duration, so the write-buffer folds and segment
+merges an insert triggers show up as per-batch spikes. Only the GUCs passed on
+the command line are set, so it runs unchanged against older builds.
+
+```sh
+PGPORT=28818 python3 benchmarks/insert_latency.py \
+  --docs 300000 --batch 1000 --write-buffer-docs 1024 --max-segments 32 \
+  --output benchmarks/results/insert-latency-01.json
+```
+
+On one laptop, 300k documents in 1,000-row batches, before and after the
+tiered merge policy replaced merge-everything-at-the-limit (max is the
+slowest single INSERT statement):
+
+| Settings | Before: max / p99 / total | After: max / p99 / total |
+| --- | --- | --- |
+| defaults (no merge reached before) | 46 ms / 41 ms / 2.5 s | 458 ms / 75 ms / 3.3 s |
+| `write_buffer_docs=2048` (128-segment limit reached once) | 942 ms / 32 ms / 4.1 s | 407 ms / 98 ms / 3.9 s |
+| `write_buffer_docs=1024, max_segments=32` (limit reached nine times) | 1,102 ms / 925 ms / 8.0 s | 210 ms / 208 ms / 4.0 s |
+
+With the defaults the old policy had not merged at all by 300k documents; its
+first merge would have rewritten two million documents in one insert. The new
+policy's largest stall is one tier's merge (eight write-buffer folds), and it
+does not grow with the index until the next tier fills.
+
 ## Historical 100k comparison provenance
 
 The [reported results](README.md) come from these September 17, 2026 campaigns:
