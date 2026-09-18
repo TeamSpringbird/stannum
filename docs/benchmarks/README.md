@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [streaming search report](streaming-search.md) covers unordered search,
+LIMIT consumption, cursor lifetime checks, and paired full-traversal benchmarks.
+
 The [page-bitmap count report](page-bitmap-counts.md) covers adaptive dense-count
 execution, correctness checks, and paired count-only measurements.
 
