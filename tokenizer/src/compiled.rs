@@ -15,7 +15,7 @@ pub struct CompiledTokenizerPipeline {
 
 impl CompiledTokenizerPipeline {
     pub(crate) fn from_validated_spec(spec: TokenizerPipelineSpec) -> Self {
-        let kind = if spec == TokenizerPipelineSpec::stanum_default() {
+        let kind = if spec == TokenizerPipelineSpec::stannum_default() {
             CompiledPipelineKind::TinDefault
         } else {
             let stages = CompiledStages {
@@ -198,7 +198,7 @@ const fn default_stages() -> CompiledStages {
     }
 }
 
-/// Exact ASCII specialization of the complete Stanum default pipeline.
+/// Exact ASCII specialization of the complete Stannum default pipeline.
 ///
 /// ASCII has no emoji or accents, every scalar is one grapheme, and removing
 /// punctuation creates no positions. That reduces the fixed default pipeline

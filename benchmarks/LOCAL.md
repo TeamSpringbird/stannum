@@ -1,8 +1,8 @@
-# Local Stanum campaigns
+# Local Stannum campaigns
 
 The current results, 100k protocol, limitations, and TIN comparison plan are in
 [../BENCHMARKS.md](../BENCHMARKS.md). Benchmarks run locally, not in CI. No artifacts
-are uploaded automatically. Code and metadata use `stanum`; historical result
+are uploaded automatically. Code and metadata use `stannum`; historical result
 folders and source snapshots retain their original names.
 
 ## Quick synthetic check
@@ -10,9 +10,9 @@ folders and source snapshots retain their original names.
 ```sh
 export PATH="$(brew --prefix postgresql@18)/bin:$PATH"
 python3 benchmarks/campaign.py --build \
-  --image stanum-bench:local \
-  --output benchmarks/results/stanum-smoke-01 \
-  --engines stanum --repetitions 1 --rows 10000 \
+  --image stannum-bench:local \
+  --output benchmarks/results/stannum-smoke-01 \
+  --engines stannum --repetitions 1 --rows 10000 \
   --profiles count mixed --seconds 30 --warmup 5 --clients 2 --write-rate 20
 ```
 
@@ -22,7 +22,7 @@ architecture, and recipe. It retains logs before removing its own container and
 volume. Builds include the `segment` crate, which is also covered by the source
 fingerprint. Use immutable image IDs for comparisons.
 
-The default local engine list is `stanum gin paradedb pg_textsearch`. With count
+The default local engine list is `stannum gin paradedb pg_textsearch`. With count
 and mixed profiles, five repetitions produce 35 trials; GIN does not participate
 in mixed/ranked BM25 comparisons. `tin` is available only as an explicit adapter
 for an externally provisioned PlanetScale TIN installation, not the local image.
@@ -52,8 +52,8 @@ are retained, including failed ones. `report.md`, `aggregate.json`, and
 `history.csv` contain the summaries. Rebuild a report without rerunning traffic:
 
 ```sh
-python3 benchmarks/campaign.py --report-only --output benchmarks/results/stanum-smoke-01
-python3 benchmarks/run.py history benchmarks/results/stanum-smoke-01 > benchmarks/results/stanum-smoke-01/history.csv
+python3 benchmarks/campaign.py --report-only --output benchmarks/results/stannum-smoke-01
+python3 benchmarks/run.py history benchmarks/results/stannum-smoke-01 > benchmarks/results/stannum-smoke-01/history.csv
 ```
 
 Use medians as the main local trend and retain min/max and dispersion. Five samples
@@ -73,7 +73,7 @@ the runners use Python's standard library.
 python3 -m venv benchmarks/results/data-venv
 benchmarks/results/data-venv/bin/pip install pyarrow==23.0.1
 benchmarks/results/data-venv/bin/python benchmarks/dataset.py \
-  --output "$HOME/Library/Application Support/StanumBenchmarks/datasets"
+  --output "$HOME/Library/Application Support/StannumBenchmarks/datasets"
 ```
 
 Existing frozen datasets under `LeadBenchmarks/datasets` remain usable and should
@@ -87,8 +87,8 @@ Run the 100k series with an already built and verified image:
 ```sh
 caffeinate -i python3 benchmarks/baselines.py \
   --datasets "$HOME/Library/Application Support/LeadBenchmarks/datasets" \
-  --output "$HOME/Library/Application Support/StanumBenchmarks/campaigns/wiki-100k-01" \
-  --image stanum-bench:local
+  --output "$HOME/Library/Application Support/StannumBenchmarks/campaigns/wiki-100k-01" \
+  --image stannum-bench:local
 ```
 
 `--sizes` defaults to `100000`; only an explicit `--sizes 1000000` launches the
@@ -100,21 +100,21 @@ Detached processes survive terminal closure, not reboot. A completion watcher,
 `notify.py`, can request local macOS notifications; delivery depends on system
 settings. It does not post to chat.
 
-## Paired Stanum builds
+## Paired Stannum builds
 
-`paired.py` compares two Stanum images in alternating order with fresh volumes,
+`paired.py` compares two Stannum images in alternating order with fresh volumes,
 identical settings, and a shared seed within each pair:
 
 ```sh
 python3 benchmarks/paired.py \
-  --output benchmarks/results/paired-stanum-01 \
+  --output benchmarks/results/paired-stannum-01 \
   --original-image ORIGINAL_IMAGE_ID --original-source ORIGINAL_SOURCE_JSON \
   --fork-image CANDIDATE_IMAGE_ID --fork-source CANDIDATE_SOURCE_JSON \
   --profile mixed --rows 10000 --repetitions 5 --seconds 30 --warmup 5
 ```
 
-Both images must use the Stanum package and current recipe/provenance labels.
-This tool does not mix historical `tin`-named Lead binaries with renamed Stanum.
+Both images must use the Stannum package and current recipe/provenance labels.
+This tool does not mix historical `tin`-named Lead binaries with renamed Stannum.
 Use archived protocols to inspect historical artifacts. Aggregate paired speedups
 are withheld until every planned pair passes correctness, protocol equality, and
 OOM checks. A 10k synthetic result is an iteration check; use the frozen 100k corpus

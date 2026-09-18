@@ -220,11 +220,11 @@ so `\d`, `\w`, `\b`, `\\`, etc. work as you would expect.
 
 ### Interaction with SQL
 
-Since `stanum` queries are typically written inside SQL string literals, it helps
+Since `stannum` queries are typically written inside SQL string literals, it helps
 to understand how the layers interact.
 
 In **standard SQL strings** (the default in PostgreSQL), backslash has no
-special meaning. `'foo\bar'` delivers the literal text `foo\bar` to `stanum`,
+special meaning. `'foo\bar'` delivers the literal text `foo\bar` to `stannum`,
 which treats it as a single term containing a backslash.
 
 In **escape strings** (`E'...'`), PostgreSQL interprets `\\` as a single

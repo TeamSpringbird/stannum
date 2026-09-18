@@ -25,16 +25,16 @@ COPY tinql tinql
 COPY tokenizer tokenizer
 COPY boldi-vigna boldi-vigna
 COPY segment segment
-RUN cargo pgrx install --package stanum --no-default-features --features pg18 --release
+RUN cargo pgrx install --package stannum --no-default-features --features pg18 --release
 
 FROM ${BASE}
 USER root
-ARG STANUM_SOURCE_SHA256=unknown
-ARG STANUM_COMMIT=unknown
+ARG STANNUM_SOURCE_SHA256=unknown
+ARG STANNUM_COMMIT=unknown
 ARG RECIPE_SHA256=unknown
-LABEL benchmark.stanum_source_sha256=${STANUM_SOURCE_SHA256} benchmark.stanum_commit=${STANUM_COMMIT} benchmark.recipe_sha256=${RECIPE_SHA256}
-COPY --from=builder /usr/lib/postgresql/18/lib/stanum.so /usr/lib/postgresql/18/lib/
-COPY --from=builder /usr/share/postgresql/18/extension/stanum* /usr/share/postgresql/18/extension/
+LABEL benchmark.stannum_source_sha256=${STANNUM_SOURCE_SHA256} benchmark.stannum_commit=${STANNUM_COMMIT} benchmark.recipe_sha256=${RECIPE_SHA256}
+COPY --from=builder /usr/lib/postgresql/18/lib/stannum.so /usr/lib/postgresql/18/lib/
+COPY --from=builder /usr/share/postgresql/18/extension/stannum* /usr/share/postgresql/18/extension/
 COPY --from=builder /usr/lib/postgresql/18/lib/pg_textsearch.so /usr/lib/postgresql/18/lib/
 COPY --from=builder /usr/share/postgresql/18/extension/pg_textsearch* /usr/share/postgresql/18/extension/
 # The campaign owns settings/extension creation; omit the distribution's auto-tuner

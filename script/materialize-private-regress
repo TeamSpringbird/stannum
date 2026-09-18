@@ -50,8 +50,8 @@ root = Path(sys.argv[1])
 for directory in ("sql", "expected"):
     for path in (root / directory).iterdir():
         if path.is_file():
-            text = re.sub(r"\btin\b", "stanum", path.read_text())
-            path.write_text(text.replace("tin_text_", "stanum_text_"))
+            text = re.sub(r"\btin\b", "stannum", path.read_text())
+            path.write_text(text.replace("tin_text_", "stannum_text_"))
 PYTHON
 
 if [[ "$missing" -ne 0 ]]; then

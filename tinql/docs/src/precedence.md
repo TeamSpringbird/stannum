@@ -67,7 +67,7 @@ same rules as explicit `AND`:
 beer wine OR stout cheese  →  (beer AND wine) OR (stout AND cheese)
 ```
 
-Stanum's SQL interface uses implicit AND. Callers of the Rust parser API can
+Stannum's SQL interface uses implicit AND. Callers of the Rust parser API can
 select implicit OR; in that mode, `beer stout AND wine` parses as
 `beer OR (stout AND wine)`. See [Boolean Operators](./boolean-operators.md).
 

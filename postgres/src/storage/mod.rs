@@ -53,8 +53,8 @@ static MAX_SEGMENTS_GUC: GucSetting<i32> = GucSetting::<i32>::new(MAX_SEGMENTS a
 /// merges and reclamation at small scale; the defaults are the intended ones.
 pub fn init() {
     GucRegistry::define_int_guc(
-        c"stanum.write_buffer_docs",
-        c"Documents buffered before folding into a Stanum segment",
+        c"stannum.write_buffer_docs",
+        c"Documents buffered before folding into a Stannum segment",
         c"Lower values fold sooner, producing more and smaller segments.",
         &WRITE_BUFFER_DOCS,
         1,
@@ -63,8 +63,8 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
-        c"stanum.build_segment_docs",
-        c"Documents an index build accumulates per Stanum segment",
+        c"stannum.build_segment_docs",
+        c"Documents an index build accumulates per Stannum segment",
         c"Bounds build memory; lower values write more segments.",
         &BUILD_SEGMENT_DOCS,
         1,
@@ -73,8 +73,8 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
-        c"stanum.max_segments",
-        c"Stanum segments allowed before a fold merges them",
+        c"stannum.max_segments",
+        c"Stannum segments allowed before a fold merges them",
         c"The on-disk directory holds at most 128 entries.",
         &MAX_SEGMENTS_GUC,
         1,
@@ -93,7 +93,7 @@ fn checked<T>(result: Result<T, &'static str>) -> T {
 }
 
 fn codec<T>(result: segment::Result<T>) -> T {
-    result.unwrap_or_else(|error| pgrx::error!("Stanum index data: {error}; REINDEX required"))
+    result.unwrap_or_else(|error| pgrx::error!("Stannum index data: {error}; REINDEX required"))
 }
 
 /// Owns a buffer pin and content lock; page borrows cannot outlive this guard.
@@ -210,7 +210,7 @@ pub unsafe fn present(index: pg_sys::Relation) -> bool {
         }
         let meta = Buffer::read(index, 0, false);
         if meta.kind() != KIND_META {
-            pgrx::error!("Stanum index has an unsupported format; REINDEX required");
+            pgrx::error!("Stannum index has an unsupported format; REINDEX required");
         }
         true
     }
@@ -220,7 +220,7 @@ unsafe fn read_meta(index: pg_sys::Relation, exclusive: bool) -> (Buffer, Meta) 
     unsafe {
         let buffer = Buffer::read(index, 0, exclusive);
         if buffer.kind() != KIND_META {
-            pgrx::error!("Stanum index has an unsupported format; REINDEX required");
+            pgrx::error!("Stannum index has an unsupported format; REINDEX required");
         }
         let meta = checked(Meta::decode(layout::payload(buffer.page())));
         (buffer, meta)
@@ -245,7 +245,9 @@ pub fn tokenizer_for(spec: &[u8; crate::options::SPEC_BYTES]) -> Rc<CompiledToke
             .entry(*spec)
             .or_insert_with(|| {
                 let spec = crate::options::decode_spec(spec).unwrap_or_else(|| {
-                    pgrx::error!("Stanum index tokenizer settings are unreadable; REINDEX required")
+                    pgrx::error!(
+                        "Stannum index tokenizer settings are unreadable; REINDEX required"
+                    )
                 });
                 Rc::new(spec.compile().expect("decoded spec validated"))
             })
@@ -293,11 +295,11 @@ unsafe fn read_run(index: pg_sys::Relation, run: Run) -> Vec<u8> {
         for _ in 0..run.blocks {
             pgrx::check_for_interrupts!();
             if block == NONE {
-                pgrx::error!("Stanum run ends early; REINDEX required");
+                pgrx::error!("Stannum run ends early; REINDEX required");
             }
             let buffer = Buffer::read(index, block, false);
             if buffer.kind() != KIND_RUN {
-                pgrx::error!("Stanum run page has the wrong kind; REINDEX required");
+                pgrx::error!("Stannum run page has the wrong kind; REINDEX required");
             }
             let (next, data) = checked(layout::chain(buffer.page()));
             let take = (run.bytes as usize - out.len()).min(data.len());
@@ -305,7 +307,7 @@ unsafe fn read_run(index: pg_sys::Relation, run: Run) -> Vec<u8> {
             block = next;
         }
         if out.len() != run.bytes as usize {
-            pgrx::error!("Stanum run is shorter than its directory entry; REINDEX required");
+            pgrx::error!("Stannum run is shorter than its directory entry; REINDEX required");
         }
         out
     }
@@ -387,7 +389,7 @@ unsafe fn page_table(index: pg_sys::Relation, identity: u64, entry: &SegmentEntr
     }
     let table = Rc::new(decode_page_table(&unsafe { read_run(index, entry.map) }));
     if table.len() != entry.run.blocks as usize {
-        pgrx::error!("Stanum segment page table does not match its run; REINDEX required");
+        pgrx::error!("Stannum segment page table does not match its run; REINDEX required");
     }
     PAGE_TABLES.with_borrow_mut(|tables| {
         if tables.len() > 4096 {
@@ -427,7 +429,7 @@ impl segment::source::Source for RunSource {
         unsafe {
             let index = pg_sys::RelationIdGetRelation(self.index_oid);
             if index.is_null() {
-                pgrx::error!("Stanum index no longer exists");
+                pgrx::error!("Stannum index no longer exists");
             }
             let mut at = offset;
             while at < end {
@@ -442,7 +444,7 @@ impl segment::source::Source for RunSource {
                 };
                 let buffer = Buffer::read(index, block, false);
                 if buffer.kind() != KIND_RUN {
-                    pgrx::error!("Stanum run page has the wrong kind; REINDEX required");
+                    pgrx::error!("Stannum run page has the wrong kind; REINDEX required");
                 }
                 let (_, data) = checked(layout::chain(buffer.page()));
                 let take = ((end - at) as usize).min(data.len().saturating_sub(within));
@@ -548,7 +550,7 @@ fn release(meta: &mut Meta, run: Run) {
     if meta.pending.len() >= MAX_PENDING {
         // Leak rather than block; VACUUM will drain the list over time.
         pgrx::warning!(
-            "Stanum index pending-free list is full; {} pages leaked until REINDEX",
+            "Stannum index pending-free list is full; {} pages leaked until REINDEX",
             run.blocks
         );
         return;
@@ -597,19 +599,19 @@ unsafe fn read_buffer_range(
                 let buffer = Buffer::read(index, last, false);
                 let (next, _) = checked(layout::chain(buffer.page()));
                 if next == NONE {
-                    pgrx::error!("Stanum write buffer ends early; REINDEX required");
+                    pgrx::error!("Stannum write buffer ends early; REINDEX required");
                 }
                 pages.push(next);
             }
             let buffer = Buffer::read(index, pages[page], false);
             if buffer.kind() != KIND_BUFFER {
-                pgrx::error!("Stanum write buffer page has the wrong kind; REINDEX required");
+                pgrx::error!("Stannum write buffer page has the wrong kind; REINDEX required");
             }
             let (_, data) = checked(layout::chain(buffer.page()));
             let within = at % CHAIN_CAPACITY;
             let take = (to - at).min(data.len().saturating_sub(within));
             if take == 0 {
-                pgrx::error!("Stanum write buffer page is short; REINDEX required");
+                pgrx::error!("Stannum write buffer page is short; REINDEX required");
             }
             out.extend_from_slice(&data[within..within + take]);
             at += take;
@@ -686,16 +688,16 @@ unsafe fn read_buffer_stream(index: pg_sys::Relation, state: &BufferState) -> Ve
         while out.len() < state.bytes as usize {
             pgrx::check_for_interrupts!();
             if block == NONE {
-                pgrx::error!("Stanum write buffer ends early; REINDEX required");
+                pgrx::error!("Stannum write buffer ends early; REINDEX required");
             }
             let buffer = Buffer::read(index, block, false);
             if buffer.kind() != KIND_BUFFER {
-                pgrx::error!("Stanum write buffer page has the wrong kind; REINDEX required");
+                pgrx::error!("Stannum write buffer page has the wrong kind; REINDEX required");
             }
             let (next, data) = checked(layout::chain(buffer.page()));
             let take = (state.bytes as usize - out.len()).min(data.len());
             if take < data.len() && out.len() + take < state.bytes as usize {
-                pgrx::error!("Stanum write buffer page is short; REINDEX required");
+                pgrx::error!("Stannum write buffer page is short; REINDEX required");
             }
             out.extend_from_slice(&data[..take]);
             block = next;
@@ -712,12 +714,12 @@ unsafe fn append_to_buffer(index: pg_sys::Relation, state: &mut BufferState, mut
             pgrx::check_for_interrupts!();
             let tail = Buffer::read(index, state.tail, true);
             if tail.kind() != KIND_BUFFER {
-                pgrx::error!("Stanum write buffer page has the wrong kind; REINDEX required");
+                pgrx::error!("Stannum write buffer page has the wrong kind; REINDEX required");
             }
             let (next, existing) = checked(layout::chain(tail.page()));
             let used = state.tail_used as usize;
             if used > existing.len() {
-                pgrx::error!("Stanum write buffer page is short; REINDEX required");
+                pgrx::error!("Stannum write buffer page is short; REINDEX required");
             }
             if used == CHAIN_CAPACITY {
                 let next_block = if next == NONE {
@@ -869,12 +871,12 @@ pub unsafe fn build_empty(index: pg_sys::Relation) {
             return;
         }
         if blocks(index) != 0 {
-            pgrx::error!("Stanum index build requires an empty relation");
+            pgrx::error!("Stannum index build requires an empty relation");
         }
         let meta_buffer = Buffer::allocate(index);
         let head_buffer = Buffer::allocate(index);
         if meta_buffer.block() != 0 || head_buffer.block() != 1 {
-            pgrx::error!("unexpected Stanum index allocation");
+            pgrx::error!("unexpected Stannum index allocation");
         }
         write_page(
             index,
@@ -1093,7 +1095,7 @@ pub unsafe fn scan(
             let mut cursors: Vec<Box<dyn Cursor>> = Vec::with_capacity(queries.len());
             for query in queries {
                 let plan = plan(query, segment, &limits)
-                    .unwrap_or_else(|error| pgrx::error!("Stanum query plan: {error}"));
+                    .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
                 exact &= plan.exact;
                 cursors.push(plan.cursor);
             }
@@ -1279,7 +1281,7 @@ pub unsafe fn is_segmented(oid: pg_sys::Oid) -> bool {
     }
 }
 
-/// One row of `stanum.segment_info`, mirroring TIN's columns.
+/// One row of `stannum.segment_info`, mirroring TIN's columns.
 pub struct SegmentRow {
     pub ordinal: i64,
     pub kind: String,

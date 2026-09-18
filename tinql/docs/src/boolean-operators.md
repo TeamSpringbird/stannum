@@ -91,7 +91,7 @@ beer wine                  →  beer OR wine
 beer stout AND wine        →  beer OR (stout AND wine)
 ```
 
-Stanum's SQL interface uses implicit AND for both `==>` and `stanum.ql_parse()`.
+Stannum's SQL interface uses implicit AND for both `==>` and `stannum.ql_parse()`.
 Write `OR` explicitly in the TinQL string to request either term.
 
 ## Hyphens

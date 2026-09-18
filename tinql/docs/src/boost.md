@@ -45,7 +45,7 @@ The effect on the total score also depends on term frequency, document length,
 other query terms, and the scoring function's term selection. A boost
 of 3 does not guarantee that one document scores three times as high as another.
 
-Stanum collects scoring terms from the whole query and adds their weights when a
+Stannum collects scoring terms from the whole query and adds their weights when a
 term occurs in multiple branches. For example, `"craft beer"^3 OR (craft NEAR/5
 beer)` gives both terms weight 4 in every matching document, including one that
 matches only the proximity branch. Boosting the phrase provides no separate

@@ -3,12 +3,12 @@
 diff match sets and scores, bit for bit.
 
 Both sides use equivalent SQL with engine-specific schema and access-method
-names, comparing Stanum against TIN (or two Stanum builds). Connection details come from libpq environment variables read
+names, comparing Stannum against TIN (or two Stannum builds). Connection details come from libpq environment variables read
 from two env files, one per side, so credentials never appear on a command
 line or in results. Each side gets a fresh table in its own database; the
 script never drops anything it did not create.
 
-    python3 benchmarks/oracle.py --left stanum.env --right tin.env --rows 5000 \
+    python3 benchmarks/oracle.py --left stannum.env --right tin.env --rows 5000 \
         --output benchmarks/results/oracle-01
 
 States exercised, in order: after build; after deletes before VACUUM; after
@@ -88,7 +88,7 @@ def run(sql, env):
     return result.stdout
 
 
-def observe(env, query, engine="stanum"):
+def observe(env, query, engine="stannum"):
     """Match set and score bits, or the error text if the server rejects the query."""
     literal = query.replace("'", "''")
     sql = f"""SELECT json_build_object(
@@ -109,8 +109,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--left", required=True, help="env file for the first server (libpq variables)")
     parser.add_argument("--right", required=True, help="env file for the second server")
-    parser.add_argument("--left-engine", choices=("stanum", "tin"), default="stanum")
-    parser.add_argument("--right-engine", choices=("stanum", "tin"), default="tin")
+    parser.add_argument("--left-engine", choices=("stannum", "tin"), default="stannum")
+    parser.add_argument("--right-engine", choices=("stannum", "tin"), default="tin")
     parser.add_argument("--rows", type=int, default=5000)
     parser.add_argument("--output", required=True)
     parser.add_argument("--keep", action="store_true", help="leave oracle_docs in place afterwards")

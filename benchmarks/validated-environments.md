@@ -1,7 +1,7 @@
 # Adapter smoke environments, 2026-09-17
 
 Historical environment observations; Lead/TIN build identities are preserved.
-For current Stanum results, see [BENCHMARKS.md](../BENCHMARKS.md).
+For current Stannum results, see [BENCHMARKS.md](../BENCHMARKS.md).
 
 These are correctness/execution checks with 1,000 synthetic documents, one reader,
 5 seconds of traffic, 1 second of read warmup, and a requested 10 updates/second.

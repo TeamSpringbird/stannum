@@ -1,6 +1,6 @@
-# Benchmarking Stanum
+# Benchmarking Stannum
 
-Our question is whether Stanum can provide exact Boolean/phrase search, BM25
+Our question is whether Stannum can provide exact Boolean/phrase search, BM25
 ranking, and counts at useful throughput while documents are being updated. We
 compare behavior before speed, retain failures, and keep raw evidence for each
 build. This page is the current plan and results summary; older investigation
@@ -17,7 +17,7 @@ has all five successful repetitions.
 A frozen development build from `t3code/postgres-full-text-index-design-1`, commit
 `3906c288ec2142133439cec4b31364d89b2515a3` **plus uncommitted changes**, then passed
 one count trial and one mixed trial under the same workload and resource settings.
-This build still used the old `tin` extension identity. The Stanum rename itself
+This build still used the old `tin` extension identity. The Stannum rename itself
 has not been measured in these results. A commit alone cannot reproduce that
 working-tree build: its source snapshot, per-file hashes, patch, and immutable
 image ID were retained.
@@ -28,14 +28,14 @@ image ID were retained.
 | PostgreSQL GIN | 3.25 | 5/5 | not tested | — |
 | ParadeDB | 80.33 | 5/5 | 80.93 | 5/5 |
 | pg_textsearch | 0.21 | 5/5 | incomplete | 1/5 |
-| Stanum development build, before rename | **1,458.45** | **1/1** | **644.79** | **1/1** |
+| Stannum development build, before rename | **1,458.45** | **1/1** | **644.79** | **1/1** |
 
-Baseline values are medians of five trials. Stanum values are single trials, not
+Baseline values are medians of five trials. Stannum values are single trials, not
 five-run estimates. These are earlier-versus-later measurements on one host, not
 interleaved pairs. Large differences justify further testing; they do not establish
 an engine-wide performance ranking, significance, or production capacity.
 
-Stanum sustained about 20.24 updates/second in both trials. Index build time was
+Stannum sustained about 20.24 updates/second in both trials. Index build time was
 17.73 s for count and 18.47 s for mixed; total index size after traffic was about
 175.29 MiB, including the primary-key index. Peak container memory was below
 1.9 GiB. Both trials passed before/after exact-membership checks; mixed also passed
@@ -66,7 +66,7 @@ The development machine retains these folders beneath
 source snapshots, plans, logs, resource counters, and comparison reports. They are
 local evidence, not downloadable public artifacts. Generated corpora and raw
 results are excluded from Git. Keep legacy folders and frozen protocols unchanged;
-new Stanum builds use new output folders and image tags.
+new Stannum builds use new output folders and image tags.
 
 ## Workload and resource envelope
 
@@ -102,10 +102,10 @@ sets, and long-running maintenance are separate workloads still needed. CPU and
 memory limits are ceilings, not reserved hardware; background host activity is
 recorded and can affect results. Client CPU is outside the server budget.
 
-## Reproduce a Stanum campaign
+## Reproduce a Stannum campaign
 
 Install Docker with native ARM64 support, Python 3, and PostgreSQL 18 client tools.
-The Docker recipe builds Stanum and pins the comparator distribution/sources.
+The Docker recipe builds Stannum and pins the comparator distribution/sources.
 Use an existing checksummed 100k corpus, or prepare one using `benchmarks/dataset.py`
 as described in [LOCAL.md](benchmarks/LOCAL.md). Corpus preparation currently also
 materializes a nested million-document sample; that does not authorize or launch
@@ -114,14 +114,14 @@ a million-document evaluation. The series runner defaults to 100k only.
 ```sh
 export PATH="$(brew --prefix postgresql@18)/bin:$PATH"
 DATASETS="$HOME/Library/Application Support/LeadBenchmarks/datasets"
-RESULTS="$HOME/Library/Application Support/StanumBenchmarks/campaigns"
+RESULTS="$HOME/Library/Application Support/StannumBenchmarks/campaigns"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 
 python3 benchmarks/campaign.py --build \
-  --image "stanum-bench:$RUN_ID" \
-  --output "$RESULTS/stanum-100k-$RUN_ID" \
+  --image "stannum-bench:$RUN_ID" \
+  --output "$RESULTS/stannum-100k-$RUN_ID" \
   --dataset "$DATASETS/wikipedia-100000" --rows 100000 \
-  --engines stanum --profiles count mixed --repetitions 5 \
+  --engines stannum --profiles count mixed --repetitions 5 \
   --seconds 300 --warmup 30 --clients 2 --write-rate 20 \
   --statement-timeout-ms 1800000
 ```
@@ -133,16 +133,16 @@ fingerprints including the `segment` crate. Pause other benchmark traffic and
 heavy builds before measured trials. A campaign builds its image before traffic.
 
 For a new all-engine local campaign select
-`--engines stanum gin paradedb pg_textsearch`. TIN is an explicit external adapter;
+`--engines stannum gin paradedb pg_textsearch`. TIN is an explicit external adapter;
 it is not bundled in the Docker image or included in the local defaults.
 
 ## Comparing with PlanetScale TIN
 
 The earlier remote TIN measurements use PlanetScale hardware and a network path
-that differ from local Stanum. Their QPS is not comparable to the table above.
+that differ from local Stannum. Their QPS is not comparable to the table above.
 Server-side execution probes suggest similar orders of magnitude for some shapes,
 but they also use different hardware/settings. We have not demonstrated that
-Stanum is faster than TIN on equal resources.
+Stannum is faster than TIN on equal resources.
 
 ### Server-side execution time, shape by shape
 
@@ -150,12 +150,12 @@ Stanum is faster than TIN on equal resources.
 time of the twenty mixed-profile shapes, in one warm session, median of five
 after two discarded executions, with `enable_seqscan` off on both sides. The
 100k Wikipedia corpus and the same SQL were used on both; only the schema name
-differs. Stanum ran commit `859cda5` in release mode on the local pgrx server;
+differs. Stannum ran commit `859cda5` in release mode on the local pgrx server;
 TIN 1.0.2 ran on the PlanetScale instance. Different hardware, so read the
 table for structure: which shapes are cheap, which are broad, and whether the
 two engines are in the same range.
 
-| Query shape | TIN on PlanetScale, ms | Stanum, local, ms |
+| Query shape | TIN on PlanetScale, ms | Stannum, local, ms |
 | --- | ---: | ---: |
 | miss count | 0.17 | 0.02 |
 | miss ranked | 0.21 | 0.04 |
@@ -178,7 +178,7 @@ two engines are in the same range.
 | phrase miss count | 0.21 | 0.04 |
 | phrase miss ranked | 0.31 | 0.06 |
 
-Raw plans and timings: `benchmarks/results/server-times-stanum-01` and
+Raw plans and timings: `benchmarks/results/server-times-stannum-01` and
 `server-times-tin-01` (local, not in Git).
 
 ### Compatibility oracle
@@ -186,14 +186,14 @@ Raw plans and timings: `benchmarks/results/server-times-stanum-01` and
 The compatibility oracle agrees on all 205 query/state pairs (41 queries across
 five mutation states), including document sets and score bits, for the renamed
 build `859cda5` against TIN on PlanetScale
-(`benchmarks/results/stanum-vs-tin-oracle-01`). It selects each extension
+(`benchmarks/results/stannum-vs-tin-oracle-01`). It selects each extension
 explicitly:
 
 ```sh
 python3 benchmarks/oracle.py \
-  --left stanum.env --left-engine stanum \
+  --left stannum.env --left-engine stannum \
   --right tin.env --right-engine tin \
-  --rows 5000 --output benchmarks/results/stanum-vs-tin-oracle-01
+  --rows 5000 --output benchmarks/results/stannum-vs-tin-oracle-01
 ```
 
 Use dedicated test databases and libpq environment files. The two databases must
@@ -207,7 +207,7 @@ for five repetitions, run one workload at a time, and compare per-query latency,
 QPS, achieved writes, build time, index bytes, and resource pressure. Verify plans,
 match sets, and scoring behavior before accepting performance claims.
 
-Our current PlanetScale role cannot install server binaries, and Stanum is not an
+Our current PlanetScale role cannot install server binaries, and Stannum is not an
 available extension on the checked instance. PlanetScale support would need to
 provide custom-extension installation, or we would need access to a TIN build on
 a host we control. See [PlanetScale's extension policy](https://planetscale.com/docs/postgres/extensions#need-additional-extensions).
@@ -215,8 +215,8 @@ Renaming the extension does not remove this deployment requirement.
 
 ## Next steps and interpretation
 
-1. Repeat the renamed Stanum build under the frozen 100k protocol; retain all runs.
-2. Obtain same-instance TIN/Stanum comparisons with alternating trials.
+1. Repeat the renamed Stannum build under the frozen 100k protocol; retain all runs.
+2. Obtain same-instance TIN/Stannum comparisons with alternating trials.
 3. Extend correctness and latency coverage to sustained inserts/deletes, changing
    matches, folding/merging, VACUUM, restart, and crash recovery.
 4. Investigate long-tail latency, broad ranked queries, cold sessions, and

@@ -3,7 +3,7 @@
 
 The throughput harness (`run.py`) measures what a client sees, which on a
 remote server is mostly the network. This probe asks the server how long each
-statement took to execute, so a Stanum build on one machine can be set beside
+statement took to execute, so a Stannum build on one machine can be set beside
 TIN on PlanetScale shape by shape. Hardware and settings still differ between
 the two sides; the numbers show structure, not a ranking.
 
@@ -14,8 +14,8 @@ environment variables; the `documents` table and its index must already exist,
 as `run.py` leaves them.
 
     PGHOST=... PGDATABASE=... python3 benchmarks/server_times.py \\
-        --engine stanum --dataset "$DATASETS/wikipedia-100000" \\
-        --output benchmarks/results/server-times-stanum-01
+        --engine stannum --dataset "$DATASETS/wikipedia-100000" \\
+        --output benchmarks/results/server-times-stannum-01
 """
 import argparse
 import json
@@ -39,7 +39,7 @@ def load_cases(dataset):
 
 def explain_all(engine, queries, repetitions, disable_seqscan, env):
     """Runs every query `repetitions` times in one session; returns the plans."""
-    load = {"stanum": "DO $$ BEGIN PERFORM stanum.tokenize('load'); END $$;",
+    load = {"stannum": "DO $$ BEGIN PERFORM stannum.tokenize('load'); END $$;",
             "tin": "DO $$ BEGIN PERFORM tin.tokenize('load'); END $$;"}.get(engine, "")
     script = [load]
     if disable_seqscan:

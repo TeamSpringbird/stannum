@@ -52,8 +52,8 @@ mod tests {
                (1, 'craft beer'), (2, 'wine'), (3, 'beer festival')",
         )
         .unwrap();
-        Spi::run("CREATE INDEX lite_search_idx ON lite_search USING stanum (body)").unwrap();
-        Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL stanum.enable_custom_scan = off")
+        Spi::run("CREATE INDEX lite_search_idx ON lite_search USING stannum (body)").unwrap();
+        Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL stannum.enable_custom_scan = off")
             .unwrap();
         let ids = Spi::get_one::<Vec<i32>>(
             "SELECT array_agg(id ORDER BY id) FROM lite_search WHERE body ==> 'beer'",
@@ -78,8 +78,8 @@ mod tests {
             "CREATE TABLE posting_probe (id int, body text);
           INSERT INTO posting_probe SELECT n, 'common ' || repeat('filler ', 120) ||
             CASE WHEN n=777 THEN 'needle' ELSE '' END FROM generate_series(1,1500) n;
-          CREATE INDEX posting_probe_idx ON posting_probe USING stanum(body);
-          SET LOCAL enable_seqscan=off; SET LOCAL stanum.enable_custom_scan=off;",
+          CREATE INDEX posting_probe_idx ON posting_probe USING stannum(body);
+          SET LOCAL enable_seqscan=off; SET LOCAL stannum.enable_custom_scan=off;",
         )
         .unwrap();
         // Meta page, one write-buffer page, and at least one segment page.
@@ -125,8 +125,8 @@ mod tests {
                  (3,'beer craft'), (4,'wine'), (5,'beer beer'), (6,'cider');
              INSERT INTO boolean_docs SELECT n, repeat('padding ',120)
                  FROM generate_series(7,1000) n;
-             CREATE INDEX boolean_docs_search ON boolean_docs USING stanum(body);
-             SET LOCAL stanum.enable_custom_scan = off;",
+             CREATE INDEX boolean_docs_search ON boolean_docs USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = off;",
         )
         .unwrap();
         for (query, expected) in [
@@ -212,8 +212,8 @@ mod tests {
                     WHEN n%4=2 THEN 'beer craft ' ELSE 'wine craft ' END
                || CASE WHEN n=1500 THEN 'needle ' ELSE '' END
                || repeat('padding ',500) FROM generate_series(1,3000) n;
-             CREATE INDEX lossy_docs_search ON lossy_docs USING stanum(body);
-             SET LOCAL work_mem='64kB'; SET LOCAL enable_seqscan=off; SET LOCAL stanum.enable_custom_scan=off;",
+             CREATE INDEX lossy_docs_search ON lossy_docs USING stannum(body);
+             SET LOCAL work_mem='64kB'; SET LOCAL enable_seqscan=off; SET LOCAL stannum.enable_custom_scan=off;",
         )
         .unwrap();
         // The 3.5KB inline documents create enough heap pages to force lossiness
@@ -275,10 +275,10 @@ mod tests {
     fn write_buffer_folds_and_merges_keep_results_exact() {
         Spi::run(
             "CREATE TABLE folded(id int, body text);
-             CREATE INDEX folded_idx ON folded USING stanum(body);
-             SET LOCAL stanum.enable_custom_scan = off;
-             SET LOCAL stanum.write_buffer_docs = 4;
-             SET LOCAL stanum.max_segments = 3;
+             CREATE INDEX folded_idx ON folded USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = off;
+             SET LOCAL stannum.write_buffer_docs = 4;
+             SET LOCAL stannum.max_segments = 3;
              INSERT INTO folded
                SELECT n, 'w' || (n % 7) || ' common ' ||
                       CASE WHEN n % 10 = 0 THEN 'rare needle' ELSE 'other filler' END
@@ -336,7 +336,7 @@ mod tests {
         Spi::run(
             "CREATE TABLE cased(id int, body text);
              INSERT INTO cased VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER');
-             CREATE INDEX cased_idx ON cased USING stanum(body) WITH (case_folding = preserve);
+             CREATE INDEX cased_idx ON cased USING stannum(body) WITH (case_folding = preserve);
              SET LOCAL enable_seqscan = off;",
         )
         .unwrap();
@@ -364,14 +364,14 @@ mod tests {
             "CREATE TABLE parity(id int primary key, body text);
              INSERT INTO parity VALUES (1,'rare common'), (2,'common common'),
                (3,'common'), (4,'rare rare common x'), (5,'other');
-             CREATE INDEX parity_idx ON parity USING stanum(body);",
+             CREATE INDEX parity_idx ON parity USING stannum(body);",
         )
         .unwrap();
         let scores = |label: &str| -> Vec<(i32, u32)> {
             let rows = Spi::connect(|client| {
                 client
                     .select(
-                        "SELECT id, stanum.full_score(ctid) FROM parity
+                        "SELECT id, stannum.full_score(ctid) FROM parity
                          WHERE body ==> 'rare OR common' ORDER BY id",
                         None,
                         &[],
@@ -434,11 +434,11 @@ mod tests {
             "CREATE TABLE dense(id int primary key, body text);
              INSERT INTO dense SELECT n, CASE WHEN n <= 3 THEN 'rare common' ELSE 'common filler' END
                FROM generate_series(1, 30) n;
-             CREATE INDEX dense_idx ON dense USING stanum(body);",
+             CREATE INDEX dense_idx ON dense USING stannum(body);",
         )
         .unwrap();
         let dense = Spi::get_one::<Vec<f32>>(
-            "SELECT array_agg(stanum.score(ctid) ORDER BY id) FROM dense
+            "SELECT array_agg(stannum.score(ctid) ORDER BY id) FROM dense
              WHERE body ==> 'rare OR common' AND id <= 5",
         )
         .unwrap()
@@ -459,7 +459,7 @@ mod tests {
             "CREATE TABLE mx(id int primary key, body text);
              INSERT INTO mx VALUES (1,'a'), (2,'a a'), (3,'a b c d'), (4,'a a a b'), (5,'b'),
                (6,'c c c c c c'), (7,'rare'), (8,'rate'), (9,'rave'), (10,'x y z');
-             CREATE INDEX mx_idx ON mx USING stanum(body);",
+             CREATE INDEX mx_idx ON mx USING stannum(body);",
         )
         .unwrap();
         let bits = |sql: &str| -> Vec<u32> {
@@ -472,53 +472,53 @@ mod tests {
         };
         assert_eq!(
             bits(
-                "SELECT array_agg(stanum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'a'"
+                "SELECT array_agg(stannum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'a'"
             ),
             [0x3f96_44a5, 0x3fa5_0c72, 0x3f33_c8fc, 0x3f9d_4fdb]
         );
         // Standalone max_score: full policy, maximum over matching rows.
         assert_eq!(
             bits(
-                "SELECT array_agg(m) FROM (SELECT stanum.max_score(ctid) m FROM mx WHERE body ==> 'a' LIMIT 1) s"
+                "SELECT array_agg(m) FROM (SELECT stannum.max_score(ctid) m FROM mx WHERE body ==> 'a' LIMIT 1) s"
             ),
             [0x3fa5_0c72]
         );
         assert_eq!(
             bits(
-                "SELECT array_agg(m) FROM (SELECT stanum.max_score(ctid) m FROM mx WHERE body ==> 'a OR b' LIMIT 1) s"
+                "SELECT array_agg(m) FROM (SELECT stannum.max_score(ctid) m FROM mx WHERE body ==> 'a OR b' LIMIT 1) s"
             ),
             [0x4008_3d61]
         );
         assert_eq!(
             bits(
-                "SELECT array_agg(m) FROM (SELECT stanum.max_score(ctid) m FROM mx WHERE body ==> 'c' LIMIT 1) s"
+                "SELECT array_agg(m) FROM (SELECT stannum.max_score(ctid) m FROM mx WHERE body ==> 'c' LIMIT 1) s"
             ),
             [0x400a_26fb]
         );
-        // Beside stanum.score in the same target list it adapts to the dense
+        // Beside stannum.score in the same target list it adapts to the dense
         // policy (a is in 4 of 9 documents, so it is elided and scores zero).
         assert_eq!(
             bits(
-                "SELECT array_agg(m) FROM (SELECT stanum.max_score(ctid) + 0::real * stanum.score(ctid) AS m FROM mx WHERE body ==> 'a' LIMIT 1) t"
+                "SELECT array_agg(m) FROM (SELECT stannum.max_score(ctid) + 0::real * stannum.score(ctid) AS m FROM mx WHERE body ==> 'a' LIMIT 1) t"
             ),
             [0x0000_0000]
         );
         // Fuzzy and wildcard expansions score every matching dictionary term.
         assert_eq!(
             bits(
-                "SELECT array_agg(stanum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'rare~1'"
+                "SELECT array_agg(stannum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'rare~1'"
             ),
             [0x4027_7bac, 0x4027_7bac, 0x4027_7bac]
         );
         assert_eq!(
             bits(
-                "SELECT array_agg(stanum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'ra*'"
+                "SELECT array_agg(stannum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'ra*'"
             ),
             [0x4027_7bac, 0x4027_7bac, 0x4027_7bac]
         );
         let inspect = |query: &str| -> Vec<String> {
             Spi::get_one::<Vec<String>>(&format!(
-                "SELECT array_agg(term || ':' || weight ORDER BY term) FROM stanum.score_inspect('mx_idx', '{query}', 1.0)"
+                "SELECT array_agg(term || ':' || weight ORDER BY term) FROM stannum.score_inspect('mx_idx', '{query}', 1.0)"
             ))
             .unwrap()
             .unwrap_or_default()
@@ -540,8 +540,8 @@ mod tests {
              INSERT INTO cs SELECT n, 'common w' || (n % 7) || ' ' ||
                CASE WHEN n % 100 = 0 THEN 'rare alpha beta' ELSE 'filler' END
                FROM generate_series(1, 3000) n;
-             CREATE INDEX cs_idx ON cs USING stanum(body);
-             CREATE INDEX cs_partial ON cs USING stanum(lower(body)) WHERE active;
+             CREATE INDEX cs_idx ON cs USING stannum(body);
+             CREATE INDEX cs_partial ON cs USING stannum(lower(body)) WHERE active;
              UPDATE cs SET active = false WHERE id = 300;
              DELETE FROM cs WHERE id % 500 = 0;",
         )
@@ -557,7 +557,7 @@ mod tests {
         for query in queries {
             let both = |custom: bool| -> (Vec<i32>, i64, Vec<i32>) {
                 Spi::run(&format!(
-                    "SET LOCAL stanum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;"
+                    "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;"
                 ))
                 .unwrap();
                 let ids = Spi::get_one::<Vec<i32>>(&format!(
@@ -572,7 +572,7 @@ mod tests {
                 .unwrap();
                 let top = Spi::get_one::<Vec<i32>>(&format!(
                     "SELECT coalesce(array_agg(id), '{{}}') FROM (SELECT id FROM cs WHERE body ==> '{query}'
-                     ORDER BY stanum.full_score(ctid) DESC, id LIMIT 5) t"
+                     ORDER BY stannum.full_score(ctid) DESC, id LIMIT 5) t"
                 ))
                 .unwrap()
                 .unwrap();
@@ -580,7 +580,7 @@ mod tests {
             };
             assert_eq!(both(true), both(false), "{query}");
         }
-        Spi::run("SET LOCAL stanum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;")
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;")
             .unwrap();
         let plan = Spi::get_one::<Json>(
             "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM cs WHERE body ==> 'rare'",
@@ -588,16 +588,16 @@ mod tests {
         .unwrap()
         .unwrap()
         .0;
-        assert_eq!(plan[0]["Plan"]["Custom Plan Provider"], "Stanum Count");
+        assert_eq!(plan[0]["Plan"]["Custom Plan Provider"], "Stannum Count");
         let plan = Spi::get_one::<Json>(
             "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM cs WHERE body ==> 'common OR rare'
-             ORDER BY stanum.full_score(ctid) DESC LIMIT 2",
+             ORDER BY stannum.full_score(ctid) DESC LIMIT 2",
         )
         .unwrap()
         .unwrap()
         .0;
         let scan = &plan[0]["Plan"]["Plans"][0]["Plans"][0];
-        assert_eq!(scan["Custom Plan Provider"], "Stanum Text Search Scan");
+        assert_eq!(scan["Custom Plan Provider"], "Stannum Text Search Scan");
         assert_eq!(scan["Order"], "score DESC");
         assert_eq!(scan["Heap Fetches"], 2);
         // A partial index answers only queries that imply its predicate; the
@@ -625,14 +625,14 @@ mod tests {
         .unwrap();
         let joined = |custom: bool| -> Vec<i32> {
             Spi::run(&format!(
-                "SET LOCAL stanum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;
+                "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;
                  SET LOCAL enable_sort = off; SET LOCAL enable_hashjoin = off;
                  SET LOCAL enable_mergejoin = off;"
             ))
             .unwrap();
             Spi::get_one::<Vec<i32>>(
                 "SELECT array_agg(id ORDER BY id) FROM (SELECT d.id FROM cs d JOIN cs_keep k USING (id)
-                 WHERE d.body ==> 'common OR rare' ORDER BY stanum.full_score(d.ctid) DESC LIMIT 4) t",
+                 WHERE d.body ==> 'common OR rare' ORDER BY stannum.full_score(d.ctid) DESC LIMIT 4) t",
             )
             .unwrap()
             .unwrap()
@@ -642,16 +642,16 @@ mod tests {
         let with_custom = joined(true);
         assert_eq!(with_custom, vec![2600, 2700, 2800, 2900]);
         assert_eq!(with_custom, joined(false));
-        Spi::run("SET LOCAL stanum.enable_custom_scan = on;").unwrap();
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on;").unwrap();
         let plan = Spi::get_one::<Json>(
             "EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.id FROM cs d JOIN cs_keep k USING (id)
-             WHERE d.body ==> 'common OR rare' ORDER BY stanum.full_score(d.ctid) DESC LIMIT 4",
+             WHERE d.body ==> 'common OR rare' ORDER BY stannum.full_score(d.ctid) DESC LIMIT 4",
         )
         .unwrap()
         .unwrap()
         .0;
         let text = plan.to_string();
-        assert!(text.contains("Stanum Text Search Scan"), "{text}");
+        assert!(text.contains("Stannum Text Search Scan"), "{text}");
         assert!(text.contains("\"Top K\":4"), "{text}");
     }
 
@@ -660,8 +660,8 @@ mod tests {
         Spi::run(
             "CREATE TABLE si(id int primary key, body text);
              INSERT INTO si SELECT n, 'w' || (n % 5) || ' common' FROM generate_series(1, 50) n;
-             CREATE INDEX si_idx ON si USING stanum(body);
-             SET LOCAL stanum.write_buffer_docs = 4;
+             CREATE INDEX si_idx ON si USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 4;
              INSERT INTO si SELECT n, 'late needle' FROM generate_series(100, 109) n;
              DELETE FROM si WHERE id <= 10;",
         )
@@ -670,7 +670,7 @@ mod tests {
             client
                 .select(
                     "SELECT kind, docs, dead_docs, sum_doc_lengths, total_pages
-                     FROM stanum.segment_info('si_idx') ORDER BY ordinal",
+                     FROM stannum.segment_info('si_idx') ORDER BY ordinal",
                     None,
                     &[],
                 )
@@ -702,7 +702,7 @@ mod tests {
     fn posting_inserts_rolled_back_by_subtransaction_are_not_visible() {
         Spi::run(
             "CREATE TABLE posting_abort(body text);
-          CREATE INDEX posting_abort_idx ON posting_abort USING stanum(body);
+          CREATE INDEX posting_abort_idx ON posting_abort USING stannum(body);
           DO $$ BEGIN
             INSERT INTO posting_abort VALUES ('aborted');
             RAISE EXCEPTION 'abort subtransaction';
@@ -728,7 +728,7 @@ mod tests {
         Spi::run(
             "CREATE UNLOGGED TABLE posting_unlogged(body text);
           INSERT INTO posting_unlogged VALUES ('beer');
-          CREATE INDEX posting_unlogged_idx ON posting_unlogged USING stanum(body);
+          CREATE INDEX posting_unlogged_idx ON posting_unlogged USING stannum(body);
           SET LOCAL enable_seqscan=off;",
         )
         .unwrap();
@@ -747,7 +747,7 @@ mod tests {
     fn bitmap_scan_follows_heap_growth_and_truncate() {
         Spi::run(
             "CREATE TABLE lite_growth (id int, body text);
-             CREATE INDEX lite_growth_idx ON lite_growth USING stanum (body);
+             CREATE INDEX lite_growth_idx ON lite_growth USING stannum (body);
              SET LOCAL enable_seqscan = off;",
         )
         .unwrap();
@@ -785,8 +785,8 @@ mod tests {
                (1, 'BEER', true), (2, 'wine', true),
                (3, 'BEER', false), (4, NULL, true);
              CREATE INDEX lite_partial_idx ON lite_partial
-               USING stanum (lower(body)) WHERE active;
-             SET LOCAL enable_seqscan = off; SET LOCAL stanum.enable_custom_scan = off;",
+               USING stannum (lower(body)) WHERE active;
+             SET LOCAL enable_seqscan = off; SET LOCAL stannum.enable_custom_scan = off;",
         )
         .unwrap();
         let plan = Spi::get_one::<Json>(
@@ -827,8 +827,8 @@ mod tests {
              INSERT INTO lite_union VALUES
                (1, 'beer', 'wine'), (2, 'wine', 'beer'),
                (3, 'beer', 'beer'), (4, 'wine', 'wine');
-             CREATE INDEX lite_union_title_idx ON lite_union USING stanum (title);
-             CREATE INDEX lite_union_body_idx ON lite_union USING stanum (body);
+             CREATE INDEX lite_union_title_idx ON lite_union USING stannum (title);
+             CREATE INDEX lite_union_body_idx ON lite_union USING stannum (body);
              SET LOCAL enable_seqscan = off;",
         )
         .unwrap();
@@ -855,7 +855,7 @@ mod tests {
         Spi::run(
             "CREATE TABLE lite_mvcc (id int, body text);
              INSERT INTO lite_mvcc VALUES (1, 'old term'), (2, 'keep term');
-             CREATE INDEX lite_mvcc_idx ON lite_mvcc USING stanum (body);
+             CREATE INDEX lite_mvcc_idx ON lite_mvcc USING stannum (body);
              UPDATE lite_mvcc SET body = 'new term' WHERE id = 1;
              DELETE FROM lite_mvcc WHERE id = 2;
              SET LOCAL enable_seqscan = off;",
@@ -887,11 +887,11 @@ mod tests {
             "CREATE TABLE lite_score (id int, body text);
              INSERT INTO lite_score VALUES
                (1, 'rare'), (2, 'rare rare rare'), (3, 'common');
-             CREATE INDEX lite_score_idx ON lite_score USING stanum (body);",
+             CREATE INDEX lite_score_idx ON lite_score USING stannum (body);",
         )
         .unwrap();
         let ids = Spi::get_one::<Vec<i32>>(
-            "SELECT array_agg(id ORDER BY stanum.full_score(ctid) DESC, id)
+            "SELECT array_agg(id ORDER BY stannum.full_score(ctid) DESC, id)
              FROM lite_score WHERE body ==> 'rare'",
         )
         .unwrap();
@@ -904,17 +904,17 @@ mod tests {
             "CREATE TABLE lite_score_helpers (id int, body text);
              INSERT INTO lite_score_helpers VALUES
                (1, 'common rare'), (2, 'common'), (3, 'common');
-             CREATE INDEX lite_score_helpers_idx ON lite_score_helpers USING stanum (body)",
+             CREATE INDEX lite_score_helpers_idx ON lite_score_helpers USING stannum (body)",
         )
         .unwrap();
         let full_max = Spi::get_one::<f32>(
-            "SELECT max(stanum.full_score(ctid))
+            "SELECT max(stannum.full_score(ctid))
              FROM lite_score_helpers WHERE body ==> 'rare^1.0'",
         )
         .unwrap()
         .unwrap();
         let reported = Spi::get_one::<f32>(
-            "SELECT stanum.max_score(ctid)
+            "SELECT stannum.max_score(ctid)
              FROM lite_score_helpers WHERE body ==> 'rare^1.0' LIMIT 1",
         )
         .unwrap()
@@ -922,7 +922,7 @@ mod tests {
         assert_eq!(reported, full_max);
         let inspected = Spi::get_one::<Vec<String>>(
             "SELECT array_agg(term ORDER BY term)
-             FROM stanum.score_inspect('lite_score_helpers_idx', 'common OR rare', 0.5)",
+             FROM stannum.score_inspect('lite_score_helpers_idx', 'common OR rare', 0.5)",
         )
         .unwrap();
         assert_eq!(inspected, Some(vec!["rare".to_owned()]));
@@ -939,13 +939,13 @@ mod tests {
              INSERT INTO lite_expression_score
                SELECT n, 'noise', n::text FROM generate_series(4, 30) AS n;
              CREATE INDEX lite_expression_score_idx ON lite_expression_score
-               USING stanum (((s1 || ' '::text) || s2));",
+               USING stannum (((s1 || ' '::text) || s2));",
         )
         .unwrap();
         let rows = Spi::connect(|client| {
             client
                 .select(
-                    "SELECT id, stanum.score(ctid) AS score
+                    "SELECT id, stannum.score(ctid) AS score
                      FROM lite_expression_score
                      WHERE (s1 || ' ' || s2) ==> 'hello world 10'
                      ORDER BY score DESC, id LIMIT 5",
@@ -969,7 +969,7 @@ mod tests {
     fn highlighting_supports_explicit_and_implicit_queries() {
         assert_eq!(
             Spi::get_one::<String>(
-                "SELECT stanum.highlight('Beer and wine', '[', ']', query => 'beer')"
+                "SELECT stannum.highlight('Beer and wine', '[', ']', query => 'beer')"
             )
             .unwrap(),
             Some("[Beer] and wine".into())
@@ -979,12 +979,12 @@ mod tests {
              INSERT INTO lite_highlight VALUES
                (1, 'Beer', 'and wine'), (2, 'cider', 'only');
              CREATE INDEX lite_highlight_idx ON lite_highlight
-               USING stanum (((s1 || ' '::text) || s2));",
+               USING stannum (((s1 || ' '::text) || s2));",
         )
         .unwrap();
         assert_eq!(
             Spi::get_one::<String>(
-                "SELECT stanum.highlight(s1 || ' ' || s2)
+                "SELECT stannum.highlight(s1 || ' ' || s2)
                  FROM lite_highlight
                  WHERE (s1 || ' ' || s2) ==> 'beer'"
             )
@@ -992,7 +992,7 @@ mod tests {
             Some("<b>Beer</b> and wine".into())
         );
         let ansi = Spi::get_one::<String>(
-            "SELECT stanum.highlight_ansi(s1 || ' ' || s2)
+            "SELECT stannum.highlight_ansi(s1 || ' ' || s2)
              FROM lite_highlight
              WHERE (s1 || ' ' || s2) ==> 'beer'",
         )

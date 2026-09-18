@@ -65,7 +65,7 @@ jobs:
       - name: Build
         env:
           PG_MAJOR: ${{ matrix.postgres }}
-        run: cargo build --locked --package stanum --no-default-features --features "pg${PG_MAJOR}"
+        run: cargo build --locked --package stannum --no-default-features --features "pg${PG_MAJOR}"
 
       - name: Clippy
         env:
@@ -75,4 +75,4 @@ jobs:
       - name: Test local suite
         env:
           PG_MAJOR: ${{ matrix.postgres }}
-        run: cargo pgrx test "pg${PG_MAJOR}" --package stanum --no-default-features --features "pg${PG_MAJOR}"
+        run: cargo pgrx test "pg${PG_MAJOR}" --package stannum --no-default-features --features "pg${PG_MAJOR}"

@@ -39,15 +39,15 @@ class DatasetTests(unittest.TestCase):
         corpus = {'cases': [dataset.CASES[1]], 'match_counts': {'common': 12}}
         with patch.object(run, 'sql_json', return_value={'count': 12, 'differences': 2}):
             with self.assertRaises(ValueError):
-                run.validate('stanum', 1000, {}, corpus)
+                run.validate('stannum', 1000, {}, corpus)
 
     def test_external_ranked_oracle_checks_membership(self):
         corpus = {'cases': [dataset.CASES[1]], 'match_counts': {'common': 1}}
         with patch.object(run, 'sql_json', side_effect=[[{'id': 3, 'score': 1.0}], [3]]):
-            run.validate_ranked('stanum', 1000, {}, corpus)
+            run.validate_ranked('stannum', 1000, {}, corpus)
         with patch.object(run, 'sql_json', side_effect=[[{'id': 3, 'score': 1.0}], []]):
             with self.assertRaises(ValueError):
-                run.validate_ranked('stanum', 1000, {}, corpus)
+                run.validate_ranked('stannum', 1000, {}, corpus)
 
 
 if __name__ == '__main__':

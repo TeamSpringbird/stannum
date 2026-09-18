@@ -97,7 +97,7 @@ pub fn init() {
         pg_sys::add_int_reloption(
             kind,
             c"initial_segment_count".as_ptr(),
-            c"Ignored Stanum segment-count compatibility option".as_ptr(),
+            c"Ignored Stannum segment-count compatibility option".as_ptr(),
             1,
             1,
             1024,
@@ -187,7 +187,7 @@ pub fn init() {
         pg_sys::add_string_reloption(
             kind,
             c"score_stop_words".as_ptr(),
-            c"Comma-separated analyzed terms omitted by stanum.score".as_ptr(),
+            c"Comma-separated analyzed terms omitted by stannum.score".as_ptr(),
             std::ptr::null(),
             None,
             lock,
@@ -294,7 +294,7 @@ unsafe fn parsed(index: pg_sys::Relation) -> Option<&'static IndexOptions> {
 
 pub unsafe fn tokenizer_spec(index: pg_sys::Relation) -> TokenizerPipelineSpec {
     let Some(options) = (unsafe { parsed(index) }) else {
-        return TokenizerPipelineSpec::stanum_default();
+        return TokenizerPipelineSpec::stannum_default();
     };
     TokenizerPipelineSpec {
         tokenizer: match options.tokenizer {
@@ -450,7 +450,7 @@ mod tests {
             position_gaps: PositionGapMode::Collapse,
         };
         assert_eq!(decode_spec(&encode_spec(&spec)), Some(spec));
-        let default = TokenizerPipelineSpec::stanum_default();
+        let default = TokenizerPipelineSpec::stannum_default();
         assert_eq!(decode_spec(&encode_spec(&default)), Some(default));
         assert_eq!(decode_spec(&[9, 0, 0, 0, 0, 1, 0, 0]), None);
         assert_eq!(decode_spec(&[0, 0, 0, 0, 1, 0, 0, 0]), None);
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn defaults_match_the_standalone_pipeline() {
         assert_eq!(
-            TokenizerPipelineSpec::stanum_default()
+            TokenizerPipelineSpec::stannum_default()
                 .long_tokens
                 .max_bytes,
             256

@@ -15,9 +15,9 @@ import subprocess
 import sys
 import time
 
-ROOT = Path(os.environ.get("STANUM_BENCH_ROOT", Path(__file__).resolve().parents[1]))
-# "tin" targets PlanetScale TIN; "stanum" targets this extension under its own schema.
-ENGINES = ("stanum", "tin", "gin", "paradedb", "pg_textsearch")
+ROOT = Path(os.environ.get("STANNUM_BENCH_ROOT", Path(__file__).resolve().parents[1]))
+# "tin" targets PlanetScale TIN; "stannum" targets this extension under its own schema.
+ENGINES = ("stannum", "tin", "gin", "paradedb", "pg_textsearch")
 SETTINGS_SQL = """SELECT json_object_agg(name, setting) FROM pg_settings
 WHERE name = ANY(ARRAY['server_version','block_size','shared_buffers','work_mem',
  'maintenance_work_mem','effective_cache_size','max_connections','max_worker_processes',
@@ -32,7 +32,7 @@ WHERE name = ANY(ARRAY['server_version','block_size','shared_buffers','work_mem'
  'shared_preload_libraries','default_text_search_config','statement_timeout',
  'track_io_timing','huge_pages','hash_mem_multiplier',
  'pg_textsearch.memtable_spill_threshold','pg_textsearch.bulk_load_threshold',
- 'pg_textsearch.default_limit','pg_textsearch.compress_segments']) OR name LIKE 'tin.%' OR name LIKE 'stanum.%';"""
+ 'pg_textsearch.default_limit','pg_textsearch.compress_segments']) OR name LIKE 'tin.%' OR name LIKE 'stannum.%';"""
 CASES = [
     ("miss", "absenttoken", "absenttoken", "absenttoken", "term", 0),
     ("rare", "rare", "rare", "rare", "term", 100),
@@ -73,7 +73,7 @@ def sql_json(sql, env):
 
 def predicate(engine, case):
     _, tinql, ts, plain, kind, _ = case
-    if engine in ("stanum", "tin"):
+    if engine in ("stannum", "tin"):
         return f"body ==> '{tinql}'"
     if engine == "gin":
         return f"to_tsvector('simple', body) @@ to_tsquery('simple', '{ts}')"
@@ -92,7 +92,7 @@ def workload(engine, profile, cases=CASES):
             queries.append((name + "_count", f"SELECT count(*) FROM documents WHERE {where};"))
         if profile != "count":
             score = {
-                "stanum": "stanum.full_score(ctid)",
+                "stannum": "stannum.full_score(ctid)",
                 "tin": "tin.full_score(ctid)",
                 "paradedb": "pdb.score(id)",
                 "pg_textsearch": f"-(body <@> '{case[3]}')",
@@ -117,7 +117,7 @@ FROM generate_series(1, {rows}) AS n;
 
 def index_sql(engine):
     return {
-        "stanum": "CREATE INDEX search_idx ON documents USING stanum(body);",
+        "stannum": "CREATE INDEX search_idx ON documents USING stannum(body);",
         "tin": "CREATE INDEX search_idx ON documents USING tin(body);",
         "gin": "CREATE INDEX search_idx ON documents USING gin(to_tsvector('simple', body));",
         "paradedb": "CREATE INDEX search_idx ON documents USING paradedb(id, body) WITH (key_field='id');",
@@ -251,8 +251,8 @@ def run(args):
     env = dict(os.environ)
     # Credentials remain in libpq environment/.pgpass, never in artifacts or command arguments.
     env["PGDATABASE"] = args.database
-    if not args.database.startswith("stanum_bench_"):
-        raise ValueError("Use a dedicated database named stanum_bench_*; create it before running")
+    if not args.database.startswith("stannum_bench_"):
+        raise ValueError("Use a dedicated database named stannum_bench_*; create it before running")
     env["PGOPTIONS"] = env.get("PGOPTIONS", "") + f" -c default_text_search_config=simple -c statement_timeout={args.statement_timeout_ms}"
     queries = workload(args.engine, args.profile, cases)
     settings = sql_json(SETTINGS_SQL, env)
@@ -275,7 +275,7 @@ def run(args):
     save(out / "manifest.json", manifest)
     children = []
     try:
-        extension = {"stanum": "stanum", "tin": "tin", "paradedb": "pg_search", "pg_textsearch": "pg_textsearch"}.get(args.engine)
+        extension = {"stannum": "stannum", "tin": "tin", "paradedb": "pg_search", "pg_textsearch": "pg_textsearch"}.get(args.engine)
         if extension:
             psql(f"CREATE EXTENSION IF NOT EXISTS {extension} CASCADE;", env)
         manifest["extensions"] = sql_json("SELECT json_object_agg(extname, extversion) FROM pg_extension;", env)
@@ -283,7 +283,7 @@ def run(args):
             # Load the library so its GUCs are visible; LOAD needs privileges a
             # managed server may not grant, so prefer calling into the extension.
             load = {"tin": "DO $$ BEGIN PERFORM tin.tokenize('load'); END $$; ",
-                    "stanum": "DO $$ BEGIN PERFORM stanum.tokenize('load'); END $$; "}.get(extension, f"LOAD '{extension}'; ")
+                    "stannum": "DO $$ BEGIN PERFORM stannum.tokenize('load'); END $$; "}.get(extension, f"LOAD '{extension}'; ")
             manifest["settings"] = sql_json(load + SETTINGS_SQL, env)
         # Never overwrite an existing table. Each repetition uses a fresh dedicated database.
         (out / "fixture.sql").write_text("-- External verified corpus; see dataset.json.\n" if corpus else fixture_sql(args.rows))

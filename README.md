@@ -1,6 +1,6 @@
-# Stanum
+# Stannum
 
-Stanum is an experimental, open-source PostgreSQL search engine with Boolean and
+Stannum is an experimental, open-source PostgreSQL search engine with Boolean and
 positional queries, BM25 ranking, and exact counts under concurrent writes. The
 index, query execution, scoring, and storage implementation live in this repository.
 
@@ -8,7 +8,7 @@ We started from [PlanetScale Lead](https://github.com/planetscale/lead), a delib
 slow, correctness-oriented substitute for TIN. We are developing that foundation
 into a useful search engine: durable inverted indexes, stored ranking statistics,
 and PostgreSQL execution paths that avoid scanning and retokenizing the entire
-corpus for every query. Stanum is an independent fork, not PlanetScale TIN or a
+corpus for every query. Stannum is an independent fork, not PlanetScale TIN or a
 PlanetScale-supported product. The inherited code remains under AGPL-3.0; see
 [LICENSE](LICENSE).
 
@@ -26,7 +26,7 @@ recovery testing. See [BENCHMARKS.md](BENCHMARKS.md) for evidence and limitation
   dictionaries, tuple postings, positions, term frequencies, and document lengths.
 - Index-backed BM25 scoring, visibility-aware count scans, and top-k selection.
 - Inserts, updates, VACUUM, segment folding/merging, page reuse, and generic WAL.
-- Highlighting, tokenizer options, and `stanum.segment_info` for index inspection.
+- Highlighting, tokenizer options, and `stannum.segment_info` for index inspection.
 
 The [storage and execution notes](docs/segmented-storage.md) describe the design and
 its current boundaries. Ranked queries still score all candidates before selecting
@@ -43,55 +43,55 @@ initialize a supported PostgreSQL version:
 ```sh
 cargo install cargo-pgrx --version 0.19.1 --locked
 cargo pgrx init --pg18=download
-cargo pgrx run pg18 --package stanum
+cargo pgrx run pg18 --package stannum
 ```
 
 Inside the development database:
 
 ```sql
-CREATE EXTENSION stanum;
+CREATE EXTENSION stannum;
 
 CREATE TABLE documents (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, body text);
 INSERT INTO documents (body) VALUES
   ('PostgreSQL supports full text search'),
   ('A search engine with exact phrase matching');
-CREATE INDEX documents_search ON documents USING stanum (body);
+CREATE INDEX documents_search ON documents USING stannum (body);
 ANALYZE documents;
 
-SELECT id, stanum.full_score(ctid) AS score
+SELECT id, stannum.full_score(ctid) AS score
 FROM documents
 WHERE body ==> 'search'
 ORDER BY score DESC
 LIMIT 10;
 
 SELECT count(*) FROM documents WHERE body ==> '"phrase matching"';
-SELECT stanum.highlight(body, '<mark>', '</mark>', query => 'search') FROM documents;
-SELECT * FROM stanum.segment_info('documents_search');
+SELECT stannum.highlight(body, '<mark>', '</mark>', query => 'search') FROM documents;
+SELECT * FROM stannum.segment_info('documents_search');
 ```
 
 For a release package:
 
 ```sh
-cargo pgrx package --package stanum --no-default-features --features pg18
+cargo pgrx package --package stannum --no-default-features --features pg18
 ```
 
 PostgreSQL 17 and 18 are build targets. Most recent local lifecycle and benchmark
-evidence is on PostgreSQL 18. Stanum loads on demand; it does not require
+evidence is on PostgreSQL 18. Stannum loads on demand; it does not require
 `shared_preload_libraries`. The receiving server must have the compiled library,
 control file, and extension SQL installed before `CREATE EXTENSION` can work.
 
 ## Names and compatibility
 
-The extension, library, access method, and SQL schema are **`stanum`**. Functions
-include `stanum.score`, `stanum.full_score`, `stanum.max_score`,
-`stanum.score_inspect`, `stanum.highlight`, and `stanum.highlight_ansi`. Settings
-use the `stanum.` prefix; for example, `SET stanum.enable_custom_scan = off`
+The extension, library, access method, and SQL schema are **`stannum`**. Functions
+include `stannum.score`, `stannum.full_score`, `stannum.max_score`,
+`stannum.score_inspect`, `stannum.highlight`, and `stannum.highlight_ansi`. Settings
+use the `stannum.` prefix; for example, `SET stannum.enable_custom_scan = off`
 selects the bitmap path.
 
 TINQL remains the query language name, and the `tinql` crate implements that
 language. References to TIN in compatibility research and the `--engine tin`
 benchmark adapter refer to PlanetScale's actual extension. They do not identify
-Stanum builds. Sampled oracle fixtures compare match sets and score bits against
+Stannum builds. Sampled oracle fixtures compare match sets and score bits against
 TIN; this is evidence of compatibility on those fixtures, not full equivalence.
 
 Scoring and implicitly bound highlighting must appear at the same query level as
@@ -100,11 +100,11 @@ the matching `==>` predicate. Explicit highlighting accepts its own query.
 ### Moving from the pre-rename build
 
 This is a breaking package/SQL rename, not an `ALTER EXTENSION tin UPDATE` migration.
-Create Stanum in a fresh database, reload the data, and rebuild indexes with
-`USING stanum`. Update `tin.*` application calls and settings to `stanum.*`.
+Create Stannum in a fresh database, reload the data, and rebuild indexes with
+`USING stannum`. Update `tin.*` application calls and settings to `stannum.*`.
 Do not rename or replace an installed TIN library or reuse its indexes.
 
-The `==>` operator still lives in `pg_catalog` for compatibility. Stanum and TIN
+The `==>` operator still lives in `pg_catalog` for compatibility. Stannum and TIN
 therefore need separate databases; distinct extension names alone do not make
 installation together in one database supported. Same-instance benchmarks can use
 one database per engine and alternate the measured traffic.
@@ -113,7 +113,7 @@ one database per engine and alternate the measured traffic.
 
 ```sh
 cargo test --locked -p tinql -p tokenizer -p boldi-vigna -p segment
-cargo pgrx test pg18 --package stanum --no-default-features --features pg18
+cargo pgrx test pg18 --package stannum --no-default-features --features pg18
 cargo clippy --locked --workspace --all-targets --no-default-features --features 'pg18 pg_test' -- -D warnings
 python3 -m unittest discover -s benchmarks -p 'test_*.py'
 ```

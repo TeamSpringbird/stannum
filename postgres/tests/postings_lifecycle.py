@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native PG18 lifecycle checks in a disposable private cluster; install stanum first."""
+"""Native PG18 lifecycle checks in a disposable private cluster; install stannum first."""
 import json
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ import time
 
 
 def main():
-    root = Path(tempfile.mkdtemp(prefix='stanum-postings-'))
+    root = Path(tempfile.mkdtemp(prefix='stannum-postings-'))
     data = root / 'data'
     standby = root / 'standby'
     # A private Unix socket directory avoids touching any existing server/port.
@@ -38,14 +38,14 @@ def main():
         with (data/'postgresql.conf').open('a') as f:
             f.write(f"\nlisten_addresses=''\nport=28928\nunix_socket_directories='{root}'\nshared_buffers='64MB'\n")
         start()
-        sql("""CREATE EXTENSION stanum;
+        sql("""CREATE EXTENSION stannum;
           CREATE TABLE docs(id int PRIMARY KEY, body text, revision int DEFAULT 0) WITH(fillfactor=60);
           INSERT INTO docs SELECT n, 'common ' || CASE WHEN n%100=0 THEN 'needle' ELSE 'other' END, 0
             FROM generate_series(1,5000) n;
-          CREATE INDEX docs_search ON docs USING stanum(body);
+          CREATE INDEX docs_search ON docs USING stannum(body);
           CREATE UNLOGGED TABLE volatile_docs(body text);
           INSERT INTO volatile_docs VALUES ('needle');
-          CREATE INDEX volatile_search ON volatile_docs USING stanum(body);
+          CREATE INDEX volatile_search ON volatile_docs USING stannum(body);
         """)
         check()
         # Cancel after scan initialization in a single reusable backend, then
@@ -59,10 +59,10 @@ def main():
         # Scorer state lives for one statement: a document inserted between
         # two statements in one backend is scored by the second.
         ranked = command(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'], input="""SET enable_seqscan=off;
-            SELECT id FROM docs WHERE body ==> 'needle' ORDER BY stanum.full_score(ctid) DESC LIMIT 1;
+            SELECT id FROM docs WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC LIMIT 1;
             INSERT INTO docs VALUES(99998,'needle needle needle needle',0);
-            SELECT id, stanum.full_score(ctid) > 0 FROM docs WHERE body ==> 'needle' ORDER BY stanum.full_score(ctid) DESC LIMIT 1;
-            SELECT count(*) FROM docs WHERE body ==> 'needle' AND stanum.full_score(ctid) > 0;
+            SELECT id, stannum.full_score(ctid) > 0 FROM docs WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC LIMIT 1;
+            SELECT count(*) FROM docs WHERE body ==> 'needle' AND stannum.full_score(ctid) > 0;
             DELETE FROM docs WHERE id=99998;""", env=env).split()
         assert ranked[-2] == '99998|t' and ranked[-1] == '51', ranked
         sql("BEGIN; INSERT INTO docs VALUES(99999,'needle',0); ROLLBACK;")
@@ -79,7 +79,7 @@ def main():
         writer.stdin.write('\n'.join(statements)); writer.stdin.close()
         # Validate a concurrently built index, then make it the only search index.
         check()
-        sql('CREATE INDEX CONCURRENTLY docs_search_new ON docs USING stanum(body);')
+        sql('CREATE INDEX CONCURRENTLY docs_search_new ON docs USING stannum(body);')
         sql('DROP INDEX docs_search; ALTER INDEX docs_search_new RENAME TO docs_search;')
         checks = 0
         while writer.poll() is None:
@@ -88,11 +88,11 @@ def main():
         check()
         # A repeatable-read transaction keeps the old snapshot through a concurrent update and vacuum.
         snapshot_sql = "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM docs WHERE body ==> 'needle'; SELECT pg_sleep(2); SELECT count(*) FROM docs WHERE body ==> 'needle'; COMMIT;"
-        snapshot = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(env,PGAPPNAME='stanum-snapshot-check'))
+        snapshot = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=dict(env,PGAPPNAME='stannum-snapshot-check'))
         snapshot.stdin.write(snapshot_sql); snapshot.stdin.close(); snapshot.stdin=None
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
-            if sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='stanum-snapshot-check' AND wait_event='PgSleep';") == '1': break
+            if sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='stannum-snapshot-check' AND wait_event='PgSleep';") == '1': break
             time.sleep(.02)
         else: raise AssertionError('snapshot session did not enter wait')
         sql("UPDATE docs SET body='fresh' WHERE body='needle';")
@@ -107,7 +107,7 @@ def main():
         # Small thresholds drive folds, merges, dead lists, segment rewrites
         # and page reclamation through the FSM. Results must stay exact and
         # the index must stop growing once freed pages are reused.
-        tuned = 'SET stanum.write_buffer_docs=4; SET stanum.max_segments=3;'
+        tuned = 'SET stannum.write_buffer_docs=4; SET stannum.max_segments=3;'
         def check_folded():
             for term in ('needle', 'common', 'missing'):
                 differences = sql(f"""WITH actual AS MATERIALIZED (SELECT id FROM folded WHERE body ==> '{term}'),
@@ -117,7 +117,7 @@ def main():
                     SELECT count(*) FROM delta;""")
                 assert differences == '0', ('folded', term, differences)
         sql(tuned + """CREATE TABLE folded(id int PRIMARY KEY, body text);
-            CREATE INDEX folded_search ON folded USING stanum(body);
+            CREATE INDEX folded_search ON folded USING stannum(body);
             INSERT INTO folded SELECT n, CASE WHEN n%10=0 THEN 'needle' ELSE 'common' END
               FROM generate_series(1,400) n;""")
         check_folded()
@@ -160,14 +160,14 @@ def main():
         assert plan[0]['Plan']['Lossy Heap Blocks'] == 1, plan
         assert plan[0]['Plan']['Actual Rows'] == 1, plan
         # A snapshot acquired during recovery retains the fallback after promotion.
-        promotion_env = dict(standby_env, PGAPPNAME='stanum-promotion-check')
+        promotion_env = dict(standby_env, PGAPPNAME='stannum-promotion-check')
         promotion = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=promotion_env)
-        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL stanum.enable_custom_scan=off; SELECT count(*) FROM docs; SELECT pg_sleep(3); EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; SET LOCAL stanum.enable_custom_scan=on; SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle'; COMMIT;")
+        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL stannum.enable_custom_scan=off; SELECT count(*) FROM docs; SELECT pg_sleep(3); EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; SET LOCAL stannum.enable_custom_scan=on; SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle'; COMMIT;")
         promotion.stdin.close(); promotion.stdin=None
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
-            waiting=command(['psql','-X','-qAt','-c',"SELECT count(*) FROM pg_stat_activity WHERE application_name='stanum-promotion-check' AND wait_event='PgSleep';"],env=standby_env).strip()
+            waiting=command(['psql','-X','-qAt','-c',"SELECT count(*) FROM pg_stat_activity WHERE application_name='stannum-promotion-check' AND wait_event='PgSleep';"],env=standby_env).strip()
             if waiting == '1': break
             time.sleep(.02)
         else: raise AssertionError('promotion session did not enter wait')
@@ -178,11 +178,11 @@ def main():
         assert old_plan[0]['Plan']['Lossy Heap Blocks'] == 1, old_plan
         # The custom scan falls back to a heap scan for the same recovery snapshot.
         assert 'custom:1' in out, out
-        new_plan=json.loads(command(['psql','-X','-qAt','-c',"SET stanum.enable_custom_scan=off; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
+        new_plan=json.loads(command(['psql','-X','-qAt','-c',"SET stannum.enable_custom_scan=off; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert new_plan[0]['Plan']['Exact Heap Blocks'] == 1, new_plan
         assert new_plan[0]['Plan']['Lossy Heap Blocks'] == 0, new_plan
         custom_plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
-        assert custom_plan[0]['Plan']['Custom Plan Provider'] == 'Stanum Text Search Scan', custom_plan
+        assert custom_plan[0]['Plan']['Custom Plan Provider'] == 'Stannum Text Search Scan', custom_plan
         assert custom_plan[0]['Plan']['Actual Rows'] == 1, custom_plan
         result={'status':'passed', 'concurrent_reader_checks':checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','per-statement scorer state']}
         (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')

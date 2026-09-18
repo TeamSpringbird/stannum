@@ -45,16 +45,16 @@ class MeasurementTests(unittest.TestCase):
 
 
 class EngineIdentityTests(unittest.TestCase):
-    def test_stanum_and_tin_use_distinct_names_with_the_same_query_shapes(self):
-        for engine in ('stanum', 'tin'):
+    def test_stannum_and_tin_use_distinct_names_with_the_same_query_shapes(self):
+        for engine in ('stannum', 'tin'):
             queries = run.workload(engine, 'mixed')
             self.assertIn(f'USING {engine}(body)', run.index_sql(engine))
             ranked = [sql for name, sql in queries if name.endswith('_ranked')]
             self.assertTrue(all(f'{engine}.full_score(ctid)' in sql for sql in ranked))
-        stanum = run.workload('stanum', 'mixed')
-        tin = [(name, sql.replace('tin.full_score', 'stanum.full_score'))
+        stannum = run.workload('stannum', 'mixed')
+        tin = [(name, sql.replace('tin.full_score', 'stannum.full_score'))
                for name, sql in run.workload('tin', 'mixed')]
-        self.assertEqual(stanum, tin)
+        self.assertEqual(stannum, tin)
 
 
 class ProvenanceTests(unittest.TestCase):

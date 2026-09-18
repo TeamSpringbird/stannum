@@ -29,7 +29,7 @@
 //! - Chen et al., "E-morphic: Scalable Equality Saturation for Structural
 //!   Exploration in Logic Synthesis" (arXiv:2504.11574) is useful as a recent
 //!   example of scaling eqsat with pruning and custom extraction. We do not use
-//!   that machinery here because Stanum is not exploring a broad alternative plan
+//!   that machinery here because Stannum is not exploring a broad alternative plan
 //!   space at this boundary, it is just deleting a small set of provably
 //!   redundant unscored subtrees.
 //!

@@ -19,9 +19,9 @@ class ServerTimesTests(unittest.TestCase):
         self.assertEqual(len(server_times.parse_plans(text)), 3)
 
     def test_top_node_looks_through_limit_and_aggregate(self):
-        scan = {"Node Type": "Custom Scan", "Custom Plan Provider": "Stanum Text Search Scan"}
+        scan = {"Node Type": "Custom Scan", "Custom Plan Provider": "Stannum Text Search Scan"}
         nested = plan("Limit", 2.0, child={"Node Type": "Result", "Plans": [scan]})
-        self.assertEqual(server_times.top_node(nested), "Stanum Text Search Scan")
+        self.assertEqual(server_times.top_node(nested), "Stannum Text Search Scan")
         self.assertEqual(server_times.top_node(plan("Aggregate", 1.0, child={"Node Type": "Bitmap Heap Scan"})),
                          "Bitmap Heap Scan")
 
@@ -34,11 +34,11 @@ class ServerTimesTests(unittest.TestCase):
         self.assertEqual(rows[0]["min_ms"], 1.0)
 
     def test_workload_shapes_come_from_the_harness(self):
-        queries = server_times.workload("stanum", "mixed", server_times.load_cases(None))
+        queries = server_times.workload("stannum", "mixed", server_times.load_cases(None))
         names = [name for name, _ in queries]
         self.assertIn("rare_count", names)
         self.assertIn("rare_ranked", names)
-        self.assertTrue(all("stanum.full_score" in sql for name, sql in queries if name.endswith("_ranked")))
+        self.assertTrue(all("stannum.full_score" in sql for name, sql in queries if name.endswith("_ranked")))
 
 
 if __name__ == "__main__":

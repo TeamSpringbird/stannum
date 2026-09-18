@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::ffi::{CStr, c_void};
 
 fn missing_binding(function: &str) -> ! {
-    pgrx::error!("{function} requires an explicit query or a matching stanum index scan")
+    pgrx::error!("{function} requires an explicit query or a matching stannum index scan")
 }
 
 fn render_highlight(
@@ -14,7 +14,7 @@ fn render_highlight(
     query: Option<&str>,
 ) -> Option<String> {
     let text = text?;
-    let query = query.unwrap_or_else(|| missing_binding("stanum.highlight()"));
+    let query = query.unwrap_or_else(|| missing_binding("stannum.highlight()"));
     let positions = positions_from_query(query, text);
     highlight_text(text, begin_tag, end_tag, &positions)
         .map(Some)
@@ -27,7 +27,7 @@ fn render_highlight_ansi(
     query: Option<&str>,
 ) -> Option<String> {
     let text = text?;
-    let query = query.unwrap_or_else(|| missing_binding("stanum.highlight_ansi()"));
+    let query = query.unwrap_or_else(|| missing_binding("stannum.highlight_ansi()"));
     let text = match wrap_to {
         Some(width) if width <= 0 => pgrx::error!("wrap_to must be positive"),
         Some(width) => Cow::Owned(rewrap_text(text, width as usize)),
@@ -218,7 +218,7 @@ fn highlight_support(request: Internal) -> Internal {
         let rte = pg_sys::list_nth((*parse).rtable, vars.varno - 1).cast::<pg_sys::RangeTblEntry>();
         if rte.is_null()
             || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
-            || crate::score::find_matching_stanum_index((*rte).relid, vars.varno, document)
+            || crate::score::find_matching_stannum_index((*rte).relid, vars.varno, document)
                 .is_none()
         {
             return unhandled();

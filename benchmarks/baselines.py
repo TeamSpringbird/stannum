@@ -16,7 +16,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--datasets', required=True)
     parser.add_argument('--output', required=True)
-    parser.add_argument('--image', default='stanum-bench:local')
+    parser.add_argument('--image', default='stannum-bench:local')
     parser.add_argument('--sizes', type=int, nargs='+', choices=(100000, 1000000), default=[100000],
                         help='Dataset sizes to run (default: 100000)')
     args = parser.parse_args()
@@ -35,7 +35,7 @@ def main():
     state = {'status': 'running', 'started_at': dt.datetime.now(dt.timezone.utc).isoformat(),
              'pid': os.getpid(), 'image_id': image, 'campaigns': {}}
     bench.save(root / 'status.json', state)
-    env = dict(os.environ, STANUM_BENCH_ROOT=str(bench.ROOT))
+    env = dict(os.environ, STANNUM_BENCH_ROOT=str(bench.ROOT))
     try:
         for rows in args.sizes:
             name = f'wikipedia-{rows}'

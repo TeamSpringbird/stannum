@@ -15,36 +15,36 @@ yet constitute a representative competitive benchmark or a production soak test.
 
 ## Run
 
-Build/install Stanum in release mode first (see the repository README for toolchain
+Build/install Stannum in release mode first (see the repository README for toolchain
 setup). Use a dedicated server and a **fresh database for every repetition**:
 
 ```sh
 export PATH="$(brew --prefix rustup)/bin:$HOME/.cargo/bin:$(brew --prefix postgresql@18)/bin:$PATH"
 export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
-cargo pgrx install --package stanum --no-default-features --features pg18 --release
+cargo pgrx install --package stannum --no-default-features --features pg18 --release
 cargo pgrx start pg18
 
 export PGHOST=localhost PGPORT=28818
-createdb stanum_bench_baseline_01
+createdb stannum_bench_baseline_01
 python3 benchmarks/run.py run \
-  --engine stanum --database stanum_bench_baseline_01 \
+  --engine stannum --database stannum_bench_baseline_01 \
   --output benchmarks/results/baseline-01 \
   --environment local-arm64-pgrx \
   --build-id "$(git rev-parse HEAD):cargo-pgrx-release" \
-  --artifact "$(pg_config --pkglibdir)/stanum.dylib" \
+  --artifact "$(pg_config --pkglibdir)/stannum.dylib" \
   --profile mixed --rows 10000 --seconds 60 --warmup 10 \
   --clients 2 --write-rate 20 --label initial-baseline
 ```
 
 The installed library location varies by packaging. Prefer
-`$(pg_config --pkglibdir)/stanum.dylib` on macOS, or `stanum.so` on Linux, if that differs
+`$(pg_config --pkglibdir)/stannum.dylib` on macOS, or `stannum.so` on Linux, if that differs
 from the example. `--artifact` hashes the binary; `--build-id` is a required build
 attestation or immutable container-image digest. Source checkout identity alone
 does not prove which binary the server loaded. Restart existing sessions after
 installing a new binary. Do not change builds while a benchmark is running.
 
 Connection credentials use normal libpq environment variables or `.pgpass` and
-are not recorded. The runner requires a `stanum_bench_*` database name, creates its
+are not recorded. The runner requires a `stannum_bench_*` database name, creates its
 own `documents` table, and refuses to overwrite it. It leaves the database for
 inspection; explicitly drop only benchmark databases when finished. It does not
 change server-wide settings. An existing `PGOPTIONS` is honored; relevant effective
@@ -60,15 +60,15 @@ For useful latency distributions increase duration, scale, and repetitions.
 `server_times.py` runs the same twenty mixed-profile shapes through
 `EXPLAIN ANALYZE` in one session and reports the server's own execution time per
 shape, median after discarding warm-up executions, with the top plan node so a
-fallback to the heap is visible. It exists for one purpose: setting a Stanum build
+fallback to the heap is visible. It exists for one purpose: setting a Stannum build
 beside TIN on PlanetScale, where client-side timing is dominated by the network.
 It needs the `documents` table and index that `run.py` leaves behind.
 
 ```sh
-PGHOST=localhost PGPORT=28818 PGDATABASE=stanum_bench_wiki_01 \
-python3 benchmarks/server_times.py --engine stanum --disable-seqscan \
+PGHOST=localhost PGPORT=28818 PGDATABASE=stannum_bench_wiki_01 \
+python3 benchmarks/server_times.py --engine stannum --disable-seqscan \
   --dataset "$DATASETS/wikipedia-100000" \
-  --output benchmarks/results/server-times-stanum-01
+  --output benchmarks/results/server-times-stannum-01
 ```
 
 Its numbers are not throughput and do not include planning, fetching rows to the
@@ -78,7 +78,7 @@ client, or contention; use them to compare shapes, not to rank engines.
 
 | Adapter | Installed extension | SQL contract | Status |
 | --- | --- | --- | --- |
-| `stanum` | `stanum` | TINQL; `stanum.full_score` | This repository |
+| `stannum` | `stannum` | TINQL; `stannum.full_score` | This repository |
 | `tin` | `tin` | TINQL; `tin.full_score` | PlanetScale TIN, externally installed |
 | `gin` | Built-in | `simple` tsvector/tsquery; counts only | Locally exercised |
 | `paradedb` | `pg_search` | Current `USING paradedb`, `|||`, `&&&`, `###`, `pdb.score` | Smoke checked on 0.25.9 |
@@ -105,7 +105,7 @@ cardinality, membership, uniqueness, finite scores, and descending order. They d
 GIN ranking is deliberately excluded: `ts_rank` is not BM25. Different BM25
 statistics, quantization, and phrase scoring can change rank/tie groups. Therefore
 the comparison command blocks cross-engine ranked/mixed speedup claims until an
-independent ranking-quality/contract suite is added. Stanum explicitly uses
+independent ranking-quality/contract suite is added. Stannum explicitly uses
 `full_score` to avoid default dense-term elision.
 
 For pg_textsearch the projection negates its negative BM25 value for a common
@@ -209,4 +209,4 @@ explicitly selected with `--sizes 1000000`.
 
 The rename changes generated SQL and therefore comparison hashes. Historical
 `lead` artifacts remain immutable; they use their saved protocol. Do not relabel
-old manifests as `stanum` or bypass comparison checks to manufacture a match.
+old manifests as `stannum` or bypass comparison checks to manufacture a match.

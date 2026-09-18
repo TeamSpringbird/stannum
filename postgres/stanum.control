@@ -1,8 +1,0 @@
-comment = 'Stanum: experimental PostgreSQL text search with TINQL and BM25'
-default_version = '@CARGO_VERSION@'
-module_pathname = 'stanum'
-relocatable = false
-schema = 'stanum'
-superuser = true
-trusted = false
-

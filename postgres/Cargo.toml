@@ -1,6 +1,6 @@
 [package]
-name = "stanum"
-description = "Stanum: an experimental PostgreSQL search engine with TINQL and BM25 ranking"
+name = "stannum"
+description = "Stannum: an experimental PostgreSQL search engine with TINQL and BM25 ranking"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn default_tokens_fold_case_and_accents() {
         assert_eq!(
-            collect_tokens("Beer JALAPEÑO", TokenizerPipelineSpec::stanum_default()),
+            collect_tokens("Beer JALAPEÑO", TokenizerPipelineSpec::stannum_default()),
             ["beer", "jalapeno"]
         );
     }
@@ -256,10 +256,11 @@ fn segment_info(
         name!(generation, i64),
     ),
 > {
-    let stanum_name = std::ffi::CString::new("stanum").expect("static access method name is valid");
-    let stanum_am = unsafe { pgrx::pg_sys::get_index_am_oid(stanum_name.as_ptr(), false) };
-    if unsafe { (*(*index.as_ptr()).rd_rel).relam } != stanum_am {
-        pgrx::error!("stanum.segment_info() requires a stanum index");
+    let stannum_name =
+        std::ffi::CString::new("stannum").expect("static access method name is valid");
+    let stannum_am = unsafe { pgrx::pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
+    if unsafe { (*(*index.as_ptr()).rd_rel).relam } != stannum_am {
+        pgrx::error!("stannum.segment_info() requires a stannum index");
     }
     if !unsafe { crate::storage::present(index.as_ptr()) } {
         return TableIterator::new(Vec::new());

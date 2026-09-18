@@ -277,7 +277,7 @@ mod tests {
         // source splitter would emit two chunks and shift `tail` by one.
         let run = "İ".repeat(130);
         let text = format!("{run} tail");
-        let spec = TokenizerPipelineSpec::stanum_default();
+        let spec = TokenizerPipelineSpec::stannum_default();
 
         assert_eq!(
             pipeline_positions(spec, &text),
@@ -296,7 +296,7 @@ mod tests {
         // cut at the same grapheme counts so `tail` stays at position 2.
         let run = "Ⱥ".repeat(100);
         let text = format!("{run} tail");
-        let spec = TokenizerPipelineSpec::stanum_default();
+        let spec = TokenizerPipelineSpec::stannum_default();
 
         assert_eq!(
             pipeline_positions(spec, &text),
@@ -324,7 +324,7 @@ mod tests {
         // there so `omega` stays at position 2.
         const MARKS: &str = "\u{0351}\u{034c}\u{0369}\u{0314}\u{0357}\u{0305}";
         let text = format!("alpha {MARKS} omega");
-        let spec = TokenizerPipelineSpec::stanum_default();
+        let spec = TokenizerPipelineSpec::stannum_default();
 
         assert_eq!(
             pipeline_positions(spec, &text),
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn collapse_mode_skips_dropped_tokens_entirely() {
-        let mut spec = TokenizerPipelineSpec::legacy_stanum_default();
+        let mut spec = TokenizerPipelineSpec::legacy_stannum_default();
         spec.long_tokens.max_bytes = 4;
         spec.long_tokens.mode = LongTokenMode::Discard;
 
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn truncated_token_spans_its_whole_source_word() {
-        let mut spec = TokenizerPipelineSpec::stanum_default();
+        let mut spec = TokenizerPipelineSpec::stannum_default();
         spec.case_folding = Folding::Preserve;
         spec.accent_folding = Folding::Preserve;
         spec.long_tokens.mode = LongTokenMode::Truncate;
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn whitespace_tokenizer_spans_follow_the_same_contract() {
-        let mut spec = TokenizerPipelineSpec::stanum_default();
+        let mut spec = TokenizerPipelineSpec::stannum_default();
         spec.tokenizer = TokenizerSpec::Whitespace;
         spec.case_folding = Folding::Preserve;
         spec.accent_folding = Folding::Preserve;
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn split_spans_keep_classification() {
-        let spec = TokenizerPipelineSpec::stanum_default();
+        let spec = TokenizerPipelineSpec::stannum_default();
         let pipeline = spec.compile().expect("spec should compile");
         let token = pipeline
             .source_spans()
