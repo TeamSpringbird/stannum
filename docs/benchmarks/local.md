@@ -119,3 +119,37 @@ Use archived protocols to inspect historical artifacts. Aggregate paired speedup
 are withheld until every planned pair passes correctness, protocol equality, and
 OOM checks. A 10k synthetic result is an iteration check; use the frozen 100k corpus
 for the current comparison baseline.
+
+## Historical 100k comparison provenance
+
+The [Lead-to-Stannum results](README.md) were measured on September 17, 2026.
+The Stannum candidate was commit `3906c288ec2142133439cec4b31364d89b2515a3`
+plus uncommitted changes, before the extension rename. Reproduction requires the
+retained source snapshot, per-file hashes, patch, and image; the commit alone is
+insufficient. These measurements do not describe the current rebased build.
+
+Original campaign: `wikipedia-v1-20260917/wikipedia-100000`.
+Candidate: `lead-current-100k-20260917-230423/campaign`.
+These names deliberately preserve the historical artifact identity.
+
+```text
+Original image:
+sha256:028b8e940aa33846aeb537e9097532e76e42b58dc3a03b32b2f8cba453728532
+Candidate image:
+sha256:1f12be2ffd865eb18a94fb21a91ece6b0ca82530e95cdd1bb57fe8f18a8dfd8c
+```
+
+The development machine retains these folders beneath
+`~/Library/Application Support/LeadBenchmarks/campaigns/`, including manifests,
+source snapshots, plans, logs, resource counters, and comparison reports. They are
+local evidence, not downloadable public artifacts. Generated corpora and raw
+results are excluded from Git. Keep legacy folders and frozen protocols unchanged;
+new Stannum builds use new output folders and image tags.
+
+The frozen corpus uses dataset revision
+`b04c8d1ceb2f5cd4588862100d08de323dccfbaa` and seed 1729. Its normalized
+100k bodies contain 278,979,934 bytes before the mutable suffix. Normalization
+concatenates title/text, keeps lowercase ASCII letter sequences, and caps each
+document at 8,192 tokens. Trials used 30 seconds of warmup and 300 seconds of
+measurement with two readers and one writer requested at 20 updates/second.
+The writer toggles a reserved suffix without changing tested query memberships.

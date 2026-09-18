@@ -1,232 +1,63 @@
 # Benchmarking Stannum
 
-Our question is whether Stannum can provide exact Boolean/phrase search, BM25
-ranking, and counts at useful throughput while documents are being updated. We
-compare behavior before speed, retain failures, and keep raw evidence for each
-build. This page is the current plan and results summary; older investigation
-notes retain their original Lead/TIN names and describe earlier implementations.
+Our first benchmark asks how much faster Stannum is than the original Lead
+implementation it grew from, while preserving search results. The useful
+comparison so far is **Lead locally versus Stannum locally**, using the same
+100,000 Wikipedia articles, workload, and resource limits on the same machine.
 
-## Current evidence: 100,000 Wikipedia articles
+## Local Lead-to-Stannum results
 
-On September 17, 2026, the original Lead/competitor campaign attempted 35 trials:
-five count trials for each of four engines and five mixed count/ranked trials for
-Lead, ParadeDB, and pg_textsearch. All trials ended; 26 passed and nine failed.
-The overall campaign is incomplete, although each count group and ParadeDB mixed
-has all five successful repetitions.
-
-A frozen development build from `t3code/postgres-full-text-index-design-1`, commit
-`3906c288ec2142133439cec4b31364d89b2515a3` **plus uncommitted changes**, then passed
-one count trial and one mixed trial under the same workload and resource settings.
-This build still used the old `tin` extension identity. The Stannum rename itself
-has not been measured in these results. A commit alone cannot reproduce that
-working-tree build: its source snapshot, per-file hashes, patch, and immutable
-image ID were retained.
-
-| Engine/build | Count read QPS | Successful count trials | Mixed read QPS | Successful mixed trials |
-| --- | ---: | ---: | ---: | ---: |
-| Original Lead | 0.39 | 5/5 | unavailable | 0/5 |
-| PostgreSQL GIN | 3.25 | 5/5 | not tested | — |
-| ParadeDB | 80.33 | 5/5 | 80.93 | 5/5 |
-| pg_textsearch | 0.21 | 5/5 | incomplete | 1/5 |
-| Stannum development build, before rename | **1,458.45** | **1/1** | **644.79** | **1/1** |
-
-Baseline values are medians of five trials. Stannum values are single trials, not
-five-run estimates. These are earlier-versus-later measurements on one host, not
-interleaved pairs. Large differences justify further testing; they do not establish
-an engine-wide performance ranking, significance, or production capacity.
-
-Stannum sustained about 20.24 updates/second in both trials. Index build time was
-17.73 s for count and 18.47 s for mixed; total index size after traffic was about
-175.29 MiB, including the primary-key index. Peak container memory was below
-1.9 GiB. Both trials passed before/after exact-membership checks; mixed also passed
-ranked cardinality, membership, finite-score, and score-order checks. No transaction
-failures or memory-limit events were observed, and timed CPU throttling was zero.
-The ranked checks do not prove globally optimal top-k selection or relevance.
-
-All five original Lead mixed trials experienced an OOM kill at the 4-GiB limit.
-The four failed pg_textsearch mixed trials did not sample every query type within
-the measurement window. Its one passing trial is not a complete baseline. Failed
-runs never become zero-latency samples or disappear through trimming.
-
-### Evidence identity
-
-Original campaign: `wikipedia-v1-20260917/wikipedia-100000`.
-Candidate: `lead-current-100k-20260917-230423/campaign`.
-These names deliberately preserve the historical artifact identity.
-
-```text
-Original image:
-sha256:028b8e940aa33846aeb537e9097532e76e42b58dc3a03b32b2f8cba453728532
-Candidate image:
-sha256:1f12be2ffd865eb18a94fb21a91ece6b0ca82530e95cdd1bb57fe8f18a8dfd8c
-```
-
-The development machine retains these folders beneath
-`~/Library/Application Support/LeadBenchmarks/campaigns/`, including manifests,
-source snapshots, plans, logs, resource counters, and comparison reports. They are
-local evidence, not downloadable public artifacts. Generated corpora and raw
-results are excluded from Git. Keep legacy folders and frozen protocols unchanged;
-new Stannum builds use new output folders and image tags.
-
-## Workload and resource envelope
-
-The frozen corpus samples the English November 2023 Wikimedia Wikipedia dataset,
-pinned to revision `b04c8d1ceb2f5cd4588862100d08de323dccfbaa`, with seed 1729.
-The normalized 100k bodies contain 278,979,934 bytes before the mutable suffix.
-Normalization concatenates title/text, keeps lowercase ASCII letter sequences,
-and caps each document at 8,192 tokens. It is not a multilingual workload.
-Original article attribution and dataset checksums are retained with the corpus.
-The historical absent-term token is part of the fixture, not a product name to
-rewrite; changing it would change the benchmark.
-
-Queries include common/medium/rare terms, AND/OR, three phrase frequencies, and
-term/phrase misses. Count runs have ten query shapes. Mixed runs have twenty:
-each count plus its ranked top ten. Query streams use the same seed. GIN is tested
-for counts only; its ranking is not treated as BM25. Engine-specific adapters are
-in `benchmarks/run.py`.
-
-| Setting | Value |
-| --- | --- |
-| Host/runtime | Local Mac Studio, native ARM64 Docker/OrbStack, PostgreSQL 18.6 |
-| Server budget | 4 VM CPUs, cpuset 0–3, 4 GiB memory, no swap |
-| PostgreSQL | 1 GiB shared buffers, 16 MiB work_mem, 512 MiB maintenance_work_mem |
-| Readers / writer | 2 closed-loop readers; 1 writer requested at 20 updates/s |
-| Warmup / measurement | 30 seconds / 300 seconds per trial |
-| Cache policy | Warm workload; host/VM caches are not forcibly evicted |
-| Durability | fsync, synchronous commit, full-page writes, and autovacuum enabled |
-| Isolation | Fresh database volume/container per trial; one measured engine at a time |
-
-The writer toggles a reserved suffix. This rewrites and indexes document content
-without changing the tested query memberships. Inserts, deletes, changing result
-sets, and long-running maintenance are separate workloads still needed. CPU and
-memory limits are ceilings, not reserved hardware; background host activity is
-recorded and can affect results. Client CPU is outside the server budget.
-
-## Reproduce a Stannum campaign
-
-Install Docker with native ARM64 support, Python 3, and PostgreSQL 18 client tools.
-The Docker recipe builds Stannum and pins the comparator distribution/sources.
-Use an existing checksummed 100k corpus, or prepare one using `benchmarks/dataset.py`
-as described in [LOCAL.md](local.md). Corpus preparation currently also
-materializes a nested million-document sample; that does not authorize or launch
-a million-document evaluation. The series runner defaults to 100k only.
-
-```sh
-export PATH="$(brew --prefix postgresql@18)/bin:$PATH"
-DATASETS="$HOME/Library/Application Support/LeadBenchmarks/datasets"
-RESULTS="$HOME/Library/Application Support/StannumBenchmarks/campaigns"
-RUN_ID="$(date +%Y%m%d-%H%M%S)"
-
-python3 benchmarks/campaign.py --build \
-  --image "stannum-bench:$RUN_ID" \
-  --output "$RESULTS/stannum-100k-$RUN_ID" \
-  --dataset "$DATASETS/wikipedia-100000" --rows 100000 \
-  --engines stannum --profiles count mixed --repetitions 5 \
-  --seconds 300 --warmup 30 --clients 2 --write-rate 20 \
-  --statement-timeout-ms 1800000
-```
-
-This is ten five-minute measurement windows plus loading, building, and checking.
-Use `--repetitions 1` for a preliminary two-trial check, labeling it as such. Never
-reuse a results directory. The runner freezes its protocol and records source
-fingerprints including the `segment` crate. Pause other benchmark traffic and
-heavy builds before measured trials. A campaign builds its image before traffic.
-
-For a new all-engine local campaign select
-`--engines stannum gin paradedb pg_textsearch`. TIN is an explicit external adapter;
-it is not bundled in the Docker image or included in the local defaults.
-
-## Comparing with PlanetScale TIN
-
-The earlier remote TIN measurements use PlanetScale hardware and a network path
-that differ from local Stannum. Their QPS is not comparable to the table above.
-Server-side execution probes suggest similar orders of magnitude for some shapes,
-but they also use different hardware/settings. We have not demonstrated that
-Stannum is faster than TIN on equal resources.
-
-### Server-side execution time, shape by shape
-
-`benchmarks/server_times.py` asks each server for `EXPLAIN ANALYZE` execution
-time of the twenty mixed-profile shapes, in one warm session, median of five
-after two discarded executions, with `enable_seqscan` off on both sides. The
-100k Wikipedia corpus and the same SQL were used on both; only the schema name
-differs. Stannum ran commit `859cda5` in release mode on the local pgrx server;
-TIN 1.0.2 ran on the PlanetScale instance. Different hardware, so read the
-table for structure: which shapes are cheap, which are broad, and whether the
-two engines are in the same range.
-
-| Query shape | TIN on PlanetScale, ms | Stannum, local, ms |
+| Build | Count queries/second | Mixed count/ranked queries/second |
 | --- | ---: | ---: |
-| miss count | 0.17 | 0.02 |
-| miss ranked | 0.21 | 0.04 |
-| common count | 1.33 | 0.25 |
-| common ranked | 1.67 | 1.55 |
-| medium count | 0.28 | 0.02 |
-| medium ranked | 0.72 | 0.37 |
-| rare count | 0.21 | 0.01 |
-| rare ranked | 0.46 | 0.32 |
-| and count | 1.21 | 0.34 |
-| and ranked | 3.29 | 1.42 |
-| or count | 0.41 | 0.04 |
-| or ranked | 0.82 | 0.42 |
-| phrase common count | 3.24 | 1.43 |
-| phrase common ranked | 5.34 | 3.37 |
-| phrase medium count | 0.94 | 0.29 |
-| phrase medium ranked | 1.55 | 0.77 |
-| phrase rare count | 0.45 | 0.06 |
-| phrase rare ranked | 0.80 | 0.50 |
-| phrase miss count | 0.21 | 0.04 |
-| phrase miss ranked | 0.31 | 0.06 |
+| Original Lead | 0.39 | No successful runs; all five exceeded the memory limit |
+| Stannum development build | 1,458.45 | 644.79 |
 
-Raw plans and timings: `benchmarks/results/server-times-stannum-01` and
-`server-times-tin-01` (local, not in Git).
+Both workloads ran alongside document updates. Count queries cover terms,
+Boolean combinations, phrases, and misses; the mixed workload adds ranked top-ten
+queries. Both engines had a four-CPU, 4-GiB server budget. Stannum sustained
+approximately 20 updates/second in both trials and passed the before/after
+membership checks and the mixed workload's ranking checks.
 
-### Compatibility oracle
+These results show substantial progress over Lead on this workload. They are
+preliminary: Lead's count value is the median of five trials, while Stannum has
+one trial per workload. Runs were performed sequentially, not as alternating
+pairs. Lead has no successful mixed result from which to calculate a speedup.
+The Stannum measurements also predate the rename and recent upstream fixes;
+they are not measurements of the current commit.
 
-The compatibility oracle agrees on all 205 query/state pairs (41 queries across
-five mutation states), including document sets and score bits, for the renamed
-build `859cda5` against TIN on PlanetScale
-(`benchmarks/results/stannum-vs-tin-oracle-01`). It selects each extension
-explicitly:
+Build identities and reproduction details are in the
+[local campaign guide](local.md#historical-100k-comparison-provenance).
+Raw artifacts are retained locally and are not yet published.
 
-```sh
-python3 benchmarks/oracle.py \
-  --left stannum.env --left-engine stannum \
-  --right tin.env --right-engine tin \
-  --rows 5000 --output benchmarks/results/stannum-vs-tin-oracle-01
-```
+## Correctness evidence
 
-Use dedicated test databases and libpq environment files. The two databases must
-be distinct and have no existing `oracle_docs` table. The oracle creates its own
-fixture and removes it on successful completion unless `--keep` is selected.
+The local benchmark checks exact match membership before and after updates, plus
+ranked result membership, cardinality, finite scores, and score order. Those checks
+do not establish that every query returns the globally correct top ten.
 
-For a direct performance comparison, install both libraries on the same instance
-and use separate databases, with identical corpus, settings, SQL shapes, clients,
-and write schedules. Only extension/schema names differ. Alternate engine order
-for five repetitions, run one workload at a time, and compare per-query latency,
-QPS, achieved writes, build time, index bytes, and resource pressure. Verify plans,
-match sets, and scoring behavior before accepting performance claims.
+Separately, a development build matched TIN's document sets and score bits across
+205 query/state pairs: 41 queries across five mutation states. This is sampled
+compatibility evidence, not proof of complete equivalence or a speed comparison.
 
-Our current PlanetScale role cannot install server binaries, and Stannum is not an
-available extension on the checked instance. PlanetScale support would need to
-provide custom-extension installation, or we would need access to a TIN build on
-a host we control. See [PlanetScale's extension policy](https://planetscale.com/docs/postgres/extensions#need-additional-extensions).
-Renaming the extension does not remove this deployment requirement.
+## Building comparable benchmarks
 
-## Next steps and interpretation
+We are working toward repeatable comparisons where hardware, PostgreSQL settings,
+corpus, query shapes, client load, and write schedules are held constant. Local
+Stannum and remote PlanetScale TIN timings do not meet that standard, so we do not
+use them to rank the engines or report a speedup over TIN.
 
-1. Repeat the renamed Stannum build under the frozen 100k protocol; retain all runs.
-2. Obtain same-instance TIN/Stannum comparisons with alternating trials.
-3. Extend correctness and latency coverage to sustained inserts/deletes, changing
-   matches, folding/merging, VACUUM, restart, and crash recovery.
-4. Investigate long-tail latency, broad ranked queries, cold sessions, and
-   maintenance-induced stalls before making release-readiness claims.
+The next steps are:
 
-The million-document evaluation is intentionally out of scope for now. A larger
-static corpus is not the next proof we need.
+1. Repeat the local Lead-to-Stannum comparison with pinned builds and five trials
+   per workload, alternating execution order and retaining failed runs.
+2. Establish a baseline for the current Stannum build before optimizing it.
+3. Extend workloads to inserts, deletes, changing match sets, and sustained
+   maintenance; report tail latency and correctness alongside throughput.
+4. Compare with TIN when both engines can be measured in an equivalent environment
+   under the same protocol.
 
-For five or more valid repetitions, reports retain median, range, dispersion, and
-a trimmed mean that removes one minimum and maximum **per metric**, never whole
-runs. Incomplete groups withhold aggregate comparisons. Do not pool transactions
-from different runs as independent experiments or average p99s into a workload p99.
-The harness reference is [harness reference](harness.md).
+The evaluation stays at 100k documents for now. Better-controlled measurements
+are more useful than increasing the dataset size at this stage.
+
+See the [harness reference](harness.md) and [local campaign guide](local.md) for
+commands, configuration, and result collection.
