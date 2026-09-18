@@ -375,13 +375,14 @@ impl AreaFetch for MutableIndex {
         self.encoded.borrow().slot(extent)
     }
 
-    fn length_bytes(&self, ordinal: u32) -> Result<&[u8]> {
+    fn length(&self, ordinal: u32) -> Result<u32> {
         let extent = self.lengths_extent();
         let bytes = self.encoded.borrow().slot(extent)?;
         let at = ordinal as usize * 4;
-        bytes
+        let bytes = bytes
             .get(at..at + 4)
-            .ok_or(Error::Corrupt("document ordinal out of range"))
+            .ok_or(Error::Corrupt("document ordinal out of range"))?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 

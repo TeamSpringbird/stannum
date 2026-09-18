@@ -275,7 +275,6 @@ fn segment_error<T>(result: segment::Result<T>) -> T {
 impl IndexScorer {
     /// Score of one visible document, or zero if the index does not hold it.
     pub(crate) fn score(&mut self, tid: Tid) -> f32 {
-        let mut positions = Vec::new();
         for i in 0..self.view.sources.len() {
             if self.dead[i].contains(&tid) {
                 continue;
@@ -300,8 +299,7 @@ impl IndexScorer {
                     continue;
                 };
                 segment_error(term.payload.seek(posting));
-                positions.clear();
-                let bucket = segment_error(term.payload.next_into(&mut positions));
+                let bucket = segment_error(term.payload.next_bucket());
                 let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
                     pgrx::error!("Lead index data: term-frequency bucket; REINDEX required")
                 });

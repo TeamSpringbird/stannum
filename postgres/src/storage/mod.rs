@@ -427,9 +427,9 @@ impl PageSource for RunSource {
         u64::from(self.run.bytes)
     }
 
-    fn page(&self, index: u64) -> segment::Result<Vec<u8>> {
+    fn page(&self, index: u64) -> segment::Result<Rc<[u8]>> {
         if let Some(page) = self.pages.borrow().get(&index) {
-            return Ok(page.to_vec());
+            return Ok(page.clone());
         }
         let block = *self
             .table
@@ -454,7 +454,7 @@ impl PageSource for RunSource {
             data
         };
         self.pages.borrow_mut().insert(index, data.clone());
-        Ok(data.to_vec())
+        Ok(data)
     }
 }
 

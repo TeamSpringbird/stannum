@@ -130,6 +130,9 @@ struct Ordering {
     b: Option<f32>,
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
+    /// Rows the query will consume (offset plus limit) when the planner
+    /// knows; only that many are sorted up front.
+    top_k: Option<usize>,
 }
 
 unsafe fn const_text(node: *mut pg_sys::Node) -> Option<String> {
@@ -274,6 +277,9 @@ unsafe fn find_ordering(
             let Ok(term_replace) = const_datum::<Vec<String>>(arg(9)) else {
                 continue;
             };
+            // `limit_tuples` is offset plus count when both are known.
+            let limit = (*root).limit_tuples;
+            let top_k = (limit >= 0.0).then(|| limit.ceil() as usize);
             return Some(Ordering {
                 full: mode == 1,
                 dense_ratio,
@@ -281,6 +287,7 @@ unsafe fn find_ordering(
                 b,
                 term_add,
                 term_replace,
+                top_k,
             });
         }
         None
@@ -338,6 +345,7 @@ impl Clone for Ordering {
             b: self.b,
             term_add: self.term_add.clone(),
             term_replace: self.term_replace.clone(),
+            top_k: self.top_k,
         }
     }
 }
@@ -359,6 +367,7 @@ impl Private {
                     list.push(make_float_or_null(ordering.b));
                     list.push(make_array_or_null(&ordering.term_add));
                     list.push(make_array_or_null(&ordering.term_replace));
+                    list.push(make_int(ordering.top_k.map_or(-1, |k| k as i64)));
                 }
             }
             list.into_pg()
@@ -395,6 +404,7 @@ impl Private {
                     b: float(7),
                     term_add: array(8),
                     term_replace: array(9),
+                    top_k: usize::try_from(int(10)).ok(),
                 }),
             };
             (
@@ -639,6 +649,10 @@ struct ScanExec {
     recheck: bool,
     /// Candidates in output order, filled on first execution.
     tids: Vec<Tid>,
+    /// Scores aligned with `tids` for an ordered scan; only the first
+    /// `sorted` entries are in order, the rest are sorted if ever reached.
+    scores: Vec<f32>,
+    sorted: usize,
     next: usize,
     started: bool,
     /// Heap scan for the recovery-snapshot fallback.
@@ -739,6 +753,8 @@ unsafe extern "C-unwind" fn begin_scan(
             heap,
             recheck: false,
             tids: Vec::new(),
+            scores: Vec::new(),
+            sorted: 0,
             next: 0,
             started: false,
             fallback: std::ptr::null_mut(),
@@ -794,6 +810,8 @@ unsafe fn gather(exec: &mut ScanExec) {
         tids.sort_unstable();
         tids.dedup();
         exec.candidates = tids.len();
+        exec.scores.clear();
+        exec.sorted = tids.len();
         if let Some(ordering) = &exec.private.ordering {
             let mut scorer = crate::score::scorer_for_scan(
                 exec.private.heap_oid,
@@ -808,14 +826,51 @@ unsafe fn gather(exec: &mut ScanExec) {
             );
             let mut scored: Vec<(f32, Tid)> =
                 tids.iter().map(|tid| (scorer.score(*tid), *tid)).collect();
-            // Descending score; ties in heap order for a stable result.
-            scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            // Only the rows the query will consume are ordered now; the rest
+            // are ordered on demand should the executor ask for them.
+            let sorted = match ordering.top_k {
+                Some(k) if k < scored.len() => {
+                    scored.select_nth_unstable_by(k, rank);
+                    scored[..k].sort_by(rank);
+                    k
+                }
+                _ => {
+                    scored.sort_by(rank);
+                    scored.len()
+                }
+            };
+            exec.sorted = sorted;
+            exec.scores = scored.iter().map(|(score, _)| *score).collect();
             tids = scored.into_iter().map(|(_, tid)| tid).collect();
         }
         exec.tids = tids;
         exec.next = 0;
         exec.started = true;
     }
+}
+
+/// Descending score; ties in heap order for a stable result.
+fn rank(a: &(f32, Tid), b: &(f32, Tid)) -> std::cmp::Ordering {
+    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
+}
+
+/// Orders the candidates past the up-front top-k, once the executor reads
+/// beyond them.
+fn sort_rest(exec: &mut ScanExec) {
+    if exec.sorted >= exec.tids.len() {
+        return;
+    }
+    let mut rest: Vec<(f32, Tid)> = exec.scores[exec.sorted..]
+        .iter()
+        .copied()
+        .zip(exec.tids[exec.sorted..].iter().copied())
+        .collect();
+    rest.sort_by(rank);
+    for (i, (score, tid)) in rest.into_iter().enumerate() {
+        exec.scores[exec.sorted + i] = score;
+        exec.tids[exec.sorted + i] = tid;
+    }
+    exec.sorted = exec.tids.len();
 }
 
 /// Evaluates the original clause against the tuple in `slot`.
@@ -866,6 +921,9 @@ unsafe extern "C-unwind" fn search_access(
         }
         while exec.next < exec.tids.len() {
             pgrx::check_for_interrupts!();
+            if exec.next >= exec.sorted {
+                sort_rest(exec);
+            }
             let tid = exec.tids[exec.next];
             exec.next += 1;
             let mut pointer = pointer_of(tid);
@@ -1079,6 +1137,9 @@ unsafe extern "C-unwind" fn explain(
         pg_sys::ExplainPropertyText(c"Query".as_ptr(), query.as_ptr(), es);
         if exec.ordered {
             pg_sys::ExplainPropertyText(c"Order".as_ptr(), c"score DESC".as_ptr(), es);
+            if let Some(k) = exec.private.ordering.as_ref().and_then(|o| o.top_k) {
+                pg_sys::ExplainPropertyInteger(c"Top K".as_ptr(), std::ptr::null(), k as i64, es);
+            }
         }
         if (*es).analyze {
             pg_sys::ExplainPropertyInteger(

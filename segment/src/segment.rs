@@ -201,7 +201,7 @@ impl<'a> Term<'a> {
 pub trait AreaFetch {
     fn postings_bytes(&self, extent: Extent) -> Result<&[u8]>;
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]>;
-    fn length_bytes(&self, ordinal: u32) -> Result<&[u8]>;
+    fn length(&self, ordinal: u32) -> Result<u32>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -467,11 +467,16 @@ impl<S: Source> AreaFetch for Reader<S> {
         self.load(self.header.payload_at + extent.offset, extent.len as usize)
     }
 
-    fn length_bytes(&self, ordinal: u32) -> Result<&[u8]> {
+    fn length(&self, ordinal: u32) -> Result<u32> {
         if ordinal >= self.header.doc_count {
             return Err(Error::Corrupt("document ordinal out of range"));
         }
-        self.load(self.header.lengths_at + u64::from(ordinal) * 4, 4)
+        let at = self.header.lengths_at + u64::from(ordinal) * 4;
+        if let Some(bytes) = self.source.slice(at, 4) {
+            return Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        let bytes = self.source.read(at, 4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
 
@@ -487,21 +492,21 @@ pub enum Lengths<'a> {
 
 impl Lengths<'_> {
     pub fn get(&self, ordinal: u32) -> Result<u32> {
-        let bytes = match self {
+        match self {
             Self::Bytes(bytes) => {
                 let at = ordinal as usize * 4;
-                bytes
+                let bytes = bytes
                     .get(at..at + 4)
-                    .ok_or(Error::Corrupt("document ordinal out of range"))?
+                    .ok_or(Error::Corrupt("document ordinal out of range"))?;
+                Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             }
             Self::Lazy { fetch, count } => {
                 if ordinal >= *count {
                     return Err(Error::Corrupt("document ordinal out of range"));
                 }
-                fetch.length_bytes(ordinal)?
+                fetch.length(ordinal)
             }
-        };
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
     }
 }
 

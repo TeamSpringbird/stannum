@@ -184,19 +184,24 @@ reads with the incremental buffer index):
 
 | Query | TIN, ms | Lead, ms |
 | --- | ---: | ---: |
-| miss count | 0.25 | 0.2 |
-| rare count (8 matches) | 0.38 | 0.2 |
-| common count (22,063 matches) | 3.3 | 0.9 |
-| AND count | 2.5 | 0.8 |
-| phrase "united states" count (15,381) | 5.3 | 2.5 |
-| rare ranked, top 10 | 0.91 | 1.8 |
-| common ranked | 2.4 | 8.2 |
-| phrase "united states" ranked | 6.5 | 9.4 |
-| OR ranked | 1.4 | 2.6 |
+| miss count | 0.25 | 0.20 |
+| rare count (8 matches) | 0.38 | 0.16 |
+| common count (22,063 matches) | 3.3 | 0.72 |
+| AND count | 2.5 | 0.60 |
+| phrase "united states" count (15,381) | 5.3 | 2.1 |
+| rare ranked, top 10 | 0.91 | 1.3 |
+| medium ranked (182 matches) | 1.3 | 1.7 |
+| common ranked | 2.4 | 4.0 |
+| AND ranked | 4.1 | 3.4 |
+| phrase "united states" ranked | 6.5 | 5.8 |
+| OR ranked | 1.4 | 2.2 |
 
-Counts are now at or below TIN; ranked queries over broad terms are 2 to 3x
-slower because Lead scores every candidate before the top-k heap. Block-max
-pruning inside the custom scan is the remaining gap.
+Counts are at or below TIN everywhere. Ranked queries are within 1.7x: the
+scan scores every candidate at about 100 ns each and then selects the top k,
+and the ranked path carries about 1 ms of fixed cost (a second scorer for
+the projected `tin.full_score`, and term lookups per source) that shows on
+the rare shapes. Block-level score bounds and sharing the scan's scorer with
+the projection are the remaining gap.
 
 Selective shapes are within about 1.5x either way. The broad `OR` is where
 TIN's count strategies and in-scan top-k bound pay off: Lead still drains

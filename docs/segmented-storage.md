@@ -148,9 +148,11 @@ pages.
   near 90 ms per fresh backend. Pooled connections pay it once.
 * Folds happen in the inserting backend and rewrite the whole buffer; merges
   rewrite every segment. Both are bounded but make the triggering insert slow.
-* Ranked queries still score every matching row through the executor and sort;
-  TIN prunes inside its custom scan with a top-k bound. On the 10,000-document
-  fixture a broad `OR` ranked query scores all rows in about 2 ms.
+* Ranked queries score every candidate before selecting the top k: about
+  100 ns per candidate through the per-source cursors, or 2.2 ms for the
+  22,000 articles matching `history` at 100,000 documents. TIN reaches 2.4 ms
+  end to end on that query; Lead is at 4.3 ms. Block-level score bounds that
+  let the scan skip candidates are the next step in the segment format.
 * The pending-free list caps at 64 runs; beyond that, released pages leak
   until REINDEX with a warning.
 * PostgreSQL 17 has not been run for this slice.
@@ -217,7 +219,11 @@ whose partial predicate, if any, the planner has proven:
   rows with the original clause. When the query orders by `tin.score`,
   `tin.full_score` or `tin.max_score` bound to the same index, the path claims
   the sort's path keys and emits rows by descending score, so `LIMIT k` stops
-  after k fetches.
+  after k fetches. The planner's `limit_tuples` (offset plus limit, when both
+  are constants) is carried into the node as `Top K`: every candidate is
+  scored, but only the top k are ordered up front, by selection rather than a
+  full sort. A parent that reads past k, such as a nested loop that filters
+  joined rows, gets the remainder ordered on demand.
 * **Lead Count** replaces `SELECT count(*)` when the `==>` clause is the only
   restriction. It counts candidates on pages the visibility map marks
   all-visible without touching the heap and fetches the rest.
@@ -257,21 +263,24 @@ one writer scheduled at 20 updates/s, 30 s), on the local machine. The
 segment per backend after each write; the last column keeps an incremental
 buffer index per backend instead.
 
-| | Whole-segment reads | Paged reads | Paged reads, buffer index |
-| --- | ---: | ---: | ---: |
-| Read queries/s, all twenty shapes | 74 | 182 | 815 |
-| Count queries, median ms | 5 to 12 | 3 to 5.5 | 0.26 to 2.5 |
-| Ranked queries, median ms | 120 to 350 | 6.7 to 16.6 | 0.5 to 9.4 |
-| Ranked queries, p95 ms | | 29 to 57 | 1.1 to 11 |
-| Achieved writes/s, p95 ms | | 19.8, 10.4 | 19.8, 11.2 |
-| Index build, s | 15 | 14.7 | 14.6 |
-| Index size | 161 MB | 161 MB | 161 MB |
+| | Whole-segment reads | Paged reads | Buffer index | Top-k selection |
+| --- | ---: | ---: | ---: | ---: |
+| Read queries/s, all twenty shapes | 74 | 182 | 815 | 1,146 |
+| Count queries, median ms | 5 to 12 | 3 to 5.5 | 0.26 to 2.5 | 0.22 to 2.2 |
+| Ranked queries, median ms | 120 to 350 | 6.7 to 16.6 | 0.5 to 9.4 | 0.4 to 6.0 |
+| Ranked queries, p95 ms | | 29 to 57 | 1.1 to 11 | 0.5 to 6.6 |
+| Achieved writes/s, p95 ms | | 19.8, 10.4 | 19.8, 11.2 | 19.8, 10.8 |
+| Index build, s | 15 | 14.7 | 14.6 | 14.6 |
+| Index size | 161 MB | 161 MB | 161 MB | 161 MB |
 
+The last column also stops copying a page on every cache hit and reads
+document lengths without the arena, which halved the per-candidate scoring
+cost, and reads only the term-frequency bucket from the payload when scoring.
 Server-side execution time from `EXPLAIN ANALYZE` on the same index once a
-session is warm: count queries 0.17 to 2 ms, ranked 0.5 to 9 ms. TIN on
+session is warm: count queries 0.15 to 2.1 ms, ranked 0.33 to 5.8 ms. TIN on
 PlanetScale for the same 100,000 articles: count 0.25 to 5.3 ms, ranked 0.33
-to 6.5 ms. A fresh session pays the buffer index build first (27 ms with 1.2
-MB buffered), then nothing.
+to 6.5 ms. A fresh session pays the buffer index build first (about 18 ms
+with 600 articles buffered), then nothing.
 
 ## Validation
 

@@ -107,8 +107,8 @@ pub trait PageSource {
     fn pages(&self) -> u64;
     /// Total data bytes (the last page may be partial).
     fn data_len(&self) -> u64;
-    /// The data of page `index`.
-    fn page(&self, index: u64) -> Result<Vec<u8>>;
+    /// The data of page `index`, shared so a cache hit costs no copy.
+    fn page(&self, index: u64) -> Result<Rc<[u8]>>;
 }
 
 impl<P: PageSource> Source for P {
@@ -153,9 +153,9 @@ mod tests {
         fn data_len(&self) -> u64 {
             self.0.len() as u64
         }
-        fn page(&self, index: u64) -> Result<Vec<u8>> {
+        fn page(&self, index: u64) -> Result<Rc<[u8]>> {
             let start = index as usize * 7;
-            Ok(self.0[start..(start + 7).min(self.0.len())].to_vec())
+            Ok(Rc::from(&self.0[start..(start + 7).min(self.0.len())]))
         }
     }
 

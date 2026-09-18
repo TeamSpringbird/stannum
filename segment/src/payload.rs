@@ -79,6 +79,18 @@ pub(crate) fn encode_positions(out: &mut Vec<u8>, positions: &[u32]) {
     }
 }
 
+/// Skips one encoded position list without materializing it.
+pub(crate) fn skip_positions(reader: &mut Reader<'_>) -> Result<()> {
+    let n = reader.varint_u32()?;
+    if n == 0 {
+        return Err(Error::InvalidPositions);
+    }
+    for _ in 0..n {
+        reader.varint_u32()?;
+    }
+    Ok(())
+}
+
 /// Appends decoded positions to `into` and returns how many were read.
 pub(crate) fn decode_positions(reader: &mut Reader<'_>, into: &mut Vec<u32>) -> Result<usize> {
     let n = reader.varint_u32()?;
@@ -205,12 +217,24 @@ impl PayloadCursor<'_> {
             self.reader.seek(at)?;
             self.next_ordinal = start;
         }
-        let mut scratch = Vec::new();
         while self.next_ordinal < ordinal {
-            self.next_into(&mut scratch)?;
-            scratch.clear();
+            self.next_bucket()?;
         }
         Ok(())
+    }
+
+    /// Decodes the next entry's term-frequency bucket, skipping its positions.
+    pub fn next_bucket(&mut self) -> Result<u8> {
+        if self.next_ordinal >= self.payload.count {
+            return Err(Error::Corrupt("payload read past end"));
+        }
+        let byte = self.reader.u8()?;
+        if byte > MAX_TF_BUCKET {
+            return Err(Error::Corrupt("payload bucket byte"));
+        }
+        skip_positions(&mut self.reader)?;
+        self.next_ordinal += 1;
+        Ok(byte)
     }
 
     /// Decodes the next entry, appending its positions to `positions` and

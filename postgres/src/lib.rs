@@ -610,6 +610,43 @@ mod tests {
             .unwrap(),
             Some(vec![100, 200, 400])
         );
+        // A join above the ordered scan can consume more rows than the LIMIT
+        // it was planned for; the rows past the top-k are ordered on demand.
+        Spi::run(
+            "CREATE TABLE cs_keep(id int primary key);
+             INSERT INTO cs_keep SELECT n FROM generate_series(2500, 3000) n;",
+        )
+        .unwrap();
+        let joined = |custom: bool| -> Vec<i32> {
+            Spi::run(&format!(
+                "SET LOCAL tin.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;
+                 SET LOCAL enable_sort = off; SET LOCAL enable_hashjoin = off;
+                 SET LOCAL enable_mergejoin = off;"
+            ))
+            .unwrap();
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM (SELECT d.id FROM cs d JOIN cs_keep k USING (id)
+                 WHERE d.body ==> 'common OR rare' ORDER BY tin.full_score(d.ctid) DESC LIMIT 4) t",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // The four surviving 'rare' rows tie on score; the plain sort breaks
+        // ties arbitrarily, so the comparison is by set.
+        let with_custom = joined(true);
+        assert_eq!(with_custom, vec![2600, 2700, 2800, 2900]);
+        assert_eq!(with_custom, joined(false));
+        Spi::run("SET LOCAL tin.enable_custom_scan = on;").unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.id FROM cs d JOIN cs_keep k USING (id)
+             WHERE d.body ==> 'common OR rare' ORDER BY tin.full_score(d.ctid) DESC LIMIT 4",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        let text = plan.to_string();
+        assert!(text.contains("Lead Text Search Scan"), "{text}");
+        assert!(text.contains("\"Top K\":4"), "{text}");
     }
 
     #[pg_test]
