@@ -51,3 +51,6 @@ pub use tid::Tid;
 
 #[cfg(test)]
 mod random_tests;
+
+#[cfg(test)]
+mod format_tests;

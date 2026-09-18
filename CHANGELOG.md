@@ -11,3 +11,7 @@
 - Heap permission and row-security checks for physical index diagnostics;
   catalog-dependent SQL functions use STABLE rather than IMMUTABLE.
 - Malformed indexed-query and future page-version regression checks.
+- Segment format `LSG3`: one term bound for postings that fit a block, no
+  payload skip slot for entry 0, and dictionary entries with gap-encoded
+  extents; the 100k Wikipedia index shrinks by about a tenth with the same
+  pruning. `LSG1` and `LSG2` segments remain readable; `REINDEX` rewrites.
