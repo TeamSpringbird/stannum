@@ -33,7 +33,8 @@ positions, term frequencies, and document lengths.
 
 Searches read both segments and the buffer, so new rows do not wait for a fold to
 be searchable. Per-backend caches reuse immutable segment data and incrementally
-index new buffer records. Retained document cursors keep their encoded length
+index new buffer records (see [per-backend caches](#per-backend-caches)).
+Retained document cursors keep their encoded length
 array from the same buffer state. Refreshing the buffer can insert a reused heap
 location before existing rows; looking up old ordinals in a new length array
 would change scores midway through a ranked scan.
@@ -45,7 +46,7 @@ would change scores midway through a ranked scan.
 | `stannum.write_buffer_bytes` | 1,048,576 | Encoded forward-record bytes before folding |
 | `stannum.max_merge_docs` | 1,024 | Total input documents ordinary insert merges may rewrite per fold |
 | `stannum.merge_tier_factor` | 8 | Segments per size tier before they merge |
-| `stannum.max_segments` | 128 | Hard bound on directory entries |
+| `stannum.max_segments` | 128 | Soft bound on directory entries; 128 is the hard on-disk bound |
 
 The next insert folds a nonempty buffer before appending a record that would
 exceed either cap. A single document may exceed the byte cap: it remains one
@@ -70,16 +71,28 @@ remaining budget waits for VACUUM, and the directory can therefore hold more
 than `factor - 1` entries in a tier. Zero defers all ordinary insert merges.
 Index construction retains unrestricted tier maintenance.
 
-The directory bound takes precedence: before publication, an overfull directory
-merges only its smallest `entry_count - max_segments + 1` entries (normally two).
-It does this before considering a tier merge. Lowering `max_segments` on an
-existing index can require a larger emergency merge. **The emergency path is
-bounded by the minimum number of entries needed to make room, not by
-`max_merge_docs`.** A fixed document ceiling is impossible alongside a fixed
-128-entry directory when all 128 entries already exceed that ceiling. Keep
-VACUUM timely to avoid emergency work. These settings do not promise a maximum
-wall-clock insert latency; I/O, lock waits, huge documents and other VACUUM
-work still matter.
+`max_segments` is a soft bound. A directory over it merges its smallest
+`entry_count - max_segments + 1` entries (normally two), which is the cheapest
+set of that size and therefore the cheapest way back under the bound; an
+insert performs that merge only when it fits the remaining budget, preferring
+a due tier merge that fits, and otherwise lets the directory grow for VACUUM
+to shrink. VACUUM merges due tiers and then the smallest entries until the
+directory fits, with no budget. The on-disk directory of 128 entries is the
+hard bound: an insert that would leave 129 entries merges the two smallest
+whatever they cost. **That is the only unbudgeted merge.** A fixed document
+ceiling is impossible alongside a fixed 128-entry directory when all 128
+entries already exceed that ceiling.
+
+Worst case: without VACUUM, folds keep adding entries; once the directory is
+full, every fold merges the two smallest. While unmerged folds remain those
+are two folds (1,024 documents at the default fold size), so the cost stays
+at the ordinary budget; after about 128 folds every entry has doubled and the
+cost doubles with it, and so on geometrically. Lowering `max_segments` below
+128 makes budget-fitting merges happen earlier, keeps the directory smaller
+and leaves `128 - max_segments` folds of headroom before the hard bound.
+Keep VACUUM timely to avoid emergency work. These settings do not promise a
+maximum wall-clock insert latency; I/O, lock waits, huge documents and other
+VACUUM work still matter.
 
 ### Deferred merges and autovacuum
 
@@ -90,24 +103,39 @@ races and a new preload requirement. No `shared_preload_libraries` entry is
 needed. The segment directory itself records deferred work; restart does not
 lose a maintenance queue, and the on-disk page format is unchanged.
 
-A merge copies its selected runs and dead lists under a shared meta lock,
-releases that lock, and builds the new segment from owned bytes. Most merge
-CPU work therefore does not block inserts or readers. It reacquires the meta
-lock exclusively and checks index identity and every complete input directory
-entry, including the dead-list run. If an insert's emergency merge changed an
-input, maintenance abandons the output; a later VACUUM retries. Changes to other
-entries or the write buffer are preserved. Only then does it allocate and WAL
-write the new runs, publish a fresh generation and retire the old runs.
+VACUUM holds the meta lock exclusively only to publish. Every phase works
+from a directory captured under a shared lock and then runs with no meta
+lock at all: reading the input runs and dead lists, comparing documents with
+the dead-tuple callback, building the output segment or dead list, writing
+its run pages (through the FSM and the extension lock, as any writer) and
+walking pending chains. Publication reacquires the lock exclusively, checks
+the index identity and matches every input entry against the directory
+again, complete entry including the dead-list run, then swaps in the new
+entry or dead list, retires the old runs and writes the meta page: a few
+page writes. Work whose inputs an insert changed meanwhile is dropped and
+its pages are freed at once; the job is retried against the new directory.
+Changes to other entries or the write buffer are preserved.
 
-The lock order stays meta, buffer/run pages, extension lock. Permanent-index page writes
-still use generic WAL; temporary and unlogged main-fork writes skip WAL.
-Readers with captured directories retain the existing snapshot-horizon
-protection for retired runs. The maintenance builder uses
+Reading without the lock is sound because a published entry's pages are
+immutable until it is retired, retirement happens only under the exclusive
+lock, an entry that has not been retired has never had a page freed, and
+generations never repeat. An entry found unchanged at publication therefore
+proves the bytes read were its own. A read that fails while unlocked is
+reported as corruption only if the entry is still published; otherwise it
+was a race with a retirement. Bulk deletion scans segments this way in up
+to three rounds, so entries that inserts fold or merge during a round are
+scanned in the next; whatever appears during the last round is finished
+under the lock, as is the write buffer, which the fold caps keep small. No
+document the callback knows dead survives in any segment.
+
+The lock order stays meta, buffer/run pages, extension lock. Permanent-index
+page writes still use generic WAL; temporary and unlogged main-fork writes
+skip WAL. Readers with captured directories retain the existing
+snapshot-horizon protection for retired runs. The maintenance builder uses
 owned bytes while unlocked, so it does not depend on VACUUM having a reader
-snapshot. Run copying and output WAL publication still hold the meta lock;
-this is not a fully nonblocking compactor. A cleanup call attempts at most the
-number of directory entries it observed on entry, so continuing inserts cannot
-extend its merge loop indefinitely.
+snapshot. A cleanup call attempts at most twice the number of directory
+entries it observed on entry, so continuing inserts cannot extend its merge
+loop indefinitely.
 
 PostgreSQL 17/18 call `amvacuumcleanup` even when AUTO skips bulk deletion,
 so insert-triggered autovacuum reaches deferred merges without table changes.
@@ -135,8 +163,11 @@ and the [cleanup/bypass implementation](https://github.com/postgres/postgres/blo
 
 The private-cluster scenario in `docs/benchmarks/merge_lifecycle.py` checks
 insert-triggered autovacuum without preload, concurrent inserts and merges,
-retained readers, restart and index verification. The [merge-budget experiment](../benchmarks/merge-budget.md)
-records latency, reader tails, segment counts and correctness results.
+retained readers, restart, index verification, and a crash between a run
+write and its publication followed by orphan reclamation. The [merge-budget experiment](../benchmarks/merge-budget.md)
+records latency, reader tails, segment counts and correctness results; the
+[VACUUM publication experiment](../benchmarks/vacuum-publication.md) measures
+the unlocked VACUUM and budgeted overflow merges against it.
 
 ## Reading an index
 
@@ -158,6 +189,46 @@ custom scan nodes:
 
 `EXPLAIN ANALYZE` shows the chosen path. `SET stannum.enable_custom_scan = off`
 selects the bitmap path for comparison.
+
+### Per-backend caches
+
+A query captures the directory and the buffer state under one shared meta
+lock, then reads through four caches that live in the backend and key on
+what the meta page says, so every backend sees the same thing without any
+coordination:
+
+- **Segment readers**, by index identity and segment generation. A reader
+  keeps the byte ranges it has fetched (dictionary index, dictionary blocks,
+  postings, payload, document table) for as long as the generation is in the
+  directory; the readers of one backend hold at most 64 MiB of fetched bytes
+  before they are all dropped. Generations never repeat within an identity,
+  and REINDEX changes the identity, so a cached reader can never describe a
+  different segment.
+- **Dictionary lookups**, per cached segment: a term's entry or its absence,
+  at most 4,096 terms per segment. A statement resolves each of its terms in
+  every segment several times (planning, statistics, cursor setup), and the
+  next statement repeats that. With a dozen small segments those walks over
+  prefix-compressed dictionary blocks cost more than the lookups they serve,
+  so the memo answers repeats without them. Segments are immutable, so the
+  memo needs no invalidation of its own; it lives and dies with the reader.
+- **Page tables**, by identity and generation.
+- **The buffer index**, by identity and buffer epoch. It is an in-memory
+  inverted index of the buffer's forward records, extended from the last
+  byte it covered on each use (an insert by any backend only appends), and
+  rebuilt when the epoch changes: a fold empties the buffer, and VACUUM
+  rewrites it without dead records. Building costs about 11 ms per MiB of
+  records on the benchmark machine, so the worst case for a fresh connection
+  at the default caps is a few tens of milliseconds; existing backends absorb
+  each record once, as it arrives.
+
+The buffer index is not shared between backends. Sharing it would need a
+shared-memory rendezvous (`shared_preload_libraries` or the DSM registry of
+PostgreSQL 17+), a serialized form of the index, and lifetime management
+across epochs and identities, to save at most one build per connection and
+one per VACUUM rewrite per backend, bounded by the byte cap. The
+[buffer-index measurements](../benchmarks/buffer-index.md) record that cost
+and the reader cost of small folds, which is what the defaults trade against
+write stalls.
 
 ### One tokenizer per clause
 
@@ -260,6 +331,14 @@ top rows were deleted), the scan scores every candidate and continues with the
 rows it has not emitted yet; documents indexed since the top k was built can
 rank into the completed ordering, so it is not resumed by position.
 
+A ranked scan keeps its scorer for as long as it lives, under its own
+identity, with the score of every row it ranked: a cursor fetched across
+later statements, or two scans on one query open at once, each report the
+scores they ranked by even as writes move the statistics. A HOT-updated row
+is posted at its chain root; the score functions resolve the visible member's
+location to that root. `docs/testing.md` describes the concurrency fuzzer
+that checks this against the unpruned path and the bug classes it found.
+
 ## Durability and maintenance
 
 Logged indexes use PostgreSQL's generic write-ahead log. A metadata page tracks
@@ -273,6 +352,26 @@ custom WAL resource manager so hot standbys resolve the same conflict on replay.
 VACUUM records dead tuples, rewrites sufficiently dead segments, and reclaims
 pages.
 `stannum.segment_info('index_name')` exposes the segment layout for inspection.
+
+Reclamation publishes first and frees second: VACUUM walks the chains of the
+pending runs no snapshot can still read, removes those entries from the meta
+page under the exclusive lock (each matched exactly against what it walked,
+so an entry an insert coalesced more runs into meanwhile waits for the next
+VACUUM), and marks their pages FREE afterwards. A crash between the two, like
+a crash between writing a run and publishing it, leaves pages that nothing
+references and that are not FREE. VACUUM's cleanup reclaims such orphans: it
+computes every page the captured directory references (page 0, each entry's
+run through its page table, the page-table and dead-list chains, the whole
+buffer chain, pending runs up to their recorded lengths), reads the kind of
+every other page that existed at the capture, and keeps the ones not marked
+FREE as candidates. Under a shared meta lock, which no writer can hold a
+half-written run beneath, it walks only what changed since the capture and
+confirms the candidates the current directory still does not reference; it
+frees them after releasing the lock. No snapshot can reference such a page:
+a reader's directory holds only published entries, a retired entry stays
+referenced through the pending list until reclaimed, only FREE pages are ever
+allocated, and a crash ends every session. The number reclaimed is written
+to the server log.
 
 The page and segment format signatures are `LDP2` and `LSG3`. Their definitions
 live in `postgres/src/storage/layout.rs` and the `segment` crate. `LSG2` added
@@ -351,8 +450,8 @@ What is checked:
 | `segment generation G run` / `page table` / `dead list` | The chain of pages holding that blob is broken: a page has the wrong kind, is marked `FREE`, belongs to something else, holds too few bytes, or the page table disagrees with the chain. | `REINDEX` |
 | `segment generation G, ...` | The blob decoded from those pages is inconsistent inside: header, dictionary, a term (`term "x"`), a document (`document (block,offset)`), the document table or the dead list. Queries touching that term or document fail or return wrong rows. An `LSG1` warning means the segment predates block bounds and ranked scans over it score every candidate. | `REINDEX`; for the `LSG1` warning only if pruning matters |
 | `write buffer` | The buffer chain or its records are unreadable, or the counters in the meta page disagree with the stream. Inserts and every search fail. | `REINDEX` |
-| `pending entry N` (warning) | A run awaiting reclamation is shorter than recorded; the missing pages leak. Harmless to queries. | `REINDEX` if the space matters |
-| `page N` (warning) | A page nothing references and not marked `FREE`: typically leaked by a crash between writing a run and publishing it. Harmless to queries. | `REINDEX` if the space matters |
+| `pending entry N` (warning) | A run awaiting reclamation is shorter than recorded; the pages past the break are unreferenced. Harmless to queries. | `VACUUM` reclaims the entry and the orphaned remainder |
+| `page N` (warning) | A page nothing references and not marked `FREE`: typically leaked by a crash between writing a run and publishing it. Harmless to queries. | `VACUUM` reclaims it |
 | `heap` | A visible row with tokens is missing from the index, so searches miss it. | `REINDEX` |
 | any source, `document (b,o) points ...` | The index holds a location the heap no longer has (beyond its end or an unused line pointer), so VACUUM missed a deletion. Searches may return wrong rows after the slot is reused. | `REINDEX` |
 | any source, `document (b,o) is also live in ...` | One location is live in two segments or in a segment and the buffer; a search can return it twice and scores add up. | `REINDEX` |
@@ -361,10 +460,10 @@ In short: every `error` means `REINDEX`, because the on-disk structure no
 longer describes the table and nothing rewrites a segment in place.
 `VACUUM` is the answer to things `verify_index` does not report as errors:
 dead documents still counted in segment statistics (`dead_docs` in
-`stannum.segment_info`), runs waiting on the pending-free list, and a
-directory holding empty segments (a warning), all of which VACUUM's dead
-lists, rewrites and reclamation take care of. If the index is inconsistent,
-the table is the source of truth; `REINDEX` rebuilds from it.
+`stannum.segment_info`), runs waiting on the pending-free list, pages nothing
+references, and a directory holding empty segments (a warning), all of which
+VACUUM's dead lists, rewrites and reclamation take care of. If the index is
+inconsistent, the table is the source of truth; `REINDEX` rebuilds from it.
 
 ## Current limits
 
@@ -384,15 +483,23 @@ the table is the source of truth; `REINDEX` rebuilds from it.
 - Unordered custom scans are worker-safe but do not split a scan across workers.
 - Fresh connections rebuild their own buffer index. Large buffers increase
   first-query latency; connection pooling amortizes that work.
-- Folding, merging, and VACUUM can hold up concurrent operations.
+- Folding and insert-side merging hold the meta lock for their duration, so
+  concurrent inserts and readers wait for them. VACUUM holds it exclusively
+  only to publish (a few page writes per merge, rewrite, dead list or
+  reclamation), plus the scan of whatever inserts folded during its last
+  unlocked round and the rewrite of the write buffer without dead records.
 - The pending-free list holds 64 entries; runs released together share one.
   A full list first frees runs no snapshot can still read and otherwise
   appends to its newest entry, delaying that entry's reclamation. A crash
-  before a new run is published leaves its pages unreclaimed until REINDEX;
-  `stannum.verify_index` lists them as `page N` warnings.
-- Ordinary insert merges have a document budget. Directory-overflow merges
-  can exceed it, and VACUUM still holds the meta lock while copying runs,
-  publishing outputs, marking dead tuples and reclaiming pages.
+  before a new run is published, or between removing a reclaimed pending
+  entry and freeing its pages, leaves orphaned pages that
+  `stannum.verify_index` lists as `page N` warnings until the next VACUUM
+  cleanup reclaims them.
+- Ordinary insert merges have a document budget, and so do merges that bring
+  the directory back under `max_segments`. Only the merge that keeps the
+  directory within its 128-entry on-disk bound is unbudgeted; its cost grows
+  geometrically with the number of folds VACUUM has missed (see Merge
+  policy).
 
 Use the tests listed in the [project README](../../README.md#validate-changes)
 when changing these paths. Performance evidence and its limitations are kept in
