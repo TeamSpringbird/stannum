@@ -581,6 +581,49 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_records_keep_each_occurrence_with_its_own_positions() {
+        // Positions are stored flat per term in arrival order while postings
+        // stay in TID order; an occurrence inserted before earlier ones must
+        // still resolve to its own positions and term frequency.
+        let mutable = MutableIndex::default();
+        mutable
+            .add_record(record(300, "beer beer beer ale"))
+            .unwrap();
+        mutable.add_record(record(200, "ale beer")).unwrap();
+        mutable.add_record(record(100, "beer")).unwrap();
+        let beer = mutable.term("beer").unwrap().unwrap();
+        assert_eq!(beer.df(), 3);
+        let tids = collect(beer.cursor().unwrap()).unwrap();
+        assert_eq!(
+            tids,
+            [
+                record(100, "").tid,
+                record(200, "").tid,
+                record(300, "").tid
+            ]
+        );
+        let payload = beer.payload().unwrap();
+        assert_eq!(payload.get(0).unwrap().positions, [1]);
+        assert_eq!(payload.get(1).unwrap().positions, [2]);
+        assert_eq!(payload.get(2).unwrap().positions, [1, 2, 3]);
+        let ale = mutable.term("ale").unwrap().unwrap();
+        let payload = ale.payload().unwrap();
+        assert_eq!(payload.get(0).unwrap().positions, [1]);
+        assert_eq!(payload.get(1).unwrap().positions, [4]);
+        // The same records through the segment builder agree in every detail.
+        let mut builder = SegmentBuilder::default();
+        for (id, text) in [
+            (300, "beer beer beer ale"),
+            (200, "ale beer"),
+            (100, "beer"),
+        ] {
+            builder.add_record(&record(id, text)).unwrap();
+        }
+        let bytes = builder.finish();
+        same(&mutable, &Reader::parse(&bytes).unwrap(), &["beer", "ale"]);
+    }
+
+    #[test]
     fn mutable_index_matches_a_segment_built_from_the_same_records() {
         let texts = [
             (7, "beer beer wine"),

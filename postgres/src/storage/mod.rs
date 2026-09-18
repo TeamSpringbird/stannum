@@ -662,6 +662,9 @@ type TermMemo = Rc<RefCell<FxHashMap<String, Option<TermEntry>>>>;
 /// Memoized lookups per segment before the memo is emptied.
 const TERM_MEMO_LIMIT: usize = 4096;
 
+/// A segment's dead list, decoded once per backend and dead run.
+type DeadSet = Rc<BTreeSet<Tid>>;
+
 /// A segment reader kept per backend with the bytes it has fetched, plus the
 /// segment's dead list as of the directory entry it was last checked against.
 struct CachedSegment {
@@ -672,7 +675,7 @@ struct CachedSegment {
     dead_run: Run,
     dead: Option<Rc<Vec<u8>>>,
     /// `dead` decoded once per dead run, for scorers that test membership.
-    dead_set: Rc<BTreeSet<Tid>>,
+    dead_set: DeadSet,
 }
 
 /// An immutable segment as a query source: the shared reader plus the
@@ -744,7 +747,7 @@ unsafe fn cached_segment(
     index_oid: pg_sys::Oid,
     identity: u64,
     entry: &SegmentEntry,
-) -> (MemoizedSegment, Option<Rc<Vec<u8>>>, Rc<BTreeSet<Tid>>) {
+) -> (MemoizedSegment, Option<Rc<Vec<u8>>>, DeadSet) {
     let key = (identity, entry.generation);
     let found = SEGMENT_READERS.with_borrow(|readers| {
         readers.get(&key).map(|cached| {
@@ -1701,7 +1704,7 @@ pub struct View {
     pub labels: Vec<String>,
     /// Each source's dead list as a set, decoded once per backend and dead
     /// run rather than once per statement; empty for the write buffer.
-    pub dead_sets: Vec<Rc<BTreeSet<Tid>>>,
+    pub dead_sets: Vec<DeadSet>,
 }
 
 /// # Safety
@@ -1717,8 +1720,7 @@ pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
         trim_reader_cache(meta.identity, &meta);
         for entry in &meta.segments {
             pgrx::check_for_interrupts!();
-            let (segment, dead, dead_set) =
-                cached_segment(index, index_oid, meta.identity, entry);
+            let (segment, dead, dead_set) = cached_segment(index, index_oid, meta.identity, entry);
             sources.push((Box::new(segment), dead));
             labels.push(generation_label(entry.generation));
             dead_sets.push(dead_set);

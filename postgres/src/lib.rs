@@ -3061,8 +3061,12 @@ mod tests {
         assert_eq!(exact_count("memo", "needle"), 6);
         assert_eq!(exact_count("memo", "w1"), 9);
         assert_eq!(
-            ids("SELECT id FROM memo WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC, id LIMIT 3"),
-            ids("SELECT id FROM (SELECT id, stannum.full_score(ctid) AS s FROM memo WHERE body ==> 'needle') t ORDER BY s DESC, id LIMIT 3")
+            ids(
+                "SELECT id FROM memo WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC, id LIMIT 3"
+            ),
+            ids(
+                "SELECT id FROM (SELECT id, stannum.full_score(ctid) AS s FROM memo WHERE body ==> 'needle') t ORDER BY s DESC, id LIMIT 3"
+            )
         );
         let before = crate::storage::cache_probe();
         Spi::run("REINDEX INDEX memo_idx").unwrap();
@@ -3105,7 +3109,11 @@ mod tests {
         assert_eq!(exact_count("bufidx", "needle"), 15);
         assert_eq!(exact_count("bufidx", "n12"), 1);
         let grown = crate::storage::cache_probe().buffer.unwrap();
-        assert_eq!((grown.0, grown.1), (first.0, first.1), "same identity and epoch");
+        assert_eq!(
+            (grown.0, grown.1),
+            (first.0, first.1),
+            "same identity and epoch"
+        );
         assert!(grown.2 > first.2, "covers the appended bytes");
         assert_eq!(grown.3, 15);
         // VACUUM rewrites the buffer without the dead records: new epoch.
