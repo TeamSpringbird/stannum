@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "boldi-vigna"
-version = "1.0.3"
+version = "0.0.0"
 dependencies = [
  "proptest",
  "rustc-hash",
@@ -1532,6 +1532,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
+name = "segment"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1667,6 +1675,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "stannum"
+version = "0.0.0"
+dependencies = [
+ "boldi-vigna",
+ "pgrx",
+ "pgrx-tests",
+ "rustc-hash",
+ "segment",
+ "thiserror",
+ "tinql",
+ "tokenizer",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1774,28 +1796,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "tin"
-version = "1.0.3"
-dependencies = [
- "boldi-vigna",
- "pgrx",
- "pgrx-tests",
- "rustc-hash",
- "thiserror",
- "tinql",
- "tokenizer",
-]
-
-[[package]]
 name = "tinql"
-version = "1.0.3"
+version = "0.0.0"
 dependencies = [
  "boldi-vigna",
  "pest",
  "pest_derive",
+ "proptest",
  "regex-automata",
  "regex-syntax",
  "rustc-hash",
+ "segment",
  "thiserror",
  "tokenizer",
 ]
@@ -1827,7 +1838,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokenizer"
-version = "1.0.3"
+version = "0.0.0"
 dependencies = [
  "emojis",
  "proptest",

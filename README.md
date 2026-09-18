@@ -1,65 +1,140 @@
-# Lead
+# Stannum
 
-Lead is a deliberately non-production Postgres text-search extension for exercising TIN-compatible application SQL in development, test, CI, and staging environments.
+Stannum is an experimental, open-source PostgreSQL search engine with Boolean and
+positional queries, BM25 ranking, and exact counts under concurrent writes. The
+index, query execution, scoring, and storage implementation live in this repository.
 
-It favors correctness and a small implementation over production query performance.
+We started from [PlanetScale Lead](https://github.com/planetscale/lead), a deliberately
+slow, correctness-oriented substitute for TIN. We are developing that foundation
+into a useful search engine: durable inverted indexes, stored ranking statistics,
+and PostgreSQL execution paths that avoid scanning and retokenizing the entire
+corpus for every query. Stannum is an independent fork, not PlanetScale TIN or a
+PlanetScale-supported product. The inherited code remains under AGPL-3.0; see
+[LICENSE](LICENSE).
 
-It is intentionally unsuitable for production workloads. Every index scan returns all heap pages as candidates; Postgres rechecks their visible rows for exact TINQL and MVCC behavior. The index stores no search data.
+**This is development software, not a production-ready database extension.** The
+first 100k-document measurements are encouraging, but short benchmarks and targeted
+correctness tests do not establish long-term reliability. Our next steps are
+repeated comparisons, sustained mutation and maintenance tests, and broader
+recovery testing. See [benchmark results and plan](docs/benchmarks/README.md) for evidence and limitations.
 
-## Build
+## What works today
 
-[Install `cargo-pgrx`](https://github.com/pgcentralfoundation/pgrx/blob/develop/cargo-pgrx/README.md) version 0.19.1 exactly and initialize it for the Postgres major versions you need, then build or package with one version feature:
+- TINQL terms, Boolean expressions, phrases, proximity, positional filters, and
+  expansion queries, with exact matching or a conservative recheck fallback.
+- Logged indexes with a mutable write buffer and immutable segments containing
+  dictionaries, tuple postings, positions, term frequencies, and document lengths.
+- Index-backed BM25 scoring, visibility-aware count scans, and top-k selection.
+- Inserts, updates, VACUUM, segment folding/merging, page reuse, and generic WAL.
+- Highlighting, tokenizer options, and `stannum.segment_info` for index inspection.
 
-```sh
-cargo pgrx package --package tin --no-default-features --features pg18
-```
+The [storage and execution notes](docs/architecture/segmented-storage.md) describe the design and
+its current boundaries. Ranked queries still score all candidates before selecting
+the top k. Folding and merging can delay the inserting transaction; maintenance
+and reclamation need more testing. Standby/recovery reads and temporary or unlogged
+indexes use slower fallback paths. Nondefault tokenizer behavior can differ between
+an index scan and a sequential scan. These are active engineering gaps.
 
-For an interactive development database, run:
+## Build and try it
 
-```sh
-cargo pgrx run pg18 --package tin
-```
-
-Then run `CREATE EXTENSION tin` in the database. Lead loads on demand and does not require `shared_preload_libraries` or `session_preload_libraries`.
-
-## Compatibility boundary
-
-Lead provides the `tin` access method, the `==>` operator, TINQL parsing, tokenizer and index reloptions, and the scoring functions `tin.score`, `tin.full_score`, `tin.max_score`, and `tin.score_inspect`, plus explicit and implicitly bound `tin.highlight` and `tin.highlight_ansi`. Postgres 17 and 18 are build targets. Search results are exact because the access method returns whole-page candidates and Postgres evaluates `==>` against each visible heap tuple, including expression and partial-index rechecks.
-
-Scoring deliberately rescans and retokenizes the visible indexed column or expression. A score call must be in the same query level as the matching `==>` predicate. Implicit highlighting has the same binding boundary; passing its `query` argument explicitly works without a bound predicate.
-
-## Execution and storage
-
-Each scan reads the table's current block count and adds every block to a lossy bitmap. Postgres owns row visibility, query rechecks, and table maintenance. Index builds evaluate indexed expressions and predicates for validation and statistics; inserts and VACUUM have no index entries to maintain.
-
-Lead allocates no extension shared memory and creates no files outside Postgres's normal relation storage. Server restarts and crash recovery do not require rebuilding Lead indexes: scans use the recovered heap directly.
-
-
-## Tests
-
-Run the local unit and Postgres tests for a supported Postgres major version with:
-
-```sh
-cargo pgrx test pg18 --package tin --no-default-features --features pg18
-```
-
-Developers with access to the TIN private source may also run the more comprehensive test suite that comes with that:
+The toolchain is pinned in `rust-toolchain.toml`. Install `cargo-pgrx` **0.19.1** and
+initialize a supported PostgreSQL version:
 
 ```sh
-TIN_PRIVATE_REPO=/path/to/full-tin script/run-private-regress pg18
+cargo install cargo-pgrx --version 0.19.1 --locked
+cargo pgrx init --pg18=download
+cargo pgrx run pg18 --package stannum
 ```
 
-## TINQL guide
+Inside the development database:
 
-The [TINQL guide](tinql/docs/src/SUMMARY.md) documents the query language. To build it with mdBook, run from the repository root:
+```sql
+CREATE EXTENSION stannum;
+
+CREATE TABLE documents (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, body text);
+INSERT INTO documents (body) VALUES
+  ('PostgreSQL supports full text search'),
+  ('A search engine with exact phrase matching');
+CREATE INDEX documents_search ON documents USING stannum (body);
+ANALYZE documents;
+
+SELECT id, stannum.full_score(ctid) AS score
+FROM documents
+WHERE body ==> 'search'
+ORDER BY score DESC
+LIMIT 10;
+
+SELECT count(*) FROM documents WHERE body ==> '"phrase matching"';
+SELECT stannum.highlight(body, '<mark>', '</mark>', query => 'search') FROM documents;
+SELECT * FROM stannum.segment_info('documents_search');
+```
+
+For a release package:
 
 ```sh
-cargo install mdbook --version 0.5.2 --locked
-mdbook build tinql/docs
+cargo pgrx package --package stannum --no-default-features --features pg18
 ```
 
-Open `tinql/docs/book/index.html` in your browser to read the book.
+PostgreSQL 17 and 18 are build targets. Most recent local lifecycle and benchmark
+evidence is on PostgreSQL 18. Stannum loads on demand; it does not require
+`shared_preload_libraries`. The receiving server must have the compiled library,
+control file, and extension SQL installed before `CREATE EXTENSION` can work.
 
-## Contributing
+## Names and compatibility
 
-We intend for Lead to be a slow but correct substitute for TIN, for use at small scales in development and testing environments.  If you find cases where it's unsuitable for that, please contact PlanetScale through normal support channels or open an issue in this repo.  The most helpful bug reports will include information about what you expected Lead to do (which is normally whatever TIN would do in the same situation) versus what it actually did.  Help us recreate the problem so we can fix it.
+The extension, library, access method, and SQL schema are **`stannum`**. Functions
+include `stannum.score`, `stannum.full_score`, `stannum.max_score`,
+`stannum.score_inspect`, `stannum.highlight`, and `stannum.highlight_ansi`. Settings
+use the `stannum.` prefix; for example, `SET stannum.enable_custom_scan = off`
+selects the bitmap path.
+
+TINQL remains the query language name, and the `tinql` crate implements that
+language. References to TIN in compatibility research and the `--engine tin`
+benchmark adapter refer to PlanetScale's actual extension. They do not identify
+Stannum builds. Sampled oracle fixtures compare match sets and score bits against
+TIN; this is evidence of compatibility on those fixtures, not full equivalence.
+
+Scoring and implicitly bound highlighting must appear at the same query level as
+the matching `==>` predicate. Explicit highlighting accepts its own query.
+
+### Moving from the pre-rename build
+
+This is a breaking package/SQL rename, not an `ALTER EXTENSION tin UPDATE` migration.
+Create Stannum in a fresh database, reload the data, and rebuild indexes with
+`USING stannum`. Update `tin.*` application calls and settings to `stannum.*`.
+Do not rename or replace an installed TIN library or reuse its indexes.
+
+The `==>` operator still lives in `pg_catalog` for compatibility. Stannum and TIN
+therefore need separate databases; distinct extension names alone do not make
+installation together in one database supported. Same-instance benchmarks can use
+one database per engine and alternate the measured traffic.
+
+## Validate changes
+
+```sh
+cargo test --locked -p tinql -p tokenizer -p boldi-vigna -p segment
+cargo pgrx test pg18 --package stannum --no-default-features --features pg18
+cargo clippy --locked --workspace --all-targets --no-default-features --features 'pg18 pg_test' -- -D warnings
+python3 -m unittest discover -s benchmarks -p 'test_*.py'
+```
+
+After installing the extension into the PostgreSQL distribution on `PATH`, run
+`python3 postgres/tests/postings_lifecycle.py` for an isolated temporary cluster's
+mutation, VACUUM, restart, and crash-recovery checks. It removes its own cluster
+when finished. Developers with access to the upstream private regression suite can
+use `TIN_PRIVATE_REPO=/path/to/full-tin script/run-private-regress pg18`; the copier
+translates extension names in generated fixtures without changing the upstream source.
+
+## Learn more and contribute
+
+Start with the [documentation index](docs/README.md) for current guides and archived research.
+
+- [Benchmarks, results, and the comparison plan](docs/benchmarks/README.md)
+- [Benchmark harness reference](docs/benchmarks/harness.md)
+- [Storage and query execution](docs/architecture/segmented-storage.md)
+- [TINQL guide](docs/query-language/src/SUMMARY.md)
+
+The query guide can be built with `mdbook build docs/query-language` using mdBook 0.5.2.
+Report issues in this repository with reproduction SQL, PostgreSQL version,
+expected results, and observed results. Preserve correctness evidence alongside
+performance changes; a faster query that changes the answer is not an improvement.

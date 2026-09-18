@@ -1,8 +1,0 @@
-comment = 'Lead: TIN-compatible non-production text search'
-default_version = '@CARGO_VERSION@'
-module_pathname = 'tin'
-relocatable = false
-schema = 'tin'
-superuser = true
-trusted = false
-

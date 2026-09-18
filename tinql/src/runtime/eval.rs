@@ -48,6 +48,14 @@ impl TokenizedDoc {
         self.positions.get(term).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Every token with its position, in document order.
+    pub fn positioned_tokens(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.tokens
+            .iter()
+            .map(String::as_str)
+            .zip(self.token_positions.iter().copied())
+    }
+
     pub fn snippet(&self, interval: Interval, context: usize) -> String {
         if self.tokens.is_empty() {
             return String::new();
@@ -392,7 +400,7 @@ fn collect_highlight_matches(query: &Query, doc: &TokenizedDoc, out: &mut Vec<Hi
         Query::MatchAll => {}
         Query::Regex(pattern) => {
             // Highlight part labels are user-facing (`$QUERY_PART` in
-            // tin.highlight tags): use the tinql surface form, not the
+            // stannum.highlight tags): use the tinql surface form, not the
             // `REGEX(..)` IR form. Wildcards normalize to Regex during
             // sub-tokenization, so this labels `email*` as `MATCHES email.*`.
             collect_expanded_matches(
