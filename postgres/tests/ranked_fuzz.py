@@ -656,7 +656,7 @@ class Fuzzer:
         if not exhausted:
             # Only a prefix was read; it must be a prefix of the expected rows.
             expected = expected[:len(actual)]
-        return self.compare('cursor', actual, expected, oracle, visible, roots, strict, spec)
+        return self.after_failure(reader, spec, self.compare('cursor', actual, expected, oracle, visible, roots, strict, spec))
 
     def oracle_of(self, spec, by_statement):
         """The unpruned path's rows in the scan's promised order, the regex
@@ -713,9 +713,24 @@ class Fuzzer:
         self.stats['cursor_fetches'] += 1
         if twin['exhausted'] or all_rows:
             expected = twin['expected'] if twin['exhausted'] else twin['expected'][:len(twin['actual'])]
-            return self.compare('second cursor', twin['actual'], expected, twin['oracle_rows'],
-                                twin['visible'], twin['roots'], self.strict_for(reader, twin), twin)
+            return self.after_failure(reader, twin, self.compare(
+                'second cursor', twin['actual'], expected, twin['oracle_rows'],
+                twin['visible'], twin['roots'], self.strict_for(reader, twin), twin))
         return None
+
+    def after_failure(self, reader, spec, failure):
+        """Diagnostics in the still-open snapshot: the unpruned path again,
+        so a drifted cursor and a drifted oracle can be told apart."""
+        if failure is None:
+            return None
+        try:
+            out = reader.run(['SET LOCAL stannum.enable_custom_scan = off', 'SET LOCAL enable_bitmapscan = on',
+                              spec['oracle'], "SELECT * FROM stannum.segment_info('docs_idx')"])
+            failure.detail['oracle_after'] = self.parse_rows(out[2][1])
+            failure.detail['segments'] = out[3][1]
+        except FuzzFailure as error:
+            failure.detail['oracle_after_error'] = str(error)
+        return failure
 
     def strict_for(self, reader, spec):
         """Tie order is the scan's promise only when no Sort sits above it."""
