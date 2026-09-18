@@ -108,6 +108,73 @@ jobs:
       - name: Index lifecycle checks
         run: python3 postgres/tests/postings_lifecycle.py
 
+  # Behavioral regression suite: the same fixture, 41 query shapes and five
+  # mutation states on Stannum and on the original Lead reference, built from
+  # the upstream commit in this repository's history under its own name `tin`.
+  # Match sets and rank order must agree; Lead's score bits differ only where
+  # it counts token-less documents in the corpus size.
+  reference-oracle:
+    name: Reference oracle against Lead
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PG_MAJOR: 18
+      LEAD_COMMIT: 0e29dbe
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Check out the Lead reference commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.LEAD_COMMIT }}
+          path: lead-ref
+      - name: Install PostgreSQL ${{ env.PG_MAJOR }} from PGDG
+        run: |
+          sudo apt-get install --yes --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install --yes --no-install-recommends \
+            "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}" libclang-dev pkg-config libssl-dev
+          sudo systemctl stop postgresql || true
+          sudo chown -R "$USER" "/usr/lib/postgresql/${PG_MAJOR}" "/usr/share/postgresql/${PG_MAJOR}"
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
+      - name: Cache Cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ env.PG_MAJOR }}-reference
+          workspaces: |
+            . -> target
+            lead-ref -> target
+      - name: Cache cargo-pgrx
+        id: pgrx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: cargo-pgrx-${{ env.PGRX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install cargo-pgrx
+        if: steps.pgrx-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+      - name: Point pgrx at the installed server
+        run: |
+          echo "PGRX_HOME=$RUNNER_TEMP/pgrx" >> "$GITHUB_ENV"
+          PGRX_HOME="$RUNNER_TEMP/pgrx" cargo pgrx init "--pg${PG_MAJOR}=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+      - name: Start a throwaway cluster
+        run: |
+          initdb -D "$RUNNER_TEMP/oracle-data" -U "$USER" -A trust --no-locale --encoding=UTF8
+          pg_ctl -D "$RUNNER_TEMP/oracle-data" -o "-p 28999 -c listen_addresses=localhost" -l "$RUNNER_TEMP/oracle.log" -w start
+      - name: Build both extensions and run the oracle
+        env:
+          PGHOST: localhost
+          PGPORT: 28999
+          LEAD_REF_DIR: ${{ github.workspace }}/lead-ref
+        run: script/reference-oracle "$RUNNER_TEMP/reference-oracle"
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-oracle
+          path: ${{ runner.temp }}/reference-oracle
+          if-no-files-found: ignore
+
   # Bit-for-bit comparison against PlanetScale TIN. Needs a TIN instance, so it
   # runs only when dispatched by hand with the TIN_DATABASE_URL secret set.
   compatibility-oracle:

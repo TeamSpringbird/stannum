@@ -1,0 +1,44 @@
+#!/bin/sh
+# Differential check of Stannum against the original Lead reference.
+#
+# Lead is the deliberately slow, correctness-first implementation this project
+# started from, and its last upstream head is in this repository's history.
+# This script builds that commit under its own extension name, `tin`, into the
+# PostgreSQL that pg_config on PATH describes, creates two databases on the
+# server named by the usual libpq variables, and runs the oracle: 41 query
+# shapes across five mutation states. Match sets and rank order must agree;
+# score bits are not compared, because Lead counts token-less documents present
+# at index build in its corpus size and Stannum, like TIN, does not.
+#
+#   PGHOST=localhost PGPORT=28818 script/reference-oracle [output-dir]
+set -eu
+LEAD_COMMIT="${LEAD_COMMIT:-0e29dbe}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="${1:-$ROOT/benchmarks/results/reference-oracle-$(date +%Y%m%d-%H%M%S)}"
+REF="${LEAD_REF_DIR:-${TMPDIR:-/tmp}/stannum-lead-ref}"
+PG_FEATURE="pg$(pg_config --version | sed -E 's/PostgreSQL ([0-9]+).*/\1/')"
+
+if [ ! -d "$REF/.git" ] && [ ! -f "$REF/.git" ]; then
+  git -C "$ROOT" worktree add --detach "$REF" "$LEAD_COMMIT"
+fi
+echo "building Lead $LEAD_COMMIT as extension 'tin' for $PG_FEATURE"
+( cd "$REF/postgres" && CARGO_TARGET_DIR="${LEAD_TARGET_DIR:-$REF/target}" \
+    cargo pgrx install --release --no-default-features --features "$PG_FEATURE" >/dev/null )
+echo "installing Stannum for $PG_FEATURE"
+( cd "$ROOT/postgres" && cargo pgrx install --release --no-default-features --features "$PG_FEATURE" >/dev/null )
+
+for db in reference_oracle_stannum reference_oracle_lead; do
+  dropdb --if-exists "$db"
+  createdb "$db"
+done
+LEFT="$(mktemp)"; RIGHT="$(mktemp)"
+printf 'PGDATABASE=reference_oracle_stannum\n' > "$LEFT"
+printf 'PGDATABASE=reference_oracle_lead\n' > "$RIGHT"
+status=0
+python3 "$ROOT/benchmarks/oracle.py" --left "$LEFT" --left-engine stannum \
+  --right "$RIGHT" --right-engine tin --scores order --rows "${ROWS:-5000}" \
+  --output "$OUT" || status=$?
+rm -f "$LEFT" "$RIGHT"
+dropdb --if-exists reference_oracle_stannum
+dropdb --if-exists reference_oracle_lead
+exit $status

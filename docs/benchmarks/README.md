@@ -39,6 +39,35 @@ Separately, a development build matched TIN's document sets and score bits acros
 205 query/state pairs: 41 queries across five mutation states. This is sampled
 compatibility evidence, not proof of complete equivalence or a speed comparison.
 
+### The behavioral regression suite
+
+Two differential oracles share one fixture and one query list
+(`benchmarks/oracle.py`): 41 TINQL shapes covering terms, Boolean forms, phrases,
+gaps, slop, proximity, relations, positional filters, wildcards, regular
+expressions, ranges, fuzzy matching, AT LEAST, boosts and the match-all form,
+observed after build, after deletes, after VACUUM, after inserts into the write
+buffer and after REINDEX.
+
+* **Lead reference, in CI on every push** (`script/reference-oracle`, job
+  "Reference oracle against Lead"). The original Lead implementation is built
+  from the upstream commit kept in this repository's history, under its own
+  extension name `tin`, into the same server as Stannum. Match sets and the rank
+  order of full and dense scores must agree (`--scores order`). Score bits are
+  not compared: Lead counts a token-less document present at index build in its
+  corpus size, which shifts every IDF in the last bits; TIN and Stannum do not.
+  Expansion shapes (wildcards, regular expressions, ranges) compare match sets
+  only, because Lead scores their matches as zero where TIN scores the expanded
+  terms. On every other input tried, Lead's bits match Stannum's exactly.
+* **TIN, by hand** (job "Compatibility oracle against TIN", `workflow_dispatch`
+  with the `TIN_DATABASE_URL` secret; or `benchmarks/oracle.py --right-engine tin`
+  locally). Bit-for-bit scores, including `max_score`. This is the standard the
+  Lead oracle cannot provide, and it needs a PlanetScale instance.
+
+Add to the query list whenever a behavior is fixed or a gap is found; a new
+shape costs one line and is then checked against both references. Regressions
+found by hand belong in `postgres/src/lib.rs` as pg_tests or in
+`postgres/tests/postings_lifecycle.py` when they need a real server.
+
 ## Building comparable benchmarks
 
 We are working toward repeatable comparisons where hardware, PostgreSQL settings,

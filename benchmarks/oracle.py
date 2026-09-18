@@ -21,6 +21,7 @@ AT LEAST, boosts and the match-all form.
 import argparse
 import json
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -105,6 +106,36 @@ def observe(env, query, engine="stannum"):
     return json.loads(result.stdout)
 
 
+def score_value(bits):
+    """float4send output such as '\\x407403eb' as a Python float."""
+    return struct.unpack(">f", bytes.fromhex(bits[2:]))[0]
+
+
+def ranking(scored):
+    """Document ids ordered as a top-k scan would emit them: score descending,
+    then id ascending. Ties in score keep both ids adjacent, so a reference
+    that differs only in the last bits of an IDF still ranks identically."""
+    return [id_ for id_, _ in sorted(scored, key=lambda pair: (-score_value(pair[1]), pair[0]))]
+
+
+# Shapes the Lead reference does not score: it returns zero for every match of
+# an expansion, while TIN and Stannum score the expanded terms. In `order` mode
+# these compare match sets only.
+REFERENCE_UNSCORED = frozenset(["alp*", "*eta", "b?ta", "MATCHES al.*a", "alpha TO beta", "* TO alpha"])
+
+
+def comparable(observed, scores, query=""):
+    """What is compared for one side: everything for `bits`; for `order` the
+    match set and the rank order of the full and dense scores, so a reference
+    with slightly different corpus statistics can still be checked, and the
+    match set alone for shapes the reference leaves unscored."""
+    if "error" in observed or scores == "bits":
+        return observed
+    if query in REFERENCE_UNSCORED:
+        return {"ids": observed["ids"]}
+    return {"ids": observed["ids"], "full": ranking(observed["full"]), "dense": ranking(observed["dense"])}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--left", required=True, help="env file for the first server (libpq variables)")
@@ -114,6 +145,9 @@ def main():
     parser.add_argument("--rows", type=int, default=5000)
     parser.add_argument("--output", required=True)
     parser.add_argument("--keep", action="store_true", help="leave oracle_docs in place afterwards")
+    parser.add_argument("--scores", choices=("bits", "order"), default="bits",
+                        help="bits: scores must match bit for bit (TIN); order: match sets and rank "
+                             "order must match (the Lead reference, whose corpus size counts empty documents)")
     args = parser.parse_args()
     sides = {"left": load_env(args.left), "right": load_env(args.right)}
     out = Path(args.output)
@@ -124,7 +158,7 @@ def main():
         run(f"CREATE EXTENSION IF NOT EXISTS {engine};", env)
         # CREATE TABLE fails on an existing fixture instead of deleting user data.
         run(FIXTURE.format(rows=args.rows, engine=engine), env)
-    report = {"rows": args.rows, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "engines": engines, "states": {}}
+    report = {"rows": args.rows, "scores": args.scores, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "engines": engines, "states": {}}
     differences = 0
     for state, transition in STATES:
         if transition:
@@ -133,7 +167,8 @@ def main():
         results = {}
         for query in QUERIES:
             observed = {side: observe(env, query, engines[side]) for side, env in sides.items()}
-            same = observed["left"] == observed["right"]
+            same = (comparable(observed["left"], args.scores, query)
+                    == comparable(observed["right"], args.scores, query))
             if not same:
                 differences += 1
             results[query] = {"same": same, **observed}
