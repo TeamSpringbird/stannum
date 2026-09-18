@@ -38,36 +38,101 @@ index new buffer records.
 | Setting | Default | Purpose |
 | --- | ---: | --- |
 | `stannum.build_segment_docs` | 32,768 | Documents per segment during index creation |
-| `stannum.write_buffer_docs` | 16,384 | Documents before folding the write buffer |
+| `stannum.write_buffer_docs` | 512 | Documents before folding the write buffer |
+| `stannum.write_buffer_bytes` | 1,048,576 | Encoded forward-record bytes before folding |
+| `stannum.max_merge_docs` | 1,024 | Total input documents ordinary insert merges may rewrite per fold |
 | `stannum.merge_tier_factor` | 8 | Segments per size tier before they merge |
 | `stannum.max_segments` | 128 | Hard bound on directory entries |
 
-The write buffer also folds at 4 MiB. Folding and merging happen synchronously,
-so the insert that triggers them can take longer.
+The next insert folds a nonempty buffer before appending a record that would
+exceed either cap. A single document may exceed the byte cap: it remains one
+record and is folded before the following insert. The two caps bound document
+count and encoded input size, not elapsed time or tokenizer cost. At 2.8 KiB
+per record, the byte limit now folds roughly 365 documents rather than roughly
+1,460. Short documents hit the 512-document limit. Smaller folds also reduce
+the amount a fresh reader must index before its first query.
 
 ### Merge policy
 
 Each segment belongs to a size tier by document count: tier *t* holds
-segments with `factor^t` to `factor^(t+1) - 1` documents. After every new
-segment, the lowest tier holding `merge_tier_factor` or more segments merges
-them into one segment, which lands in the next tier up; the loop repeats until
-no tier is full. Merging skips documents on a segment's dead list, appends the
-new segment with a fresh generation number, and queues the old runs on the
-pending-free list.
+segments with `factor^t` to `factor^(t+1) - 1` documents. The lowest full tier
+supplies `merge_tier_factor` entries for a merge. Merging skips dead documents,
+publishes a fresh generation, and queues the old runs for delayed reclamation.
+Generation exhaustion raises an error requiring REINDEX, rather than wrapping
+and reusing a reader-cache key.
 
-With the defaults, write-buffer folds of 16,384 documents merge eight at a
-time into segments of about 131,072 documents, eight of those merge into about
-one million, and so on. Every document is rewritten about once per tier, so
-the merge work per insert is amortized logarithmic in the index size, and any
-one merge touches a run of similarly sized segments rather than everything.
-The directory holds at most `merge_tier_factor - 1` segments per tier, well
-under `max_segments`. If a lower `max_segments` or an unusual size mix leaves
-the directory over the bound, the smallest entries merge until it fits.
+Inserts spend at most `max_merge_docs` input documents on ordinary merges
+across the entire fold, including cascades. A due merge that exceeds the
+remaining budget waits for VACUUM, and the directory can therefore hold more
+than `factor - 1` entries in a tier. Zero defers all ordinary insert merges.
+Index construction retains unrestricted tier maintenance.
 
-Index builds publish segments through the same policy, so a freshly built
-index has the same tiered shape as one filled by inserts. A merge still runs
-in the inserting transaction under the meta page's exclusive lock; the largest
-possible merge is bounded by the largest tier in the index, not amortized away.
+The directory bound takes precedence: before publication, an overfull directory
+merges only its smallest `entry_count - max_segments + 1` entries (normally two).
+It does this before considering a tier merge. Lowering `max_segments` on an
+existing index can require a larger emergency merge. **The emergency path is
+bounded by the minimum number of entries needed to make room, not by
+`max_merge_docs`.** A fixed document ceiling is impossible alongside a fixed
+128-entry directory when all 128 entries already exceed that ceiling. Keep
+VACUUM timely to avoid emergency work. These settings do not promise a maximum
+wall-clock insert latency; I/O, lock waits, huge documents and other VACUUM
+work still matter.
+
+### Deferred merges and autovacuum
+
+Large merges run from `amvacuumcleanup`. PostgreSQL already supplies per-table
+maintenance scheduling, relation locking, process lifetime and error cleanup;
+using it avoids a second queue, worker-slot exhaustion, dynamic-worker launch
+races and a new preload requirement. No `shared_preload_libraries` entry is
+needed. The segment directory itself records deferred work; restart does not
+lose a maintenance queue, and the on-disk page format is unchanged.
+
+A merge copies its selected runs and dead lists under a shared meta lock,
+releases that lock, and builds the new segment from owned bytes. Most merge
+CPU work therefore does not block inserts or readers. It reacquires the meta
+lock exclusively and checks index identity and every complete input directory
+entry, including the dead-list run. If an insert's emergency merge changed an
+input, maintenance abandons the output; a later VACUUM retries. Changes to other
+entries or the write buffer are preserved. Only then does it allocate and WAL
+write the new runs, publish a fresh generation and retire the old runs.
+
+The lock order stays meta, buffer/run pages, extension lock. All page writes
+still use generic WAL. Readers with captured directories retain the existing
+snapshot-horizon protection for retired runs. The maintenance builder uses
+owned bytes while unlocked, so it does not depend on VACUUM having a reader
+snapshot. Run copying and output WAL publication still hold the meta lock;
+this is not a fully nonblocking compactor. A cleanup call attempts at most the
+number of directory entries it observed on entry, so continuing inserts cannot
+extend its merge loop indefinitely.
+
+PostgreSQL 17/18 call `amvacuumcleanup` even when AUTO skips bulk deletion,
+so insert-triggered autovacuum reaches deferred merges without table changes.
+For a predictable maintenance cadence on insert-only or mixed workloads, use:
+
+```sql
+ALTER TABLE documents SET (
+  vacuum_index_cleanup = auto,
+  autovacuum_vacuum_insert_threshold = 1000,
+  autovacuum_vacuum_insert_scale_factor = 0,
+  autovacuum_vacuum_threshold = 1000,
+  autovacuum_vacuum_scale_factor = 0
+);
+```
+
+Tune these thresholds for the workload and keep server `autovacuum` and
+`track_counts` enabled. PostgreSQL's default insert trigger includes a scale
+factor. The AUTO bypass applies to bulk deletion, not the cleanup callback;
+explicit OFF and the transaction-wraparound failsafe skip cleanup. Stannum
+does not silently alter application table settings. Manual
+`VACUUM (INDEX_CLEANUP ON) documents` also drains deferred tiers. With autovacuum
+disabled or index cleanup disabled, inserts remain correct but eventually pay
+emergency merges. See PostgreSQL's [autovacuum settings](https://www.postgresql.org/docs/18/runtime-config-vacuum.html)
+and the [cleanup/bypass implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/heap/vacuumlazy.c).
+
+The private-cluster scenario in `docs/benchmarks/merge_lifecycle.py` checks
+insert-triggered autovacuum without preload, concurrent inserts and merges,
+retained readers, restart and index verification. The [merge-budget experiment](../benchmarks/merge-budget.md)
+records latency, reader tails, segment counts and correctness results.
 
 ## Reading an index
 
@@ -272,8 +337,9 @@ the table is the source of truth; `REINDEX` rebuilds from it.
   appends to its newest entry, delaying that entry's reclamation. A crash
   before a new run is published leaves its pages unreclaimed until REINDEX;
   `stannum.verify_index` lists them as `page N` warnings.
-- Merges are synchronous. The tiered policy bounds the amortized cost, but
-  the top tier's merge still rewrites a large share of the index in one insert.
+- Ordinary insert merges have a document budget. Directory-overflow merges
+  can exceed it, and VACUUM still holds the meta lock while copying runs,
+  publishing outputs, marking dead tuples and reclaiming pages.
 
 Use the tests listed in the [project README](../../README.md#validate-changes)
 when changing these paths. Performance evidence and its limitations are kept in

@@ -2,7 +2,8 @@
 //! segments, all in ordinary index pages.
 //!
 //! Locking: the meta page (block 0) serializes every structural change.
-//! Writers hold it exclusively for the whole insert, fold, VACUUM or merge.
+//! Writers hold it exclusively for inserts, folds and publication. VACUUM
+//! copies merge inputs under a shared lock and builds the output unlocked.
 //! Readers hold it shared while copying the directory and the write buffer,
 //! then read immutable segment runs without any lock beyond the per-page
 //! content lock. Runs released by a merge or VACUUM wait on the meta page's
@@ -42,12 +43,14 @@ use tinql::runtime::Query;
 use tinql::runtime::plan::{Limits, plan};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
-/// The write buffer folds into a segment past this many bytes.
-pub const BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Encoded forward-record bytes buffered before folding.
+static WRITE_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1024 * 1024);
+/// Total input documents ordinary insert-side merges may rewrite per fold.
+static MAX_MERGE_DOCS: GucSetting<i32> = GucSetting::<i32>::new(1024);
 const BITMAP_BATCH: usize = 1024;
 
 /// Documents the write buffer holds before folding into a segment.
-static WRITE_BUFFER_DOCS: GucSetting<i32> = GucSetting::<i32>::new(16_384);
+static WRITE_BUFFER_DOCS: GucSetting<i32> = GucSetting::<i32>::new(512);
 /// Documents an index build accumulates before writing a segment.
 static BUILD_SEGMENT_DOCS: GucSetting<i32> = GucSetting::<i32>::new(32_768);
 /// Hard bound on directory entries; the tiered policy normally stays well below it.
@@ -62,6 +65,26 @@ pub const MAX_MERGE_TIER_FACTOR: i32 = 64;
 /// Registers the tunables. Low values exist so tests can drive folds,
 /// merges and reclamation at small scale; the defaults are the intended ones.
 pub fn init() {
+    GucRegistry::define_int_guc(
+        c"stannum.write_buffer_bytes",
+        c"Encoded bytes buffered before folding into a Stannum segment",
+        c"A fold happens before either the byte or document cap is exceeded. A single oversized document is allowed.",
+        &WRITE_BUFFER_BYTES,
+        1024,
+        64 * 1024 * 1024,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.max_merge_docs",
+        c"Document budget for ordinary merges performed by one inserting backend per fold",
+        c"Larger merges wait for VACUUM. Directory overflow forces the minimum number of smallest entries to merge even above this budget; zero defers all ordinary merges.",
+        &MAX_MERGE_DOCS,
+        0,
+        i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
     GucRegistry::define_int_guc(
         c"stannum.write_buffer_docs",
         c"Documents buffered before folding into a Stannum segment",
@@ -1064,7 +1087,10 @@ fn finish_builder(builder: SegmentBuilder) -> (Vec<u8>, u32, u64) {
 /// generation number. Generations never repeat within an index identity.
 fn new_entry(meta: &mut Meta, run: Run, map: Run, docs: u32, total_length: u64) -> SegmentEntry {
     let generation = meta.next_generation;
-    meta.next_generation = meta.next_generation.wrapping_add(1);
+    meta.next_generation = meta
+        .next_generation
+        .checked_add(1)
+        .unwrap_or_else(|| pgrx::error!("Stannum segment generations exhausted; REINDEX required"));
     SegmentEntry {
         run,
         map,
@@ -1088,7 +1114,7 @@ unsafe fn release_entry(index: pg_sys::Relation, meta: &mut Meta, entry: Segment
 }
 
 /// Publishes a built segment: writes its run, appends a directory entry and
-/// then merges whatever the tiered policy says is due, so the directory
+/// then spends the caller's merge budget and enforces the hard bound, so the directory
 /// never leaves this function with more than `stannum.max_segments` entries.
 unsafe fn add_segment(
     index: pg_sys::Relation,
@@ -1096,12 +1122,13 @@ unsafe fn add_segment(
     blob: &[u8],
     docs: u32,
     total_length: u64,
+    budget: u64,
 ) {
     unsafe {
         let (run, map) = write_segment_run(index, blob);
         let entry = new_entry(meta, run, map, docs, total_length);
         meta.segments.push(entry);
-        maintain(index, meta);
+        maintain(index, meta, budget);
     }
 }
 
@@ -1140,7 +1167,7 @@ fn merge_candidates(docs: &[u32], factor: u32, limit: usize) -> Option<Vec<usize
         .min_by_key(|(tier, _)| *tier)
         .map(|(_, members)| members)
     {
-        return Some(members);
+        return Some(members.into_iter().take(factor as usize).collect());
     }
     if docs.len() > limit {
         let mut by_size: Vec<usize> = (0..docs.len()).collect();
@@ -1151,18 +1178,44 @@ fn merge_candidates(docs: &[u32], factor: u32, limit: usize) -> Option<Vec<usize
     None
 }
 
-/// Applies the merge policy until the directory is in shape.
+/// The hard directory bound takes precedence over the work budget. Its
+/// emergency merge includes only the smallest `len - limit + 1` entries;
+/// normally just two. No fixed document ceiling can also guarantee space in
+/// a fixed-size directory when every entry is already larger than that ceiling.
+fn bounded_merge_candidates(
+    docs: &[u32],
+    factor: u32,
+    limit: usize,
+    budget: u64,
+) -> Option<Vec<usize>> {
+    if docs.len() > limit {
+        let mut positions: Vec<usize> = (0..docs.len()).collect();
+        positions.sort_by_key(|p| (docs[*p], *p));
+        positions.truncate((docs.len() - limit + 1).max(2));
+        return Some(positions);
+    }
+    let positions = merge_candidates(docs, factor, limit)?;
+    let work: u64 = positions.iter().map(|p| u64::from(docs[*p])).sum();
+    (work <= budget).then_some(positions)
+}
+
+/// Applies ordinary merges within the remaining budget and emergency merges
+/// until the directory fits. Excess full tiers wait for VACUUM.
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively.
-unsafe fn maintain(index: pg_sys::Relation, meta: &mut Meta) {
+unsafe fn maintain(index: pg_sys::Relation, meta: &mut Meta, mut budget: u64) {
     let factor = merge_tier_factor();
     let limit = max_segments();
     loop {
         pgrx::check_for_interrupts!();
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-        match merge_candidates(&docs, factor, limit) {
-            Some(positions) => unsafe { merge(index, meta, positions) },
+        match bounded_merge_candidates(&docs, factor, limit, budget) {
+            Some(positions) => {
+                let work: u64 = positions.iter().map(|p| u64::from(docs[*p])).sum();
+                budget = budget.saturating_sub(work);
+                unsafe { merge(index, meta, positions) };
+            }
             None => break,
         }
     }
@@ -1203,6 +1256,65 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
     }
 }
 
+/// VACUUM owns maintenance scheduling; no preload library or worker slots
+/// are required. Limit each call to the directory size captured on entry so
+/// a steady stream of inserts cannot keep VACUUM here forever.
+unsafe fn deferred_merges(index: pg_sys::Relation) {
+    let attempts = unsafe { read_meta(index, false) }.1.segments.len();
+    for _ in 0..attempts {
+        pgrx::check_for_interrupts!();
+        let (identity, entries, inputs) = unsafe {
+            let (_guard, meta) = read_meta(index, false);
+            let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
+            let Some(positions) = merge_candidates(&docs, merge_tier_factor(), max_segments())
+            else {
+                return;
+            };
+            let entries: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
+            let inputs: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        read_run(index, entry.run, &generation_label(entry.generation)),
+                        dead_set(index, entry),
+                    )
+                })
+                .collect();
+            (meta.identity, entries, inputs)
+        };
+        // Own all input bytes before dropping the shared meta lock. VACUUM
+        // need not hold a snapshot to protect pages during this CPU work.
+        let mut builder = SegmentBuilder::default();
+        for (entry, (bytes, dead)) in entries.iter().zip(&inputs) {
+            pgrx::check_for_interrupts!();
+            let label = generation_label(entry.generation);
+            let segment = codec_in(Segment::parse(bytes), &label);
+            for record in codec_in(segment.records(|tid| dead.contains(&tid)), &label) {
+                codec_in(builder.add_record(&record), &label);
+            }
+        }
+        let (blob, docs, total_length) = finish_builder(builder);
+        unsafe {
+            let (guard, mut meta) = read_meta(index, true);
+            // An insert can force an emergency merge while we build. Match
+            // complete entries, including dead-list identity, not positions.
+            if meta.identity != identity
+                || !entries.iter().all(|entry| meta.segments.contains(entry))
+            {
+                return;
+            }
+            let (run, map) = write_segment_run(index, &blob);
+            meta.segments.retain(|entry| !entries.contains(entry));
+            let entry = new_entry(&mut meta, run, map, docs, total_length);
+            meta.segments.push(entry);
+            for entry in entries {
+                release_entry(index, &mut meta, entry);
+            }
+            write_meta(index, &guard, &meta);
+        }
+    }
+}
+
 /// Folds the write buffer into a new segment and empties it.
 unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
     unsafe {
@@ -1218,7 +1330,14 @@ unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
             );
         }
         let (blob, docs, total_length) = finish_builder(builder);
-        add_segment(index, meta, &blob, docs, total_length);
+        add_segment(
+            index,
+            meta,
+            &blob,
+            docs,
+            total_length,
+            MAX_MERGE_DOCS.get() as u64,
+        );
         meta.buffer.tail = meta.buffer.head;
         meta.buffer.tail_used = 0;
         meta.buffer.bytes = 0;
@@ -1390,7 +1509,7 @@ impl Builder {
         let (blob, docs, total_length) = finish_builder(builder);
         unsafe {
             let (meta_buffer, mut meta) = read_meta(index, true);
-            add_segment(index, &mut meta, &blob, docs, total_length);
+            add_segment(index, &mut meta, &blob, docs, total_length, u64::MAX);
             write_meta(index, &meta_buffer, &meta);
         }
     }
@@ -1430,7 +1549,7 @@ pub unsafe fn insert(
         let mut bytes = Vec::new();
         codec(record.encode(&mut bytes));
         if meta.buffer.docs > 0
-            && (meta.buffer.bytes as usize + bytes.len() > BUFFER_MAX_BYTES
+            && (meta.buffer.bytes as usize + bytes.len() > WRITE_BUFFER_BYTES.get() as usize
                 || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32)
         {
             fold(index, &mut meta);
@@ -1631,6 +1750,7 @@ pub unsafe fn bulk_delete(
 /// `index` is a live LDP2 index locked for VACUUM.
 pub unsafe fn cleanup(index: pg_sys::Relation) {
     unsafe {
+        deferred_merges(index);
         let (meta_buffer, mut meta) = read_meta(index, true);
         for i in 0..meta.segments.len() {
             pgrx::check_for_interrupts!();
@@ -1797,7 +1917,30 @@ pub unsafe fn document_count(index: pg_sys::Relation) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_candidates, tier};
+    use super::{bounded_merge_candidates, merge_candidates, tier};
+
+    #[test]
+    fn merge_budget_is_cumulative_and_emergency_work_is_minimal() {
+        let docs = [1, 1, 2, 2];
+        assert_eq!(bounded_merge_candidates(&docs, 2, 128, 2), Some(vec![0, 1]));
+        // That merge spends the entire budget; its output must not cascade.
+        assert_eq!(bounded_merge_candidates(&[2, 2, 2], 2, 128, 0), None);
+        assert_eq!(bounded_merge_candidates(&[8, 8], 2, 128, 15), None);
+        assert_eq!(
+            bounded_merge_candidates(&[8, 8], 2, 128, 16),
+            Some(vec![0, 1])
+        );
+        // Overflow overrides a full higher tier and the budget, picking only
+        // the two smallest entries even when all entries exceed the budget.
+        assert_eq!(
+            bounded_merge_candidates(&[80, 80, 10, 20], 2, 3, 0),
+            Some(vec![2, 3])
+        );
+        assert_eq!(
+            bounded_merge_candidates(&[u32::MAX, u32::MAX], 2, 128, u64::from(u32::MAX)),
+            None
+        );
+    }
 
     #[test]
     fn tiers_are_powers_of_the_factor() {
