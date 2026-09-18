@@ -1,5 +1,9 @@
 # Benchmarking Stannum
 
+The [round-four integration report](round4-integration.md) records the recovered
+agent branches, combined-build validation, and a paired comparison with the
+preceding published Stannum build. The Lead comparison below is historical.
+
 Our first benchmark asks how much faster Stannum is than the original Lead
 implementation it grew from, while preserving search results. The useful
 comparison so far is **Lead locally versus Stannum locally**, using the same
