@@ -14,9 +14,10 @@
 //!   are counted without a heap fetch.
 //!
 //! Both fall back to a plain heap scan evaluating the original clause when the
-//! snapshot was taken during recovery, where selective index reads are not yet
-//! safe. The bitmap index scan path remains available; `stannum.enable_custom_scan`
-//! disables these nodes.
+//! index cannot be read selectively at execution time: on a hot standby that
+//! is the case unless the primary logs removal horizons and this server
+//! replays them (see `storage::index_reads_allowed`). The bitmap index scan
+//! path remains available; `stannum.enable_custom_scan` disables these nodes.
 
 use std::ffi::{CStr, c_void};
 
@@ -470,7 +471,6 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
             previous(root, rel, rti, rte);
         }
         if !ENABLE.get()
-            || pg_sys::RecoveryInProgress()
             || (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
             || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
             || byte((*rte).relkind) != b'r'
@@ -643,10 +643,7 @@ unsafe extern "C-unwind" fn upper_paths_hook(
         }
         let rte = pg_sys::list_nth((*parse).rtable, (*input_rel).relid as i32 - 1)
             .cast::<pg_sys::RangeTblEntry>();
-        if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION
-            || byte((*rte).relkind) != b'r'
-            || pg_sys::RecoveryInProgress()
-        {
+        if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION || byte((*rte).relkind) != b'r' {
             return;
         }
         let Some(found) = find_match(input_rel, rte) else {
@@ -741,8 +738,11 @@ unsafe extern "C-unwind" fn plan_count_path(
 struct ScanExec {
     private: Private,
     /// The original `==>` clause, compiled against heap tuples, for rechecks
-    /// of inexact plans and for the recovery fallback.
+    /// of inexact plans and for the heap fallback.
     clause: *mut pg_sys::ExprState,
+    /// Whether this execution scans the heap instead of the index, decided
+    /// once on first access (see [`heap_fallback`]).
+    heap_fallback: Option<bool>,
     fetch: *mut pg_sys::IndexFetchTableData,
     /// A heap tuple slot for the count node, whose scan slot is virtual.
     fetch_slot: *mut pg_sys::TupleTableSlot,
@@ -757,7 +757,7 @@ struct ScanExec {
     sorted: usize,
     next: usize,
     started: bool,
-    /// Heap scan for the recovery-snapshot fallback.
+    /// Heap scan for the fallback.
     fallback: *mut pg_sys::TableScanDescData,
     /// `tids` holds only the pruned top k; the rest are produced on demand.
     pruned: bool,
@@ -855,6 +855,7 @@ unsafe extern "C-unwind" fn begin_scan(
         let exec = ScanExec {
             private,
             clause,
+            heap_fallback: None,
             fetch,
             fetch_slot,
             heap,
@@ -1077,11 +1078,18 @@ unsafe fn passes_clause(
     }
 }
 
-unsafe fn recovery_snapshot(node: *mut pg_sys::CustomScanState) -> bool {
-    unsafe {
-        let snapshot = (*(*node).ss.ps.state).es_snapshot;
-        !snapshot.is_null() && (*snapshot).takenDuringRecovery
+/// Whether this execution reads the heap instead of the index. The path was
+/// planned when index reads were allowed; they can have become unavailable
+/// since (a prepared plan executed on a standby whose primary stopped logging
+/// removal horizons), and once decided the choice holds for the execution.
+unsafe fn heap_fallback(exec: &mut ScanExec) -> bool {
+    if let Some(fallback) = exec.heap_fallback {
+        return fallback;
     }
+    let fallback =
+        !unsafe { crate::storage::is_segmented(pg_sys::Oid::from(exec.private.index_oid)) };
+    exec.heap_fallback = Some(fallback);
+    fallback
 }
 
 unsafe fn pointer_of(tid: Tid) -> pg_sys::ItemPointerData {
@@ -1104,7 +1112,7 @@ unsafe extern "C-unwind" fn search_access(
         let slot = (*scan).ss_ScanTupleSlot;
         let snapshot = (*(*scan).ps.state).es_snapshot;
         let exec = exec_of(node);
-        if recovery_snapshot(node) {
+        if heap_fallback(exec) {
             return fallback_access(scan, exec, slot);
         }
         if !exec.started {
@@ -1152,7 +1160,7 @@ unsafe extern "C-unwind" fn search_access(
     }
 }
 
-/// Recovery-era snapshots read the whole heap and evaluate the original clause.
+/// The fallback reads the whole heap and evaluates the original clause.
 unsafe fn fallback_access(
     scan: *mut pg_sys::ScanState,
     exec: &mut ScanExec,
@@ -1208,7 +1216,7 @@ unsafe extern "C-unwind" fn exec_count(
         }
         let mut count = 0i64;
         let fetch_slot = exec.fetch_slot;
-        if recovery_snapshot(node) {
+        if heap_fallback(exec) {
             // Count through a heap scan with the original clause.
             let scan = pg_sys::table_beginscan(exec.heap, snapshot, 0, std::ptr::null_mut());
             while pg_sys::table_scan_getnextslot(

@@ -167,17 +167,12 @@ unsafe extern "C-unwind" fn ambeginscan(
     scan
 }
 
-/// Selective retrieval needs a primary snapshot: generic WAL carries no
-/// index-VACUUM conflict information for standbys. hot_standby_feedback is
-/// asynchronous and cannot establish that the primary protected this snapshot;
-/// testing the local pending list is insufficient after runs have been reused.
+/// Selective retrieval needs LDP2 storage and, during recovery, the logged
+/// removal horizons that make freeing pages a snapshot conflict on this
+/// standby (see `storage::index_reads_allowed`); otherwise every heap page is
+/// a candidate.
 unsafe fn selective(scan: pg_sys::IndexScanDesc) -> bool {
-    unsafe {
-        !pg_sys::RecoveryInProgress()
-            && !(*scan).xs_snapshot.is_null()
-            && !(*(*scan).xs_snapshot).takenDuringRecovery
-            && crate::storage::present((*scan).indexRelation)
-    }
+    unsafe { crate::storage::index_reads_allowed((*scan).indexRelation) }
 }
 
 #[pg_guard]
