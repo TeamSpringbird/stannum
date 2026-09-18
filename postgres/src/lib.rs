@@ -3746,7 +3746,10 @@ mod tests {
                         &format!(
                             "SELECT id, stannum.full_score(ctid) AS score FROM hot
                              WHERE body ==> 'needle' ORDER BY score DESC{} LIMIT 8",
-                            if custom { "" } else { ", ctid" }
+                            // The custom scan breaks score ties by the indexed
+                            // HOT root, while SQL ctid is the visible member.
+                            // IDs follow the original root order in this fixture.
+                            if custom { "" } else { ", id" }
                         ),
                         None,
                         &[],
