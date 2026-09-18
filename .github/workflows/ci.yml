@@ -111,6 +111,12 @@ jobs:
       - name: Index lifecycle checks
         run: python3 postgres/tests/postings_lifecycle.py
 
+      # Randomized concurrent writers against ranked readers, each checked in
+      # one snapshot against the unpruned path and a regex scan; fixed seeds
+      # plus the regression list, under two minutes.
+      - name: Ranked-scan concurrency fuzz (smoke)
+        run: python3 postgres/tests/ranked_fuzz.py --smoke
+
   # Behavioral regression suite: the same fixture, 47 query shapes and five
   # mutation states on Stannum and on the original Lead, checked out directly
   # from PlanetScale's repository and built under its own name `tin`. Match

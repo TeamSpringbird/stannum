@@ -319,10 +319,31 @@ fn segment_error_in<T>(result: segment::Result<T>, label: &str) -> T {
 
 impl IndexScorer {
     /// Score of one visible document, or zero if the index does not hold it.
+    ///
+    /// A HOT-updated row keeps its posting at the root of its chain while the
+    /// executor hands the projection the visible member's location, so a
+    /// location absent from every source is resolved to its root first.
     pub(crate) fn score(&mut self, tid: Tid) -> f32 {
         if let Some(score) = self.known.get(&tid) {
             return *score;
         }
+        if let Some(score) = self.score_listed(tid) {
+            return score;
+        }
+        let root = unsafe { hot_root(pg_sys::Oid::from(self.key.heap_oid), tid) };
+        if root != tid {
+            if let Some(score) = self.known.get(&root) {
+                return *score;
+            }
+            if let Some(score) = self.score_listed(root) {
+                return score;
+            }
+        }
+        0.0
+    }
+
+    /// Score of the document at `tid` in the first source listing it live.
+    fn score_listed(&mut self, tid: Tid) -> Option<f32> {
         for i in 0..self.view.sources.len() {
             if self.dead[i].contains(&tid) {
                 continue;
@@ -356,9 +377,42 @@ impl IndexScorer {
                 });
                 total += scorer.score_bucket(bucket, length);
             }
-            return total;
+            return Some(total);
         }
-        0.0
+        None
+    }
+}
+
+/// The root of the HOT chain holding `tid`, or `tid` itself when it is not a
+/// heap-only member (including when the page has no such line pointer).
+///
+/// # Safety
+/// `heap_oid` names a relation the caller may open; `tid` was fetched from
+/// it under the active snapshot, so its block exists.
+unsafe fn hot_root(heap_oid: pg_sys::Oid, tid: Tid) -> Tid {
+    unsafe {
+        let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as _);
+        let buffer = pg_sys::ReadBuffer(heap, tid.block);
+        pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+        let page = pg_sys::BufferGetPage(buffer);
+        let max = pg_sys::PageGetMaxOffsetNumber(page);
+        let mut root = tid;
+        if tid.offset <= max {
+            // Written for every possible line pointer of a page; a page can
+            // hold at most BLCKSZ / 4 of them.
+            let mut roots = vec![pg_sys::InvalidOffsetNumber; pg_sys::BLCKSZ as usize / 4];
+            pg_sys::heap_get_root_tuples(page, roots.as_mut_ptr());
+            let offset = roots[usize::from(tid.offset) - 1];
+            if offset != pg_sys::InvalidOffsetNumber {
+                root = Tid {
+                    block: tid.block,
+                    offset,
+                };
+            }
+        }
+        pg_sys::UnlockReleaseBuffer(buffer);
+        pg_sys::table_close(heap, pg_sys::AccessShareLock as _);
+        root
     }
 }
 

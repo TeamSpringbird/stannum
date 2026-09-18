@@ -3008,4 +3008,74 @@ mod tests {
             0
         );
     }
+
+    #[pg_test]
+    fn hot_updated_rows_keep_their_score_on_both_ranked_paths() {
+        // A HOT update leaves the posting at the root of the chain while the
+        // executor projects the visible member's location. Found by the
+        // ranked-scan fuzzer: the unpruned path scored such rows zero and the
+        // pruned path ordered them by their real score but reported zero.
+        Spi::run(
+            "CREATE TABLE hot(id int primary key, body text, revision int default 0)
+               WITH (fillfactor = 50);
+             INSERT INTO hot SELECT n, CASE WHEN n % 3 = 0 THEN 'needle needle pad'
+               WHEN n % 3 = 1 THEN 'needle pad pad' ELSE 'other' END
+               FROM generate_series(1, 30) n;
+             CREATE INDEX hot_idx ON hot USING stannum(body);
+             UPDATE hot SET revision = revision + 1 WHERE id IN (3, 4);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        // The updated rows moved within their page: heap-only members.
+        assert_eq!(
+            value("SELECT count(*) FROM hot WHERE id IN (3, 4) AND ctid > '(0,30)'::tid"),
+            2
+        );
+        let rows = |custom: bool| -> Vec<(i32, u32)> {
+            Spi::run(&format!(
+                "SET LOCAL stannum.enable_custom_scan = {custom};
+                 SET LOCAL enable_bitmapscan = {};",
+                !custom
+            ))
+            .unwrap();
+            Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, stannum.full_score(ctid) AS score FROM hot
+                             WHERE body ==> 'needle' ORDER BY score DESC{} LIMIT 8",
+                            if custom { "" } else { ", ctid" }
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        };
+        let pruned = rows(true);
+        let unpruned = rows(false);
+        assert_eq!(pruned, unpruned);
+        let score = |id: i32| pruned.iter().find(|(i, _)| *i == id).map(|(_, s)| *s);
+        // The member scores as its root document: the same as any unmoved
+        // row with the same body, and never zero.
+        assert_eq!(pruned[0].0, 3);
+        assert_eq!(score(3), score(6));
+        assert!(f32::from_bits(score(3).unwrap()) > 0.0);
+        assert!(
+            Spi::get_one::<bool>(
+                "SELECT a.s = b.s AND a.s > 0 FROM
+                 (SELECT stannum.full_score(ctid) s FROM hot WHERE body ==> 'needle' AND id = 4) a,
+                 (SELECT stannum.full_score(ctid) s FROM hot WHERE body ==> 'needle' AND id = 7) b"
+            )
+            .unwrap()
+            .unwrap()
+        );
+    }
 }
