@@ -851,6 +851,48 @@ mod tests {
     }
 
     #[pg_test]
+    fn buffered_scoring_keeps_document_lengths_when_heap_space_is_reused() {
+        Spi::run(
+            "CREATE TABLE length_snapshot(id int, body text) WITH (fillfactor=50);
+             INSERT INTO length_snapshot SELECT n, repeat('filler ', 100)
+               FROM generate_series(1, 200) n;
+             CREATE INDEX length_snapshot_idx ON length_snapshot USING stannum(body);
+             INSERT INTO length_snapshot VALUES (1000, 'needle ' || repeat('filler ', 100));",
+        )
+        .unwrap();
+        let heap = oid_of("length_snapshot");
+        let index = oid_of("length_snapshot_idx");
+        let tid = Spi::get_one::<pgrx::pg_sys::ItemPointerData>(
+            "SELECT ctid FROM length_snapshot WHERE id=1000",
+        )
+        .unwrap()
+        .unwrap();
+        let tid = segment::Tid::new(
+            (u32::from(tid.ip_blkid.bi_hi) << 16) | u32::from(tid.ip_blkid.bi_lo),
+            tid.ip_posid,
+        )
+        .unwrap();
+        let mut scorer = crate::score::scorer_for_scan(
+            heap, index, "needle", true, None, None, None, None, None,
+        );
+        let before = scorer.score(tid);
+        assert!(before > 0.0);
+        Spi::run("UPDATE length_snapshot SET body='needle' WHERE id=1").unwrap();
+        assert!(
+            Spi::get_one::<bool>(
+                "SELECT a.ctid < b.ctid FROM length_snapshot a, length_snapshot b
+                 WHERE a.id=1 AND b.id=1000",
+            )
+            .unwrap()
+            .unwrap()
+        );
+        // Completing a pruned scan refreshes the buffer while retaining its
+        // scorer. The earlier insertion must not change the retained lengths.
+        let _refreshed = unsafe { crate::storage::view(index.into()) };
+        assert_eq!(scorer.score(tid).to_bits(), before.to_bits());
+    }
+
+    #[pg_test]
     fn a_completed_ranked_scan_does_not_repeat_the_rows_it_emitted() {
         // The second-best row is deleted, so its location stays in the index
         // but the parent reads past the pruned top k and the scan completes

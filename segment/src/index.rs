@@ -453,10 +453,17 @@ impl Index for MutableIndex {
     }
 
     fn lengths(&self) -> Lengths<'_> {
-        Lengths::Lazy {
-            fetch: self,
-            count: self.document_count(),
-        }
+        // A document cursor retains its encoded TID order. Keep the matching
+        // length order too: appending a record in reused heap space may insert
+        // before those TIDs. A lazy lookup into the current map would then
+        // score retained documents using another document's length.
+        let extent = self.lengths_extent();
+        Lengths::Bytes(
+            self.encoded
+                .borrow()
+                .slot(extent)
+                .expect("length extent was just encoded"),
+        )
     }
 }
 
@@ -519,6 +526,22 @@ mod tests {
             let y = names(b.expand(window, &|_| true, 1000).unwrap());
             assert_eq!(x, y);
         }
+    }
+
+    #[test]
+    fn retained_document_ordinals_keep_their_lengths_after_buffer_growth() {
+        let mutable = MutableIndex::default();
+        let original = record(50, "needle filler filler filler");
+        let tid = original.tid;
+        mutable.add_record(original).unwrap();
+        let mut documents = mutable.documents().unwrap();
+        let lengths = mutable.lengths();
+        // Reused heap space inserts before the retained document cursor.
+        mutable.add_record(record(1, "needle")).unwrap();
+        let ordinal = documents.rank(tid).unwrap().unwrap();
+        assert_eq!(lengths.get(ordinal).unwrap(), 4);
+        assert_eq!(mutable.lengths().get(0).unwrap(), 1);
+        assert_eq!(mutable.lengths().get(1).unwrap(), 4);
     }
 
     #[test]
