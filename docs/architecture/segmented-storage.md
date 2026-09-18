@@ -127,9 +127,13 @@ them. `stannum.max_score` supplies a normalization value using the associated
 scoring policy. Calls must bind to a matching `==>` predicate at the same query
 level.
 
-Statistics include buffered documents immediately. Dead documents remain in
-segment statistics until rewriting removes them. Partial indexes use their
-indexed population. These choices affect scores as well as performance.
+Scoring statistics include buffered documents immediately and retain dead
+documents until a segment rewrite. Planner estimates instead subtract known
+segment dead lists: exact dead-posting subtraction for terms with at most 1,024
+postings, and live-fraction scaling for more common terms and their expansions.
+DELETE alone does not populate these lists; VACUUM must first identify dead
+versions. Estimates cannot account for those unknown deaths beforehand. The
+write buffer has no dead list. Partial indexes use their indexed population.
 
 A ranked scan with a known `LIMIT` prunes instead of scoring every candidate
 when the query is a flat `AND` or `OR` of terms (a single term included) whose
@@ -142,7 +146,11 @@ skips every run of postings whose summed block bounds cannot reach it
 every bucket up to its maximum, and summed in the scorer's term order, so
 rounding never puts a bound below a score it covers; a run whose bound equals
 the threshold is skipped only when every location in it sorts after the
-current k-th row. The result is therefore identical to scoring every candidate:
+current k-th row. Conjunctions additionally use the largest of all current blocks' minimum
+document lengths for every term, combined with each bucket's own minimum. The
+shared bound is cached through the nearest block end and can skip the rarest
+term before another intersection walk. The result is therefore identical to
+scoring every candidate:
 same rows, same scores, same tie order. `EXPLAIN ANALYZE` reports `Pruning:
 block-max` and the number of candidates actually scored. Phrase, positional,
 expansion, `NOT` and `AT LEAST` queries, and limits above 4,096 rows, score

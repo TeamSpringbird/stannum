@@ -25,6 +25,9 @@
 //! of a live index.
 
 use segment::index::{Expanded, Index, Window};
+use segment::postings::Postings;
+use segment::segment::Term;
+use segment::set::Cursor;
 
 use super::eval::FuzzyMatcher;
 use super::{CompiledRegex, Query, RangeBound, SpanTermSlot};
@@ -362,7 +365,7 @@ impl<S: Statistics + ?Sized> Estimator<'_, S> {
 /// Frequencies summed over the sources of an index (its segments and write
 /// buffer), each expanded under the same cap the plan uses.
 pub struct IndexStatistics<'a> {
-    pub sources: Vec<&'a dyn Index>,
+    pub sources: Vec<(&'a dyn Index, Option<Postings<'a>>)>,
     pub max_expansion: usize,
 }
 
@@ -373,15 +376,21 @@ impl Statistics for IndexStatistics<'_> {
         Ok(self
             .sources
             .iter()
-            .map(|source| f64::from(source.document_count()))
+            .map(|(source, dead)| {
+                f64::from(
+                    source
+                        .document_count()
+                        .saturating_sub(dead.as_ref().map_or(0, Postings::count)),
+                )
+            })
             .sum())
     }
 
     fn document_frequency(&self, term: &str) -> Result<f64, Self::Error> {
         let mut sum = 0.0;
-        for source in &self.sources {
+        for (source, dead) in &self.sources {
             if let Some(term) = source.term(term)? {
-                sum += f64::from(term.df());
+                sum += live_frequency(*source, dead.as_ref(), &term)?;
             }
         }
         Ok(sum)
@@ -393,18 +402,47 @@ impl Statistics for IndexStatistics<'_> {
         filter: &dyn Fn(&str) -> bool,
     ) -> Result<Option<f64>, Self::Error> {
         let mut sum = 0.0;
-        for source in &self.sources {
+        for (source, dead) in &self.sources {
             match source.expand(window, filter, self.max_expansion)? {
                 Expanded::Terms(terms) => {
-                    sum += terms
-                        .iter()
-                        .map(|(_, term)| f64::from(term.df()))
-                        .sum::<f64>();
+                    for (_, term) in terms {
+                        sum += live_frequency(*source, dead.as_ref(), &term)?;
+                    }
                 }
                 Expanded::Overflow => return Ok(None),
             }
         }
         Ok(Some(sum))
+    }
+}
+
+/// Keep planning bounded: count dead hits exactly for short posting lists,
+/// and use the segment's live fraction for common terms. Buffered sources
+/// have no dead list and retain their original frequencies.
+fn live_frequency(
+    index: &dyn Index,
+    dead: Option<&Postings<'_>>,
+    term: &Term<'_>,
+) -> segment::Result<f64> {
+    let Some(dead) = dead.filter(|dead| dead.count() > 0) else {
+        return Ok(f64::from(term.df()));
+    };
+    let documents = index.document_count();
+    if documents == 0 || dead.count() >= documents {
+        return Ok(0.0);
+    }
+    if term.df() <= 1024 {
+        let mut postings = term.cursor()?;
+        let mut deleted = dead.cursor()?;
+        let mut live = 0u32;
+        while let Some(tid) = postings.current() {
+            deleted.seek(tid)?;
+            live += u32::from(deleted.current() != Some(tid));
+            postings.advance()?;
+        }
+        Ok(f64::from(live))
+    } else {
+        Ok(f64::from(term.df()) * f64::from(documents - dead.count()) / f64::from(documents))
     }
 }
 
@@ -605,5 +643,97 @@ mod tests {
     fn match_all_and_at_least() {
         close(run("*").selectivity, 1.0);
         close(run("AT LEAST 2 OF [half fifth rare]").selectivity, 0.105);
+    }
+    #[test]
+    fn index_statistics_subtract_known_deaths_and_preserve_buffer() {
+        use segment::{
+            Tid, forward::ForwardRecord, index::MutableIndex, postings::PostingsBuilder,
+        };
+        let index = MutableIndex::default();
+        let buffer = MutableIndex::default();
+        let mut dead = PostingsBuilder::default();
+        for n in 0..2000 {
+            let tid = Tid::new(n, 1).unwrap();
+            let mut tokens = vec![("common", 0)];
+            if n < 20 {
+                tokens.push(("rare", 1));
+            }
+            index
+                .add_record(ForwardRecord::from_tokens(tid, tokens).unwrap())
+                .unwrap();
+            if n < 10 || (100..590).contains(&n) {
+                dead.push(tid).unwrap();
+            }
+        }
+        buffer
+            .add_record(
+                ForwardRecord::from_tokens(Tid::new(2001, 1).unwrap(), [("rare", 0)]).unwrap(),
+            )
+            .unwrap();
+        let bytes = dead.finish();
+        let stats = IndexStatistics {
+            sources: vec![
+                (&index, Some(Postings::parse(&bytes).unwrap())),
+                (&buffer, None),
+            ],
+            max_expansion: 10,
+        };
+        close(stats.documents().unwrap(), 1501.0);
+        close(stats.document_frequency("rare").unwrap(), 11.0);
+        close(stats.document_frequency("common").unwrap(), 1500.0);
+        close(stats.document_frequency("missing").unwrap(), 0.0);
+        close(
+            stats
+                .expansion_frequency(Window::Prefix("ra"), &|_| true)
+                .unwrap()
+                .unwrap(),
+            11.0,
+        );
+        close(
+            stats
+                .expansion_frequency(Window::All, &|_| true)
+                .unwrap()
+                .unwrap(),
+            1511.0,
+        );
+        let capped = IndexStatistics {
+            max_expansion: 1,
+            ..stats
+        };
+        assert_eq!(
+            capped.expansion_frequency(Window::All, &|_| true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn wholly_dead_and_empty_sources_estimate_zero() {
+        use segment::{
+            Tid, forward::ForwardRecord, index::MutableIndex, postings::PostingsBuilder,
+        };
+        let index = MutableIndex::default();
+        let empty = MutableIndex::default();
+        let tid = Tid::new(0, 1).unwrap();
+        index
+            .add_record(ForwardRecord::from_tokens(tid, [("gone", 0)]).unwrap())
+            .unwrap();
+        let mut dead = PostingsBuilder::default();
+        dead.push(tid).unwrap();
+        let bytes = dead.finish();
+        let stats = IndexStatistics {
+            sources: vec![
+                (&index, Some(Postings::parse(&bytes).unwrap())),
+                (&empty, None),
+            ],
+            max_expansion: 10,
+        };
+        close(stats.documents().unwrap(), 0.0);
+        close(stats.document_frequency("gone").unwrap(), 0.0);
+        close(
+            estimate(&parse_tinql_to_query_default("gone").unwrap(), &stats)
+                .unwrap()
+                .selectivity,
+            0.0,
+        );
     }
 }

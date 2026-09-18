@@ -930,6 +930,10 @@ mod tests {
             "missing",
             "alpha AND beta",
             "alpha AND beta AND gamma",
+            "alpha AND beta AND gamma AND tail",
+            "pad AND alpha AND tail",
+            "delta AND gamma AND alpha",
+            "alpha^2 AND beta^0.25",
             "alpha AND delta",
             "alpha AND missing",
             "alpha OR gamma",
@@ -952,6 +956,12 @@ mod tests {
             "LIMIT 10",
             "LIMIT 5 OFFSET 8",
             "LIMIT 100",
+            "LIMIT 127",
+            "LIMIT 128",
+            "LIMIT 129",
+            "LIMIT 255",
+            "LIMIT 256",
+            "LIMIT 257",
             "LIMIT 5000",
         ];
         for query in queries {
@@ -2419,5 +2429,95 @@ mod tests {
         .unwrap()
         .0;
         assert!(plan_mentions(&plan, "indexed_query"), "{plan}");
+    }
+    #[pg_test]
+    fn planner_estimates_follow_dead_lists_before_segment_rewrite() {
+        use std::collections::BTreeSet;
+        // pg_test runs inside a transaction, where SQL VACUUM is forbidden.
+        // Exercise its two storage callbacks separately so the estimate is
+        // checked while the original segment and its dead list still exist.
+        Spi::run("CREATE TABLE est_live(id int, body text);
+            INSERT INTO est_live SELECT n, CASE WHEN n <= 20 THEN 'rare common' ELSE 'common' END FROM generate_series(1, 200) n;
+            CREATE INDEX est_live_idx ON est_live USING stannum(body);
+            ANALYZE est_live").unwrap();
+        let mut dead: BTreeSet<(u32, u16)> = Spi::connect(|client| {
+            client
+                .select("SELECT ctid FROM est_live WHERE id <= 10", None, &[])
+                .unwrap()
+                .map(|row| {
+                    let tid = row.get::<pg_sys::ItemPointerData>(1).unwrap().unwrap();
+                    (
+                        (u32::from(tid.ip_blkid.bi_hi) << 16) | u32::from(tid.ip_blkid.bi_lo),
+                        tid.ip_posid,
+                    )
+                })
+                .collect()
+        });
+        Spi::run("DELETE FROM est_live WHERE id <= 10; ANALYZE est_live").unwrap();
+        unsafe extern "C-unwind" fn deleted(
+            tid: pg_sys::ItemPointer,
+            state: *mut std::ffi::c_void,
+        ) -> bool {
+            let tid = unsafe { *tid };
+            let dead = unsafe { &*state.cast::<BTreeSet<(u32, u16)>>() };
+            dead.contains(&(
+                (u32::from(tid.ip_blkid.bi_hi) << 16) | u32::from(tid.ip_blkid.bi_lo),
+                tid.ip_posid,
+            ))
+        }
+        let index = unsafe { pgrx::PgRelation::open_with_name("est_live_idx") }.unwrap();
+        unsafe {
+            crate::storage::bulk_delete(
+                index.as_ptr(),
+                Some(deleted),
+                std::ptr::from_mut(&mut dead).cast(),
+            );
+        }
+        let check = || {
+            assert_eq!(
+                Spi::get_one::<i64>("SELECT count(*) FROM est_live WHERE body ==> 'rare'").unwrap(),
+                Some(10)
+            );
+            let plan = plan_of("SELECT * FROM est_live WHERE body ==> 'rare'").0;
+            let rows = plan[0]["Plan"]["Plan Rows"].as_f64().unwrap();
+            assert!((10.0 / 1.5..=15.0).contains(&rows), "{plan}");
+        };
+        check();
+        // Cleanup does not rewrite a segment less than half dead.
+        unsafe {
+            crate::storage::cleanup(index.as_ptr());
+        }
+        check();
+        // Force the rewrite threshold, preserving ten live rare matches.
+        dead.extend(Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT ctid FROM est_live WHERE id > 20 AND id <= 120",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| {
+                    let tid = row.get::<pg_sys::ItemPointerData>(1).unwrap().unwrap();
+                    (
+                        (u32::from(tid.ip_blkid.bi_hi) << 16) | u32::from(tid.ip_blkid.bi_lo),
+                        tid.ip_posid,
+                    )
+                })
+                .collect::<Vec<_>>()
+        }));
+        Spi::run("DELETE FROM est_live WHERE id > 20 AND id <= 120; ANALYZE est_live").unwrap();
+        unsafe {
+            crate::storage::bulk_delete(
+                index.as_ptr(),
+                Some(deleted),
+                std::ptr::from_mut(&mut dead).cast(),
+            );
+        }
+        check();
+        unsafe {
+            crate::storage::cleanup(index.as_ptr());
+        }
+        check();
     }
 }

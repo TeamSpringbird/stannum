@@ -66,7 +66,18 @@ pub unsafe fn estimate_query(index_oid: pg_sys::Oid, query: &str) -> Option<Esti
         let query = tinql::runtime::parse_tinql_to_query(query, tokenizer.as_ref()).ok()?;
         let view = crate::storage::view(index_oid);
         let statistics = IndexStatistics {
-            sources: view.sources.iter().map(|(index, _)| &**index).collect(),
+            sources: view
+                .sources
+                .iter()
+                .map(|(index, dead)| {
+                    let dead = dead
+                        .as_ref()
+                        .map(|bytes| segment::postings::Postings::parse(bytes))
+                        .transpose();
+                    dead.map(|dead| (&**index, dead))
+                })
+                .collect::<Result<_, _>>()
+                .ok()?,
             max_expansion: Limits::default().max_expansion,
         };
         let estimate = estimate(&query, &statistics).ok()?;
