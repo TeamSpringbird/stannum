@@ -7,7 +7,7 @@ use proptest::prelude::*;
 use crate::dictionary::{DictionaryBuilder, Extent, OwnedDictionary, TermEntry};
 use crate::forward::ForwardRecord;
 use crate::payload::{Payload, PayloadBuilder};
-use crate::postings::{Postings, PostingsBuilder};
+use crate::postings::{BLOCK_POSTINGS, BlockBound, Postings, PostingsBuilder};
 use crate::set::{Cursor, Difference, Intersection, Union, collect};
 use crate::tid::MAX_OFFSET;
 use crate::{Result, Tid};
@@ -336,6 +336,83 @@ proptest! {
                         max_bucket = max_bucket.max(bucket);
                     }
                     prop_assert_eq!(term.entry.max_tf_bucket, max_bucket);
+                    // Block bounds are exact over each block of the term's postings.
+                    let expected_bounds: Vec<BlockBound> = expected
+                        .iter()
+                        .collect::<Vec<_>>()
+                        .chunks(BLOCK_POSTINGS as usize)
+                        .map(|block| {
+                            let scores: Vec<(u8, u32)> = block
+                                .iter()
+                                .map(|(tid, positions)| {
+                                    (TfBucket::from_count(positions.len() as u32).value(), lengths[tid])
+                                })
+                                .collect();
+                            BlockBound::over(&scores, *block[block.len() - 1].0)
+                        })
+                        .collect();
+                    prop_assert_eq!(term.cursor().unwrap().block_bounds().unwrap(), expected_bounds);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_bounds_match_oracle_in_both_layouts(
+        set in tid_set(1500),
+        scores in prop::collection::vec((0u8..=15, 1u32..5000), 1500),
+        targets in prop::collection::vec((0u32..2100, 1u16..=MAX_OFFSET), 0..40),
+    ) {
+        // Scored postings in both layouts: a dense list is grouped, a thinned
+        // copy of the same list is sparse.
+        let ordered: Vec<Tid> = set.iter().copied().collect();
+        let thinned: Vec<Tid> = ordered.iter().copied().step_by(3).collect();
+        for tids in [ordered, thinned] {
+            let scores = &scores[..tids.len()];
+            let mut builder = PostingsBuilder::default();
+            for (tid, (bucket, len)) in tids.iter().zip(scores) {
+                builder.push_scored(*tid, *bucket, *len).unwrap();
+            }
+            let bytes = builder.finish();
+            let postings = Postings::parse(&bytes).unwrap();
+            prop_assert_eq!(postings.has_bounds(), !tids.is_empty());
+            prop_assert_eq!(postings.to_vec().unwrap(), tids.clone());
+            let expected: Vec<BlockBound> = tids
+                .chunks(BLOCK_POSTINGS as usize)
+                .zip(scores.chunks(BLOCK_POSTINGS as usize))
+                .map(|(block, block_scores)| BlockBound::over(block_scores, block[block.len() - 1]))
+                .collect();
+            let decoded = postings.cursor().unwrap().block_bounds().unwrap();
+            prop_assert_eq!(&decoded, &expected);
+            // Every posting is covered by its block's bound: its bucket occurs
+            // with a length no larger than its own, and no reported bucket is
+            // absent from the block.
+            for (block, bound) in scores.chunks(BLOCK_POSTINGS as usize).zip(&decoded) {
+                for (bucket, len) in block {
+                    prop_assert!(bound.min_len[usize::from(*bucket)] <= *len);
+                }
+                for (bucket, len) in bound.buckets() {
+                    prop_assert!(block.contains(&(bucket, len)));
+                }
+            }
+
+            // `bound_at` names the block of the successor of any target the
+            // cursor has not passed; seeks through the table keep ordinals.
+            let mut sorted_targets: Vec<Tid> = targets.iter().map(|(b, o)| Tid::new(*b, *o).unwrap()).collect();
+            sorted_targets.sort_unstable();
+            let mut cursor = postings.cursor().unwrap();
+            let mut fresh = postings.cursor().unwrap();
+            for target in sorted_targets {
+                let successor = tids.iter().position(|t| *t >= target);
+                let expected_bound = successor.map(|i| expected[i / BLOCK_POSTINGS as usize]);
+                prop_assert_eq!(fresh.bound_at(target).unwrap(), expected_bound);
+                prop_assert_eq!(cursor.bound_at(target).unwrap(), expected_bound);
+                cursor.seek(target).unwrap();
+                prop_assert_eq!(cursor.current(), successor.map(|i| tids[i]));
+                if let Some(i) = successor {
+                    prop_assert_eq!(cursor.ordinal() as usize, i);
+                    // The cursor's own block is the bound for anything behind it.
+                    prop_assert_eq!(cursor.bound_at(Tid::new(0, 1).unwrap()).unwrap(), expected_bound);
                 }
             }
         }
@@ -344,6 +421,12 @@ proptest! {
     #[test]
     fn decoders_never_panic_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
         let _ = Postings::parse(&bytes).and_then(|p| p.to_vec());
+        let _ = Postings::parse(&bytes).and_then(|p| p.cursor()?.block_bounds());
+        let _ = Postings::parse(&bytes).and_then(|p| {
+            let mut cursor = p.cursor()?;
+            cursor.seek(Tid::new(100, 1).unwrap())?;
+            cursor.bound_at(Tid::new(200, 1).unwrap())
+        });
         let _ = Payload::parse(&bytes).and_then(|p| p.get(0));
         let _ = OwnedDictionary::parse(&bytes).map(|d| d.view().iter().count());
         let _ = OwnedDictionary::parse(&bytes).and_then(|d| d.view().get("a"));

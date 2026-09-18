@@ -5,18 +5,24 @@
 //! positions or scores.
 //!
 //! ```text
-//! stream := count varint, skip_count varint, skip_delta varint * skip_count, data
+//! stream := count varint, skip_count varint, skip u32le * skip_count, data
 //! entry  := tf_bucket u8 (low four bits), n varint, position varint * n
 //!           positions: first absolute, then (delta - 1)
 //! ```
 //!
 //! The skip table holds the byte offset (relative to `data`) of every
-//! `SKIP_INTERVAL`-th entry, stored as deltas.
+//! `SKIP_INTERVAL`-th entry. Offsets are fixed-width so a seek jumps to its
+//! slot in constant time; a ranked scan seeks once per scored document.
+//!
+//! `LSG1` segments hold the previous layout, still readable through
+//! [`Payload::parse_legacy`]: one skip per 64 entries, stored as varint
+//! deltas, so a seek walks the table from its start.
 
 use crate::reader::Reader;
 use crate::{Error, Result, varint};
 
-pub const SKIP_INTERVAL: u32 = 64;
+pub const SKIP_INTERVAL: u32 = 32;
+const LEGACY_SKIP_INTERVAL: u32 = 64;
 pub const MAX_TF_BUCKET: u8 = crate::tf_bucket::BUCKET_MAX;
 
 #[derive(Default, Debug)]
@@ -51,13 +57,12 @@ impl PayloadBuilder {
     }
 
     pub fn finish(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.data.len() + self.skips.len() * 3 + 8);
+        let mut out = Vec::with_capacity(self.data.len() + self.skips.len() * 4 + 8);
         varint::put(&mut out, u64::from(self.count));
         varint::put(&mut out, self.skips.len() as u64);
-        let mut previous = 0;
         for skip in &self.skips {
-            varint::put(&mut out, (skip - previous) as u64);
-            previous = *skip;
+            let skip = u32::try_from(*skip).expect("payload streams are far below 4 GiB");
+            out.extend_from_slice(&skip.to_le_bytes());
         }
         out.extend_from_slice(&self.data);
         out
@@ -124,20 +129,41 @@ pub struct Payload<'a> {
     skips_at: usize,
     skip_count: usize,
     data_at: usize,
+    /// Entries per skip; 64 with varint deltas in the legacy layout.
+    interval: u32,
+    legacy: bool,
 }
 
 impl<'a> Payload<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
+        Self::parse_layout(bytes, false)
+    }
+
+    /// Parses the `LSG1` layout: varint delta skips every 64 entries.
+    pub fn parse_legacy(bytes: &'a [u8]) -> Result<Self> {
+        Self::parse_layout(bytes, true)
+    }
+
+    fn parse_layout(bytes: &'a [u8], legacy: bool) -> Result<Self> {
+        let interval = if legacy {
+            LEGACY_SKIP_INTERVAL
+        } else {
+            SKIP_INTERVAL
+        };
         let mut reader = Reader::new(bytes);
         let count = reader.varint_u32()?;
         let skip_count = reader.varint_u32()? as usize;
-        let expected = (count as usize).div_ceil(SKIP_INTERVAL as usize);
+        let expected = (count as usize).div_ceil(interval as usize);
         if skip_count != expected {
             return Err(Error::Corrupt("payload skip table size"));
         }
         let skips_at = reader.position();
-        for _ in 0..skip_count {
-            reader.varint()?;
+        if legacy {
+            for _ in 0..skip_count {
+                reader.varint()?;
+            }
+        } else {
+            reader.skip(skip_count * 4)?;
         }
         Ok(Self {
             bytes,
@@ -145,6 +171,8 @@ impl<'a> Payload<'a> {
             skips_at,
             skip_count,
             data_at: reader.position(),
+            interval,
+            legacy,
         })
     }
 
@@ -155,23 +183,30 @@ impl<'a> Payload<'a> {
     /// Byte position of the skip-table entry containing `ordinal`, and the
     /// ordinal that entry starts at.
     fn skip_to(&self, ordinal: u32) -> Result<(usize, u32)> {
-        let slot = (ordinal / SKIP_INTERVAL) as usize;
+        let slot = (ordinal / self.interval) as usize;
         if slot >= self.skip_count {
             return Err(Error::Corrupt("payload ordinal out of range"));
         }
-        let mut reader = Reader::at(self.bytes, self.skips_at);
-        let mut offset = 0usize;
-        for _ in 0..=slot {
-            offset = offset
-                .checked_add(reader.varint()? as usize)
-                .ok_or(Error::Corrupt("payload skip overflow"))?;
-        }
+        let offset = if self.legacy {
+            let mut reader = Reader::at(self.bytes, self.skips_at);
+            let mut offset = 0usize;
+            for _ in 0..=slot {
+                offset = offset
+                    .checked_add(reader.varint()? as usize)
+                    .ok_or(Error::Corrupt("payload skip overflow"))?;
+            }
+            offset
+        } else {
+            let at = self.skips_at + slot * 4;
+            let bytes = &self.bytes[at..at + 4];
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
+        };
         let at = self
             .data_at
             .checked_add(offset)
             .filter(|at| *at <= self.bytes.len())
             .ok_or(Error::Truncated)?;
-        Ok((at, slot as u32 * SKIP_INTERVAL))
+        Ok((at, slot as u32 * self.interval))
     }
 
     pub fn cursor(&self) -> PayloadCursor<'a> {
@@ -209,9 +244,10 @@ impl PayloadCursor<'_> {
         if ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload ordinal out of range"));
         }
+        let interval = self.payload.interval;
         let forward_only = ordinal >= self.next_ordinal
-            && ordinal - self.next_ordinal < SKIP_INTERVAL
-            && ordinal / SKIP_INTERVAL == self.next_ordinal / SKIP_INTERVAL;
+            && ordinal - self.next_ordinal < interval
+            && ordinal / interval == self.next_ordinal / interval;
         if !forward_only {
             let (at, start) = self.payload.skip_to(ordinal)?;
             self.reader.seek(at)?;
@@ -285,7 +321,7 @@ mod tests {
 
     #[test]
     fn random_and_sequential_access_agree_across_skip_boundaries() {
-        let entries = sample(3 * SKIP_INTERVAL + 5);
+        let entries = sample(6 * SKIP_INTERVAL + 5);
         let bytes = build(&entries);
         let payload = Payload::parse(&bytes).unwrap();
         assert_eq!(payload.count(), entries.len() as u32);
@@ -312,6 +348,50 @@ mod tests {
         }
         assert!(cursor.seek(entries.len() as u32).is_err());
         assert!(payload.get(u32::MAX).is_err());
+    }
+
+    /// Encodes entries in the `LSG1` layout, as the previous builder did.
+    fn build_legacy(entries: &[Entry]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut skips = Vec::new();
+        for (ordinal, entry) in entries.iter().enumerate() {
+            if (ordinal as u32).is_multiple_of(LEGACY_SKIP_INTERVAL) {
+                skips.push(data.len());
+            }
+            data.push(entry.tf_bucket);
+            encode_positions(&mut data, &entry.positions);
+        }
+        let mut out = Vec::new();
+        varint::put(&mut out, entries.len() as u64);
+        varint::put(&mut out, skips.len() as u64);
+        let mut previous = 0;
+        for skip in skips {
+            varint::put(&mut out, (skip - previous) as u64);
+            previous = skip;
+        }
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn legacy_layout_is_still_read() {
+        let entries = sample(3 * LEGACY_SKIP_INTERVAL + 5);
+        let bytes = build_legacy(&entries);
+        // The layouts differ, so each parser rejects the other's table.
+        assert!(
+            Payload::parse(&bytes).is_err() || Payload::parse(&bytes).unwrap().get(150).is_err()
+        );
+        let payload = Payload::parse_legacy(&bytes).unwrap();
+        assert_eq!(payload.count(), entries.len() as u32);
+        for (ordinal, entry) in entries.iter().enumerate() {
+            assert_eq!(&payload.get(ordinal as u32).unwrap(), entry, "{ordinal}");
+        }
+        let mut cursor = payload.cursor();
+        for ordinal in [190u32, 5, 6, 70, 69, 63, 64, 0, 196] {
+            cursor.seek(ordinal).unwrap();
+            assert_eq!(&cursor.next_entry().unwrap(), &entries[ordinal as usize]);
+        }
+        assert!(Payload::parse_legacy(&build(&entries)).is_err());
     }
 
     #[test]
@@ -348,9 +428,12 @@ mod tests {
         );
         // Tamper with the skip table so the second slot points past the data.
         let payload = Payload::parse(&bytes).unwrap();
-        let second_skip_at = payload.skips_at + 1;
+        let second_skip_at = payload.skips_at + 4 + 1;
         bytes[second_skip_at] = 0x7f;
         let tampered = Payload::parse(&bytes).unwrap();
-        assert!(tampered.get(64).is_err() || tampered.get(64).unwrap() != entries[64]);
+        let probe = SKIP_INTERVAL;
+        assert!(
+            tampered.get(probe).is_err() || tampered.get(probe).unwrap() != entries[probe as usize]
+        );
     }
 }
