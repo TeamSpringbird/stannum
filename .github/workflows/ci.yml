@@ -103,6 +103,9 @@ jobs:
       - name: Install release build
         run: cargo pgrx install --release --package stannum --no-default-features --features "pg${PG_MAJOR}"
 
+      - name: Release schema and upgrade compatibility
+        run: python3 postgres/tests/extension_upgrade.py
+
       # Crash recovery, VACUUM, folds and merges, standby fallback and
       # backend reuse, against a real server in a throwaway cluster.
       - name: Index lifecycle checks

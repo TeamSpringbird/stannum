@@ -73,13 +73,17 @@ fn highlight(
     )
 }
 
-#[pg_extern(name = "highlight", immutable, parallel_safe)]
+#[pg_extern(name = "highlight", stable, parallel_safe)]
 fn highlight_bound(
     text: Option<&str>,
     begin_tag: &str,
     end_tag: &str,
     query: indexed_query,
 ) -> Option<String> {
+    let index = unsafe {
+        pgrx::PgRelation::with_lock(pg_sys::Oid::from(query.index), pg_sys::AccessShareLock as _)
+    };
+    crate::udfs::validate_stannum_index(&index, "highlight");
     let pipeline = unsafe { crate::storage::tokenizer_by_oid(pg_sys::Oid::from(query.index)) };
     render_highlight(&pipeline, text, begin_tag, end_tag, Some(&query.query))
 }
@@ -93,12 +97,16 @@ fn highlight_ansi(
     render_highlight_ansi(tokenizer::presets::default_pipeline(), text, wrap_to, query)
 }
 
-#[pg_extern(name = "highlight_ansi", immutable, parallel_safe)]
+#[pg_extern(name = "highlight_ansi", stable, parallel_safe)]
 fn highlight_ansi_bound(
     text: Option<&str>,
     wrap_to: Option<i32>,
     query: indexed_query,
 ) -> Option<String> {
+    let index = unsafe {
+        pgrx::PgRelation::with_lock(pg_sys::Oid::from(query.index), pg_sys::AccessShareLock as _)
+    };
+    crate::udfs::validate_stannum_index(&index, "highlight");
     let pipeline = unsafe { crate::storage::tokenizer_by_oid(pg_sys::Oid::from(query.index)) };
     render_highlight_ansi(&pipeline, text, wrap_to, Some(&query.query))
 }

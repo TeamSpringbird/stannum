@@ -261,6 +261,16 @@ fn score_bound_indexed(
         INDEX_SCORE_CACHE.with_borrow(|slot| slot.as_ref().is_some_and(|s| matches(&s.key)));
     INDEX_SCORE_CACHE.with_borrow_mut(|slot| {
         if !cached {
+            let index = unsafe {
+                PgRelation::with_lock(
+                    pg_sys::Oid::from(index_oid as u32),
+                    pg_sys::AccessShareLock as _,
+                )
+            };
+            crate::udfs::require_stannum_index(&index, "score_bound_indexed");
+            if unsafe { pg_sys::IndexGetRelation(index.oid(), false) }.to_u32() != heap_oid as u32 {
+                pgrx::error!("score index does not belong to the supplied table");
+            }
             let key = CacheKey {
                 statement,
                 heap_oid: heap_oid as u32,
@@ -1491,7 +1501,7 @@ fn corpus_universe(tokenized: &[Vec<String>]) -> BTreeSet<&str> {
         .collect()
 }
 
-#[pg_extern(stable, parallel_unsafe)]
+#[pg_extern(volatile, parallel_unsafe)]
 fn score_inspect(
     index: Option<PgRelation>,
     query: Option<&str>,
@@ -1521,19 +1531,8 @@ fn score_inspect(
                 .collect::<Vec<_>>()
         })
     };
+    crate::udfs::require_index_select(&index);
     let heap_oid = unsafe { pg_sys::IndexGetRelation(index.oid(), false) };
-    let acl = unsafe {
-        pg_sys::pg_class_aclcheck(heap_oid, pg_sys::GetUserId(), pg_sys::ACL_SELECT as _)
-    };
-    if acl != pg_sys::AclResult::ACLCHECK_OK {
-        unsafe {
-            pg_sys::aclcheck_error(
-                acl,
-                pg_sys::ObjectType::OBJECT_TABLE,
-                pg_sys::get_rel_name(heap_oid),
-            )
-        };
-    }
     let tokenizer = unsafe { crate::options::tokenizer(index.as_ptr()) };
     let parsed = parse_tinql_to_query(query, &tokenizer)
         .unwrap_or_else(|error| pgrx::error!("stannum.score_inspect() query error: {error}"));
