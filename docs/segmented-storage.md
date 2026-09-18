@@ -73,11 +73,24 @@ stale and get overwritten after a fold.
 * **Merge.** When the directory would exceed `tin.max_segments` (default and
   maximum 128), every segment is rewritten into one, skipping dead documents.
   The old runs move to the pending list.
-* **Scan.** Under a shared meta lock the scan copies the directory and the
-  live buffer bytes, then releases the lock. Each segment is planned and
-  drained into the caller's bitmap, minus its dead list. The buffer is built
-  into an in-memory segment cached per backend by its version, so it is
-  planned exactly like the others and rebuilt only after it changes.
+* **Scan.** Under a shared meta lock the scan copies the directory and
+  brings the backend's buffer index up to date, then releases the lock. Each
+  segment is planned against a page-granular reader and drained into the
+  caller's bitmap, minus its dead list. Both segments and the buffer are
+  queried through one `Index` trait (`segment::index`).
+* **Segment reads.** Every segment run has a companion page table run listing
+  its block numbers, so any byte range of the blob is reached with one page
+  read per 8 KiB, no chain walk. A query reads the header, the dictionary's
+  block index, the dictionary blocks its terms fall in, those terms' postings
+  and payload extents, and the document lengths it scores. Whole-segment reads
+  no longer happen; the buffer manager is the cache.
+* **Buffer index.** The write buffer is a forward stream, so each backend keeps
+  an incremental inverted index over it (`MutableIndex`), keyed by index
+  identity and the buffer's epoch. A scan appends only the records written
+  since the backend last looked; a fold or VACUUM rewrite bumps the epoch and
+  the index starts over. Per-term postings are encoded lazily on first use in
+  the same on-disk shape a segment uses, so planning code does not know which
+  kind of index it is reading.
 * **VACUUM.** `ambulkdelete` asks PostgreSQL's callback about every document
   in every segment and writes a new dead list where anything changed; the
   buffer is rewritten without dead records. `amvacuumcleanup` rewrites any
@@ -127,10 +140,12 @@ pages.
 
 ## Known limits of this slice
 
-* A scan reads each segment's bytes into a backend-local cache (64 MiB cap)
-  on first use. Segments are immutable and keyed by index identity, first
-  block and generation, so the cache never serves stale data, but the first
-  query after a fold pays the read.
+* Page reads go through the buffer manager one page at a time with a pin and
+  unpin per page; there is no readahead or batching for long postings lists.
+* The buffer index lives in one backend; a new connection rebuilds it from the
+  buffer stream on its first query. Measured on Wikipedia articles this is
+  about 22 ms per megabyte of buffer, so the 4 MiB fold cap bounds the cost
+  near 90 ms per fresh backend. Pooled connections pay it once.
 * Folds happen in the inserting backend and rewrite the whole buffer; merges
   rewrite every segment. Both are bounded but make the triggering insert slow.
 * Ranked queries still score every matching row through the executor and sort;
@@ -233,6 +248,30 @@ The harness's mixed profile went from about 1,160 to 9,700 read queries per
 second on this machine. TIN's numbers come from PlanetScale's hardware and
 Lead's from a local machine, so treat the comparison as coarse; the point is
 that no shape is an order of magnitude apart any more.
+
+## Page-granular reads and the buffer index, at 100,000 documents
+
+Same Wikipedia fixture and mixed protocol as before (two closed-loop readers,
+one writer scheduled at 20 updates/s, 30 s), on the local machine. The
+"paged" column reads segments page by page but rebuilt the buffer's in-memory
+segment per backend after each write; the last column keeps an incremental
+buffer index per backend instead.
+
+| | Whole-segment reads | Paged reads | Paged reads, buffer index |
+| --- | ---: | ---: | ---: |
+| Read queries/s, all twenty shapes | 74 | 182 | 815 |
+| Count queries, median ms | 5 to 12 | 3 to 5.5 | 0.26 to 2.5 |
+| Ranked queries, median ms | 120 to 350 | 6.7 to 16.6 | 0.5 to 9.4 |
+| Ranked queries, p95 ms | | 29 to 57 | 1.1 to 11 |
+| Achieved writes/s, p95 ms | | 19.8, 10.4 | 19.8, 11.2 |
+| Index build, s | 15 | 14.7 | 14.6 |
+| Index size | 161 MB | 161 MB | 161 MB |
+
+Server-side execution time from `EXPLAIN ANALYZE` on the same index once a
+session is warm: count queries 0.17 to 2 ms, ranked 0.5 to 9 ms. TIN on
+PlanetScale for the same 100,000 articles: count 0.25 to 5.3 ms, ranked 0.33
+to 6.5 ms. A fresh session pays the buffer index build first (27 ms with 1.2
+MB buffered), then nothing.
 
 ## Validation
 

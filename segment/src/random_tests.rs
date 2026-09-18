@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 
-use crate::dictionary::{Dictionary, DictionaryBuilder, Extent, TermEntry};
+use crate::dictionary::{DictionaryBuilder, Extent, OwnedDictionary, TermEntry};
 use crate::forward::ForwardRecord;
 use crate::payload::{Payload, PayloadBuilder};
 use crate::postings::{Postings, PostingsBuilder};
@@ -227,7 +227,8 @@ proptest! {
             builder.push(term, *entry).unwrap();
         }
         let bytes = builder.finish();
-        let dictionary = Dictionary::parse(&bytes).unwrap();
+        let owned = OwnedDictionary::parse(&bytes).unwrap();
+        let dictionary = owned.view();
         prop_assert_eq!(dictionary.len(), expected.len());
         let all: Vec<(String, TermEntry)> = dictionary.iter().collect::<Result<_>>().unwrap();
         prop_assert_eq!(all, expected.iter().map(|(t, e)| (t.clone(), *e)).collect::<Vec<_>>());
@@ -313,7 +314,7 @@ proptest! {
         for (tid, len) in &lengths {
             prop_assert_eq!(segment.document_length(*tid).unwrap(), Some(*len));
         }
-        let listed: Vec<String> = segment.dictionary().iter().map(|r| r.unwrap().0).collect();
+        let listed: Vec<String> = segment.dictionary().unwrap().iter().map(|r| r.unwrap().0).collect();
         prop_assert_eq!(&listed, &oracle.keys().cloned().collect::<Vec<_>>());
         for word in oracle.keys().chain(probes.iter()) {
             let resolved = segment.term(word).unwrap();
@@ -344,8 +345,8 @@ proptest! {
     fn decoders_never_panic_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
         let _ = Postings::parse(&bytes).and_then(|p| p.to_vec());
         let _ = Payload::parse(&bytes).and_then(|p| p.get(0));
-        let _ = Dictionary::parse(&bytes).map(|d| d.iter().count());
-        let _ = Dictionary::parse(&bytes).and_then(|d| d.get("a"));
+        let _ = OwnedDictionary::parse(&bytes).map(|d| d.view().iter().count());
+        let _ = OwnedDictionary::parse(&bytes).and_then(|d| d.view().get("a"));
         let _ = ForwardRecord::decode(&bytes);
         let _ = crate::segment::Segment::parse(&bytes).and_then(|s| s.term("a").map(|_| ()));
     }

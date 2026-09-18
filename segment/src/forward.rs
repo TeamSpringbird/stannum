@@ -23,6 +23,14 @@ pub struct ForwardTerm {
     pub positions: Vec<u32>,
 }
 
+/// The fixed part of a record, from [`ForwardRecord::decode_with`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordHeader {
+    pub tid: Tid,
+    pub doc_len: u32,
+    pub term_count: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForwardRecord {
     pub tid: Tid,
@@ -125,6 +133,45 @@ impl ForwardRecord {
     /// Decodes the record at the start of `bytes`, returning it and the bytes
     /// consumed.
     pub fn decode(bytes: &[u8]) -> Result<(Self, usize)> {
+        let mut terms = Vec::new();
+        let (header, total) = Self::decode_with(bytes, |term, positions| {
+            terms.push(ForwardTerm {
+                term: term.to_owned(),
+                positions: positions.to_vec(),
+            });
+            Ok(())
+        })?;
+        Ok((
+            Self {
+                tid: header.tid,
+                doc_len: header.doc_len,
+                terms,
+            },
+            total,
+        ))
+    }
+
+    /// Reads only the fixed part of the record at the start of `bytes`.
+    pub fn peek(bytes: &[u8]) -> Result<RecordHeader> {
+        let mut reader = Reader::new(bytes);
+        let len = reader.varint()? as usize;
+        let mut body = Reader::new(reader.take(len)?);
+        let block = body.varint_u32()?;
+        let offset = u16::try_from(body.varint_u32()?).map_err(|_| Error::InvalidTid)?;
+        Ok(RecordHeader {
+            tid: Tid::new(block, offset)?,
+            doc_len: body.varint_u32()?,
+            term_count: body.varint_u32()?,
+        })
+    }
+
+    /// Decodes the record at the start of `bytes` without building it,
+    /// handing each term and its positions to `visit` in term order. Returns
+    /// the header and the bytes consumed.
+    pub fn decode_with(
+        bytes: &[u8],
+        mut visit: impl FnMut(&str, &[u32]) -> Result<()>,
+    ) -> Result<(RecordHeader, usize)> {
         let total = Self::encoded_len(bytes)?;
         let mut reader = Reader::new(bytes);
         let len = reader.varint()? as usize;
@@ -133,36 +180,40 @@ impl ForwardRecord {
         let offset = u16::try_from(body.varint_u32()?).map_err(|_| Error::InvalidTid)?;
         let tid = Tid::new(block, offset)?;
         let doc_len = body.varint_u32()?;
-        let term_count = body.varint_u32()? as usize;
-        let mut terms = Vec::with_capacity(term_count.min(1024));
-        let mut previous: Vec<u8> = Vec::new();
+        let term_count = body.varint_u32()?;
+        let mut term: Vec<u8> = Vec::new();
+        let mut positions: Vec<u32> = Vec::new();
         for _ in 0..term_count {
             let shared = body.varint_u32()? as usize;
-            if shared > previous.len() {
+            if shared > term.len() {
                 return Err(Error::Corrupt("forward term prefix"));
             }
             let suffix_len = body.varint_u32()? as usize;
             let suffix = body.take(suffix_len)?;
-            let mut term = Vec::with_capacity(shared + suffix_len);
-            term.extend_from_slice(&previous[..shared]);
-            term.extend_from_slice(suffix);
-            if term.is_empty() || (!previous.is_empty() && previous >= term) {
+            // The new term is previous[..shared] + suffix; it follows the
+            // previous term exactly when the suffix exceeds the rest of it.
+            if !term.is_empty() && term[shared..] >= *suffix {
                 return Err(Error::Corrupt("forward term order"));
             }
-            let mut positions = Vec::new();
+            term.truncate(shared);
+            term.extend_from_slice(suffix);
+            if term.is_empty() {
+                return Err(Error::Corrupt("forward term order"));
+            }
+            positions.clear();
             decode_positions(&mut body, &mut positions)?;
-            let term = String::from_utf8(term).map_err(|_| Error::Corrupt("forward term UTF-8"))?;
-            previous = term.as_bytes().to_vec();
-            terms.push(ForwardTerm { term, positions });
+            let text =
+                std::str::from_utf8(&term).map_err(|_| Error::Corrupt("forward term UTF-8"))?;
+            visit(text, &positions)?;
         }
         if body.remaining() != 0 {
             return Err(Error::Corrupt("forward record length"));
         }
         Ok((
-            Self {
+            RecordHeader {
                 tid,
                 doc_len,
-                terms,
+                term_count,
             },
             total,
         ))

@@ -26,20 +26,21 @@ use layout::{
     BufferState, CHAIN_CAPACITY, KIND_BUFFER, KIND_FREE, KIND_META, KIND_RUN, MAX_PENDING,
     MAX_SEGMENTS, Meta, NONE, PAGE_SIZE, Pending, Run, SPECIAL_SIZE, SegmentEntry,
 };
-use pgrx::{FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, pg_sys};
+use pgrx::{FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgRelation, pg_sys};
 use segment::Tid;
 use segment::forward::ForwardRecord;
+use segment::index::{Index, MutableIndex};
 use segment::postings::{Postings, PostingsBuilder};
+use segment::segment::Reader;
 use segment::segment::{Segment, SegmentBuilder};
 use segment::set::{Cursor, Difference, Intersection};
+use segment::source::PageSource;
 use tinql::runtime::Query;
 use tinql::runtime::plan::{Limits, plan};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
 /// The write buffer folds into a segment past this many bytes.
 pub const BUFFER_MAX_BYTES: usize = 4 * 1024 * 1024;
-/// Backend-local cache of immutable segment bytes.
-const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const BITMAP_BATCH: usize = 1024;
 
 /// Documents the write buffer holds before folding into a segment.
@@ -314,6 +315,11 @@ unsafe fn read_run(index: pg_sys::Relation, run: Run) -> Vec<u8> {
 /// Writes a blob as a new chain of run pages, last page first so each page
 /// can carry its successor's block number.
 unsafe fn write_run(index: pg_sys::Relation, data: &[u8]) -> Run {
+    unsafe { write_run_with_map(index, data).0 }
+}
+
+/// Writes a run and returns its block numbers in order.
+unsafe fn write_run_with_map(index: pg_sys::Relation, data: &[u8]) -> (Run, Vec<u32>) {
     unsafe {
         let chunks: Vec<&[u8]> = if data.is_empty() {
             vec![&[][..]]
@@ -321,6 +327,7 @@ unsafe fn write_run(index: pg_sys::Relation, data: &[u8]) -> Run {
             data.chunks(CHAIN_CAPACITY).collect()
         };
         let mut next = NONE;
+        let mut blocks = Vec::with_capacity(chunks.len());
         for chunk in chunks.iter().rev() {
             pgrx::check_for_interrupts!();
             let buffer = Buffer::allocate(index);
@@ -332,12 +339,122 @@ unsafe fn write_run(index: pg_sys::Relation, data: &[u8]) -> Run {
                 &layout::chain_payload(next, chunk),
             );
             next = buffer.block();
+            blocks.push(next);
         }
-        Run {
-            first: next,
-            blocks: chunks.len() as u32,
-            bytes: data.len() as u32,
+        blocks.reverse();
+        (
+            Run {
+                first: next,
+                blocks: chunks.len() as u32,
+                bytes: data.len() as u32,
+            },
+            blocks,
+        )
+    }
+}
+
+/// Writes a segment run and its page table; returns both runs.
+unsafe fn write_segment_run(index: pg_sys::Relation, data: &[u8]) -> (Run, Run) {
+    unsafe {
+        let (run, blocks) = write_run_with_map(index, data);
+        let mut table = Vec::with_capacity(blocks.len() * 4);
+        for block in blocks {
+            table.extend_from_slice(&block.to_le_bytes());
         }
+        (run, write_run(index, &table))
+    }
+}
+
+fn decode_page_table(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// Page tables by (index identity, segment generation).
+type PageTables = HashMap<(u64, u32), Rc<Vec<u32>>>;
+
+thread_local! {
+    static PAGE_TABLES: RefCell<PageTables> = RefCell::new(HashMap::new());
+}
+
+/// A segment run's page table, cached per backend by index identity and
+/// generation. Generations never repeat within an identity.
+unsafe fn page_table(index: pg_sys::Relation, identity: u64, entry: &SegmentEntry) -> Rc<Vec<u32>> {
+    let key = (identity, entry.generation);
+    if let Some(table) = PAGE_TABLES.with_borrow(|tables| tables.get(&key).cloned()) {
+        return table;
+    }
+    let table = Rc::new(decode_page_table(&unsafe { read_run(index, entry.map) }));
+    if table.len() != entry.run.blocks as usize {
+        pgrx::error!("Lead segment page table does not match its run; REINDEX required");
+    }
+    PAGE_TABLES.with_borrow_mut(|tables| {
+        if tables.len() > 4096 {
+            tables.clear();
+        }
+        tables.insert(key, table.clone());
+    });
+    table
+}
+
+/// Serves a segment run page by page, copying each page once per view.
+///
+/// The relation is looked up per page read rather than held open, because a
+/// view may be cached across statements by the scorer and a relcache
+/// reference cannot outlive the statement that took it.
+/// Pages copied out of shared buffers, by page index within the run.
+type PageCache = RefCell<HashMap<u64, Rc<[u8]>>>;
+
+pub struct RunSource {
+    index_oid: pg_sys::Oid,
+    run: Run,
+    table: Rc<Vec<u32>>,
+    pages: PageCache,
+}
+
+impl PageSource for RunSource {
+    fn page_len(&self) -> usize {
+        CHAIN_CAPACITY
+    }
+
+    fn pages(&self) -> u64 {
+        u64::from(self.run.blocks)
+    }
+
+    fn data_len(&self) -> u64 {
+        u64::from(self.run.bytes)
+    }
+
+    fn page(&self, index: u64) -> segment::Result<Vec<u8>> {
+        if let Some(page) = self.pages.borrow().get(&index) {
+            return Ok(page.to_vec());
+        }
+        let block = *self
+            .table
+            .get(index as usize)
+            .ok_or(segment::Error::Truncated)?;
+        // SAFETY: the transaction still holds the lock the planner or scan
+        // took on the index; the relcache reference is scoped to this read.
+        let data: Rc<[u8]> = unsafe {
+            let index = pg_sys::RelationIdGetRelation(self.index_oid);
+            if index.is_null() {
+                pgrx::error!("Lead index no longer exists");
+            }
+            let data = {
+                let buffer = Buffer::read(index, block, false);
+                if buffer.kind() != KIND_RUN {
+                    pgrx::error!("Lead run page has the wrong kind; REINDEX required");
+                }
+                let (_, data) = checked(layout::chain(buffer.page()));
+                Rc::from(data)
+            };
+            pg_sys::RelationClose(index);
+            data
+        };
+        self.pages.borrow_mut().insert(index, data.clone());
+        Ok(data.to_vec())
     }
 }
 
@@ -360,52 +477,102 @@ fn release(meta: &mut Meta, run: Run) {
     });
 }
 
-// --- Segment cache ------------------------------------------------------------
+// --- Write buffer index -------------------------------------------------------
 
-struct Cache {
-    total: usize,
-    entries: HashMap<(u64, u32, u32), Rc<Vec<u8>>>,
+/// The write buffer as an in-memory index that grows with the buffer. Appends
+/// only extend the stream, so the index absorbs the bytes past `covered` on
+/// each use; a fold or VACUUM rewrite starts a new epoch and a new index.
+/// Block numbers of buffer pages are remembered so the tail is reached
+/// without walking the chain from its head.
+struct BufferIndex {
+    identity: u64,
+    epoch: u32,
+    covered: usize,
+    pages: Vec<u32>,
+    index: Rc<MutableIndex>,
 }
 
 thread_local! {
-    static SEGMENTS: RefCell<Cache> = RefCell::new(Cache { total: 0, entries: HashMap::new() });
+    static BUFFER_INDEX: RefCell<Option<BufferIndex>> = const { RefCell::new(None) };
 }
 
-fn cached(key: (u64, u32, u32), load: impl FnOnce() -> Vec<u8>) -> Rc<Vec<u8>> {
-    if let Some(bytes) = SEGMENTS.with_borrow(|cache| cache.entries.get(&key).cloned()) {
-        return bytes;
-    }
-    let bytes = Rc::new(load());
-    SEGMENTS.with_borrow_mut(|cache| {
-        if cache.total + bytes.len() > CACHE_BYTES {
-            cache.entries.clear();
-            cache.total = 0;
+/// Reads buffer bytes `[from, to)` using and extending the page map.
+unsafe fn read_buffer_range(
+    index: pg_sys::Relation,
+    pages: &mut Vec<u32>,
+    from: usize,
+    to: usize,
+) -> Vec<u8> {
+    unsafe {
+        let mut out = Vec::with_capacity(to - from);
+        let mut at = from;
+        while at < to {
+            pgrx::check_for_interrupts!();
+            let page = at / CHAIN_CAPACITY;
+            while pages.len() <= page {
+                // Follow the chain from the last known page to discover the next.
+                let last = *pages.last().expect("head is always known");
+                let buffer = Buffer::read(index, last, false);
+                let (next, _) = checked(layout::chain(buffer.page()));
+                if next == NONE {
+                    pgrx::error!("Lead write buffer ends early; REINDEX required");
+                }
+                pages.push(next);
+            }
+            let buffer = Buffer::read(index, pages[page], false);
+            if buffer.kind() != KIND_BUFFER {
+                pgrx::error!("Lead write buffer page has the wrong kind; REINDEX required");
+            }
+            let (_, data) = checked(layout::chain(buffer.page()));
+            let within = at % CHAIN_CAPACITY;
+            let take = (to - at).min(data.len().saturating_sub(within));
+            if take == 0 {
+                pgrx::error!("Lead write buffer page is short; REINDEX required");
+            }
+            out.extend_from_slice(&data[within..within + take]);
+            at += take;
         }
-        cache.total += bytes.len();
-        cache.entries.insert(key, bytes.clone());
-    });
-    bytes
+        out
+    }
 }
 
-unsafe fn cached_segment(
+/// The buffer's index for the current state, extended with any records
+/// appended since it was last used.
+unsafe fn buffer_index(
     index: pg_sys::Relation,
     identity: u64,
-    entry: &SegmentEntry,
-) -> Rc<Vec<u8>> {
-    cached((identity, entry.run.first, entry.generation), || unsafe {
-        read_run(index, entry.run)
-    })
-}
-
-/// The write buffer as an in-memory segment, rebuilt only when it changes.
-fn cached_buffer_segment(identity: u64, version: u32, stream: &[u8]) -> Rc<Vec<u8>> {
-    cached((identity, NONE, version), || {
-        let mut builder = SegmentBuilder::default();
-        for record in segment::forward::records(stream) {
-            codec(builder.add_record(&codec(record)));
+    state: &BufferState,
+) -> Rc<MutableIndex> {
+    let cache = BUFFER_INDEX.with_borrow_mut(Option::take);
+    let mut entry = match cache {
+        Some(entry)
+            if entry.identity == identity
+                && entry.epoch == state.epoch
+                && entry.covered <= state.bytes as usize =>
+        {
+            entry
         }
-        builder.finish()
-    })
+        _ => BufferIndex {
+            identity,
+            epoch: state.epoch,
+            covered: 0,
+            pages: vec![state.head],
+            index: Rc::new(MutableIndex::default()),
+        },
+    };
+    if entry.covered < state.bytes as usize {
+        let tail = unsafe {
+            read_buffer_range(index, &mut entry.pages, entry.covered, state.bytes as usize)
+        };
+        let mut at = 0;
+        while at < tail.len() {
+            at += codec(entry.index.add_encoded(&tail[at..]));
+        }
+        entry.covered = state.bytes as usize;
+    }
+    let result = entry.index.clone();
+    BUFFER_INDEX.with_borrow_mut(|slot| *slot = Some(entry));
+    result
 }
 
 unsafe fn dead_set(index: pg_sys::Relation, entry: &SegmentEntry) -> BTreeSet<Tid> {
@@ -513,6 +680,7 @@ unsafe fn replace_buffer(index: pg_sys::Relation, state: &mut BufferState, data:
     state.bytes = 0;
     state.docs = docs;
     state.version = state.version.wrapping_add(1);
+    state.epoch = state.epoch.wrapping_add(1);
     unsafe { append_to_buffer(index, state, data) };
 }
 
@@ -531,11 +699,12 @@ unsafe fn add_segment(
         if meta.segments.len() >= max_segments() {
             merge_all(index, meta);
         }
-        let run = write_run(index, blob);
+        let (run, map) = write_segment_run(index, blob);
         let generation = meta.next_generation;
         meta.next_generation = meta.next_generation.wrapping_add(1);
         meta.segments.push(SegmentEntry {
             run,
+            map,
             dead: Run::EMPTY,
             docs,
             total_length,
@@ -558,7 +727,7 @@ unsafe fn merge_all(index: pg_sys::Relation, meta: &mut Meta) {
         let old = std::mem::take(&mut meta.segments);
         for entry in &old {
             pgrx::check_for_interrupts!();
-            let bytes = cached_segment(index, meta.identity, entry);
+            let bytes = read_run(index, entry.run);
             let segment = codec(Segment::parse(&bytes));
             let dead = dead_set(index, entry);
             for record in codec(segment.records(|tid| dead.contains(&tid))) {
@@ -566,11 +735,12 @@ unsafe fn merge_all(index: pg_sys::Relation, meta: &mut Meta) {
             }
         }
         let (blob, docs, total_length) = finish_builder(builder);
-        let run = write_run(index, &blob);
+        let (run, map) = write_segment_run(index, &blob);
         let generation = meta.next_generation;
         meta.next_generation = meta.next_generation.wrapping_add(1);
         meta.segments.push(SegmentEntry {
             run,
+            map,
             dead: Run::EMPTY,
             docs,
             total_length,
@@ -578,6 +748,7 @@ unsafe fn merge_all(index: pg_sys::Relation, meta: &mut Meta) {
         });
         for entry in old {
             release(meta, entry.run);
+            release(meta, entry.map);
             release(meta, entry.dead);
         }
     }
@@ -601,6 +772,7 @@ unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
         meta.buffer.bytes = 0;
         meta.buffer.docs = 0;
         meta.buffer.version = meta.buffer.version.wrapping_add(1);
+        meta.buffer.epoch = meta.buffer.epoch.wrapping_add(1);
     }
 }
 
@@ -638,6 +810,7 @@ pub unsafe fn build_empty(index: pg_sys::Relation) {
             spec: crate::options::encode_spec(&spec),
             buffer: BufferState {
                 version: 0,
+                epoch: 0,
                 head: 1,
                 tail: 1,
                 tail_used: 0,
@@ -765,45 +938,53 @@ pub unsafe fn insert(
 
 // --- Scan ---------------------------------------------------------------------
 
-/// One searchable unit: segment bytes and an optional dead list.
-pub type Source = (Rc<Vec<u8>>, Option<Vec<u8>>);
+/// A queryable index (a lazily read segment or the buffer's in-memory index)
+/// plus its dead list, if any.
+pub type Source = (Box<dyn Index>, Option<Vec<u8>>);
 
 /// Everything a scan or a scorer needs from an index, captured under one
 /// shared meta lock so the buffer and directory are mutually consistent.
+/// Segment pages are fetched on demand through the readers; the view keeps
+/// the index relation open for as long as it lives.
 pub struct View {
-    /// Immutable segments, then the write buffer as an in-memory segment.
+    /// Immutable segments first, then the write buffer as in-memory segments.
     pub sources: Vec<Source>,
-    /// Index of the buffer source within `sources`, if the buffer is non-empty.
-    pub buffer_source: Option<usize>,
+    /// How many leading entries of `sources` are immutable segments.
+    pub immutable_sources: usize,
 }
 
 /// # Safety
-/// `index` is a live LDP2 index.
-pub unsafe fn view(index: pg_sys::Relation) -> View {
+/// `index_oid` names a live LDP2 index the caller may open.
+pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
     unsafe {
+        let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
+        let index = relation.as_ptr();
         let (meta_buffer, meta) = read_meta(index, false);
-        // The buffer is read under the shared meta lock so a fold cannot
-        // rewrite it underneath us.
-        let stream = read_buffer_stream(index, &meta.buffer);
-        drop(meta_buffer);
         let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
         for entry in &meta.segments {
             pgrx::check_for_interrupts!();
-            let bytes = cached_segment(index, meta.identity, entry);
+            let source: Box<dyn segment::source::Source> = Box::new(RunSource {
+                index_oid,
+                run: entry.run,
+                table: page_table(index, meta.identity, entry),
+                pages: PageCache::new(HashMap::new()),
+            });
+            let reader: Box<dyn Index> = Box::new(codec(Reader::new(source)));
             let dead_bytes = (!entry.dead.is_empty()).then(|| read_run(index, entry.dead));
-            sources.push((bytes, dead_bytes));
+            sources.push((reader, dead_bytes));
         }
-        let mut buffer_source = None;
+        let immutable_sources = sources.len();
         if meta.buffer.docs > 0 {
-            buffer_source = Some(sources.len());
-            sources.push((
-                cached_buffer_segment(meta.identity, meta.buffer.version, &stream),
-                None,
-            ));
+            let buffer = buffer_index(index, meta.identity, &meta.buffer);
+            sources.push((Box::new(buffer), None));
         }
+        // Segments are immutable; the buffer index was extended under the
+        // shared meta lock, so a fold cannot rewrite pages underneath it.
+        drop(meta_buffer);
+        drop(relation);
         View {
             sources,
-            buffer_source,
+            immutable_sources,
         }
     }
 }
@@ -819,7 +1000,7 @@ pub unsafe fn scan(
     bitmap: *mut pg_sys::TIDBitmap,
 ) -> i64 {
     unsafe {
-        let view = view(index);
+        let view = view((*index).rd_id);
         let limits = Limits::default();
         let mut added = 0i64;
         let mut pending: Vec<pg_sys::ItemPointerData> = Vec::with_capacity(BITMAP_BATCH);
@@ -830,13 +1011,12 @@ pub unsafe fn scan(
             }
         };
 
-        for (bytes, dead_bytes) in &view.sources {
+        for (segment, dead_bytes) in &view.sources {
             pgrx::check_for_interrupts!();
-            let segment = codec(Segment::parse(bytes));
             let mut exact = true;
             let mut cursors: Vec<Box<dyn Cursor>> = Vec::with_capacity(queries.len());
             for query in queries {
-                let plan = plan(query, &segment, &limits)
+                let plan = plan(query, segment, &limits)
                     .unwrap_or_else(|error| pgrx::error!("Lead query plan: {error}"));
                 exact &= plan.exact;
                 cursors.push(plan.cursor);
@@ -887,7 +1067,7 @@ pub unsafe fn bulk_delete(
         for i in 0..meta.segments.len() {
             pgrx::check_for_interrupts!();
             let entry = meta.segments[i];
-            let bytes = cached_segment(index, meta.identity, &entry);
+            let bytes = read_run(index, entry.run);
             let segment = codec(Segment::parse(&bytes));
             let mut dead = dead_set(index, &entry);
             let before = dead.len();
@@ -956,24 +1136,26 @@ pub unsafe fn cleanup(index: pg_sys::Relation) {
             let dead: BTreeSet<Tid> = codec(Postings::parse(&dead_bytes).and_then(|p| p.to_vec()))
                 .into_iter()
                 .collect();
-            let bytes = cached_segment(index, meta.identity, &entry);
+            let bytes = read_run(index, entry.run);
             let segment = codec(Segment::parse(&bytes));
             let mut builder = SegmentBuilder::default();
             for record in codec(segment.records(|tid| dead.contains(&tid))) {
                 codec(builder.add_record(&record));
             }
             let (blob, docs, total_length) = finish_builder(builder);
-            let run = write_run(index, &blob);
+            let (run, map) = write_segment_run(index, &blob);
             let generation = meta.next_generation;
             meta.next_generation = meta.next_generation.wrapping_add(1);
             meta.segments[i] = SegmentEntry {
                 run,
+                map,
                 dead: Run::EMPTY,
                 docs,
                 total_length,
                 generation,
             };
             release(&mut meta, entry.run);
+            release(&mut meta, entry.map);
             release(&mut meta, entry.dead);
         }
         let mut still_pending = Vec::new();

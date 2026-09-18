@@ -64,7 +64,7 @@ impl PayloadBuilder {
     }
 }
 
-pub(crate) fn validate_positions(positions: &[u32]) -> Result<()> {
+pub fn validate_positions(positions: &[u32]) -> Result<()> {
     if positions.is_empty() || positions.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(Error::InvalidPositions);
     }

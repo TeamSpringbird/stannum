@@ -9,8 +9,8 @@ use pgrx::{
 };
 use rustc_hash::FxHashMap;
 use segment::Tid;
+use segment::index::{Expanded, Index, Window};
 use segment::postings::Postings;
-use segment::segment::Segment;
 use segment::set::Cursor as _;
 use segment::tf_bucket::TfBucket;
 use std::cell::RefCell;
@@ -24,7 +24,6 @@ use tinql::runtime::{
 use tokenizer::Tokenizer;
 
 use crate::storage::View;
-use std::rc::Rc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheKey {
@@ -80,12 +79,11 @@ struct TermReader {
 
 impl SourceReader {
     /// # Safety
-    /// `bytes` must stay alive and unmoved for as long as the reader exists.
-    /// The owning `IndexScorer` keeps the `Rc` in `view` and drops readers first.
-    unsafe fn new(bytes: &Rc<Vec<u8>>, terms: &[(String, TermScorer)]) -> Self {
-        let bytes: &'static [u8] =
-            unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
-        let segment = segment_error(Segment::parse(bytes));
+    /// `segment` must stay alive and unmoved for as long as this reader exists:
+    /// the owning `IndexScorer` keeps it in `view` and drops readers first.
+    unsafe fn new(segment: &dyn Index, terms: &[(String, TermScorer)]) -> Self {
+        let segment: &'static (dyn Index + 'static) =
+            unsafe { std::mem::transmute::<&dyn Index, &'static (dyn Index + 'static)>(segment) };
         let documents = segment_error(segment.documents());
         let terms = terms
             .iter()
@@ -284,7 +282,7 @@ impl IndexScorer {
             }
             if self.sources[i].behind(tid) {
                 self.sources[i] =
-                    unsafe { SourceReader::new(&self.view.sources[i].0, &self.terms) };
+                    unsafe { SourceReader::new(&*self.view.sources[i].0, &self.terms) };
             }
             let reader = &mut self.sources[i];
             reader.last = Some(tid);
@@ -443,12 +441,8 @@ fn build_index_scorer(
         stop_csv.as_deref().and_then(ScoreStopWords::from_csv)
     };
 
-    let view = unsafe { crate::storage::view(index.as_ptr()) };
-    let segments: Vec<Segment<'_>> = view
-        .sources
-        .iter()
-        .map(|(bytes, _)| segment_error(Segment::parse(bytes)))
-        .collect();
+    let view = unsafe { crate::storage::view(index.oid()) };
+    let segments: Vec<&dyn Index> = view.sources.iter().map(|(index, _)| &**index).collect();
     let mut collected = Collected::default();
     collect_score_terms(&query, 1.0, false, &mut collected);
     let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
@@ -465,7 +459,7 @@ fn build_index_scorer(
         .collect();
     // Statistics include dead documents until their segment is rewritten,
     // and buffered documents immediately; elision uses immutable segments only.
-    let is_immutable = |i: usize| view.buffer_source != Some(i);
+    let is_immutable = |i: usize| i < view.immutable_sources;
     let total_docs: u64 = segments.iter().map(|s| u64::from(s.document_count())).sum();
     let immutable_docs: u64 = segments
         .iter()
@@ -473,7 +467,7 @@ fn build_index_scorer(
         .filter(|(i, _)| is_immutable(*i))
         .map(|(_, s)| u64::from(s.document_count()))
         .sum();
-    let total_length: u64 = segments.iter().map(Segment::total_length).sum();
+    let total_length: u64 = segments.iter().map(|s| s.total_length()).sum();
     let average_length = if total_docs == 0 {
         1.0
     } else {
@@ -484,8 +478,7 @@ fn build_index_scorer(
         let mut total_df = 0u64;
         let mut immutable_df = 0u64;
         for (i, segment) in segments.iter().enumerate() {
-            let df = segment_error(segment.dictionary().get(term.text()))
-                .map_or(0, |entry| u64::from(entry.df));
+            let df = segment_error(segment.term(term.text())).map_or(0, |t| u64::from(t.df()));
             total_df += df;
             if is_immutable(i) {
                 immutable_df += df;
@@ -504,7 +497,7 @@ fn build_index_scorer(
     let sources = view
         .sources
         .iter()
-        .map(|(bytes, _)| unsafe { SourceReader::new(bytes, &scorers) })
+        .map(|(index, _)| unsafe { SourceReader::new(&**index, &scorers) })
         .collect();
     IndexScorer {
         key,
@@ -525,9 +518,8 @@ impl IndexScorer {
             return max;
         }
         let mut candidates = BTreeSet::new();
-        for (i, (bytes, _)) in self.view.sources.iter().enumerate() {
-            let segment = segment_error(Segment::parse(bytes));
-            let planned = plan(&self.query, &segment, &Limits::default())
+        for (i, (segment, _)) in self.view.sources.iter().enumerate() {
+            let planned = plan(&self.query, &**segment, &Limits::default())
                 .unwrap_or_else(|error| pgrx::error!("Lead query plan: {error}"));
             let mut cursor = planned.cursor;
             while let Some(tid) = cursor.current() {
@@ -549,7 +541,7 @@ impl IndexScorer {
             .view
             .sources
             .iter()
-            .map(|(bytes, _)| unsafe { SourceReader::new(bytes, &self.terms) })
+            .map(|(index, _)| unsafe { SourceReader::new(&**index, &self.terms) })
             .collect();
         self.max = Some(max);
         max
@@ -736,42 +728,36 @@ impl Expansion<'_> {
         }
     }
 
-    /// Every matching term across the given dictionaries.
-    fn expand_in(&self, segments: &[Segment<'_>]) -> Vec<String> {
+    /// Every matching term across the given indexes.
+    fn expand_in(&self, segments: &[&dyn Index]) -> Vec<String> {
         let mut found = BTreeSet::new();
+        let matcher = self.matcher();
         for segment in segments {
-            let dictionary = segment.dictionary();
-            let items: Box<dyn Iterator<Item = segment::Result<(String, _)>>> = match self {
+            let expanded = match self {
                 Self::Regex(regex) => match regex.pure_prefix() {
-                    Some(prefix) => {
-                        Box::new(dictionary.prefix(&prefix).collect::<Vec<_>>().into_iter())
-                    }
-                    None => Box::new(dictionary.iter()),
+                    Some(prefix) => segment.expand(Window::Prefix(&prefix), &|_| true, usize::MAX),
+                    None => segment.expand(Window::All, &*matcher, usize::MAX),
                 },
                 Self::Range(lower, upper) => {
-                    let bound = |bound: &RangeBound| match bound {
-                        RangeBound::Open => None,
-                        RangeBound::Term(term) => Some(term.clone()),
-                    };
-                    let (lower, upper) = (bound(lower), bound(upper));
-                    Box::new(
-                        dictionary
-                            .range(lower.as_deref(), upper.as_deref())
-                            .collect::<Vec<_>>()
-                            .into_iter(),
+                    fn bound(bound: &RangeBound) -> Option<&str> {
+                        match bound {
+                            RangeBound::Open => None,
+                            RangeBound::Term(term) => Some(term.as_str()),
+                        }
+                    }
+                    segment.expand(
+                        Window::Range(bound(lower), bound(upper)),
+                        &|_| true,
+                        usize::MAX,
                     )
                 }
                 Self::Fuzzy { term, prefix, .. } => {
                     let fixed: String = term.chars().take(*prefix as usize).collect();
-                    Box::new(dictionary.prefix(&fixed).collect::<Vec<_>>().into_iter())
+                    segment.expand(Window::Prefix(&fixed), &*matcher, usize::MAX)
                 }
             };
-            let matcher = self.matcher();
-            for item in items {
-                let (term, _) = segment_error(item);
-                if matcher(&term) {
-                    found.insert(term);
-                }
+            if let Expanded::Terms(terms) = segment_error(expanded) {
+                found.extend(terms.into_iter().map(|(t, _)| t));
             }
         }
         found.into_iter().collect()
@@ -973,15 +959,11 @@ fn score_inspect(
     let mut collected = Collected::default();
     collect_score_terms(&parsed, 1.0, false, &mut collected);
     let rows = if unsafe { crate::storage::present(index.as_ptr()) } {
-        let view = unsafe { crate::storage::view(index.as_ptr()) };
-        let segments: Vec<Segment<'_>> = view
-            .sources
-            .iter()
-            .map(|(bytes, _)| segment_error(Segment::parse(bytes)))
-            .collect();
+        let view = unsafe { crate::storage::view(index.oid()) };
+        let segments: Vec<&dyn Index> = view.sources.iter().map(|(index, _)| &**index).collect();
         let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
         let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
-        let is_immutable = |i: usize| view.buffer_source != Some(i);
+        let is_immutable = |i: usize| i < view.immutable_sources;
         let immutable_docs: u64 = segments
             .iter()
             .enumerate()
@@ -993,8 +975,8 @@ fn score_inspect(
             .filter_map(|term| {
                 let (mut total_df, mut immutable_df) = (0u64, 0u64);
                 for (i, segment) in segments.iter().enumerate() {
-                    let df = segment_error(segment.dictionary().get(term.text()))
-                        .map_or(0, |entry| u64::from(entry.df));
+                    let df =
+                        segment_error(segment.term(term.text())).map_or(0, |t| u64::from(t.df()));
                     total_df += df;
                     if is_immutable(i) {
                         immutable_df += df;

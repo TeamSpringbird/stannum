@@ -179,6 +179,25 @@ also running a Docker benchmark campaign), so treat ratios as coarse.
 | phrase ranked | 0.69 | 0.61 |
 | OR ranked (10,000 scored) | 1.32 | 14.6 |
 
+At 100,000 Wikipedia articles (median of five, warm session, page-granular
+reads with the incremental buffer index):
+
+| Query | TIN, ms | Lead, ms |
+| --- | ---: | ---: |
+| miss count | 0.25 | 0.2 |
+| rare count (8 matches) | 0.38 | 0.2 |
+| common count (22,063 matches) | 3.3 | 0.9 |
+| AND count | 2.5 | 0.8 |
+| phrase "united states" count (15,381) | 5.3 | 2.5 |
+| rare ranked, top 10 | 0.91 | 1.8 |
+| common ranked | 2.4 | 8.2 |
+| phrase "united states" ranked | 6.5 | 9.4 |
+| OR ranked | 1.4 | 2.6 |
+
+Counts are now at or below TIN; ranked queries over broad terms are 2 to 3x
+slower because Lead scores every candidate before the top-k heap. Block-max
+pruning inside the custom scan is the remaining gap.
+
 Selective shapes are within about 1.5x either way. The broad `OR` is where
 TIN's count strategies and in-scan top-k bound pay off: Lead still drains
 every posting into a bitmap and scores every matching row through the

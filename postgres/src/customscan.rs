@@ -25,7 +25,6 @@ use pgrx::{
     pg_sys,
 };
 use segment::Tid;
-use segment::segment::Segment;
 use segment::set::Cursor as _;
 use tinql::runtime::Query;
 use tinql::runtime::plan::{Limits, plan};
@@ -757,23 +756,19 @@ unsafe extern "C-unwind" fn begin_scan(
 /// Gathers the matching TIDs from the index, in output order.
 unsafe fn gather(exec: &mut ScanExec) {
     unsafe {
-        let index = pg_sys::index_open(
-            pg_sys::Oid::from(exec.private.index_oid),
-            pg_sys::AccessShareLock as _,
-        );
+        let index_oid = pg_sys::Oid::from(exec.private.index_oid);
+        let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
         let tokenizer = crate::storage::index_tokenizer(index);
+        pg_sys::index_close(index, pg_sys::AccessShareLock as _);
         let query: Query =
             tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
                 .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
-        let view = crate::storage::view(index);
-        pg_sys::index_close(index, pg_sys::AccessShareLock as _);
+        let view = crate::storage::view(index_oid);
         let limits = Limits::default();
         let mut tids = Vec::new();
-        for (bytes, dead) in &view.sources {
+        for (segment, dead) in &view.sources {
             pgrx::check_for_interrupts!();
-            let segment = Segment::parse(bytes)
-                .unwrap_or_else(|error| pgrx::error!("Lead index data: {error}; REINDEX required"));
-            let planned = plan(&query, &segment, &limits)
+            let planned = plan(&query, segment, &limits)
                 .unwrap_or_else(|error| pgrx::error!("Lead query plan: {error}"));
             let mut cursor: Box<dyn segment::set::Cursor> = planned.cursor;
             // A capped expansion yields a superset; those rows are rechecked.

@@ -22,12 +22,16 @@
 
 use std::collections::BTreeMap;
 
-use crate::dictionary::{Dictionary, DictionaryBuilder, Extent, TermEntry};
+use std::cell::{OnceCell, RefCell};
+
+use crate::dictionary::{
+    BlockFetch, Blocks, Dictionary, DictionaryBuilder, DictionaryIndex, Extent, TermEntry,
+};
 use crate::forward::{ForwardRecord, ForwardTerm};
 use crate::payload::{Payload, PayloadBuilder};
 use crate::postings::{Postings, PostingsBuilder, PostingsCursor};
-use crate::reader::Reader;
 use crate::set::Cursor as _;
+use crate::source::Source;
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Result, Tid, varint};
 
@@ -162,21 +166,26 @@ impl SegmentBuilder {
     }
 }
 
-/// A term resolved against a segment.
-#[derive(Clone, Copy, Debug)]
+/// A term resolved against a segment. Postings and payload bytes are fetched
+/// only when a cursor asks for them, so Boolean queries never read positions.
+#[derive(Clone, Copy)]
 pub struct Term<'a> {
     pub entry: TermEntry,
-    postings: &'a [u8],
-    payload: &'a [u8],
+    areas: &'a dyn AreaFetch,
 }
 
 impl<'a> Term<'a> {
+    /// A term over any area provider, such as the mutable index.
+    pub const fn new(entry: TermEntry, areas: &'a dyn AreaFetch) -> Self {
+        Self { entry, areas }
+    }
+
     pub const fn df(&self) -> u32 {
         self.entry.df
     }
 
     pub fn postings(&self) -> Result<Postings<'a>> {
-        Postings::parse(self.postings)
+        Postings::parse(self.areas.postings_bytes(self.entry.postings)?)
     }
 
     pub fn cursor(&self) -> Result<PostingsCursor<'a>> {
@@ -184,24 +193,56 @@ impl<'a> Term<'a> {
     }
 
     pub fn payload(&self) -> Result<Payload<'a>> {
-        Payload::parse(self.payload)
+        Payload::parse(self.areas.payload_bytes(self.entry.payload)?)
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Segment<'a> {
-    doc_count: u32,
-    total_length: u64,
-    dictionary: Dictionary<'a>,
-    postings_area: &'a [u8],
-    payload_area: &'a [u8],
-    docs: &'a [u8],
-    lengths: &'a [u8],
+/// Fetches extents of the postings and payload areas and document lengths.
+pub trait AreaFetch {
+    fn postings_bytes(&self, extent: Extent) -> Result<&[u8]>;
+    fn payload_bytes(&self, extent: Extent) -> Result<&[u8]>;
+    fn length_bytes(&self, ordinal: u32) -> Result<&[u8]>;
 }
 
-impl<'a> Segment<'a> {
+#[derive(Clone, Copy, Debug)]
+struct Header {
+    doc_count: u32,
+    total_length: u64,
+    dictionary_at: u64,
+    dictionary_len: usize,
+    postings_at: u64,
+    postings_len: usize,
+    payload_at: u64,
+    payload_len: usize,
+    docs_at: u64,
+    docs_len: usize,
+    lengths_at: u64,
+}
+
+/// Reads a segment from any [`Source`], fetching only the extents a query
+/// touches. Fetched bytes live in an append-only arena for the reader's
+/// lifetime, so borrowed views stay valid however many fetches follow.
+pub struct Reader<S: Source> {
+    source: S,
+    header: Header,
+    arena: RefCell<Vec<Box<[u8]>>>,
+    dictionary: OnceCell<DictionaryIndex<'static>>,
+}
+
+/// A segment held entirely in memory.
+pub type Segment<'a> = Reader<&'a [u8]>;
+
+impl<'a> Reader<&'a [u8]> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        let mut reader = Reader::new(bytes);
+        Self::new(bytes)
+    }
+}
+
+impl<S: Source> Reader<S> {
+    pub fn new(source: S) -> Result<Self> {
+        let total = source.len();
+        let head = source.read(0, (total.min(64)) as usize)?;
+        let mut reader = crate::reader::Reader::new(&head);
         if reader.take(MAGIC.len())? != MAGIC {
             return Err(Error::Corrupt("segment magic"));
         }
@@ -211,59 +252,112 @@ impl<'a> Segment<'a> {
         let postings_len = reader.varint_u32()? as usize;
         let payload_len = reader.varint_u32()? as usize;
         let docs_len = reader.varint_u32()? as usize;
-        let dictionary = Dictionary::parse(reader.take(dictionary_len)?)?;
-        let postings_area = reader.take(postings_len)?;
-        let payload_area = reader.take(payload_len)?;
-        let docs = reader.take(docs_len)?;
-        let lengths = reader.take(doc_count as usize * 4)?;
-        if reader.remaining() != 0 {
-            return Err(Error::Corrupt("segment trailing bytes"));
-        }
-        if Postings::parse(docs)?.count() != doc_count {
-            return Err(Error::Corrupt("segment document count"));
+        let dictionary_at = reader.position() as u64;
+        let postings_at = dictionary_at + dictionary_len as u64;
+        let payload_at = postings_at + postings_len as u64;
+        let docs_at = payload_at + payload_len as u64;
+        let lengths_at = docs_at + docs_len as u64;
+        if lengths_at + u64::from(doc_count) * 4 != total {
+            return Err(Error::Corrupt("segment length"));
         }
         Ok(Self {
-            doc_count,
-            total_length,
-            dictionary,
-            postings_area,
-            payload_area,
-            docs,
-            lengths,
+            source,
+            header: Header {
+                doc_count,
+                total_length,
+                dictionary_at,
+                dictionary_len,
+                postings_at,
+                postings_len,
+                payload_at,
+                payload_len,
+                docs_at,
+                docs_len,
+                lengths_at,
+            },
+            arena: RefCell::new(Vec::new()),
+            dictionary: OnceCell::new(),
         })
     }
 
+    /// Bytes `[offset, offset + len)` of the source, borrowed for as long as
+    /// this reader lives.
+    fn load(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        if let Some(slice) = self.source.slice(offset, len) {
+            return Ok(slice);
+        }
+        let bytes = self.source.read(offset, len)?.into_boxed_slice();
+        let pointer: *const [u8] = &*bytes;
+        self.arena.borrow_mut().push(bytes);
+        // SAFETY: the box was just moved into the arena, which only ever
+        // grows and is dropped with `self`; the heap allocation never moves.
+        Ok(unsafe { &*pointer })
+    }
+
     pub const fn document_count(&self) -> u32 {
-        self.doc_count
+        self.header.doc_count
     }
 
     /// Sum of document lengths, for average-length normalization.
     pub const fn total_length(&self) -> u64 {
-        self.total_length
+        self.header.total_length
     }
 
-    pub const fn dictionary(&self) -> &Dictionary<'a> {
-        &self.dictionary
+    fn dictionary_index(&self) -> Result<&DictionaryIndex<'_>> {
+        if let Some(index) = self.dictionary.get() {
+            return Ok(index);
+        }
+        let probe = self.load(
+            self.header.dictionary_at,
+            self.header.dictionary_len.min(32),
+        )?;
+        let prefix = DictionaryIndex::prefix_len(probe)?;
+        if prefix > self.header.dictionary_len {
+            return Err(Error::Corrupt("dictionary index length"));
+        }
+        let bytes = self.load(self.header.dictionary_at, prefix)?;
+        let index = DictionaryIndex::parse(bytes)?;
+        // SAFETY: `bytes` lives in the arena for the reader's lifetime; the
+        // index is only ever handed out shortened to a borrow of `self`.
+        let index: DictionaryIndex<'static> = unsafe { std::mem::transmute(index) };
+        Ok(self.dictionary.get_or_init(|| index))
+    }
+
+    /// The dictionary, with blocks fetched on demand.
+    pub fn dictionary(&self) -> Result<Dictionary<'_>> {
+        let index = self.dictionary_index()?;
+        let blocks = if let Some(all) = self
+            .source
+            .slice(self.header.dictionary_at, self.header.dictionary_len)
+        {
+            Blocks::Slice(&all[index.header_len..])
+        } else {
+            Blocks::Lazy {
+                len: self.header.dictionary_len - index.header_len,
+                fetch: self,
+            }
+        };
+        Ok(Dictionary::new(index, blocks))
     }
 
     /// Resolves a dictionary entry obtained earlier from this segment.
-    pub fn resolve(&self, entry: TermEntry) -> Result<Term<'a>> {
-        let slice = |area: &'a [u8], extent: Extent| -> Result<&'a [u8]> {
-            let start = usize::try_from(extent.offset).map_err(|_| Error::Truncated)?;
-            let end = start
-                .checked_add(extent.len as usize)
-                .ok_or(Error::Truncated)?;
-            area.get(start..end).ok_or(Error::Truncated)
+    pub fn resolve(&self, entry: TermEntry) -> Result<Term<'_>> {
+        let within = |extent: Extent, area_len: usize| {
+            extent
+                .offset
+                .checked_add(u64::from(extent.len))
+                .is_some_and(|end| end <= area_len as u64)
         };
-        Ok(Term {
-            entry,
-            postings: slice(self.postings_area, entry.postings)?,
-            payload: slice(self.payload_area, entry.payload)?,
-        })
+        if !within(entry.postings, self.header.postings_len)
+            || !within(entry.payload, self.header.payload_len)
+        {
+            return Err(Error::Truncated);
+        }
+        Ok(Term { entry, areas: self })
     }
 
-    pub fn term(&self, term: &str) -> Result<Option<Term<'a>>> {
-        self.dictionary
+    pub fn term(&self, term: &str) -> Result<Option<Term<'_>>> {
+        self.dictionary()?
             .get(term)?
             .map(|entry| self.resolve(entry))
             .transpose()
@@ -273,7 +367,7 @@ impl<'a> Segment<'a> {
     pub fn resolve_all<'s>(
         &'s self,
         items: impl Iterator<Item = Result<(String, TermEntry)>> + 's,
-    ) -> impl Iterator<Item = Result<(String, Term<'a>)>> + 's {
+    ) -> impl Iterator<Item = Result<(String, Term<'s>)>> + 's {
         items.map(move |item| {
             let (term, entry) = item?;
             Ok((term, self.resolve(entry)?))
@@ -281,8 +375,8 @@ impl<'a> Segment<'a> {
     }
 
     /// Cursor over every document in the segment, the universe for NOT.
-    pub fn documents(&self) -> Result<PostingsCursor<'a>> {
-        Postings::parse(self.docs)?.cursor()
+    pub fn documents(&self) -> Result<PostingsCursor<'_>> {
+        Postings::parse(self.load(self.header.docs_at, self.header.docs_len)?)?.cursor()
     }
 
     /// Length of the document at `tid`, if it is in this segment.
@@ -292,6 +386,23 @@ impl<'a> Segment<'a> {
             .rank(tid)?
             .map(|ordinal| self.length_at(ordinal))
             .transpose()
+    }
+
+    /// Length by document ordinal, as reported by [`Reader::documents`].
+    pub fn length_at(&self, ordinal: u32) -> Result<u32> {
+        self.lengths().get(ordinal)
+    }
+
+    /// A copyable handle on the length table.
+    pub fn lengths(&self) -> Lengths<'_> {
+        let len = self.header.doc_count as usize * 4;
+        match self.source.slice(self.header.lengths_at, len) {
+            Some(bytes) => Lengths::Bytes(bytes),
+            None => Lengths::Lazy {
+                fetch: self,
+                count: self.header.doc_count,
+            },
+        }
     }
 
     /// Rebuilds every document as a forward record, skipping those for which
@@ -306,7 +417,7 @@ impl<'a> Segment<'a> {
             }
             documents.advance()?;
         }
-        for item in self.dictionary().iter() {
+        for item in self.dictionary()?.iter() {
             let (term, entry) = item?;
             let resolved = self.resolve(entry)?;
             let mut postings = resolved.cursor()?;
@@ -337,29 +448,59 @@ impl<'a> Segment<'a> {
         }
         Ok(out)
     }
+}
 
-    /// Length by document ordinal, as reported by [`Segment::documents`].
-    pub fn length_at(&self, ordinal: u32) -> Result<u32> {
-        self.lengths().get(ordinal)
+impl<S: Source> BlockFetch for Reader<S> {
+    fn fetch_block(&self, offset: usize, len: usize) -> Result<&[u8]> {
+        let index = self.dictionary_index()?;
+        let at = self.header.dictionary_at + index.header_len as u64 + offset as u64;
+        self.load(at, len)
+    }
+}
+
+impl<S: Source> AreaFetch for Reader<S> {
+    fn postings_bytes(&self, extent: Extent) -> Result<&[u8]> {
+        self.load(self.header.postings_at + extent.offset, extent.len as usize)
     }
 
-    /// A copyable handle on the length table.
-    pub const fn lengths(&self) -> Lengths<'a> {
-        Lengths(self.lengths)
+    fn payload_bytes(&self, extent: Extent) -> Result<&[u8]> {
+        self.load(self.header.payload_at + extent.offset, extent.len as usize)
+    }
+
+    fn length_bytes(&self, ordinal: u32) -> Result<&[u8]> {
+        if ordinal >= self.header.doc_count {
+            return Err(Error::Corrupt("document ordinal out of range"));
+        }
+        self.load(self.header.lengths_at + u64::from(ordinal) * 4, 4)
     }
 }
 
 /// Document lengths addressed by document ordinal.
-#[derive(Clone, Copy, Debug)]
-pub struct Lengths<'a>(&'a [u8]);
+#[derive(Clone, Copy)]
+pub enum Lengths<'a> {
+    Bytes(&'a [u8]),
+    Lazy {
+        fetch: &'a dyn AreaFetch,
+        count: u32,
+    },
+}
 
 impl Lengths<'_> {
     pub fn get(&self, ordinal: u32) -> Result<u32> {
-        let at = ordinal as usize * 4;
-        let bytes = self
-            .0
-            .get(at..at + 4)
-            .ok_or(Error::Corrupt("document ordinal out of range"))?;
+        let bytes = match self {
+            Self::Bytes(bytes) => {
+                let at = ordinal as usize * 4;
+                bytes
+                    .get(at..at + 4)
+                    .ok_or(Error::Corrupt("document ordinal out of range"))?
+            }
+            Self::Lazy { fetch, count } => {
+                if ordinal >= *count {
+                    return Err(Error::Corrupt("document ordinal out of range"));
+                }
+                fetch.length_bytes(ordinal)?
+            }
+        };
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 }
@@ -421,10 +562,15 @@ mod tests {
         assert_eq!(payload.get(0).unwrap().positions, [2]);
 
         assert!(segment.term("ale").unwrap().is_none());
-        let terms: Vec<String> = segment.dictionary().iter().map(|r| r.unwrap().0).collect();
+        let terms: Vec<String> = segment
+            .dictionary()
+            .unwrap()
+            .iter()
+            .map(|r| r.unwrap().0)
+            .collect();
         assert_eq!(terms, ["beer", "craft", "wine"]);
         let expanded: Vec<(String, u32)> = segment
-            .resolve_all(segment.dictionary().prefix("c"))
+            .resolve_all(segment.dictionary().unwrap().prefix("c"))
             .map(|r| r.map(|(t, term)| (t, term.df())).unwrap())
             .collect();
         assert_eq!(expanded, [("craft".to_owned(), 1)]);

@@ -3,7 +3,9 @@
 //! Terms are ordered by their UTF-8 bytes, which is the order TINQL ranges
 //! (`a TO cat`) and prefixes (`brew*`) need. Terms are grouped into blocks of
 //! `BLOCK_TERMS`; a block index of first terms supports binary search and each
-//! block is decoded sequentially from its first (uncompressed) term.
+//! block is decoded sequentially from its first (uncompressed) term. Blocks
+//! are fetched one at a time through [`Blocks`], so a lookup over a paged
+//! segment reads the index once and then a single block.
 //!
 //! ```text
 //! stream := count varint, block_count varint, index_len varint, index, blocks
@@ -102,16 +104,18 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-/// A parsed dictionary. The block index is decoded eagerly; blocks are decoded
-/// on demand.
+/// The decoded block index: where each block starts and its first term.
 #[derive(Clone, Debug)]
-pub struct Dictionary<'a> {
+pub struct DictionaryIndex<'a> {
     count: usize,
-    index: Vec<(&'a [u8], usize)>,
-    blocks: &'a [u8],
+    /// Byte length of the header and index, so callers can locate the blocks.
+    pub header_len: usize,
+    entries: Vec<(&'a [u8], usize)>,
 }
 
-impl<'a> Dictionary<'a> {
+impl<'a> DictionaryIndex<'a> {
+    /// Parses the header and index from the start of a dictionary stream;
+    /// `bytes` may be a prefix that ends anywhere after the index.
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         let mut reader = Reader::new(bytes);
         let count = reader.varint_u32()? as usize;
@@ -121,21 +125,20 @@ impl<'a> Dictionary<'a> {
         }
         let index_len = reader.varint_u32()? as usize;
         let index_bytes = reader.take(index_len)?;
-        let blocks = reader.take(reader.remaining())?;
-        let mut index = Vec::with_capacity(block_count);
+        let header_len = reader.position();
+        let mut entries = Vec::with_capacity(block_count);
         let mut index_reader = Reader::new(index_bytes);
         let mut previous: Option<&[u8]> = None;
         for _ in 0..block_count {
             let offset = index_reader.varint_u32()? as usize;
             let len = index_reader.varint_u32()? as usize;
             let first = index_reader.take(len)?;
-            if offset > blocks.len()
-                || previous.is_some_and(|p| p >= first)
-                || index.last().is_some_and(|(_, o)| *o >= offset)
+            if previous.is_some_and(|p| p >= first)
+                || entries.last().is_some_and(|(_, o)| *o >= offset)
             {
                 return Err(Error::Corrupt("dictionary index order"));
             }
-            index.push((first, offset));
+            entries.push((first, offset));
             previous = Some(first);
         }
         if index_reader.remaining() != 0 {
@@ -143,9 +146,19 @@ impl<'a> Dictionary<'a> {
         }
         Ok(Self {
             count,
-            index,
-            blocks,
+            header_len,
+            entries,
         })
+    }
+
+    /// How many bytes of a stream are needed to parse the index: the header
+    /// plus `index_len`, discoverable from the first few bytes.
+    pub fn prefix_len(bytes: &[u8]) -> Result<usize> {
+        let mut reader = Reader::new(bytes);
+        reader.varint()?;
+        reader.varint()?;
+        let index_len = reader.varint_u32()? as usize;
+        Ok(reader.position() + index_len)
     }
 
     pub const fn len(&self) -> usize {
@@ -156,10 +169,14 @@ impl<'a> Dictionary<'a> {
         self.count == 0
     }
 
+    pub fn blocks(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Index of the block that could contain `term`, if any block starts at or
     /// before it.
     fn block_for(&self, term: &[u8]) -> Option<usize> {
-        self.index
+        self.entries
             .partition_point(|(first, _)| *first <= term)
             .checked_sub(1)
     }
@@ -168,21 +185,88 @@ impl<'a> Dictionary<'a> {
         (self.count - block * BLOCK_TERMS).min(BLOCK_TERMS)
     }
 
-    fn walker(&self, block: usize) -> Walker<'a, '_> {
-        Walker {
-            dictionary: self,
-            block,
-            reader: Reader::at(self.blocks, self.index[block].1),
-            remaining_in_block: self.block_terms(block),
-            term: Vec::new(),
+    /// Byte range of block `block` within the blocks area.
+    fn block_range(&self, block: usize, blocks_len: usize) -> (usize, usize) {
+        let start = self.entries[block].1;
+        let end = self
+            .entries
+            .get(block + 1)
+            .map_or(blocks_len, |(_, offset)| *offset);
+        (start, end)
+    }
+}
+
+/// Fetches ranges of the blocks area on demand.
+pub trait BlockFetch {
+    fn fetch_block(&self, offset: usize, len: usize) -> Result<&[u8]>;
+}
+
+/// Access to the blocks area, either in memory or fetched per block.
+#[derive(Clone, Copy)]
+pub enum Blocks<'a> {
+    Slice(&'a [u8]),
+    Lazy {
+        len: usize,
+        fetch: &'a dyn BlockFetch,
+    },
+}
+
+impl<'a> Blocks<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Slice(bytes) => bytes.len(),
+            Self::Lazy { len, .. } => *len,
         }
     }
 
+    fn block(&self, range: (usize, usize)) -> Result<&'a [u8]> {
+        let (start, end) = range;
+        if start > end || end > self.len() {
+            return Err(Error::Corrupt("dictionary block bounds"));
+        }
+        match self {
+            Self::Slice(bytes) => Ok(&bytes[start..end]),
+            Self::Lazy { fetch, .. } => fetch.fetch_block(start, end - start),
+        }
+    }
+}
+
+/// A dictionary view: an index plus block access. Cheap to copy.
+#[derive(Clone, Copy)]
+pub struct Dictionary<'a> {
+    index: &'a DictionaryIndex<'a>,
+    blocks: Blocks<'a>,
+}
+
+impl<'a> Dictionary<'a> {
+    pub const fn new(index: &'a DictionaryIndex<'a>, blocks: Blocks<'a>) -> Self {
+        Self { index, blocks }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.index.count
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.index.count == 0
+    }
+
+    fn walker(&self, block: usize) -> Result<Walker<'a>> {
+        let range = self.index.block_range(block, self.blocks.len());
+        Ok(Walker {
+            dictionary: *self,
+            block,
+            reader: Reader::new(self.blocks.block(range)?),
+            remaining_in_block: self.index.block_terms(block),
+            term: Vec::new(),
+        })
+    }
+
     pub fn get(&self, term: &str) -> Result<Option<TermEntry>> {
-        let Some(block) = self.block_for(term.as_bytes()) else {
+        let Some(block) = self.index.block_for(term.as_bytes()) else {
             return Ok(None);
         };
-        let mut walker = self.walker(block);
+        let mut walker = self.walker(block)?;
         while walker.remaining_in_block > 0 {
             let entry = walker.step()?;
             match walker.term.as_slice().cmp(term.as_bytes()) {
@@ -195,19 +279,36 @@ impl<'a> Dictionary<'a> {
     }
 
     /// All terms at or after `start`, in order.
-    pub fn iter_from(&self, start: &str) -> Iter<'a, '_> {
-        let block = self.block_for(start.as_bytes());
+    pub fn iter_from(&self, start: &str) -> Iter<'a> {
+        let block = if self.index.count == 0 {
+            None
+        } else {
+            Some(self.index.block_for(start.as_bytes()).unwrap_or(0))
+        };
         let mut iter = Iter {
-            walker: block.map(|block| self.walker(block)),
+            walker: None,
             pending: None,
         };
-        if block.is_none() && self.count > 0 {
-            iter.walker = Some(self.walker(0));
-        }
+        let Some(block) = block else {
+            return iter;
+        };
+        iter.walker = match self.walker(block) {
+            Ok(walker) => Some(walker),
+            Err(error) => {
+                iter.pending = Some(Err(error));
+                return iter;
+            }
+        };
         // Skip entries below `start` inside the first block.
         while let Some(walker) = iter.walker.as_mut() {
             if walker.remaining_in_block == 0 {
-                iter.walker = walker.next_block();
+                iter.walker = match walker.next_block() {
+                    Ok(next) => next,
+                    Err(error) => {
+                        iter.pending = Some(Err(error));
+                        return iter;
+                    }
+                };
                 continue;
             }
             match walker.step() {
@@ -226,12 +327,12 @@ impl<'a> Dictionary<'a> {
         iter
     }
 
-    pub fn iter(&self) -> Iter<'a, '_> {
+    pub fn iter(&self) -> Iter<'a> {
         self.iter_from("")
     }
 
     /// Terms starting with `prefix`.
-    pub fn prefix(&self, prefix: &str) -> impl Iterator<Item = Result<(String, TermEntry)>> {
+    pub fn prefix(&self, prefix: &str) -> impl Iterator<Item = Result<(String, TermEntry)>> + 'a {
         let prefix = prefix.to_owned();
         self.iter_from(&prefix).take_while(move |item| match item {
             Ok((term, _)) => term.starts_with(&prefix),
@@ -244,7 +345,7 @@ impl<'a> Dictionary<'a> {
         &self,
         lower: Option<&str>,
         upper: Option<&str>,
-    ) -> impl Iterator<Item = Result<(String, TermEntry)>> {
+    ) -> impl Iterator<Item = Result<(String, TermEntry)>> + 'a {
         let upper = upper.map(str::to_owned);
         self.iter_from(lower.unwrap_or(""))
             .take_while(move |item| match item {
@@ -254,15 +355,15 @@ impl<'a> Dictionary<'a> {
     }
 }
 
-struct Walker<'a, 'd> {
-    dictionary: &'d Dictionary<'a>,
+struct Walker<'a> {
+    dictionary: Dictionary<'a>,
     block: usize,
     reader: Reader<'a>,
     remaining_in_block: usize,
     term: Vec<u8>,
 }
 
-impl<'a, 'd> Walker<'a, 'd> {
+impl<'a> Walker<'a> {
     fn step(&mut self) -> Result<TermEntry> {
         let shared = self.reader.varint_u32()? as usize;
         if shared > self.term.len() {
@@ -298,18 +399,21 @@ impl<'a, 'd> Walker<'a, 'd> {
         })
     }
 
-    fn next_block(&self) -> Option<Walker<'a, 'd>> {
+    fn next_block(&self) -> Result<Option<Walker<'a>>> {
         let block = self.block + 1;
-        (block < self.dictionary.index.len()).then(|| self.dictionary.walker(block))
+        if block >= self.dictionary.index.blocks() {
+            return Ok(None);
+        }
+        self.dictionary.walker(block).map(Some)
     }
 }
 
-pub struct Iter<'a, 'd> {
-    walker: Option<Walker<'a, 'd>>,
+pub struct Iter<'a> {
+    walker: Option<Walker<'a>>,
     pending: Option<Result<(Vec<u8>, TermEntry)>>,
 }
 
-impl Iterator for Iter<'_, '_> {
+impl Iterator for Iter<'_> {
     type Item = Result<(String, TermEntry)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -319,7 +423,13 @@ impl Iterator for Iter<'_, '_> {
             loop {
                 let walker = self.walker.as_mut()?;
                 if walker.remaining_in_block == 0 {
-                    self.walker = walker.next_block();
+                    match walker.next_block() {
+                        Ok(next) => self.walker = next,
+                        Err(error) => {
+                            self.walker = None;
+                            return Some(Err(error));
+                        }
+                    }
                     continue;
                 }
                 break walker.step().map(|entry| (walker.term.clone(), entry));
@@ -338,6 +448,24 @@ impl Iterator for Iter<'_, '_> {
                 Err(error)
             }
         })
+    }
+}
+
+/// Convenience for tests and in-memory callers: a dictionary over one slice.
+pub struct OwnedDictionary<'a> {
+    index: DictionaryIndex<'a>,
+    blocks: Blocks<'a>,
+}
+
+impl<'a> OwnedDictionary<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
+        let index = DictionaryIndex::parse(bytes)?;
+        let blocks = Blocks::Slice(&bytes[index.header_len..]);
+        Ok(Self { index, blocks })
+    }
+
+    pub fn view(&self) -> Dictionary<'_> {
+        Dictionary::new(&self.index, self.blocks)
     }
 }
 
@@ -373,7 +501,8 @@ mod tests {
         let terms: Vec<String> = (0..300).map(|i| format!("term{i:04}")).collect();
         let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
         let bytes = build(&refs);
-        let dictionary = Dictionary::parse(&bytes).unwrap();
+        let owned = OwnedDictionary::parse(&bytes).unwrap();
+        let dictionary = owned.view();
         assert_eq!(dictionary.len(), 300);
         for (i, term) in refs.iter().enumerate() {
             assert_eq!(
@@ -410,16 +539,64 @@ mod tests {
     }
 
     #[test]
+    fn lazy_blocks_fetch_one_block_per_lookup() {
+        let terms: Vec<String> = (0..300).map(|i| format!("term{i:04}")).collect();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let prefix = DictionaryIndex::prefix_len(&bytes).unwrap();
+        let index = DictionaryIndex::parse(&bytes[..prefix]).unwrap();
+        assert_eq!(index.header_len, prefix);
+        let area = &bytes[prefix..];
+        struct Counting<'a> {
+            area: &'a [u8],
+            fetches: std::cell::Cell<usize>,
+        }
+        impl BlockFetch for Counting<'_> {
+            fn fetch_block(&self, offset: usize, len: usize) -> Result<&[u8]> {
+                self.fetches.set(self.fetches.get() + 1);
+                Ok(&self.area[offset..offset + len])
+            }
+        }
+        let counting = Counting {
+            area,
+            fetches: std::cell::Cell::new(0),
+        };
+        let fetches = &counting.fetches;
+        let blocks = Blocks::Lazy {
+            len: area.len(),
+            fetch: &counting,
+        };
+        let dictionary = Dictionary::new(&index, blocks);
+        assert_eq!(dictionary.get("term0130").unwrap(), Some(entry(130)));
+        assert_eq!(fetches.get(), 1);
+        // A miss inside the key space still costs exactly one block.
+        assert_eq!(dictionary.get("term0130x").unwrap(), None);
+        assert_eq!(fetches.get(), 2);
+        // A miss below the first term costs nothing.
+        assert_eq!(dictionary.get("nothing").unwrap(), None);
+        assert_eq!(fetches.get(), 2);
+        let ranged: Vec<String> = dictionary
+            .range(Some("term0060"), Some("term0070"))
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(ranged, terms[60..=70]);
+        assert_eq!(fetches.get(), 4);
+        assert_eq!(dictionary.iter().count(), 300);
+    }
+
+    #[test]
     fn empty_dictionary_and_unicode_terms() {
         let bytes = build(&[]);
-        let dictionary = Dictionary::parse(&bytes).unwrap();
+        let owned = OwnedDictionary::parse(&bytes).unwrap();
+        let dictionary = owned.view();
         assert!(dictionary.is_empty());
         assert_eq!(dictionary.get("x").unwrap(), None);
         assert_eq!(dictionary.iter().count(), 0);
         let mut terms = vec!["café", "cafés", "日本", "日本語", "🍺", "z"];
         terms.sort_unstable();
         let bytes = build(&terms);
-        let dictionary = Dictionary::parse(&bytes).unwrap();
+        let owned = OwnedDictionary::parse(&bytes).unwrap();
+        let dictionary = owned.view();
         let all: Vec<String> = dictionary.iter().map(|r| r.unwrap().0).collect();
         assert_eq!(all, terms);
         let prefixed: Vec<String> = dictionary.prefix("日本").map(|r| r.unwrap().0).collect();
@@ -446,13 +623,14 @@ mod tests {
         let terms: Vec<String> = (0..70).map(|i| format!("w{i:03}")).collect();
         let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
         let bytes = build(&refs);
-        assert!(Dictionary::parse(&bytes[..bytes.len() - 1]).is_ok_and(|d| d.get("w069").is_err()));
-        assert!(Dictionary::parse(&bytes[..5]).is_err());
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(OwnedDictionary::parse(truncated).is_ok_and(|d| d.view().get("w069").is_err()));
+        assert!(OwnedDictionary::parse(&bytes[..5]).is_err());
         let mut tampered = bytes.clone();
         // Break UTF-8 in the last term's suffix byte.
         let last = tampered.len() - 8;
         tampered[last] = 0xff;
-        let dictionary = Dictionary::parse(&tampered).unwrap();
-        assert!(dictionary.iter().any(|item| item.is_err()));
+        let owned = OwnedDictionary::parse(&tampered).unwrap();
+        assert!(owned.view().iter().any(|item| item.is_err()));
     }
 }

@@ -23,7 +23,7 @@ use std::mem::{offset_of, size_of};
 use pgrx::pg_sys;
 
 pub const MAGIC: u32 = 0x4c44_5032;
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();
@@ -151,13 +151,15 @@ impl Run {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SegmentEntry {
     pub run: Run,
+    /// The run's block numbers in order, so byte offsets map to pages.
+    pub map: Run,
     pub dead: Run,
     pub docs: u32,
     pub total_length: u64,
     pub generation: u32,
 }
 
-const ENTRY_BYTES: usize = 12 + 12 + 4 + 8 + 4;
+const ENTRY_BYTES: usize = 12 + 12 + 12 + 4 + 8 + 4;
 
 /// A run waiting until every scan that could still read it has finished.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -173,6 +175,9 @@ const PENDING_BYTES: usize = 12 + 4;
 pub struct BufferState {
     /// Incremented on every change, so backends can cache the buffer's contents.
     pub version: u32,
+    /// Incremented when the buffer is rewritten from its head (fold, VACUUM),
+    /// so a cached prefix knows appends since it was built are still valid.
+    pub epoch: u32,
     pub head: u32,
     /// Page holding the byte after the last written one.
     pub tail: u32,
@@ -193,7 +198,7 @@ pub struct Meta {
     pub pending: Vec<Pending>,
 }
 
-const META_HEADER: usize = 8 + crate::options::SPEC_BYTES + 24 + 4 + 4 + 4;
+const META_HEADER: usize = 8 + crate::options::SPEC_BYTES + 28 + 4 + 4 + 4;
 
 fn put_run(out: &mut Vec<u8>, run: Run) {
     out.extend_from_slice(&run.first.to_le_bytes());
@@ -220,6 +225,7 @@ impl Meta {
         out.extend_from_slice(&self.identity.to_le_bytes());
         out.extend_from_slice(&self.spec);
         out.extend_from_slice(&self.buffer.version.to_le_bytes());
+        out.extend_from_slice(&self.buffer.epoch.to_le_bytes());
         out.extend_from_slice(&self.buffer.head.to_le_bytes());
         out.extend_from_slice(&self.buffer.tail.to_le_bytes());
         out.extend_from_slice(&self.buffer.tail_used.to_le_bytes());
@@ -230,6 +236,7 @@ impl Meta {
         out.extend_from_slice(&(self.pending.len() as u32).to_le_bytes());
         for entry in &self.segments {
             put_run(&mut out, entry.run);
+            put_run(&mut out, entry.map);
             put_run(&mut out, entry.dead);
             out.extend_from_slice(&entry.docs.to_le_bytes());
             out.extend_from_slice(&entry.total_length.to_le_bytes());
@@ -255,13 +262,14 @@ impl Meta {
         let mut at = 8 + crate::options::SPEC_BYTES;
         let buffer = BufferState {
             version: u32_at(bytes, at),
-            head: u32_at(bytes, at + 4),
-            tail: u32_at(bytes, at + 8),
-            tail_used: u32_at(bytes, at + 12),
-            bytes: u32_at(bytes, at + 16),
-            docs: u32_at(bytes, at + 20),
+            epoch: u32_at(bytes, at + 4),
+            head: u32_at(bytes, at + 8),
+            tail: u32_at(bytes, at + 12),
+            tail_used: u32_at(bytes, at + 16),
+            bytes: u32_at(bytes, at + 20),
+            docs: u32_at(bytes, at + 24),
         };
-        at += 24;
+        at += 28;
         let next_generation = u32_at(bytes, at);
         let segment_count = u32_at(bytes, at + 4) as usize;
         let pending_count = u32_at(bytes, at + 8) as usize;
@@ -276,10 +284,11 @@ impl Meta {
         for _ in 0..segment_count {
             let entry = SegmentEntry {
                 run: get_run(bytes, at),
-                dead: get_run(bytes, at + 12),
-                docs: u32_at(bytes, at + 24),
-                total_length: u64_at(bytes, at + 28),
-                generation: u32_at(bytes, at + 36),
+                map: get_run(bytes, at + 12),
+                dead: get_run(bytes, at + 24),
+                docs: u32_at(bytes, at + 36),
+                total_length: u64_at(bytes, at + 40),
+                generation: u32_at(bytes, at + 48),
             };
             if entry.run.is_empty() || entry.run.blocks == 0 {
                 return Err("invalid Lead segment entry");
@@ -316,6 +325,7 @@ mod tests {
             spec: [0, 1, 1, 2, 0, 1, 1, 1],
             buffer: BufferState {
                 version: 5,
+                epoch: 2,
                 head: 1,
                 tail: 7,
                 tail_used: 300,
@@ -330,6 +340,11 @@ mod tests {
                         blocks: 5,
                         bytes: 40_123,
                     },
+                    map: Run {
+                        first: 12,
+                        blocks: 1,
+                        bytes: 20,
+                    },
                     dead: Run::EMPTY,
                     docs: 100,
                     total_length: 12_345,
@@ -341,6 +356,7 @@ mod tests {
                         blocks: 1,
                         bytes: 12,
                     },
+                    map: Run::EMPTY,
                     dead: Run {
                         first: 10,
                         blocks: 1,

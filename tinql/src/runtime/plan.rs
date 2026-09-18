@@ -17,9 +17,10 @@
 
 use boldi_vigna::{SpanQuery, SpanSolver};
 use segment::Tid;
+use segment::index::{Expanded, Index, Window};
 use segment::payload::PayloadCursor;
 use segment::postings::PostingsCursor;
-use segment::segment::{Lengths, Segment, Term};
+use segment::segment::{Lengths, Term};
 use segment::set::{AtLeast, Cursor, Difference, Empty, Intersection, Union};
 
 use super::eval::FuzzyMatcher;
@@ -61,23 +62,27 @@ pub struct Plan<'a> {
 }
 
 /// Compiles `query` against `segment`.
-pub fn plan<'a>(query: &Query, segment: &Segment<'a>, limits: &Limits) -> Result<Plan<'a>> {
+pub fn plan<'a, I: Index + ?Sized>(
+    query: &Query,
+    segment: &'a I,
+    limits: &Limits,
+) -> Result<Plan<'a>> {
     Planner { segment, limits }.query(query)
 }
 
 /// Drains a plan, returning the documents and whether they are exact.
-pub fn matches<'a>(
+pub fn matches<I: Index + ?Sized>(
     query: &Query,
-    segment: &Segment<'a>,
+    segment: &I,
     limits: &Limits,
 ) -> Result<(Vec<Tid>, bool)> {
     let plan = plan(query, segment, limits)?;
     Ok((segment::set::collect(plan.cursor)?, plan.exact))
 }
 
-struct Planner<'s, 'a> {
-    segment: &'s Segment<'a>,
-    limits: &'s Limits,
+struct Planner<'a, 'l, I: Index + ?Sized> {
+    segment: &'a I,
+    limits: &'l Limits,
 }
 
 enum Expansion<'a> {
@@ -85,7 +90,7 @@ enum Expansion<'a> {
     Overflow,
 }
 
-impl<'a> Planner<'_, 'a> {
+impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
     fn universe(&self) -> Result<Plan<'a>> {
         Ok(Plan {
             cursor: Box::new(NonEmptyDocuments::new(
@@ -201,34 +206,28 @@ impl<'a> Planner<'_, 'a> {
         }
     }
 
-    fn collect_expansion(
+    fn expand_window(
         &self,
-        items: impl Iterator<Item = segment::Result<(String, Term<'a>)>>,
+        window: Window<'_>,
+        filter: &dyn Fn(&str) -> bool,
     ) -> Result<Expansion<'a>> {
-        let mut terms = Vec::new();
-        for item in items {
-            let (_, term) = item?;
-            if terms.len() >= self.limits.max_expansion {
-                return Ok(Expansion::Overflow);
-            }
-            terms.push(term);
-        }
-        Ok(Expansion::Terms(terms))
+        Ok(
+            match self
+                .segment
+                .expand(window, filter, self.limits.max_expansion)?
+            {
+                Expanded::Terms(terms) => {
+                    Expansion::Terms(terms.into_iter().map(|(_, t)| t).collect())
+                }
+                Expanded::Overflow => Expansion::Overflow,
+            },
+        )
     }
 
     fn expand_regex(&self, regex: &super::CompiledRegex) -> Result<Expansion<'a>> {
-        let dictionary = self.segment.dictionary();
         match regex.pure_prefix() {
-            Some(prefix) => {
-                self.collect_expansion(self.segment.resolve_all(dictionary.prefix(&prefix)))
-            }
-            None => {
-                self.collect_expansion(self.segment.resolve_all(
-                    dictionary.iter().filter(|item| {
-                        item.as_ref().map_or(true, |(term, _)| regex.is_match(term))
-                    }),
-                ))
-            }
+            Some(prefix) => self.expand_window(Window::Prefix(&prefix), &|_| true),
+            None => self.expand_window(Window::All, &|term| regex.is_match(term)),
         }
     }
 
@@ -237,30 +236,21 @@ impl<'a> Planner<'_, 'a> {
         lower: &super::RangeBound,
         upper: &super::RangeBound,
     ) -> Result<Expansion<'a>> {
-        let bound = |bound: &super::RangeBound| match bound {
-            super::RangeBound::Open => None,
-            super::RangeBound::Term(term) => Some(term.clone()),
-        };
-        let (lower, upper) = (bound(lower), bound(upper));
-        let items = self
-            .segment
-            .dictionary()
-            .range(lower.as_deref(), upper.as_deref());
-        self.collect_expansion(self.segment.resolve_all(items))
+        fn bound(bound: &super::RangeBound) -> Option<&str> {
+            match bound {
+                super::RangeBound::Open => None,
+                super::RangeBound::Term(term) => Some(term.as_str()),
+            }
+        }
+        self.expand_window(Window::Range(bound(lower), bound(upper)), &|_| true)
     }
 
     fn expand_fuzzy(&self, term: &str, prefix: u32, distance: u32) -> Result<Expansion<'a>> {
         let matcher = FuzzyMatcher::new(term, prefix, distance);
         let fixed: String = term.chars().take(prefix as usize).collect();
-        let items = self
-            .segment
-            .dictionary()
-            .prefix(&fixed)
-            .filter(move |item| {
-                item.as_ref()
-                    .map_or(true, |(candidate, _)| matcher.is_match(candidate))
-            });
-        self.collect_expansion(self.segment.resolve_all(items))
+        self.expand_window(Window::Prefix(&fixed), &|candidate| {
+            matcher.is_match(candidate)
+        })
     }
 
     fn slot(&self, slot: &SpanTermSlot) -> Result<Expansion<'a>> {
@@ -685,7 +675,7 @@ fn span_to_segment_error(error: PlanError) -> segment::Error {
 mod tests {
     use super::*;
     use crate::runtime::{evaluate, parse_tinql_to_query_default, tokenize_doc};
-    use segment::segment::SegmentBuilder;
+    use segment::segment::{Segment, SegmentBuilder};
     use tokenizer::presets::default_pipeline;
 
     fn tid(i: u32) -> Tid {
