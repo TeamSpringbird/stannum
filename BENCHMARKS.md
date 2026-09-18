@@ -144,9 +144,50 @@ Server-side execution probes suggest similar orders of magnitude for some shapes
 but they also use different hardware/settings. We have not demonstrated that
 Stanum is faster than TIN on equal resources.
 
-The compatibility oracle previously agreed on 205 query/state pairs (41 queries
-across five mutation states), including document sets and score bits. After this
-rename it selects each extension explicitly:
+### Server-side execution time, shape by shape
+
+`benchmarks/server_times.py` asks each server for `EXPLAIN ANALYZE` execution
+time of the twenty mixed-profile shapes, in one warm session, median of five
+after two discarded executions, with `enable_seqscan` off on both sides. The
+100k Wikipedia corpus and the same SQL were used on both; only the schema name
+differs. Stanum ran commit `859cda5` in release mode on the local pgrx server;
+TIN 1.0.2 ran on the PlanetScale instance. Different hardware, so read the
+table for structure: which shapes are cheap, which are broad, and whether the
+two engines are in the same range.
+
+| Query shape | TIN on PlanetScale, ms | Stanum, local, ms |
+| --- | ---: | ---: |
+| miss count | 0.17 | 0.02 |
+| miss ranked | 0.21 | 0.04 |
+| common count | 1.33 | 0.25 |
+| common ranked | 1.67 | 1.55 |
+| medium count | 0.28 | 0.02 |
+| medium ranked | 0.72 | 0.37 |
+| rare count | 0.21 | 0.01 |
+| rare ranked | 0.46 | 0.32 |
+| and count | 1.21 | 0.34 |
+| and ranked | 3.29 | 1.42 |
+| or count | 0.41 | 0.04 |
+| or ranked | 0.82 | 0.42 |
+| phrase common count | 3.24 | 1.43 |
+| phrase common ranked | 5.34 | 3.37 |
+| phrase medium count | 0.94 | 0.29 |
+| phrase medium ranked | 1.55 | 0.77 |
+| phrase rare count | 0.45 | 0.06 |
+| phrase rare ranked | 0.80 | 0.50 |
+| phrase miss count | 0.21 | 0.04 |
+| phrase miss ranked | 0.31 | 0.06 |
+
+Raw plans and timings: `benchmarks/results/server-times-stanum-01` and
+`server-times-tin-01` (local, not in Git).
+
+### Compatibility oracle
+
+The compatibility oracle agrees on all 205 query/state pairs (41 queries across
+five mutation states), including document sets and score bits, for the renamed
+build `859cda5` against TIN on PlanetScale
+(`benchmarks/results/stanum-vs-tin-oracle-01`). It selects each extension
+explicitly:
 
 ```sh
 python3 benchmarks/oracle.py \

@@ -55,6 +55,25 @@ full-scoring top-10, or `mixed` for both. `--write-rate 0` selects read-only.
 Rows must be a multiple of 1,000. A 1,000-row / 5-second run is only a smoke test.
 For useful latency distributions increase duration, scale, and repetitions.
 
+## Server-side execution probe
+
+`server_times.py` runs the same twenty mixed-profile shapes through
+`EXPLAIN ANALYZE` in one session and reports the server's own execution time per
+shape, median after discarding warm-up executions, with the top plan node so a
+fallback to the heap is visible. It exists for one purpose: setting a Stanum build
+beside TIN on PlanetScale, where client-side timing is dominated by the network.
+It needs the `documents` table and index that `run.py` leaves behind.
+
+```sh
+PGHOST=localhost PGPORT=28818 PGDATABASE=stanum_bench_wiki_01 \
+python3 benchmarks/server_times.py --engine stanum --disable-seqscan \
+  --dataset "$DATASETS/wikipedia-100000" \
+  --output benchmarks/results/server-times-stanum-01
+```
+
+Its numbers are not throughput and do not include planning, fetching rows to the
+client, or contention; use them to compare shapes, not to rank engines.
+
 ## Engine adapters and semantic limits
 
 | Adapter | Installed extension | SQL contract | Status |
