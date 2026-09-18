@@ -1,0 +1,130 @@
+# Reader cost of the write buffer and small folds
+
+The [merge-budget experiment](merge-budget.md) folded the write buffer at 512
+documents or 1 MiB instead of 16,384 documents or 4 MiB, which cut the worst
+insert from about 430 ms to about 150 ms but cost readers about 1.7% p99 and
+2.6% throughput in its isolation run, and the [integrated comparison](ranked-integration.md)
+showed about 4% p99 and 7% throughput against the previous build. Every
+backend also builds its own in-memory index of the buffer. This note profiles
+where that reader time goes, records what was changed to recover it, and
+revisits the fold caps with measurements.
+
+## Protocol and limits
+
+- PostgreSQL 18.6 on the shared local pgrx server (localhost:28818), release
+  builds of `9b0bf47` (baseline) and `9b0bf47+buffer-index` (this change).
+  Both binaries were built from the same commit tree and copied into the
+  shared install at the start of every window; each window records the
+  installed SHA256, because other agents install their own builds between
+  windows on this machine.
+- Verified Wikipedia 100,000-document corpus at
+  `$HOME/Library/Application Support/LeadBenchmarks/datasets/wikipedia-100000`.
+- **Controlled states** for profiling: the corpus built into 4 segments, then
+  7,000 rows inserted from `benchmark_pool` and 2,000 deleted followed by
+  `VACUUM (INDEX_CLEANUP ON)`, under the new caps (`new`: 12 immutable
+  segments plus a 130-document buffer) or the old caps (`old`: 7 segments plus a
+  491-document buffer). Reads are the harness's ten count and ten ranked
+  shapes through `pgbench -c 2`, 45-second windows, baseline and patched
+  binaries alternated within one locked window per state, no writers.
+- **Profiles**: `sample` (macOS) of one reader backend for 30–40 seconds
+  while `pgbench -c 1` loops over a mix of shapes; inclusive counts per
+  function from the call graph.
+- **Fresh connections**: eight new `psql` connections per case, each running
+  `EXPLAIN ANALYZE` of the `history` ranked query three times; planning plus
+  execution time of the first, second and third statement. The buffer index
+  and the segment readers are built during planning (the selectivity estimate
+  reads the index), so execution time alone hides the cost.
+- **Mutation windows**: `python3 benchmarks/run.py run --profile mutation`,
+  600-second timed windows, 30-second warmup, two readers, 50 scheduled
+  mutations/second with equal insert/delete/update weights, seed 1729, checks
+  every 30 seconds, scheduled `VACUUM (INDEX_CLEANUP ON)` every 60 seconds,
+  custom scans on, one window per configuration, each in a fresh
+  `stannum_bench_*` database dropped afterwards.
+- A machine-wide lock covers every install, test and measurement window, but
+  the machine is shared with other agents' builds and tests. Bursts of
+  contention are visible in the raw logs (one probe measured the same
+  0.9 ms statement at 11 ms while a foreign `rustc` ran at 98% CPU). Paired
+  and alternated windows limit that; single 600-second windows do not, and
+  none of the numbers below are confidence intervals.
+
+## Where reader time goes
+
+Per-query latency on the controlled states with the baseline binary
+(`pgbench` per-statement times, ms):
+
+| Shape | `old` (7 segments, 491 buffered) p50 / p99 | `new` (12 segments, 130 buffered) p50 / p99 |
+| --- | ---: | ---: |
+| count, all ten shapes | 0.244 / 2.506 | 0.282 / 2.545 |
+| ranked, all ten shapes | 0.720 / 4.899 | 0.785 / 4.997 |
+| `history` count / ranked | 0.741 / 0.848 | 0.751 / 0.871 |
+| `quasar` count / ranked | 0.128 / 0.425 | 0.161 / 0.472 |
+| `"united states"` count / ranked | 2.378 / 4.720 | 2.356 / 4.663 |
+| reads/s | 2,391 | 2,285 |
+
+Five more small segments cost each count query roughly 8 µs per segment and
+each ranked query roughly 12 µs per segment, independent of how much work
+the query itself does: the cheap shapes (`quasar`, the misses) lose 25–35%,
+the expensive phrase loses nothing. The buffer, three to four times larger in
+the `old` state, is not visible at this granularity. The per-segment setup,
+not the buffer, is where the small-fold reader cost lives.
+
+A sampled profile of the `history` ranked query on the `new` state (2,355
+samples inside the custom scan, baseline binary) splits as:
+
+| Inclusive share | Where |
+| ---: | --- |
+| 64% | `gather`: the block-max walk and scoring itself |
+| 20% | `Index::term`: dictionary lookups (`Dictionary::get`, `Walker::step`) |
+| 17% | `scorer_for_scan`: building the statement's scorer, including `SourceReader::new` per source, dead-list decoding to `BTreeSet`s and a second round of term lookups |
+| 9% | `clause_estimate`: the planner's selectivity estimate, a third round of term lookups plus a query parse |
+| 4% | `parse_tinql_to_query` (three parses per statement: estimate, scan, scorer) |
+
+A term is looked up in every source about three times per statement, and
+each lookup walks up to 64 prefix-compressed dictionary entries after a
+binary search over block heads; with a dozen sources that is a few hundred
+walks per statement. The selectivity memo is cleared at every executor
+start, so planning repeats the lookups too. Dead lists were decoded into a
+`BTreeSet` per source per statement.
+
+The write buffer's own cost is small by comparison. Turning encoded forward
+records into the in-memory index costs (release build, `segment/tests/buffer_cost.rs`,
+whitespace-tokenized Wikipedia records of about 3.3 KiB):
+
+| Records | Bytes | Before | After |
+| ---: | ---: | ---: | ---: |
+| 512 | 1.69 MB | 21.3 ms | 17.9 ms |
+| 1,460 | 4.23 MB | 54.7 ms | 46.2 ms |
+| 4,096 | 11.18 MB | 144.9 ms | 110.1 ms |
+
+Decoding the records is now more than half of it. An existing backend pays
+this once per record as it arrives (about 35 µs per document, or about
+1 ms/s of CPU per reader at 33 new records/s), and again for the whole
+buffer after VACUUM rewrites it; a fresh connection pays it for the whole
+buffer on its first query. A fold does not cost anything here: it empties
+the buffer, so the next index starts empty.
+
+## What changed
+
+- **Dictionary lookups are memoized per cached segment** (`postgres/src/storage/mod.rs`,
+  `MemoizedSegment`): the reader cache keeps, per index identity and
+  generation, a map from term to entry-or-absence, at most 4,096 terms per
+  segment. Segments are immutable, so the memo is valid for as long as the
+  generation is in the directory, and it goes away with the reader. All
+  three rounds of lookups per statement, and every later statement, hit it.
+- **Dead lists are decoded once per backend and dead run**: the cached
+  segment keeps the `BTreeSet` next to the dead-list bytes, and the view
+  hands it to the scorer instead of the scorer decoding it per statement.
+- **`MutableIndex` stores positions flat per term** (`segment/src/index.rs`):
+  one vector of positions and one of occurrence descriptors per term instead
+  of one allocation per term occurrence, with an Fx hasher for the term maps.
+  Encoding per term on first use is unchanged.
+- The buffer index stays per backend; see the architecture note for why
+  sharing it was not worth a shared-memory dependency at these sizes.
+
+## Results
+
+RESULTS_PENDING
+
+## Verification
+
+VERIFICATION_PENDING

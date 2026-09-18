@@ -3008,4 +3008,176 @@ mod tests {
             0
         );
     }
+
+    /// Index and sequential-scan answers for `query`, which must agree, with
+    /// the custom scan path enabled.
+    fn exact_count(table: &str, query: &str) -> i64 {
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;")
+            .unwrap();
+        let indexed = value(&format!(
+            "SELECT count(*) FROM {table} WHERE body ==> '{query}'"
+        ));
+        Spi::run("SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;").unwrap();
+        let reference = value(&format!(
+            "SELECT count(*) FROM {table} WHERE body ==> '{query}'"
+        ));
+        Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = on;").unwrap();
+        assert_eq!(indexed, reference, "{query}");
+        indexed
+    }
+
+    #[pg_test]
+    fn memoized_term_lookups_stay_exact_across_folds_merges_reindex_and_drop() {
+        // Every segment memoizes its dictionary lookups per backend. The memo
+        // must never answer for a segment it was not built from: new folds,
+        // merged generations, a rebuilt identity and a recreated index all
+        // carry fresh lookups, while the memo of a live segment keeps serving
+        // its (immutable) answer, including a remembered absence.
+        Spi::run(
+            "CREATE TABLE memo(id int primary key, body text);
+             INSERT INTO memo SELECT n, 'filler w' || (n % 5) FROM generate_series(1, 40) n;
+             CREATE INDEX memo_idx ON memo USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 3;
+             SET LOCAL stannum.merge_tier_factor = 2;",
+        )
+        .unwrap();
+        assert_eq!(exact_count("memo", "needle"), 0);
+        assert_eq!(exact_count("memo", "w1"), 8);
+        let probe = crate::storage::cache_probe();
+        assert_eq!(probe.cached_segments, 1);
+        assert!(probe.memoized_terms >= 2, "{probe:?}");
+        // Absence is memoized for generation 1; the folds that follow put
+        // `needle` into new generations and into merged ones.
+        Spi::run(
+            "INSERT INTO memo VALUES (101, 'needle'), (102, 'needle other'), (103, 'other'),
+               (104, 'needle w1'), (105, 'w1'), (106, 'needle'), (107, 'needle');",
+        )
+        .unwrap();
+        assert!(directory_shape("memo_idx").0 >= 2);
+        assert_eq!(exact_count("memo", "needle"), 5);
+        assert_eq!(exact_count("memo", "w1"), 10);
+        assert_eq!(exact_count("memo", "needle AND w1"), 1);
+        Spi::run("UPDATE memo SET body = 'needle moved' WHERE id = 1").unwrap();
+        assert_eq!(exact_count("memo", "needle"), 6);
+        assert_eq!(exact_count("memo", "w1"), 9);
+        assert_eq!(
+            ids("SELECT id FROM memo WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC, id LIMIT 3"),
+            ids("SELECT id FROM (SELECT id, stannum.full_score(ctid) AS s FROM memo WHERE body ==> 'needle') t ORDER BY s DESC, id LIMIT 3")
+        );
+        let before = crate::storage::cache_probe();
+        Spi::run("REINDEX INDEX memo_idx").unwrap();
+        assert_eq!(exact_count("memo", "needle"), 6);
+        assert_eq!(exact_count("memo", "w1"), 9);
+        assert_eq!(exact_count("memo", "missing"), 0);
+        let after = crate::storage::cache_probe();
+        assert_ne!(before, after);
+        Spi::run(
+            "DROP INDEX memo_idx;
+             INSERT INTO memo VALUES (108, 'needle w1');
+             CREATE INDEX memo_idx ON memo USING stannum(body);",
+        )
+        .unwrap();
+        assert_eq!(exact_count("memo", "needle"), 7);
+        assert_eq!(exact_count("memo", "needle AND w1"), 2);
+        assert_index_matches_seqscan("memo", &["needle", "w1", "needle AND w1", "w*", "missing"]);
+    }
+
+    #[pg_test]
+    fn buffer_index_extends_incrementally_and_restarts_on_epoch_and_identity_changes() {
+        // The per-backend buffer index keys on what the meta page says, which
+        // is the same for every backend: appends by any writer are absorbed
+        // from the covered byte onward; a VACUUM rewrite or a fold starts a
+        // new epoch and a new index; REINDEX changes the identity.
+        use std::collections::BTreeSet;
+        Spi::run(
+            "CREATE TABLE bufidx(id int primary key, body text);
+             CREATE INDEX bufidx_idx ON bufidx USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 100;
+             INSERT INTO bufidx SELECT n, 'needle n' || n FROM generate_series(1, 10) n;",
+        )
+        .unwrap();
+        assert_eq!(exact_count("bufidx", "needle"), 10);
+        let first = crate::storage::cache_probe().buffer.unwrap();
+        assert_eq!(first.3, 10);
+        // Another writer appends: the index covers the new bytes only.
+        Spi::run("INSERT INTO bufidx SELECT n, 'needle n' || n FROM generate_series(11, 15) n")
+            .unwrap();
+        assert_eq!(exact_count("bufidx", "needle"), 15);
+        assert_eq!(exact_count("bufidx", "n12"), 1);
+        let grown = crate::storage::cache_probe().buffer.unwrap();
+        assert_eq!((grown.0, grown.1), (first.0, first.1), "same identity and epoch");
+        assert!(grown.2 > first.2, "covers the appended bytes");
+        assert_eq!(grown.3, 15);
+        // VACUUM rewrites the buffer without the dead records: new epoch.
+        let mut dead: BTreeSet<(u32, u16)> = Spi::connect(|client| {
+            client
+                .select("SELECT ctid FROM bufidx WHERE id <= 3", None, &[])
+                .unwrap()
+                .map(|row| {
+                    let tid = row.get::<pg_sys::ItemPointerData>(1).unwrap().unwrap();
+                    (
+                        (u32::from(tid.ip_blkid.bi_hi) << 16) | u32::from(tid.ip_blkid.bi_lo),
+                        tid.ip_posid,
+                    )
+                })
+                .collect()
+        });
+        Spi::run("DELETE FROM bufidx WHERE id <= 3").unwrap();
+        unsafe extern "C-unwind" fn deleted(
+            tid: pg_sys::ItemPointer,
+            state: *mut std::ffi::c_void,
+        ) -> bool {
+            let tid = unsafe { *tid };
+            let dead = unsafe { &*state.cast::<BTreeSet<(u32, u16)>>() };
+            dead.contains(&(
+                (u32::from(tid.ip_blkid.bi_hi) << 16) | u32::from(tid.ip_blkid.bi_lo),
+                tid.ip_posid,
+            ))
+        }
+        let index = unsafe { pgrx::PgRelation::open_with_name("bufidx_idx") }.unwrap();
+        unsafe {
+            crate::storage::bulk_delete(
+                index.as_ptr(),
+                Some(deleted),
+                std::ptr::from_mut(&mut dead).cast(),
+            );
+        }
+        drop(index);
+        assert_eq!(exact_count("bufidx", "needle"), 12);
+        assert_eq!(exact_count("bufidx", "n2"), 0);
+        let rewritten = crate::storage::cache_probe().buffer.unwrap();
+        assert_eq!(rewritten.0, first.0);
+        assert_ne!(rewritten.1, first.1, "VACUUM's rewrite starts an epoch");
+        assert_eq!(rewritten.3, 12);
+        // A fold empties the buffer and starts another epoch; the one record
+        // appended afterwards is all the new index holds.
+        Spi::run(
+            "SET LOCAL stannum.write_buffer_docs = 1;
+             INSERT INTO bufidx VALUES (16, 'needle n16');",
+        )
+        .unwrap();
+        assert_eq!(exact_count("bufidx", "needle"), 13);
+        let folded = crate::storage::cache_probe().buffer.unwrap();
+        assert_ne!(folded.1, rewritten.1);
+        assert_eq!(folded.3, 1);
+        assert!(directory_shape("bufidx_idx").0 >= 1);
+        // REINDEX changes the identity; nothing of the old index is reused.
+        Spi::run(
+            "SET LOCAL stannum.write_buffer_docs = 100;
+             REINDEX INDEX bufidx_idx;
+             INSERT INTO bufidx VALUES (17, 'needle n17');",
+        )
+        .unwrap();
+        assert_eq!(exact_count("bufidx", "needle"), 14);
+        let rebuilt = crate::storage::cache_probe().buffer.unwrap();
+        assert_ne!(rebuilt.0, first.0, "REINDEX changes the identity");
+        assert_eq!(rebuilt.3, 1);
+        assert_index_matches_seqscan("bufidx", &["needle", "n17", "n2", "n1*"]);
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.verify_index('bufidx_idx') WHERE severity = 'error'"
+            ),
+            0
+        );
+    }
 }
