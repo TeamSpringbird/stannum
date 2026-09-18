@@ -3709,6 +3709,8 @@ mod tests {
             ),
             0
         );
+    }
+
     #[pg_test]
     fn hot_updated_rows_keep_their_score_on_both_ranked_paths() {
         // A HOT update leaves the posting at the root of the chain while the
