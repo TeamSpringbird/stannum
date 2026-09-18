@@ -418,9 +418,14 @@ generated TINQL, including mid-stream seeks:
 PROPTEST_CASES=50000 cargo test -p tinql --release plans_agree
 ```
 
-What does not exist yet: the PostgreSQL page layout, the meta page and
-segment directory, the write buffer fold, dead bitmaps, and scoring from
-segment statistics. Constants that section 11 says to measure (`LIST_MAX`,
+The PostgreSQL side of sections 3 and 4 is implemented as format LDP2 in
+`postgres/src/storage/`: meta page with tokenizer spec and directory, chained
+write buffer of forward records folded into segment runs, dead lists and
+segment rewrites in VACUUM, and page reclamation through the pending list and
+the FSM. See [segmented-storage.md](segmented-storage.md). What does not
+exist yet: scoring from segment statistics (section 4.4), cost estimation from
+dictionary df (section 4.3), the planner-level tokenizer binding (section 7),
+and the custom scan for top-k (section 8). Constants that section 11 says to measure (`LIST_MAX`,
 `BLOCK_TERMS`, `SKIP_INTERVAL`, the sparse-versus-grouped choice) are single
 definitions in the crate and are not yet tuned on real data.
 

@@ -1,7 +1,6 @@
-use boldi_vigna::SpanQuery;
 use pgrx::{FromDatum, PgBox, PgMemoryContexts, pg_extern, pg_guard, pg_sys};
 use std::ffi::c_void;
-use tinql::runtime::{Query, SpanTermSlot};
+use tinql::runtime::Query;
 
 #[pg_extern(sql = "
     CREATE OR REPLACE FUNCTION @extschema@.amhandler(internal)
@@ -38,14 +37,22 @@ unsafe extern "C-unwind" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
     true
 }
 
+struct BuildState {
+    builder: crate::storage::Builder,
+    tuples: u64,
+}
+
 #[pg_guard]
 unsafe extern "C-unwind" fn ambuild(
     heap: pg_sys::Relation,
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
-    unsafe { crate::postings::build_empty(index) };
-    let mut index_tuples = 0_u64;
+    unsafe { crate::storage::build_empty(index) };
+    let mut state = BuildState {
+        builder: unsafe { crate::storage::Builder::new(index) },
+        tuples: 0,
+    };
     let heap_tuples = unsafe {
         pg_sys::table_index_build_scan(
             heap,
@@ -54,13 +61,14 @@ unsafe extern "C-unwind" fn ambuild(
             true,
             true,
             Some(build_callback),
-            (&mut index_tuples as *mut u64).cast(),
+            (&mut state as *mut BuildState).cast(),
             std::ptr::null_mut(),
         )
     };
+    unsafe { state.builder.finish(index) };
     let mut result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     result.heap_tuples = heap_tuples;
-    result.index_tuples = index_tuples as f64;
+    result.index_tuples = state.tuples as f64;
     result.into_pg_boxed().into_pg()
 }
 
@@ -74,8 +82,9 @@ unsafe extern "C-unwind" fn build_callback(
     state: *mut c_void,
 ) {
     unsafe {
-        crate::postings::insert(index, values, isnull, tid);
-        *state.cast::<u64>() += 1;
+        let state = &mut *state.cast::<BuildState>();
+        state.builder.add(index, values, isnull, tid);
+        state.tuples += 1;
     };
 }
 
@@ -97,181 +106,22 @@ unsafe extern "C-unwind" fn aminsert(
     _index_unchanged: bool,
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
-    unsafe { crate::postings::insert(index, values, isnull, heap_tid) };
+    unsafe { crate::storage::insert(index, values, isnull, heap_tid) };
     false
 }
 
-/// Conservative candidate supersets, before visibility and exact heap rechecks.
-/// `All` is an explicit fallback, while `Empty` is a proven candidate miss.
-#[derive(Debug, PartialEq, Eq)]
-enum CandidatePlan {
-    All,
-    Empty,
-    Term(String),
-    And(Box<Self>, Box<Self>),
-    Or(Box<Self>, Box<Self>),
-}
-
-impl CandidatePlan {
-    // Bound both recursive execution depth and the number of temporary bitmaps.
-    // An over-budget query retains the complete reference path.
-    const NODE_BUDGET: usize = 128;
-
-    fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Empty, _) | (_, Self::Empty) => Self::Empty,
-            (Self::All, plan) | (plan, Self::All) => plan,
-            (a, b) => Self::And(Box::new(a), Box::new(b)),
-        }
-    }
-
-    fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::All, _) | (_, Self::All) => Self::All,
-            (Self::Empty, plan) | (plan, Self::Empty) => plan,
-            (a, b) => Self::Or(Box::new(a), Box::new(b)),
-        }
-    }
-
-    fn consume(budget: &mut usize) -> Result<(), ()> {
-        *budget = budget.checked_sub(1).ok_or(())?;
-        Ok(())
-    }
-
-    fn query(query: &Query, budget: &mut usize) -> Result<Self, ()> {
-        Self::consume(budget)?;
-        Ok(match query {
-            Query::Term(term) => Self::Term(term.clone()),
-            Query::And(a, b) => Self::query(a, budget)?.and(Self::query(b, budget)?),
-            Query::Or(a, b) => Self::query(a, budget)?.or(Self::query(b, budget)?),
-            Query::Conjunction(children) => {
-                children.iter().try_fold(Self::All, |plan, child| {
-                    Ok::<_, ()>(plan.and(Self::query(child, budget)?))
-                })?
-            }
-            Query::Disjunction { min: 1, children } | Query::AtLeast { min: 1, children } => {
-                children.iter().try_fold(Self::Empty, |plan, child| {
-                    Ok::<_, ()>(plan.or(Self::query(child, budget)?))
-                })?
-            }
-            Query::Boost { inner, .. } => Self::query(inner, budget)?,
-            Query::Span {
-                term_slots,
-                span_query,
-                ..
-            } => Self::span(span_query, term_slots, budget)?,
-            // Never complement an approximate posting set. Expansion, threshold
-            // and advanced span expressions remain the exact evaluator's job.
-            Query::Not(_)
-            | Query::MatchAll
-            | Query::Regex(_)
-            | Query::Range { .. }
-            | Query::Fuzzy { .. }
-            | Query::Disjunction { .. }
-            | Query::AtLeast { .. }
-            | Query::SpanExpr { .. } => Self::All,
-        })
-    }
-
-    fn span(query: &SpanQuery, slots: &[SpanTermSlot], budget: &mut usize) -> Result<Self, ()> {
-        Self::consume(budget)?;
-        Ok(match query {
-            SpanQuery::Empty => Self::Empty,
-            SpanQuery::Term(i) => match slots.get(*i) {
-                Some(SpanTermSlot::Term(term)) => Self::Term(term.clone()),
-                _ => Self::All,
-            },
-            SpanQuery::Ordered(children) | SpanQuery::Unordered(children) => {
-                children.iter().try_fold(Self::All, |plan, child| {
-                    Ok::<_, ()>(plan.and(Self::span(child, slots, budget)?))
-                })?
-            }
-            SpanQuery::Or(children) => children.iter().try_fold(Self::Empty, |plan, child| {
-                Ok::<_, ()>(plan.or(Self::span(child, slots, budget)?))
-            })?,
-            SpanQuery::MaxGaps { inner, .. }
-            | SpanQuery::GapsInRange { inner, .. }
-            | SpanQuery::MaxWidth { inner, .. }
-            | SpanQuery::WithinPositions { inner, .. } => Self::span(inner, slots, budget)?,
-            // Negative positional relations require only the retained side.
-            SpanQuery::NotContaining { big, .. } => Self::span(big, slots, budget)?,
-            SpanQuery::NotContainedBy { little, .. } => Self::span(little, slots, budget)?,
-            SpanQuery::NonOverlapping { a, .. } => Self::span(a, slots, budget)?,
-            SpanQuery::Containing { big: a, little: b }
-            | SpanQuery::ContainedBy { little: a, big: b }
-            | SpanQuery::Overlapping { a, b }
-            | SpanQuery::Before { a, b }
-            | SpanQuery::After { a, b } => {
-                Self::span(a, slots, budget)?.and(Self::span(b, slots, budget)?)
-            }
-        })
-    }
-
-    /// Number of concurrently live bitmaps under left-to-right evaluation.
-    fn bitmap_slots(&self) -> usize {
-        match self {
-            Self::And(a, b) | Self::Or(a, b) => a.bitmap_slots().max(1 + b.bitmap_slots()),
-            _ => 1,
-        }
-    }
-
-    /// # Safety
-    /// The caller holds a live LDP1 relation and a scratch memory context; all
-    /// returned bitmap guards must be dropped before deleting that context.
-    unsafe fn execute(&self, index: pg_sys::Relation, bytes: usize) -> CandidateBitmap {
-        unsafe {
-            pgrx::check_for_interrupts!();
-            match self {
-                Self::All => unreachable!("fallback plans are never materialized"),
-                Self::Empty => CandidateBitmap::new(bytes),
-                Self::Term(term) => {
-                    let mut result = CandidateBitmap::new(bytes);
-                    result.estimated_tuples = crate::postings::lookup(index, term, result.raw);
-                    result
-                }
-                Self::And(a, b) | Self::Or(a, b) => {
-                    let mut left = a.execute(index, bytes);
-                    let right = b.execute(index, bytes);
-                    if matches!(self, Self::And(..)) {
-                        // PostgreSQL preserves conservative membership and
-                        // recheck flags for both exact and lossy intersections.
-                        pg_sys::tbm_intersect(left.raw, right.raw);
-                        left.estimated_tuples = left.estimated_tuples.min(right.estimated_tuples);
-                    } else {
-                        pg_sys::tbm_union(left.raw, right.raw);
-                        left.estimated_tuples =
-                            left.estimated_tuples.saturating_add(right.estimated_tuples);
-                    }
-                    left
-                }
-            }
-        }
-    }
-}
-
-/// Private, non-shared TBM allocated inside the candidate scratch context.
-struct CandidateBitmap {
-    raw: *mut pg_sys::TIDBitmap,
-    estimated_tuples: i64,
-}
-impl CandidateBitmap {
-    unsafe fn new(bytes: usize) -> Self {
-        Self {
-            raw: unsafe { pg_sys::tbm_create(bytes, std::ptr::null_mut()) },
-            estimated_tuples: 0,
-        }
-    }
-}
-impl Drop for CandidateBitmap {
-    fn drop(&mut self) {
-        // SAFETY: this guard exclusively owns a TBM allocated in the enclosing
-        // scratch context, which is alive throughout guard destruction.
-        unsafe { pg_sys::tbm_free(self.raw) };
-    }
+/// What a rescan compiled from its scan keys.
+enum ScanPlan {
+    /// A NULL key: nothing can match.
+    Inactive,
+    /// Queries analyzed with the index's own tokenizer, one per key.
+    Queries(Vec<Query>),
+    /// The index has no LDP2 storage; every heap page is a candidate.
+    Fallback,
 }
 
 struct ScanState {
-    plan: CandidatePlan,
+    plan: ScanPlan,
 }
 
 // The reset callback owns the outer holder. Normal end-of-scan takes its Box;
@@ -280,7 +130,7 @@ type ScanOwner = Option<Box<ScanState>>;
 
 fn new_scan_state() -> *mut ScanOwner {
     PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(Some(Box::new(ScanState {
-        plan: CandidatePlan::Empty,
+        plan: ScanPlan::Inactive,
     })))
 }
 
@@ -307,6 +157,17 @@ unsafe extern "C-unwind" fn ambeginscan(
     scan
 }
 
+/// Selective retrieval needs a primary snapshot: generic WAL carries no
+/// index-VACUUM conflict information for standbys.
+unsafe fn selective(scan: pg_sys::IndexScanDesc) -> bool {
+    unsafe {
+        !pg_sys::RecoveryInProgress()
+            && !(*scan).xs_snapshot.is_null()
+            && !(*(*scan).xs_snapshot).takenDuringRecovery
+            && crate::storage::present((*scan).indexRelation)
+    }
+}
+
 #[pg_guard]
 unsafe extern "C-unwind" fn amrescan(
     scan: pg_sys::IndexScanDesc,
@@ -320,7 +181,7 @@ unsafe extern "C-unwind" fn amrescan(
             .as_deref_mut()
             .expect("active scan")
     };
-    state.plan = CandidatePlan::Empty;
+    state.plan = ScanPlan::Inactive;
     // PostgreSQL may rescan with no replacement keys. Keep a copy in the scan
     // descriptor, as the built-in AMs do, and recompile its current arguments.
     if !keys.is_null() {
@@ -342,24 +203,30 @@ unsafe extern "C-unwind" fn amrescan(
     {
         return;
     }
-    let mut plan = CandidatePlan::All;
-    let mut budget = CandidatePlan::NODE_BUDGET;
+    let selective = unsafe { selective(scan) };
+    let tokenizer =
+        selective.then(|| unsafe { crate::storage::index_tokenizer((*scan).indexRelation) });
+    let mut queries = Vec::with_capacity(keys.len());
     for key in keys {
         if key.sk_flags != 0 {
-            continue;
+            // An unknown key flag keeps the full reference path.
+            state.plan = ScanPlan::Fallback;
+            return;
         }
         let text =
             unsafe { String::from_datum(key.sk_argument, false) }.expect("non-null search key");
-        let query = tinql::runtime::parse_tinql_to_query_default(&text)
-            .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
-        let Ok(candidate) = CandidatePlan::query(&query, &mut budget) else {
-            state.plan = CandidatePlan::All;
-            return;
-        };
-        // Multiple scan keys are conjunctive; unknown keys keep exact rechecks.
-        plan = plan.and(candidate);
+        let query = match &tokenizer {
+            Some(tokenizer) => tinql::runtime::parse_tinql_to_query(&text, tokenizer.as_ref()),
+            None => tinql::runtime::parse_tinql_to_query_default(&text),
+        }
+        .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
+        queries.push(query);
     }
-    state.plan = plan;
+    state.plan = if selective {
+        ScanPlan::Queries(queries)
+    } else {
+        ScanPlan::Fallback
+    };
 }
 
 #[pg_guard]
@@ -372,49 +239,27 @@ unsafe extern "C-unwind" fn amgetbitmap(
             .as_deref()
             .expect("active scan")
     };
-    if matches!(state.plan, CandidatePlan::Empty) {
-        return 0;
-    }
     let index = unsafe { (*scan).indexRelation };
-    // Generic WAL does not encode index-VACUUM standby conflicts.
-    // A replaying standby must use heap scans until that protocol exists.
-    if !matches!(state.plan, CandidatePlan::All)
-        && unsafe {
-            !pg_sys::RecoveryInProgress()
-                && !(*scan).xs_snapshot.is_null()
-                && !(*(*scan).xs_snapshot).takenDuringRecovery
-                && crate::postings::present(index)
+    match &state.plan {
+        ScanPlan::Inactive => 0,
+        ScanPlan::Queries(queries) => unsafe { crate::storage::scan(index, queries, bitmap) },
+        ScanPlan::Fallback => {
+            let heap_oid = unsafe { (*(*index).rd_index).indrelid };
+            let heap = unsafe { pg_sys::table_open(heap_oid, pg_sys::NoLock as _) };
+            let heap_blocks = unsafe {
+                pg_sys::RelationGetNumberOfBlocksInFork(heap, pg_sys::ForkNumber::MAIN_FORKNUM)
+            };
+            unsafe { pg_sys::table_close(heap, pg_sys::NoLock as _) };
+            // Lossy pages make PostgreSQL check every visible tuple against the
+            // original query, including partial-index predicates and expressions.
+            for block in 0..heap_blocks {
+                pgrx::check_for_interrupts!();
+                unsafe { pg_sys::tbm_add_page(bitmap, block) };
+            }
+            // Like BRIN, estimate ten tuples per page for scan statistics only.
+            i64::from(heap_blocks) * 10
         }
-    {
-        if let CandidatePlan::Term(term) = &state.plan {
-            return unsafe { crate::postings::lookup(index, term, bitmap) };
-        }
-        // This context also reclaims allocations if a PostgreSQL error interrupts
-        // construction before an owned bitmap can be returned.
-        let mut scratch = PgMemoryContexts::new("Lead candidate bitmaps");
-        let bytes = (unsafe { pg_sys::work_mem } as usize * 1024) / state.plan.bitmap_slots();
-        // work_mem is a shared target, not a hard cap: PostgreSQL can exceed a
-        // TBM target when even its lossy representation needs more space.
-        let result = unsafe { scratch.switch_to(|_| state.plan.execute(index, bytes)) };
-        unsafe { pg_sys::tbm_union(bitmap, result.raw) };
-        let estimated_tuples = result.estimated_tuples;
-        drop(result);
-        drop(scratch);
-        return estimated_tuples;
     }
-    let heap_oid = unsafe { (*(*index).rd_index).indrelid };
-    let heap = unsafe { pg_sys::table_open(heap_oid, pg_sys::NoLock as _) };
-    let heap_blocks =
-        unsafe { pg_sys::RelationGetNumberOfBlocksInFork(heap, pg_sys::ForkNumber::MAIN_FORKNUM) };
-    unsafe { pg_sys::table_close(heap, pg_sys::NoLock as _) };
-    // Lossy pages make PostgreSQL check every visible tuple against the
-    // original query, including partial-index predicates and expressions.
-    for block in 0..heap_blocks {
-        pgrx::check_for_interrupts!();
-        unsafe { pg_sys::tbm_add_page(bitmap, block) };
-    }
-    // Like BRIN, estimate ten tuples per page for scan statistics only.
-    i64::from(heap_blocks) * 10
 }
 
 #[pg_guard]
@@ -435,7 +280,7 @@ unsafe extern "C-unwind" fn ambulkdelete(
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     unsafe {
         let index = (*info).index;
-        if !crate::postings::present(index) {
+        if !crate::storage::present(index) {
             return stats;
         }
         let stats = if stats.is_null() {
@@ -444,11 +289,9 @@ unsafe extern "C-unwind" fn ambulkdelete(
         } else {
             stats
         };
-        let (_, removed) = crate::postings::vacuum(index, callback, callback_state);
-        // Physical term postings are not indexed rows. Use an explicitly marked
-        // heap-row estimate instead of reporting term frequency as row count.
-        (*stats).num_index_tuples = (*info).num_heap_tuples;
-        (*stats).estimated_count = true;
+        let (live, removed) = crate::storage::bulk_delete(index, callback, callback_state);
+        (*stats).num_index_tuples = live as f64;
+        (*stats).estimated_count = false;
         (*stats).tuples_removed += removed as f64;
         (*stats).num_pages =
             pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
@@ -461,15 +304,24 @@ unsafe extern "C-unwind" fn amvacuumcleanup(
     info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    if !stats.is_null() {
-        // Cleanup receives the final heap-row estimate; bulk-delete can run
-        // multiple times with provisional counts during one VACUUM.
-        unsafe {
-            (*stats).num_index_tuples = (*info).num_heap_tuples.max(0.0);
-            (*stats).estimated_count = true;
+    unsafe {
+        let index = (*info).index;
+        if (*info).analyze_only || !crate::storage::present(index) {
+            return stats;
         }
+        crate::storage::cleanup(index);
+        let stats = if stats.is_null() {
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBulkDeleteResult>())
+                .cast::<pg_sys::IndexBulkDeleteResult>()
+        } else {
+            stats
+        };
+        (*stats).num_index_tuples = crate::storage::document_count(index) as f64;
+        (*stats).estimated_count = false;
+        (*stats).num_pages =
+            pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
+        stats
     }
-    stats
 }
 
 #[pg_guard]
@@ -504,40 +356,6 @@ mod tests {
     use pgrx::prelude::*;
 
     #[pg_test]
-    fn candidate_plans_distinguish_fallback_and_misses_and_bound_complexity() {
-        let compile = |text: &str| {
-            let query = tinql::runtime::parse_tinql_to_query_default(text).unwrap();
-            CandidatePlan::query(&query, &mut { CandidatePlan::NODE_BUDGET }).unwrap()
-        };
-        assert_eq!(compile("beer OR win*"), CandidatePlan::All);
-        assert_eq!(compile("beer AND win*"), CandidatePlan::Term("beer".into()));
-        assert_eq!(
-            compile("beer AND NOT wine"),
-            CandidatePlan::Term("beer".into())
-        );
-        let not = Query::Not(Box::new(Query::Term("beer".into())));
-        assert_eq!(
-            CandidatePlan::query(&not, &mut 4).unwrap(),
-            CandidatePlan::All
-        );
-        assert_eq!(
-            CandidatePlan::All.or(CandidatePlan::Empty),
-            CandidatePlan::All
-        );
-        assert_eq!(
-            CandidatePlan::All.and(CandidatePlan::Empty),
-            CandidatePlan::Empty
-        );
-        let terms = vec![Query::Term("beer".into()); CandidatePlan::NODE_BUDGET];
-        assert!(
-            CandidatePlan::query(&Query::Conjunction(terms), &mut {
-                CandidatePlan::NODE_BUDGET
-            })
-            .is_err()
-        );
-    }
-
-    #[pg_test]
     fn scan_state_is_reclaimed_on_context_reset_or_normal_end() {
         use std::sync::atomic::Ordering;
         let before = DROPPED_SCAN_STATES.load(Ordering::Relaxed);
@@ -545,8 +363,7 @@ mod tests {
         unsafe {
             context.switch_to(|_| {
                 let owner = new_scan_state();
-                (*owner).as_deref_mut().unwrap().plan =
-                    CandidatePlan::Term("owned query".repeat(100));
+                (*owner).as_deref_mut().unwrap().plan = ScanPlan::Fallback;
                 // Simulate ERROR teardown: no amendscan, only context reset.
             });
             context.reset();

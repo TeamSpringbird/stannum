@@ -9,8 +9,8 @@ mod highlight_udfs;
 mod match_positions;
 mod operator;
 pub(crate) mod options;
-mod postings;
 mod score;
+mod storage;
 mod tf_bucket {
     pub(crate) use segment::tf_bucket::*;
 }
@@ -19,6 +19,7 @@ mod udfs;
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     options::init();
+    storage::init();
 }
 
 #[cfg(test)]
@@ -78,11 +79,12 @@ mod tests {
           SET LOCAL enable_seqscan=off;",
         )
         .unwrap();
+        // Meta page, one write-buffer page, and at least one segment page.
         assert!(
             Spi::get_one::<i64>("SELECT pg_relation_size('posting_probe_idx')")
                 .unwrap()
                 .unwrap()
-                > 129 * 8192
+                >= 3 * 8192
         );
         assert_eq!(
             Spi::get_one::<i64>("SELECT count(*) FROM posting_probe WHERE body ==> 'common'")
@@ -165,15 +167,21 @@ mod tests {
         ).unwrap().unwrap().0;
         assert_eq!(phrase[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
         assert_eq!(phrase[0]["Plan"]["Actual Rows"].as_f64(), Some(1.0));
+        // Positions are stored, so the phrase is exact: no candidate is rechecked.
         assert_eq!(
             phrase[0]["Plan"]["Rows Removed by Index Recheck"].as_f64(),
-            Some(1.0)
+            Some(0.0)
         );
         assert_eq!(phrase[0]["Plan"]["Lossy Heap Blocks"], 0);
-        let fallback = Spi::get_one::<Json>(
+        let expansion = Spi::get_one::<Json>(
             "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM boolean_docs WHERE body ==> 'missing OR win*'",
         ).unwrap().unwrap().0;
-        assert!(fallback[0]["Plan"]["Lossy Heap Blocks"].as_u64().unwrap() > 0);
+        assert_eq!(expansion[0]["Plan"]["Lossy Heap Blocks"], 0);
+        assert_eq!(expansion[0]["Plan"]["Actual Rows"].as_f64(), Some(3.0));
+        assert_eq!(
+            expansion[0]["Plan"]["Rows Removed by Index Recheck"].as_f64(),
+            Some(0.0)
+        );
 
         // The inner bitmap scan is rescanned with each outer row's query value.
         Spi::run("SET LOCAL enable_material=off; SET LOCAL enable_memoize=off;").unwrap();
@@ -224,10 +232,14 @@ mod tests {
                 Some(expected as f64),
                 "{query}"
             );
-            assert!(
-                plan[0]["Plan"]["Lossy Heap Blocks"].as_u64().unwrap() > 0,
-                "{query}"
-            );
+            // Exact results with at least 1,500 tuples exceed the 64kB bitmap
+            // budget; smaller exact results may stay exact.
+            if expected >= 1500 {
+                assert!(
+                    plan[0]["Plan"]["Lossy Heap Blocks"].as_u64().unwrap() > 0,
+                    "{query}"
+                );
+            }
             let actual = Spi::get_one::<Vec<i32>>(&format!(
                 "SELECT array_agg(id ORDER BY id) FROM lossy_docs WHERE body ==> '{query}'"
             ))
@@ -253,6 +265,91 @@ mod tests {
                 Some(vec![1500])
             );
         }
+    }
+
+    #[pg_test]
+    fn write_buffer_folds_and_merges_keep_results_exact() {
+        Spi::run(
+            "CREATE TABLE folded(id int, body text);
+             CREATE INDEX folded_idx ON folded USING tin(body);
+             SET LOCAL tin.write_buffer_docs = 4;
+             SET LOCAL tin.max_segments = 3;
+             INSERT INTO folded
+               SELECT n, 'w' || (n % 7) || ' common ' ||
+                      CASE WHEN n % 10 = 0 THEN 'rare needle' ELSE 'other filler' END
+               FROM generate_series(1, 100) n;
+             INSERT INTO folded VALUES (101, ''), (102, NULL), (103, 'w1 w1 w1');",
+        )
+        .unwrap();
+        for query in [
+            "rare",
+            "common",
+            "missing",
+            "\"rare needle\"",
+            "\"needle rare\"",
+            "w1 AND NOT rare",
+            "* AND NOT common",
+            "w* AND rare",
+            "AT LEAST 2 OF [w1 w2 rare]",
+            "(w3 NEAR/2 needle) IN FIRST 3 WORDS",
+            "common IN LAST 50%",
+        ] {
+            Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = on;").unwrap();
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM folded WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan", "{query}");
+            assert_eq!(
+                plan[0]["Plan"]["Rows Removed by Index Recheck"].as_f64(),
+                Some(0.0),
+                "{query}"
+            );
+            let actual = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id), '{{}}'::int[]) FROM folded WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            Spi::run("SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;").unwrap();
+            let reference = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id), '{{}}'::int[]) FROM folded WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, reference, "{query}");
+        }
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM folded WHERE body ==> 'rare'").unwrap(),
+            Some(10)
+        );
+    }
+
+    #[pg_test]
+    fn index_tokenizer_options_govern_matching() {
+        Spi::run(
+            "CREATE TABLE cased(id int, body text);
+             INSERT INTO cased VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER');
+             CREATE INDEX cased_idx ON cased USING tin(body) WITH (case_folding = preserve);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        // Exact index results honor the index's own analyzer settings.
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM cased WHERE body ==> 'beer'"
+            )
+            .unwrap(),
+            Some(vec![2])
+        );
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM cased WHERE body ==> 'Beer'"
+            )
+            .unwrap(),
+            Some(vec![1])
+        );
     }
 
     #[pg_test]

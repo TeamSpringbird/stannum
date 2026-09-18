@@ -1,3 +1,7 @@
+> Superseded. LDP1 was replaced by the segmented LDP2 format described in
+> [segmented-storage.md](segmented-storage.md). Indexes in this format report
+> `REINDEX required`. This document is kept as a record of the first slice.
+
 # Durable candidate retrieval, format LDP1
 
 New logged `tin` indexes now persist term-fingerprint → heap-TID postings.

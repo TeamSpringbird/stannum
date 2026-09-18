@@ -73,3 +73,12 @@ bitmap scans. VACUUM removes dead postings; other queries, legacy zero-page inde
 unlogged/temporary indexes, and recovery-mode reads retain the reference fallback.
 See [format, validation and remaining limits](durable-postings.md). Stage 1 remains
 in progress: persisted Boolean/phrase candidates are implemented; efficient page reuse and ranking remain pending.
+
+## Segmented storage
+
+The fingerprint format above was replaced by segmented storage (LDP2): a write
+buffer of per-document records folded into immutable segments with a term
+dictionary, positions and lengths, exact bitmaps for every query form, and
+page reclamation. See [segmented-storage.md](segmented-storage.md). Stages 1
+and 3 of the table are now implemented; stage 2 (persisted ranking statistics)
+is next.

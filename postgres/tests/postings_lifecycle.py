@@ -95,6 +95,38 @@ def main():
         check()
         sql('REINDEX INDEX docs_search;')
         check()
+        # Small thresholds drive folds, merges, dead lists, segment rewrites
+        # and page reclamation through the FSM. Results must stay exact and
+        # the index must stop growing once freed pages are reused.
+        tuned = 'SET tin.write_buffer_docs=4; SET tin.max_segments=3;'
+        def check_folded():
+            for term in ('needle', 'common', 'missing'):
+                differences = sql(f"""WITH actual AS MATERIALIZED (SELECT id FROM folded WHERE body ==> '{term}'),
+                    expected AS MATERIALIZED (SELECT id FROM folded WHERE body ~ '\\m{term}\\M'),
+                    delta AS ((SELECT * FROM actual EXCEPT SELECT * FROM expected)
+                              UNION ALL (SELECT * FROM expected EXCEPT SELECT * FROM actual))
+                    SELECT count(*) FROM delta;""")
+                assert differences == '0', ('folded', term, differences)
+        sql(tuned + """CREATE TABLE folded(id int PRIMARY KEY, body text);
+            CREATE INDEX folded_search ON folded USING tin(body);
+            INSERT INTO folded SELECT n, CASE WHEN n%10=0 THEN 'needle' ELSE 'common' END
+              FROM generate_series(1,400) n;""")
+        check_folded()
+        sql('DELETE FROM folded WHERE id%2=0; VACUUM (INDEX_CLEANUP ON) folded;')
+        check_folded()
+        sql('VACUUM (INDEX_CLEANUP ON) folded;')
+        check_folded()
+        size_after_first_cycle = int(sql("SELECT pg_relation_size('folded_search');"))
+        for cycle in range(4):
+            sql(tuned + f"""DELETE FROM folded WHERE id%4={cycle};
+                INSERT INTO folded SELECT n, CASE WHEN n%10=0 THEN 'needle' ELSE 'common' END
+                  FROM generate_series({1000*(cycle+1)}, {1000*(cycle+1)+200}) n
+                  ON CONFLICT DO NOTHING;""")
+            sql('VACUUM (INDEX_CLEANUP ON) folded; VACUUM (INDEX_CLEANUP ON) folded;')
+            check_folded()
+        size_after_cycles = int(sql("SELECT pg_relation_size('folded_search');"))
+        assert size_after_cycles <= 3 * size_after_first_cycle, (size_after_first_cycle, size_after_cycles)
+
         # No manual checkpoint before immediate shutdown: replay must recover WAL.
         sql("INSERT INTO docs VALUES(99998,'needle',0); DELETE FROM docs WHERE id=1;")
         stop('immediate'); start()
@@ -138,7 +170,7 @@ def main():
         new_plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert new_plan[0]['Plan']['Exact Heap Blocks'] == 1, new_plan
         assert new_plan[0]['Plan']['Lossy Heap Blocks'] == 0, new_plan
-        result={'status':'passed', 'concurrent_reader_checks':checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion']}
+        result={'status':'passed', 'concurrent_reader_checks':checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion']}
         (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result)); print('Artifacts:',root)
     finally:

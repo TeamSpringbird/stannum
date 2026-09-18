@@ -23,9 +23,11 @@
 use std::collections::BTreeMap;
 
 use crate::dictionary::{Dictionary, DictionaryBuilder, Extent, TermEntry};
+use crate::forward::{ForwardRecord, ForwardTerm};
 use crate::payload::{Payload, PayloadBuilder};
 use crate::postings::{Postings, PostingsBuilder, PostingsCursor};
 use crate::reader::Reader;
+use crate::set::Cursor as _;
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Result, Tid, varint};
 
@@ -81,7 +83,7 @@ impl SegmentBuilder {
     }
 
     /// Adds a document from a forward record, as a buffer fold does.
-    pub fn add_record(&mut self, record: &crate::forward::ForwardRecord) -> Result<()> {
+    pub fn add_record(&mut self, record: &ForwardRecord) -> Result<()> {
         self.add_document(record.tid, record.tokens())
     }
 
@@ -287,6 +289,50 @@ impl<'a> Segment<'a> {
             .transpose()
     }
 
+    /// Rebuilds every document as a forward record, skipping those for which
+    /// `skip` returns true. This is how folds and merges carry documents
+    /// between segments without re-reading the heap.
+    pub fn records(&self, mut skip: impl FnMut(Tid) -> bool) -> Result<Vec<ForwardRecord>> {
+        let mut by_document: BTreeMap<Tid, Vec<ForwardTerm>> = BTreeMap::new();
+        let mut documents = self.documents()?;
+        while let Some(tid) = documents.current() {
+            if !skip(tid) {
+                by_document.insert(tid, Vec::new());
+            }
+            documents.advance()?;
+        }
+        for item in self.dictionary().iter() {
+            let (term, entry) = item?;
+            let resolved = self.resolve(entry)?;
+            let mut postings = resolved.cursor()?;
+            let mut payload = resolved.payload()?.cursor();
+            while let Some(tid) = postings.current() {
+                let mut positions = Vec::new();
+                payload.next_into(&mut positions)?;
+                if let Some(terms) = by_document.get_mut(&tid) {
+                    terms.push(ForwardTerm {
+                        term: term.clone(),
+                        positions,
+                    });
+                }
+                postings.advance()?;
+            }
+        }
+        let mut lengths = self.documents()?;
+        let mut out = Vec::with_capacity(by_document.len());
+        for (tid, terms) in by_document {
+            let ordinal = lengths
+                .rank(tid)?
+                .ok_or(Error::Corrupt("document missing from table"))?;
+            out.push(ForwardRecord {
+                tid,
+                doc_len: self.length_at(ordinal)?,
+                terms,
+            });
+        }
+        Ok(out)
+    }
+
     /// Length by document ordinal, as reported by [`Segment::documents`].
     pub fn length_at(&self, ordinal: u32) -> Result<u32> {
         self.lengths().get(ordinal)
@@ -382,6 +428,37 @@ mod tests {
             crate::set::Difference::new(segment.documents().unwrap(), beer.cursor().unwrap())
                 .unwrap();
         assert_eq!(collect(not_beer).unwrap(), [tid(1, 3)]);
+    }
+
+    #[test]
+    fn records_reconstruct_documents_and_skip_dead_ones() {
+        let mut builder = SegmentBuilder::default();
+        builder
+            .add_document(tid(2, 1), tokens("beer beer wine"))
+            .unwrap();
+        builder
+            .add_document(tid(0, 5), tokens("craft beer"))
+            .unwrap();
+        builder.add_document(tid(1, 3), tokens("")).unwrap();
+        let bytes = builder.finish();
+        let segment = Segment::parse(&bytes).unwrap();
+        let records = segment.records(|t| t == tid(0, 5)).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].tid, tid(1, 3));
+        assert_eq!(records[0].doc_len, 0);
+        assert_eq!(records[1].tid, tid(2, 1));
+        assert_eq!(records[1].doc_len, 3);
+        assert_eq!(records[1].tokens(), [("beer", 1), ("beer", 2), ("wine", 3)]);
+        // Rebuilding from the records yields an equivalent segment.
+        let mut rebuilt = SegmentBuilder::default();
+        for record in &records {
+            rebuilt.add_record(record).unwrap();
+        }
+        let rebuilt = rebuilt.finish();
+        let again = Segment::parse(&rebuilt).unwrap();
+        assert_eq!(again.document_count(), 2);
+        assert_eq!(again.term("craft").unwrap().map(|t| t.df()), None);
+        assert_eq!(again.term("beer").unwrap().map(|t| t.df()), Some(1));
     }
 
     #[test]
