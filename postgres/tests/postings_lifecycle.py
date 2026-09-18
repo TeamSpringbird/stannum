@@ -74,6 +74,35 @@ def main():
         """)
         check()
         verify('volatile_search')
+        # A paused unordered stream retains its index view while another
+        # backend changes matches, folds the buffer and vacuums old segments.
+        sql("CREATE TABLE cursor_docs(id int, body text);"
+            "INSERT INTO cursor_docs SELECT n, 'common blue' FROM generate_series(1,2000) n;"
+            "CREATE INDEX cursor_search ON cursor_docs USING stannum(body);")
+        cursor_sql = ("BEGIN ISOLATION LEVEL REPEATABLE READ;"
+                      "DECLARE saved NO SCROLL CURSOR FOR SELECT id FROM cursor_docs WHERE body ==> 'common AND blue';"
+                      "FETCH 1 FROM saved; SELECT pg_sleep(2); FETCH ALL FROM saved; COMMIT;")
+        paused = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(env, PGAPPNAME='stannum-stream-snapshot'))
+        paused.stdin.write(cursor_sql); paused.stdin.close(); paused.stdin = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='stannum-stream-snapshot' AND wait_event='PgSleep';") == '1':
+                break
+            time.sleep(.02)
+        else:
+            raise AssertionError('stream snapshot did not enter wait')
+        sql("UPDATE cursor_docs SET body='other';")
+        sql('VACUUM (INDEX_CLEANUP ON) cursor_docs;')
+        sql("SET stannum.write_buffer_docs=4; INSERT INTO cursor_docs SELECT n, 'common blue' FROM generate_series(2001,2020) n;")
+        sql('VACUUM (INDEX_CLEANUP ON) cursor_docs;')
+        out, err = paused.communicate(timeout=30)
+        assert paused.returncode == 0, err
+        assert sorted(int(x) for x in out.splitlines() if x.isdigit()) == list(range(1,2001)), out
+        assert sql("SELECT count(*) FROM cursor_docs WHERE body ==> 'common AND blue';") == '20'
+        verify('cursor_search')
+        sql('DROP TABLE cursor_docs;')
         # Cancel after scan initialization in a single reusable backend, then
         # prove that transaction/error cleanup leaves subsequent scans usable.
         cancelled = command(['psql','-X','-qAt'], input="""SET statement_timeout='50ms';

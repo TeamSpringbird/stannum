@@ -13,6 +13,7 @@ pub(crate) mod options;
 mod score;
 mod selectivity;
 mod storage;
+mod stream;
 mod tf_bucket {
     pub(crate) use segment::tf_bucket::*;
 }
@@ -3518,6 +3519,95 @@ mod tests {
             assert_eq!(plan["Node Type"], "Seq Scan", "{mode}: {plan}");
         }
     }
+    #[pg_test]
+    fn streaming_search_stops_at_limit_and_retains_its_snapshot() {
+        Spi::run(
+            "CREATE TABLE streamed(id int, body text, payload int) WITH (fillfactor=60);
+            INSERT INTO streamed SELECT n, 'common red blue', 0 FROM generate_series(1, 6000) n;
+            CREATE INDEX streamed_idx ON streamed USING stannum(body);
+            INSERT INTO streamed VALUES (6001, 'common red blue', 0);
+            SET LOCAL enable_seqscan = off;
+            SET LOCAL stannum.enable_custom_scan = on;",
+        )
+        .unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON)
+            SELECT id FROM streamed WHERE body ==> 'common AND red' LIMIT 10",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        let scan = &plan[0]["Plan"]["Plans"][0];
+        assert_eq!(scan["Custom Plan Provider"], "Stannum Text Search Scan");
+        assert_eq!(scan["Candidate Strategy"], "streaming page bitmaps");
+        assert_eq!(scan["Candidates Visited"], 10);
+        assert!(
+            scan.get("Candidates").is_none(),
+            "partial traversal is not a total count"
+        );
+        let ids = |sql: &str| {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            })
+        };
+        Spi::run("DECLARE paused NO SCROLL CURSOR FOR SELECT id FROM streamed WHERE body ==> 'common AND red'").unwrap();
+        let mut seen = ids("FETCH 7 FROM paused");
+        Spi::run("UPDATE streamed SET payload=1 WHERE id % 11 = 0;
+            DELETE FROM streamed WHERE id % 13 = 0;
+            SET LOCAL stannum.write_buffer_docs = 1;
+            INSERT INTO streamed VALUES (7000, 'common red blue', 0), (7001, 'common red blue', 0);").unwrap();
+        // Refresh backend caches while the earlier stream still borrows its view.
+        assert!(value("SELECT count(*) FROM streamed WHERE body ==> 'common'") > 0);
+        seen.extend(ids("FETCH ALL FROM paused"));
+        seen.sort_unstable();
+        assert_eq!(seen, (1..=6001).collect::<Vec<_>>());
+        Spi::run("CLOSE paused; SET LOCAL stannum.enable_custom_scan = off;").unwrap();
+        assert_index_matches_seqscan(
+            "streamed",
+            &[
+                "common AND red",
+                "common OR missing",
+                "common AND NOT missing",
+                "\"red blue\"",
+            ],
+        );
+        // An extra SQL filter may require consuming more than LIMIT candidates.
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;")
+            .unwrap();
+        assert_eq!(
+            ids("SELECT id FROM streamed WHERE body ==> 'common' AND id >= 6000 LIMIT 3"),
+            vec![6000, 6001, 7000]
+        );
+    }
+
+    #[pg_test]
+    fn streaming_search_rewinds_for_nested_loop_rescans() {
+        Spi::run("CREATE TABLE stream_rescan(id int, body text);
+            INSERT INTO stream_rescan SELECT n, CASE WHEN n % 2 = 0 THEN 'common blue' ELSE 'common red' END FROM generate_series(1, 2000) n;
+            CREATE INDEX stream_rescan_idx ON stream_rescan USING stannum(body);
+            SET LOCAL enable_seqscan = off; SET LOCAL enable_material = off; SET LOCAL enable_memoize = off;").unwrap();
+        let sql = "SELECT sum(s.id) FROM generate_series(1,3) g
+            CROSS JOIN LATERAL (SELECT id FROM stream_rescan WHERE body ==> 'common AND blue' OFFSET g * 0) s";
+        assert_eq!(value(sql), 3 * 1001000);
+        let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+            .unwrap()
+            .unwrap()
+            .0;
+        fn find_scan(plan: &serde_json::Value) -> Option<&serde_json::Value> {
+            if plan["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(plan);
+            }
+            plan.get("Plans")?.as_array()?.iter().find_map(find_scan)
+        }
+        let scan = find_scan(&plan[0]["Plan"]).expect("custom scan beneath lateral limit");
+        assert_eq!(scan["Actual Loops"], 3);
+        assert_eq!(scan["Candidates Visited"], 3000);
+    }
+
     #[pg_test]
     fn pg_page_counts_match_heap_predicates_after_hot_updates_and_deletes() {
         Spi::run(
