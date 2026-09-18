@@ -12,7 +12,7 @@ PostgreSQL's default PUBLIC EXECUTE remains appropriate for the functions below.
 | Indexed operator and bound highlighting | Public; STABLE, PARALLEL SAFE because tokenizer settings come from catalogs/index metadata. Validate the supplied relation is Stannum before accessing its options. No table contents are returned; supplied text is analyzed. |
 | `bind_query`, indexed-query input/output | Public data construction/serialization; IMMUTABLE, PARALLEL SAFE. Explicit InOutFuncs reject malformed JSON, invalid field types, missing fields, out-of-range OIDs and unknown fields. The pgrx default silently returned NULL on decoding failure and is deliberately overridden. Relation validity is checked when evaluated. |
 | `segment_info`, `verify_index`, `score_inspect` | VOLATILE, PARALLEL UNSAFE because physical state can change inside a statement. Require heap ownership or table-wide SELECT (including inherited grants and pg_read_all_data); reject readers subject to RLS because physical diagnostics cannot filter index contents by policy. Column-only grants are insufficient. |
-| `score`, `full_score`, `max_score` | Immutable planner placeholders, PARALLEL UNSAFE; direct execution errors. Actual bound scoring functions are VOLATILE and PARALLEL UNSAFE. Heap scoring uses invoker SPI permissions and row security. Indexed SQL scoring checks table/index association and the same index-read permission policy on statement-cache population. |
+| `score`, `full_score`, `max_score` | Immutable planner placeholders, PARALLEL UNSAFE; direct execution errors. Actual bound scoring functions are VOLATILE and PARALLEL UNSAFE. Heap scoring uses invoker SPI permissions and row security. Indexed SQL scoring checks table/index association and the same index-read permission policy on statement-cache population. Direct indexed scoring rejects recovery snapshots, including those retained after promotion. |
 | Access-method handler, planner support and selectivity functions | Internal PostgreSQL signatures; cannot be invoked with user-constructed internal pointers. Handler is IMMUTABLE/STRICT/PARALLEL SAFE; support functions are planner-only. |
 | `corrupt_index_page`, `index_page_kinds` | Compiled only with `pg_test`, absent from release SQL. Both validate relation/heap permissions; byte mutation additionally requires superuser. |
 
@@ -27,7 +27,8 @@ SQL from catalog-deparsed index expressions/predicates, quoted relation names,
 and numeric OIDs; user query strings and options are not SQL-interpolated.
 
 Storage GUCs are USERSET with bounds: write-buffer docs 1..1,000,000, build docs
-1..10,000,000, maximum segments 1..128, tier factor 2..64. Custom-scan selection is
+1..10,000,000, write-buffer bytes 1,024..67,108,864, merge documents
+0..2,147,483,647, maximum segments 1..128, tier factor 2..64. Custom-scan selection is
 a USERSET boolean. These tune the caller's work without escalating privileges;
 large build settings can consume substantial memory, as other PostgreSQL user
 query settings can. No GUC accepts a filesystem path.

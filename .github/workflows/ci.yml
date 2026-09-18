@@ -111,7 +111,7 @@ jobs:
       - name: Index lifecycle checks
         run: python3 postgres/tests/postings_lifecycle.py
 
-  # Behavioral regression suite: the same fixture, 41 query shapes and five
+  # Behavioral regression suite: the same fixture, 47 query shapes and five
   # mutation states on Stannum and on the original Lead, checked out directly
   # from PlanetScale's repository and built under its own name `tin`. Match
   # sets and rank order must agree; Lead's score bits are not compared (see

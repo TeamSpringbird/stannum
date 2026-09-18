@@ -33,7 +33,10 @@ positions, term frequencies, and document lengths.
 
 Searches read both segments and the buffer, so new rows do not wait for a fold to
 be searchable. Per-backend caches reuse immutable segment data and incrementally
-index new buffer records.
+index new buffer records. Retained document cursors keep their encoded length
+array from the same buffer state. Refreshing the buffer can insert a reused heap
+location before existing rows; looking up old ordinals in a new length array
+would change scores midway through a ranked scan.
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
@@ -96,9 +99,10 @@ input, maintenance abandons the output; a later VACUUM retries. Changes to other
 entries or the write buffer are preserved. Only then does it allocate and WAL
 write the new runs, publish a fresh generation and retire the old runs.
 
-The lock order stays meta, buffer/run pages, extension lock. All page writes
-still use generic WAL. Readers with captured directories retain the existing
-snapshot-horizon protection for retired runs. The maintenance builder uses
+The lock order stays meta, buffer/run pages, extension lock. Permanent-index page writes
+still use generic WAL; temporary and unlogged main-fork writes skip WAL.
+Readers with captured directories retain the existing snapshot-horizon
+protection for retired runs. The maintenance builder uses
 owned bytes while unlocked, so it does not depend on VACUUM having a reader
 snapshot. Run copying and output WAL publication still hold the meta lock;
 this is not a fully nonblocking compactor. A cleanup call attempts at most the
