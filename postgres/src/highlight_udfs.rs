@@ -167,16 +167,13 @@ unsafe fn combined_query(queries: &[*mut pg_sys::Node]) -> *mut pg_sys::Node {
 /// query at `query_position`.
 unsafe fn bound_overload(name: &CStr, query_position: usize) -> pg_sys::Oid {
     unsafe {
-        let mut names = PgList::<pg_sys::Node>::new();
-        names.push(pg_sys::makeString(pg_sys::pstrdup(c"stannum".as_ptr())).cast());
-        names.push(pg_sys::makeString(pg_sys::pstrdup(name.as_ptr())).cast());
         let mut types = if query_position == 3 {
             vec![pg_sys::TEXTOID, pg_sys::TEXTOID, pg_sys::TEXTOID]
         } else {
             vec![pg_sys::TEXTOID, pg_sys::INT4OID]
         };
         types.push(crate::operator::indexed_query_type_oid());
-        pg_sys::LookupFuncName(names.into_pg(), types.len() as i32, types.as_ptr(), true)
+        crate::operator::extension_function_oid(name, &types)
     }
 }
 

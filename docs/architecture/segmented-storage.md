@@ -188,6 +188,37 @@ are bound to. `stannum.tokenize` and `stannum.ql_parse` take explicit
 settings and are unaffected: pass the index's options to reproduce its
 analysis.
 
+Binding needs a query to plan. Everything PostgreSQL plans binds: views,
+CTEs, cursors, data-modifying statements, inlined SQL functions, PL/pgSQL
+statements and `EXECUTE` (through SPI), prepared statements (a generic plan
+keeps the binding and is invalidated when the index changes), and
+row-security `USING` and `WITH CHECK` expressions. The operator is also
+evaluated by `expression_planner`, which has no query: the predicate of a
+partial index (at build and on every insert), a CHECK constraint, a stored
+generated column, a trigger's `WHEN` clause, an expression in extended
+statistics. There `==>` means the default settings whatever index the column
+has. The same holds when the document is not a column: a PL/pgSQL variable
+or `NEW.body`, the argument of a SQL function that is not inlined, an
+expression no index covers, a literal. Nothing resolves these at execution
+time: a function sees its argument's `Var`, a range-table position, not a
+table, so it cannot find the column's index, and warning on every unbound
+evaluation would flag the legitimate default-settings uses above. The one
+place the mismatch is cheap to detect is a `stannum` index built with other
+settings whose own predicate holds a `==>` clause, where the index's
+settings would be expected: `CREATE INDEX` and `REINDEX` raise a WARNING.
+
+A partial index whose predicate is a `==>` clause therefore holds the rows
+the default settings match, and only a query clause meaning the default
+settings can prove it. Before the planner examines a relation's indexes, a
+`get_relation_info` hook rewrites such a predicate clause into the bound
+form of the query's matching clause when that clause is bound to an index
+with the default settings; `predicate_implied_by` then sees equal clauses
+and the partial index, of any access method, is usable (for partitions, the
+parent's clause is translated to the partition first). A clause bound to an
+index with other settings never proves it: a partial index with other
+settings and a `==>` predicate is still bound to when it is the first
+covering index by OID, but is never scanned for that clause.
+
 ## Ranking
 
 BM25 scoring reads term frequencies, document lengths, and corpus statistics from
@@ -337,12 +368,14 @@ the table is the source of truth; `REINDEX` rebuilds from it.
 
 ## Current limits
 
-- `==>` uses the default tokenizer settings where the planner cannot bind it
-  to an index: with no planner state (index predicates, generated columns,
-  check constraints) or on a document expression no `stannum` index covers.
-  A partial index whose predicate is itself a `==>` clause is therefore not
-  matched against the bound clause, and its predicate is not proven by the
-  planner.
+- `==>` means the default tokenizer settings wherever no query is planned
+  around it (partial-index predicates, CHECK constraints, generated columns,
+  trigger `WHEN` clauses, statistics expressions) and wherever the document
+  is not a column a `stannum` index covers (PL/pgSQL variables, non-inlined
+  function arguments, uncovered expressions, literals). A partial index with
+  other settings and a `==>` predicate holds the rows the defaults match, is
+  never scanned for that clause, and warns when built. See "One tokenizer
+  per clause".
 - Legacy zero-page indexes use the slower reference path. Hot standbys use
   the segmented path only when the extension is preloaded on the primary and
   the standby (removal-horizon WAL records, see
