@@ -80,6 +80,17 @@ AS 'MODULE_PATHNAME', 'highlight_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- postgres/src/storage/wal.rs:260
+-- stannum::storage::wal::index_reads_allowed
+CREATE  FUNCTION "index_reads_allowed"(
+	"index" regclass /* pgrx :: PgRelation */
+) RETURNS bool /* bool */
+STRICT VOLATILE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'index_reads_allowed_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- postgres/src/operator.rs:43
 -- indexed_query
 CREATE TYPE indexed_query;
@@ -113,19 +124,6 @@ CREATE TYPE indexed_query (
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:100
--- stannum::highlight_udfs::highlight_ansi
-CREATE  FUNCTION "highlight_ansi"(
-	"text" TEXT, /* Option < & str > */
-	"wrap_to" INT, /* Option < i32 > */
-	"query" indexed_query /* indexed_query */
-) RETURNS TEXT /* Option < String > */
-STABLE PARALLEL SAFE 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'highlight_ansi_bound_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
 -- postgres/src/operator.rs:149
 -- stannum::operator::bind_query
 CREATE  FUNCTION "bind_query"(
@@ -152,6 +150,19 @@ AS 'MODULE_PATHNAME', 'highlight_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- postgres/src/highlight_udfs.rs:100
+-- stannum::highlight_udfs::highlight_ansi
+CREATE  FUNCTION "highlight_ansi"(
+	"text" TEXT, /* Option < & str > */
+	"wrap_to" INT, /* Option < i32 > */
+	"query" indexed_query /* indexed_query */
+) RETURNS TEXT /* Option < String > */
+STABLE PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'highlight_ansi_bound_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- postgres/src/highlight_udfs.rs:275
 -- requires:
 --   highlight
@@ -165,6 +176,17 @@ ALTER FUNCTION @extschema@.highlight(pg_catalog.text, pg_catalog.text, pg_catalo
     SUPPORT @extschema@.highlight_support;
 ALTER FUNCTION @extschema@.highlight_ansi(pg_catalog.text, pg_catalog.int4, pg_catalog.text)
     SUPPORT @extschema@.highlight_support;
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/storage/wal.rs:251
+-- stannum::storage::wal::logs_removal_horizons
+CREATE  FUNCTION "logs_removal_horizons"(
+	"index" regclass /* pgrx :: PgRelation */
+) RETURNS bool /* bool */
+STRICT VOLATILE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'logs_removal_horizons_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -265,7 +287,7 @@ AS 'MODULE_PATHNAME', 'score_bound_indexed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:1504
+-- postgres/src/score.rs:1542
 -- stannum::score::score_inspect
 CREATE  FUNCTION "score_inspect"(
 	"index" regclass, /* Option < PgRelation > */
@@ -283,7 +305,7 @@ AS 'MODULE_PATHNAME', 'score_inspect_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:1784
+-- postgres/src/score.rs:1822
 -- stannum::score::score_support
 CREATE  FUNCTION "score_support"(
 	"request" internal /* Internal */
@@ -294,7 +316,7 @@ AS 'MODULE_PATHNAME', 'score_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:2012
+-- postgres/src/score.rs:2050
 -- requires:
 --   full_score
 --   full_score_with_bm25
@@ -369,7 +391,7 @@ AS 'MODULE_PATHNAME', 'stannum_text_cmpfunc_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/selectivity.rs:128
+-- postgres/src/selectivity.rs:139
 -- stannum::selectivity::stannum_text_restrict
 
     CREATE OR REPLACE FUNCTION @extschema@.stannum_text_restrict(internal, oid, internal, integer)
@@ -454,5 +476,14 @@ CREATE  FUNCTION "version"() RETURNS TEXT /* & '_ str */
 IMMUTABLE STRICT PARALLEL SAFE
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'version_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/storage/wal.rs:243
+-- stannum::storage::wal::wal_rmgr_id
+CREATE  FUNCTION "wal_rmgr_id"() RETURNS INT /* Option < i32 > */
+STRICT STABLE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'wal_rmgr_id_wrapper';
 /* </end connected objects> */
 
