@@ -269,7 +269,7 @@ mod tests {
     use super::*;
     use pgrx::prelude::*;
 
-    #[test]
+    #[pg_test]
     fn reclaim_record_round_trips_and_rejects_bad_lengths() {
         let record = Reclaim {
             locator: pg_sys::RelFileLocator {
