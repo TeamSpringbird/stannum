@@ -865,8 +865,10 @@ pub(super) unsafe fn referenced_pages(
 ) -> Result<Vec<bool>, String> {
     let mut referenced = vec![false; nblocks as usize];
     // Pages past `nblocks` were extended after the caller's capture and are
-    // no candidates for anything; the checker reports references beyond the
-    // actual end of the index.
+    // no candidates for anything, but chains written since may run through
+    // them; they are read up to the relation's current extent. The checker
+    // reports references beyond the actual end of the index.
+    let extent = unsafe { blocks(index) };
     let mut mark = |block: u32| {
         if block < nblocks {
             referenced[block as usize] = true;
@@ -879,7 +881,7 @@ pub(super) unsafe fn referenced_pages(
         let mut block = run.first;
         for i in 0..run.blocks {
             pgrx::check_for_interrupts!();
-            if block == NONE || block >= nblocks {
+            if block == NONE || block >= extent {
                 return Err(format!(
                     "{owner}: chain ends after {i} of {} pages",
                     run.blocks
@@ -930,7 +932,7 @@ pub(super) unsafe fn referenced_pages(
             }
         }
     }
-    let (pages, ended) = unsafe { chain_pages(index, meta.buffer.head, nblocks, KIND_BUFFER) };
+    let (pages, ended) = unsafe { chain_pages(index, meta.buffer.head, extent, KIND_BUFFER) };
     if ended != NONE {
         return Err(format!(
             "write buffer chain cannot continue at page {ended}"
