@@ -241,16 +241,6 @@ fn score_bound_indexed(
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
 ) -> f32 {
-    // SQL callers can bypass the planner's heap-scoring fallback. Check even
-    // cache hits, including a recovery snapshot retained after promotion.
-    if unsafe {
-        pg_sys::RecoveryInProgress()
-            || (pg_sys::ActiveSnapshotSet() && (*pg_sys::GetActiveSnapshot()).takenDuringRecovery)
-    } {
-        pgrx::error!(
-            "indexed scoring is unavailable for recovery snapshots; use stannum.score or stannum.full_score"
-        );
-    }
     let statement = current_statement();
     let dense = dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits();
     // Per-row calls compare against the cached key without allocating; the
@@ -280,6 +270,13 @@ fn score_bound_indexed(
             crate::udfs::require_stannum_index(&index, "score_bound_indexed");
             if unsafe { pg_sys::IndexGetRelation(index.oid(), false) }.to_u32() != heap_oid as u32 {
                 pgrx::error!("score index does not belong to the supplied table");
+            }
+            // SQL callers can bypass the planner's heap-scoring fallback; the
+            // statement cache is filled only where the index may be read.
+            if !unsafe { crate::storage::index_reads_allowed(index.as_ptr()) } {
+                pgrx::error!(
+                    "indexed scoring is unavailable for this index during recovery; use stannum.score or stannum.full_score"
+                );
             }
             let key = CacheKey {
                 statement,

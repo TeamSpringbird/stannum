@@ -45,7 +45,12 @@ def main():
     try:
         command(['initdb', '-D', str(data), '-U', 'postgres', '-A', 'trust', '--no-locale', '--encoding=UTF8', '--data-checksums'])
         with (data/'postgresql.conf').open('a') as f:
-            f.write(f"\nlisten_addresses=''\nport=28928\nunix_socket_directories='{root}'\nshared_buffers='64MB'\n")
+            # Preload so the custom WAL resource manager registers on the
+            # primary and, through pg_basebackup's copy of this file, on the
+            # standby. Removal-horizon records are what makes standby index
+            # reads safe; without preload the primary still works and writes
+            # none, and standbys keep the heap fallback.
+            f.write(f"\nlisten_addresses=''\nport=28928\nunix_socket_directories='{root}'\nshared_buffers='64MB'\nshared_preload_libraries='stannum'\n")
         start()
         sql("""CREATE EXTENSION stannum;
           CREATE TABLE docs(id int PRIMARY KEY, body text, revision int DEFAULT 0) WITH(fillfactor=60);
@@ -151,7 +156,14 @@ def main():
         size_after_cycles = int(sql("SELECT pg_relation_size('folded_search');"))
         assert size_after_cycles <= 3 * size_after_first_cycle, (size_after_first_cycle, size_after_cycles)
 
-        # No manual checkpoint before immediate shutdown: replay must recover WAL.
+        # The custom WAL resource manager is registered on the preloaded
+        # primary and the folded cycles above emitted RECLAIM records.
+        assert sql("SELECT stannum.wal_rmgr_id() IS NOT NULL;") == 't'
+        assert sql("SELECT bool_or(rm_name='stannum') FROM pg_get_wal_resource_managers();") == 't'
+        # No manual checkpoint before immediate shutdown: replay must recover
+        # WAL, including the new RECLAIM records (a crash-recovering primary is
+        # never in hot standby, so their redo resolves no conflict).
+        sql("DELETE FROM docs WHERE id%3=0; VACUUM (INDEX_CLEANUP ON) docs;")
         sql("INSERT INTO docs VALUES(99998,'needle',0); DELETE FROM docs WHERE id=1;")
         stop('immediate'); start()
         check()
@@ -196,7 +208,11 @@ def main():
             assert 'Heap Fetches' not in custom_nodes[0] and 'Candidates' not in custom_nodes[0], custom_nodes[0]
         assert sql(parallel_settings + "SELECT count(*) FROM worker_docs WHERE body ==> 'needle';") == '1000'
         sql(tuned + "CREATE TABLE standby_churn(id int, body text); INSERT INTO standby_churn SELECT n, 'needle common' FROM generate_series(1,200) n; CREATE INDEX standby_churn_idx ON standby_churn USING stannum(body);")
-        # Verify the conservative read path on an actual streaming standby.
+        # Streaming standby with the extension preloaded on both ends (the
+        # primary's shared_preload_libraries is copied by pg_basebackup), so the
+        # custom WAL resource manager registers here and removal-horizon records
+        # are replayed. Index reads are therefore enabled on the standby, and
+        # every answer is checked against a heap regex scan in the same snapshot.
         command(['pg_basebackup','-h',str(root),'-p','28928','-U','postgres','-D',str(standby),'-X','stream','-R','--checkpoint=fast'])
         with (standby/'postgresql.conf').open('a') as f:
             f.write("\nport=28929\nhot_standby=on\nmax_standby_streaming_delay=-1\nwal_receiver_status_interval=1s\n")
@@ -204,105 +220,167 @@ def main():
         standby_env=dict(env,PGPORT='28929')
         recovery=command(['psql','-X','-qAt','-c','SELECT pg_is_in_recovery();'],env=standby_env).strip()
         assert recovery == 't'
+        def standby_sql(text):
+            return command(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=text, env=standby_env).strip()
+        # The resource manager is registered on the standby and the primary
+        # logged removal horizons for these indexes.
+        assert standby_sql("SELECT stannum.wal_rmgr_id() IS NOT NULL;") == 't'
+        assert standby_sql("SELECT stannum.logs_removal_horizons('standby_churn_idx');") == 't'
+        assert standby_sql("SELECT stannum.index_reads_allowed('standby_churn_idx');") == 't'
         # Verification takes only AccessShareLock during recovery.
         verify(env=standby_env)
         verify('folded_search', env=standby_env)
-        plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
-        assert plan[0]['Plan']['Lossy Heap Blocks'] == 1, plan
+        # Index reads happen on the standby: a custom Text Search Scan, and the
+        # bitmap path fetching exact (not lossy) heap blocks.
+        plan=json.loads(standby_sql("EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"))
+        assert plan[0]['Plan']['Custom Plan Provider'] == 'Stannum Text Search Scan', plan
         assert plan[0]['Plan']['Actual Rows'] == 1, plan
-        standby_snapshot_checks = 0
-        def standby_sql(text):
-            return command(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=text, env=standby_env).strip()
-        for feedback in ('off', 'on'):
-            standby_sql(f"ALTER SYSTEM SET hot_standby_feedback={feedback}; SELECT pg_reload_conf();")
-            # Wait for replay of the preceding scenario before acquiring a new
-            # snapshot, then record its expected answer independently of Stannum.
+        bitmap=json.loads(standby_sql("SET stannum.enable_custom_scan=off; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"))
+        assert bitmap[0]['Plan']['Exact Heap Blocks'] == 1 and bitmap[0]['Plan']['Lossy Heap Blocks'] == 0, bitmap
+        assert bitmap[0]['Plan']['Actual Rows'] == 1, bitmap
+        # Indexed scoring is available on the standby now that reads are safe.
+        ranked_plan = json.loads(standby_sql("EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) SELECT stannum.full_score(ctid) FROM docs WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC;"))
+        assert 'score_bound_indexed' in json.dumps(ranked_plan), ranked_plan
+        assert standby_sql("SELECT stannum.full_score(ctid) > 0 FROM docs WHERE body ==> 'needle';") == 't'
+        direct_indexed_score = "SELECT stannum.score_bound_indexed('(0,1)'::tid, 'needle', 'docs'::regclass::oid::int, 'docs_search'::regclass::oid::int, 1, NULL, NULL, NULL, NULL, NULL);"
+        assert standby_sql(direct_indexed_score), 'indexed scorer returned no value on the standby'
+        standby_sql("SET stannum.enable_custom_scan=on;")
+
+        # The correctness harness: a standby session holds a REPEATABLE READ
+        # snapshot and repeatedly compares the index answer with a heap regex
+        # scan in that same snapshot, alternating the custom-scan and bitmap
+        # index paths, while the primary forces folds, merges, deletes, VACUUM
+        # and page reuse. Answers must match exactly (zero wrong answers); a
+        # recovery conflict may instead cancel the query. Both feedback states
+        # and both an infinite and a finite max_standby_streaming_delay run.
+        totals = {'answers': 0, 'wrong': 0, 'conflicts': 0, 'runs': []}
+        cancel_message = 'canceling statement due to conflict with recovery'
+        def run_reader(feedback, delay, base):
+            standby_sql(f"ALTER SYSTEM SET hot_standby_feedback={feedback};"
+                        f"ALTER SYSTEM SET max_standby_streaming_delay='{delay}'; SELECT pg_reload_conf();")
+            # Reload is asynchronous; wait until the receiver applied the delay.
+            deadline = time.monotonic() + 10
+            while standby_sql("SHOW max_standby_streaming_delay;") != delay:
+                assert time.monotonic() < deadline, 'delay reload did not take effect'
+                time.sleep(.05)
             target = sql('SELECT pg_current_wal_flush_lsn();')
             deadline = time.monotonic() + 20
             while standby_sql(f"SELECT pg_last_wal_replay_lsn() >= '{target}'::pg_lsn;") != 't':
                 assert time.monotonic() < deadline, 'standby failed to catch up'
                 time.sleep(.02)
-            expected = standby_sql("SELECT count(*) FROM standby_churn WHERE body LIKE '%needle%';")
-            reader_env = dict(standby_env, PGAPPNAME='stannum-standby-snapshot')
-            statements = ['BEGIN ISOLATION LEVEL REPEATABLE READ;']
+            appname = f'stannum-standby-{feedback}-{base}'
+            reader_env = dict(standby_env, PGAPPNAME=appname)
+            # One held snapshot; each iteration compares the index count with a
+            # heap regex count in that snapshot in a single statement.
+            pair = ("SELECT 'PAIR:' || (SELECT count(*) FROM standby_churn WHERE body ==> 'needle')"
+                    " || '|' || (SELECT count(*) FROM standby_churn WHERE body ~ '\\mneedle\\M');")
+            statements = ['\\set ON_ERROR_STOP off', 'BEGIN ISOLATION LEVEL REPEATABLE READ;']
             for iteration in range(160):
-                statements.append(f"SET LOCAL stannum.enable_custom_scan={'on' if iteration%2 else 'off'}; SELECT count(*) FROM standby_churn WHERE body ==> 'needle'; SELECT pg_sleep(0.03);")
+                statements.append(f"SET stannum.enable_custom_scan={'on' if iteration%2 else 'off'};")
+                statements.append(pair)
+                statements.append('SELECT pg_sleep(0.03);')
             statements.append('COMMIT;')
-            reader_script = root / f'standby-reader-{feedback}.sql'
-            reader_script.write_text('\n'.join(statements))
-            reader = subprocess.Popen(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-f', str(reader_script)],
+            script = root / f'standby-reader-{feedback}-{base}.sql'
+            script.write_text('\n'.join(statements))
+            reader = subprocess.Popen(['psql', '-XqAt', '-f', str(script)],
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=reader_env)
             deadline = time.monotonic() + 10
-            while standby_sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='stannum-standby-snapshot' AND wait_event='PgSleep';") != '1':
+            while standby_sql(f"SELECT count(*) FROM pg_stat_activity WHERE application_name='{appname}' AND wait_event='PgSleep';") != '1':
                 assert time.monotonic() < deadline, 'standby snapshot did not start'
                 time.sleep(.02)
             if feedback == 'on':
-                deadline = time.monotonic() + 3
+                deadline = time.monotonic() + 5
                 while sql('SELECT count(*) FROM pg_stat_replication WHERE backend_xmin IS NOT NULL;') == '0':
                     assert time.monotonic() < deadline, 'standby feedback xmin not received'
                     time.sleep(.02)
-            # Inserts force repeated folds, merges and reclamation. Updates and
-            # VACUUM also test heap recovery conflicts: with feedback off, replay
-            # may wait for this reader, rather than cancelling its old snapshot.
-            base = 10000 if feedback == 'off' else 20000
+            # Inserts force repeated folds, merges and reclamation; updates plus
+            # VACUUM force heap pruning and index page reuse behind logged
+            # horizons.
             for iteration in range(16):
                 first = base + iteration * 30
                 sql(tuned + f"INSERT INTO standby_churn SELECT n, 'needle common' FROM generate_series({first}, {first+29}) n;")
             sql("UPDATE standby_churn SET body='changed' WHERE id<=100;")
             sql('VACUUM (INDEX_CLEANUP ON) standby_churn;')
-            out, err = reader.communicate(timeout=30)
-            assert reader.returncode == 0, (feedback, err)
-            counts = [line for line in out.splitlines() if line.isdigit()]
-            assert len(counts) == 160 and set(counts) == {expected}, (feedback, expected, counts)
-            standby_snapshot_checks += len(counts)
-            verify('standby_churn_idx')
-        ranked_plan = json.loads(standby_sql("EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) SELECT stannum.full_score(ctid) FROM docs WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC;"))
-        assert 'score_bound_indexed' not in json.dumps(ranked_plan), ranked_plan
-        assert 'score_bound' in json.dumps(ranked_plan), ranked_plan
-        assert standby_sql("SELECT stannum.full_score(ctid) > 0 FROM docs WHERE body ==> 'needle';") == 't'
-        # Direct SQL calls bypass planner routing, including privileged callers.
-        direct_indexed_score = "SELECT stannum.score_bound_indexed('(0,1)'::tid, 'needle', 'docs'::regclass::oid::int, 'docs_search'::regclass::oid::int, 1, NULL, NULL, NULL, NULL, NULL);"
-        recovery_score_error = 'indexed scoring is unavailable for recovery snapshots'
-        rejected = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1'],
-                                  input=direct_indexed_score, text=True, capture_output=True,
-                                  env=standby_env)
-        assert rejected.returncode == 3 and recovery_score_error in rejected.stderr, rejected
-        # A snapshot acquired during recovery retains the fallback after promotion.
+            sql('VACUUM (INDEX_CLEANUP ON) standby_churn;')
+            out, err = reader.communicate(timeout=60)
+            pairs = [line[len('PAIR:'):] for line in out.splitlines() if line.startswith('PAIR:')]
+            refs = set()
+            matched = 0
+            for entry in pairs:
+                idx, ref = entry.split('|')
+                refs.add(ref)
+                if idx == ref:
+                    matched += 1
+                else:
+                    totals['wrong'] += 1
+            # The snapshot is fixed, so the reference answer never changes.
+            assert len(refs) <= 1, (feedback, delay, refs)
+            cancelled = cancel_message in err
+            totals['answers'] += matched
+            if cancelled:
+                totals['conflicts'] += 1
+            totals['runs'].append({'feedback': feedback, 'delay': delay,
+                                   'answers': matched, 'cancelled': cancelled})
+            # Correctness is absolute; availability is not guaranteed with a
+            # finite delay and no feedback.
+            assert reader.returncode == 0 or cancelled, (feedback, delay, err)
+            if delay == '-1' or feedback == 'on':
+                assert matched == 160 and not cancelled, (feedback, delay, matched, cancelled, err)
+            verify('standby_churn_idx', env=standby_env)
+            return matched, cancelled
+
+        run_reader('off', '-1', 10000)          # replay waits for the reader
+        run_reader('off', '250ms', 20000)       # finite delay: cancellation allowed
+        run_reader('on', '250ms', 30000)        # feedback retains xmin: answers
+        assert totals['wrong'] == 0, totals
+        standby_snapshot_checks = totals['answers']
+
+        # Promotion: a snapshot taken during recovery keeps reading the index
+        # after promotion, because its xmin stays in the procarray and replay,
+        # the only writer that bypassed the meta lock, has ended.
         promotion_env = dict(standby_env, PGAPPNAME='stannum-promotion-check')
         promotion = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=promotion_env)
-        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL stannum.enable_custom_scan=off; SELECT count(*) FROM docs; SELECT pg_sleep(3); SELECT 'promoted:' || (NOT pg_is_in_recovery())::text; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; SET LOCAL stannum.enable_custom_scan=on; SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle'; SELECT 'score:' || (stannum.full_score(ctid)>0)::text FROM docs WHERE body ==> 'needle'; SAVEPOINT direct_score;\n"
-                              + "\\set ON_ERROR_STOP off\n" + direct_indexed_score + "\n"
-                              + "\\echo direct-indexed-error :ERROR\n\\set ON_ERROR_STOP on\n"
-                              + "ROLLBACK TO SAVEPOINT direct_score; SELECT 'snapshot-survived:' || count(*) FROM docs; COMMIT;")
+        promotion.stdin.write(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ;\n"
+            "SELECT 'before:' || count(*) FROM docs WHERE body ==> 'needle';\n"
+            "SELECT pg_sleep(3);\n"
+            "SELECT 'promoted:' || (NOT pg_is_in_recovery())::text;\n"
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';\n"
+            "SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle';\n"
+            "SELECT 'score:' || (stannum.full_score(ctid)>0)::text FROM docs WHERE body ==> 'needle';\n"
+            "SELECT 'indexed:' || (" + direct_indexed_score.rstrip(';')[len('SELECT '):] + ")::text;\n"
+            "SELECT 'survived:' || count(*) FROM docs;\n"
+            "COMMIT;\n")
         promotion.stdin.close(); promotion.stdin=None
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
-            waiting=command(['psql','-X','-qAt','-c',"SELECT count(*) FROM pg_stat_activity WHERE application_name='stannum-promotion-check' AND wait_event='PgSleep';"],env=standby_env).strip()
+            waiting=standby_sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='stannum-promotion-check' AND wait_event='PgSleep';")
             if waiting == '1': break
             time.sleep(.02)
         else: raise AssertionError('promotion session did not enter wait')
         command(['pg_ctl','-D',str(standby),'-w','promote'])
         out, err = promotion.communicate()
-        assert promotion.returncode == 0, err
-        old_plan=json.loads(out[out.index('['):out.rindex(']')+1])
-        assert old_plan[0]['Plan']['Lossy Heap Blocks'] == 1, old_plan
-        # The same recovery snapshot retains heap fallback with custom scans enabled.
+        assert promotion.returncode == 0, (out, err)
+        assert 'before:1' in out, out
+        assert 'promoted:true' in out, out
         assert 'custom:1' in out, out
         assert 'score:true' in out, out
-        assert 'promoted:true' in out, out
-        assert 'direct-indexed-error true' in out and recovery_score_error in err, (out, err)
-        assert 'snapshot-survived:1' in out, out
-        # New primary snapshots can call the indexed scorer again.
+        assert 'indexed:' in out and 'survived:1' in out, out
+        old_plan=json.loads(out[out.index('['):out.rindex(']')+1])
+        # The snapshot still reads the index after promotion, no heap fallback.
+        assert old_plan[0]['Plan']['Custom Plan Provider'] == 'Stannum Text Search Scan', old_plan
+        assert old_plan[0]['Plan']['Actual Rows'] == 1, old_plan
+        # New primary snapshots read the index the same way.
         assert standby_sql(direct_indexed_score), 'indexed scorer returned no value after promotion'
-        new_plan=json.loads(command(['psql','-X','-qAt','-c',"SET stannum.enable_custom_scan=off; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
+        new_plan=json.loads(standby_sql("SET stannum.enable_custom_scan=off; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"))
         assert new_plan[0]['Plan']['Exact Heap Blocks'] == 1, new_plan
         assert new_plan[0]['Plan']['Lossy Heap Blocks'] == 0, new_plan
-        custom_plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
+        custom_plan=json.loads(standby_sql("EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"))
         assert custom_plan[0]['Plan']['Custom Plan Provider'] == 'Stannum Text Search Scan', custom_plan
         assert custom_plan[0]['Plan']['Actual Rows'] == 1, custom_plan
         verify(env=standby_env)
-        result={'status':'passed', 'concurrent_reader_checks':checks, 'verify_index_calls':verified, 'standby_snapshot_checks':standby_snapshot_checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset and indexed REINDEX','parallel worker execution','standby feedback on/off during folds and vacuum','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','direct indexed scoring rejects recovery snapshots','per-statement scorer state','verify_index after every phase']}
+        result={'status':'passed', 'concurrent_reader_checks':checks, 'verify_index_calls':verified, 'standby_snapshot_checks':standby_snapshot_checks, 'standby_answers':totals['answers'], 'standby_wrong_answers':totals['wrong'], 'standby_conflicts':totals['conflicts'], 'standby_runs':totals['runs'], 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery (RECLAIM records)','unlogged reset and indexed REINDEX','parallel worker execution','standby index reads vs heap regex in the same snapshot (feedback off/on, delay -1/finite)','standby indexed scoring','truncate','clean restart','snapshot-origin index reads across promotion','per-statement scorer state','verify_index after every phase']}
         (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result)); print('Artifacts:',root)
     finally:

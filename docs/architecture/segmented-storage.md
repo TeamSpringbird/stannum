@@ -277,8 +277,11 @@ the buffer, segment directory, and runs awaiting reclamation. Structural changes
 hold its exclusive lock; readers copy the directory under a shared lock.
 
 Segments are immutable. Retired pages become reusable only after PostgreSQL's
-visibility horizon makes reuse safe for readers with older snapshots. VACUUM
-records dead tuples, rewrites sufficiently dead segments, and reclaims pages.
+visibility horizon makes reuse safe for readers with older snapshots. With the
+extension preloaded, freeing pages first logs a removal horizon through a
+custom WAL resource manager so hot standbys resolve the same conflict on replay.
+VACUUM records dead tuples, rewrites sufficiently dead segments, and reclaims
+pages.
 `stannum.segment_info('index_name')` exposes the segment layout for inspection.
 
 The page and segment format signatures are `LDP2` and `LSG3`. Their definitions
@@ -381,8 +384,11 @@ the table is the source of truth; `REINDEX` rebuilds from it.
   A partial index whose predicate is itself a `==>` clause is therefore not
   matched against the bound clause, and its predicate is not proven by the
   planner.
-- Standby/recovery reads and legacy zero-page indexes use slower reference
-  paths rather than the normal segmented search path.
+- Legacy zero-page indexes use the slower reference path. Hot standbys use
+  the segmented path only when the extension is preloaded on the primary and
+  the standby (removal-horizon WAL records, see
+  [recovery](recovery-and-parallel.md#standby-selective-reads)); otherwise
+  they use the reference path.
 - Unordered custom scans are worker-safe but do not split a scan across workers.
 - Fresh connections rebuild their own buffer index. Large buffers increase
   first-query latency; connection pooling amortizes that work.
