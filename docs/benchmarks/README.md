@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [insert-preparation report](insert-preparation.md) validates moving text
+preparation outside the exclusive metadata lock and records paired contention runs.
+
 The [concurrent contention probe](concurrent-write-contention.md) measures
 reader/writer tails, sampled waits, and correctness during foreground maintenance.
 
