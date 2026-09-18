@@ -280,7 +280,10 @@ def run(args):
             psql(f"CREATE EXTENSION IF NOT EXISTS {extension} CASCADE;", env)
         manifest["extensions"] = sql_json("SELECT json_object_agg(extname, extversion) FROM pg_extension;", env)
         if extension:
-            manifest["settings"] = sql_json(f"LOAD '{extension}'; " + SETTINGS_SQL, env)
+            # Load the library so its GUCs are visible; LOAD needs privileges a
+            # managed server may not grant, so prefer calling into the extension.
+            load = {"tin": "DO $$ BEGIN PERFORM tin.tokenize('load'); END $$; "}.get(extension, f"LOAD '{extension}'; ")
+            manifest["settings"] = sql_json(load + SETTINGS_SQL, env)
         # Never overwrite an existing table. Each repetition uses a fresh dedicated database.
         (out / "fixture.sql").write_text("-- External verified corpus; see dataset.json.\n" if corpus else fixture_sql(args.rows))
         (out / "index.sql").write_text(index_sql(args.engine) + "\n")

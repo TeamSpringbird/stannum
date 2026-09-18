@@ -47,8 +47,9 @@ pub struct SegmentBuilder {
 
 impl SegmentBuilder {
     /// Adds one document. `tokens` are `(term, position)` in document order
-    /// with strictly increasing positions; `doc_len` is the token count. A TID
-    /// may be added once per segment; an empty document is still recorded.
+    /// with strictly increasing positions. A TID may be added once per
+    /// segment. A document with no tokens is not recorded at all: it can match
+    /// nothing, and TIN excludes such documents from scoring statistics.
     pub fn add_document<'t>(
         &mut self,
         tid: Tid,
@@ -71,6 +72,9 @@ impl SegmentBuilder {
             last = Some(position);
             doc_len += 1;
             by_term.entry(term).or_default().push(position);
+        }
+        if doc_len == 0 {
+            return Ok(());
         }
         self.lengths.insert(tid, doc_len);
         for (term, positions) in by_term {
@@ -392,14 +396,15 @@ mod tests {
         );
         let bytes = builder.finish();
         let segment = Segment::parse(&bytes).unwrap();
-        assert_eq!(segment.document_count(), 3);
+        // The empty document is not recorded.
+        assert_eq!(segment.document_count(), 2);
         assert_eq!(segment.total_length(), 5);
         assert_eq!(
             collect(segment.documents().unwrap()).unwrap(),
-            [tid(0, 5), tid(1, 3), tid(2, 1)]
+            [tid(0, 5), tid(2, 1)]
         );
         assert_eq!(segment.document_length(tid(2, 1)).unwrap(), Some(3));
-        assert_eq!(segment.document_length(tid(1, 3)).unwrap(), Some(0));
+        assert_eq!(segment.document_length(tid(1, 3)).unwrap(), None);
         assert_eq!(segment.document_length(tid(1, 4)).unwrap(), None);
 
         let beer = segment.term("beer").unwrap().unwrap();
@@ -428,7 +433,7 @@ mod tests {
         let not_beer =
             crate::set::Difference::new(segment.documents().unwrap(), beer.cursor().unwrap())
                 .unwrap();
-        assert_eq!(collect(not_beer).unwrap(), [tid(1, 3)]);
+        assert_eq!(collect(not_beer).unwrap(), Vec::<Tid>::new());
     }
 
     #[test]
@@ -444,12 +449,10 @@ mod tests {
         let bytes = builder.finish();
         let segment = Segment::parse(&bytes).unwrap();
         let records = segment.records(|t| t == tid(0, 5)).unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].tid, tid(1, 3));
-        assert_eq!(records[0].doc_len, 0);
-        assert_eq!(records[1].tid, tid(2, 1));
-        assert_eq!(records[1].doc_len, 3);
-        assert_eq!(records[1].tokens(), [("beer", 1), ("beer", 2), ("wine", 3)]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tid, tid(2, 1));
+        assert_eq!(records[0].doc_len, 3);
+        assert_eq!(records[0].tokens(), [("beer", 1), ("beer", 2), ("wine", 3)]);
         // Rebuilding from the records yields an equivalent segment.
         let mut rebuilt = SegmentBuilder::default();
         for record in &records {
@@ -457,7 +460,7 @@ mod tests {
         }
         let rebuilt = rebuilt.finish();
         let again = Segment::parse(&rebuilt).unwrap();
-        assert_eq!(again.document_count(), 2);
+        assert_eq!(again.document_count(), 1);
         assert_eq!(again.term("craft").unwrap().map(|t| t.df()), None);
         assert_eq!(again.term("beer").unwrap().map(|t| t.df()), Some(1));
     }

@@ -297,6 +297,9 @@ proptest! {
             let tid = Tid::new(*block, *offset).unwrap();
             let tokens: Vec<(&str, u32)> = words.iter().enumerate().map(|(i, w)| (w.as_str(), i as u32 + 1)).collect();
             builder.add_document(tid, tokens.iter().copied()).unwrap();
+            if words.is_empty() {
+                continue; // Token-less documents are not recorded.
+            }
             lengths.insert(tid, words.len() as u32);
             for (word, position) in tokens {
                 oracle.entry(word.to_owned()).or_default().entry(tid).or_default().push(position);

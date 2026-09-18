@@ -107,6 +107,34 @@ the directory already stores: `docs` and `total_length` per segment entry,
 at the dead threshold (TIN's `dead_percent_threshold` default 0.5, LDP2's
 "at least half dead" rule) changes statistics at the same moment TIN's do.
 
+## Scoring policy details, verified by the oracle
+
+`benchmarks/oracle.py` compares Lead against the live TIN on identical
+fixtures, forty-one query shapes, five states. Getting it to agree on every
+one of the 205 query/state pairs, match sets and score bits alike, required
+four changes to Lead, each observed first on TIN:
+
+* **Token-less documents are not documents.** A body that tokenizes to
+  nothing (empty, or `...`) is absent from `segment_info` counts and from N
+  and the average length. Lead used to count them.
+* **Expansions score their dictionary terms.** `ra*`, `MATCHES r.*e`,
+  `x TO z` and `rare~1` each contribute every matching term at the node's
+  boost (`ra*^2` gives each term weight 2); a fuzzy term's own literal is one
+  of them. Lead scored none of the regex and range forms and only the fuzzy
+  literal.
+* **Boolean NOT drops its subtree from scoring**: `a AND NOT (b OR c)` scores
+  `a` alone and `* AND NOT c` scores nothing. Negative span relations keep
+  both sides: `a NOT OVERLAPPING b` scores `a` and `b`. Lead scored negated
+  terms.
+* **`tin.max_score` is the maximum actual score over the visible matching
+  rows**, not an upper bound and not over candidates the index still holds
+  for deleted rows. Alone it uses the full policy; beside `tin.score` in the
+  same target list it adapts to the dense policy. Lead's old maximum ranged
+  over every document holding any scoring term under the dense policy.
+
+TIN also rejects `tin.score` and `tin.full_score` together on one scanned
+relation. Lead still allows that.
+
 ## Tokenizer binding and fallback paths
 
 * With the custom scan disabled, TIN still offers a `Bitmap Index Scan` on
@@ -129,6 +157,32 @@ answers `SupportRequestIndexCondition` with `lhs ==> rhs` marked exact so the
 bitmap path still applies. Executed outside an index path, Lead can tokenize
 with the index's stored settings, which is stricter than today and more
 useful than TIN's error.
+
+## Server-side timings, TIN versus LDP2
+
+The harness's `tin` engine ran the mixed profile against PlanetScale, but
+every query came back at about 31 ms median: that is client-to-AWS round
+trip, not TIN. Server-side execution time from `EXPLAIN ANALYZE`, median of
+seven, on the harness's 10,000-document fixture, is the comparable figure.
+Different hardware (PlanetScale's instance versus a local machine that was
+also running a Docker benchmark campaign), so treat ratios as coarse.
+
+| Query | TIN, ms | Lead LDP2, ms |
+| --- | ---: | ---: |
+| miss count | 0.24 | 0.38 |
+| rare count | 0.33 | 0.51 |
+| AND count | 0.46 | 0.68 |
+| OR count (10,000 matches) | 0.49 | 2.25 |
+| phrase count | 0.41 | 0.47 |
+| rare ranked, top 10 | 0.94 | 0.82 |
+| AND ranked | 1.12 | 1.70 |
+| phrase ranked | 0.69 | 0.61 |
+| OR ranked (10,000 scored) | 1.32 | 14.6 |
+
+Selective shapes are within about 1.5x either way. The broad `OR` is where
+TIN's count strategies and in-scan top-k bound pay off: Lead still drains
+every posting into a bitmap and scores every matching row through the
+executor. That gap is the custom-scan milestone.
 
 ## Plan shapes, for the custom-scan milestone
 

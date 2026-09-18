@@ -447,6 +447,83 @@ mod tests {
         );
     }
 
+    /// Values observed from TIN 1.0.2 on the same documents (docs/tin-observed-shape.md).
+    #[pg_test]
+    fn scoring_terms_expansions_not_and_max_match_tin() {
+        Spi::run(
+            "CREATE TABLE mx(id int primary key, body text);
+             INSERT INTO mx VALUES (1,'a'), (2,'a a'), (3,'a b c d'), (4,'a a a b'), (5,'b'),
+               (6,'c c c c c c'), (7,'rare'), (8,'rate'), (9,'rave'), (10,'x y z');
+             CREATE INDEX mx_idx ON mx USING tin(body);",
+        )
+        .unwrap();
+        let bits = |sql: &str| -> Vec<u32> {
+            Spi::get_one::<Vec<f32>>(sql)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect()
+        };
+        assert_eq!(
+            bits("SELECT array_agg(tin.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'a'"),
+            [0x3f96_44a5, 0x3fa5_0c72, 0x3f33_c8fc, 0x3f9d_4fdb]
+        );
+        // Standalone max_score: full policy, maximum over matching rows.
+        assert_eq!(
+            bits(
+                "SELECT array_agg(m) FROM (SELECT tin.max_score(ctid) m FROM mx WHERE body ==> 'a' LIMIT 1) s"
+            ),
+            [0x3fa5_0c72]
+        );
+        assert_eq!(
+            bits(
+                "SELECT array_agg(m) FROM (SELECT tin.max_score(ctid) m FROM mx WHERE body ==> 'a OR b' LIMIT 1) s"
+            ),
+            [0x4008_3d61]
+        );
+        assert_eq!(
+            bits(
+                "SELECT array_agg(m) FROM (SELECT tin.max_score(ctid) m FROM mx WHERE body ==> 'c' LIMIT 1) s"
+            ),
+            [0x400a_26fb]
+        );
+        // Beside tin.score in the same target list it adapts to the dense
+        // policy (a is in 4 of 9 documents, so it is elided and scores zero).
+        assert_eq!(
+            bits(
+                "SELECT array_agg(m) FROM (SELECT tin.max_score(ctid) + 0::real * tin.score(ctid) AS m FROM mx WHERE body ==> 'a' LIMIT 1) t"
+            ),
+            [0x0000_0000]
+        );
+        // Fuzzy and wildcard expansions score every matching dictionary term.
+        assert_eq!(
+            bits(
+                "SELECT array_agg(tin.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'rare~1'"
+            ),
+            [0x4027_7bac, 0x4027_7bac, 0x4027_7bac]
+        );
+        assert_eq!(
+            bits("SELECT array_agg(tin.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'ra*'"),
+            [0x4027_7bac, 0x4027_7bac, 0x4027_7bac]
+        );
+        let inspect = |query: &str| -> Vec<String> {
+            Spi::get_one::<Vec<String>>(&format!(
+                "SELECT array_agg(term || ':' || weight ORDER BY term) FROM tin.score_inspect('mx_idx', '{query}', 1.0)"
+            ))
+            .unwrap()
+            .unwrap_or_default()
+        };
+        assert_eq!(inspect("rare~1"), ["rare:1", "rate:1", "rave:1"]);
+        assert_eq!(inspect("ra*^2"), ["rare:2", "rate:2", "rave:2"]);
+        assert_eq!(inspect("MATCHES r.*e"), ["rare:1", "rate:1", "rave:1"]);
+        assert_eq!(inspect("x TO z"), ["x:1", "y:1", "z:1"]);
+        assert_eq!(inspect("a AND NOT (b OR c)"), ["a:1"]);
+        assert_eq!(inspect("a OR (b AND NOT c)"), ["a:1", "b:1"]);
+        assert_eq!(inspect("* AND NOT c"), Vec::<String>::new());
+        assert_eq!(inspect("a NOT OVERLAPPING b"), ["a:1", "b:1"]);
+    }
+
     #[pg_test]
     fn posting_inserts_rolled_back_by_subtransaction_are_not_visible() {
         Spi::run(

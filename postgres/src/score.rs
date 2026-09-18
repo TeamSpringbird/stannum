@@ -16,7 +16,11 @@ use segment::tf_bucket::TfBucket;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_void};
-use tinql::runtime::{Query, SpanTermSlot, parse_tinql_to_query};
+use tinql::runtime::plan::{Limits, plan};
+use tinql::runtime::{
+    CompiledRegex, FuzzyMatcher, Query, RangeBound, SpanTermSlot, TokenizedDoc, evaluate,
+    parse_tinql_to_query, range_matches, tokenize_doc,
+};
 use tokenizer::Tokenizer;
 
 use crate::storage::View;
@@ -52,7 +56,9 @@ struct IndexScorer {
     view: View,
     dead: Vec<BTreeSet<Tid>>,
     terms: Vec<(String, TermScorer)>,
-    max: f32,
+    query: Query,
+    /// Computed on first request: the maximum over matching documents.
+    max: Option<f32>,
 }
 
 /// Cursors over one source that advance monotonically across rows. Rows from
@@ -176,7 +182,7 @@ fn score_bound(
         heap_oid: heap_oid as u32,
         index_oid: index_oid as u32,
         query: query.to_owned(),
-        full: mode == 1,
+        full: mode == 1 || mode == 3,
         dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
         k1: bits(k1),
         b: bits(b),
@@ -188,7 +194,7 @@ fn score_bound(
             *slot = Some(build_corpus(key.clone(), k1, b, term_add, term_replace));
         }
         let corpus = slot.as_ref().expect("score corpus was just populated");
-        if mode == 2 {
+        if mode >= 2 {
             corpus.max
         } else {
             corpus.by_document.get(document).copied().unwrap_or(0.0)
@@ -225,7 +231,7 @@ fn score_bound_indexed(
             && key.command == command
             && key.heap_oid == heap_oid as u32
             && key.index_oid == index_oid as u32
-            && key.full == (mode == 1)
+            && key.full == (mode == 1 || mode == 3)
             && key.dense == dense
             && key.k1 == bits(k1)
             && key.b == bits(b)
@@ -243,25 +249,18 @@ fn score_bound_indexed(
                 heap_oid: heap_oid as u32,
                 index_oid: index_oid as u32,
                 query: query.to_owned(),
-                full: mode == 1,
+                full: mode == 1 || mode == 3,
                 dense,
                 k1: bits(k1),
                 b: bits(b),
                 add: term_add.clone(),
                 replace: term_replace.clone(),
             };
-            *slot = Some(build_index_scorer(
-                key,
-                k1,
-                b,
-                term_add,
-                term_replace,
-                mode == 2,
-            ));
+            *slot = Some(build_index_scorer(key, k1, b, term_add, term_replace));
         }
         let scorer = slot.as_mut().expect("index scorer was just populated");
-        if mode == 2 {
-            scorer.max
+        if mode >= 2 {
+            scorer.max_score()
         } else {
             let block = (u32::from(ctid.ip_blkid.bi_hi) << 16) | u32::from(ctid.ip_blkid.bi_lo);
             let tid = Tid::new(block, ctid.ip_posid)
@@ -316,13 +315,63 @@ impl IndexScorer {
     }
 }
 
+/// Filters tuple locations to those visible under the active snapshot,
+/// following HOT chains as an index scan would.
+///
+/// # Safety
+/// `heap_oid` names a relation the caller may open; an active snapshot exists.
+unsafe fn visible_tids(heap_oid: pg_sys::Oid, tids: BTreeSet<Tid>) -> Vec<Tid> {
+    unsafe {
+        let heap = pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as _);
+        let fetch = pg_sys::table_index_fetch_begin(heap);
+        let slot = pg_sys::table_slot_create(heap, std::ptr::null_mut());
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let mut visible = Vec::new();
+        for tid in tids {
+            pgrx::check_for_interrupts!();
+            let mut pointer = pg_sys::ItemPointerData {
+                ip_blkid: pg_sys::BlockIdData {
+                    bi_hi: (tid.block >> 16) as u16,
+                    bi_lo: tid.block as u16,
+                },
+                ip_posid: tid.offset,
+            };
+            let mut call_again = false;
+            let mut all_dead = false;
+            let mut found = false;
+            loop {
+                if pg_sys::table_index_fetch_tuple(
+                    fetch,
+                    &mut pointer,
+                    snapshot,
+                    slot,
+                    &mut call_again,
+                    &mut all_dead,
+                ) {
+                    found = true;
+                    break;
+                }
+                if !call_again {
+                    break;
+                }
+            }
+            if found {
+                visible.push(tid);
+            }
+        }
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+        pg_sys::table_index_fetch_end(fetch);
+        pg_sys::table_close(heap, pg_sys::AccessShareLock as _);
+        visible
+    }
+}
+
 fn build_index_scorer(
     key: CacheKey,
     k1: Option<f32>,
     b: Option<f32>,
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
-    want_max: bool,
 ) -> IndexScorer {
     let heap_oid = pg_sys::Oid::from(key.heap_oid);
     let index = unsafe {
@@ -347,8 +396,6 @@ fn build_index_scorer(
     }
     let query = parse_tinql_to_query(&key.query, tokenizer.as_ref())
         .unwrap_or_else(|error| pgrx::error!("TIN score query error: {error}"));
-    let mut inputs = Vec::new();
-    collect_score_terms(&query, 1.0, false, &mut inputs);
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("tin.score(): {error}"))
         .analyzed_with(|text| {
@@ -362,7 +409,6 @@ fn build_index_scorer(
     } else {
         stop_csv.as_deref().and_then(ScoreStopWords::from_csv)
     };
-    let terms = compile_scoring_terms(inputs, &edit, stop.as_ref());
 
     let view = unsafe { crate::storage::view(index.as_ptr()) };
     let segments: Vec<Segment<'_>> = view
@@ -370,6 +416,10 @@ fn build_index_scorer(
         .iter()
         .map(|(bytes, _)| segment_error(Segment::parse(bytes)))
         .collect();
+    let mut collected = Collected::default();
+    collect_score_terms(&query, 1.0, false, &mut collected);
+    let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
+    let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
     let dead: Vec<BTreeSet<Tid>> = view
         .sources
         .iter()
@@ -423,46 +473,54 @@ fn build_index_scorer(
         .iter()
         .map(|(bytes, _)| unsafe { SourceReader::new(bytes, &scorers) })
         .collect();
-    let mut scorer = IndexScorer {
+    IndexScorer {
         key,
         sources,
         view,
         dead,
         terms: scorers,
-        max: 0.0,
-    };
-    if want_max {
-        // Every document holding any scoring term is a candidate for the maximum.
+        query,
+        max: None,
+    }
+}
+
+impl IndexScorer {
+    /// Maximum score over the visible documents matching the query, as TIN
+    /// reports over its result rows. Restores the readers afterwards.
+    fn max_score(&mut self) -> f32 {
+        if let Some(max) = self.max {
+            return max;
+        }
         let mut candidates = BTreeSet::new();
-        for (i, (bytes, _)) in scorer.view.sources.iter().enumerate() {
+        for (i, (bytes, _)) in self.view.sources.iter().enumerate() {
             let segment = segment_error(Segment::parse(bytes));
-            for (term, _) in &scorer.terms {
-                if let Some(term) = segment_error(segment.term(term)) {
-                    let mut cursor = segment_error(term.cursor());
-                    while let Some(tid) = cursor.current() {
-                        if !scorer.dead[i].contains(&tid) {
-                            candidates.insert(tid);
-                        }
-                        segment_error(cursor.advance());
-                    }
+            let planned = plan(&self.query, &segment, &Limits::default())
+                .unwrap_or_else(|error| pgrx::error!("Lead query plan: {error}"));
+            let mut cursor = planned.cursor;
+            while let Some(tid) = cursor.current() {
+                if !self.dead[i].contains(&tid) {
+                    candidates.insert(tid);
                 }
+                segment_error(cursor.advance());
             }
         }
+        // The index cannot see deletes that VACUUM has not reported yet, so
+        // each candidate is checked against the active snapshot.
+        let visible = unsafe { visible_tids(pg_sys::Oid::from(self.key.heap_oid), candidates) };
         let mut max = 0.0_f32;
-        for tid in candidates {
+        for tid in visible {
             pgrx::check_for_interrupts!();
-            max = max.max(scorer.score(tid));
+            max = max.max(self.score(tid));
         }
-        scorer.max = max;
-        // Leave the readers positioned at the start for the row stream.
-        scorer.sources = scorer
+        self.sources = self
             .view
             .sources
             .iter()
-            .map(|(bytes, _)| unsafe { SourceReader::new(bytes, &scorer.terms) })
+            .map(|(bytes, _)| unsafe { SourceReader::new(bytes, &self.terms) })
             .collect();
+        self.max = Some(max);
+        max
     }
-    scorer
 }
 
 fn build_corpus(
@@ -495,8 +553,6 @@ fn build_corpus(
     }
     let query = parse_tinql_to_query(&key.query, &tokenizer)
         .unwrap_or_else(|error| pgrx::error!("TIN score query error: {error}"));
-    let mut inputs = Vec::new();
-    collect_score_terms(&query, 1.0, false, &mut inputs);
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("tin.score(): {error}"))
         .analyzed_with(|text| {
@@ -510,18 +566,26 @@ fn build_corpus(
     } else {
         stop_csv.as_deref().and_then(ScoreStopWords::from_csv)
     };
-    let terms = compile_scoring_terms(inputs, &edit, stop.as_ref());
     let documents = load_documents(heap_oid, index.oid());
-    let tokenized = documents
+    let positioned: Vec<TokenizedDoc> = documents
         .iter()
-        .map(|document| {
-            tokenizer
-                .tokenize(document)
-                .map(|token| token.text.into_owned())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let total_docs = tokenized.len() as u64;
+        .map(|document| tokenize_doc(document, &tokenizer))
+        .collect();
+    let tokenized: Vec<Vec<String>> = positioned.iter().map(|doc| doc.tokens().to_vec()).collect();
+    let universe = corpus_universe(&tokenized);
+    let mut collected = Collected::default();
+    collect_score_terms(&query, 1.0, false, &mut collected);
+    let owned = collected.resolve(|expansion| {
+        let matcher = expansion.matcher();
+        universe
+            .iter()
+            .filter(|term| matcher(term))
+            .map(|term| (*term).to_owned())
+            .collect()
+    });
+    let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
+    // Token-less documents are not documents for scoring, as in TIN.
+    let total_docs = tokenized.iter().filter(|tokens| !tokens.is_empty()).count() as u64;
     let average_length = if total_docs == 0 {
         1.0
     } else {
@@ -544,7 +608,7 @@ fn build_corpus(
     }
     let mut by_document = FxHashMap::default();
     let mut max = 0.0_f32;
-    for (document, tokens) in documents.into_iter().zip(tokenized) {
+    for ((document, tokens), doc) in documents.into_iter().zip(tokenized).zip(&positioned) {
         let score = sum_scores_in_order(scorers.iter().map(|(term, scorer)| {
             let tf = tokens.iter().filter(|token| *token == term).count() as u32;
             if tf == 0 {
@@ -553,7 +617,10 @@ fn build_corpus(
                 scorer.score_count(tf, tokens.len() as u32)
             }
         }));
-        max = max.max(score);
+        // The maximum is over matching documents only, as in TIN.
+        if evaluate(&query, doc).is_ok_and(|result| result.matched) {
+            max = max.max(score);
+        }
         by_document.insert(document, score);
     }
     ScoreCorpus {
@@ -607,25 +674,179 @@ fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> 
     }
 }
 
+/// A query node that scores every dictionary term it expands to, as TIN does.
+enum Expansion<'a> {
+    Regex(&'a CompiledRegex),
+    Range(&'a RangeBound, &'a RangeBound),
+    Fuzzy {
+        term: &'a str,
+        prefix: u32,
+        distance: u32,
+    },
+}
+
+impl Expansion<'_> {
+    fn matcher(&self) -> Box<dyn Fn(&str) -> bool + '_> {
+        match self {
+            Self::Regex(regex) => Box::new(move |candidate| regex.is_match(candidate)),
+            Self::Range(lower, upper) => {
+                Box::new(move |candidate| range_matches(candidate, lower, upper))
+            }
+            Self::Fuzzy {
+                term,
+                prefix,
+                distance,
+            } => {
+                let matcher = FuzzyMatcher::new(term, *prefix, *distance);
+                Box::new(move |candidate| matcher.is_match(candidate))
+            }
+        }
+    }
+
+    /// Every matching term across the given dictionaries.
+    fn expand_in(&self, segments: &[Segment<'_>]) -> Vec<String> {
+        let mut found = BTreeSet::new();
+        for segment in segments {
+            let dictionary = segment.dictionary();
+            let items: Box<dyn Iterator<Item = segment::Result<(String, _)>>> = match self {
+                Self::Regex(regex) => match regex.pure_prefix() {
+                    Some(prefix) => {
+                        Box::new(dictionary.prefix(&prefix).collect::<Vec<_>>().into_iter())
+                    }
+                    None => Box::new(dictionary.iter()),
+                },
+                Self::Range(lower, upper) => {
+                    let bound = |bound: &RangeBound| match bound {
+                        RangeBound::Open => None,
+                        RangeBound::Term(term) => Some(term.clone()),
+                    };
+                    let (lower, upper) = (bound(lower), bound(upper));
+                    Box::new(
+                        dictionary
+                            .range(lower.as_deref(), upper.as_deref())
+                            .collect::<Vec<_>>()
+                            .into_iter(),
+                    )
+                }
+                Self::Fuzzy { term, prefix, .. } => {
+                    let fixed: String = term.chars().take(*prefix as usize).collect();
+                    Box::new(dictionary.prefix(&fixed).collect::<Vec<_>>().into_iter())
+                }
+            };
+            let matcher = self.matcher();
+            for item in items {
+                let (term, _) = segment_error(item);
+                if matcher(&term) {
+                    found.insert(term);
+                }
+            }
+        }
+        found.into_iter().collect()
+    }
+}
+
+/// Scoring inputs gathered from a query before expansions are resolved.
+#[derive(Default)]
+struct Collected<'a> {
+    terms: Vec<ScoringTermInput<'a>>,
+    expansions: Vec<(Expansion<'a>, f32, bool)>,
+}
+
+impl<'a> Collected<'a> {
+    /// Resolves expansions through `expand` and returns owned inputs.
+    fn resolve(
+        self,
+        mut expand: impl FnMut(&Expansion<'a>) -> Vec<String>,
+    ) -> Vec<(String, f32, bool)> {
+        let mut out: Vec<(String, f32, bool)> = self
+            .terms
+            .iter()
+            .map(|input| (input.text.to_owned(), input.boost, input.explicitly_boosted))
+            .collect();
+        for (expansion, boost, explicit) in &self.expansions {
+            for term in expand(expansion) {
+                out.push((term, *boost, *explicit));
+            }
+        }
+        out
+    }
+}
+
+fn inputs_of(owned: &[(String, f32, bool)]) -> impl Iterator<Item = ScoringTermInput<'_>> {
+    owned
+        .iter()
+        .map(|(text, boost, explicit)| ScoringTermInput {
+            text,
+            boost: *boost,
+            explicitly_boosted: *explicit,
+        })
+}
+
+/// Boolean NOT contributes nothing to scoring; negative span relations keep
+/// both sides. Wildcards, regexes, ranges and fuzzy terms score every term
+/// they expand to with the node's boost.
 fn collect_score_terms<'a>(
     query: &'a Query,
     boost: f32,
     explicitly_boosted: bool,
-    out: &mut Vec<ScoringTermInput<'a>>,
+    out: &mut Collected<'a>,
 ) {
     let mut push = |text: &'a str| {
-        out.push(ScoringTermInput {
+        out.terms.push(ScoringTermInput {
             text,
             boost,
             explicitly_boosted,
         });
     };
     match query {
-        Query::Term(text) | Query::Fuzzy { term: text, .. } => push(text),
+        Query::Term(text) => push(text),
+        Query::Fuzzy {
+            term,
+            prefix,
+            distance,
+        } => out.expansions.push((
+            Expansion::Fuzzy {
+                term,
+                prefix: *prefix,
+                distance: *distance,
+            },
+            boost,
+            explicitly_boosted,
+        )),
+        Query::Regex(regex) => {
+            out.expansions
+                .push((Expansion::Regex(regex), boost, explicitly_boosted))
+        }
+        Query::Range { lower, upper } => {
+            out.expansions
+                .push((Expansion::Range(lower, upper), boost, explicitly_boosted))
+        }
         Query::Span { term_slots, .. } | Query::SpanExpr { term_slots, .. } => {
             for slot in term_slots {
-                if let SpanTermSlot::Term(text) | SpanTermSlot::Fuzzy { term: text, .. } = slot {
-                    push(text);
+                match slot {
+                    SpanTermSlot::Term(text) => push(text),
+                    SpanTermSlot::Regex(regex) => {
+                        out.expansions
+                            .push((Expansion::Regex(regex), boost, explicitly_boosted))
+                    }
+                    SpanTermSlot::Range { lower, upper } => out.expansions.push((
+                        Expansion::Range(lower, upper),
+                        boost,
+                        explicitly_boosted,
+                    )),
+                    SpanTermSlot::Fuzzy {
+                        term,
+                        prefix,
+                        distance,
+                    } => out.expansions.push((
+                        Expansion::Fuzzy {
+                            term,
+                            prefix: *prefix,
+                            distance: *distance,
+                        },
+                        boost,
+                        explicitly_boosted,
+                    )),
                 }
             }
         }
@@ -640,12 +861,19 @@ fn collect_score_terms<'a>(
                 collect_score_terms(child, boost, explicitly_boosted, out);
             }
         }
-        Query::Not(inner) => collect_score_terms(inner, boost, explicitly_boosted, out),
+        Query::Not(_) | Query::MatchAll => {}
         Query::Boost { factor, inner } => {
             collect_score_terms(inner, boost * *factor, true, out);
         }
-        Query::MatchAll | Query::Regex(_) | Query::Range { .. } => {}
     }
+}
+
+/// Distinct tokens of a corpus, the expansion universe without a dictionary.
+fn corpus_universe(tokenized: &[Vec<String>]) -> BTreeSet<&str> {
+    tokenized
+        .iter()
+        .flat_map(|tokens| tokens.iter().map(String::as_str))
+        .collect()
 }
 
 #[pg_extern(stable, parallel_unsafe)]
@@ -692,8 +920,6 @@ fn score_inspect(
     let tokenizer = unsafe { crate::options::tokenizer(index.as_ptr()) };
     let parsed = parse_tinql_to_query(query, &tokenizer)
         .unwrap_or_else(|error| pgrx::error!("tin.score_inspect() query error: {error}"));
-    let mut inputs = Vec::new();
-    collect_score_terms(&parsed, 1.0, false, &mut inputs);
     let edit = TermSetEdit::from_bound_arrays(
         unwrap("term_add", term_add),
         unwrap("term_replace", term_replace),
@@ -707,34 +933,128 @@ fn score_inspect(
     });
     let stop_csv = unsafe { crate::options::score_stop_words(index.as_ptr()) };
     let stop = stop_csv.as_deref().and_then(ScoreStopWords::from_csv);
-    let terms = compile_scoring_terms(inputs, &edit, stop.as_ref());
     let ratio = DenseRatio::new(dense_ratio);
     if !ratio.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let docs = load_documents(heap_oid, index.oid());
-    let tokenized = docs
-        .iter()
-        .map(|doc| {
-            tokenizer
-                .tokenize(doc)
-                .map(|t| t.text.into_owned())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let n = tokenized.len() as u64;
-    let rows = terms
-        .into_iter()
-        .filter_map(|term| {
-            let df = tokenized
+    let mut collected = Collected::default();
+    collect_score_terms(&parsed, 1.0, false, &mut collected);
+    let rows = if unsafe { crate::storage::present(index.as_ptr()) } {
+        let view = unsafe { crate::storage::view(index.as_ptr()) };
+        let segments: Vec<Segment<'_>> = view
+            .sources
+            .iter()
+            .map(|(bytes, _)| segment_error(Segment::parse(bytes)))
+            .collect();
+        let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
+        let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
+        let is_immutable = |i: usize| view.buffer_source != Some(i);
+        let immutable_docs: u64 = segments
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| is_immutable(*i))
+            .map(|(_, s)| u64::from(s.document_count()))
+            .sum();
+        terms
+            .into_iter()
+            .filter_map(|term| {
+                let (mut total_df, mut immutable_df) = (0u64, 0u64);
+                for (i, segment) in segments.iter().enumerate() {
+                    let df = segment_error(segment.dictionary().get(term.text()))
+                        .map_or(0, |entry| u64::from(entry.df));
+                    total_df += df;
+                    if is_immutable(i) {
+                        immutable_df += df;
+                    }
+                }
+                term.is_retained(total_df, immutable_df, immutable_docs, Some(ratio))
+                    .then(|| (term.text().to_owned(), term.boost()))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let docs = load_documents(heap_oid, index.oid());
+        let tokenized = docs
+            .iter()
+            .map(|doc| {
+                tokenizer
+                    .tokenize(doc)
+                    .map(|t| t.text.into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let universe = corpus_universe(&tokenized);
+        let owned = collected.resolve(|expansion| {
+            let matcher = expansion.matcher();
+            universe
                 .iter()
-                .filter(|doc| doc.iter().any(|t| t == term.text()))
-                .count() as u64;
-            term.is_retained(df, df, n, Some(ratio))
-                .then(|| (term.text().to_owned(), term.boost()))
-        })
-        .collect::<Vec<_>>();
+                .filter(|term| matcher(term))
+                .map(|term| (*term).to_owned())
+                .collect()
+        });
+        let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
+        let n = tokenized.iter().filter(|tokens| !tokens.is_empty()).count() as u64;
+        terms
+            .into_iter()
+            .filter_map(|term| {
+                let df = tokenized
+                    .iter()
+                    .filter(|doc| doc.iter().any(|t| t == term.text()))
+                    .count() as u64;
+                term.is_retained(df, df, n, Some(ratio))
+                    .then(|| (term.text().to_owned(), term.boost()))
+            })
+            .collect::<Vec<_>>()
+    };
     TableIterator::new(rows)
+}
+
+#[derive(Default)]
+struct ScoreCalls {
+    dense: bool,
+    full: bool,
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn find_score_calls(
+    node: *mut pg_sys::Node,
+    context: *mut c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    let calls = unsafe { &mut *context.cast::<ScoreCalls>() };
+    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_FuncExpr {
+        let func = node.cast::<pg_sys::FuncExpr>();
+        let name = unsafe { pg_sys::get_func_name((*func).funcid) };
+        if !name.is_null() {
+            let namespace = unsafe { pg_sys::get_func_namespace((*func).funcid) };
+            let schema = unsafe { pg_sys::get_namespace_name(namespace) };
+            let in_tin =
+                !schema.is_null() && unsafe { CStr::from_ptr(schema) }.to_bytes() == b"tin";
+            if in_tin {
+                match unsafe { CStr::from_ptr(name) }.to_bytes() {
+                    b"score" => calls.dense = true,
+                    b"full_score" => calls.full = true,
+                    // A sibling already rewritten to its bound form carries
+                    // its mode as the fifth argument.
+                    b"score_bound" | b"score_bound_indexed" => {
+                        let mode =
+                            unsafe { pg_sys::list_nth((*func).args, 4) }.cast::<pg_sys::Node>();
+                        if !mode.is_null() && unsafe { (*mode).type_ } == pg_sys::NodeTag::T_Const {
+                            let value = unsafe { (*mode.cast::<pg_sys::Const>()).constvalue };
+                            match value.value() as i32 {
+                                0 => calls.dense = true,
+                                1 => calls.full = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    unsafe { pg_sys::expression_tree_walker(node, Some(find_score_calls), context) }
 }
 
 struct QualBinding {
@@ -864,7 +1184,14 @@ fn score_support(request: Internal) -> Internal {
         let mode = if fname.as_ref() == "full_score" {
             1
         } else if fname.as_ref() == "max_score" {
-            2
+            // max_score adapts to a sibling tin.score() call; alone it uses
+            // the full policy, as TIN does.
+            let mut calls = ScoreCalls::default();
+            find_score_calls(
+                (*parse).targetList.cast(),
+                (&mut calls as *mut ScoreCalls).cast(),
+            );
+            if calls.dense && !calls.full { 2 } else { 3 }
         } else {
             0
         };
