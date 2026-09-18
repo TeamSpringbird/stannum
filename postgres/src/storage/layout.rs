@@ -4,9 +4,14 @@
 //! Every page is a standard PostgreSQL page with an 8-byte special area:
 //!
 //! ```text
-//! special := magic u32 "LDP2", kind u8, version u8, reserved u16
+//! special := magic u32 "LDP2", kind u8, version u8, flags u16
 //! payload := bytes [PAGE_HEADER, pd_lower)
 //! ```
+//!
+//! `flags` was reserved (always zero) before removal-horizon logging existed;
+//! readers never validate it. Only the meta page uses it: bit 0
+//! ([`FLAG_REMOVAL_HORIZONS`]) says the writer logs removal horizons for
+//! standbys (see `storage::wal`). A writer without that support clears it.
 //!
 //! Page kinds:
 //!
@@ -37,6 +42,12 @@ pub const KIND_META: u8 = 1;
 pub const KIND_BUFFER: u8 = 2;
 pub const KIND_RUN: u8 = 3;
 pub const KIND_FREE: u8 = 4;
+
+/// Meta-page flag: the last writer of this index emits removal-horizon WAL
+/// records before freeing pages, so a hot standby with the same resource
+/// manager can serve segmented reads from it.
+pub const FLAG_REMOVAL_HORIZONS: u16 = 1;
+const FLAGS: usize = PAGE_SIZE - SPECIAL_SIZE + 6;
 
 /// Directory entries the meta page can hold before a merge is forced.
 pub const MAX_SEGMENTS: usize = 128;
@@ -84,6 +95,16 @@ pub fn kind(page: &[u8]) -> Result<u8> {
         return Err("unsupported Stannum page version");
     }
     Ok(page[special + 4])
+}
+
+/// The flags of a validated page (zero on pages written before flags existed).
+pub fn flags(page: &[u8]) -> u16 {
+    u16_at(page, FLAGS)
+}
+
+/// Sets the flags of a page already written by [`write`].
+pub fn set_flags(page: &mut [u8], flags: u16) {
+    page[FLAGS..FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
 }
 
 /// The live payload of a validated page.
@@ -412,5 +433,20 @@ mod tests {
         assert!(write(&mut page, KIND_RUN, &vec![0; CAPACITY + 1]).is_err());
         assert!(write(&mut page, KIND_RUN, &vec![7; CAPACITY]).is_ok());
         assert_eq!(super::payload(&page).len(), CAPACITY);
+    }
+
+    #[test]
+    fn flags_live_in_the_special_area_and_are_not_validated() {
+        let mut page = vec![0u8; PAGE_SIZE];
+        write(&mut page, KIND_META, b"meta").unwrap();
+        assert_eq!(flags(&page), 0);
+        set_flags(&mut page, FLAG_REMOVAL_HORIZONS);
+        assert_eq!(flags(&page), FLAG_REMOVAL_HORIZONS);
+        assert_eq!(kind(&page).unwrap(), KIND_META);
+        assert_eq!(super::payload(&page), b"meta");
+        // A page written by a build without flags reads as zero, and a
+        // rewrite clears whatever was there.
+        write(&mut page, KIND_META, b"meta").unwrap();
+        assert_eq!(flags(&page), 0);
     }
 }

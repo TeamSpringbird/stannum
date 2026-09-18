@@ -22,6 +22,7 @@ mod udfs;
 pub extern "C-unwind" fn _PG_init() {
     options::init();
     storage::init();
+    storage::wal::init();
     customscan::init();
 }
 

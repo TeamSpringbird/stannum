@@ -49,7 +49,7 @@ pub fn note_executor_start() {
 /// `index_oid` names an index relation the caller may open.
 pub unsafe fn estimate_query(index_oid: pg_sys::Oid, query: &str) -> Option<Estimate> {
     unsafe {
-        if pg_sys::RecoveryInProgress() {
+        if !crate::storage::is_segmented(index_oid) {
             return None;
         }
         let stamp = crate::storage::stamp(index_oid)?;
