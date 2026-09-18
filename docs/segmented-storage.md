@@ -82,8 +82,16 @@ stale and get overwritten after a fold.
   its block numbers, so any byte range of the blob is reached with one page
   read per 8 KiB, no chain walk. A query reads the header, the dictionary's
   block index, the dictionary blocks its terms fall in, those terms' postings
-  and payload extents, and the document lengths it scores. Whole-segment reads
-  no longer happen; the buffer manager is the cache.
+  and payload extents, and the document lengths it scores (in 4 KiB chunks).
+  Whole-segment reads no longer happen.
+* **Reader cache.** Each backend keeps one reader per segment, keyed by index
+  identity and segment generation, holding every extent it has fetched so a
+  repeated fetch returns the same bytes. Segments are immutable, so a cached
+  reader is never stale; only the dead list is re-read when the directory
+  entry's dead run changes. Readers for segments no longer in the directory
+  are dropped on the next scan, and all readers are dropped once their
+  fetched bytes exceed 64 MiB. A warm statement therefore reads no index
+  pages for the dictionary index, document table or postings it has seen.
 * **Buffer index.** The write buffer is a forward stream, so each backend keeps
   an incremental inverted index over it (`MutableIndex`), keyed by index
   identity and the buffer's epoch. A scan appends only the records written
@@ -140,8 +148,12 @@ pages.
 
 ## Known limits of this slice
 
-* Page reads go through the buffer manager one page at a time with a pin and
-  unpin per page; there is no readahead or batching for long postings lists.
+* A cold extent is fetched one buffer pin per page with no readahead; the
+  reader cache makes this a first-touch cost per backend.
+* Scorer state is per statement, counted by an `ExecutorStart` hook, because
+  transaction and command ids do not distinguish consecutive read-only
+  statements. The search scan publishes its scorer for the statement's score
+  projections with the emitted rows' scores remembered.
 * The buffer index lives in one backend; a new connection rebuilds it from the
   buffer stream on its first query. Measured on Wikipedia articles this is
   about 22 ms per megabyte of buffer, so the 4 MiB fold cap bounds the cost

@@ -34,7 +34,6 @@ use segment::postings::{Postings, PostingsBuilder};
 use segment::segment::Reader;
 use segment::segment::{Segment, SegmentBuilder};
 use segment::set::{Cursor, Difference, Intersection};
-use segment::source::PageSource;
 use tinql::runtime::Query;
 use tinql::runtime::plan::{Limits, plan};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
@@ -399,63 +398,146 @@ unsafe fn page_table(index: pg_sys::Relation, identity: u64, entry: &SegmentEntr
     table
 }
 
-/// Serves a segment run page by page, copying each page once per view.
+/// Serves byte ranges of a segment run, one buffer pin per page touched and
+/// copying only the bytes asked for. The reader above memoizes extents, so a
+/// range is fetched once per backend for as long as the reader is cached.
 ///
-/// The relation is looked up per page read rather than held open, because a
-/// view may be cached across statements by the scorer and a relcache
-/// reference cannot outlive the statement that took it.
-/// Pages copied out of shared buffers, by page index within the run.
-type PageCache = RefCell<HashMap<u64, Rc<[u8]>>>;
-
+/// The relation is looked up per read rather than held open, because a
+/// reader is cached across statements and a relcache reference cannot
+/// outlive the statement that took it.
 pub struct RunSource {
     index_oid: pg_sys::Oid,
     run: Run,
     table: Rc<Vec<u32>>,
-    pages: PageCache,
 }
 
-impl PageSource for RunSource {
-    fn page_len(&self) -> usize {
-        CHAIN_CAPACITY
-    }
-
-    fn pages(&self) -> u64 {
-        u64::from(self.run.blocks)
-    }
-
-    fn data_len(&self) -> u64 {
+impl segment::source::Source for RunSource {
+    fn len(&self) -> u64 {
         u64::from(self.run.bytes)
     }
 
-    fn page(&self, index: u64) -> segment::Result<Rc<[u8]>> {
-        if let Some(page) = self.pages.borrow().get(&index) {
-            return Ok(page.clone());
-        }
-        let block = *self
-            .table
-            .get(index as usize)
+    fn read(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|end| *end <= u64::from(self.run.bytes))
             .ok_or(segment::Error::Truncated)?;
+        let mut out = Vec::with_capacity(len);
         // SAFETY: the transaction still holds the lock the planner or scan
         // took on the index; the relcache reference is scoped to this read.
-        let data: Rc<[u8]> = unsafe {
+        unsafe {
             let index = pg_sys::RelationIdGetRelation(self.index_oid);
             if index.is_null() {
                 pgrx::error!("Lead index no longer exists");
             }
-            let data = {
+            let mut at = offset;
+            while at < end {
+                let page = (at / CHAIN_CAPACITY as u64) as usize;
+                let within = (at % CHAIN_CAPACITY as u64) as usize;
+                let block = match self.table.get(page) {
+                    Some(block) => *block,
+                    None => {
+                        pg_sys::RelationClose(index);
+                        return Err(segment::Error::Truncated);
+                    }
+                };
                 let buffer = Buffer::read(index, block, false);
                 if buffer.kind() != KIND_RUN {
                     pgrx::error!("Lead run page has the wrong kind; REINDEX required");
                 }
                 let (_, data) = checked(layout::chain(buffer.page()));
-                Rc::from(data)
-            };
+                let take = ((end - at) as usize).min(data.len().saturating_sub(within));
+                if take == 0 {
+                    pg_sys::RelationClose(index);
+                    return Err(segment::Error::Truncated);
+                }
+                out.extend_from_slice(&data[within..within + take]);
+                at += take as u64;
+            }
             pg_sys::RelationClose(index);
-            data
-        };
-        self.pages.borrow_mut().insert(index, data.clone());
-        Ok(data)
+        }
+        Ok(out)
     }
+}
+
+/// A reader over a page-backed run, shared between the cache and live views.
+type SharedReader = Rc<Reader<Box<dyn segment::source::Source>>>;
+
+/// A segment reader kept per backend with the bytes it has fetched, plus the
+/// segment's dead list as of the directory entry it was last checked against.
+struct CachedSegment {
+    reader: SharedReader,
+    dead_run: Run,
+    dead: Option<Rc<Vec<u8>>>,
+}
+
+/// Cached readers by (index identity, segment generation).
+type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
+
+/// Fetched bytes across cached readers before the cache is emptied.
+const READER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+thread_local! {
+    static SEGMENT_READERS: RefCell<SegmentReaders> = RefCell::new(HashMap::new());
+}
+
+/// The cached reader for a directory entry, created on first use. Readers
+/// are immutable like their segments; only the dead list can change.
+unsafe fn cached_segment(
+    index: pg_sys::Relation,
+    index_oid: pg_sys::Oid,
+    identity: u64,
+    entry: &SegmentEntry,
+) -> (SharedReader, Option<Rc<Vec<u8>>>) {
+    let key = (identity, entry.generation);
+    let found = SEGMENT_READERS.with_borrow(|readers| {
+        readers.get(&key).map(|cached| {
+            (
+                cached.reader.clone(),
+                (cached.dead_run == entry.dead).then(|| cached.dead.clone()),
+            )
+        })
+    });
+    let (reader, dead) = match found {
+        Some((reader, Some(dead))) => return (reader, dead),
+        Some((reader, None)) => (reader, None),
+        None => {
+            let source: Box<dyn segment::source::Source> = Box::new(RunSource {
+                index_oid,
+                run: entry.run,
+                table: unsafe { page_table(index, identity, entry) },
+            });
+            (Rc::new(codec(Reader::new(source))), None)
+        }
+    };
+    let dead = dead.unwrap_or_else(|| {
+        (!entry.dead.is_empty()).then(|| Rc::new(unsafe { read_run(index, entry.dead) }))
+    });
+    SEGMENT_READERS.with_borrow_mut(|readers| {
+        readers.insert(
+            key,
+            CachedSegment {
+                reader: reader.clone(),
+                dead_run: entry.dead,
+                dead: dead.clone(),
+            },
+        );
+    });
+    (reader, dead)
+}
+
+/// Drops cached readers for segments no longer in the directory, and every
+/// reader once the fetched bytes exceed the budget. Live views keep their
+/// own references, so dropping here only releases what nothing else holds.
+fn trim_reader_cache(identity: u64, meta: &Meta) {
+    SEGMENT_READERS.with_borrow_mut(|readers| {
+        readers.retain(|(id, generation), _| {
+            *id != identity || meta.segments.iter().any(|e| e.generation == *generation)
+        });
+        let bytes: usize = readers.values().map(|c| c.reader.cached_bytes()).sum();
+        if bytes > READER_CACHE_BYTES {
+            readers.clear();
+        }
+    });
 }
 
 /// Queues a run for reclamation once no scan can still hold it.
@@ -938,9 +1020,9 @@ pub unsafe fn insert(
 
 // --- Scan ---------------------------------------------------------------------
 
-/// A queryable index (a lazily read segment or the buffer's in-memory index)
-/// plus its dead list, if any.
-pub type Source = (Box<dyn Index>, Option<Vec<u8>>);
+/// A queryable index (a cached segment reader or the buffer's in-memory
+/// index) plus its dead list, if any.
+pub type Source = (Box<dyn Index>, Option<Rc<Vec<u8>>>);
 
 /// Everything a scan or a scorer needs from an index, captured under one
 /// shared meta lock so the buffer and directory are mutually consistent.
@@ -961,17 +1043,11 @@ pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
         let index = relation.as_ptr();
         let (meta_buffer, meta) = read_meta(index, false);
         let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
+        trim_reader_cache(meta.identity, &meta);
         for entry in &meta.segments {
             pgrx::check_for_interrupts!();
-            let source: Box<dyn segment::source::Source> = Box::new(RunSource {
-                index_oid,
-                run: entry.run,
-                table: page_table(index, meta.identity, entry),
-                pages: PageCache::new(HashMap::new()),
-            });
-            let reader: Box<dyn Index> = Box::new(codec(Reader::new(source)));
-            let dead_bytes = (!entry.dead.is_empty()).then(|| read_run(index, entry.dead));
-            sources.push((reader, dead_bytes));
+            let (reader, dead) = cached_segment(index, index_oid, meta.identity, entry);
+            sources.push((Box::new(reader), dead));
         }
         let immutable_sources = sources.len();
         if meta.buffer.docs > 0 {

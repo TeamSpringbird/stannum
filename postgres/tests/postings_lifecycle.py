@@ -56,6 +56,15 @@ def main():
             SELECT count(*) FROM docs WHERE body ==> 'needle';""", env=env)
         assert 'canceling statement due to statement timeout' in cancelled, cancelled
         assert cancelled.strip().endswith('50'), cancelled
+        # Scorer state lives for one statement: a document inserted between
+        # two statements in one backend is scored by the second.
+        ranked = command(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'], input="""SET enable_seqscan=off;
+            SELECT id FROM docs WHERE body ==> 'needle' ORDER BY tin.full_score(ctid) DESC LIMIT 1;
+            INSERT INTO docs VALUES(99998,'needle needle needle needle',0);
+            SELECT id, tin.full_score(ctid) > 0 FROM docs WHERE body ==> 'needle' ORDER BY tin.full_score(ctid) DESC LIMIT 1;
+            SELECT count(*) FROM docs WHERE body ==> 'needle' AND tin.full_score(ctid) > 0;
+            DELETE FROM docs WHERE id=99998;""", env=env).split()
+        assert ranked[-2] == '99998|t' and ranked[-1] == '51', ranked
         sql("BEGIN; INSERT INTO docs VALUES(99999,'needle',0); ROLLBACK;")
         sql("UPDATE docs SET revision=revision+1; DELETE FROM docs WHERE id%2=0;")
         sql('VACUUM (INDEX_CLEANUP ON) docs;')
@@ -175,7 +184,7 @@ def main():
         custom_plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert custom_plan[0]['Plan']['Custom Plan Provider'] == 'Lead Text Search Scan', custom_plan
         assert custom_plan[0]['Plan']['Actual Rows'] == 1, custom_plan
-        result={'status':'passed', 'concurrent_reader_checks':checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion']}
+        result={'status':'passed', 'concurrent_reader_checks':checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','per-statement scorer state']}
         (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result)); print('Artifacts:',root)
     finally:

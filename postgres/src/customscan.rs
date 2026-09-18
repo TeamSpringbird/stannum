@@ -38,6 +38,7 @@ unsafe impl<T> Sync for Methods<T> {}
 
 static mut PREVIOUS_REL_HOOK: pg_sys::set_rel_pathlist_hook_type = None;
 static mut PREVIOUS_UPPER_HOOK: pg_sys::create_upper_paths_hook_type = None;
+static mut PREVIOUS_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
 
 static SEARCH_PATH_METHODS: Methods<pg_sys::CustomPathMethods> =
     Methods(pg_sys::CustomPathMethods {
@@ -108,8 +109,26 @@ pub fn init() {
         pg_sys::set_rel_pathlist_hook = Some(rel_pathlist_hook);
         PREVIOUS_UPPER_HOOK = pg_sys::create_upper_paths_hook;
         pg_sys::create_upper_paths_hook = Some(upper_paths_hook);
+        PREVIOUS_EXECUTOR_START = pg_sys::ExecutorStart_hook;
+        pg_sys::ExecutorStart_hook = Some(executor_start_hook);
         pg_sys::RegisterCustomScanMethods(&SEARCH_SCAN_METHODS.0);
         pg_sys::RegisterCustomScanMethods(&COUNT_SCAN_METHODS.0);
+    }
+}
+
+/// Marks the start of an executor run so per-statement scorer state is not
+/// carried into the next statement.
+#[pg_guard]
+unsafe extern "C-unwind" fn executor_start_hook(
+    query_desc: *mut pg_sys::QueryDesc,
+    eflags: std::ffi::c_int,
+) {
+    crate::score::note_executor_start();
+    unsafe {
+        match PREVIOUS_EXECUTOR_START {
+            Some(previous) => previous(query_desc, eflags),
+            None => pg_sys::standard_ExecutorStart(query_desc, eflags),
+        }
     }
 }
 
@@ -840,6 +859,7 @@ unsafe fn gather(exec: &mut ScanExec) {
                 }
             };
             exec.sorted = sorted;
+            crate::score::publish_scan_scorer(scorer, &scored[..sorted]);
             exec.scores = scored.iter().map(|(score, _)| *score).collect();
             tids = scored.into_iter().map(|(_, tid)| tid).collect();
         }

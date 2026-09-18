@@ -13,7 +13,7 @@ use segment::index::{Expanded, Index, Window};
 use segment::postings::Postings;
 use segment::set::Cursor as _;
 use segment::tf_bucket::TfBucket;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::plan::{Limits, plan};
@@ -27,8 +27,8 @@ use crate::storage::View;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheKey {
-    transaction: u32,
-    command: u32,
+    /// The executor run the scorer was built for; see [`note_executor_start`].
+    statement: u64,
     heap_oid: u32,
     index_oid: u32,
     query: String,
@@ -58,6 +58,9 @@ pub(crate) struct IndexScorer {
     query: Query,
     /// Computed on first request: the maximum over matching documents.
     max: Option<f32>,
+    /// Scores the search scan already computed for the rows it emits, so the
+    /// projected score function does not move the cursors backwards.
+    known: FxHashMap<Tid, f32>,
 }
 
 /// Cursors over one source that advance monotonically across rows. Rows from
@@ -112,6 +115,20 @@ impl SourceReader {
 thread_local! {
     static SCORE_CACHE: RefCell<Option<ScoreCorpus>> = const { RefCell::new(None) };
     static INDEX_SCORE_CACHE: RefCell<Option<IndexScorer>> = const { RefCell::new(None) };
+    /// Counts executor runs in this backend. Transaction and command ids do
+    /// not distinguish consecutive read-only statements, which never assign
+    /// a transaction id and each start at command zero.
+    static STATEMENT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Called from the `ExecutorStart` hook so scorers built for one statement
+/// are never reused by the next.
+pub(crate) fn note_executor_start() {
+    STATEMENT.with(|s| s.set(s.get().wrapping_add(1)));
+}
+
+fn current_statement() -> u64 {
+    STATEMENT.with(Cell::get)
 }
 
 fn score_context_error(function: &str) -> ! {
@@ -175,8 +192,7 @@ fn score_bound(
     term_replace: Option<Vec<String>>,
 ) -> f32 {
     let key = CacheKey {
-        transaction: unsafe { pg_sys::GetTopTransactionIdIfAny().into_inner() },
-        command: unsafe { pg_sys::GetCurrentCommandId(false) },
+        statement: current_statement(),
         heap_oid: heap_oid as u32,
         index_oid: index_oid as u32,
         query: query.to_owned(),
@@ -219,14 +235,12 @@ fn score_bound_indexed(
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
 ) -> f32 {
-    let transaction = unsafe { pg_sys::GetTopTransactionIdIfAny().into_inner() };
-    let command = unsafe { pg_sys::GetCurrentCommandId(false) };
+    let statement = current_statement();
     let dense = dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits();
     // Per-row calls compare against the cached key without allocating; the
     // owned key is built only when the cache misses.
     let matches = |key: &CacheKey| {
-        key.transaction == transaction
-            && key.command == command
+        key.statement == statement
             && key.heap_oid == heap_oid as u32
             && key.index_oid == index_oid as u32
             && key.full == (mode == 1 || mode == 3)
@@ -242,8 +256,7 @@ fn score_bound_indexed(
     INDEX_SCORE_CACHE.with_borrow_mut(|slot| {
         if !cached {
             let key = CacheKey {
-                transaction,
-                command,
+                statement,
                 heap_oid: heap_oid as u32,
                 index_oid: index_oid as u32,
                 query: query.to_owned(),
@@ -275,6 +288,9 @@ fn segment_error<T>(result: segment::Result<T>) -> T {
 impl IndexScorer {
     /// Score of one visible document, or zero if the index does not hold it.
     pub(crate) fn score(&mut self, tid: Tid) -> f32 {
+        if let Some(score) = self.known.get(&tid) {
+            return *score;
+        }
         for i in 0..self.view.sources.len() {
             if self.dead[i].contains(&tid) {
                 continue;
@@ -380,8 +396,7 @@ pub(crate) fn scorer_for_scan(
     term_replace: Option<Vec<String>>,
 ) -> IndexScorer {
     let key = CacheKey {
-        transaction: 0,
-        command: 0,
+        statement: current_statement(),
         heap_oid,
         index_oid,
         query: query.to_owned(),
@@ -392,7 +407,22 @@ pub(crate) fn scorer_for_scan(
         add: term_add.clone(),
         replace: term_replace.clone(),
     };
-    build_index_scorer(key, k1, b, term_add, term_replace)
+    // A rescan within the same statement reuses the scorer it published.
+    let cached = INDEX_SCORE_CACHE.with_borrow_mut(|slot| match slot {
+        Some(scorer) if scorer.key == key => slot.take(),
+        _ => None,
+    });
+    cached.unwrap_or_else(|| build_index_scorer(key, k1, b, term_add, term_replace))
+}
+
+/// Hands the scan's scorer to the SQL score functions for the rest of the
+/// command, with the scores of the rows the scan will emit remembered.
+pub(crate) fn publish_scan_scorer(mut scorer: IndexScorer, emitted: &[(f32, Tid)]) {
+    scorer.known.clear();
+    scorer
+        .known
+        .extend(emitted.iter().map(|(score, tid)| (*tid, *score)));
+    INDEX_SCORE_CACHE.with_borrow_mut(|slot| *slot = Some(scorer));
 }
 
 fn build_index_scorer(
@@ -505,6 +535,7 @@ fn build_index_scorer(
         terms: scorers,
         query,
         max: None,
+        known: FxHashMap::default(),
     }
 }
 

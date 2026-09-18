@@ -22,7 +22,8 @@
 
 use std::collections::BTreeMap;
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashMap;
 
 use crate::dictionary::{
     BlockFetch, Blocks, Dictionary, DictionaryBuilder, DictionaryIndex, Extent, TermEntry,
@@ -220,14 +221,22 @@ struct Header {
 }
 
 /// Reads a segment from any [`Source`], fetching only the extents a query
-/// touches. Fetched bytes live in an append-only arena for the reader's
-/// lifetime, so borrowed views stay valid however many fetches follow.
+/// touches. Fetched bytes live in an arena for the reader's lifetime, keyed
+/// by extent so a repeated fetch returns the same bytes; borrowed views stay
+/// valid however many fetches follow.
 pub struct Reader<S: Source> {
     source: S,
     header: Header,
-    arena: RefCell<Vec<Box<[u8]>>>,
+    arena: RefCell<Arena>,
+    arena_bytes: Cell<usize>,
     dictionary: OnceCell<DictionaryIndex<'static>>,
 }
+
+/// Fetched extents by (offset, len).
+type Arena = HashMap<(u64, usize), Box<[u8]>>;
+
+/// Granularity at which document lengths are fetched from a paged source.
+const LENGTH_CHUNK: u64 = 4096;
 
 /// A segment held entirely in memory.
 pub type Segment<'a> = Reader<&'a [u8]>;
@@ -275,9 +284,15 @@ impl<S: Source> Reader<S> {
                 docs_len,
                 lengths_at,
             },
-            arena: RefCell::new(Vec::new()),
+            arena: RefCell::new(HashMap::new()),
+            arena_bytes: Cell::new(0),
             dictionary: OnceCell::new(),
         })
+    }
+
+    /// Bytes held in the arena, for cache budgeting.
+    pub fn cached_bytes(&self) -> usize {
+        self.arena_bytes.get()
     }
 
     /// Bytes `[offset, offset + len)` of the source, borrowed for as long as
@@ -286,9 +301,15 @@ impl<S: Source> Reader<S> {
         if let Some(slice) = self.source.slice(offset, len) {
             return Ok(slice);
         }
+        if let Some(bytes) = self.arena.borrow().get(&(offset, len)) {
+            let pointer: *const [u8] = &**bytes;
+            // SAFETY: as below; the box stays in the arena for `self`'s life.
+            return Ok(unsafe { &*pointer });
+        }
         let bytes = self.source.read(offset, len)?.into_boxed_slice();
         let pointer: *const [u8] = &*bytes;
-        self.arena.borrow_mut().push(bytes);
+        self.arena_bytes.set(self.arena_bytes.get() + bytes.len());
+        self.arena.borrow_mut().insert((offset, len), bytes);
         // SAFETY: the box was just moved into the arena, which only ever
         // grows and is dropped with `self`; the heap allocation never moves.
         Ok(unsafe { &*pointer })
@@ -475,8 +496,19 @@ impl<S: Source> AreaFetch for Reader<S> {
         if let Some(bytes) = self.source.slice(at, 4) {
             return Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
         }
-        let bytes = self.source.read(at, 4)?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        // Paged sources: fetch the chunk around the entry once, then index it.
+        let within = (at - self.header.lengths_at) % LENGTH_CHUNK;
+        let chunk_at = at - within;
+        let end = self.header.lengths_at + u64::from(self.header.doc_count) * 4;
+        let chunk_len = (end - chunk_at).min(LENGTH_CHUNK) as usize;
+        let chunk = self.load(chunk_at, chunk_len)?;
+        let i = within as usize;
+        Ok(u32::from_le_bytes([
+            chunk[i],
+            chunk[i + 1],
+            chunk[i + 2],
+            chunk[i + 3],
+        ]))
     }
 }
 
