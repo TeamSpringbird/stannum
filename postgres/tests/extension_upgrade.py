@@ -74,6 +74,20 @@ def main():
                       oprjoin::regproc::text, oprcanmerge, oprcanhash)::text FROM pg_operator WHERE oid=d.objid)
                   WHEN d.classid='pg_am'::regclass THEN
                     (SELECT amhandler::regproc::text || amtype::text FROM pg_am WHERE oid=d.objid)
+                  WHEN d.classid='pg_opclass'::regclass THEN
+                    (SELECT jsonb_build_array(c.opcintype::regtype::text, c.opckeytype::regtype::text,
+                       c.opcdefault,
+                       (SELECT jsonb_agg(jsonb_build_array(a.amopstrategy, a.amoppurpose,
+                          a.amoplefttype::regtype::text, a.amoprighttype::regtype::text,
+                          a.amopopr::regoperator::text) ORDER BY a.amopstrategy,
+                          a.amoplefttype::regtype::text, a.amoprighttype::regtype::text)
+                        FROM pg_amop a WHERE a.amopfamily=c.opcfamily),
+                       (SELECT jsonb_agg(jsonb_build_array(p.amprocnum,
+                          p.amproclefttype::regtype::text, p.amprocrighttype::regtype::text,
+                          p.amproc::regprocedure::text) ORDER BY p.amprocnum,
+                          p.amproclefttype::regtype::text, p.amprocrighttype::regtype::text)
+                        FROM pg_amproc p WHERE p.amprocfamily=c.opcfamily))::text
+                     FROM pg_opclass c WHERE c.oid=d.objid)
                   ELSE '' END
                 FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid
                 WHERE d.refclassid='pg_extension'::regclass AND e.extname='stannum'
