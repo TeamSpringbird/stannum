@@ -7,6 +7,7 @@ license.workspace = true
 description = "Byte codecs for immutable search-index segments: dictionary, TID postings, positional payloads, forward records"
 
 [dependencies]
+rustc-hash.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

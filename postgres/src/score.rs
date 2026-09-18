@@ -11,7 +11,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use segment::Tid;
 use segment::index::{Expanded, Index, Window};
 use segment::payload::PayloadCursor;
-use segment::postings::{BlockBound, Postings, PostingsCursor};
+use segment::postings::{BlockBound, PostingsCursor};
 use segment::segment::Lengths;
 use segment::set::Cursor as _;
 use segment::tf_bucket::TfBucket;
@@ -57,7 +57,7 @@ pub(crate) struct IndexScorer {
     /// Per-source cursors, declared before `view` so they drop first.
     sources: Vec<SourceReader>,
     view: View,
-    dead: Vec<BTreeSet<Tid>>,
+    dead: Vec<std::rc::Rc<BTreeSet<Tid>>>,
     terms: Vec<(String, TermScorer)>,
     query: Query,
     /// Computed on first request: the maximum over matching documents.
@@ -1080,16 +1080,7 @@ fn build_index_scorer(
     collect_score_terms(&query, 1.0, false, &mut collected);
     let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
     let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
-    let dead: Vec<BTreeSet<Tid>> = view
-        .sources
-        .iter()
-        .map(|(_, dead)| match dead {
-            Some(bytes) => segment_error(Postings::parse(bytes).and_then(|p| p.to_vec()))
-                .into_iter()
-                .collect(),
-            None => BTreeSet::new(),
-        })
-        .collect();
+    let dead = view.dead_sets.clone();
     // Statistics include dead documents until their segment is rewritten,
     // and buffered documents immediately; elision uses immutable segments only.
     let is_immutable = |i: usize| i < view.immutable_sources;

@@ -6,7 +6,9 @@
 //! grows by one record at a time are interchangeable at query time.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+
+use rustc_hash::FxHashMap;
 
 use crate::dictionary::{Extent, TermEntry};
 use crate::forward::ForwardRecord;
@@ -174,12 +176,33 @@ impl<I: Index + ?Sized> Index for std::rc::Rc<I> {
     }
 }
 
+/// One document's occurrence of a term: the score inputs and where its
+/// positions sit in the term's flat position store.
+#[derive(Clone, Copy)]
+struct Occurrence {
+    bucket: u8,
+    doc_len: u32,
+    start: u32,
+    len: u32,
+}
+
+/// A term's postings under construction. Positions of every occurrence share
+/// one vector in arrival order, so adding a record costs one append per term
+/// rather than one allocation per term; `occurrences` follows `tids` in TID
+/// order and points back into it.
 struct TermData {
     /// Strictly increasing.
     tids: Vec<Tid>,
-    /// Aligned with `tids`: term-frequency bucket, document length and
-    /// positions.
-    payload: Vec<(u8, u32, Vec<u32>)>,
+    /// Aligned with `tids`.
+    occurrences: Vec<Occurrence>,
+    positions: Vec<u32>,
+}
+
+impl TermData {
+    fn positions_of(&self, occurrence: &Occurrence) -> &[u32] {
+        let start = occurrence.start as usize;
+        &self.positions[start..start + occurrence.len as usize]
+    }
 }
 
 /// Encoded streams handed to cursors. Append-only: a slot is never freed or
@@ -188,7 +211,7 @@ struct TermData {
 struct Encoded {
     slots: Vec<Box<[u8]>>,
     /// Slots and entry per term, dropped from the map when the term changes.
-    terms: HashMap<String, TermEntry>,
+    terms: FxHashMap<String, TermEntry>,
     documents: Option<usize>,
     lengths: Option<usize>,
 }
@@ -226,7 +249,7 @@ impl Encoded {
 pub struct MutableIndex {
     documents: RefCell<BTreeMap<Tid, u32>>,
     total_length: RefCell<u64>,
-    terms: RefCell<HashMap<String, TermData>>,
+    terms: RefCell<FxHashMap<String, TermData>>,
     /// Term names in order, built on the first expansion and dropped when a
     /// new term appears.
     sorted: RefCell<Option<Vec<String>>>,
@@ -275,7 +298,8 @@ impl MutableIndex {
                     *sorted = None;
                     terms.entry(term.to_owned()).or_insert_with(|| TermData {
                         tids: Vec::new(),
-                        payload: Vec::new(),
+                        occurrences: Vec::new(),
+                        positions: Vec::new(),
                     })
                 }
             };
@@ -285,9 +309,21 @@ impl MutableIndex {
                 Some(last) if *last < tid => data.tids.len(),
                 _ => data.tids.partition_point(|existing| *existing < tid),
             };
+            let start = u32::try_from(data.positions.len())
+                .ok()
+                .filter(|start| start.checked_add(positions.len() as u32).is_some())
+                .ok_or(Error::Corrupt("mutable index positions"))?;
+            data.positions.extend_from_slice(positions);
             data.tids.insert(at, tid);
-            data.payload
-                .insert(at, (bucket, doc_len, positions.to_vec()));
+            data.occurrences.insert(
+                at,
+                Occurrence {
+                    bucket,
+                    doc_len,
+                    start,
+                    len: positions.len() as u32,
+                },
+            );
             Ok(())
         })?;
         Ok(consumed)
@@ -301,14 +337,14 @@ impl MutableIndex {
         let mut postings = PostingsBuilder::default();
         let mut payload = PayloadBuilder::default();
         let mut max_tf_bucket = 0;
-        for (tid, (bucket, doc_len, positions)) in data.tids.iter().zip(&data.payload) {
+        for (tid, occurrence) in data.tids.iter().zip(&data.occurrences) {
             postings
-                .push_scored(*tid, *bucket, *doc_len)
+                .push_scored(*tid, occurrence.bucket, occurrence.doc_len)
                 .expect("tids kept sorted and unique");
             payload
-                .push(*bucket, positions)
+                .push(occurrence.bucket, data.positions_of(occurrence))
                 .expect("positions validated on insertion");
-            max_tf_bucket = max_tf_bucket.max(*bucket);
+            max_tf_bucket = max_tf_bucket.max(occurrence.bucket);
         }
         let mut encoded = self.encoded.borrow_mut();
         let entry = TermEntry {
@@ -542,6 +578,49 @@ mod tests {
         assert_eq!(lengths.get(ordinal).unwrap(), 4);
         assert_eq!(mutable.lengths().get(0).unwrap(), 1);
         assert_eq!(mutable.lengths().get(1).unwrap(), 4);
+    }
+
+    #[test]
+    fn out_of_order_records_keep_each_occurrence_with_its_own_positions() {
+        // Positions are stored flat per term in arrival order while postings
+        // stay in TID order; an occurrence inserted before earlier ones must
+        // still resolve to its own positions and term frequency.
+        let mutable = MutableIndex::default();
+        mutable
+            .add_record(record(300, "beer beer beer ale"))
+            .unwrap();
+        mutable.add_record(record(200, "ale beer")).unwrap();
+        mutable.add_record(record(100, "beer")).unwrap();
+        let beer = mutable.term("beer").unwrap().unwrap();
+        assert_eq!(beer.df(), 3);
+        let tids = collect(beer.cursor().unwrap()).unwrap();
+        assert_eq!(
+            tids,
+            [
+                record(100, "").tid,
+                record(200, "").tid,
+                record(300, "").tid
+            ]
+        );
+        let payload = beer.payload().unwrap();
+        assert_eq!(payload.get(0).unwrap().positions, [1]);
+        assert_eq!(payload.get(1).unwrap().positions, [2]);
+        assert_eq!(payload.get(2).unwrap().positions, [1, 2, 3]);
+        let ale = mutable.term("ale").unwrap().unwrap();
+        let payload = ale.payload().unwrap();
+        assert_eq!(payload.get(0).unwrap().positions, [1]);
+        assert_eq!(payload.get(1).unwrap().positions, [4]);
+        // The same records through the segment builder agree in every detail.
+        let mut builder = SegmentBuilder::default();
+        for (id, text) in [
+            (300, "beer beer beer ale"),
+            (200, "ale beer"),
+            (100, "beer"),
+        ] {
+            builder.add_record(&record(id, text)).unwrap();
+        }
+        let bytes = builder.finish();
+        same(&mutable, &Reader::parse(&bytes).unwrap(), &["beer", "ale"]);
     }
 
     #[test]

@@ -33,7 +33,8 @@ positions, term frequencies, and document lengths.
 
 Searches read both segments and the buffer, so new rows do not wait for a fold to
 be searchable. Per-backend caches reuse immutable segment data and incrementally
-index new buffer records. Retained document cursors keep their encoded length
+index new buffer records (see [per-backend caches](#per-backend-caches)).
+Retained document cursors keep their encoded length
 array from the same buffer state. Refreshing the buffer can insert a reused heap
 location before existing rows; looking up old ordinals in a new length array
 would change scores midway through a ranked scan.
@@ -188,6 +189,46 @@ custom scan nodes:
 
 `EXPLAIN ANALYZE` shows the chosen path. `SET stannum.enable_custom_scan = off`
 selects the bitmap path for comparison.
+
+### Per-backend caches
+
+A query captures the directory and the buffer state under one shared meta
+lock, then reads through four caches that live in the backend and key on
+what the meta page says, so every backend sees the same thing without any
+coordination:
+
+- **Segment readers**, by index identity and segment generation. A reader
+  keeps the byte ranges it has fetched (dictionary index, dictionary blocks,
+  postings, payload, document table) for as long as the generation is in the
+  directory; the readers of one backend hold at most 64 MiB of fetched bytes
+  before they are all dropped. Generations never repeat within an identity,
+  and REINDEX changes the identity, so a cached reader can never describe a
+  different segment.
+- **Dictionary lookups**, per cached segment: a term's entry or its absence,
+  at most 4,096 terms per segment. A statement resolves each of its terms in
+  every segment several times (planning, statistics, cursor setup), and the
+  next statement repeats that. With a dozen small segments those walks over
+  prefix-compressed dictionary blocks cost more than the lookups they serve,
+  so the memo answers repeats without them. Segments are immutable, so the
+  memo needs no invalidation of its own; it lives and dies with the reader.
+- **Page tables**, by identity and generation.
+- **The buffer index**, by identity and buffer epoch. It is an in-memory
+  inverted index of the buffer's forward records, extended from the last
+  byte it covered on each use (an insert by any backend only appends), and
+  rebuilt when the epoch changes: a fold empties the buffer, and VACUUM
+  rewrites it without dead records. Building costs about 11 ms per MiB of
+  records on the benchmark machine, so the worst case for a fresh connection
+  at the default caps is a few tens of milliseconds; existing backends absorb
+  each record once, as it arrives.
+
+The buffer index is not shared between backends. Sharing it would need a
+shared-memory rendezvous (`shared_preload_libraries` or the DSM registry of
+PostgreSQL 17+), a serialized form of the index, and lifetime management
+across epochs and identities, to save at most one build per connection and
+one per VACUUM rewrite per backend, bounded by the byte cap. The
+[buffer-index measurements](../benchmarks/buffer-index.md) record that cost
+and the reader cost of small folds, which is what the defaults trade against
+write stalls.
 
 ### One tokenizer per clause
 

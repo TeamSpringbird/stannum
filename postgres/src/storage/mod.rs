@@ -41,11 +41,13 @@ use pgrx::{
     FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgLogLevel, PgRelation,
     PgSqlErrorCode, pg_sys,
 };
+use rustc_hash::FxHashMap;
 use segment::Tid;
+use segment::dictionary::TermEntry;
 use segment::forward::ForwardRecord;
-use segment::index::{Index, MutableIndex};
-use segment::postings::{Postings, PostingsBuilder};
-use segment::segment::Reader;
+use segment::index::{Expanded, Index, MutableIndex, Window};
+use segment::postings::{Postings, PostingsBuilder, PostingsCursor};
+use segment::segment::{Lengths, Reader, Term};
 use segment::segment::{Segment, SegmentBuilder};
 use segment::set::{Cursor, Difference, Intersection};
 use tinql::runtime::Query;
@@ -768,12 +770,78 @@ impl segment::source::Source for RunSource {
 /// A reader over a page-backed run, shared between the cache and live views.
 type SharedReader = Rc<Reader<Box<dyn segment::source::Source>>>;
 
+/// Dictionary lookups memoized per backend: a term's entry, or its absence.
+type TermMemo = Rc<RefCell<FxHashMap<String, Option<TermEntry>>>>;
+
+/// Memoized lookups per segment before the memo is emptied.
+const TERM_MEMO_LIMIT: usize = 4096;
+
+/// A segment's dead list, decoded once per backend and dead run.
+type DeadSet = Rc<BTreeSet<Tid>>;
+
 /// A segment reader kept per backend with the bytes it has fetched, plus the
 /// segment's dead list as of the directory entry it was last checked against.
 struct CachedSegment {
     reader: SharedReader,
+    /// Dictionary lookups made through this reader. Segments are immutable,
+    /// so an answer stays right for as long as the generation exists.
+    terms: TermMemo,
     dead_run: Run,
     dead: Option<Rc<Vec<u8>>>,
+    /// `dead` decoded once per dead run, for scorers that test membership.
+    dead_set: DeadSet,
+}
+
+/// An immutable segment as a query source: the shared reader plus the
+/// backend's memo of its dictionary lookups. A query resolves each of its
+/// terms in every segment several times (planning, statistics, scoring),
+/// and every statement repeats that; walking a prefix-compressed dictionary
+/// block each time costs more than the lookups it serves once the directory
+/// holds a dozen segments. The memo answers repeats without the walk and
+/// hands out the same `Term` the reader would.
+struct MemoizedSegment {
+    reader: SharedReader,
+    terms: TermMemo,
+}
+
+impl Index for MemoizedSegment {
+    fn document_count(&self) -> u32 {
+        self.reader.document_count()
+    }
+
+    fn total_length(&self) -> u64 {
+        self.reader.total_length()
+    }
+
+    fn term(&self, term: &str) -> segment::Result<Option<Term<'_>>> {
+        if let Some(entry) = self.terms.borrow().get(term) {
+            return entry.map(|entry| self.reader.resolve(entry)).transpose();
+        }
+        let found = self.reader.term(term)?;
+        let mut memo = self.terms.borrow_mut();
+        if memo.len() >= TERM_MEMO_LIMIT {
+            memo.clear();
+        }
+        memo.insert(term.to_owned(), found.map(|found| found.entry));
+        Ok(found)
+    }
+
+    fn expand(
+        &self,
+        window: Window<'_>,
+        filter: &dyn Fn(&str) -> bool,
+        limit: usize,
+    ) -> segment::Result<Expanded<'_>> {
+        Index::expand(&*self.reader, window, filter, limit)
+    }
+
+    fn documents(&self) -> segment::Result<PostingsCursor<'_>> {
+        self.reader.documents()
+    }
+
+    fn lengths(&self) -> Lengths<'_> {
+        self.reader.lengths()
+    }
 }
 
 /// Cached readers by (index identity, segment generation).
@@ -793,19 +861,23 @@ unsafe fn cached_segment(
     index_oid: pg_sys::Oid,
     identity: u64,
     entry: &SegmentEntry,
-) -> (SharedReader, Option<Rc<Vec<u8>>>) {
+) -> (MemoizedSegment, Option<Rc<Vec<u8>>>, DeadSet) {
     let key = (identity, entry.generation);
     let found = SEGMENT_READERS.with_borrow(|readers| {
         readers.get(&key).map(|cached| {
             (
-                cached.reader.clone(),
-                (cached.dead_run == entry.dead).then(|| cached.dead.clone()),
+                MemoizedSegment {
+                    reader: cached.reader.clone(),
+                    terms: cached.terms.clone(),
+                },
+                (cached.dead_run == entry.dead)
+                    .then(|| (cached.dead.clone(), cached.dead_set.clone())),
             )
         })
     });
-    let (reader, dead) = match found {
-        Some((reader, Some(dead))) => return (reader, dead),
-        Some((reader, None)) => (reader, None),
+    let (segment, dead) = match found {
+        Some((segment, Some((dead, dead_set)))) => return (segment, dead, dead_set),
+        Some((segment, None)) => (segment, None),
         None => {
             let label = generation_label(entry.generation);
             let source: Box<dyn segment::source::Source> = Box::new(RunSource {
@@ -814,7 +886,11 @@ unsafe fn cached_segment(
                 table: unsafe { page_table(index, identity, entry) },
                 label: label.clone(),
             });
-            (Rc::new(codec_in(Reader::new(source), &label)), None)
+            let segment = MemoizedSegment {
+                reader: Rc::new(codec_in(Reader::new(source), &label)),
+                terms: Rc::default(),
+            };
+            (segment, None)
         }
     };
     let dead = dead.unwrap_or_else(|| {
@@ -828,17 +904,28 @@ unsafe fn cached_segment(
             })
         })
     });
+    let dead_set = Rc::new(match &dead {
+        Some(bytes) => codec_in(
+            Postings::parse(bytes).and_then(|p| p.to_vec()),
+            &format!("{} dead list", generation_label(entry.generation)),
+        )
+        .into_iter()
+        .collect(),
+        None => BTreeSet::new(),
+    });
     SEGMENT_READERS.with_borrow_mut(|readers| {
         readers.insert(
             key,
             CachedSegment {
-                reader: reader.clone(),
+                reader: segment.reader.clone(),
+                terms: segment.terms.clone(),
                 dead_run: entry.dead,
                 dead: dead.clone(),
+                dead_set: dead_set.clone(),
             },
         );
     });
-    (reader, dead)
+    (segment, dead, dead_set)
 }
 
 /// Drops cached readers for segments no longer in the directory, and every
@@ -1089,6 +1176,43 @@ unsafe fn buffer_index(
     let result = entry.index.clone();
     BUFFER_INDEX.with_borrow_mut(|slot| *slot = Some(entry));
     Some(result)
+}
+
+/// What this backend's caches hold, for tests.
+#[cfg(any(test, feature = "pg_test"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheProbe {
+    pub cached_segments: usize,
+    /// Memoized dictionary lookups over every cached segment.
+    pub memoized_terms: usize,
+    /// (index identity, buffer epoch, bytes covered, documents) of the
+    /// cached buffer index, if any.
+    pub buffer: Option<(u64, u32, usize, u32)>,
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub fn cache_probe() -> CacheProbe {
+    let (cached_segments, memoized_terms) = SEGMENT_READERS.with_borrow(|readers| {
+        (
+            readers.len(),
+            readers.values().map(|c| c.terms.borrow().len()).sum(),
+        )
+    });
+    let buffer = BUFFER_INDEX.with_borrow(|slot| {
+        slot.as_ref().map(|entry| {
+            (
+                entry.identity,
+                entry.epoch,
+                entry.covered,
+                entry.index.document_count(),
+            )
+        })
+    });
+    CacheProbe {
+        cached_segments,
+        memoized_terms,
+        buffer,
+    }
 }
 
 unsafe fn dead_set(index: pg_sys::Relation, entry: &SegmentEntry) -> BTreeSet<Tid> {
@@ -1697,6 +1821,9 @@ pub struct View {
     /// A name per source for error messages: `segment generation 7` or
     /// `write buffer`.
     pub labels: Vec<String>,
+    /// Each source's dead list as a set, decoded once per backend and dead
+    /// run rather than once per statement; empty for the write buffer.
+    pub dead_sets: Vec<DeadSet>,
 }
 
 /// During recovery the view is served only when [`index_reads_allowed`]
@@ -1749,17 +1876,21 @@ pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
             };
             let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
             let mut labels = Vec::with_capacity(meta.segments.len() + 1);
+            let mut dead_sets = Vec::with_capacity(meta.segments.len() + 1);
             trim_reader_cache(meta.identity, &meta);
             for entry in &meta.segments {
                 pgrx::check_for_interrupts!();
-                let (reader, dead) = cached_segment(index, index_oid, meta.identity, entry);
-                sources.push((Box::new(reader), dead));
+                let (segment, dead, dead_set) =
+                    cached_segment(index, index_oid, meta.identity, entry);
+                sources.push((Box::new(segment), dead));
                 labels.push(generation_label(entry.generation));
+                dead_sets.push(dead_set);
             }
             let immutable_sources = sources.len();
             if let Some(buffer) = buffer {
                 sources.push((Box::new(buffer), None));
                 labels.push("write buffer".to_owned());
+                dead_sets.push(Rc::default());
             }
             // Segments are immutable; the buffer index was extended under the
             // shared meta lock, so a fold cannot rewrite pages underneath it.
@@ -1769,6 +1900,7 @@ pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
                 sources,
                 immutable_sources,
                 labels,
+                dead_sets,
             };
         }
     }
