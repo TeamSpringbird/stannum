@@ -2,6 +2,14 @@ use pgrx::{FromDatum, PgBox, PgMemoryContexts, pg_extern, pg_guard, pg_sys};
 use std::ffi::c_void;
 use tinql::runtime::Query;
 
+/// Operator class strategies: `text ==> text` and `text ==> indexed_query`
+/// (see [`crate::operator`]).
+const BOUND_STRATEGY: u16 = 2;
+
+/// Added to the cost of scanning an index for a clause bound to an index
+/// with other tokenizer settings (PostgreSQL's own `disable_cost`).
+const FOREIGN_CLAUSE_COST: f64 = 1.0e10;
+
 #[pg_extern(sql = "
     CREATE OR REPLACE FUNCTION @extschema@.amhandler(internal)
         RETURNS index_am_handler
@@ -12,7 +20,7 @@ use tinql::runtime::Query;
 pub(crate) fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let mut routine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
-    routine.amstrategies = 1;
+    routine.amstrategies = BOUND_STRATEGY;
     routine.amsupport = 0;
     routine.amcanmulticol = false;
     routine.amsearcharray = false;
@@ -204,8 +212,8 @@ unsafe extern "C-unwind" fn amrescan(
         return;
     }
     let selective = unsafe { selective(scan) };
-    let tokenizer =
-        selective.then(|| unsafe { crate::storage::index_tokenizer((*scan).indexRelation) });
+    let spec = selective.then(|| unsafe { crate::storage::index_spec((*scan).indexRelation) });
+    let tokenizer = spec.as_ref().map(crate::storage::tokenizer_for);
     let mut queries = Vec::with_capacity(keys.len());
     for key in keys {
         if key.sk_flags != 0 {
@@ -213,8 +221,22 @@ unsafe extern "C-unwind" fn amrescan(
             state.plan = ScanPlan::Fallback;
             return;
         }
-        let text =
-            unsafe { String::from_datum(key.sk_argument, false) }.expect("non-null search key");
+        let text = if key.sk_strategy == BOUND_STRATEGY {
+            let bound =
+                unsafe { crate::operator::indexed_query::from_datum(key.sk_argument, false) }
+                    .expect("non-null search key");
+            // A query bound to an index with other settings than this one
+            // can only be answered by rechecking every row with its own.
+            if let Some(spec) = spec
+                && unsafe { crate::storage::spec_by_oid(pg_sys::Oid::from(bound.index)) } != spec
+            {
+                state.plan = ScanPlan::Fallback;
+                return;
+            }
+            bound.query
+        } else {
+            unsafe { String::from_datum(key.sk_argument, false) }.expect("non-null search key")
+        };
         let query = match &tokenizer {
             Some(tokenizer) => tinql::runtime::parse_tinql_to_query(&text, tokenizer.as_ref()),
             None => tinql::runtime::parse_tinql_to_query_default(&text),
@@ -343,11 +365,14 @@ unsafe extern "C-unwind" fn amcostestimate(
         let info = (*path).indexinfo;
         let tuples = (*(*info).rel).tuples.max(1.0);
         // Every ==> clause is estimated from the index; the scan ANDs them.
-        let queries = crate::selectivity::index_path_queries(path);
-        let estimates: Vec<_> = queries
+        let clauses = crate::selectivity::index_path_clauses(path);
+        let estimates: Vec<_> = clauses
             .iter()
-            .map(|query| {
-                crate::selectivity::estimate_query((*info).indexoid, query)
+            .map(|clause| {
+                clause
+                    .query
+                    .as_deref()
+                    .and_then(|query| crate::selectivity::estimate_query((*info).indexoid, query))
                     .unwrap_or(crate::selectivity::FALLBACK)
             })
             .collect();
@@ -363,13 +388,29 @@ unsafe extern "C-unwind" fn amcostestimate(
             &estimate,
             tuples,
             loop_count,
-            queries.len().max(1),
+            clauses.len().max(1),
         );
+        // A clause bound to an index with other tokenizer settings makes
+        // this index scan a full recheck (see amrescan): every heap page is
+        // a candidate.
+        let own_spec = crate::storage::spec_by_oid((*info).indexoid);
+        let foreign = clauses.iter().any(|clause| {
+            clause
+                .bound
+                .is_some_and(|bound| crate::storage::spec_by_oid(bound) != own_spec)
+        });
         *startup = cost.startup;
-        *total = cost.total;
         // The bitmap heap scan fetches every candidate the index yields,
-        // including the superset of an inexact plan.
-        *selectivity = estimate.candidates.clamp(0.0, 1.0);
+        // including the superset of an inexact plan. A foreign clause yields
+        // every page, and is priced out so the bound index wins whenever it
+        // is available.
+        if foreign {
+            *total = cost.total + FOREIGN_CLAUSE_COST;
+            *selectivity = 1.0;
+        } else {
+            *total = cost.total;
+            *selectivity = estimate.candidates.clamp(0.0, 1.0);
+        }
         *correlation = 0.0;
         *pages = cost.pages;
     }
