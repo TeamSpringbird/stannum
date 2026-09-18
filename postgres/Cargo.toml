@@ -22,6 +22,7 @@ thiserror.workspace = true
 tokenizer = { path = "../tokenizer" }
 tinql = { path = "../tinql" }
 boldi-vigna = { path = "../boldi-vigna" }
+segment = { path = "../segment" }
 
 [dev-dependencies]
 pgrx-tests = "=0.19.1"

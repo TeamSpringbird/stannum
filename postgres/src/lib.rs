@@ -11,7 +11,9 @@ mod operator;
 pub(crate) mod options;
 mod postings;
 mod score;
-mod tf_bucket;
+mod tf_bucket {
+    pub(crate) use segment::tf_bucket::*;
+}
 mod udfs;
 
 #[pg_guard]

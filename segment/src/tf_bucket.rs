@@ -1,11 +1,11 @@
 //! Production-compatible term-frequency quantization.
 
 /// Number of bits in a stored term-frequency bucket.
-pub(crate) const BUCKET_BITS: u8 = 4;
+pub const BUCKET_BITS: u8 = 4;
 /// Number of representable term-frequency buckets.
-pub(crate) const BUCKET_COUNT: usize = 1 << BUCKET_BITS;
+pub const BUCKET_COUNT: usize = 1 << BUCKET_BITS;
 /// Largest valid bucket value.
-pub(crate) const BUCKET_MAX: u8 = BUCKET_COUNT as u8 - 1;
+pub const BUCKET_MAX: u8 = BUCKET_COUNT as u8 - 1;
 
 /// The representative count is also the first positive count in the bucket.
 const REPRESENTATIVE_COUNTS: [u32; BUCKET_COUNT] = [
@@ -14,12 +14,12 @@ const REPRESENTATIVE_COUNTS: [u32; BUCKET_COUNT] = [
 
 /// A validated four-bit term-frequency bucket.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct TfBucket(u8);
+pub struct TfBucket(u8);
 
 impl TfBucket {
     /// Quantizes a raw count using the production PagePack bucket boundaries.
     #[must_use]
-    pub(crate) fn from_count(count: u32) -> Self {
+    pub fn from_count(count: u32) -> Self {
         let positive_count = count.max(1);
         let first_greater = REPRESENTATIVE_COUNTS.partition_point(|&start| start <= positive_count);
         Self((first_greater - 1) as u8)
@@ -27,7 +27,7 @@ impl TfBucket {
 
     /// Validates a bucket decoded from an external representation.
     #[must_use]
-    pub(crate) const fn new(value: u8) -> Option<Self> {
+    pub const fn new(value: u8) -> Option<Self> {
         if value <= BUCKET_MAX {
             Some(Self(value))
         } else {
@@ -36,13 +36,13 @@ impl TfBucket {
     }
 
     #[must_use]
-    pub(crate) const fn value(self) -> u8 {
+    pub const fn value(self) -> u8 {
         self.0
     }
 
     /// Returns the count used by scoring for every raw count in this bucket.
     #[must_use]
-    pub(crate) const fn representative_count(self) -> u32 {
+    pub const fn representative_count(self) -> u32 {
         REPRESENTATIVE_COUNTS[self.0 as usize]
     }
 }
@@ -50,14 +50,14 @@ impl TfBucket {
 /// Compatibility helper for callers that store buckets as raw bytes.
 #[must_use]
 #[cfg(test)]
-pub(crate) fn quantize_tf_count(count: u32) -> u8 {
+pub fn quantize_tf_count(count: u32) -> u8 {
     TfBucket::from_count(count).value()
 }
 
 /// Compatibility helper for callers that already validated a stored bucket.
 #[must_use]
 #[cfg(test)]
-pub(crate) fn representative_tf_count(bucket: u8) -> u32 {
+pub fn representative_tf_count(bucket: u8) -> u32 {
     TfBucket::new(bucket)
         .expect("term-frequency bucket must fit in four bits")
         .representative_count()

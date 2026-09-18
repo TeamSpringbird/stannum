@@ -20,6 +20,9 @@
 //! * [`forward`]: one document's tokens as a single record for a mutable write
 //!   buffer, so an insert is one append rather than one per term.
 //! * [`set`]: intersection, union and difference over any cursors.
+//! * [`segment`]: assembles the components above into one immutable segment
+//!   with a document table of lengths, and reads them back.
+//! * [`tf_bucket`]: the production-compatible term-frequency quantization.
 //!
 //! Every decoder returns [`Error`] on malformed input instead of panicking.
 //! Formats are versioned by the caller (page kind and version live in the
@@ -33,7 +36,9 @@ pub mod dictionary;
 pub mod forward;
 pub mod payload;
 pub mod postings;
+pub mod segment;
 pub mod set;
+pub mod tf_bucket;
 pub mod tid;
 
 pub use error::{Error, Result};

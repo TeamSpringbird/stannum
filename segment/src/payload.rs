@@ -17,7 +17,7 @@ use crate::reader::Reader;
 use crate::{Error, Result, varint};
 
 pub const SKIP_INTERVAL: u32 = 64;
-pub const MAX_TF_BUCKET: u8 = 15;
+pub const MAX_TF_BUCKET: u8 = crate::tf_bucket::BUCKET_MAX;
 
 #[derive(Default, Debug)]
 pub struct PayloadBuilder {

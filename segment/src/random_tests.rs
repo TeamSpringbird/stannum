@@ -267,11 +267,70 @@ proptest! {
     }
 
     #[test]
+    fn segment_assembly_matches_per_document_oracle(
+        docs in prop::collection::btree_map(
+            (0u32..300, 1u16..=MAX_OFFSET),
+            prop::collection::vec("[a-e]{1,3}", 0..30),
+            0..40,
+        ),
+        probes in prop::collection::vec("[a-f]{1,3}", 0..10),
+    ) {
+        use crate::segment::{Segment, SegmentBuilder};
+        use crate::tf_bucket::TfBucket;
+        let mut builder = SegmentBuilder::default();
+        let mut oracle: BTreeMap<String, BTreeMap<Tid, Vec<u32>>> = BTreeMap::new();
+        let mut lengths: BTreeMap<Tid, u32> = BTreeMap::new();
+        for ((block, offset), words) in &docs {
+            let tid = Tid::new(*block, *offset).unwrap();
+            let tokens: Vec<(&str, u32)> = words.iter().enumerate().map(|(i, w)| (w.as_str(), i as u32 + 1)).collect();
+            builder.add_document(tid, tokens.iter().copied()).unwrap();
+            lengths.insert(tid, words.len() as u32);
+            for (word, position) in tokens {
+                oracle.entry(word.to_owned()).or_default().entry(tid).or_default().push(position);
+            }
+        }
+        let bytes = builder.finish();
+        let segment = Segment::parse(&bytes).unwrap();
+        prop_assert_eq!(segment.document_count() as usize, lengths.len());
+        prop_assert_eq!(segment.total_length(), lengths.values().map(|l| u64::from(*l)).sum::<u64>());
+        prop_assert_eq!(collect(segment.documents().unwrap()).unwrap(), lengths.keys().copied().collect::<Vec<_>>());
+        for (tid, len) in &lengths {
+            prop_assert_eq!(segment.document_length(*tid).unwrap(), Some(*len));
+        }
+        let listed: Vec<String> = segment.dictionary().iter().map(|r| r.unwrap().0).collect();
+        prop_assert_eq!(&listed, &oracle.keys().cloned().collect::<Vec<_>>());
+        for word in oracle.keys().chain(probes.iter()) {
+            let resolved = segment.term(word).unwrap();
+            match oracle.get(word) {
+                None => prop_assert!(resolved.is_none()),
+                Some(expected) => {
+                    let term = resolved.unwrap();
+                    prop_assert_eq!(term.df() as usize, expected.len());
+                    prop_assert_eq!(collect(term.cursor().unwrap()).unwrap(), expected.keys().copied().collect::<Vec<_>>());
+                    let payload = term.payload().unwrap();
+                    let mut max_bucket = 0;
+                    let mut cursor = term.cursor().unwrap();
+                    for (tid, positions) in expected {
+                        let ordinal = cursor.rank(*tid).unwrap().unwrap();
+                        let entry = payload.get(ordinal).unwrap();
+                        prop_assert_eq!(&entry.positions, positions);
+                        let bucket = TfBucket::from_count(positions.len() as u32).value();
+                        prop_assert_eq!(entry.tf_bucket, bucket);
+                        max_bucket = max_bucket.max(bucket);
+                    }
+                    prop_assert_eq!(term.entry.max_tf_bucket, max_bucket);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decoders_never_panic_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
         let _ = Postings::parse(&bytes).and_then(|p| p.to_vec());
         let _ = Payload::parse(&bytes).and_then(|p| p.get(0));
         let _ = Dictionary::parse(&bytes).map(|d| d.iter().count());
         let _ = Dictionary::parse(&bytes).and_then(|d| d.get("a"));
         let _ = ForwardRecord::decode(&bytes);
+        let _ = crate::segment::Segment::parse(&bytes).and_then(|s| s.term("a").map(|_| ()));
     }
 }

@@ -1789,6 +1789,7 @@ dependencies = [
  "pgrx",
  "pgrx-tests",
  "rustc-hash",
+ "segment",
  "thiserror",
  "tinql",
  "tokenizer",
