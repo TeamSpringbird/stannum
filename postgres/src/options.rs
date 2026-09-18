@@ -97,7 +97,7 @@ pub fn init() {
         pg_sys::add_int_reloption(
             kind,
             c"initial_segment_count".as_ptr(),
-            c"Ignored Lead segment-count compatibility option".as_ptr(),
+            c"Ignored Stannum segment-count compatibility option".as_ptr(),
             1,
             1,
             1024,
@@ -187,7 +187,7 @@ pub fn init() {
         pg_sys::add_string_reloption(
             kind,
             c"score_stop_words".as_ptr(),
-            c"Comma-separated analyzed terms omitted by tin.score".as_ptr(),
+            c"Comma-separated analyzed terms omitted by stannum.score".as_ptr(),
             std::ptr::null(),
             None,
             lock,
@@ -294,7 +294,7 @@ unsafe fn parsed(index: pg_sys::Relation) -> Option<&'static IndexOptions> {
 
 pub unsafe fn tokenizer_spec(index: pg_sys::Relation) -> TokenizerPipelineSpec {
     let Some(options) = (unsafe { parsed(index) }) else {
-        return TokenizerPipelineSpec::tin_default();
+        return TokenizerPipelineSpec::stannum_default();
     };
     TokenizerPipelineSpec {
         tokenizer: match options.tokenizer {
@@ -321,6 +321,79 @@ pub unsafe fn tokenizer_spec(index: pg_sys::Relation) -> TokenizerPipelineSpec {
             _ => PositionGapMode::Preserve,
         },
     }
+}
+
+/// Serialized tokenizer settings stored in the index meta page, so scans and
+/// inserts analyze text exactly as the build did.
+pub const SPEC_BYTES: usize = 8;
+
+pub fn encode_spec(spec: &TokenizerPipelineSpec) -> [u8; SPEC_BYTES] {
+    let folding = |value: Folding| match value {
+        Folding::Preserve => FOLDING_PRESERVE,
+        Folding::Fold => FOLDING_FOLD,
+    } as u8;
+    let mut out = [0u8; SPEC_BYTES];
+    out[0] = match spec.tokenizer {
+        TokenizerSpec::Unicode => TOKENIZER_UNICODE,
+        TokenizerSpec::Whitespace => TOKENIZER_WHITESPACE,
+    } as u8;
+    out[1] = folding(spec.case_folding);
+    out[2] = folding(spec.accent_folding);
+    out[3] = match spec.long_tokens.mode {
+        LongTokenMode::Truncate => LONG_TRUNCATE,
+        LongTokenMode::Discard => LONG_DISCARD,
+        LongTokenMode::Split => LONG_SPLIT,
+    } as u8;
+    out[4..6].copy_from_slice(&(spec.long_tokens.max_bytes as u16).to_le_bytes());
+    out[6] = match spec.graphemes {
+        GraphemeMode::Discard => GRAPHEME_DISCARD,
+        GraphemeMode::Emoji => GRAPHEME_EMOJI,
+        GraphemeMode::Retain => GRAPHEME_RETAIN,
+    } as u8;
+    out[7] = match spec.position_gaps {
+        PositionGapMode::Collapse => GAPS_COLLAPSE,
+        PositionGapMode::Preserve => GAPS_PRESERVE,
+    } as u8;
+    out
+}
+
+pub fn decode_spec(bytes: &[u8; SPEC_BYTES]) -> Option<TokenizerPipelineSpec> {
+    let folding = |value: u8| match i32::from(value) {
+        FOLDING_PRESERVE => Some(Folding::Preserve),
+        FOLDING_FOLD => Some(Folding::Fold),
+        _ => None,
+    };
+    let spec = TokenizerPipelineSpec {
+        tokenizer: match i32::from(bytes[0]) {
+            TOKENIZER_UNICODE => TokenizerSpec::Unicode,
+            TOKENIZER_WHITESPACE => TokenizerSpec::Whitespace,
+            _ => return None,
+        },
+        case_folding: folding(bytes[1])?,
+        accent_folding: folding(bytes[2])?,
+        long_tokens: LongTokenSpec {
+            mode: match i32::from(bytes[3]) {
+                LONG_TRUNCATE => LongTokenMode::Truncate,
+                LONG_DISCARD => LongTokenMode::Discard,
+                LONG_SPLIT => LongTokenMode::Split,
+                _ => return None,
+            },
+            max_bytes: usize::from(u16::from_le_bytes([bytes[4], bytes[5]])),
+        },
+        graphemes: match i32::from(bytes[6]) {
+            GRAPHEME_DISCARD => GraphemeMode::Discard,
+            GRAPHEME_EMOJI => GraphemeMode::Emoji,
+            GRAPHEME_RETAIN => GraphemeMode::Retain,
+            _ => return None,
+        },
+        position_gaps: match i32::from(bytes[7]) {
+            GAPS_COLLAPSE => PositionGapMode::Collapse,
+            GAPS_PRESERVE => PositionGapMode::Preserve,
+            _ => return None,
+        },
+    };
+    spec.validate().ok()?;
+    Some(spec)
 }
 
 fn decode_folding(value: i32) -> Folding {
@@ -364,9 +437,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spec_bytes_round_trip_every_setting() {
+        let spec = TokenizerPipelineSpec {
+            tokenizer: TokenizerSpec::Whitespace,
+            case_folding: Folding::Preserve,
+            accent_folding: Folding::Fold,
+            long_tokens: LongTokenSpec {
+                mode: LongTokenMode::Discard,
+                max_bytes: 2_692,
+            },
+            graphemes: GraphemeMode::Retain,
+            position_gaps: PositionGapMode::Collapse,
+        };
+        assert_eq!(decode_spec(&encode_spec(&spec)), Some(spec));
+        let default = TokenizerPipelineSpec::stannum_default();
+        assert_eq!(decode_spec(&encode_spec(&default)), Some(default));
+        assert_eq!(decode_spec(&[9, 0, 0, 0, 0, 1, 0, 0]), None);
+        assert_eq!(decode_spec(&[0, 0, 0, 0, 1, 0, 0, 0]), None);
+    }
+
+    #[test]
     fn defaults_match_the_standalone_pipeline() {
         assert_eq!(
-            TokenizerPipelineSpec::tin_default().long_tokens.max_bytes,
+            TokenizerPipelineSpec::stannum_default()
+                .long_tokens
+                .max_bytes,
             256
         );
         assert_eq!(Bm25Params::default(), Bm25Params { k1: 1.2, b: 0.75 });

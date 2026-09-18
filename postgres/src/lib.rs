@@ -4,18 +4,24 @@ use pgrx::pg_guard;
 
 mod am;
 mod bm25;
+mod customscan;
 mod highlight;
 mod highlight_udfs;
 mod match_positions;
 mod operator;
 pub(crate) mod options;
 mod score;
-mod tf_bucket;
+mod storage;
+mod tf_bucket {
+    pub(crate) use segment::tf_bucket::*;
+}
 mod udfs;
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     options::init();
+    storage::init();
+    customscan::init();
 }
 
 #[cfg(test)]
@@ -46,8 +52,9 @@ mod tests {
                (1, 'craft beer'), (2, 'wine'), (3, 'beer festival')",
         )
         .unwrap();
-        Spi::run("CREATE INDEX lite_search_idx ON lite_search USING tin (body)").unwrap();
-        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        Spi::run("CREATE INDEX lite_search_idx ON lite_search USING stannum (body)").unwrap();
+        Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL stannum.enable_custom_scan = off")
+            .unwrap();
         let ids = Spi::get_one::<Vec<i32>>(
             "SELECT array_agg(id ORDER BY id) FROM lite_search WHERE body ==> 'beer'",
         )
@@ -61,15 +68,686 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
-        assert_eq!(plan[0]["Plan"]["Lossy Heap Blocks"], 1);
+        assert_eq!(plan[0]["Plan"]["Lossy Heap Blocks"], 0);
         assert_eq!(plan[0]["Plan"]["Plans"][0]["Index Name"], "lite_search_idx");
+    }
+
+    #[pg_test]
+    fn selective_postings_skip_unrelated_heap_pages_and_follow_overflow() {
+        Spi::run(
+            "CREATE TABLE posting_probe (id int, body text);
+          INSERT INTO posting_probe SELECT n, 'common ' || repeat('filler ', 120) ||
+            CASE WHEN n=777 THEN 'needle' ELSE '' END FROM generate_series(1,1500) n;
+          CREATE INDEX posting_probe_idx ON posting_probe USING stannum(body);
+          SET LOCAL enable_seqscan=off; SET LOCAL stannum.enable_custom_scan=off;",
+        )
+        .unwrap();
+        // Meta page, one write-buffer page, and at least one segment page.
+        assert!(
+            Spi::get_one::<i64>("SELECT pg_relation_size('posting_probe_idx')")
+                .unwrap()
+                .unwrap()
+                >= 3 * 8192
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_probe WHERE body ==> 'common'")
+                .unwrap(),
+            Some(1500)
+        );
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM posting_probe WHERE body ==> 'needle'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(plan[0]["Plan"]["Exact Heap Blocks"], 1);
+        assert_eq!(plan[0]["Plan"]["Lossy Heap Blocks"], 0);
+        let miss = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM posting_probe WHERE body ==> 'missing'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(miss[0]["Plan"]["Exact Heap Blocks"], 0);
+        Spi::run("INSERT INTO posting_probe VALUES (1501,'needle');").unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_probe WHERE body ==> 'needle'")
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[pg_test]
+    fn persisted_boolean_and_phrase_candidates_preserve_exact_matches() {
+        Spi::run(
+            "CREATE TABLE boolean_docs(id int, body text);
+             INSERT INTO boolean_docs VALUES (1,'beer wine'), (2,'wine beer'),
+                 (3,'beer craft'), (4,'wine'), (5,'beer beer'), (6,'cider');
+             INSERT INTO boolean_docs SELECT n, repeat('padding ',120)
+                 FROM generate_series(7,1000) n;
+             CREATE INDEX boolean_docs_search ON boolean_docs USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = off;",
+        )
+        .unwrap();
+        for (query, expected) in [
+            ("beer AND wine", vec![1, 2]),
+            ("beer OR wine", vec![1, 2, 3, 4, 5]),
+            ("\"beer wine\"", vec![1]),
+            ("\"beer beer\"", vec![5]),
+            ("beer AND NOT wine", vec![3, 5]),
+            ("beer OR win*", vec![1, 2, 3, 4, 5]),
+            ("missing OR win*", vec![1, 2, 4]),
+            ("beer AND win*", vec![1, 2]),
+            ("missing AND wine", vec![]),
+            ("(beer OR wine) AND craft", vec![3]),
+            ("beer NOT ENCLOSES wine", vec![1, 2, 3, 5]),
+            ("beer NOT ENCLOSED BY wine", vec![1, 2, 3, 5]),
+            ("beer NOT OVERLAPPING wine", vec![1, 2, 3, 5]),
+            ("beer BEFORE wine", vec![1]),
+            ("beer AFTER wine", vec![2]),
+            ("beer THEN/1 win*", vec![1]),
+            ("AT LEAST 2 OF [beer, wine, craft]", vec![1, 2, 3]),
+        ] {
+            Spi::run("SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=on;").unwrap();
+            let actual = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id),'{{}}'::int[]) \
+                 FROM boolean_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, expected, "{query}");
+            Spi::run("SET LOCAL enable_seqscan=on; SET LOCAL enable_bitmapscan=off;").unwrap();
+            let reference = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id),'{{}}'::int[]) \
+                 FROM boolean_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, reference, "reference disagreement: {query}");
+        }
+        Spi::run("SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=on;").unwrap();
+        let phrase = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM boolean_docs WHERE body ==> '\"beer wine\"'",
+        ).unwrap().unwrap().0;
+        assert_eq!(phrase[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
+        assert_eq!(phrase[0]["Plan"]["Actual Rows"].as_f64(), Some(1.0));
+        // Positions are stored, so the phrase is exact: no candidate is rechecked.
+        assert_eq!(
+            phrase[0]["Plan"]["Rows Removed by Index Recheck"].as_f64(),
+            Some(0.0)
+        );
+        assert_eq!(phrase[0]["Plan"]["Lossy Heap Blocks"], 0);
+        let expansion = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM boolean_docs WHERE body ==> 'missing OR win*'",
+        ).unwrap().unwrap().0;
+        assert_eq!(expansion[0]["Plan"]["Lossy Heap Blocks"], 0);
+        assert_eq!(expansion[0]["Plan"]["Actual Rows"].as_f64(), Some(3.0));
+        assert_eq!(
+            expansion[0]["Plan"]["Rows Removed by Index Recheck"].as_f64(),
+            Some(0.0)
+        );
+
+        // The inner bitmap scan is rescanned with each outer row's query value.
+        Spi::run("SET LOCAL enable_material=off; SET LOCAL enable_memoize=off;").unwrap();
+        let counts = Spi::get_one::<Vec<i64>>(
+            "SELECT array_agg(found.n ORDER BY q.ordinal) FROM
+             (VALUES (1,'beer AND wine'), (2,'beer OR wine'),
+                     (3,'\"beer wine\"'), (4,'missing'), (5,'missing OR win*')) q(ordinal,query)
+             CROSS JOIN LATERAL (SELECT count(*) n FROM boolean_docs
+                 WHERE body ==> q.query OFFSET 0) found",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(counts, vec![2, 5, 1, 0, 3]);
+    }
+
+    #[pg_test]
+    fn persisted_boolean_candidates_recheck_lossy_bitmaps() {
+        Spi::run(
+            "CREATE TABLE lossy_docs(id int, body text);
+             ALTER TABLE lossy_docs ALTER COLUMN body SET STORAGE PLAIN;
+             INSERT INTO lossy_docs SELECT n,
+               CASE WHEN n%4=0 THEN 'beer wine '
+                    WHEN n%4=1 THEN 'wine beer '
+                    WHEN n%4=2 THEN 'beer craft ' ELSE 'wine craft ' END
+               || CASE WHEN n=1500 THEN 'needle ' ELSE '' END
+               || repeat('padding ',500) FROM generate_series(1,3000) n;
+             CREATE INDEX lossy_docs_search ON lossy_docs USING stannum(body);
+             SET LOCAL work_mem='64kB'; SET LOCAL enable_seqscan=off; SET LOCAL stannum.enable_custom_scan=off;",
+        )
+        .unwrap();
+        // The 3.5KB inline documents create enough heap pages to force lossiness
+        // in both input bitmaps under the shared work_mem target.
+        for (query, expected) in [
+            ("beer AND wine", 1500_i64),
+            ("beer OR wine", 3000),
+            ("\"beer wine\"", 750),
+            ("(beer OR craft) AND wine", 2250),
+        ] {
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM lossy_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
+            assert_eq!(
+                plan[0]["Plan"]["Actual Rows"].as_f64(),
+                Some(expected as f64),
+                "{query}"
+            );
+            // Exact results with at least 1,500 tuples exceed the 64kB bitmap
+            // budget; smaller exact results may stay exact.
+            if expected >= 1500 {
+                assert!(
+                    plan[0]["Plan"]["Lossy Heap Blocks"].as_u64().unwrap() > 0,
+                    "{query}"
+                );
+            }
+            let actual = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT array_agg(id ORDER BY id) FROM lossy_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            Spi::run("SET LOCAL enable_seqscan=on; SET LOCAL enable_bitmapscan=off;").unwrap();
+            let reference = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT array_agg(id ORDER BY id) FROM lossy_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, reference, "lossy reference disagreement: {query}");
+            Spi::run("SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=on;").unwrap();
+        }
+        // Intersection must remain conservative with exact/lossy operands in
+        // either order; the rare posting list stays exact at this work_mem.
+        for query in ["beer AND needle", "needle AND beer"] {
+            assert_eq!(
+                Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT array_agg(id ORDER BY id) FROM lossy_docs WHERE body ==> '{query}'"
+                ))
+                .unwrap(),
+                Some(vec![1500])
+            );
+        }
+    }
+
+    #[pg_test]
+    fn write_buffer_folds_and_merges_keep_results_exact() {
+        Spi::run(
+            "CREATE TABLE folded(id int, body text);
+             CREATE INDEX folded_idx ON folded USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = off;
+             SET LOCAL stannum.write_buffer_docs = 4;
+             SET LOCAL stannum.max_segments = 3;
+             INSERT INTO folded
+               SELECT n, 'w' || (n % 7) || ' common ' ||
+                      CASE WHEN n % 10 = 0 THEN 'rare needle' ELSE 'other filler' END
+               FROM generate_series(1, 100) n;
+             INSERT INTO folded VALUES (101, ''), (102, NULL), (103, 'w1 w1 w1');",
+        )
+        .unwrap();
+        for query in [
+            "rare",
+            "common",
+            "missing",
+            "\"rare needle\"",
+            "\"needle rare\"",
+            "w1 AND NOT rare",
+            "* AND NOT common",
+            "w* AND rare",
+            "AT LEAST 2 OF [w1 w2 rare]",
+            "(w3 NEAR/2 needle) IN FIRST 3 WORDS",
+            "common IN LAST 50%",
+        ] {
+            Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = on;").unwrap();
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM folded WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan", "{query}");
+            assert_eq!(
+                plan[0]["Plan"]["Rows Removed by Index Recheck"].as_f64(),
+                Some(0.0),
+                "{query}"
+            );
+            let actual = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id), '{{}}'::int[]) FROM folded WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            Spi::run("SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;").unwrap();
+            let reference = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id), '{{}}'::int[]) FROM folded WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, reference, "{query}");
+        }
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM folded WHERE body ==> 'rare'").unwrap(),
+            Some(10)
+        );
+    }
+
+    #[pg_test]
+    fn index_tokenizer_options_govern_matching() {
+        Spi::run(
+            "CREATE TABLE cased(id int, body text);
+             INSERT INTO cased VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER');
+             CREATE INDEX cased_idx ON cased USING stannum(body) WITH (case_folding = preserve);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        // Exact index results honor the index's own analyzer settings.
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM cased WHERE body ==> 'beer'"
+            )
+            .unwrap(),
+            Some(vec![2])
+        );
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM cased WHERE body ==> 'Beer'"
+            )
+            .unwrap(),
+            Some(vec![1])
+        );
+    }
+
+    /// Values observed from TIN 1.0.2 on the same documents (docs/archive/tin-observed-shape.md).
+    #[pg_test]
+    fn scoring_matches_tin_statistics_contract_bit_for_bit() {
+        Spi::run(
+            "CREATE TABLE parity(id int primary key, body text);
+             INSERT INTO parity VALUES (1,'rare common'), (2,'common common'),
+               (3,'common'), (4,'rare rare common x'), (5,'other');
+             CREATE INDEX parity_idx ON parity USING stannum(body);",
+        )
+        .unwrap();
+        let scores = |label: &str| -> Vec<(i32, u32)> {
+            let rows = Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT id, stannum.full_score(ctid) FROM parity
+                         WHERE body ==> 'rare OR common' ORDER BY id",
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            eprintln!("{label}: {rows:?}");
+            rows
+        };
+        let bits = |value: f32| value.to_bits();
+        assert_eq!(
+            scores("all live"),
+            vec![
+                (1, bits(1.163_150_8)),
+                (2, bits(0.395_562_86)),
+                (3, bits(0.361_657_47)),
+                (4, bits(1.143_688_9))
+            ]
+        );
+        // Deleted documents stay in the statistics until their segment is rewritten.
+        Spi::run("DELETE FROM parity WHERE id IN (2, 3)").unwrap();
+        assert_eq!(
+            scores("two deleted"),
+            vec![(1, bits(1.163_150_8)), (4, bits(1.143_688_9))]
+        );
+        // Buffered documents count immediately, alongside the dead ones.
+        Spi::run("INSERT INTO parity VALUES (6,'common common common'), (7,'rare')").unwrap();
+        assert_eq!(
+            scores("two buffered"),
+            vec![
+                (1, bits(1.201_372)),
+                (4, bits(1.153_078_8)),
+                (6, bits(0.531_823)),
+                (7, bits(1.039_253_1))
+            ]
+        );
+        // A rebuild re-indexes rows deleted by this still-open transaction, as
+        // every index AM must, so inside one transaction the statistics keep
+        // seven documents. TIN observed after a committed delete and VACUUM
+        // gave 1.1196322, 1.0063113, 0.78576607, 0.6938147 for five.
+        Spi::run("REINDEX INDEX parity_idx").unwrap();
+        assert_eq!(
+            scores("reindexed in transaction"),
+            vec![
+                (1, bits(1.201_372)),
+                (4, bits(1.153_078_8)),
+                (6, bits(0.531_823)),
+                (7, bits(1.039_253_1))
+            ]
+        );
+        // Dense-term elision from a single immutable segment.
+        Spi::run(
+            "CREATE TABLE dense(id int primary key, body text);
+             INSERT INTO dense SELECT n, CASE WHEN n <= 3 THEN 'rare common' ELSE 'common filler' END
+               FROM generate_series(1, 30) n;
+             CREATE INDEX dense_idx ON dense USING stannum(body);",
+        )
+        .unwrap();
+        let dense = Spi::get_one::<Vec<f32>>(
+            "SELECT array_agg(stannum.score(ctid) ORDER BY id) FROM dense
+             WHERE body ==> 'rare OR common' AND id <= 5",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            dense.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            [2.181_224_3_f32, 2.181_224_3, 2.181_224_3, 0.0, 0.0]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Values observed from TIN 1.0.2 on the same documents (docs/archive/tin-observed-shape.md).
+    #[pg_test]
+    fn scoring_terms_expansions_not_and_max_match_tin() {
+        Spi::run(
+            "CREATE TABLE mx(id int primary key, body text);
+             INSERT INTO mx VALUES (1,'a'), (2,'a a'), (3,'a b c d'), (4,'a a a b'), (5,'b'),
+               (6,'c c c c c c'), (7,'rare'), (8,'rate'), (9,'rave'), (10,'x y z');
+             CREATE INDEX mx_idx ON mx USING stannum(body);",
+        )
+        .unwrap();
+        let bits = |sql: &str| -> Vec<u32> {
+            Spi::get_one::<Vec<f32>>(sql)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect()
+        };
+        assert_eq!(
+            bits(
+                "SELECT array_agg(stannum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'a'"
+            ),
+            [0x3f96_44a5, 0x3fa5_0c72, 0x3f33_c8fc, 0x3f9d_4fdb]
+        );
+        // Standalone max_score: full policy, maximum over matching rows.
+        assert_eq!(
+            bits(
+                "SELECT array_agg(m) FROM (SELECT stannum.max_score(ctid) m FROM mx WHERE body ==> 'a' LIMIT 1) s"
+            ),
+            [0x3fa5_0c72]
+        );
+        assert_eq!(
+            bits(
+                "SELECT array_agg(m) FROM (SELECT stannum.max_score(ctid) m FROM mx WHERE body ==> 'a OR b' LIMIT 1) s"
+            ),
+            [0x4008_3d61]
+        );
+        assert_eq!(
+            bits(
+                "SELECT array_agg(m) FROM (SELECT stannum.max_score(ctid) m FROM mx WHERE body ==> 'c' LIMIT 1) s"
+            ),
+            [0x400a_26fb]
+        );
+        // Beside stannum.score in the same target list it adapts to the dense
+        // policy (a is in 4 of 9 documents, so it is elided and scores zero).
+        assert_eq!(
+            bits(
+                "SELECT array_agg(m) FROM (SELECT stannum.max_score(ctid) + 0::real * stannum.score(ctid) AS m FROM mx WHERE body ==> 'a' LIMIT 1) t"
+            ),
+            [0x0000_0000]
+        );
+        // Fuzzy and wildcard expansions score every matching dictionary term.
+        assert_eq!(
+            bits(
+                "SELECT array_agg(stannum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'rare~1'"
+            ),
+            [0x4027_7bac, 0x4027_7bac, 0x4027_7bac]
+        );
+        assert_eq!(
+            bits(
+                "SELECT array_agg(stannum.full_score(ctid) ORDER BY id) FROM mx WHERE body ==> 'ra*'"
+            ),
+            [0x4027_7bac, 0x4027_7bac, 0x4027_7bac]
+        );
+        let inspect = |query: &str| -> Vec<String> {
+            Spi::get_one::<Vec<String>>(&format!(
+                "SELECT array_agg(term || ':' || weight ORDER BY term) FROM stannum.score_inspect('mx_idx', '{query}', 1.0)"
+            ))
+            .unwrap()
+            .unwrap_or_default()
+        };
+        assert_eq!(inspect("rare~1"), ["rare:1", "rate:1", "rave:1"]);
+        assert_eq!(inspect("ra*^2"), ["rare:2", "rate:2", "rave:2"]);
+        assert_eq!(inspect("MATCHES r.*e"), ["rare:1", "rate:1", "rave:1"]);
+        assert_eq!(inspect("x TO z"), ["x:1", "y:1", "z:1"]);
+        assert_eq!(inspect("a AND NOT (b OR c)"), ["a:1"]);
+        assert_eq!(inspect("a OR (b AND NOT c)"), ["a:1", "b:1"]);
+        assert_eq!(inspect("* AND NOT c"), Vec::<String>::new());
+        assert_eq!(inspect("a NOT OVERLAPPING b"), ["a:1", "b:1"]);
+    }
+
+    #[pg_test]
+    fn custom_scan_search_count_and_topk_match_the_bitmap_path() {
+        Spi::run(
+            "CREATE TABLE cs(id int primary key, body text, active bool DEFAULT true);
+             INSERT INTO cs SELECT n, 'common w' || (n % 7) || ' ' ||
+               CASE WHEN n % 100 = 0 THEN 'rare alpha beta' ELSE 'filler' END
+               FROM generate_series(1, 3000) n;
+             CREATE INDEX cs_idx ON cs USING stannum(body);
+             CREATE INDEX cs_partial ON cs USING stannum(lower(body)) WHERE active;
+             UPDATE cs SET active = false WHERE id = 300;
+             DELETE FROM cs WHERE id % 500 = 0;",
+        )
+        .unwrap();
+        let queries = [
+            "rare",
+            "missing",
+            "common AND NOT rare",
+            "\"alpha beta\"",
+            "ra* OR filler",
+            "common OR rare",
+        ];
+        for query in queries {
+            let both = |custom: bool| -> (Vec<i32>, i64, Vec<i32>) {
+                Spi::run(&format!(
+                    "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;"
+                ))
+                .unwrap();
+                let ids = Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT coalesce(array_agg(id ORDER BY id), '{{}}') FROM cs WHERE body ==> '{query}' AND id % 3 = 0"
+                ))
+                .unwrap()
+                .unwrap();
+                let count = Spi::get_one::<i64>(&format!(
+                    "SELECT count(*) FROM cs WHERE body ==> '{query}'"
+                ))
+                .unwrap()
+                .unwrap();
+                let top = Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT coalesce(array_agg(id), '{{}}') FROM (SELECT id FROM cs WHERE body ==> '{query}'
+                     ORDER BY stannum.full_score(ctid) DESC, id LIMIT 5) t"
+                ))
+                .unwrap()
+                .unwrap();
+                (ids, count, top)
+            };
+            assert_eq!(both(true), both(false), "{query}");
+        }
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;")
+            .unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM cs WHERE body ==> 'rare'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(plan[0]["Plan"]["Custom Plan Provider"], "Stannum Count");
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM cs WHERE body ==> 'common OR rare'
+             ORDER BY stannum.full_score(ctid) DESC LIMIT 2",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        let scan = &plan[0]["Plan"]["Plans"][0]["Plans"][0];
+        assert_eq!(scan["Custom Plan Provider"], "Stannum Text Search Scan");
+        assert_eq!(scan["Order"], "score DESC");
+        assert_eq!(scan["Heap Fetches"], 2);
+        // A partial index answers only queries that imply its predicate; the
+        // inactive row must still be found through the full index.
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM cs WHERE lower(body) ==> 'rare' AND id <= 400"
+            )
+            .unwrap(),
+            Some(vec![100, 200, 300, 400])
+        );
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM cs WHERE active AND lower(body) ==> 'rare' AND id <= 400"
+            )
+            .unwrap(),
+            Some(vec![100, 200, 400])
+        );
+        // A join above the ordered scan can consume more rows than the LIMIT
+        // it was planned for; the rows past the top-k are ordered on demand.
+        Spi::run(
+            "CREATE TABLE cs_keep(id int primary key);
+             INSERT INTO cs_keep SELECT n FROM generate_series(2500, 3000) n;",
+        )
+        .unwrap();
+        let joined = |custom: bool| -> Vec<i32> {
+            Spi::run(&format!(
+                "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;
+                 SET LOCAL enable_sort = off; SET LOCAL enable_hashjoin = off;
+                 SET LOCAL enable_mergejoin = off;"
+            ))
+            .unwrap();
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM (SELECT d.id FROM cs d JOIN cs_keep k USING (id)
+                 WHERE d.body ==> 'common OR rare' ORDER BY stannum.full_score(d.ctid) DESC LIMIT 4) t",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // The four surviving 'rare' rows tie on score; the plain sort breaks
+        // ties arbitrarily, so the comparison is by set.
+        let with_custom = joined(true);
+        assert_eq!(with_custom, vec![2600, 2700, 2800, 2900]);
+        assert_eq!(with_custom, joined(false));
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on;").unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.id FROM cs d JOIN cs_keep k USING (id)
+             WHERE d.body ==> 'common OR rare' ORDER BY stannum.full_score(d.ctid) DESC LIMIT 4",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        let text = plan.to_string();
+        assert!(text.contains("Stannum Text Search Scan"), "{text}");
+        assert!(text.contains("\"Top K\":4"), "{text}");
+    }
+
+    #[pg_test]
+    fn segment_info_reports_segments_and_the_write_buffer() {
+        Spi::run(
+            "CREATE TABLE si(id int primary key, body text);
+             INSERT INTO si SELECT n, 'w' || (n % 5) || ' common' FROM generate_series(1, 50) n;
+             CREATE INDEX si_idx ON si USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 4;
+             INSERT INTO si SELECT n, 'late needle' FROM generate_series(100, 109) n;
+             DELETE FROM si WHERE id <= 10;",
+        )
+        .unwrap();
+        let rows = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT kind, docs, dead_docs, sum_doc_lengths, total_pages
+                     FROM stannum.segment_info('si_idx') ORDER BY ordinal",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<String>(1).unwrap().unwrap(),
+                        row.get::<i64>(2).unwrap().unwrap(),
+                        row.get::<i64>(3).unwrap().unwrap(),
+                        row.get::<i64>(4).unwrap().unwrap(),
+                        row.get::<i64>(5).unwrap().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        // The build segment, two folded segments of four, and two buffered.
+        assert_eq!(rows[0], ("immutable".into(), 50, 0, 100, 1));
+        assert_eq!(rows[1].0, "immutable");
+        assert_eq!(rows[1].1, 4);
+        assert_eq!(rows[2].1, 4);
+        assert_eq!(rows.last().unwrap().0, "mutable");
+        assert_eq!(rows.last().unwrap().1, 2);
+        assert_eq!(rows.len(), 4);
+        // Dead documents only appear after VACUUM reports them.
+        assert!(rows.iter().all(|row| row.2 == 0));
+    }
+
+    #[pg_test]
+    fn posting_inserts_rolled_back_by_subtransaction_are_not_visible() {
+        Spi::run(
+            "CREATE TABLE posting_abort(body text);
+          CREATE INDEX posting_abort_idx ON posting_abort USING stannum(body);
+          DO $$ BEGIN
+            INSERT INTO posting_abort VALUES ('aborted');
+            RAISE EXCEPTION 'abort subtransaction';
+          EXCEPTION WHEN raise_exception THEN NULL; END $$;
+          INSERT INTO posting_abort VALUES ('committed');
+          SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_abort WHERE body ==> 'aborted'")
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_abort WHERE body ==> 'committed'")
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[pg_test]
+    fn unlogged_indexes_use_the_reference_path() {
+        Spi::run(
+            "CREATE UNLOGGED TABLE posting_unlogged(body text);
+          INSERT INTO posting_unlogged VALUES ('beer');
+          CREATE INDEX posting_unlogged_idx ON posting_unlogged USING stannum(body);
+          SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT pg_relation_size('posting_unlogged_idx')").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_unlogged WHERE body ==> 'beer'")
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[pg_test]
     fn bitmap_scan_follows_heap_growth_and_truncate() {
         Spi::run(
             "CREATE TABLE lite_growth (id int, body text);
-             CREATE INDEX lite_growth_idx ON lite_growth USING tin (body);
+             CREATE INDEX lite_growth_idx ON lite_growth USING stannum (body);
              SET LOCAL enable_seqscan = off;",
         )
         .unwrap();
@@ -107,8 +785,8 @@ mod tests {
                (1, 'BEER', true), (2, 'wine', true),
                (3, 'BEER', false), (4, NULL, true);
              CREATE INDEX lite_partial_idx ON lite_partial
-               USING tin (lower(body)) WHERE active;
-             SET LOCAL enable_seqscan = off;",
+               USING stannum (lower(body)) WHERE active;
+             SET LOCAL enable_seqscan = off; SET LOCAL stannum.enable_custom_scan = off;",
         )
         .unwrap();
         let plan = Spi::get_one::<Json>(
@@ -149,8 +827,8 @@ mod tests {
              INSERT INTO lite_union VALUES
                (1, 'beer', 'wine'), (2, 'wine', 'beer'),
                (3, 'beer', 'beer'), (4, 'wine', 'wine');
-             CREATE INDEX lite_union_title_idx ON lite_union USING tin (title);
-             CREATE INDEX lite_union_body_idx ON lite_union USING tin (body);
+             CREATE INDEX lite_union_title_idx ON lite_union USING stannum (title);
+             CREATE INDEX lite_union_body_idx ON lite_union USING stannum (body);
              SET LOCAL enable_seqscan = off;",
         )
         .unwrap();
@@ -177,7 +855,7 @@ mod tests {
         Spi::run(
             "CREATE TABLE lite_mvcc (id int, body text);
              INSERT INTO lite_mvcc VALUES (1, 'old term'), (2, 'keep term');
-             CREATE INDEX lite_mvcc_idx ON lite_mvcc USING tin (body);
+             CREATE INDEX lite_mvcc_idx ON lite_mvcc USING stannum (body);
              UPDATE lite_mvcc SET body = 'new term' WHERE id = 1;
              DELETE FROM lite_mvcc WHERE id = 2;
              SET LOCAL enable_seqscan = off;",
@@ -209,11 +887,11 @@ mod tests {
             "CREATE TABLE lite_score (id int, body text);
              INSERT INTO lite_score VALUES
                (1, 'rare'), (2, 'rare rare rare'), (3, 'common');
-             CREATE INDEX lite_score_idx ON lite_score USING tin (body);",
+             CREATE INDEX lite_score_idx ON lite_score USING stannum (body);",
         )
         .unwrap();
         let ids = Spi::get_one::<Vec<i32>>(
-            "SELECT array_agg(id ORDER BY tin.full_score(ctid) DESC, id)
+            "SELECT array_agg(id ORDER BY stannum.full_score(ctid) DESC, id)
              FROM lite_score WHERE body ==> 'rare'",
         )
         .unwrap();
@@ -226,17 +904,17 @@ mod tests {
             "CREATE TABLE lite_score_helpers (id int, body text);
              INSERT INTO lite_score_helpers VALUES
                (1, 'common rare'), (2, 'common'), (3, 'common');
-             CREATE INDEX lite_score_helpers_idx ON lite_score_helpers USING tin (body)",
+             CREATE INDEX lite_score_helpers_idx ON lite_score_helpers USING stannum (body)",
         )
         .unwrap();
         let full_max = Spi::get_one::<f32>(
-            "SELECT max(tin.full_score(ctid))
+            "SELECT max(stannum.full_score(ctid))
              FROM lite_score_helpers WHERE body ==> 'rare^1.0'",
         )
         .unwrap()
         .unwrap();
         let reported = Spi::get_one::<f32>(
-            "SELECT tin.max_score(ctid)
+            "SELECT stannum.max_score(ctid)
              FROM lite_score_helpers WHERE body ==> 'rare^1.0' LIMIT 1",
         )
         .unwrap()
@@ -244,7 +922,7 @@ mod tests {
         assert_eq!(reported, full_max);
         let inspected = Spi::get_one::<Vec<String>>(
             "SELECT array_agg(term ORDER BY term)
-             FROM tin.score_inspect('lite_score_helpers_idx', 'common OR rare', 0.5)",
+             FROM stannum.score_inspect('lite_score_helpers_idx', 'common OR rare', 0.5)",
         )
         .unwrap();
         assert_eq!(inspected, Some(vec!["rare".to_owned()]));
@@ -261,13 +939,13 @@ mod tests {
              INSERT INTO lite_expression_score
                SELECT n, 'noise', n::text FROM generate_series(4, 30) AS n;
              CREATE INDEX lite_expression_score_idx ON lite_expression_score
-               USING tin (((s1 || ' '::text) || s2));",
+               USING stannum (((s1 || ' '::text) || s2));",
         )
         .unwrap();
         let rows = Spi::connect(|client| {
             client
                 .select(
-                    "SELECT id, tin.score(ctid) AS score
+                    "SELECT id, stannum.score(ctid) AS score
                      FROM lite_expression_score
                      WHERE (s1 || ' ' || s2) ==> 'hello world 10'
                      ORDER BY score DESC, id LIMIT 5",
@@ -291,7 +969,7 @@ mod tests {
     fn highlighting_supports_explicit_and_implicit_queries() {
         assert_eq!(
             Spi::get_one::<String>(
-                "SELECT tin.highlight('Beer and wine', '[', ']', query => 'beer')"
+                "SELECT stannum.highlight('Beer and wine', '[', ']', query => 'beer')"
             )
             .unwrap(),
             Some("[Beer] and wine".into())
@@ -301,12 +979,12 @@ mod tests {
              INSERT INTO lite_highlight VALUES
                (1, 'Beer', 'and wine'), (2, 'cider', 'only');
              CREATE INDEX lite_highlight_idx ON lite_highlight
-               USING tin (((s1 || ' '::text) || s2));",
+               USING stannum (((s1 || ' '::text) || s2));",
         )
         .unwrap();
         assert_eq!(
             Spi::get_one::<String>(
-                "SELECT tin.highlight(s1 || ' ' || s2)
+                "SELECT stannum.highlight(s1 || ' ' || s2)
                  FROM lite_highlight
                  WHERE (s1 || ' ' || s2) ==> 'beer'"
             )
@@ -314,7 +992,7 @@ mod tests {
             Some("<b>Beer</b> and wine".into())
         );
         let ansi = Spi::get_one::<String>(
-            "SELECT tin.highlight_ansi(s1 || ' ' || s2)
+            "SELECT stannum.highlight_ansi(s1 || ' ' || s2)
              FROM lite_highlight
              WHERE (s1 || ' ' || s2) ==> 'beer'",
         )
