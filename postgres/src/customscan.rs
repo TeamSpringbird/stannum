@@ -1154,6 +1154,9 @@ unsafe extern "C-unwind" fn search_access(
                 ) {
                     exec.fetched += 1;
                     if !exec.recheck || passes_clause(node, exec, slot) {
+                        if exec.ordered {
+                            crate::score::note_scan_emitted(exec.scan_id);
+                        }
                         return slot;
                     }
                     break;

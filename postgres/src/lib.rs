@@ -3101,9 +3101,12 @@ mod tests {
              INSERT INTO twin SELECT n, repeat('needle ', 1 + n % 4) || repeat('pad ', n % 7)
                FROM generate_series(301, 340) n;
              CREATE INDEX twin_idx ON twin USING stannum(body);
+             DELETE FROM twin WHERE id IN (303, 307, 311);
              SET LOCAL enable_seqscan = off;",
         )
         .unwrap();
+        // The deleted rows stay posted, so cursor a's pruned top 12 holds
+        // invisible rows and a completes its ordering after b was opened.
         let rows = |sql: &str| {
             Spi::connect(|client| {
                 client

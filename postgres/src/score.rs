@@ -123,12 +123,32 @@ thread_local! {
     /// every row the scan ranked. Cursors keep scans open across statements
     /// and two scans on one query can be open at once, so a scan's rows are
     /// scored by the scan's own statistics and never by another's.
-    static SCAN_SCORERS: RefCell<Vec<(u64, IndexScorer)>> = const { RefCell::new(Vec::new()) };
+    static SCAN_SCORERS: RefCell<Vec<ScanScorer>> = const { RefCell::new(Vec::new()) };
+    /// Scan identities and emission stamps, from one counter.
     static NEXT_SCAN: Cell<u64> = const { Cell::new(0) };
     /// Counts executor runs in this backend. Transaction and command ids do
     /// not distinguish consecutive read-only statements, which never assign
     /// a transaction id and each start at command zero.
     static STATEMENT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A live ranked scan's scorer; see [`SCAN_SCORERS`].
+struct ScanScorer {
+    scan: u64,
+    /// Stamp of the scan's latest emitted row. A row is projected after its
+    /// scan emitted it and before that scan emits another, so when two scans
+    /// on one query both ranked a location, the most recent emitter's score
+    /// is the row's.
+    recent: u64,
+    scorer: IndexScorer,
+}
+
+fn next_stamp() -> u64 {
+    NEXT_SCAN.with(|next| {
+        let id = next.get().wrapping_add(1);
+        next.set(id);
+        id
+    })
 }
 
 /// Called from the `ExecutorStart` hook so scorers built for one statement
@@ -284,16 +304,17 @@ fn score_bound_indexed(
             SCAN_SCORERS.with_borrow(|scans| {
                 scans
                     .iter()
-                    .rev()
-                    .filter(|(_, scorer)| same_query(&scorer.key))
-                    .find_map(|(_, scorer)| scorer.known.get(&tid).copied())
+                    .filter(|entry| same_query(&entry.scorer.key))
+                    .filter_map(|entry| entry.scorer.known.get(&tid).map(|s| (entry.recent, *s)))
+                    .max_by_key(|(recent, _)| *recent)
+                    .map(|(_, score)| score)
             })
         };
         if let Some(score) = from_scan(tid) {
             return score;
         }
-        let any_scan =
-            SCAN_SCORERS.with_borrow(|scans| scans.iter().any(|(_, s)| same_query(&s.key)));
+        let any_scan = SCAN_SCORERS
+            .with_borrow(|scans| scans.iter().any(|entry| same_query(&entry.scorer.key)));
         if any_scan {
             let root = unsafe { hot_root(pg_sys::Oid::from(heap_oid as u32), tid) };
             if root != tid
@@ -1078,16 +1099,21 @@ unsafe fn visible_tids(heap_oid: pg_sys::Oid, tids: BTreeSet<Tid>) -> Vec<Tid> {
 
 /// A fresh identity for a ranked scan; see [`SCAN_SCORERS`].
 pub(crate) fn scan_id() -> u64 {
-    NEXT_SCAN.with(|next| {
-        let id = next.get().wrapping_add(1);
-        next.set(id);
-        id
-    })
+    next_stamp()
+}
+
+/// Records that the scan just emitted a row; see [`ScanScorer::recent`].
+pub(crate) fn note_scan_emitted(scan: u64) {
+    SCAN_SCORERS.with_borrow_mut(|scans| {
+        if let Some(entry) = scans.iter_mut().find(|entry| entry.scan == scan) {
+            entry.recent = next_stamp();
+        }
+    });
 }
 
 /// Drops the scorer a scan published, when the scan ends.
 pub(crate) fn forget_scan_scorer(scan: u64) {
-    SCAN_SCORERS.with_borrow_mut(|scans| scans.retain(|(id, _)| *id != scan));
+    SCAN_SCORERS.with_borrow_mut(|scans| scans.retain(|entry| entry.scan != scan));
 }
 
 /// The scorer for a custom scan's top-k ordering, from the bound arguments
@@ -1124,8 +1150,8 @@ pub(crate) fn scorer_for_scan(
     let published = SCAN_SCORERS.with_borrow_mut(|scans| {
         scans
             .iter()
-            .position(|(id, _)| *id == scan)
-            .map(|at| scans.remove(at).1)
+            .position(|entry| entry.scan == scan)
+            .map(|at| scans.remove(at).scorer)
     });
     match published {
         Some(mut scorer) => {
@@ -1152,8 +1178,16 @@ pub(crate) fn publish_scan_scorer(scan: u64, mut scorer: IndexScorer, ranked: &[
         .known
         .extend(ranked.iter().map(|(score, tid)| (*tid, *score)));
     SCAN_SCORERS.with_borrow_mut(|scans| {
-        scans.retain(|(id, _)| *id != scan);
-        scans.push((scan, scorer));
+        let recent = scans
+            .iter()
+            .find(|entry| entry.scan == scan)
+            .map_or(0, |entry| entry.recent);
+        scans.retain(|entry| entry.scan != scan);
+        scans.push(ScanScorer {
+            scan,
+            recent,
+            scorer,
+        });
     });
 }
 
