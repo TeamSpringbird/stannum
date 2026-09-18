@@ -162,7 +162,11 @@ jobs:
       - name: Start a throwaway cluster
         run: |
           initdb -D "$RUNNER_TEMP/oracle-data" -U "$USER" -A trust --no-locale --encoding=UTF8
-          pg_ctl -D "$RUNNER_TEMP/oracle-data" -o "-p 28999 -c listen_addresses=localhost" -l "$RUNNER_TEMP/oracle.log" -w start
+          # Debian builds default the socket directory to /var/run/postgresql,
+          # which the runner user cannot write.
+          pg_ctl -D "$RUNNER_TEMP/oracle-data" \
+            -o "-p 28999 -c listen_addresses=localhost -c unix_socket_directories=$RUNNER_TEMP" \
+            -l "$RUNNER_TEMP/oracle.log" -w start || { cat "$RUNNER_TEMP/oracle.log"; exit 1; }
       - name: Build both extensions and run the oracle
         env:
           PGHOST: localhost
