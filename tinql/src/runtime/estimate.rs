@@ -10,8 +10,8 @@
 //!   by the rarest child (an intersection can never exceed its smallest input);
 //! * a disjunction matches by inclusion-exclusion, `1 - Π(1 - fᵢ)`;
 //! * a negation matches the complement, `1 - f`;
-//! * `AT LEAST k OF` matches the k-th largest child fraction, the nested
-//!   model [`plan`](super::plan) also uses for ordering;
+//! * `AT LEAST k OF` matches the probability that at least k independent
+//!   children match, the tail of their Poisson binomial distribution;
 //! * a phrase or proximity query is bounded by its rarest term and discounted
 //!   once per additional slot, because positions constrain far more than
 //!   co-occurrence but rarely to independence;
@@ -132,15 +132,32 @@ pub fn complement(fraction: f64) -> f64 {
     1.0 - clamp(fraction)
 }
 
-/// AT LEAST `min` OF: the `min`-th largest fraction. Zero is the universe;
-/// more than the child count is unsatisfiable.
+/// AT LEAST `min` OF: the probability that at least `min` of independent
+/// events occur (the Poisson binomial tail), which is the disjunction for
+/// `min == 1` and the product for `min == n`. Zero is the universe; more
+/// than the child count is unsatisfiable.
 pub fn at_least(fractions: impl IntoIterator<Item = f64>, min: usize) -> f64 {
     if min == 0 {
         return 1.0;
     }
-    let mut sorted: Vec<f64> = fractions.into_iter().map(clamp).collect();
-    sorted.sort_unstable_by(|a, b| b.total_cmp(a));
-    sorted.get(min - 1).copied().unwrap_or(0.0)
+    let fractions: Vec<f64> = fractions.into_iter().map(clamp).collect();
+    if min > fractions.len() {
+        return 0.0;
+    }
+    // exactly[j]: probability that exactly j of the events seen so far occur.
+    let mut exactly = vec![0.0; fractions.len() + 1];
+    exactly[0] = 1.0;
+    for (seen, fraction) in fractions.iter().enumerate() {
+        for j in (0..=seen + 1).rev() {
+            let with = if j > 0 {
+                exactly[j - 1] * fraction
+            } else {
+                0.0
+            };
+            exactly[j] = exactly[j] * (1.0 - fraction) + with;
+        }
+    }
+    exactly[min..].iter().sum::<f64>().min(1.0)
 }
 
 /// Phrase or proximity: bounded by the rarest slot, discounted once per
@@ -498,11 +515,13 @@ mod tests {
     fn complement_and_at_least() {
         close(complement(0.2), 0.8);
         close(complement(-1.0), 1.0);
-        close(at_least([0.1, 0.5, 0.3], 1), 0.5);
-        close(at_least([0.1, 0.5, 0.3], 2), 0.3);
-        close(at_least([0.1, 0.5, 0.3], 3), 0.1);
+        // At least one is the disjunction; all of them is the product.
+        close(at_least([0.1, 0.5, 0.3], 1), disjunction([0.1, 0.5, 0.3]));
+        close(at_least([0.1, 0.5, 0.3], 2), 0.2);
+        close(at_least([0.1, 0.5, 0.3], 3), 0.015);
         close(at_least([0.1, 0.5, 0.3], 4), 0.0);
         close(at_least([0.1], 0), 1.0);
+        close(at_least([], 1), 0.0);
     }
 
     #[test]
@@ -585,6 +604,6 @@ mod tests {
     #[test]
     fn match_all_and_at_least() {
         close(run("*").selectivity, 1.0);
-        close(run("AT LEAST 2 OF [half fifth rare]").selectivity, 0.2);
+        close(run("AT LEAST 2 OF [half fifth rare]").selectivity, 0.105);
     }
 }

@@ -1186,6 +1186,7 @@ mod tests {
             ("seven AND needle", 1.0, 2.0),
             ("need*", 10.0, 1.5),
             ("needle OR missing", 10.0, 1.5),
+            ("AT LEAST 2 OF [seven five needle]", 123.0, 1.5),
         ];
         for custom in [true, false] {
             Spi::run(&format!("SET LOCAL stannum.enable_custom_scan = {custom}")).unwrap();
