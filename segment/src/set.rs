@@ -1,0 +1,319 @@
+//! Set operations over ordered cursors.
+//!
+//! Every operator is itself a [`Cursor`], so plans compose. Intersection
+//! drives from its first input; callers should place the rarest input first so
+//! the others are probed with `seek`, which skips groups and pages.
+
+use crate::{Result, Tid};
+
+pub trait Cursor {
+    /// The posting the cursor is positioned on, or `None` when exhausted.
+    fn current(&self) -> Option<Tid>;
+    /// Moves to the next posting. A no-op when exhausted.
+    fn advance(&mut self) -> Result<()>;
+    /// Moves to the first posting at or after `target`.
+    fn seek(&mut self, target: Tid) -> Result<()>;
+}
+
+impl<C: Cursor + ?Sized> Cursor for Box<C> {
+    fn current(&self) -> Option<Tid> {
+        (**self).current()
+    }
+    fn advance(&mut self) -> Result<()> {
+        (**self).advance()
+    }
+    fn seek(&mut self, target: Tid) -> Result<()> {
+        (**self).seek(target)
+    }
+}
+
+/// An always-empty cursor, the identity for union.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Empty;
+
+impl Cursor for Empty {
+    fn current(&self) -> Option<Tid> {
+        None
+    }
+    fn advance(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn seek(&mut self, _: Tid) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A cursor over an in-memory sorted list, for tests and small sets.
+#[derive(Clone, Debug)]
+pub struct Slice<'a> {
+    tids: &'a [Tid],
+    index: usize,
+}
+
+impl<'a> Slice<'a> {
+    /// `tids` must be strictly increasing.
+    pub fn new(tids: &'a [Tid]) -> Self {
+        debug_assert!(tids.windows(2).all(|pair| pair[0] < pair[1]));
+        Self { tids, index: 0 }
+    }
+}
+
+impl Cursor for Slice<'_> {
+    fn current(&self) -> Option<Tid> {
+        self.tids.get(self.index).copied()
+    }
+    fn advance(&mut self) -> Result<()> {
+        if self.index < self.tids.len() {
+            self.index += 1;
+        }
+        Ok(())
+    }
+    fn seek(&mut self, target: Tid) -> Result<()> {
+        self.index += self.tids[self.index..].partition_point(|tid| *tid < target);
+        Ok(())
+    }
+}
+
+/// Postings present in every input.
+pub struct Intersection<C> {
+    cursors: Vec<C>,
+    current: Option<Tid>,
+}
+
+impl<C: Cursor> Intersection<C> {
+    /// An empty input list yields no postings: there is no universe to return.
+    pub fn new(cursors: Vec<C>) -> Result<Self> {
+        let mut this = Self {
+            cursors,
+            current: None,
+        };
+        this.align()?;
+        Ok(this)
+    }
+
+    fn align(&mut self) -> Result<()> {
+        let Some((lead, rest)) = self.cursors.split_first_mut() else {
+            self.current = None;
+            return Ok(());
+        };
+        'outer: loop {
+            let Some(mut target) = lead.current() else {
+                self.current = None;
+                return Ok(());
+            };
+            for cursor in rest.iter_mut() {
+                cursor.seek(target)?;
+                match cursor.current() {
+                    None => {
+                        self.current = None;
+                        return Ok(());
+                    }
+                    Some(found) if found > target => {
+                        target = found;
+                        lead.seek(target)?;
+                        continue 'outer;
+                    }
+                    Some(_) => {}
+                }
+            }
+            self.current = Some(target);
+            return Ok(());
+        }
+    }
+}
+
+impl<C: Cursor> Cursor for Intersection<C> {
+    fn current(&self) -> Option<Tid> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        if self.current.is_none() {
+            return Ok(());
+        }
+        self.cursors[0].advance()?;
+        self.align()
+    }
+    fn seek(&mut self, target: Tid) -> Result<()> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(());
+        }
+        if let Some(lead) = self.cursors.first_mut() {
+            lead.seek(target)?;
+        }
+        self.align()
+    }
+}
+
+/// Postings present in any input.
+pub struct Union<C> {
+    cursors: Vec<C>,
+    current: Option<Tid>,
+}
+
+impl<C: Cursor> Union<C> {
+    pub fn new(cursors: Vec<C>) -> Self {
+        let mut this = Self {
+            cursors,
+            current: None,
+        };
+        this.align();
+        this
+    }
+
+    fn align(&mut self) {
+        self.current = self.cursors.iter().filter_map(Cursor::current).min();
+    }
+}
+
+impl<C: Cursor> Cursor for Union<C> {
+    fn current(&self) -> Option<Tid> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        let Some(current) = self.current else {
+            return Ok(());
+        };
+        for cursor in &mut self.cursors {
+            if cursor.current() == Some(current) {
+                cursor.advance()?;
+            }
+        }
+        self.align();
+        Ok(())
+    }
+    fn seek(&mut self, target: Tid) -> Result<()> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(());
+        }
+        for cursor in &mut self.cursors {
+            cursor.seek(target)?;
+        }
+        self.align();
+        Ok(())
+    }
+}
+
+/// Postings of `keep` that are absent from `remove`. Only safe when `keep` is
+/// an exact set; subtracting from a superset is never sound.
+pub struct Difference<A, B> {
+    keep: A,
+    remove: B,
+    current: Option<Tid>,
+}
+
+impl<A: Cursor, B: Cursor> Difference<A, B> {
+    pub fn new(keep: A, remove: B) -> Result<Self> {
+        let mut this = Self {
+            keep,
+            remove,
+            current: None,
+        };
+        this.align()?;
+        Ok(this)
+    }
+
+    fn align(&mut self) -> Result<()> {
+        loop {
+            let Some(candidate) = self.keep.current() else {
+                self.current = None;
+                return Ok(());
+            };
+            self.remove.seek(candidate)?;
+            if self.remove.current() == Some(candidate) {
+                self.keep.advance()?;
+                continue;
+            }
+            self.current = Some(candidate);
+            return Ok(());
+        }
+    }
+}
+
+impl<A: Cursor, B: Cursor> Cursor for Difference<A, B> {
+    fn current(&self) -> Option<Tid> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        if self.current.is_none() {
+            return Ok(());
+        }
+        self.keep.advance()?;
+        self.align()
+    }
+    fn seek(&mut self, target: Tid) -> Result<()> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(());
+        }
+        self.keep.seek(target)?;
+        self.align()
+    }
+}
+
+/// Drains a cursor, counting its postings.
+pub fn count(mut cursor: impl Cursor) -> Result<u64> {
+    let mut total = 0;
+    while cursor.current().is_some() {
+        total += 1;
+        cursor.advance()?;
+    }
+    Ok(total)
+}
+
+/// Drains a cursor into a vector.
+pub fn collect(mut cursor: impl Cursor) -> Result<Vec<Tid>> {
+    let mut out = Vec::new();
+    while let Some(tid) = cursor.current() {
+        out.push(tid);
+        cursor.advance()?;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tids(blocks: &[u32]) -> Vec<Tid> {
+        blocks.iter().map(|b| Tid::new(*b, 1).unwrap()).collect()
+    }
+
+    #[test]
+    fn composes_intersection_union_and_difference() {
+        let a = tids(&[1, 3, 5, 7, 9]);
+        let b = tids(&[3, 4, 5, 9, 10]);
+        let c = tids(&[5, 9, 11]);
+        let and = Intersection::new(vec![Slice::new(&a), Slice::new(&b), Slice::new(&c)]).unwrap();
+        assert_eq!(collect(and).unwrap(), tids(&[5, 9]));
+        let or = Union::new(vec![Slice::new(&a), Slice::new(&c)]);
+        assert_eq!(collect(or).unwrap(), tids(&[1, 3, 5, 7, 9, 11]));
+        let diff = Difference::new(Slice::new(&a), Slice::new(&b)).unwrap();
+        assert_eq!(collect(diff).unwrap(), tids(&[1, 7]));
+        let nested: Vec<Box<dyn Cursor>> = vec![
+            Box::new(Union::new(vec![Slice::new(&a), Slice::new(&c)])),
+            Box::new(Difference::new(Slice::new(&b), Slice::new(&a)).unwrap()),
+        ];
+        assert_eq!(
+            collect(Intersection::new(nested).unwrap()).unwrap(),
+            Vec::<Tid>::new()
+        );
+        assert_eq!(
+            count(Intersection::<Slice>::new(Vec::new()).unwrap()).unwrap(),
+            0
+        );
+        assert_eq!(count(Union::new(vec![Empty, Empty])).unwrap(), 0);
+    }
+
+    #[test]
+    fn seek_on_composed_cursors_lands_on_first_member_at_or_after() {
+        let a = tids(&[1, 3, 5, 7, 9]);
+        let b = tids(&[2, 3, 6, 7]);
+        let mut or = Union::new(vec![Slice::new(&a), Slice::new(&b)]);
+        or.seek(Tid::new(4, 1).unwrap()).unwrap();
+        assert_eq!(or.current(), Some(Tid::new(5, 1).unwrap()));
+        let mut and = Intersection::new(vec![Slice::new(&a), Slice::new(&b)]).unwrap();
+        and.seek(Tid::new(4, 1).unwrap()).unwrap();
+        assert_eq!(and.current(), Some(Tid::new(7, 1).unwrap()));
+        and.seek(Tid::new(8, 1).unwrap()).unwrap();
+        assert_eq!(and.current(), None);
+    }
+}
