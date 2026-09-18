@@ -24,6 +24,7 @@ use pgrx::{
     FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgList, PgMemoryContexts, pg_guard,
     pg_sys,
 };
+use rustc_hash::FxHashSet;
 use segment::Tid;
 use segment::set::Cursor as _;
 use tinql::runtime::Query;
@@ -999,8 +1000,11 @@ fn finish(exec: &mut ScanExec, mut tids: Vec<Tid>, scorer: Option<crate::score::
 }
 
 /// Replaces a pruned top k with the complete ordering once the executor
-/// reads past it. The first k rows of the complete ordering are the rows
-/// already emitted, so the read position carries over.
+/// reads past it. The locations already consumed are removed from the
+/// complete ordering rather than skipped by position: documents indexed
+/// since the top k was built (invisible to the snapshot, but present in the
+/// index and scored) can rank above them and would otherwise shift the
+/// consumed rows back into the output.
 unsafe fn complete(exec: &mut ScanExec) {
     unsafe {
         let ordering = exec
@@ -1019,10 +1023,26 @@ unsafe fn complete(exec: &mut ScanExec) {
             ordering.term_add.clone(),
             ordering.term_replace.clone(),
         );
+        let consumed: FxHashSet<Tid> = exec.tids[..exec.next].iter().copied().collect();
         let tids = candidates(exec);
-        let next = exec.next;
         finish(exec, tids, Some(scorer));
-        exec.next = next;
+        let mut kept = 0;
+        let mut sorted = exec.sorted;
+        for i in 0..exec.tids.len() {
+            if consumed.contains(&exec.tids[i]) {
+                if i < exec.sorted {
+                    sorted -= 1;
+                }
+                continue;
+            }
+            exec.tids[kept] = exec.tids[i];
+            exec.scores[kept] = exec.scores[i];
+            kept += 1;
+        }
+        exec.tids.truncate(kept);
+        exec.scores.truncate(kept);
+        exec.sorted = sorted;
+        exec.next = 0;
         exec.pruned = false;
     }
 }

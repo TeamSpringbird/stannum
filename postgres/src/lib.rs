@@ -851,6 +851,53 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_completed_ranked_scan_does_not_repeat_the_rows_it_emitted() {
+        // The second-best row is deleted, so its location stays in the index
+        // but the parent reads past the pruned top k and the scan completes
+        // the ordering. By then documents indexed after the cursor's snapshot
+        // outrank every visible row; the completed ordering must skip the
+        // rows already emitted rather than resume at a position.
+        Spi::run(
+            "CREATE TABLE cur(id int primary key, body text);
+             INSERT INTO cur SELECT n, 'other filler' FROM generate_series(1, 200) n;
+             INSERT INTO cur VALUES (301, 'needle needle needle needle'),
+               (302, 'needle needle needle'), (303, 'needle needle'), (304, 'needle');
+             CREATE INDEX cur_idx ON cur USING stannum(body);
+             INSERT INTO cur VALUES (305, 'needle other');
+             DELETE FROM cur WHERE id = 302;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let ids = |sql: &str| {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let query = "SELECT id FROM cur WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC LIMIT 3";
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off;").unwrap();
+        let expected = ids(query);
+        assert_eq!(expected.len(), 3);
+        Spi::run(&format!(
+            "SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_bitmapscan = off;
+             DECLARE top CURSOR FOR {query};"
+        ))
+        .unwrap();
+        let mut seen = ids("FETCH 1 FROM top");
+        Spi::run(
+            "INSERT INTO cur SELECT n, 'needle needle needle needle needle needle'
+             FROM generate_series(401, 403) n",
+        )
+        .unwrap();
+        seen.extend(ids("FETCH ALL FROM top"));
+        assert_eq!(seen, expected);
+        Spi::run("CLOSE top").unwrap();
+    }
+
+    #[pg_test]
     fn pruned_top_k_matches_full_scoring_bit_for_bit() {
         // Four build segments of 1,000 documents and a write buffer, with a
         // 60-row pattern of term frequencies and lengths so exact score ties

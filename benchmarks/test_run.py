@@ -181,6 +181,17 @@ class MutationProfileTests(unittest.TestCase):
             self.assertEqual(writes[0]["shapes"]["update"]["completed"], 1)
             self.assertEqual(writes[1]["queries"]["delete"]["completed"], 1)
 
+    def test_a_partial_trailing_log_record_is_dropped_but_a_corrupt_middle_one_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "reader-log.1"
+            log.write_text("0 1 2000 0 100 0\n0 2 3000 1 100 0\n0 3 25")
+            buckets = mutation.bucket_logs([log], ["rare_count", "rare_ranked"], 10, 100)
+            self.assertEqual(buckets[0]["shapes"]["count"]["completed"], 1)
+            self.assertEqual(buckets[0]["shapes"]["ranked"]["completed"], 1)
+            log.write_text("0 1 2000 0 100 0\n0 3 25\n0 2 3000 1 100 0\n")
+            with self.assertRaises(ValueError):
+                mutation.bucket_logs([log], ["rare_count", "rare_ranked"], 10, 100)
+
     def test_timeline_annotation_and_rendering_show_events_per_bucket(self):
         buckets = mutation.bucket_logs([], [], 10, 0)
         self.assertEqual(buckets, [])
