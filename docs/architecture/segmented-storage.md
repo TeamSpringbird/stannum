@@ -26,8 +26,10 @@ positions, term frequencies, and document lengths.
 2. Inserts append a document's tokens to the write buffer. Updates that change
    indexed content add a new tuple version; PostgreSQL controls its visibility.
 3. When the buffer fills, the inserting backend converts it into a segment.
-4. When the segment limit is reached, segments merge. VACUUM identifies dead
-   tuple references and can rewrite segments to reclaim space.
+4. Segments merge in size tiers, like the levels of a log-structured merge
+   tree, so the directory stays small without ever rewriting the whole index
+   at once. VACUUM identifies dead tuple references and can rewrite segments
+   to reclaim space.
 
 Searches read both segments and the buffer, so new rows do not wait for a fold to
 be searchable. Per-backend caches reuse immutable segment data and incrementally
@@ -37,10 +39,35 @@ index new buffer records.
 | --- | ---: | --- |
 | `stannum.build_segment_docs` | 32,768 | Documents per segment during index creation |
 | `stannum.write_buffer_docs` | 16,384 | Documents before folding the write buffer |
-| `stannum.max_segments` | 128 | Segment count before merging |
+| `stannum.merge_tier_factor` | 8 | Segments per size tier before they merge |
+| `stannum.max_segments` | 128 | Hard bound on directory entries |
 
 The write buffer also folds at 4 MiB. Folding and merging happen synchronously,
 so the insert that triggers them can take longer.
+
+### Merge policy
+
+Each segment belongs to a size tier by document count: tier *t* holds
+segments with `factor^t` to `factor^(t+1) - 1` documents. After every new
+segment, the lowest tier holding `merge_tier_factor` or more segments merges
+them into one segment, which lands in the next tier up; the loop repeats until
+no tier is full. Merging skips documents on a segment's dead list, appends the
+new segment with a fresh generation number, and queues the old runs on the
+pending-free list.
+
+With the defaults, write-buffer folds of 16,384 documents merge eight at a
+time into segments of about 131,072 documents, eight of those merge into about
+one million, and so on. Every document is rewritten about once per tier, so
+the merge work per insert is amortized logarithmic in the index size, and any
+one merge touches a run of similarly sized segments rather than everything.
+The directory holds at most `merge_tier_factor - 1` segments per tier, well
+under `max_segments`. If a lower `max_segments` or an unusual size mix leaves
+the directory over the bound, the smallest entries merge until it fits.
+
+Index builds publish segments through the same policy, so a freshly built
+index has the same tiered shape as one filled by inserts. A merge still runs
+in the inserting transaction under the meta page's exclusive lock; the largest
+possible merge is bounded by the largest tier in the index, not amortized away.
 
 ## Reading an index
 
@@ -103,8 +130,12 @@ old formats require rebuilding the index.
 - Fresh connections rebuild their own buffer index. Large buffers increase
   first-query latency; connection pooling amortizes that work.
 - Folding, merging, and VACUUM can hold up concurrent operations.
-- The pending-free list holds 64 runs. Overflow, or a crash before a new run is
-  published, can leave pages unreclaimed until REINDEX.
+- The pending-free list holds 64 entries; runs released together share one.
+  A full list first frees runs no snapshot can still read and otherwise
+  appends to its newest entry, delaying that entry's reclamation. A crash
+  before a new run is published leaves its pages unreclaimed until REINDEX.
+- Merges are synchronous. The tiered policy bounds the amortized cost, but
+  the top tier's merge still rewrites a large share of the index in one insert.
 
 Use the tests listed in the [project README](../../README.md#validate-changes)
 when changing these paths. Performance evidence and its limitations are kept in
