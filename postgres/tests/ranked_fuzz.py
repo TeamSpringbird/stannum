@@ -618,6 +618,7 @@ class Fuzzer:
             return self.compare('custom scan', actual, expected, oracle, visible, roots, strict, spec)
         # Cursor modes: keep fetching with writes in between.
         actual = self.parse_rows(results[-1][1])
+        spec['chunks'] = [(results[-1][0], len(actual))]
         self.stats['cursor_fetches'] += 1
         twin = None
         if spec['mode'] == 'twin':
@@ -638,6 +639,7 @@ class Fuzzer:
             self.stats['cursor_fetches'] += 1
             rows = self.parse_rows(out[-1][1])
             actual += rows
+            spec['chunks'].append((out[-1][0], len(rows)))
             n = out[-1][0].split()[1]
             exhausted = n == 'ALL' or len(rows) < int(n)
             if twin and rng.random() < 0.6:
@@ -695,6 +697,7 @@ class Fuzzer:
         twin['roots'] = roots
         twin['expected'] = oracle[twin['offset']:twin['offset'] + twin['limit']]
         twin['actual'] = self.parse_rows(results[-1][1])
+        twin['chunks'] = [(results[-1][0], len(twin['actual']))]
         twin['exhausted'] = len(twin['actual']) < int(results[-1][0].split()[1])
         return twin
 
@@ -705,6 +708,7 @@ class Fuzzer:
         out = reader.run([f'FETCH {n} FROM c2'])
         rows = self.parse_rows(out[-1][1])
         twin['actual'] += rows
+        twin['chunks'].append((out[-1][0], len(rows)))
         twin['exhausted'] = n == 'ALL' or len(rows) < int(n)
         self.stats['cursor_fetches'] += 1
         if twin['exhausted'] or all_rows:
@@ -723,13 +727,13 @@ class Fuzzer:
         self.stats['rows_compared'] += len(actual)
         failure = self.check_rows(label, actual, visible, roots)
         if failure:
-            failure.detail.update(spec=describe(spec), actual=actual[:40], expected=expected[:40])
+            failure.detail.update(spec=describe(spec), actual=actual, expected=expected, roots=roots)
             return failure
         if strict:
             if actual != expected:
                 return Failure(f'{label} differs from the unpruned path', spec=describe(spec),
                                first_difference=first_difference(actual, expected),
-                               actual=actual[:40], expected=expected[:40], oracle_rows=len(oracle))
+                               actual=actual, expected=expected, oracle_rows=len(oracle), roots=roots)
             return None
         # A Sort above the scan breaks ties arbitrarily: same scores in order,
         # each id with the score the unpruned path gave it.
@@ -842,7 +846,7 @@ class Fuzzer:
 
 
 def describe(spec):
-    return {k: v for k, v in spec.items() if k in ('scorer', 'limit', 'offset', 'join', 'extra', 'mode', 'isolation', 'oracle', 'custom', 'regex')} | {'tinql': spec['query'].tinql, 'shape': spec['query'].shape}
+    return {k: v for k, v in spec.items() if k in ('scorer', 'limit', 'offset', 'join', 'extra', 'mode', 'isolation', 'oracle', 'custom', 'regex', 'chunks')} | {'tinql': spec['query'].tinql, 'shape': spec['query'].shape}
 
 
 def first_difference(actual, expected):
