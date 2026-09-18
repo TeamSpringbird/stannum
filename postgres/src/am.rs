@@ -330,7 +330,7 @@ unsafe extern "C-unwind" fn amvacuumcleanup(
     reason = "PostgreSQL index AM callback signature"
 )]
 unsafe extern "C-unwind" fn amcostestimate(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     path: *mut pg_sys::IndexPath,
     loop_count: f64,
     startup: *mut pg_sys::Cost,
@@ -339,13 +339,39 @@ unsafe extern "C-unwind" fn amcostestimate(
     correlation: *mut f64,
     pages: *mut f64,
 ) {
-    let tuples = unsafe { (*(*(*path).indexinfo).rel).tuples.max(1.0) };
     unsafe {
-        *startup = pg_sys::seq_page_cost * loop_count;
-        *total = *startup + tuples * pg_sys::cpu_operator_cost * loop_count;
-        *selectivity = 0.1;
+        let info = (*path).indexinfo;
+        let tuples = (*(*info).rel).tuples.max(1.0);
+        // Every ==> clause is estimated from the index; the scan ANDs them.
+        let queries = crate::selectivity::index_path_queries(path);
+        let estimates: Vec<_> = queries
+            .iter()
+            .map(|query| {
+                crate::selectivity::estimate_query((*info).indexoid, query)
+                    .unwrap_or(crate::selectivity::FALLBACK)
+            })
+            .collect();
+        let estimate = if estimates.is_empty() {
+            crate::selectivity::FALLBACK
+        } else {
+            crate::selectivity::conjoin(&estimates)
+        };
+        let cost = crate::selectivity::index_cost(
+            root,
+            (*info).indexoid,
+            (*info).reltablespace,
+            &estimate,
+            tuples,
+            loop_count,
+            queries.len().max(1),
+        );
+        *startup = cost.startup;
+        *total = cost.total;
+        // The bitmap heap scan fetches every candidate the index yields,
+        // including the superset of an inexact plan.
+        *selectivity = estimate.candidates.clamp(0.0, 1.0);
         *correlation = 0.0;
-        *pages = (tuples / 512.0).ceil();
+        *pages = cost.pages;
     }
 }
 

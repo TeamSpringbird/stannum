@@ -1,5 +1,7 @@
 #[allow(unused_imports)]
 use crate::am::amhandler;
+#[allow(unused_imports)]
+use crate::selectivity::stannum_text_restrict;
 use pgrx::{extension_sql, pg_extern};
 use tinql::runtime::{evaluate, lower::lower, subtokenize::sub_tokenize, tokenize_doc};
 use tokenizer::presets::default_pipeline;
@@ -26,7 +28,8 @@ extension_sql!(
 CREATE OPERATOR pg_catalog.==> (
     PROCEDURE = @extschema@.stannum_text_cmpfunc,
     LEFTARG = pg_catalog.text,
-    RIGHTARG = pg_catalog.text
+    RIGHTARG = pg_catalog.text,
+    RESTRICT = @extschema@.stannum_text_restrict
 );
 
 CREATE OPERATOR CLASS @extschema@.stannum_text_ops DEFAULT FOR TYPE pg_catalog.text USING stannum AS
@@ -34,7 +37,7 @@ CREATE OPERATOR CLASS @extschema@.stannum_text_ops DEFAULT FOR TYPE pg_catalog.t
     STORAGE pg_catalog.text;
 "#,
     name = "stannum_text_operator",
-    requires = [amhandler, stannum_text_cmpfunc]
+    requires = [amhandler, stannum_text_cmpfunc, stannum_text_restrict]
 );
 
 #[cfg(test)]
