@@ -154,7 +154,10 @@ smaller buffer's reader count/ranked p99 were 1.7%/1.1% higher and throughput
 was 2.6% lower than the old-cap run. That is a modest observed read tradeoff,
 not proof of zero reader cost; the smaller defaults prioritize stall latency.
 Both caps remain tunable, and repeated trials are needed to distinguish these
-small reader differences from shared-host variation.
+small reader differences from shared-host variation. The
+[buffer-index note](buffer-index.md) profiles that reader cost, attributes it
+to per-segment query setup rather than the buffer, removes most of it, and
+re-measures the caps.
 
 The ceiling is on ordinary merge input documents per fold, not elapsed time.
 Directory overflow, large individual records, run copying/publication and

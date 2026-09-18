@@ -169,7 +169,54 @@ scoring candidates, whose cost does not depend on the number of segments
 
 ### Mutation windows: fold caps with the patched build
 
-MUTATION_PENDING
+Writer values are execution latency (pgbench schedule lag subtracted), p99 /
+maximum over the whole run including drain. Reader p99 combines all queries
+of the shape. One window each.
+
+| Run | Caps (docs / bytes) | Insert p99 / max | Delete p99 / max | Update p99 / max |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline `9b0bf47` | 512 / 1 MiB | 1.873 / 117.182 | 1.471 / 19.094 | 2.391 / 88.110 |
+| Patched | 512 / 1 MiB | 1.343 / 72.815 | 0.972 / 2.608 | 1.988 / 165.083 |
+| Patched | 2,048 / 4 MiB | 1.438 / 283.500 | 0.969 / 3.080 | 1.842 / 270.251 |
+| Patched | 4,096 / 8 MiB | 1.436 / 515.255 | 0.968 / 3.374 | 1.782 / 599.288 |
+
+| Run | Caps | Count p50 / p99 | Ranked p50 / p99 | Reads/s | Segments min–max / final | Max buffered docs | Check rounds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 512 / 1 MiB | 0.439 / 3.303 | 0.990 / 6.581 | 1,778.8 | 4–20 / 14 | 509 | 20 |
+| Patched | 512 / 1 MiB | 0.330 / 3.097 | 0.775 / 6.038 | 2,089.7 | 4–20 / 14 | 504 | 20 |
+| Patched | 2,048 / 4 MiB | 0.323 / 3.069 | 0.769 / 5.992 | 2,126.2 | 4–11 / 6 | 2,008 | 20 |
+| Patched | 4,096 / 8 MiB | 0.323 / 3.114 | 0.768 / 6.038 | 2,115.2 | 4–8 / 8 | 4,028 | 20 |
+
+Every window passed all twenty periodic oracle rounds and the final
+post-traffic round; the binary hash was unchanged across each window.
+
+At the default caps the patched build serves 17.5% more reads per second
+than the baseline, with count p99 6% and ranked p99 8% lower and medians 25%
+and 22% lower, against the same directory shape (4–20 segments, the same
+folds and VACUUM merges at the same times). That is more than the 4%/7%
+reader cost the merge-budget change was measured to have introduced. Insert
+and delete p99 fell too (the writer shares the machine with the readers).
+The single 165 ms update sits in the 480-second bucket where VACUUM merged
+the directory from 20 segments to 10, as the baseline's 1.1-second VACUUM did;
+its lag column shows the same value, so it is a stall behind the merge, not a
+slow statement.
+
+Raising the caps no longer buys readers anything measurable: 2,048 documents
+gained 1.7% reads/s and 4,096 lost it again, with the p99s within 1.5% of the
+default's. Worst writes, on the other hand, scale with the buffer: 283/270 ms
+at 2,048 documents and 515/599 ms at 4,096, versus 73/165 ms at 512, because
+a fold builds a segment from the whole buffer under the meta lock. The
+fresh-connection cost also scales with the buffer (about 11 ms per MiB).
+
+**Defaults stay at 512 documents and 1 MiB.** The reader cost that motivated
+revisiting them came from per-segment query setup, which is now memoized, and
+the remaining per-segment cost (about 2% of median latency for five extra
+small segments) is far below the write-stall cost of a larger buffer.
+
+Raw artifacts: `/tmp/stannum-bi-results/mut-before-512`, `mut-after-512`,
+`mut-after-2048`, `mut-after-4096` (manifests, per-statement logs, plans,
+oracle rounds, layout samples, VACUUM output, timelines), the paired
+read-only logs `p1-*`, and the `*.sample` profiles.
 
 ## Verification
 

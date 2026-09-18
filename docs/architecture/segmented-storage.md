@@ -186,7 +186,7 @@ coordination:
   inverted index of the buffer's forward records, extended from the last
   byte it covered on each use (an insert by any backend only appends), and
   rebuilt when the epoch changes: a fold empties the buffer, and VACUUM
-  rewrites it without dead records. Building costs about 25 ms per MiB of
+  rewrites it without dead records. Building costs about 11 ms per MiB of
   records on the benchmark machine, so the worst case for a fresh connection
   at the default caps is a few tens of milliseconds; existing backends absorb
   each record once, as it arrives.
