@@ -256,12 +256,7 @@ fn segment_info(
         name!(generation, i64),
     ),
 > {
-    let stannum_name =
-        std::ffi::CString::new("stannum").expect("static access method name is valid");
-    let stannum_am = unsafe { pgrx::pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
-    if unsafe { (*(*index.as_ptr()).rd_rel).relam } != stannum_am {
-        pgrx::error!("stannum.segment_info() requires a stannum index");
-    }
+    require_stannum_index(&index, "segment_info");
     if !unsafe { crate::storage::present(index.as_ptr()) } {
         return TableIterator::new(Vec::new());
     }
@@ -280,12 +275,45 @@ fn segment_info(
     }))
 }
 
-fn require_stannum_index(index: &PgRelation, function: &str) {
+pub(crate) fn require_stannum_index(index: &PgRelation, function: &str) {
+    validate_stannum_index(index, function);
+    require_index_select(index);
+}
+
+pub(crate) fn validate_stannum_index(index: &PgRelation, function: &str) {
     let stannum_name =
         std::ffi::CString::new("stannum").expect("static access method name is valid");
     let stannum_am = unsafe { pgrx::pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
     if unsafe { (*(*index.as_ptr()).rd_rel).relam } != stannum_am {
         pgrx::error!("stannum.{function}() requires a stannum index");
+    }
+}
+
+/// Diagnostics expose physical contents, so require table-wide SELECT (column
+/// grants and RLS are insufficient), or table ownership. PostgreSQL's ACL
+/// check includes pg_read_all_data and inherited role membership.
+pub(crate) fn require_index_select(index: &PgRelation) {
+    use pgrx::pg_sys;
+    unsafe {
+        let heap = pg_sys::IndexGetRelation(index.oid(), false);
+        let user = pg_sys::GetUserId();
+        if pg_sys::object_ownercheck(pg_sys::RelationRelationId, heap, user) {
+            return;
+        }
+        let acl = pg_sys::pg_class_aclcheck(heap, user, pg_sys::ACL_SELECT as _);
+        if acl != pg_sys::AclResult::ACLCHECK_OK {
+            pg_sys::aclcheck_error(
+                acl,
+                pg_sys::ObjectType::OBJECT_TABLE,
+                pg_sys::get_rel_name(heap),
+            );
+        }
+        // Physical index diagnostics cannot apply row-security policies.
+        if pg_sys::check_enable_rls(heap, user, true)
+            == pg_sys::CheckEnableRlsResult::RLS_ENABLED as i32
+        {
+            pgrx::error!("index diagnostics require ownership or SELECT without row security");
+        }
     }
 }
 
@@ -319,6 +347,9 @@ fn verify_index(
 #[cfg(feature = "pg_test")]
 #[pg_extern(volatile, parallel_unsafe)]
 fn corrupt_index_page(index: PgRelation, block: i64, at: i32, bytes: &[u8]) -> i32 {
+    if !unsafe { pgrx::pg_sys::superuser() } {
+        pgrx::error!("test corruption helpers require superuser");
+    }
     require_stannum_index(&index, "corrupt_index_page");
     let block = u32::try_from(block).unwrap_or_else(|_| pgrx::error!("invalid block number"));
     let at = usize::try_from(at).unwrap_or_else(|_| pgrx::error!("invalid page offset"));
@@ -339,4 +370,10 @@ fn index_page_kinds(
             .into_iter()
             .map(|(block, kind)| (i64::from(block), kind)),
     )
+}
+
+/// The installed binary's release version (matches the control-file version).
+#[pg_extern(immutable, parallel_safe)]
+fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }

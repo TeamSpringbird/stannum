@@ -2420,4 +2420,122 @@ mod tests {
         .0;
         assert!(plan_mentions(&plan, "indexed_query"), "{plan}");
     }
+
+    #[pg_test]
+    fn diagnostics_require_heap_select_and_reject_row_security() {
+        Spi::run(
+            "CREATE ROLE diagnostic_reader; GRANT USAGE ON SCHEMA stannum TO diagnostic_reader;
+            CREATE TABLE private_docs(body text); INSERT INTO private_docs VALUES ('secret');
+            CREATE INDEX private_idx ON private_docs USING stannum(body);",
+        )
+        .unwrap();
+        for function in ["segment_info", "verify_index", "score_inspect"] {
+            let args = if function == "score_inspect" {
+                "'private_idx', 'secret'"
+            } else {
+                "'private_idx'"
+            };
+            Spi::run(&format!(
+                "SET LOCAL ROLE diagnostic_reader;
+                DO $$ BEGIN
+                  BEGIN PERFORM * FROM stannum.{function}({args});
+                    RAISE EXCEPTION 'diagnostic disclosed private index';
+                  EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+                END $$; RESET ROLE;"
+            ))
+            .unwrap();
+        }
+        Spi::run(
+            "SET LOCAL ROLE diagnostic_reader;
+            DO $$ BEGIN
+              BEGIN PERFORM stannum.score_bound_indexed('(0,1)'::tid, 'secret',
+                'private_docs'::regclass::oid::int, 'private_idx'::regclass::oid::int,
+                1, NULL, NULL, NULL, NULL, NULL);
+                RAISE EXCEPTION 'bound scorer disclosed private index';
+              EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+            END $$; RESET ROLE;",
+        )
+        .unwrap();
+        Spi::run("GRANT SELECT ON private_docs TO diagnostic_reader;
+            SET LOCAL ROLE diagnostic_reader;
+            SELECT * FROM stannum.segment_info('private_idx');
+            SELECT * FROM stannum.verify_index('private_idx', true);
+            SELECT * FROM stannum.score_inspect('private_idx', 'secret');
+            RESET ROLE;
+            ALTER TABLE private_docs ENABLE ROW LEVEL SECURITY;
+            SET LOCAL ROLE diagnostic_reader;
+            DO $$ BEGIN
+              BEGIN PERFORM * FROM stannum.segment_info('private_idx');
+                RAISE EXCEPTION 'diagnostic ignored row security';
+              EXCEPTION WHEN OTHERS THEN
+                IF SQLERRM <> 'index diagnostics require ownership or SELECT without row security' THEN RAISE; END IF;
+              END;
+            END $$; RESET ROLE;").unwrap();
+    }
+
+    #[pg_test]
+    fn indexed_query_rejects_malformed_values_as_unprivileged_user() {
+        Spi::run(
+            "CREATE ROLE query_reader; GRANT USAGE ON SCHEMA stannum TO query_reader;
+            SET LOCAL ROLE query_reader;
+            DO $$ DECLARE value text; BEGIN
+              FOREACH value IN ARRAY ARRAY['garbage', '{}', 'null', '[]',
+                '{\"index\":-1,\"query\":\"beer\"}',
+                '{\"index\":1,\"query\":null}',
+                '{\"index\":1,\"query\":\"beer\",\"extra\":true}'] LOOP
+                BEGIN EXECUTE format('SELECT %L::stannum.indexed_query', value);
+                EXCEPTION WHEN OTHERS THEN CONTINUE; END;
+                RAISE EXCEPTION 'accepted malformed indexed_query: %', value;
+              END LOOP;
+            END $$; RESET ROLE;",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn reindex_writes_current_format_and_future_pages_fail_cleanly() {
+        use crate::storage::layout;
+        let root = corruptible("release_format");
+        let index = unsafe { pgrx::PgRelation::open_with_name("release_format_idx") }.unwrap();
+        let read_page = |block| unsafe {
+            let buffer = pg_sys::ReadBuffer(index.as_ptr(), block);
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let bytes = std::slice::from_raw_parts(
+                pg_sys::BufferGetPage(buffer).cast::<u8>(),
+                layout::PAGE_SIZE,
+            )
+            .to_vec();
+            pg_sys::UnlockReleaseBuffer(buffer);
+            bytes
+        };
+        assert_eq!(
+            &read_page(root as u32)[DATA_AT as usize..DATA_AT as usize + 4],
+            b"LSG2"
+        );
+        drop(index);
+        corrupt("release_format_idx", 0, KIND_AT + 1, "ff");
+        assert!(
+            findings("release_format_idx", false)
+                .iter()
+                .any(|s| s.contains("unsupported Stannum page version"))
+        );
+        Spi::run("REINDEX INDEX release_format_idx").unwrap();
+        assert_clean("release_format_idx");
+        let index = unsafe { pgrx::PgRelation::open_with_name("release_format_idx") }.unwrap();
+        unsafe {
+            let buffer = pg_sys::ReadBuffer(index.as_ptr(), 0);
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let bytes = std::slice::from_raw_parts(
+                pg_sys::BufferGetPage(buffer).cast::<u8>(),
+                layout::PAGE_SIZE,
+            )
+            .to_vec();
+            pg_sys::UnlockReleaseBuffer(buffer);
+            assert_eq!(
+                bytes[layout::PAGE_SIZE - layout::SPECIAL_SIZE + 5],
+                layout::VERSION
+            );
+            assert_eq!(layout::kind(&bytes), Ok(layout::KIND_META));
+        }
+    }
 }

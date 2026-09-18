@@ -64,6 +64,10 @@ evidence is on PostgreSQL 18. Stannum loads on demand; it does not require
 `shared_preload_libraries`. The receiving server must have the compiled library,
 control file, and extension SQL installed before `CREATE EXTENSION` can work.
 
+Current release baseline: **0.1.0-dev** (`stannum.version()` returns `0.1.0`).
+See [release and upgrade procedures](docs/RELEASING.md) and
+[SQL permissions](docs/SECURITY.md).
+
 ## Names and compatibility
 
 The extension, library, access method, and SQL schema are **`stannum`**. Functions

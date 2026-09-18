@@ -41,9 +41,26 @@ use tokenizer::{CompiledTokenizerPipeline, TokenizerPipelineSpec};
 /// A query bound to the index whose tokenizer settings evaluate it.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, PostgresType)]
+#[inoutfuncs]
+#[serde(deny_unknown_fields)]
 pub struct indexed_query {
     pub index: u32,
     pub query: String,
+}
+
+// pgrx's default JSON input returns SQL NULL on decoding errors. PostgreSQL
+// type input must reject malformed non-NULL input explicitly.
+impl pgrx::InOutFuncs for indexed_query {
+    fn input(input: &CStr) -> Self {
+        pgrx::inoutfuncs::json_from_slice(input.to_bytes())
+            .unwrap_or_else(|error| pgrx::error!("invalid indexed_query: {error}"))
+    }
+
+    fn output(&self, buffer: &mut pgrx::StringInfo) {
+        let bytes = pgrx::inoutfuncs::json_to_vec(self)
+            .unwrap_or_else(|error| pgrx::error!("cannot serialize indexed_query: {error}"));
+        buffer.push_bytes(&bytes);
+    }
 }
 
 // --- Evaluation -----------------------------------------------------------------
@@ -116,8 +133,12 @@ pub fn stannum_text_cmpfunc(document: &str, query: &str) -> bool {
 }
 
 /// `text ==> indexed_query`: the bound index's tokenizer settings.
-#[pg_extern(immutable, parallel_safe)]
+#[pg_extern(stable, parallel_safe)]
 pub fn stannum_text_cmpfunc_indexed(document: &str, query: indexed_query) -> bool {
+    let index = unsafe {
+        pgrx::PgRelation::with_lock(pg_sys::Oid::from(query.index), pg_sys::AccessShareLock as _)
+    };
+    crate::udfs::validate_stannum_index(&index, "indexed_query");
     let spec = unsafe { crate::storage::spec_by_oid(pg_sys::Oid::from(query.index)) };
     let tokenizer = crate::storage::tokenizer_for(&spec);
     evaluate_with(document, &query.query, spec, &tokenizer)
