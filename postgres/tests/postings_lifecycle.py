@@ -25,7 +25,16 @@ def main():
         command(['pg_ctl', '-D', str(data), '-l', str(root/'server.log'), '-w', 'start'])
     def stop(mode='fast'):
         command(['pg_ctl', '-D', str(data), '-m', mode, '-w', 'stop'])
+    verified = 0
+    def verify(index='docs_search', heap_check=True, env=env):
+        # An empty result is the contract: every finding names a location.
+        nonlocal verified
+        findings = command(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1'], env=env,
+            input=f"SELECT severity || ': ' || location || ': ' || message FROM stannum.verify_index('{index}', {str(heap_check).lower()});").strip()
+        assert findings == '', (index, findings)
+        verified += 1
     def check():
+        verify()
         for term in ('needle', 'common', 'fresh', 'missing'):
             differences = sql(f"""WITH actual AS MATERIALIZED (SELECT id FROM docs WHERE body ==> '{term}'),
                 expected AS MATERIALIZED (SELECT id FROM docs WHERE body ~ '\\m{term}\\M'),
@@ -48,6 +57,7 @@ def main():
           CREATE INDEX volatile_search ON volatile_docs USING stannum(body);
         """)
         check()
+        verify('volatile_search')
         # Cancel after scan initialization in a single reusable backend, then
         # prove that transaction/error cleanup leaves subsequent scans usable.
         cancelled = command(['psql','-X','-qAt'], input="""SET statement_timeout='50ms';
@@ -67,7 +77,9 @@ def main():
         assert ranked[-2] == '99998|t' and ranked[-1] == '51', ranked
         sql("BEGIN; INSERT INTO docs VALUES(99999,'needle',0); ROLLBACK;")
         sql("UPDATE docs SET revision=revision+1; DELETE FROM docs WHERE id%2=0;")
+        verify()
         sql('VACUUM (INDEX_CLEANUP ON) docs;')
+        verify()
         sql("INSERT INTO docs SELECT n, 'fresh',0 FROM generate_series(6000,7500) n;")
         check()
         # A writer and a differential reader use independent sessions/snapshots.
@@ -109,6 +121,7 @@ def main():
         # the index must stop growing once freed pages are reused.
         tuned = 'SET stannum.write_buffer_docs=4; SET stannum.max_segments=3; SET stannum.merge_tier_factor=2;'
         def check_folded():
+            verify('folded_search')
             for term in ('needle', 'common', 'missing'):
                 differences = sql(f"""WITH actual AS MATERIALIZED (SELECT id FROM folded WHERE body ==> '{term}'),
                     expected AS MATERIALIZED (SELECT id FROM folded WHERE body ~ '\\m{term}\\M'),
@@ -142,6 +155,7 @@ def main():
         sql("INSERT INTO docs VALUES(99998,'needle',0); DELETE FROM docs WHERE id=1;")
         stop('immediate'); start()
         check()
+        verify('volatile_search')
         assert sql("SELECT count(*) FROM docs WHERE id=99998 AND body ==> 'needle';") == '1'
         assert sql('SELECT count(*) FROM volatile_docs;') == '0'
         sql("INSERT INTO volatile_docs VALUES('needle');")
@@ -158,6 +172,9 @@ def main():
         standby_env=dict(env,PGPORT='28929')
         recovery=command(['psql','-X','-qAt','-c','SELECT pg_is_in_recovery();'],env=standby_env).strip()
         assert recovery == 't'
+        # Verification takes only AccessShareLock during recovery.
+        verify(env=standby_env)
+        verify('folded_search', env=standby_env)
         plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert plan[0]['Plan']['Lossy Heap Blocks'] == 1, plan
         assert plan[0]['Plan']['Actual Rows'] == 1, plan
@@ -186,7 +203,8 @@ def main():
         custom_plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert custom_plan[0]['Plan']['Custom Plan Provider'] == 'Stannum Text Search Scan', custom_plan
         assert custom_plan[0]['Plan']['Actual Rows'] == 1, custom_plan
-        result={'status':'passed', 'concurrent_reader_checks':checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','per-statement scorer state']}
+        verify(env=standby_env)
+        result={'status':'passed', 'concurrent_reader_checks':checks, 'verify_index_calls':verified, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','per-statement scorer state','verify_index after every phase']}
         (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result)); print('Artifacts:',root)
     finally:

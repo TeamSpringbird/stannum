@@ -139,6 +139,82 @@ per-block score bounds to term postings and fixed-width payload skip offsets;
 `LSG1` segments are still read, and ranked scans over them score every
 candidate. Unsupported old formats require rebuilding the index.
 
+## Checking an index
+
+Readers validate what they touch and fail with `ERROR: ... REINDEX required`
+(SQLSTATE `XX002`, index corrupted) naming the page, segment generation or
+buffer involved. That is the right behavior for a query, but it reports one
+problem, only when a query happens to read it. `stannum.verify_index` walks
+the whole index instead and lists every inconsistency it finds, in the spirit
+of PostgreSQL's `amcheck`:
+
+```sql
+SELECT * FROM stannum.verify_index('documents_search');
+SELECT * FROM stannum.verify_index('documents_search', heap_check => true);
+```
+
+It returns `(severity, location, message)` rows; no rows means the index is
+consistent. `severity` is `error` when a reader can fail or return wrong
+results and `warning` when every reader copes but something is off. The check
+holds a `ShareLock` on the index and its table (`AccessShareLock` on a
+standby), so queries proceed while inserts, folds, merges and VACUUM wait for
+it; it reads every page once and never uses the per-backend caches. With
+`heap_check`, it also scans the table: every live location in the index must
+point at a heap line pointer that exists (visibility aside), and every
+visible row with at least one token must be in the index. Rows whose indexed
+value is NULL or has no tokens are not required, since folds drop empty
+documents.
+
+What is checked:
+
+- the meta page: page kind and layout version, the tokenizer spec, every
+  directory entry (generation numbering, run shapes, page table present),
+  the pending-free list and the write-buffer counters;
+- every segment run, page table run and dead-list run: page kinds, chain
+  length, every page but the last full, byte counts, and the page table
+  listing exactly the chain's pages;
+- every segment blob: header, dictionary block index and blocks in order,
+  each term's postings and payload extents inside their areas and not
+  overlapping, postings sorted and all present in the document table, the
+  payload holding one entry per posting with a bucket that matches its
+  positions, `max_tf_bucket`, block bounds equal to what the postings and
+  document lengths imply, document lengths nonzero, summing to the header's
+  total and equal to the positions the terms hold for each document;
+- every dead list: decodes, sorted, a subset of its segment's documents, and
+  the directory entry's document count and total length match the blob;
+- the write buffer: page kinds, full pages before the tail, tail state
+  matching the byte count, record framing, one record per counted document
+  and no location recorded twice;
+- pending-free runs: chains of run pages, nothing already `FREE`;
+- page accounting: no page referenced twice, no referenced page marked
+  `FREE`, no live document in two sources, and pages nothing references.
+
+### Operator guide
+
+`location` says where a finding is; the first words name its class.
+
+| Location starts with | Meaning | Remedy |
+| --- | --- | --- |
+| `meta page` | Page 0 is unreadable, has the wrong kind or version, its tokenizer spec does not decode, or the buffer counters contradict each other. Every read of the index fails. | `REINDEX` |
+| `directory entry N` | A generation number repeats or is not below the next one. Per-backend caches key on generations, so readers can serve the wrong segment. | `REINDEX` |
+| `segment generation G run` / `page table` / `dead list` | The chain of pages holding that blob is broken: a page has the wrong kind, is marked `FREE`, belongs to something else, holds too few bytes, or the page table disagrees with the chain. | `REINDEX` |
+| `segment generation G, ...` | The blob decoded from those pages is inconsistent inside: header, dictionary, a term (`term "x"`), a document (`document (block,offset)`), the document table or the dead list. Queries touching that term or document fail or return wrong rows. An `LSG1` warning means the segment predates block bounds and ranked scans over it score every candidate. | `REINDEX`; for the `LSG1` warning only if pruning matters |
+| `write buffer` | The buffer chain or its records are unreadable, or the counters in the meta page disagree with the stream. Inserts and every search fail. | `REINDEX` |
+| `pending entry N` (warning) | A run awaiting reclamation is shorter than recorded; the missing pages leak. Harmless to queries. | `REINDEX` if the space matters |
+| `page N` (warning) | A page nothing references and not marked `FREE`: typically leaked by a crash between writing a run and publishing it. Harmless to queries. | `REINDEX` if the space matters |
+| `heap` | A visible row with tokens is missing from the index, so searches miss it. | `REINDEX` |
+| any source, `document (b,o) points ...` | The index holds a location the heap no longer has (beyond its end or an unused line pointer), so VACUUM missed a deletion. Searches may return wrong rows after the slot is reused. | `REINDEX` |
+| any source, `document (b,o) is also live in ...` | One location is live in two segments or in a segment and the buffer; a search can return it twice and scores add up. | `REINDEX` |
+
+In short: every `error` means `REINDEX`, because the on-disk structure no
+longer describes the table and nothing rewrites a segment in place.
+`VACUUM` is the answer to things `verify_index` does not report as errors:
+dead documents still counted in segment statistics (`dead_docs` in
+`stannum.segment_info`), runs waiting on the pending-free list, and a
+directory holding empty segments (a warning), all of which VACUUM's dead
+lists, rewrites and reclamation take care of. If the index is inconsistent,
+the table is the source of truth; `REINDEX` rebuilds from it.
+
 ## Current limits
 
 - Nondefault tokenizer settings can produce different matches in indexed and
@@ -152,7 +228,8 @@ candidate. Unsupported old formats require rebuilding the index.
 - The pending-free list holds 64 entries; runs released together share one.
   A full list first frees runs no snapshot can still read and otherwise
   appends to its newest entry, delaying that entry's reclamation. A crash
-  before a new run is published leaves its pages unreclaimed until REINDEX.
+  before a new run is published leaves its pages unreclaimed until REINDEX;
+  `stannum.verify_index` lists them as `page N` warnings.
 - Merges are synchronous. The tiered policy bounds the amortized cost, but
   the top tier's merge still rewrites a large share of the index in one insert.
 

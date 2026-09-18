@@ -1670,4 +1670,256 @@ mod tests {
         assert_eq!(true_count("alpha AND beta"), 31.0);
         assert_eq!(true_count("\"beta alpha\""), 0.0);
     }
+
+    /// Every row of `stannum.verify_index` as `severity: location: message`.
+    fn findings(index: &str, heap_check: bool) -> Vec<String> {
+        Spi::connect(|client| {
+            client
+                .select(
+                    &format!(
+                        "SELECT severity || ': ' || location || ': ' || message
+                         FROM stannum.verify_index('{index}', {heap_check})"
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| row.get::<String>(1).unwrap().unwrap())
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn assert_clean(index: &str) {
+        let rows = findings(index, true);
+        assert!(rows.is_empty(), "{index}:\n{}", rows.join("\n"));
+    }
+
+    #[pg_test]
+    fn verify_index_is_clean_across_folds_merges_deletes_and_updates() {
+        // A built index: one segment per `build_segment_docs`, then folds of
+        // two documents with a tier factor of two so merges run on nearly
+        // every fold, deletes and updates that leave dead versions behind,
+        // an expression index, a partial index and rows with no tokens.
+        Spi::run(
+            "CREATE TABLE checked(id int primary key, body text, tag text);
+             SET LOCAL stannum.build_segment_docs = 40;
+             INSERT INTO checked
+               SELECT n, 'w' || (n % 7) || ' common ' ||
+                      CASE WHEN n % 10 = 0 THEN 'rare needle' ELSE 'other filler' END,
+                      CASE WHEN n % 3 = 0 THEN 'odd' ELSE 'even' END
+               FROM generate_series(1, 150) n;
+             INSERT INTO checked VALUES (151, NULL, 'even'), (152, '', 'odd'), (153, '   ', 'odd');
+             CREATE INDEX checked_idx ON checked USING stannum(body);
+             CREATE INDEX checked_expr_idx ON checked USING stannum((body || ' ' || tag));
+             CREATE INDEX checked_part_idx ON checked USING stannum(body) WHERE tag = 'odd';",
+        )
+        .unwrap();
+        assert_clean("checked_idx");
+        assert_clean("checked_expr_idx");
+        assert_clean("checked_part_idx");
+        Spi::run(
+            "SET LOCAL stannum.write_buffer_docs = 2;
+             SET LOCAL stannum.merge_tier_factor = 2;
+             SET LOCAL stannum.max_segments = 6;
+             INSERT INTO checked
+               SELECT n, 'w' || (n % 7) || ' common ' ||
+                      CASE WHEN n % 10 = 0 THEN 'rare needle' ELSE 'other filler' END,
+                      CASE WHEN n % 3 = 0 THEN 'odd' ELSE 'even' END
+               FROM generate_series(200, 260) n;
+             DELETE FROM checked WHERE id % 3 = 0;
+             UPDATE checked SET body = body || ' updated' WHERE id % 11 = 0;
+             INSERT INTO checked VALUES (300, 'w1 w1 w1', 'odd'), (301, NULL, 'odd'), (302, '', 'even');",
+        )
+        .unwrap();
+        let (segments, generations, _) = directory_shape("checked_idx");
+        assert!(segments >= 2, "{segments} segments");
+        assert_eq!(generations, segments);
+        assert_clean("checked_idx");
+        assert_clean("checked_expr_idx");
+        assert_clean("checked_part_idx");
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off").unwrap();
+        assert_index_matches_seqscan("checked", TIERED_QUERIES);
+        // The buffer alone, the buffer empty, and an index with no storage.
+        Spi::run(
+            "CREATE TABLE fresh(id int, body text);
+             CREATE INDEX fresh_idx ON fresh USING stannum(body);
+             INSERT INTO fresh VALUES (1, 'only buffered');
+             CREATE TABLE empty_docs(id int, body text);
+             CREATE INDEX empty_idx ON empty_docs USING stannum(body);
+             CREATE UNLOGGED TABLE volatile(id int, body text);
+             INSERT INTO volatile VALUES (1, 'x');
+             CREATE INDEX volatile_idx ON volatile USING stannum(body);",
+        )
+        .unwrap();
+        assert_clean("fresh_idx");
+        assert_clean("empty_idx");
+        assert_clean("volatile_idx");
+        assert!(findings("fresh_idx", false).is_empty());
+    }
+
+    /// Fresh single-segment index on `table`; returns the segment's root block.
+    fn corruptible(table: &str) -> i64 {
+        Spi::run(&format!(
+            "CREATE TABLE {table}(id int, body text);
+             INSERT INTO {table} SELECT n, 'w' || (n % 5) || ' common needle' FROM generate_series(1, 60) n;
+             CREATE INDEX {table}_idx ON {table} USING stannum(body);"
+        ))
+        .unwrap();
+        Spi::get_one::<i64>(&format!(
+            "SELECT root_block FROM stannum.segment_info('{table}_idx') WHERE kind = 'immutable'"
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    fn corrupt(index: &str, block: i64, at: i32, bytes: &str) {
+        Spi::run(&format!(
+            "SELECT stannum.corrupt_index_page('{index}', {block}, {at}, '\\x{bytes}'::bytea)"
+        ))
+        .unwrap();
+    }
+
+    /// Page header bytes before the payload, then the chain link.
+    const PAGE_HEADER: i32 = 24;
+    const DATA_AT: i32 = PAGE_HEADER + 4;
+    /// The kind byte in the special area.
+    const KIND_AT: i32 = 8192 - 8 + 4;
+    const PD_LOWER_AT: i32 = 12;
+
+    #[pg_test]
+    fn verify_index_reports_deliberate_corruption_without_crashing() {
+        // The segment's magic.
+        let root = corruptible("c_magic");
+        corrupt("c_magic_idx", root, DATA_AT, "58585858");
+        let rows = findings("c_magic_idx", false);
+        assert_eq!(rows.len(), 1, "{}", rows.join("\n"));
+        assert_eq!(
+            rows[0],
+            "error: segment generation 1, header: corrupt segment data: segment magic"
+        );
+
+        // A run page marked FREE while the directory still references it.
+        let root = corruptible("c_free");
+        corrupt("c_free_idx", root, KIND_AT, "04");
+        let rows = findings("c_free_idx", false);
+        assert!(
+            rows.contains(&format!(
+                "error: segment generation 1 run: page {root} is marked FREE but still referenced"
+            )),
+            "{}",
+            rows.join("\n")
+        );
+
+        // A run page with the buffer kind.
+        let root = corruptible("c_kind");
+        corrupt("c_kind_idx", root, KIND_AT, "02");
+        let rows = findings("c_kind_idx", false);
+        assert_eq!(
+            rows,
+            [format!(
+                "error: segment generation 1 run: page {root} has kind buffer instead of run"
+            )]
+        );
+
+        // A run page truncated by its page header: pd_lower just past the link.
+        let root = corruptible("c_short");
+        corrupt("c_short_idx", root, PD_LOWER_AT, "2600");
+        let rows = findings("c_short_idx", false);
+        assert!(
+            rows.iter().any(|row| row.starts_with(&format!(
+                "error: segment generation 1 run: page {root} holds 10 bytes; "
+            ))),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.starts_with("error: segment generation 1 run: ")),
+            "{}",
+            rows.join("\n")
+        );
+
+        // The page table chain: a fresh index writes it right after the run.
+        let root = corruptible("c_table");
+        corrupt("c_table_idx", root + 1, KIND_AT, "02");
+        let rows = findings("c_table_idx", false);
+        assert_eq!(
+            rows,
+            [format!(
+                "error: segment generation 1 page table: page {} has kind buffer instead of run",
+                root + 1
+            )]
+        );
+
+        // A header varint inside the blob (the document count) so the
+        // header's length check fails; every finding names the segment.
+        let root = corruptible("c_dict");
+        corrupt("c_dict_idx", root, DATA_AT + 4, "ff");
+        let rows = findings("c_dict_idx", false);
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row.starts_with("error: segment generation 1")),
+            "{}",
+            rows.join("\n")
+        );
+
+        // The meta page: an unreadable tokenizer spec.
+        corruptible("c_meta");
+        corrupt("c_meta_idx", 0, PAGE_HEADER + 8, "ff");
+        let rows = findings("c_meta_idx", false);
+        assert_eq!(rows.len(), 1, "{}", rows.join("\n"));
+        assert!(rows[0].starts_with("error: meta page: tokenizer spec"));
+
+        // A meta page that is not a meta page at all.
+        corruptible("c_nometa");
+        corrupt("c_nometa_idx", 0, KIND_AT, "03");
+        let rows = findings("c_nometa_idx", false);
+        assert_eq!(
+            rows,
+            ["error: meta page: page 0 has kind run instead of meta"]
+        );
+
+        // The write buffer: a record whose length runs past the stream, so
+        // the buffered rows are neither decodable nor found by the heap check.
+        corruptible("c_buffer");
+        Spi::run("INSERT INTO c_buffer VALUES (61, 'late needle'), (62, 'late needle')").unwrap();
+        corrupt("c_buffer_idx", 1, DATA_AT, "ffff");
+        let rows = findings("c_buffer_idx", true);
+        assert!(
+            rows.contains(
+                &"error: write buffer, record 0 at byte 0: record runs past the end of the buffer"
+                    .to_owned()
+            ),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.contains(
+                &"error: write buffer: buffer state says 2 documents but the stream holds 0"
+                    .to_owned()
+            ),
+            "{}",
+            rows.join("\n")
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.starts_with("error: heap: visible row")
+                    && row.ends_with("is not in the index"))
+                .count(),
+            2,
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[pg_test(
+        error = "Stannum segment generation 1: corrupt segment data: segment magic; REINDEX required"
+    )]
+    fn corrupted_segments_name_their_generation_when_read() {
+        let root = corruptible("c_read");
+        corrupt("c_read_idx", root, DATA_AT, "58585858");
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        Spi::get_one::<i64>("SELECT count(*) FROM c_read WHERE body ==> 'needle'").unwrap();
+    }
 }

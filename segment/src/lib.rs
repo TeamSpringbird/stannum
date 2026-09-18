@@ -23,6 +23,8 @@
 //! * [`segment`]: assembles the components above into one immutable segment
 //!   with a document table of lengths, and reads them back.
 //! * [`tf_bucket`]: the production-compatible term-frequency quantization.
+//! * [`verify`]: whole-blob consistency checks that list every problem found
+//!   instead of stopping at the first, for an index checker.
 //!
 //! Every decoder returns [`Error`] on malformed input instead of panicking.
 //! Formats are versioned by the caller (page kind and version live in the
@@ -42,6 +44,7 @@ pub mod set;
 pub mod source;
 pub mod tf_bucket;
 pub mod tid;
+pub mod verify;
 
 pub use error::{Error, Result};
 pub use tid::Tid;

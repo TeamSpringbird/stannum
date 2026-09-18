@@ -50,6 +50,7 @@ LIMIT 10;
 SELECT count(*) FROM documents WHERE body ==> '"phrase matching"';
 SELECT stannum.highlight(body, '<mark>', '</mark>', query => 'search') FROM documents;
 SELECT * FROM stannum.segment_info('documents_search');
+SELECT * FROM stannum.verify_index('documents_search', heap_check => true);
 ```
 
 For a release package:
@@ -67,7 +68,8 @@ control file, and extension SQL installed before `CREATE EXTENSION` can work.
 
 The extension, library, access method, and SQL schema are **`stannum`**. Functions
 include `stannum.score`, `stannum.full_score`, `stannum.max_score`,
-`stannum.score_inspect`, `stannum.highlight`, and `stannum.highlight_ansi`. Settings
+`stannum.score_inspect`, `stannum.highlight`, `stannum.highlight_ansi`,
+`stannum.segment_info`, and `stannum.verify_index`. Settings
 use the `stannum.` prefix; for example, `SET stannum.enable_custom_scan = off`
 selects the bitmap path.
 

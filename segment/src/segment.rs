@@ -355,6 +355,16 @@ impl<S: Source> Reader<S> {
         self.header.total_length
     }
 
+    /// True for an `LSG1` blob, whose term postings carry no block bounds.
+    pub const fn is_legacy(&self) -> bool {
+        self.header.legacy
+    }
+
+    /// Byte lengths of the postings and payload areas.
+    pub const fn area_lengths(&self) -> (usize, usize) {
+        (self.header.postings_len, self.header.payload_len)
+    }
+
     fn dictionary_index(&self) -> Result<&DictionaryIndex<'_>> {
         if let Some(index) = self.dictionary.get() {
             return Ok(index);

@@ -937,7 +937,7 @@ unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
         let view = crate::storage::view(index_oid);
         let limits = Limits::default();
         let mut tids = Vec::new();
-        for (segment, dead) in &view.sources {
+        for ((segment, dead), label) in view.sources.iter().zip(&view.labels) {
             pgrx::check_for_interrupts!();
             let planned = plan(&query, segment, &limits)
                 .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
@@ -945,21 +945,18 @@ unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
             // A capped expansion yields a superset; those rows are rechecked.
             exec.recheck |= !planned.exact;
             if let Some(dead) = dead {
-                let dead = segment::postings::Postings::parse(dead)
-                    .and_then(|p| p.cursor())
-                    .unwrap_or_else(|error| {
-                        pgrx::error!("Stannum index data: {error}; REINDEX required")
-                    });
-                cursor = Box::new(
-                    segment::set::Difference::new(cursor, dead)
-                        .unwrap_or_else(|error| pgrx::error!("Stannum index data: {error}")),
+                let dead = crate::storage::codec_in(
+                    segment::postings::Postings::parse(dead).and_then(|p| p.cursor()),
+                    &format!("{label} dead list"),
                 );
+                cursor = Box::new(crate::storage::codec_in(
+                    segment::set::Difference::new(cursor, dead),
+                    label,
+                ));
             }
             while let Some(tid) = cursor.current() {
                 tids.push(tid);
-                cursor.advance().unwrap_or_else(|error| {
-                    pgrx::error!("Stannum index data: {error}; REINDEX required")
-                });
+                crate::storage::codec_in(cursor.advance(), label);
             }
         }
         tids.sort_unstable();
