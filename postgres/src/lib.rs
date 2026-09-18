@@ -3733,7 +3733,7 @@ mod tests {
             value("SELECT count(*) FROM hot WHERE id IN (3, 4) AND ctid > '(0,30)'::tid"),
             2
         );
-        let rows = |custom: bool| -> Vec<(i32, u32)> {
+        let rows = |custom: bool, limit: usize| -> Vec<(i32, u32)> {
             Spi::run(&format!(
                 "SET LOCAL stannum.enable_custom_scan = {custom};
                  SET LOCAL enable_bitmapscan = {};",
@@ -3745,7 +3745,7 @@ mod tests {
                     .select(
                         &format!(
                             "SELECT id, stannum.full_score(ctid) AS score FROM hot
-                             WHERE body ==> 'needle' ORDER BY score DESC{} LIMIT 8",
+                             WHERE body ==> 'needle' ORDER BY score DESC{} LIMIT {limit}",
                             // The custom scan breaks score ties by the indexed
                             // HOT root, while SQL ctid is the visible member.
                             // IDs follow the original root order in this fixture.
@@ -3764,8 +3764,8 @@ mod tests {
                     .collect()
             })
         };
-        let pruned = rows(true);
-        let unpruned = rows(false);
+        let pruned = rows(true, 8);
+        let unpruned = rows(false, 8);
         assert_eq!(pruned, unpruned);
         let score = |id: i32| pruned.iter().find(|(i, _)| *i == id).map(|(_, s)| *s);
         // The member scores as its root document: the same as any unmoved
@@ -3773,15 +3773,12 @@ mod tests {
         assert_eq!(pruned[0].0, 3);
         assert_eq!(score(3), score(6));
         assert!(f32::from_bits(score(3).unwrap()) > 0.0);
-        assert!(
-            Spi::get_one::<bool>(
-                "SELECT a.s = b.s AND a.s > 0 FROM
-                 (SELECT stannum.full_score(ctid) s FROM hot WHERE body ==> 'needle' AND id = 4) a,
-                 (SELECT stannum.full_score(ctid) s FROM hot WHERE body ==> 'needle' AND id = 7) b"
-            )
-            .unwrap()
-            .unwrap()
-        );
+        // Compare the lower-scoring HOT member too, with scoring and the
+        // matching predicate at one query level (no flattened self-join).
+        let all = rows(false, 30);
+        let score = |id: i32| all.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert_eq!(score(4), score(7));
+        assert!(f32::from_bits(score(4)) > 0.0);
     }
 
     #[pg_test]
