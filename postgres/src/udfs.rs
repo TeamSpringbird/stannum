@@ -279,3 +279,64 @@ fn segment_info(
         )
     }))
 }
+
+fn require_stannum_index(index: &PgRelation, function: &str) {
+    let stannum_name =
+        std::ffi::CString::new("stannum").expect("static access method name is valid");
+    let stannum_am = unsafe { pgrx::pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
+    if unsafe { (*(*index.as_ptr()).rd_rel).relam } != stannum_am {
+        pgrx::error!("stannum.{function}() requires a stannum index");
+    }
+}
+
+/// Checks a whole index and lists every inconsistency found; no rows means
+/// the index is consistent. `heap_check` also compares the index with the
+/// table: every indexed location must exist in the heap and every visible
+/// row with indexable tokens must be indexed. See the architecture guide for
+/// what each finding means and whether REINDEX or VACUUM resolves it.
+#[pg_extern(volatile, parallel_unsafe)]
+fn verify_index(
+    index: PgRelation,
+    heap_check: default!(bool, false),
+) -> TableIterator<
+    'static,
+    (
+        name!(severity, String),
+        name!(location, String),
+        name!(message, String),
+    ),
+> {
+    require_stannum_index(&index, "verify_index");
+    let rows = unsafe { crate::storage::verify::verify(index.as_ptr(), heap_check) };
+    TableIterator::new(
+        rows.into_iter()
+            .map(|row| (row.severity, row.location, row.message)),
+    )
+}
+
+/// Test-only: overwrites raw bytes of an index page in shared buffers, so
+/// tests can corrupt an index deliberately and check what the readers say.
+#[cfg(feature = "pg_test")]
+#[pg_extern(volatile, parallel_unsafe)]
+fn corrupt_index_page(index: PgRelation, block: i64, at: i32, bytes: &[u8]) -> i32 {
+    require_stannum_index(&index, "corrupt_index_page");
+    let block = u32::try_from(block).unwrap_or_else(|_| pgrx::error!("invalid block number"));
+    let at = usize::try_from(at).unwrap_or_else(|_| pgrx::error!("invalid page offset"));
+    unsafe { crate::storage::verify::corrupt_page(index.as_ptr(), block, at, bytes) };
+    bytes.len() as i32
+}
+
+/// Test-only: the kind of every page of an index, to pick pages to corrupt.
+#[cfg(feature = "pg_test")]
+#[pg_extern(volatile, parallel_unsafe)]
+fn index_page_kinds(
+    index: PgRelation,
+) -> TableIterator<'static, (name!(block, i64), name!(kind, String))> {
+    require_stannum_index(&index, "index_page_kinds");
+    let kinds = unsafe { crate::storage::verify::page_kinds(index.as_ptr()) };
+    TableIterator::new(
+        kinds
+            .into_iter()
+            .map(|(block, kind)| (i64::from(block), kind)),
+    )
+}

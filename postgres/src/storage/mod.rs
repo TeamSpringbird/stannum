@@ -17,6 +17,7 @@
 //! the two leaks unreferenced pages rather than referencing unwritten ones.
 
 pub mod layout;
+pub mod verify;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -26,7 +27,10 @@ use layout::{
     BufferState, CHAIN_CAPACITY, KIND_BUFFER, KIND_FREE, KIND_META, KIND_RUN, MAX_PENDING,
     MAX_SEGMENTS, Meta, NONE, PAGE_SIZE, Pending, Run, SPECIAL_SIZE, SegmentEntry,
 };
-use pgrx::{FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgRelation, pg_sys};
+use pgrx::{
+    FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgLogLevel, PgRelation,
+    PgSqlErrorCode, pg_sys,
+};
 use segment::Tid;
 use segment::forward::ForwardRecord;
 use segment::index::{Index, MutableIndex};
@@ -110,12 +114,37 @@ fn merge_tier_factor() -> u32 {
         .clamp(MIN_MERGE_TIER_FACTOR, MAX_MERGE_TIER_FACTOR) as u32
 }
 
-fn checked<T>(result: Result<T, &'static str>) -> T {
-    result.unwrap_or_else(|message| pgrx::error!("{message}; REINDEX required"))
+/// Reports index corruption: what was found and where, with the standard
+/// advice. `stannum.verify_index` lists every problem rather than the first.
+pub(crate) fn corrupt(message: impl std::fmt::Display) -> ! {
+    pg_sys::panic::ErrorReport::new(
+        PgSqlErrorCode::ERRCODE_INDEX_CORRUPTED,
+        format!("{message}; REINDEX required"),
+        "stannum",
+    )
+    .set_hint("Run SELECT * FROM stannum.verify_index('<index>') to list every problem.")
+    .report(PgLogLevel::ERROR);
+    unreachable!()
 }
 
+/// Page-layout results that carry no location of their own.
+fn checked<T>(result: Result<T, &'static str>) -> T {
+    result.unwrap_or_else(|message| corrupt(format!("Stannum index: {message}")))
+}
+
+/// Codec results from a source the caller cannot name more precisely.
 fn codec<T>(result: segment::Result<T>) -> T {
-    result.unwrap_or_else(|error| pgrx::error!("Stannum index data: {error}; REINDEX required"))
+    result.unwrap_or_else(|error| corrupt(format!("Stannum index data: {error}")))
+}
+
+/// Codec results from a named source, such as `segment generation 7`.
+pub(crate) fn codec_in<T>(result: segment::Result<T>, what: &str) -> T {
+    result.unwrap_or_else(|error| corrupt(format!("Stannum {what}: {error}")))
+}
+
+/// A directory entry's name in messages.
+fn generation_label(generation: u32) -> String {
+    format!("segment generation {generation}")
 }
 
 /// Owns a buffer pin and content lock; page borrows cannot outlive this guard.
@@ -172,7 +201,16 @@ impl Buffer {
 
     /// Validated kind of this page.
     fn kind(&self) -> u8 {
-        checked(layout::kind(self.page()))
+        layout::kind(self.page()).unwrap_or_else(|message| {
+            corrupt(format!("Stannum index page {}: {message}", self.block()))
+        })
+    }
+
+    /// Link and data of this chained page.
+    fn chain(&self) -> (u32, &[u8]) {
+        layout::chain(self.page()).unwrap_or_else(|message| {
+            corrupt(format!("Stannum index page {}: {message}", self.block()))
+        })
     }
 }
 
@@ -231,8 +269,11 @@ pub unsafe fn present(index: pg_sys::Relation) -> bool {
             return false;
         }
         let meta = Buffer::read(index, 0, false);
-        if meta.kind() != KIND_META {
-            pgrx::error!("Stannum index has an unsupported format; REINDEX required");
+        let kind = meta.kind();
+        if kind != KIND_META {
+            corrupt(format!(
+                "Stannum index page 0 has kind {kind} instead of a meta page (unsupported format?)"
+            ));
         }
         true
     }
@@ -241,10 +282,14 @@ pub unsafe fn present(index: pg_sys::Relation) -> bool {
 unsafe fn read_meta(index: pg_sys::Relation, exclusive: bool) -> (Buffer, Meta) {
     unsafe {
         let buffer = Buffer::read(index, 0, exclusive);
-        if buffer.kind() != KIND_META {
-            pgrx::error!("Stannum index has an unsupported format; REINDEX required");
+        let kind = buffer.kind();
+        if kind != KIND_META {
+            corrupt(format!(
+                "Stannum index page 0 has kind {kind} instead of a meta page (unsupported format?)"
+            ));
         }
-        let meta = checked(Meta::decode(layout::payload(buffer.page())));
+        let meta = Meta::decode(layout::payload(buffer.page()))
+            .unwrap_or_else(|message| corrupt(format!("Stannum index meta page: {message}")));
         (buffer, meta)
     }
 }
@@ -267,9 +312,7 @@ pub fn tokenizer_for(spec: &[u8; crate::options::SPEC_BYTES]) -> Rc<CompiledToke
             .entry(*spec)
             .or_insert_with(|| {
                 let spec = crate::options::decode_spec(spec).unwrap_or_else(|| {
-                    pgrx::error!(
-                        "Stannum index tokenizer settings are unreadable; REINDEX required"
-                    )
+                    corrupt("Stannum index meta page: tokenizer settings are unreadable")
                 });
                 Rc::new(spec.compile().expect("decoded spec validated"))
             })
@@ -309,29 +352,46 @@ fn pointer_of(tid: Tid) -> pg_sys::ItemPointerData {
 
 // --- Runs ---------------------------------------------------------------------
 
-/// Reads a whole run into memory.
-unsafe fn read_run(index: pg_sys::Relation, run: Run) -> Vec<u8> {
+/// Reads a whole run into memory. `what` names the run in error messages,
+/// such as `segment generation 7 dead list`.
+unsafe fn read_run(index: pg_sys::Relation, run: Run, what: &str) -> Vec<u8> {
     unsafe {
         let mut out = Vec::with_capacity(run.bytes as usize);
         let mut block = run.first;
-        for _ in 0..run.blocks {
+        for i in 0..run.blocks {
             pgrx::check_for_interrupts!();
             if block == NONE {
-                pgrx::error!("Stannum run ends early; REINDEX required");
+                corrupt(format!(
+                    "Stannum {what}: chain ends after {i} of {} pages",
+                    run.blocks
+                ));
             }
             let buffer = Buffer::read(index, block, false);
-            if buffer.kind() != KIND_RUN {
-                pgrx::error!("Stannum run page has the wrong kind; REINDEX required");
-            }
-            let (next, data) = checked(layout::chain(buffer.page()));
+            expect_run_page(&buffer, what);
+            let (next, data) = buffer.chain();
             let take = (run.bytes as usize - out.len()).min(data.len());
             out.extend_from_slice(&data[..take]);
             block = next;
         }
         if out.len() != run.bytes as usize {
-            pgrx::error!("Stannum run is shorter than its directory entry; REINDEX required");
+            corrupt(format!(
+                "Stannum {what}: {} of {} bytes readable",
+                out.len(),
+                run.bytes
+            ));
         }
         out
+    }
+}
+
+/// Fails unless the page is a run page of `what`.
+fn expect_run_page(buffer: &Buffer, what: &str) {
+    let kind = buffer.kind();
+    if kind != KIND_RUN {
+        corrupt(format!(
+            "Stannum {what}: page {} has kind {kind} instead of a run page",
+            buffer.block()
+        ));
     }
 }
 
@@ -409,9 +469,16 @@ unsafe fn page_table(index: pg_sys::Relation, identity: u64, entry: &SegmentEntr
     if let Some(table) = PAGE_TABLES.with_borrow(|tables| tables.get(&key).cloned()) {
         return table;
     }
-    let table = Rc::new(decode_page_table(&unsafe { read_run(index, entry.map) }));
+    let label = generation_label(entry.generation);
+    let table = Rc::new(decode_page_table(&unsafe {
+        read_run(index, entry.map, &format!("{label} page table"))
+    }));
     if table.len() != entry.run.blocks as usize {
-        pgrx::error!("Stannum segment page table does not match its run; REINDEX required");
+        corrupt(format!(
+            "Stannum {label}: page table lists {} pages for a run of {}",
+            table.len(),
+            entry.run.blocks
+        ));
     }
     PAGE_TABLES.with_borrow_mut(|tables| {
         if tables.len() > 4096 {
@@ -433,6 +500,8 @@ pub struct RunSource {
     index_oid: pg_sys::Oid,
     run: Run,
     table: Rc<Vec<u32>>,
+    /// The run's name in error messages.
+    label: String,
 }
 
 impl segment::source::Source for RunSource {
@@ -465,10 +534,8 @@ impl segment::source::Source for RunSource {
                     }
                 };
                 let buffer = Buffer::read(index, block, false);
-                if buffer.kind() != KIND_RUN {
-                    pgrx::error!("Stannum run page has the wrong kind; REINDEX required");
-                }
-                let (_, data) = checked(layout::chain(buffer.page()));
+                expect_run_page(&buffer, &self.label);
+                let (_, data) = buffer.chain();
                 let take = ((end - at) as usize).min(data.len().saturating_sub(within));
                 if take == 0 {
                     pg_sys::RelationClose(index);
@@ -525,16 +592,26 @@ unsafe fn cached_segment(
         Some((reader, Some(dead))) => return (reader, dead),
         Some((reader, None)) => (reader, None),
         None => {
+            let label = generation_label(entry.generation);
             let source: Box<dyn segment::source::Source> = Box::new(RunSource {
                 index_oid,
                 run: entry.run,
                 table: unsafe { page_table(index, identity, entry) },
+                label: label.clone(),
             });
-            (Rc::new(codec(Reader::new(source))), None)
+            (Rc::new(codec_in(Reader::new(source), &label)), None)
         }
     };
     let dead = dead.unwrap_or_else(|| {
-        (!entry.dead.is_empty()).then(|| Rc::new(unsafe { read_run(index, entry.dead) }))
+        (!entry.dead.is_empty()).then(|| {
+            Rc::new(unsafe {
+                read_run(
+                    index,
+                    entry.dead,
+                    &format!("{} dead list", generation_label(entry.generation)),
+                )
+            })
+        })
     });
     SEGMENT_READERS.with_borrow_mut(|readers| {
         readers.insert(
@@ -607,24 +684,24 @@ unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
 /// `index` that no directory references any more.
 unsafe fn prepend_chain(index: pg_sys::Relation, run: Run, next: u32) {
     unsafe {
+        let what = format!("released run at page {}", run.first);
         let mut block = run.first;
-        for _ in 1..run.blocks {
+        for i in 1..run.blocks {
             pgrx::check_for_interrupts!();
             let buffer = Buffer::read(index, block, false);
-            if buffer.kind() != KIND_RUN {
-                pgrx::error!("Stannum run page has the wrong kind; REINDEX required");
-            }
-            let (following, _) = checked(layout::chain(buffer.page()));
+            expect_run_page(&buffer, &what);
+            let (following, _) = buffer.chain();
             if following == NONE {
-                pgrx::error!("Stannum run ends early; REINDEX required");
+                corrupt(format!(
+                    "Stannum {what}: chain ends after {i} of {} pages",
+                    run.blocks
+                ));
             }
             block = following;
         }
         let last = Buffer::read(index, block, true);
-        if last.kind() != KIND_RUN {
-            pgrx::error!("Stannum run page has the wrong kind; REINDEX required");
-        }
-        let (_, data) = checked(layout::chain(last.page()));
+        expect_run_page(&last, &what);
+        let (_, data) = last.chain();
         let payload = layout::chain_payload(next, data);
         write_page(index, &last, false, KIND_RUN, &payload);
     }
@@ -654,7 +731,7 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
                 if buffer.kind() != KIND_RUN {
                     break;
                 }
-                let (next, _) = checked(layout::chain(buffer.page()));
+                let (next, _) = buffer.chain();
                 write_page(index, &buffer, false, KIND_FREE, &pending.xid.to_le_bytes());
                 let freed = buffer.block();
                 drop(buffer);
@@ -702,21 +779,25 @@ unsafe fn read_buffer_range(
                 // Follow the chain from the last known page to discover the next.
                 let last = *pages.last().expect("head is always known");
                 let buffer = Buffer::read(index, last, false);
-                let (next, _) = checked(layout::chain(buffer.page()));
+                let (next, _) = buffer.chain();
                 if next == NONE {
-                    pgrx::error!("Stannum write buffer ends early; REINDEX required");
+                    corrupt(format!(
+                        "Stannum write buffer: chain ends at page {last} before byte {to}"
+                    ));
                 }
                 pages.push(next);
             }
             let buffer = Buffer::read(index, pages[page], false);
-            if buffer.kind() != KIND_BUFFER {
-                pgrx::error!("Stannum write buffer page has the wrong kind; REINDEX required");
-            }
-            let (_, data) = checked(layout::chain(buffer.page()));
+            expect_buffer_page(&buffer);
+            let (_, data) = buffer.chain();
             let within = at % CHAIN_CAPACITY;
             let take = (to - at).min(data.len().saturating_sub(within));
             if take == 0 {
-                pgrx::error!("Stannum write buffer page is short; REINDEX required");
+                corrupt(format!(
+                    "Stannum write buffer: page {} holds {} bytes but byte {at} is expected on it",
+                    pages[page],
+                    data.len()
+                ));
             }
             out.extend_from_slice(&data[within..within + take]);
             at += take;
@@ -755,7 +836,7 @@ unsafe fn buffer_index(
         };
         let mut at = 0;
         while at < tail.len() {
-            at += codec(entry.index.add_encoded(&tail[at..]));
+            at += codec_in(entry.index.add_encoded(&tail[at..]), "write buffer");
         }
         entry.covered = state.bytes as usize;
     }
@@ -768,8 +849,9 @@ unsafe fn dead_set(index: pg_sys::Relation, entry: &SegmentEntry) -> BTreeSet<Ti
     if entry.dead.is_empty() {
         return BTreeSet::new();
     }
-    let bytes = unsafe { read_run(index, entry.dead) };
-    codec(Postings::parse(&bytes).and_then(|p| p.to_vec()))
+    let what = format!("{} dead list", generation_label(entry.generation));
+    let bytes = unsafe { read_run(index, entry.dead, &what) };
+    codec_in(Postings::parse(&bytes).and_then(|p| p.to_vec()), &what)
         .into_iter()
         .collect()
 }
@@ -793,16 +875,21 @@ unsafe fn read_buffer_stream(index: pg_sys::Relation, state: &BufferState) -> Ve
         while out.len() < state.bytes as usize {
             pgrx::check_for_interrupts!();
             if block == NONE {
-                pgrx::error!("Stannum write buffer ends early; REINDEX required");
+                corrupt(format!(
+                    "Stannum write buffer: chain ends after {} of {} bytes",
+                    out.len(),
+                    state.bytes
+                ));
             }
             let buffer = Buffer::read(index, block, false);
-            if buffer.kind() != KIND_BUFFER {
-                pgrx::error!("Stannum write buffer page has the wrong kind; REINDEX required");
-            }
-            let (next, data) = checked(layout::chain(buffer.page()));
+            expect_buffer_page(&buffer);
+            let (next, data) = buffer.chain();
             let take = (state.bytes as usize - out.len()).min(data.len());
             if take < data.len() && out.len() + take < state.bytes as usize {
-                pgrx::error!("Stannum write buffer page is short; REINDEX required");
+                corrupt(format!(
+                    "Stannum write buffer: page {block} holds {} bytes but the buffer continues past it",
+                    data.len()
+                ));
             }
             out.extend_from_slice(&data[..take]);
             block = next;
@@ -818,13 +905,15 @@ unsafe fn append_to_buffer(index: pg_sys::Relation, state: &mut BufferState, mut
         while !data.is_empty() {
             pgrx::check_for_interrupts!();
             let tail = Buffer::read(index, state.tail, true);
-            if tail.kind() != KIND_BUFFER {
-                pgrx::error!("Stannum write buffer page has the wrong kind; REINDEX required");
-            }
-            let (next, existing) = checked(layout::chain(tail.page()));
+            expect_buffer_page(&tail);
+            let (next, existing) = tail.chain();
             let used = state.tail_used as usize;
             if used > existing.len() {
-                pgrx::error!("Stannum write buffer page is short; REINDEX required");
+                corrupt(format!(
+                    "Stannum write buffer: tail page {} holds {} bytes but {used} are in use",
+                    state.tail,
+                    existing.len()
+                ));
             }
             if used == CHAIN_CAPACITY {
                 let next_block = if next == NONE {
@@ -859,6 +948,17 @@ unsafe fn append_to_buffer(index: pg_sys::Relation, state: &mut BufferState, mut
             data = &data[take..];
         }
         state.version = state.version.wrapping_add(1);
+    }
+}
+
+/// Fails unless the page is a write-buffer page.
+fn expect_buffer_page(buffer: &Buffer) {
+    let kind = buffer.kind();
+    if kind != KIND_BUFFER {
+        corrupt(format!(
+            "Stannum write buffer: page {} has kind {kind} instead of a buffer page",
+            buffer.block()
+        ));
     }
 }
 
@@ -1007,11 +1107,12 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
         let mut builder = SegmentBuilder::default();
         for entry in &old {
             pgrx::check_for_interrupts!();
-            let bytes = read_run(index, entry.run);
-            let segment = codec(Segment::parse(&bytes));
+            let label = generation_label(entry.generation);
+            let bytes = read_run(index, entry.run, &label);
+            let segment = codec_in(Segment::parse(&bytes), &label);
             let dead = dead_set(index, entry);
-            for record in codec(segment.records(|tid| dead.contains(&tid))) {
-                codec(builder.add_record(&record));
+            for record in codec_in(segment.records(|tid| dead.contains(&tid)), &label) {
+                codec_in(builder.add_record(&record), &label);
             }
         }
         let (blob, docs, total_length) = finish_builder(builder);
@@ -1033,7 +1134,10 @@ unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
         let stream = read_buffer_stream(index, &meta.buffer);
         let mut builder = SegmentBuilder::default();
         for record in segment::forward::records(&stream) {
-            codec(builder.add_record(&codec(record)));
+            codec_in(
+                builder.add_record(&codec_in(record, "write buffer")),
+                "write buffer",
+            );
         }
         let (blob, docs, total_length) = finish_builder(builder);
         add_segment(index, meta, &blob, docs, total_length);
@@ -1221,6 +1325,9 @@ pub struct View {
     pub sources: Vec<Source>,
     /// How many leading entries of `sources` are immutable segments.
     pub immutable_sources: usize,
+    /// A name per source for error messages: `segment generation 7` or
+    /// `write buffer`.
+    pub labels: Vec<String>,
 }
 
 /// # Safety
@@ -1231,16 +1338,19 @@ pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
         let index = relation.as_ptr();
         let (meta_buffer, meta) = read_meta(index, false);
         let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
+        let mut labels = Vec::with_capacity(meta.segments.len() + 1);
         trim_reader_cache(meta.identity, &meta);
         for entry in &meta.segments {
             pgrx::check_for_interrupts!();
             let (reader, dead) = cached_segment(index, index_oid, meta.identity, entry);
             sources.push((Box::new(reader), dead));
+            labels.push(generation_label(entry.generation));
         }
         let immutable_sources = sources.len();
         if meta.buffer.docs > 0 {
             let buffer = buffer_index(index, meta.identity, &meta.buffer);
             sources.push((Box::new(buffer), None));
+            labels.push("write buffer".to_owned());
         }
         // Segments are immutable; the buffer index was extended under the
         // shared meta lock, so a fold cannot rewrite pages underneath it.
@@ -1249,6 +1359,7 @@ pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
         View {
             sources,
             immutable_sources,
+            labels,
         }
     }
 }
@@ -1275,7 +1386,7 @@ pub unsafe fn scan(
             }
         };
 
-        for (segment, dead_bytes) in &view.sources {
+        for ((segment, dead_bytes), label) in view.sources.iter().zip(&view.labels) {
             pgrx::check_for_interrupts!();
             let mut exact = true;
             let mut cursors: Vec<Box<dyn Cursor>> = Vec::with_capacity(queries.len());
@@ -1288,11 +1399,14 @@ pub unsafe fn scan(
             let mut cursor: Box<dyn Cursor> = if cursors.len() == 1 {
                 cursors.pop().expect("one cursor")
             } else {
-                Box::new(codec(Intersection::new(cursors)))
+                Box::new(codec_in(Intersection::new(cursors), label))
             };
             if let Some(dead_bytes) = dead_bytes {
-                let dead = codec(Postings::parse(dead_bytes).and_then(|p| p.cursor()));
-                cursor = Box::new(codec(Difference::new(cursor, dead)));
+                let dead = codec_in(
+                    Postings::parse(dead_bytes).and_then(|p| p.cursor()),
+                    &format!("{label} dead list"),
+                );
+                cursor = Box::new(codec_in(Difference::new(cursor, dead), label));
             }
             while let Some(tid) = cursor.current() {
                 pending.push(pointer_of(tid));
@@ -1301,7 +1415,7 @@ pub unsafe fn scan(
                     pgrx::check_for_interrupts!();
                     flush(&mut pending, !exact);
                 }
-                codec(cursor.advance());
+                codec_in(cursor.advance(), label);
             }
             flush(&mut pending, !exact);
         }
@@ -1331,11 +1445,12 @@ pub unsafe fn bulk_delete(
         for i in 0..meta.segments.len() {
             pgrx::check_for_interrupts!();
             let entry = meta.segments[i];
-            let bytes = read_run(index, entry.run);
-            let segment = codec(Segment::parse(&bytes));
+            let label = generation_label(entry.generation);
+            let bytes = read_run(index, entry.run, &label);
+            let segment = codec_in(Segment::parse(&bytes), &label);
             let mut dead = dead_set(index, &entry);
             let before = dead.len();
-            let mut documents = codec(segment.documents());
+            let mut documents = codec_in(segment.documents(), &label);
             while let Some(tid) = documents.current() {
                 if dead.contains(&tid) {
                     // Already dead: nothing to report.
@@ -1345,7 +1460,7 @@ pub unsafe fn bulk_delete(
                 } else {
                     live += 1;
                 }
-                codec(documents.advance());
+                codec_in(documents.advance(), &label);
             }
             if dead.len() != before {
                 let run = write_run(index, &encode_dead(&dead));
@@ -1359,7 +1474,7 @@ pub unsafe fn bulk_delete(
             let mut kept_docs = 0u32;
             let mut dropped = false;
             for record in segment::forward::records(&stream) {
-                let record = codec(record);
+                let record = codec_in(record, "write buffer");
                 if is_dead(record.tid) {
                     removed += 1;
                     dropped = true;
@@ -1392,19 +1507,24 @@ pub unsafe fn cleanup(index: pg_sys::Relation) {
             if entry.dead.is_empty() {
                 continue;
             }
-            let dead_bytes = read_run(index, entry.dead);
-            let dead_count = codec(Postings::parse(&dead_bytes)).count();
+            let label = generation_label(entry.generation);
+            let dead_label = format!("{label} dead list");
+            let dead_bytes = read_run(index, entry.dead, &dead_label);
+            let dead_count = codec_in(Postings::parse(&dead_bytes), &dead_label).count();
             if u64::from(dead_count) * 2 < u64::from(entry.docs) {
                 continue;
             }
-            let dead: BTreeSet<Tid> = codec(Postings::parse(&dead_bytes).and_then(|p| p.to_vec()))
-                .into_iter()
-                .collect();
-            let bytes = read_run(index, entry.run);
-            let segment = codec(Segment::parse(&bytes));
+            let dead: BTreeSet<Tid> = codec_in(
+                Postings::parse(&dead_bytes).and_then(|p| p.to_vec()),
+                &dead_label,
+            )
+            .into_iter()
+            .collect();
+            let bytes = read_run(index, entry.run, &label);
+            let segment = codec_in(Segment::parse(&bytes), &label);
             let mut builder = SegmentBuilder::default();
-            for record in codec(segment.records(|tid| dead.contains(&tid))) {
-                codec(builder.add_record(&record));
+            for record in codec_in(segment.records(|tid| dead.contains(&tid)), &label) {
+                codec_in(builder.add_record(&record), &label);
             }
             let (blob, docs, total_length) = finish_builder(builder);
             let (run, map) = write_segment_run(index, &blob);
@@ -1455,8 +1575,9 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
             let dead = if entry.dead.is_empty() {
                 0
             } else {
-                let bytes = read_run(index, entry.dead);
-                i64::from(codec(Postings::parse(&bytes)).count())
+                let what = format!("{} dead list", generation_label(entry.generation));
+                let bytes = read_run(index, entry.dead, &what);
+                i64::from(codec_in(Postings::parse(&bytes), &what).count())
             };
             rows.push(SegmentRow {
                 ordinal: ordinal as i64,
@@ -1472,7 +1593,7 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
         if meta.buffer.docs > 0 {
             let stream = read_buffer_stream(index, &meta.buffer);
             let lengths: u64 = segment::forward::records(&stream)
-                .map(|record| u64::from(codec(record).doc_len))
+                .map(|record| u64::from(codec_in(record, "write buffer").doc_len))
                 .sum();
             rows.push(SegmentRow {
                 ordinal: meta.segments.len() as i64,

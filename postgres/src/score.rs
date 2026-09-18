@@ -287,8 +287,14 @@ fn score_bound_indexed(
     })
 }
 
+/// Codec results from a source this code cannot name; prefer
+/// [`segment_error_in`] where the source is known.
 fn segment_error<T>(result: segment::Result<T>) -> T {
-    result.unwrap_or_else(|error| pgrx::error!("Stannum index data: {error}; REINDEX required"))
+    result.unwrap_or_else(|error| crate::storage::corrupt(format!("Stannum index data: {error}")))
+}
+
+fn segment_error_in<T>(result: segment::Result<T>, label: &str) -> T {
+    crate::storage::codec_in(result, label)
 }
 
 impl IndexScorer {
@@ -305,25 +311,28 @@ impl IndexScorer {
                 self.sources[i] =
                     unsafe { SourceReader::new(&*self.view.sources[i].0, &self.terms) };
             }
+            let label = self.view.labels[i].as_str();
             let reader = &mut self.sources[i];
             reader.last = Some(tid);
-            let Some(ordinal) = segment_error(reader.documents.rank(tid)) else {
+            let Some(ordinal) = segment_error_in(reader.documents.rank(tid), label) else {
                 continue;
             };
-            let length = segment_error(reader.lengths.get(ordinal));
+            let length = segment_error_in(reader.lengths.get(ordinal), label);
             // Left-to-right f32 fold in lexical term order, as production does.
             let mut total = 0.0_f32;
             for (slot, (_, scorer)) in reader.terms.iter_mut().zip(&self.terms) {
                 let Some(term) = slot else {
                     continue;
                 };
-                let Some(posting) = segment_error(term.postings.rank(tid)) else {
+                let Some(posting) = segment_error_in(term.postings.rank(tid), label) else {
                     continue;
                 };
-                segment_error(term.payload.seek(posting));
-                let bucket = segment_error(term.payload.next_bucket());
+                segment_error_in(term.payload.seek(posting), label);
+                let bucket = segment_error_in(term.payload.next_bucket(), label);
                 let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
-                    pgrx::error!("Stannum index data: term-frequency bucket; REINDEX required")
+                    crate::storage::corrupt(format!(
+                        "Stannum {label}: term-frequency bucket {bucket} out of range"
+                    ))
                 });
                 total += scorer.score_bucket(bucket, length);
             }
@@ -465,7 +474,9 @@ impl TermCursor<'_> {
         segment_error(self.payload.seek(self.postings.ordinal()));
         let bucket = segment_error(self.payload.next_bucket());
         TfBucket::new(bucket).unwrap_or_else(|| {
-            pgrx::error!("Stannum index data: term-frequency bucket; REINDEX required")
+            crate::storage::corrupt(format!(
+                "Stannum index data: term-frequency bucket {bucket} out of range"
+            ))
         })
     }
 }
@@ -539,7 +550,10 @@ impl Walk<'_, '_> {
             return;
         }
         let Some(ordinal) = segment_error(self.documents.rank(pivot)) else {
-            pgrx::error!("Stannum index data: document missing from table; REINDEX required")
+            crate::storage::corrupt(format!(
+                "Stannum index data: document ({},{}) is posted but missing from the document table",
+                pivot.block, pivot.offset
+            ))
         };
         let length = segment_error(self.lengths.get(ordinal));
         let mut pending: Vec<usize> = (0..self.cursors.len())
@@ -785,6 +799,7 @@ impl IndexScorer {
             for (i, (source, _)) in self.view.sources.iter().enumerate() {
                 if !self.prune_source(
                     &**source,
+                    &self.view.labels[i],
                     &self.dead[i],
                     combine,
                     k,
@@ -812,9 +827,14 @@ impl IndexScorer {
     }
 
     /// Walks one source. Returns `Ok(false)` when the source cannot be pruned.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site; the arguments are the walk's state"
+    )]
     fn prune_source(
         &self,
         source: &dyn Index,
+        label: &str,
         dead: &BTreeSet<Tid>,
         combine: Combine,
         k: usize,
@@ -823,15 +843,15 @@ impl IndexScorer {
     ) -> Option<bool> {
         let mut cursors: Vec<TermCursor<'_>> = Vec::with_capacity(self.terms.len());
         for (slot, (name, scorer)) in self.terms.iter().enumerate() {
-            let Some(term) = segment_error(source.term(name)) else {
+            let Some(term) = segment_error_in(source.term(name), label) else {
                 match combine {
                     // A missing term empties the conjunction in this source.
                     Combine::All => return Some(true),
                     Combine::Any => continue,
                 }
             };
-            let mut postings = segment_error(term.cursor());
-            let bounds = segment_error(postings.block_bounds());
+            let mut postings = segment_error_in(term.cursor(), label);
+            let bounds = segment_error_in(postings.block_bounds(), label);
             let Some(whole) = bounds
                 .iter()
                 .copied()
@@ -842,7 +862,7 @@ impl IndexScorer {
             cursors.push(TermCursor {
                 slot,
                 postings,
-                payload: segment_error(term.payload()).cursor(),
+                payload: segment_error_in(term.payload(), label).cursor(),
                 count: term.df(),
                 term_max: scorer.bound(&whole),
                 cached: None,
@@ -855,7 +875,7 @@ impl IndexScorer {
         let mut walk = Walk {
             scorer: self,
             cursors,
-            documents: segment_error(source.documents()),
+            documents: segment_error_in(source.documents(), label),
             lengths: source.lengths(),
             dead,
             k,
@@ -1099,7 +1119,7 @@ impl IndexScorer {
                 if !self.dead[i].contains(&tid) {
                     candidates.insert(tid);
                 }
-                segment_error(cursor.advance());
+                segment_error_in(cursor.advance(), &self.view.labels[i]);
             }
         }
         // The index cannot see deletes that VACUUM has not reported yet, so
