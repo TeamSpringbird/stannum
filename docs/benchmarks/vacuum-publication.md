@@ -141,8 +141,9 @@ by design; the fold caps and the merge budget are the knobs for them.
   the latter now ending with a crash between a run write and its publication:
   a 40,000-document fold is interrupted by an immediate shutdown while its run
   pages are being written, `stannum.verify_index` reports the pages as
-  `page N` warnings, `VACUUM (INDEX_CLEANUP ON)` reclaims them into the FSM,
-  the verifier is clean and the repeated fold reuses the pages.
+  `page N` warnings (337 in the recorded run), `VACUUM (INDEX_CLEANUP ON)`
+  reclaims them into the FSM, the verifier is clean and the repeated fold
+  reuses the pages.
 - `script/reference-oracle` against upstream Lead.
 
 Raw local artifacts are in `/tmp/stannum-vacuum-results/`.

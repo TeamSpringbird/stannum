@@ -132,7 +132,10 @@ def crash_between_run_write_and_publication(sql, command, env, data, root, start
                      "WHERE severity = 'warning' AND location LIKE 'page %'")
     sql("ALTER TABLE docs SET (autovacuum_enabled=false); CREATE EXTENSION IF NOT EXISTS pg_freespacemap;")
     for attempt in range(5):
-        if sql("SELECT coalesce(sum(docs), 0) FROM stannum.segment_info('docs_idx') WHERE kind = 'mutable'") == "0":
+        buffered = int(sql("SELECT coalesce(sum(docs), 0) FROM stannum.segment_info('docs_idx') WHERE kind = 'mutable'"))
+        if buffered < 40000:
+            # The buffer holds at most a few documents from the steps above
+            # (or nothing, after an attempt whose fold was published).
             sql("""SET stannum.write_buffer_docs=100000; SET stannum.write_buffer_bytes=67108864;
                 INSERT INTO docs SELECT n, 'orphan ' || repeat(md5(n::text) || ' ', 30)
                 FROM generate_series(100000 + 50000 * %d, 100000 + 50000 * %d + 39999) n;""" % (attempt, attempt))
