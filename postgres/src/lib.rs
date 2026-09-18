@@ -613,6 +613,49 @@ mod tests {
     }
 
     #[pg_test]
+    fn segment_info_reports_segments_and_the_write_buffer() {
+        Spi::run(
+            "CREATE TABLE si(id int primary key, body text);
+             INSERT INTO si SELECT n, 'w' || (n % 5) || ' common' FROM generate_series(1, 50) n;
+             CREATE INDEX si_idx ON si USING tin(body);
+             SET LOCAL tin.write_buffer_docs = 4;
+             INSERT INTO si SELECT n, 'late needle' FROM generate_series(100, 109) n;
+             DELETE FROM si WHERE id <= 10;",
+        )
+        .unwrap();
+        let rows = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT kind, docs, dead_docs, sum_doc_lengths, total_pages
+                     FROM tin.segment_info('si_idx') ORDER BY ordinal",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<String>(1).unwrap().unwrap(),
+                        row.get::<i64>(2).unwrap().unwrap(),
+                        row.get::<i64>(3).unwrap().unwrap(),
+                        row.get::<i64>(4).unwrap().unwrap(),
+                        row.get::<i64>(5).unwrap().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        // The build segment, two folded segments of four, and two buffered.
+        assert_eq!(rows[0], ("immutable".into(), 50, 0, 100, 1));
+        assert_eq!(rows[1].0, "immutable");
+        assert_eq!(rows[1].1, 4);
+        assert_eq!(rows[2].1, 4);
+        assert_eq!(rows.last().unwrap().0, "mutable");
+        assert_eq!(rows.last().unwrap().1, 2);
+        assert_eq!(rows.len(), 4);
+        // Dead documents only appear after VACUUM reports them.
+        assert!(rows.iter().all(|row| row.2 == 0));
+    }
+
+    #[pg_test]
     fn posting_inserts_rolled_back_by_subtransaction_are_not_visible() {
         Spi::run(
             "CREATE TABLE posting_abort(body text);

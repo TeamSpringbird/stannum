@@ -1021,6 +1021,64 @@ pub unsafe fn is_segmented(oid: pg_sys::Oid) -> bool {
     }
 }
 
+/// One row of `tin.segment_info`, mirroring TIN's columns.
+pub struct SegmentRow {
+    pub ordinal: i64,
+    pub kind: String,
+    pub root_block: i64,
+    pub docs: i64,
+    pub dead_docs: i64,
+    pub sum_doc_lengths: i64,
+    pub total_pages: i64,
+    pub generation: i64,
+}
+
+/// The directory as rows: immutable segments first, then the write buffer.
+///
+/// # Safety
+/// `index` is a live LDP2 index.
+pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
+    unsafe {
+        let (_, meta) = read_meta(index, false);
+        let mut rows = Vec::with_capacity(meta.segments.len() + 1);
+        for (ordinal, entry) in meta.segments.iter().enumerate() {
+            let dead = if entry.dead.is_empty() {
+                0
+            } else {
+                let bytes = read_run(index, entry.dead);
+                i64::from(codec(Postings::parse(&bytes)).count())
+            };
+            rows.push(SegmentRow {
+                ordinal: ordinal as i64,
+                kind: "immutable".to_owned(),
+                root_block: i64::from(entry.run.first),
+                docs: i64::from(entry.docs),
+                dead_docs: dead,
+                sum_doc_lengths: entry.total_length as i64,
+                total_pages: i64::from(entry.run.blocks + entry.dead.blocks),
+                generation: i64::from(entry.generation),
+            });
+        }
+        if meta.buffer.docs > 0 {
+            let stream = read_buffer_stream(index, &meta.buffer);
+            let lengths: u64 = segment::forward::records(&stream)
+                .map(|record| u64::from(codec(record).doc_len))
+                .sum();
+            rows.push(SegmentRow {
+                ordinal: meta.segments.len() as i64,
+                kind: "mutable".to_owned(),
+                root_block: i64::from(meta.buffer.head),
+                docs: i64::from(meta.buffer.docs),
+                dead_docs: 0,
+                sum_doc_lengths: lengths as i64,
+                total_pages: i64::from(meta.buffer.bytes.div_ceil(CHAIN_CAPACITY as u32).max(1)),
+                generation: i64::from(meta.buffer.version),
+            });
+        }
+        rows
+    }
+}
+
 /// Segment and buffer document counts from the directory, for statistics.
 ///
 /// # Safety

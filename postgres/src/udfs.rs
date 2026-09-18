@@ -1,4 +1,5 @@
-use pgrx::{default, iter::SetOfIterator, pg_extern};
+use pgrx::iter::TableIterator;
+use pgrx::{PgRelation, default, iter::SetOfIterator, name, pg_extern};
 use tokenizer::{
     Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, Tokenizer,
     TokenizerPipelineSpec, TokenizerSpec,
@@ -235,4 +236,45 @@ mod tests {
         };
         assert!(options.into_spec().is_err());
     }
+}
+
+/// The index's segment directory: immutable segments and the write buffer.
+#[pg_extern(volatile, parallel_unsafe)]
+#[allow(clippy::type_complexity)]
+fn segment_info(
+    index: PgRelation,
+) -> TableIterator<
+    'static,
+    (
+        name!(ordinal, i64),
+        name!(kind, String),
+        name!(root_block, i64),
+        name!(docs, i64),
+        name!(dead_docs, i64),
+        name!(sum_doc_lengths, i64),
+        name!(total_pages, i64),
+        name!(generation, i64),
+    ),
+> {
+    let tin_name = std::ffi::CString::new("tin").expect("static access method name is valid");
+    let tin_am = unsafe { pgrx::pg_sys::get_index_am_oid(tin_name.as_ptr(), false) };
+    if unsafe { (*(*index.as_ptr()).rd_rel).relam } != tin_am {
+        pgrx::error!("tin.segment_info() requires a tin index");
+    }
+    if !unsafe { crate::storage::present(index.as_ptr()) } {
+        return TableIterator::new(Vec::new());
+    }
+    let rows = unsafe { crate::storage::segment_rows(index.as_ptr()) };
+    TableIterator::new(rows.into_iter().map(|row| {
+        (
+            row.ordinal,
+            row.kind,
+            row.root_block,
+            row.docs,
+            row.dead_docs,
+            row.sum_doc_lengths,
+            row.total_pages,
+            row.generation,
+        )
+    }))
 }
