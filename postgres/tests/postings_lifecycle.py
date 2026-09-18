@@ -260,11 +260,21 @@ def main():
         assert 'score_bound_indexed' not in json.dumps(ranked_plan), ranked_plan
         assert 'score_bound' in json.dumps(ranked_plan), ranked_plan
         assert standby_sql("SELECT stannum.full_score(ctid) > 0 FROM docs WHERE body ==> 'needle';") == 't'
+        # Direct SQL calls bypass planner routing, including privileged callers.
+        direct_indexed_score = "SELECT stannum.score_bound_indexed('(0,1)'::tid, 'needle', 'docs'::regclass::oid::int, 'docs_search'::regclass::oid::int, 1, NULL, NULL, NULL, NULL, NULL);"
+        recovery_score_error = 'indexed scoring is unavailable for recovery snapshots'
+        rejected = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1'],
+                                  input=direct_indexed_score, text=True, capture_output=True,
+                                  env=standby_env)
+        assert rejected.returncode == 3 and recovery_score_error in rejected.stderr, rejected
         # A snapshot acquired during recovery retains the fallback after promotion.
         promotion_env = dict(standby_env, PGAPPNAME='stannum-promotion-check')
         promotion = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=promotion_env)
-        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL stannum.enable_custom_scan=off; SELECT count(*) FROM docs; SELECT pg_sleep(3); EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; SET LOCAL stannum.enable_custom_scan=on; SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle'; SELECT 'score:' || (stannum.full_score(ctid)>0)::text FROM docs WHERE body ==> 'needle'; COMMIT;")
+        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL stannum.enable_custom_scan=off; SELECT count(*) FROM docs; SELECT pg_sleep(3); SELECT 'promoted:' || (NOT pg_is_in_recovery())::text; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; SET LOCAL stannum.enable_custom_scan=on; SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle'; SELECT 'score:' || (stannum.full_score(ctid)>0)::text FROM docs WHERE body ==> 'needle'; SAVEPOINT direct_score;\n"
+                              + "\\set ON_ERROR_STOP off\n" + direct_indexed_score + "\n"
+                              + "\\echo direct-indexed-error :ERROR\n\\set ON_ERROR_STOP on\n"
+                              + "ROLLBACK TO SAVEPOINT direct_score; SELECT 'snapshot-survived:' || count(*) FROM docs; COMMIT;")
         promotion.stdin.close(); promotion.stdin=None
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
@@ -280,6 +290,11 @@ def main():
         # The same recovery snapshot retains heap fallback with custom scans enabled.
         assert 'custom:1' in out, out
         assert 'score:true' in out, out
+        assert 'promoted:true' in out, out
+        assert 'direct-indexed-error true' in out and recovery_score_error in err, (out, err)
+        assert 'snapshot-survived:1' in out, out
+        # New primary snapshots can call the indexed scorer again.
+        assert standby_sql(direct_indexed_score), 'indexed scorer returned no value after promotion'
         new_plan=json.loads(command(['psql','-X','-qAt','-c',"SET stannum.enable_custom_scan=off; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert new_plan[0]['Plan']['Exact Heap Blocks'] == 1, new_plan
         assert new_plan[0]['Plan']['Lossy Heap Blocks'] == 0, new_plan
@@ -287,7 +302,7 @@ def main():
         assert custom_plan[0]['Plan']['Custom Plan Provider'] == 'Stannum Text Search Scan', custom_plan
         assert custom_plan[0]['Plan']['Actual Rows'] == 1, custom_plan
         verify(env=standby_env)
-        result={'status':'passed', 'concurrent_reader_checks':checks, 'verify_index_calls':verified, 'standby_snapshot_checks':standby_snapshot_checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset and indexed REINDEX','parallel worker execution','standby feedback on/off during folds and vacuum','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','per-statement scorer state','verify_index after every phase']}
+        result={'status':'passed', 'concurrent_reader_checks':checks, 'verify_index_calls':verified, 'standby_snapshot_checks':standby_snapshot_checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset and indexed REINDEX','parallel worker execution','standby feedback on/off during folds and vacuum','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion','direct indexed scoring rejects recovery snapshots','per-statement scorer state','verify_index after every phase']}
         (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result)); print('Artifacts:',root)
     finally:

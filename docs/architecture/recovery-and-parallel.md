@@ -29,6 +29,8 @@ A recovery snapshot still uses heap fallback, even after promotion. New snapshot
 on the promoted primary use segmented reads normally. The shared planner check
 also selects heap-based scoring during recovery and for recovery-origin snapshots;
 previously ranking could select the indexed scorer despite the scan fallback.
+Direct SQL calls to the internal indexed scorer also reject recovery and
+recovery-origin snapshots before accessing either cached scores or the index.
 The heap scorer also uses a read-only SPI catalog lookup: pgrx's convenience
 `Spi::get_two` opens a mutable connection and requests an XID, which recovery
 cannot assign.
