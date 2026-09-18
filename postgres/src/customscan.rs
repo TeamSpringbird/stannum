@@ -1155,7 +1155,14 @@ unsafe extern "C-unwind" fn search_access(
                     exec.fetched += 1;
                     if !exec.recheck || passes_clause(node, exec, slot) {
                         if exec.ordered {
-                            crate::score::note_scan_emitted(exec.scan_id);
+                            let member = (*slot).tts_tid;
+                            let block = (u32::from(member.ip_blkid.bi_hi) << 16)
+                                | u32::from(member.ip_blkid.bi_lo);
+                            let member = Tid {
+                                block,
+                                offset: member.ip_posid,
+                            };
+                            crate::score::note_scan_emitted(exec.scan_id, member, tid);
                         }
                         return slot;
                     }
