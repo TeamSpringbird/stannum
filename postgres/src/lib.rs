@@ -3101,6 +3101,57 @@ mod tests {
     }
 
     #[pg_test]
+    fn insert_prepares_unlocked_and_publishes_against_current_buffer() {
+        Spi::run(
+            "CREATE TABLE insert_race(id int PRIMARY KEY, body text);
+             CREATE INDEX insert_race_idx ON insert_race USING stannum(body)
+                 WITH (case_folding = preserve);
+             CREATE TEMP TABLE insert_race_observed(matches bigint, docs bigint);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.max_segments = 2;
+             INSERT INTO insert_race VALUES (1, 'Craft Beer');
+             ALTER INDEX insert_race_idx SET (case_folding = fold);",
+        )
+        .unwrap();
+        // Preparing the outer record must use the persisted tokenizer, not
+        // the newly changed reloptions. The callback searches and reads the
+        // directory before inserting: either operation would self-deadlock
+        // if preparation still held the metadata page exclusively.
+        insert_at_race_point(
+            "insert:prepared",
+            "INSERT INTO insert_race_observed SELECT
+                 (SELECT count(*) FROM insert_race WHERE body ==> 'Beer'),
+                 (SELECT sum(docs) FROM stannum.segment_info('insert_race_idx'));
+             INSERT INTO insert_race VALUES (2, 'Craft Beer'), (3, 'craft beer');",
+        );
+        Spi::run("INSERT INTO insert_race VALUES (4, 'Craft Beer')").unwrap();
+        crate::storage::testing::set_race_hook(None);
+        // This also proves that the hook fired. Its nested inserts fold the
+        // original buffer; publishing a stale captured Meta would lose them.
+        assert_eq!(value("SELECT count(*) FROM insert_race_observed"), 1);
+        assert_eq!(value("SELECT matches FROM insert_race_observed"), 1);
+        assert_eq!(value("SELECT docs FROM insert_race_observed"), 1);
+        assert_eq!(
+            ids("SELECT id FROM insert_race WHERE body ==> 'Beer' ORDER BY id"),
+            vec![1, 2, 4]
+        );
+        assert_eq!(
+            ids("SELECT id FROM insert_race WHERE body ==> 'beer' ORDER BY id"),
+            vec![3]
+        );
+        assert_eq!(
+            ids("SELECT id FROM insert_race WHERE body ==> '\"Craft Beer\"' ORDER BY id"),
+            vec![1, 2, 4]
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('insert_race_idx')"),
+            4
+        );
+        assert_clean("insert_race_idx");
+    }
+
+    #[pg_test]
     fn vacuum_publishes_against_a_directory_inserts_changed_meanwhile() {
         Spi::run(
             "CREATE TABLE vac_race(id int primary key, body text);

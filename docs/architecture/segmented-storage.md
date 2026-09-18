@@ -56,6 +56,21 @@ per record, the byte limit now folds roughly 365 documents rather than roughly
 1,460. Short documents hit the 512-document limit. Smaller folds also reduce
 the amount a fresh reader must index before its first query.
 
+### Insert preparation
+
+An insert captures the index identity and persisted tokenizer settings under a
+short shared metadata lock, then releases it before tokenizing and encoding its
+forward record. Temporary token/record allocations are also dropped before the
+exclusive lock is acquired. Under that lock it validates identity and settings
+and uses the latest buffer and directory; unrelated appends, folds, or VACUUM do
+not invalidate the prepared record. An identity/settings change retries
+preparation. Current reloptions are not substituted for the persisted pipeline.
+
+This removes text preparation from the exclusive critical section. Folding,
+segment writes, foreground merges, and publication remain locked. In particular,
+orphan reclamation relies on that lock to exclude unpublished foreground runs;
+moving their writes outside it requires a separate reservation protocol.
+
 ### Merge policy
 
 Each segment belongs to a size tier by document count: tier *t* holds

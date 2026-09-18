@@ -1782,15 +1782,40 @@ pub unsafe fn insert(
             return;
         }
         let text = String::from_datum(*values, false).expect("non-null indexed text");
-        let (meta_buffer, mut meta) = read_meta(index, true);
-        let tokenizer = tokenizer_for(&meta.spec);
-        let tokens = tokens_of(&tokenizer, &text);
-        let record = codec(ForwardRecord::from_tokens(
-            tid_of(*tid),
-            tokens.iter().map(|(term, pos)| (term.as_str(), *pos)),
-        ));
-        let mut bytes = Vec::new();
-        codec(record.encode(&mut bytes));
+        let (meta_buffer, mut meta, bytes) = loop {
+            pgrx::check_for_interrupts!();
+            let (identity, spec) = {
+                let (guard, captured) = read_meta(index, false);
+                let settings = (captured.identity, captured.spec);
+                drop(guard);
+                settings
+            };
+            // Text preparation touches no index pages. In particular, long
+            // documents must not serialize readers and other writers while
+            // tokenization and forward-record encoding run.
+            let bytes = {
+                let tokenizer = tokenizer_for(&spec);
+                let tokens = tokens_of(&tokenizer, &text);
+                let record = codec(ForwardRecord::from_tokens(
+                    tid_of(*tid),
+                    tokens.iter().map(|(term, pos)| (term.as_str(), *pos)),
+                ));
+                let mut bytes = Vec::new();
+                codec(record.encode(&mut bytes));
+                bytes
+            };
+            race_point("insert:prepared");
+            let (guard, current) = read_meta(index, true);
+            if current.identity == identity && current.spec == spec {
+                // Use the latest buffer/directory. Appends, folds and VACUUM
+                // during preparation do not invalidate this row's encoding.
+                break (guard, current, bytes);
+            }
+            // Rebuilds normally conflict with the caller's relation lock;
+            // validate the persisted tokenizer nevertheless, never publishing
+            // bytes encoded for a different index identity or pipeline.
+            drop(guard);
+        };
         if meta.buffer.docs > 0
             && (meta.buffer.bytes as usize + bytes.len() > WRITE_BUFFER_BYTES.get() as usize
                 || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32)
@@ -1997,7 +2022,7 @@ pub unsafe fn scan(
 /// folding or merging are finished under the lock, so VACUUM always ends.
 const DEAD_LIST_ROUNDS: usize = 3;
 
-/// A point where a test may interleave an insert with VACUUM's unlocked work.
+/// A point where a test may interleave operations with unlocked preparation.
 fn race_point(name: &'static str) {
     #[cfg(feature = "pg_test")]
     if let Some(mut hook) = testing::RACE_HOOK.with_borrow_mut(Option::take) {
