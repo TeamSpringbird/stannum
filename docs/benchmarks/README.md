@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [page-bitmap count report](page-bitmap-counts.md) covers adaptive dense-count
+execution, correctness checks, and paired count-only measurements.
+
 The [round-four integration report](round4-integration.md) records the recovered
 agent branches, combined-build validation, and a paired comparison with the
 preceding published Stannum build. The Lead comparison below is historical.

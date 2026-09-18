@@ -42,6 +42,17 @@ def main():
                           UNION ALL (SELECT * FROM expected EXCEPT SELECT * FROM actual))
                 SELECT count(*) FROM delta;""")
             assert differences == '0', (term, differences)
+        # Count subqueries exercise the page-mask custom node; the regex side
+        # independently evaluates the same fixture vocabulary in one snapshot.
+        for query, predicate in [
+            ('needle', "body ~ '\\mneedle\\M'"),
+            ('needle AND common', "body ~ '\\mneedle\\M' AND body ~ '\\mcommon\\M'"),
+            ('needle OR fresh', "body ~ '\\mneedle\\M' OR body ~ '\\mfresh\\M'"),
+            ('common AND NOT needle', "body ~ '\\mcommon\\M' AND body !~ '\\mneedle\\M'"),
+        ]:
+            equal = sql(f"SELECT (SELECT count(*) FROM docs WHERE body ==> '{query}')"
+                        f" = (SELECT count(*) FROM docs WHERE {predicate});")
+            assert equal == 't', (query, equal)
     try:
         command(['initdb', '-D', str(data), '-U', 'postgres', '-A', 'trust', '--no-locale', '--encoding=UTF8', '--data-checksums'])
         with (data/'postgresql.conf').open('a') as f:

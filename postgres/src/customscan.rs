@@ -767,6 +767,7 @@ struct ScanExec {
     scored: Option<usize>,
     fetched: usize,
     skipped_pages: usize,
+    page_masks: Option<bool>,
     ordered: bool,
     /// Identity under which the scan publishes its scorer.
     scan_id: u64,
@@ -881,6 +882,7 @@ unsafe extern "C-unwind" fn begin_scan(
             scored: None,
             fetched: 0,
             skipped_pages: 0,
+            page_masks: None,
             ordered,
             scan_id: crate::score::scan_id(),
         };
@@ -950,34 +952,38 @@ unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
             tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
                 .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
         let view = crate::storage::view(index_oid);
-        let limits = Limits::default();
-        let mut tids = Vec::new();
-        for ((segment, dead), label) in view.sources.iter().zip(&view.labels) {
-            pgrx::check_for_interrupts!();
-            let planned = plan(&query, segment, &limits)
-                .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
-            let mut cursor: Box<dyn segment::set::Cursor> = planned.cursor;
-            // A capped expansion yields a superset; those rows are rechecked.
-            exec.recheck |= !planned.exact;
-            if let Some(dead) = dead {
-                let dead = crate::storage::codec_in(
-                    segment::postings::Postings::parse(dead).and_then(|p| p.cursor()),
-                    &format!("{label} dead list"),
-                );
-                cursor = Box::new(crate::storage::codec_in(
-                    segment::set::Difference::new(cursor, dead),
-                    label,
-                ));
-            }
-            while let Some(tid) = cursor.current() {
-                tids.push(tid);
-                crate::storage::codec_in(cursor.advance(), label);
-            }
-        }
-        tids.sort_unstable();
-        tids.dedup();
-        tids
+        candidates_in_view(exec, &query, &view)
     }
+}
+
+fn candidates_in_view(exec: &mut ScanExec, query: &Query, view: &crate::storage::View) -> Vec<Tid> {
+    let limits = Limits::default();
+    let mut tids = Vec::new();
+    for ((segment, dead), label) in view.sources.iter().zip(&view.labels) {
+        pgrx::check_for_interrupts!();
+        let planned = plan(query, segment, &limits)
+            .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
+        let mut cursor: Box<dyn segment::set::Cursor> = planned.cursor;
+        // A capped expansion yields a superset; those rows are rechecked.
+        exec.recheck |= !planned.exact;
+        if let Some(dead) = dead {
+            let dead = crate::storage::codec_in(
+                segment::postings::Postings::parse(dead).and_then(|p| p.cursor()),
+                &format!("{label} dead list"),
+            );
+            cursor = Box::new(crate::storage::codec_in(
+                segment::set::Difference::new(cursor, dead),
+                label,
+            ));
+        }
+        while let Some(tid) = cursor.current() {
+            tids.push(tid);
+            crate::storage::codec_in(cursor.advance(), label);
+        }
+    }
+    tids.sort_unstable();
+    tids.dedup();
+    tids
 }
 
 /// Stores every candidate; with a scorer, scored and in output order.
@@ -1227,6 +1233,52 @@ unsafe extern "C-unwind" fn exec_search(
     unsafe { pg_sys::ExecScan(&mut (*node).ss, Some(search_access), Some(search_recheck)) }
 }
 
+/// Counts one exact candidate page; only all-visible pages can bypass the heap.
+unsafe fn count_page(
+    node: *mut pg_sys::CustomScanState,
+    exec: &mut ScanExec,
+    block: u32,
+    offsets: impl Iterator<Item = u16>,
+    size: usize,
+    vmbuf: &mut pg_sys::Buffer,
+) -> i64 {
+    unsafe {
+        pgrx::check_for_interrupts!();
+        let status = pg_sys::visibilitymap_get_status(exec.heap, block, vmbuf);
+        if !exec.recheck && status & pg_sys::VISIBILITYMAP_ALL_VISIBLE as u8 != 0 {
+            exec.skipped_pages += 1;
+            return size as i64;
+        }
+        let snapshot = (*(*node).ss.ps.state).es_snapshot;
+        let mut count = 0;
+        for offset in offsets {
+            let mut pointer = pointer_of(Tid { block, offset });
+            let mut call_again = false;
+            let mut all_dead = false;
+            loop {
+                if pg_sys::table_index_fetch_tuple(
+                    exec.fetch,
+                    &mut pointer,
+                    snapshot,
+                    exec.fetch_slot,
+                    &mut call_again,
+                    &mut all_dead,
+                ) {
+                    exec.fetched += 1;
+                    if !exec.recheck || passes_clause(node, exec, exec.fetch_slot) {
+                        count += 1;
+                    }
+                    break;
+                }
+                if !call_again {
+                    break;
+                }
+            }
+        }
+        count
+    }
+}
+
 /// Counts visible candidates, skipping heap fetches on all-visible pages.
 #[pg_guard]
 unsafe extern "C-unwind" fn exec_count(
@@ -1256,48 +1308,85 @@ unsafe extern "C-unwind" fn exec_count(
             }
             pg_sys::table_endscan(scan);
         } else {
-            gather(exec);
-            let mut vmbuf = pg_sys::InvalidBuffer as pg_sys::Buffer;
-            let mut i = 0;
-            while i < exec.tids.len() {
-                pgrx::check_for_interrupts!();
-                let block = exec.tids[i].block;
-                let mut end = i;
-                while end < exec.tids.len() && exec.tids[end].block == block {
-                    end += 1;
+            let index_oid = pg_sys::Oid::from(exec.private.index_oid);
+            let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
+            let tokenizer = crate::storage::index_tokenizer(index);
+            pg_sys::index_close(index, pg_sys::AccessShareLock as _);
+            let query =
+                tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
+                    .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
+            let view = crate::storage::view(index_oid);
+            let mut use_pages = false;
+            for (source, _) in &view.sources {
+                use_pages |= tinql::runtime::plan::prefers_pages(&query, source)
+                    .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
+                if use_pages {
+                    break;
                 }
-                let status = pg_sys::visibilitymap_get_status(exec.heap, block, &mut vmbuf);
-                if !exec.recheck && status & pg_sys::VISIBILITYMAP_ALL_VISIBLE as u8 != 0 {
-                    count += (end - i) as i64;
-                    exec.skipped_pages += 1;
-                } else {
-                    for tid in &exec.tids[i..end] {
-                        let mut pointer = pointer_of(*tid);
-                        let mut call_again = false;
-                        let mut all_dead = false;
-                        loop {
-                            if pg_sys::table_index_fetch_tuple(
-                                exec.fetch,
-                                &mut pointer,
-                                snapshot,
-                                fetch_slot,
-                                &mut call_again,
-                                &mut all_dead,
-                            ) {
-                                exec.fetched += 1;
-                                if !exec.recheck || passes_clause(node, exec, fetch_slot) {
-                                    count += 1;
-                                }
-                                break;
-                            }
-                            if !call_again {
-                                break;
-                            }
-                        }
-                    }
-                }
-                i = end;
             }
+            exec.page_masks = Some(use_pages);
+            let mut vmbuf = pg_sys::InvalidBuffer as pg_sys::Buffer;
+            let mut candidates = 0usize;
+            if !use_pages {
+                let tids = candidates_in_view(exec, &query, &view);
+                candidates = tids.len();
+                let mut i = 0;
+                while i < tids.len() {
+                    let block = tids[i].block;
+                    let mut end = i + 1;
+                    while end < tids.len() && tids[end].block == block {
+                        end += 1;
+                    }
+                    count += count_page(
+                        node,
+                        exec,
+                        block,
+                        tids[i..end].iter().map(|tid| tid.offset),
+                        end - i,
+                        &mut vmbuf,
+                    );
+                    i = end;
+                }
+            } else {
+                let mut sources: Vec<Box<dyn segment::pages::Cursor>> = Vec::new();
+                for ((source, dead), label) in view.sources.iter().zip(&view.labels) {
+                    pgrx::check_for_interrupts!();
+                    let planned =
+                        tinql::runtime::plan::page_plan(&query, source, &Limits::default())
+                            .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
+                    exec.recheck |= !planned.exact;
+                    let mut cursor = planned.cursor;
+                    if let Some(dead) = dead {
+                        let dead = crate::storage::codec_in(
+                            segment::postings::Postings::parse(dead).and_then(|p| p.pages()),
+                            &format!("{label} dead list"),
+                        );
+                        cursor = Box::new(crate::storage::codec_in(
+                            segment::pages::Difference::new(cursor, dead),
+                            label,
+                        ));
+                    }
+                    sources.push(cursor);
+                }
+                use segment::pages::Cursor as _;
+                // Union deduplicates across segments before visibility checks, with
+                // one offset mask per source rather than a sorted vector of TIDs.
+                let mut pages = segment::pages::Union::new(sources);
+                while let Some(page) = pages.current() {
+                    let size = page.offsets.count() as usize;
+                    candidates += size;
+                    count += count_page(
+                        node,
+                        exec,
+                        page.block,
+                        page.offsets.iter(),
+                        size,
+                        &mut vmbuf,
+                    );
+                    crate::storage::codec_in(pages.advance(), "count page stream");
+                }
+            }
+            exec.candidates = Some(candidates);
             if vmbuf != pg_sys::InvalidBuffer as pg_sys::Buffer {
                 pg_sys::ReleaseBuffer(vmbuf);
             }
@@ -1384,6 +1473,17 @@ unsafe extern "C-unwind" fn explain(
                     es,
                 );
                 return;
+            }
+            if let Some(pages) = exec.page_masks {
+                pg_sys::ExplainPropertyText(
+                    c"Count Strategy".as_ptr(),
+                    if pages {
+                        c"page bitmaps".as_ptr()
+                    } else {
+                        c"scalar".as_ptr()
+                    },
+                    es,
+                );
             }
             if let Some(candidates) = exec.candidates {
                 pg_sys::ExplainPropertyInteger(

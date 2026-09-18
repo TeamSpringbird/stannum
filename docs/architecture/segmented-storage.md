@@ -184,10 +184,25 @@ custom scan nodes:
 
 - **Text Search Scan** checks tuple visibility and any remaining SQL filters.
   For supported ranked queries it scores candidates and selects the top results.
-- **Count** skips heap reads on all-visible pages when the search predicate is
-  exact and is the query's only restriction.
+- **Count** uses page masks when a Boolean term has grouped postings averaging at
+  least four tuples per occupied page; purely sparse or positional plans keep
+  the scalar path. The bulk path streams exact offset masks in heap-page order.
+  Dense grouped postings decode directly into five machine words; Boolean AND/OR/NOT combine
+  those masks, segment dead lists are subtracted, and a streaming union removes
+  cross-segment duplicates. All-visible pages use popcount when the predicate
+  is exact and is the query's only restriction. Other pages retain tuple-by-tuple
+  visibility checks and, where required, text rechecks. Within bulk plans,
+  sparse postings and positional subexpressions adapt the existing scalar
+  cursors into page masks. The bulk path does not build or sort a vector of
+  every candidate CTID.
 
-`EXPLAIN ANALYZE` shows the chosen path. `SET stannum.enable_custom_scan = off`
+The page path currently applies to the custom Count node. Ordinary search,
+ranked retrieval, and PostgreSQL bitmap scans retain their existing cursors.
+The word operations are portable Rust; no architecture-specific SIMD dispatch
+or on-disk format change is required.
+
+`EXPLAIN ANALYZE` shows the chosen path and, for executed custom counts,
+`Count Strategy: page bitmaps` or `scalar`. `SET stannum.enable_custom_scan = off`
 selects the bitmap path for comparison.
 
 ### Per-backend caches

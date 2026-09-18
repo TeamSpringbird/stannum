@@ -70,6 +70,112 @@ pub fn plan<'a, I: Index + ?Sized>(
     Planner { segment, limits }.query(query)
 }
 
+/// Prefer bulk execution when a Boolean term has dense grouped postings. Purely
+/// sparse and positional plans retain scalar execution: building a five-word
+/// mask for each isolated tuple costs more than walking its existing cursor.
+pub fn prefers_pages<I: Index + ?Sized>(query: &Query, segment: &I) -> Result<bool> {
+    Ok(match query {
+        Query::Term(term) => segment
+            .term(term)?
+            .map(|t| t.postings().and_then(|p| p.prefers_pages()))
+            .transpose()?
+            .unwrap_or(false),
+        Query::And(a, b) | Query::Or(a, b) => {
+            prefers_pages(a, segment)? || prefers_pages(b, segment)?
+        }
+        Query::Conjunction(children)
+        | Query::Disjunction { min: 1, children }
+        | Query::AtLeast { min: 1, children } => {
+            let mut any = false;
+            for child in children {
+                if prefers_pages(child, segment)? {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        }
+        Query::Boost { inner, .. } => prefers_pages(inner, segment)?,
+        _ => false,
+    })
+}
+
+/// A page-oriented plan. Exactness has the same meaning as [`Plan`].
+pub struct PagePlan<'a> {
+    pub cursor: Box<dyn segment::pages::Cursor + 'a>,
+    pub exact: bool,
+}
+
+/// Boolean nodes combine offset masks; positional and capped expansion nodes
+/// retain the existing evaluator and its conservative exactness contract.
+pub fn page_plan<'a, I: Index + ?Sized>(
+    query: &Query,
+    segment: &'a I,
+    limits: &Limits,
+) -> Result<PagePlan<'a>> {
+    use segment::pages;
+    let scalar = || -> Result<PagePlan<'a>> {
+        let plan = plan(query, segment, limits)?;
+        Ok(PagePlan {
+            cursor: Box::new(pages::Rows::new(plan.cursor)?),
+            exact: plan.exact,
+        })
+    };
+    let children = |queries: Vec<&Query>, intersection: bool| -> Result<PagePlan<'a>> {
+        let plans = queries
+            .into_iter()
+            .map(|q| page_plan(q, segment, limits))
+            .collect::<Result<Vec<_>>>()?;
+        let exact = plans.iter().all(|p| p.exact);
+        let cursors = plans.into_iter().map(|p| p.cursor).collect();
+        let cursor: Box<dyn pages::Cursor> = if intersection {
+            Box::new(pages::Intersection::new(cursors)?)
+        } else {
+            Box::new(pages::Union::new(cursors))
+        };
+        Ok(PagePlan { cursor, exact })
+    };
+    match query {
+        Query::Term(term) => match segment.term(term)? {
+            Some(term) => Ok(PagePlan {
+                cursor: term.postings()?.pages()?,
+                exact: true,
+            }),
+            None => Ok(PagePlan {
+                cursor: Box::new(pages::Rows::new(Empty)?),
+                exact: true,
+            }),
+        },
+        Query::And(a, b) => children(vec![a, b], true),
+        Query::Or(a, b) => children(vec![a, b], false),
+        Query::Conjunction(items) if !items.is_empty() => children(items.iter().collect(), true),
+        Query::Disjunction {
+            min: 1,
+            children: items,
+        }
+        | Query::AtLeast {
+            min: 1,
+            children: items,
+        } => children(items.iter().collect(), false),
+        Query::Not(inner) => {
+            let inner = page_plan(inner, segment, limits)?;
+            if !inner.exact {
+                return scalar();
+            }
+            let universe = Planner { segment, limits }.universe()?;
+            Ok(PagePlan {
+                cursor: Box::new(pages::Difference::new(
+                    pages::Rows::new(universe.cursor)?,
+                    inner.cursor,
+                )?),
+                exact: true,
+            })
+        }
+        Query::Boost { inner, .. } => page_plan(inner, segment, limits),
+        _ => scalar(),
+    }
+}
+
 /// Drains a plan, returning the documents and whether they are exact.
 pub fn matches<I: Index + ?Sized>(
     query: &Query,
@@ -706,11 +812,29 @@ mod tests {
             .collect()
     }
 
+    fn page_matches(segment: &impl Index, query: &Query, limits: &Limits) -> (Vec<Tid>, bool) {
+        let mut plan = page_plan(query, segment, limits).unwrap();
+        let mut found = Vec::new();
+        while let Some(page) = plan.cursor.current() {
+            found.extend(page.offsets.iter().map(|offset| Tid {
+                block: page.block,
+                offset,
+            }));
+            plan.cursor.advance().unwrap();
+        }
+        (found, plan.exact)
+    }
+
     fn check(docs: &[&str], query_text: &str, expect_exact: bool) {
         let bytes = build(docs);
         let segment = Segment::parse(&bytes).unwrap();
-        let query = parse_tinql_to_query_default(query_text).unwrap();
+        let query = parse_tinql_to_query_default(query_text)
+            .unwrap_or_else(|error| panic!("{query_text}: {error}"));
         let (found, exact) = matches(&query, &segment, &Limits::default()).unwrap();
+        assert_eq!(
+            page_matches(&segment, &query, &Limits::default()),
+            (found.clone(), exact)
+        );
         let expected = reference(docs, &query);
         assert_eq!(exact, expect_exact, "{query_text}");
         if exact {
@@ -719,6 +843,39 @@ mod tests {
             for tid in &expected {
                 assert!(found.contains(tid), "{query_text}: missing {tid:?}");
             }
+        }
+    }
+
+    #[test]
+    fn dense_page_plans_agree_with_reference_for_nested_boolean_and_positional_queries() {
+        let docs: Vec<_> = (0..2000)
+            .map(|i| match i % 7 {
+                0 => "",
+                1 => "common red blue",
+                2 => "common blue red",
+                3 => "common green",
+                4 => "rare green",
+                5 => "red",
+                _ => "common",
+            })
+            .collect();
+        for query in [
+            "common",
+            "missing",
+            "common AND red",
+            "common OR rare",
+            "(common OR rare) AND (red OR green)",
+            "common AND NOT red",
+            "* AND NOT common",
+            "* AND NOT missing",
+            "*",
+            "common OR common",
+            "red AND blue",
+            "common AND \"red blue\"",
+            "common OR \"red blue\"",
+            "red NEAR/2 blue",
+        ] {
+            check(&docs, query, true);
         }
     }
 
@@ -908,6 +1065,7 @@ mod tests {
                 let segment = Segment::parse(&bytes).unwrap();
                 let limits = Limits { max_expansion: cap };
                 let (found, exact) = matches(&query, &segment, &limits).unwrap();
+                prop_assert_eq!(page_matches(&segment, &query, &limits), (found.clone(), exact));
                 let expected = reference(&docs, &query);
                 if exact {
                     prop_assert_eq!(&found, &expected, "{}", query_text);

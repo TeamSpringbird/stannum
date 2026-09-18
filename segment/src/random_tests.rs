@@ -426,6 +426,12 @@ proptest! {
     #[test]
     fn decoders_never_panic_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
         let _ = Postings::parse(&bytes).and_then(|p| p.to_vec());
+        let _ = Postings::parse(&bytes).and_then(|p| {
+            let mut pages = p.pages()?;
+            pages.seek(100)?;
+            while pages.current().is_some() { pages.advance()?; }
+            Ok(())
+        });
         let _ = Postings::parse(&bytes).and_then(|p| p.cursor()?.block_bounds());
         let _ = Postings::parse(&bytes).and_then(|p| {
             let mut cursor = p.cursor()?;
