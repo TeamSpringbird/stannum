@@ -27,6 +27,10 @@ class CampaignTests(unittest.TestCase):
         firsts = [next(j["engine"] for j in jobs if j["repetition"] == r and j["profile"] == "count") for r in range(1, 5)]
         self.assertEqual(len(set(firsts)), 4)
 
+    def test_mutation_profile_is_schedulable_without_gin(self):
+        jobs = campaign.schedule(["stannum", "gin"], ["mutation"], 2)
+        self.assertEqual([(j["engine"], j["profile"]) for j in jobs], [("stannum", "mutation")] * 2)
+
     def test_pressure_excludes_startup_counters_and_preserves_oom(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -53,7 +53,9 @@ The default server budget is four CPUs and 4 GiB memory, with durability and
 autovacuum enabled. Clients run outside that budget. Treat these runs as warm-cache
 measurements. The writer changes a reserved suffix while preserving expected
 query memberships; this does not exercise changing match sets or insert/delete
-workloads.
+workloads. The [mutation profile](harness.md#sustained-mutation-profile)
+(`--profiles mutation`) covers those, with scheduled VACUUM and continuous
+oracle checks.
 
 ## Read the results
 

@@ -83,7 +83,9 @@ The next steps are:
    per workload, alternating execution order and retaining failed runs.
 2. Establish a baseline for the current Stannum build before optimizing it.
 3. Extend workloads to inserts, deletes, changing match sets, and sustained
-   maintenance; report tail latency and correctness alongside throughput.
+   maintenance; report tail latency and correctness alongside throughput. The
+   harness now has a [mutation profile](harness.md#sustained-mutation-profile)
+   for this; its results are not yet part of the campaign summary.
 4. Compare with TIN when both engines can be measured in an equivalent environment
    under the same protocol.
 

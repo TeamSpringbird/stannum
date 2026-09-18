@@ -115,7 +115,7 @@ def aggregate(root):
             lines.append(f"| {engine} / {profile} | {len(runs)}/{expected} | incomplete | — | — | — | — |")
             continue
         reads = describe([sum(q["completed_per_second"] for q in s["reader"]["queries"].values()) for _, s in runs])
-        writes = describe([s.get("writer", {}).get("queries", {}).get("update", {}).get("completed_per_second", 0) for _, s in runs])
+        writes = describe([sum(q["completed_per_second"] for q in s.get("writer", {}).get("queries", {}).values()) for _, s in runs])
         queries = {}
         for name in reference["query_names"]:
             queries[name] = {}
@@ -167,7 +167,7 @@ def execute(args):
     root.mkdir(parents=True, exist_ok=False)
     protocol = root / "protocol"
     protocol.mkdir()
-    for name in ("run.py", "campaign.py", "dataset.py", "Dockerfile", "Dockerfile.dockerignore"):
+    for name in ("run.py", "mutation.py", "campaign.py", "dataset.py", "Dockerfile", "Dockerfile.dockerignore"):
         shutil.copy2(Path(__file__).resolve().parent / name, protocol / name)
     source = json.loads(Path(args.source_manifest).read_text()) if args.source_manifest else bench.provenance(root)
     bench.save(root / "source.json", source)
@@ -272,7 +272,7 @@ def main():
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--label", default="local-baseline")
     parser.add_argument("--engines", nargs="+", choices=bench.ENGINES, default=["stannum", "gin", "paradedb", "pg_textsearch"])
-    parser.add_argument("--profiles", nargs="+", choices=("count", "mixed", "ranked"), default=["count", "mixed"])
+    parser.add_argument("--profiles", nargs="+", choices=bench.PROFILES, default=["count", "mixed"])
     parser.add_argument("--repetitions", type=bench.positive, default=5)
     parser.add_argument("--source-manifest", help=argparse.SUPPRESS)
     parser.add_argument("--dataset", help="Verified dataset directory from dataset.py")

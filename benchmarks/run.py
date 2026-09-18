@@ -8,6 +8,7 @@ import dataset
 import hashlib
 import json
 import math
+import mutation
 import os
 from pathlib import Path
 import platform
@@ -18,6 +19,8 @@ import time
 ROOT = Path(os.environ.get("STANNUM_BENCH_ROOT", Path(__file__).resolve().parents[1]))
 # "tin" targets PlanetScale TIN; "stannum" targets this extension under its own schema.
 ENGINES = ("stannum", "tin", "gin", "paradedb", "pg_textsearch")
+# "mutation" runs the mixed read shapes under inserts, deletes and match-changing updates.
+PROFILES = ("count", "ranked", "mixed", "mutation")
 SETTINGS_SQL = """SELECT json_object_agg(name, setting) FROM pg_settings
 WHERE name = ANY(ARRAY['server_version','block_size','shared_buffers','work_mem',
  'maintenance_work_mem','effective_cache_size','max_connections','max_worker_processes',
@@ -91,17 +94,22 @@ def workload(engine, profile, cases=CASES):
         if profile != "ranked":
             queries.append((name + "_count", f"SELECT count(*) FROM documents WHERE {where};"))
         if profile != "count":
-            score = {
-                "stannum": "stannum.full_score(ctid)",
-                "tin": "tin.full_score(ctid)",
-                "paradedb": "pdb.score(id)",
-                "pg_textsearch": f"-(body <@> '{case[3]}')",
-            }[engine]
-            # No secondary sort: ties are deliberately unordered in the measured workload.
-            order = f"body <@> '{case[3]}' ASC" if engine == "pg_textsearch" else "score DESC"
+            score, order = ranking(engine, case)
             queries.append((name + "_ranked", f"SELECT id, {score} AS score FROM documents "
                             f"WHERE {where} ORDER BY {order} LIMIT 10;"))
     return queries
+
+
+def ranking(engine, case):
+    score = {
+        "stannum": "stannum.full_score(ctid)",
+        "tin": "tin.full_score(ctid)",
+        "paradedb": "pdb.score(id)",
+        "pg_textsearch": f"-(body <@> '{case[3]}')",
+    }[engine]
+    # No secondary sort: ties are deliberately unordered in the measured workload.
+    order = f"body <@> '{case[3]}' ASC" if engine == "pg_textsearch" else "score DESC"
+    return score, order
 
 
 def fixture_sql(rows):
@@ -254,14 +262,20 @@ def run(args):
     if not args.database.startswith("stannum_bench_"):
         raise ValueError("Use a dedicated database named stannum_bench_*; create it before running")
     env["PGOPTIONS"] = env.get("PGOPTIONS", "") + f" -c default_text_search_config=simple -c statement_timeout={args.statement_timeout_ms}"
+    mutating = args.profile == "mutation"
+    for setting in (args.set if mutating else []):
+        env["PGOPTIONS"] += " -c " + setting
     queries = workload(args.engine, args.profile, cases)
+    checks = [(case[0], mutation.check_sql(case, predicate(args.engine, case), *ranking(args.engine, case))) for case in cases]
     settings = sql_json(SETTINGS_SQL, env)
     manifest = {
         "schema_version": 1, "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "status": "running", "engine": args.engine, "label": args.label,
         "environment": args.environment, "build_id": args.build_id,
         "artifact_sha256": digest(Path(args.artifact).read_bytes()) if args.artifact else None,
-        "source": json.loads(Path(args.source_manifest).read_text()) if args.source_manifest else provenance(out), "harness_sha256": digest(Path(__file__).read_bytes() + Path(dataset.__file__).read_bytes()),
+        "source": json.loads(Path(args.source_manifest).read_text()) if args.source_manifest else provenance(out),
+        "harness_sha256": digest(Path(__file__).read_bytes() + Path(dataset.__file__).read_bytes()
+                                 + (Path(mutation.__file__).read_bytes() if mutating else b"")),
         "host": {"platform": platform.platform(), "machine": platform.machine(), "cpus": os.cpu_count()},
         "server_version": psql("SELECT version();", env), "settings": settings,
         "pgbench_version": command(["pgbench", "--version"]),
@@ -272,8 +286,19 @@ def run(args):
         "cache_policy": "warm read workload; no OS cache eviction", "load_model": "closed-loop readers; rate-scheduled single writer",
         "execution_context": json.loads(Path(args.context).read_text()) if args.context else None,
     }
+    if mutating:
+        mix = mutation.parse_mix(args.mix)
+        kinds = [kind for kind in mutation.KINDS if mix[kind]]
+        manifest["config"]["mutation"] = {
+            "mix": mix, "settings": args.set, "check_interval": args.check_interval,
+            "vacuum_interval": args.vacuum_interval, "sample_interval": args.sample_interval,
+            "bucket_seconds": args.bucket_seconds, "oracle": "regex sequential scan in one repeatable-read snapshot"}
+        manifest["load_model"] = ("closed-loop readers; rate-scheduled single writer mixing inserts, deletes and "
+                                  "match-changing updates; scheduled VACUUM; periodic oracle checks")
+        manifest["check_sql_sha256"] = digest(canonical(checks))
     save(out / "manifest.json", manifest)
     children = []
+    maintenance = None
     try:
         extension = {"stannum": "stannum", "tin": "tin", "paradedb": "pg_search", "pg_textsearch": "pg_textsearch"}.get(args.engine)
         if extension:
@@ -307,6 +332,19 @@ def run(args):
         manifest["index_build_seconds"] = time.monotonic() - start
         manifest["index_definition"] = psql("SELECT pg_get_indexdef('search_idx'::regclass);", env)
         psql("VACUUM ANALYZE documents;", setup_env)
+        freespace = False
+        if mutating:
+            psql(mutation.pool_sql(args.rows), setup_env)
+            probe = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-c",
+                                    "CREATE EXTENSION IF NOT EXISTS pg_freespacemap;"], env=setup_env, capture_output=True)
+            freespace = probe.returncode == 0
+            manifest["config"]["mutation"]["fsm_sampled"] = freespace
+            for name, sql in checks:
+                (out / f"check-{name}.sql").write_text(sql + "\n")
+                plan = sql_json("SET enable_seqscan = off; EXPLAIN (FORMAT JSON) " + sql, env)
+                save(out / f"plan-check-{name}.json", plan)
+                if not mutation.oracle_plan_is_independent(plan):
+                    raise RuntimeError(f"Oracle check for {name} does not separate index and sequential scans; see plan-check-{name}.json")
         save(out / "correctness-before.json", validate(args.engine, args.rows, env, corpus))
         if args.profile != "count":
             save(out / "ranked-before.json", validate_ranked(args.engine, args.rows, env, corpus))
@@ -319,7 +357,19 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
  THEN left(body, length(body)-8) || 'mutableb'
  ELSE left(body, length(body)-8) || 'mutablea' END WHERE id = :id;
 """
-        (out / "writer.sql").write_text(writer_sql)
+        writer_files = ["-f", str(out / "writer.sql")]
+        writer_names = ["update"]
+        if mutating:
+            # Deletes and updates may probe ids inserted during the window.
+            ceiling = args.rows + args.write_rate * args.seconds * mix["insert"] // sum(mix.values())
+            scripts = mutation.writer_scripts(args.rows, cases, ceiling)
+            writer_files, writer_names = [], kinds
+            for kind in kinds:
+                (out / f"writer-{kind}.sql").write_text(scripts[kind])
+                writer_files += ["-f", f"{out / f'writer-{kind}.sql'}@{mix[kind]}"]
+            manifest["writer_sql_sha256"] = digest(canonical([scripts[kind] for kind in kinds]))
+        else:
+            (out / "writer.sql").write_text(writer_sql)
         base = ["pgbench", "-n", "-M", "simple", "--random-seed", str(args.seed)]
         reader = base + ["-c", str(args.clients), "-j", str(min(args.clients, 4))]
         for i in range(len(queries)):
@@ -330,12 +380,19 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
             save(out / "cgroup-before.json", container_counters(args.container))
         jobs = [("reader", reader + ["-T", str(args.seconds), "-l", "--log-prefix", str(out / "reader-log")])]
         if args.write_rate:
-            jobs.insert(0, ("writer", base + ["-c", "1", "-j", "1", "-f", str(out / "writer.sql"),
+            jobs.insert(0, ("writer", base + ["-c", "1", "-j", "1", *writer_files,
                          "-T", str(args.seconds), "-R", str(args.write_rate), "-l", "--log-prefix", str(out / "writer-log")]))
         starts = {}
         handles = []
         manifest["traffic_started_at"] = {}
         manifest["traffic_finished_at"] = {}
+        if mutating:
+            check_env = dict(env, PGOPTIONS=env["PGOPTIONS"] + " -c statement_timeout=0")
+            maintenance = mutation.Maintenance(psql, sql_json, env, check_env, args.engine, checks, freespace, out,
+                                               args.sample_interval, args.vacuum_interval, args.check_interval)
+            manifest["traffic_origin_epoch"] = time.time()
+            save(out / "manifest.json", manifest)
+            maintenance.start(manifest["traffic_origin_epoch"])
         for name, cmd in jobs:
             handle = (out / f"{name}.txt").open("w")
             handles.append(handle)
@@ -351,23 +408,41 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
                     elapsed = time.monotonic() - starts[name]
                     if proc.returncode:
                         raise RuntimeError(f"{name} exited {proc.returncode}; see {name}.txt")
-                    names = [q[0] for q in queries] if name == "reader" else ["update"]
+                    names = [q[0] for q in queries] if name == "reader" else writer_names
                     summary[name] = summarize_logs(out.glob(f"{name}-log.*"), names, elapsed)
                     del pending[name]
+            if maintenance and maintenance.failures:
+                raise RuntimeError("Maintenance thread failed: " + json.dumps(maintenance.failures))
             if pending:
                 time.sleep(.05)
         for handle in handles:
             handle.close()
+        if maintenance:
+            maintenance.finish()
+            save_maintenance(out, maintenance)
+            if maintenance.failures:
+                raise RuntimeError("Maintenance thread failed: " + json.dumps(maintenance.failures))
+            summary["maintenance"] = {"samples": len(maintenance.samples), "vacuums": len(maintenance.vacuums),
+                                      "checks": len(maintenance.checks), "reclaim": mutation.reclaim_summary(maintenance.vacuums)}
         save(out / "summary.json", summary)
         save(out / "after.json", snapshot(env))
         if args.container:
             save(out / "cgroup-after.json", container_counters(args.container))
-        save(out / "correctness-after.json", validate(args.engine, args.rows, env, corpus))
-        if args.profile != "count":
-            save(out / "ranked-after.json", validate_ranked(args.engine, args.rows, env, corpus))
-        if any(s["failures"] for s in summary.values()):
+        if mutating:
+            # Match sets drifted by design; the oracle, not the fixture's expected sets, is the reference.
+            save(out / "correctness-after.json", mutation.check_round(psql, check_env, checks))
+            buckets = timeline(out, args.bucket_seconds)
+            summary["worst_mutations"] = mutation.worst_mutations(buckets, kinds)
+            save(out / "summary.json", summary)
+            print((out / "timeline.txt").read_text())
+        else:
+            save(out / "correctness-after.json", validate(args.engine, args.rows, env, corpus))
+            if args.profile != "count":
+                save(out / "ranked-after.json", validate_ranked(args.engine, args.rows, env, corpus))
+        traffic = [summary[name] for name in ("reader", "writer") if name in summary]
+        if any(s["failures"] for s in traffic):
             raise RuntimeError("Transactions failed/skipped; run retained but not comparable")
-        if any(q["completed"] == 0 for s in summary.values() for q in s["queries"].values()):
+        if any(q["completed"] == 0 for s in traffic for q in s["queries"].values()):
             raise RuntimeError("At least one workload had no completed transactions; lengthen the run")
         manifest["status"] = "complete"
     except BaseException as error:
@@ -375,6 +450,9 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
             if proc.poll() is None:
                 proc.terminate()
                 proc.wait()
+        if maintenance:
+            maintenance.finish()
+            save_maintenance(out, maintenance)
         manifest["status"] = "failed"
         manifest["error"] = type(error).__name__
         raise
@@ -382,6 +460,32 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
         manifest["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         save(out / "manifest.json", manifest)
     print(out)
+
+
+def save_maintenance(out, maintenance):
+    save(out / "samples.json", maintenance.samples)
+    save(out / "vacuums.json", maintenance.vacuums)
+    save(out / "checks.json", maintenance.checks)
+
+
+def timeline(out, bucket_seconds):
+    """Bucketed reader/writer latency with layout samples and events; writes timeline.json/.txt."""
+    manifest = json.loads((out / "manifest.json").read_text())
+    kinds = [k for k in mutation.KINDS if manifest["config"]["mutation"]["mix"][k]]
+    origin = manifest["traffic_origin_epoch"]
+    buckets = mutation.bucket_logs(sorted(out.glob("reader-log.*")), manifest["query_names"], bucket_seconds, origin)
+    by_number = {b["bucket"]: b for b in buckets}
+    for bucket in mutation.bucket_logs(sorted(out.glob("writer-log.*")), kinds, bucket_seconds, origin):
+        target = by_number.setdefault(bucket["bucket"], {"bucket": bucket["bucket"], "start_seconds": bucket["start_seconds"],
+                                                         "queries": {}, "shapes": {}, "schedule_lag_max_ms": None})
+        target["queries"].update(bucket["queries"])
+        target["schedule_lag_max_ms"] = bucket["schedule_lag_max_ms"]
+    buckets = [by_number[n] for n in sorted(by_number)]
+    load = lambda name: json.loads((out / name).read_text()) if (out / name).exists() else []
+    mutation.annotate(buckets, bucket_seconds, load("samples.json"), load("vacuums.json"), load("checks.json"))
+    save(out / "timeline.json", {"bucket_seconds": bucket_seconds, "buckets": buckets})
+    (out / "timeline.txt").write_text(mutation.render(buckets, kinds, bucket_seconds))
+    return buckets
 
 
 def comparison_keys(cross_engine=False):
@@ -420,9 +524,10 @@ def compare(args):
         print(f"{name},{x},{y},{x/y if x and y else ''},{qa['p95_ms']},{qb['p95_ms']},"
               f"{qa['completed_per_second']},{qb['completed_per_second']}")
     if a["config"]["write_rate"]:
-        qa, qb = [s["writer"]["queries"]["update"] for s in summaries]
-        print(f"# Achieved writes/s: {qa['completed_per_second']:.3f} -> {qb['completed_per_second']:.3f}; "
-              f"writer p95 ms: {qa['p95_ms']} -> {qb['p95_ms']}")
+        for kind in summaries[0]["writer"]["queries"]:
+            qa, qb = [s["writer"]["queries"][kind] for s in summaries]
+            print(f"# Achieved {kind}s/s: {qa['completed_per_second']:.3f} -> {qb['completed_per_second']:.3f}; "
+                  f"writer p95 ms: {qa['p95_ms']} -> {qb['p95_ms']}")
     print("# Descriptive single-run comparison, not statistical significance. Inspect writer throughput and tails.")
 
 
@@ -435,7 +540,7 @@ def history(args):
             continue
         s = json.loads((path.parent / "summary.json").read_text())
         cohort = digest(canonical({k: m.get(k) for k in comparison_keys()}))[:16]
-        writes = s.get("writer", {}).get("queries", {}).get("update", {}).get("completed_per_second", 0)
+        writes = sum(q["completed_per_second"] for q in s.get("writer", {}).get("queries", {}).values())
         for name, q in s["reader"]["queries"].items():
             writer.writerow([m["started_at"], m["source"]["commit"], m["source"]["source_sha256"],
                              m["source"]["source_dirty"], m["label"], m["engine"], m["environment"], cohort,
@@ -462,7 +567,7 @@ def main():
     r.add_argument("--context", help="Campaign resource/protocol JSON to preserve and compare")
     r.add_argument("--container", help="Local Docker container for timed-phase cgroup snapshots")
     r.add_argument("--label", default="")
-    r.add_argument("--profile", choices=("count", "ranked", "mixed"), default="mixed")
+    r.add_argument("--profile", choices=PROFILES, default="mixed")
     r.add_argument("--source-manifest", help=argparse.SUPPRESS)
     r.add_argument("--dataset", help="Verified dataset directory from dataset.py")
     r.add_argument("--statement-timeout-ms", type=positive, default=60000)
@@ -472,19 +577,41 @@ def main():
     r.add_argument("--clients", type=positive, default=2)
     r.add_argument("--write-rate", type=int, default=20)
     r.add_argument("--seed", type=positive, default=1729)
+    m = r.add_argument_group("mutation profile")
+    m.add_argument("--mix", default="insert=1,delete=1,update=1", help="Writer weights per mutation kind")
+    m.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="Session setting for every connection, e.g. stannum.write_buffer_docs=256")
+    m.add_argument("--check-interval", type=positive, default=30, help="Seconds between oracle checks of every query")
+    m.add_argument("--vacuum-interval", type=int, default=60, help="Seconds between VACUUM (INDEX_CLEANUP ON); 0 disables")
+    m.add_argument("--sample-interval", type=positive, default=5, help="Seconds between index layout samples")
+    m.add_argument("--bucket-seconds", type=positive, default=10, help="Latency bucket width in the timeline")
     c = sub.add_parser("compare")
     c.add_argument("before")
     c.add_argument("after")
     c.add_argument("--cross-engine", action="store_true")
     h = sub.add_parser("history")
     h.add_argument("directory")
+    t = sub.add_parser("timeline", help="Rebucket a mutation run's logs, samples and events")
+    t.add_argument("directory")
+    t.add_argument("--bucket-seconds", type=positive, default=10)
     args = parser.parse_args()
     if args.action == "run":
         if args.write_rate < 0:
             parser.error("--write-rate must be nonnegative")
+        if args.profile == "mutation":
+            if args.write_rate == 0 or args.vacuum_interval < 0:
+                parser.error("the mutation profile needs a positive --write-rate and a nonnegative --vacuum-interval")
+            if args.engine == "gin":
+                parser.error("GIN does not implement BM25; the mutation profile runs ranked shapes")
+            mutation.parse_mix(args.mix)
+            if any("=" not in setting or not setting.split("=", 1)[0] for setting in args.set):
+                parser.error("--set expects NAME=VALUE")
+    if args.action == "run":
         run(args)
     elif args.action == "compare":
         compare(args)
+    elif args.action == "timeline":
+        timeline(Path(args.directory).resolve(), args.bucket_seconds)
+        print((Path(args.directory) / "timeline.txt").read_text())
     else:
         history(args)
 
