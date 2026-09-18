@@ -240,11 +240,21 @@ visibility horizon makes reuse safe for readers with older snapshots. VACUUM
 records dead tuples, rewrites sufficiently dead segments, and reclaims pages.
 `stannum.segment_info('index_name')` exposes the segment layout for inspection.
 
-The page and segment format signatures are `LDP2` and `LSG2`. Their definitions
-live in `postgres/src/storage/layout.rs` and the `segment` crate. `LSG2` adds
-per-block score bounds to term postings and fixed-width payload skip offsets;
-`LSG1` segments are still read, and ranked scans over them score every
-candidate. Unsupported old formats require rebuilding the index.
+The page and segment format signatures are `LDP2` and `LSG3`. Their definitions
+live in `postgres/src/storage/layout.rs` and the `segment` crate. `LSG2` added
+per-block score bounds to term postings and fixed-width payload skip offsets.
+`LSG3` keeps the same bounds in less space: a term whose postings fit one
+block (128 postings, the vast majority of a vocabulary) stores a single term
+bound without the per-block last location and byte offset, the payload skip
+table omits the always-zero slot for entry 0, and dictionary entries store
+each term's extents as gaps from the previous term's (zero, since streams
+are laid out back to back) with `df` and `max_tf_bucket` packed into one
+varint. `LSG2` and `LSG1` segments are still read; ranked scans over `LSG2`
+prune exactly as over `LSG3`, and over `LSG1` score every candidate.
+Unsupported old formats require rebuilding the index.
+`script/dump-segments.py` writes an index's segment blobs to files and
+`cargo run -p segment --release --example breakdown -- --reencode <blobs>`
+reports where their bytes go, by section and by term document frequency.
 
 ## Checking an index
 
