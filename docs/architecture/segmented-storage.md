@@ -185,16 +185,16 @@ custom scan nodes:
 - **Text Search Scan** checks tuple visibility and any remaining SQL filters.
   For supported ranked queries it scores candidates and selects the top results.
 - **Count** uses page masks when a Boolean term has grouped postings averaging at
-  least four tuples per occupied page; purely
-  sparse or positional plans keep the scalar path. The bulk path streams exact
-  offset masks in heap-page order. Dense grouped
-  postings decode directly into five machine words; Boolean AND/OR/NOT combine
+  least four tuples per occupied page; purely sparse or positional plans keep
+  the scalar path. The bulk path streams exact offset masks in heap-page order.
+  Dense grouped postings decode directly into five machine words; Boolean AND/OR/NOT combine
   those masks, segment dead lists are subtracted, and a streaming union removes
   cross-segment duplicates. All-visible pages use popcount when the predicate
   is exact and is the query's only restriction. Other pages retain tuple-by-tuple
-  visibility checks and, where required, text rechecks. Sparse postings and
-  positional queries adapt the existing scalar cursors into page masks. This
-  path does not build or sort a vector of every candidate CTID.
+  visibility checks and, where required, text rechecks. Within bulk plans,
+  sparse postings and positional subexpressions adapt the existing scalar
+  cursors into page masks. The bulk path does not build or sort a vector of
+  every candidate CTID.
 
 The page path currently applies to the custom Count node. Ordinary search,
 ranked retrieval, and PostgreSQL bitmap scans retain their existing cursors.
