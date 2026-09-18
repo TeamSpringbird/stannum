@@ -1,5 +1,7 @@
 # Boolean Operators
 
+Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).
+
 Boolean operators combine expressions to determine which documents match.
 
 ## AND

@@ -1,5 +1,7 @@
 # Alternatives, AT LEAST & ALL OF
 
+Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).
+
 ## Alternatives
 
 Square brackets enclose a whitespace-separated list of expressions. A document

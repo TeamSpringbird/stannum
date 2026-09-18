@@ -1,5 +1,7 @@
 # Operator Precedence
 
+Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).
+
 When a query uses multiple operators without parentheses, the language has
 rules for grouping their operands. Operators lower in the table bind more
 tightly than operators near the top.

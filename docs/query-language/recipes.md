@@ -1,5 +1,7 @@
 # Recipes
 
+Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).
+
 These examples combine TinQL operators for common search tasks.
 
 ## Find a topic in the opening section

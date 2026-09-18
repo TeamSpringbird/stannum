@@ -1,8 +1,0 @@
-[book]
-authors = ["PlanetScale"]
-language = "en"
-src = "src"
-title = "Stannum: TINQL Query Language Guide"
-
-[output.html]
-default-theme = "light"

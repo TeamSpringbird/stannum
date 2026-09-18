@@ -4,36 +4,19 @@ Stannum is an experimental, open-source PostgreSQL search engine with Boolean an
 positional queries, BM25 ranking, and exact counts under concurrent writes. The
 index, query execution, scoring, and storage implementation live in this repository.
 
-We started from [PlanetScale Lead](https://github.com/planetscale/lead), a deliberately
-slow, correctness-oriented substitute for TIN. We are developing that foundation
-into a useful search engine: durable inverted indexes, stored ranking statistics,
-and PostgreSQL execution paths that avoid scanning and retokenizing the entire
-corpus for every query. Stannum is an independent fork, not PlanetScale TIN or a
-PlanetScale-supported product. The inherited code remains under AGPL-3.0; see
-[LICENSE](LICENSE).
+Stannum is an independent fork of [PlanetScale Lead](https://github.com/planetscale/lead),
+which provides a correctness-oriented substitute for PlanetScale TIN. We are
+building an indexed search engine on that foundation. The project uses the TINQL
+query language and retains the inherited [AGPL-3.0 license](LICENSE).
 
-**This is development software, not a production-ready database extension.** The
-first 100k-document measurements are encouraging, but short benchmarks and targeted
-correctness tests do not establish long-term reliability. Our next steps are
-repeated comparisons, sustained mutation and maintenance tests, and broader
-recovery testing. See [benchmark results and plan](docs/benchmarks/README.md) for evidence and limitations.
+**Stannum is development software.** Local 100k-document benchmarks show substantial
+progress over Lead, but reliability and broader compatibility are still being
+validated. See [results and next steps](docs/benchmarks/README.md).
 
-## What works today
-
-- TINQL terms, Boolean expressions, phrases, proximity, positional filters, and
-  expansion queries, with exact matching or a conservative recheck fallback.
-- Logged indexes with a mutable write buffer and immutable segments containing
-  dictionaries, tuple postings, positions, term frequencies, and document lengths.
-- Index-backed BM25 scoring, visibility-aware count scans, and top-k selection.
-- Inserts, updates, VACUUM, segment folding/merging, page reuse, and generic WAL.
-- Highlighting, tokenizer options, and `stannum.segment_info` for index inspection.
-
-The [storage and execution notes](docs/architecture/segmented-storage.md) describe the design and
-its current boundaries. Ranked queries still score all candidates before selecting
-the top k. Folding and merging can delay the inserting transaction; maintenance
-and reclamation need more testing. Standby/recovery reads and temporary or unlogged
-indexes use slower fallback paths. Nondefault tokenizer behavior can differ between
-an index scan and a sequential scan. These are active engineering gaps.
+It supports terms, Boolean queries, phrases, proximity, ranking, and highlighting.
+The [architecture guide](docs/architecture/segmented-storage.md) explains how the
+index works and lists known limitations, including tokenizer consistency,
+maintenance latency, and slower fallback paths.
 
 ## Build and try it
 
@@ -88,26 +71,12 @@ include `stannum.score`, `stannum.full_score`, `stannum.max_score`,
 use the `stannum.` prefix; for example, `SET stannum.enable_custom_scan = off`
 selects the bitmap path.
 
-TINQL remains the query language name, and the `tinql` crate implements that
-language. References to TIN in compatibility research and the `--engine tin`
-benchmark adapter refer to PlanetScale's actual extension. They do not identify
-Stannum builds. Sampled oracle fixtures compare match sets and score bits against
-TIN; this is evidence of compatibility on those fixtures, not full equivalence.
-
 Scoring and implicitly bound highlighting must appear at the same query level as
 the matching `==>` predicate. Explicit highlighting accepts its own query.
 
-### Moving from the pre-rename build
-
-This is a breaking package/SQL rename, not an `ALTER EXTENSION tin UPDATE` migration.
-Create Stannum in a fresh database, reload the data, and rebuild indexes with
-`USING stannum`. Update `tin.*` application calls and settings to `stannum.*`.
-Do not rename or replace an installed TIN library or reuse its indexes.
-
-The `==>` operator still lives in `pg_catalog` for compatibility. Stannum and TIN
-therefore need separate databases; distinct extension names alone do not make
-installation together in one database supported. Same-instance benchmarks can use
-one database per engine and alternate the measured traffic.
+Stannum and TIN need separate databases because both define the `==>` operator in
+`pg_catalog`. There is no in-place migration from TIN or older renamed builds:
+create a fresh database, reload the data, and rebuild indexes with `USING stannum`.
 
 ## Validate changes
 
@@ -121,20 +90,17 @@ python3 -m unittest discover -s benchmarks -p 'test_*.py'
 After installing the extension into the PostgreSQL distribution on `PATH`, run
 `python3 postgres/tests/postings_lifecycle.py` for an isolated temporary cluster's
 mutation, VACUUM, restart, and crash-recovery checks. It removes its own cluster
-when finished. Developers with access to the upstream private regression suite can
-use `TIN_PRIVATE_REPO=/path/to/full-tin script/run-private-regress pg18`; the copier
-translates extension names in generated fixtures without changing the upstream source.
+when finished.
 
 ## Learn more and contribute
 
-Start with the [documentation index](docs/README.md) for current guides and archived research.
+Start with the [documentation index](docs/README.md) for the current guides.
 
 - [Benchmarks, results, and the comparison plan](docs/benchmarks/README.md)
 - [Benchmark harness reference](docs/benchmarks/harness.md)
 - [Storage and query execution](docs/architecture/segmented-storage.md)
-- [TINQL guide](docs/query-language/src/SUMMARY.md)
+- [TINQL guide](docs/query-language/README.md)
 
-The query guide can be built with `mdbook build docs/query-language` using mdBook 0.5.2.
 Report issues in this repository with reproduction SQL, PostgreSQL version,
 expected results, and observed results. Preserve correctness evidence alongside
 performance changes; a faster query that changes the answer is not an improvement.

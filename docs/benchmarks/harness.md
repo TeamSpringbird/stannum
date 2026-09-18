@@ -1,212 +1,100 @@
-# Recording search performance
+# Benchmark tools
 
-For the project results and current plan, start with [benchmark results and plan](README.md).
-For the repeatable, containerized Mac Studio workflow, see
-[local campaigns](local.md). Benchmark execution and analysis are local-only.
+Start with [Run a local benchmark](local.md) for a complete campaign. This page
+explains the individual tools, their outputs, and comparison limits. Run commands
+from the repository root; each tool also provides `--help`.
 
-Use **source fingerprints plus commit hashes, unique run directories for measurements,
-and tags for human milestones**. Fingerprints include uncommitted source and the `segment` crate. A commit can have many measurements. Never replace
-an old result with a newer one, and never infer a speedup from a tag alone.
+## Tools
 
-`run.py` is the first executable measurement loop: standard-library Python plus
-`psql` and `pgbench`. It captures normal SQL execution with concurrent updates,
-checks fixture match sets before/after, and stores raw transaction logs. It does not
-yet constitute a representative competitive benchmark or a production soak test.
+| Script in `benchmarks/` | Purpose |
+| --- | --- |
+| `dataset.py` | Prepare checksummed Wikipedia samples and expected match sets |
+| `campaign.py` | Build a container image and run repeated trials in fresh volumes |
+| `baselines.py` | Run a series over selected dataset sizes; defaults to 100k |
+| `run.py` | Run one workload, compare compatible results, or export history |
+| `paired.py` | Alternate two Stannum builds under the same protocol |
+| `oracle.py` | Compare document sets and score bits between Stannum and TIN |
+| `server_times.py` | Inspect per-query server execution times and plans |
 
-## Run
+## One run against an existing server
 
-Build/install Stannum in release mode first (see the repository README for toolchain
-setup). Use a dedicated server and a **fresh database for every repetition**:
+Install a release build first. Set libpq connection variables for your dedicated
+benchmark server and create a fresh database with a `stannum_bench_` prefix:
 
 ```sh
-export PATH="$(brew --prefix rustup)/bin:$HOME/.cargo/bin:$(brew --prefix postgresql@18)/bin:$PATH"
-export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
-cargo pgrx install --package stannum --no-default-features --features pg18 --release
-cargo pgrx start pg18
-
-export PGHOST=localhost PGPORT=28818
-createdb stannum_bench_baseline_01
+createdb stannum_bench_run01
 python3 benchmarks/run.py run \
-  --engine stannum --database stannum_bench_baseline_01 \
-  --output benchmarks/results/baseline-01 \
-  --environment local-arm64-pgrx \
-  --build-id "$(git rev-parse HEAD):cargo-pgrx-release" \
-  --artifact "$(pg_config --pkglibdir)/stannum.dylib" \
+  --engine stannum --database stannum_bench_run01 \
+  --output benchmarks/results/run01 \
+  --environment dedicated-benchmark-server \
+  --build-id "$(git rev-parse HEAD):release" \
   --profile mixed --rows 10000 --seconds 60 --warmup 10 \
-  --clients 2 --write-rate 20 --label initial-baseline
+  --clients 2 --write-rate 20
 ```
 
-The installed library location varies by packaging. Prefer
-`$(pg_config --pkglibdir)/stannum.dylib` on macOS, or `stannum.so` on Linux, if that differs
-from the example. `--artifact` hashes the binary; `--build-id` is a required build
-attestation or immutable container-image digest. Source checkout identity alone
-does not prove which binary the server loaded. Restart existing sessions after
-installing a new binary. Do not change builds while a benchmark is running.
+`--build-id` must identify the installed build, not just your source checkout.
+Use `--artifact /path/to/stannum.so` (or `.dylib`) to record its binary hash.
+Restart server sessions after installing a new binary. The runner creates its own
+`documents` table and refuses to overwrite an existing fixture. It leaves the
+database for inspection.
 
-Connection credentials use normal libpq environment variables or `.pgpass` and
-are not recorded. The runner requires a `stannum_bench_*` database name, creates its
-own `documents` table, and refuses to overwrite it. It leaves the database for
-inspection; explicitly drop only benchmark databases when finished. It does not
-change server-wide settings. An existing `PGOPTIONS` is honored; relevant effective
-settings are saved. Query timeout is explicitly 60 seconds.
+Use `count` for counts, `ranked` for top-ten ranking, and `mixed` for both.
+`--write-rate 0` makes a single run read-only. Credentials belong in local libpq
+configuration, not in committed files or build labels.
 
-Use `--profile count` for equivalent cross-engine count queries, `ranked` for
-full-scoring top-10, or `mixed` for both. `--write-rate 0` selects read-only.
-Rows must be a multiple of 1,000. A 1,000-row / 5-second run is only a smoke test.
-For useful latency distributions increase duration, scale, and repetitions.
+## Available adapters
 
-## Server-side execution probe
+The harness supports `stannum`, externally installed `tin`, built-in PostgreSQL
+`gin`, ParadeDB `paradedb`, and `pg_textsearch`. GIN is count-only. The local
+container recipe pins comparator versions; different versions may require
+adapter changes. TIN is not bundled in that image.
 
-`server_times.py` runs the same twenty mixed-profile shapes through
-`EXPLAIN ANALYZE` in one session and reports the server's own execution time per
-shape, median after discarding warm-up executions, with the top plan node so a
-fallback to the heap is visible. It exists for one purpose: setting a Stannum build
-beside TIN on PlanetScale, where client-side timing is dominated by the network.
-It needs the `documents` table and index that `run.py` leaves behind.
+Matching result sets does not establish equivalent ranking across engines.
+Cross-engine ranked/mixed speedup reports are therefore blocked by the comparison
+tool. Different hardware or resource budgets are not comparable even when the
+query text matches.
+
+## Correctness and diagnostics
+
+`run.py` checks match membership before and after traffic. Ranked checks cover
+membership, cardinality, uniqueness, finite scores, and descending order; they do
+not prove global top-k correctness.
+
+`oracle.py` compares exact document sets and score bits across mutation states:
 
 ```sh
-PGHOST=localhost PGPORT=28818 PGDATABASE=stannum_bench_wiki_01 \
-python3 benchmarks/server_times.py --engine stannum --disable-seqscan \
-  --dataset "$DATASETS/wikipedia-100000" \
-  --output benchmarks/results/server-times-stannum-01
+python3 benchmarks/oracle.py \
+  --left stannum.env --left-engine stannum \
+  --right tin.env --right-engine tin \
+  --rows 5000 --output benchmarks/results/oracle-01
 ```
 
-Its numbers are not throughput and do not include planning, fetching rows to the
-client, or contention; use them to compare shapes, not to rank engines.
+Use two distinct, dedicated databases with no `oracle_docs` table. The environment
+files contain libpq settings and must remain outside Git. The tool creates its
+fixture and removes it on success unless `--keep` is selected.
 
-## Engine adapters and semantic limits
+`server_times.py` runs `EXPLAIN ANALYZE` against an existing benchmark fixture.
+It reports execution time and plan shape, excluding planning and client transfer.
+It is a diagnostic tool, not a substitute for comparable end-to-end benchmarks.
 
-| Adapter | Installed extension | SQL contract | Status |
-| --- | --- | --- | --- |
-| `stannum` | `stannum` | TINQL; `stannum.full_score` | This repository |
-| `tin` | `tin` | TINQL; `tin.full_score` | PlanetScale TIN, externally installed |
-| `gin` | Built-in | `simple` tsvector/tsquery; counts only | Locally exercised |
-| `paradedb` | `pg_search` | Current `USING paradedb`, `|||`, `&&&`, `###`, `pdb.score` | Smoke checked on 0.25.9 |
-| `pg_textsearch` | `pg_textsearch` | Current text `@@` Boolean filtering, `USING bm25`, `<@>` scoring | Smoke checked on pinned 1.5.0-dev; not validated on released 1.4.0 |
+## Result files
 
-The ParadeDB and pg_textsearch adapters follow their primary documentation, **not** the older
-versions used in TIN's launch article. An older extension may reject their SQL;
-that is an adapter/version mismatch, not proof of a missing capability or poor
-performance. The runner preserves failure status rather than reporting a speedup.
-Provision engines separately, pin their exact versions and image digests, and
-record server hardware/CPU/memory/storage constraints in `--environment` and the
-experiment notes. Do not compare native macOS against a resource-limited VM.
+| File | Contents |
+| --- | --- |
+| `manifest.json` | Build, source fingerprint, settings, workload, and completion status |
+| `source.patch` | Tracked source changes at measurement time |
+| `fixture.sql`, `query-*.sql`, `writer.sql` | Executed workload |
+| `correctness-*.json`, `ranked-*.json`, `plan-*.json` | Checks and query plans |
+| `reader-log.*`, `writer-log.*` | Raw transaction measurements |
+| `summary.json` | Throughput, latency, and achieved write rate |
+| `before.json`, `after.json` | Size and database counter snapshots |
 
-Sources: [ParadeDB match](https://www.paradedb.com/docs/reference/full-text/match),
-[phrase](https://www.paradedb.com/docs/reference/full-text/phrase),
-[score](https://www.paradedb.com/docs/reference/full-text/score),
-[index example](https://www.paradedb.com/docs/reference/full-text/top-k),
-[pg_textsearch](https://github.com/timescale/pg_textsearch).
-
-This fixture uses simple ASCII words without stemming-sensitive tokens; all engines
-must return exactly the expected ID sets. Ranked probes additionally check result
-cardinality, membership, uniqueness, finite scores, and descending order. They do
-**not** prove score arithmetic, globally optimal top-k, or equivalent relevance.
-GIN ranking is deliberately excluded: `ts_rank` is not BM25. Different BM25
-statistics, quantization, and phrase scoring can change rank/tie groups. Therefore
-the comparison command blocks cross-engine ranked/mixed speedup claims until an
-independent ranking-quality/contract suite is added. Stannum explicitly uses
-`full_score` to avoid default dense-term elision.
-
-For pg_textsearch the projection negates its negative BM25 value for a common
-descending-score result convention, but the actual ORDER BY retains the native
-`body <@> query ASC` expression. Negating the ORDER BY expression could hide its
-index ordering. The Boolean filter is retained to guarantee exact match semantics;
-the current engine documents Boolean and ranked retrieval as separate scan modes.
-Audit plans rather than assuming this combined query uses both optimizations.
-
-See [validated smoke environments](validated-environments.md) for exact versions
-and reproduction commands. Those environments validate adapters, not fair relative
-performance: a controlled campaign must align their resource and platform budgets.
-
-## Artifacts and history
-
-Every directory contains:
-
-* `manifest.json`: exact commit/tags, engine-source fingerprint, dirty status,
-  binary hash/build ID, harness hash, environment label, client host description,
-  PostgreSQL/extension versions, selected effective settings, workload/seed,
-  fixture/SQL hashes, index DDL/build time, traffic timestamps, completion status.
-* `source.patch`: tracked engine changes relative to HEAD. Untracked engine files
-  have hashes but are not archived: commit source before publishing a result.
-* `fixture.sql`, `index.sql`, `query-*.sql`, `writer.sql`: actual generated workload.
-* `correctness-*.json`, `ranked-*.json`, `plan-*.json`: result checks and diagnostic
-  plans collected outside the timed load.
-* `reader-log.*`, `writer-log.*`, `reader.txt`, `writer.txt`, `warmup.txt`: raw
-  pgbench records/output. Failures and skipped transactions never become successful
-  latency samples. Process errors make a run incomplete.
-* `summary.json`: per-query completions, throughput, p50/p95, and p99 only with at
-  least 1,000 samples. Percentiles use nearest rank. Writer metrics include schedule
-  lag and achieved rate, rather than assuming the requested rate was met.
-* `before.json`, `after.json`: relation sizes, heap/index/TOAST I/O counters and
-  server WAL insertion positions. Statistics can lag; these are snapshots, not an
-  assertion of physical-device reads. WAL is server-wide and includes maintenance.
-
-The fixture and plans warm data; this is a **warm-cache** experiment. Readers run
-closed-loop at fixed concurrency. A separate rate-scheduled writer toggles one
-indexed token without changing tested match sets or document lengths. Traffic
-starts are close but not synchronized; timestamps expose startup/end skew. This
-is not an open-loop reader latency-SLO test and does not eliminate coordinated
-omission under overload. Keep the distinction in published results.
+Keep complete result directories outside Git. Do not pool incompatible runs,
+rewrite old manifests, or discard failures. Reports should retain the number of
+successful trials and the spread of results, not just a single speedup.
 
 ```sh
-python3 benchmarks/run.py compare benchmarks/results/baseline-01 benchmarks/results/candidate-01
-python3 benchmarks/run.py compare --cross-engine benchmarks/results/lead-count-01 benchmarks/results/gin-count-01
+python3 benchmarks/run.py compare benchmarks/results/run01 benchmarks/results/run02
 python3 benchmarks/run.py history benchmarks/results > benchmarks/results/history.csv
 python3 -m unittest discover -s benchmarks -p 'test_*.py'
 ```
-
-Comparison rejects incomplete runs and differences in workload, harness,
-environment, recorded hardware, PostgreSQL version/settings, or client version.
-Cross-engine comparisons require count-only and matching core settings; engine
-settings remain visible for review. A successful comparison is a descriptive
-single-run ratio, **not statistical evidence or automatic acceptance**. Inspect
-write throughput and reader/writer tails before interpreting it.
-
-`history.csv` has one row per query/run, including commit, label, fingerprints,
-latency and achieved read/write throughput. Its cohort identifies comparable
-conditions. Chart each query within a cohort; separate cohorts when fixtures,
-hardware, or harness change. Tags such as `perf/selective-postings-v1` can label a
-reviewed milestone later; this harness does not create tags or commits.
-
-Raw results are ignored by Git. Keep code, workload definitions, protocol, and
-small reviewed milestone summaries in Git. Archive complete run directories as
-local archives with a retention policy; milestone summaries
-should link to immutable artifacts and checksums. No upload occurs automatically.
-
-## Evidence ladder
-
-1. **Local iteration:** smoke correctness plus short latency runs to spot large
-   effects. These cannot justify competitive claims.
-2. **Controlled regression:** dedicated machine, identical budgets and fresh
-   databases; at least five independent runs per candidate, alternating baseline
-   and candidate order. Compare per-run metrics, not pooled transactions as if
-   independent. Report medians and confidence intervals before setting gates.
-3. **Competitive campaign:** pinned real corpus/query traces, semantic audits,
-   tuned and default configurations as separate lanes, data fitting/exceeding RAM,
-   ranking-quality checks, and readers plus inserts/updates/deletes. Fix a read p99
-   ceiling and required achieved write rate before claiming throughput wins.
-4. **Sustained operation:** long enough to reach spills, compaction and VACUUM;
-   capture CPU/RSS/device I/O, maintenance backlog, index growth, recovery, and
-   post-load drain time. The current short token-toggle writer does not cover this.
-
-Keep CPU/allocation profiles as diagnostic attachments to the same run identity.
-Run profiling separately from uninstrumented timing; use profiles to explain
-results, not replace end-to-end measurements. This initial harness does not yet
-automate host profiling, confidence intervals, inserts/deletes, or
-maintenance-backlog collection. Dataset import and local comparator provisioning
-are handled by `dataset.py` and `campaign.py`.
-
-See [Tin configuration research](../archive/tin-configuration-research.md) for which
-knobs change semantics versus execution and why build/maintenance state matters.
-The [pgbench documentation](https://www.postgresql.org/docs/18/pgbench.html)
-defines the retained log fields and scheduling behavior.
-
-For the checksummed Wikipedia corpus and background campaigns, see
-[the real-corpus protocol](local.md#wikipedia-corpus). `baselines.py` now defaults
-to 100,000 documents only. The million-document evaluation is out of scope unless
-explicitly selected with `--sizes 1000000`.
-
-The rename changes generated SQL and therefore comparison hashes. Historical
-`lead` artifacts remain immutable; they use their saved protocol. Do not relabel
-old manifests as `stannum` or bypass comparison checks to manufacture a match.

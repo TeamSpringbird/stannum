@@ -1,5 +1,7 @@
 # Introduction
 
+Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).
+
 TinQL is the query language used in the text argument of Stannum's `==>` operator
 in PostgreSQL. It supports terms, phrases, Boolean expressions, and constraints
 on where matches occur in a document.

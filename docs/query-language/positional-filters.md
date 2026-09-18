@@ -1,5 +1,7 @@
 # Positional Filters
 
+Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).
+
 Positional filters restrict matches to a range of token positions, such as the
 first 100 positions or the final quarter of a document.
 

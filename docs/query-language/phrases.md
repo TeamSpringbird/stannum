@@ -1,5 +1,7 @@
 # Phrases
 
+Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).
+
 A phrase is a sequence of words enclosed in double quotes. It matches documents
 where those words appear consecutively, in exactly that order.
 

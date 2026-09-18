@@ -1,5 +1,7 @@
 # Keywords & Special Characters
 
+Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).
+
 Keywords and syntax characters have the meanings listed below. Quoting and
 escaping let you use them as search text.
 
