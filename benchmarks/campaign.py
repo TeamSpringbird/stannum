@@ -144,7 +144,7 @@ def start_server(image, name, volume, args):
     cmd = ["run", "-d", "--name", name, "--cpus", str(args.cpus), "--cpuset-cpus", args.cpuset,
            "--memory", args.memory, "--memory-swap", args.memory, "--shm-size", "1g",
            "-p", f"127.0.0.1:{args.port}:5432", "--mount", f"type=volume,src={volume},dst=/var/lib/postgresql",
-           "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_DB=lead_bench_campaign", image, "postgres"]
+           "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-e", "POSTGRES_DB=stanum_bench_campaign", image, "postgres"]
     for key, value in PG_SETTINGS.items():
         cmd += ["-c", key + "=" + value]
     docker(*cmd)
@@ -175,14 +175,14 @@ def execute(args):
     if args.build:
         with (root / "image-build.log").open("w") as log:
             subprocess.run(["docker", "build", "--platform", "linux/arm64", "-f", "benchmarks/Dockerfile",
-                            "--build-arg", "LEAD_SOURCE_SHA256=" + source["source_sha256"],
-                            "--build-arg", "LEAD_COMMIT=" + source["commit"],
+                            "--build-arg", "STANUM_SOURCE_SHA256=" + source["source_sha256"],
+                            "--build-arg", "STANUM_COMMIT=" + source["commit"],
                             "--build-arg", "RECIPE_SHA256=" + recipe, "-t", args.image, "."],
                            cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
     image = json.loads(docker("image", "inspect", args.image))[0]
     if image["Architecture"] != "arm64":
         raise ValueError("This Mac campaign requires native ARM64, not emulated x86")
-    if image["Config"].get("Labels", {}).get("benchmark.lead_source_sha256") != source["source_sha256"]:
+    if image["Config"].get("Labels", {}).get("benchmark.stanum_source_sha256") != source["source_sha256"]:
         raise ValueError("Image does not match engine source; rerun with --build")
     if image["Config"].get("Labels", {}).get("benchmark.recipe_sha256") != recipe:
         raise ValueError("Image does not match Docker build recipe; rerun with --build")
@@ -207,7 +207,7 @@ def execute(args):
     awake = subprocess.Popen(["caffeinate", "-i"]) if sys.platform == "darwin" else None
     try:
         for number, job in enumerate(jobs, 1):
-            prefix = "lead-campaign-" + uuid.uuid4().hex[:12]
+            prefix = "stanum-campaign-" + uuid.uuid4().hex[:12]
             volume = prefix + "-data"
             path = root / job["directory"]
             job["status"] = "running"
@@ -224,7 +224,7 @@ def execute(args):
                 for key in ("PGOPTIONS", "PGSERVICE", "PGSERVICEFILE", "PGDATABASE"):
                     env.pop(key, None)
                 cmd = [sys.executable, str(protocol / "run.py"), "run", "--engine", job["engine"],
-                       "--profile", job["profile"], "--database", "lead_bench_campaign", "--output", str(path),
+                       "--profile", job["profile"], "--database", "stanum_bench_campaign", "--output", str(path),
                        "--environment", "mac-studio-orbstack-" + bench.digest(bench.canonical(context))[:12],
                        "--build-id", image_id, "--source-manifest", str(root / "source.json"), "--context", str(root / "context.json"), "--container", prefix,
                        "--rows", str(args.rows), "--seconds", str(args.seconds), "--warmup", str(args.warmup),
@@ -267,11 +267,11 @@ def execute(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--image", default="lead-bench:local")
+    parser.add_argument("--image", default="stanum-bench:local")
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--label", default="local-baseline")
-    parser.add_argument("--engines", nargs="+", choices=bench.ENGINES, default=list(bench.ENGINES))
+    parser.add_argument("--engines", nargs="+", choices=bench.ENGINES, default=["stanum", "gin", "paradedb", "pg_textsearch"])
     parser.add_argument("--profiles", nargs="+", choices=("count", "mixed", "ranked"), default=["count", "mixed"])
     parser.add_argument("--repetitions", type=bench.positive, default=5)
     parser.add_argument("--source-manifest", help=argparse.SUPPRESS)

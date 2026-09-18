@@ -7,7 +7,7 @@ use tinql::runtime::Query;
         RETURNS index_am_handler
         PARALLEL SAFE IMMUTABLE STRICT
         LANGUAGE c AS 'MODULE_PATHNAME', '@FUNCTION_NAME@';
-    CREATE ACCESS METHOD tin TYPE INDEX HANDLER @extschema@.amhandler;
+    CREATE ACCESS METHOD stanum TYPE INDEX HANDLER @extschema@.amhandler;
 ")]
 pub(crate) fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let mut routine =
@@ -359,7 +359,7 @@ mod tests {
     fn scan_state_is_reclaimed_on_context_reset_or_normal_end() {
         use std::sync::atomic::Ordering;
         let before = DROPPED_SCAN_STATES.load(Ordering::Relaxed);
-        let mut context = PgMemoryContexts::new("lead scan ownership regression");
+        let mut context = PgMemoryContexts::new("stanum scan ownership regression");
         unsafe {
             context.switch_to(|_| {
                 let owner = new_scan_state();

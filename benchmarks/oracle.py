@@ -2,18 +2,18 @@
 """Differential oracle: run identical fixtures and queries on two servers and
 diff match sets and scores, bit for bit.
 
-Both sides use the same SQL, so this compares Lead against TIN (or any two
-Lead builds). Connection details come from libpq environment variables read
+Both sides use equivalent SQL with engine-specific schema and access-method
+names, comparing Stanum against TIN (or two Stanum builds). Connection details come from libpq environment variables read
 from two env files, one per side, so credentials never appear on a command
 line or in results. Each side gets a fresh table in its own database; the
 script never drops anything it did not create.
 
-    python3 benchmarks/oracle.py --left lead.env --right tin.env --rows 5000 \
+    python3 benchmarks/oracle.py --left stanum.env --right tin.env --rows 5000 \
         --output benchmarks/results/oracle-01
 
 States exercised, in order: after build; after deletes before VACUUM; after
 VACUUM; after inserts into the mutable side; after REINDEX. Any difference in
-result sets or in the float bits of tin.full_score / tin.score is reported.
+result sets or in the float bits of full_score / score is reported.
 Query shapes cover terms, Boolean, phrases, gaps, alternatives, slop,
 proximity, relations, positional filters, wildcards, regex, ranges, fuzzy,
 AT LEAST, boosts and the match-all form.
@@ -51,7 +51,7 @@ SELECT n,
   repeat('pad ', n % 5)
 FROM generate_series(1, {rows}) n;
 INSERT INTO oracle_docs VALUES ({rows} + 1, ''), ({rows} + 2, NULL), ({rows} + 3, 'alpha alpha beta beta rare');
-CREATE INDEX oracle_docs_idx ON oracle_docs USING tin(body);
+CREATE INDEX oracle_docs_idx ON oracle_docs USING {engine}(body);
 """
 
 STATES = [
@@ -88,16 +88,16 @@ def run(sql, env):
     return result.stdout
 
 
-def observe(env, query):
+def observe(env, query, engine="stanum"):
     """Match set and score bits, or the error text if the server rejects the query."""
     literal = query.replace("'", "''")
     sql = f"""SELECT json_build_object(
       'ids', (SELECT coalesce(json_agg(id ORDER BY id), '[]') FROM oracle_docs WHERE body ==> '{literal}'),
-      'full', (SELECT coalesce(json_agg(json_build_array(id, float4send(tin.full_score(ctid))::text) ORDER BY id), '[]')
+      'full', (SELECT coalesce(json_agg(json_build_array(id, float4send({engine}.full_score(ctid))::text) ORDER BY id), '[]')
                FROM oracle_docs WHERE body ==> '{literal}'),
-      'dense', (SELECT coalesce(json_agg(json_build_array(id, float4send(tin.score(ctid))::text) ORDER BY id), '[]')
+      'dense', (SELECT coalesce(json_agg(json_build_array(id, float4send({engine}.score(ctid))::text) ORDER BY id), '[]')
                 FROM oracle_docs WHERE body ==> '{literal}'),
-      'max', (SELECT float4send(max(m))::text FROM (SELECT tin.max_score(ctid) m FROM oracle_docs WHERE body ==> '{literal}' LIMIT 1) s)
+      'max', (SELECT float4send(max(m))::text FROM (SELECT {engine}.max_score(ctid) m FROM oracle_docs WHERE body ==> '{literal}' LIMIT 1) s)
     );"""
     result = psql(sql, env)
     if result.returncode != 0:
@@ -109,6 +109,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--left", required=True, help="env file for the first server (libpq variables)")
     parser.add_argument("--right", required=True, help="env file for the second server")
+    parser.add_argument("--left-engine", choices=("stanum", "tin"), default="stanum")
+    parser.add_argument("--right-engine", choices=("stanum", "tin"), default="tin")
     parser.add_argument("--rows", type=int, default=5000)
     parser.add_argument("--output", required=True)
     parser.add_argument("--keep", action="store_true", help="leave oracle_docs in place afterwards")
@@ -116,12 +118,13 @@ def main():
     sides = {"left": load_env(args.left), "right": load_env(args.right)}
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
-    fixture = FIXTURE.format(rows=args.rows)
-    for env in sides.values():
-        run("DROP TABLE IF EXISTS oracle_docs;", env)
-        run("CREATE EXTENSION IF NOT EXISTS tin;", env)
-        run(fixture, env)
-    report = {"rows": args.rows, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "states": {}}
+    engines = {"left": args.left_engine, "right": args.right_engine}
+    for side, env in sides.items():
+        engine = engines[side]
+        run(f"CREATE EXTENSION IF NOT EXISTS {engine};", env)
+        # CREATE TABLE fails on an existing fixture instead of deleting user data.
+        run(FIXTURE.format(rows=args.rows, engine=engine), env)
+    report = {"rows": args.rows, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "engines": engines, "states": {}}
     differences = 0
     for state, transition in STATES:
         if transition:
@@ -129,7 +132,7 @@ def main():
                 run(transition, env)
         results = {}
         for query in QUERIES:
-            observed = {side: observe(env, query) for side, env in sides.items()}
+            observed = {side: observe(env, query, engines[side]) for side, env in sides.items()}
             same = observed["left"] == observed["right"]
             if not same:
                 differences += 1

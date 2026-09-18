@@ -1,10 +1,11 @@
 # Recording search performance
 
-For the repeatable, containerized Mac Studio workflow, start with
+For the project results and current plan, start with [BENCHMARKS.md](../BENCHMARKS.md).
+For the repeatable, containerized Mac Studio workflow, see
 [local campaigns](LOCAL.md). Benchmark execution and analysis are local-only.
 
-Use **commit hashes for source identity, unique run directories for measurements,
-and tags for human milestones**. A commit can have many measurements. Never replace
+Use **source fingerprints plus commit hashes, unique run directories for measurements,
+and tags for human milestones**. Fingerprints include uncommitted source and the `segment` crate. A commit can have many measurements. Never replace
 an old result with a newer one, and never infer a speedup from a tag alone.
 
 `run.py` is the first executable measurement loop: standard-library Python plus
@@ -14,36 +15,36 @@ yet constitute a representative competitive benchmark or a production soak test.
 
 ## Run
 
-Build/install Lead in release mode first (see the repository README for toolchain
+Build/install Stanum in release mode first (see the repository README for toolchain
 setup). Use a dedicated server and a **fresh database for every repetition**:
 
 ```sh
 export PATH="$(brew --prefix rustup)/bin:$HOME/.cargo/bin:$(brew --prefix postgresql@18)/bin:$PATH"
 export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
-cargo pgrx install --package tin --no-default-features --features pg18 --release
+cargo pgrx install --package stanum --no-default-features --features pg18 --release
 cargo pgrx start pg18
 
 export PGHOST=localhost PGPORT=28818
-createdb lead_bench_baseline_01
+createdb stanum_bench_baseline_01
 python3 benchmarks/run.py run \
-  --engine lead --database lead_bench_baseline_01 \
+  --engine stanum --database stanum_bench_baseline_01 \
   --output benchmarks/results/baseline-01 \
   --environment local-arm64-pgrx \
   --build-id "$(git rev-parse HEAD):cargo-pgrx-release" \
-  --artifact "$(pg_config --pkglibdir)/tin.dylib" \
+  --artifact "$(pg_config --pkglibdir)/stanum.dylib" \
   --profile mixed --rows 10000 --seconds 60 --warmup 10 \
   --clients 2 --write-rate 20 --label initial-baseline
 ```
 
 The installed library location varies by packaging. Prefer
-`$(pg_config --pkglibdir)/tin.dylib` on macOS, or `tin.so` on Linux, if that differs
+`$(pg_config --pkglibdir)/stanum.dylib` on macOS, or `stanum.so` on Linux, if that differs
 from the example. `--artifact` hashes the binary; `--build-id` is a required build
 attestation or immutable container-image digest. Source checkout identity alone
 does not prove which binary the server loaded. Restart existing sessions after
 installing a new binary. Do not change builds while a benchmark is running.
 
 Connection credentials use normal libpq environment variables or `.pgpass` and
-are not recorded. The runner requires a `lead_bench_*` database name, creates its
+are not recorded. The runner requires a `stanum_bench_*` database name, creates its
 own `documents` table, and refuses to overwrite it. It leaves the database for
 inspection; explicitly drop only benchmark databases when finished. It does not
 change server-wide settings. An existing `PGOPTIONS` is honored; relevant effective
@@ -58,12 +59,13 @@ For useful latency distributions increase duration, scale, and repetitions.
 
 | Adapter | Installed extension | SQL contract | Status |
 | --- | --- | --- | --- |
-| `lead` | `tin` | TINQL; `tin.full_score` | Locally exercised |
+| `stanum` | `stanum` | TINQL; `stanum.full_score` | This repository |
+| `tin` | `tin` | TINQL; `tin.full_score` | PlanetScale TIN, externally installed |
 | `gin` | Built-in | `simple` tsvector/tsquery; counts only | Locally exercised |
 | `paradedb` | `pg_search` | Current `USING paradedb`, `|||`, `&&&`, `###`, `pdb.score` | Smoke checked on 0.25.9 |
 | `pg_textsearch` | `pg_textsearch` | Current text `@@` Boolean filtering, `USING bm25`, `<@>` scoring | Smoke checked on pinned 1.5.0-dev; not validated on released 1.4.0 |
 
-The latter two adapters follow current primary documentation, **not** the older
+The ParadeDB and pg_textsearch adapters follow their primary documentation, **not** the older
 versions used in TIN's launch article. An older extension may reject their SQL;
 that is an adapter/version mismatch, not proof of a missing capability or poor
 performance. The runner preserves failure status rather than reporting a speedup.
@@ -84,7 +86,7 @@ cardinality, membership, uniqueness, finite scores, and descending order. They d
 GIN ranking is deliberately excluded: `ts_rank` is not BM25. Different BM25
 statistics, quantization, and phrase scoring can change rank/tie groups. Therefore
 the comparison command blocks cross-engine ranked/mixed speedup claims until an
-independent ranking-quality/contract suite is added. Lead explicitly uses
+independent ranking-quality/contract suite is added. Stanum explicitly uses
 `full_score` to avoid default dense-term elision.
 
 For pg_textsearch the projection negates its negative BM25 value for a common
@@ -172,16 +174,20 @@ should link to immutable artifacts and checksums. No upload occurs automatically
 Keep CPU/allocation profiles as diagnostic attachments to the same run identity.
 Run profiling separately from uninstrumented timing; use profiles to explain
 results, not replace end-to-end measurements. This initial harness does not yet
-automate host profiling, confidence intervals, real-corpus import, competitor
-provisioning, inserts/deletes, or maintenance-backlog collection.
+automate host profiling, confidence intervals, inserts/deletes, or
+maintenance-backlog collection. Dataset import and local comparator provisioning
+are handled by `dataset.py` and `campaign.py`.
 
 See [Tin configuration research](../docs/tin-configuration-research.md) for which
 knobs change semantics versus execution and why build/maintenance state matters.
 The [pgbench documentation](https://www.postgresql.org/docs/18/pgbench.html)
 defines the retained log fields and scheduling behavior.
 
-For the nested 100,000 / 1,000,000-document Wikipedia datasets and sequential
-background baseline campaigns, see [the real-corpus protocol](LOCAL.md#wikipedia-baselines-100000-and-1000000-documents).
-Use `dataset.py` to prepare checksummed corpora and `baselines.py` to run both sizes
-with five repetitions (five minutes at 100k; thirty minutes at 1m). These are separate cohorts from the synthetic
-10,000-document benchmark.
+For the checksummed Wikipedia corpus and background campaigns, see
+[the real-corpus protocol](LOCAL.md#wikipedia-corpus). `baselines.py` now defaults
+to 100,000 documents only. The million-document evaluation is out of scope unless
+explicitly selected with `--sizes 1000000`.
+
+The rename changes generated SQL and therefore comparison hashes. Historical
+`lead` artifacts remain immutable; they use their saved protocol. Do not relabel
+old manifests as `stanum` or bypass comparison checks to manufacture a match.

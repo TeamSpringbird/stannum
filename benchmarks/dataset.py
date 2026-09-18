@@ -13,6 +13,8 @@ import urllib.request
 
 REVISION = 'b04c8d1ceb2f5cd4588862100d08de323dccfbaa'
 REPO = 'https://huggingface.co/datasets/wikimedia/wikipedia'
+# The absent-term sentinel is frozen corpus data from the original Lead baseline.
+# Keep it stable across product renames so checksums and query identities stay valid.
 CASES = [
     ('miss', 'zzleadmissingtoken', 'zzleadmissingtoken', 'zzleadmissingtoken', 'term', 0),
     ('common', 'history', 'history', 'history', 'term', 0),

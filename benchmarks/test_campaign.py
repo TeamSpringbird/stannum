@@ -19,10 +19,10 @@ class CampaignTests(unittest.TestCase):
         self.assertIsNone(campaign.describe([1, 2, 3, 4])["trimmed_mean"])
 
     def test_schedule_pairs_seeds_rotates_order_and_excludes_gin_ranking(self):
-        jobs = campaign.schedule(["lead", "gin", "paradedb", "pg_textsearch"], ["count", "mixed"], 5)
+        jobs = campaign.schedule(["stanum", "gin", "paradedb", "pg_textsearch"], ["count", "mixed"], 5)
         self.assertEqual(len(jobs), 35)
         self.assertFalse(any(j["engine"] == "gin" and j["profile"] == "mixed" for j in jobs))
-        for engine in ("lead", "gin", "paradedb", "pg_textsearch"):
+        for engine in ("stanum", "gin", "paradedb", "pg_textsearch"):
             self.assertEqual(sum(j["engine"] == engine and j["profile"] == "count" for j in jobs), 5)
         firsts = [next(j["engine"] for j in jobs if j["repetition"] == r and j["profile"] == "count") for r in range(1, 5)]
         self.assertEqual(len(set(firsts)), 4)
@@ -44,7 +44,7 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "campaign.json").write_text(json.dumps({"config": {"repetitions": 5},
-                "jobs": [{"directory": f"r{i}", "engine": "lead", "profile": "count"} for i in range(5)]}))
+                "jobs": [{"directory": f"r{i}", "engine": "stanum", "profile": "count"} for i in range(5)]}))
             campaign.aggregate(root)
             result = json.loads((root / "aggregate.json").read_text())
             self.assertEqual(len(result["invalid_runs"]), 5)

@@ -1,4 +1,4 @@
-# Private production regressions suitable for Lead.
+# Private production regressions suitable for Stanum (with generated SQL names translated).
 #
 # One test basename per line.  The materializer copies the corresponding
 # sql/<name>.sql and expected/<name>.out from the private repository. Keep plan,

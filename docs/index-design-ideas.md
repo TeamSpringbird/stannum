@@ -1,5 +1,9 @@
 # Index design ideas for fast full-text search in Lead
 
+> Historical research/design note. References to Lead describe the original project
+> or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
+> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+
 Written 2026-09-17 against `3fcf441` plus the uncommitted work on the
 `t3code/investigate-lead-search-performance` worktree (LDP1 postings, in-memory
 retrieval core, benchmark harness, and the design docs under `docs/`). This is a

@@ -10,9 +10,9 @@ A bare word is a term. It matches documents that contain that word.
 beer
 ```
 
-The parser preserves the term's spelling. TIN then analyzes it with the
+The parser preserves the term's spelling. Stanum then analyzes it with the
 index's tokenizer, which may normalize its case and accents or split it into
-several tokens. A split literal becomes a phrase. TIN's default tokenizer
+several tokens. A split literal becomes a phrase. Stanum's default tokenizer
 folds case and accents; it does not stem words.
 
 ## Term characters
@@ -182,7 +182,7 @@ and literal fragments are regex-escaped.
 
 Prefix patterns keep their fast expansion: `email.*` scans only the `email`-
 prefixed range of the term dictionary, exactly as the glob form did. Use
-`tin.ql_parse('e-mail*')` to see the rewrite a given pattern gets under
+`stanum.ql_parse('e-mail*')` to see the rewrite a given pattern gets under
 the options passed to the function. Supply the index's tokenization options
 explicitly when they differ from the defaults.
 
@@ -249,7 +249,7 @@ Standard regex escapes such as `\d`, `\w`, and `\b` pass through to the regex
 engine. TinQL interprets `\ ` (backslash-space) as a literal space and leaves
 other backslash sequences in the pattern.
 
-The regex pattern is preserved exactly as written. `tin` does not transparently
+The regex pattern is preserved exactly as written. `stanum` does not transparently
 rewrite it to be case-insensitive or otherwise modify it before matching.
 Invalid regex syntax is rejected during query lowering/planning instead of
 silently behaving like an empty match.

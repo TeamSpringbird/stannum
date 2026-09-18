@@ -400,7 +400,7 @@ fn collect_highlight_matches(query: &Query, doc: &TokenizedDoc, out: &mut Vec<Hi
         Query::MatchAll => {}
         Query::Regex(pattern) => {
             // Highlight part labels are user-facing (`$QUERY_PART` in
-            // tin.highlight tags): use the tinql surface form, not the
+            // stanum.highlight tags): use the tinql surface form, not the
             // `REGEX(..)` IR form. Wildcards normalize to Regex during
             // sub-tokenization, so this labels `email*` as `MATCHES email.*`.
             collect_expanded_matches(

@@ -66,22 +66,22 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
 /// Validates a page's header and special area and returns its kind.
 pub fn kind(page: &[u8]) -> Result<u8> {
     if page.len() != PAGE_SIZE {
-        return Err("invalid Lead page size");
+        return Err("invalid Stanum page size");
     }
     let lower = usize::from(u16_at(page, LOWER));
     let upper = usize::from(u16_at(page, UPPER));
     let special = usize::from(u16_at(page, SPECIAL));
     if special != PAGE_SIZE - SPECIAL_SIZE {
-        return Err("not a Lead LDP2 page");
+        return Err("not a Stanum LDP2 page");
     }
     if lower < PAGE_HEADER || lower > upper || upper > special {
-        return Err("invalid Lead page bounds");
+        return Err("invalid Stanum page bounds");
     }
     if u32_at(page, special) != MAGIC {
-        return Err("not a Lead LDP2 page");
+        return Err("not a Stanum LDP2 page");
     }
     if page[special + 5] != VERSION {
-        return Err("unsupported Lead page version");
+        return Err("unsupported Stanum page version");
     }
     Ok(page[special + 4])
 }
@@ -96,7 +96,7 @@ pub fn payload(page: &[u8]) -> &[u8] {
 /// `SPECIAL_SIZE`, stamping the special area.
 pub fn write(page: &mut [u8], kind: u8, payload: &[u8]) -> Result<()> {
     if page.len() != PAGE_SIZE || payload.len() > CAPACITY {
-        return Err("Lead page payload too large");
+        return Err("Stanum page payload too large");
     }
     let special = PAGE_SIZE - SPECIAL_SIZE;
     page[PAGE_HEADER..PAGE_HEADER + payload.len()].copy_from_slice(payload);
@@ -116,7 +116,7 @@ pub fn write(page: &mut [u8], kind: u8, payload: &[u8]) -> Result<()> {
 pub fn chain(page: &[u8]) -> Result<(u32, &[u8])> {
     let payload = payload(page);
     if payload.len() < 4 {
-        return Err("truncated Lead chain page");
+        return Err("truncated Stanum chain page");
     }
     Ok((u32_at(payload, 0), &payload[4..]))
 }
@@ -217,7 +217,7 @@ fn get_run(bytes: &[u8], at: usize) -> Run {
 impl Meta {
     pub fn encode(&self) -> Result<Vec<u8>> {
         if self.segments.len() > MAX_SEGMENTS || self.pending.len() > MAX_PENDING {
-            return Err("Lead meta page overflow");
+            return Err("Stanum meta page overflow");
         }
         let mut out = Vec::with_capacity(
             META_HEADER + self.segments.len() * ENTRY_BYTES + self.pending.len() * PENDING_BYTES,
@@ -247,14 +247,14 @@ impl Meta {
             out.extend_from_slice(&pending.xid.to_le_bytes());
         }
         if out.len() > CAPACITY {
-            return Err("Lead meta page overflow");
+            return Err("Stanum meta page overflow");
         }
         Ok(out)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < META_HEADER {
-            return Err("truncated Lead meta page");
+            return Err("truncated Stanum meta page");
         }
         let identity = u64_at(bytes, 0);
         let mut spec = [0u8; crate::options::SPEC_BYTES];
@@ -278,7 +278,7 @@ impl Meta {
             || pending_count > MAX_PENDING
             || bytes.len() != at + segment_count * ENTRY_BYTES + pending_count * PENDING_BYTES
         {
-            return Err("invalid Lead meta page");
+            return Err("invalid Stanum meta page");
         }
         let mut segments = Vec::with_capacity(segment_count);
         for _ in 0..segment_count {
@@ -291,7 +291,7 @@ impl Meta {
                 generation: u32_at(bytes, at + 48),
             };
             if entry.run.is_empty() || entry.run.blocks == 0 {
-                return Err("invalid Lead segment entry");
+                return Err("invalid Stanum segment entry");
             }
             segments.push(entry);
             at += ENTRY_BYTES;

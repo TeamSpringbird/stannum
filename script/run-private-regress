@@ -24,6 +24,6 @@ esac
 cd "$root_dir"
 cargo pgrx regress "$pg_version" \
   --resetdb \
-  --package tin \
+  --package stanum \
   --no-default-features \
   --features "$pg_version"

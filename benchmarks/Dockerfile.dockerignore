@@ -9,3 +9,6 @@
 !boldi-vigna/**
 **/target/**
 **/tests/pg_regress/**
+
+!segment/**
+**/target/**

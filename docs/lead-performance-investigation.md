@@ -1,5 +1,9 @@
 # From Lead compatibility to a real search engine
 
+> Historical research/design note. References to Lead describe the original project
+> or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
+> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+
 Investigation date: 2026-09-17. Source baseline: `3fcf441ac7c3d183de179b1f846ceb0ef83e1358`.
 
 ## Conclusion and evidence boundary

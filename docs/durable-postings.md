@@ -1,4 +1,8 @@
 > Superseded. LDP1 was replaced by the segmented LDP2 format described in
+
+> Historical research/design note. References to Lead describe the original project
+> or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
+> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
 > [segmented-storage.md](segmented-storage.md). Indexes in this format report
 > `REINDEX required`. This document is kept as a record of the first slice.
 

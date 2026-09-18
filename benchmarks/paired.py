@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two immutable Lead images locally with alternating paired trials."""
+"""Compare two immutable Stanum images locally with alternating paired trials."""
 import argparse
 import fcntl
 import json
@@ -39,7 +39,7 @@ def report(root, jobs):
     complete = len(pairs) == len({j['pair'] for j in jobs})
     result = {'complete_pairs': len(pairs), 'complete': complete, 'invalid_pairs': invalid,
               'jobs': jobs, 'queries': {}, 'variants': {}}
-    lines = ['# Paired Lead comparison', '',
+    lines = ['# Paired Stanum comparison', '',
              'Identical synthetic documents, SQL, runtime settings and scheduled writes. Fresh container and volume per trial; order alternates each pair.',
              'Each pair shares a random seed. All runs are retained, including failures. This is a small diagnostic benchmark, not a production or competitor claim.', '',
              f'Complete pairs: {len(pairs)} / {len({j["pair"] for j in jobs})}.', '',
@@ -93,7 +93,7 @@ def execute(args):
         bench.save(root / (variant + '-source.json'), source)
         image = json.loads(campaign.docker('image', 'inspect', getattr(args, variant + '_image')))[0]
         labels = image['Config'].get('Labels', {})
-        if image['Architecture'] != 'arm64' or labels.get('benchmark.lead_source_sha256') != source['source_sha256'] or labels.get('benchmark.recipe_sha256') != recipe:
+        if image['Architecture'] != 'arm64' or labels.get('benchmark.stanum_source_sha256') != source['source_sha256'] or labels.get('benchmark.recipe_sha256') != recipe:
             raise ValueError(f'{variant} image source, architecture or recipe mismatch')
         images[variant] = image['Id']
         bench.save(root / (variant + '-image.json'), image)
@@ -111,7 +111,7 @@ def execute(args):
     bench.save(root / 'paired.json', manifest)
     try:
         for job in jobs:
-            name = 'lead-paired-' + uuid.uuid4().hex[:12]
+            name = 'stanum-paired-' + uuid.uuid4().hex[:12]
             volume = name + '-data'
             directory = job['directory']
             job['status'] = 'running'
@@ -123,12 +123,12 @@ def execute(args):
                 env = dict(os.environ, PGHOST='127.0.0.1', PGPORT=str(args.port), PGUSER='postgres')
                 for key in ('PGOPTIONS', 'PGSERVICE', 'PGSERVICEFILE', 'PGDATABASE'):
                     env.pop(key, None)
-                command = [sys.executable, str(protocol / 'run.py'), 'run', '--engine', 'lead', '--profile', args.profile,
-                           '--database', 'lead_bench_campaign', '--output', str(root / directory),
+                command = [sys.executable, str(protocol / 'run.py'), 'run', '--engine', 'stanum', '--profile', args.profile,
+                           '--database', 'stanum_bench_campaign', '--output', str(root / directory),
                            '--environment', 'paired-' + bench.digest(bench.canonical(context))[:12],
                            '--build-id', images[job['variant']], '--source-manifest', str(root / (job['variant'] + '-source.json')),
                            '--context', str(root / 'context.json'), '--container', name,
-                           '--seed', str(args.seed + 1009 * (job['pair'] - 1)), '--label', 'paired-lead']
+                           '--seed', str(args.seed + 1009 * (job['pair'] - 1)), '--label', 'paired-stanum']
                 for flag in ('rows', 'seconds', 'warmup', 'clients', 'write_rate', 'statement_timeout_ms'):
                     command += ['--' + flag.replace('_', '-'), str(getattr(args, flag))]
                 with (root / (directory + '-runner.log')).open('w') as log:

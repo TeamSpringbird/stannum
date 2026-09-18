@@ -1,7 +1,11 @@
 # Segmented storage, format LDP2
 
+Current extension names are `stanum`. Historical measurements below describe
+pre-rename builds of this fork; format signatures `LDP2` and `LSG1` are unchanged.
+See [the current benchmark summary](../BENCHMARKS.md) for comparison limits.
+
 LDP2 replaces the LDP1 fingerprint chains described in
-[durable-postings.md](durable-postings.md). A logged `tin` index now holds a
+[durable-postings.md](durable-postings.md). A logged `stanum` index now holds a
 write buffer of per-document records and a directory of immutable segments,
 each carrying a real term dictionary, TID-native postings, token positions and
 document lengths. Scans compile the query with the index's own tokenizer, run
@@ -24,7 +28,7 @@ except an expansion past the 1,024-term cap.
 all-visible pages, so counts on a vacuumed table approach index-only cost
 without a custom scan.
 
-Ranking reads the index too. `tin.score`, `tin.full_score` and `tin.max_score`
+Ranking reads the index too. `stanum.score`, `stanum.full_score` and `stanum.max_score`
 bind to `score_bound_indexed`, which builds per-term scorers from the segment
 directory and dictionaries and looks each row up by TID with forward-seeking
 cursors. Statistics follow TIN's contract, verified bit for bit against a live
@@ -63,14 +67,14 @@ stale and get overwritten after a fold.
 ## Operations
 
 * **Build.** `ambuild` tokenizes each heap tuple into an in-memory segment
-  builder and writes a segment every `tin.build_segment_docs` documents
+  builder and writes a segment every `stanum.build_segment_docs` documents
   (default 32,768). The write buffer starts empty.
 * **Insert.** One forward record is appended to the buffer under an exclusive
-  lock on the meta page. When the buffer would exceed `tin.write_buffer_docs`
+  lock on the meta page. When the buffer would exceed `stanum.write_buffer_docs`
   documents (default 16,384) or 4 MiB, it is first folded: decoded, built into
   a segment, written as a new run, and published in the directory. The buffer
   then restarts from its head page, reusing its chain.
-* **Merge.** When the directory would exceed `tin.max_segments` (default and
+* **Merge.** When the directory would exceed `stanum.max_segments` (default and
   maximum 128), every segment is rewritten into one, skipping dead documents.
   The old runs move to the pending list.
 * **Scan.** Under a shared meta lock the scan copies the directory and
@@ -163,7 +167,7 @@ pages.
 * Ranked queries score every candidate before selecting the top k: about
   100 ns per candidate through the per-source cursors, or 2.2 ms for the
   22,000 articles matching `history` at 100,000 documents. TIN reaches 2.4 ms
-  end to end on that query; Lead is at 4.3 ms. Block-level score bounds that
+  end to end on that query; Stanum is at 4.3 ms. Block-level score bounds that
   let the scan skip candidates are the next step in the segment format.
 * The pending-free list caps at 64 runs; beyond that, released pages leak
   until REINDEX with a warning.
@@ -199,7 +203,7 @@ and retokenizing the corpus, unchanged here and the next thing to remove.
 
 ### With indexed scoring
 
-Same protocol, one run, after `tin.score` moved to the index:
+Same protocol, one run, after `stanum.score` moved to the index:
 
 | Query, median ms | LDP2 heap scoring | LDP2 indexed scoring |
 | --- | ---: | ---: |
@@ -219,24 +223,24 @@ against 2.4 µs with fresh cursors per row.
 
 ## Custom scan nodes
 
-Two planner hooks add paths when `tin.enable_custom_scan` is on (the default)
+Two planner hooks add paths when `stanum.enable_custom_scan` is on (the default)
 and a `==>` restriction on a base relation is answered by a segmented index
 whose partial predicate, if any, the planner has proven:
 
-* **Lead Text Search Scan** replaces the relation scan. It compiles the query
+* **Stanum Text Search Scan** replaces the relation scan. It compiles the query
   with the index's own tokenizer, plans it against every segment and the
   buffer, and fetches each candidate by TID under the query snapshot,
   evaluating any remaining quals. The `==>` clause itself is not re-evaluated
   unless an expansion exceeded its cap, in which case the node rechecks those
-  rows with the original clause. When the query orders by `tin.score`,
-  `tin.full_score` or `tin.max_score` bound to the same index, the path claims
+  rows with the original clause. When the query orders by `stanum.score`,
+  `stanum.full_score` or `stanum.max_score` bound to the same index, the path claims
   the sort's path keys and emits rows by descending score, so `LIMIT k` stops
   after k fetches. The planner's `limit_tuples` (offset plus limit, when both
   are constants) is carried into the node as `Top K`: every candidate is
   scored, but only the top k are ordered up front, by selection rather than a
   full sort. A parent that reads past k, such as a nested loop that filters
   joined rows, gets the remainder ordered on demand.
-* **Lead Count** replaces `SELECT count(*)` when the `==>` clause is the only
+* **Stanum Count** replaces `SELECT count(*)` when the `==>` clause is the only
   restriction. It counts candidates on pages the visibility map marks
   all-visible without touching the heap and fetches the rest.
 
@@ -264,7 +268,7 @@ of seven, alongside the earlier measurements:
 
 The harness's mixed profile went from about 1,160 to 9,700 read queries per
 second on this machine. TIN's numbers come from PlanetScale's hardware and
-Lead's from a local machine, so treat the comparison as coarse; the point is
+Stanum's from a local machine, so treat the comparison as coarse; the point is
 that no shape is an order of magnitude apart any more.
 
 ## Page-granular reads and the buffer index, at 100,000 documents
@@ -297,8 +301,8 @@ with 600 articles buffered), then nothing.
 ## Validation
 
 ```sh
-cargo pgrx test pg18 --package tin --no-default-features --features pg18
-cargo pgrx install --package tin --no-default-features --features pg18 --release
+cargo pgrx test pg18 --package stanum --no-default-features --features pg18
+cargo pgrx install --package stanum --no-default-features --features pg18 --release
 python3 postgres/tests/postings_lifecycle.py
 cargo clippy --locked --workspace --all-targets --no-default-features --features 'pg18 pg_test' -- -D warnings
 ```

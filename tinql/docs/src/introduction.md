@@ -1,6 +1,6 @@
 # Introduction
 
-TinQL is the query language used in the text argument of TIN's `==>` operator
+TinQL is the query language used in the text argument of Stanum's `==>` operator
 in PostgreSQL. It supports terms, phrases, Boolean expressions, and constraints
 on where matches occur in a document.
 
@@ -14,7 +14,7 @@ WHERE body ==> '(craft THEN/5 beer) IN FIRST 200 WORDS';
 
 ## Positions and spans
 
-TIN stores the positions of tokens produced by the index's tokenizer. Positions
+Stanum stores the positions of tokens produced by the index's tokenizer. Positions
 start at 1. The tokenizer's settings determine word boundaries, normalization,
 and whether gaps left by discarded tokens are preserved.
 
@@ -45,6 +45,6 @@ written in upper case. Lowercase words such as `and`, `or`, and `to` are search
 terms. With implicit AND, `to be or not to be` requires each of those words.
 
 The parser preserves the spelling of a search term. Before executing the query,
-TIN analyzes literal terms with the index's tokenizer. Under the default
+Stanum analyzes literal terms with the index's tokenizer. Under the default
 settings, that includes case and accent folding. A written term can produce
 several tokens; see [Terms](./terms.md) for the syntax and tokenization rules.

@@ -1,5 +1,9 @@
 # First measured retrieval milestone — 2026-09-17
 
+> Historical research/design note. References to Lead describe the original project
+> or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
+> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+
 The fork now prunes persisted term, Boolean and phrase candidates. Five paired
 release-build trials completed successfully on 10,000 synthetic documents with
 ranked results, counts, phrases and scheduled writes. Median mixed read throughput
@@ -59,7 +63,7 @@ an uncommitted working tree identified by source SHA-256
 
 - Original image: `sha256:028b8e940aa33846aeb537e9097532e76e42b58dc3a03b32b2f8cba453728532`.
 - Fork image: `sha256:436f6aaf9348f320c84afbeecbf2b252d286828fd4526b40e9451bf9b2d89a7e`.
-- [Full paired report](../benchmarks/results/paired-boolean-mixed-01/report.md),
+- Full paired report (`benchmarks/results/paired-boolean-mixed-01/report.md`, local historical artifact),
   with JSON summaries, raw logs, SQL, plans, source identities and frozen protocol.
 - The build artifact includes `source-tree.tar.gz`, containing tracked and untracked
   engine files verified against the source manifest. A commit plus tracked patch

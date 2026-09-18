@@ -1,7 +1,7 @@
 //! Shared pure-Rust tinql runtime.
 //!
 //! Owns the lowered query AST, sub-tokenization, lowering, capability
-//! classification, and arbitrary-text evaluation used by both tin and qfuzz.
+//! classification, and arbitrary-text evaluation used by Stanum.
 
 pub mod capability;
 mod display;

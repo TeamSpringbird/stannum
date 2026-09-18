@@ -1,5 +1,9 @@
 # Tin configuration: evidence for the engine and benchmark design
 
+> Historical research/design note. References to Lead describe the original project
+> or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
+> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+
 Researched 2026-09-17 against PlanetScale's live documentation and Lead source at
 `3fcf441ac7c3d183de179b1f846ceb0ef83e1358`. Documentation is not a pinned Tin release;
 save the actual extension version and effective settings with any future Tin run.

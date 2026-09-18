@@ -2,7 +2,7 @@
 authors = ["PlanetScale"]
 language = "en"
 src = "src"
-title = "tin Query Language Guide"
+title = "Stanum: TINQL Query Language Guide"
 
 [output.html]
 default-theme = "light"

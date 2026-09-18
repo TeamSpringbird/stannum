@@ -1,5 +1,9 @@
 # Storage quality and incremental implementation
 
+> Historical research/design note. References to Lead describe the original project
+> or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
+> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+
 Two agents reviewed the first durable-posting slice on the shared branch. The
 requested Fable 5.1 model was unavailable; both used the session's inherited model.
 Their assignments are complementary and file ownership is explicit:

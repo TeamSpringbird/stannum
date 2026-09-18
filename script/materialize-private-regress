@@ -41,6 +41,19 @@ while IFS= read -r test_name; do
   cp "$expected_source" "$dest_dir/expected/$test_name.out"
 done < "$manifest"
 
+# Keep the upstream checkout untouched; only translate our generated fixtures.
+python3 - "$dest_dir" <<'PYTHON'
+from pathlib import Path
+import re
+import sys
+root = Path(sys.argv[1])
+for directory in ("sql", "expected"):
+    for path in (root / directory).iterdir():
+        if path.is_file():
+            text = re.sub(r"\btin\b", "stanum", path.read_text())
+            path.write_text(text.replace("tin_text_", "stanum_text_"))
+PYTHON
+
 if [[ "$missing" -ne 0 ]]; then
   echo "materialized available tests, but the manifest needs reconciliation" >&2
   exit 3

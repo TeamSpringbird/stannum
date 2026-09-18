@@ -22,17 +22,17 @@ def milestones(root):
     if small.get('status') in ('complete', 'incomplete', 'failed'):
         jobs = small.get('jobs', [])
         passed = sum(j.get('status') == 'complete' for j in jobs)
-        events['100k'] = ('Lead benchmarks: 100k finished',
+        events['100k'] = ('Stanum benchmarks: 100k finished',
                          f'{passed}/{len(jobs)} trials passed. Campaign {small["status"]}. Results: {root}/wikipedia-100000/report.md')
     series = read(root / 'status.json')
     if series.get('status') in ('complete', 'incomplete', 'failed'):
-        events['series'] = ('Lead benchmark series finished',
+        events['series'] = ('Stanum benchmark series finished',
                             f'Status: {series["status"]}. Results: {root}')
     elif series.get('pid'):
         try:
             os.kill(series['pid'], 0)
         except ProcessLookupError:
-            events['stopped'] = ('Lead benchmark process stopped',
+            events['stopped'] = ('Stanum benchmark process stopped',
                                  f'No completion recorded. Inspect logs in {root}.')
     return events
 

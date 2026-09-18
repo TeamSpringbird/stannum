@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import run
 
@@ -39,6 +40,44 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(run.comparison_mismatches(before, after), [])
         after["environment"] = "host-b"
         self.assertIn("environment", run.comparison_mismatches(before, after))
+
+
+
+
+class EngineIdentityTests(unittest.TestCase):
+    def test_stanum_and_tin_use_distinct_names_with_the_same_query_shapes(self):
+        for engine in ('stanum', 'tin'):
+            queries = run.workload(engine, 'mixed')
+            self.assertIn(f'USING {engine}(body)', run.index_sql(engine))
+            ranked = [sql for name, sql in queries if name.endswith('_ranked')]
+            self.assertTrue(all(f'{engine}.full_score(ctid)' in sql for sql in ranked))
+        stanum = run.workload('stanum', 'mixed')
+        tin = [(name, sql.replace('tin.full_score', 'stanum.full_score'))
+               for name, sql in run.workload('tin', 'mixed')]
+        self.assertEqual(stanum, tin)
+
+
+class ProvenanceTests(unittest.TestCase):
+    def test_segment_changes_change_build_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'segment').mkdir()
+            source = root / 'segment/lib.rs'
+            source.write_text('first version')
+            out = root / 'metadata'
+            out.mkdir()
+            def git(command, **kwargs):
+                if command[1] == 'ls-files':
+                    return 'segment/lib.rs'
+                if command[1] == 'rev-parse':
+                    return 'test-commit'
+                return ''
+            with patch.object(run, 'ROOT', root), patch.object(run, 'command', side_effect=git):
+                first = run.provenance(out)
+                source.write_text('second version')
+                second = run.provenance(out)
+            self.assertIn('segment/lib.rs', first['source_files'])
+            self.assertNotEqual(first['source_sha256'], second['source_sha256'])
 
 
 if __name__ == "__main__":

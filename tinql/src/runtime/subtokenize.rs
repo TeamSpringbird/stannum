@@ -470,7 +470,7 @@ mod tests {
         max_bytes: usize,
         position_gaps: PositionGapMode,
     ) -> tokenizer::CompiledTokenizerPipeline {
-        let mut spec = TokenizerPipelineSpec::tin_default();
+        let mut spec = TokenizerPipelineSpec::stanum_default();
         spec.tokenizer = TokenizerSpec::Whitespace;
         spec.case_folding = Folding::Preserve;
         spec.accent_folding = Folding::Preserve;

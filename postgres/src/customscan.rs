@@ -2,20 +2,20 @@
 //!
 //! Two nodes, mirroring what TIN exposes:
 //!
-//! * **Lead Text Search Scan** replaces a scan of a base relation whose
-//!   restrictions include `expr ==> 'query'` backed by a segmented `tin` index.
+//! * **Stanum Text Search Scan** replaces a scan of a base relation whose
+//!   restrictions include `expr ==> 'query'` backed by a segmented `stanum` index.
 //!   It plans the query against the index with the index's own tokenizer,
 //!   fetches each visible tuple by TID, and evaluates any remaining quals. When
 //!   the query orders by a bound score call on the same index, the node claims
 //!   those path keys and emits rows in score order, so `LIMIT k` stops after k
 //!   fetches instead of sorting every match.
-//! * **Lead Count** replaces `SELECT count(*)` over such a scan when the `==>`
+//! * **Stanum Count** replaces `SELECT count(*)` over such a scan when the `==>`
 //!   clause is the only restriction. Pages the visibility map marks all-visible
 //!   are counted without a heap fetch.
 //!
 //! Both fall back to a plain heap scan evaluating the original clause when the
 //! snapshot was taken during recovery, where selective index reads are not yet
-//! safe. The bitmap index scan path remains available; `tin.enable_custom_scan`
+//! safe. The bitmap index scan path remains available; `stanum.enable_custom_scan`
 //! disables these nodes.
 
 use std::ffi::{CStr, c_void};
@@ -42,29 +42,29 @@ static mut PREVIOUS_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
 
 static SEARCH_PATH_METHODS: Methods<pg_sys::CustomPathMethods> =
     Methods(pg_sys::CustomPathMethods {
-        CustomName: c"Lead Text Search".as_ptr(),
+        CustomName: c"Stanum Text Search".as_ptr(),
         PlanCustomPath: Some(plan_search_path),
         ReparameterizeCustomPathByChild: None,
     });
 static COUNT_PATH_METHODS: Methods<pg_sys::CustomPathMethods> =
     Methods(pg_sys::CustomPathMethods {
-        CustomName: c"Lead Count".as_ptr(),
+        CustomName: c"Stanum Count".as_ptr(),
         PlanCustomPath: Some(plan_count_path),
         ReparameterizeCustomPathByChild: None,
     });
 static SEARCH_SCAN_METHODS: Methods<pg_sys::CustomScanMethods> =
     Methods(pg_sys::CustomScanMethods {
-        CustomName: c"Lead Text Search Scan".as_ptr(),
+        CustomName: c"Stanum Text Search Scan".as_ptr(),
         CreateCustomScanState: Some(create_search_state),
     });
 static COUNT_SCAN_METHODS: Methods<pg_sys::CustomScanMethods> =
     Methods(pg_sys::CustomScanMethods {
-        CustomName: c"Lead Count".as_ptr(),
+        CustomName: c"Stanum Count".as_ptr(),
         CreateCustomScanState: Some(create_count_state),
     });
 static SEARCH_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
     Methods(pg_sys::CustomExecMethods {
-        CustomName: c"Lead Text Search Scan".as_ptr(),
+        CustomName: c"Stanum Text Search Scan".as_ptr(),
         BeginCustomScan: Some(begin_scan),
         ExecCustomScan: Some(exec_search),
         EndCustomScan: Some(end_scan),
@@ -80,7 +80,7 @@ static SEARCH_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
     });
 static COUNT_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
     Methods(pg_sys::CustomExecMethods {
-        CustomName: c"Lead Count".as_ptr(),
+        CustomName: c"Stanum Count".as_ptr(),
         BeginCustomScan: Some(begin_scan),
         ExecCustomScan: Some(exec_count),
         EndCustomScan: Some(end_scan),
@@ -97,8 +97,8 @@ static COUNT_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
 
 pub fn init() {
     GucRegistry::define_bool_guc(
-        c"tin.enable_custom_scan",
-        c"Enable Lead's custom scan nodes for ==> queries",
+        c"stanum.enable_custom_scan",
+        c"Enable Stanum's custom scan nodes for ==> queries",
         c"Off leaves the bitmap index scan path, which rechecks nothing either.",
         &ENABLE,
         GucContext::Userset,
@@ -181,7 +181,7 @@ unsafe fn const_datum<T: FromDatum>(node: *mut pg_sys::Node) -> Result<Option<T>
 }
 
 /// Finds a `expr ==> 'literal'` restriction on `rel` answered by a segmented
-/// tin index.
+/// stanum index.
 unsafe fn find_match(
     rel: *mut pg_sys::RelOptInfo,
     rte: *mut pg_sys::RangeTblEntry,
@@ -207,7 +207,7 @@ unsafe fn find_match(
                 continue;
             };
             let Some(index_oid) =
-                crate::score::find_matching_tin_index((*rte).relid, (*rel).relid as i32, left)
+                crate::score::find_matching_stanum_index((*rte).relid, (*rel).relid as i32, left)
             else {
                 continue;
             };
@@ -237,7 +237,7 @@ unsafe fn predicate_proven(rel: *mut pg_sys::RelOptInfo, index_oid: pg_sys::Oid)
     }
 }
 
-/// Recognizes `ORDER BY tin.score(ctid) DESC` and friends after the scoring
+/// Recognizes `ORDER BY stanum.score(ctid) DESC` and friends after the scoring
 /// support function has bound them to this index.
 unsafe fn find_ordering(
     root: *mut pg_sys::PlannerInfo,
@@ -684,7 +684,7 @@ struct ScanExec {
 }
 
 #[repr(C)]
-struct LeadScanState {
+struct StanumScanState {
     css: pg_sys::CustomScanState,
     exec: *mut Option<Box<ScanExec>>,
 }
@@ -695,7 +695,8 @@ unsafe fn create_state(
     buffer_slots: bool,
 ) -> *mut pg_sys::Node {
     unsafe {
-        let state = pg_sys::palloc0(std::mem::size_of::<LeadScanState>()).cast::<LeadScanState>();
+        let state =
+            pg_sys::palloc0(std::mem::size_of::<StanumScanState>()).cast::<StanumScanState>();
         (*state).css.ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
         (*state).css.methods = methods;
         (*state).css.flags = (*cscan).flags;
@@ -723,7 +724,7 @@ unsafe extern "C-unwind" fn create_count_state(
 
 unsafe fn exec_of<'a>(node: *mut pg_sys::CustomScanState) -> &'a mut ScanExec {
     unsafe {
-        (&mut *(*node.cast::<LeadScanState>()).exec)
+        (&mut *(*node.cast::<StanumScanState>()).exec)
             .as_deref_mut()
             .expect("scan state initialized")
     }
@@ -784,7 +785,7 @@ unsafe extern "C-unwind" fn begin_scan(
         };
         let holder = PgMemoryContexts::For((*estate).es_query_cxt)
             .leak_and_drop_on_delete(Some(Box::new(exec)));
-        (*node.cast::<LeadScanState>()).exec = holder;
+        (*node.cast::<StanumScanState>()).exec = holder;
     }
 }
 
@@ -804,7 +805,7 @@ unsafe fn gather(exec: &mut ScanExec) {
         for (segment, dead) in &view.sources {
             pgrx::check_for_interrupts!();
             let planned = plan(&query, segment, &limits)
-                .unwrap_or_else(|error| pgrx::error!("Lead query plan: {error}"));
+                .unwrap_or_else(|error| pgrx::error!("Stanum query plan: {error}"));
             let mut cursor: Box<dyn segment::set::Cursor> = planned.cursor;
             // A capped expansion yields a superset; those rows are rechecked.
             exec.recheck |= !planned.exact;
@@ -812,17 +813,17 @@ unsafe fn gather(exec: &mut ScanExec) {
                 let dead = segment::postings::Postings::parse(dead)
                     .and_then(|p| p.cursor())
                     .unwrap_or_else(|error| {
-                        pgrx::error!("Lead index data: {error}; REINDEX required")
+                        pgrx::error!("Stanum index data: {error}; REINDEX required")
                     });
                 cursor = Box::new(
                     segment::set::Difference::new(cursor, dead)
-                        .unwrap_or_else(|error| pgrx::error!("Lead index data: {error}")),
+                        .unwrap_or_else(|error| pgrx::error!("Stanum index data: {error}")),
                 );
             }
             while let Some(tid) = cursor.current() {
                 tids.push(tid);
                 cursor.advance().unwrap_or_else(|error| {
-                    pgrx::error!("Lead index data: {error}; REINDEX required")
+                    pgrx::error!("Stanum index data: {error}; REINDEX required")
                 });
             }
         }
@@ -1102,7 +1103,7 @@ unsafe extern "C-unwind" fn exec_count(
 #[pg_guard]
 unsafe extern "C-unwind" fn end_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
-        let holder = (*node.cast::<LeadScanState>()).exec;
+        let holder = (*node.cast::<StanumScanState>()).exec;
         if holder.is_null() {
             return;
         }

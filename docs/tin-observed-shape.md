@@ -1,5 +1,9 @@
 # TIN's observed shape, from a live PlanetScale database
 
+> Historical research/design note. References to Lead describe the original project
+> or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
+> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+
 Observed 2026-09-17 against PlanetScale Postgres 18.6 with `tin` 1.0.2, through
 a non-superuser role. `pageinspect` and raw file reads were unavailable, so
 these are behaviors and structure names exposed by TIN's own SQL surface and
