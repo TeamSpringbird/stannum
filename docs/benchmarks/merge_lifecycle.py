@@ -86,8 +86,9 @@ def main():
         vacuum = subprocess.Popen(["psql", "-XqAt", "-v", "ON_ERROR_STOP=1", "-c",
                                    "VACUUM (INDEX_CLEANUP ON) docs"], env=env,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        # Force an emergency merge that can invalidate VACUUM's captured inputs.
-        sql("""SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0;
+        # Force overflow merges at a low soft bound, within a budget that
+        # covers them, so an insert retires the inputs VACUUM captured.
+        sql("""SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=1000000;
             SET stannum.max_segments=4;
             INSERT INTO docs SELECT n, 'needle fresh' FROM generate_series(2066,2100) n;""")
         _, error = vacuum.communicate(timeout=60)
@@ -107,9 +108,74 @@ def main():
         started = True
         verify()
         print(f"concurrent maintenance, retained scan, WAL recovery and verification passed: {root}")
+        orphans = crash_between_run_write_and_publication(sql, command, env, data, root, start)
+        command(["pg_ctl", "-D", str(data), "-m", "fast", "-w", "stop"])
+        started = False
+        start()
+        started = True
+        verify()
+        print(f"crash between run write and publication: {orphans} orphaned page(s) "
+              "reported by verify_index, reclaimed by VACUUM and reused by the next fold")
     finally:
-        if started:
+        if started or (data / "postmaster.pid").exists():
             command(["pg_ctl", "-D", str(data), "-m", "fast", "-w", "stop"])
+
+
+def crash_between_run_write_and_publication(sql, command, env, data, root, start):
+    """Buffers a large fold, stops the server immediately while the fold is
+    writing its run, and checks that verify_index reports the run's pages as
+    orphans, VACUUM reclaims them into the FSM and the next fold reuses them.
+    The kill is timed on relation growth; a kill that lands before the run
+    write starts leaves the buffer intact, so the attempt simply repeats.
+    Returns the number of orphaned pages reported."""
+    page_warnings = ("SELECT count(*) FROM stannum.verify_index('docs_idx') "
+                     "WHERE severity = 'warning' AND location LIKE 'page %'")
+    sql("ALTER TABLE docs SET (autovacuum_enabled=false); CREATE EXTENSION IF NOT EXISTS pg_freespacemap;")
+    for attempt in range(5):
+        if sql("SELECT coalesce(sum(docs), 0) FROM stannum.segment_info('docs_idx') WHERE kind = 'mutable'") == "0":
+            sql("""SET stannum.write_buffer_docs=100000; SET stannum.write_buffer_bytes=67108864;
+                INSERT INTO docs SELECT n, 'orphan ' || repeat(md5(n::text) || ' ', 30)
+                FROM generate_series(100000 + 50000 * %d, 100000 + 50000 * %d + 39999) n;""" % (attempt, attempt))
+        size = int(sql("SELECT pg_relation_size('docs_idx')"))
+        # The next insert folds the buffer before appending. Watch the relation
+        # grow as the run is written, then stop the server at once.
+        folder = subprocess.Popen(["psql", "-XqAt", "-c",
+                                   "SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0; "
+                                   "INSERT INTO docs VALUES (%d, 'orphan')" % (99000 + attempt)],
+                                  env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        watcher = subprocess.Popen(["psql", "-XqAt"], env=env, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        deadline = time.monotonic() + 120
+        grown = False
+        while time.monotonic() < deadline and folder.poll() is None:
+            watcher.stdin.write("SELECT pg_relation_size('docs_idx');\n")
+            watcher.stdin.flush()
+            line = watcher.stdout.readline().strip()
+            if line.isdigit() and int(line) >= size + 32 * 8192:
+                grown = True
+                break
+        watcher.kill()
+        command(["pg_ctl", "-D", str(data), "-m", "immediate", "-w", "stop"])
+        folder.wait()
+        start()
+        assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx') WHERE severity = 'error'") == "0"
+        orphans = int(sql(page_warnings))
+        if orphans == 0:
+            # Killed before the run write began (or after publication): retry.
+            continue
+        assert grown, "orphans without observed growth"
+        free_before = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0"))
+        sql("VACUUM (INDEX_CLEANUP ON) docs")
+        assert sql(page_warnings) == "0"
+        assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx', true) WHERE severity = 'error'") == "0"
+        free_after = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0"))
+        assert free_after >= free_before + orphans, (free_before, free_after, orphans)
+        # The interrupted fold repeats and takes the reclaimed pages first.
+        sql("SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0; INSERT INTO docs VALUES (98000, 'orphan')")
+        assert int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0")) < free_after
+        assert sql(page_warnings) == "0"
+        return orphans
+    raise AssertionError("no crash attempt interrupted a run write: %s" % root)
 
 
 if __name__ == "__main__":

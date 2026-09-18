@@ -2955,8 +2955,27 @@ mod tests {
             ),
             128
         );
+        // `stannum.max_segments` is a soft bound: with no budget, an insert
+        // leaves the directory over it and only the on-disk bound forces the
+        // two smallest entries to merge.
         Spi::run("SET LOCAL stannum.max_segments = 3; INSERT INTO merge_full VALUES ('needle')")
             .unwrap();
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
+            ),
+            128
+        );
+        assert_eq!(
+            value("SELECT max(docs) FROM stannum.segment_info('merge_full_idx')"),
+            2
+        );
+        // With a budget that covers it, the cheapest merge brings the
+        // directory back to the soft bound.
+        Spi::run(
+            "SET LOCAL stannum.max_merge_docs = 1000; INSERT INTO merge_full VALUES ('needle')",
+        )
+        .unwrap();
         assert_eq!(
             value(
                 "SELECT count(*) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
@@ -2965,7 +2984,7 @@ mod tests {
         );
         assert_eq!(
             value("SELECT sum(docs)::bigint FROM stannum.segment_info('merge_full_idx')"),
-            131
+            132
         );
         assert_eq!(
             value(
@@ -2976,7 +2995,227 @@ mod tests {
         Spi::run("SET LOCAL enable_seqscan = off").unwrap();
         assert_eq!(
             value("SELECT count(*) FROM merge_full WHERE body ==> 'needle'"),
-            131
+            132
+        );
+    }
+
+    #[pg_test]
+    fn overflow_merges_stay_within_the_budget_below_the_hard_bound() {
+        // Tier 0 fills at eight singletons (cost 8) and the soft bound is
+        // four: with a budget of two, only the two smallest entries merge
+        // when they are both singletons.
+        Spi::run(
+            "CREATE TABLE merge_soft(body text);
+             CREATE INDEX merge_soft_idx ON merge_soft USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.merge_tier_factor = 8;
+             SET LOCAL stannum.max_segments = 4;
+             SET LOCAL stannum.max_merge_docs = 2;
+             INSERT INTO merge_soft SELECT 'needle' FROM generate_series(1,9);",
+        )
+        .unwrap();
+        let segments = || {
+            value(
+                "SELECT count(*) FROM stannum.segment_info('merge_soft_idx') WHERE kind = 'immutable'",
+            )
+        };
+        assert_eq!(segments(), 4);
+        // [2,2,2,2] plus a singleton: the cheapest merge costs three.
+        Spi::run("INSERT INTO merge_soft VALUES ('needle')").unwrap();
+        assert_eq!(segments(), 5);
+        assert_eq!(
+            value("SELECT max(docs) FROM stannum.segment_info('merge_soft_idx')"),
+            2
+        );
+        Spi::run("INSERT INTO merge_soft VALUES ('needle')").unwrap();
+        assert_eq!(segments(), 6);
+        // Three over the soft bound, the cheapest merge takes the four
+        // smallest entries (1+1+1+2); a budget of five covers it.
+        Spi::run("SET LOCAL stannum.max_merge_docs = 5; INSERT INTO merge_soft VALUES ('needle')")
+            .unwrap();
+        assert_eq!(segments(), 4);
+        assert_eq!(
+            value("SELECT max(docs) FROM stannum.segment_info('merge_soft_idx')"),
+            5
+        );
+        // VACUUM's cleanup enforces the soft bound with no budget at all.
+        Spi::run("SET LOCAL stannum.max_merge_docs = 0; INSERT INTO merge_soft SELECT 'needle' FROM generate_series(1,6)")
+            .unwrap();
+        assert_eq!(segments(), 10);
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'merge_soft_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        unsafe {
+            let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+            crate::storage::cleanup(index.as_ptr());
+        }
+        assert!(segments() <= 4, "{}", segments());
+        assert_clean("merge_soft_idx");
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM merge_soft WHERE body ==> 'needle'"),
+            18
+        );
+    }
+
+    /// Heap locations as `(block,offset)` text, from a statement returning ctids.
+    fn tids(sql: &str) -> std::collections::BTreeSet<segment::Tid> {
+        Spi::connect_mut(|client| {
+            client
+                .update(sql, None, &[])
+                .unwrap()
+                .map(|row| {
+                    let text = row.get::<String>(1).unwrap().unwrap();
+                    let (block, offset) = text
+                        .trim_matches(|c| c == '(' || c == ')')
+                        .split_once(',')
+                        .unwrap();
+                    segment::Tid::new(block.parse().unwrap(), offset.parse().unwrap()).unwrap()
+                })
+                .collect()
+        })
+    }
+
+    /// Runs `sql` once at the first race point named `at`, so an insert
+    /// lands between VACUUM's unlocked work and its publication.
+    fn insert_at_race_point(at: &'static str, sql: &'static str) {
+        let mut fired = false;
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == at && !fired {
+                fired = true;
+                Spi::run(sql).unwrap();
+            }
+        })));
+    }
+
+    #[pg_test]
+    fn vacuum_publishes_against_a_directory_inserts_changed_meanwhile() {
+        Spi::run(
+            "CREATE TABLE vac_race(id int primary key, body text);
+             CREATE INDEX vac_race_idx ON vac_race USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.max_merge_docs = 0;
+             INSERT INTO vac_race
+               SELECT n, CASE WHEN n % 3 = 0 THEN 'needle common' ELSE 'other common' END
+               FROM generate_series(1, 30) n;",
+        )
+        .unwrap();
+        let dead = tids("DELETE FROM vac_race WHERE id % 5 = 0 RETURNING ctid::text");
+        assert_eq!(dead.len(), 6);
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'vac_race_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        let counts = || {
+            (
+                value(
+                    "SELECT count(*) FROM stannum.segment_info('vac_race_idx') WHERE kind = 'immutable'",
+                ),
+                value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('vac_race_idx')"),
+            )
+        };
+        assert_eq!(counts(), (29, 0));
+        // Between scanning the 29 entries and attaching their dead lists, an
+        // insert folds the buffer and merges every entry into one. The
+        // prepared lists no longer apply, the merged entry is scanned in
+        // the next round, and every dead location is still recorded once.
+        insert_at_race_point(
+            "bulk_delete:scanned",
+            "SET LOCAL stannum.max_merge_docs = 1000000; SET LOCAL stannum.max_segments = 2;
+             INSERT INTO vac_race SELECT n, 'needle late' FROM generate_series(31, 33) n;",
+        );
+        let (live, removed) =
+            unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        crate::storage::testing::set_race_hook(None);
+        assert_eq!((live, removed), (27, 6));
+        assert_eq!(counts(), (2, 6));
+        assert_clean("vac_race_idx");
+        // Between building a merge or rewrite and publishing it, an insert
+        // retires its inputs: the output is discarded and its pages freed,
+        // and cleanup retries against the new directory.
+        Spi::run(
+            "SET LOCAL stannum.max_merge_docs = 0; SET LOCAL stannum.max_segments = 128;
+                  INSERT INTO vac_race SELECT n, 'needle later' FROM generate_series(34, 40) n;",
+        )
+        .unwrap();
+        assert_eq!(counts().0, 9);
+        insert_at_race_point(
+            "maintenance:built",
+            "SET LOCAL stannum.max_merge_docs = 1000000; SET LOCAL stannum.max_segments = 2;
+             INSERT INTO vac_race SELECT n, 'needle latest' FROM generate_series(41, 43) n;",
+        );
+        Spi::run("SET LOCAL stannum.max_segments = 2").unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        crate::storage::testing::set_race_hook(None);
+        assert!(counts().0 <= 2, "{:?}", counts());
+        assert_clean("vac_race_idx");
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM vac_race WHERE body ==> 'needle'"),
+            value("SELECT count(*) FROM vac_race WHERE body LIKE '%needle%'")
+        );
+        assert_eq!(
+            value("SELECT count(*) FROM vac_race WHERE body ==> 'needle'"),
+            21
+        );
+    }
+
+    #[pg_test]
+    fn cleanup_reclaims_orphaned_pages_and_leaves_pages_inserts_allocate_alone() {
+        Spi::run(
+            "CREATE TABLE orphans(body text);
+             CREATE INDEX orphans_idx ON orphans USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.max_merge_docs = 0;
+             INSERT INTO orphans SELECT 'needle' FROM generate_series(1, 4);",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'orphans_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        // A run written but never published, as a crash leaves behind.
+        let mut leaked =
+            unsafe { crate::storage::testing::leak_run(index.as_ptr(), &vec![7u8; 8 * 8000]) };
+        assert_eq!(leaked.len(), 8);
+        leaked.sort_unstable();
+        let warnings = findings("orphans_idx", false);
+        assert_eq!(warnings.len(), 8, "{}", warnings.join("\n"));
+        for (block, warning) in leaked.iter().zip(&warnings) {
+            assert!(
+                warning.starts_with(&format!(
+                    "warning: page {block}: run page referenced by nothing; VACUUM reclaims it"
+                )),
+                "{warning}"
+            );
+        }
+        let size = || value("SELECT pg_relation_size('orphans_idx')");
+        let before = size();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("orphans_idx");
+        // The freed pages are reused: two folds take two pages each, and
+        // four FREE pages remain for the race below.
+        Spi::run("INSERT INTO orphans SELECT 'needle' FROM generate_series(5, 6)").unwrap();
+        assert_eq!(size(), before);
+        // An insert allocating FREE pages after the capture, before their
+        // kinds are read, makes them look like orphans; the walk of what
+        // changed since the capture finds them published and keeps them.
+        let leaked =
+            unsafe { crate::storage::testing::leak_run(index.as_ptr(), &vec![9u8; 2 * 8000]) };
+        assert_eq!(leaked.len(), 2);
+        insert_at_race_point(
+            "orphans:captured",
+            "INSERT INTO orphans SELECT 'needle' FROM generate_series(7, 9)",
+        );
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        crate::storage::testing::set_race_hook(None);
+        assert_clean("orphans_idx");
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM orphans WHERE body ==> 'needle'"),
+            9
         );
     }
 

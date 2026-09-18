@@ -574,7 +574,7 @@ impl Checker {
                 Ok(kind) => self.warning(
                     format!("page {block}"),
                     format!(
-                        "{} page referenced by nothing; REINDEX reclaims it",
+                        "{} page referenced by nothing; VACUUM reclaims it",
                         kind_name(kind)
                     ),
                 ),
@@ -807,6 +807,150 @@ pub unsafe fn verify(index: pg_sys::Relation, heap_check: bool) -> Vec<Row> {
         .into_iter()
         .map(Row::from)
         .collect()
+}
+
+/// The pages of a chain starting at `first`: up to `limit` pages of `kind`,
+/// stopping without complaint at the end of the chain, at a page beyond the
+/// index, of another kind or unreadable. Returns the pages and the block the
+/// walk stopped at: `NONE` when the chain ended, otherwise the page it could
+/// not use. Used without the meta lock, where a chain retired and reclaimed
+/// meanwhile is not an error but a reason to check the directory again.
+///
+/// # Safety
+/// `index` is an open index relation.
+pub(super) unsafe fn chain_pages(
+    index: pg_sys::Relation,
+    first: u32,
+    limit: u32,
+    kind: u8,
+) -> (Vec<u32>, u32) {
+    let nblocks = unsafe { blocks(index) };
+    let mut pages = Vec::new();
+    let mut block = first;
+    while pages.len() < limit as usize {
+        pgrx::check_for_interrupts!();
+        if block == NONE || block >= nblocks {
+            break;
+        }
+        let buffer = unsafe { Buffer::read(index, block, false) };
+        if layout::kind(buffer.page()) != Ok(kind) {
+            break;
+        }
+        let Ok((next, _)) = layout::chain(buffer.page()) else {
+            break;
+        };
+        pages.push(block);
+        block = next;
+    }
+    (pages, block)
+}
+
+/// Every page `meta` references, by the ownership rules of the checker:
+/// page 0, each directory entry's run through its page table, the page-table
+/// and dead-list chains, the whole write-buffer chain including stale pages
+/// past the live bytes, and pending runs up to their recorded lengths, or
+/// as far as their chains go. Directory entries and pending runs also present
+/// in `already` are skipped, so a caller extending an earlier result under
+/// the meta lock only walks what changed. `Err` names a directory chain that
+/// could not be followed: corruption, or a race with a retirement when the
+/// caller holds no lock; the caller decides which.
+///
+/// # Safety
+/// `index` is an open index relation of at least `nblocks` pages.
+pub(super) unsafe fn referenced_pages(
+    index: pg_sys::Relation,
+    meta: &Meta,
+    nblocks: u32,
+    already: Option<&Meta>,
+) -> Result<Vec<bool>, String> {
+    let mut referenced = vec![false; nblocks as usize];
+    let mut mark = |block: u32, owner: &str| -> Result<(), String> {
+        if block >= nblocks {
+            return Err(format!(
+                "{owner} references page {block} beyond the end of the index"
+            ));
+        }
+        referenced[block as usize] = true;
+        Ok(())
+    };
+    mark(0, "meta page")?;
+    let whole = |run: Run, owner: &str| -> Result<(Vec<u32>, Vec<u8>), String> {
+        let mut bytes = Vec::with_capacity(run.bytes as usize);
+        let mut pages = Vec::with_capacity(run.blocks as usize);
+        let mut block = run.first;
+        for i in 0..run.blocks {
+            pgrx::check_for_interrupts!();
+            if block == NONE || block >= nblocks {
+                return Err(format!(
+                    "{owner}: chain ends after {i} of {} pages",
+                    run.blocks
+                ));
+            }
+            let buffer = unsafe { Buffer::read(index, block, false) };
+            if layout::kind(buffer.page()) != Ok(KIND_RUN) {
+                return Err(format!("{owner}: page {block} is not a run page"));
+            }
+            let (next, data) =
+                layout::chain(buffer.page()).map_err(|message| format!("{owner}: {message}"))?;
+            let take = (run.bytes as usize)
+                .saturating_sub(bytes.len())
+                .min(data.len());
+            bytes.extend_from_slice(&data[..take]);
+            pages.push(block);
+            block = next;
+        }
+        Ok((pages, bytes))
+    };
+    for entry in &meta.segments {
+        if already.is_some_and(|earlier| earlier.segments.contains(entry)) {
+            continue;
+        }
+        let label = format!("segment generation {}", entry.generation);
+        if entry.map.is_empty() {
+            return Err(format!("{label} has no page table"));
+        }
+        let (pages, bytes) = whole(entry.map, &format!("{label} page table"))?;
+        for block in pages {
+            mark(block, &label)?;
+        }
+        let table = decode_page_table(&bytes);
+        if table.len() != entry.run.blocks as usize {
+            return Err(format!(
+                "{label} page table lists {} pages for a run of {}",
+                table.len(),
+                entry.run.blocks
+            ));
+        }
+        for block in table {
+            mark(block, &label)?;
+        }
+        if !entry.dead.is_empty() {
+            let (pages, _) = whole(entry.dead, &format!("{label} dead list"))?;
+            for block in pages {
+                mark(block, &label)?;
+            }
+        }
+    }
+    let (pages, ended) = unsafe { chain_pages(index, meta.buffer.head, nblocks, KIND_BUFFER) };
+    if ended != NONE {
+        return Err(format!(
+            "write buffer chain cannot continue at page {ended}"
+        ));
+    }
+    for block in pages {
+        mark(block, "write buffer")?;
+    }
+    for pending in &meta.pending {
+        if already.is_some_and(|earlier| earlier.pending.contains(pending)) {
+            continue;
+        }
+        let (pages, _) =
+            unsafe { chain_pages(index, pending.run.first, pending.run.blocks, KIND_RUN) };
+        for block in pages {
+            mark(block, "pending list")?;
+        }
+    }
+    Ok(referenced)
 }
 
 /// Overwrites raw bytes of an index page in shared buffers without WAL, so
