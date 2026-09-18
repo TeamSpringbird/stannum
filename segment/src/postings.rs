@@ -404,6 +404,68 @@ impl<'a> Postings<'a> {
         })
     }
 
+    fn grouped(&self) -> Result<GroupedCursor<'a>> {
+        let mut reader = Reader::at(self.bytes, self.body_at);
+        let groups_left = reader.varint_u32()?;
+        Ok(GroupedCursor {
+            reader,
+            total: self.count,
+            groups_left,
+            previous_gid: None,
+            gid: 0,
+            group_count: 0,
+            page_bitmap: [0; PAGE_BITMAP_BYTES],
+            body_end: 0,
+            next_bit: 0,
+            group_consumed: 0,
+            block: 0,
+            offsets: Vec::new(),
+            index: 0,
+            current: None,
+            ordinal: 0,
+            seen: 0,
+            bounds: None,
+        })
+    }
+
+    /// Whether masks amortize their fixed five-word cost. Grouped encoding
+    /// alone is not enough: it can also win for many sparsely occupied pages.
+    /// Read group headers only, skipping offset bodies. Four tuples per page
+    /// is a conservative crossover for the bulk count path.
+    pub fn prefers_pages(&self) -> Result<bool> {
+        if !self.is_grouped() {
+            return Ok(false);
+        }
+        let mut groups = self.grouped()?;
+        if u64::from(self.count) >= u64::from(groups.groups_left) * u64::from(GROUP_BLOCKS) * 4 {
+            return Ok(self.count != 0);
+        }
+        let mut pages = 0u64;
+        while groups.enter_group()? {
+            pages += groups
+                .page_bitmap
+                .iter()
+                .map(|b| u64::from(b.count_ones()))
+                .sum::<u64>();
+            groups.reader.seek(groups.body_end)?;
+        }
+        Ok(pages != 0 && u64::from(self.count) >= pages * 4)
+    }
+
+    /// Reads dense pages as bitmaps without expanding them into tuple IDs.
+    pub fn pages(&self) -> Result<Box<dyn crate::pages::Cursor + 'a>> {
+        if self.is_grouped() {
+            let mut pages = GroupedPages {
+                inner: self.grouped()?,
+                current: None,
+            };
+            crate::pages::Cursor::advance(&mut pages)?;
+            Ok(Box::new(pages))
+        } else {
+            Ok(Box::new(crate::pages::Rows::new(self.cursor_with(false)?)?))
+        }
+    }
+
     pub fn cursor(&self) -> Result<PostingsCursor<'a>> {
         self.cursor_with(true)
     }
@@ -416,27 +478,9 @@ impl<'a> Postings<'a> {
             None
         };
         let mut cursor = if self.is_grouped() {
-            let mut reader = Reader::at(self.bytes, self.body_at);
-            let groups_left = reader.varint_u32()?;
-            PostingsCursor::Grouped(GroupedCursor {
-                reader,
-                total: self.count,
-                groups_left,
-                previous_gid: None,
-                gid: 0,
-                group_count: 0,
-                page_bitmap: [0; PAGE_BITMAP_BYTES],
-                body_end: 0,
-                next_bit: 0,
-                group_consumed: 0,
-                block: 0,
-                offsets: Vec::new(),
-                index: 0,
-                current: None,
-                ordinal: 0,
-                seen: 0,
-                bounds,
-            })
+            let mut grouped = self.grouped()?;
+            grouped.bounds = bounds;
+            PostingsCursor::Grouped(grouped)
         } else {
             PostingsCursor::Sparse(SparseCursor {
                 reader: Reader::at(self.bytes, self.body_at),
@@ -788,6 +832,71 @@ pub struct GroupedCursor<'a> {
     bounds: Option<Bounds<'a>>,
 }
 
+struct GroupedPages<'a> {
+    inner: GroupedCursor<'a>,
+    current: Option<crate::pages::Page>,
+}
+
+impl crate::pages::Cursor for GroupedPages<'_> {
+    fn current(&self) -> Option<crate::pages::Page> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        let c = &mut self.inner;
+        self.current = None;
+        loop {
+            if c.previous_gid.is_some() {
+                if let Some(bit) = c.next_set_bit(c.next_bit) {
+                    let offsets = c.decode_offsets()?;
+                    c.next_bit = bit + 1;
+                    c.group_consumed = c
+                        .group_consumed
+                        .checked_add(offsets.count())
+                        .ok_or(Error::Corrupt("posting count overflow"))?;
+                    let block = c.gid * GROUP_BLOCKS + u32::from(bit);
+                    Tid::new(block, 1)?;
+                    self.current = Some(crate::pages::Page { block, offsets });
+                    return Ok(());
+                }
+                c.finish_group()?;
+            }
+            if !c.enter_group()? {
+                if c.seen != c.total {
+                    return Err(Error::Corrupt("posting count mismatch"));
+                }
+                // An exhausted cursor must remain exhausted on further advances.
+                c.previous_gid = None;
+                return Ok(());
+            }
+        }
+    }
+    fn seek(&mut self, block: u32) -> Result<()> {
+        if self.current.is_none_or(|page| page.block >= block) {
+            return Ok(());
+        }
+        let c = &mut self.inner;
+        let target_gid = block / GROUP_BLOCKS;
+        // Skip complete group bodies by their stored length/count.
+        while c.gid < target_gid {
+            c.reader.seek(c.body_end)?;
+            c.group_consumed = c.group_count;
+            c.finish_group()?;
+            if !c.enter_group()? {
+                if c.seen != c.total {
+                    return Err(Error::Corrupt("posting count mismatch"));
+                }
+                c.previous_gid = None;
+                self.current = None;
+                return Ok(());
+            }
+        }
+        if c.gid == target_gid {
+            c.skip_pages_before((block % GROUP_BLOCKS) as u16)?;
+        }
+        self.advance()
+    }
+}
+
 impl<'a> GroupedCursor<'a> {
     /// Reads the next group header. Returns false when no groups remain.
     fn enter_group(&mut self) -> Result<bool> {
@@ -876,42 +985,28 @@ impl<'a> GroupedCursor<'a> {
         Ok(n)
     }
 
-    /// Decodes the page at the read position into `offsets`.
-    fn decode_page(&mut self) -> Result<()> {
+    fn decode_offsets(&mut self) -> Result<crate::pages::Offsets> {
         let mut reader = self.page_reader()?;
-        self.offsets.clear();
+        let mut offsets = crate::pages::Offsets::default();
         match reader.u8()? {
             TAG_LIST => {
                 let n = reader.varint_u32()?;
                 if n == 0 || n as usize > LIST_MAX {
                     return Err(Error::Corrupt("offset list length"));
                 }
+                let mut previous = 0;
                 for _ in 0..n {
                     let offset = reader.u16_le()?;
-                    if offset == 0
-                        || offset > MAX_OFFSET
-                        || self.offsets.last().is_some_and(|last| *last >= offset)
-                    {
+                    if offset == 0 || offset > MAX_OFFSET || offset <= previous {
                         return Err(Error::Corrupt("offset list not increasing"));
                     }
-                    self.offsets.push(offset);
+                    offsets.insert(offset);
+                    previous = offset;
                 }
             }
             TAG_BITMAP => {
-                let bitmap = reader.take(TUPLE_BITMAP_BYTES)?;
-                for (byte_index, byte) in bitmap.iter().enumerate() {
-                    let mut bits = *byte;
-                    while bits != 0 {
-                        let bit = bits.trailing_zeros() as usize;
-                        bits &= bits - 1;
-                        let offset = (byte_index * 8 + bit + 1) as u16;
-                        if offset > MAX_OFFSET {
-                            return Err(Error::Corrupt("tuple bitmap offset"));
-                        }
-                        self.offsets.push(offset);
-                    }
-                }
-                if self.offsets.is_empty() {
+                offsets = crate::pages::Offsets::from_bitmap(reader.take(TUPLE_BITMAP_BYTES)?)?;
+                if offsets.is_empty() {
                     return Err(Error::Corrupt("empty tuple bitmap"));
                 }
             }
@@ -921,6 +1016,13 @@ impl<'a> GroupedCursor<'a> {
             return Err(Error::Corrupt("page beyond group body"));
         }
         self.reader = reader;
+        Ok(offsets)
+    }
+
+    fn decode_page(&mut self) -> Result<()> {
+        let offsets = self.decode_offsets()?;
+        self.offsets.clear();
+        self.offsets.extend(offsets.iter());
         Ok(())
     }
 

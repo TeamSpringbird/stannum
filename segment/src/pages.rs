@@ -1,0 +1,431 @@
+//! Streaming set operations over exact, nonempty heap-page bitmaps.
+//!
+//! Only the current page of each input is retained. Sparse or positional
+//! cursors can participate through [`Rows`]; grouped postings decode their
+//! stored bitmaps directly. Padding bits are never part of a set.
+
+use crate::{Result, Tid, set, tid::MAX_OFFSET};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Offsets([u64; 5]);
+
+impl Offsets {
+    pub fn insert(&mut self, offset: u16) {
+        assert!((1..=MAX_OFFSET).contains(&offset));
+        let bit = usize::from(offset - 1);
+        self.0[bit / 64] |= 1 << (bit % 64);
+    }
+
+    pub fn from_bitmap(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 37 || bytes[36] & 0xf8 != 0 {
+            return Err(crate::Error::Corrupt("tuple bitmap offset"));
+        }
+        let mut words = [0; 5];
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks(8)) {
+            let mut raw = [0; 8];
+            raw[..chunk.len()].copy_from_slice(chunk);
+            *word = u64::from_le_bytes(raw);
+        }
+        Ok(Self(words))
+    }
+
+    pub fn count(self) -> u32 {
+        self.0.iter().map(|word| word.count_ones()).sum()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == [0; 5]
+    }
+
+    pub fn union(&mut self, other: Self) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a |= b;
+        }
+    }
+
+    pub fn intersect(&mut self, other: Self) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a &= b;
+        }
+    }
+
+    pub fn subtract(&mut self, other: Self) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a &= !b;
+        }
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = u16> {
+        self.0.into_iter().enumerate().flat_map(|(i, mut word)| {
+            std::iter::from_fn(move || {
+                if word == 0 {
+                    return None;
+                }
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                Some((i * 64 + bit + 1) as u16)
+            })
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Page {
+    pub block: u32,
+    pub offsets: Offsets,
+}
+
+pub trait Cursor {
+    fn current(&self) -> Option<Page>;
+    fn advance(&mut self) -> Result<()>;
+    fn seek(&mut self, block: u32) -> Result<()> {
+        while self.current().is_some_and(|page| page.block < block) {
+            self.advance()?;
+        }
+        Ok(())
+    }
+}
+
+impl<C: Cursor + ?Sized> Cursor for Box<C> {
+    fn current(&self) -> Option<Page> {
+        (**self).current()
+    }
+    fn advance(&mut self) -> Result<()> {
+        (**self).advance()
+    }
+    fn seek(&mut self, block: u32) -> Result<()> {
+        (**self).seek(block)
+    }
+}
+
+/// Adapts a scalar cursor without buffering the whole result.
+pub struct Rows<C> {
+    rows: C,
+    current: Option<Page>,
+}
+
+impl<C: set::Cursor> Rows<C> {
+    pub fn new(rows: C) -> Result<Self> {
+        let mut this = Self {
+            rows,
+            current: None,
+        };
+        this.advance()?;
+        Ok(this)
+    }
+}
+
+impl<C: set::Cursor> Cursor for Rows<C> {
+    fn current(&self) -> Option<Page> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        self.current = None;
+        if let Some(first) = self.rows.current() {
+            let mut offsets = Offsets::default();
+            while let Some(tid) = self.rows.current().filter(|tid| tid.block == first.block) {
+                offsets.insert(tid.offset);
+                self.rows.advance()?;
+            }
+            self.current = Some(Page {
+                block: first.block,
+                offsets,
+            });
+        }
+        Ok(())
+    }
+    fn seek(&mut self, block: u32) -> Result<()> {
+        if self.current.is_some_and(|page| page.block < block) {
+            self.rows.seek(Tid { block, offset: 1 })?;
+            self.advance()?;
+        }
+        Ok(())
+    }
+}
+
+pub struct Union<C> {
+    inputs: Vec<C>,
+    current: Option<Page>,
+}
+
+impl<C: Cursor> Union<C> {
+    pub fn new(inputs: Vec<C>) -> Self {
+        let mut this = Self {
+            inputs,
+            current: None,
+        };
+        this.select();
+        this
+    }
+    fn select(&mut self) {
+        self.current = self
+            .inputs
+            .iter()
+            .filter_map(Cursor::current)
+            .map(|p| p.block)
+            .min()
+            .map(|block| {
+                let mut offsets = Offsets::default();
+                for page in self
+                    .inputs
+                    .iter()
+                    .filter_map(Cursor::current)
+                    .filter(|p| p.block == block)
+                {
+                    offsets.union(page.offsets);
+                }
+                Page { block, offsets }
+            });
+    }
+}
+impl<C: Cursor> Cursor for Union<C> {
+    fn current(&self) -> Option<Page> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        if let Some(page) = self.current {
+            for input in &mut self.inputs {
+                if input.current().is_some_and(|p| p.block == page.block) {
+                    input.advance()?;
+                }
+            }
+            self.select();
+        }
+        Ok(())
+    }
+    fn seek(&mut self, block: u32) -> Result<()> {
+        for input in &mut self.inputs {
+            input.seek(block)?;
+        }
+        self.select();
+        Ok(())
+    }
+}
+
+pub struct Intersection<C> {
+    inputs: Vec<C>,
+    current: Option<Page>,
+}
+impl<C: Cursor> Intersection<C> {
+    pub fn new(inputs: Vec<C>) -> Result<Self> {
+        let mut this = Self {
+            inputs,
+            current: None,
+        };
+        this.align()?;
+        Ok(this)
+    }
+    fn align(&mut self) -> Result<()> {
+        self.current = None;
+        'next: loop {
+            let Some(mut page) = self.inputs.first().and_then(Cursor::current) else {
+                return Ok(());
+            };
+            for input in &mut self.inputs[1..] {
+                input.seek(page.block)?;
+                let Some(other) = input.current() else {
+                    return Ok(());
+                };
+                if other.block > page.block {
+                    self.inputs[0].seek(other.block)?;
+                    continue 'next;
+                }
+                page.offsets.intersect(other.offsets);
+            }
+            if !page.offsets.is_empty() {
+                self.current = Some(page);
+                return Ok(());
+            }
+            self.inputs[0].advance()?;
+        }
+    }
+}
+impl<C: Cursor> Cursor for Intersection<C> {
+    fn current(&self) -> Option<Page> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        if self.current.is_some() {
+            self.inputs[0].advance()?;
+            self.align()?;
+        }
+        Ok(())
+    }
+    fn seek(&mut self, block: u32) -> Result<()> {
+        if self.current.is_some_and(|p| p.block < block) {
+            self.inputs[0].seek(block)?;
+            self.align()?;
+        }
+        Ok(())
+    }
+}
+
+pub struct Difference<L, R> {
+    left: L,
+    right: R,
+    current: Option<Page>,
+}
+impl<L: Cursor, R: Cursor> Difference<L, R> {
+    pub fn new(left: L, right: R) -> Result<Self> {
+        let mut this = Self {
+            left,
+            right,
+            current: None,
+        };
+        this.align()?;
+        Ok(this)
+    }
+    fn align(&mut self) -> Result<()> {
+        self.current = None;
+        while let Some(mut page) = self.left.current() {
+            self.right.seek(page.block)?;
+            if let Some(other) = self.right.current().filter(|p| p.block == page.block) {
+                page.offsets.subtract(other.offsets);
+            }
+            if !page.offsets.is_empty() {
+                self.current = Some(page);
+                break;
+            }
+            self.left.advance()?;
+        }
+        Ok(())
+    }
+}
+impl<L: Cursor, R: Cursor> Cursor for Difference<L, R> {
+    fn current(&self) -> Option<Page> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        if self.current.is_some() {
+            self.left.advance()?;
+            self.align()?;
+        }
+        Ok(())
+    }
+    fn seek(&mut self, block: u32) -> Result<()> {
+        if self.current.is_some_and(|p| p.block < block) {
+            self.left.seek(block)?;
+            self.align()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::postings::{Postings, PostingsBuilder};
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    fn encode(tids: &BTreeSet<Tid>) -> Vec<u8> {
+        let mut builder = PostingsBuilder::default();
+        for tid in tids {
+            builder.push(*tid).unwrap();
+        }
+        builder.finish()
+    }
+    fn collect(mut pages: impl Cursor) -> Vec<Tid> {
+        let mut out = Vec::new();
+        while let Some(page) = pages.current() {
+            assert_eq!(page.offsets.count() as usize, page.offsets.iter().count());
+            out.extend(page.offsets.iter().map(|offset| Tid {
+                block: page.block,
+                offset,
+            }));
+            pages.advance().unwrap();
+        }
+        pages.advance().unwrap();
+        assert!(pages.current().is_none());
+        out
+    }
+    fn locations() -> impl Strategy<Value = BTreeSet<Tid>> {
+        prop::collection::btree_set(
+            (prop_oneof![0u32..8, 0u32..800], 1u16..=MAX_OFFSET)
+                .prop_map(|(block, offset)| Tid { block, offset }),
+            0..1500,
+        )
+    }
+    proptest! {
+        #[test]
+        fn page_algebra_matches_independent_sets(a in locations(), b in locations(), target in 0u32..1000) {
+            let ab = encode(&a); let bb = encode(&b);
+            let ap = Postings::parse(&ab).unwrap(); let bp = Postings::parse(&bb).unwrap();
+            let mut cursor = ap.pages().unwrap();
+            cursor.seek(target).unwrap();
+            prop_assert_eq!(collect(cursor), a.iter().filter(|t| t.block >= target).copied().collect::<Vec<_>>());
+            let mut union = Union::new(vec![ap.pages().unwrap(), bp.pages().unwrap()]);
+            union.seek(target).unwrap();
+            prop_assert_eq!(collect(union), a.union(&b).filter(|t| t.block >= target).copied().collect::<Vec<_>>());
+            let mut intersection = Intersection::new(vec![ap.pages().unwrap(), bp.pages().unwrap()]).unwrap();
+            intersection.seek(target).unwrap();
+            prop_assert_eq!(collect(intersection), a.intersection(&b).filter(|t| t.block >= target).copied().collect::<Vec<_>>());
+            let mut difference = Difference::new(ap.pages().unwrap(), bp.pages().unwrap()).unwrap();
+            difference.seek(target).unwrap();
+            prop_assert_eq!(collect(difference), a.difference(&b).filter(|t| t.block >= target).copied().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn dense_pages_seek_across_groups_and_preserve_boundary_offsets() {
+        let tids: BTreeSet<_> = [0, 1, 255, 256, 257, 511, 768]
+            .into_iter()
+            .flat_map(|block| (1..=MAX_OFFSET).map(move |offset| Tid { block, offset }))
+            .collect();
+        let bytes = encode(&tids);
+        let postings = Postings::parse(&bytes).unwrap();
+        assert!(postings.is_grouped());
+        assert_eq!(
+            collect(postings.pages().unwrap()),
+            tids.iter().copied().collect::<Vec<_>>()
+        );
+        for target in [
+            0,
+            1,
+            2,
+            255,
+            256,
+            257,
+            258,
+            511,
+            512,
+            767,
+            768,
+            769,
+            u32::MAX,
+        ] {
+            let mut cursor = postings.pages().unwrap();
+            cursor.seek(target).unwrap();
+            assert_eq!(
+                collect(cursor),
+                tids.iter()
+                    .filter(|t| t.block >= target)
+                    .copied()
+                    .collect::<Vec<_>>()
+            );
+        }
+        let mut cursor = postings.pages().unwrap();
+        for target in [0, 1, 255, 256, 256, 511, 768, 769] {
+            cursor.seek(target).unwrap();
+            assert_eq!(
+                cursor.current().map(|p| p.block),
+                tids.iter().find(|t| t.block >= target).map(|t| t.block)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bitmap_padding_and_preserves_the_highest_valid_offset() {
+        let mut raw = [0; 37];
+        raw[36] = 4;
+        assert_eq!(
+            Offsets::from_bitmap(&raw)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![291]
+        );
+        raw[36] = 8;
+        assert!(Offsets::from_bitmap(&raw).is_err());
+    }
+}

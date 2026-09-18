@@ -3518,6 +3518,64 @@ mod tests {
             assert_eq!(plan["Node Type"], "Seq Scan", "{mode}: {plan}");
         }
     }
+    #[pg_test]
+    fn pg_page_counts_match_heap_predicates_after_hot_updates_and_deletes() {
+        Spi::run(
+            "CREATE TABLE page_counts(id int, body text, payload int) WITH (fillfactor=60);
+            INSERT INTO page_counts SELECT n, CASE n % 5
+              WHEN 0 THEN '' WHEN 1 THEN 'common red' WHEN 2 THEN 'common blue'
+              WHEN 3 THEN 'rare blue' ELSE 'common red blue' END, 0
+              FROM generate_series(1, 6000) n;
+            CREATE INDEX page_counts_idx ON page_counts USING stannum(body);
+            SET LOCAL enable_seqscan = off;
+            SET LOCAL stannum.enable_custom_scan = on;",
+        )
+        .unwrap();
+        for mutation in [
+            "SELECT 1",
+            "UPDATE page_counts SET payload = 1 WHERE id % 7 = 0",
+            "DELETE FROM page_counts WHERE id % 11 = 0",
+            "UPDATE page_counts SET body = 'rare blue' WHERE id % 13 = 0",
+        ] {
+            Spi::run(mutation).unwrap();
+            for (query, predicate) in [
+                ("common", "body LIKE '%common%'"),
+                (
+                    "common AND blue",
+                    "body LIKE '%common%' AND body LIKE '%blue%'",
+                ),
+                (
+                    "common OR rare",
+                    "body LIKE '%common%' OR body LIKE '%rare%'",
+                ),
+                (
+                    "common AND NOT red",
+                    "body LIKE '%common%' AND body NOT LIKE '%red%'",
+                ),
+                ("\"red blue\"", "body LIKE '%red blue%'"),
+                (
+                    "* AND NOT common",
+                    "body <> '' AND body NOT LIKE '%common%'",
+                ),
+            ] {
+                assert_eq!(
+                    value(&format!(
+                        "SELECT count(*) FROM page_counts WHERE body ==> '{query}'"
+                    )),
+                    value(&format!(
+                        "SELECT count(*) FROM page_counts WHERE {predicate}"
+                    )),
+                    "{mutation}: {query}",
+                );
+            }
+        }
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM page_counts WHERE body ==> 'common OR rare'"
+        ).unwrap().unwrap().0;
+        assert_eq!(plan[0]["Plan"]["Custom Plan Provider"], "Stannum Count");
+        assert_eq!(plan[0]["Plan"]["Count Strategy"], "page bitmaps");
+    }
+
     /// Index and sequential-scan answers for `query`, which must agree, with
     /// the custom scan path enabled.
     fn exact_count(table: &str, query: &str) -> i64 {
