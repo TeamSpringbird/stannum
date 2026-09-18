@@ -27,7 +27,7 @@ use crate::storage::View;
 use std::rc::Rc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CacheKey {
+pub(crate) struct CacheKey {
     transaction: u32,
     command: u32,
     heap_oid: u32,
@@ -49,7 +49,7 @@ struct ScoreCorpus {
 
 /// Scoring state read from a segmented index: per-term scorers built from
 /// dead-inclusive segment statistics, and the sources to look each row up in.
-struct IndexScorer {
+pub(crate) struct IndexScorer {
     key: CacheKey,
     /// Per-source cursors, declared before `view` so they drop first.
     sources: Vec<SourceReader>,
@@ -276,7 +276,7 @@ fn segment_error<T>(result: segment::Result<T>) -> T {
 
 impl IndexScorer {
     /// Score of one visible document, or zero if the index does not hold it.
-    fn score(&mut self, tid: Tid) -> f32 {
+    pub(crate) fn score(&mut self, tid: Tid) -> f32 {
         let mut positions = Vec::new();
         for i in 0..self.view.sources.len() {
             if self.dead[i].contains(&tid) {
@@ -364,6 +364,39 @@ unsafe fn visible_tids(heap_oid: pg_sys::Oid, tids: BTreeSet<Tid>) -> Vec<Tid> {
         pg_sys::table_close(heap, pg_sys::AccessShareLock as _);
         visible
     }
+}
+
+/// Builds a scorer for a custom scan's top-k ordering from the bound
+/// arguments of a `score_bound_indexed` call.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the bound scoring function's arguments"
+)]
+pub(crate) fn scorer_for_scan(
+    heap_oid: u32,
+    index_oid: u32,
+    query: &str,
+    full: bool,
+    dense_ratio: Option<f32>,
+    k1: Option<f32>,
+    b: Option<f32>,
+    term_add: Option<Vec<String>>,
+    term_replace: Option<Vec<String>>,
+) -> IndexScorer {
+    let key = CacheKey {
+        transaction: 0,
+        command: 0,
+        heap_oid,
+        index_oid,
+        query: query.to_owned(),
+        full,
+        dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
+        k1: bits(k1),
+        b: bits(b),
+        add: term_add.clone(),
+        replace: term_replace.clone(),
+    };
+    build_index_scorer(key, k1, b, term_add, term_replace)
 }
 
 fn build_index_scorer(

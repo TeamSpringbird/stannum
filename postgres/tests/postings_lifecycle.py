@@ -154,7 +154,7 @@ def main():
         promotion_env = dict(standby_env, PGAPPNAME='lead-promotion-check')
         promotion = subprocess.Popen(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=promotion_env)
-        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM docs; SELECT pg_sleep(3); EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; COMMIT;")
+        promotion.stdin.write("BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL tin.enable_custom_scan=off; SELECT count(*) FROM docs; SELECT pg_sleep(3); EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle'; SET LOCAL tin.enable_custom_scan=on; SELECT 'custom:' || count(*) FROM docs WHERE body ==> 'needle'; COMMIT;")
         promotion.stdin.close(); promotion.stdin=None
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
@@ -165,11 +165,16 @@ def main():
         command(['pg_ctl','-D',str(standby),'-w','promote'])
         out, err = promotion.communicate()
         assert promotion.returncode == 0, err
-        old_plan=json.loads(out[out.index('['):])
+        old_plan=json.loads(out[out.index('['):out.rindex(']')+1])
         assert old_plan[0]['Plan']['Lossy Heap Blocks'] == 1, old_plan
-        new_plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
+        # The custom scan falls back to a heap scan for the same recovery snapshot.
+        assert 'custom:1' in out, out
+        new_plan=json.loads(command(['psql','-X','-qAt','-c',"SET tin.enable_custom_scan=off; EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
         assert new_plan[0]['Plan']['Exact Heap Blocks'] == 1, new_plan
         assert new_plan[0]['Plan']['Lossy Heap Blocks'] == 0, new_plan
+        custom_plan=json.loads(command(['psql','-X','-qAt','-c',"EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM docs WHERE body ==> 'needle';"],env=standby_env))
+        assert custom_plan[0]['Plan']['Custom Plan Provider'] == 'Lead Text Search Scan', custom_plan
+        assert custom_plan[0]['Plan']['Actual Rows'] == 1, custom_plan
         result={'status':'passed', 'concurrent_reader_checks':checks, 'checks':['build','overflow','rollback','HOT-eligible updates','vacuum','tuple reuse','concurrent index build','concurrent writer/readers','repeatable-read snapshot with vacuum','reindex','fold/merge/rewrite/reclaim cycles','immediate shutdown and WAL recovery','unlogged reset','truncate','clean restart','streaming standby fallback','cancellation and backend reuse','snapshot-origin fallback after promotion']}
         (root/'result.json').write_text(json.dumps(result,indent=2)+'\n')
         print(json.dumps(result)); print('Artifacts:',root)

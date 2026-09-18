@@ -4,6 +4,7 @@ use pgrx::pg_guard;
 
 mod am;
 mod bm25;
+mod customscan;
 mod highlight;
 mod highlight_udfs;
 mod match_positions;
@@ -20,6 +21,7 @@ mod udfs;
 pub extern "C-unwind" fn _PG_init() {
     options::init();
     storage::init();
+    customscan::init();
 }
 
 #[cfg(test)]
@@ -51,7 +53,7 @@ mod tests {
         )
         .unwrap();
         Spi::run("CREATE INDEX lite_search_idx ON lite_search USING tin (body)").unwrap();
-        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL tin.enable_custom_scan = off").unwrap();
         let ids = Spi::get_one::<Vec<i32>>(
             "SELECT array_agg(id ORDER BY id) FROM lite_search WHERE body ==> 'beer'",
         )
@@ -76,7 +78,7 @@ mod tests {
           INSERT INTO posting_probe SELECT n, 'common ' || repeat('filler ', 120) ||
             CASE WHEN n=777 THEN 'needle' ELSE '' END FROM generate_series(1,1500) n;
           CREATE INDEX posting_probe_idx ON posting_probe USING tin(body);
-          SET LOCAL enable_seqscan=off;",
+          SET LOCAL enable_seqscan=off; SET LOCAL tin.enable_custom_scan=off;",
         )
         .unwrap();
         // Meta page, one write-buffer page, and at least one segment page.
@@ -122,7 +124,8 @@ mod tests {
                  (3,'beer craft'), (4,'wine'), (5,'beer beer'), (6,'cider');
              INSERT INTO boolean_docs SELECT n, repeat('padding ',120)
                  FROM generate_series(7,1000) n;
-             CREATE INDEX boolean_docs_search ON boolean_docs USING tin(body);",
+             CREATE INDEX boolean_docs_search ON boolean_docs USING tin(body);
+             SET LOCAL tin.enable_custom_scan = off;",
         )
         .unwrap();
         for (query, expected) in [
@@ -209,7 +212,7 @@ mod tests {
                || CASE WHEN n=1500 THEN 'needle ' ELSE '' END
                || repeat('padding ',500) FROM generate_series(1,3000) n;
              CREATE INDEX lossy_docs_search ON lossy_docs USING tin(body);
-             SET LOCAL work_mem='64kB'; SET LOCAL enable_seqscan=off;",
+             SET LOCAL work_mem='64kB'; SET LOCAL enable_seqscan=off; SET LOCAL tin.enable_custom_scan=off;",
         )
         .unwrap();
         // The 3.5KB inline documents create enough heap pages to force lossiness
@@ -272,6 +275,7 @@ mod tests {
         Spi::run(
             "CREATE TABLE folded(id int, body text);
              CREATE INDEX folded_idx ON folded USING tin(body);
+             SET LOCAL tin.enable_custom_scan = off;
              SET LOCAL tin.write_buffer_docs = 4;
              SET LOCAL tin.max_segments = 3;
              INSERT INTO folded
@@ -525,6 +529,90 @@ mod tests {
     }
 
     #[pg_test]
+    fn custom_scan_search_count_and_topk_match_the_bitmap_path() {
+        Spi::run(
+            "CREATE TABLE cs(id int primary key, body text, active bool DEFAULT true);
+             INSERT INTO cs SELECT n, 'common w' || (n % 7) || ' ' ||
+               CASE WHEN n % 100 = 0 THEN 'rare alpha beta' ELSE 'filler' END
+               FROM generate_series(1, 3000) n;
+             CREATE INDEX cs_idx ON cs USING tin(body);
+             CREATE INDEX cs_partial ON cs USING tin(lower(body)) WHERE active;
+             UPDATE cs SET active = false WHERE id = 300;
+             DELETE FROM cs WHERE id % 500 = 0;",
+        )
+        .unwrap();
+        let queries = [
+            "rare",
+            "missing",
+            "common AND NOT rare",
+            "\"alpha beta\"",
+            "ra* OR filler",
+            "common OR rare",
+        ];
+        for query in queries {
+            let both = |custom: bool| -> (Vec<i32>, i64, Vec<i32>) {
+                Spi::run(&format!(
+                    "SET LOCAL tin.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;"
+                ))
+                .unwrap();
+                let ids = Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT coalesce(array_agg(id ORDER BY id), '{{}}') FROM cs WHERE body ==> '{query}' AND id % 3 = 0"
+                ))
+                .unwrap()
+                .unwrap();
+                let count = Spi::get_one::<i64>(&format!(
+                    "SELECT count(*) FROM cs WHERE body ==> '{query}'"
+                ))
+                .unwrap()
+                .unwrap();
+                let top = Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT coalesce(array_agg(id), '{{}}') FROM (SELECT id FROM cs WHERE body ==> '{query}'
+                     ORDER BY tin.full_score(ctid) DESC, id LIMIT 5) t"
+                ))
+                .unwrap()
+                .unwrap();
+                (ids, count, top)
+            };
+            assert_eq!(both(true), both(false), "{query}");
+        }
+        Spi::run("SET LOCAL tin.enable_custom_scan = on; SET LOCAL enable_seqscan = off;").unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM cs WHERE body ==> 'rare'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(plan[0]["Plan"]["Custom Plan Provider"], "Lead Count");
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM cs WHERE body ==> 'common OR rare'
+             ORDER BY tin.full_score(ctid) DESC LIMIT 2",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        let scan = &plan[0]["Plan"]["Plans"][0]["Plans"][0];
+        assert_eq!(scan["Custom Plan Provider"], "Lead Text Search Scan");
+        assert_eq!(scan["Order"], "score DESC");
+        assert_eq!(scan["Heap Fetches"], 2);
+        // A partial index answers only queries that imply its predicate; the
+        // inactive row must still be found through the full index.
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM cs WHERE lower(body) ==> 'rare' AND id <= 400"
+            )
+            .unwrap(),
+            Some(vec![100, 200, 300, 400])
+        );
+        assert_eq!(
+            Spi::get_one::<Vec<i32>>(
+                "SELECT array_agg(id ORDER BY id) FROM cs WHERE active AND lower(body) ==> 'rare' AND id <= 400"
+            )
+            .unwrap(),
+            Some(vec![100, 200, 400])
+        );
+    }
+
+    #[pg_test]
     fn posting_inserts_rolled_back_by_subtransaction_are_not_visible() {
         Spi::run(
             "CREATE TABLE posting_abort(body text);
@@ -612,7 +700,7 @@ mod tests {
                (3, 'BEER', false), (4, NULL, true);
              CREATE INDEX lite_partial_idx ON lite_partial
                USING tin (lower(body)) WHERE active;
-             SET LOCAL enable_seqscan = off;",
+             SET LOCAL enable_seqscan = off; SET LOCAL tin.enable_custom_scan = off;",
         )
         .unwrap();
         let plan = Spi::get_one::<Json>(

@@ -188,6 +188,52 @@ heap scan's TID order; in an isolated release-mode probe
 (`segment/tests/scoring_cost.rs`) the lookup sequence costs 21 ns per row
 against 2.4 µs with fresh cursors per row.
 
+## Custom scan nodes
+
+Two planner hooks add paths when `tin.enable_custom_scan` is on (the default)
+and a `==>` restriction on a base relation is answered by a segmented index
+whose partial predicate, if any, the planner has proven:
+
+* **Lead Text Search Scan** replaces the relation scan. It compiles the query
+  with the index's own tokenizer, plans it against every segment and the
+  buffer, and fetches each candidate by TID under the query snapshot,
+  evaluating any remaining quals. The `==>` clause itself is not re-evaluated
+  unless an expansion exceeded its cap, in which case the node rechecks those
+  rows with the original clause. When the query orders by `tin.score`,
+  `tin.full_score` or `tin.max_score` bound to the same index, the path claims
+  the sort's path keys and emits rows by descending score, so `LIMIT k` stops
+  after k fetches.
+* **Lead Count** replaces `SELECT count(*)` when the `==>` clause is the only
+  restriction. It counts candidates on pages the visibility map marks
+  all-visible without touching the heap and fetches the rest.
+
+Both fall back to a heap scan evaluating the original clause when the
+snapshot was taken during recovery, and neither is offered while the server
+is in recovery, so standbys keep the bitmap path. Setting the GUC off leaves
+the bitmap index scan, which is also exact. `EXPLAIN ANALYZE` reports the
+index, the query, the order, candidate and heap-fetch counts, and the number
+of all-visible pages skipped.
+
+Server-side execution time on the harness's 10,000-document fixture, median
+of seven, alongside the earlier measurements:
+
+| Query, ms | TIN | LDP2 bitmap path | LDP2 custom scan |
+| --- | ---: | ---: | ---: |
+| miss count | 0.24 | 0.38 | 0.13 |
+| rare count | 0.33 | 0.51 | 0.17 |
+| AND count | 0.46 | 0.68 | 0.20 |
+| OR count, 10,000 matches | 0.49 | 2.25 | 0.32 |
+| phrase count | 0.41 | 0.47 | 0.17 |
+| rare ranked, top 10 | 0.94 | 0.82 | 0.21 |
+| AND ranked | 1.12 | 1.70 | 0.31 |
+| phrase ranked | 0.69 | 0.61 | 0.23 |
+| OR ranked, 10,000 scored | 1.32 | 14.6 | 1.05 |
+
+The harness's mixed profile went from about 1,160 to 9,700 read queries per
+second on this machine. TIN's numbers come from PlanetScale's hardware and
+Lead's from a local machine, so treat the comparison as coarse; the point is
+that no shape is an order of magnitude apart any more.
+
 ## Validation
 
 ```sh

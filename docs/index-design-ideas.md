@@ -424,9 +424,11 @@ write buffer of forward records folded into segment runs, dead lists and
 segment rewrites in VACUUM, and page reclamation through the pending list and
 the FSM. See [segmented-storage.md](segmented-storage.md). Scoring from
 segment statistics (section 4.4) is implemented with TIN's dead-inclusive
-contract. What does not exist yet: cost estimation from dictionary df
-(section 4.3), the `tin_text_cmpfunc_indexed` tokenizer binding (section 7,
-revised in tin-observed-shape.md), and the custom scan for top-k (section 8). Constants that section 11 says to measure (`LIST_MAX`,
+contract. The custom scan (section 8) exists with count pushdown and top-k ordering,
+and it binds the query to the index's tokenizer, which covers most of
+section 7 for index paths. What does not exist yet: cost estimation from
+dictionary df (section 4.3), the `tin_text_cmpfunc_indexed` binding for
+non-index paths, and block-max pruning inside the top-k scan. Constants that section 11 says to measure (`LIST_MAX`,
 `BLOCK_TERMS`, `SKIP_INTERVAL`, the sparse-versus-grouped choice) are single
 definitions in the crate and are not yet tuned on real data.
 
