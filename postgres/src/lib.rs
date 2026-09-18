@@ -23,6 +23,7 @@ pub extern "C-unwind" fn _PG_init() {
     options::init();
     storage::init();
     storage::wal::init();
+    operator::init();
     customscan::init();
 }
 
@@ -3008,5 +3009,265 @@ mod tests {
             ),
             0
         );
+    }
+
+    // --- Where the unbound operator is evaluated ---------------------------------
+
+    /// A table whose only index preserves case: `body ==> 'Beer'` matches
+    /// row 1 with the index's settings and every row with the defaults.
+    fn case_preserving_fixture(table: &str) {
+        Spi::run(&format!(
+            "CREATE TABLE {table}(id int, body text);
+             INSERT INTO {table} VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER');
+             CREATE INDEX {table}_idx ON {table} USING stannum(body)
+               WITH (case_folding = preserve);"
+        ))
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn planned_statements_bind_wherever_they_run() {
+        case_preserving_fixture("pl");
+        // Views, CTEs and cursors are planned like the statement itself.
+        Spi::run("CREATE VIEW pl_view AS SELECT id FROM pl WHERE body ==> 'Beer'").unwrap();
+        assert_eq!(ids("SELECT id FROM pl_view ORDER BY id"), vec![1]);
+        assert_eq!(
+            ids("WITH m AS (SELECT id FROM pl WHERE body ==> 'Beer') SELECT id FROM m ORDER BY id"),
+            vec![1]
+        );
+        Spi::run(
+            "DECLARE pl_cursor CURSOR FOR SELECT id FROM pl WHERE body ==> 'Beer' ORDER BY id",
+        )
+        .unwrap();
+        assert_eq!(ids("FETCH ALL FROM pl_cursor"), vec![1]);
+        Spi::run("CLOSE pl_cursor").unwrap();
+        // Data-modifying statements too.
+        assert_eq!(
+            ids(
+                "WITH u AS (UPDATE pl SET id = id WHERE body ==> 'Beer' RETURNING id)
+                 SELECT id FROM u"
+            ),
+            vec![1]
+        );
+        // SQL-language bodies are planned: inlined into the caller, or as
+        // their own statements.
+        Spi::run(
+            "CREATE FUNCTION pl_count() RETURNS bigint LANGUAGE sql AS
+               $$ SELECT count(*) FROM pl WHERE body ==> 'Beer' $$;
+             CREATE FUNCTION pl_is(t text) RETURNS boolean LANGUAGE sql AS
+               $$ SELECT t ==> 'Beer' $$;",
+        )
+        .unwrap();
+        assert_eq!(value("SELECT pl_count()"), 1);
+        assert_eq!(
+            ids("SELECT id FROM pl WHERE pl_is(body) ORDER BY id"),
+            vec![1]
+        );
+        // PL/pgSQL statements go through SPI and the planner, EXECUTE too.
+        Spi::run(
+            "CREATE FUNCTION pl_spi() RETURNS bigint LANGUAGE plpgsql AS $$
+               DECLARE n bigint; BEGIN
+                 SELECT count(*) INTO n FROM pl WHERE body ==> 'Beer';
+                 RETURN n;
+               END $$;
+             CREATE FUNCTION pl_execute(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+               DECLARE n bigint; BEGIN
+                 EXECUTE 'SELECT count(*) FROM pl WHERE body ==> $1' INTO n USING q;
+                 RETURN n;
+               END $$;",
+        )
+        .unwrap();
+        assert_eq!(value("SELECT pl_spi()"), 1);
+        assert_eq!(value("SELECT pl_execute('Beer')"), 1);
+        assert_eq!(value("SELECT pl_execute('beer')"), 1);
+        // Row-security policies are planned with the statement they guard:
+        // USING as a restriction, WITH CHECK on the new row.
+        Spi::run(
+            "CREATE ROLE pl_reader; GRANT SELECT, INSERT ON pl TO pl_reader;
+             ALTER TABLE pl ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY pl_select ON pl FOR SELECT USING (body ==> 'Beer');
+             CREATE POLICY pl_insert ON pl FOR INSERT WITH CHECK (body ==> 'Beer');
+             SET LOCAL ROLE pl_reader;",
+        )
+        .unwrap();
+        assert_eq!(ids("SELECT id FROM pl ORDER BY id"), vec![1]);
+        Spi::run(
+            "INSERT INTO pl VALUES (4, 'Beer');
+             DO $$ BEGIN
+               BEGIN INSERT INTO pl VALUES (5, 'beer');
+                 RAISE EXCEPTION 'policy accepted a row its index settings reject';
+               EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+             END $$;
+             RESET ROLE;",
+        )
+        .unwrap();
+        assert_eq!(ids("SELECT id FROM pl ORDER BY id"), vec![1, 2, 3, 4]);
+    }
+
+    #[pg_test]
+    fn expressions_planned_without_a_query_use_the_default_settings() {
+        case_preserving_fixture("np");
+        // A partial index's predicate is evaluated at build and insert time
+        // with `expression_planner`, which has no query to bind against: the
+        // index holds every row the default settings match.
+        Spi::run(
+            "CREATE INDEX np_part ON np USING stannum(body)
+               WITH (case_folding = preserve) WHERE body ==> 'beer';
+             INSERT INTO np VALUES (4, 'Beer');",
+        )
+        .unwrap();
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('np_part')"),
+            4
+        );
+        // CHECK constraints and stored generated columns likewise.
+        Spi::run(
+            "CREATE TABLE np_check(id int, body text, CHECK (body ==> 'beer'));
+             CREATE INDEX np_check_idx ON np_check USING stannum(body)
+               WITH (case_folding = preserve);
+             INSERT INTO np_check VALUES (1, 'Beer'), (2, 'BEER');
+             CREATE TABLE np_gen(id int, body text,
+               hit boolean GENERATED ALWAYS AS (body ==> 'beer') STORED);
+             CREATE INDEX np_gen_idx ON np_gen USING stannum(body)
+               WITH (case_folding = preserve);
+             INSERT INTO np_gen VALUES (1, 'Beer');",
+        )
+        .unwrap();
+        assert_eq!(value("SELECT count(*) FROM np_check"), 2);
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT hit FROM np_gen").unwrap(),
+            Some(true)
+        );
+        // A trigger's WHEN clause sees the new row, not a table column.
+        Spi::run(
+            "CREATE FUNCTION np_tag() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN NEW.id := NEW.id + 100; RETURN NEW; END $$;
+             CREATE TRIGGER np_when BEFORE INSERT ON np FOR EACH ROW
+               WHEN (NEW.body ==> 'beer') EXECUTE FUNCTION np_tag();
+             INSERT INTO np VALUES (5, 'Beer');",
+        )
+        .unwrap();
+        assert_eq!(ids("SELECT id FROM np WHERE id > 100"), vec![105]);
+        // A PL/pgSQL variable, a non-inlined SQL function's argument, an
+        // expression no index covers and a literal are not columns: nothing
+        // to bind to.
+        Spi::run(
+            "CREATE FUNCTION np_var(t text) RETURNS boolean LANGUAGE plpgsql AS
+               $$ BEGIN RETURN t ==> 'beer'; END $$;
+             CREATE FUNCTION np_opaque(t text) RETURNS boolean LANGUAGE sql
+               SET search_path = pg_catalog AS $$ SELECT t ==> 'beer' $$;",
+        )
+        .unwrap();
+        assert_eq!(
+            ids("SELECT id FROM np WHERE np_var(body) ORDER BY id"),
+            vec![1, 2, 3, 4, 105]
+        );
+        assert_eq!(
+            ids("SELECT id FROM np WHERE np_opaque(body) ORDER BY id"),
+            vec![1, 2, 3, 4, 105]
+        );
+        assert_eq!(
+            ids("SELECT id FROM np WHERE (body || '') ==> 'beer' ORDER BY id"),
+            vec![1, 2, 3, 4, 105]
+        );
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT 'Beer' ==> 'beer'").unwrap(),
+            Some(true)
+        );
+        // The same statements bound: the column's settings.
+        assert_eq!(
+            ids("SELECT id FROM np WHERE body ==> 'beer' ORDER BY id"),
+            vec![2]
+        );
+    }
+
+    #[pg_test]
+    fn search_predicates_of_partial_indexes_are_proven() {
+        // A partial index whose predicate is a `==>` clause holds the rows
+        // the default settings match. A query clause bound to an index with
+        // the default settings proves it; the planner then uses the index.
+        Spi::run(
+            "CREATE TABLE pp(id int, body text);
+             INSERT INTO pp SELECT g, CASE WHEN g % 2 = 0 THEN 'craft beer' ELSE 'wine' END
+               FROM generate_series(1, 200) g;
+             CREATE INDEX pp_part ON pp USING stannum(body) WHERE body ==> 'beer';
+             CREATE INDEX pp_btree ON pp (id) WHERE body ==> 'beer';",
+        )
+        .unwrap();
+        let sql = "SELECT id FROM pp WHERE body ==> 'beer' AND body ==> 'craft' ORDER BY id";
+        let expected = (2..=200).step_by(2).collect::<Vec<i32>>();
+        let bound = format!("\"index\":{}", oid_of("pp_part"));
+        for (mode, plan, rows) in by_mode(sql) {
+            assert_eq!(rows, expected, "{mode}");
+            if mode == "custom" {
+                assert_eq!(plan["Index"], "pp_part", "{mode}: {plan}");
+            } else {
+                assert!(plan_mentions(&plan, &bound), "{mode}: {plan}");
+            }
+            if mode == "bitmap" {
+                assert!(plan_mentions(&plan, "pp_part"), "{mode}: {plan}");
+            }
+        }
+        // Any index with such a predicate, not only a stannum one.
+        Spi::run(
+            "SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
+             SET LOCAL enable_indexscan = on; SET LOCAL stannum.enable_custom_scan = off",
+        )
+        .unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (FORMAT JSON) SELECT id FROM pp WHERE body ==> 'beer' AND id = 4",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert!(plan_mentions(&plan, "pp_btree"), "{plan}");
+        assert_eq!(
+            ids("SELECT id FROM pp WHERE body ==> 'beer' AND id = 4"),
+            vec![4]
+        );
+        // A partition's index is proven through the parent's clause.
+        Spi::run(
+            "CREATE TABLE ppt(id int, body text) PARTITION BY RANGE (id);
+             CREATE TABLE ppt1 PARTITION OF ppt FOR VALUES FROM (1) TO (101);
+             CREATE TABLE ppt2 PARTITION OF ppt FOR VALUES FROM (101) TO (201);
+             INSERT INTO ppt SELECT * FROM pp;
+             CREATE INDEX ppt_part ON ppt USING stannum(body) WHERE body ==> 'beer';",
+        )
+        .unwrap();
+        let sql = "SELECT id FROM ppt WHERE body ==> 'beer' AND body ==> 'craft' ORDER BY id";
+        for (mode, plan, rows) in by_mode(sql) {
+            assert_eq!(rows, expected, "{mode}");
+            if mode != "seq" {
+                assert!(plan_mentions(&plan, "ppt1_body_idx"), "{mode}: {plan}");
+            }
+        }
+    }
+
+    #[pg_test]
+    fn search_predicates_with_other_settings_are_never_proven() {
+        // The predicate of a partial index with other settings was evaluated
+        // with the defaults, so a clause bound to that index (still the first
+        // covering index by OID) cannot prove it: every plan evaluates the
+        // clause with the index's settings, and none scans that index.
+        Spi::run(
+            "CREATE TABLE pn(id int, body text);
+             INSERT INTO pn VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER'), (4, 'wine');
+             CREATE INDEX pn_part ON pn USING stannum(body)
+               WITH (case_folding = preserve) WHERE body ==> 'beer';
+             CREATE INDEX pn_full ON pn USING stannum(body);",
+        )
+        .unwrap();
+        let bound = format!("\"index\":{}", oid_of("pn_part"));
+        let sql = "SELECT id FROM pn WHERE body ==> 'beer' ORDER BY id";
+        for (mode, plan, rows) in by_mode(sql) {
+            assert_eq!(rows, vec![2], "{mode}");
+            assert!(plan_mentions(&plan, &bound), "{mode}: {plan}");
+            assert!(!plan_mentions(&plan, "pn_part"), "{mode}: {plan}");
+        }
+        Spi::run("DROP INDEX pn_full").unwrap();
+        for (mode, plan, rows) in by_mode(sql) {
+            assert_eq!(rows, vec![2], "{mode}");
+            assert_eq!(plan["Node Type"], "Seq Scan", "{mode}: {plan}");
+        }
     }
 }
