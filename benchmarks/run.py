@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Small, dependency-free PostgreSQL benchmark recorder. See docs/benchmarks/harness.md."""
+import argparse
+import collections
+import csv
+import datetime as dt
+import dataset
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import time
+
+ROOT = Path(os.environ.get("STANNUM_BENCH_ROOT", Path(__file__).resolve().parents[1]))
+# "tin" targets PlanetScale TIN; "stannum" targets this extension under its own schema.
+ENGINES = ("stannum", "tin", "gin", "paradedb", "pg_textsearch")
+SETTINGS_SQL = """SELECT json_object_agg(name, setting) FROM pg_settings
+WHERE name = ANY(ARRAY['server_version','block_size','shared_buffers','work_mem',
+ 'maintenance_work_mem','effective_cache_size','max_connections','max_worker_processes',
+ 'max_parallel_workers','max_parallel_workers_per_gather','max_parallel_maintenance_workers',
+ 'effective_io_concurrency','maintenance_io_concurrency','random_page_cost','seq_page_cost',
+ 'cpu_tuple_cost','cpu_index_tuple_cost','cpu_operator_cost','default_statistics_target',
+ 'jit','jit_above_cost','enable_seqscan','enable_bitmapscan','enable_indexscan',
+ 'enable_indexonlyscan','enable_sort','enable_incremental_sort','synchronous_commit',
+ 'fsync','full_page_writes','wal_level','wal_compression','max_wal_size','checkpoint_timeout',
+ 'autovacuum','autovacuum_vacuum_scale_factor','autovacuum_analyze_scale_factor',
+ 'autovacuum_max_workers','autovacuum_vacuum_cost_limit','autovacuum_vacuum_cost_delay',
+ 'shared_preload_libraries','default_text_search_config','statement_timeout',
+ 'track_io_timing','huge_pages','hash_mem_multiplier',
+ 'pg_textsearch.memtable_spill_threshold','pg_textsearch.bulk_load_threshold',
+ 'pg_textsearch.default_limit','pg_textsearch.compress_segments']) OR name LIKE 'tin.%' OR name LIKE 'stannum.%';"""
+CASES = [
+    ("miss", "absenttoken", "absenttoken", "absenttoken", "term", 0),
+    ("rare", "rare", "rare", "rare", "term", 100),
+    ("and", "common AND rare", "common & rare", "common rare", "and", 100),
+    ("or", "common OR rare", "common | rare", "common rare", "or", 1),
+    ("phrase", '"alpha beta"', "alpha <-> beta", "alpha beta", "phrase", 1000),
+    ("phrase_miss", '"beta alpha"', "beta <-> alpha", "beta alpha", "phrase", 0),
+]
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def command(args, **kw):
+    try:
+        return subprocess.run(args, check=True, capture_output=True, text=True, **kw).stdout.strip()
+    except subprocess.CalledProcessError as error:
+        sys.stderr.write(error.stderr or "")
+        raise
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def psql(sql, env):
+    return command(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"], input=sql, env=env)
+
+
+def sql_json(sql, env):
+    return json.loads(psql(sql, env))
+
+
+def predicate(engine, case):
+    _, tinql, ts, plain, kind, _ = case
+    if engine in ("stannum", "tin"):
+        return f"body ==> '{tinql}'"
+    if engine == "gin":
+        return f"to_tsvector('simple', body) @@ to_tsquery('simple', '{ts}')"
+    if engine == "pg_textsearch":
+        return f"body @@ to_tsquery('simple', '{ts}')"
+    op = {"term": "|||", "or": "|||", "and": "&&&", "phrase": "###"}[kind]
+    return f"body {op} '{plain}'"
+
+
+def workload(engine, profile, cases=CASES):
+    queries = []
+    for case in cases:
+        name = case[0]
+        where = predicate(engine, case)
+        if profile != "ranked":
+            queries.append((name + "_count", f"SELECT count(*) FROM documents WHERE {where};"))
+        if profile != "count":
+            score = {
+                "stannum": "stannum.full_score(ctid)",
+                "tin": "tin.full_score(ctid)",
+                "paradedb": "pdb.score(id)",
+                "pg_textsearch": f"-(body <@> '{case[3]}')",
+            }[engine]
+            # No secondary sort: ties are deliberately unordered in the measured workload.
+            order = f"body <@> '{case[3]}' ASC" if engine == "pg_textsearch" else "score DESC"
+            queries.append((name + "_ranked", f"SELECT id, {score} AS score FROM documents "
+                            f"WHERE {where} ORDER BY {order} LIMIT 10;"))
+    return queries
+
+
+def fixture_sql(rows):
+    return f"""CREATE TABLE documents (id bigint PRIMARY KEY, body text NOT NULL);
+INSERT INTO documents
+SELECT n, 'common ' || repeat('filler ', 8 + n % 7)
+ || CASE WHEN n % 100 = 0 THEN 'rare ' ELSE '' END
+ || CASE WHEN n % 1000 = 0 THEN 'alpha beta ' ELSE '' END
+ || 'mutablea'
+FROM generate_series(1, {rows}) AS n;
+"""
+
+
+def index_sql(engine):
+    return {
+        "stannum": "CREATE INDEX search_idx ON documents USING stannum(body);",
+        "tin": "CREATE INDEX search_idx ON documents USING tin(body);",
+        "gin": "CREATE INDEX search_idx ON documents USING gin(to_tsvector('simple', body));",
+        "paradedb": "CREATE INDEX search_idx ON documents USING paradedb(id, body) WITH (key_field='id');",
+        "pg_textsearch": "CREATE INDEX search_idx ON documents USING bm25(body) WITH (text_config='simple');",
+    }[engine]
+
+
+def percentile(values, fraction):
+    if not values:
+        return None
+    return sorted(values)[max(0, math.ceil(len(values) * fraction) - 1)]
+
+
+def summarize_logs(paths, names, elapsed):
+    samples = collections.defaultdict(list)
+    failures = collections.Counter()
+    lag = []
+    for path in paths:
+        for line in path.read_text().splitlines():
+            fields = line.split()
+            if len(fields) < 6:
+                raise ValueError(f"Malformed pgbench record in {path}")
+            name = names[int(fields[3])]
+            if fields[2] in ("failed", "skipped", "serialization", "deadlock"):
+                failures[name + ":" + fields[2]] += 1
+                continue
+            samples[name].append(int(fields[2]) / 1000)
+            if len(fields) >= 7:
+                lag.append(int(fields[6]) / 1000)
+    result = {}
+    for name in names:
+        vals = samples[name]
+        result[name] = {
+            "completed": len(vals), "completed_per_second": len(vals) / elapsed,
+            "p50_ms": percentile(vals, .5), "p95_ms": percentile(vals, .95),
+            "p99_ms": percentile(vals, .99) if len(vals) >= 1000 else None,
+            "p99_insufficient_samples": len(vals) < 1000,
+        }
+    return {"queries": result, "failures": dict(failures),
+            "schedule_lag_p95_ms": percentile(lag, .95), "wall_seconds": elapsed}
+
+
+def validate(engine, rows, env, corpus=None):
+    records = {}
+    for case in (corpus["cases"] if corpus else CASES):
+        expected = corpus["match_counts"][case[0]] if corpus else (rows // case[-1] if case[-1] else 0)
+        where = predicate(engine, case)
+        # Exact set comparison against a fixture oracle independent of text evaluation.
+        truth = "false" if not case[-1] else f"id % {case[-1]} = 0"
+        expected_sql = (f"SELECT id FROM benchmark_matches WHERE name = '{case[0]}'" if corpus
+                        else f"SELECT id FROM documents WHERE {truth}")
+        result = sql_json(f"""WITH actual AS (SELECT id FROM documents WHERE {where}),
+expected AS ({expected_sql}),
+differences AS ((SELECT * FROM actual EXCEPT SELECT * FROM expected)
+ UNION ALL (SELECT * FROM expected EXCEPT SELECT * FROM actual))
+SELECT json_build_object('count', (SELECT count(*) FROM actual),
+ 'differences', (SELECT count(*) FROM differences));""", env)
+        records[case[0]] = result
+        if result != {"count": expected, "differences": 0}:
+            raise ValueError(f"Incorrect match set for {case[0]}: {result}")
+    return records
+
+
+def validate_ranked(engine, rows, env, corpus=None):
+    records = {}
+    cases = corpus["cases"] if corpus else CASES
+    for case, (name, query) in zip(cases, workload(engine, "ranked", cases)):
+        result = sql_json("SELECT coalesce(json_agg(r), '[]'::json) FROM (" + query.rstrip(";") + ") r;", env)
+        count = corpus["match_counts"][case[0]] if corpus else (rows // case[-1] if case[-1] else 0)
+        ids = [r["id"] for r in result]
+        scores = [float(r["score"]) for r in result]
+        if corpus and ids:
+            valid_ids = sql_json(f"SELECT coalesce(json_agg(id), '[]'::json) FROM benchmark_matches "
+                                 f"WHERE name = '{case[0]}' AND id IN ({','.join(str(int(i)) for i in ids)});", env)
+            invalid_member = set(ids) != set(valid_ids)
+        else:
+            invalid_member = any(not (1 <= i <= rows) or not case[-1] or i % case[-1] for i in ids)
+        if (len(ids) != min(10, count) or len(set(ids)) != len(ids)
+                or invalid_member
+                or any(not math.isfinite(s) for s in scores) or scores != sorted(scores, reverse=True)):
+            raise ValueError(f"Incorrect ranked result shape/membership/order: {name}")
+        records[name] = result
+    # This is deliberately NOT a proof of BM25 arithmetic or global top-k optimality.
+    return records
+
+
+def snapshot(env):
+    return sql_json("""SELECT json_build_object(
+ 'wal_lsn', pg_current_wal_insert_lsn()::text,
+ 'table_bytes', pg_table_size('documents'),
+ 'index_bytes', pg_indexes_size('documents'),
+ 'database', (SELECT row_to_json(s) FROM pg_stat_database s WHERE datname=current_database()),
+ 'table_io', (SELECT row_to_json(s) FROM pg_statio_user_tables s WHERE relname='documents'),
+ 'indexes', (SELECT json_agg(s) FROM pg_statio_user_indexes s WHERE relname='documents'));""", env)
+
+
+def container_counters(name):
+    result = {}
+    for metric in ("cpu.stat", "cpu.max", "cpuset.cpus.effective", "memory.current",
+                   "memory.peak", "memory.events", "memory.max", "memory.swap.max", "io.stat"):
+        proc = subprocess.run(["docker", "exec", name, "cat", "/sys/fs/cgroup/" + metric],
+                              capture_output=True, text=True)
+        result[metric] = proc.stdout.strip() if proc.returncode == 0 else None
+    return result
+
+
+def provenance(out):
+    paths = command(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=ROOT).splitlines()
+    selected = [p for p in paths if p.startswith(("postgres/", "tinql/", "tokenizer/", "boldi-vigna/", "segment/", ".cargo/"))
+                or p in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")]
+    hashes = {p: digest((ROOT / p).read_bytes()) for p in selected if (ROOT / p).is_file()}
+    patch = command(["git", "diff", "HEAD", "--binary", "--", *selected], cwd=ROOT)
+    (out / "source.patch").write_text(patch + "\n" if patch else "")
+    tracked = set(command(["git", "ls-files"], cwd=ROOT).splitlines())
+    return {"commit": command(["git", "rev-parse", "HEAD"], cwd=ROOT),
+            "tags": command(["git", "tag", "--points-at", "HEAD"], cwd=ROOT).splitlines(),
+            "source_sha256": digest(canonical(hashes)), "source_files": hashes,
+            "source_dirty": bool(patch) or any(p not in tracked for p in selected),
+            "working_tree_dirty": bool(command(["git", "status", "--porcelain"], cwd=ROOT))}
+
+
+def run(args):
+    if args.engine == "gin" and args.profile != "count":
+        raise ValueError("GIN does not implement BM25; use --profile count for equivalent comparisons")
+    if args.rows < 1000 or args.rows % 1000:
+        raise ValueError("--rows must be a positive multiple of 1000")
+    corpus = dataset.verify(args.dataset, args.rows) if args.dataset else None
+    cases = corpus["cases"] if corpus else CASES
+    out = Path(args.output).resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    env = dict(os.environ)
+    # Credentials remain in libpq environment/.pgpass, never in artifacts or command arguments.
+    env["PGDATABASE"] = args.database
+    if not args.database.startswith("stannum_bench_"):
+        raise ValueError("Use a dedicated database named stannum_bench_*; create it before running")
+    env["PGOPTIONS"] = env.get("PGOPTIONS", "") + f" -c default_text_search_config=simple -c statement_timeout={args.statement_timeout_ms}"
+    queries = workload(args.engine, args.profile, cases)
+    settings = sql_json(SETTINGS_SQL, env)
+    manifest = {
+        "schema_version": 1, "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "status": "running", "engine": args.engine, "label": args.label,
+        "environment": args.environment, "build_id": args.build_id,
+        "artifact_sha256": digest(Path(args.artifact).read_bytes()) if args.artifact else None,
+        "source": json.loads(Path(args.source_manifest).read_text()) if args.source_manifest else provenance(out), "harness_sha256": digest(Path(__file__).read_bytes() + Path(dataset.__file__).read_bytes()),
+        "host": {"platform": platform.platform(), "machine": platform.machine(), "cpus": os.cpu_count()},
+        "server_version": psql("SELECT version();", env), "settings": settings,
+        "pgbench_version": command(["pgbench", "--version"]),
+        "config": {k: getattr(args, k) for k in ("rows", "seconds", "warmup", "clients", "write_rate", "seed", "profile")},
+        "fixture_sha256": digest(canonical(corpus)) if corpus else digest(fixture_sql(args.rows).encode()),
+        "dataset": corpus,
+        "sql_sha256": digest(canonical(queries)), "query_names": [q[0] for q in queries],
+        "cache_policy": "warm read workload; no OS cache eviction", "load_model": "closed-loop readers; rate-scheduled single writer",
+        "execution_context": json.loads(Path(args.context).read_text()) if args.context else None,
+    }
+    save(out / "manifest.json", manifest)
+    children = []
+    try:
+        extension = {"stannum": "stannum", "tin": "tin", "paradedb": "pg_search", "pg_textsearch": "pg_textsearch"}.get(args.engine)
+        if extension:
+            psql(f"CREATE EXTENSION IF NOT EXISTS {extension} CASCADE;", env)
+        manifest["extensions"] = sql_json("SELECT json_object_agg(extname, extversion) FROM pg_extension;", env)
+        if extension:
+            # Load the library so its GUCs are visible; LOAD needs privileges a
+            # managed server may not grant, so prefer calling into the extension.
+            load = {"tin": "DO $$ BEGIN PERFORM tin.tokenize('load'); END $$; ",
+                    "stannum": "DO $$ BEGIN PERFORM stannum.tokenize('load'); END $$; "}.get(extension, f"LOAD '{extension}'; ")
+            manifest["settings"] = sql_json(load + SETTINGS_SQL, env)
+        # Never overwrite an existing table. Each repetition uses a fresh dedicated database.
+        (out / "fixture.sql").write_text("-- External verified corpus; see dataset.json.\n" if corpus else fixture_sql(args.rows))
+        (out / "index.sql").write_text(index_sql(args.engine) + "\n")
+        setup_env = dict(env, PGOPTIONS=env["PGOPTIONS"] + " -c statement_timeout=0")
+        if corpus:
+            save(out / "dataset.json", corpus)
+            psql("CREATE TABLE documents (id bigint PRIMARY KEY, body text NOT NULL); "
+                 "CREATE TABLE benchmark_matches (name text NOT NULL, id bigint NOT NULL, PRIMARY KEY(name,id));", setup_env)
+            for filename, table in (("documents.csv", "documents"), ("matches.csv", "benchmark_matches")):
+                # Stream CSV through libpq; no Docker bind mount or multi-GB Python string.
+                with (Path(args.dataset) / filename).open("rb") as source:
+                    subprocess.run(["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c",
+                                    f"COPY {table} FROM STDIN WITH (FORMAT csv)"],
+                                   stdin=source, env=setup_env, check=True)
+            psql("ANALYZE benchmark_matches;", setup_env)
+        else:
+            psql(fixture_sql(args.rows), setup_env)
+        start = time.monotonic()
+        psql(index_sql(args.engine), setup_env)
+        manifest["index_build_seconds"] = time.monotonic() - start
+        manifest["index_definition"] = psql("SELECT pg_get_indexdef('search_idx'::regclass);", env)
+        psql("VACUUM ANALYZE documents;", setup_env)
+        save(out / "correctness-before.json", validate(args.engine, args.rows, env, corpus))
+        if args.profile != "count":
+            save(out / "ranked-before.json", validate_ranked(args.engine, args.rows, env, corpus))
+        for i, (name, sql) in enumerate(queries):
+            (out / f"query-{i}.sql").write_text(sql + "\n")
+            plan = sql_json("EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, FORMAT JSON) " + sql, env)
+            save(out / f"plan-{name}.json", plan)
+        writer_sql = f"""\\set id random(1, {args.rows})
+UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
+ THEN left(body, length(body)-8) || 'mutableb'
+ ELSE left(body, length(body)-8) || 'mutablea' END WHERE id = :id;
+"""
+        (out / "writer.sql").write_text(writer_sql)
+        base = ["pgbench", "-n", "-M", "simple", "--random-seed", str(args.seed)]
+        reader = base + ["-c", str(args.clients), "-j", str(min(args.clients, 4))]
+        for i in range(len(queries)):
+            reader += ["-f", str(out / f"query-{i}.sql")]
+        (out / "warmup.txt").write_text(command(reader + ["-T", str(args.warmup)], env=env))
+        save(out / "before.json", snapshot(env))
+        if args.container:
+            save(out / "cgroup-before.json", container_counters(args.container))
+        jobs = [("reader", reader + ["-T", str(args.seconds), "-l", "--log-prefix", str(out / "reader-log")])]
+        if args.write_rate:
+            jobs.insert(0, ("writer", base + ["-c", "1", "-j", "1", "-f", str(out / "writer.sql"),
+                         "-T", str(args.seconds), "-R", str(args.write_rate), "-l", "--log-prefix", str(out / "writer-log")]))
+        starts = {}
+        handles = []
+        manifest["traffic_started_at"] = {}
+        manifest["traffic_finished_at"] = {}
+        for name, cmd in jobs:
+            handle = (out / f"{name}.txt").open("w")
+            handles.append(handle)
+            starts[name] = time.monotonic()
+            manifest["traffic_started_at"][name] = dt.datetime.now(dt.timezone.utc).isoformat()
+            children.append((name, subprocess.Popen(cmd, env=env, stdout=handle, stderr=subprocess.STDOUT)))
+        summary = {}
+        pending = dict(children)
+        while pending:
+            for name, proc in list(pending.items()):
+                if proc.poll() is not None:
+                    manifest["traffic_finished_at"][name] = dt.datetime.now(dt.timezone.utc).isoformat()
+                    elapsed = time.monotonic() - starts[name]
+                    if proc.returncode:
+                        raise RuntimeError(f"{name} exited {proc.returncode}; see {name}.txt")
+                    names = [q[0] for q in queries] if name == "reader" else ["update"]
+                    summary[name] = summarize_logs(out.glob(f"{name}-log.*"), names, elapsed)
+                    del pending[name]
+            if pending:
+                time.sleep(.05)
+        for handle in handles:
+            handle.close()
+        save(out / "summary.json", summary)
+        save(out / "after.json", snapshot(env))
+        if args.container:
+            save(out / "cgroup-after.json", container_counters(args.container))
+        save(out / "correctness-after.json", validate(args.engine, args.rows, env, corpus))
+        if args.profile != "count":
+            save(out / "ranked-after.json", validate_ranked(args.engine, args.rows, env, corpus))
+        if any(s["failures"] for s in summary.values()):
+            raise RuntimeError("Transactions failed/skipped; run retained but not comparable")
+        if any(q["completed"] == 0 for s in summary.values() for q in s["queries"].values()):
+            raise RuntimeError("At least one workload had no completed transactions; lengthen the run")
+        manifest["status"] = "complete"
+    except BaseException as error:
+        for _, proc in children:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
+        manifest["status"] = "failed"
+        manifest["error"] = type(error).__name__
+        raise
+    finally:
+        manifest["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        save(out / "manifest.json", manifest)
+    print(out)
+
+
+def comparison_keys(cross_engine=False):
+    keys = ["schema_version", "environment", "host", "server_version", "pgbench_version", "config", "fixture_sha256", "harness_sha256", "cache_policy", "query_names", "execution_context"]
+    # Extension GUCs differ across engines; compare PostgreSQL settings in that mode.
+    if not cross_engine:
+        keys += ["engine", "sql_sha256", "settings"]
+    return keys
+
+
+def comparison_mismatches(a, b, cross_engine=False):
+    mismatches = [key for key in comparison_keys(cross_engine) if a.get(key) != b.get(key)]
+    if cross_engine:
+        if a["config"]["profile"] != "count" or b["config"]["profile"] != "count":
+            mismatches.append("ranking contract")
+        pg_settings = [{k: v for k, v in m["settings"].items() if "." not in k} for m in (a, b)]
+        if pg_settings[0] != pg_settings[1]:
+            mismatches.append("PostgreSQL settings")
+    if a["status"] != "complete" or b["status"] != "complete":
+        mismatches.append("completion status")
+    return mismatches
+
+
+def compare(args):
+    dirs = [Path(args.before), Path(args.after)]
+    manifests = [json.loads((d / "manifest.json").read_text()) for d in dirs]
+    a, b = manifests
+    mismatches = comparison_mismatches(a, b, args.cross_engine)
+    if mismatches:
+        raise ValueError(f"Incomparable/incomplete runs; differing fields: {mismatches}")
+    summaries = [json.loads((d / "summary.json").read_text()) for d in dirs]
+    print("query,before_p50_ms,after_p50_ms,before_over_after,before_p95_ms,after_p95_ms,before_qps,after_qps")
+    for name in a["query_names"]:
+        qa, qb = [s["reader"]["queries"][name] for s in summaries]
+        x, y = qa["p50_ms"], qb["p50_ms"]
+        print(f"{name},{x},{y},{x/y if x and y else ''},{qa['p95_ms']},{qb['p95_ms']},"
+              f"{qa['completed_per_second']},{qb['completed_per_second']}")
+    if a["config"]["write_rate"]:
+        qa, qb = [s["writer"]["queries"]["update"] for s in summaries]
+        print(f"# Achieved writes/s: {qa['completed_per_second']:.3f} -> {qb['completed_per_second']:.3f}; "
+              f"writer p95 ms: {qa['p95_ms']} -> {qb['p95_ms']}")
+    print("# Descriptive single-run comparison, not statistical significance. Inspect writer throughput and tails.")
+
+
+def history(args):
+    writer = csv.writer(sys.stdout)
+    writer.writerow(["started_at", "commit", "source_sha256", "dirty", "label", "engine", "environment", "cohort", "query", "completed", "p50_ms", "p95_ms", "p99_ms", "read_qps", "write_qps"])
+    for path in sorted(Path(args.directory).glob("*/manifest.json")):
+        m = json.loads(path.read_text())
+        if m["status"] != "complete":
+            continue
+        s = json.loads((path.parent / "summary.json").read_text())
+        cohort = digest(canonical({k: m.get(k) for k in comparison_keys()}))[:16]
+        writes = s.get("writer", {}).get("queries", {}).get("update", {}).get("completed_per_second", 0)
+        for name, q in s["reader"]["queries"].items():
+            writer.writerow([m["started_at"], m["source"]["commit"], m["source"]["source_sha256"],
+                             m["source"]["source_dirty"], m["label"], m["engine"], m["environment"], cohort,
+                             name, q["completed"], q["p50_ms"], q["p95_ms"], q["p99_ms"], q["completed_per_second"], writes])
+
+
+def positive(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--engine", choices=ENGINES, required=True)
+    r.add_argument("--database", required=True)
+    r.add_argument("--output", required=True)
+    r.add_argument("--environment", required=True, help="Stable server hardware/resource identity; no credentials")
+    r.add_argument("--build-id", required=True, help="Release build command/commit or immutable image digest")
+    r.add_argument("--artifact", help="Optional path to installed extension binary to hash")
+    r.add_argument("--context", help="Campaign resource/protocol JSON to preserve and compare")
+    r.add_argument("--container", help="Local Docker container for timed-phase cgroup snapshots")
+    r.add_argument("--label", default="")
+    r.add_argument("--profile", choices=("count", "ranked", "mixed"), default="mixed")
+    r.add_argument("--source-manifest", help=argparse.SUPPRESS)
+    r.add_argument("--dataset", help="Verified dataset directory from dataset.py")
+    r.add_argument("--statement-timeout-ms", type=positive, default=60000)
+    r.add_argument("--rows", type=positive, default=10000)
+    r.add_argument("--seconds", type=positive, default=60)
+    r.add_argument("--warmup", type=positive, default=10)
+    r.add_argument("--clients", type=positive, default=2)
+    r.add_argument("--write-rate", type=int, default=20)
+    r.add_argument("--seed", type=positive, default=1729)
+    c = sub.add_parser("compare")
+    c.add_argument("before")
+    c.add_argument("after")
+    c.add_argument("--cross-engine", action="store_true")
+    h = sub.add_parser("history")
+    h.add_argument("directory")
+    args = parser.parse_args()
+    if args.action == "run":
+        if args.write_rate < 0:
+            parser.error("--write-rate must be nonnegative")
+        run(args)
+    elif args.action == "compare":
+        compare(args)
+    else:
+        history(args)
+
+
+if __name__ == "__main__":
+    main()

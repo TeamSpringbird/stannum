@@ -1,14 +1,16 @@
 //! Shared pure-Rust tinql runtime.
 //!
 //! Owns the lowered query AST, sub-tokenization, lowering, capability
-//! classification, and arbitrary-text evaluation used by both tin and qfuzz.
+//! classification, and arbitrary-text evaluation used by Stannum.
 
 pub mod capability;
 mod display;
 pub mod eval;
 pub mod lower;
+pub mod plan;
 pub mod position_filter;
 pub mod regex;
+pub mod retrieval;
 pub mod simplify;
 pub mod span_expr;
 pub mod subtokenize;

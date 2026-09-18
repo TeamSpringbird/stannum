@@ -8,11 +8,33 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PGRX_VERSION: 0.19.1
+
 jobs:
+  # Formatting and the pure-Python harness need no PostgreSQL; fail fast here.
+  lint:
+    name: Format and harness tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Benchmark harness unit tests
+        run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+
+  # Both architectures matter: `c_char` is signed on x86-64 and unsigned on
+  # AArch64, and both PostgreSQL majors have caught API differences.
   build-and-test:
     name: ${{ matrix.arch.name }} / PostgreSQL ${{ matrix.postgres }}
     runs-on: ${{ matrix.arch.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -22,57 +44,117 @@ jobs:
           - name: arm64
             runner: ubuntu-24.04-arm
         postgres: [17, 18]
-
     env:
-      CARGO_TERM_COLOR: always
-      RUST_BACKTRACE: 1
-
+      PG_MAJOR: ${{ matrix.postgres }}
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Configure pgrx home
-        run: echo "PGRX_HOME=$RUNNER_TEMP/pgrx" >> "$GITHUB_ENV"
-
-      - name: Install PostgreSQL build dependencies
+      # PGDG packages instead of building PostgreSQL from source: the same
+      # server binaries users install, and minutes instead of tens of minutes.
+      - name: Install PostgreSQL ${{ matrix.postgres }} from PGDG
         run: |
-          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install --yes --no-install-recommends \
-            bison \
-            build-essential \
-            ccache \
-            flex \
-            libreadline-dev \
-            libssl-dev \
-            libxml2-dev \
-            libxml2-utils \
-            libxslt1-dev \
-            pkg-config \
-            xsltproc \
-            zlib1g-dev
+            "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}" \
+            libclang-dev pkg-config libssl-dev
+          sudo systemctl stop postgresql || true
+          # pgrx installs the extension into the server's own directories.
+          sudo chown -R "$USER" "/usr/lib/postgresql/${PG_MAJOR}" "/usr/share/postgresql/${PG_MAJOR}"
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
 
       - name: Install pinned Rust toolchain and Clippy
         run: rustup component add clippy
 
-      - name: Install cargo-pgrx
-        run: cargo install cargo-pgrx --version 0.19.1 --locked
+      - name: Cache Cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ matrix.postgres }}
 
-      - name: Install PostgreSQL ${{ matrix.postgres }}
-        env:
-          PG_MAJOR: ${{ matrix.postgres }}
-        run: cargo pgrx init "--pg${PG_MAJOR}=download" --jobs "$(nproc)"
+      - name: Cache cargo-pgrx
+        id: pgrx-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: cargo-pgrx-${{ env.PGRX_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-pgrx
+        if: steps.pgrx-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Point pgrx at the installed server
+        run: |
+          echo "PGRX_HOME=$RUNNER_TEMP/pgrx" >> "$GITHUB_ENV"
+          PGRX_HOME="$RUNNER_TEMP/pgrx" cargo pgrx init "--pg${PG_MAJOR}=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
 
       - name: Build
-        env:
-          PG_MAJOR: ${{ matrix.postgres }}
-        run: cargo build --locked --package tin --no-default-features --features "pg${PG_MAJOR}"
+        run: cargo build --locked --package stannum --no-default-features --features "pg${PG_MAJOR}"
 
       - name: Clippy
-        env:
-          PG_MAJOR: ${{ matrix.postgres }}
         run: cargo clippy --locked --workspace --all-targets --no-default-features --features "pg${PG_MAJOR} pg_test" -- -D warnings
 
-      - name: Test local suite
+      - name: Library crate tests
+        run: cargo test --locked --workspace --exclude stannum
+
+      - name: Extension tests
+        run: cargo pgrx test "pg${PG_MAJOR}" --package stannum --no-default-features --features "pg${PG_MAJOR} pg_test"
+
+      - name: Install release build
+        run: cargo pgrx install --release --package stannum --no-default-features --features "pg${PG_MAJOR}"
+
+      # Crash recovery, VACUUM, folds and merges, standby fallback and
+      # backend reuse, against a real server in a throwaway cluster.
+      - name: Index lifecycle checks
+        run: python3 postgres/tests/postings_lifecycle.py
+
+  # Bit-for-bit comparison against PlanetScale TIN. Needs a TIN instance, so it
+  # runs only when dispatched by hand with the TIN_DATABASE_URL secret set.
+  compatibility-oracle:
+    name: Compatibility oracle against TIN
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PG_MAJOR: 18
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Require the TIN connection secret
         env:
-          PG_MAJOR: ${{ matrix.postgres }}
-        run: cargo pgrx test "pg${PG_MAJOR}" --package tin --no-default-features --features "pg${PG_MAJOR}"
+          TIN_DATABASE_URL: ${{ secrets.TIN_DATABASE_URL }}
+        run: test -n "$TIN_DATABASE_URL" || { echo "TIN_DATABASE_URL secret is not set"; exit 1; }
+      - name: Install PostgreSQL ${{ env.PG_MAJOR }} from PGDG
+        run: |
+          sudo apt-get install --yes --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install --yes --no-install-recommends \
+            "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}" libclang-dev pkg-config libssl-dev
+          sudo systemctl stop postgresql || true
+          sudo chown -R "$USER" "/usr/lib/postgresql/${PG_MAJOR}" "/usr/share/postgresql/${PG_MAJOR}"
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
+      - name: Cache Cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ env.PG_MAJOR }}
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+      - name: Install the release build
+        run: |
+          echo "PGRX_HOME=$RUNNER_TEMP/pgrx" >> "$GITHUB_ENV"
+          PGRX_HOME="$RUNNER_TEMP/pgrx" cargo pgrx init "--pg${PG_MAJOR}=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+          PGRX_HOME="$RUNNER_TEMP/pgrx" cargo pgrx install --release --package stannum --no-default-features --features "pg${PG_MAJOR}"
+      - name: Run the oracle
+        env:
+          TIN_DATABASE_URL: ${{ secrets.TIN_DATABASE_URL }}
+        run: |
+          initdb -D "$RUNNER_TEMP/oracle-data" -U postgres -A trust --no-locale --encoding=UTF8
+          pg_ctl -D "$RUNNER_TEMP/oracle-data" -o "-p 28999 -c listen_addresses=localhost" -l "$RUNNER_TEMP/oracle.log" -w start
+          createdb -h localhost -p 28999 -U postgres oracle_stannum
+          printf 'PGHOST=localhost\nPGPORT=28999\nPGUSER=postgres\nPGDATABASE=oracle_stannum\n' > "$RUNNER_TEMP/left.env"
+          # libpq reads the URL from PGDATABASE; nothing about it is printed.
+          printf 'PGDATABASE=%s\n' "$TIN_DATABASE_URL" > "$RUNNER_TEMP/right.env"
+          python3 benchmarks/oracle.py --left "$RUNNER_TEMP/left.env" --left-engine stannum \
+            --right "$RUNNER_TEMP/right.env" --right-engine tin --rows 5000 \
+            --output "$RUNNER_TEMP/oracle-result"
+          pg_ctl -D "$RUNNER_TEMP/oracle-data" -m fast stop

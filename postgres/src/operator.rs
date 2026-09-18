@@ -16,7 +16,7 @@ fn evaluate_text(document: &str, query_text: &str) -> Result<bool, String> {
 }
 
 #[pg_extern(immutable, parallel_safe)]
-pub fn tin_text_cmpfunc(document: &str, query: &str) -> bool {
+pub fn stannum_text_cmpfunc(document: &str, query: &str) -> bool {
     evaluate_text(document, query)
         .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"))
 }
@@ -24,17 +24,17 @@ pub fn tin_text_cmpfunc(document: &str, query: &str) -> bool {
 extension_sql!(
     r#"
 CREATE OPERATOR pg_catalog.==> (
-    PROCEDURE = @extschema@.tin_text_cmpfunc,
+    PROCEDURE = @extschema@.stannum_text_cmpfunc,
     LEFTARG = pg_catalog.text,
     RIGHTARG = pg_catalog.text
 );
 
-CREATE OPERATOR CLASS @extschema@.tin_text_ops DEFAULT FOR TYPE pg_catalog.text USING tin AS
+CREATE OPERATOR CLASS @extschema@.stannum_text_ops DEFAULT FOR TYPE pg_catalog.text USING stannum AS
     OPERATOR 1 pg_catalog.==>(pg_catalog.text, pg_catalog.text),
     STORAGE pg_catalog.text;
 "#,
-    name = "tin_text_operator",
-    requires = [amhandler, tin_text_cmpfunc]
+    name = "stannum_text_operator",
+    requires = [amhandler, stannum_text_cmpfunc]
 );
 
 #[cfg(test)]

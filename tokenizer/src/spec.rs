@@ -15,12 +15,12 @@ pub struct TokenizerPipelineSpec {
 
 impl Default for TokenizerPipelineSpec {
     fn default() -> Self {
-        Self::tin_default()
+        Self::stannum_default()
     }
 }
 
 impl TokenizerPipelineSpec {
-    pub const fn tin_default() -> Self {
+    pub const fn stannum_default() -> Self {
         Self {
             tokenizer: TokenizerSpec::Unicode,
             case_folding: Folding::Fold,
@@ -34,10 +34,10 @@ impl TokenizerPipelineSpec {
         }
     }
 
-    /// The fixed pipeline used by tin before per-index tokenization options
+    /// The fixed pipeline used by Stannum before per-index tokenization options
     /// existed. Regression fixtures use this tuple when they need to keep
     /// testing their historical corpus and scoring behavior.
-    pub const fn legacy_tin_default() -> Self {
+    pub const fn legacy_stannum_default() -> Self {
         Self {
             tokenizer: TokenizerSpec::Unicode,
             case_folding: Folding::Fold,
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn default_is_the_sql_default_tuple() {
         assert_eq!(
-            TokenizerPipelineSpec::tin_default(),
+            TokenizerPipelineSpec::stannum_default(),
             TokenizerPipelineSpec {
                 tokenizer: TokenizerSpec::Unicode,
                 case_folding: Folding::Fold,
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_a_ceiling_smaller_than_one_utf8_scalar() {
-        let mut spec = TokenizerPipelineSpec::tin_default();
+        let mut spec = TokenizerPipelineSpec::stannum_default();
         spec.long_tokens.max_bytes = MIN_TOKEN_BYTES - 1;
         assert!(matches!(
             spec.validate(),
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn legacy_default_pins_pre_reloptions_behavior() {
         assert_eq!(
-            TokenizerPipelineSpec::legacy_tin_default(),
+            TokenizerPipelineSpec::legacy_stannum_default(),
             TokenizerPipelineSpec {
                 tokenizer: TokenizerSpec::Unicode,
                 case_folding: Folding::Fold,

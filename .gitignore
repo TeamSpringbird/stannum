@@ -1,7 +1,20 @@
 .idea
 /target/
 /tmp/
-/private-regress/
-/postgres/tests/pg_regress/
 *.log
 .DS_Store
+/benchmarks/results/
+/benchmarks/__pycache__/
+
+# Local credentials and connection configuration. Commit sanitized examples only.
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+.pgpass
+.pg_service.conf
+
+# Python caches and local artifacts.
+**/__pycache__/
+/artifacts/

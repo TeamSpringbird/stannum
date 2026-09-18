@@ -1,0 +1,13 @@
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!.cargo/**
+!postgres/**
+!tinql/**
+!tokenizer/**
+!boldi-vigna/**
+**/target/**
+
+!segment/**
+**/target/**
