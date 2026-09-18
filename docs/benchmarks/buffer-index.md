@@ -220,4 +220,24 @@ read-only logs `p1-*`, and the `*.sample` profiles.
 
 ## Verification
 
-VERIFICATION_PENDING
+The measured binary (`442be435…`) was built from this branch before it was
+merged with `stannum/main` (`d968a6e`, the LSG3 segment format) and the
+standby WAL-horizon work (`a55a678`); the merge keeps that work's LSN
+validation in `read_buffer_range`, `buffer_index` and `view` and adds the
+memoized segments and dead sets inside its retry loop. Verification ran on
+the merged tree:
+
+- `cargo fmt --all --check`; PG18 and PG17 workspace/all-target clippy with
+  `pg_test`, warnings denied.
+- Non-extension workspace tests: 438 passed, including the new
+  `out_of_order_records_keep_each_occurrence_with_its_own_positions`.
+- `cargo pgrx test pg18`: 93 passed, including
+  `memoized_term_lookups_stay_exact_across_folds_merges_reindex_and_drop`
+  (folds, tiered merges, an update, REINDEX, DROP/CREATE INDEX, custom scan
+  against bitmap path, and a memoized absence that later folds fill) and
+  `buffer_index_extends_incrementally_and_restarts_on_epoch_and_identity_changes`
+  (append by another statement, VACUUM's buffer rewrite, a fold and REINDEX,
+  each checked through `storage::cache_probe`).
+- `postgres/tests/postings_lifecycle.py`: passed, 42 index verifications, 15
+  concurrent reader checks, 333 standby snapshot checks with no wrong answers.
+- `script/reference-oracle` against Lead: 235/235 query/state pairs agree.
