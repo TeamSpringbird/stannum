@@ -698,48 +698,72 @@ impl Walk<'_, '_> {
         }
     }
 
-    /// A conjunction: the rarest term leads and the others seek to it, as
-    /// an intersection does. At each common location the block bounds of
-    /// all terms decide whether to score it or to move the lead past the
-    /// nearest block end.
+    /// Build a shared-length bound at an intersection, then reuse it before
+    /// intersecting later candidates through the nearest block end. Every
+    /// conjunction member shares one length, at least the largest of these
+    /// blocks' shortest lengths.
     fn all(&mut self) {
         let lead = (0..self.cursors.len())
             .min_by_key(|&i| self.cursors[i].count)
             .expect("a conjunction has terms");
         let others: Vec<usize> = (0..self.cursors.len()).filter(|&i| i != lead).collect();
+        let mut range: Option<(Tid, f32)> = None;
         loop {
             self.tick();
-            let Some(mut pivot) = self.cursors[lead].current() else {
+            let Some(pivot) = self.cursors[lead].current() else {
                 return;
             };
-            let mut aligned = true;
+            if let Some((end, bound)) = range
+                && pivot <= end
+                && !self.can_beat(bound, pivot)
+            {
+                segment_error(self.cursors[lead].postings.seek(successor(end)));
+                continue;
+            }
+            let mut next = pivot;
             for &i in &others {
                 segment_error(self.cursors[i].postings.seek(pivot));
                 match self.cursors[i].current() {
                     None => return,
                     Some(found) if found > pivot => {
-                        pivot = found;
-                        aligned = false;
+                        next = found;
                         break;
                     }
                     Some(_) => {}
                 }
             }
-            if !aligned {
-                segment_error(self.cursors[lead].postings.seek(pivot));
+            if next > pivot {
+                segment_error(self.cursors[lead].postings.seek(next));
                 continue;
             }
-            let mut boundary: Option<Tid> = None;
-            for i in 0..self.cursors.len() {
-                let (_, last) = self
-                    .bound_at(i, pivot)
-                    .expect("a cursor at the pivot has a block");
-                boundary = Some(boundary.map_or(last, |b| b.min(last)));
+            if range.is_none_or(|(end, _)| pivot > end) {
+                let mut boundary: Option<Tid> = None;
+                let mut min_length = 0;
+                for i in 0..self.cursors.len() {
+                    let Some((_, last)) = self.bound_at(i, pivot) else {
+                        return;
+                    };
+                    boundary = Some(boundary.map_or(last, |end| end.min(last)));
+                    min_length = min_length.max(
+                        self.cursors[i]
+                            .cached
+                            .as_ref()
+                            .expect("bound loaded")
+                            .0
+                            .shortest(),
+                    );
+                }
+                let bound = fold(&self.cursors, |cursor| {
+                    Some(self.scorer.terms[cursor.slot].1.bound_with_min_length(
+                        &cursor.cached.as_ref().expect("bound loaded").0,
+                        min_length,
+                    ))
+                });
+                range = Some((boundary.expect("conjunction has terms"), bound));
             }
-            let bound = fold(&self.cursors, |c| c.cached.map(|(_, bound)| bound));
+            let (end, bound) = range.expect("range loaded");
             if !self.can_beat(bound, pivot) {
-                let next = successor(boundary.expect("every cursor bounds the pivot"));
-                segment_error(self.cursors[lead].postings.seek(next));
+                segment_error(self.cursors[lead].postings.seek(successor(end)));
                 continue;
             }
             self.score(pivot);

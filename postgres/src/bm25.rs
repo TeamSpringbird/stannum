@@ -371,6 +371,20 @@ impl TermScorer {
         bound
     }
 
+    /// Conjunction members share one document length. Every matching document
+    /// is at least `min_length` long and also respects its bucket's minimum.
+    pub(crate) fn bound_with_min_length(&self, block: &BlockBound, min_length: u32) -> f32 {
+        block
+            .buckets()
+            .map(|(bucket, length)| {
+                self.score_bucket(
+                    TfBucket::new(bucket).expect("valid block bucket"),
+                    length.max(min_length),
+                )
+            })
+            .fold(0.0_f32, f32::max)
+    }
+
     /// An upper bound on the score of a document of `length` in `block`:
     /// its bucket is one of the block's, so its score is one of these.
     #[must_use]
@@ -645,6 +659,13 @@ mod tests {
                 let score = scorer.score_bucket(TfBucket::new(*bucket).unwrap(), *len);
                 assert!(score <= bound, "{bucket} {len}: {score} above {bound}");
                 // The bound at the document's own length covers it too.
+                for min_length in [1, *len / 2, *len] {
+                    let joint = scorer.bound_with_min_length(&block, min_length);
+                    assert!(
+                        score <= joint && joint <= bound,
+                        "{bucket} {len} {min_length}"
+                    );
+                }
                 let for_length = scorer.bound_for_length(&block, *len);
                 assert!(score <= for_length, "{bucket} {len}");
             }
