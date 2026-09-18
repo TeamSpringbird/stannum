@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use rustc_hash::FxHashSet;
+use segment::postings::BlockBound;
 use thiserror::Error;
 
 use crate::tf_bucket::{BUCKET_COUNT, TfBucket};
@@ -350,6 +351,37 @@ impl TermScorer {
     pub(crate) fn score_count(&self, term_frequency: u32, document_length: u32) -> f32 {
         self.score_bucket(TfBucket::from_count(term_frequency), document_length)
     }
+
+    /// An upper bound on the score of every document a block bound covers:
+    /// the best of `score_bucket(bucket, min_len)` over the block's buckets
+    /// and their shortest documents.
+    ///
+    /// The score is computed with correctly rounded `f32` operations, each
+    /// monotonic in its operands, so it never increases with the document
+    /// length: the score at a bucket's shortest document covers every longer
+    /// document with that bucket. The bound is attained by one of them, so
+    /// it is the block's exact maximum.
+    #[must_use]
+    pub(crate) fn bound(&self, block: &BlockBound) -> f32 {
+        let mut bound = 0.0_f32;
+        for (bucket, min_len) in block.buckets() {
+            let bucket = TfBucket::new(bucket).expect("block bounds hold valid buckets");
+            bound = bound.max(self.score_bucket(bucket, min_len));
+        }
+        bound
+    }
+
+    /// An upper bound on the score of a document of `length` in `block`:
+    /// its bucket is one of the block's, so its score is one of these.
+    #[must_use]
+    pub(crate) fn bound_for_length(&self, block: &BlockBound, length: u32) -> f32 {
+        let mut bound = 0.0_f32;
+        for (bucket, _) in block.buckets() {
+            let bucket = TfBucket::new(bucket).expect("block bounds hold valid buckets");
+            bound = bound.max(self.score_bucket(bucket, length));
+        }
+        bound
+    }
 }
 
 /// Sums already ordered term contributions with production's left-to-right
@@ -560,6 +592,66 @@ mod tests {
                 scorer.score_count(tf, dl).to_bits(),
                 expected_bits,
                 "tf={tf} dl={dl}"
+            );
+        }
+    }
+
+    #[test]
+    fn bound_dominates_every_score_it_covers() {
+        let scorers = [
+            TermScorer::from_statistics(100, 10, 0.7, Bm25Params::default(), 80.0).unwrap(),
+            TermScorer::from_statistics(100_000, 22_000, 1.0, Bm25Params::default(), 333.7)
+                .unwrap(),
+            TermScorer::from_statistics(5, 5, 2.5, Bm25Params { k1: 0.0, b: 1.0 }, 1.0).unwrap(),
+            TermScorer::from_statistics(1 << 30, 3, 1.0, Bm25Params { k1: 1e4, b: 0.0 }, 7.5)
+                .unwrap(),
+            TermScorer::from_statistics(1000, 1, 3.0, Bm25Params { k1: 0.3, b: 0.99 }, 0.01)
+                .unwrap(),
+        ];
+        let lengths: Vec<u32> = (1..300)
+            .chain((300..5_000).step_by(37))
+            .chain([65_535, 1 << 20, u32::MAX / 2, u32::MAX - 1])
+            .collect();
+        let last = segment::Tid::new(1, 1).unwrap();
+        for scorer in &scorers {
+            // Blocks holding one bucket at one shortest length: every longer
+            // document with that bucket scores at most the bound, which the
+            // shortest attains.
+            for bucket in 0..BUCKET_COUNT as u8 {
+                for &min_len in &lengths {
+                    let block = BlockBound::over(&[(bucket, min_len)], last);
+                    let bound = scorer.bound(&block);
+                    let bucket = TfBucket::new(bucket).unwrap();
+                    assert!(bound >= 0.0);
+                    assert_eq!(scorer.score_bucket(bucket, min_len), bound);
+                    for &length in lengths.iter().filter(|length| **length >= min_len) {
+                        let score = scorer.score_bucket(bucket, length);
+                        assert!(
+                            score <= bound,
+                            "bucket {bucket:?} length {length} scores {score} above bound {bound} at min_len {min_len}"
+                        );
+                    }
+                }
+            }
+            // A mixed block: each posting is covered by its own bucket's entry.
+            let postings: Vec<(u8, u32)> = lengths
+                .iter()
+                .enumerate()
+                .map(|(i, len)| ((i % BUCKET_COUNT) as u8, *len))
+                .collect();
+            let block = BlockBound::over(&postings, last);
+            let bound = scorer.bound(&block);
+            for (bucket, len) in &postings {
+                let score = scorer.score_bucket(TfBucket::new(*bucket).unwrap(), *len);
+                assert!(score <= bound, "{bucket} {len}: {score} above {bound}");
+                // The bound at the document's own length covers it too.
+                let for_length = scorer.bound_for_length(&block, *len);
+                assert!(score <= for_length, "{bucket} {len}");
+            }
+            assert!(
+                postings
+                    .iter()
+                    .any(|(b, l)| scorer.score_bucket(TfBucket::new(*b).unwrap(), *l) == bound)
             );
         }
     }

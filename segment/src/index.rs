@@ -177,8 +177,9 @@ impl<I: Index + ?Sized> Index for std::rc::Rc<I> {
 struct TermData {
     /// Strictly increasing.
     tids: Vec<Tid>,
-    /// Aligned with `tids`: term-frequency bucket and positions.
-    payload: Vec<(u8, Vec<u32>)>,
+    /// Aligned with `tids`: term-frequency bucket, document length and
+    /// positions.
+    payload: Vec<(u8, u32, Vec<u32>)>,
 }
 
 /// Encoded streams handed to cursors. Append-only: a slot is never freed or
@@ -261,6 +262,7 @@ impl MutableIndex {
         encoded.documents = None;
         encoded.lengths = None;
         let tid = header.tid;
+        let doc_len = header.doc_len;
         let (_, consumed) = ForwardRecord::decode_with(bytes, |term, positions| {
             crate::payload::validate_positions(positions)?;
             let bucket = TfBucket::from_count(positions.len() as u32).value();
@@ -284,7 +286,8 @@ impl MutableIndex {
                 _ => data.tids.partition_point(|existing| *existing < tid),
             };
             data.tids.insert(at, tid);
-            data.payload.insert(at, (bucket, positions.to_vec()));
+            data.payload
+                .insert(at, (bucket, doc_len, positions.to_vec()));
             Ok(())
         })?;
         Ok(consumed)
@@ -298,8 +301,10 @@ impl MutableIndex {
         let mut postings = PostingsBuilder::default();
         let mut payload = PayloadBuilder::default();
         let mut max_tf_bucket = 0;
-        for (tid, (bucket, positions)) in data.tids.iter().zip(&data.payload) {
-            postings.push(*tid).expect("tids kept sorted and unique");
+        for (tid, (bucket, doc_len, positions)) in data.tids.iter().zip(&data.payload) {
+            postings
+                .push_scored(*tid, *bucket, *doc_len)
+                .expect("tids kept sorted and unique");
             payload
                 .push(*bucket, positions)
                 .expect("positions validated on insertion");
@@ -492,6 +497,10 @@ mod tests {
             assert_eq!(x.entry.max_tf_bucket, y.entry.max_tf_bucket);
             let tids = collect(x.cursor().unwrap()).unwrap();
             assert_eq!(tids, collect(y.cursor().unwrap()).unwrap());
+            // Both carry the same block bounds, computed from the same documents.
+            let bounds = x.cursor().unwrap().block_bounds().unwrap();
+            assert!(!bounds.is_empty(), "{term}");
+            assert_eq!(bounds, y.cursor().unwrap().block_bounds().unwrap());
             let (px, py) = (x.payload().unwrap(), y.payload().unwrap());
             for ordinal in 0..tids.len() as u32 {
                 assert_eq!(px.get(ordinal).unwrap(), py.get(ordinal).unwrap());

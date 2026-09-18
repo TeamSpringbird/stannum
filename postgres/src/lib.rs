@@ -822,6 +822,175 @@ mod tests {
         assert!(text.contains("\"Top K\":4"), "{text}");
     }
 
+    /// Rows of a ranked query as `(id, score bits)` so scores compare exactly.
+    fn ranked(custom: bool, query: &str, order_by: &str, limit: &str) -> Vec<(i32, u32)> {
+        Spi::run(&format!(
+            "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;"
+        ))
+        .unwrap();
+        Spi::connect(|client| {
+            client
+                .select(
+                    &format!(
+                        "SELECT id, {order_by} AS score FROM bmw WHERE body ==> '{query}'
+                         ORDER BY score DESC{} {limit}",
+                        if custom { "" } else { ", ctid" }
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<i32>(1).unwrap().unwrap(),
+                        row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[pg_test]
+    fn pruned_top_k_matches_full_scoring_bit_for_bit() {
+        // Four build segments of 1,000 documents and a write buffer, with a
+        // 60-row pattern of term frequencies and lengths so exact score ties
+        // abound, deleted and updated rows that the index still lists, and
+        // terms present in every document, in one segment only, or absent.
+        Spi::run(
+            "CREATE TABLE bmw(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 1000;
+             SET LOCAL stannum.write_buffer_docs = 1000;
+             INSERT INTO bmw SELECT n,
+               repeat('alpha ', n % 4) ||
+               CASE WHEN n % 3 = 0 THEN 'beta ' ELSE '' END ||
+               CASE WHEN n % 5 = 0 THEN repeat('gamma ', 1 + n % 2) ELSE '' END ||
+               CASE WHEN n BETWEEN 2000 AND 2100 THEN 'delta ' ELSE '' END ||
+               repeat('pad ', n % 6) || 'tail'
+               FROM generate_series(1, 4000) n;
+             CREATE INDEX bmw_idx ON bmw USING stannum(body);
+             INSERT INTO bmw SELECT n, 'alpha alpha beta gamma tail' FROM generate_series(4001, 4300) n;
+             INSERT INTO bmw SELECT n, 'alpha ' || repeat('pad ', n % 9) || 'tail' FROM generate_series(4301, 4400) n;
+             DELETE FROM bmw WHERE id % 17 = 0;
+             UPDATE bmw SET body = body || ' extra' WHERE id % 23 = 0;",
+        )
+        .unwrap();
+        let queries = [
+            "alpha",
+            "beta",
+            "delta",
+            "pad",
+            "tail",
+            "missing",
+            "alpha AND beta",
+            "alpha AND beta AND gamma",
+            "alpha AND delta",
+            "alpha AND missing",
+            "alpha OR gamma",
+            "alpha OR beta OR gamma",
+            "delta OR gamma",
+            "alpha OR missing",
+            "alpha^2 OR beta",
+            "(alpha AND beta)^0.5",
+            "alpha OR alpha",
+            "pad OR alpha",
+            // Shapes the pruned path leaves to full scoring.
+            "\"alpha beta\"",
+            "alpha AND NOT beta",
+            "al*",
+            "AT LEAST 2 OF [alpha beta gamma]",
+        ];
+        let limits = [
+            "LIMIT 1",
+            "LIMIT 3",
+            "LIMIT 10",
+            "LIMIT 5 OFFSET 8",
+            "LIMIT 100",
+            "LIMIT 5000",
+        ];
+        for query in queries {
+            for limit in limits {
+                for order_by in ["stannum.full_score(ctid)", "stannum.score(ctid)"] {
+                    let expected = ranked(false, query, order_by, limit);
+                    let actual = ranked(true, query, order_by, limit);
+                    assert_eq!(actual, expected, "{query} {limit} {order_by}");
+                }
+            }
+        }
+        // The custom scan pruned the single-term query...
+        Spi::run(
+            "SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;",
+        )
+        .unwrap();
+        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node.clone());
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        let explain = |query: &str| {
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM bmw WHERE body ==> '{query}'
+                 ORDER BY stannum.full_score(ctid) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{query}: {plan}"))
+        };
+        let scan = explain("alpha");
+        assert_eq!(scan["Custom Plan Provider"], "Stannum Text Search Scan");
+        assert_eq!(scan["Top K"], 10);
+        assert_eq!(scan["Pruning"], "block-max");
+        // The ten best rows share the best score and are the earliest such
+        // rows, so once they are found every later block is skipped.
+        let scored = scan["Scored Candidates"].as_i64().unwrap();
+        assert!(scored > 0 && scored < 1000, "{scan}");
+        // ...and the conjunction and disjunction too.
+        for query in ["alpha AND beta", "alpha OR gamma"] {
+            let scan = explain(query);
+            assert_eq!(scan["Pruning"], "block-max", "{query}");
+            assert!(scan["Scored Candidates"].as_i64().unwrap() < 1500, "{scan}");
+        }
+        // Rows deleted after the top k was built are invisible, so the parent
+        // reads past k and the scan completes the ordering from scratch.
+        let top: Vec<i32> = ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        Spi::run(&format!(
+            "DELETE FROM bmw WHERE id IN ({})",
+            top.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .unwrap();
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM bmw WHERE body ==> 'delta'
+             ORDER BY stannum.full_score(ctid) DESC LIMIT 3",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        let scan = search_scan(&plan[0]["Plan"]).unwrap();
+        assert_eq!(scan["Pruning"], "block-max");
+        assert!(scan["Candidates"].as_i64().unwrap() > 3, "{scan}");
+        assert_eq!(
+            ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3"),
+            ranked(false, "delta", "stannum.full_score(ctid)", "LIMIT 3")
+        );
+        // A phrase query is not pruned and reports its candidates as before.
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on;").unwrap();
+        let scan = explain("\"alpha beta\"");
+        assert!(scan["Pruning"].is_null());
+        assert!(scan["Candidates"].as_i64().unwrap() > 0);
+    }
+
     #[pg_test]
     fn segment_info_reports_segments_and_the_write_buffer() {
         Spi::run(
