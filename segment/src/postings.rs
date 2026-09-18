@@ -1,12 +1,14 @@
 //! A term's tuple locations in heap order.
 //!
 //! Two body layouts share one stream header; the builder emits whichever is
-//! smaller. Either may carry a table of per-block score bounds (forms 2 and
-//! 3), which a term's postings do and the document table does not:
+//! smaller. Either may carry score bounds, which a term's postings do and the
+//! document table does not: a table with one entry per block of
+//! `BLOCK_POSTINGS` postings, or, when the stream is one block, a single
+//! term bound without the per-block fields.
 //!
 //! ```text
-//! stream  := form u8, count varint, [bounds_len varint, bounds], body
-//!            form 0 sparse, 1 grouped, 2 sparse + bounds, 3 grouped + bounds
+//! stream  := form u8, count varint, [bounds_len varint, table | term_bound], body
+//!            form bits: 1 grouped (else sparse), 2 table follows, 4 term bound follows
 //! sparse  := (block_delta varint, offset varint)*        first block absolute
 //! grouped := group_count varint, group*
 //! group   := gid varint, count varint, page_bitmap[32], body_len varint, body
@@ -14,11 +16,12 @@
 //! body    := page*  one per set bit of page_bitmap, ascending
 //! page    := 0x00, n varint, offset u16le * n     (n <= LIST_MAX)
 //!          | 0x01, tuple_bitmap[37]               (bit offset-1 set)
-//! bounds  := entry * ceil(count / BLOCK_POSTINGS)
-//! entry   := buckets varint (bit b set: bucket b occurs in the block),
-//!            min_len varint per set bit ascending,
+//! table   := entry * ceil(count / BLOCK_POSTINGS)
+//! entry   := term_bound,
 //!            last_block varint (delta from the previous entry), last_offset varint,
 //!            [sparse: start varint, byte offset into body, delta from the previous entry]
+//! term_bound := buckets varint (bit b set: bucket b occurs in the block),
+//!            min_len varint per set bit ascending
 //! ```
 //!
 //! Groups cover 256 consecutive heap blocks, so intersecting two grouped terms
@@ -26,16 +29,21 @@
 //! and page carries its count, so `seek` maintains the ordinal of the current
 //! posting, which is how the parallel payload stream is addressed.
 //!
-//! The bounds table describes each run of `BLOCK_POSTINGS` consecutive
-//! postings: for every term-frequency bucket that occurs in the run, the
-//! shortest document it occurs in. A BM25 contribution never grows with the
-//! document length, so the best score in the block under any parameters is
-//! the best of those (bucket, length) pairs: a ranked scan bounds the block
-//! exactly without decoding it. The block's last location tells it the range
-//! of tuples the bound covers. Sparse streams also record where each block
-//! starts, and their `seek` jumps over whole blocks through the table.
+//! A bound describes a run of postings: for every term-frequency bucket that
+//! occurs in the run, the shortest document it occurs in. A BM25 contribution
+//! never grows with the document length, so the best score in the run under
+//! any parameters is the best of those (bucket, length) pairs: a ranked scan
+//! bounds the run exactly without decoding it. A table entry's last location
+//! tells it the range of tuples the bound covers, and sparse streams also
+//! record where each block starts, so their `seek` jumps over whole blocks
+//! through the table. A stream of at most `BLOCK_POSTINGS` postings is one
+//! block, so `LSG3` writers store only the term bound (form bit 4): its last
+//! location is the stream's last posting, which a cursor finds by walking the
+//! stream once when first asked. `LSG2` writers stored the full table for
+//! such streams (form bit 2); both are still read.
 
 use crate::reader::Reader;
+use crate::segment::Format;
 use crate::set::Cursor;
 use crate::tf_bucket::BUCKET_COUNT;
 use crate::tid::MAX_OFFSET;
@@ -53,6 +61,11 @@ const FORM_SPARSE: u8 = 0;
 const FORM_GROUPED: u8 = 1;
 /// Set on a form byte when a bounds table precedes the body.
 const FORM_BOUNDED: u8 = 2;
+/// Set on a form byte when a single term bound precedes the body; the stream
+/// then holds at most `BLOCK_POSTINGS` postings.
+const FORM_TERM_BOUND: u8 = 4;
+/// The form bits that describe bounds rather than the body layout.
+const FORM_FLAGS: u8 = FORM_BOUNDED | FORM_TERM_BOUND;
 const TAG_LIST: u8 = 0;
 const TAG_BITMAP: u8 = 1;
 
@@ -151,10 +164,18 @@ impl PostingsBuilder {
 
     /// Encodes with whichever form is smaller for this list.
     pub fn finish(self) -> Vec<u8> {
-        let scores = (!self.tids.is_empty() && self.scores.len() == self.tids.len())
-            .then_some(self.scores.as_slice());
-        let sparse = encode_sparse(&self.tids, scores);
-        let grouped = encode_grouped(&self.tids, scores);
+        self.finish_as(Format::CURRENT)
+    }
+
+    /// Encodes in the layout of an earlier format, for compatibility tests:
+    /// `LSG1` streams carry no bounds and `LSG2` streams a table however few
+    /// blocks they have.
+    pub(crate) fn finish_as(self, format: Format) -> Vec<u8> {
+        let scores =
+            (format.has_bounds() && !self.tids.is_empty() && self.scores.len() == self.tids.len())
+                .then_some(self.scores.as_slice());
+        let sparse = encode_sparse(&self.tids, scores, format);
+        let grouped = encode_grouped(&self.tids, scores, format);
         if sparse.len() <= grouped.len() {
             sparse
         } else {
@@ -163,8 +184,20 @@ impl PostingsBuilder {
     }
 }
 
-/// Encodes the bounds table: per block, the maxima and minima of the score
-/// inputs, the last location and, for sparse streams, where the block starts.
+/// Encodes one bound: the buckets that occur and the shortest document per
+/// bucket.
+fn encode_term_bound(out: &mut Vec<u8>, bound: &BlockBound) {
+    let buckets = bound
+        .buckets()
+        .fold(0u64, |mask, (bucket, _)| mask | 1 << bucket);
+    varint::put(out, buckets);
+    for (_, len) in bound.buckets() {
+        varint::put(out, u64::from(len));
+    }
+}
+
+/// Encodes the bounds table: per block, the bound over the score inputs, the
+/// last location and, for sparse streams, where the block starts.
 fn encode_bounds(tids: &[Tid], scores: &[(u8, u32)], starts: Option<&[usize]>) -> Vec<u8> {
     let mut out = Vec::new();
     let mut previous_block = 0u32;
@@ -174,14 +207,7 @@ fn encode_bounds(tids: &[Tid], scores: &[(u8, u32)], starts: Option<&[usize]>) -
         .zip(scores.chunks(BLOCK_POSTINGS as usize));
     for (index, (block, block_scores)) in blocks.enumerate() {
         let last = block[block.len() - 1];
-        let bound = BlockBound::over(block_scores, last);
-        let buckets = bound
-            .buckets()
-            .fold(0u64, |mask, (bucket, _)| mask | 1 << bucket);
-        varint::put(&mut out, buckets);
-        for (_, len) in bound.buckets() {
-            varint::put(&mut out, u64::from(len));
-        }
+        encode_term_bound(&mut out, &BlockBound::over(block_scores, last));
         varint::put(&mut out, u64::from(last.block - previous_block));
         varint::put(&mut out, u64::from(last.offset));
         previous_block = last.block;
@@ -193,21 +219,36 @@ fn encode_bounds(tids: &[Tid], scores: &[(u8, u32)], starts: Option<&[usize]>) -
     out
 }
 
-fn encode_header(form: u8, count: usize, bounds: Option<&[u8]>) -> Vec<u8> {
-    let mut out = vec![if bounds.is_some() {
-        form | FORM_BOUNDED
+/// The bounds a scored stream carries: a single term bound when it is one
+/// block, else the table. Returns the form bit and the encoded bytes.
+fn encode_scored(
+    tids: &[Tid],
+    scores: &[(u8, u32)],
+    starts: Option<&[usize]>,
+    format: Format,
+) -> (u8, Vec<u8>) {
+    if format >= Format::Lsg3 && tids.len() <= BLOCK_POSTINGS as usize {
+        let mut out = Vec::new();
+        encode_term_bound(&mut out, &BlockBound::over(scores, tids[tids.len() - 1]));
+        (FORM_TERM_BOUND, out)
     } else {
-        form
-    }];
+        (FORM_BOUNDED, encode_bounds(tids, scores, starts))
+    }
+}
+
+fn encode_header(form: u8, count: usize, bounds: Option<&(u8, Vec<u8>)>) -> Vec<u8> {
+    let mut out = vec![bounds.map_or(form, |(bit, _)| form | bit)];
     varint::put(&mut out, count as u64);
-    if let Some(bounds) = bounds {
-        varint::put(&mut out, bounds.len() as u64);
+    if let Some((bit, bounds)) = bounds {
+        if *bit == FORM_BOUNDED {
+            varint::put(&mut out, bounds.len() as u64);
+        }
         out.extend_from_slice(bounds);
     }
     out
 }
 
-fn encode_sparse(tids: &[Tid], scores: Option<&[(u8, u32)]>) -> Vec<u8> {
+fn encode_sparse(tids: &[Tid], scores: Option<&[(u8, u32)]>, format: Format) -> Vec<u8> {
     let mut body = Vec::new();
     let mut starts = Vec::new();
     let mut last_block = 0u32;
@@ -219,15 +260,15 @@ fn encode_sparse(tids: &[Tid], scores: Option<&[(u8, u32)]>) -> Vec<u8> {
         varint::put(&mut body, u64::from(tid.offset));
         last_block = tid.block;
     }
-    let bounds = scores.map(|scores| encode_bounds(tids, scores, Some(&starts)));
-    let mut out = encode_header(FORM_SPARSE, tids.len(), bounds.as_deref());
+    let bounds = scores.map(|scores| encode_scored(tids, scores, Some(&starts), format));
+    let mut out = encode_header(FORM_SPARSE, tids.len(), bounds.as_ref());
     out.extend_from_slice(&body);
     out
 }
 
-fn encode_grouped(tids: &[Tid], scores: Option<&[(u8, u32)]>) -> Vec<u8> {
-    let bounds = scores.map(|scores| encode_bounds(tids, scores, None));
-    let mut out = encode_header(FORM_GROUPED, tids.len(), bounds.as_deref());
+fn encode_grouped(tids: &[Tid], scores: Option<&[(u8, u32)]>, format: Format) -> Vec<u8> {
+    let bounds = scores.map(|scores| encode_scored(tids, scores, None, format));
+    let mut out = encode_header(FORM_GROUPED, tids.len(), bounds.as_ref());
     let groups = tids.chunk_by(|a, b| a.group() == b.group());
     varint::put(&mut out, groups.clone().count() as u64);
     let mut previous_gid: Option<u32> = None;
@@ -283,8 +324,10 @@ impl<'a> Postings<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         let mut reader = Reader::new(bytes);
         let form = reader.u8()?;
-        let layout = form & !FORM_BOUNDED;
-        if layout != FORM_SPARSE && layout != FORM_GROUPED {
+        let layout = form & !FORM_FLAGS;
+        if (layout != FORM_SPARSE && layout != FORM_GROUPED)
+            || (form & FORM_BOUNDED != 0 && form & FORM_TERM_BOUND != 0)
+        {
             return Err(Error::Corrupt("unknown postings form"));
         }
         let count = reader.varint_u32()?;
@@ -293,6 +336,13 @@ impl<'a> Postings<'a> {
             let at = reader.position();
             reader.skip(len)?;
             Some((at, len))
+        } else if form & FORM_TERM_BOUND != 0 {
+            if count == 0 || count > BLOCK_POSTINGS {
+                return Err(Error::Corrupt("term bound on a stream of several blocks"));
+            }
+            let at = reader.position();
+            decode_term_bound(&mut reader)?;
+            Some((at, reader.position() - at))
         } else {
             None
         };
@@ -311,7 +361,7 @@ impl<'a> Postings<'a> {
     }
 
     pub const fn is_grouped(&self) -> bool {
-        self.form & !FORM_BOUNDED == FORM_GROUPED
+        self.form & !FORM_FLAGS == FORM_GROUPED
     }
 
     /// True when the stream carries per-block score bounds.
@@ -319,21 +369,52 @@ impl<'a> Postings<'a> {
         self.bounds.is_some()
     }
 
+    /// True when the bounds are a single term bound rather than a table.
+    pub const fn has_term_bound(&self) -> bool {
+        self.form & FORM_TERM_BOUND != 0
+    }
+
+    /// Bytes of the bounds table, for size accounting.
+    pub const fn bounds_len(&self) -> usize {
+        match self.bounds {
+            Some((_, len)) => len,
+            None => 0,
+        }
+    }
+
+    /// Bytes of the body after the header and bounds table.
+    pub const fn body_len(&self) -> usize {
+        self.bytes.len() - self.body_at
+    }
+
     fn bounds_table(&self) -> Option<Bounds<'a>> {
         self.bounds.map(|(at, len)| Bounds {
             reader: Reader::new(&self.bytes[at..at + len]),
             blocks: self.count.div_ceil(BLOCK_POSTINGS),
-            starts: if self.is_grouped() {
+            starts: if self.is_grouped() || self.has_term_bound() {
                 None
             } else {
                 Some(Vec::new())
             },
             body_len: self.bytes.len() - self.body_at,
             entries: Vec::new(),
+            stream: *self,
+            compact: self.has_term_bound(),
+            term_last: None,
         })
     }
 
     pub fn cursor(&self) -> Result<PostingsCursor<'a>> {
+        self.cursor_with(true)
+    }
+
+    /// A cursor, with or without its bounds attached.
+    fn cursor_with(&self, with_bounds: bool) -> Result<PostingsCursor<'a>> {
+        let bounds = if with_bounds {
+            self.bounds_table()
+        } else {
+            None
+        };
         let mut cursor = if self.is_grouped() {
             let mut reader = Reader::at(self.bytes, self.body_at);
             let groups_left = reader.varint_u32()?;
@@ -354,7 +435,7 @@ impl<'a> Postings<'a> {
                 current: None,
                 ordinal: 0,
                 seen: 0,
-                bounds: self.bounds_table(),
+                bounds,
             })
         } else {
             PostingsCursor::Sparse(SparseCursor {
@@ -365,7 +446,7 @@ impl<'a> Postings<'a> {
                 last_block: 0,
                 current: None,
                 ordinal: 0,
-                bounds: self.bounds_table(),
+                bounds,
             })
         };
         cursor.start()?;
@@ -441,6 +522,7 @@ impl<'a> PostingsCursor<'a> {
         };
         let target = target.max(current);
         let mut block = self.ordinal() / BLOCK_POSTINGS;
+        self.resolve_term_last()?;
         let Some(bounds) = self.bounds_mut() else {
             return Ok(None);
         };
@@ -457,6 +539,7 @@ impl<'a> PostingsCursor<'a> {
 
     /// Every block's bounds, in order; empty when the stream carries none.
     pub fn block_bounds(&mut self) -> Result<Vec<BlockBound>> {
+        self.resolve_term_last()?;
         let Some(bounds) = self.bounds_mut() else {
             return Ok(Vec::new());
         };
@@ -465,6 +548,25 @@ impl<'a> PostingsCursor<'a> {
             all.push(bounds.entry(block)?.expect("block index is in range"));
         }
         Ok(all)
+    }
+
+    /// A term bound stores no last location: find the stream's last posting
+    /// by walking a fresh cursor once, so the bound covers exactly the
+    /// stream. The walk is short, since such a stream is one block.
+    fn resolve_term_last(&mut self) -> Result<()> {
+        let stream = match self.bounds_mut() {
+            Some(bounds) if bounds.compact && bounds.term_last.is_none() => bounds.stream,
+            _ => return Ok(()),
+        };
+        let mut probe = stream.cursor_with(false)?;
+        let mut last = None;
+        while let Some(current) = probe.current() {
+            last = Some(current);
+            probe.advance()?;
+        }
+        let last = last.ok_or(Error::Corrupt("term bound on an empty stream"))?;
+        self.bounds_mut().expect("checked above").term_last = Some(last);
+        Ok(())
     }
 }
 
@@ -497,16 +599,43 @@ impl Cursor for PostingsCursor<'_> {
     }
 }
 
+/// Decodes a term bound: the bucket mask and the shortest document per
+/// bucket that occurs.
+fn decode_term_bound(reader: &mut Reader<'_>) -> Result<[u32; BUCKET_COUNT]> {
+    let buckets = reader.varint_u32()?;
+    if buckets == 0 || buckets >> BUCKET_COUNT != 0 {
+        return Err(Error::Corrupt("block bound buckets"));
+    }
+    let mut min_len = [u32::MAX; BUCKET_COUNT];
+    for (bucket, len) in min_len.iter_mut().enumerate() {
+        if buckets & (1 << bucket) != 0 {
+            *len = reader.varint_u32()?;
+            if *len == u32::MAX {
+                return Err(Error::Corrupt("block bound length"));
+            }
+        }
+    }
+    Ok(min_len)
+}
+
 /// The bounds table, decoded one entry at a time as the cursor moves.
 #[derive(Clone, Debug)]
 struct Bounds<'a> {
     /// Positioned at the next undecoded entry.
     reader: Reader<'a>,
     blocks: u32,
-    /// Sparse streams only: byte offset of each block's first posting.
+    /// Sparse streams with a table only: byte offset of each block's first
+    /// posting.
     starts: Option<Vec<usize>>,
     body_len: usize,
     entries: Vec<BlockBound>,
+    /// The stream, so a term bound's last location can be found.
+    stream: Postings<'a>,
+    /// True for a term bound: one entry, without a stored last location.
+    compact: bool,
+    /// A term bound's last location once found (see
+    /// [`PostingsCursor::resolve_term_last`]).
+    term_last: Option<Tid>,
 }
 
 impl Bounds<'_> {
@@ -522,41 +651,35 @@ impl Bounds<'_> {
     }
 
     fn decode(&mut self) -> Result<()> {
-        let buckets = self.reader.varint_u32()?;
-        if buckets == 0 || buckets >> BUCKET_COUNT != 0 {
-            return Err(Error::Corrupt("block bound buckets"));
-        }
-        let mut min_len = [u32::MAX; BUCKET_COUNT];
-        for (bucket, len) in min_len.iter_mut().enumerate() {
-            if buckets & (1 << bucket) != 0 {
-                *len = self.reader.varint_u32()?;
-                if *len == u32::MAX {
-                    return Err(Error::Corrupt("block bound length"));
-                }
-            }
-        }
+        let min_len = decode_term_bound(&mut self.reader)?;
         let previous = self.entries.last().copied();
-        let block = previous
-            .map_or(0, |entry| entry.last.block)
-            .checked_add(self.reader.varint_u32()?)
-            .ok_or(Error::Corrupt("block overflow"))?;
-        let offset = u16::try_from(self.reader.varint_u32()?).map_err(|_| Error::InvalidTid)?;
-        let last = Tid::new(block, offset)?;
-        if previous.is_some_and(|entry| entry.last >= last) {
-            return Err(Error::Corrupt("block bounds not increasing"));
-        }
-        if let Some(starts) = self.starts.as_mut() {
-            let previous_start = starts.last().copied();
-            let start = previous_start
-                .unwrap_or(0)
-                .checked_add(self.reader.varint()? as usize)
-                .filter(|start| *start < self.body_len)
-                .ok_or(Error::Corrupt("block start beyond body"))?;
-            if previous_start.is_some_and(|previous| previous >= start) {
-                return Err(Error::Corrupt("block starts not increasing"));
+        let last = if self.compact {
+            self.term_last
+                .expect("a term bound's last location is resolved before decoding")
+        } else {
+            let block = previous
+                .map_or(0, |entry| entry.last.block)
+                .checked_add(self.reader.varint_u32()?)
+                .ok_or(Error::Corrupt("block overflow"))?;
+            let offset = u16::try_from(self.reader.varint_u32()?).map_err(|_| Error::InvalidTid)?;
+            let last = Tid::new(block, offset)?;
+            if previous.is_some_and(|entry| entry.last >= last) {
+                return Err(Error::Corrupt("block bounds not increasing"));
             }
-            starts.push(start);
-        }
+            if let Some(starts) = self.starts.as_mut() {
+                let previous_start = starts.last().copied();
+                let start = previous_start
+                    .unwrap_or(0)
+                    .checked_add(self.reader.varint()? as usize)
+                    .filter(|start| *start < self.body_len)
+                    .ok_or(Error::Corrupt("block start beyond body"))?;
+                if previous_start.is_some_and(|previous| previous >= start) {
+                    return Err(Error::Corrupt("block starts not increasing"));
+                }
+                starts.push(start);
+            }
+            last
+        };
         self.entries.push(BlockBound { min_len, last });
         if self.entries.len() == self.blocks as usize && self.reader.remaining() != 0 {
             return Err(Error::Corrupt("block bounds length"));
@@ -579,7 +702,7 @@ pub struct SparseCursor<'a> {
 
 impl SparseCursor<'_> {
     fn seek(&mut self, target: Tid) -> Result<()> {
-        if self.bounds.is_some() {
+        if self.bounds.as_ref().is_some_and(|b| b.starts.is_some()) {
             self.skip_blocks_before(target)?;
         }
         while self.current.is_some_and(|current| current < target) {
@@ -1066,6 +1189,70 @@ mod tests {
     }
 
     #[test]
+    fn one_block_streams_carry_a_term_bound_in_both_layouts() {
+        // Dense enough to be grouped, and a thinned copy that is sparse.
+        let dense: Vec<Tid> = (0..BLOCK_POSTINGS)
+            .map(|i| tid(i / 40, (i % 40 + 1) as u16))
+            .collect();
+        let sparse: Vec<Tid> = dense
+            .iter()
+            .step_by(3)
+            .map(|t| tid(t.block * 500, t.offset))
+            .collect();
+        for (tids, grouped) in [(dense, true), (sparse, false)] {
+            let bytes = build_scored(&tids);
+            let postings = Postings::parse(&bytes).unwrap();
+            assert_eq!(postings.is_grouped(), grouped);
+            assert!(postings.has_bounds());
+            assert!(postings.has_term_bound());
+            assert_eq!(postings.to_vec().unwrap(), tids);
+            // The bound is the block bound, with the stream's last posting.
+            let expected = expected_bounds(&tids);
+            assert_eq!(expected.len(), 1);
+            let mut cursor = postings.cursor().unwrap();
+            assert_eq!(cursor.block_bounds().unwrap(), expected);
+            let mut cursor = postings.cursor().unwrap();
+            for target in [tids[0], tids[tids.len() / 2], tids[tids.len() - 1]] {
+                assert_eq!(cursor.bound_at(target).unwrap(), Some(expected[0]));
+            }
+            let last = tids[tids.len() - 1];
+            let past = Tid {
+                block: last.block,
+                offset: last.offset + 1,
+            };
+            assert_eq!(cursor.bound_at(past).unwrap(), None);
+            // A cursor moved past the middle still reports the one block,
+            // and one that was exhausted reports nothing.
+            cursor.seek(tids[tids.len() / 2]).unwrap();
+            assert_eq!(cursor.bound_at(tids[0]).unwrap(), Some(expected[0]));
+            assert_eq!(cursor.ordinal() as usize, tids.len() / 2);
+            cursor.seek(past).unwrap();
+            assert_eq!(cursor.current(), None);
+            assert_eq!(cursor.bound_at(tids[0]).unwrap(), None);
+            // The term bound is smaller than the table it replaces.
+            let with_table = {
+                let mut builder = PostingsBuilder::default();
+                for tid in &tids {
+                    let (bucket, len) = score_of(*tid);
+                    builder.push_scored(*tid, bucket, len).unwrap();
+                }
+                builder.finish_as(Format::Lsg2)
+            };
+            assert!(bytes.len() < with_table.len());
+            let old = Postings::parse(&with_table).unwrap();
+            assert!(!old.has_term_bound() && old.has_bounds());
+            assert_eq!(old.is_grouped(), grouped);
+            assert_eq!(old.cursor().unwrap().block_bounds().unwrap(), expected);
+        }
+        // One posting more than a block gets the table.
+        let spill: Vec<Tid> = (0..=BLOCK_POSTINGS).map(|i| tid(i * 7, 1)).collect();
+        let bytes = build_scored(&spill);
+        let postings = Postings::parse(&bytes).unwrap();
+        assert!(postings.has_bounds() && !postings.has_term_bound());
+        assert_eq!(postings.cursor().unwrap().block_bounds().unwrap().len(), 2);
+    }
+
+    #[test]
     fn bounds_describe_each_block_in_both_layouts() {
         let sparse: Vec<Tid> = (0..1000).map(|i| tid(i * 37, (i % 3 + 1) as u16)).collect();
         let dense: Vec<Tid> = (0..3000)
@@ -1201,6 +1388,35 @@ mod tests {
         assert_eq!(bytes[tag_at], TAG_BITMAP);
         bytes[tag_at] = 7;
         assert!(Postings::parse(&bytes).unwrap().to_vec().is_err());
+    }
+
+    #[test]
+    fn corrupt_term_bounds_are_reported_not_trusted() {
+        let tids: Vec<Tid> = (0..50).map(|i| tid(i * 37, 1)).collect();
+        let bytes = build_scored(&tids);
+        let postings = Postings::parse(&bytes).unwrap();
+        let (at, len) = postings.bounds.unwrap();
+        // An empty bucket set is impossible for a non-empty stream.
+        let mut tampered = bytes.clone();
+        tampered[at] = 0;
+        assert!(Postings::parse(&tampered).is_err());
+        // A term bound on a stream of several blocks is not a layout.
+        let mut tampered = bytes.clone();
+        tampered[1] = 200;
+        assert!(Postings::parse(&tampered).is_err());
+        // Both bound bits at once are not a layout either.
+        let mut tampered = bytes.clone();
+        tampered[0] |= FORM_BOUNDED;
+        assert!(Postings::parse(&tampered).is_err());
+        // A truncated bound fails to parse.
+        assert!(Postings::parse(&bytes[..at + len - 1]).is_err());
+        // A body that ends early is caught when the last posting is sought.
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(
+            Postings::parse(truncated)
+                .and_then(|p| p.cursor()?.block_bounds())
+                .is_err()
+        );
     }
 
     #[test]

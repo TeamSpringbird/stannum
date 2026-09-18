@@ -2,7 +2,7 @@
 //! document table, assembled from documents and read back by term or TID.
 //!
 //! ```text
-//! blob   := magic "LSG2", doc_count varint, total_length varint,
+//! blob   := magic "LSG3", doc_count varint, total_length varint,
 //!           dictionary_len varint, postings_len varint, payload_len varint,
 //!           docs_len varint,
 //!           dictionary, postings_area, payload_area, docs, lengths
@@ -14,12 +14,13 @@
 //! each dictionary entry's extents locate them. Document frequency is the
 //! postings count and `max_tf_bucket` is computed while building, so the
 //! dictionary alone answers selectivity and score-bound questions. Each
-//! term's postings carry per-block score bounds (see [`crate::postings`]).
+//! term's postings carry score bounds (see [`crate::postings`]).
 //!
-//! `LSG2` differs from `LSG1` in that term postings carry block bounds and
-//! the payload skip table holds fixed-width offsets. `LSG1` segments are
-//! still read, their payloads through the legacy layout; ranked scans over
-//! them score every candidate instead of pruning.
+//! Every released signature is still read; see [`Format`]. `LSG2` added
+//! block bounds to term postings and fixed-width payload skip offsets;
+//! `LSG3` stores a single term bound for postings of one block, drops the
+//! payload skip slot for entry 0 and gap-encodes dictionary extents. Ranked
+//! scans over `LSG1` segments score every candidate instead of pruning.
 //!
 //! The builder holds the segment in memory. That matches the intended use,
 //! folding a bounded write buffer, and an index build that partitions the heap
@@ -42,9 +43,49 @@ use crate::source::Source;
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Result, Tid, varint};
 
-const MAGIC: &[u8; 4] = b"LSG2";
-/// The previous signature, readable but written no more.
-const MAGIC_V1: &[u8; 4] = b"LSG1";
+/// A segment format, named by the signature that opens its blob. Every
+/// format listed is read; only [`Format::CURRENT`] is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Format {
+    /// No score bounds; payload skips as varint deltas every 64 entries.
+    Lsg1,
+    /// Block bounds on every term; fixed-width payload skips every 32
+    /// entries, counted explicitly and including entry 0.
+    Lsg2,
+    /// A single term bound for postings of one block; no payload skip slot
+    /// for entry 0; dictionary entries pack `df` with the bucket and store
+    /// extents as gaps from the previous entry's.
+    Lsg3,
+}
+
+impl Format {
+    pub const CURRENT: Self = Self::Lsg3;
+
+    pub const fn magic(self) -> &'static [u8; 4] {
+        match self {
+            Self::Lsg1 => b"LSG1",
+            Self::Lsg2 => b"LSG2",
+            Self::Lsg3 => b"LSG3",
+        }
+    }
+
+    pub fn from_magic(magic: &[u8]) -> Option<Self> {
+        [Self::Lsg1, Self::Lsg2, Self::Lsg3]
+            .into_iter()
+            .find(|format| format.magic() == magic)
+    }
+
+    /// True when term postings carry score bounds a ranked scan can prune with.
+    pub const fn has_bounds(self) -> bool {
+        !matches!(self, Self::Lsg1)
+    }
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(std::str::from_utf8(self.magic()).expect("ASCII"))
+    }
+}
 
 struct Occurrence {
     tid: Tid,
@@ -114,7 +155,31 @@ impl SegmentBuilder {
     }
 
     pub fn finish(self) -> Vec<u8> {
-        let mut dictionary = DictionaryBuilder::default();
+        self.finish_as(Format::CURRENT)
+    }
+
+    /// Encodes in the layout of an earlier format, for compatibility tests.
+    pub(crate) fn finish_as(self, format: Format) -> Vec<u8> {
+        self.finish_mixed(format, format, format)
+    }
+
+    /// A builder over `documents`, for tests.
+    #[cfg(test)]
+    pub(crate) fn from_documents(documents: &[(Tid, Vec<(String, u32)>)]) -> Self {
+        let mut builder = Self::default();
+        for (tid, tokens) in documents {
+            builder
+                .add_document(*tid, tokens.iter().map(|(t, p)| (t.as_str(), *p)))
+                .unwrap();
+        }
+        builder
+    }
+
+    /// Encodes with the signature of one format and the stream layouts of
+    /// others, so the verifier's layout checks can be exercised.
+    pub(crate) fn finish_mixed(self, magic: Format, postings: Format, payload: Format) -> Vec<u8> {
+        let (postings_format, payload_format) = (postings, payload);
+        let mut dictionary = DictionaryBuilder::with_format(magic);
         let mut postings_area = Vec::new();
         let mut payload_area = Vec::new();
         for (term, mut occurrences) in self.terms {
@@ -132,8 +197,8 @@ impl SegmentBuilder {
                     .push(bucket, &occurrence.positions)
                     .expect("positions validated on insertion");
             }
-            let postings_bytes = postings.finish();
-            let payload_bytes = payload.finish();
+            let postings_bytes = postings.finish_as(postings_format);
+            let payload_bytes = payload.finish_as(payload_format);
             let entry = TermEntry {
                 df: occurrences.len() as u32,
                 max_tf_bucket,
@@ -164,7 +229,7 @@ impl SegmentBuilder {
         let docs_bytes = docs.finish();
 
         let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(magic.magic());
         varint::put(&mut out, self.lengths.len() as u64);
         varint::put(&mut out, total_length);
         varint::put(&mut out, dictionary_bytes.len() as u64);
@@ -208,11 +273,7 @@ impl<'a> Term<'a> {
 
     pub fn payload(&self) -> Result<Payload<'a>> {
         let bytes = self.areas.payload_bytes(self.entry.payload)?;
-        if self.areas.legacy_payload() {
-            Payload::parse_legacy(bytes)
-        } else {
-            Payload::parse(bytes)
-        }
+        Payload::parse_format(bytes, self.areas.format())
     }
 }
 
@@ -221,16 +282,15 @@ pub trait AreaFetch {
     fn postings_bytes(&self, extent: Extent) -> Result<&[u8]>;
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]>;
     fn length(&self, ordinal: u32) -> Result<u32>;
-    /// True when payload streams use the `LSG1` skip-table layout.
-    fn legacy_payload(&self) -> bool {
-        false
+    /// The format the streams were written in.
+    fn format(&self) -> Format {
+        Format::CURRENT
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Header {
-    /// True for an `LSG1` blob.
-    legacy: bool,
+    format: Format,
     doc_count: u32,
     total_length: u64,
     dictionary_at: u64,
@@ -259,6 +319,17 @@ pub struct Reader<S: Source> {
     last_chunk: Cell<Option<(u64, *const [u8])>>,
 }
 
+/// Byte lengths of a segment's sections, in blob order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sections {
+    pub header: usize,
+    pub dictionary: usize,
+    pub postings: usize,
+    pub payload: usize,
+    pub docs: usize,
+    pub lengths: usize,
+}
+
 /// Fetched extents by (offset, len).
 type Arena = HashMap<(u64, usize), Box<[u8]>>;
 
@@ -279,11 +350,8 @@ impl<S: Source> Reader<S> {
         let total = source.len();
         let head = source.read(0, (total.min(64)) as usize)?;
         let mut reader = crate::reader::Reader::new(&head);
-        let magic = reader.take(MAGIC.len())?;
-        if magic != MAGIC && magic != MAGIC_V1 {
-            return Err(Error::Corrupt("segment magic"));
-        }
-        let legacy = magic == MAGIC_V1;
+        let magic = reader.take(4)?;
+        let format = Format::from_magic(magic).ok_or(Error::Corrupt("segment magic"))?;
         let doc_count = reader.varint_u32()?;
         let total_length = reader.varint()?;
         let dictionary_len = reader.varint_u32()? as usize;
@@ -301,7 +369,7 @@ impl<S: Source> Reader<S> {
         Ok(Self {
             source,
             header: Header {
-                legacy,
+                format,
                 doc_count,
                 total_length,
                 dictionary_at,
@@ -355,14 +423,31 @@ impl<S: Source> Reader<S> {
         self.header.total_length
     }
 
+    /// The blob's format, from its signature.
+    pub const fn format(&self) -> Format {
+        self.header.format
+    }
+
     /// True for an `LSG1` blob, whose term postings carry no block bounds.
     pub const fn is_legacy(&self) -> bool {
-        self.header.legacy
+        matches!(self.header.format, Format::Lsg1)
     }
 
     /// Byte lengths of the postings and payload areas.
     pub const fn area_lengths(&self) -> (usize, usize) {
         (self.header.postings_len, self.header.payload_len)
+    }
+
+    /// Byte lengths of every section of the blob, for size accounting.
+    pub const fn sections(&self) -> Sections {
+        Sections {
+            header: self.header.dictionary_at as usize,
+            dictionary: self.header.dictionary_len,
+            postings: self.header.postings_len,
+            payload: self.header.payload_len,
+            docs: self.header.docs_len,
+            lengths: self.header.doc_count as usize * 4,
+        }
     }
 
     fn dictionary_index(&self) -> Result<&DictionaryIndex<'_>> {
@@ -399,7 +484,7 @@ impl<S: Source> Reader<S> {
                 fetch: self,
             }
         };
-        Ok(Dictionary::new(index, blocks))
+        Ok(Dictionary::with_format(index, blocks, self.header.format))
     }
 
     /// Resolves a dictionary entry obtained earlier from this segment.
@@ -529,8 +614,8 @@ impl<S: Source> AreaFetch for Reader<S> {
         self.load(self.header.payload_at + extent.offset, extent.len as usize)
     }
 
-    fn legacy_payload(&self) -> bool {
-        self.header.legacy
+    fn format(&self) -> Format {
+        self.header.format
     }
 
     fn length(&self, ordinal: u32) -> Result<u32> {
@@ -727,10 +812,23 @@ mod tests {
         assert!(Segment::parse(&bytes[..bytes.len() - 1]).is_err());
         assert!(Segment::parse(b"LSG3").is_err());
         assert!(Segment::parse(b"LSG1").is_err());
-        // An LSG1 blob (no block bounds) is still readable.
-        let mut old = bytes.clone();
-        old[..4].copy_from_slice(MAGIC_V1);
-        assert_eq!(Segment::parse(&old).unwrap().document_count(), 0);
+        assert_eq!(&bytes[..4], Format::CURRENT.magic());
+        // An unknown signature is rejected outright.
+        let mut future = bytes.clone();
+        future[..4].copy_from_slice(b"LSG4");
+        assert_eq!(
+            Segment::parse(&future).err(),
+            Some(Error::Corrupt("segment magic"))
+        );
+        // Earlier signatures are still readable.
+        for format in [Format::Lsg1, Format::Lsg2] {
+            let mut old = bytes.clone();
+            old[..4].copy_from_slice(format.magic());
+            let segment = Segment::parse(&old).unwrap();
+            assert_eq!(segment.document_count(), 0);
+            assert_eq!(segment.format(), format);
+            assert_eq!(segment.is_legacy(), format == Format::Lsg1);
+        }
         let mut builder = SegmentBuilder::default();
         builder.add_document(tid(1, 1), tokens("a b c")).unwrap();
         let mut bytes = builder.finish();
