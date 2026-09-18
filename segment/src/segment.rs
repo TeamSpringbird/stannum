@@ -2,7 +2,7 @@
 //! document table, assembled from documents and read back by term or TID.
 //!
 //! ```text
-//! blob   := magic "LSG1", doc_count varint, total_length varint,
+//! blob   := magic "LSG2", doc_count varint, total_length varint,
 //!           dictionary_len varint, postings_len varint, payload_len varint,
 //!           docs_len varint,
 //!           dictionary, postings_area, payload_area, docs, lengths
@@ -13,7 +13,13 @@
 //! The postings and payload areas are concatenations of per-term streams;
 //! each dictionary entry's extents locate them. Document frequency is the
 //! postings count and `max_tf_bucket` is computed while building, so the
-//! dictionary alone answers selectivity and score-bound questions.
+//! dictionary alone answers selectivity and score-bound questions. Each
+//! term's postings carry per-block score bounds (see [`crate::postings`]).
+//!
+//! `LSG2` differs from `LSG1` in that term postings carry block bounds and
+//! the payload skip table holds fixed-width offsets. `LSG1` segments are
+//! still read, their payloads through the legacy layout; ranked scans over
+//! them score every candidate instead of pruning.
 //!
 //! The builder holds the segment in memory. That matches the intended use,
 //! folding a bounded write buffer, and an index build that partitions the heap
@@ -36,10 +42,13 @@ use crate::source::Source;
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Result, Tid, varint};
 
-const MAGIC: &[u8; 4] = b"LSG1";
+const MAGIC: &[u8; 4] = b"LSG2";
+/// The previous signature, readable but written no more.
+const MAGIC_V1: &[u8; 4] = b"LSG1";
 
 struct Occurrence {
     tid: Tid,
+    doc_len: u32,
     positions: Vec<u32>,
 }
 
@@ -86,7 +95,11 @@ impl SegmentBuilder {
             self.terms
                 .entry(term.to_owned())
                 .or_default()
-                .push(Occurrence { tid, positions });
+                .push(Occurrence {
+                    tid,
+                    doc_len,
+                    positions,
+                });
         }
         Ok(())
     }
@@ -113,7 +126,7 @@ impl SegmentBuilder {
                 let bucket = TfBucket::from_count(occurrence.positions.len() as u32).value();
                 max_tf_bucket = max_tf_bucket.max(bucket);
                 postings
-                    .push(occurrence.tid)
+                    .push_scored(occurrence.tid, bucket, occurrence.doc_len)
                     .expect("occurrences are unique per document and sorted");
                 payload
                     .push(bucket, &occurrence.positions)
@@ -194,7 +207,12 @@ impl<'a> Term<'a> {
     }
 
     pub fn payload(&self) -> Result<Payload<'a>> {
-        Payload::parse(self.areas.payload_bytes(self.entry.payload)?)
+        let bytes = self.areas.payload_bytes(self.entry.payload)?;
+        if self.areas.legacy_payload() {
+            Payload::parse_legacy(bytes)
+        } else {
+            Payload::parse(bytes)
+        }
     }
 }
 
@@ -203,10 +221,16 @@ pub trait AreaFetch {
     fn postings_bytes(&self, extent: Extent) -> Result<&[u8]>;
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]>;
     fn length(&self, ordinal: u32) -> Result<u32>;
+    /// True when payload streams use the `LSG1` skip-table layout.
+    fn legacy_payload(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Header {
+    /// True for an `LSG1` blob.
+    legacy: bool,
     doc_count: u32,
     total_length: u64,
     dictionary_at: u64,
@@ -230,6 +254,9 @@ pub struct Reader<S: Source> {
     arena: RefCell<Arena>,
     arena_bytes: Cell<usize>,
     dictionary: OnceCell<DictionaryIndex<'static>>,
+    /// The length chunk read last, by offset: scoring reads lengths in
+    /// document order, so consecutive reads hit the same chunk.
+    last_chunk: Cell<Option<(u64, *const [u8])>>,
 }
 
 /// Fetched extents by (offset, len).
@@ -252,9 +279,11 @@ impl<S: Source> Reader<S> {
         let total = source.len();
         let head = source.read(0, (total.min(64)) as usize)?;
         let mut reader = crate::reader::Reader::new(&head);
-        if reader.take(MAGIC.len())? != MAGIC {
+        let magic = reader.take(MAGIC.len())?;
+        if magic != MAGIC && magic != MAGIC_V1 {
             return Err(Error::Corrupt("segment magic"));
         }
+        let legacy = magic == MAGIC_V1;
         let doc_count = reader.varint_u32()?;
         let total_length = reader.varint()?;
         let dictionary_len = reader.varint_u32()? as usize;
@@ -272,6 +301,7 @@ impl<S: Source> Reader<S> {
         Ok(Self {
             source,
             header: Header {
+                legacy,
                 doc_count,
                 total_length,
                 dictionary_at,
@@ -287,6 +317,7 @@ impl<S: Source> Reader<S> {
             arena: RefCell::new(HashMap::new()),
             arena_bytes: Cell::new(0),
             dictionary: OnceCell::new(),
+            last_chunk: Cell::new(None),
         })
     }
 
@@ -488,6 +519,10 @@ impl<S: Source> AreaFetch for Reader<S> {
         self.load(self.header.payload_at + extent.offset, extent.len as usize)
     }
 
+    fn legacy_payload(&self) -> bool {
+        self.header.legacy
+    }
+
     fn length(&self, ordinal: u32) -> Result<u32> {
         if ordinal >= self.header.doc_count {
             return Err(Error::Corrupt("document ordinal out of range"));
@@ -499,9 +534,19 @@ impl<S: Source> AreaFetch for Reader<S> {
         // Paged sources: fetch the chunk around the entry once, then index it.
         let within = (at - self.header.lengths_at) % LENGTH_CHUNK;
         let chunk_at = at - within;
-        let end = self.header.lengths_at + u64::from(self.header.doc_count) * 4;
-        let chunk_len = (end - chunk_at).min(LENGTH_CHUNK) as usize;
-        let chunk = self.load(chunk_at, chunk_len)?;
+        let chunk: &[u8] = match self.last_chunk.get() {
+            // SAFETY: the pointer came from `load`, whose arena keeps the
+            // allocation alive and in place for as long as `self` lives.
+            Some((last_at, pointer)) if last_at == chunk_at => unsafe { &*pointer },
+            _ => {
+                let end = self.header.lengths_at + u64::from(self.header.doc_count) * 4;
+                let chunk_len = (end - chunk_at).min(LENGTH_CHUNK) as usize;
+                let chunk = self.load(chunk_at, chunk_len)?;
+                self.last_chunk
+                    .set(Some((chunk_at, std::ptr::from_ref(chunk))));
+                chunk
+            }
+        };
         let i = within as usize;
         Ok(u32::from_le_bytes([
             chunk[i],
@@ -592,6 +637,20 @@ mod tests {
             collect(beer.cursor().unwrap()).unwrap(),
             [tid(0, 5), tid(2, 1)]
         );
+        // Term postings carry block bounds over the term's documents.
+        let mut cursor = beer.cursor().unwrap();
+        assert!(cursor.has_bounds());
+        assert_eq!(
+            cursor.block_bounds().unwrap(),
+            [crate::postings::BlockBound::over(
+                &[
+                    (TfBucket::from_count(1).value(), 2),
+                    (TfBucket::from_count(2).value(), 3)
+                ],
+                tid(2, 1),
+            )]
+        );
+        assert!(!segment.documents().unwrap().has_bounds());
         let payload = beer.payload().unwrap();
         let mut cursor = beer.cursor().unwrap();
         let ordinal = cursor.rank(tid(2, 1)).unwrap().unwrap();
@@ -656,7 +715,12 @@ mod tests {
         assert!(segment.term("x").unwrap().is_none());
         assert_eq!(segment.documents().unwrap().current(), None);
         assert!(Segment::parse(&bytes[..bytes.len() - 1]).is_err());
-        assert!(Segment::parse(b"LSG2").is_err());
+        assert!(Segment::parse(b"LSG3").is_err());
+        assert!(Segment::parse(b"LSG1").is_err());
+        // An LSG1 blob (no block bounds) is still readable.
+        let mut old = bytes.clone();
+        old[..4].copy_from_slice(MAGIC_V1);
+        assert_eq!(Segment::parse(&old).unwrap().document_count(), 0);
         let mut builder = SegmentBuilder::default();
         builder.add_document(tid(1, 1), tokens("a b c")).unwrap();
         let mut bytes = builder.finish();
