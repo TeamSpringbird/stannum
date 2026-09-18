@@ -46,8 +46,14 @@ const BITMAP_BATCH: usize = 1024;
 static WRITE_BUFFER_DOCS: GucSetting<i32> = GucSetting::<i32>::new(16_384);
 /// Documents an index build accumulates before writing a segment.
 static BUILD_SEGMENT_DOCS: GucSetting<i32> = GucSetting::<i32>::new(32_768);
-/// Segments allowed before a fold merges everything into one.
+/// Hard bound on directory entries; the tiered policy normally stays well below it.
 static MAX_SEGMENTS_GUC: GucSetting<i32> = GucSetting::<i32>::new(MAX_SEGMENTS as i32);
+/// Segments a size tier holds before they merge into one segment of the next tier.
+static MERGE_TIER_FACTOR: GucSetting<i32> = GucSetting::<i32>::new(8);
+/// Smallest `stannum.merge_tier_factor` value; below it every fold would merge.
+pub const MIN_MERGE_TIER_FACTOR: i32 = 2;
+/// Largest `stannum.merge_tier_factor` value that still keeps tiers meaningful.
+pub const MAX_MERGE_TIER_FACTOR: i32 = 64;
 
 /// Registers the tunables. Low values exist so tests can drive folds,
 /// merges and reclamation at small scale; the defaults are the intended ones.
@@ -74,11 +80,21 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"stannum.max_segments",
-        c"Stannum segments allowed before a fold merges them",
-        c"The on-disk directory holds at most 128 entries.",
+        c"Most Stannum segments an index directory may hold",
+        c"Tiered merges keep the count far lower; reaching this bound forces the smallest segments to merge. The on-disk directory holds at most 128 entries.",
         &MAX_SEGMENTS_GUC,
         1,
         MAX_SEGMENTS as i32,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.merge_tier_factor",
+        c"Stannum segments per size tier before they merge",
+        c"Segments are tiered by document count in powers of this factor; a tier holding this many segments merges them into one segment of the next tier.",
+        &MERGE_TIER_FACTOR,
+        MIN_MERGE_TIER_FACTOR,
+        MAX_MERGE_TIER_FACTOR,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -86,6 +102,12 @@ pub fn init() {
 
 fn max_segments() -> usize {
     (MAX_SEGMENTS_GUC.get().max(1) as usize).min(MAX_SEGMENTS)
+}
+
+fn merge_tier_factor() -> u32 {
+    MERGE_TIER_FACTOR
+        .get()
+        .clamp(MIN_MERGE_TIER_FACTOR, MAX_MERGE_TIER_FACTOR) as u32
 }
 
 fn checked<T>(result: Result<T, &'static str>) -> T {
@@ -543,22 +565,105 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
 }
 
 /// Queues a run for reclamation once no scan can still hold it.
-fn release(meta: &mut Meta, run: Run) {
+///
+/// Runs released at the same transaction horizon share one pending entry:
+/// the new run's last page is linked ahead of the entry's chain. No reader
+/// follows that link, because every reader stops at its own run's block
+/// count or uses the page table, so the pages stay valid for old directories.
+/// A full list is first drained of runs no snapshot can still read, and
+/// otherwise the run joins the newest entry, so the list never overflows and
+/// no page is leaked; reclamation of that entry just waits for the newer xid.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
     if run.is_empty() {
         return;
     }
+    let xid = unsafe { pg_sys::ReadNextTransactionId() }.into_inner();
     if meta.pending.len() >= MAX_PENDING {
-        // Leak rather than block; VACUUM will drain the list over time.
-        pgrx::warning!(
-            "Stannum index pending-free list is full; {} pages leaked until REINDEX",
-            run.blocks
-        );
-        return;
+        unsafe { drain_pending(index, meta) };
     }
-    meta.pending.push(Pending {
-        run,
-        xid: unsafe { pg_sys::ReadNextTransactionId() }.into_inner(),
-    });
+    let full = meta.pending.len() >= MAX_PENDING;
+    match meta.pending.last_mut() {
+        Some(last) if full || last.xid == xid => {
+            unsafe { prepend_chain(index, run, last.run.first) };
+            last.run = Run {
+                first: run.first,
+                blocks: last.run.blocks + run.blocks,
+                bytes: last.run.bytes.saturating_add(run.bytes),
+            };
+            last.xid = xid;
+        }
+        _ => meta.pending.push(Pending { run, xid }),
+    }
+}
+
+/// Points the last page of `run` at `next`, joining two chains of pages that
+/// only the reclamation walk will ever follow across.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively; `run` is a run of
+/// `index` that no directory references any more.
+unsafe fn prepend_chain(index: pg_sys::Relation, run: Run, next: u32) {
+    unsafe {
+        let mut block = run.first;
+        for _ in 1..run.blocks {
+            pgrx::check_for_interrupts!();
+            let buffer = Buffer::read(index, block, false);
+            if buffer.kind() != KIND_RUN {
+                pgrx::error!("Stannum run page has the wrong kind; REINDEX required");
+            }
+            let (following, _) = checked(layout::chain(buffer.page()));
+            if following == NONE {
+                pgrx::error!("Stannum run ends early; REINDEX required");
+            }
+            block = following;
+        }
+        let last = Buffer::read(index, block, true);
+        if last.kind() != KIND_RUN {
+            pgrx::error!("Stannum run page has the wrong kind; REINDEX required");
+        }
+        let (_, data) = checked(layout::chain(last.page()));
+        let payload = layout::chain_payload(next, data);
+        write_page(index, &last, false, KIND_RUN, &payload);
+    }
+}
+
+/// Marks the pages of every pending run that no snapshot can still read as
+/// free and records them in the FSM; the rest stay on the list.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
+    unsafe {
+        let mut still_pending = Vec::new();
+        for pending in std::mem::take(&mut meta.pending) {
+            let xid = pg_sys::TransactionId::from(pending.xid);
+            if !pg_sys::GlobalVisCheckRemovableXid(index, xid) {
+                still_pending.push(pending);
+                continue;
+            }
+            let mut block = pending.run.first;
+            for _ in 0..pending.run.blocks {
+                pgrx::check_for_interrupts!();
+                if block == NONE {
+                    break;
+                }
+                let buffer = Buffer::read(index, block, true);
+                if buffer.kind() != KIND_RUN {
+                    break;
+                }
+                let (next, _) = checked(layout::chain(buffer.page()));
+                write_page(index, &buffer, false, KIND_FREE, &pending.xid.to_le_bytes());
+                let freed = buffer.block();
+                drop(buffer);
+                pg_sys::RecordFreeIndexPage(index, freed);
+                block = next;
+            }
+        }
+        meta.pending = still_pending;
+    }
 }
 
 // --- Write buffer index -------------------------------------------------------
@@ -770,8 +875,43 @@ unsafe fn replace_buffer(index: pg_sys::Relation, state: &mut BufferState, data:
 
 // --- Segments -----------------------------------------------------------------
 
-/// Publishes a built segment: writes its run and appends a directory entry,
-/// merging everything first if the directory is full.
+fn finish_builder(builder: SegmentBuilder) -> (Vec<u8>, u32, u64) {
+    let docs = builder.document_count() as u32;
+    let blob = builder.finish();
+    let total_length = codec(Segment::parse(&blob)).total_length();
+    (blob, docs, total_length)
+}
+
+/// A directory entry for a freshly written segment run, with the next
+/// generation number. Generations never repeat within an index identity.
+fn new_entry(meta: &mut Meta, run: Run, map: Run, docs: u32, total_length: u64) -> SegmentEntry {
+    let generation = meta.next_generation;
+    meta.next_generation = meta.next_generation.wrapping_add(1);
+    SegmentEntry {
+        run,
+        map,
+        dead: Run::EMPTY,
+        docs,
+        total_length,
+        generation,
+    }
+}
+
+/// Queues every run of a retired directory entry for reclamation.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn release_entry(index: pg_sys::Relation, meta: &mut Meta, entry: SegmentEntry) {
+    unsafe {
+        release(index, meta, entry.run);
+        release(index, meta, entry.map);
+        release(index, meta, entry.dead);
+    }
+}
+
+/// Publishes a built segment: writes its run, appends a directory entry and
+/// then merges whatever the tiered policy says is due, so the directory
+/// never leaves this function with more than `stannum.max_segments` entries.
 unsafe fn add_segment(
     index: pg_sys::Relation,
     meta: &mut Meta,
@@ -780,35 +920,91 @@ unsafe fn add_segment(
     total_length: u64,
 ) {
     unsafe {
-        if meta.segments.len() >= max_segments() {
-            merge_all(index, meta);
-        }
         let (run, map) = write_segment_run(index, blob);
-        let generation = meta.next_generation;
-        meta.next_generation = meta.next_generation.wrapping_add(1);
-        meta.segments.push(SegmentEntry {
-            run,
-            map,
-            dead: Run::EMPTY,
-            docs,
-            total_length,
-            generation,
-        });
+        let entry = new_entry(meta, run, map, docs, total_length);
+        meta.segments.push(entry);
+        maintain(index, meta);
     }
 }
 
-fn finish_builder(builder: SegmentBuilder) -> (Vec<u8>, u32, u64) {
-    let docs = builder.document_count() as u32;
-    let blob = builder.finish();
-    let total_length = codec(Segment::parse(&blob)).total_length();
-    (blob, docs, total_length)
+/// The size tier of a segment: how many times `factor` divides its document
+/// count. Tier `t` holds counts in `[factor^t, factor^(t+1))`.
+fn tier(docs: u32, factor: u32) -> u32 {
+    let mut remaining = docs.max(1);
+    let mut tier = 0;
+    while remaining >= factor {
+        remaining /= factor;
+        tier += 1;
+    }
+    tier
 }
 
-/// Rewrites every segment into one, dropping dead documents.
-unsafe fn merge_all(index: pg_sys::Relation, meta: &mut Meta) {
+/// The directory positions the merge policy combines next, if any.
+///
+/// Segments are tiered by document count in powers of `factor`, like the
+/// levels of a log-structured merge tree. The lowest tier holding `factor` or
+/// more segments merges into one segment that lands in the next tier up, so
+/// every document is rewritten about once per tier and a merge touches only
+/// a small run of similarly sized segments rather than the whole index. If no
+/// tier is due but the directory still exceeds `limit`, the smallest entries
+/// merge until it fits. `None` means the directory is in shape.
+fn merge_candidates(docs: &[u32], factor: u32, limit: usize) -> Option<Vec<usize>> {
+    let mut tiers: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (position, count) in docs.iter().enumerate() {
+        tiers
+            .entry(tier(*count, factor))
+            .or_default()
+            .push(position);
+    }
+    if let Some(members) = tiers
+        .into_iter()
+        .filter(|(_, members)| members.len() >= factor as usize)
+        .min_by_key(|(tier, _)| *tier)
+        .map(|(_, members)| members)
+    {
+        return Some(members);
+    }
+    if docs.len() > limit {
+        let mut by_size: Vec<usize> = (0..docs.len()).collect();
+        by_size.sort_by_key(|position| (docs[*position], *position));
+        by_size.truncate((docs.len() - limit + 1).max(2));
+        return Some(by_size);
+    }
+    None
+}
+
+/// Applies the merge policy until the directory is in shape.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn maintain(index: pg_sys::Relation, meta: &mut Meta) {
+    let factor = merge_tier_factor();
+    let limit = max_segments();
+    loop {
+        pgrx::check_for_interrupts!();
+        let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
+        match merge_candidates(&docs, factor, limit) {
+            Some(positions) => unsafe { merge(index, meta, positions) },
+            None => break,
+        }
+    }
+}
+
+/// Rewrites the segments at `positions` into one, dropping dead documents.
+/// The merged segment takes a fresh generation at the end of the directory;
+/// the old runs go to the pending-free list.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usize>) {
     unsafe {
+        positions.sort_unstable();
+        let mut old = Vec::with_capacity(positions.len());
+        for position in positions.into_iter().rev() {
+            old.push(meta.segments.remove(position));
+        }
+        old.reverse();
         let mut builder = SegmentBuilder::default();
-        let old = std::mem::take(&mut meta.segments);
         for entry in &old {
             pgrx::check_for_interrupts!();
             let bytes = read_run(index, entry.run);
@@ -820,20 +1016,10 @@ unsafe fn merge_all(index: pg_sys::Relation, meta: &mut Meta) {
         }
         let (blob, docs, total_length) = finish_builder(builder);
         let (run, map) = write_segment_run(index, &blob);
-        let generation = meta.next_generation;
-        meta.next_generation = meta.next_generation.wrapping_add(1);
-        meta.segments.push(SegmentEntry {
-            run,
-            map,
-            dead: Run::EMPTY,
-            docs,
-            total_length,
-            generation,
-        });
+        let entry = new_entry(meta, run, map, docs, total_length);
+        meta.segments.push(entry);
         for entry in old {
-            release(meta, entry.run);
-            release(meta, entry.map);
-            release(meta, entry.dead);
+            release_entry(index, meta, entry);
         }
     }
 }
@@ -1164,7 +1350,7 @@ pub unsafe fn bulk_delete(
             if dead.len() != before {
                 let run = write_run(index, &encode_dead(&dead));
                 let old = std::mem::replace(&mut meta.segments[i].dead, run);
-                release(&mut meta, old);
+                release(index, &mut meta, old);
             }
         }
         if meta.buffer.docs > 0 {
@@ -1222,46 +1408,10 @@ pub unsafe fn cleanup(index: pg_sys::Relation) {
             }
             let (blob, docs, total_length) = finish_builder(builder);
             let (run, map) = write_segment_run(index, &blob);
-            let generation = meta.next_generation;
-            meta.next_generation = meta.next_generation.wrapping_add(1);
-            meta.segments[i] = SegmentEntry {
-                run,
-                map,
-                dead: Run::EMPTY,
-                docs,
-                total_length,
-                generation,
-            };
-            release(&mut meta, entry.run);
-            release(&mut meta, entry.map);
-            release(&mut meta, entry.dead);
+            meta.segments[i] = new_entry(&mut meta, run, map, docs, total_length);
+            release_entry(index, &mut meta, entry);
         }
-        let mut still_pending = Vec::new();
-        for pending in std::mem::take(&mut meta.pending) {
-            let xid = pg_sys::TransactionId::from(pending.xid);
-            if !pg_sys::GlobalVisCheckRemovableXid(index, xid) {
-                still_pending.push(pending);
-                continue;
-            }
-            let mut block = pending.run.first;
-            for _ in 0..pending.run.blocks {
-                pgrx::check_for_interrupts!();
-                if block == NONE {
-                    break;
-                }
-                let buffer = Buffer::read(index, block, true);
-                if buffer.kind() != KIND_RUN {
-                    break;
-                }
-                let (next, _) = checked(layout::chain(buffer.page()));
-                write_page(index, &buffer, false, KIND_FREE, &pending.xid.to_le_bytes());
-                let freed = buffer.block();
-                drop(buffer);
-                pg_sys::RecordFreeIndexPage(index, freed);
-                block = next;
-            }
-        }
-        meta.pending = still_pending;
+        drain_pending(index, &mut meta);
         write_meta(index, &meta_buffer, &meta);
         drop(meta_buffer);
         pg_sys::IndexFreeSpaceMapVacuum(index);
@@ -1350,4 +1500,92 @@ pub unsafe fn document_count(index: pg_sys::Relation) -> u64 {
         .map(|entry| u64::from(entry.docs))
         .sum::<u64>()
         + u64::from(meta.buffer.docs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_candidates, tier};
+
+    #[test]
+    fn tiers_are_powers_of_the_factor() {
+        assert_eq!(tier(0, 8), 0);
+        assert_eq!(tier(7, 8), 0);
+        assert_eq!(tier(8, 8), 1);
+        assert_eq!(tier(63, 8), 1);
+        assert_eq!(tier(64, 8), 2);
+        assert_eq!(tier(16_384, 8), 4);
+        assert_eq!(tier(131_072, 8), 5);
+        assert_eq!(tier(u32::MAX, 2), 31);
+    }
+
+    #[test]
+    fn a_full_tier_merges_before_anything_larger() {
+        // Seven folds of one write buffer and two older, larger segments.
+        let docs = [
+            200_000, 16_384, 16_384, 16_384, 16_384, 16_384, 16_384, 16_384, 40_000,
+        ];
+        assert_eq!(merge_candidates(&docs, 8, 128), None);
+        let docs = [
+            200_000, 16_384, 16_384, 16_384, 16_384, 16_384, 16_384, 16_384, 40_000, 16_384,
+        ];
+        assert_eq!(
+            merge_candidates(&docs, 8, 128),
+            Some(vec![1, 2, 3, 4, 5, 6, 7, 9])
+        );
+        // The lowest due tier goes first even when a higher one is also due.
+        let docs = [64, 64, 8, 8, 64];
+        assert_eq!(merge_candidates(&docs, 2, 128), Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn an_overfull_directory_merges_its_smallest_entries() {
+        // No tier is due, but the directory is over the limit: the smallest
+        // entries merge into one so the count drops back to the limit.
+        let docs = [500, 9, 70, 1, 3_000];
+        assert_eq!(merge_candidates(&docs, 8, 3), Some(vec![3, 1, 2]));
+        assert_eq!(merge_candidates(&docs, 8, 4), Some(vec![3, 1]));
+        assert_eq!(merge_candidates(&docs, 8, 5), None);
+        // A limit of one still merges at least two entries.
+        assert_eq!(merge_candidates(&[5, 6], 8, 1), Some(vec![0, 1]));
+        assert_eq!(merge_candidates(&[5], 8, 1), None);
+        assert_eq!(merge_candidates(&[], 8, 1), None);
+    }
+
+    #[test]
+    fn repeated_maintenance_keeps_the_directory_logarithmic() {
+        // Simulate folds of one document each and count the directory after
+        // every fold: it is the base-`factor` digit sum of the total, so
+        // 1,000 documents never need more than (factor - 1) * tiers entries.
+        for factor in [2u32, 3, 8] {
+            let mut docs: Vec<u32> = Vec::new();
+            let mut merges = 0usize;
+            let mut rewritten = 0u64;
+            for total in 1..=1_000u32 {
+                docs.push(1);
+                while let Some(positions) = merge_candidates(&docs, factor, 128) {
+                    let merged: u32 = positions.iter().map(|p| docs[*p]).sum();
+                    rewritten += u64::from(merged);
+                    merges += 1;
+                    let mut positions = positions;
+                    positions.sort_unstable();
+                    for position in positions.into_iter().rev() {
+                        docs.remove(position);
+                    }
+                    docs.push(merged);
+                }
+                let mut digits = 0usize;
+                let mut rest = total;
+                while rest > 0 {
+                    digits += (rest % factor) as usize;
+                    rest /= factor;
+                }
+                assert_eq!(docs.len(), digits, "factor {factor}, total {total}");
+                assert_eq!(docs.iter().sum::<u32>(), total);
+            }
+            assert!(merges > 0);
+            // Every document is rewritten once per tier it climbs through.
+            let tiers = tier(1_000, factor) as u64 + 1;
+            assert!(rewritten <= 1_000 * tiers, "factor {factor}: {rewritten}");
+        }
+    }
 }

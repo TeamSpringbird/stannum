@@ -331,6 +331,172 @@ mod tests {
         );
     }
 
+    /// Every query must return the same ids through the bitmap index path
+    /// as through a sequential scan, with no rows removed by recheck.
+    fn assert_index_matches_seqscan(table: &str, queries: &[&str]) {
+        for query in queries {
+            Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = on;").unwrap();
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM {table} WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan", "{query}");
+            assert_eq!(
+                plan[0]["Plan"]["Rows Removed by Index Recheck"].as_f64(),
+                Some(0.0),
+                "{query}"
+            );
+            let actual = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id), '{{}}'::int[]) FROM {table} WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            Spi::run("SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;").unwrap();
+            let reference = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id), '{{}}'::int[]) FROM {table} WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, reference, "{query}");
+        }
+    }
+
+    /// (immutable segment count, distinct generations, documents) of an index.
+    fn directory_shape(index: &str) -> (i64, i64, i64) {
+        Spi::get_three::<i64, i64, i64>(&format!(
+            "SELECT count(*), count(DISTINCT generation), coalesce(sum(docs), 0)::bigint
+             FROM stannum.segment_info('{index}') WHERE kind = 'immutable'"
+        ))
+        .map(|(a, b, c)| (a.unwrap(), b.unwrap(), c.unwrap()))
+        .unwrap()
+    }
+
+    const TIERED_QUERIES: &[&str] = &[
+        "rare",
+        "common",
+        "missing",
+        "\"rare needle\"",
+        "\"needle rare\"",
+        "w1 AND NOT rare",
+        "* AND NOT common",
+        "w* AND rare",
+        "updated",
+        "AT LEAST 2 OF [w1 w2 rare]",
+        "(w3 NEAR/2 needle) IN FIRST 3 WORDS",
+        "common IN LAST 50%",
+    ];
+
+    #[pg_test]
+    fn tiered_merges_keep_results_exact_across_deletes_and_updates() {
+        // Two-document folds and a tier factor of two drive a merge on nearly
+        // every fold; a directory limit of six forces the smallest-entries
+        // fallback as well. Deleted rows stay in segments (VACUUM cannot run
+        // in a test transaction), so merges carry dead documents along.
+        Spi::run(
+            "CREATE TABLE tiered(id int, body text);
+             CREATE INDEX tiered_idx ON tiered USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = off;
+             SET LOCAL stannum.write_buffer_docs = 2;
+             SET LOCAL stannum.merge_tier_factor = 2;
+             SET LOCAL stannum.max_segments = 6;
+             INSERT INTO tiered
+               SELECT n, 'w' || (n % 7) || ' common ' ||
+                      CASE WHEN n % 10 = 0 THEN 'rare needle' ELSE 'other filler' END
+               FROM generate_series(1, 200) n;",
+        )
+        .unwrap();
+        assert_index_matches_seqscan("tiered", TIERED_QUERIES);
+        let (segments, generations, docs) = directory_shape("tiered_idx");
+        assert!((2..=6).contains(&segments), "{segments} segments");
+        assert_eq!(generations, segments);
+        assert_eq!(docs, 198, "one two-document buffer is still unfolded");
+        Spi::run(
+            "DELETE FROM tiered WHERE id % 3 = 0;
+             INSERT INTO tiered
+               SELECT n, 'w' || (n % 7) || ' common ' ||
+                      CASE WHEN n % 10 = 0 THEN 'rare needle' ELSE 'other filler' END
+               FROM generate_series(201, 300) n;
+             UPDATE tiered SET body = body || ' updated' WHERE id % 11 = 0;
+             INSERT INTO tiered VALUES (301, NULL), (302, 'w1 w1 w1');",
+        )
+        .unwrap();
+        assert_index_matches_seqscan("tiered", TIERED_QUERIES);
+        let (segments, generations, docs) = directory_shape("tiered_idx");
+        assert!((2..=6).contains(&segments), "{segments} segments");
+        assert_eq!(generations, segments);
+        let updated = Spi::get_one::<i64>("SELECT count(*) FROM tiered WHERE id % 11 = 0")
+            .unwrap()
+            .unwrap();
+        // Dead versions stay in segments until VACUUM; nulls are not indexed.
+        let buffered = Spi::get_one::<i64>(
+            "SELECT coalesce(sum(docs), 0)::bigint FROM stannum.segment_info('tiered_idx') WHERE kind = 'mutable'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(docs + buffered, 300 + updated + 1);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM tiered WHERE body ==> 'rare'").unwrap(),
+            Some(24)
+        );
+    }
+
+    #[pg_test]
+    fn merge_tier_factor_bounds_the_directory_logarithmically() {
+        // One-document folds: after tiered merges the directory holds one
+        // segment per base-four digit of the folded document count, never
+        // more than three per tier, and never everything in one segment.
+        Spi::run(
+            "CREATE TABLE lsm(id int, body text);
+             CREATE INDEX lsm_idx ON lsm USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = off;
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.merge_tier_factor = 4;
+             INSERT INTO lsm
+               SELECT n, 'w' || (n % 7) || ' common ' ||
+                      CASE WHEN n % 10 = 0 THEN 'rare needle' ELSE 'other filler' END
+               FROM generate_series(1, 500) n;",
+        )
+        .unwrap();
+        let (segments, generations, docs) = directory_shape("lsm_idx");
+        assert_eq!(docs, 499, "the last document is still buffered");
+        let mut digits = 0;
+        let mut rest = docs;
+        while rest > 0 {
+            digits += rest % 4;
+            rest /= 4;
+        }
+        assert_eq!(segments, digits, "499 = 13303 in base four");
+        assert_eq!(generations, segments);
+        let per_tier = Spi::get_one::<i64>(
+            "SELECT max(n) FROM (
+               SELECT count(*) AS n FROM stannum.segment_info('lsm_idx')
+               WHERE kind = 'immutable' GROUP BY floor(ln(docs) / ln(4) + 1e-9)
+             ) tiers",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(per_tier <= 3, "{per_tier} segments in one tier");
+        assert_index_matches_seqscan("lsm", TIERED_QUERIES);
+        // Lowering the directory bound below the tier layout merges the
+        // smallest entries on the next fold; results stay exact.
+        Spi::run(
+            "SET LOCAL stannum.max_segments = 3;
+             INSERT INTO lsm VALUES (501, 'w1 rare needle'), (502, 'w2 common');",
+        )
+        .unwrap();
+        let (segments, generations, docs) = directory_shape("lsm_idx");
+        assert!(segments <= 3, "{segments} segments");
+        assert_eq!(generations, segments);
+        assert_eq!(docs, 501);
+        assert_index_matches_seqscan("lsm", TIERED_QUERIES);
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM lsm WHERE body ==> 'rare'").unwrap(),
+            Some(51)
+        );
+    }
+
     #[pg_test]
     fn index_tokenizer_options_govern_matching() {
         Spi::run(
