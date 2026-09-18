@@ -47,8 +47,10 @@ FILLER = 'pad'
 # Scenarios that once failed or that pin a bug class. Each is run by `--smoke`
 # in addition to the fixed smoke seed; keep them short.
 REGRESSIONS = [
-    # Two open cursors on the same query in one session, so the projected score
-    # of one cursor's rows must not come from the other cursor's scorer.
+    # Two open cursors in one session (seed 1 failed at 3 seconds before the
+    # per-scan scorer registry): the projected score of one cursor's rows must
+    # not come from a scorer another scan rebuilt over newer statistics.
+    dict(seed=1, seconds=10, writers=3, readers=2, corpus=800),
     dict(seed=101, seconds=8, writers=2, readers=1, corpus=300, twin_weight=100),
     # Rows deleted after the snapshot plus high-scoring inserts, so the pruned
     # top k is exhausted and the completed ordering must skip emitted rows.
@@ -674,6 +676,7 @@ class Fuzzer:
         """A second cursor in the same transaction, on the same or another
         query, with its own oracle taken right before its first fetch."""
         twin = self.reader_query(rng) if rng.random() < 0.5 else dict(spec)
+        twin['mode'] = 'second cursor'
         self.churn(rng.randint(0, 3))
         self.quiesce_writers()
         batch = ['SET LOCAL stannum.enable_custom_scan = off', 'SET LOCAL enable_bitmapscan = on',

@@ -873,7 +873,16 @@ mod tests {
         )
         .unwrap();
         let mut scorer = crate::score::scorer_for_scan(
-            heap, index, "needle", true, None, None, None, None, None,
+            crate::score::scan_id(),
+            heap,
+            index,
+            "needle",
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         let before = scorer.score(tid);
         assert!(before > 0.0);
@@ -3077,5 +3086,65 @@ mod tests {
             .unwrap()
             .unwrap()
         );
+    }
+
+    #[pg_test]
+    fn concurrent_cursors_on_one_query_keep_their_own_scores() {
+        // Found by the ranked-scan fuzzer: a scorer keyed by a backend-wide
+        // statement counter is replaced by any later scan on the same query,
+        // so a cursor's remaining rows were projected with statistics that
+        // documents indexed in between had changed, out of step with the
+        // order the cursor ranked them in.
+        Spi::run(
+            "CREATE TABLE twin(id int primary key, body text);
+             INSERT INTO twin SELECT n, 'other filler' FROM generate_series(1, 300) n;
+             INSERT INTO twin SELECT n, repeat('needle ', 1 + n % 4) || repeat('pad ', n % 7)
+               FROM generate_series(301, 340) n;
+             CREATE INDEX twin_idx ON twin USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let rows = |sql: &str| {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let query = "SELECT id, stannum.full_score(ctid) AS score FROM twin WHERE body ==> 'needle' ORDER BY score DESC";
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off;").unwrap();
+        let before = rows(&format!("{query}, ctid"));
+        Spi::run(&format!(
+            "SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_bitmapscan = off;
+             DECLARE a CURSOR FOR {query} LIMIT 12;"
+        ))
+        .unwrap();
+        let mut from_a = rows("FETCH 3 FROM a");
+        // New documents change every statistic the scores depend on.
+        Spi::run(
+            "INSERT INTO twin SELECT n, 'needle needle needle needle needle needle'
+             FROM generate_series(401, 460) n",
+        )
+        .unwrap();
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off;").unwrap();
+        let after = rows(&format!("{query}, ctid"));
+        assert_ne!(before[..12], after[..12]);
+        Spi::run(&format!(
+            "SET LOCAL stannum.enable_custom_scan = on; DECLARE b CURSOR FOR {query} LIMIT 12;"
+        ))
+        .unwrap();
+        let mut from_b = rows("FETCH 5 FROM b");
+        from_a.extend(rows("FETCH ALL FROM a"));
+        from_b.extend(rows("FETCH ALL FROM b"));
+        assert_eq!(from_a, before[..12]);
+        assert_eq!(from_b, after[..12]);
+        Spi::run("CLOSE a; CLOSE b;").unwrap();
     }
 }

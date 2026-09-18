@@ -768,6 +768,16 @@ struct ScanExec {
     fetched: usize,
     skipped_pages: usize,
     ordered: bool,
+    /// Identity under which the scan publishes its scorer.
+    scan_id: u64,
+}
+
+impl Drop for ScanExec {
+    /// Runs when the executor's query context is deleted, including after an
+    /// error, so a scan's scorer never outlives the scan.
+    fn drop(&mut self) {
+        crate::score::forget_scan_scorer(self.scan_id);
+    }
 }
 
 #[repr(C)]
@@ -871,6 +881,7 @@ unsafe extern "C-unwind" fn begin_scan(
             fetched: 0,
             skipped_pages: 0,
             ordered,
+            scan_id: crate::score::scan_id(),
         };
         let holder = PgMemoryContexts::For((*estate).es_query_cxt)
             .leak_and_drop_on_delete(Some(Box::new(exec)));
@@ -891,6 +902,7 @@ unsafe fn gather(exec: &mut ScanExec) {
         exec.scored = None;
         let mut scorer = exec.private.ordering.as_ref().map(|ordering| {
             crate::score::scorer_for_scan(
+                exec.scan_id,
                 exec.private.heap_oid,
                 exec.private.index_oid,
                 &exec.private.query,
@@ -914,7 +926,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             exec.sorted = exec.tids.len();
             exec.pruned = !top.complete;
             let scorer = scorer.take().expect("a top k needs a scorer");
-            crate::score::publish_scan_scorer(scorer, &top.rows);
+            crate::score::publish_scan_scorer(exec.scan_id, scorer, &top.rows);
             exec.next = 0;
             exec.started = true;
             return;
@@ -990,7 +1002,9 @@ fn finish(exec: &mut ScanExec, mut tids: Vec<Tid>, scorer: Option<crate::score::
             }
         };
         exec.sorted = sorted;
-        crate::score::publish_scan_scorer(scorer, &scored[..sorted]);
+        // Every candidate's score, not only the ordered prefix: rows past it
+        // are emitted too once the parent reads that far.
+        crate::score::publish_scan_scorer(exec.scan_id, scorer, &scored);
         exec.scores = scored.iter().map(|(score, _)| *score).collect();
         tids = scored.into_iter().map(|(_, tid)| tid).collect();
     }
@@ -1011,6 +1025,7 @@ unsafe fn complete(exec: &mut ScanExec) {
             .as_ref()
             .expect("pruned scans are ordered");
         let scorer = crate::score::scorer_for_scan(
+            exec.scan_id,
             exec.private.heap_oid,
             exec.private.index_oid,
             &exec.private.query,

@@ -119,6 +119,12 @@ impl SourceReader {
 thread_local! {
     static SCORE_CACHE: RefCell<Option<ScoreCorpus>> = const { RefCell::new(None) };
     static INDEX_SCORE_CACHE: RefCell<Option<IndexScorer>> = const { RefCell::new(None) };
+    /// One scorer per live ranked scan, newest last, holding the score of
+    /// every row the scan ranked. Cursors keep scans open across statements
+    /// and two scans on one query can be open at once, so a scan's rows are
+    /// scored by the scan's own statistics and never by another's.
+    static SCAN_SCORERS: RefCell<Vec<(u64, IndexScorer)>> = const { RefCell::new(Vec::new()) };
+    static NEXT_SCAN: Cell<u64> = const { Cell::new(0) };
     /// Counts executor runs in this backend. Transaction and command ids do
     /// not distinguish consecutive read-only statements, which never assign
     /// a transaction id and each start at command zero.
@@ -255,9 +261,8 @@ fn score_bound_indexed(
     let dense = dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits();
     // Per-row calls compare against the cached key without allocating; the
     // owned key is built only when the cache misses.
-    let matches = |key: &CacheKey| {
-        key.statement == statement
-            && key.heap_oid == heap_oid as u32
+    let same_query = |key: &CacheKey| {
+        key.heap_oid == heap_oid as u32
             && key.index_oid == index_oid as u32
             && key.full == (mode == 1 || mode == 3)
             && key.dense == dense
@@ -267,6 +272,37 @@ fn score_bound_indexed(
             && key.add.as_deref() == term_add.as_deref()
             && key.replace.as_deref() == term_replace.as_deref()
     };
+    let matches = |key: &CacheKey| key.statement == statement && same_query(key);
+    if mode < 2 {
+        let block = (u32::from(ctid.ip_blkid.bi_hi) << 16) | u32::from(ctid.ip_blkid.bi_lo);
+        let tid = Tid::new(block, ctid.ip_posid)
+            .unwrap_or_else(|_| pgrx::error!("invalid heap tuple location"));
+        // A row emitted by a ranked scan carries the score that scan ranked
+        // it by. The scan posts the chain root of a HOT-updated row while the
+        // executor projects the visible member, so the root is tried next.
+        let from_scan = |tid: Tid| {
+            SCAN_SCORERS.with_borrow(|scans| {
+                scans
+                    .iter()
+                    .rev()
+                    .filter(|(_, scorer)| same_query(&scorer.key))
+                    .find_map(|(_, scorer)| scorer.known.get(&tid).copied())
+            })
+        };
+        if let Some(score) = from_scan(tid) {
+            return score;
+        }
+        let any_scan =
+            SCAN_SCORERS.with_borrow(|scans| scans.iter().any(|(_, s)| same_query(&s.key)));
+        if any_scan {
+            let root = unsafe { hot_root(pg_sys::Oid::from(heap_oid as u32), tid) };
+            if root != tid
+                && let Some(score) = from_scan(root)
+            {
+                return score;
+            }
+        }
+    }
     let cached =
         INDEX_SCORE_CACHE.with_borrow(|slot| slot.as_ref().is_some_and(|s| matches(&s.key)));
     INDEX_SCORE_CACHE.with_borrow_mut(|slot| {
@@ -1040,13 +1076,29 @@ unsafe fn visible_tids(heap_oid: pg_sys::Oid, tids: BTreeSet<Tid>) -> Vec<Tid> {
     }
 }
 
-/// Builds a scorer for a custom scan's top-k ordering from the bound
-/// arguments of a `score_bound_indexed` call.
+/// A fresh identity for a ranked scan; see [`SCAN_SCORERS`].
+pub(crate) fn scan_id() -> u64 {
+    NEXT_SCAN.with(|next| {
+        let id = next.get().wrapping_add(1);
+        next.set(id);
+        id
+    })
+}
+
+/// Drops the scorer a scan published, when the scan ends.
+pub(crate) fn forget_scan_scorer(scan: u64) {
+    SCAN_SCORERS.with_borrow_mut(|scans| scans.retain(|(id, _)| *id != scan));
+}
+
+/// The scorer for a custom scan's top-k ordering, from the bound arguments
+/// of a `score_bound_indexed` call: the one the scan published earlier (when
+/// it completes a pruned top k), otherwise a new one over the current index.
 #[expect(
     clippy::too_many_arguments,
     reason = "mirrors the bound scoring function's arguments"
 )]
 pub(crate) fn scorer_for_scan(
+    scan: u64,
     heap_oid: u32,
     index_oid: u32,
     query: &str,
@@ -1069,22 +1121,40 @@ pub(crate) fn scorer_for_scan(
         add: term_add.clone(),
         replace: term_replace.clone(),
     };
-    // A rescan within the same statement reuses the scorer it published.
-    let cached = INDEX_SCORE_CACHE.with_borrow_mut(|slot| match slot {
-        Some(scorer) if scorer.key == key => slot.take(),
-        _ => None,
+    let published = SCAN_SCORERS.with_borrow_mut(|scans| {
+        scans
+            .iter()
+            .position(|(id, _)| *id == scan)
+            .map(|at| scans.remove(at).1)
     });
-    cached.unwrap_or_else(|| build_index_scorer(key, k1, b, term_add, term_replace))
+    match published {
+        Some(mut scorer) => {
+            // Rebuilt readers: the retained cursors may sit past rows a
+            // completed ordering scores again.
+            scorer.key = key;
+            scorer.sources = scorer
+                .view
+                .sources
+                .iter()
+                .map(|(index, _)| unsafe { SourceReader::new(&**index, &scorer.terms) })
+                .collect();
+            scorer
+        }
+        None => build_index_scorer(key, k1, b, term_add, term_replace),
+    }
 }
 
-/// Hands the scan's scorer to the SQL score functions for the rest of the
-/// command, with the scores of the rows the scan will emit remembered.
-pub(crate) fn publish_scan_scorer(mut scorer: IndexScorer, emitted: &[(f32, Tid)]) {
+/// Keeps the scan's scorer, with the score of every row it ranked, for the
+/// SQL score functions to project from until the scan ends.
+pub(crate) fn publish_scan_scorer(scan: u64, mut scorer: IndexScorer, ranked: &[(f32, Tid)]) {
     scorer.known.clear();
     scorer
         .known
-        .extend(emitted.iter().map(|(score, tid)| (*tid, *score)));
-    INDEX_SCORE_CACHE.with_borrow_mut(|slot| *slot = Some(scorer));
+        .extend(ranked.iter().map(|(score, tid)| (*tid, *score)));
+    SCAN_SCORERS.with_borrow_mut(|scans| {
+        scans.retain(|(id, _)| *id != scan);
+        scans.push((scan, scorer));
+    });
 }
 
 fn build_index_scorer(
