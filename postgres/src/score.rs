@@ -139,8 +139,22 @@ struct ScanScorer {
     /// location the scan ranked (the root of a HOT chain). A row is projected
     /// after its scan emitted it and before that scan emits another, so this
     /// names exactly the rows whose score the scan owns.
-    emitted: Option<(Tid, Tid)>,
+    emitted: Option<Emitted>,
     scorer: IndexScorer,
+}
+
+/// The row a ranked scan emitted last; see [`ScanScorer::emitted`].
+#[derive(Clone, Copy)]
+struct Emitted {
+    /// The visible tuple's location, as the executor projects it.
+    member: Tid,
+    /// The location the scan ranked: the root of the tuple's HOT chain.
+    root: Tid,
+    /// The statement the row was emitted in; a later statement's score
+    /// calls are for other rows.
+    statement: u64,
+    /// Emission order across scans.
+    stamp: u64,
 }
 
 fn next_stamp() -> u64 {
@@ -297,17 +311,27 @@ fn score_bound_indexed(
         let block = (u32::from(ctid.ip_blkid.bi_hi) << 16) | u32::from(ctid.ip_blkid.bi_lo);
         let tid = Tid::new(block, ctid.ip_posid)
             .unwrap_or_else(|_| pgrx::error!("invalid heap tuple location"));
-        // The row a ranked scan just emitted carries the score that scan
-        // ranked it by; any other location (an unpruned scan's row, say) is
-        // scored by the statement's scorer below.
+        // The row a ranked scan just emitted, in this statement, carries the
+        // score that scan ranked it by; any other location (an unpruned
+        // scan's row, say, or a row a paused cursor emitted in an earlier
+        // statement) is scored by the statement's scorer below. Fetches from
+        // several cursors share one statement number, so the newest emission
+        // of a location wins.
         let from_scan = SCAN_SCORERS.with_borrow(|scans| {
             scans
                 .iter()
                 .filter(|entry| same_query(&entry.scorer.key))
-                .find_map(|entry| match entry.emitted {
-                    Some((member, root)) if member == tid => entry.scorer.known.get(&root).copied(),
+                .filter_map(|entry| match entry.emitted {
+                    Some(emitted) if emitted.member == tid && emitted.statement == statement => {
+                        Some((
+                            emitted.stamp,
+                            entry.scorer.known.get(&emitted.root).copied(),
+                        ))
+                    }
                     _ => None,
                 })
+                .max_by_key(|(stamp, _)| *stamp)
+                .and_then(|(_, score)| score)
         });
         if let Some(score) = from_scan {
             return score;
@@ -1095,7 +1119,12 @@ pub(crate) fn scan_id() -> u64 {
 pub(crate) fn note_scan_emitted(scan: u64, member: Tid, root: Tid) {
     SCAN_SCORERS.with_borrow_mut(|scans| {
         if let Some(entry) = scans.iter_mut().find(|entry| entry.scan == scan) {
-            entry.emitted = Some((member, root));
+            entry.emitted = Some(Emitted {
+                member,
+                root,
+                statement: current_statement(),
+                stamp: next_stamp(),
+            });
         }
     });
 }

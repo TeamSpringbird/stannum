@@ -88,13 +88,16 @@ minutes; CI runs it after the lifecycle checks.
   cursor's remaining rows were projected with statistics that writes in
   between had changed, out of step with the order it ranked them in. Scans
   now publish their scorer under their own identity with the score of every
-  row they ranked and record the row they emitted last; a score call for
-  exactly that location takes the scan's score (any other location, such as
-  an unpruned scan's row while a cursor is open on the same query, is scored
-  by the statement's own scorer), and the entry is dropped when the scan
-  ends, including after an error. The fuzzer's first two attempts at this
-  fix (newest scan wins; most recent emitter wins) each failed the same seed
-  within three seconds, which is the point of running it.
+  row they ranked and record the row they emitted last, with the statement
+  number and an emission stamp; a score call in that statement for exactly
+  that location takes the scan's score, newest emission first (any other
+  location, such as an unpruned scan's row while a cursor is open on the
+  same query, or a row a paused cursor emitted in an earlier statement, is
+  scored by the statement's own scorer), and the entry is dropped when the
+  scan ends, including after an error. The fuzzer's first three attempts at
+  this fix (newest scan wins; most recent emitter wins; exact location
+  without the statement scope) each failed the same seed within three
+  seconds, which is the point of running it.
   Test: `concurrent_cursors_on_one_query_keep_their_own_scores`.
 
 The earlier two bugs remain covered by
