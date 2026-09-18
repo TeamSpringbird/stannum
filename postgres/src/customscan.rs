@@ -528,8 +528,16 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
         };
         let per_tuple =
             pg_sys::cpu_tuple_cost + ((*rel).baserestrictcost.per_tuple - saved).max(0.0);
-        // Candidates are gathered before the first row is returned.
-        let mut startup = index.total + (*rel).baserestrictcost.startup;
+        // Candidate decoding streams, but opening a term still fetches its
+        // encoded postings bytes. Keep estimated index I/O in startup and move
+        // only per-candidate traversal CPU into run cost for unordered scans.
+        let index_run = if private.ordering.is_some() {
+            0.0
+        } else {
+            index.candidates * pg_sys::cpu_index_tuple_cost
+        };
+        let mut startup =
+            (index.total - index_run).max(index.startup) + (*rel).baserestrictcost.startup;
         if let Some(ordering) = &private.ordering {
             // Scoring every candidate, then ordering the ones the query
             // consumes (or all of them).
@@ -542,7 +550,8 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
             path.path.pathkeys = (*root).sort_pathkeys;
         }
         path.path.startup_cost = startup;
-        path.path.total_cost = startup + heap_pages * cost_per_page + index.candidates * per_tuple;
+        path.path.total_cost =
+            startup + index_run + heap_pages * cost_per_page + index.candidates * per_tuple;
         path.flags = 0;
         path.custom_paths = std::ptr::null_mut();
         path.custom_restrictinfo = std::ptr::null_mut();
@@ -751,6 +760,9 @@ struct ScanExec {
     recheck: bool,
     /// Candidates in output order, filled on first execution.
     tids: Vec<Tid>,
+    /// Unordered scans retain only their stream and current page.
+    stream: Option<crate::stream::CandidateStream>,
+    stream_visits: usize,
     /// Scores aligned with `tids` for an ordered scan; only the first
     /// `sorted` entries are in order, the rest are sorted if ever reached.
     scores: Vec<f32>,
@@ -872,6 +884,8 @@ unsafe extern "C-unwind" fn begin_scan(
             heap,
             recheck: false,
             tids: Vec::new(),
+            stream: None,
+            stream_visits: 0,
             scores: Vec::new(),
             sorted: 0,
             next: 0,
@@ -896,8 +910,8 @@ unsafe extern "C-unwind" fn begin_scan(
 ///
 /// A ranked scan with a known top k first tries to prune: the scorer walks
 /// the index itself, skipping blocks of postings that cannot enter the top
-/// k, and only those k rows are materialized. Every other scan, and any
-/// query the scorer cannot bound, enumerates and scores every candidate.
+/// k, and only those k rows are materialized. Ranked queries the scorer cannot
+/// bound enumerate and score every candidate; unordered scans use a stream.
 unsafe fn gather(exec: &mut ScanExec) {
     unsafe {
         exec.scores.clear();
@@ -941,8 +955,7 @@ unsafe fn gather(exec: &mut ScanExec) {
     }
 }
 
-/// Every matching TID across the index's sources, in heap order.
-unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
+unsafe fn scan_query(exec: &ScanExec) -> Query {
     unsafe {
         let index_oid = pg_sys::Oid::from(exec.private.index_oid);
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
@@ -951,6 +964,26 @@ unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
         let query: Query =
             tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
                 .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
+        query
+    }
+}
+
+unsafe fn start_stream(exec: &mut ScanExec) {
+    unsafe {
+        let query = scan_query(exec);
+        let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
+        let stream = crate::stream::CandidateStream::new(view, query);
+        exec.recheck = stream.recheck;
+        exec.stream = Some(stream);
+        exec.started = true;
+    }
+}
+
+/// Every matching TID across the index's sources, in heap order.
+unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
+    unsafe {
+        let index_oid = pg_sys::Oid::from(exec.private.index_oid);
+        let query = scan_query(exec);
         let view = crate::storage::view(index_oid);
         candidates_in_view(exec, &query, &view)
     }
@@ -1137,23 +1170,37 @@ unsafe extern "C-unwind" fn search_access(
             return fallback_access(scan, exec, slot);
         }
         if !exec.started {
-            gather(exec);
+            if exec.ordered {
+                gather(exec);
+            } else {
+                start_stream(exec);
+            }
         }
         loop {
-            if exec.next >= exec.tids.len() {
-                if !exec.pruned {
-                    break;
-                }
-                // The executor reads past the pruned top k: score everything.
-                complete(exec);
-                continue;
-            }
             pgrx::check_for_interrupts!();
-            if exec.next >= exec.sorted {
-                sort_rest(exec);
-            }
-            let tid = exec.tids[exec.next];
-            exec.next += 1;
+            let tid = if let Some(stream) = &mut exec.stream {
+                let Some(tid) = stream.next() else {
+                    break;
+                };
+                exec.stream_visits += 1;
+                tid
+            } else {
+                if exec.next >= exec.tids.len() {
+                    if !exec.pruned {
+                        break;
+                    }
+                    // The executor reads past the pruned top k: score everything.
+                    complete(exec);
+                    continue;
+                }
+                pgrx::check_for_interrupts!();
+                if exec.next >= exec.sorted {
+                    sort_rest(exec);
+                }
+                let tid = exec.tids[exec.next];
+                exec.next += 1;
+                tid
+            };
             let mut pointer = pointer_of(tid);
             let mut call_again = false;
             let mut all_dead = false;
@@ -1431,10 +1478,14 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let exec = exec_of(node);
         exec.next = 0;
+        if let Some(stream) = &mut exec.stream {
+            stream.rewind();
+            exec.recheck = stream.recheck;
+        }
         if !exec.fallback.is_null() {
             pg_sys::table_rescan(exec.fallback, std::ptr::null_mut());
         }
-        // The count node re-counts; the search node replays its candidates.
+        // Counts re-count; searches rewind their captured stream or ranked rows.
         let cscan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
         if (*cscan).scan.scanrelid == 0 {
             exec.started = false;
@@ -1473,6 +1524,23 @@ unsafe extern "C-unwind" fn explain(
                     es,
                 );
                 return;
+            }
+            if let Some(stream) = &exec.stream {
+                pg_sys::ExplainPropertyText(
+                    c"Candidate Strategy".as_ptr(),
+                    if stream.page_masks {
+                        c"streaming page bitmaps".as_ptr()
+                    } else {
+                        c"streaming scalar".as_ptr()
+                    },
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Candidates Visited".as_ptr(),
+                    std::ptr::null(),
+                    exec.stream_visits as i64,
+                    es,
+                );
             }
             if let Some(pages) = exec.page_masks {
                 pg_sys::ExplainPropertyText(

@@ -183,7 +183,11 @@ PostgreSQL can execute these candidates through a bitmap scan or Stannum's
 custom scan nodes:
 
 - **Text Search Scan** checks tuple visibility and any remaining SQL filters.
-  For supported ranked queries it scores candidates and selects the top results.
+  Unordered searches stream distinct candidates in heap order, using page masks
+  for dense Boolean terms and scalar cursors otherwise. They do not collect or
+  sort all candidate CTIDs before returning the first row. `LIMIT` stops the
+  traversal after enough visible rows pass the remaining SQL filters. For
+  supported ranked queries the existing scorer selects the top results.
 - **Count** uses page masks when a Boolean term has grouped postings averaging at
   least four tuples per occupied page; purely sparse or positional plans keep
   the scalar path. The bulk path streams exact offset masks in heap-page order.
@@ -196,14 +200,24 @@ custom scan nodes:
   cursors into page masks. The bulk path does not build or sort a vector of
   every candidate CTID.
 
-The page path currently applies to the custom Count node. Ordinary search,
-ranked retrieval, and PostgreSQL bitmap scans retain their existing cursors.
-The word operations are portable Rust; no architecture-specific SIMD dispatch
-or on-disk format change is required.
+Unordered searches own their captured index view until the scan ends, including
+across cursor FETCH calls. Rescans rebuild cursors against that same view, so
+buffer appends and directory changes do not replace the original candidate set.
+The cursor is dropped before its owning view, also on error cleanup. Encoded
+postings bytes can still be fetched up front; streaming bounds decoded candidate
+buffering, not all index memory or I/O. Planner startup cost continues to include
+estimated index I/O and moves only candidate traversal CPU into run cost.
+
+Ranked retrieval and PostgreSQL bitmap scans retain their existing execution
+strategies. The word operations are portable Rust; no architecture-specific
+SIMD dispatch or on-disk format change is required.
 
 `EXPLAIN ANALYZE` shows the chosen path and, for executed custom counts,
-`Count Strategy: page bitmaps` or `scalar`. `SET stannum.enable_custom_scan = off`
-selects the bitmap path for comparison.
+`Count Strategy: page bitmaps` or `scalar`. Unordered searches show
+`Candidate Strategy: streaming page bitmaps` or `streaming scalar` and
+`Candidates Visited`; that counter records consumed candidates, not an unknown
+full cardinality when LIMIT stops early. `SET stannum.enable_custom_scan = off`
+selects the PostgreSQL bitmap path for comparison.
 
 ### Per-backend caches
 

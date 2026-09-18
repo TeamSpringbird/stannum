@@ -29,6 +29,18 @@ impl Offsets {
         Ok(Self(words))
     }
 
+    /// Removes and returns the lowest offset, without expanding the mask.
+    pub fn pop_first(&mut self) -> Option<u16> {
+        for (i, word) in self.0.iter_mut().enumerate() {
+            if *word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                *word &= *word - 1;
+                return Some((i * 64 + bit + 1) as u16);
+            }
+        }
+        None
+    }
+
     pub fn count(self) -> u32 {
         self.0.iter().map(|word| word.count_ones()).sum()
     }
@@ -329,10 +341,13 @@ mod tests {
         let mut out = Vec::new();
         while let Some(page) = pages.current() {
             assert_eq!(page.offsets.count() as usize, page.offsets.iter().count());
-            out.extend(page.offsets.iter().map(|offset| Tid {
-                block: page.block,
-                offset,
-            }));
+            let mut offsets = page.offsets;
+            while let Some(offset) = offsets.pop_first() {
+                out.push(Tid {
+                    block: page.block,
+                    offset,
+                });
+            }
             pages.advance().unwrap();
         }
         pages.advance().unwrap();
