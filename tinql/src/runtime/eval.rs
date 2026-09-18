@@ -48,6 +48,14 @@ impl TokenizedDoc {
         self.positions.get(term).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Every token with its position, in document order.
+    pub fn positioned_tokens(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.tokens
+            .iter()
+            .map(String::as_str)
+            .zip(self.token_positions.iter().copied())
+    }
+
     pub fn snippet(&self, interval: Interval, context: usize) -> String {
         if self.tokens.is_empty() {
             return String::new();

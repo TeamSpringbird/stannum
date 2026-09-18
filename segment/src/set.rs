@@ -193,6 +193,76 @@ impl<C: Cursor> Cursor for Union<C> {
     }
 }
 
+/// Postings present in at least `min` of the inputs. With `min == 1` this is a
+/// union; with `min == inputs.len()` an intersection without seek-driven skipping.
+pub struct AtLeast<C> {
+    cursors: Vec<C>,
+    min: usize,
+    current: Option<Tid>,
+}
+
+impl<C: Cursor> AtLeast<C> {
+    /// `min` of zero is rejected as meaningless; use a universe cursor instead.
+    pub fn new(cursors: Vec<C>, min: usize) -> Result<Self> {
+        let mut this = Self {
+            cursors,
+            min: min.max(1),
+            current: None,
+        };
+        this.align()?;
+        Ok(this)
+    }
+
+    fn align(&mut self) -> Result<()> {
+        loop {
+            let Some(smallest) = self.cursors.iter().filter_map(Cursor::current).min() else {
+                self.current = None;
+                return Ok(());
+            };
+            let present = self
+                .cursors
+                .iter()
+                .filter(|cursor| cursor.current() == Some(smallest))
+                .count();
+            if present >= self.min {
+                self.current = Some(smallest);
+                return Ok(());
+            }
+            for cursor in &mut self.cursors {
+                if cursor.current() == Some(smallest) {
+                    cursor.advance()?;
+                }
+            }
+        }
+    }
+}
+
+impl<C: Cursor> Cursor for AtLeast<C> {
+    fn current(&self) -> Option<Tid> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        let Some(current) = self.current else {
+            return Ok(());
+        };
+        for cursor in &mut self.cursors {
+            if cursor.current() == Some(current) {
+                cursor.advance()?;
+            }
+        }
+        self.align()
+    }
+    fn seek(&mut self, target: Tid) -> Result<()> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(());
+        }
+        for cursor in &mut self.cursors {
+            cursor.seek(target)?;
+        }
+        self.align()
+    }
+}
+
 /// Postings of `keep` that are absent from `remove`. Only safe when `keep` is
 /// an exact set; subtracting from a superset is never sound.
 pub struct Difference<A, B> {
@@ -301,6 +371,24 @@ mod tests {
             0
         );
         assert_eq!(count(Union::new(vec![Empty, Empty])).unwrap(), 0);
+    }
+
+    #[test]
+    fn at_least_counts_members_across_inputs() {
+        let a = tids(&[1, 2, 3, 9]);
+        let b = tids(&[2, 3, 4, 9]);
+        let c = tids(&[3, 4, 5]);
+        let two = AtLeast::new(vec![Slice::new(&a), Slice::new(&b), Slice::new(&c)], 2).unwrap();
+        assert_eq!(collect(two).unwrap(), tids(&[2, 3, 4, 9]));
+        let three = AtLeast::new(vec![Slice::new(&a), Slice::new(&b), Slice::new(&c)], 3).unwrap();
+        assert_eq!(collect(three).unwrap(), tids(&[3]));
+        let mut one = AtLeast::new(vec![Slice::new(&a), Slice::new(&c)], 1).unwrap();
+        one.seek(Tid::new(4, 1).unwrap()).unwrap();
+        assert_eq!(collect(one).unwrap(), tids(&[4, 5, 9]));
+        assert_eq!(
+            count(AtLeast::new(vec![Slice::new(&a)], 2).unwrap()).unwrap(),
+            0
+        );
     }
 
     #[test]

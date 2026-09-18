@@ -289,9 +289,24 @@ impl<'a> Segment<'a> {
 
     /// Length by document ordinal, as reported by [`Segment::documents`].
     pub fn length_at(&self, ordinal: u32) -> Result<u32> {
+        self.lengths().get(ordinal)
+    }
+
+    /// A copyable handle on the length table.
+    pub const fn lengths(&self) -> Lengths<'a> {
+        Lengths(self.lengths)
+    }
+}
+
+/// Document lengths addressed by document ordinal.
+#[derive(Clone, Copy, Debug)]
+pub struct Lengths<'a>(&'a [u8]);
+
+impl Lengths<'_> {
+    pub fn get(&self, ordinal: u32) -> Result<u32> {
         let at = ordinal as usize * 4;
         let bytes = self
-            .lengths
+            .0
             .get(at..at + 4)
             .ok_or(Error::Corrupt("document ordinal out of range"))?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))

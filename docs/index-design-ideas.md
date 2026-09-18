@@ -404,9 +404,25 @@ PROPTEST_CASES=4000 cargo test -p segment --release
 cargo clippy -p segment --all-targets -- -D warnings
 ```
 
-Constants that section 11 says to measure (`LIST_MAX`, `BLOCK_TERMS`,
-`SKIP_INTERVAL`, the sparse-versus-grouped choice) are single definitions in
-the crate and are not yet tuned on real data.
+`segment::segment` assembles those codecs into one immutable segment blob
+with a document table and lengths, and `tinql::runtime::plan` compiles a
+lowered `Query` into a cursor over a segment with the exactness flag from
+section 4.1. Terms, Boolean operators, `AT LEAST`, `NOT` over exact children,
+dictionary expansions within a cap, and every positional form (phrases, gaps,
+alternatives, slop, `NEAR`/`THEN`, `WITHIN`, relations, positional filters)
+are exact against stored positions and lengths. A randomized differential
+test checks plans against the reference evaluator over generated corpora and
+generated TINQL, including mid-stream seeks:
+
+```sh
+PROPTEST_CASES=50000 cargo test -p tinql --release plans_agree
+```
+
+What does not exist yet: the PostgreSQL page layout, the meta page and
+segment directory, the write buffer fold, dead bitmaps, and scoring from
+segment statistics. Constants that section 11 says to measure (`LIST_MAX`,
+`BLOCK_TERMS`, `SKIP_INTERVAL`, the sparse-versus-grouped choice) are single
+definitions in the crate and are not yet tuned on real data.
 
 ## 11. Things to measure before committing to constants
 

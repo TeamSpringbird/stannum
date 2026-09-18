@@ -14,3 +14,7 @@ regex-automata = "0.4"
 regex-syntax = "0.8"
 tokenizer = { path = "../tokenizer" }
 boldi-vigna = { path = "../boldi-vigna" }
+segment = { path = "../segment" }
+
+[dev-dependencies]
+proptest = "1"

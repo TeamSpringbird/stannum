@@ -7,6 +7,7 @@ pub mod capability;
 mod display;
 pub mod eval;
 pub mod lower;
+pub mod plan;
 pub mod position_filter;
 pub mod regex;
 pub mod retrieval;

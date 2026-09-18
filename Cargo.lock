@@ -1802,9 +1802,11 @@ dependencies = [
  "boldi-vigna",
  "pest",
  "pest_derive",
+ "proptest",
  "regex-automata",
  "regex-syntax",
  "rustc-hash",
+ "segment",
  "thiserror",
  "tokenizer",
 ]

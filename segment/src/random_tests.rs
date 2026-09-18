@@ -29,6 +29,14 @@ fn tid_set(max_len: usize) -> impl Strategy<Value = BTreeSet<Tid>> {
     )
 }
 
+/// Default case count, overridable with `PROPTEST_CASES` for heavier runs.
+fn cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 fn encode(set: &BTreeSet<Tid>) -> Vec<u8> {
     let mut builder = PostingsBuilder::default();
     for tid in set {
@@ -42,7 +50,7 @@ fn successor(set: &BTreeSet<Tid>, target: Tid) -> Option<Tid> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig { cases: cases(256), ..ProptestConfig::default() })]
 
     #[test]
     fn postings_round_trip_and_seek_match_oracle(
@@ -128,6 +136,11 @@ proptest! {
         let or = Union::new(vec![pa.cursor().unwrap(), pb.cursor().unwrap(), pc.cursor().unwrap()]);
         let expected: Vec<Tid> = a.union(&b).copied().collect::<BTreeSet<_>>().union(&c).copied().collect();
         prop_assert_eq!(collect(or).unwrap(), expected);
+
+        let two = crate::set::AtLeast::new(vec![pa.cursor().unwrap(), pb.cursor().unwrap(), pc.cursor().unwrap()], 2).unwrap();
+        let expected: Vec<Tid> = a.iter().chain(&b).chain(&c).copied().collect::<BTreeSet<_>>().into_iter()
+            .filter(|t| [&a, &b, &c].iter().filter(|s| s.contains(t)).count() >= 2).collect();
+        prop_assert_eq!(collect(two).unwrap(), expected);
 
         let diff = Difference::new(pa.cursor().unwrap(), pb.cursor().unwrap()).unwrap();
         let expected: Vec<Tid> = a.difference(&b).copied().collect();
