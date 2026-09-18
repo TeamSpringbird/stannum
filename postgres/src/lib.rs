@@ -2681,4 +2681,68 @@ mod tests {
         }
         check();
     }
+
+    #[pg_test]
+    fn tin_maintenance_options_are_accepted_without_changing_search() {
+        Spi::run("CREATE TABLE compat_options(id int, body text);
+            INSERT INTO compat_options VALUES (1, 'Éclair 3.14 can''t wi-fi 👩‍💻'), (2, 'other');
+            CREATE INDEX compat_options_idx ON compat_options USING stannum(body) WITH (
+                initial_segment_count=4096, target_segment_count=4096,
+                max_mutable_segment_size=131072, max_merged_segment_size=100, dead_percent_threshold=0.0)").unwrap();
+        for query in ["eclair", "3.14", "can't", "wi-fi", "👩‍💻"] {
+            assert_eq!(
+                agreed_ids("compat_options", "compat_options_idx", query),
+                vec![1]
+            );
+        }
+        Spi::run("ALTER INDEX compat_options_idx SET (target_segment_count=1, max_mutable_segment_size=2147483647,
+            max_merged_segment_size=2147483647, dead_percent_threshold=1.0)").unwrap();
+        assert_eq!(
+            agreed_ids("compat_options", "compat_options_idx", "eclair"),
+            vec![1]
+        );
+    }
+
+    #[pg_test]
+    fn tokenizer_audit_inputs_use_index_options_for_matching_and_highlighting() {
+        Spi::run("CREATE TABLE audit_tokens(id int, body text);
+            INSERT INTO audit_tokens VALUES (1, 'Éclair Éclair Ελληνικά 東京 👩‍💻 3.14 can''t wi-fi https://Example.com/a');").unwrap();
+        for (options, query) in [
+            ("tokenizer=unicode", "eclair"),
+            ("tokenizer=whitespace", "wi-fi"),
+            ("case_folding=preserve", "Éclair"),
+            ("accent_folding=preserve", "Éclair"),
+            ("graphemes=emoji", "👩‍💻"),
+            ("graphemes=retain", "👩‍💻"),
+            ("graphemes=discard", "3.14"),
+            ("long_tokens=split, max_token_bytes=4", "ecla"),
+            ("long_tokens=truncate, max_token_bytes=4", "ecla"),
+            (
+                "long_tokens=discard, max_token_bytes=4, position_gaps=preserve",
+                "3.14",
+            ),
+            (
+                "long_tokens=discard, max_token_bytes=4, position_gaps=collapse",
+                "3.14",
+            ),
+        ] {
+            Spi::run(&format!(
+                "CREATE INDEX audit_tokens_idx ON audit_tokens USING stannum(body) WITH ({options})"
+            ))
+            .unwrap();
+            assert_eq!(
+                agreed_ids("audit_tokens", "audit_tokens_idx", query),
+                vec![1],
+                "{options} {query}"
+            );
+            let literal = query.replace('\'', "''");
+            let rendered = Spi::get_one::<String>(&format!(
+                "SELECT stannum.highlight(body) FROM audit_tokens WHERE body ==> '{literal}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert!(rendered.contains("<b>"), "{options}: {rendered}");
+            Spi::run("DROP INDEX audit_tokens_idx").unwrap();
+        }
+    }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Differential oracle: run identical fixtures and queries on two servers and
-diff match sets and scores, bit for bit.
+diff match sets, scores, and HTML/ANSI highlights.
 
 Both sides use equivalent SQL with engine-specific schema and access-method
 names, comparing Stannum against TIN (or two Stannum builds). Connection details come from libpq environment variables read
@@ -13,7 +13,7 @@ script never drops anything it did not create.
 
 States exercised, in order: after build; after deletes before VACUUM; after
 VACUUM; after inserts into the mutable side; after REINDEX. Any difference in
-result sets or in the float bits of full_score / score is reported.
+result sets, highlights, or the float bits of full_score / score is reported.
 Query shapes cover terms, Boolean, phrases, gaps, alternatives, slop,
 proximity, relations, positional filters, wildcards, regex, ranges, fuzzy,
 AT LEAST, boosts and the match-all form.
@@ -29,6 +29,7 @@ from pathlib import Path
 
 QUERIES = [
     "common", "rare", "absenttoken", "*",
+    "eclair", "3.14", "can't", "wi-fi", "example.com", "👩‍💻",
     "common AND rare", "common OR rare", "rare AND NOT beta", "* AND NOT common",
     '"alpha beta"', '"beta alpha"', '"alpha _ gamma"', '"[alpha rare] beta"', '"alpha beta"~2',
     "alpha NEAR/2 gamma", "alpha THEN/0 beta", "beta THEN/0 alpha", "(alpha NEAR/5 gamma) WITHIN 3",
@@ -49,6 +50,7 @@ SELECT n,
   CASE WHEN n % 100 = 0 THEN 'rare ' ELSE '' END ||
   CASE WHEN n % 250 = 0 THEN 'alpha beta gamma ' WHEN n % 251 = 0 THEN 'alpha x gamma beta ' ELSE '' END ||
   CASE WHEN n % 7 = 0 THEN 'Éclair naïve ' ELSE '' END ||
+  CASE WHEN n % 11 = 0 THEN '3.14 can''t wi-fi https://example.com/a 👩‍💻 ' ELSE '' END ||
   repeat('pad ', n % 5)
 FROM generate_series(1, {rows}) n;
 INSERT INTO oracle_docs VALUES ({rows} + 1, ''), ({rows} + 2, NULL), ({rows} + 3, 'alpha alpha beta beta rare');
@@ -103,7 +105,29 @@ def observe(env, query, engine="stannum"):
     result = psql(sql, env)
     if result.returncode != 0:
         return {"error": result.stderr.strip().splitlines()[0] if result.stderr.strip() else "unknown error"}
-    return json.loads(result.stdout)
+    observed = json.loads(result.stdout)
+    observed["highlights"] = {}
+    for style, function in HIGHLIGHT_FUNCTIONS[engine].items():
+        # Separate statements preserve membership/scoring evidence when a
+        # reference highlighter rejects a shape. Never silently omit errors.
+        highlighted = psql(f"""SELECT json_build_array(id, {function}(body))
+            FROM oracle_docs WHERE body ==> '{literal}' ORDER BY id;""", env)
+        observed["highlights"][style] = ([json.loads(row) for row in highlighted.stdout.splitlines()]
+            if highlighted.returncode == 0
+            else {"error": highlighted.stderr.strip()})
+    return observed
+
+
+# Verified from Lead's pg_proc catalog by script/reference-oracle. The one-
+# argument calls deliberately exercise implicit query binding in both engines.
+HIGHLIGHT_FUNCTIONS = {
+    "stannum": {"html": "stannum.highlight", "ansi": "stannum.highlight_ansi"},
+    "tin": {"html": "tin.highlight", "ansi": "tin.highlight_ansi"},
+}
+
+# Query -> reason. Only confirmed Lead highlighting defects belong here;
+# observations remain in oracle.json even when excluded from order comparison.
+REFERENCE_UNHIGHLIGHTED = {}
 
 
 def score_value(bits):
@@ -120,7 +144,7 @@ def ranking(scored):
 
 # Shapes the Lead reference does not score: it returns zero for every match of
 # an expansion, while TIN and Stannum score the expanded terms. In `order` mode
-# these compare match sets only.
+# these compare match sets and highlights, but not rank order.
 REFERENCE_UNSCORED = frozenset(["alp*", "*eta", "b?ta", "MATCHES al.*a", "alpha TO beta", "* TO alpha"])
 
 
@@ -128,12 +152,22 @@ def comparable(observed, scores, query=""):
     """What is compared for one side: everything for `bits`; for `order` the
     match set and the rank order of the full and dense scores, so a reference
     with slightly different corpus statistics can still be checked, and the
-    match set alone for shapes the reference leaves unscored."""
+    exact highlights even for shapes the reference leaves unscored."""
     if "error" in observed or scores == "bits":
         return observed
-    if query in REFERENCE_UNSCORED:
-        return {"ids": observed["ids"]}
-    return {"ids": observed["ids"], "full": ranking(observed["full"]), "dense": ranking(observed["dense"])}
+    result = {"ids": observed["ids"]}
+    if query not in REFERENCE_UNSCORED:
+        result.update(full=ranking(observed["full"]), dense=ranking(observed["dense"]))
+    if query not in REFERENCE_UNHIGHLIGHTED:
+        result["highlights"] = observed["highlights"]
+    return result
+
+
+def unexpected_highlight_error(observed, scores, query):
+    if scores == "order" and query in REFERENCE_UNHIGHLIGHTED:
+        return False
+    return any(isinstance(value, dict) and "error" in value
+               for value in observed.get("highlights", {}).values())
 
 
 def main():
@@ -158,7 +192,7 @@ def main():
         run(f"CREATE EXTENSION IF NOT EXISTS {engine};", env)
         # CREATE TABLE fails on an existing fixture instead of deleting user data.
         run(FIXTURE.format(rows=args.rows, engine=engine), env)
-    report = {"rows": args.rows, "scores": args.scores, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "engines": engines, "states": {}}
+    report = {"rows": args.rows, "scores": args.scores, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "engines": engines, "highlight_exclusions": REFERENCE_UNHIGHLIGHTED if args.scores == "order" else {}, "states": {}}
     differences = 0
     for state, transition in STATES:
         if transition:
@@ -169,6 +203,8 @@ def main():
             observed = {side: observe(env, query, engines[side]) for side, env in sides.items()}
             same = (comparable(observed["left"], args.scores, query)
                     == comparable(observed["right"], args.scores, query))
+            same = same and not any(unexpected_highlight_error(value, args.scores, query)
+                                    for value in observed.values())
             if not same:
                 differences += 1
             results[query] = {"same": same, **observed}

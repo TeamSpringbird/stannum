@@ -42,9 +42,10 @@ compatibility evidence, not proof of complete equivalence or a speed comparison.
 ### The behavioral regression suite
 
 Two differential oracles share one fixture and one query list
-(`benchmarks/oracle.py`): 41 TINQL shapes covering terms, Boolean forms, phrases,
+(`benchmarks/oracle.py`): 47 TINQL shapes covering terms, Boolean forms, phrases,
 gaps, slop, proximity, relations, positional filters, wildcards, regular
-expressions, ranges, fuzzy matching, AT LEAST, boosts and the match-all form,
+expressions, ranges, fuzzy matching, AT LEAST, boosts, the match-all form,
+and tokenizer-sensitive accents, numerics, apostrophes, hyphens, URL hosts and emoji,
 observed after build, after deletes, after VACUUM, after inserts into the write
 buffer and after REINDEX.
 
@@ -53,15 +54,20 @@ buffer and after REINDEX.
   directly from its repository (`main` unless `LEAD_REF` pins a revision) and
   built under its own extension name `tin` into the same server as Stannum, so
   the comparison tracks Lead as it is maintained. Match sets and the rank
-  order of full and dense scores must agree (`--scores order`). Score bits are
+  order of full and dense scores, and exact HTML/ANSI highlighted strings must
+  agree (`--scores order`). Score bits are
   not compared: Lead counts a token-less document present at index build in its
   corpus size, which shifts every IDF in the last bits; TIN and Stannum do not.
   Expansion shapes (wildcards, regular expressions, ranges) compare match sets
-  only, because Lead scores their matches as zero where TIN scores the expanded
-  terms. On every other input tried, Lead's bits match Stannum's exactly.
+  and highlights, because Lead scores their matches as zero where TIN scores the
+  expanded terms. Highlight defects require an explicit reason in
+  `REFERENCE_UNHIGHLIGHTED`; score exclusions never suppress highlight checks.
+  The [compatibility audit](../compatibility.md) records the inspected function
+  signatures and local results.
 * **TIN, locally by hand** (`benchmarks/oracle.py --right-engine tin` against
   a PlanetScale database, with the connection in a libpq env file that never
-  enters the repository). Bit-for-bit scores, including `max_score`. This is
+  enters the repository). Bit-for-bit scores, including `max_score`, and exact
+  HTML/ANSI highlights. This is
   the standard the Lead oracle cannot provide; it is not part of CI because it
   needs a live TIN instance and credentials.
 

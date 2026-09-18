@@ -5,8 +5,8 @@
 # started from. This script clones PlanetScale's Lead (or uses LEAD_REF_DIR if
 # it already holds a checkout), builds it under its own extension name, `tin`,
 # into the PostgreSQL that pg_config on PATH describes, creates two databases
-# on the server named by the usual libpq variables, and runs the oracle: 41
-# query shapes across five mutation states. Match sets and rank order must
+# on the server named by the usual libpq variables, and runs the oracle: 47
+# query shapes across five mutation states. Match sets, rank order, and HTML/ANSI highlights must
 # agree; score bits are not compared, because Lead counts token-less documents
 # present at index build in its corpus size and scores expansions as zero,
 # where Stannum follows TIN.
@@ -35,6 +35,12 @@ for db in reference_oracle_stannum reference_oracle_lead; do
   dropdb --if-exists "$db"
   createdb "$db"
 done
+# Record actual callable signatures: absent/changed functions fail observation,
+# never silently disable highlight comparison.
+mkdir -p "$OUT"
+psql -X -v ON_ERROR_STOP=1 -d reference_oracle_lead -c 'CREATE EXTENSION tin' >/dev/null
+psql -X -v ON_ERROR_STOP=1 -d reference_oracle_lead -c '\df tin.*highlight*' > "$OUT/lead-highlight-functions.txt"
+git -C "$REF" rev-parse HEAD > "$OUT/lead-revision.txt"
 LEFT="$(mktemp)"; RIGHT="$(mktemp)"
 printf 'PGDATABASE=reference_oracle_stannum\n' > "$LEFT"
 printf 'PGDATABASE=reference_oracle_lead\n' > "$RIGHT"
