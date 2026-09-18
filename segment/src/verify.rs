@@ -19,8 +19,9 @@
 //!   overlapping the previous term's, postings decoding to `df` increasing
 //!   locations that are all in the document table, the payload holding one
 //!   entry per posting with a valid bucket that matches its position count,
-//!   `max_tf_bucket` equal to the largest bucket, and (for `LSG2`) block
-//!   bounds equal to what the postings and document lengths imply;
+//!   `max_tf_bucket` equal to the largest bucket, and (from `LSG2` on) score
+//!   bounds equal to what the postings and document lengths imply, in the
+//!   layout the segment's format writes;
 //! * the document table: decodes to `doc_count` increasing locations;
 //! * document lengths: nonzero, summing to `total_length`, and equal to the
 //!   number of positions the term payloads hold for that document.
@@ -29,7 +30,7 @@ use std::fmt;
 
 use crate::forward::ForwardRecord;
 use crate::postings::{BLOCK_POSTINGS, BlockBound, Postings};
-use crate::segment::Segment;
+use crate::segment::{Format, Segment};
 use crate::set::collect;
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Tid};
@@ -151,6 +152,8 @@ pub struct SegmentReport {
     /// From the header, when it parsed.
     pub doc_count: Option<u32>,
     pub total_length: Option<u64>,
+    /// From the signature, when it parsed.
+    pub format: Option<Format>,
     /// True for an `LSG1` blob.
     pub legacy: bool,
     /// The document table, when it decoded; empty otherwise.
@@ -181,6 +184,8 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
     };
     report.doc_count = Some(segment.document_count());
     report.total_length = Some(segment.total_length());
+    let format = segment.format();
+    report.format = Some(format);
     report.legacy = segment.is_legacy();
     if report.legacy {
         findings.warning(
@@ -291,8 +296,14 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             }
             previous = Some(term.clone());
             let location = format!("term {term:?}");
-            let postings_extent_end = entry.postings.offset + u64::from(entry.postings.len);
-            let payload_extent_end = entry.payload.offset + u64::from(entry.payload.len);
+            let postings_extent_end = entry
+                .postings
+                .offset
+                .saturating_add(u64::from(entry.postings.len));
+            let payload_extent_end = entry
+                .payload
+                .offset
+                .saturating_add(u64::from(entry.payload.len));
             let mut resolvable = true;
             if postings_extent_end > postings_len as u64 {
                 findings.error(
@@ -470,7 +481,8 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 );
             }
 
-            // Block bounds: what the postings and lengths imply.
+            // Score bounds: what the postings and lengths imply, in the
+            // layout the segment's format writes.
             let bounds = match resolved.cursor().and_then(|mut c| c.block_bounds()) {
                 Ok(bounds) => bounds,
                 Err(error) => {
@@ -478,7 +490,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     continue;
                 }
             };
-            if report.legacy {
+            if !format.has_bounds() {
                 continue;
             }
             if bounds.is_empty() {
@@ -486,6 +498,26 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     findings.error(location, "postings carry no block bounds");
                 }
                 continue;
+            }
+            let one_block = postings.count() <= BLOCK_POSTINGS;
+            match format {
+                Format::Lsg1 => {}
+                Format::Lsg2 => {
+                    if postings.has_term_bound() {
+                        findings.warning(
+                            location.clone(),
+                            "postings carry an LSG3 term bound where LSG2 writes a block table",
+                        );
+                    }
+                }
+                Format::Lsg3 => {
+                    if one_block && !postings.has_term_bound() {
+                        findings.warning(
+                            location.clone(),
+                            "postings of one block carry a block table where LSG3 writes a term bound",
+                        );
+                    }
+                }
             }
             if unknown > 0 || scores.len() != tids.len() {
                 // Lengths are unknown for postings outside the table; the
@@ -840,15 +872,8 @@ mod tests {
         let payload = crate::payload::Payload::parse(extent).unwrap();
         let first = payload.get(0).unwrap();
         assert_eq!(first.tf_bucket, 0);
-        // The bucket byte of entry 0 is the first data byte: after count,
-        // skip_count and the fixed-width skips.
-        let data_at = {
-            let mut reader = crate::reader::Reader::new(extent);
-            reader.varint().unwrap();
-            let skips = reader.varint().unwrap() as usize;
-            reader.skip(skips * 4).unwrap();
-            reader.position()
-        };
+        // The bucket byte of entry 0 is the first data byte.
+        let data_at = extent.len() - payload.data_len();
         let mut tampered = bytes.clone();
         tampered[payload_at + entry.payload.offset as usize + data_at] = 3;
         let report = verify_segment(&tampered);

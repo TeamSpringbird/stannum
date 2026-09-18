@@ -18,3 +18,7 @@
   budget; only the 128-entry on-disk bound forces an unbudgeted merge.
 - VACUUM reclaims pages a crash left unreferenced (`page N` warnings of
   `stannum.verify_index`) instead of requiring REINDEX.
+- Segment format `LSG3`: one term bound for postings that fit a block, no
+  payload skip slot for entry 0, and dictionary entries with gap-encoded
+  extents; the 100k Wikipedia index shrinks by about a tenth with the same
+  pruning. `LSG1` and `LSG2` segments remain readable; `REINDEX` rewrites.

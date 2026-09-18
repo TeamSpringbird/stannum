@@ -2564,7 +2564,7 @@ mod tests {
         };
         assert_eq!(
             &read_page(root as u32)[DATA_AT as usize..DATA_AT as usize + 4],
-            b"LSG2"
+            b"LSG3"
         );
         drop(index);
         corrupt("release_format_idx", 0, KIND_AT + 1, "ff");

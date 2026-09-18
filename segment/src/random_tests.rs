@@ -8,6 +8,7 @@ use crate::dictionary::{DictionaryBuilder, Extent, OwnedDictionary, TermEntry};
 use crate::forward::ForwardRecord;
 use crate::payload::{Payload, PayloadBuilder};
 use crate::postings::{BLOCK_POSTINGS, BlockBound, Postings, PostingsBuilder};
+use crate::segment::Format;
 use crate::set::{Cursor, Difference, Intersection, Union, collect};
 use crate::tid::MAX_OFFSET;
 use crate::{Result, Tid};
@@ -208,7 +209,6 @@ proptest! {
         ),
         probes in prop::collection::vec("[a-d\u{e9}\u{65e5}]{0,6}", 0..30),
     ) {
-        let mut builder = DictionaryBuilder::default();
         let expected: BTreeMap<String, TermEntry> = terms
             .into_iter()
             .map(|(term, (df, bucket, offset, len))| {
@@ -223,26 +223,30 @@ proptest! {
                 )
             })
             .collect();
+        // Extents here are in no particular order, which the gap-encoded
+        // layout must take in its stride as the absolute ones do.
+        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+        let mut builder = DictionaryBuilder::with_format(format);
         for (term, entry) in &expected {
             builder.push(term, *entry).unwrap();
         }
         let bytes = builder.finish();
-        let owned = OwnedDictionary::parse(&bytes).unwrap();
+        let owned = OwnedDictionary::parse_format(&bytes, format).unwrap();
         let dictionary = owned.view();
         prop_assert_eq!(dictionary.len(), expected.len());
         let all: Vec<(String, TermEntry)> = dictionary.iter().collect::<Result<_>>().unwrap();
         prop_assert_eq!(all, expected.iter().map(|(t, e)| (t.clone(), *e)).collect::<Vec<_>>());
-        for probe in probes {
-            prop_assert_eq!(dictionary.get(&probe).unwrap(), expected.get(&probe).copied());
-            let from: Vec<String> = dictionary.iter_from(&probe).map(|r| r.unwrap().0).collect();
+        for probe in &probes {
+            prop_assert_eq!(dictionary.get(probe).unwrap(), expected.get(probe).copied());
+            let from: Vec<String> = dictionary.iter_from(probe).map(|r| r.unwrap().0).collect();
             let oracle: Vec<String> = expected.range(probe.clone()..).map(|(t, _)| t.clone()).collect();
             prop_assert_eq!(from, oracle);
-            let prefixed: Vec<String> = dictionary.prefix(&probe).map(|r| r.unwrap().0).collect();
-            let oracle: Vec<String> = expected.keys().filter(|t| t.starts_with(&probe)).cloned().collect();
+            let prefixed: Vec<String> = dictionary.prefix(probe).map(|r| r.unwrap().0).collect();
+            let oracle: Vec<String> = expected.keys().filter(|t| t.starts_with(probe.as_str())).cloned().collect();
             prop_assert_eq!(prefixed, oracle);
             let upper = format!("{probe}b");
             let ranged: Vec<String> = dictionary
-                .range(Some(&probe), Some(&upper))
+                .range(Some(probe.as_str()), Some(&upper))
                 .map(|r| r.unwrap().0)
                 .collect();
             let oracle: Vec<String> = expected
@@ -250,6 +254,7 @@ proptest! {
                 .map(|(t, _)| t.clone())
                 .collect();
             prop_assert_eq!(ranged, oracle);
+        }
         }
     }
 
@@ -427,10 +432,62 @@ proptest! {
             cursor.seek(Tid::new(100, 1).unwrap())?;
             cursor.bound_at(Tid::new(200, 1).unwrap())
         });
-        let _ = Payload::parse(&bytes).and_then(|p| p.get(0));
+        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+            let _ = Payload::parse_format(&bytes, format).and_then(|p| p.get(0));
+            let _ = Payload::parse_format(&bytes, format).and_then(|p| p.get(40));
+            // The same bytes under every signature.
+            let mut blob = format.magic().to_vec();
+            blob.extend_from_slice(&bytes);
+            let _ = crate::segment::Segment::parse(&blob).and_then(|s| s.records(|_| false));
+            let _ = crate::verify::verify_segment(&blob);
+        }
         let _ = OwnedDictionary::parse(&bytes).map(|d| d.view().iter().count());
         let _ = OwnedDictionary::parse(&bytes).and_then(|d| d.view().get("a"));
         let _ = ForwardRecord::decode(&bytes);
         let _ = crate::segment::Segment::parse(&bytes).and_then(|s| s.term("a").map(|_| ()));
+    }
+
+    /// Every released format reads to the same documents, and the formats
+    /// with bounds (`LSG2` and `LSG3`) to the same bounds per term, so a
+    /// ranked scan prunes them identically.
+    #[test]
+    fn every_format_reads_the_same_segment(
+        docs in prop::collection::btree_map(
+            (0u32..300, 1u16..=MAX_OFFSET),
+            prop::collection::vec("[a-e]{1,2}", 0..30),
+            0..200,
+        ),
+    ) {
+        use crate::format_tests::{build_as, contents};
+        use crate::verify::{Severity, verify_segment};
+        let documents: Vec<(Tid, Vec<(String, u32)>)> = docs
+            .into_iter()
+            .map(|((block, offset), words)| {
+                let tokens = words.into_iter().enumerate().map(|(i, w)| (w, i as u32 + 1)).collect();
+                (Tid::new(block, offset).unwrap(), tokens)
+            })
+            .collect();
+        let current = build_as(&documents, Format::Lsg3);
+        prop_assert!(verify_segment(&current).is_clean());
+        let (records, bounds) = contents(&current).unwrap();
+        for format in [Format::Lsg1, Format::Lsg2] {
+            let old = build_as(&documents, format);
+            prop_assert_eq!(&old[..4], format.magic());
+            if format == Format::Lsg2 {
+                prop_assert!(old.len() >= current.len(), "{} < {}", old.len(), current.len());
+            }
+            let report = verify_segment(&old);
+            prop_assert!(
+                report.findings.iter().all(|f| f.severity == Severity::Warning && !format.has_bounds()),
+                "{}", report.findings.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+            );
+            let (old_records, old_bounds) = contents(&old).unwrap();
+            prop_assert_eq!(&old_records, &records);
+            if format.has_bounds() {
+                prop_assert_eq!(&old_bounds, &bounds);
+            } else {
+                prop_assert!(old_bounds.iter().all(|(_, b)| b.is_empty()));
+            }
+        }
     }
 }
