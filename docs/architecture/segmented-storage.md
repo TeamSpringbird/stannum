@@ -162,8 +162,11 @@ and the [cleanup/bypass implementation](https://github.com/postgres/postgres/blo
 
 The private-cluster scenario in `docs/benchmarks/merge_lifecycle.py` checks
 insert-triggered autovacuum without preload, concurrent inserts and merges,
-retained readers, restart and index verification. The [merge-budget experiment](../benchmarks/merge-budget.md)
-records latency, reader tails, segment counts and correctness results.
+retained readers, restart, index verification, and a crash between a run
+write and its publication followed by orphan reclamation. The [merge-budget experiment](../benchmarks/merge-budget.md)
+records latency, reader tails, segment counts and correctness results; the
+[VACUUM publication experiment](../benchmarks/vacuum-publication.md) measures
+the unlocked VACUUM and budgeted overflow merges against it.
 
 ## Reading an index
 
