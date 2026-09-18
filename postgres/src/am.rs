@@ -56,6 +56,7 @@ unsafe extern "C-unwind" fn ambuild(
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
+    unsafe { crate::operator::warn_about_search_predicate(index) };
     unsafe { crate::storage::build_empty(index) };
     let mut state = BuildState {
         builder: unsafe { crate::storage::Builder::new(index) },

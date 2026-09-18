@@ -17,8 +17,20 @@
 //! index with different settings is penalized by `amcostestimate` and, if
 //! chosen anyway, rechecks every row with the bound settings, so a result
 //! never depends on the plan. A clause the support function does not see
-//! (no planner state, as in index predicates and generated columns; a
-//! document expression no index covers) keeps the default settings.
+//! keeps the default settings: one planned without a query (`expression_planner`
+//! has no planner state: index predicates, CHECK constraints, generated
+//! columns, trigger WHEN clauses) or one whose document is not a column an
+//! index covers (a PL/pgSQL variable, a non-inlined function's argument, a
+//! literal). A function cannot recover the relation from its argument at
+//! execution time (a `Var` is a range-table position), so nothing resolves
+//! these later.
+//!
+//! An index predicate holding a `==>` clause was therefore evaluated with
+//! the defaults, and only a query clause meaning the defaults can prove it.
+//! A `get_relation_info` hook rewrites such a predicate clause into the
+//! bound form of the query's matching clause when that clause is bound to
+//! an index with the default settings, so `predicate_implied_by` sees equal
+//! clauses; see [`bind_index_predicates`].
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -164,11 +176,50 @@ unsafe fn name_list(names: &[&CStr]) -> *mut pg_sys::List {
     list.into_pg()
 }
 
+/// The extension's schema, or `InvalidOid` outside the extension.
+///
+/// Lookups by qualified name (`LookupTypeNameOid`, `LookupFuncName`) check
+/// USAGE on the schema for the current role, and the planner runs them for
+/// whoever plans the query, so the catalog is searched directly: a role
+/// needs no privilege on the schema to have its clauses bound.
+unsafe fn extension_schema() -> pg_sys::Oid {
+    unsafe { pg_sys::get_namespace_oid(c"stannum".as_ptr(), true) }
+}
+
 /// The OID of `stannum.indexed_query`, or `InvalidOid` outside the extension.
 pub(crate) unsafe fn indexed_query_type_oid() -> pg_sys::Oid {
     unsafe {
-        let name = pg_sys::makeTypeNameFromNameList(name_list(&[c"stannum", c"indexed_query"]));
-        pg_sys::LookupTypeNameOid(std::ptr::null_mut(), name, true)
+        let schema = extension_schema();
+        if schema == pg_sys::InvalidOid {
+            return pg_sys::InvalidOid;
+        }
+        pg_sys::GetSysCacheOid(
+            pg_sys::SysCacheIdentifier::TYPENAMENSP as _,
+            pg_sys::Anum_pg_type_oid as _,
+            pg_sys::Datum::from(c"indexed_query".as_ptr()),
+            pg_sys::Datum::from(schema.to_u32() as usize),
+            pg_sys::Datum::from(0_usize),
+            pg_sys::Datum::from(0_usize),
+        )
+    }
+}
+
+/// The OID of `stannum.<name>(<types>)`, or `InvalidOid` when absent.
+pub(crate) unsafe fn extension_function_oid(name: &CStr, types: &[pg_sys::Oid]) -> pg_sys::Oid {
+    unsafe {
+        let schema = extension_schema();
+        if schema == pg_sys::InvalidOid {
+            return pg_sys::InvalidOid;
+        }
+        let arguments = pg_sys::buildoidvector(types.as_ptr(), types.len() as _);
+        pg_sys::GetSysCacheOid(
+            pg_sys::SysCacheIdentifier::PROCNAMEARGSNSP as _,
+            pg_sys::Anum_pg_proc_oid as _,
+            pg_sys::Datum::from(name.as_ptr()),
+            pg_sys::Datum::from(arguments),
+            pg_sys::Datum::from(schema.to_u32() as usize),
+            pg_sys::Datum::from(0_usize),
+        )
     }
 }
 
@@ -192,15 +243,7 @@ unsafe fn bound_operator() -> Option<(pg_sys::Oid, pg_sys::Oid)> {
 }
 
 unsafe fn bind_query_oid() -> pg_sys::Oid {
-    unsafe {
-        let types = [pg_sys::TEXTOID, pg_sys::OIDOID];
-        pg_sys::LookupFuncName(
-            name_list(&[c"stannum", c"bind_query"]),
-            types.len() as i32,
-            types.as_ptr(),
-            true,
-        )
-    }
+    unsafe { extension_function_oid(c"bind_query", &[pg_sys::TEXTOID, pg_sys::OIDOID]) }
 }
 
 // --- Constants ------------------------------------------------------------------
@@ -585,6 +628,203 @@ fn stannum_text_cmpfunc_support(request: Internal) -> Internal {
         (*expr).opfuncid = opfuncid;
         (*expr).location = (*request.fcall).location;
         Internal::from(Some(pg_sys::Datum::from(expr as usize)))
+    }
+}
+
+// --- Index predicates -----------------------------------------------------------
+
+/// `==>` clauses in the text form (the right operand a text expression).
+struct UnboundClauses(Vec<*mut pg_sys::OpExpr>);
+
+#[pg_guard]
+unsafe extern "C-unwind" fn collect_unbound(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    unsafe {
+        if search_clause(node).is_some() {
+            let op = node.cast::<pg_sys::OpExpr>();
+            let right = pg_sys::list_nth((*op).args, 1).cast::<pg_sys::Node>();
+            if pg_sys::exprType(right) == pg_sys::TEXTOID {
+                (*context.cast::<UnboundClauses>()).0.push(op);
+            }
+        }
+        pg_sys::expression_tree_walker(node, Some(collect_unbound), context)
+    }
+}
+
+/// The `==>` clauses of `node` still in the text form.
+unsafe fn unbound_search_clauses(node: *mut pg_sys::Node) -> Vec<*mut pg_sys::OpExpr> {
+    let mut clauses = UnboundClauses(Vec::new());
+    unsafe { collect_unbound(node, (&mut clauses as *mut UnboundClauses).cast()) };
+    clauses.0
+}
+
+/// Warns when a stannum index built with other than the default settings
+/// has a `==>` clause in its predicate: a predicate is evaluated without a
+/// query to bind it against, so with the defaults, whatever the index's
+/// settings, and a clause bound to the index cannot prove it.
+///
+/// # Safety
+/// `index` is an open index relation.
+pub(crate) unsafe fn warn_about_search_predicate(index: pg_sys::Relation) {
+    unsafe {
+        let predicate = pg_sys::RelationGetIndexPredicate(index);
+        if predicate.is_null() || unbound_search_clauses(predicate.cast()).is_empty() {
+            return;
+        }
+        let spec = crate::options::encode_spec(&crate::options::tokenizer_spec(index));
+        if spec == default_spec() {
+            return;
+        }
+        let name = CStr::from_ptr((*(*index).rd_rel).relname.data.as_ptr()).to_string_lossy();
+        pgrx::warning!(
+            "==> in the predicate of index \"{name}\" uses the default tokenizer settings, \
+             not the index's: the index holds the rows the defaults match, and a query \
+             bound to the index cannot prove its predicate"
+        );
+    }
+}
+
+static mut PREVIOUS_RELATION_INFO_HOOK: pg_sys::get_relation_info_hook_type = None;
+
+/// Installs the planner hook that lets bound clauses prove `==>` index
+/// predicates.
+pub fn init() {
+    unsafe {
+        PREVIOUS_RELATION_INFO_HOOK = pg_sys::get_relation_info_hook;
+        pg_sys::get_relation_info_hook = Some(relation_info_hook);
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn relation_info_hook(
+    root: *mut pg_sys::PlannerInfo,
+    relation_oid: pg_sys::Oid,
+    inhparent: bool,
+    rel: *mut pg_sys::RelOptInfo,
+) {
+    unsafe {
+        if let Some(previous) = PREVIOUS_RELATION_INFO_HOOK {
+            previous(root, relation_oid, inhparent, rel);
+        }
+        bind_index_predicates(root, rel);
+    }
+}
+
+/// A `==>` clause of the query bound at plan time, with a constant query.
+struct BoundClause {
+    document: *mut pg_sys::Node,
+    query: String,
+    index: pg_sys::Oid,
+}
+
+struct BoundClauses(Vec<BoundClause>);
+
+#[pg_guard]
+unsafe extern "C-unwind" fn collect_bound(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    unsafe {
+        if let Some(clause) = search_clause(node)
+            && let Some(index) = clause.index
+            && let Some(query) = query_text(clause.query)
+        {
+            (*context.cast::<BoundClauses>()).0.push(BoundClause {
+                document: clause.document,
+                query,
+                index,
+            });
+        }
+        pg_sys::expression_tree_walker(node, Some(collect_bound), context)
+    }
+}
+
+/// The query's bound clauses (its join tree and the relation's row-security
+/// quals), their documents translated to `rel`'s variables when it is a
+/// partition or inheritance child, as the planner translates its
+/// restrictions.
+unsafe fn query_bindings(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+) -> Vec<BoundClause> {
+    unsafe {
+        let parse = (*root).parse;
+        let mut clauses = BoundClauses(Vec::new());
+        let context = (&mut clauses as *mut BoundClauses).cast::<c_void>();
+        collect_bound((*parse).jointree.cast(), context);
+        let top = if (*rel).top_parent.is_null() {
+            rel
+        } else {
+            (*rel).top_parent
+        };
+        let varno = (*top).relid as i32;
+        if varno >= 1 && varno <= pg_sys::list_length((*parse).rtable) {
+            let rte = pg_sys::list_nth((*parse).rtable, varno - 1).cast::<pg_sys::RangeTblEntry>();
+            collect_bound((*rte).securityQuals.cast(), context);
+        }
+        if top != rel {
+            for clause in &mut clauses.0 {
+                clause.document = pg_sys::adjust_appendrel_attrs_multilevel(
+                    root,
+                    pg_sys::copyObjectImpl(clause.document.cast()).cast(),
+                    rel,
+                    top,
+                );
+            }
+        }
+        clauses.0
+    }
+}
+
+/// Rewrites each text-form `==>` clause in the predicates of `rel`'s
+/// indexes into the bound form of the query's matching clause, when that
+/// clause is bound to an index with the default settings.
+///
+/// The predicate was evaluated with the defaults when the index was built
+/// and on every insert (there is no query to bind it against), so a clause
+/// meaning the defaults is the same predicate, and rewriting it lets
+/// `predicate_implied_by` see equal clauses: the index, of any access
+/// method, becomes usable. A clause bound to other settings is a different
+/// predicate and never proves it. The rewrite touches the planner's private
+/// copy of the predicate only.
+unsafe fn bind_index_predicates(root: *mut pg_sys::PlannerInfo, rel: *mut pg_sys::RelOptInfo) {
+    unsafe {
+        if root.is_null() || rel.is_null() || (*root).parse.is_null() {
+            return;
+        }
+        let mut bindings: Option<Vec<BoundClause>> = None;
+        for info in PgList::<pg_sys::IndexOptInfo>::from_pg((*rel).indexlist).iter_ptr() {
+            let predicate = (*info).indpred;
+            if predicate.is_null() {
+                continue;
+            }
+            for op in unbound_search_clauses(predicate.cast()) {
+                let document = pg_sys::list_nth((*op).args, 0).cast::<pg_sys::Node>();
+                let Some(text) = query_text(pg_sys::list_nth((*op).args, 1).cast()) else {
+                    continue;
+                };
+                let bindings = bindings.get_or_insert_with(|| query_bindings(root, rel));
+                let Some(binding) = bindings.iter().find(|binding| {
+                    binding.query == text && pg_sys::equal(binding.document.cast(), document.cast())
+                }) else {
+                    continue;
+                };
+                if crate::storage::spec_by_oid(binding.index) != default_spec() {
+                    continue;
+                }
+                let Some((opno, opfuncid)) = bound_operator() else {
+                    return;
+                };
+                let mut args = PgList::<pg_sys::Node>::new();
+                args.push(document);
+                args.push(make_indexed_const(&text, binding.index));
+                (*op).args = args.into_pg();
+                (*op).opno = opno;
+                (*op).opfuncid = opfuncid;
+            }
+        }
     }
 }
 
