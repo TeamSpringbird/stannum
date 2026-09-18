@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small, dependency-free PostgreSQL benchmark recorder. See README.md."""
+"""Small, dependency-free PostgreSQL benchmark recorder. See docs/benchmarks/harness.md."""
 import argparse
 import collections
 import csv

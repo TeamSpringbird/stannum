@@ -2,10 +2,10 @@
 
 Current extension names are `stannum`. Historical measurements below describe
 pre-rename builds of this fork; format signatures `LDP2` and `LSG1` are unchanged.
-See [the current benchmark summary](../BENCHMARKS.md) for comparison limits.
+See [the current benchmark summary](../benchmarks/README.md) for comparison limits.
 
 LDP2 replaces the LDP1 fingerprint chains described in
-[durable-postings.md](durable-postings.md). A logged `stannum` index now holds a
+[durable-postings.md](../archive/durable-postings.md). A logged `stannum` index now holds a
 write buffer of per-document records and a directory of immutable segments,
 each carrying a real term dictionary, TID-native postings, token positions and
 document lengths. Scans compile the query with the index's own tokenizer, run
@@ -32,7 +32,7 @@ Ranking reads the index too. `stannum.score`, `stannum.full_score` and `stannum.
 bind to `score_bound_indexed`, which builds per-term scorers from the segment
 directory and dictionaries and looks each row up by TID with forward-seeking
 cursors. Statistics follow TIN's contract, verified bit for bit against a live
-TIN in [tin-observed-shape.md](tin-observed-shape.md): document counts,
+TIN in [tin-observed-shape.md](../archive/tin-observed-shape.md): document counts,
 total lengths and document frequencies include dead documents until their
 segment is rewritten, buffered documents count immediately, and dense-term
 elision uses immutable segments only. Indexes without LDP2 storage keep the

@@ -1,8 +1,8 @@
 # Recording search performance
 
-For the project results and current plan, start with [BENCHMARKS.md](../BENCHMARKS.md).
+For the project results and current plan, start with [benchmark results and plan](README.md).
 For the repeatable, containerized Mac Studio workflow, see
-[local campaigns](LOCAL.md). Benchmark execution and analysis are local-only.
+[local campaigns](local.md). Benchmark execution and analysis are local-only.
 
 Use **source fingerprints plus commit hashes, unique run directories for measurements,
 and tags for human milestones**. Fingerprints include uncommitted source and the `segment` crate. A commit can have many measurements. Never replace
@@ -197,13 +197,13 @@ automate host profiling, confidence intervals, inserts/deletes, or
 maintenance-backlog collection. Dataset import and local comparator provisioning
 are handled by `dataset.py` and `campaign.py`.
 
-See [Tin configuration research](../docs/tin-configuration-research.md) for which
+See [Tin configuration research](../archive/tin-configuration-research.md) for which
 knobs change semantics versus execution and why build/maintenance state matters.
 The [pgbench documentation](https://www.postgresql.org/docs/18/pgbench.html)
 defines the retained log fields and scheduling behavior.
 
 For the checksummed Wikipedia corpus and background campaigns, see
-[the real-corpus protocol](LOCAL.md#wikipedia-corpus). `baselines.py` now defaults
+[the real-corpus protocol](local.md#wikipedia-corpus). `baselines.py` now defaults
 to 100,000 documents only. The million-document evaluation is out of scope unless
 explicitly selected with `--sizes 1000000`.
 

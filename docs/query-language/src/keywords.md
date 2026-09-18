@@ -57,7 +57,7 @@ search term. `ENCLOSED` itself is always reserved: a bare
 | `TO` | Lexicographic range between two terms | `aardvark TO cat` |
 
 Use `*` for an open bound: `* TO cat` or `monkey TO *`. See
-[Terms](./terms.md#ranges) for details.
+[Terms](terms.md#ranges) for details.
 
 ### Positional keywords
 
@@ -76,7 +76,7 @@ Use `*` for an open bound: `* TO cat` or `monkey TO *`. See
 parse error. For example, `beer IN bar` does not parse; quote `"IN"` or use
 lowercase `in` to search for the word. `TO` also appears in positional filters
 (`IN WORDS 500 TO 1000`).
-`WITHIN` limits span width; see [Proximity](./proximity.md#within).
+`WITHIN` limits span width; see [Proximity](proximity.md#within).
 
 ### Term keyword
 
@@ -155,7 +155,7 @@ Inside double quotes, these characters have special meaning:
 ### Characters in terms
 
 Bare terms accept characters other than whitespace and `(`, `)`, `[`, `]`,
-`"`, `~`, `^`. See [Terms](./terms.md) for the complete syntax and how the
+`"`, `~`, `^`. See [Terms](terms.md) for the complete syntax and how the
 index tokenizer analyzes a term.
 
 ## Escaping
@@ -164,7 +164,7 @@ The backslash `\` has different meanings depending on context:
 
 - **In bare terms:** `\` is an escape only before `*` and `?` (`file\*` is the
   literal term `file*`; see
-  [Terms → Escaping `*` and `?`](./terms.md#escaping--and-)). Before any other
+  [Terms → Escaping `*` and `?`](terms.md#escaping--and-)). Before any other
   character it remains literal: `foo\bar` is a single term containing a
   backslash.
 - **Inside phrases:** `\` escapes the next character, letting you include

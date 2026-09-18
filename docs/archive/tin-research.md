@@ -2,7 +2,7 @@
 
 > Historical research/design note. References to Lead describe the original project
 > or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
-> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+> and status are in [README](../../README.md) and [BENCHMARKS](../benchmarks/README.md).
 
 Investigated 2026-09-17. This note records primary-source claims and inspected benchmark assets. No TIN or Lead performance measurements were taken.
 

@@ -1,7 +1,7 @@
 # Local Stannum campaigns
 
 The current results, 100k protocol, limitations, and TIN comparison plan are in
-[../BENCHMARKS.md](../BENCHMARKS.md). Benchmarks run locally, not in CI. No artifacts
+[benchmark results and plan](README.md). Benchmarks run locally, not in CI. No artifacts
 are uploaded automatically. Code and metadata use `stannum`; historical result
 folders and source snapshots retain their original names.
 

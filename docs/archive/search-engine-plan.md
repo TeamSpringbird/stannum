@@ -2,7 +2,7 @@
 
 > Historical research/design note. References to Lead describe the original project
 > or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
-> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+> and status are in [README](../../README.md) and [BENCHMARKS](../benchmarks/README.md).
 
 Status: proposed implementation plan, 2026-09-17. This supersedes “near TIN” as the objective in the initial investigation. No competitive performance claim has been established.
 
@@ -83,6 +83,6 @@ in progress: persisted Boolean/phrase candidates are implemented; efficient page
 The fingerprint format above was replaced by segmented storage (LDP2): a write
 buffer of per-document records folded into immutable segments with a term
 dictionary, positions and lengths, exact bitmaps for every query form, and
-page reclamation. See [segmented-storage.md](segmented-storage.md). Stages 1
+page reclamation. See [segmented-storage.md](../architecture/segmented-storage.md). Stages 1
 and 3 of the table are now implemented; stage 2 (persisted ranking statistics)
 is next.

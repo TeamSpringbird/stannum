@@ -2,7 +2,7 @@
 
 > Historical research/design note. References to Lead describe the original project
 > or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
-> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+> and status are in [README](../../README.md) and [BENCHMARKS](../benchmarks/README.md).
 
 The fork now prunes persisted term, Boolean and phrase candidates. Five paired
 release-build trials completed successfully on 10,000 synthetic documents with

@@ -36,7 +36,7 @@ phrase containing only gaps matches nothing.
 
 Gaps are exact: `"big _ wolf"` requires *exactly* one word between "big" and
 "wolf". If you want *up to* a certain distance, use slop (below) or the
-[`THEN/N` proximity operator](./proximity.md#thenn).
+[`THEN/N` proximity operator](proximity.md#thenn).
 
 ## Per-position alternatives
 

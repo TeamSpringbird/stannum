@@ -2,8 +2,8 @@
 
 > Historical research/design note. References to Lead describe the original project
 > or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
-> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
-> [segmented-storage.md](segmented-storage.md). Indexes in this format report
+> and status are in [README](../../README.md) and [BENCHMARKS](../benchmarks/README.md).
+> [segmented-storage.md](../architecture/segmented-storage.md). Indexes in this format report
 > `REINDEX required`. This document is kept as a record of the first slice.
 
 # Durable candidate retrieval, format LDP1

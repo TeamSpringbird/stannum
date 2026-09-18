@@ -96,7 +96,7 @@ keywords, put it in double quotes. Inside a phrase, keywords and `*`/`?` are
 literal text. The characters `_` (gap), `[` `]` (per-position alternatives),
 and `\` (escape) keep their special meanings;
 escape them with a backslash to treat them as literal text. See the
-[Phrases](./phrases.md) chapter.
+[Phrases](phrases.md) chapter.
 
 ## CONTAINS
 

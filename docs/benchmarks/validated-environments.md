@@ -1,7 +1,7 @@
 # Adapter smoke environments, 2026-09-17
 
 Historical environment observations; Lead/TIN build identities are preserved.
-For current Stannum results, see [BENCHMARKS.md](../BENCHMARKS.md).
+For current Stannum results, see [benchmark results and plan](README.md).
 
 These are correctness/execution checks with 1,000 synthetic documents, one reader,
 5 seconds of traffic, 1 second of read warmup, and a requested 10 updates/second.
@@ -88,7 +88,7 @@ comparison was correctly rejected. The temporary servers were stopped after runs
 database contents, the downloaded Docker image/container, and source build remain
 available locally for inspection.
 
-The subsequent [local Mac Studio campaign](LOCAL.md) runs all four engines inside
+The subsequent [local Mac Studio campaign](local.md) runs all four engines inside
 the same Linux VM using equal container budgets, a common pinned image and five
 rotating repetitions. Extend correctness coverage and ranking-quality validation
 before allowing ranked cross-engine ratios. Import real corpora and run long enough

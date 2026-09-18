@@ -16,7 +16,7 @@ PlanetScale-supported product. The inherited code remains under AGPL-3.0; see
 first 100k-document measurements are encouraging, but short benchmarks and targeted
 correctness tests do not establish long-term reliability. Our next steps are
 repeated comparisons, sustained mutation and maintenance tests, and broader
-recovery testing. See [BENCHMARKS.md](BENCHMARKS.md) for evidence and limitations.
+recovery testing. See [benchmark results and plan](docs/benchmarks/README.md) for evidence and limitations.
 
 ## What works today
 
@@ -28,7 +28,7 @@ recovery testing. See [BENCHMARKS.md](BENCHMARKS.md) for evidence and limitation
 - Inserts, updates, VACUUM, segment folding/merging, page reuse, and generic WAL.
 - Highlighting, tokenizer options, and `stannum.segment_info` for index inspection.
 
-The [storage and execution notes](docs/segmented-storage.md) describe the design and
+The [storage and execution notes](docs/architecture/segmented-storage.md) describe the design and
 its current boundaries. Ranked queries still score all candidates before selecting
 the top k. Folding and merging can delay the inserting transaction; maintenance
 and reclamation need more testing. Standby/recovery reads and temporary or unlogged
@@ -127,12 +127,14 @@ translates extension names in generated fixtures without changing the upstream s
 
 ## Learn more and contribute
 
-- [Benchmarks, results, and the comparison plan](BENCHMARKS.md)
-- [Benchmark harness reference](benchmarks/README.md)
-- [Storage and query execution](docs/segmented-storage.md)
-- [TINQL guide](tinql/docs/src/SUMMARY.md)
+Start with the [documentation index](docs/README.md) for current guides and archived research.
 
-The query guide can be built with `mdbook build tinql/docs` using mdBook 0.5.2.
+- [Benchmarks, results, and the comparison plan](docs/benchmarks/README.md)
+- [Benchmark harness reference](docs/benchmarks/harness.md)
+- [Storage and query execution](docs/architecture/segmented-storage.md)
+- [TINQL guide](docs/query-language/src/SUMMARY.md)
+
+The query guide can be built with `mdbook build docs/query-language` using mdBook 0.5.2.
 Report issues in this repository with reproduction SQL, PostgreSQL version,
 expected results, and observed results. Preserve correctness evidence alongside
 performance changes; a faster query that changes the answer is not an improvement.

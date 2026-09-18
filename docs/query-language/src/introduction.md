@@ -47,4 +47,4 @@ terms. With implicit AND, `to be or not to be` requires each of those words.
 The parser preserves the spelling of a search term. Before executing the query,
 Stannum analyzes literal terms with the index's tokenizer. Under the default
 settings, that includes case and accent folding. A written term can produce
-several tokens; see [Terms](./terms.md) for the syntax and tokenization rules.
+several tokens; see [Terms](terms.md) for the syntax and tokenization rules.

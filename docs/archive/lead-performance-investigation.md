@@ -2,7 +2,7 @@
 
 > Historical research/design note. References to Lead describe the original project
 > or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
-> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+> and status are in [README](../../README.md) and [BENCHMARKS](../benchmarks/README.md).
 
 Investigation date: 2026-09-17. Source baseline: `3fcf441ac7c3d183de179b1f846ceb0ef83e1358`.
 
@@ -18,17 +18,17 @@ See [TIN research and benchmark sources](tin-research.md) for the external evide
 
 | Path | Observed behavior | Consequence inferred from the code |
 | --- | --- | --- |
-| [`am.rs`, `build_callback`, `aminsert`](../postgres/src/am.rs) | Build counts tuples; insert persists no postings. | Index creation does not precompute document search data. Lead's index build time/size is not comparable to a functional search index. |
-| [`am.rs`, `amgetbitmap`](../postgres/src/am.rs) | Reads heap block count and calls `tbm_add_page` for every block. Scan keys only determine whether the scan is active. | Even a nonexistent term offers no index pruning. A bitmap path nominates the entire heap for recheck. |
-| [`operator.rs`, `evaluate_text`](../postgres/src/operator.rs) | Parses, subtokenizes, lowers, tokenizes the document, then evaluates on each invocation. | Query preparation repeats across rows; document analysis repeats across searches. |
-| [`runtime/eval.rs`, `TokenizedDoc`, `evaluate`](../tinql/src/runtime/eval.rs) | Allocates token strings, position maps, and match intervals. | Boolean predicates pay for representations also useful to positional queries. Whether these allocations dominate needs profiling. |
-| [`score.rs`, `build_corpus`, `load_documents`](../postgres/src/score.rs) | On a cache miss, SPI reads all non-null indexed column/expression values, tokenizes all documents, derives document frequencies, and scores every document. | Ranked queries incur corpus-wide work even if only a few documents match and only ten results are requested. |
-| [`score.rs`, `SCORE_CACHE`, `score_bound`](../postgres/src/score.rs) | One cached corpus per backend thread; key includes query, relation/index, transaction/command, and scoring options. Scores are keyed by full document text. | It does **not** rebuild for every score call with the same key. Alternating keys can evict each other; text ownership and hashing add memory/CPU costs. Cache hit behavior must be measured explicitly. |
-| [`am.rs`, `amcostestimate`](../postgres/src/am.rs) | Fixed 0.1 selectivity; estimated pages derived from tuples/512. | Estimates do not model term frequency or the actual all-page scan. Planner selection can obscure engine comparisons. |
+| [`am.rs`, `build_callback`, `aminsert`](../../postgres/src/am.rs) | Build counts tuples; insert persists no postings. | Index creation does not precompute document search data. Lead's index build time/size is not comparable to a functional search index. |
+| [`am.rs`, `amgetbitmap`](../../postgres/src/am.rs) | Reads heap block count and calls `tbm_add_page` for every block. Scan keys only determine whether the scan is active. | Even a nonexistent term offers no index pruning. A bitmap path nominates the entire heap for recheck. |
+| [`operator.rs`, `evaluate_text`](../../postgres/src/operator.rs) | Parses, subtokenizes, lowers, tokenizes the document, then evaluates on each invocation. | Query preparation repeats across rows; document analysis repeats across searches. |
+| [`runtime/eval.rs`, `TokenizedDoc`, `evaluate`](../../tinql/src/runtime/eval.rs) | Allocates token strings, position maps, and match intervals. | Boolean predicates pay for representations also useful to positional queries. Whether these allocations dominate needs profiling. |
+| [`score.rs`, `build_corpus`, `load_documents`](../../postgres/src/score.rs) | On a cache miss, SPI reads all non-null indexed column/expression values, tokenizes all documents, derives document frequencies, and scores every document. | Ranked queries incur corpus-wide work even if only a few documents match and only ten results are requested. |
+| [`score.rs`, `SCORE_CACHE`, `score_bound`](../../postgres/src/score.rs) | One cached corpus per backend thread; key includes query, relation/index, transaction/command, and scoring options. Scores are keyed by full document text. | It does **not** rebuild for every score call with the same key. Alternating keys can evict each other; text ownership and hashing add memory/CPU costs. Cache hit behavior must be measured explicitly. |
+| [`am.rs`, `amcostestimate`](../../postgres/src/am.rs) | Fixed 0.1 selectivity; estimated pages derived from tuples/512. | Estimates do not model term frequency or the actual all-page scan. Planner selection can obscure engine comparisons. |
 
 Let `N` be visible documents, `T` their total token count, and `Q` scoring terms. A full bitmap recheck performs document processing across the heap, plus repeated query preparation. A scoring cache miss adds roughly `O(T + Q*T)` token traversal and holds owned documents and tokens in memory during construction. These are structural estimates, not fitted timing models; expression evaluation, allocation, I/O, token lengths, query expansion, and cache behavior also matter. `LIMIT 10` does not bound this corpus construction.
 
-Existing tests explicitly check lossy heap scans, heap growth/TRUNCATE, expression and partial-index rechecks, unions, and update/delete visibility in [`postgres/src/lib.rs`](../postgres/src/lib.rs). They passed after the development environment was installed.
+Existing tests explicitly check lossy heap scans, heap growth/TRUNCATE, expression and partial-index rechecks, unions, and update/delete visibility in [`postgres/src/lib.rs`](../../postgres/src/lib.rs). They passed after the development environment was installed.
 
 ## What can be reused
 
@@ -46,7 +46,7 @@ cargo pgrx test pg18 --package tin --no-default-features --features pg18
 cargo pgrx package --package tin --no-default-features --features pg18 --release
 ```
 
-Check CLI options against the installed pinned pgrx before automating packaging. Install the resulting package in the isolated benchmark instance. Performance runs must use an optimized build; test builds alone are not a baseline. The optional private regression runner needs private TIN sources and excludes performance/recovery/lifecycle coverage according to [`private-regress.manifest`](../private-regress.manifest).
+Check CLI options against the installed pinned pgrx before automating packaging. Install the resulting package in the isolated benchmark instance. Performance runs must use an optimized build; test builds alone are not a baseline. The optional private regression runner needs private TIN sources and excludes performance/recovery/lifecycle coverage according to [`private-regress.manifest`](../../private-regress.manifest).
 
 First use a deterministic synthetic corpus at 10k, 100k, then 1m documents, increasing only after the smaller case is practical. Give every row `common filler`, every 100th row `rare`, and every 1,000th row `alpha beta`; vary document length in separate fixtures. At sizes divisible by 1,000, expected matches are:
 

@@ -357,7 +357,7 @@ mod tests {
         );
     }
 
-    /// Values observed from TIN 1.0.2 on the same documents (docs/tin-observed-shape.md).
+    /// Values observed from TIN 1.0.2 on the same documents (docs/archive/tin-observed-shape.md).
     #[pg_test]
     fn scoring_matches_tin_statistics_contract_bit_for_bit() {
         Spi::run(
@@ -452,7 +452,7 @@ mod tests {
         );
     }
 
-    /// Values observed from TIN 1.0.2 on the same documents (docs/tin-observed-shape.md).
+    /// Values observed from TIN 1.0.2 on the same documents (docs/archive/tin-observed-shape.md).
     #[pg_test]
     fn scoring_terms_expansions_not_and_max_match_tin() {
         Spi::run(

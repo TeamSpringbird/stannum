@@ -2,7 +2,7 @@
 
 > Historical research/design note. References to Lead describe the original project
 > or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
-> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+> and status are in [README](../../README.md) and [BENCHMARKS](../benchmarks/README.md).
 
 Researched 2026-09-17 against PlanetScale's live documentation and Lead source at
 `3fcf441ac7c3d183de179b1f846ceb0ef83e1358`. Documentation is not a pinned Tin release;
@@ -16,10 +16,10 @@ and account for the resources and maintenance costs of the second.
 ## Search semantics already present in Lead
 
 These defaults and ranges are verified in local
-[options.rs](../postgres/src/options.rs),
-[bm25.rs](../postgres/src/bm25.rs),
-[udfs.rs](../postgres/src/udfs.rs), and
-[tokenizer/spec.rs](../tokenizer/src/spec.rs).
+[options.rs](../../postgres/src/options.rs),
+[bm25.rs](../../postgres/src/bm25.rs),
+[udfs.rs](../../postgres/src/udfs.rs), and
+[tokenizer/spec.rs](../../tokenizer/src/spec.rs).
 
 | Index option | Default | Accepted values | Contract affected |
 | --- | --- | --- | --- |
@@ -38,7 +38,7 @@ Tin documents the same semantic settings. Scoring changes apply without rebuildi
 tokenizer changes require `REINDEX` for existing documents.
 [Tin index reference](https://planetscale.com/docs/postgres/search/reference/indexes).
 
-Lead's [score.rs](../postgres/src/score.rs) implements query overrides for `k1`, `b`,
+Lead's [score.rs](../../postgres/src/score.rs) implements query overrides for `k1`, `b`,
 `dense_ratio`, `term_add`, and `term_replace`; its default `dense_ratio` is `0.10`.
 These are not interchangeable performance switches. Tin omits terms reaching 10%
 document frequency from default scoring. Explicit boosts pin terms; added/replacement
@@ -70,7 +70,7 @@ other changes affect subsequent maintenance. Segment count bounds parallelism.
 
 Lead accepts `initial_segment_count` but explicitly ignores it, with default `1`
 and domain `1..1024`. It registers none of the other four storage options.
-The entire registration is in [options.rs](../postgres/src/options.rs).
+The entire registration is in [options.rs](../../postgres/src/options.rs).
 Do not describe unsupported settings as merely ignored, or reuse Tin DDL blindly.
 
 **Inference:** a useful engine needs separately measurable write buffering,
@@ -104,7 +104,7 @@ Numerical domains not published there remain unknown.
 
 Debug controls preserve results and force planner alternatives. Maintenance job
 scheduling rejects session `SET`; use server configuration. Lead registers no such
-GUCs in [_PG_init](../postgres/src/lib.rs).
+GUCs in [_PG_init](../../postgres/src/lib.rs).
 
 **Inference:** these switches suggest valuable future experiments: compare bounded
 ranking against exhaustive scoring; compare rare-term candidate generation against
@@ -125,7 +125,7 @@ state. Replica readers need `hot_standby_feedback`.
 
 Tin's scoring statistics include stored dead documents until segment reclamation
 or rebuild, even though returned rows obey visibility. Lead's
-[build_corpus](../postgres/src/score.rs) instead reads documents through SQL and
+[build_corpus](../../postgres/src/score.rs) instead reads documents through SQL and
 reconstructs statistics from that visible corpus. Cross-engine scores during churn
 therefore need not agree even when both correctly implement their own contracts.
 [Tin scoring visibility](https://planetscale.com/docs/postgres/search/scoring#visibility).
@@ -156,7 +156,7 @@ terms and weights. `tin.fsck(index, heapcheck => true)` adds heap/TID checks to 
 read-only structural check; it requires index ownership and does not repair data.
 [Tin functions reference](https://planetscale.com/docs/postgres/search/reference/functions).
 Lead implements tokenization and score inspection, but no `fsck` in the inspected
-[Postgres module tree](../postgres/src/lib.rs).
+[Postgres module tree](../../postgres/src/lib.rs).
 
 **Recommendation:** record sampled plans separately from timed traffic and make
 engine health observable before optimizing compaction. Our future equivalent

@@ -107,7 +107,7 @@ recorded and can affect results. Client CPU is outside the server budget.
 Install Docker with native ARM64 support, Python 3, and PostgreSQL 18 client tools.
 The Docker recipe builds Stannum and pins the comparator distribution/sources.
 Use an existing checksummed 100k corpus, or prepare one using `benchmarks/dataset.py`
-as described in [LOCAL.md](benchmarks/LOCAL.md). Corpus preparation currently also
+as described in [LOCAL.md](local.md). Corpus preparation currently also
 materializes a nested million-document sample; that does not authorize or launch
 a million-document evaluation. The series runner defaults to 100k only.
 
@@ -229,4 +229,4 @@ For five or more valid repetitions, reports retain median, range, dispersion, an
 a trimmed mean that removes one minimum and maximum **per metric**, never whole
 runs. Incomplete groups withhold aggregate comparisons. Do not pool transactions
 from different runs as independent experiments or average p99s into a workload p99.
-The harness reference is [benchmarks/README.md](benchmarks/README.md).
+The harness reference is [harness reference](harness.md).

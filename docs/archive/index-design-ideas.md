@@ -2,7 +2,7 @@
 
 > Historical research/design note. References to Lead describe the original project
 > or pre-rename fork; TIN refers to PlanetScale's extension. Current project names
-> and status are in [README](../README.md) and [BENCHMARKS](../BENCHMARKS.md).
+> and status are in [README](../../README.md) and [BENCHMARKS](../benchmarks/README.md).
 
 Written 2026-09-17 against `3fcf441` plus the uncommitted work on the
 `t3code/investigate-lead-search-performance` worktree (LDP1 postings, in-memory
@@ -426,7 +426,7 @@ The PostgreSQL side of sections 3 and 4 is implemented as format LDP2 in
 `postgres/src/storage/`: meta page with tokenizer spec and directory, chained
 write buffer of forward records folded into segment runs, dead lists and
 segment rewrites in VACUUM, and page reclamation through the pending list and
-the FSM. See [segmented-storage.md](segmented-storage.md). Scoring from
+the FSM. See [segmented-storage.md](../architecture/segmented-storage.md). Scoring from
 segment statistics (section 4.4) is implemented with TIN's dead-inclusive
 contract. The custom scan (section 8) exists with count pushdown and top-k ordering,
 and it binds the query to the index's tokenizer, which covers most of

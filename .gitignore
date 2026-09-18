@@ -7,3 +7,17 @@
 .DS_Store
 /benchmarks/results/
 /benchmarks/__pycache__/
+
+# Local credentials and connection configuration. Commit sanitized examples only.
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+.pgpass
+.pg_service.conf
+
+# Generated documentation and Python caches.
+**/__pycache__/
+/docs/query-language/book/
+/artifacts/
