@@ -864,16 +864,15 @@ pub(super) unsafe fn referenced_pages(
     already: Option<&Meta>,
 ) -> Result<Vec<bool>, String> {
     let mut referenced = vec![false; nblocks as usize];
-    let mut mark = |block: u32, owner: &str| -> Result<(), String> {
-        if block >= nblocks {
-            return Err(format!(
-                "{owner} references page {block} beyond the end of the index"
-            ));
+    // Pages past `nblocks` were extended after the caller's capture and are
+    // no candidates for anything; the checker reports references beyond the
+    // actual end of the index.
+    let mut mark = |block: u32| {
+        if block < nblocks {
+            referenced[block as usize] = true;
         }
-        referenced[block as usize] = true;
-        Ok(())
     };
-    mark(0, "meta page")?;
+    mark(0);
     let whole = |run: Run, owner: &str| -> Result<(Vec<u32>, Vec<u8>), String> {
         let mut bytes = Vec::with_capacity(run.bytes as usize);
         let mut pages = Vec::with_capacity(run.blocks as usize);
@@ -911,7 +910,7 @@ pub(super) unsafe fn referenced_pages(
         }
         let (pages, bytes) = whole(entry.map, &format!("{label} page table"))?;
         for block in pages {
-            mark(block, &label)?;
+            mark(block);
         }
         let table = decode_page_table(&bytes);
         if table.len() != entry.run.blocks as usize {
@@ -922,12 +921,12 @@ pub(super) unsafe fn referenced_pages(
             ));
         }
         for block in table {
-            mark(block, &label)?;
+            mark(block);
         }
         if !entry.dead.is_empty() {
             let (pages, _) = whole(entry.dead, &format!("{label} dead list"))?;
             for block in pages {
-                mark(block, &label)?;
+                mark(block);
             }
         }
     }
@@ -938,7 +937,7 @@ pub(super) unsafe fn referenced_pages(
         ));
     }
     for block in pages {
-        mark(block, "write buffer")?;
+        mark(block);
     }
     for pending in &meta.pending {
         if already.is_some_and(|earlier| earlier.pending.contains(pending)) {
@@ -947,7 +946,7 @@ pub(super) unsafe fn referenced_pages(
         let (pages, _) =
             unsafe { chain_pages(index, pending.run.first, pending.run.blocks, KIND_RUN) };
         for block in pages {
-            mark(block, "pending list")?;
+            mark(block);
         }
     }
     Ok(referenced)
