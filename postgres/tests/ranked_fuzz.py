@@ -429,8 +429,10 @@ class Fuzzer:
             return [update_hot(chosen)] if chosen else []
         if kind == 'vacuum':
             self.stats['vacuums'] += 1
+            # No FREEZE: an aggressive vacuum waits for a cleanup lock on a
+            # page an open cursor keeps pinned, behind a reader the scheduler
+            # is itself waiting on.
             return [rng.choice(['VACUUM (INDEX_CLEANUP ON) docs', 'VACUUM docs',
-                                'VACUUM (INDEX_CLEANUP ON, FREEZE) docs',
                                 'VACUUM (INDEX_CLEANUP ON) docs; VACUUM (INDEX_CLEANUP ON) docs'])]
         if kind == 'gucs':
             return [self.writer_gucs()]
@@ -784,8 +786,10 @@ class Fuzzer:
                     failure = self.episode(reader)
                 finally:
                     try:
+                        if reader.pending is not None:
+                            reader.wait(timeout=30)
                         reader.run(['COMMIT'], allow=('WARNING',))
-                    except FuzzFailure:
+                    except (FuzzFailure, AssertionError):
                         pass
                 if failure is None and args.stop_at and episode >= args.stop_at:
                     break
