@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [foreground write probe](foreground-writes.md) attributes insert latency to
+buffer appends, folds, and merges, establishing the next optimization baseline.
+
 The [streaming search report](streaming-search.md) covers unordered search,
 LIMIT consumption, cursor lifetime checks, and paired full-traversal benchmarks.
 
