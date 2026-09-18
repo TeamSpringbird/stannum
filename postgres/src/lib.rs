@@ -11,6 +11,7 @@ mod match_positions;
 mod operator;
 pub(crate) mod options;
 mod score;
+mod selectivity;
 mod storage;
 mod tf_bucket {
     pub(crate) use segment::tf_bucket::*;
@@ -1297,5 +1298,207 @@ mod tests {
         .unwrap();
         assert!(ansi.contains("\x1b["));
         assert!(ansi.contains("Beer"));
+    }
+
+    /// A corpus with known term frequencies: 4000 rows where `seven` and
+    /// `five` are independent (every 7th and 5th row), `needle` is rare,
+    /// `alpha beta` is a phrase on every 100th row and `beta` alone on
+    /// another 40 rows. Returns nothing; the table is `est`.
+    fn known_frequency_fixture() {
+        Spi::run(
+            "CREATE TABLE est(id int primary key, body text);
+             INSERT INTO est SELECT n, 'every '
+               || CASE WHEN n % 7 = 0 THEN 'seven ' ELSE '' END
+               || CASE WHEN n % 5 = 0 THEN 'five ' ELSE '' END
+               || CASE WHEN n % 400 = 0 THEN 'needle ' ELSE '' END
+               || CASE WHEN n % 100 = 0 THEN 'alpha beta ' WHEN n % 100 = 50 THEN 'beta ' ELSE '' END
+               || 'filler w' || (n % 13)
+               FROM generate_series(1, 4000) n;
+             CREATE INDEX est_idx ON est USING stannum(body);
+             ANALYZE est;",
+        )
+        .unwrap();
+    }
+
+    fn plan_of(sql: &str) -> Json {
+        Spi::get_one::<Json>(&format!("EXPLAIN (FORMAT JSON) {sql}"))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn true_count(query: &str) -> f64 {
+        Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM est WHERE body ==> '{query}'"
+        ))
+        .unwrap()
+        .unwrap() as f64
+    }
+
+    #[pg_test]
+    fn planner_row_estimates_follow_index_statistics() {
+        known_frequency_fixture();
+        // (query, true count, allowed factor either way). Boolean shapes use
+        // independence, which the fixture satisfies; a phrase is bounded by
+        // its rarest term with a discount, so it is allowed a factor of 2.5.
+        let cases = [
+            ("needle", 10.0, 1.5),
+            ("every", 4000.0, 1.5),
+            ("seven", 571.0, 1.5),
+            ("seven AND five", 114.0, 1.5),
+            ("seven five", 114.0, 1.5),
+            ("seven OR five", 1257.0, 1.5),
+            ("every AND NOT seven", 3429.0, 1.5),
+            ("\"alpha beta\"", 40.0, 2.5),
+            ("seven AND needle", 1.0, 2.0),
+            ("need*", 10.0, 1.5),
+            ("needle OR missing", 10.0, 1.5),
+            ("AT LEAST 2 OF [seven five needle]", 123.0, 1.5),
+        ];
+        for custom in [true, false] {
+            Spi::run(&format!("SET LOCAL stannum.enable_custom_scan = {custom}")).unwrap();
+            for (query, expected, factor) in cases {
+                assert_eq!(true_count(query), expected, "{query}: fixture");
+                let plan = plan_of(&format!("SELECT * FROM est WHERE body ==> '{query}'")).0;
+                let rows = plan[0]["Plan"]["Plan Rows"].as_f64().unwrap();
+                assert!(
+                    rows <= expected * factor && rows >= expected / factor,
+                    "{query}: estimated {rows} rows, true {expected} (custom scan {custom})"
+                );
+            }
+        }
+        // The bitmap path prices itself from the same estimate: a rare
+        // query costs far less than a common one.
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off; SET LOCAL enable_seqscan = off")
+            .unwrap();
+        let rare = plan_of("SELECT * FROM est WHERE body ==> 'needle'").0;
+        let common = plan_of("SELECT * FROM est WHERE body ==> 'every'").0;
+        assert_eq!(rare[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
+        let rare_cost = rare[0]["Plan"]["Total Cost"].as_f64().unwrap();
+        let common_cost = common[0]["Plan"]["Total Cost"].as_f64().unwrap();
+        assert!(
+            rare_cost * 2.0 < common_cost,
+            "{rare_cost} vs {common_cost}"
+        );
+        // Unreadable at plan time: a query the index tokenizer rejects still
+        // plans (the executor reports the error), with the fallback estimate.
+        let plan = plan_of("SELECT * FROM est WHERE body ==> 'needle OR'").0;
+        assert_eq!(plan[0]["Plan"]["Plan Rows"], 400);
+        Spi::run("SET LOCAL enable_seqscan = on").unwrap();
+        // A table with no stannum index keeps the fallback too.
+        Spi::run("CREATE TABLE unindexed AS SELECT * FROM est; ANALYZE unindexed").unwrap();
+        let plan = plan_of("SELECT * FROM unindexed WHERE body ==> 'needle'").0;
+        assert_eq!(plan[0]["Plan"]["Plan Rows"], 400);
+    }
+
+    #[pg_test]
+    fn selective_queries_use_the_index_and_common_ones_scan_the_heap() {
+        known_frequency_fixture();
+        let rare = plan_of("SELECT * FROM est WHERE body ==> 'needle'").0;
+        assert_eq!(
+            rare[0]["Plan"]["Custom Plan Provider"], "Stannum Text Search Scan",
+            "{rare}"
+        );
+        let count = plan_of("SELECT count(*) FROM est WHERE body ==> 'needle'").0;
+        assert_eq!(
+            count[0]["Plan"]["Custom Plan Provider"], "Stannum Count",
+            "{count}"
+        );
+        let everything = plan_of("SELECT * FROM est WHERE body ==> 'every'").0;
+        assert_eq!(
+            everything[0]["Plan"]["Node Type"], "Seq Scan",
+            "{everything}"
+        );
+        // The estimate follows the index as it grows: the write buffer counts.
+        Spi::run("INSERT INTO est SELECT n, 'needle fresh' FROM generate_series(4001, 4400) n")
+            .unwrap();
+        let grown = plan_of("SELECT * FROM est WHERE body ==> 'needle'").0;
+        let rows = grown[0]["Plan"]["Plan Rows"].as_f64().unwrap();
+        assert!((300.0..=500.0).contains(&rows), "{rows}");
+    }
+
+    #[pg_test]
+    fn rare_predicate_drives_a_nested_loop_join() {
+        known_frequency_fixture();
+        Spi::run(
+            "CREATE TABLE big(id int primary key, payload text);
+             INSERT INTO big SELECT n, 'row ' || n FROM generate_series(1, 60000) n;
+             ANALYZE big;",
+        )
+        .unwrap();
+        let sql = "SELECT b.payload FROM est d JOIN big b ON b.id = d.id WHERE d.body ==> 'needle'";
+        let plan = plan_of(sql).0;
+        let join = &plan[0]["Plan"];
+        assert_eq!(join["Node Type"], "Nested Loop", "{plan}");
+        assert_eq!(
+            join["Plans"][0]["Custom Plan Provider"], "Stannum Text Search Scan",
+            "{plan}"
+        );
+        assert!(
+            join["Plans"][1]["Node Type"]
+                .as_str()
+                .unwrap()
+                .contains("Index"),
+            "{plan}"
+        );
+        assert_eq!(
+            Spi::get_one::<i64>(&format!("SELECT count(*) FROM ({sql}) t")).unwrap(),
+            Some(10)
+        );
+    }
+
+    #[pg_test]
+    fn plans_stay_correct_when_the_estimate_is_wrong() {
+        known_frequency_fixture();
+        Spi::run(
+            "CREATE TABLE big(id int primary key, payload text);
+             INSERT INTO big SELECT n, 'row ' || n FROM generate_series(1, 20000) n;
+             ANALYZE big;
+             -- Dead rows: the index still counts them, the heap no longer has them
+             -- (nine of the forty 'alpha beta' rows are multiples of 400 too).
+             DELETE FROM est WHERE id % 400 = 0 AND id <> 400;",
+        )
+        .unwrap();
+        // Overestimated (needle: 10 indexed, 1 live), underestimated
+        // (alpha AND beta always co-occur; independence says 1 row, 31 live), and a
+        // phrase that never occurs in that order (estimate 20, truth 0).
+        let queries = [
+            "needle",
+            "alpha AND beta",
+            "\"beta alpha\"",
+            "beta OR needle",
+        ];
+        for query in queries {
+            let sql = format!(
+                "SELECT d.id FROM est d JOIN big b ON b.id = d.id WHERE d.body ==> '{query}' ORDER BY d.id"
+            );
+            let planned = Spi::connect(|client| {
+                client
+                    .select(&sql, None, &[])
+                    .unwrap()
+                    .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            Spi::run(
+                "SET LOCAL stannum.enable_custom_scan = off; SET LOCAL enable_bitmapscan = off;
+                 SET LOCAL enable_indexscan = off",
+            )
+            .unwrap();
+            let reference = Spi::connect(|client| {
+                client
+                    .select(&sql, None, &[])
+                    .unwrap()
+                    .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            Spi::run(
+                "SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_bitmapscan = on;
+                 SET LOCAL enable_indexscan = on",
+            )
+            .unwrap();
+            assert_eq!(planned, reference, "{query}");
+        }
+        assert_eq!(true_count("needle"), 1.0);
+        assert_eq!(true_count("alpha AND beta"), 31.0);
+        assert_eq!(true_count("\"beta alpha\""), 0.0);
     }
 }

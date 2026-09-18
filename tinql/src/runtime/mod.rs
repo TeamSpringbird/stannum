@@ -5,6 +5,7 @@
 
 pub mod capability;
 mod display;
+pub mod estimate;
 pub mod eval;
 pub mod lower;
 pub mod plan;

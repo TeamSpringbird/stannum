@@ -124,6 +124,7 @@ unsafe extern "C-unwind" fn executor_start_hook(
     eflags: std::ffi::c_int,
 ) {
     crate::score::note_executor_start();
+    crate::selectivity::note_executor_start();
     unsafe {
         match PREVIOUS_EXECUTOR_START {
             Some(previous) => previous(query_desc, eflags),
@@ -172,7 +173,8 @@ struct Ordering {
     top_k: Option<usize>,
 }
 
-unsafe fn const_text(node: *mut pg_sys::Node) -> Option<String> {
+/// The text of a non-null `Const` node.
+pub(crate) unsafe fn const_text(node: *mut pg_sys::Node) -> Option<String> {
     unsafe {
         if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_Const {
             return None;
@@ -493,19 +495,52 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
         path.path.pathtarget = (*rel).reltarget;
         path.path.param_info = std::ptr::null_mut();
         path.path.parallel_aware = false;
-        path.path.parallel_safe = false;
+        // An unordered scan keeps no state outside its own process, so a
+        // worker may run it (as a join's inner side). An ordered scan
+        // publishes scorer state to the score calls of its own backend.
+        path.path.parallel_safe = (*rel).consider_parallel && private.ordering.is_none();
         path.path.parallel_workers = 0;
+        // The relation's row estimate already reflects the clause's
+        // selectivity through the operator's restriction function; the same
+        // estimate prices the index read and the heap fetches.
         path.path.rows = (*rel).rows.max(1.0);
-        // A little cheaper than the bitmap path for the same rows, plus a
-        // per-row fetch; sorted output costs a sort of the candidates.
-        let rows = path.path.rows;
-        path.path.startup_cost = 1.0;
-        path.path.total_cost = 1.0 + rows * (pg_sys::cpu_tuple_cost + pg_sys::cpu_index_tuple_cost);
-        if private.ordering.is_some() {
-            path.path.startup_cost += rows * pg_sys::cpu_operator_cost * 2.0;
-            path.path.total_cost += rows * pg_sys::cpu_operator_cost * 2.0;
+        let estimate = crate::selectivity::estimate_query(found.index_oid, &found.query)
+            .unwrap_or(crate::selectivity::FALLBACK);
+        let index = crate::selectivity::index_cost(
+            root,
+            found.index_oid,
+            (*rel).reltablespace,
+            &estimate,
+            (*rel).tuples,
+            1.0,
+            1,
+        );
+        let (heap_pages, cost_per_page) =
+            crate::selectivity::heap_fetch(&index, f64::from((*rel).pages));
+        // Each candidate is fetched by TID and passes the remaining quals; an
+        // exact plan skips re-evaluating ==> itself, unlike the bitmap path.
+        let saved = if estimate.exact {
+            pg_sys::cpu_operator_cost
+        } else {
+            0.0
+        };
+        let per_tuple =
+            pg_sys::cpu_tuple_cost + ((*rel).baserestrictcost.per_tuple - saved).max(0.0);
+        // Candidates are gathered before the first row is returned.
+        let mut startup = index.total + (*rel).baserestrictcost.startup;
+        if let Some(ordering) = &private.ordering {
+            // Scoring every candidate, then ordering the ones the query
+            // consumes (or all of them).
+            let sorted = ordering
+                .top_k
+                .map_or(index.candidates, |k| (k as f64).min(index.candidates))
+                .max(2.0);
+            startup += index.candidates * pg_sys::cpu_operator_cost * 2.0
+                + index.candidates * sorted.log2() * pg_sys::cpu_operator_cost;
             path.path.pathkeys = (*root).sort_pathkeys;
         }
+        path.path.startup_cost = startup;
+        path.path.total_cost = startup + heap_pages * cost_per_page + index.candidates * per_tuple;
         path.flags = 0;
         path.custom_paths = std::ptr::null_mut();
         path.custom_restrictinfo = std::ptr::null_mut();
@@ -626,10 +661,36 @@ unsafe extern "C-unwind" fn upper_paths_hook(
         path.path.parent = output_rel;
         path.path.pathtarget = (*output_rel).reltarget;
         path.path.param_info = std::ptr::null_mut();
-        path.path.parallel_safe = false;
+        path.path.parallel_safe = (*output_rel).consider_parallel;
         path.path.rows = 1.0;
-        let candidates = (*input_rel).rows.max(1.0);
-        path.path.startup_cost = 1.0 + candidates * pg_sys::cpu_index_tuple_cost;
+        let estimate = crate::selectivity::estimate_query(found.index_oid, &found.query)
+            .unwrap_or(crate::selectivity::FALLBACK);
+        let index = crate::selectivity::index_cost(
+            root,
+            found.index_oid,
+            (*input_rel).reltablespace,
+            &estimate,
+            (*input_rel).tuples,
+            1.0,
+            1,
+        );
+        let (heap_pages, cost_per_page) =
+            crate::selectivity::heap_fetch(&index, f64::from((*input_rel).pages));
+        // Candidates on all-visible pages are counted without a heap fetch;
+        // an inexact plan fetches and rechecks every candidate.
+        let fetched_pages = if estimate.exact {
+            heap_pages * (1.0 - (*input_rel).allvisfrac.clamp(0.0, 1.0))
+        } else {
+            heap_pages
+        };
+        let recheck = if estimate.exact {
+            0.0
+        } else {
+            (*input_rel).baserestrictcost.per_tuple
+        };
+        path.path.startup_cost = index.total
+            + fetched_pages * cost_per_page
+            + index.candidates * (pg_sys::cpu_operator_cost + recheck);
         path.path.total_cost = path.path.startup_cost + pg_sys::cpu_tuple_cost;
         path.flags = 0;
         path.custom_private = private.to_list(found.clause);

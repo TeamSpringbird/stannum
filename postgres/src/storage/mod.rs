@@ -1489,6 +1489,38 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
     }
 }
 
+/// Identifies the contents of an index for planner memoization: a fold, a
+/// merge, a rebuild or any write to the buffer changes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    identity: u64,
+    buffer_version: u32,
+    buffer_epoch: u32,
+    next_generation: u32,
+}
+
+/// The stamp of the index with this OID, or `None` when it has no LDP2
+/// storage to read.
+///
+/// # Safety
+/// `index_oid` names an index relation that the caller may open.
+pub unsafe fn stamp(index_oid: pg_sys::Oid) -> Option<Stamp> {
+    unsafe {
+        let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
+        let index = relation.as_ptr();
+        if !present(index) {
+            return None;
+        }
+        let (_, meta) = read_meta(index, false);
+        Some(Stamp {
+            identity: meta.identity,
+            buffer_version: meta.buffer.version,
+            buffer_epoch: meta.buffer.epoch,
+            next_generation: meta.next_generation,
+        })
+    }
+}
+
 /// Segment and buffer document counts from the directory, for statistics.
 ///
 /// # Safety
