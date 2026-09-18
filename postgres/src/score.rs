@@ -7,14 +7,18 @@ use pgrx::{
     FromDatum, Internal, IntoDatum, PgList, PgRelation, Spi, default, name, pg_extern, pg_guard,
     pg_sys,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use segment::Tid;
 use segment::index::{Expanded, Index, Window};
-use segment::postings::Postings;
+use segment::payload::PayloadCursor;
+use segment::postings::{BlockBound, Postings, PostingsCursor};
+use segment::segment::Lengths;
 use segment::set::Cursor as _;
 use segment::tf_bucket::TfBucket;
+use segment::tid::MAX_OFFSET;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, BinaryHeap};
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::plan::{Limits, plan};
 use tinql::runtime::{
@@ -326,6 +330,544 @@ impl IndexScorer {
             return total;
         }
         0.0
+    }
+}
+
+/// Output order of a ranked scan: descending score, then heap order, so ties
+/// are stable.
+pub(crate) fn rank(a: &(f32, Tid), b: &(f32, Tid)) -> Ordering {
+    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
+}
+
+/// Most rows a scan prunes for. Beyond this the heap bookkeeping outweighs
+/// the scoring it saves, and the scan scores every candidate instead.
+pub(crate) const PRUNE_MAX_K: usize = 4096;
+
+/// The best rows of a pruned ranked scan.
+pub(crate) struct TopK {
+    /// In output order; fewer than `k` only when the query matched fewer.
+    pub(crate) rows: Vec<(f32, Tid)>,
+    /// Candidates whose score was computed.
+    pub(crate) scored: usize,
+    /// True when `rows` holds every candidate: the threshold never formed,
+    /// so nothing was skipped.
+    pub(crate) complete: bool,
+}
+
+/// How a query's leaf terms combine into its candidate set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Combine {
+    /// Every term must be present: a conjunction.
+    All,
+    /// Any term suffices: a disjunction or a single term.
+    Any,
+}
+
+/// A query the scan can prune: a flat conjunction or disjunction of terms
+/// (a single term included), each optionally boosted, with the terms in
+/// lexical order and deduplicated.
+fn prunable_shape(query: &Query) -> Option<(Combine, Vec<&str>)> {
+    fn unboost(query: &Query) -> &Query {
+        match query {
+            Query::Boost { inner, .. } => unboost(inner),
+            other => other,
+        }
+    }
+    fn leaves<'q>(children: impl IntoIterator<Item = &'q Query>) -> Option<Vec<&'q str>> {
+        children
+            .into_iter()
+            .map(|child| match unboost(child) {
+                Query::Term(term) => Some(term.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+    let (combine, mut terms) = match unboost(query) {
+        Query::Term(term) => (Combine::Any, vec![term.as_str()]),
+        Query::And(left, right) => (Combine::All, leaves([&**left, &**right])?),
+        Query::Conjunction(children) => (Combine::All, leaves(children)?),
+        Query::Or(left, right) => (Combine::Any, leaves([&**left, &**right])?),
+        Query::Disjunction { min: 1, children } => (Combine::Any, leaves(children)?),
+        _ => return None,
+    };
+    terms.sort_unstable();
+    terms.dedup();
+    Some((combine, terms))
+}
+
+/// A heap entry ordered so the worst-ranked row is the greatest.
+struct Ranked(f32, Tid);
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Ranked {}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> Ordering {
+        rank(&(self.0, self.1), &(other.0, other.1))
+    }
+}
+
+/// One scoring term's cursors in one source, for the pruned scan.
+struct TermCursor<'a> {
+    /// Index into the scorer's lexically ordered terms.
+    slot: usize,
+    postings: PostingsCursor<'a>,
+    payload: PayloadCursor<'a>,
+    /// Postings in this source; the rarest term drives a conjunction.
+    count: u32,
+    /// Upper bound on the term's contribution anywhere in the source.
+    term_max: f32,
+    /// The block last asked about and its bound.
+    cached: Option<(BlockBound, f32)>,
+    /// The exact contribution to the document being scored, once decoded.
+    exact: Option<f32>,
+}
+
+impl TermCursor<'_> {
+    fn current(&self) -> Option<Tid> {
+        self.postings.current()
+    }
+
+    /// Bound and last posting of the block holding the first posting at or
+    /// after `target` (see [`PostingsCursor::bound_at`]).
+    fn bound_at(&mut self, target: Tid, scorer: &TermScorer) -> Option<(f32, Tid)> {
+        let block = segment_error(self.postings.bound_at(target))?;
+        if let Some((cached, bound)) = &self.cached
+            && cached.last == block.last
+        {
+            return Some((*bound, cached.last));
+        }
+        let bound = scorer.bound(&block);
+        self.cached = Some((block, bound));
+        Some((bound, block.last))
+    }
+
+    /// The bound on the current posting's contribution given its document's
+    /// length, from the block last asked about, which holds it.
+    fn bound_for_length(&self, length: u32, scorer: &TermScorer) -> f32 {
+        let (block, _) = self.cached.as_ref().expect("bound computed before scoring");
+        scorer.bound_for_length(block, length)
+    }
+
+    /// Term-frequency bucket of the current posting.
+    fn bucket(&mut self) -> TfBucket {
+        segment_error(self.payload.seek(self.postings.ordinal()));
+        let bucket = segment_error(self.payload.next_bucket());
+        TfBucket::new(bucket).unwrap_or_else(|| {
+            pgrx::error!("Stannum index data: term-frequency bucket; REINDEX required")
+        })
+    }
+}
+
+/// Sums `f(cursor)` in the scorer's term order, as the score itself is
+/// folded, so rounding cannot put a sum of bounds below a score it covers.
+fn fold(cursors: &[TermCursor<'_>], f: impl Fn(&TermCursor<'_>) -> Option<f32>) -> f32 {
+    let mut total = 0.0_f32;
+    for cursor in cursors {
+        if let Some(value) = f(cursor) {
+            total += value;
+        }
+    }
+    total
+}
+
+/// One source being walked by the pruned scan.
+struct Walk<'a, 's> {
+    scorer: &'s IndexScorer,
+    /// In slot order.
+    cursors: Vec<TermCursor<'a>>,
+    documents: PostingsCursor<'a>,
+    lengths: Lengths<'a>,
+    dead: &'s BTreeSet<Tid>,
+    k: usize,
+    heap: &'s mut BinaryHeap<Ranked>,
+    scored: &'s mut usize,
+    iterations: u32,
+}
+
+impl Walk<'_, '_> {
+    fn tick(&mut self) {
+        self.iterations = self.iterations.wrapping_add(1);
+        if self.iterations.is_multiple_of(1024) {
+            pgrx::check_for_interrupts!();
+        }
+    }
+
+    /// The k-th best row so far, once there are k.
+    fn threshold(&self) -> Option<(f32, Tid)> {
+        if self.heap.len() == self.k {
+            self.heap.peek().map(|w| (w.0, w.1))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a document at `tid` scoring at most `bound` could enter the
+    /// top k: it must beat the k-th row's score, or tie it from an earlier
+    /// location.
+    fn can_beat(&self, bound: f32, tid: Tid) -> bool {
+        self.threshold().is_none_or(|(threshold, holder)| {
+            bound > threshold || (bound == threshold && tid < holder)
+        })
+    }
+
+    fn bound_at(&mut self, i: usize, target: Tid) -> Option<(f32, Tid)> {
+        let scorer = &self.scorer.terms[self.cursors[i].slot].1;
+        self.cursors[i].bound_at(target, scorer)
+    }
+
+    /// Scores the document at `pivot`, held by every cursor positioned on
+    /// it, exactly as the unpruned path does: the sum in term order of each
+    /// present term's contribution. Once the document's length is known,
+    /// each term's contribution is bounded over its block's buckets at that
+    /// length; the document is abandoned when those bounds cannot enter the
+    /// top k, and again after each term is decoded (rarest first) if its
+    /// exact contributions so far plus the remaining bounds cannot.
+    fn score(&mut self, pivot: Tid) {
+        if self.dead.contains(&pivot) {
+            return;
+        }
+        let Some(ordinal) = segment_error(self.documents.rank(pivot)) else {
+            pgrx::error!("Stannum index data: document missing from table; REINDEX required")
+        };
+        let length = segment_error(self.lengths.get(ordinal));
+        let mut pending: Vec<usize> = (0..self.cursors.len())
+            .filter(|&i| self.cursors[i].current() == Some(pivot))
+            .collect();
+        pending.sort_by_key(|&i| self.cursors[i].count);
+        let present = |cursor: &TermCursor<'_>| cursor.current() == Some(pivot);
+        let pruning = self.threshold().is_some();
+        for cursor in &mut self.cursors {
+            cursor.exact = None;
+        }
+        if pruning {
+            let scorer = self.scorer;
+            for &i in &pending {
+                let cursor = &mut self.cursors[i];
+                cursor.exact = Some(cursor.bound_for_length(length, &scorer.terms[cursor.slot].1));
+            }
+            let optimistic = fold(&self.cursors, |c| present(c).then_some(c.exact).flatten());
+            if !self.can_beat(optimistic, pivot) {
+                return;
+            }
+        }
+        for (n, &i) in pending.iter().enumerate() {
+            let bucket = self.cursors[i].bucket();
+            let scorer = &self.scorer.terms[self.cursors[i].slot].1;
+            self.cursors[i].exact = Some(scorer.score_bucket(bucket, length));
+            if n + 1 < pending.len() && pruning {
+                let optimistic = fold(&self.cursors, |c| present(c).then_some(c.exact).flatten());
+                if !self.can_beat(optimistic, pivot) {
+                    return;
+                }
+            }
+        }
+        let total = fold(&self.cursors, |c| {
+            present(c).then(|| c.exact.expect("every present term was decoded"))
+        });
+        *self.scored += 1;
+        let candidate = Ranked(total, pivot);
+        if self.heap.len() < self.k {
+            self.heap.push(candidate);
+        } else if self.heap.peek().is_some_and(|w| candidate < *w) {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    /// A disjunction: block-max WAND. Cursors are kept in location order;
+    /// the pivot is the first location at which the terms up to it could
+    /// together reach the threshold, and the block bounds at the pivot
+    /// decide whether to score it, skip to the end of the nearest block, or
+    /// align the cursors behind it.
+    fn any(&mut self) {
+        let mut order: Vec<usize> = (0..self.cursors.len()).collect();
+        loop {
+            self.tick();
+            order.retain(|&i| self.cursors[i].current().is_some());
+            if order.is_empty() {
+                return;
+            }
+            order.sort_by_key(|&i| self.cursors[i].current());
+            let threshold = self.threshold();
+            let mut p = None;
+            for cursor in &mut self.cursors {
+                cursor.exact = None;
+            }
+            for (j, &i) in order.iter().enumerate() {
+                self.cursors[i].exact = Some(self.cursors[i].term_max);
+                let reach = fold(&self.cursors, |c| c.exact);
+                if threshold.is_none_or(|(threshold, _)| reach >= threshold) {
+                    p = Some(j);
+                    break;
+                }
+            }
+            let Some(mut p) = p else {
+                // Even all remaining terms together cannot reach the
+                // threshold: nothing left in this source can enter.
+                return;
+            };
+            let pivot = self.cursors[order[p]]
+                .current()
+                .expect("retained cursors are positioned");
+            while p + 1 < order.len() && self.cursors[order[p + 1]].current() == Some(pivot) {
+                p += 1;
+            }
+            // The block-level bound over the range starting at the pivot.
+            for cursor in &mut self.cursors {
+                cursor.exact = None;
+            }
+            let mut boundary: Option<Tid> = None;
+            for &i in &order[..=p] {
+                if let Some((bound, last)) = self.bound_at(i, pivot) {
+                    self.cursors[i].exact = Some(bound);
+                    boundary = Some(boundary.map_or(last, |b| b.min(last)));
+                }
+            }
+            let bound = fold(&self.cursors, |c| c.exact);
+            if !self.can_beat(bound, pivot) {
+                // Nothing in [pivot, next) can enter the top k: move every
+                // cursor of the range past it.
+                let mut next = successor(boundary.expect("the pivot's own block bounds it"));
+                if let Some(&after) = order.get(p + 1) {
+                    next = next.min(self.cursors[after].current().expect("positioned"));
+                }
+                for &i in &order[..=p] {
+                    if self.cursors[i]
+                        .current()
+                        .is_some_and(|current| current < next)
+                    {
+                        segment_error(self.cursors[i].postings.seek(next));
+                    }
+                }
+                continue;
+            }
+            if self.cursors[order[0]].current() != Some(pivot) {
+                // Align the cursors behind the pivot on it.
+                for &i in &order[..p] {
+                    if self.cursors[i]
+                        .current()
+                        .is_some_and(|current| current < pivot)
+                    {
+                        segment_error(self.cursors[i].postings.seek(pivot));
+                    }
+                }
+                continue;
+            }
+            self.score(pivot);
+            for cursor in &mut self.cursors {
+                if cursor.current() == Some(pivot) {
+                    segment_error(cursor.postings.advance());
+                }
+            }
+        }
+    }
+
+    /// A conjunction: the rarest term leads and the others seek to it, as
+    /// an intersection does. At each common location the block bounds of
+    /// all terms decide whether to score it or to move the lead past the
+    /// nearest block end.
+    fn all(&mut self) {
+        let lead = (0..self.cursors.len())
+            .min_by_key(|&i| self.cursors[i].count)
+            .expect("a conjunction has terms");
+        let others: Vec<usize> = (0..self.cursors.len()).filter(|&i| i != lead).collect();
+        loop {
+            self.tick();
+            let Some(mut pivot) = self.cursors[lead].current() else {
+                return;
+            };
+            let mut aligned = true;
+            for &i in &others {
+                segment_error(self.cursors[i].postings.seek(pivot));
+                match self.cursors[i].current() {
+                    None => return,
+                    Some(found) if found > pivot => {
+                        pivot = found;
+                        aligned = false;
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+            if !aligned {
+                segment_error(self.cursors[lead].postings.seek(pivot));
+                continue;
+            }
+            let mut boundary: Option<Tid> = None;
+            for i in 0..self.cursors.len() {
+                let (_, last) = self
+                    .bound_at(i, pivot)
+                    .expect("a cursor at the pivot has a block");
+                boundary = Some(boundary.map_or(last, |b| b.min(last)));
+            }
+            let bound = fold(&self.cursors, |c| c.cached.map(|(_, bound)| bound));
+            if !self.can_beat(bound, pivot) {
+                let next = successor(boundary.expect("every cursor bounds the pivot"));
+                segment_error(self.cursors[lead].postings.seek(next));
+                continue;
+            }
+            self.score(pivot);
+            segment_error(self.cursors[lead].postings.advance());
+        }
+    }
+}
+
+/// The location just after `tid`.
+fn successor(tid: Tid) -> Tid {
+    if tid.offset < MAX_OFFSET {
+        Tid {
+            block: tid.block,
+            offset: tid.offset + 1,
+        }
+    } else {
+        Tid {
+            block: tid.block.saturating_add(1),
+            offset: 1,
+        }
+    }
+}
+
+impl IndexScorer {
+    /// The `k` best candidates of the scan's query in output order, found
+    /// with block-max pruning: the sources are walked in tuple order with
+    /// one cursor per scoring term, the `k`-th best score so far is the
+    /// threshold, and runs of postings whose block bounds cannot reach it
+    /// are skipped without decoding. Bit-identical to scoring every
+    /// candidate and sorting, including tie order.
+    ///
+    /// `None` when the query is not a flat conjunction or disjunction of
+    /// exactly the scoring terms, or a source carries no block bounds; the
+    /// caller then scores every candidate.
+    pub(crate) fn top_k(&self, k: usize) -> Option<TopK> {
+        let (combine, leaves) = prunable_shape(&self.query)?;
+        // Every scoring term must be a leaf (no added terms), and a leaf that
+        // is not a scoring term must be absent from the index altogether: it
+        // then adds nothing to a disjunction and empties a conjunction. A
+        // present leaf without a scorer (an elided dense term) would give
+        // its documents a score of zero, which this walk cannot bound.
+        if self
+            .terms
+            .iter()
+            .any(|(term, _)| leaves.binary_search(&term.as_str()).is_err())
+        {
+            return None;
+        }
+        let mut absent = false;
+        for leaf in &leaves {
+            if self.terms.iter().any(|(term, _)| term == leaf) {
+                continue;
+            }
+            if self
+                .view
+                .sources
+                .iter()
+                .any(|(source, _)| segment_error(source.term(leaf)).is_some())
+            {
+                return None;
+            }
+            absent = true;
+        }
+        let mut heap = BinaryHeap::with_capacity(k + 1);
+        let mut scored = 0usize;
+        if k > 0 && !(absent && combine == Combine::All) {
+            for (i, (source, _)) in self.view.sources.iter().enumerate() {
+                if !self.prune_source(
+                    &**source,
+                    &self.dead[i],
+                    combine,
+                    k,
+                    &mut heap,
+                    &mut scored,
+                )? {
+                    return None;
+                }
+            }
+        }
+        let mut rows: Vec<(f32, Tid)> = heap.into_iter().map(|Ranked(s, t)| (s, t)).collect();
+        rows.sort_by(rank);
+        // A location present in two sources is scored by the first only in
+        // the unpruned path; leave that case to it.
+        let mut seen = FxHashSet::default();
+        if !rows.iter().all(|(_, tid)| seen.insert(*tid)) {
+            return None;
+        }
+        let complete = rows.len() < k;
+        Some(TopK {
+            rows,
+            scored,
+            complete,
+        })
+    }
+
+    /// Walks one source. Returns `Ok(false)` when the source cannot be pruned.
+    fn prune_source(
+        &self,
+        source: &dyn Index,
+        dead: &BTreeSet<Tid>,
+        combine: Combine,
+        k: usize,
+        heap: &mut BinaryHeap<Ranked>,
+        scored: &mut usize,
+    ) -> Option<bool> {
+        let mut cursors: Vec<TermCursor<'_>> = Vec::with_capacity(self.terms.len());
+        for (slot, (name, scorer)) in self.terms.iter().enumerate() {
+            let Some(term) = segment_error(source.term(name)) else {
+                match combine {
+                    // A missing term empties the conjunction in this source.
+                    Combine::All => return Some(true),
+                    Combine::Any => continue,
+                }
+            };
+            let mut postings = segment_error(term.cursor());
+            let bounds = segment_error(postings.block_bounds());
+            let Some(whole) = bounds
+                .iter()
+                .copied()
+                .reduce(|merged, block| merged.merge(&block))
+            else {
+                return Some(false);
+            };
+            cursors.push(TermCursor {
+                slot,
+                postings,
+                payload: segment_error(term.payload()).cursor(),
+                count: term.df(),
+                term_max: scorer.bound(&whole),
+                cached: None,
+                exact: None,
+            });
+        }
+        if cursors.is_empty() {
+            return Some(true);
+        }
+        let mut walk = Walk {
+            scorer: self,
+            cursors,
+            documents: segment_error(source.documents()),
+            lengths: source.lengths(),
+            dead,
+            k,
+            heap,
+            scored,
+            iterations: 0,
+        };
+        match combine {
+            Combine::Any => walk.any(),
+            Combine::All => walk.all(),
+        }
+        Some(true)
     }
 }
 

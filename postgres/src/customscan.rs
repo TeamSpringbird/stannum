@@ -29,6 +29,8 @@ use segment::set::Cursor as _;
 use tinql::runtime::Query;
 use tinql::runtime::plan::{Limits, plan};
 
+use crate::score::rank;
+
 static ENABLE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Method tables hold C string pointers; they are immutable and never
@@ -694,8 +696,12 @@ struct ScanExec {
     started: bool,
     /// Heap scan for the recovery-snapshot fallback.
     fallback: *mut pg_sys::TableScanDescData,
-    /// Explain counters.
-    candidates: usize,
+    /// `tids` holds only the pruned top k; the rest are produced on demand.
+    pruned: bool,
+    /// Explain counters. Candidates are unknown while pruned; `scored`
+    /// counts the candidates a pruned scan scored.
+    candidates: Option<usize>,
+    scored: Option<usize>,
     fetched: usize,
     skipped_pages: usize,
     ordered: bool,
@@ -796,7 +802,9 @@ unsafe extern "C-unwind" fn begin_scan(
             next: 0,
             started: false,
             fallback: std::ptr::null_mut(),
-            candidates: 0,
+            pruned: false,
+            candidates: None,
+            scored: None,
             fetched: 0,
             skipped_pages: 0,
             ordered,
@@ -808,7 +816,55 @@ unsafe extern "C-unwind" fn begin_scan(
 }
 
 /// Gathers the matching TIDs from the index, in output order.
+///
+/// A ranked scan with a known top k first tries to prune: the scorer walks
+/// the index itself, skipping blocks of postings that cannot enter the top
+/// k, and only those k rows are materialized. Every other scan, and any
+/// query the scorer cannot bound, enumerates and scores every candidate.
 unsafe fn gather(exec: &mut ScanExec) {
+    unsafe {
+        exec.scores.clear();
+        exec.pruned = false;
+        exec.scored = None;
+        let mut scorer = exec.private.ordering.as_ref().map(|ordering| {
+            crate::score::scorer_for_scan(
+                exec.private.heap_oid,
+                exec.private.index_oid,
+                &exec.private.query,
+                ordering.full,
+                ordering.dense_ratio,
+                ordering.k1,
+                ordering.b,
+                ordering.term_add.clone(),
+                ordering.term_replace.clone(),
+            )
+        });
+        let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
+        if let Some(k) = top_k
+            && k <= crate::score::PRUNE_MAX_K
+            && let Some(top) = scorer.as_ref().and_then(|scorer| scorer.top_k(k))
+        {
+            exec.candidates = top.complete.then_some(top.rows.len());
+            exec.scored = Some(top.scored);
+            exec.scores = top.rows.iter().map(|(score, _)| *score).collect();
+            exec.tids = top.rows.iter().map(|(_, tid)| *tid).collect();
+            exec.sorted = exec.tids.len();
+            exec.pruned = !top.complete;
+            let scorer = scorer.take().expect("a top k needs a scorer");
+            crate::score::publish_scan_scorer(scorer, &top.rows);
+            exec.next = 0;
+            exec.started = true;
+            return;
+        }
+        let tids = candidates(exec);
+        finish(exec, tids, scorer);
+        exec.next = 0;
+        exec.started = true;
+    }
+}
+
+/// Every matching TID across the index's sources, in heap order.
+unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
     unsafe {
         let index_oid = pg_sys::Oid::from(exec.private.index_oid);
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
@@ -847,50 +903,67 @@ unsafe fn gather(exec: &mut ScanExec) {
         }
         tids.sort_unstable();
         tids.dedup();
-        exec.candidates = tids.len();
-        exec.scores.clear();
-        exec.sorted = tids.len();
-        if let Some(ordering) = &exec.private.ordering {
-            let mut scorer = crate::score::scorer_for_scan(
-                exec.private.heap_oid,
-                exec.private.index_oid,
-                &exec.private.query,
-                ordering.full,
-                ordering.dense_ratio,
-                ordering.k1,
-                ordering.b,
-                ordering.term_add.clone(),
-                ordering.term_replace.clone(),
-            );
-            let mut scored: Vec<(f32, Tid)> =
-                tids.iter().map(|tid| (scorer.score(*tid), *tid)).collect();
-            // Only the rows the query will consume are ordered now; the rest
-            // are ordered on demand should the executor ask for them.
-            let sorted = match ordering.top_k {
-                Some(k) if k < scored.len() => {
-                    scored.select_nth_unstable_by(k, rank);
-                    scored[..k].sort_by(rank);
-                    k
-                }
-                _ => {
-                    scored.sort_by(rank);
-                    scored.len()
-                }
-            };
-            exec.sorted = sorted;
-            crate::score::publish_scan_scorer(scorer, &scored[..sorted]);
-            exec.scores = scored.iter().map(|(score, _)| *score).collect();
-            tids = scored.into_iter().map(|(_, tid)| tid).collect();
-        }
-        exec.tids = tids;
-        exec.next = 0;
-        exec.started = true;
+        tids
     }
 }
 
-/// Descending score; ties in heap order for a stable result.
-fn rank(a: &(f32, Tid), b: &(f32, Tid)) -> std::cmp::Ordering {
-    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
+/// Stores every candidate; with a scorer, scored and in output order.
+fn finish(exec: &mut ScanExec, mut tids: Vec<Tid>, scorer: Option<crate::score::IndexScorer>) {
+    exec.candidates = Some(tids.len());
+    exec.scores.clear();
+    exec.sorted = tids.len();
+    if let Some(mut scorer) = scorer {
+        let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
+        let mut scored: Vec<(f32, Tid)> =
+            tids.iter().map(|tid| (scorer.score(*tid), *tid)).collect();
+        // Only the rows the query will consume are ordered now; the rest
+        // are ordered on demand should the executor ask for them.
+        let sorted = match top_k {
+            Some(k) if k < scored.len() => {
+                scored.select_nth_unstable_by(k, rank);
+                scored[..k].sort_by(rank);
+                k
+            }
+            _ => {
+                scored.sort_by(rank);
+                scored.len()
+            }
+        };
+        exec.sorted = sorted;
+        crate::score::publish_scan_scorer(scorer, &scored[..sorted]);
+        exec.scores = scored.iter().map(|(score, _)| *score).collect();
+        tids = scored.into_iter().map(|(_, tid)| tid).collect();
+    }
+    exec.tids = tids;
+}
+
+/// Replaces a pruned top k with the complete ordering once the executor
+/// reads past it. The first k rows of the complete ordering are the rows
+/// already emitted, so the read position carries over.
+unsafe fn complete(exec: &mut ScanExec) {
+    unsafe {
+        let ordering = exec
+            .private
+            .ordering
+            .as_ref()
+            .expect("pruned scans are ordered");
+        let scorer = crate::score::scorer_for_scan(
+            exec.private.heap_oid,
+            exec.private.index_oid,
+            &exec.private.query,
+            ordering.full,
+            ordering.dense_ratio,
+            ordering.k1,
+            ordering.b,
+            ordering.term_add.clone(),
+            ordering.term_replace.clone(),
+        );
+        let tids = candidates(exec);
+        let next = exec.next;
+        finish(exec, tids, Some(scorer));
+        exec.next = next;
+        exec.pruned = false;
+    }
 }
 
 /// Orders the candidates past the up-front top-k, once the executor reads
@@ -958,7 +1031,15 @@ unsafe extern "C-unwind" fn search_access(
         if !exec.started {
             gather(exec);
         }
-        while exec.next < exec.tids.len() {
+        loop {
+            if exec.next >= exec.tids.len() {
+                if !exec.pruned {
+                    break;
+                }
+                // The executor reads past the pruned top k: score everything.
+                complete(exec);
+                continue;
+            }
             pgrx::check_for_interrupts!();
             if exec.next >= exec.sorted {
                 sort_rest(exec);
@@ -1181,12 +1262,23 @@ unsafe extern "C-unwind" fn explain(
             }
         }
         if (*es).analyze {
-            pg_sys::ExplainPropertyInteger(
-                c"Candidates".as_ptr(),
-                std::ptr::null(),
-                exec.candidates as i64,
-                es,
-            );
+            if let Some(candidates) = exec.candidates {
+                pg_sys::ExplainPropertyInteger(
+                    c"Candidates".as_ptr(),
+                    std::ptr::null(),
+                    candidates as i64,
+                    es,
+                );
+            }
+            if let Some(scored) = exec.scored {
+                pg_sys::ExplainPropertyText(c"Pruning".as_ptr(), c"block-max".as_ptr(), es);
+                pg_sys::ExplainPropertyInteger(
+                    c"Scored Candidates".as_ptr(),
+                    std::ptr::null(),
+                    scored as i64,
+                    es,
+                );
+            }
             pg_sys::ExplainPropertyInteger(
                 c"Heap Fetches".as_ptr(),
                 std::ptr::null(),

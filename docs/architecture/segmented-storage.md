@@ -75,8 +75,25 @@ Statistics include buffered documents immediately. Dead documents remain in
 segment statistics until rewriting removes them. Partial indexes use their
 indexed population. These choices affect scores as well as performance.
 
-Ranked scans currently score every candidate before selecting the top k.
-Skipping candidates using safe score bounds is a future optimization.
+A ranked scan with a known `LIMIT` prunes instead of scoring every candidate
+when the query is a flat `AND` or `OR` of terms (a single term included) whose
+terms are exactly the scoring terms. Each term's postings carry a bound per
+block of 128 postings: the largest term-frequency bucket, the smallest document
+length and the block's last location. The scan walks the sources in tuple
+order with one cursor per term, keeps the k-th best score as a threshold, and
+skips every run of postings whose summed block bounds cannot reach it
+(block-max WAND). Bounds are evaluated at each block's minimum length and over
+every bucket up to its maximum, and summed in the scorer's term order, so
+rounding never puts a bound below a score it covers; a run whose bound equals
+the threshold is skipped only when every location in it sorts after the
+current k-th row. The result is therefore identical to scoring every candidate:
+same rows, same scores, same tie order. `EXPLAIN ANALYZE` reports `Pruning:
+block-max` and the number of candidates actually scored. Phrase, positional,
+expansion, `NOT` and `AT LEAST` queries, and limits above 4,096 rows, score
+every candidate as before; so does a query over segments written before block
+bounds existed. Should the parent read past the limit (for example because
+top rows were deleted), the scan scores every candidate and continues from the
+same position.
 
 ## Durability and maintenance
 
@@ -89,9 +106,11 @@ visibility horizon makes reuse safe for readers with older snapshots. VACUUM
 records dead tuples, rewrites sufficiently dead segments, and reclaims pages.
 `stannum.segment_info('index_name')` exposes the segment layout for inspection.
 
-The page and segment format signatures are `LDP2` and `LSG1`. Their definitions
-live in `postgres/src/storage/layout.rs` and the `segment` crate. Unsupported
-old formats require rebuilding the index.
+The page and segment format signatures are `LDP2` and `LSG2`. Their definitions
+live in `postgres/src/storage/layout.rs` and the `segment` crate. `LSG2` adds
+per-block score bounds to term postings and fixed-width payload skip offsets;
+`LSG1` segments are still read, and ranked scans over them score every
+candidate. Unsupported old formats require rebuilding the index.
 
 ## Current limits
 

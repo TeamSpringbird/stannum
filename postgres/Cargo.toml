@@ -13,10 +13,11 @@ crate-type = ["cdylib", "rlib"]
 default = ["pg18"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
-pg_test = []
+pg_test = ["dep:serde_json"]
 
 [dependencies]
 pgrx = "=0.19.1"
+serde_json = { version = "1", optional = true }
 rustc-hash.workspace = true
 thiserror.workspace = true
 tokenizer = { path = "../tokenizer" }
