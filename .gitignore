@@ -5,3 +5,5 @@
 /postgres/tests/pg_regress/
 *.log
 .DS_Store
+/benchmarks/results/
+/benchmarks/__pycache__/

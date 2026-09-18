@@ -9,6 +9,7 @@ pub mod eval;
 pub mod lower;
 pub mod position_filter;
 pub mod regex;
+pub mod retrieval;
 pub mod simplify;
 pub mod span_expr;
 pub mod subtokenize;

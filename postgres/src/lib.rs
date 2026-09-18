@@ -9,6 +9,7 @@ mod highlight_udfs;
 mod match_positions;
 mod operator;
 pub(crate) mod options;
+mod postings;
 mod score;
 mod tf_bucket;
 mod udfs;
@@ -61,8 +62,240 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
-        assert_eq!(plan[0]["Plan"]["Lossy Heap Blocks"], 1);
+        assert_eq!(plan[0]["Plan"]["Lossy Heap Blocks"], 0);
         assert_eq!(plan[0]["Plan"]["Plans"][0]["Index Name"], "lite_search_idx");
+    }
+
+    #[pg_test]
+    fn selective_postings_skip_unrelated_heap_pages_and_follow_overflow() {
+        Spi::run(
+            "CREATE TABLE posting_probe (id int, body text);
+          INSERT INTO posting_probe SELECT n, 'common ' || repeat('filler ', 120) ||
+            CASE WHEN n=777 THEN 'needle' ELSE '' END FROM generate_series(1,1500) n;
+          CREATE INDEX posting_probe_idx ON posting_probe USING tin(body);
+          SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+        assert!(
+            Spi::get_one::<i64>("SELECT pg_relation_size('posting_probe_idx')")
+                .unwrap()
+                .unwrap()
+                > 129 * 8192
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_probe WHERE body ==> 'common'")
+                .unwrap(),
+            Some(1500)
+        );
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM posting_probe WHERE body ==> 'needle'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(plan[0]["Plan"]["Exact Heap Blocks"], 1);
+        assert_eq!(plan[0]["Plan"]["Lossy Heap Blocks"], 0);
+        let miss = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM posting_probe WHERE body ==> 'missing'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert_eq!(miss[0]["Plan"]["Exact Heap Blocks"], 0);
+        Spi::run("INSERT INTO posting_probe VALUES (1501,'needle');").unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_probe WHERE body ==> 'needle'")
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[pg_test]
+    fn persisted_boolean_and_phrase_candidates_preserve_exact_matches() {
+        Spi::run(
+            "CREATE TABLE boolean_docs(id int, body text);
+             INSERT INTO boolean_docs VALUES (1,'beer wine'), (2,'wine beer'),
+                 (3,'beer craft'), (4,'wine'), (5,'beer beer'), (6,'cider');
+             INSERT INTO boolean_docs SELECT n, repeat('padding ',120)
+                 FROM generate_series(7,1000) n;
+             CREATE INDEX boolean_docs_search ON boolean_docs USING tin(body);",
+        )
+        .unwrap();
+        for (query, expected) in [
+            ("beer AND wine", vec![1, 2]),
+            ("beer OR wine", vec![1, 2, 3, 4, 5]),
+            ("\"beer wine\"", vec![1]),
+            ("\"beer beer\"", vec![5]),
+            ("beer AND NOT wine", vec![3, 5]),
+            ("beer OR win*", vec![1, 2, 3, 4, 5]),
+            ("missing OR win*", vec![1, 2, 4]),
+            ("beer AND win*", vec![1, 2]),
+            ("missing AND wine", vec![]),
+            ("(beer OR wine) AND craft", vec![3]),
+            ("beer NOT ENCLOSES wine", vec![1, 2, 3, 5]),
+            ("beer NOT ENCLOSED BY wine", vec![1, 2, 3, 5]),
+            ("beer NOT OVERLAPPING wine", vec![1, 2, 3, 5]),
+            ("beer BEFORE wine", vec![1]),
+            ("beer AFTER wine", vec![2]),
+            ("beer THEN/1 win*", vec![1]),
+            ("AT LEAST 2 OF [beer, wine, craft]", vec![1, 2, 3]),
+        ] {
+            Spi::run("SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=on;").unwrap();
+            let actual = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id),'{{}}'::int[]) \
+                 FROM boolean_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, expected, "{query}");
+            Spi::run("SET LOCAL enable_seqscan=on; SET LOCAL enable_bitmapscan=off;").unwrap();
+            let reference = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id),'{{}}'::int[]) \
+                 FROM boolean_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, reference, "reference disagreement: {query}");
+        }
+        Spi::run("SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=on;").unwrap();
+        let phrase = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM boolean_docs WHERE body ==> '\"beer wine\"'",
+        ).unwrap().unwrap().0;
+        assert_eq!(phrase[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
+        assert_eq!(phrase[0]["Plan"]["Actual Rows"].as_f64(), Some(1.0));
+        assert_eq!(
+            phrase[0]["Plan"]["Rows Removed by Index Recheck"].as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(phrase[0]["Plan"]["Lossy Heap Blocks"], 0);
+        let fallback = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM boolean_docs WHERE body ==> 'missing OR win*'",
+        ).unwrap().unwrap().0;
+        assert!(fallback[0]["Plan"]["Lossy Heap Blocks"].as_u64().unwrap() > 0);
+
+        // The inner bitmap scan is rescanned with each outer row's query value.
+        Spi::run("SET LOCAL enable_material=off; SET LOCAL enable_memoize=off;").unwrap();
+        let counts = Spi::get_one::<Vec<i64>>(
+            "SELECT array_agg(found.n ORDER BY q.ordinal) FROM
+             (VALUES (1,'beer AND wine'), (2,'beer OR wine'),
+                     (3,'\"beer wine\"'), (4,'missing'), (5,'missing OR win*')) q(ordinal,query)
+             CROSS JOIN LATERAL (SELECT count(*) n FROM boolean_docs
+                 WHERE body ==> q.query OFFSET 0) found",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(counts, vec![2, 5, 1, 0, 3]);
+    }
+
+    #[pg_test]
+    fn persisted_boolean_candidates_recheck_lossy_bitmaps() {
+        Spi::run(
+            "CREATE TABLE lossy_docs(id int, body text);
+             ALTER TABLE lossy_docs ALTER COLUMN body SET STORAGE PLAIN;
+             INSERT INTO lossy_docs SELECT n,
+               CASE WHEN n%4=0 THEN 'beer wine '
+                    WHEN n%4=1 THEN 'wine beer '
+                    WHEN n%4=2 THEN 'beer craft ' ELSE 'wine craft ' END
+               || CASE WHEN n=1500 THEN 'needle ' ELSE '' END
+               || repeat('padding ',500) FROM generate_series(1,3000) n;
+             CREATE INDEX lossy_docs_search ON lossy_docs USING tin(body);
+             SET LOCAL work_mem='64kB'; SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+        // The 3.5KB inline documents create enough heap pages to force lossiness
+        // in both input bitmaps under the shared work_mem target.
+        for (query, expected) in [
+            ("beer AND wine", 1500_i64),
+            ("beer OR wine", 3000),
+            ("\"beer wine\"", 750),
+            ("(beer OR craft) AND wine", 2250),
+        ] {
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM lossy_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
+            assert_eq!(
+                plan[0]["Plan"]["Actual Rows"].as_f64(),
+                Some(expected as f64),
+                "{query}"
+            );
+            assert!(
+                plan[0]["Plan"]["Lossy Heap Blocks"].as_u64().unwrap() > 0,
+                "{query}"
+            );
+            let actual = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT array_agg(id ORDER BY id) FROM lossy_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            Spi::run("SET LOCAL enable_seqscan=on; SET LOCAL enable_bitmapscan=off;").unwrap();
+            let reference = Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT array_agg(id ORDER BY id) FROM lossy_docs WHERE body ==> '{query}'"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, reference, "lossy reference disagreement: {query}");
+            Spi::run("SET LOCAL enable_seqscan=off; SET LOCAL enable_bitmapscan=on;").unwrap();
+        }
+        // Intersection must remain conservative with exact/lossy operands in
+        // either order; the rare posting list stays exact at this work_mem.
+        for query in ["beer AND needle", "needle AND beer"] {
+            assert_eq!(
+                Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT array_agg(id ORDER BY id) FROM lossy_docs WHERE body ==> '{query}'"
+                ))
+                .unwrap(),
+                Some(vec![1500])
+            );
+        }
+    }
+
+    #[pg_test]
+    fn posting_inserts_rolled_back_by_subtransaction_are_not_visible() {
+        Spi::run(
+            "CREATE TABLE posting_abort(body text);
+          CREATE INDEX posting_abort_idx ON posting_abort USING tin(body);
+          DO $$ BEGIN
+            INSERT INTO posting_abort VALUES ('aborted');
+            RAISE EXCEPTION 'abort subtransaction';
+          EXCEPTION WHEN raise_exception THEN NULL; END $$;
+          INSERT INTO posting_abort VALUES ('committed');
+          SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_abort WHERE body ==> 'aborted'")
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_abort WHERE body ==> 'committed'")
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[pg_test]
+    fn unlogged_indexes_use_the_reference_path() {
+        Spi::run(
+            "CREATE UNLOGGED TABLE posting_unlogged(body text);
+          INSERT INTO posting_unlogged VALUES ('beer');
+          CREATE INDEX posting_unlogged_idx ON posting_unlogged USING tin(body);
+          SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT pg_relation_size('posting_unlogged_idx')").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM posting_unlogged WHERE body ==> 'beer'")
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[pg_test]
