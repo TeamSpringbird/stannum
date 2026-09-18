@@ -766,7 +766,47 @@ pub unsafe fn insert(
 // --- Scan ---------------------------------------------------------------------
 
 /// One searchable unit: segment bytes and an optional dead list.
-type Source = (Rc<Vec<u8>>, Option<Vec<u8>>);
+pub type Source = (Rc<Vec<u8>>, Option<Vec<u8>>);
+
+/// Everything a scan or a scorer needs from an index, captured under one
+/// shared meta lock so the buffer and directory are mutually consistent.
+pub struct View {
+    /// Immutable segments, then the write buffer as an in-memory segment.
+    pub sources: Vec<Source>,
+    /// Index of the buffer source within `sources`, if the buffer is non-empty.
+    pub buffer_source: Option<usize>,
+}
+
+/// # Safety
+/// `index` is a live LDP2 index.
+pub unsafe fn view(index: pg_sys::Relation) -> View {
+    unsafe {
+        let (meta_buffer, meta) = read_meta(index, false);
+        // The buffer is read under the shared meta lock so a fold cannot
+        // rewrite it underneath us.
+        let stream = read_buffer_stream(index, &meta.buffer);
+        drop(meta_buffer);
+        let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
+        for entry in &meta.segments {
+            pgrx::check_for_interrupts!();
+            let bytes = cached_segment(index, meta.identity, entry);
+            let dead_bytes = (!entry.dead.is_empty()).then(|| read_run(index, entry.dead));
+            sources.push((bytes, dead_bytes));
+        }
+        let mut buffer_source = None;
+        if meta.buffer.docs > 0 {
+            buffer_source = Some(sources.len());
+            sources.push((
+                cached_buffer_segment(meta.identity, meta.buffer.version, &stream),
+                None,
+            ));
+        }
+        View {
+            sources,
+            buffer_source,
+        }
+    }
+}
 
 /// Adds every document matching all `queries` to `bitmap`, exact where the
 /// plan is exact. Returns the number of candidates added.
@@ -779,12 +819,7 @@ pub unsafe fn scan(
     bitmap: *mut pg_sys::TIDBitmap,
 ) -> i64 {
     unsafe {
-        let (meta_buffer, meta) = read_meta(index, false);
-        // The buffer is read under the shared meta lock so a fold cannot
-        // rewrite it underneath us.
-        let stream = read_buffer_stream(index, &meta.buffer);
-        drop(meta_buffer);
-
+        let view = view(index);
         let limits = Limits::default();
         let mut added = 0i64;
         let mut pending: Vec<pg_sys::ItemPointerData> = Vec::with_capacity(BITMAP_BATCH);
@@ -795,20 +830,7 @@ pub unsafe fn scan(
             }
         };
 
-        let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
-        for entry in &meta.segments {
-            pgrx::check_for_interrupts!();
-            let bytes = cached_segment(index, meta.identity, entry);
-            let dead_bytes = (!entry.dead.is_empty()).then(|| read_run(index, entry.dead));
-            sources.push((bytes, dead_bytes));
-        }
-        if meta.buffer.docs > 0 {
-            sources.push((
-                cached_buffer_segment(meta.identity, meta.buffer.version, &stream),
-                None,
-            ));
-        }
-        for (bytes, dead_bytes) in &sources {
+        for (bytes, dead_bytes) in &view.sources {
             pgrx::check_for_interrupts!();
             let segment = codec(Segment::parse(bytes));
             let mut exact = true;
@@ -983,6 +1005,19 @@ pub unsafe fn cleanup(index: pg_sys::Relation) {
         write_meta(index, &meta_buffer, &meta);
         drop(meta_buffer);
         pg_sys::IndexFreeSpaceMapVacuum(index);
+    }
+}
+
+/// Whether the index with this OID has LDP2 storage, for planner decisions.
+///
+/// # Safety
+/// `oid` names an index relation that the caller may open.
+pub unsafe fn is_segmented(oid: pg_sys::Oid) -> bool {
+    unsafe {
+        let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as _);
+        let segmented = present(index);
+        pg_sys::index_close(index, pg_sys::AccessShareLock as _);
+        segmented
     }
 }
 

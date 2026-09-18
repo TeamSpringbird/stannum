@@ -16,7 +16,8 @@ import sys
 import time
 
 ROOT = Path(os.environ.get("LEAD_BENCH_ROOT", Path(__file__).resolve().parents[1]))
-ENGINES = ("lead", "gin", "paradedb", "pg_textsearch")
+# "tin" is PlanetScale's TIN: the same SQL as Lead against a server that has it installed.
+ENGINES = ("lead", "tin", "gin", "paradedb", "pg_textsearch")
 SETTINGS_SQL = """SELECT json_object_agg(name, setting) FROM pg_settings
 WHERE name = ANY(ARRAY['server_version','block_size','shared_buffers','work_mem',
  'maintenance_work_mem','effective_cache_size','max_connections','max_worker_processes',
@@ -72,7 +73,7 @@ def sql_json(sql, env):
 
 def predicate(engine, case):
     _, tin, ts, plain, kind, _ = case
-    if engine == "lead":
+    if engine in ("lead", "tin"):
         return f"body ==> '{tin}'"
     if engine == "gin":
         return f"to_tsvector('simple', body) @@ to_tsquery('simple', '{ts}')"
@@ -92,6 +93,7 @@ def workload(engine, profile, cases=CASES):
         if profile != "count":
             score = {
                 "lead": "tin.full_score(ctid)",
+                "tin": "tin.full_score(ctid)",
                 "paradedb": "pdb.score(id)",
                 "pg_textsearch": f"-(body <@> '{case[3]}')",
             }[engine]
@@ -116,6 +118,7 @@ FROM generate_series(1, {rows}) AS n;
 def index_sql(engine):
     return {
         "lead": "CREATE INDEX search_idx ON documents USING tin(body);",
+        "tin": "CREATE INDEX search_idx ON documents USING tin(body);",
         "gin": "CREATE INDEX search_idx ON documents USING gin(to_tsvector('simple', body));",
         "paradedb": "CREATE INDEX search_idx ON documents USING paradedb(id, body) WITH (key_field='id');",
         "pg_textsearch": "CREATE INDEX search_idx ON documents USING bm25(body) WITH (text_config='simple');",
@@ -272,7 +275,7 @@ def run(args):
     save(out / "manifest.json", manifest)
     children = []
     try:
-        extension = {"lead": "tin", "paradedb": "pg_search", "pg_textsearch": "pg_textsearch"}.get(args.engine)
+        extension = {"lead": "tin", "tin": "tin", "paradedb": "pg_search", "pg_textsearch": "pg_textsearch"}.get(args.engine)
         if extension:
             psql(f"CREATE EXTENSION IF NOT EXISTS {extension} CASCADE;", env)
         manifest["extensions"] = sql_json("SELECT json_object_agg(extname, extversion) FROM pg_extension;", env)

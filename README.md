@@ -4,7 +4,7 @@ Lead is a deliberately non-production Postgres text-search extension for exercis
 
 It favors correctness and a small implementation over production query performance.
 
-This fork is developing a real indexing engine and remains unsuitable for production workloads. Logged indexes store a write buffer of per-document records and immutable segments with a term dictionary, positions and document lengths, and answer every query form exactly from the index. Ranking still reads the heap. See [segmented storage](docs/segmented-storage.md) for the format, tested behavior and limits.
+This fork is developing a real indexing engine and remains unsuitable for production workloads. Logged indexes store a write buffer of per-document records and immutable segments with a term dictionary, positions and document lengths, and answer every query form exactly from the index, including ranking statistics that match TIN's. See [segmented storage](docs/segmented-storage.md) for the format, tested behavior and limits.
 
 ## Build
 

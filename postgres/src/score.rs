@@ -8,10 +8,19 @@ use pgrx::{
     pg_sys,
 };
 use rustc_hash::FxHashMap;
+use segment::Tid;
+use segment::postings::Postings;
+use segment::segment::Segment;
+use segment::set::Cursor as _;
+use segment::tf_bucket::TfBucket;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::{Query, SpanTermSlot, parse_tinql_to_query};
 use tokenizer::Tokenizer;
+
+use crate::storage::View;
+use std::rc::Rc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CacheKey {
@@ -34,8 +43,71 @@ struct ScoreCorpus {
     max: f32,
 }
 
+/// Scoring state read from a segmented index: per-term scorers built from
+/// dead-inclusive segment statistics, and the sources to look each row up in.
+struct IndexScorer {
+    key: CacheKey,
+    /// Per-source cursors, declared before `view` so they drop first.
+    sources: Vec<SourceReader>,
+    view: View,
+    dead: Vec<BTreeSet<Tid>>,
+    terms: Vec<(String, TermScorer)>,
+    max: f32,
+}
+
+/// Cursors over one source that advance monotonically across rows. Rows from
+/// a bitmap heap scan arrive in TID order, so each lookup is a forward seek;
+/// a backwards request simply recreates the cursors.
+struct SourceReader {
+    /// The previous request; a smaller one means the readers must restart.
+    last: Option<Tid>,
+    documents: segment::postings::PostingsCursor<'static>,
+    lengths: segment::segment::Lengths<'static>,
+    /// One per scoring term: the term's cursors in this source, if present.
+    terms: Vec<Option<TermReader>>,
+}
+
+struct TermReader {
+    postings: segment::postings::PostingsCursor<'static>,
+    payload: segment::payload::PayloadCursor<'static>,
+}
+
+impl SourceReader {
+    /// # Safety
+    /// `bytes` must stay alive and unmoved for as long as the reader exists.
+    /// The owning `IndexScorer` keeps the `Rc` in `view` and drops readers first.
+    unsafe fn new(bytes: &Rc<Vec<u8>>, terms: &[(String, TermScorer)]) -> Self {
+        let bytes: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
+        let segment = segment_error(Segment::parse(bytes));
+        let documents = segment_error(segment.documents());
+        let terms = terms
+            .iter()
+            .map(|(term, _)| {
+                segment_error(segment.term(term)).map(|term| TermReader {
+                    postings: segment_error(term.cursor()),
+                    payload: segment_error(term.payload()).cursor(),
+                })
+            })
+            .collect();
+        Self {
+            last: None,
+            documents,
+            lengths: segment.lengths(),
+            terms,
+        }
+    }
+
+    /// Term cursors legitimately sit ahead after a miss, so only the request
+    /// order decides whether the readers must restart.
+    fn behind(&self, tid: Tid) -> bool {
+        self.last.is_some_and(|last| last > tid)
+    }
+}
+
 thread_local! {
     static SCORE_CACHE: RefCell<Option<ScoreCorpus>> = const { RefCell::new(None) };
+    static INDEX_SCORE_CACHE: RefCell<Option<IndexScorer>> = const { RefCell::new(None) };
 }
 
 fn score_context_error(function: &str) -> ! {
@@ -122,6 +194,275 @@ fn score_bound(
             corpus.by_document.get(document).copied().unwrap_or(0.0)
         }
     })
+}
+
+/// Scoring bound to a segmented index: statistics and per-document term
+/// frequencies come from the index, never from the heap.
+#[pg_extern(volatile, parallel_unsafe)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SQL signature used by the scoring support function"
+)]
+fn score_bound_indexed(
+    ctid: pg_sys::ItemPointerData,
+    query: &str,
+    heap_oid: i32,
+    index_oid: i32,
+    mode: i32,
+    dense_ratio: Option<f32>,
+    k1: Option<f32>,
+    b: Option<f32>,
+    term_add: Option<Vec<String>>,
+    term_replace: Option<Vec<String>>,
+) -> f32 {
+    let transaction = unsafe { pg_sys::GetTopTransactionIdIfAny().into_inner() };
+    let command = unsafe { pg_sys::GetCurrentCommandId(false) };
+    let dense = dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits();
+    // Per-row calls compare against the cached key without allocating; the
+    // owned key is built only when the cache misses.
+    let matches = |key: &CacheKey| {
+        key.transaction == transaction
+            && key.command == command
+            && key.heap_oid == heap_oid as u32
+            && key.index_oid == index_oid as u32
+            && key.full == (mode == 1)
+            && key.dense == dense
+            && key.k1 == bits(k1)
+            && key.b == bits(b)
+            && key.query == query
+            && key.add.as_deref() == term_add.as_deref()
+            && key.replace.as_deref() == term_replace.as_deref()
+    };
+    let cached =
+        INDEX_SCORE_CACHE.with_borrow(|slot| slot.as_ref().is_some_and(|s| matches(&s.key)));
+    INDEX_SCORE_CACHE.with_borrow_mut(|slot| {
+        if !cached {
+            let key = CacheKey {
+                transaction,
+                command,
+                heap_oid: heap_oid as u32,
+                index_oid: index_oid as u32,
+                query: query.to_owned(),
+                full: mode == 1,
+                dense,
+                k1: bits(k1),
+                b: bits(b),
+                add: term_add.clone(),
+                replace: term_replace.clone(),
+            };
+            *slot = Some(build_index_scorer(
+                key,
+                k1,
+                b,
+                term_add,
+                term_replace,
+                mode == 2,
+            ));
+        }
+        let scorer = slot.as_mut().expect("index scorer was just populated");
+        if mode == 2 {
+            scorer.max
+        } else {
+            let block = (u32::from(ctid.ip_blkid.bi_hi) << 16) | u32::from(ctid.ip_blkid.bi_lo);
+            let tid = Tid::new(block, ctid.ip_posid)
+                .unwrap_or_else(|_| pgrx::error!("invalid heap tuple location"));
+            scorer.score(tid)
+        }
+    })
+}
+
+fn segment_error<T>(result: segment::Result<T>) -> T {
+    result.unwrap_or_else(|error| pgrx::error!("Lead index data: {error}; REINDEX required"))
+}
+
+impl IndexScorer {
+    /// Score of one visible document, or zero if the index does not hold it.
+    fn score(&mut self, tid: Tid) -> f32 {
+        let mut positions = Vec::new();
+        for i in 0..self.view.sources.len() {
+            if self.dead[i].contains(&tid) {
+                continue;
+            }
+            if self.sources[i].behind(tid) {
+                self.sources[i] =
+                    unsafe { SourceReader::new(&self.view.sources[i].0, &self.terms) };
+            }
+            let reader = &mut self.sources[i];
+            reader.last = Some(tid);
+            let Some(ordinal) = segment_error(reader.documents.rank(tid)) else {
+                continue;
+            };
+            let length = segment_error(reader.lengths.get(ordinal));
+            // Left-to-right f32 fold in lexical term order, as production does.
+            let mut total = 0.0_f32;
+            for (slot, (_, scorer)) in reader.terms.iter_mut().zip(&self.terms) {
+                let Some(term) = slot else {
+                    continue;
+                };
+                let Some(posting) = segment_error(term.postings.rank(tid)) else {
+                    continue;
+                };
+                segment_error(term.payload.seek(posting));
+                positions.clear();
+                let bucket = segment_error(term.payload.next_into(&mut positions));
+                let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
+                    pgrx::error!("Lead index data: term-frequency bucket; REINDEX required")
+                });
+                total += scorer.score_bucket(bucket, length);
+            }
+            return total;
+        }
+        0.0
+    }
+}
+
+fn build_index_scorer(
+    key: CacheKey,
+    k1: Option<f32>,
+    b: Option<f32>,
+    term_add: Option<Vec<String>>,
+    term_replace: Option<Vec<String>>,
+    want_max: bool,
+) -> IndexScorer {
+    let heap_oid = pg_sys::Oid::from(key.heap_oid);
+    let index = unsafe {
+        PgRelation::with_lock(
+            pg_sys::Oid::from(key.index_oid),
+            pg_sys::AccessShareLock as _,
+        )
+    };
+    if unsafe { pg_sys::IndexGetRelation(index.oid(), false) } != heap_oid {
+        pgrx::error!("tin score index no longer belongs to the scored relation");
+    }
+    let tokenizer = unsafe { crate::storage::index_tokenizer(index.as_ptr()) };
+    let defaults = unsafe { crate::options::bm25(index.as_ptr()) };
+    let stop_csv = unsafe { crate::options::score_stop_words(index.as_ptr()) };
+    let params = Bm25Overrides { k1, b }
+        .resolve(defaults)
+        .checked()
+        .unwrap_or_else(|error| pgrx::error!("tin score parameters: {error}"));
+    let dense = DenseRatio::new(Some(f32::from_bits(key.dense)));
+    if !key.full && !dense.is_valid() {
+        pgrx::error!("dense_ratio must be finite and non-negative");
+    }
+    let query = parse_tinql_to_query(&key.query, tokenizer.as_ref())
+        .unwrap_or_else(|error| pgrx::error!("TIN score query error: {error}"));
+    let mut inputs = Vec::new();
+    collect_score_terms(&query, 1.0, false, &mut inputs);
+    let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
+        .unwrap_or_else(|error| pgrx::error!("tin.score(): {error}"))
+        .analyzed_with(|text| {
+            tokenizer
+                .tokenize(text)
+                .map(|token| token.text.into_owned())
+                .collect::<Vec<_>>()
+        });
+    let stop = if key.full {
+        None
+    } else {
+        stop_csv.as_deref().and_then(ScoreStopWords::from_csv)
+    };
+    let terms = compile_scoring_terms(inputs, &edit, stop.as_ref());
+
+    let view = unsafe { crate::storage::view(index.as_ptr()) };
+    let segments: Vec<Segment<'_>> = view
+        .sources
+        .iter()
+        .map(|(bytes, _)| segment_error(Segment::parse(bytes)))
+        .collect();
+    let dead: Vec<BTreeSet<Tid>> = view
+        .sources
+        .iter()
+        .map(|(_, dead)| match dead {
+            Some(bytes) => segment_error(Postings::parse(bytes).and_then(|p| p.to_vec()))
+                .into_iter()
+                .collect(),
+            None => BTreeSet::new(),
+        })
+        .collect();
+    // Statistics include dead documents until their segment is rewritten,
+    // and buffered documents immediately; elision uses immutable segments only.
+    let is_immutable = |i: usize| view.buffer_source != Some(i);
+    let total_docs: u64 = segments.iter().map(|s| u64::from(s.document_count())).sum();
+    let immutable_docs: u64 = segments
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| is_immutable(*i))
+        .map(|(_, s)| u64::from(s.document_count()))
+        .sum();
+    let total_length: u64 = segments.iter().map(Segment::total_length).sum();
+    let average_length = if total_docs == 0 {
+        1.0
+    } else {
+        total_length as f32 / total_docs as f32
+    };
+    let mut scorers = Vec::new();
+    for term in terms {
+        let mut total_df = 0u64;
+        let mut immutable_df = 0u64;
+        for (i, segment) in segments.iter().enumerate() {
+            let df = segment_error(segment.dictionary().get(term.text()))
+                .map_or(0, |entry| u64::from(entry.df));
+            total_df += df;
+            if is_immutable(i) {
+                immutable_df += df;
+            }
+        }
+        let ratio = (!key.full).then_some(dense);
+        if !term.is_retained(total_df, immutable_df, immutable_docs, ratio) {
+            continue;
+        }
+        let scorer =
+            TermScorer::from_statistics(total_docs, total_df, term.boost(), params, average_length)
+                .unwrap_or_else(|error| pgrx::error!("tin score parameters: {error}"));
+        scorers.push((term.text().to_owned(), scorer));
+    }
+    drop(segments);
+    let sources = view
+        .sources
+        .iter()
+        .map(|(bytes, _)| unsafe { SourceReader::new(bytes, &scorers) })
+        .collect();
+    let mut scorer = IndexScorer {
+        key,
+        sources,
+        view,
+        dead,
+        terms: scorers,
+        max: 0.0,
+    };
+    if want_max {
+        // Every document holding any scoring term is a candidate for the maximum.
+        let mut candidates = BTreeSet::new();
+        for (i, (bytes, _)) in scorer.view.sources.iter().enumerate() {
+            let segment = segment_error(Segment::parse(bytes));
+            for (term, _) in &scorer.terms {
+                if let Some(term) = segment_error(segment.term(term)) {
+                    let mut cursor = segment_error(term.cursor());
+                    while let Some(tid) = cursor.current() {
+                        if !scorer.dead[i].contains(&tid) {
+                            candidates.insert(tid);
+                        }
+                        segment_error(cursor.advance());
+                    }
+                }
+            }
+        }
+        let mut max = 0.0_f32;
+        for tid in candidates {
+            pgrx::check_for_interrupts!();
+            max = max.max(scorer.score(tid));
+        }
+        scorer.max = max;
+        // Leave the readers positioned at the start for the row stream.
+        scorer.sources = scorer
+            .view
+            .sources
+            .iter()
+            .map(|(bytes, _)| unsafe { SourceReader::new(bytes, &scorer.terms) })
+            .collect();
+    }
+    scorer
 }
 
 fn build_corpus(
@@ -490,11 +831,11 @@ fn score_support(request: Internal) -> Internal {
         if request.root.is_null() || request.fcall.is_null() {
             return unhandled();
         }
-        let ctid = pg_sys::list_nth((*request.fcall).args, 0).cast::<pg_sys::Node>();
-        if ctid.is_null() || (*ctid).type_ != pg_sys::NodeTag::T_Var {
+        let ctid_node = pg_sys::list_nth((*request.fcall).args, 0).cast::<pg_sys::Node>();
+        if ctid_node.is_null() || (*ctid_node).type_ != pg_sys::NodeTag::T_Var {
             return unhandled();
         }
-        let ctid = &*ctid.cast::<pg_sys::Var>();
+        let ctid = &*ctid_node.cast::<pg_sys::Var>();
         if ctid.varattno != pg_sys::SelfItemPointerAttributeNumber as i16 || ctid.varlevelsup != 0 {
             return unhandled();
         }
@@ -527,8 +868,13 @@ fn score_support(request: Internal) -> Internal {
         } else {
             0
         };
+        let segmented = crate::storage::is_segmented(index_oid);
         let mut args = PgList::<pg_sys::Node>::new();
-        args.push(pg_sys::copyObjectImpl(document.cast()).cast());
+        if segmented {
+            args.push(pg_sys::copyObjectImpl(ctid_node.cast()).cast());
+        } else {
+            args.push(pg_sys::copyObjectImpl(document.cast()).cast());
+        }
         let same_expression = binding
             .matches
             .iter()
@@ -570,7 +916,7 @@ fn score_support(request: Internal) -> Internal {
             args.push(null_array().cast());
             args.push(null_array().cast());
         }
-        let oid = lookup_score_bound();
+        let oid = lookup_score_bound(segmented);
         let replacement = pg_sys::makeFuncExpr(
             oid,
             pg_sys::FLOAT4OID,
@@ -648,11 +994,20 @@ unsafe fn make_null_const(type_oid: pg_sys::Oid) -> *mut pg_sys::Const {
     }
 }
 
-unsafe fn lookup_score_bound() -> pg_sys::Oid {
-    let name = CString::new("tin.score_bound").unwrap();
+unsafe fn lookup_score_bound(segmented: bool) -> pg_sys::Oid {
+    let name = CString::new(if segmented {
+        "tin.score_bound_indexed"
+    } else {
+        "tin.score_bound"
+    })
+    .unwrap();
     let names = unsafe { pg_sys::stringToQualifiedNameList(name.as_ptr(), std::ptr::null_mut()) };
     let types = [
-        pg_sys::TEXTOID,
+        if segmented {
+            pg_sys::TIDOID
+        } else {
+            pg_sys::TEXTOID
+        },
         pg_sys::TEXTOID,
         pg_sys::INT4OID,
         pg_sys::INT4OID,
@@ -673,6 +1028,7 @@ ALTER FUNCTION @extschema@.full_score(pg_catalog.tid, pg_catalog.float4, pg_cata
 ALTER FUNCTION @extschema@.score(pg_catalog.tid, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) SUPPORT @extschema@.score_support;
 ALTER FUNCTION @extschema@.max_score(pg_catalog.tid) SUPPORT @extschema@.score_support;
 REVOKE ALL ON FUNCTION @extschema@.score_bound(pg_catalog.text, pg_catalog.text, pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION @extschema@.score_bound_indexed(pg_catalog.tid, pg_catalog.text, pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
 "#,
     name = "score_support_bindings",
     requires = [
@@ -681,6 +1037,7 @@ REVOKE ALL ON FUNCTION @extschema@.score_bound(pg_catalog.text, pg_catalog.text,
         score,
         max_score,
         score_bound,
+        score_bound_indexed,
         score_support
     ]
 );

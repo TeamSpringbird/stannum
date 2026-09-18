@@ -242,7 +242,8 @@ impl<'a> Segment<'a> {
         &self.dictionary
     }
 
-    fn resolve(&self, entry: TermEntry) -> Result<Term<'a>> {
+    /// Resolves a dictionary entry obtained earlier from this segment.
+    pub fn resolve(&self, entry: TermEntry) -> Result<Term<'a>> {
         let slice = |area: &'a [u8], extent: Extent| -> Result<&'a [u8]> {
             let start = usize::try_from(extent.offset).map_err(|_| Error::Truncated)?;
             let end = start

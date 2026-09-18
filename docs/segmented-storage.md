@@ -24,8 +24,15 @@ except an expansion past the 1,024-term cap.
 all-visible pages, so counts on a vacuumed table approach index-only cost
 without a custom scan.
 
-Ranking is unchanged in this slice: `tin.score` still rebuilds its statistics
-from the heap per query. Persisting statistics is the next milestone.
+Ranking reads the index too. `tin.score`, `tin.full_score` and `tin.max_score`
+bind to `score_bound_indexed`, which builds per-term scorers from the segment
+directory and dictionaries and looks each row up by TID with forward-seeking
+cursors. Statistics follow TIN's contract, verified bit for bit against a live
+TIN in [tin-observed-shape.md](tin-observed-shape.md): document counts,
+total lengths and document frequencies include dead documents until their
+segment is rewritten, buffered documents count immediately, and dense-term
+elision uses immutable segments only. Indexes without LDP2 storage keep the
+heap-reloading scorer.
 
 ## Page layout
 
@@ -126,7 +133,9 @@ pages.
   query after a fold pays the read.
 * Folds happen in the inserting backend and rewrite the whole buffer; merges
   rewrite every segment. Both are bounded but make the triggering insert slow.
-* Ranking statistics are not yet read from segments.
+* Ranked queries still score every matching row through the executor and sort;
+  TIN prunes inside its custom scan with a top-k bound. On the 10,000-document
+  fixture a broad `OR` ranked query scores all rows in about 2 ms.
 * The pending-free list caps at 64 runs; beyond that, released pages leak
   until REINDEX with a warning.
 * PostgreSQL 17 has not been run for this slice.
@@ -158,6 +167,26 @@ planned as a cached in-memory segment keyed by its version, so a scan pays a
 rebuild only after an insert changed it. Ranked queries sit at about 15 ms in
 every build that finds candidates quickly: that is the scoring path reloading
 and retokenizing the corpus, unchanged here and the next thing to remove.
+
+### With indexed scoring
+
+Same protocol, one run, after `tin.score` moved to the index:
+
+| Query, median ms | LDP2 heap scoring | LDP2 indexed scoring |
+| --- | ---: | ---: |
+| rare ranked | 14.5 | 0.16 to 0.45 |
+| AND ranked | 15.3 | 0.22 to 1.3 |
+| phrase ranked | 14.7 | 0.12 to 0.30 |
+| OR ranked (all 10,000 rows scored) | 17.0 | 2 to 14 |
+| Total read queries/s, all twelve shapes | 360 | 740 to 1,160 |
+
+Ranges span several single runs taken while a Docker benchmark campaign was
+running on the same machine, so sub-10 ms medians moved with its load;
+direct timing of the 10,000-row scoring sum gave 1.7 to 4.5 ms across
+repetitions. The per-source cursors advance monotonically with the bitmap
+heap scan's TID order; in an isolated release-mode probe
+(`segment/tests/scoring_cost.rs`) the lookup sequence costs 21 ns per row
+against 2.4 µs with fresh cursors per row.
 
 ## Validation
 

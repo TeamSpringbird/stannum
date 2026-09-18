@@ -352,6 +352,101 @@ mod tests {
         );
     }
 
+    /// Values observed from TIN 1.0.2 on the same documents (docs/tin-observed-shape.md).
+    #[pg_test]
+    fn scoring_matches_tin_statistics_contract_bit_for_bit() {
+        Spi::run(
+            "CREATE TABLE parity(id int primary key, body text);
+             INSERT INTO parity VALUES (1,'rare common'), (2,'common common'),
+               (3,'common'), (4,'rare rare common x'), (5,'other');
+             CREATE INDEX parity_idx ON parity USING tin(body);",
+        )
+        .unwrap();
+        let scores = |label: &str| -> Vec<(i32, u32)> {
+            let rows = Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT id, tin.full_score(ctid) FROM parity
+                         WHERE body ==> 'rare OR common' ORDER BY id",
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            eprintln!("{label}: {rows:?}");
+            rows
+        };
+        let bits = |value: f32| value.to_bits();
+        assert_eq!(
+            scores("all live"),
+            vec![
+                (1, bits(1.163_150_8)),
+                (2, bits(0.395_562_86)),
+                (3, bits(0.361_657_47)),
+                (4, bits(1.143_688_9))
+            ]
+        );
+        // Deleted documents stay in the statistics until their segment is rewritten.
+        Spi::run("DELETE FROM parity WHERE id IN (2, 3)").unwrap();
+        assert_eq!(
+            scores("two deleted"),
+            vec![(1, bits(1.163_150_8)), (4, bits(1.143_688_9))]
+        );
+        // Buffered documents count immediately, alongside the dead ones.
+        Spi::run("INSERT INTO parity VALUES (6,'common common common'), (7,'rare')").unwrap();
+        assert_eq!(
+            scores("two buffered"),
+            vec![
+                (1, bits(1.201_372)),
+                (4, bits(1.153_078_8)),
+                (6, bits(0.531_823)),
+                (7, bits(1.039_253_1))
+            ]
+        );
+        // A rebuild re-indexes rows deleted by this still-open transaction, as
+        // every index AM must, so inside one transaction the statistics keep
+        // seven documents. TIN observed after a committed delete and VACUUM
+        // gave 1.1196322, 1.0063113, 0.78576607, 0.6938147 for five.
+        Spi::run("REINDEX INDEX parity_idx").unwrap();
+        assert_eq!(
+            scores("reindexed in transaction"),
+            vec![
+                (1, bits(1.201_372)),
+                (4, bits(1.153_078_8)),
+                (6, bits(0.531_823)),
+                (7, bits(1.039_253_1))
+            ]
+        );
+        // Dense-term elision from a single immutable segment.
+        Spi::run(
+            "CREATE TABLE dense(id int primary key, body text);
+             INSERT INTO dense SELECT n, CASE WHEN n <= 3 THEN 'rare common' ELSE 'common filler' END
+               FROM generate_series(1, 30) n;
+             CREATE INDEX dense_idx ON dense USING tin(body);",
+        )
+        .unwrap();
+        let dense = Spi::get_one::<Vec<f32>>(
+            "SELECT array_agg(tin.score(ctid) ORDER BY id) FROM dense
+             WHERE body ==> 'rare OR common' AND id <= 5",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            dense.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            [2.181_224_3_f32, 2.181_224_3, 2.181_224_3, 0.0, 0.0]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[pg_test]
     fn posting_inserts_rolled_back_by_subtransaction_are_not_visible() {
         Spi::run(
