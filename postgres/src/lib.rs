@@ -875,7 +875,16 @@ mod tests {
         )
         .unwrap();
         let mut scorer = crate::score::scorer_for_scan(
-            heap, index, "needle", true, None, None, None, None, None,
+            crate::score::scan_id(),
+            heap,
+            index,
+            "needle",
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
         let before = scorer.score(tid);
         assert!(before > 0.0);
@@ -3700,5 +3709,136 @@ mod tests {
             ),
             0
         );
+    #[pg_test]
+    fn hot_updated_rows_keep_their_score_on_both_ranked_paths() {
+        // A HOT update leaves the posting at the root of the chain while the
+        // executor projects the visible member's location. Found by the
+        // ranked-scan fuzzer: the unpruned path scored such rows zero and the
+        // pruned path ordered them by their real score but reported zero.
+        Spi::run(
+            "CREATE TABLE hot(id int primary key, body text, revision int default 0)
+               WITH (fillfactor = 50);
+             INSERT INTO hot SELECT n, CASE WHEN n % 3 = 0 THEN 'needle needle pad'
+               WHEN n % 3 = 1 THEN 'needle pad pad' ELSE 'other' END
+               FROM generate_series(1, 30) n;
+             CREATE INDEX hot_idx ON hot USING stannum(body);
+             UPDATE hot SET revision = revision + 1 WHERE id IN (3, 4);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        // The updated rows moved within their page: heap-only members.
+        assert_eq!(
+            value("SELECT count(*) FROM hot WHERE id IN (3, 4) AND ctid > '(0,30)'::tid"),
+            2
+        );
+        let rows = |custom: bool| -> Vec<(i32, u32)> {
+            Spi::run(&format!(
+                "SET LOCAL stannum.enable_custom_scan = {custom};
+                 SET LOCAL enable_bitmapscan = {};",
+                !custom
+            ))
+            .unwrap();
+            Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, stannum.full_score(ctid) AS score FROM hot
+                             WHERE body ==> 'needle' ORDER BY score DESC{} LIMIT 8",
+                            if custom { "" } else { ", ctid" }
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        };
+        let pruned = rows(true);
+        let unpruned = rows(false);
+        assert_eq!(pruned, unpruned);
+        let score = |id: i32| pruned.iter().find(|(i, _)| *i == id).map(|(_, s)| *s);
+        // The member scores as its root document: the same as any unmoved
+        // row with the same body, and never zero.
+        assert_eq!(pruned[0].0, 3);
+        assert_eq!(score(3), score(6));
+        assert!(f32::from_bits(score(3).unwrap()) > 0.0);
+        assert!(
+            Spi::get_one::<bool>(
+                "SELECT a.s = b.s AND a.s > 0 FROM
+                 (SELECT stannum.full_score(ctid) s FROM hot WHERE body ==> 'needle' AND id = 4) a,
+                 (SELECT stannum.full_score(ctid) s FROM hot WHERE body ==> 'needle' AND id = 7) b"
+            )
+            .unwrap()
+            .unwrap()
+        );
+    }
+
+    #[pg_test]
+    fn concurrent_cursors_on_one_query_keep_their_own_scores() {
+        // Found by the ranked-scan fuzzer: a scorer keyed by a backend-wide
+        // statement counter is replaced by any later scan on the same query,
+        // so a cursor's remaining rows were projected with statistics that
+        // documents indexed in between had changed, out of step with the
+        // order the cursor ranked them in.
+        Spi::run(
+            "CREATE TABLE twin(id int primary key, body text);
+             INSERT INTO twin SELECT n, 'other filler' FROM generate_series(1, 300) n;
+             INSERT INTO twin SELECT n, repeat('needle ', 1 + n % 4) || repeat('pad ', n % 7)
+               FROM generate_series(301, 340) n;
+             CREATE INDEX twin_idx ON twin USING stannum(body);
+             DELETE FROM twin WHERE id IN (303, 307, 311);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        // The deleted rows stay posted, so cursor a's pruned top 12 holds
+        // invisible rows and a completes its ordering after b was opened.
+        let rows = |sql: &str| {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let query = "SELECT id, stannum.full_score(ctid) AS score FROM twin WHERE body ==> 'needle' ORDER BY score DESC";
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off;").unwrap();
+        let before = rows(&format!("{query}, ctid"));
+        Spi::run(&format!(
+            "SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_bitmapscan = off;
+             DECLARE a CURSOR FOR {query} LIMIT 12;"
+        ))
+        .unwrap();
+        let mut from_a = rows("FETCH 3 FROM a");
+        // New documents change every statistic the scores depend on.
+        Spi::run(
+            "INSERT INTO twin SELECT n, 'needle needle needle needle needle needle'
+             FROM generate_series(401, 460) n",
+        )
+        .unwrap();
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off;").unwrap();
+        let after = rows(&format!("{query}, ctid"));
+        assert_ne!(before[..12], after[..12]);
+        Spi::run(&format!(
+            "SET LOCAL stannum.enable_custom_scan = on; DECLARE b CURSOR FOR {query} LIMIT 12;"
+        ))
+        .unwrap();
+        let mut from_b = rows("FETCH 5 FROM b");
+        from_a.extend(rows("FETCH ALL FROM a"));
+        from_b.extend(rows("FETCH ALL FROM b"));
+        assert_eq!(from_a, before[..12]);
+        assert_eq!(from_b, after[..12]);
+        Spi::run("CLOSE a; CLOSE b;").unwrap();
     }
 }

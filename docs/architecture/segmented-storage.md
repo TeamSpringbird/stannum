@@ -331,6 +331,14 @@ top rows were deleted), the scan scores every candidate and continues with the
 rows it has not emitted yet; documents indexed since the top k was built can
 rank into the completed ordering, so it is not resumed by position.
 
+A ranked scan keeps its scorer for as long as it lives, under its own
+identity, with the score of every row it ranked: a cursor fetched across
+later statements, or two scans on one query open at once, each report the
+scores they ranked by even as writes move the statistics. A HOT-updated row
+is posted at its chain root; the score functions resolve the visible member's
+location to that root. `docs/testing.md` describes the concurrency fuzzer
+that checks this against the unpruned path and the bug classes it found.
+
 ## Durability and maintenance
 
 Logged indexes use PostgreSQL's generic write-ahead log. A metadata page tracks
