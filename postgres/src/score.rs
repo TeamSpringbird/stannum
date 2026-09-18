@@ -1601,8 +1601,9 @@ fn score_inspect(
     TableIterator::new(rows)
 }
 
+/// The `==>` clauses of a qual tree as (document, text query, bound index).
 struct QualBinding {
-    matches: Vec<(*mut pg_sys::Node, *mut pg_sys::Node)>,
+    matches: Vec<(*mut pg_sys::Node, *mut pg_sys::Node, Option<pg_sys::Oid>)>,
 }
 
 #[pg_guard]
@@ -1611,28 +1612,43 @@ unsafe extern "C-unwind" fn find_qual(node: *mut pg_sys::Node, context: *mut c_v
         return false;
     }
     let binding = unsafe { &mut *context.cast::<QualBinding>() };
-    if unsafe { (*node).type_ } == pg_sys::NodeTag::T_OpExpr {
-        let op = node.cast::<pg_sys::OpExpr>();
-        let name = unsafe { pg_sys::get_opname((*op).opno) };
-        if !name.is_null()
-            && unsafe { CStr::from_ptr(name) }.to_bytes() == b"==>"
-            && unsafe { pg_sys::list_length((*op).args) } == 2
-        {
-            let left = unsafe { pg_sys::list_nth((*op).args, 0).cast::<pg_sys::Node>() };
-            let right = unsafe { pg_sys::list_nth((*op).args, 1).cast::<pg_sys::Node>() };
-            if !left.is_null() {
-                binding.matches.push((left, right));
-            }
-        }
+    if let Some(clause) = unsafe { crate::operator::search_clause(node) } {
+        binding
+            .matches
+            .push((clause.document, clause.query, clause.index));
     }
     unsafe { pg_sys::expression_tree_walker(node, Some(find_qual), context) }
 }
 
-pub(crate) unsafe fn find_matching_stannum_index(
+/// The index a clause bound to `bound` should be answered by, among
+/// `candidates` (in OID order): the bound index when it is one of them,
+/// otherwise the first with the same tokenizer settings, so an index scan
+/// never disagrees with the clause's own evaluation.
+pub(crate) unsafe fn pick_index(
+    candidates: &[pg_sys::Oid],
+    bound: Option<pg_sys::Oid>,
+) -> Option<pg_sys::Oid> {
+    match bound {
+        Some(bound) if candidates.contains(&bound) => Some(bound),
+        Some(bound) => {
+            let spec = unsafe { crate::storage::spec_by_oid(bound) };
+            candidates
+                .iter()
+                .copied()
+                .find(|&candidate| unsafe { crate::storage::spec_by_oid(candidate) } == spec)
+        }
+        None => candidates.first().copied(),
+    }
+}
+
+/// Every valid, ready, single-key stannum index of `heap_oid` whose key is
+/// `operand` (a variable of range-table entry `query_varno`, or an
+/// expression), in OID order.
+pub(crate) unsafe fn matching_stannum_indexes(
     heap_oid: pg_sys::Oid,
     query_varno: i32,
     operand: *mut pg_sys::Node,
-) -> Option<pg_sys::Oid> {
+) -> Vec<pg_sys::Oid> {
     let stannum_name = CString::new("stannum").expect("static access method name is valid");
     let stannum_am = unsafe { pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
     let normalized = unsafe { pg_sys::copyObjectImpl(operand.cast()).cast::<pg_sys::Node>() };
@@ -1640,7 +1656,7 @@ pub(crate) unsafe fn find_matching_stannum_index(
     let normalized = unsafe { pg_sys::strip_implicit_coercions(normalized) };
     let heap = unsafe { pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as _) };
     let indexes = unsafe { PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(heap)) };
-    let mut matched = None;
+    let mut matched = Vec::new();
     for index_oid in indexes.iter_oid() {
         let index = unsafe { pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _) };
         let metadata = unsafe { &*(*index).rd_index };
@@ -1672,8 +1688,7 @@ pub(crate) unsafe fn find_matching_stannum_index(
         };
         unsafe { pg_sys::index_close(index, pg_sys::AccessShareLock as _) };
         if matches {
-            matched = Some(index_oid);
-            break;
+            matched.push(index_oid);
         }
     }
     unsafe { pg_sys::table_close(heap, pg_sys::AccessShareLock as _) };
@@ -1781,11 +1796,16 @@ fn score_support(request: Internal) -> Internal {
         if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return unhandled();
         }
+        // Score with the index the ==> clause is bound to, so scoring
+        // statistics and matching use the same analyzer.
         let Some((document, first_query, index_oid)) =
-            binding.matches.iter().find_map(|&(document, query)| {
-                find_matching_stannum_index((*rte).relid, ctid.varno, document)
-                    .map(|index_oid| (document, query, index_oid))
-            })
+            binding
+                .matches
+                .iter()
+                .find_map(|&(document, query, bound)| {
+                    let candidates = matching_stannum_indexes((*rte).relid, ctid.varno, document);
+                    pick_index(&candidates, bound).map(|index_oid| (document, query, index_oid))
+                })
         else {
             return unhandled();
         };
@@ -1827,8 +1847,8 @@ fn score_support(request: Internal) -> Internal {
         let same_expression = binding
             .matches
             .iter()
-            .copied()
-            .filter(|(candidate, _)| pg_sys::equal((*candidate).cast(), document.cast()))
+            .filter(|(candidate, _, _)| pg_sys::equal((*candidate).cast(), document.cast()))
+            .map(|&(candidate, query, _)| (candidate, query))
             .collect::<Vec<_>>();
         let combined_query = combine_constant_queries(&same_expression)
             .unwrap_or_else(|| pg_sys::copyObjectImpl(first_query.cast()).cast());

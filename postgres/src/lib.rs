@@ -1670,4 +1670,455 @@ mod tests {
         assert_eq!(true_count("alpha AND beta"), 31.0);
         assert_eq!(true_count("\"beta alpha\""), 0.0);
     }
+
+    // --- Tokenizer settings agree across plans ----------------------------------
+
+    /// Plan modes for a `==>` query: the sequential scan evaluating the
+    /// operator itself, the bitmap index path, and the custom scan.
+    const PLAN_MODES: [(&str, &str, &str); 3] = [
+        (
+            "seq",
+            "SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+             SET LOCAL enable_bitmapscan = off; SET LOCAL stannum.enable_custom_scan = off",
+            "Seq Scan",
+        ),
+        (
+            "bitmap",
+            "SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off;
+             SET LOCAL enable_bitmapscan = on; SET LOCAL stannum.enable_custom_scan = off",
+            "Bitmap Heap Scan",
+        ),
+        (
+            "custom",
+            "SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off;
+             SET LOCAL enable_bitmapscan = on; SET LOCAL stannum.enable_custom_scan = on",
+            "Custom Scan",
+        ),
+    ];
+
+    fn ids(sql: &str) -> Vec<i32> {
+        Spi::connect(|client| {
+            client
+                .select(sql, None, &[])
+                .unwrap()
+                .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                .collect()
+        })
+    }
+
+    fn oid_of(relation: &str) -> u32 {
+        Spi::get_one::<pgrx::pg_sys::Oid>(&format!("SELECT '{relation}'::regclass::oid"))
+            .unwrap()
+            .unwrap()
+            .to_u32()
+    }
+
+    /// Whether any string in a JSON plan contains `needle`.
+    fn plan_mentions(plan: &serde_json::Value, needle: &str) -> bool {
+        match plan {
+            serde_json::Value::String(text) => text.contains(needle),
+            serde_json::Value::Array(items) => items.iter().any(|item| plan_mentions(item, needle)),
+            serde_json::Value::Object(fields) => {
+                fields.values().any(|value| plan_mentions(value, needle))
+            }
+            _ => false,
+        }
+    }
+
+    /// The plan node below any sort the `ORDER BY` added.
+    fn under_sort(plan: &serde_json::Value) -> serde_json::Value {
+        if plan["Node Type"] == "Sort" {
+            under_sort(&plan["Plans"][0])
+        } else {
+            plan.clone()
+        }
+    }
+
+    /// Runs `sql` under every plan mode: (mode, top plan node, rows).
+    fn by_mode(sql: &str) -> Vec<(&'static str, serde_json::Value, Vec<i32>)> {
+        PLAN_MODES
+            .iter()
+            .map(|(mode, settings, _)| {
+                Spi::run(settings).unwrap();
+                let plan = Spi::get_one::<Json>(&format!("EXPLAIN (VERBOSE, FORMAT JSON) {sql}"))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                (*mode, under_sort(&plan[0]["Plan"]), ids(sql))
+            })
+            .collect()
+    }
+
+    /// The rows `body ==> query` matches in `table`, asserting the plan modes
+    /// agree, each uses its own node, and every one evaluates the operator
+    /// bound to `index`.
+    fn agreed_ids(table: &str, index: &str, query: &str) -> Vec<i32> {
+        let sql = format!(
+            "SELECT id FROM {table} WHERE body ==> '{}' ORDER BY id",
+            query.replace('\'', "''")
+        );
+        let bound = format!("\"index\":{}", oid_of(index));
+        let results = by_mode(&sql);
+        for ((mode, plan, _), (_, _, node)) in results.iter().zip(PLAN_MODES) {
+            assert_eq!(plan["Node Type"], node, "{mode}: {query}: {plan}");
+            if *mode == "custom" {
+                assert_eq!(plan["Index"], index, "{mode}: {query}: {plan}");
+            } else {
+                assert!(plan_mentions(plan, &bound), "{mode}: {query}: {plan}");
+            }
+            if *mode == "bitmap" {
+                assert!(plan_mentions(plan, index), "{mode}: {query}: {plan}");
+            }
+        }
+        let rows = results.iter().map(|(_, _, rows)| rows).collect::<Vec<_>>();
+        assert!(
+            rows.windows(2).all(|pair| pair[0] == pair[1]),
+            "{query}: {rows:?}"
+        );
+        rows[0].clone()
+    }
+
+    /// The rows the default tokenizer settings match: an expression no index
+    /// covers stays unbound.
+    fn default_ids(table: &str, query: &str) -> Vec<i32> {
+        ids(&format!(
+            "SELECT id FROM {table} WHERE (body || '') ==> '{}' ORDER BY id",
+            query.replace('\'', "''")
+        ))
+    }
+
+    #[pg_test]
+    fn whitespace_tokenizer_agrees_across_plans() {
+        Spi::run(
+            "CREATE TABLE ws(id int, body text);
+             INSERT INTO ws VALUES (1, 'craft-beer'), (2, 'craft beer'), (3, 'beer,wine'),
+               (4, 'foo.bar baz'), (5, 'Craft');
+             CREATE INDEX ws_idx ON ws USING stannum(body) WITH (tokenizer = whitespace);",
+        )
+        .unwrap();
+        for query in [
+            "craft",
+            "craft-beer",
+            "\"craft beer\"",
+            "beer",
+            "wine",
+            "foo.bar",
+        ] {
+            agreed_ids("ws", "ws_idx", query);
+        }
+        assert_eq!(agreed_ids("ws", "ws_idx", "craft"), vec![2, 5]);
+        assert_eq!(default_ids("ws", "craft"), vec![1, 2, 5]);
+        assert_eq!(agreed_ids("ws", "ws_idx", "beer,wine"), vec![3]);
+    }
+
+    #[pg_test]
+    fn case_folding_preserve_agrees_across_plans() {
+        Spi::run(
+            "CREATE TABLE cs(id int, body text);
+             INSERT INTO cs VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER'), (4, 'Craft Beer');
+             CREATE INDEX cs_idx ON cs USING stannum(body) WITH (case_folding = preserve);",
+        )
+        .unwrap();
+        for query in [
+            "beer",
+            "Beer",
+            "BEER",
+            "\"craft beer\"",
+            "\"Craft Beer\"",
+            "Be*",
+        ] {
+            agreed_ids("cs", "cs_idx", query);
+        }
+        assert_eq!(agreed_ids("cs", "cs_idx", "Beer"), vec![1, 4]);
+        assert_eq!(default_ids("cs", "Beer"), vec![1, 2, 3, 4]);
+    }
+
+    #[pg_test]
+    fn accent_folding_preserve_agrees_across_plans() {
+        Spi::run(
+            "CREATE TABLE ac(id int, body text);
+             INSERT INTO ac VALUES (1, 'jalapeño'), (2, 'jalapeno'), (3, 'Crème brûlée'),
+               (4, 'creme brulee');
+             CREATE INDEX ac_idx ON ac USING stannum(body) WITH (accent_folding = preserve);",
+        )
+        .unwrap();
+        for query in [
+            "jalapeño",
+            "jalapeno",
+            "\"crème brûlée\"",
+            "creme",
+            "jalapeno~1",
+        ] {
+            agreed_ids("ac", "ac_idx", query);
+        }
+        assert_eq!(agreed_ids("ac", "ac_idx", "jalapeño"), vec![1]);
+        assert_eq!(default_ids("ac", "jalapeño"), vec![1, 2]);
+    }
+
+    #[pg_test]
+    fn long_token_modes_agree_across_plans() {
+        Spi::run(
+            "CREATE TABLE lt(id int, body text);
+             INSERT INTO lt VALUES (1, 'abcdefghijklmnop short'), (2, 'short'),
+               (3, 'abcdefgh'), (4, 'ijklmnop');",
+        )
+        .unwrap();
+        let queries = [
+            "short",
+            "abcdefgh",
+            "ijklmnop",
+            "abcdefghijklmnop",
+            "abcd*",
+            "\"abcdefgh ijklmnop\"",
+        ];
+        for mode in ["discard", "truncate", "split"] {
+            Spi::run(&format!(
+                "CREATE INDEX lt_idx ON lt USING stannum(body)
+                   WITH (long_tokens = {mode}, max_token_bytes = 8)"
+            ))
+            .unwrap();
+            for query in queries {
+                agreed_ids("lt", "lt_idx", query);
+            }
+            match mode {
+                "discard" => {
+                    assert_eq!(agreed_ids("lt", "lt_idx", "abcdefgh"), vec![3]);
+                    assert_eq!(
+                        agreed_ids("lt", "lt_idx", "\"abcdefgh ijklmnop\""),
+                        Vec::<i32>::new()
+                    );
+                }
+                "truncate" => assert_eq!(agreed_ids("lt", "lt_idx", "abcdefgh"), vec![1, 3]),
+                _ => {
+                    assert_eq!(agreed_ids("lt", "lt_idx", "ijklmnop"), vec![1, 4]);
+                    assert_eq!(agreed_ids("lt", "lt_idx", "\"abcdefgh ijklmnop\""), vec![1]);
+                }
+            }
+            Spi::run("DROP INDEX lt_idx").unwrap();
+        }
+        assert_eq!(default_ids("lt", "abcdefgh"), vec![3]);
+        assert_eq!(default_ids("lt", "ijklmnop"), vec![4]);
+        assert_eq!(default_ids("lt", "abcdefghijklmnop"), vec![1]);
+    }
+
+    #[pg_test]
+    fn grapheme_modes_agree_across_plans() {
+        Spi::run(
+            "CREATE TABLE gr(id int, body text);
+             INSERT INTO gr VALUES (1, 'I love 🍺'), (2, 'beer 🍺🍻 wine'), (3, 'plain → text'),
+               (4, '👍'), (5, 'craft 🍺 beer');",
+        )
+        .unwrap();
+        let queries = [
+            "🍺",
+            "love",
+            "\"love 🍺\"",
+            "→",
+            "\"plain → text\"",
+            "\"plain text\"",
+            "\"craft beer\"",
+            "👍",
+        ];
+        for mode in ["discard", "retain"] {
+            Spi::run(&format!(
+                "CREATE INDEX gr_idx ON gr USING stannum(body) WITH (graphemes = {mode})"
+            ))
+            .unwrap();
+            for query in queries {
+                agreed_ids("gr", "gr_idx", query);
+            }
+            if mode == "discard" {
+                assert_eq!(agreed_ids("gr", "gr_idx", "🍺"), Vec::<i32>::new());
+                // Discarded graphemes leave no position behind.
+                assert_eq!(agreed_ids("gr", "gr_idx", "\"plain text\""), vec![3]);
+            } else {
+                assert_eq!(agreed_ids("gr", "gr_idx", "→"), vec![3]);
+                assert_eq!(agreed_ids("gr", "gr_idx", "\"plain → text\""), vec![3]);
+            }
+            Spi::run("DROP INDEX gr_idx").unwrap();
+        }
+        assert_eq!(default_ids("gr", "🍺"), vec![1, 2, 5]);
+        assert_eq!(default_ids("gr", "→"), Vec::<i32>::new());
+    }
+
+    #[pg_test]
+    fn position_gap_modes_agree_across_plans() {
+        // A discarded long token leaves a gap in its phrase when positions are
+        // preserved, and none when they collapse.
+        Spi::run(
+            "CREATE TABLE pgap(id int, body text);
+             INSERT INTO pgap VALUES (1, 'craft abcdefghijklmnop beer'), (2, 'craft beer'),
+               (3, 'craft abcdefgh beer');",
+        )
+        .unwrap();
+        let queries = ["\"craft beer\"", "craft beer", "\"craft abcdefgh beer\""];
+        for gaps in ["collapse", "preserve"] {
+            Spi::run(&format!(
+                "CREATE INDEX pgap_idx ON pgap USING stannum(body)
+                   WITH (long_tokens = discard, max_token_bytes = 8, position_gaps = {gaps})"
+            ))
+            .unwrap();
+            for query in queries {
+                agreed_ids("pgap", "pgap_idx", query);
+            }
+            let expected = if gaps == "collapse" {
+                vec![1, 2]
+            } else {
+                vec![2]
+            };
+            assert_eq!(agreed_ids("pgap", "pgap_idx", "\"craft beer\""), expected);
+            Spi::run("DROP INDEX pgap_idx").unwrap();
+        }
+        assert_eq!(default_ids("pgap", "\"craft beer\""), vec![2]);
+    }
+
+    #[pg_test]
+    fn two_indexes_bind_the_first_by_oid() {
+        Spi::run(
+            "CREATE TABLE pair(id int, body text);
+             INSERT INTO pair VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER');
+             CREATE INDEX pair_fold ON pair USING stannum(body);
+             CREATE INDEX pair_case ON pair USING stannum(body) WITH (case_folding = preserve);",
+        )
+        .unwrap();
+        // The first index by OID binds; every plan follows it, and the bitmap
+        // path scans it rather than the index with other settings.
+        assert_eq!(agreed_ids("pair", "pair_fold", "Beer"), vec![1, 2, 3]);
+        assert_eq!(agreed_ids("pair", "pair_fold", "beer"), vec![1, 2, 3]);
+        Spi::run("DROP INDEX pair_fold").unwrap();
+        assert_eq!(agreed_ids("pair", "pair_case", "Beer"), vec![1]);
+        assert_eq!(agreed_ids("pair", "pair_case", "beer"), vec![2]);
+        // Created in the other order, the case-preserving index binds.
+        Spi::run(
+            "CREATE TABLE pair2(id int, body text);
+             INSERT INTO pair2 VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER');
+             CREATE INDEX pair2_case ON pair2 USING stannum(body) WITH (case_folding = preserve);
+             CREATE INDEX pair2_fold ON pair2 USING stannum(body);",
+        )
+        .unwrap();
+        assert_eq!(agreed_ids("pair2", "pair2_case", "Beer"), vec![1]);
+        // Forcing the other index scans every page and rechecks with the
+        // bound settings, so the result is unchanged.
+        Spi::run(
+            "DROP INDEX pair2_case;
+             CREATE INDEX pair2_case ON pair2 USING stannum(body) WITH (case_folding = preserve);",
+        )
+        .unwrap();
+        assert_eq!(agreed_ids("pair2", "pair2_fold", "Beer"), vec![1, 2, 3]);
+    }
+
+    #[pg_test]
+    fn partial_index_predicates_select_the_binding() {
+        Spi::run(
+            "CREATE TABLE part(id int, body text, active boolean);
+             INSERT INTO part VALUES (1, 'Beer', true), (2, 'beer', true), (3, 'BEER', false);
+             CREATE INDEX part_case ON part USING stannum(body)
+               WITH (case_folding = preserve) WHERE active;
+             CREATE INDEX part_fold ON part USING stannum(body);",
+        )
+        .unwrap();
+        // Without the predicate, the partial index cannot answer and the
+        // full one binds.
+        assert_eq!(agreed_ids("part", "part_fold", "Beer"), vec![1, 2, 3]);
+        let sql = "SELECT id FROM part WHERE active AND body ==> 'Beer' ORDER BY id";
+        let bound = format!("\"index\":{}", oid_of("part_case"));
+        for (mode, plan, rows) in by_mode(sql) {
+            assert_eq!(rows, vec![1], "{mode}");
+            if mode == "custom" {
+                assert_eq!(plan["Index"], "part_case", "{mode}: {plan}");
+            } else {
+                assert!(plan_mentions(&plan, &bound), "{mode}: {plan}");
+            }
+        }
+    }
+
+    #[pg_test]
+    fn non_constant_queries_bind_to_the_index() {
+        Spi::run(
+            "CREATE TABLE nc(id int, body text);
+             INSERT INTO nc VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER');
+             CREATE INDEX nc_idx ON nc USING stannum(body) WITH (case_folding = preserve);",
+        )
+        .unwrap();
+        let sql = "SELECT nc.id FROM nc, (VALUES ('Beer'), ('beer')) v(q)
+                   WHERE nc.body ==> v.q ORDER BY nc.id";
+        for (mode, plan, rows) in by_mode(sql) {
+            assert_eq!(rows, vec![1, 2], "{mode}");
+            assert!(plan_mentions(&plan, "bind_query"), "{mode}: {plan}");
+        }
+        // A prepared statement's generic plan holds the binding; dropping the
+        // index replans with the default settings.
+        Spi::run(
+            "SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = on;
+             SET LOCAL stannum.enable_custom_scan = on;
+             SET LOCAL plan_cache_mode = force_generic_plan;
+             PREPARE nc_plan AS SELECT id FROM nc WHERE body ==> 'Beer' ORDER BY id",
+        )
+        .unwrap();
+        assert_eq!(ids("EXECUTE nc_plan"), vec![1]);
+        Spi::run("DROP INDEX nc_idx").unwrap();
+        assert_eq!(ids("EXECUTE nc_plan"), vec![1, 2, 3]);
+    }
+
+    #[pg_test]
+    fn partitioned_indexes_bind_their_partitions() {
+        Spi::run(
+            "CREATE TABLE pt (id int, body text) PARTITION BY RANGE (id);
+             CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (1) TO (3);
+             CREATE TABLE pt2 PARTITION OF pt FOR VALUES FROM (3) TO (5);
+             INSERT INTO pt VALUES (1, 'Beer'), (2, 'beer'), (3, 'BEER'), (4, 'Beer');
+             CREATE INDEX pt_case ON pt USING stannum(body) WITH (case_folding = preserve);",
+        )
+        .unwrap();
+        let sql = "SELECT id FROM pt WHERE body ==> 'Beer' ORDER BY id";
+        let bound = format!("\"index\":{}", oid_of("pt_case"));
+        for (mode, plan, rows) in by_mode(sql) {
+            assert_eq!(rows, vec![1, 4], "{mode}");
+            assert!(
+                plan_mentions(&plan, &bound) || plan_mentions(&plan, "pt1_body_idx"),
+                "{mode}: {plan}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn highlighting_follows_the_index_tokenizer() {
+        Spi::run(
+            "CREATE TABLE hl(id int, body text);
+             INSERT INTO hl VALUES (1, 'Beer beer BEER');
+             CREATE INDEX hl_idx ON hl USING stannum(body) WITH (case_folding = preserve);",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<String>("SELECT stannum.highlight(body) FROM hl WHERE body ==> 'Beer'")
+                .unwrap(),
+            Some("<b>Beer</b> beer BEER".into())
+        );
+        assert_eq!(
+            Spi::get_one::<String>("SELECT stannum.highlight(body, query => 'beer') FROM hl")
+                .unwrap(),
+            Some("Beer <b>beer</b> BEER".into())
+        );
+        // An uncovered expression keeps the default settings.
+        assert_eq!(
+            Spi::get_one::<String>("SELECT stannum.highlight(body || '', query => 'beer') FROM hl")
+                .unwrap(),
+            Some("<b>Beer</b> <b>beer</b> <b>BEER</b>".into())
+        );
+        let ansi = Spi::get_one::<String>(
+            "SELECT stannum.highlight_ansi(body) FROM hl WHERE body ==> 'BEER'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ansi.matches("\x1b[").count(), 2, "{ansi:?}");
+        assert!(ansi.ends_with("BEER\x1b[0m"), "{ansi:?}");
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (VERBOSE, FORMAT JSON)
+             SELECT stannum.highlight(body) FROM hl WHERE body ==> 'Beer'",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        assert!(plan_mentions(&plan, "indexed_query"), "{plan}");
+    }
 }

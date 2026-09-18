@@ -227,7 +227,8 @@ fn is_permanent(index: pg_sys::Relation) -> bool {
 /// `index` is a live index relation held open by the caller.
 pub unsafe fn present(index: pg_sys::Relation) -> bool {
     unsafe {
-        if blocks(index) == 0 {
+        // A partitioned index is a catalog entry without storage.
+        if (*(*index).rd_rel).relkind.to_ne_bytes()[0] != b'i' || blocks(index) == 0 {
             return false;
         }
         let meta = Buffer::read(index, 0, false);
@@ -282,6 +283,62 @@ pub fn tokenizer_for(spec: &[u8; crate::options::SPEC_BYTES]) -> Rc<CompiledToke
 pub unsafe fn index_tokenizer(index: pg_sys::Relation) -> Rc<CompiledTokenizerPipeline> {
     let (_, meta) = unsafe { read_meta(index, false) };
     tokenizer_for(&meta.spec)
+}
+
+/// The tokenizer settings an index analyzes text with: the meta page's copy
+/// for a segmented index, otherwise (a partitioned, temporary, unlogged or
+/// legacy index, which has no LDP2 storage) its reloptions.
+///
+/// # Safety
+/// `index` is a live index relation held open by the caller.
+pub unsafe fn index_spec(index: pg_sys::Relation) -> [u8; crate::options::SPEC_BYTES] {
+    unsafe {
+        if present(index) {
+            read_meta(index, false).1.spec
+        } else {
+            crate::options::encode_spec(&crate::options::tokenizer_spec(index))
+        }
+    }
+}
+
+thread_local! {
+    /// Per-index tokenizer settings, keyed by index OID and validated
+    /// against the relation's file number, which every rebuild changes.
+    static SPECS: RefCell<HashMap<u32, (u32, [u8; crate::options::SPEC_BYTES])>> =
+        RefCell::new(HashMap::new());
+}
+
+/// [`index_spec`] of the index with this OID, memoized per backend.
+///
+/// # Safety
+/// `index_oid` names an index relation that the caller may open.
+pub unsafe fn spec_by_oid(index_oid: pg_sys::Oid) -> [u8; crate::options::SPEC_BYTES] {
+    unsafe {
+        let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
+        let file = (*index).rd_locator.relNumber.to_u32();
+        let cached = SPECS.with_borrow(|specs| specs.get(&index_oid.to_u32()).copied());
+        let spec = match cached {
+            Some((at, spec)) if at == file => spec,
+            _ => {
+                let spec = index_spec(index);
+                // Reloptions of an index without storage can change in place.
+                if present(index) {
+                    SPECS.with_borrow_mut(|specs| specs.insert(index_oid.to_u32(), (file, spec)));
+                }
+                spec
+            }
+        };
+        pg_sys::index_close(index, pg_sys::AccessShareLock as _);
+        spec
+    }
+}
+
+/// The compiled tokenizer of the index with this OID, memoized per backend.
+///
+/// # Safety
+/// `index_oid` names an index relation that the caller may open.
+pub unsafe fn tokenizer_by_oid(index_oid: pg_sys::Oid) -> Rc<CompiledTokenizerPipeline> {
+    tokenizer_for(&unsafe { spec_by_oid(index_oid) })
 }
 
 fn tokens_of(tokenizer: &CompiledTokenizerPipeline, text: &str) -> Vec<(String, u32)> {
