@@ -1,4 +1,4 @@
-use pgrx::{pg_guard, pg_sys};
+use pgrx::{PgList, pg_guard, pg_sys};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokenizer::{
@@ -75,6 +75,10 @@ enum_members!(
 struct IndexOptions {
     varlena_header: i32,
     initial_segment_count: i32,
+    target_segment_count: i32,
+    max_mutable_segment_size: i32,
+    max_merged_segment_size: i32,
+    dead_percent_threshold: f64,
     tokenizer: i32,
     case_folding: i32,
     accent_folding: i32,
@@ -100,7 +104,31 @@ pub fn init() {
             c"Ignored Stannum segment-count compatibility option".as_ptr(),
             1,
             1,
-            1024,
+            4096,
+            lock,
+        );
+        for (name, default, minimum, maximum) in [
+            (c"target_segment_count", 1, 1, 4096),
+            (c"max_mutable_segment_size", 4_194_304, 131_072, i32::MAX),
+            (c"max_merged_segment_size", 2000, 100, i32::MAX),
+        ] {
+            pg_sys::add_int_reloption(
+                kind,
+                name.as_ptr(),
+                c"Accepted for TIN DDL compatibility; ignored by Stannum".as_ptr(),
+                default,
+                minimum,
+                maximum,
+                lock,
+            );
+        }
+        pg_sys::add_real_reloption(
+            kind,
+            c"dead_percent_threshold".as_ptr(),
+            c"Accepted for TIN DDL compatibility; ignored by Stannum".as_ptr(),
+            0.5,
+            0.0,
+            1.0,
             lock,
         );
         pg_sys::add_enum_reloption(
@@ -222,6 +250,26 @@ pub unsafe extern "C-unwind" fn amoptions(
             std::mem::offset_of!(IndexOptions, initial_segment_count),
         ),
         parse_entry(
+            c"target_segment_count".as_ptr(),
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            std::mem::offset_of!(IndexOptions, target_segment_count),
+        ),
+        parse_entry(
+            c"max_mutable_segment_size".as_ptr(),
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            std::mem::offset_of!(IndexOptions, max_mutable_segment_size),
+        ),
+        parse_entry(
+            c"max_merged_segment_size".as_ptr(),
+            pg_sys::relopt_type::RELOPT_TYPE_INT,
+            std::mem::offset_of!(IndexOptions, max_merged_segment_size),
+        ),
+        parse_entry(
+            c"dead_percent_threshold".as_ptr(),
+            pg_sys::relopt_type::RELOPT_TYPE_REAL,
+            std::mem::offset_of!(IndexOptions, dead_percent_threshold),
+        ),
+        parse_entry(
             c"tokenizer".as_ptr(),
             pg_sys::relopt_type::RELOPT_TYPE_ENUM,
             std::mem::offset_of!(IndexOptions, tokenizer),
@@ -273,7 +321,7 @@ pub unsafe extern "C-unwind" fn amoptions(
         ),
     ];
     unsafe {
-        pg_sys::build_reloptions(
+        let options = pg_sys::build_reloptions(
             reloptions,
             validate,
             OPTION_KIND.load(Ordering::Relaxed),
@@ -281,7 +329,28 @@ pub unsafe extern "C-unwind" fn amoptions(
             entries.as_ptr(),
             entries.len() as i32,
         )
-        .cast()
+        .cast();
+        if validate {
+            for option in
+                PgList::<pg_sys::DefElem>::from_pg(pg_sys::untransformRelOptions(reloptions))
+                    .iter_ptr()
+            {
+                let name = CStr::from_ptr((*option).defname).to_string_lossy();
+                if matches!(
+                    name.as_ref(),
+                    "initial_segment_count"
+                        | "target_segment_count"
+                        | "max_mutable_segment_size"
+                        | "max_merged_segment_size"
+                        | "dead_percent_threshold"
+                ) {
+                    pgrx::warning!(
+                        "Stannum accepts {name} for TIN compatibility but ignores it; Stannum's storage and maintenance settings apply"
+                    );
+                }
+            }
+        }
+        options
     }
 }
 
