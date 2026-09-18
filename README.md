@@ -15,8 +15,8 @@ validated. See [results and next steps](docs/benchmarks/README.md).
 
 It supports terms, Boolean queries, phrases, proximity, ranking, and highlighting.
 The [architecture guide](docs/architecture/segmented-storage.md) explains how the
-index works and lists known limitations, including tokenizer consistency,
-maintenance latency, and slower fallback paths.
+index works and lists known limitations, including where `==>` cannot follow
+an index's tokenizer settings, maintenance latency, and slower fallback paths.
 
 ## Build and try it
 
