@@ -49,19 +49,21 @@ observed after build, after deletes, after VACUUM, after inserts into the write
 buffer and after REINDEX.
 
 * **Lead reference, in CI on every push** (`script/reference-oracle`, job
-  "Reference oracle against Lead"). The original Lead implementation is built
-  from the upstream commit kept in this repository's history, under its own
-  extension name `tin`, into the same server as Stannum. Match sets and the rank
+  "Reference oracle against upstream Lead"). PlanetScale's Lead is checked out
+  directly from its repository (`main` unless `LEAD_REF` pins a revision) and
+  built under its own extension name `tin` into the same server as Stannum, so
+  the comparison tracks Lead as it is maintained. Match sets and the rank
   order of full and dense scores must agree (`--scores order`). Score bits are
   not compared: Lead counts a token-less document present at index build in its
   corpus size, which shifts every IDF in the last bits; TIN and Stannum do not.
   Expansion shapes (wildcards, regular expressions, ranges) compare match sets
   only, because Lead scores their matches as zero where TIN scores the expanded
   terms. On every other input tried, Lead's bits match Stannum's exactly.
-* **TIN, by hand** (job "Compatibility oracle against TIN", `workflow_dispatch`
-  with the `TIN_DATABASE_URL` secret; or `benchmarks/oracle.py --right-engine tin`
-  locally). Bit-for-bit scores, including `max_score`. This is the standard the
-  Lead oracle cannot provide, and it needs a PlanetScale instance.
+* **TIN, locally by hand** (`benchmarks/oracle.py --right-engine tin` against
+  a PlanetScale database, with the connection in a libpq env file that never
+  enters the repository). Bit-for-bit scores, including `max_score`. This is
+  the standard the Lead oracle cannot provide; it is not part of CI because it
+  needs a live TIN instance and credentials.
 
 Add to the query list whenever a behavior is fixed or a gap is found; a new
 shape costs one line and is then checked against both references. Regressions
