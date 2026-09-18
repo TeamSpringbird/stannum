@@ -173,6 +173,11 @@ impl<'a> DictionaryIndex<'a> {
         self.entries.len()
     }
 
+    /// First term of block `block`, as recorded in the index.
+    pub fn block_first(&self, block: usize) -> Option<&'a [u8]> {
+        self.entries.get(block).map(|(first, _)| *first)
+    }
+
     /// Index of the block that could contain `term`, if any block starts at or
     /// before it.
     fn block_for(&self, term: &[u8]) -> Option<usize> {
@@ -249,6 +254,31 @@ impl<'a> Dictionary<'a> {
 
     pub const fn is_empty(&self) -> bool {
         self.index.count == 0
+    }
+
+    pub const fn index(&self) -> &'a DictionaryIndex<'a> {
+        self.index
+    }
+
+    /// Every term of block `block` in order, checking that the block's bytes
+    /// are consumed exactly; a verifier walks blocks one by one so a problem
+    /// in one block does not hide the others.
+    pub fn block(&self, block: usize) -> Result<Vec<(String, TermEntry)>> {
+        if block >= self.index.blocks() {
+            return Err(Error::Corrupt("dictionary block out of range"));
+        }
+        let mut walker = self.walker(block)?;
+        let mut out = Vec::with_capacity(walker.remaining_in_block);
+        while walker.remaining_in_block > 0 {
+            let entry = walker.step()?;
+            let term = String::from_utf8(walker.term.clone())
+                .map_err(|_| Error::Corrupt("dictionary term is not UTF-8"))?;
+            out.push((term, entry));
+        }
+        if walker.reader.remaining() != 0 {
+            return Err(Error::Corrupt("dictionary block length"));
+        }
+        Ok(out)
     }
 
     fn walker(&self, block: usize) -> Result<Walker<'a>> {
