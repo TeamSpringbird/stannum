@@ -202,8 +202,9 @@ unsafe fn const_datum<T: FromDatum>(node: *mut pg_sys::Node) -> Result<Option<T>
     }
 }
 
-/// Finds a `expr ==> 'literal'` restriction on `rel` answered by a segmented
-/// stannum index.
+/// Finds a `expr ==> 'literal'` restriction on `rel` (in either operator
+/// form) answered by a segmented stannum index whose tokenizer settings are
+/// the ones the clause is bound to.
 unsafe fn find_match(
     rel: *mut pg_sys::RelOptInfo,
     rte: *mut pg_sys::RangeTblEntry,
@@ -212,32 +213,27 @@ unsafe fn find_match(
         let restrictions = PgList::<pg_sys::RestrictInfo>::from_pg((*rel).baserestrictinfo);
         for info in restrictions.iter_ptr() {
             let clause = (*info).clause.cast::<pg_sys::Node>();
-            if clause.is_null() || (*clause).type_ != pg_sys::NodeTag::T_OpExpr {
-                continue;
-            }
-            let op = clause.cast::<pg_sys::OpExpr>();
-            let name = pg_sys::get_opname((*op).opno);
-            if name.is_null() || CStr::from_ptr(name).to_bytes() != b"==>" {
-                continue;
-            }
-            if pg_sys::list_length((*op).args) != 2 {
-                continue;
-            }
-            let left = pg_sys::list_nth((*op).args, 0).cast::<pg_sys::Node>();
-            let right = pg_sys::list_nth((*op).args, 1).cast::<pg_sys::Node>();
-            let Some(query) = const_text(right) else {
+            let Some(search) = crate::operator::search_clause(clause) else {
                 continue;
             };
-            let Some(index_oid) =
-                crate::score::find_matching_stannum_index((*rte).relid, (*rel).relid as i32, left)
-            else {
+            let Some(query) = const_text(search.query) else {
                 continue;
             };
-            if !crate::storage::is_segmented(index_oid) || !predicate_proven(rel, index_oid) {
+            let candidates = crate::score::matching_stannum_indexes(
+                (*rte).relid,
+                (*rel).relid as i32,
+                search.document,
+            )
+            .into_iter()
+            .filter(|&index_oid| {
+                crate::storage::is_segmented(index_oid) && predicate_proven(rel, index_oid)
+            })
+            .collect::<Vec<_>>();
+            let Some(index_oid) = crate::score::pick_index(&candidates, search.index) else {
                 continue;
-            }
+            };
             return Some(Match {
-                clause: op,
+                clause: clause.cast(),
                 index_oid,
                 query,
             });

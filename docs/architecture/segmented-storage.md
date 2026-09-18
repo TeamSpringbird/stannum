@@ -90,6 +90,35 @@ custom scan nodes:
 `EXPLAIN ANALYZE` shows the chosen path. `SET stannum.enable_custom_scan = off`
 selects the bitmap path for comparison.
 
+### One tokenizer per clause
+
+`document ==> 'query'` is evaluated outside the index too: by sequential
+scans, by bitmap and custom-scan rechecks, and wherever else the expression
+appears. On its own the operator knows nothing about the document, so it
+would tokenize with the default settings and disagree with an index built
+with others. A planner support function on the operator's function therefore
+rewrites the clause when the document is a column or expression covered by a
+`stannum` index whose predicate the query's restrictions imply: it becomes
+`document ==> '{"index":<oid>,"query":"..."}'::stannum.indexed_query`, a
+second operator (strategy 2 of the operator class) whose function tokenizes
+with that index's settings, read from the index's meta page and compiled once
+per backend. A non-constant query is wrapped as `stannum.bind_query(expr,
+oid)`. `EXPLAIN` shows the bound form, and a plan holding it is invalidated
+when the index changes.
+
+The binding is deterministic: among the covering indexes the first by OID
+(the order PostgreSQL lists them in) whose predicate holds. When indexes with
+different settings cover the same expression, the others can still be
+scanned, but `amcostestimate` prices such a scan as a full recheck and the
+scan itself rechecks every row with the bound settings, so the result never
+depends on the plan. `stannum.highlight` and `stannum.highlight_ansi` bind
+the same way, whether the query is taken from a `==>` clause or given
+explicitly, so highlights agree with matches. `stannum.score` and its
+relatives already analyze `term_add` and `term_replace` with the index they
+are bound to. `stannum.tokenize` and `stannum.ql_parse` take explicit
+settings and are unaffected: pass the index's options to reproduce its
+analysis.
+
 ## Ranking
 
 BM25 scoring reads term frequencies, document lengths, and corpus statistics from
@@ -217,8 +246,12 @@ the table is the source of truth; `REINDEX` rebuilds from it.
 
 ## Current limits
 
-- Nondefault tokenizer settings can produce different matches in indexed and
-  sequential scans. The sequential path still uses the default tokenizer.
+- `==>` uses the default tokenizer settings where the planner cannot bind it
+  to an index: with no planner state (index predicates, generated columns,
+  check constraints) or on a document expression no `stannum` index covers.
+  A partial index whose predicate is itself a `==>` clause is therefore not
+  matched against the bound clause, and its predicate is not proven by the
+  planner.
 - Standby/recovery reads and temporary or unlogged indexes use slower reference
   paths rather than the normal segmented search path.
 - Custom scans do not use parallel workers.

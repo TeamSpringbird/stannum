@@ -101,7 +101,7 @@ pub unsafe fn clause_estimate(
         }
         let left = pg_sys::list_nth(args, 0).cast::<pg_sys::Node>();
         let right = pg_sys::list_nth(args, 1).cast::<pg_sys::Node>();
-        let query = crate::customscan::const_text(right)?;
+        let query = crate::operator::query_text(right)?;
         let relids = pg_sys::pull_varnos(root, left);
         if pg_sys::bms_membership(relids) != pg_sys::BMS_Membership::BMS_SINGLETON {
             return None;
@@ -117,7 +117,8 @@ pub unsafe fn clause_estimate(
         {
             return None;
         }
-        let index_oid = crate::score::find_matching_stannum_index((*rte).relid, varno, left)?;
+        let candidates = crate::score::matching_stannum_indexes((*rte).relid, varno, left);
+        let index_oid = crate::score::pick_index(&candidates, crate::operator::bound_index(right))?;
         estimate_query(index_oid, &query)
     }
 }
@@ -240,13 +241,20 @@ pub fn heap_fetch(index: &IndexCost, heap_pages: f64) -> (f64, f64) {
     (fetched, cost_per_page)
 }
 
-/// The `==>` clauses of an index path, as their query texts.
+/// A `==>` clause of an index path: its query text, when constant, and the
+/// index it was bound to at plan time.
+pub struct PathClause {
+    pub query: Option<String>,
+    pub bound: Option<pg_sys::Oid>,
+}
+
+/// The `==>` clauses of an index path.
 ///
 /// # Safety
 /// `path` is a valid index path.
-pub unsafe fn index_path_queries(path: *mut pg_sys::IndexPath) -> Vec<String> {
+pub unsafe fn index_path_clauses(path: *mut pg_sys::IndexPath) -> Vec<PathClause> {
     unsafe {
-        let mut queries = Vec::new();
+        let mut clauses = Vec::new();
         for clause in PgList::<pg_sys::IndexClause>::from_pg((*path).indexclauses).iter_ptr() {
             let rinfo = (*clause).rinfo;
             if rinfo.is_null() {
@@ -260,12 +268,12 @@ pub unsafe fn index_path_queries(path: *mut pg_sys::IndexPath) -> Vec<String> {
             if pg_sys::list_length((*op).args) != 2 {
                 continue;
             }
-            if let Some(query) =
-                crate::customscan::const_text(pg_sys::list_nth((*op).args, 1).cast())
-            {
-                queries.push(query);
-            }
+            let right = pg_sys::list_nth((*op).args, 1).cast::<pg_sys::Node>();
+            clauses.push(PathClause {
+                query: crate::operator::query_text(right),
+                bound: crate::operator::bound_index(right),
+            });
         }
-        queries
+        clauses
     }
 }
