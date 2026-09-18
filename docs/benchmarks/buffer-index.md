@@ -123,7 +123,53 @@ the buffer, so the next index starts empty.
 
 ## Results
 
-RESULTS_PENDING
+### Read-only, controlled states, baseline and patched alternated
+
+`pgbench -c 2`, 45-second windows, all twenty shapes; per-statement latency in ms.
+
+| State | Build | count p50 / p99 | ranked p50 / p99 | reads/s | Fresh connection: first / second / third statement |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `new` (12 segments, 130 buffered) | baseline | 0.280 / 2.542 | 0.787 / 5.062 | 2,264 | 5.70 / 0.75 / 0.74 |
+| `new` | patched | 0.167 / 2.455 | 0.554 / 4.875 | 2,629 | 5.12 / 0.63 / 0.62 |
+| `old` (7 segments, 491 buffered) | baseline | 0.244 / 2.506 | 0.713 / 4.958 | 2,386 | 18.66 / 0.76 / 0.74 |
+| `old` | patched | 0.164 / 2.438 | 0.545 / 4.834 | 2,644 | 16.39 / 0.66 / 0.64 |
+
+The patched build removes 40% of the median count latency and 30% of the
+median ranked latency in the `new` state and 16% more throughput; the p99s,
+dominated by the phrase shapes' payload work, move 3–4%. The five extra
+segments of the `new` state, worth 15% of median latency on the baseline,
+are worth 2% on the patched build: the per-segment setup that made small
+folds expensive is gone, and the patched `new` state is faster than the
+baseline `old` state on every column.
+
+The fresh-connection column is planning plus execution of the first
+statement on a new connection, which builds the segment readers (three to
+twelve of them), the buffer index and the planner's estimate: 5 ms with a
+130-document buffer and 12 segments, 16–19 ms with a 491-document buffer and 7
+segments. The second statement is within 0.02 ms of the third. On the shared
+machine the same probe measured 44 ms and 128 ms once while a foreign build
+ran; the paired numbers above were taken back to back.
+
+### Profile, `history` ranked, `new` state
+
+Inclusive share of samples inside the custom scan (one reader, `pgbench -c 1`,
+30 s): baseline 15,113 samples at 1,039 statements/s; patched 15,429 samples at
+1,284 statements/s.
+
+| Where | Baseline | Patched |
+| --- | ---: | ---: |
+| block-max walk and scoring (`gather` minus setup) | 64% | 88% |
+| dictionary lookups (`Index::term`) | 20% | below 1% |
+| scorer construction (`scorer_for_scan`) | 13% | 1.7% |
+| planner estimate (`clause_estimate`) | 8% | 3.4% |
+
+What remains is the query's own work: seeking postings, decoding blocks and
+scoring candidates, whose cost does not depend on the number of segments
+(`Scored Candidates: 2531` either way), plus one query parse per phase.
+
+### Mutation windows: fold caps with the patched build
+
+MUTATION_PENDING
 
 ## Verification
 

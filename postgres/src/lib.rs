@@ -3021,9 +3021,27 @@ mod tests {
         let reference = value(&format!(
             "SELECT count(*) FROM {table} WHERE body ==> '{query}'"
         ));
-        Spi::run("SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = on;").unwrap();
+        Spi::run(
+            "SET LOCAL stannum.enable_custom_scan = off; SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = on;",
+        )
+        .unwrap();
         assert_eq!(indexed, reference, "{query}");
         indexed
+    }
+
+    /// The top three `needle` rows of `table` by full score, through the
+    /// custom scan and through the bitmap path.
+    fn top_needle_both_paths(table: &str) -> (Vec<i32>, Vec<i32>) {
+        let sql = format!(
+            "SELECT id FROM {table} WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC, id LIMIT 3"
+        );
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;")
+            .unwrap();
+        let custom = ids(&sql);
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off;").unwrap();
+        let bitmap = ids(&sql);
+        (custom, bitmap)
     }
 
     #[pg_test]
@@ -3060,14 +3078,9 @@ mod tests {
         Spi::run("UPDATE memo SET body = 'needle moved' WHERE id = 1").unwrap();
         assert_eq!(exact_count("memo", "needle"), 6);
         assert_eq!(exact_count("memo", "w1"), 9);
-        assert_eq!(
-            ids(
-                "SELECT id FROM memo WHERE body ==> 'needle' ORDER BY stannum.full_score(ctid) DESC, id LIMIT 3"
-            ),
-            ids(
-                "SELECT id FROM (SELECT id, stannum.full_score(ctid) AS s FROM memo WHERE body ==> 'needle') t ORDER BY s DESC, id LIMIT 3"
-            )
-        );
+        let (custom, bitmap) = top_needle_both_paths("memo");
+        assert_eq!(custom.len(), 3);
+        assert_eq!(custom, bitmap);
         let before = crate::storage::cache_probe();
         Spi::run("REINDEX INDEX memo_idx").unwrap();
         assert_eq!(exact_count("memo", "needle"), 6);
