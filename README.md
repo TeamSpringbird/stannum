@@ -60,8 +60,10 @@ cargo pgrx package --package stannum --no-default-features --features pg18
 ```
 
 PostgreSQL 17 and 18 are build targets. Most recent local lifecycle and benchmark
-evidence is on PostgreSQL 18. Stannum loads on demand; it does not require
-`shared_preload_libraries`. The receiving server must have the compiled library,
+evidence is on PostgreSQL 18. Stannum loads on demand on a primary; adding it to
+`shared_preload_libraries` on the primary and its standbys enables index reads on
+hot standbys (see [recovery](docs/architecture/recovery-and-parallel.md)).
+The receiving server must have the compiled library,
 control file, and extension SQL installed before `CREATE EXTENSION` can work.
 
 Current release baseline: **0.1.0-dev** (`stannum.version()` returns `0.1.0`).

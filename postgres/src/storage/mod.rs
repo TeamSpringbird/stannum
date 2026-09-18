@@ -16,17 +16,23 @@
 //! WAL: every page change goes through the generic WAL API. New runs and
 //! their directory entries are published in that order, so a crash between
 //! the two leaks unreferenced pages rather than referencing unwritten ones.
+//! Generic WAL carries no snapshot information, so freeing pages additionally
+//! logs a removal horizon through [`wal`] when the custom resource manager is
+//! registered; hot standbys serve segmented reads only then (see
+//! [`index_reads_allowed`]).
 
 pub mod layout;
 pub mod verify;
+pub mod wal;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use layout::{
-    BufferState, CHAIN_CAPACITY, KIND_BUFFER, KIND_FREE, KIND_META, KIND_RUN, MAX_PENDING,
-    MAX_SEGMENTS, Meta, NONE, PAGE_SIZE, Pending, Run, SPECIAL_SIZE, SegmentEntry,
+    BufferState, CHAIN_CAPACITY, FLAG_REMOVAL_HORIZONS, KIND_BUFFER, KIND_FREE, KIND_META,
+    KIND_RUN, MAX_PENDING, MAX_SEGMENTS, Meta, NONE, PAGE_SIZE, Pending, Run, SPECIAL_SIZE,
+    SegmentEntry,
 };
 use pgrx::{
     FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgLogLevel, PgRelation,
@@ -235,6 +241,29 @@ impl Buffer {
             corrupt(format!("Stannum index page {}: {message}", self.block()))
         })
     }
+
+    /// The WAL position of the last record that changed this page.
+    fn lsn(&self) -> u64 {
+        // SAFETY: the guard pins a full page whose header starts with pd_lsn.
+        let header = unsafe { &*pg_sys::BufferGetPage(self.0).cast::<pg_sys::PageHeaderData>() };
+        (u64::from(header.pd_lsn.xlogid) << 32) | u64::from(header.pd_lsn.xrecoff)
+    }
+
+    /// The flags in the special area (see [`layout::flags`]).
+    fn flags(&self) -> u16 {
+        layout::flags(self.page())
+    }
+}
+
+/// Flags the meta page carries when written by this backend: removal
+/// horizons are logged only with the resource manager and for WAL-logged
+/// relations.
+fn meta_flags(index: pg_sys::Relation) -> u16 {
+    if wal::registered().is_some() && is_permanent(index) {
+        FLAG_REMOVAL_HORIZONS
+    } else {
+        0
+    }
 }
 
 impl Drop for Buffer {
@@ -265,11 +294,11 @@ unsafe fn write_page(
             if initialize {
                 pg_sys::PageInit(raw, PAGE_SIZE, SPECIAL_SIZE);
             }
-            checked(layout::write(
-                std::slice::from_raw_parts_mut(raw.cast(), PAGE_SIZE),
-                kind,
-                payload,
-            ));
+            let page = std::slice::from_raw_parts_mut(raw.cast(), PAGE_SIZE);
+            checked(layout::write(page, kind, payload));
+            if kind == KIND_META {
+                layout::set_flags(page, meta_flags(index));
+            }
             pg_sys::CritSectionCount += 1;
             std::ptr::copy_nonoverlapping(raw, pg_sys::BufferGetPage(buffer.0), PAGE_SIZE);
             pg_sys::MarkBufferDirty(buffer.0);
@@ -291,6 +320,9 @@ unsafe fn write_page(
         }
         let page = std::slice::from_raw_parts_mut(raw.cast::<u8>(), PAGE_SIZE);
         checked(layout::write(page, kind, payload));
+        if kind == KIND_META {
+            layout::set_flags(page, meta_flags(index));
+        }
         pg_sys::GenericXLogFinish(wal);
     }
 }
@@ -326,6 +358,11 @@ pub unsafe fn present(index: pg_sys::Relation) -> bool {
 
 unsafe fn read_meta(index: pg_sys::Relation, exclusive: bool) -> (Buffer, Meta) {
     unsafe {
+        if exclusive {
+            // A structural change begins: forget releases of an operation
+            // that failed before publishing.
+            RELEASED_XIDS.with_borrow_mut(Vec::clear);
+        }
         let buffer = Buffer::read(index, 0, exclusive);
         let kind = buffer.kind();
         if kind != KIND_META {
@@ -340,7 +377,51 @@ unsafe fn read_meta(index: pg_sys::Relation, exclusive: bool) -> (Buffer, Meta) 
 }
 
 unsafe fn write_meta(index: pg_sys::Relation, buffer: &Buffer, meta: &Meta) {
-    unsafe { write_page(index, buffer, false, KIND_META, &checked(meta.encode())) }
+    unsafe {
+        write_page(index, buffer, false, KIND_META, &checked(meta.encode()));
+        let released = RELEASED_XIDS.with_borrow_mut(std::mem::take);
+        if released.is_empty() || wal::registered().is_none() || !is_permanent(index) {
+            return;
+        }
+        // Read only after the publication above reached WAL: every
+        // transaction id assigned before it is now below this one, so no
+        // standby snapshot that copied the old directory can have a larger
+        // xmin (see restamp).
+        let horizon = pg_sys::ReadNextTransactionId().into_inner();
+        if let Some(stamped) = restamp(meta, &released, horizon) {
+            write_page(index, buffer, false, KIND_META, &checked(stamped.encode()));
+        }
+    }
+}
+
+thread_local! {
+    /// Transaction ids [`release`] stamped on pending entries during the
+    /// structural change in progress, consumed by [`write_meta`].
+    static RELEASED_XIDS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The meta page with every pending entry released in this operation
+/// stamped `horizon`, or `None` when nothing changes.
+///
+/// `release` reads the next transaction id *before* the directory without
+/// the run is published; between that read and the publication another
+/// transaction can take that very id and commit ahead of the publication in
+/// WAL. A standby snapshot taken between the two replays then has an xmin
+/// above the stamped id while still able to copy the old directory, and the
+/// reclaim conflict logged later would miss it. Stamping again with an id read
+/// after the publication closes that window (nbtree's `safexid` tolerates
+/// it). Entries released earlier keep their ids: raising them would only
+/// delay their reclamation.
+fn restamp(meta: &Meta, released: &[u32], horizon: u32) -> Option<Meta> {
+    let mut stamped = meta.clone();
+    let mut changed = false;
+    for pending in &mut stamped.pending {
+        if pending.xid != horizon && released.contains(&pending.xid) {
+            pending.xid = horizon;
+            changed = true;
+        }
+    }
+    changed.then_some(stamped)
 }
 
 // --- Tokenizers ---------------------------------------------------------------
@@ -759,6 +840,11 @@ unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
         return;
     }
     let xid = unsafe { pg_sys::ReadNextTransactionId() }.into_inner();
+    RELEASED_XIDS.with_borrow_mut(|xids| {
+        if !xids.contains(&xid) {
+            xids.push(xid);
+        }
+    });
     if meta.pending.len() >= MAX_PENDING {
         unsafe { drain_pending(index, meta) };
     }
@@ -822,6 +908,9 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
                 still_pending.push(pending);
                 continue;
             }
+            // Standbys must resolve the snapshot conflict before the pages
+            // below become free and reusable.
+            wal::log_reclaim(index, pending.xid);
             let mut block = pending.run.first;
             for _ in 0..pending.run.blocks {
                 pgrx::check_for_interrupts!();
@@ -864,12 +953,20 @@ thread_local! {
 }
 
 /// Reads buffer bytes `[from, to)` using and extending the page map.
+///
+/// With `published`, the WAL position of the meta page the caller holds
+/// shared, a page changed by a later record makes the read `None`: replay on
+/// a standby applies a writer's buffer pages before its meta page, without
+/// the meta lock a primary writer would hold across both, so an old meta page
+/// can describe pages already rewritten from the head. Links are exempt: a
+/// page's successor is set once and never changes.
 unsafe fn read_buffer_range(
     index: pg_sys::Relation,
     pages: &mut Vec<u32>,
     from: usize,
     to: usize,
-) -> Vec<u8> {
+    published: Option<u64>,
+) -> Option<Vec<u8>> {
     unsafe {
         let mut out = Vec::with_capacity(to - from);
         let mut at = from;
@@ -889,6 +986,9 @@ unsafe fn read_buffer_range(
                 pages.push(next);
             }
             let buffer = Buffer::read(index, pages[page], false);
+            if published.is_some_and(|published| buffer.lsn() > published) {
+                return None;
+            }
             expect_buffer_page(&buffer);
             let (_, data) = buffer.chain();
             let within = at % CHAIN_CAPACITY;
@@ -903,17 +1003,19 @@ unsafe fn read_buffer_range(
             out.extend_from_slice(&data[within..within + take]);
             at += take;
         }
-        out
+        Some(out)
     }
 }
 
 /// The buffer's index for the current state, extended with any records
-/// appended since it was last used.
+/// appended since it was last used. `None` when a page read is stale against
+/// `published` (see [`read_buffer_range`]); the cache is left as it was.
 unsafe fn buffer_index(
     index: pg_sys::Relation,
     identity: u64,
     state: &BufferState,
-) -> Rc<MutableIndex> {
+    published: Option<u64>,
+) -> Option<Rc<MutableIndex>> {
     let cache = BUFFER_INDEX.with_borrow_mut(Option::take);
     let mut entry = match cache {
         Some(entry)
@@ -933,7 +1035,17 @@ unsafe fn buffer_index(
     };
     if entry.covered < state.bytes as usize {
         let tail = unsafe {
-            read_buffer_range(index, &mut entry.pages, entry.covered, state.bytes as usize)
+            read_buffer_range(
+                index,
+                &mut entry.pages,
+                entry.covered,
+                state.bytes as usize,
+                published,
+            )
+        };
+        let Some(tail) = tail else {
+            BUFFER_INDEX.with_borrow_mut(|slot| *slot = Some(entry));
+            return None;
         };
         let mut at = 0;
         while at < tail.len() {
@@ -943,7 +1055,7 @@ unsafe fn buffer_index(
     }
     let result = entry.index.clone();
     BUFFER_INDEX.with_borrow_mut(|slot| *slot = Some(entry));
-    result
+    Some(result)
 }
 
 unsafe fn dead_set(index: pg_sys::Relation, entry: &SegmentEntry) -> BTreeSet<Tid> {
@@ -1580,38 +1692,91 @@ pub struct View {
     pub labels: Vec<String>,
 }
 
+/// During recovery the view is served only when [`index_reads_allowed`]
+/// holds; callers choose their heap fallback before asking. Buffer pages
+/// read under the shared meta lock are validated against the meta page's
+/// WAL position and the copy is retried should replay have moved them on
+/// (see [`read_buffer_range`]); segment runs need no such check because their
+/// pages are freed only after a logged conflict removed every snapshot that
+/// could still reference them.
+///
 /// # Safety
 /// `index_oid` names a live LDP2 index the caller may open.
 pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
     unsafe {
         let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
         let index = relation.as_ptr();
-        let (meta_buffer, meta) = read_meta(index, false);
-        let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
-        let mut labels = Vec::with_capacity(meta.segments.len() + 1);
-        trim_reader_cache(meta.identity, &meta);
-        for entry in &meta.segments {
-            pgrx::check_for_interrupts!();
-            let (reader, dead) = cached_segment(index, index_oid, meta.identity, entry);
-            sources.push((Box::new(reader), dead));
-            labels.push(generation_label(entry.generation));
-        }
-        let immutable_sources = sources.len();
-        if meta.buffer.docs > 0 {
-            let buffer = buffer_index(index, meta.identity, &meta.buffer);
-            sources.push((Box::new(buffer), None));
-            labels.push("write buffer".to_owned());
-        }
-        // Segments are immutable; the buffer index was extended under the
-        // shared meta lock, so a fold cannot rewrite pages underneath it.
-        drop(meta_buffer);
-        drop(relation);
-        View {
-            sources,
-            immutable_sources,
-            labels,
+        let recovery = pg_sys::RecoveryInProgress();
+        let mut stale_reads = 0;
+        loop {
+            let (meta_buffer, meta) = read_meta(index, false);
+            if recovery && !standby_reads_allowed(&meta_buffer) {
+                pgrx::error!(
+                    "Stannum segmented reads are unavailable during recovery for this index: \
+                     the primary and this standby must preload the extension"
+                );
+            }
+            let published = recovery.then(|| meta_buffer.lsn());
+            let buffer = if meta.buffer.docs > 0 {
+                match buffer_index(index, meta.identity, &meta.buffer, published) {
+                    Some(buffer) => Some(buffer),
+                    None => {
+                        // Replay changed a buffer page after the meta page we
+                        // hold; let the matching meta record through and copy
+                        // again. Each attempt races one writer's records.
+                        drop(meta_buffer);
+                        stale_reads += 1;
+                        if stale_reads > STALE_READ_ATTEMPTS {
+                            pgrx::ereport!(
+                                PgLogLevel::ERROR,
+                                PgSqlErrorCode::ERRCODE_T_R_SERIALIZATION_FAILURE,
+                                "canceling statement due to Stannum index changes during recovery"
+                            );
+                        }
+                        pg_sys::pg_usleep(1000);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
+            let mut labels = Vec::with_capacity(meta.segments.len() + 1);
+            trim_reader_cache(meta.identity, &meta);
+            for entry in &meta.segments {
+                pgrx::check_for_interrupts!();
+                let (reader, dead) = cached_segment(index, index_oid, meta.identity, entry);
+                sources.push((Box::new(reader), dead));
+                labels.push(generation_label(entry.generation));
+            }
+            let immutable_sources = sources.len();
+            if let Some(buffer) = buffer {
+                sources.push((Box::new(buffer), None));
+                labels.push("write buffer".to_owned());
+            }
+            // Segments are immutable; the buffer index was extended under the
+            // shared meta lock, so a fold cannot rewrite pages underneath it.
+            drop(meta_buffer);
+            drop(relation);
+            return View {
+                sources,
+                immutable_sources,
+                labels,
+            };
         }
     }
+}
+
+/// Stale buffer reads a standby view tolerates before giving up; each
+/// retry waits for the meta record whose buffer pages it raced against.
+const STALE_READ_ATTEMPTS: u32 = 100;
+
+/// Whether a hot-standby session may read segments and buffer of the index
+/// whose meta page `meta` is: this server registered the resource manager
+/// that replays removal horizons, and the primary that last wrote the index
+/// logged them.
+fn standby_reads_allowed(meta: &Buffer) -> bool {
+    wal::registered().is_some() && meta.flags() & FLAG_REMOVAL_HORIZONS != 0
 }
 
 /// Adds every document matching all `queries` to `bitmap`, exact where the
@@ -1789,26 +1954,56 @@ pub unsafe fn cleanup(index: pg_sys::Relation) {
     }
 }
 
-/// Whether the planner may use segmented execution for this index.
-/// Feedback settings do not prove this snapshot reached the primary before
-/// index VACUUM/reclamation. Generic WAL has no removal-conflict record, so
-/// recovery snapshots (including those surviving promotion) use heap scoring
-/// and scan fallbacks. Keep this shared by the custom-path and score planners.
+/// Whether the planner may use segmented execution for this index: it has
+/// LDP2 storage and [`index_reads_allowed`] holds. Shared by the custom-path,
+/// bitmap and score planners and by the executor's fallback decision.
 ///
 /// # Safety
 /// `oid` names an index relation that the caller may open.
 pub unsafe fn is_segmented(oid: pg_sys::Oid) -> bool {
     unsafe {
-        if pg_sys::RecoveryInProgress()
-            || (pg_sys::ActiveSnapshotSet() && (*pg_sys::GetActiveSnapshot()).takenDuringRecovery)
-        {
+        let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as _);
+        let allowed = index_reads_allowed(index);
+        pg_sys::index_close(index, pg_sys::AccessShareLock as _);
+        allowed
+    }
+}
+
+/// Whether this session may read segments and the write buffer of `index`
+/// instead of scanning the heap.
+///
+/// On a primary, always for an LDP2 index: readers copy the directory under
+/// the meta lock and hold a snapshot whose xmin keeps the runs they reference
+/// off the free list ([`drain_pending`]). After promotion the same holds for
+/// snapshots taken during recovery, because their xmin is in the procarray
+/// and replay, the only writer that ignores the meta lock, has ended.
+///
+/// During recovery, only when the primary logs removal horizons and this
+/// server replays them ([`standby_reads_allowed`]): then every page free is
+/// preceded by a snapshot conflict that removes or waits for the sessions
+/// that could still reference the pages, and buffer reads are validated
+/// against replay ([`view`]). `hot_standby_feedback` alone proves nothing.
+///
+/// # Safety
+/// `index` is a live index relation held open by the caller.
+pub unsafe fn index_reads_allowed(index: pg_sys::Relation) -> bool {
+    unsafe {
+        if !present(index) {
             return false;
         }
-        let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as _);
-        let segmented = present(index);
-        pg_sys::index_close(index, pg_sys::AccessShareLock as _);
-        segmented
+        if !pg_sys::RecoveryInProgress() {
+            return true;
+        }
+        standby_reads_allowed(&Buffer::read(index, 0, false))
     }
+}
+
+/// Whether the last writer of `index` logged removal horizons.
+///
+/// # Safety
+/// `index` is a live LDP2 index held open by the caller.
+pub unsafe fn removal_horizons_logged(index: pg_sys::Relation) -> bool {
+    unsafe { Buffer::read(index, 0, false).flags() & FLAG_REMOVAL_HORIZONS != 0 }
 }
 
 /// One row of `stannum.segment_info`, mirroring TIN's columns.
