@@ -64,5 +64,69 @@ target/release/examples/merge_memory prepare /tmp/merge-fixture 512 400 400
 cmp /tmp/reference.segment /tmp/direct.segment
 ```
 
-Validation and measurement are in progress; this integration is not yet approved
-for promotion based on runtime performance.
+## Local results
+
+Apple M4 Max, ARM64, PostgreSQL 18.6, Rust 1.96.0 release builds. Baseline runtime
+source is `26b9d1e`; integrated runtime source is `a6269f4`. Subsequent lifecycle
+harness changes do not change either library. Retained library SHA-256 values:
+
+- Baseline: `ae2b0559b84bd4e2108068a6c88d9b0aba4434c7cba383d8081ccb27eeb5665a`
+- Integrated: `03caf61cb9152957dae8d89a7abc939d3fc6e848532569e9d3a7af9f13ec9a3c`
+
+All twelve contention windows passed membership oracles during traffic, final
+insert accounting and index verification. Server logs show no checkpoint starts
+inside the shared traffic windows. Medians of three windows per build:
+
+| Workload | Metric | Baseline | Integrated | Change |
+| --- | --- | ---: | ---: | ---: |
+| Long documents | Writer transactions/s | 7,021 | 7,294 | +3.9% |
+| Long documents | Reader transactions/s | 1,918 | 2,062 | +7.5% |
+| Long documents | Writer p99 ms | 4.649 | 4.259 | -8.4% |
+| Long documents | Reader p99 ms | 6.691 | 6.243 | -6.7% |
+| Short documents | Writer transactions/s | 9,529 | 9,904 | +3.9% |
+| Short documents | Reader transactions/s | 1,709 | 1,689 | -1.1% |
+| Short documents | Writer p99 ms | 2.935 | 2.836 | -3.4% |
+| Short documents | Reader p99 ms | 4.904 | 4.833 | -1.4% |
+
+Writer p95 was approximately unchanged (long: 1.430 → 1.425 ms; short: 1.192 →
+1.185 ms). Reader p95 fell from 4.676 to 4.278 ms for long documents and 4.028 to
+3.961 ms for short documents. The long-document paired writer throughput changes
+were -1.4%, +3.2%, +4.1%; the aggregate median is not a guarantee for every run.
+These are closed-loop tests against a growing table: different throughput means
+different final table sizes and reader work. Wait-event samples do not measure
+metadata-lock duration. This supports a modest local improvement, not a general
+4% throughput guarantee or a comparison with TIN.
+
+Isolated process medians from three alternating pairs, identical output bytes in
+every run (RSS in MiB):
+
+| Docs/segment | Tokens/doc | Vocabulary | Reference ms | Direct ms | Reference peak RSS | Direct peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 40 | 4 | 0.693 | 0.396 | 2.16 | 2.03 |
+| 512 | 400 | 4 | 11.471 | 7.136 | 16.34 | 9.30 |
+| 512 | 400 | 400 | 267.531 | 100.597 | 153.59 | 29.02 |
+
+Retaining encoded sources cost less than reconstructed document state in these
+fixtures. Small-process RSS includes startup overhead. This is not a bound on
+large or adversarial inputs, and does not establish PostgreSQL backend peak RSS.
+
+## Validation status
+
+Local formatting, all 60 harness tests, 454 core unit tests, four documentation
+tests, warnings-denied Clippy for PostgreSQL 17/18, and all 109 tests on each major
+passed. Lifecycle validation passed, including crash/replay, CTID reuse, ranking,
+promotion and 338 standby snapshot comparisons with zero wrong answers.
+
+The first lifecycle run hit a valid PostgreSQL recovery-conflict session
+termination that the harness recognized only as statement cancellation. The
+harness now accepts both exact recovery-conflict messages; unlimited-delay and
+feedback-enabled cases still require all 160 answers and no cancellation, and
+unrelated connection errors still fail. PostgreSQL's
+[recovery-conflict handling](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c)
+explicitly supports both outcomes. The full lifecycle rerun passed.
+
+Fixed-work results, ranked fuzz and CI are still being collected. Cross-architecture
+performance validation remains a promotion gate; local ARM64 timing does not
+establish x86-64 behavior. Raw local samples, binary identities, server logs and
+probe outputs are retained under ignored
+`benchmarks/results/direct-merge-integration/`.
