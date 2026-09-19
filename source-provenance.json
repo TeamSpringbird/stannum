@@ -837,6 +837,14 @@
     "tokenizer/tests/compatibility.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 82157ed1e4da3e195b0837dbb868897a8f57ad48."
+    },
+    "benchmarks/resources.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum resource measurement summarization and regression coverage."
+    },
+    "benchmarks/test_resources.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum resource measurement summarization and regression coverage."
     }
   }
 }

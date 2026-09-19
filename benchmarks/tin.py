@@ -24,6 +24,7 @@ import uuid
 
 import dataset
 import run as bench
+import resources
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / 'benchmarks/tin'
@@ -31,7 +32,7 @@ REVISION = 'f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86'
 REPOSITORY = 'https://github.com/planetscale/paradedb-benchmarker.git'
 DEFAULT_DRIVER = ROOT / 'benchmarks/results/tin-driver'
 LOADED_SOURCES = {str(p): dataset.sha256(p) for p in
-                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), *ASSETS.iterdir()]
+                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), Path(resources.__file__), *ASSETS.iterdir()]
                   if p.is_file()}
 
 
@@ -241,6 +242,9 @@ def report(root):
             continue
         exported = json.loads(exports[0].read_text())['runs'][engine]
         elapsed = (exported['endTime'] - exported['startTime']) / 1000
+        resource_summary = resources.summarize(path / 'resources.jsonl',
+                                               exported['startTime'] / 1000, exported['endTime'] / 1000)
+        bench.save(path / 'resource-summary.json', resource_summary)
         samples, groups = [], collections.defaultdict(list)
         queries = collections.defaultdict(list)
         updates = collections.Counter()
@@ -269,6 +273,7 @@ def report(root):
         metrics = exported['queries'][engine]
         rows.append(dict(engine=engine, status='complete', seconds=elapsed,
                          qps=len(samples) / elapsed, **distribution(samples),
+                         resources=resource_summary,
                          families={k: distribution(v) for k, v in groups.items()},
                          queries={k: distribution(v) for k, v in queries.items()},
                          measured_query_forms=len(queries),
@@ -295,6 +300,7 @@ def report(root):
     lines += ['', 'See comparison.json for query-family and individual-query distributions,',
               'semantic differences on the validation sample, and completed updates.',
               'Index read/hit bytes are block accesses, not physical disk traffic.',
+              'Resource summaries in comparison.json and resource-summary.json use samples wholly inside the measured window; boundary gaps are reported.',
               'The full pinned trace may not be traversed during short or slow runs.']
     differences = manifest.get('full_count_differences')
     if differences is None:
