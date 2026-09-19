@@ -21,3 +21,6 @@ Start with the [project README](../README.md) to build Stannum and run a search.
 
 Run commands from the repository root. Keep raw results in ignored
 `benchmarks/results/` and connection credentials outside Git.
+
+- [TIN across machine sizes](benchmarks/tin-machine-comparison.md)
+- [Expanded TIN strategy and capacity experiments](benchmarks/tin-expanded-experiments.md)
