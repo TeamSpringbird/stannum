@@ -1016,6 +1016,95 @@ mod tests {
                 .unwrap();
             }
         }
+        Spi::run(
+            "SET LOCAL enable_material = off; SET LOCAL enable_memoize = off;
+            PREPARE runtime_rescan(bigint, bigint) AS
+            SELECT s.id, s.score, s.iteration FROM generate_series(1,3) g
+            CROSS JOIN LATERAL (SELECT id, stannum.full_score(ctid) AS score, g AS iteration
+                FROM runtime_rank WHERE body ==> 'common OR blue'
+                ORDER BY score DESC LIMIT $1 OFFSET $2) s",
+        )
+        .unwrap();
+        for (limit, offset) in [(7, 0), (10, 12), (3, 2)] {
+            let sql = format!("EXECUTE runtime_rescan({limit}, {offset})");
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0;
+            fn ranked_scan(value: &serde_json::Value) -> Option<&serde_json::Value> {
+                match value {
+                    serde_json::Value::Object(fields) => {
+                        if fields.get("Order").and_then(|v| v.as_str()) == Some("score DESC") {
+                            return Some(value);
+                        }
+                        fields.values().find_map(ranked_scan)
+                    }
+                    serde_json::Value::Array(items) => items.iter().find_map(ranked_scan),
+                    _ => None,
+                }
+            }
+            let scan = ranked_scan(&plan).expect("ranked custom scan");
+            assert_eq!(scan["Actual Loops"].as_u64(), Some(3), "{plan}");
+            assert_eq!(scan["Top K"].as_i64(), Some(limit + offset), "{plan}");
+            let mut actual = [Vec::new(), Vec::new(), Vec::new()];
+            Spi::connect(|client| {
+                for row in client.select(&sql, None, &[]).unwrap() {
+                    let iteration = row.get::<i32>(3).unwrap().unwrap();
+                    actual[(iteration - 1) as usize]
+                        .push(row.get::<f32>(2).unwrap().unwrap().to_bits());
+                }
+            });
+            assert_eq!(actual[0].len(), limit as usize);
+            assert_eq!(actual[0], actual[1]);
+            assert_eq!(actual[0], actual[2]);
+        }
+        Spi::run("DEALLOCATE runtime_rescan").unwrap();
+
+        // WITH TIES must read beyond k, preserving every row at the boundary.
+        Spi::run(
+            "PREPARE runtime_ties(bigint) AS
+            SELECT id, stannum.full_score(ctid) AS score FROM runtime_rank
+            WHERE body ==> 'common OR blue' ORDER BY score DESC FETCH FIRST $1 ROWS WITH TIES",
+        )
+        .unwrap();
+        let actual = ids("EXECUTE runtime_ties(7)");
+        let expected = ids("WITH scores AS MATERIALIZED (
+            SELECT id, stannum.full_score(ctid) AS score FROM runtime_rank
+            WHERE body ==> 'common OR blue') SELECT id FROM scores ORDER BY score DESC
+            FETCH FIRST 7 ROWS WITH TIES");
+        assert!(actual.len() > 7);
+        assert_eq!(
+            actual
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        Spi::run("DEALLOCATE runtime_ties").unwrap();
+
+        // A bound above an SRF counts projected rows, not matching documents.
+        // Grouping/aggregation also cannot import the outer LIMIT into ranking.
+        for projection in [
+            "SELECT id, stannum.full_score(ctid) AS score, generate_series(1,3) FROM runtime_rank
+             WHERE body ==> 'common OR blue' ORDER BY score DESC LIMIT $1",
+            "SELECT max(stannum.full_score(ctid)) AS score FROM runtime_rank
+             WHERE body ==> 'common OR blue' GROUP BY id ORDER BY score DESC LIMIT $1",
+        ] {
+            Spi::run(&format!(
+                "PREPARE runtime_unsupported(bigint) AS {projection}"
+            ))
+            .unwrap();
+            let plan = Spi::get_one::<Json>(
+                "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE runtime_unsupported(7)",
+            )
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+            assert!(!plan.contains("\"Top K\":"), "{plan}");
+            Spi::run("DEALLOCATE runtime_unsupported").unwrap();
+        }
     }
 
     #[pg_test]
