@@ -716,6 +716,16 @@ def render_report(args):
         report(args.output)
 
 
+def catalog_command(args):
+    import tin_catalog
+    tin_catalog.run(args)
+
+
+def experiment_command(args):
+    import tin_experiments
+    tin_experiments.run(args)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--driver', type=Path, default=DEFAULT_DRIVER)
@@ -723,8 +733,7 @@ def main():
     p = commands.add_parser('catalog', help='observe plans on an existing TIN server using libpq environment')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--rows', type=int, nargs='+', default=[1000, 10000])
-    import tin_catalog
-    p.set_defaults(func=tin_catalog.run)
+    p.set_defaults(func=catalog_command)
     p = commands.add_parser('experiment', help='bounded remote TIN capacity and strategy experiments')
     p.add_argument('--dataset', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
@@ -737,8 +746,7 @@ def main():
     p.add_argument('--stages', nargs='+', choices=['synthetic','queries','prepared','forced','concurrency','multi','maintenance','projection'])
     p.add_argument('--index-segments', type=int, choices=[1,2,4,8])
     p.add_argument('--build-memory-mb', type=int, choices=[16,64,256,512])
-    import tin_experiments
-    p.set_defaults(func=tin_experiments.run)
+    p.set_defaults(func=experiment_command)
     commands.add_parser('prepare').set_defaults(func=prepare)
     commands.add_parser('build').set_defaults(func=build)
     p = commands.add_parser('report')
