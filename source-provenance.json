@@ -68,6 +68,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 42b32e939f6e5a1424d7260282cdc04a2184850b."
     },
+    "benchmarks/mutation_targets.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum native PostgreSQL workload generator regression."
+    },
     "benchmarks/notify.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."

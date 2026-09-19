@@ -50,57 +50,51 @@ def drift_bundles(cases):
     return [""] + [case[3] for case in cases if "miss" not in case[0]]
 
 
-def writer_scripts(rows, cases, id_ceiling):
-    """pgbench scripts per mutation kind. Deletes and updates hit the first live row at or
-    above a random id. Gaps beyond the live range and concurrent deletes can cause no-ops."""
+def writer_scripts(rows, cases):
+    """Pick an unlocked live row using the current ID range, wrapping gaps.
+
+    This samples key space, not live rows uniformly. Selection/locking overhead
+    is included in every engine's timed writes. Exhaustion fails the run.
+    """
     bundles = drift_bundles(cases)
     choose = " ".join(f"WHEN {i} THEN ' {bundle}'" for i, bundle in enumerate(bundles) if bundle)
-    locate = "(SELECT id FROM documents WHERE id >= :id ORDER BY id LIMIT 1)"
+    threshold = "(SELECT floor(coalesce(max(id), 1) * (:probe / 2147483647.0))::bigint FROM documents)"
+    locate = ("coalesce((SELECT id FROM documents WHERE id >= " + threshold +
+              " ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED),"
+              " (SELECT id FROM documents ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED))")
     return {
         "insert": f"\\set src random(1, {rows})\n"
                   "INSERT INTO documents (id, body) SELECT nextval('benchmark_ids'), body "
                   "FROM benchmark_pool WHERE id = :src;\n",
-        "delete": f"\\set id random(1, {id_ceiling})\nDELETE FROM documents WHERE id = {locate};\n",
-        "update": f"\\set id random(1, {id_ceiling})\n\\set k random(0, {len(bundles) - 1})\n"
+        "delete": "\\set probe random(1, 2147483647)\nDELETE FROM documents WHERE id = " + locate + ";\n",
+        "update": f"\\set probe random(1, 2147483647)\n\\set k random(0, {len(bundles) - 1})\n"
                   "UPDATE documents SET body = regexp_replace(body, ' mutable[ab].*$', '') || ' mutablea'"
                   f" || CASE :k {choose} ELSE '' END WHERE id = {locate};\n",
     }
 
 
 def accounted_writer(script, kind):
-    """Count committed single-row effects; a successful transaction can be a no-op.
+    """A completion guarantees one committed row effect, without shell logging.
 
-    The DML and RETURNING count are one autocommit statement. Only no-ops emit a
-    marker, avoiding a shell invocation for every successful mutation. The main
-    runner rejects failed transactions before trusting this accounting.
+    The count assertion and DML share one autocommit statement. Zero effects
+    (empty/fully locked target set) or multiple effects abort the statement.
+    Failed pgbench transactions invalidate the run, never count as useful work.
     """
+    if kind not in KINDS:
+        raise ValueError('unknown mutation kind')
     lines = script.splitlines()
     prefix = []
     while lines and lines[0].startswith('\\set '):
         prefix.append(lines.pop(0))
     sql = '\n'.join(lines).rstrip().removesuffix(';')
-    return '\n'.join(prefix) + rf"""
-WITH changed AS ({sql} RETURNING 1)
-SELECT count(*) AS affected FROM changed;
-\gset
-\if :affected = 0
-\shell echo STANNUM_NOOP_{kind}
-\endif
-"""
+    return '\n'.join(prefix) + f"\nWITH changed AS ({sql} RETURNING 1)\nSELECT 1 / (count(*) = 1)::int FROM changed;\n"
 
 
-def affected_rows(summary, transcript):
-    noops = collections.Counter(line.removeprefix('STANNUM_NOOP_')
-                                for line in transcript.splitlines() if line.startswith('STANNUM_NOOP_'))
-    if summary['failures'] or set(noops) - set(summary['queries']):
-        raise ValueError('cannot account mutations with failed transactions or unknown markers')
-    result = {}
-    for kind, query in summary['queries'].items():
-        completed = query['completed']
-        if noops[kind] > completed:
-            raise ValueError('more no-op markers than completed mutations')
-        result[kind] = dict(completed=completed, noops=noops[kind], affected=completed - noops[kind])
-    return result
+def affected_rows(summary):
+    if summary['failures'] or set(summary['queries']) - set(KINDS):
+        raise ValueError('cannot account mutations with failed transactions or unknown kinds')
+    return {kind: dict(completed=q['completed'], noops=0, affected=q['completed'])
+            for kind, q in summary['queries'].items()}
 
 
 def traffic_load(paths, rate, seconds):

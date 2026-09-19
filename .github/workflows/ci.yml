@@ -136,6 +136,9 @@ jobs:
       - name: Ranked-scan concurrency fuzz (smoke)
         run: python3 postgres/tests/ranked_fuzz.py --smoke
 
+      - name: Mutation target and accounting regression
+        run: python3 benchmarks/mutation_targets.py
+
       - name: VACUUM pinned-page regression
         run: python3 benchmarks/vacuum_cleanup_pins.py
 
