@@ -4,6 +4,15 @@ Status: proposed, based on code at `7d441c1` (PR #32). No execution strategy or
 performance improvement is implemented by this document. Runtime LIMIT work is
 independent until both changes meet in ranked scan execution.
 
+The accompanying instrumentation exposes `Exhaustive Score Calls` and
+`Top-K Completions` in ranked EXPLAIN ANALYZE plans. Both are cumulative across
+rescans (not per-loop averages). The first counts calls from exhaustive ranking,
+including completion; it excludes block-max scoring and score projection. The
+second counts transitions from a pruned prefix to exhaustive completion, whether
+caused by SQL filtering, invisible tuples or further cursor consumption. Existing
+`Scored Candidates` describes block-max work and is not a cumulative total of all
+ranking work. The new counters add observability, not a strategy change.
+
 ## Evidence and the gap in Stannum
 
 The remote TIN experiments in PR #35 measured `history OR war` with an SQL
