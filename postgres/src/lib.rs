@@ -930,7 +930,7 @@ mod tests {
         )
         .unwrap();
         // Constant query text must also acquire a runtime bound. Selective quals
-        // exercise completion when the first pruned candidates are rejected.
+        // retain exhaustive ranking to avoid a wasted top-k pass and completion.
         for query in ["$1", "'common OR blue'"] {
             for filter in ["true", "id > 950"] {
                 Spi::run(&format!(
@@ -956,7 +956,7 @@ mod tests {
                             .unwrap()
                             .0
                             .to_string();
-                    if let Some(k) = top_k {
+                    if let Some(k) = top_k.filter(|_| filter == "true") {
                         assert!(plan.contains(&format!("\"Top K\":{k}")), "{plan}");
                     } else {
                         assert!(!plan.contains("\"Top K\":"), "{plan}");

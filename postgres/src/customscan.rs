@@ -687,7 +687,11 @@ unsafe extern "C-unwind" fn plan_search_path(
         // LIMIT expressions here could duplicate volatile work or depend on an
         // outer tuple. The enclosing Limit remains responsible for SQL errors.
         let parse = &*(*root).parse;
+        // Residual filters can reject the initial top k and force a second,
+        // exhaustive pass. Until candidate filtering participates in ranking,
+        // keep generic filtered scans unbounded rather than adding that work.
         if private.ordering.is_some()
+            && scan.scan.plan.qual.is_null()
             && runtime_bound_shape(root, rel)
             && safe_bound_expr(parse.limitCount)
             && (parse.limitOffset.is_null() || safe_bound_expr(parse.limitOffset))
