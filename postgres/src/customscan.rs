@@ -38,6 +38,7 @@ use tinql::runtime::plan::{Limits, plan};
 use crate::score::rank;
 
 static ENABLE: GucSetting<bool> = GucSetting::<bool>::new(true);
+static EARLY_FILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Method tables hold C string pointers; they are immutable and never
 /// touched off the backend's main thread.
@@ -109,6 +110,14 @@ pub fn init() {
         c"Enable Stannum's custom scan nodes for ==> queries",
         c"Off leaves the bitmap index scan path, which rechecks nothing either.",
         &ENABLE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"stannum.experimental_early_filter",
+        c"Experimentally filter integer predicates before exhaustive ranking",
+        c"Planning-time, default-off experiment; performs additional heap fetches.",
+        &EARLY_FILTER,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -395,6 +404,7 @@ struct Private {
     heap_oid: u32,
     query: String,
     ordering: Option<Ordering>,
+    early_filter: bool,
 }
 
 impl Clone for Ordering {
@@ -431,6 +441,7 @@ impl Private {
                     list.push(make_int(ordering.top_k.map_or(-1, |k| k as i64)));
                 }
             }
+            list.push(make_int(i64::from(self.early_filter)));
             list.into_pg()
         }
     }
@@ -474,6 +485,7 @@ impl Private {
                     heap_oid: int(1) as u32,
                     query: string(2),
                     ordering,
+                    early_filter: int(pg_sys::list_length(list) - 1) == 1,
                 },
                 clause,
             )
@@ -514,6 +526,7 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
             ordering = find_ordering(root, rel, &found);
         }
         let private = Private {
+            early_filter: false,
             index_oid: found.index_oid.to_u32(),
             heap_oid: (*rte).relid.to_u32(),
             query: found.query.clone().unwrap_or_else(|| "<parameter>".into()),
@@ -659,6 +672,105 @@ unsafe fn safe_bound_expr(expr: *mut pg_sys::Node) -> bool {
     }
 }
 
+/// The experiment moves only an error-free built-in integer comparison. Keep
+/// RestrictInfo security metadata until eligibility is established; qualifiers
+/// themselves remain in the normal scan plan for final evaluation.
+unsafe fn early_filter_eligible(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    clauses: *mut pg_sys::List,
+    ours: *mut pg_sys::OpExpr,
+) -> bool {
+    unsafe {
+        if !EARLY_FILTER.get() || !runtime_bound_shape(root, rel) || !(*root).parent_root.is_null()
+        {
+            return false;
+        }
+        let parse = &*(*root).parse;
+        let rte = &*pg_sys::list_nth(parse.rtable, (*rel).relid as i32 - 1)
+            .cast::<pg_sys::RangeTblEntry>();
+        if parse.commandType != pg_sys::CmdType::CMD_SELECT
+            || parse.hasRowSecurity
+            || !parse.rowMarks.is_null()
+            || rte.security_barrier
+            || !rte.securityQuals.is_null()
+            || pg_sys::list_length(clauses) != 2
+        {
+            return false;
+        }
+        let mut predicate = std::ptr::null_mut();
+        for info in PgList::<pg_sys::RestrictInfo>::from_pg(clauses).iter_ptr() {
+            if (*info).security_level != 0 {
+                return false;
+            }
+            let expr = (*info).clause.cast::<pg_sys::Node>();
+            if !pg_sys::equal(expr.cast(), ours.cast()) {
+                predicate = expr;
+            }
+        }
+        if predicate.is_null() || (*predicate).type_ != pg_sys::NodeTag::T_OpExpr {
+            return false;
+        }
+        let op = &*predicate.cast::<pg_sys::OpExpr>();
+        if op.opretset || op.opresulttype != pg_sys::BOOLOID || pg_sys::list_length(op.args) != 2 {
+            return false;
+        }
+        let lhs = pg_sys::list_nth(op.args, 0).cast::<pg_sys::Node>();
+        let rhs = pg_sys::list_nth(op.args, 1).cast::<pg_sys::Node>();
+        if (*lhs).type_ != pg_sys::NodeTag::T_Var || (*rhs).type_ != pg_sys::NodeTag::T_Const {
+            return false;
+        }
+        let var = &*lhs.cast::<pg_sys::Var>();
+        let value = &*rhs.cast::<pg_sys::Const>();
+        if var.varno as u32 != (*rel).relid
+            || var.varlevelsup != 0
+            || var.varattno <= 0
+            || !var.varnullingrels.is_null()
+            || var.vartype != value.consttype
+        {
+            return false;
+        }
+        let functions = match var.vartype {
+            pg_sys::INT2OID => [
+                pg_sys::F_INT2LT,
+                pg_sys::F_INT2LE,
+                pg_sys::F_INT2EQ,
+                pg_sys::F_INT2GE,
+                pg_sys::F_INT2GT,
+            ],
+            pg_sys::INT4OID => [
+                pg_sys::F_INT4LT,
+                pg_sys::F_INT4LE,
+                pg_sys::F_INT4EQ,
+                pg_sys::F_INT4GE,
+                pg_sys::F_INT4GT,
+            ],
+            pg_sys::INT8OID => [
+                pg_sys::F_INT8LT,
+                pg_sys::F_INT8LE,
+                pg_sys::F_INT8EQ,
+                pg_sys::F_INT8GE,
+                pg_sys::F_INT8GT,
+            ],
+            _ => return false,
+        };
+        let function = pg_sys::get_opcode(op.opno);
+        if op.opfuncid != pg_sys::InvalidOid && op.opfuncid != function {
+            return false;
+        }
+        functions.iter().enumerate().any(|(index, expected)| {
+            function.to_u32() == *expected
+                && op.opno
+                    == pg_sys::get_opfamily_member(
+                        pg_sys::INTEGER_BTREE_FAM_OID,
+                        var.vartype,
+                        var.vartype,
+                        (index + 1) as i16,
+                    )
+        })
+    }
+}
+
 #[pg_guard]
 unsafe extern "C-unwind" fn plan_search_path(
     root: *mut pg_sys::PlannerInfo,
@@ -669,7 +781,7 @@ unsafe extern "C-unwind" fn plan_search_path(
     _custom_plans: *mut pg_sys::List,
 ) -> *mut pg_sys::Plan {
     unsafe {
-        let (private, clause) = Private::from_list((*best_path).custom_private);
+        let (mut private, clause) = Private::from_list((*best_path).custom_private);
         let mut scan = pgrx::PgBox::<pg_sys::CustomScan>::alloc_node(pg_sys::NodeTag::T_CustomScan);
         scan.scan.plan.targetlist = tlist;
         scan.scan.plan.qual = remaining_quals(clauses, clause);
@@ -705,7 +817,9 @@ unsafe extern "C-unwind" fn plan_search_path(
             }
         }
         scan.custom_exprs = expressions.into_pg();
-        scan.custom_private = (*best_path).custom_private;
+        private.early_filter =
+            private.ordering.is_some() && early_filter_eligible(root, rel, clauses, clause);
+        scan.custom_private = private.to_list(clause);
         scan.custom_scan_tlist = std::ptr::null_mut();
         scan.methods = &SEARCH_SCAN_METHODS.0;
         scan.into_pg().cast()
@@ -767,6 +881,7 @@ unsafe extern "C-unwind" fn upper_paths_hook(
             return;
         };
         let private = Private {
+            early_filter: false,
             index_oid: found.index_oid.to_u32(),
             heap_oid: (*rte).relid.to_u32(),
             query: found.query.clone().unwrap_or_else(|| "<parameter>".into()),
@@ -866,6 +981,11 @@ struct ScanExec {
     runtime_offset: *mut pg_sys::ExprState,
     bounds_bound: bool,
     query_null: bool,
+    early_qual: *mut pg_sys::ExprState,
+    early_context: *mut pg_sys::ExprContext,
+    early_candidates: usize,
+    early_fetches: usize,
+    early_survivors: usize,
     /// Whether this execution scans the heap instead of the index, decided
     /// once on first access (see [`heap_fallback`]).
     heap_fallback: Option<bool>,
@@ -990,7 +1110,20 @@ unsafe extern "C-unwind" fn begin_scan(
         } else {
             pg_sys::table_index_fetch_begin(heap)
         };
-        let fetch_slot = if is_count && !explain_only {
+        let early = private.early_filter
+            && !explain_only
+            && (*(*estate).es_snapshot).snapshot_type == pg_sys::SnapshotType::SNAPSHOT_MVCC;
+        let early_qual = if early {
+            pg_sys::ExecInitQual((*cscan).scan.plan.qual, node.cast())
+        } else {
+            std::ptr::null_mut()
+        };
+        let early_context = if early {
+            pg_sys::CreateExprContext(estate)
+        } else {
+            std::ptr::null_mut()
+        };
+        let fetch_slot = if (is_count || early) && !explain_only {
             pg_sys::table_slot_create(heap, std::ptr::null_mut())
         } else {
             std::ptr::null_mut()
@@ -1021,6 +1154,11 @@ unsafe extern "C-unwind" fn begin_scan(
             runtime_offset,
             bounds_bound: runtime_limit.is_null(),
             query_null: false,
+            early_qual,
+            early_context,
+            early_candidates: 0,
+            early_fetches: 0,
+            early_survivors: 0,
             heap_fallback: None,
             fetch,
             fetch_slot,
@@ -1057,7 +1195,7 @@ unsafe extern "C-unwind" fn begin_scan(
 /// the index itself, skipping blocks of postings that cannot enter the top
 /// k, and only those k rows are materialized. Ranked queries the scorer cannot
 /// bound enumerate and score every candidate; unordered scans use a stream.
-unsafe fn gather(exec: &mut ScanExec) {
+unsafe fn gather(exec: &mut ScanExec, snapshot: pg_sys::Snapshot) {
     unsafe {
         exec.scores.clear();
         exec.pruned = false;
@@ -1077,7 +1215,8 @@ unsafe fn gather(exec: &mut ScanExec) {
             )
         });
         let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
-        if let Some(k) = top_k
+        if exec.early_qual.is_null()
+            && let Some(k) = top_k
             && k <= crate::score::PRUNE_MAX_K
             && let Some(top) = scorer.as_ref().and_then(|scorer| scorer.top_k(k))
         {
@@ -1093,10 +1232,57 @@ unsafe fn gather(exec: &mut ScanExec) {
             exec.started = true;
             return;
         }
-        let tids = candidates(exec);
+        let mut tids = candidates(exec);
+        if !exec.early_qual.is_null() {
+            filter_candidates(exec, &mut tids, snapshot);
+        }
         finish(exec, tids, scorer);
         exec.next = 0;
         exec.started = true;
+    }
+}
+
+/// Keep root TIDs for scoring even when the snapshot resolves a HOT member.
+/// Survivors are fetched and qualified normally again during output; this
+/// intentionally measures the cost of that extra heap work in the prototype.
+unsafe fn filter_candidates(exec: &mut ScanExec, tids: &mut Vec<Tid>, snapshot: pg_sys::Snapshot) {
+    unsafe {
+        exec.early_candidates += tids.len();
+        let mut kept = 0;
+        for index in 0..tids.len() {
+            pgrx::check_for_interrupts!();
+            pg_sys::MemoryContextReset((*exec.early_context).ecxt_per_tuple_memory);
+            pg_sys::ExecClearTuple(exec.fetch_slot);
+            let mut pointer = pointer_of(tids[index]);
+            let mut again = false;
+            let mut dead = false;
+            loop {
+                if pg_sys::table_index_fetch_tuple(
+                    exec.fetch,
+                    &mut pointer,
+                    snapshot,
+                    exec.fetch_slot,
+                    &mut again,
+                    &mut dead,
+                ) {
+                    exec.early_fetches += 1;
+                    (*exec.early_context).ecxt_scantuple = exec.fetch_slot;
+                    if pg_sys::ExecQual(exec.early_qual, exec.early_context) {
+                        tids[kept] = tids[index];
+                        kept += 1;
+                    }
+                    break;
+                }
+                if !again {
+                    break;
+                }
+            }
+        }
+        tids.truncate(kept);
+        exec.early_survivors += kept;
+        pg_sys::ExecClearTuple(exec.fetch_slot);
+        pg_sys::MemoryContextReset((*exec.early_context).ecxt_per_tuple_memory);
+        pg_sys::table_index_fetch_reset(exec.fetch);
     }
 }
 
@@ -1370,7 +1556,7 @@ unsafe extern "C-unwind" fn search_access(
         }
         if !exec.started {
             if exec.ordered {
-                gather(exec);
+                gather(exec, snapshot);
             } else {
                 start_stream(exec);
             }
@@ -1658,6 +1844,9 @@ unsafe extern "C-unwind" fn end_scan(node: *mut pg_sys::CustomScanState) {
                 pg_sys::table_endscan(exec.fallback);
                 exec.fallback = std::ptr::null_mut();
             }
+            if !exec.early_context.is_null() {
+                pg_sys::FreeExprContext(exec.early_context, true);
+            }
             if !exec.fetch.is_null() {
                 pg_sys::table_index_fetch_end(exec.fetch);
             }
@@ -1677,7 +1866,13 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let exec = exec_of(node);
         exec.next = 0;
-        if !exec.runtime_query.is_null() || !exec.runtime_limit.is_null() {
+        if !exec.early_qual.is_null() {
+            pg_sys::table_index_fetch_reset(exec.fetch);
+        }
+        if !exec.runtime_query.is_null()
+            || !exec.runtime_limit.is_null()
+            || !exec.early_qual.is_null()
+        {
             crate::score::forget_scan_scorer(exec.scan_id);
             exec.query_bound = exec.runtime_query.is_null();
             exec.bounds_bound = exec.runtime_limit.is_null();
@@ -1727,6 +1922,15 @@ unsafe extern "C-unwind" fn explain(
                 pg_sys::ExplainPropertyInteger(c"Top K".as_ptr(), std::ptr::null(), k as i64, es);
             }
         }
+        if exec.private.early_filter
+            && (!(*es).analyze || (!exec.early_qual.is_null() && exec.heap_fallback != Some(true)))
+        {
+            pg_sys::ExplainPropertyText(
+                c"Candidate Strategy".as_ptr(),
+                c"early integer filter (experimental)".as_ptr(),
+                es,
+            );
+        }
         if (*es).analyze {
             // Core instrumentation is copied from workers, but these private
             // Rust counters are not. Do not report the idle leader's zero
@@ -1738,6 +1942,20 @@ unsafe extern "C-unwind" fn explain(
                     es,
                 );
                 return;
+            }
+            if !exec.early_qual.is_null() && exec.heap_fallback != Some(true) {
+                for (name, value) in [
+                    (c"Early Filter Candidates", exec.early_candidates),
+                    (c"Early Filter Heap Fetches", exec.early_fetches),
+                    (c"Early Filter Survivors", exec.early_survivors),
+                ] {
+                    pg_sys::ExplainPropertyInteger(
+                        name.as_ptr(),
+                        std::ptr::null(),
+                        value as i64,
+                        es,
+                    );
+                }
             }
             if let Some(stream) = &exec.stream {
                 pg_sys::ExplainPropertyText(

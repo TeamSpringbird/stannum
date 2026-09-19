@@ -830,6 +830,246 @@ mod tests {
         assert!(text.contains("\"Top K\":4"), "{text}");
     }
 
+    fn early_filter_fixture() {
+        Spi::run(
+            "CREATE TABLE early_filter(id int, small int2, medium int4, large int8, body text)
+               WITH (fillfactor=50);
+             INSERT INTO early_filter SELECT n, (CASE WHEN n % 11 != 0 THEN n END)::int2,
+               CASE WHEN n % 11 != 0 THEN n END, CASE WHEN n % 11 != 0 THEN n END,
+               repeat('common ', 101 - n) || CASE WHEN n % 2 = 0 THEN 'blue' ELSE 'red' END
+               FROM generate_series(1,100) n;
+             CREATE INDEX early_filter_idx ON early_filter USING stannum(body);
+             ANALYZE early_filter;
+             SET LOCAL stannum.enable_custom_scan = on;
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;
+             SET LOCAL enable_indexscan = off;",
+        )
+        .unwrap();
+    }
+
+    fn early_filter_rows(sql: &str) -> Vec<(i32, u32)> {
+        Spi::connect(|client| {
+            client
+                .select(sql, None, &[])
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<i32>(1).unwrap().unwrap(),
+                        row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn early_filter_scan(plan: &serde_json::Value) -> Option<&serde_json::Value> {
+        if plan["Custom Plan Provider"] == "Stannum Text Search Scan" {
+            return Some(plan);
+        }
+        plan.get("Plans")?
+            .as_array()?
+            .iter()
+            .find_map(early_filter_scan)
+    }
+
+    // Check membership and exact score bits without requiring an arbitrary order
+    // between ties. The oracle materializes every eligible score before sorting.
+    fn assert_early_filter_result(query: &str, predicate: &str, suffix: &str) {
+        Spi::run("SET LOCAL stannum.experimental_early_filter = off").unwrap();
+        let oracle = early_filter_rows(&format!(
+            "WITH all_scores AS MATERIALIZED (
+               SELECT id, stannum.full_score(ctid) AS score FROM early_filter
+               WHERE body ==> '{query}' AND {predicate}) SELECT id, score FROM all_scores"
+        ));
+        let expected = early_filter_rows(&format!(
+            "WITH all_scores AS MATERIALIZED (
+               SELECT id, stannum.full_score(ctid) AS score FROM early_filter
+               WHERE body ==> '{query}' AND {predicate})
+             SELECT id, score FROM all_scores ORDER BY score DESC {suffix}"
+        ));
+        Spi::run("SET LOCAL stannum.experimental_early_filter = on").unwrap();
+        let sql = format!(
+            "SELECT id, stannum.full_score(ctid) AS score FROM early_filter
+            WHERE body ==> '{query}' AND {predicate} ORDER BY score DESC {suffix}"
+        );
+        let actual = early_filter_rows(&sql);
+        let mut seen = std::collections::HashSet::new();
+        for row in &actual {
+            assert!(oracle.contains(row), "{sql}: unexpected row {row:?}");
+            assert!(seen.insert(row.0), "{sql}: duplicate id {}", row.0);
+        }
+        assert_eq!(
+            actual.iter().map(|r| r.1).collect::<Vec<_>>(),
+            expected.iter().map(|r| r.1).collect::<Vec<_>>(),
+            "{sql}"
+        );
+        let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+            .unwrap()
+            .unwrap()
+            .0;
+        let scan = early_filter_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
+        assert_eq!(
+            scan["Candidate Strategy"], "early integer filter (experimental)",
+            "{plan}"
+        );
+        assert_eq!(
+            scan["Exhaustive Score Calls"], scan["Early Filter Survivors"],
+            "{plan}"
+        );
+        assert!(
+            scan["Early Filter Survivors"].as_u64().unwrap()
+                <= scan["Early Filter Candidates"].as_u64().unwrap(),
+            "{plan}"
+        );
+    }
+
+    #[pg_test]
+    fn early_integer_filter_preserves_scores_and_is_opt_in() {
+        early_filter_fixture();
+        assert_eq!(
+            Spi::get_one::<String>("SHOW stannum.experimental_early_filter")
+                .unwrap()
+                .as_deref(),
+            Some("off")
+        );
+        let sql = "SELECT id, stannum.full_score(ctid) AS score FROM early_filter
+                   WHERE body ==> 'common OR blue' AND medium > 70 ORDER BY score DESC LIMIT 10";
+        assert!(
+            !plan_of(sql)
+                .0
+                .to_string()
+                .contains("early integer filter (experimental)")
+        );
+        for (column, ty) in [("small", "int2"), ("medium", "int4"), ("large", "int8")] {
+            for op in ["=", "<", "<=", ">", ">="] {
+                assert_early_filter_result(
+                    "common OR blue",
+                    &format!("{column} {op} 70::{ty}"),
+                    "LIMIT 7 OFFSET 2",
+                );
+            }
+        }
+        for predicate in ["medium < 0", "medium > 0", "medium > 90"] {
+            // >90 is deliberately anti-correlated with common-term frequency;
+            // nullable columns must be rejected by normal SQL qual semantics.
+            assert_early_filter_result("common OR blue", predicate, "");
+        }
+        assert_early_filter_result("\"common blue\"", "medium > 70", "LIMIT 10");
+    }
+
+    #[pg_test]
+    fn early_integer_filter_rejects_unsupported_predicates() {
+        early_filter_fixture();
+        Spi::run(
+            "SET LOCAL stannum.experimental_early_filter = on;
+            CREATE FUNCTION early_filter_less(int4, int4) RETURNS boolean
+                LANGUAGE plpgsql IMMUTABLE STRICT AS 'BEGIN RETURN $1 < $2; END';
+            CREATE OPERATOR #<# (LEFTARG = int4, RIGHTARG = int4, FUNCTION = early_filter_less)",
+        )
+        .unwrap();
+        for predicate in [
+            "medium <> 70",
+            "medium + 1 < 70",
+            "medium < 70 AND id > 20",
+            "medium #<# 70",
+            "medium IS NULL",
+            "medium < 20 OR medium > 80",
+        ] {
+            let sql = format!(
+                "SELECT id, stannum.full_score(ctid) AS score FROM early_filter
+                WHERE body ==> 'common' AND ({predicate}) ORDER BY score DESC LIMIT 10"
+            );
+            assert!(
+                !plan_of(&sql)
+                    .0
+                    .to_string()
+                    .contains("early integer filter (experimental)"),
+                "{sql}"
+            );
+        }
+        // Row-security queries must decline even when the predicate itself is safe.
+        Spi::run(
+            "ALTER TABLE early_filter ENABLE ROW LEVEL SECURITY;
+                  ALTER TABLE early_filter FORCE ROW LEVEL SECURITY;
+                  CREATE POLICY early_filter_policy ON early_filter USING (id > 10);
+                  CREATE ROLE early_filter_reader;
+                  GRANT USAGE ON SCHEMA stannum TO early_filter_reader;
+                  GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA stannum TO early_filter_reader;
+                  GRANT SELECT ON early_filter TO early_filter_reader;
+                  SET LOCAL ROLE early_filter_reader",
+        )
+        .unwrap();
+        let sql = "SELECT id, stannum.full_score(ctid) AS score FROM early_filter
+                   WHERE body ==> 'common' AND medium > 70 ORDER BY score DESC LIMIT 10";
+        assert!(
+            !plan_of(sql)
+                .0
+                .to_string()
+                .contains("early integer filter (experimental)")
+        );
+        Spi::run("RESET ROLE").unwrap();
+    }
+
+    #[pg_test]
+    fn early_integer_filter_preserves_hot_identity_and_prepared_reuse() {
+        early_filter_fixture();
+        assert_early_filter_result("common OR blue", "medium > 70", "LIMIT 10");
+        Spi::run(
+            "UPDATE early_filter SET medium = 100 WHERE id = 1;
+                  UPDATE early_filter SET medium = 1 WHERE id = 100;
+                  DELETE FROM early_filter WHERE id = 99",
+        )
+        .unwrap();
+        assert!(
+            Spi::get_one::<i64>(
+                "SELECT pg_stat_get_xact_tuples_hot_updated('early_filter'::regclass)"
+            )
+            .unwrap()
+            .unwrap()
+                >= 2,
+            "fixture must exercise HOT updates"
+        );
+        assert_early_filter_result("common OR blue", "medium > 70", "");
+        Spi::run(
+            "SET LOCAL stannum.experimental_early_filter = on;
+                  SET LOCAL plan_cache_mode = force_generic_plan;
+                  PREPARE early_filter_prepared(text) AS
+                    SELECT id, stannum.full_score(ctid) AS score FROM early_filter
+                    WHERE body ==> $1 AND medium > 70 ORDER BY score DESC",
+        )
+        .unwrap();
+        for query in ["common OR blue", "red", "missing", "blue", "common OR blue"] {
+            let sql = format!("EXECUTE early_filter_prepared('{query}')");
+            let actual = early_filter_rows(&sql);
+            let expected = early_filter_rows(&format!(
+                "WITH all_scores AS MATERIALIZED (
+                SELECT id, stannum.full_score(ctid) AS score FROM early_filter
+                WHERE body ==> '{query}' AND medium > 70)
+                SELECT id, score FROM all_scores ORDER BY score DESC"
+            ));
+            let mut actual_members = actual.clone();
+            let mut expected_members = expected.clone();
+            actual_members.sort_unstable();
+            expected_members.sort_unstable();
+            assert_eq!(actual_members, expected_members, "{query}");
+            assert_eq!(
+                actual.iter().map(|r| r.1).collect::<Vec<_>>(),
+                expected.iter().map(|r| r.1).collect::<Vec<_>>(),
+                "{query}"
+            );
+            assert!(
+                plan_of(&sql)
+                    .0
+                    .to_string()
+                    .contains("early integer filter (experimental)")
+            );
+        }
+        assert!(early_filter_rows("EXECUTE early_filter_prepared(NULL)").is_empty());
+        assert!(!early_filter_rows("EXECUTE early_filter_prepared('common')").is_empty());
+        Spi::run("DEALLOCATE early_filter_prepared").unwrap();
+    }
+
     #[pg_test]
     fn prepared_ranked_queries_use_custom_and_generic_ranked_plans() {
         Spi::run(
