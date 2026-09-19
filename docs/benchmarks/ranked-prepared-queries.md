@@ -62,3 +62,62 @@ Raw candidate artifacts: `benchmarks/results/ranked-parameters-smoke`.
 Alternating baseline/candidate measurements use the new `tin.py compare` command.
 The benchmark also captures parameterized ranked plans; the original plan
 artifacts only explained literal count queries and missed this distinction.
+
+## Controlled paired result
+
+`ranked-parameters-paired` completed four fresh-container trials in the order
+baseline, candidate, candidate, baseline. Each used the same 1000-document
+prefix, pinned driver, seed, runtime settings, two clients, five-second warmup,
+and thirty-second measurement. Every trial measured all 906 forms and passed
+membership and exhaustive top-10 checks; all 906 full query counts agreed
+between images. The only changed source files were `postgres/src/score.rs` and
+its regression tests in `postgres/src/lib.rs`.
+
+| Trial | Image | Queries/sec | p95 ms |
+| --- | --- | ---: | ---: |
+| 1 | Baseline | 147.0 | 72.869 |
+| 2 | Candidate | 5324.8 | 0.805 |
+| 3 | Candidate | 5274.7 | 0.814 |
+| 4 | Baseline | 148.1 | 72.679 |
+
+Median paired throughput improvement: **35.920x**, range **35.627–36.214x**.
+Median p95 across baseline trials was **72.774 ms**, versus **0.8095 ms** for
+the candidate. Two pairs describe observed variation, not a confidence
+interval. This is a small, resident-corpus diagnostic and does not estimate
+production capacity or compare relevance with another search engine.
+
+The [compact results](ranked-prepared-results.json) preserve image/source
+identities, the driver hash, trial metrics, correctness summaries, and the
+aggregate artifact hash. Raw trial artifacts remain under
+`benchmarks/results/ranked-parameters-paired` in the benchmark worktree. The
+new runner rejected no compatibility or coverage checks for this comparison.
+
+## 100k-document ranked baseline
+
+`ranked-parameters-100k` ran the candidate with two clients, ten seconds of
+warmup and sixty seconds of measurement under the same four-CPU/4-GiB server
+limits. It completed **1741.1 queries/sec**, with **p95 2.150 ms** and **p99
+4.097 ms**. All 906 forms were measured. All 906 exhaustive same-engine top-10
+checks and the 1000-row membership sample passed. This is a candidate baseline,
+not a paired 100k speedup estimate. The corpus remains resident in memory.
+
+| Family | p50 ms | p95 ms | p99 ms |
+| --- | ---: | ---: | ---: |
+| Conjunction | 0.888 | 1.927 | 2.758 |
+| Disjunction | 1.081 | 2.453 | 4.435 |
+| Phrase | 0.787 | 2.081 | 5.589 |
+
+The slowest individual forms are now useful, bounded profiling targets:
+
+- Source 302's long disjunction: p50 11.158 ms, p95 13.257 ms.
+- `"to be or not to be"`: p50 9.655 ms, p95 12.457 ms.
+- `"the book of life"`: p50 7.897 ms, p95 11.099 ms.
+
+Each has only about 115–116 timed samples, so no per-query p99 is reported.
+Profile these on a larger corpus before changing codecs or adding SIMD. Runtime
+ranked paths for generic prepared plans remain another distinct opportunity.
+
+The paired runner was validated separately by 107 Python tests and a review
+that caught acceptance of requested update workloads with zero completed writes.
+That case now fails closed. Re-rendering this read-only comparison with the
+hardened check still passes. No old mutation/VACUUM harness was removed.

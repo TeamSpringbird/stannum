@@ -91,3 +91,7 @@ optimization. The next harness work is repeated/paired-image orchestration,
 then deletion of the redundant launchers listed in the run guide. Exact
 published-corpus loading, other engines, and memory-pressure measurements
 remain separate, explicit gates.
+
+The [prepared-query follow-up](ranked-prepared-queries.md) identifies a planner
+binding issue behind the slow ranked disjunctions and records the fix. The
+measurements above remain the original integration observations.
