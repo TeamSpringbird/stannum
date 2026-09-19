@@ -121,11 +121,10 @@ pub fn validate_inputs(
                 });
             }
         }
-        if input
-            .dead
-            .iter()
-            .any(|tid| report.documents.binary_search(tid).is_err())
-        {
+        let mut document_at = 0;
+        if input.dead.iter().any(|tid| {
+            crate::verify::ordered_rank(&report.documents, &mut document_at, *tid).is_none()
+        }) {
             return Err(MergeError::InvalidInput {
                 index,
                 detail: "dead tuple absent from input document table".into(),
@@ -138,18 +137,27 @@ pub fn validate_inputs(
 
 // Dead postings have already been fully validated. Advance them outside the
 // cross-input heap; only live candidates need ordering against other sources.
+// Complete validation proved source membership; the map contains every live
+// document. A missing/mismatched owner therefore denotes this source's dead
+// occurrence, including a TID reused live by another source.
 fn skip_dead(
     postings: &mut crate::postings::PostingsCursor<'_>,
     payload: &mut crate::payload::PayloadCursor<'_>,
-    dead: &BTreeSet<Tid>,
+    live_lengths: &HashMap<Tid, (u32, usize)>,
+    source: usize,
     checkpoint: &mut impl FnMut() -> std::result::Result<(), MergeError>,
-) -> std::result::Result<(), MergeError> {
-    while postings.current().is_some_and(|tid| dead.contains(&tid)) {
+) -> std::result::Result<Option<u32>, MergeError> {
+    while let Some(tid) = postings.current() {
+        if let Some(&(length, owner)) = live_lengths.get(&tid)
+            && owner == source
+        {
+            return Ok(Some(length));
+        }
         checkpoint()?;
         payload.next_bucket()?;
         postings.advance()?;
     }
-    Ok(())
+    Ok(None)
 }
 
 fn merge_as(
@@ -181,7 +189,7 @@ fn merge_as(
         checkpoint()?;
         if !inputs[i].dead.contains(&tid) {
             let len = segments[i].length_at(docs[i].ordinal())?;
-            if live_lengths.insert(tid, len).is_some() {
+            if live_lengths.insert(tid, (len, i)).is_some() {
                 return Err(Error::Unordered.into());
             }
             doc_builder.push(tid)?;
@@ -195,7 +203,6 @@ fn merge_as(
             heap.push(Reverse((tid, i)));
         }
     }
-    let sources = inputs;
     let mut dictionaries = segments
         .iter()
         .map(|s| Ok(s.dictionary()?.iter()))
@@ -233,7 +240,7 @@ fn merge_as(
             if resolved.df() == 1
                 && postings
                     .current()
-                    .is_some_and(|tid| sources[i].dead.contains(&tid))
+                    .is_some_and(|tid| live_lengths.get(&tid).is_none_or(|&(_, owner)| owner != i))
             {
                 // This fully validated source term has no surviving posting.
                 // No payload cursor will be consumed for it.
@@ -241,16 +248,17 @@ fn merge_as(
                 continue;
             }
             let mut payload = resolved.payload()?.cursor();
-            skip_dead(
+            let length = skip_dead(
                 &mut postings,
                 &mut payload,
-                sources[i].dead,
+                &live_lengths,
+                i,
                 &mut checkpoint,
             )?;
             if let Some(tid) = postings.current() {
                 postings_heap.push(Reverse((tid, cursors.len())));
             }
-            cursors.push((i, postings, payload));
+            cursors.push((i, postings, payload, length));
         }
         let mut postings = PostingsBuilder::default();
         let mut payload = PayloadBuilder::default();
@@ -258,12 +266,10 @@ fn merge_as(
         let mut max_bucket = 0;
         while let Some(Reverse((tid, c))) = postings_heap.pop() {
             checkpoint()?;
-            let (i, cursor, positions_cursor) = &mut cursors[c];
+            let (i, cursor, positions_cursor, length) = &mut cursors[c];
             positions.clear();
             let bucket = positions_cursor.next_into(&mut positions)?;
-            let len = *live_lengths
-                .get(&tid)
-                .ok_or(Error::Corrupt("posting missing document"))?;
+            let len = length.ok_or(Error::Corrupt("posting missing document"))?;
             postings.push_scored(tid, bucket, len)?;
             payload.push(bucket, &positions)?;
             count = count
@@ -271,7 +277,7 @@ fn merge_as(
                 .ok_or(MergeError::Limit("postings count"))?;
             max_bucket = max_bucket.max(bucket);
             cursor.advance()?;
-            skip_dead(cursor, positions_cursor, sources[*i].dead, &mut checkpoint)?;
+            *length = skip_dead(cursor, positions_cursor, &live_lengths, *i, &mut checkpoint)?;
             if let Some(tid) = cursor.current() {
                 postings_heap.push(Reverse((tid, c)));
             }
@@ -499,6 +505,25 @@ mod tests {
             merge(&inputs(&blobs, &dead), limits(), || Ok(())).unwrap(),
             reference(&blobs, &dead, Format::CURRENT).unwrap()
         );
+    }
+
+    #[test]
+    fn live_source_ownership_distinguishes_reused_tids_in_shared_terms() {
+        let (mut blobs, _) = fixture(1, 3, 4, 2, true, 0);
+        blobs.push(blobs[0].clone());
+        let all_dead = crate::set::collect(Segment::parse(&blobs[0]).unwrap().documents().unwrap())
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for dead in [
+            [all_dead.clone(), BTreeSet::new()],
+            [BTreeSet::new(), all_dead.clone()],
+        ] {
+            assert_eq!(
+                merge(&inputs(&blobs, &dead), limits(), || Ok(())).unwrap(),
+                reference(&blobs, &dead, Format::CURRENT).unwrap()
+            );
+        }
     }
 
     #[test]

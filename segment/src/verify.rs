@@ -173,7 +173,7 @@ fn describe(tid: Tid) -> String {
 /// Locate increasing postings in an increasing document table. Galloping over
 /// gaps keeps sparse terms logarithmic in their gap size, while adjacent matches
 /// need one comparison instead of searching the whole table for every posting.
-fn ordered_rank(documents: &[Tid], at: &mut usize, target: Tid) -> Option<usize> {
+pub(crate) fn ordered_rank(documents: &[Tid], at: &mut usize, target: Tid) -> Option<usize> {
     let remaining = &documents[*at..];
     if remaining.first().is_some_and(|tid| *tid < target) {
         let mut end = 1usize;
