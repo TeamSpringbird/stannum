@@ -1,0 +1,448 @@
+{
+  "aggregate_sha256": "acc27dc54584534b2820f71e47e559e8c3e64d70c8aaae351abf619800ce2ad9",
+  "candidate_100k": {
+    "config": {
+      "clients": 2,
+      "cpus": 4,
+      "memory": "4g",
+      "rows": 100000,
+      "seconds": 60,
+      "seed": 1592614637,
+      "shared_buffers": "1GB",
+      "style": "mixed",
+      "warmup": 10,
+      "workload": "topk"
+    },
+    "correctness": {
+      "mismatches": 0,
+      "queries": 906,
+      "sampled_rows": 1000,
+      "seconds": 18.89137575030327
+    },
+    "driver_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a",
+    "image": "sha256:4130e2a2027f9146f45d02350794a0da9ede40c029193b990919e0ad3542b7db",
+    "input_sha256": "bbcc0d0fa38d773d7fa0947761ebb81f9dfea836f3e4cda30544022235a22ba7",
+    "metrics": {
+      "completed": 104467,
+      "cross_engine_membership_differences": {},
+      "engine": "stannum",
+      "families": {
+        "conjunction": {
+          "completed": 34827,
+          "p50_ms": 0.888,
+          "p95_ms": 1.927,
+          "p99_ms": 2.758
+        },
+        "disjunction": {
+          "completed": 34816,
+          "p50_ms": 1.081,
+          "p95_ms": 2.453,
+          "p99_ms": 4.435
+        },
+        "phrase": {
+          "completed": 34824,
+          "p50_ms": 0.787,
+          "p95_ms": 2.081,
+          "p99_ms": 5.589
+        }
+      },
+      "index_bytes": 165806080,
+      "index_hit_bytes": 14266875904,
+      "index_read_bytes": 0,
+      "measured_query_forms": 906,
+      "p50_ms": 0.915,
+      "p95_ms": 2.15,
+      "p99_ms": 4.097,
+      "qps": 1741.1166666666666,
+      "seconds": 60.0,
+      "status": "complete",
+      "total_bytes": 362110976,
+      "update_errors": 0,
+      "updates_attempted": 0,
+      "updates_completed": 0
+    },
+    "ranked_correctness": {
+      "mismatches": 0,
+      "queries": 906,
+      "reference": "exhaustive same-engine score multiset; ties unordered"
+    },
+    "runner_sha256": "fe2359a344849dc3305bbfc29211f3cb4cfcce36db493e0d7549526f488beea9",
+    "source_sha256": "46c805ff821b9d5726106a74e8b0d0e0b61f8f52c9f616728c7cd89c4eac7eab"
+  },
+  "images": {
+    "baseline": "sha256:4b8506e6e8facd281c292111d5b6af069768aff73ecf12c8ad48a54acce70341",
+    "candidate": "sha256:4130e2a2027f9146f45d02350794a0da9ede40c029193b990919e0ad3542b7db"
+  },
+  "paired": {
+    "complete": true,
+    "completed_trials": 4,
+    "invalid_trials": [],
+    "paired": {
+      "p95_speedup": {
+        "cv": 0.009707654730462638,
+        "max": 90.52049689440993,
+        "mean": 89.90336884032536,
+        "median": 89.90336884032536,
+        "min": 89.2862407862408,
+        "n": 2,
+        "stdev": 0.8727508638073118
+      },
+      "qps_ratio": {
+        "cv": 0.011559409635078626,
+        "max": 36.213936786820824,
+        "mean": 35.920333430580946,
+        "median": 35.920333430580946,
+        "min": 35.62673007434107,
+        "n": 2,
+        "stdev": 0.41521784835269426
+      }
+    },
+    "repetitions": 2,
+    "variants": {
+      "baseline": {
+        "p50_ms": {
+          "cv": 0.0020231953682018546,
+          "max": 0.35,
+          "mean": 0.3495,
+          "median": 0.3495,
+          "min": 0.349,
+          "n": 2,
+          "stdev": 0.0007071067811865482
+        },
+        "p95_ms": {
+          "cv": 0.001846130327114662,
+          "max": 72.869,
+          "mean": 72.774,
+          "median": 72.774,
+          "min": 72.679,
+          "n": 2,
+          "stdev": 0.13435028842544242
+        },
+        "qps": {
+          "cv": 0.004875164391609878,
+          "max": 148.05549996664666,
+          "mean": 147.54686728723345,
+          "median": 147.54686728723345,
+          "min": 147.03823460782027,
+          "n": 2,
+          "stdev": 0.7193152334923089
+        }
+      },
+      "candidate": {
+        "p50_ms": {
+          "cv": 0.007302307550979844,
+          "max": 0.292,
+          "mean": 0.2905,
+          "median": 0.2905,
+          "min": 0.289,
+          "n": 2,
+          "stdev": 0.0021213203435596446
+        },
+        "p95_ms": {
+          "cv": 0.00786159484951063,
+          "max": 0.814,
+          "mean": 0.8095,
+          "median": 0.8095,
+          "min": 0.805,
+          "n": 2,
+          "stdev": 0.006363961030678855
+        },
+        "qps": {
+          "cv": 0.006684433590828364,
+          "max": 5324.833333333333,
+          "mean": 5299.783333333333,
+          "median": 5299.783333333333,
+          "min": 5274.733333333334,
+          "n": 2,
+          "stdev": 35.426049737445645
+        }
+      }
+    }
+  },
+  "source_sha256": {
+    "baseline": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+    "candidate": "46c805ff821b9d5726106a74e8b0d0e0b61f8f52c9f616728c7cd89c4eac7eab"
+  },
+  "trials": [
+    {
+      "config": {
+        "clients": 2,
+        "cpus": 4,
+        "memory": "4g",
+        "rows": 1000,
+        "seconds": 30,
+        "seed": 1592614637,
+        "shared_buffers": "1GB",
+        "style": "mixed",
+        "warmup": 5,
+        "workload": "topk"
+      },
+      "correctness": {
+        "mismatches": 0,
+        "queries": 906,
+        "sampled_rows": 1000,
+        "seconds": 26.656497042626143
+      },
+      "directory": "r01-baseline",
+      "driver_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a",
+      "input_sha256": "e1c0131302adc067a93f0824fd5e832ff69bdc98f843e11b0be7476c220a3fc5",
+      "metrics": {
+        "completed": 4411,
+        "cross_engine_membership_differences": {
+          "135:phrase": 2
+        },
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 1473,
+            "p50_ms": 0.31,
+            "p95_ms": 0.757,
+            "p99_ms": 1.33
+          },
+          "disjunction": {
+            "completed": 1471,
+            "p50_ms": 66.003,
+            "p95_ms": 74.999,
+            "p99_ms": 77.564
+          },
+          "phrase": {
+            "completed": 1467,
+            "p50_ms": 0.249,
+            "p95_ms": 0.614,
+            "p99_ms": 1.225
+          }
+        },
+        "index_bytes": 3145728,
+        "index_hit_bytes": 633159680,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.35,
+        "p95_ms": 72.869,
+        "p99_ms": 76.01,
+        "qps": 147.03823460782027,
+        "seconds": 29.999,
+        "status": "complete",
+        "total_bytes": 6160384,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      "ranked_correctness": {
+        "mismatches": 0,
+        "queries": 906,
+        "reference": "exhaustive same-engine score multiset; ties unordered"
+      },
+      "runner_sha256": "972a2c340267cc1761a0299d09189b83061a7531091cf5f4f6c6c5a1ed191ccb"
+    },
+    {
+      "config": {
+        "clients": 2,
+        "cpus": 4,
+        "memory": "4g",
+        "rows": 1000,
+        "seconds": 30,
+        "seed": 1592614637,
+        "shared_buffers": "1GB",
+        "style": "mixed",
+        "warmup": 5,
+        "workload": "topk"
+      },
+      "correctness": {
+        "mismatches": 0,
+        "queries": 906,
+        "sampled_rows": 1000,
+        "seconds": 26.92018320877105
+      },
+      "directory": "r01-candidate",
+      "driver_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a",
+      "input_sha256": "e1c0131302adc067a93f0824fd5e832ff69bdc98f843e11b0be7476c220a3fc5",
+      "metrics": {
+        "completed": 159745,
+        "cross_engine_membership_differences": {
+          "135:phrase": 2
+        },
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 53257,
+            "p50_ms": 0.254,
+            "p95_ms": 0.827,
+            "p99_ms": 1.194
+          },
+          "disjunction": {
+            "completed": 53248,
+            "p50_ms": 0.486,
+            "p95_ms": 0.891,
+            "p99_ms": 1.209
+          },
+          "phrase": {
+            "completed": 53240,
+            "p50_ms": 0.181,
+            "p95_ms": 0.428,
+            "p99_ms": 0.717
+          }
+        },
+        "index_bytes": 3145728,
+        "index_hit_bytes": 21055619072,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.289,
+        "p95_ms": 0.805,
+        "p99_ms": 1.14,
+        "qps": 5324.833333333333,
+        "seconds": 30.0,
+        "status": "complete",
+        "total_bytes": 6160384,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      "ranked_correctness": {
+        "mismatches": 0,
+        "queries": 906,
+        "reference": "exhaustive same-engine score multiset; ties unordered"
+      },
+      "runner_sha256": "972a2c340267cc1761a0299d09189b83061a7531091cf5f4f6c6c5a1ed191ccb"
+    },
+    {
+      "config": {
+        "clients": 2,
+        "cpus": 4,
+        "memory": "4g",
+        "rows": 1000,
+        "seconds": 30,
+        "seed": 1592614637,
+        "shared_buffers": "1GB",
+        "style": "mixed",
+        "warmup": 5,
+        "workload": "topk"
+      },
+      "correctness": {
+        "mismatches": 0,
+        "queries": 906,
+        "sampled_rows": 1000,
+        "seconds": 27.0769374165684
+      },
+      "directory": "r02-candidate",
+      "driver_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a",
+      "input_sha256": "e1c0131302adc067a93f0824fd5e832ff69bdc98f843e11b0be7476c220a3fc5",
+      "metrics": {
+        "completed": 158242,
+        "cross_engine_membership_differences": {
+          "135:phrase": 2
+        },
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 52742,
+            "p50_ms": 0.256,
+            "p95_ms": 0.834,
+            "p99_ms": 1.204
+          },
+          "disjunction": {
+            "completed": 52759,
+            "p50_ms": 0.488,
+            "p95_ms": 0.898,
+            "p99_ms": 1.222
+          },
+          "phrase": {
+            "completed": 52741,
+            "p50_ms": 0.183,
+            "p95_ms": 0.454,
+            "p99_ms": 0.734
+          }
+        },
+        "index_bytes": 3145728,
+        "index_hit_bytes": 20892467200,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.292,
+        "p95_ms": 0.814,
+        "p99_ms": 1.156,
+        "qps": 5274.733333333334,
+        "seconds": 30.0,
+        "status": "complete",
+        "total_bytes": 6160384,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      "ranked_correctness": {
+        "mismatches": 0,
+        "queries": 906,
+        "reference": "exhaustive same-engine score multiset; ties unordered"
+      },
+      "runner_sha256": "972a2c340267cc1761a0299d09189b83061a7531091cf5f4f6c6c5a1ed191ccb"
+    },
+    {
+      "config": {
+        "clients": 2,
+        "cpus": 4,
+        "memory": "4g",
+        "rows": 1000,
+        "seconds": 30,
+        "seed": 1592614637,
+        "shared_buffers": "1GB",
+        "style": "mixed",
+        "warmup": 5,
+        "workload": "topk"
+      },
+      "correctness": {
+        "mismatches": 0,
+        "queries": 906,
+        "sampled_rows": 1000,
+        "seconds": 27.11806070804596
+      },
+      "directory": "r02-baseline",
+      "driver_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a",
+      "input_sha256": "e1c0131302adc067a93f0824fd5e832ff69bdc98f843e11b0be7476c220a3fc5",
+      "metrics": {
+        "completed": 4439,
+        "cross_engine_membership_differences": {
+          "135:phrase": 2
+        },
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 1481,
+            "p50_ms": 0.312,
+            "p95_ms": 0.779,
+            "p99_ms": 1.758
+          },
+          "disjunction": {
+            "completed": 1475,
+            "p50_ms": 66.344,
+            "p95_ms": 74.831,
+            "p99_ms": 77.173
+          },
+          "phrase": {
+            "completed": 1483,
+            "p50_ms": 0.248,
+            "p95_ms": 0.621,
+            "p99_ms": 1.873
+          }
+        },
+        "index_bytes": 3145728,
+        "index_hit_bytes": 630685696,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.349,
+        "p95_ms": 72.679,
+        "p99_ms": 75.885,
+        "qps": 148.05549996664666,
+        "seconds": 29.982,
+        "status": "complete",
+        "total_bytes": 6160384,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      "ranked_correctness": {
+        "mismatches": 0,
+        "queries": 906,
+        "reference": "exhaustive same-engine score multiset; ties unordered"
+      },
+      "runner_sha256": "972a2c340267cc1761a0299d09189b83061a7531091cf5f4f6c6c5a1ed191ccb"
+    }
+  ]
+}

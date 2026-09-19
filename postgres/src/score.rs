@@ -2092,7 +2092,12 @@ fn score_support(request: Internal) -> Internal {
             .collect::<Vec<_>>();
         let combined_query = combine_constant_queries(&same_expression)
             .unwrap_or_else(|| pg_sys::copyObjectImpl(first_query.cast()).cast());
-        args.push(combined_query);
+        // This query came from the parse tree's quals, not the already
+        // simplified arguments of the supported function. In a custom
+        // prepared plan it can still contain a bound Param. Simplify the
+        // copy so the score and search clause expose the same constant to
+        // ranked-path recognition. Generic plans retain their parameters.
+        args.push(pg_sys::eval_const_expressions(request.root, combined_query));
         args.push(make_int4_const((*rte).relid.to_u32() as i32).cast());
         args.push(make_int4_const(index_oid.to_u32() as i32).cast());
         args.push(make_int4_const(mode).cast());

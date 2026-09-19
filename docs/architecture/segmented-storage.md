@@ -375,6 +375,13 @@ DELETE alone does not populate these lists; VACUUM must first identify dead
 versions. Estimates cannot account for those unknown deaths beforehand. The
 write buffer has no dead list. Partial indexes use their indexed population.
 
+Ranked-path recognition needs the search predicate and its bound scoring call
+to expose the same constant query. The scoring support function simplifies the
+query it copies from the parse tree, so custom prepared plans can use bound
+parameter values just as literal queries do. Generic plans retain runtime
+parameters and use the existing fallback; this does not force PostgreSQL to
+choose custom plans. See the [prepared-query diagnosis](../benchmarks/ranked-prepared-queries.md).
+
 A ranked scan with a known `LIMIT` prunes instead of scoring every candidate
 when the query is a flat `AND` or `OR` of terms (a single term included) whose
 terms are exactly the scoring terms. Each term's postings carry a bound per

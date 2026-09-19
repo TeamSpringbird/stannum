@@ -7,6 +7,9 @@ The [initial integration results](published-trace-results.md) cover 100k-documen
 counts, ranked correctness, and concurrent updates, including two benchmark
 issues exposed by the new workload.
 
+The [ranked prepared-query diagnosis](ranked-prepared-queries.md) explains why
+parameterized disjunctions missed ranked scans and how the planner fix is validated.
+
 The [TIN methodology source audit](tin-benchmark-source-audit.md) and
 [local protocol](tin-local-protocol.md) describe how to broaden our
 benchmarks using PlanetScale's published workload, including a stored-vector
