@@ -613,9 +613,55 @@ unsafe fn remaining_quals(
     }
 }
 
+/// Limit hints are useful only below a simple ranked SELECT. Avoid importing
+/// a bound through joins, aggregation, DISTINCT, window functions or SRFs.
+unsafe fn runtime_bound_shape(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+) -> bool {
+    unsafe {
+        let query = &*(*root).parse;
+        if query.hasAggs
+            || query.hasWindowFuncs
+            || query.hasTargetSRFs
+            || !query.groupClause.is_null()
+            || !query.groupingSets.is_null()
+            || !query.distinctClause.is_null()
+            || !query.havingQual.is_null()
+            || !query.setOperations.is_null()
+            || query.jointree.is_null()
+            || pg_sys::list_length((*query.jointree).fromlist) != 1
+        {
+            return false;
+        }
+        let from = pg_sys::list_nth((*query.jointree).fromlist, 0).cast::<pg_sys::Node>();
+        (*from).type_ == pg_sys::NodeTag::T_RangeTblRef
+            && (*from.cast::<pg_sys::RangeTblRef>()).rtindex as u32 == (*rel).relid
+    }
+}
+
+unsafe fn safe_bound_expr(expr: *mut pg_sys::Node) -> bool {
+    unsafe {
+        if expr.is_null() {
+            return false;
+        }
+        match (*expr).type_ {
+            pg_sys::NodeTag::T_Const => {
+                (*expr.cast::<pg_sys::Const>()).consttype == pg_sys::INT8OID
+            }
+            pg_sys::NodeTag::T_Param => {
+                let param = &*expr.cast::<pg_sys::Param>();
+                param.paramkind == pg_sys::ParamKind::PARAM_EXTERN
+                    && param.paramtype == pg_sys::INT8OID
+            }
+            _ => false,
+        }
+    }
+}
+
 #[pg_guard]
 unsafe extern "C-unwind" fn plan_search_path(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     best_path: *mut pg_sys::CustomPath,
     tlist: *mut pg_sys::List,
@@ -623,7 +669,7 @@ unsafe extern "C-unwind" fn plan_search_path(
     _custom_plans: *mut pg_sys::List,
 ) -> *mut pg_sys::Plan {
     unsafe {
-        let (_, clause) = Private::from_list((*best_path).custom_private);
+        let (private, clause) = Private::from_list((*best_path).custom_private);
         let mut scan = pgrx::PgBox::<pg_sys::CustomScan>::alloc_node(pg_sys::NodeTag::T_CustomScan);
         scan.scan.plan.targetlist = tlist;
         scan.scan.plan.qual = remaining_quals(clauses, clause);
@@ -636,8 +682,23 @@ unsafe extern "C-unwind" fn plan_search_path(
             .expect("search clause")
             .query;
         let mut expressions = PgList::<pg_sys::Node>::new();
-        if (*query).type_ == pg_sys::NodeTag::T_Param {
-            expressions.push(pg_sys::copyObjectImpl(query.cast()).cast());
+        expressions.push(pg_sys::copyObjectImpl(query.cast()).cast());
+        // Only copy simple external parameters/constants. Evaluating arbitrary
+        // LIMIT expressions here could duplicate volatile work or depend on an
+        // outer tuple. The enclosing Limit remains responsible for SQL errors.
+        let parse = &*(*root).parse;
+        if private.ordering.is_some()
+            && runtime_bound_shape(root, rel)
+            && safe_bound_expr(parse.limitCount)
+            && (parse.limitOffset.is_null() || safe_bound_expr(parse.limitOffset))
+            && ((*parse.limitCount).type_ == pg_sys::NodeTag::T_Param
+                || (!parse.limitOffset.is_null()
+                    && (*parse.limitOffset).type_ == pg_sys::NodeTag::T_Param))
+        {
+            expressions.push(pg_sys::copyObjectImpl(parse.limitCount.cast()).cast());
+            if !parse.limitOffset.is_null() {
+                expressions.push(pg_sys::copyObjectImpl(parse.limitOffset.cast()).cast());
+            }
         }
         scan.custom_exprs = expressions.into_pg();
         scan.custom_private = (*best_path).custom_private;
@@ -797,6 +858,9 @@ struct ScanExec {
     clause: *mut pg_sys::ExprState,
     runtime_query: *mut pg_sys::ExprState,
     query_bound: bool,
+    runtime_limit: *mut pg_sys::ExprState,
+    runtime_offset: *mut pg_sys::ExprState,
+    bounds_bound: bool,
     query_null: bool,
     /// Whether this execution scans the heap instead of the index, decided
     /// once on first access (see [`heap_fallback`]).
@@ -923,20 +987,31 @@ unsafe extern "C-unwind" fn begin_scan(
         } else {
             std::ptr::null_mut()
         };
-        let runtime_query = if (*cscan).custom_exprs.is_null() {
-            std::ptr::null_mut()
-        } else {
-            pg_sys::ExecInitExpr(
-                pg_sys::list_nth((*cscan).custom_exprs, 0).cast(),
-                node.cast(),
-            )
+        let expressions = (*cscan).custom_exprs;
+        let expression = |index: i32| {
+            if pg_sys::list_length(expressions) > index {
+                pg_sys::list_nth(expressions, index).cast::<pg_sys::Expr>()
+            } else {
+                std::ptr::null_mut()
+            }
         };
+        let query = expression(0);
+        let runtime_query = if !query.is_null() && (*query).type_ == pg_sys::NodeTag::T_Param {
+            pg_sys::ExecInitExpr(query, node.cast())
+        } else {
+            std::ptr::null_mut()
+        };
+        let runtime_limit = pg_sys::ExecInitExpr(expression(1), node.cast());
+        let runtime_offset = pg_sys::ExecInitExpr(expression(2), node.cast());
         let ordered = private.ordering.is_some();
         let exec = ScanExec {
             private,
             clause,
             runtime_query,
             query_bound: runtime_query.is_null(),
+            runtime_limit,
+            runtime_offset,
+            bounds_bound: runtime_limit.is_null(),
             query_null: false,
             heap_fallback: None,
             fetch,
@@ -1216,6 +1291,39 @@ unsafe fn pointer_of(tid: Tid) -> pg_sys::ItemPointerData {
     }
 }
 
+/// A checked hint, never a truncation: visibility checks or remaining quals
+/// can reject the first k candidates, in which case `complete` supplies the rest.
+fn runtime_top_k(limit: Option<i64>, offset: Option<i64>) -> Option<usize> {
+    let limit = limit?;
+    let offset = offset.unwrap_or(0);
+    if limit < 0 || offset < 0 {
+        return None;
+    }
+    usize::try_from(limit.checked_add(offset)?).ok()
+}
+
+unsafe fn bind_bounds(exec: &mut ScanExec, context: *mut pg_sys::ExprContext) {
+    unsafe {
+        if exec.bounds_bound {
+            return;
+        }
+        let evaluate = |expr: *mut pg_sys::ExprState| {
+            if expr.is_null() {
+                return None;
+            }
+            let mut is_null = false;
+            let value = pg_sys::ExecEvalExprSwitchContext(expr, context, &mut is_null);
+            i64::from_datum(value, is_null)
+        };
+        let limit = evaluate(exec.runtime_limit);
+        let offset = evaluate(exec.runtime_offset);
+        if let Some(ordering) = &mut exec.private.ordering {
+            ordering.top_k = runtime_top_k(limit, offset);
+        }
+        exec.bounds_bound = true;
+    }
+}
+
 /// Next visible matching tuple into the scan slot, or an empty slot.
 #[pg_guard]
 unsafe extern "C-unwind" fn search_access(
@@ -1244,6 +1352,7 @@ unsafe extern "C-unwind" fn search_access(
             exec.started = true;
             return pg_sys::ExecClearTuple(slot);
         }
+        bind_bounds(exec, (*scan).ps.ps_ExprContext);
         if heap_fallback(exec) {
             return fallback_access(scan, exec, slot);
         }
@@ -1556,9 +1665,10 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let exec = exec_of(node);
         exec.next = 0;
-        if !exec.runtime_query.is_null() {
+        if !exec.runtime_query.is_null() || !exec.runtime_limit.is_null() {
             crate::score::forget_scan_scorer(exec.scan_id);
-            exec.query_bound = false;
+            exec.query_bound = exec.runtime_query.is_null();
+            exec.bounds_bound = exec.runtime_limit.is_null();
             exec.query_null = false;
             exec.started = false;
             exec.tids.clear();
