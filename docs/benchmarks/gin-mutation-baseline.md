@@ -19,7 +19,7 @@ campaign reverses the full case/engine order on alternating repetitions. The
 controlled benchmark disables table autovacuum and forces index access using
 `enable_seqscan=off`; results describe this index-access workload rather than the
 best plan PostgreSQL might choose with sequential scans allowed. Stannum storage
-settings apply only to Stannum and are recorded separately. The comparison guard
+settings apply only to Stannum and are recorded separately. The campaign rejects on-disk harness source changes between windows. The comparison guard
 permits engine-specific settings while rejecting changed reader rates, workload
 profiles or PostgreSQL settings.
 
@@ -58,7 +58,7 @@ python3 benchmarks/run.py compare /stannum/window /gin/window --cross-engine
 ```
 
 The three-engine native smoke passed locally. CI runs this smoke on PG17/18 and
-ARM/x86. No timing threshold is imposed on shared CI runners. Longer local sweeps
-and representative-corpus results are recorded separately; short synthetic
+ARM/x86. No timing threshold is imposed on shared CI runners. [Local measurements](gin-mutation-results.md) cover repeated synthetic and
+verified Wikipedia windows; short synthetic
 results must not be described as a production capacity limit or universal
 speedup over GIN.

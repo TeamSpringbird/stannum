@@ -2,6 +2,7 @@
 
 The [matched GIN baseline](gin-mutation-baseline.md) compares sustained mutations
 and count/membership searches with GIN buffered updates enabled and disabled.
+[Local results](gin-mutation-results.md) include the verified Wikipedia corpus.
 
 The [reader-pinned VACUUM diagnosis](vacuum-pinned-cleanup.md) explains deferred
 heap pruning and the corrected physical-versus-live document accounting.

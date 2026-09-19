@@ -41,6 +41,12 @@ def schedule(rates, writers, rounds):
             for rate, count in (cases if r % 2 else reversed(cases))]
 
 
+def verify_sources(expected):
+    for filename, digest in expected.items():
+        if hashlib.sha256(Path(filename).read_bytes()).hexdigest() != digest:
+            raise RuntimeError('benchmark source changed during campaign: ' + filename)
+
+
 def wal_delta(before, after):
     def value(lsn):
         high, low = lsn.split('/')
@@ -106,7 +112,11 @@ def main():
     postgres = Path(bench.command(['pg_config', '--bindir'])) / 'postgres'
     postgres_digest = hashlib.sha256(postgres.read_bytes()).hexdigest()
 
+    sources = {str(Path(module.__file__).resolve()): hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+               for module in (bench, bench.mutation, bench.dataset)}
+
     def verify_binary():
+        verify_sources(sources)
         if hashlib.sha256(installed.read_bytes()).hexdigest() != digest:
             raise RuntimeError('installed library does not match the retained release artifact')
 
@@ -118,7 +128,7 @@ def main():
     settings = ['stannum.write_buffer_docs=256', 'stannum.build_segment_docs=2000',
                 'stannum.max_segments=16', 'stannum.max_merge_docs=2048', *args.set]
     record = dict(status='running', artifact_sha256=digest, installed_library=str(installed),
-                  postgres_sha256=postgres_digest, launcher_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                  harness_sources=sources, postgres_sha256=postgres_digest, launcher_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   cluster=str(cluster), config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   settings=settings, trials=[])
     bench.save(output / 'campaign.json', record)

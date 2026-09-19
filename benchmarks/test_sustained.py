@@ -4,6 +4,7 @@
 
 from pathlib import Path
 import json
+import hashlib
 import subprocess
 import tempfile
 import unittest
@@ -144,3 +145,15 @@ class GinBaselineTests(unittest.TestCase):
         self.assertIn('PostgreSQL settings', run.comparison_mismatches(a, b, True))
         b['config']['profile'] = 'mutation'
         self.assertIn('ranking contract', run.comparison_mismatches(a, b, True))
+
+
+class CampaignIdentityTests(unittest.TestCase):
+    def test_editing_sources_invalidates_the_campaign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'runner.py'
+            path.write_text('original')
+            identity = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()}
+            sustained.verify_sources(identity)
+            path.write_text('changed')
+            with self.assertRaisesRegex(RuntimeError, 'source changed'):
+                sustained.verify_sources(identity)
