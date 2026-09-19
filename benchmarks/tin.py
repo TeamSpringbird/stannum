@@ -10,12 +10,14 @@ import csv
 import fcntl
 import gzip
 import json
+import math
 import os
 from pathlib import Path
 import platform
 import re
 import shutil
 import subprocess
+import statistics
 import time
 import uuid
 
@@ -189,6 +191,28 @@ def ranked_check_sql(queries, engine):
     return '\n'.join(statements)
 
 
+def prepared_plan_sql(query, engine, workload, mode):
+    if mode not in ('force_custom_plan', 'force_generic_plan'):
+        raise ValueError('unsupported diagnostic plan mode')
+    _, tin, postgres, _ = query
+    if engine == 'stannum':
+        fields = 'count(*)' if workload == 'count' else 'id, body, stannum.full_score(ctid) AS score'
+        predicate, argument = 'body ==> $1', tin
+    else:
+        fields = ('count(*)' if workload == 'count' else
+                  "id, body, ts_rank_cd(body_tsv, to_tsquery('simple', $1)) AS score")
+        predicate, argument = "body_tsv @@ to_tsquery('simple', $1)", postgres
+    suffix = '' if workload == 'count' else ' ORDER BY score DESC LIMIT 10'
+    # Match the driver's bind parameter and projection. Literal count plans do
+    # not reveal planner-support failures inside parameterized score calls.
+    # Each invocation runs in a separate psql session, outside measured traffic.
+    return (f'SET plan_cache_mode={mode};\n'
+            f'PREPARE stannum_bench_plan AS SELECT {fields} FROM documents WHERE {predicate}{suffix};\n'
+            'EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) '
+            f'EXECUTE stannum_bench_plan({literal(argument)});\n'
+            'DEALLOCATE stannum_bench_plan;\nRESET plan_cache_mode;')
+
+
 def semantics_sql(queries):
     return '\n'.join(
         f"SELECT {literal(name)}, count(*) FROM reference WHERE "
@@ -297,12 +321,13 @@ def run(args):
         raise ValueError('requested rows exceed dataset')
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
-    source = bench.provenance(root)
+    source_path = getattr(args, 'source_manifest', None)
+    source = recorded_source(source_path) if source_path else bench.provenance(root)
     image = json.loads(output(['docker', 'image', 'inspect', args.image]))[0]
     if image['Architecture'] != {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'amd64'}[platform.machine()]:
         raise ValueError('image must run natively; emulated timings are not supported')
     if image['Config'].get('Labels', {}).get('benchmark.stannum_source_sha256') != source['source_sha256']:
-        raise ValueError('image does not match current extension source')
+        raise ValueError('image does not match extension source provenance')
     recipe = bench.digest((ROOT / 'benchmarks/Dockerfile').read_bytes() +
                           (ROOT / 'benchmarks/Dockerfile.dockerignore').read_bytes())
     if image['Config'].get('Labels', {}).get('benchmark.recipe_sha256') != recipe:
@@ -413,11 +438,13 @@ def run(args):
                     validate_result(ranked, [q[0] for q in queries])
                     job['ranked_correctness'] = dict(queries=len(queries), mismatches=0,
                                                      reference='exhaustive same-engine score multiset; ties unordered')
-                for query_id, tin, postgres, _ in queries[:6]:
-                    predicate = (f'body ==> {literal(tin)}' if engine == 'stannum' else
-                                 f"body_tsv @@ to_tsquery('simple',{literal(postgres)})")
-                    plan = sql(f'EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) SELECT count(*) FROM documents WHERE {predicate};')
-                    (path / ('plan-' + query_id.replace(':', '-') + '.json')).write_text(plan)
+                plan_queries = [q for q in queries if args.style == 'mixed' or q[0].split(':')[1] == args.style]
+                for query in plan_queries[:6]:
+                    for mode in ('force_custom_plan', 'force_generic_plan'):
+                        statement = prepared_plan_sql(query, engine, args.workload, mode)
+                        filename = 'plan-' + query[0].replace(':', '-') + '-' + mode
+                        (path / (filename + '.sql')).write_text(statement + '\n')
+                        (path / (filename + '.json')).write_text(sql(statement))
                 sql('CHECKPOINT;')
                 job['settings'] = json.loads(sql("SELECT json_object_agg(name,setting) FROM pg_settings;"))
                 job['extensions'] = json.loads(sql('SELECT json_object_agg(extname,extversion) FROM pg_extension;'))
@@ -488,6 +515,207 @@ def run(args):
         report(root)
 
 
+def describe(values):
+    if not values or any(not math.isfinite(v) or v <= 0 for v in values):
+        raise ValueError('comparison requires finite, positive measurements')
+    mean = statistics.mean(values)
+    return dict(n=len(values), median=statistics.median(values), mean=mean,
+                min=min(values), max=max(values),
+                stdev=statistics.stdev(values) if len(values) > 1 else None,
+                cv=statistics.stdev(values) / mean if len(values) > 1 else None)
+
+
+def paired_jobs(repetitions):
+    return [dict(pair=number, variant=variant,
+                 directory=f'r{number:02d}-{variant}', status='pending')
+            for number in range(1, repetitions + 1)
+            for variant in (('baseline', 'candidate') if number % 2 else ('candidate', 'baseline'))]
+
+
+def recorded_source(path):
+    source = json.loads(path.read_text())
+    files = source.get('source_files')
+    if not files or source.get('source_sha256') != bench.digest(bench.canonical(files)):
+        raise ValueError('recorded source fingerprint is missing or inconsistent: ' + str(path))
+    if not all(isinstance(name, str) and isinstance(value, str) and
+               re.fullmatch('[0-9a-f]{64}', value) for name, value in files.items()):
+        raise ValueError('invalid recorded source file fingerprints: ' + str(path))
+    return source
+
+
+COMPARISON_SETTINGS = ('rows', 'validation_rows', 'workload', 'style', 'clients',
+                       'seconds', 'warmup', 'updates', 'seed', 'cpus', 'memory',
+                       'shared_buffers', 'engines')
+
+
+def comparison_contract(manifest):
+    if manifest['status'] != 'complete' or len(manifest['jobs']) != 1:
+        raise ValueError('trial did not complete exactly one engine')
+    job = manifest['jobs'][0]
+    if job['status'] != 'complete' or job['engine'] != 'stannum':
+        raise ValueError('trial is not a completed Stannum measurement')
+    if job['correctness']['mismatches'] != 0:
+        raise ValueError('trial correctness failed')
+    if manifest['config']['workload'] == 'topk' and job['ranked_correctness']['mismatches'] != 0:
+        raise ValueError('trial ranked correctness failed')
+    if manifest['config']['updates'] and job['post_update_correctness']['mismatches'] != 0:
+        raise ValueError('trial post-update correctness failed')
+    docker = manifest['host']['docker']
+    return dict(adapter=manifest['adapter'], corpus=manifest['corpus'],
+                harness_sources=manifest['harness_sources'],
+                runner_sha256=manifest['runner_sha256'],
+                config={k: manifest['config'][k] for k in COMPARISON_SETTINGS},
+                host={k: manifest['host'][k] for k in ('system', 'machine')},
+                docker={k: docker.get(k) for k in
+                        ('NCPU', 'MemTotal', 'Architecture', 'OperatingSystem', 'ServerVersion', 'KernelVersion')},
+                input_sha256=job['input_sha256'], settings=job['settings'],
+                extensions=job['extensions'], full_counts=job['full_counts_before'])
+
+
+def paired_report(root):
+    campaign = json.loads((root / 'paired.json').read_text())
+    trials, invalid, contract = {}, [], None
+    planned = paired_jobs(campaign['repetitions'])
+    if [(j['pair'], j['variant'], j['directory']) for j in campaign['jobs']] != [
+            (j['pair'], j['variant'], j['directory']) for j in planned]:
+        invalid.append('planned trial schedule changed')
+    for job in campaign['jobs']:
+        try:
+            if job['status'] != 'complete':
+                raise ValueError('trial ' + job['status'])
+            path = root / job['directory']
+            manifest = json.loads((path / 'manifest.json').read_text())
+            variant = job['variant']
+            if manifest['image'] != campaign['images'][variant]['Id']:
+                raise ValueError('image identity differs from planned immutable image')
+            if manifest['source'] != campaign['sources'][variant]:
+                raise ValueError('extension source differs from recorded build')
+            current = comparison_contract(manifest)
+            if contract is None:
+                contract = current
+            elif contract != current:
+                mismatches = [key for key in contract if current[key] != contract[key]]
+                raise ValueError('incompatible trial: ' + ', '.join(mismatches))
+            rows = json.loads((path / 'comparison.json').read_text())
+            if len(rows) != 1 or rows[0]['engine'] != 'stannum' or rows[0]['status'] != 'complete':
+                raise ValueError('missing completed Stannum summary')
+            row = rows[0]
+            if set(row['queries']) != set(campaign['query_ids']):
+                missing = set(campaign['query_ids']) - set(row['queries'])
+                raise ValueError(f'incomplete timed trace coverage ({len(missing)} missing forms); increase --seconds')
+            if row['update_errors'] or row['updates_attempted'] != row['updates_completed']:
+                raise ValueError('failed or incomplete update attempts')
+            if manifest['config']['updates'] > 0 and row['updates_completed'] <= 0:
+                raise ValueError('update workload completed no updates')
+            for metric in ('qps', 'p50_ms', 'p95_ms'):
+                describe([row[metric]])
+            for query in row['queries'].values():
+                for metric in ('p50_ms', 'p95_ms'):
+                    describe([query[metric]])
+            trials[(job['pair'], variant)] = row
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            invalid.append(job['directory'] + ': ' + str(error))
+    complete = campaign['status'] == 'complete' and not invalid and len(trials) == len(planned)
+    result = dict(complete=complete, repetitions=campaign['repetitions'],
+                  completed_trials=len(trials), invalid_trials=invalid, variants={}, paired={}, queries={})
+    lines = ['# Repeated Stannum comparison', '',
+             f"Complete trials: {len(trials)} / {len(planned)}. Order alternates each pair.", '',
+             'Fresh containers and volumes; immutable images, identical corpus, trace, seed and runtime settings.',
+             'Variation is observed across trials, not a confidence interval or a capacity claim.', '']
+    if complete:
+        for variant in ('baseline', 'candidate'):
+            rows = [trials[(n, variant)] for n in range(1, campaign['repetitions'] + 1)]
+            result['variants'][variant] = {metric: describe([row[metric] for row in rows])
+                                          for metric in ('qps', 'p50_ms', 'p95_ms')}
+        pairs = [(trials[(n, 'baseline')], trials[(n, 'candidate')])
+                 for n in range(1, campaign['repetitions'] + 1)]
+        result['paired'] = dict(qps_ratio=describe([b['qps'] / a['qps'] for a, b in pairs]),
+                              p95_speedup=describe([a['p95_ms'] / b['p95_ms'] for a, b in pairs]))
+        for name in campaign['query_ids']:
+            result['queries'][name] = {
+                metric: describe([a['queries'][name][metric] / b['queries'][name][metric] for a, b in pairs])
+                for metric in ('p50_ms', 'p95_ms')}
+        lines += ['| Variant | Median QPS | QPS min–max | QPS CV | Median p95 ms |',
+                  '| --- | ---: | ---: | ---: | ---: |']
+        for variant, metrics in result['variants'].items():
+            q = metrics['qps']
+            lines.append(f"| {variant} | {q['median']:.1f} | {q['min']:.1f}–{q['max']:.1f} | "
+                         f"{q['cv']:.3f} | {metrics['p95_ms']['median']:.3f} |")
+        ratio = result['paired']['qps_ratio']
+        lines += ['', f"Median paired candidate/baseline QPS: {ratio['median']:.3f}x "
+                  f"(range {ratio['min']:.3f}–{ratio['max']:.3f}x).",
+                  'Ratios above one favor the candidate. Per-query p50/p95 ratios are baseline/candidate latency.',
+                  'See aggregate.json for every distribution. Raw trials remain alongside it.']
+    else:
+        lines += ['**Incomplete comparison: aggregate ratios withheld until every planned trial is valid.**', '',
+                  *['- ' + reason for reason in invalid]]
+    bench.save(root / 'aggregate.json', result)
+    (root / 'report.md').write_text('\n'.join(lines) + '\n')
+    return complete
+
+
+def compare(args):
+    if args.repetitions < 2:
+        raise ValueError('comparison needs at least two repetitions to alternate order and measure variation')
+    verify_sources(LOADED_SOURCES)
+    root = args.output.resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    sources, images = {}, {}
+    for variant in ('baseline', 'candidate'):
+        source_path = getattr(args, variant + '_source').resolve()
+        sources[variant] = recorded_source(source_path)
+        images[variant] = json.loads(output(['docker', 'image', 'inspect', getattr(args, variant + '_image')]))[0]
+        labels = images[variant]['Config'].get('Labels') or {}
+        if labels.get('benchmark.stannum_source_sha256') != sources[variant]['source_sha256']:
+            raise ValueError(variant + ' image does not match recorded source')
+        bench.save(root / (variant + '-source.json'), sources[variant])
+        patch = source_path.parent / 'source.patch'
+        if patch.exists():
+            shutil.copy2(patch, root / (variant + '-source.patch'))
+    queries = trace_queries(args.driver.resolve())
+    campaign = dict(status='running', repetitions=args.repetitions, sources=sources, images=images,
+                    query_ids=[q[0] for q in queries if args.style == 'mixed' or q[0].split(':')[1] == args.style],
+                    jobs=paired_jobs(args.repetitions))
+    bench.save(root / 'paired.json', campaign)
+    try:
+        for job in campaign['jobs']:
+            job['status'] = 'running'
+            bench.save(root / 'paired.json', campaign)
+            trial = argparse.Namespace(**vars(args))
+            trial.command, trial.engines = 'run', ['stannum']
+            trial.image = images[job['variant']]['Id']
+            trial.source_manifest = root / (job['variant'] + '-source.json')
+            trial.output = root / job['directory']
+            print(job['directory'], flush=True)
+            try:
+                run(trial)
+                job['status'] = 'complete'
+            except BaseException as error:
+                job.update(status='failed', error=str(error))
+                raise
+            finally:
+                bench.save(root / 'paired.json', campaign)
+        campaign['status'] = 'complete'
+    except BaseException as error:
+        campaign.update(status='failed', error=str(error))
+        raise
+    finally:
+        bench.save(root / 'paired.json', campaign)
+        valid = paired_report(root)
+    if not valid:
+        campaign['status'] = 'invalid'
+        bench.save(root / 'paired.json', campaign)
+        raise ValueError('comparison failed validation; see report.md')
+
+
+def render_report(args):
+    if (args.output / 'paired.json').exists():
+        if not paired_report(args.output):
+            raise ValueError('comparison is incomplete or invalid; see report.md')
+    else:
+        report(args.output)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--driver', type=Path, default=DEFAULT_DRIVER)
@@ -496,19 +724,17 @@ def main():
     commands.add_parser('build').set_defaults(func=build)
     p = commands.add_parser('report')
     p.add_argument('--output', type=Path, required=True)
-    p.set_defaults(func=lambda args: report(args.output))
+    p.set_defaults(func=render_report)
     p = commands.add_parser('build-image')
     p.set_defaults(func=build_image)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--image', required=True)
-    p = commands.add_parser('run')
-    p.set_defaults(func=run)
+    common = argparse.ArgumentParser(add_help=False)
+    p = common
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--dataset', type=Path, required=True)
-    p.add_argument('--image', required=True)
     p.add_argument('--rows', type=bench.positive, default=1000)
     p.add_argument('--validation-rows', type=bench.positive, default=1000)
-    p.add_argument('--engines', nargs='+', choices=['stannum', 'postgres'], default=['stannum', 'postgres'])
     p.add_argument('--workload', choices=['count', 'topk'], default='count')
     p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase'], default='mixed')
     p.add_argument('--clients', type=bench.positive, default=2)
@@ -520,6 +746,16 @@ def main():
     p.add_argument('--memory', default='4g')
     p.add_argument('--shared-buffers', default='1GB')
     p.add_argument('--port', type=bench.positive, default=28928)
+    p = commands.add_parser('run', parents=[common])
+    p.set_defaults(func=run)
+    p.add_argument('--image', required=True)
+    p.add_argument('--engines', nargs='+', choices=['stannum', 'postgres'], default=['stannum', 'postgres'])
+    p = commands.add_parser('compare', parents=[common])
+    p.set_defaults(func=compare)
+    p.add_argument('--repetitions', type=bench.positive, default=5)
+    for variant in ('baseline', 'candidate'):
+        p.add_argument('--' + variant + '-image', required=True)
+        p.add_argument('--' + variant + '-source', type=Path, required=True)
     args = parser.parse_args()
     if args.command in ('prepare', 'report'):
         args.func(args)
