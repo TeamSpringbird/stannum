@@ -147,7 +147,68 @@ impl SegmentBuilder {
 
     /// Adds a document from a forward record, as a buffer fold does.
     pub fn add_record(&mut self, record: &ForwardRecord) -> Result<()> {
-        self.add_document(record.tid, record.tokens())
+        Tid::new(record.tid.block, record.tid.offset)?;
+        if self.lengths.contains_key(&record.tid) {
+            return Err(Error::Unordered);
+        }
+        // Records emitted by our codecs are already grouped by term. Avoid
+        // expanding them into tokens, sorting by position and regrouping them.
+        // Keep the old normalization behavior for arbitrary public records:
+        // unsorted/repeated terms and positions, or empty groups, are allowed
+        // when their normalized token stream is valid.
+        let canonical = record.terms.windows(2).all(|w| w[0].term < w[1].term)
+            && record.terms.iter().all(|term| {
+                !term.term.is_empty()
+                    && !term.positions.is_empty()
+                    && term.positions.windows(2).all(|w| w[0] < w[1])
+            });
+        let doc_len = record.terms.iter().try_fold(0u32, |n, term| {
+            n.checked_add(u32::try_from(term.positions.len()).ok()?)
+        });
+        let Some(doc_len) = doc_len.filter(|_| canonical) else {
+            return self.add_document(record.tid, record.tokens());
+        };
+        if doc_len == 0 {
+            return Ok(());
+        }
+        let max_position = record
+            .terms
+            .iter()
+            .filter_map(|term| term.positions.last())
+            .copied()
+            .max()
+            .unwrap();
+        // Cross-term duplicate positions must still fail before any mutation.
+        // A bounded bitmap is cheap for normal token positions. Sparse public
+        // records use the old path rather than allocating by a huge position.
+        if u64::from(max_position) > u64::from(doc_len) * 8 {
+            return self.add_document(record.tid, record.tokens());
+        }
+        let mut seen = vec![0u64; max_position as usize / 64 + 1];
+        for term in &record.terms {
+            for position in &term.positions {
+                let word = &mut seen[*position as usize / 64];
+                let bit = 1u64 << (position % 64);
+                if *word & bit != 0 {
+                    return Err(Error::InvalidPositions);
+                }
+                *word |= bit;
+            }
+        }
+        // Historically the builder recomputes length from actual tokens, even
+        // if a caller's record.doc_len disagrees. Preserve that scoring input.
+        self.lengths.insert(record.tid, doc_len);
+        for term in &record.terms {
+            self.terms
+                .entry(term.term.clone())
+                .or_default()
+                .push(Occurrence {
+                    tid: record.tid,
+                    doc_len,
+                    positions: term.positions.clone(),
+                });
+        }
+        Ok(())
     }
 
     pub fn document_count(&self) -> usize {
@@ -800,6 +861,163 @@ mod tests {
         assert_eq!(again.document_count(), 1);
         assert_eq!(again.term("craft").unwrap().map(|t| t.df()), None);
         assert_eq!(again.term("beer").unwrap().map(|t| t.df()), Some(1));
+    }
+
+    #[test]
+    fn grouped_records_match_token_rebuild_in_every_format() {
+        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+            let mut grouped = SegmentBuilder::default();
+            let mut tokens_builder = SegmentBuilder::default();
+            for n in (0..140).rev() {
+                let mut record = ForwardRecord::from_tokens(
+                    tid(n / 50, (n % 50 + 1) as u16),
+                    (0..(n % 30 + 1)).map(|p| (["alpha", "beer", "wine"][(p % 3) as usize], p * 2)),
+                )
+                .unwrap();
+                // The caller's header is not trusted for scoring lengths.
+                record.doc_len = 999;
+                grouped.add_record(&record).unwrap();
+                tokens_builder
+                    .add_document(record.tid, record.tokens())
+                    .unwrap();
+            }
+            let expected = tokens_builder.finish_as(format);
+            let actual = grouped.finish_as(format);
+            // Exact bytes cover positions, document lengths, per-term and
+            // block score bounds, and dictionary/postings ordering together.
+            assert_eq!(actual, expected, "{format}");
+            let report = crate::verify::verify_segment(&actual);
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .all(|finding| finding.severity != crate::verify::Severity::Error),
+                "{format}: {:?}",
+                report.findings
+            );
+        }
+    }
+
+    #[test]
+    fn public_record_normalization_and_errors_match_token_path() {
+        let term = |name: &str, positions: &[u32]| ForwardTerm {
+            term: name.to_owned(),
+            positions: positions.to_vec(),
+        };
+        let cases = [
+            vec![],
+            vec![term("", &[])],
+            vec![term("a", &[])],
+            vec![term("a", &[0, 2]), term("b", &[1, 3])],
+            vec![term("a", &[0, 2]), term("b", &[2, 3])],
+            vec![term("a", &[63, 64]), term("b", &[64, 65])],
+            // Nine tokens keep max=65 within the bitmap's dense threshold,
+            // covering separate words and a cross-term duplicate at bit 0.
+            vec![term("a", &[1, 2, 3, 4, 63, 64]), term("b", &[5, 6, 65])],
+            vec![term("a", &[1, 2, 3, 4, 63, 64]), term("b", &[5, 6, 64])],
+            vec![term("a", &[64, 63])],
+            vec![term("a", &[1, 1])],
+            vec![term("a", &[u32::MAX]), term("b", &[0])],
+            vec![term("b", &[1]), term("a", &[2])],
+            vec![term("a", &[1]), term("a", &[2])],
+            vec![term("", &[1]), term("a", &[2])],
+        ];
+        for terms in cases {
+            for record_tid in [
+                tid(0, 1),
+                tid(0, 2),
+                Tid {
+                    block: 0,
+                    offset: 0,
+                },
+            ] {
+                let record = ForwardRecord {
+                    tid: record_tid,
+                    doc_len: 777,
+                    terms: terms.clone(),
+                };
+                let mut grouped = SegmentBuilder::default();
+                let mut baseline = SegmentBuilder::default();
+                grouped.add_document(tid(0, 1), [("seed", 1)]).unwrap();
+                baseline.add_document(tid(0, 1), [("seed", 1)]).unwrap();
+                let expected = baseline.add_document(record.tid, record.tokens());
+                assert_eq!(grouped.add_record(&record), expected, "{record:?}");
+                assert_eq!(grouped.finish(), baseline.finish(), "{record:?}");
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn grouped_record_ingestion_matches_normalization(
+            items in proptest::collection::vec((0usize..8, 0u32..300), 0..200)
+        ) {
+            // Include duplicate cross-term positions and noncanonical order;
+            // the token path independently determines acceptance and output.
+            let mut terms = BTreeMap::<String, Vec<u32>>::new();
+            for (term, position) in items {
+                terms.entry(format!("term{term}")).or_default().push(position);
+            }
+            for positions in terms.values_mut() {
+                positions.sort_unstable();
+            }
+            let record = ForwardRecord {
+                tid: tid(0, 1), doc_len: 0,
+                terms: terms.into_iter().map(|(term, positions)| ForwardTerm {term, positions}).collect()
+            };
+            let mut grouped = SegmentBuilder::default();
+            let mut baseline = SegmentBuilder::default();
+            proptest::prop_assert_eq!(grouped.add_record(&record), baseline.add_document(record.tid, record.tokens()));
+            proptest::prop_assert_eq!(grouped.finish(), baseline.finish());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode ingestion microprobe; not a database benchmark"]
+    fn grouped_record_ingestion_microprobe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for repeats in [20, 200] {
+            let records: Vec<_> = (0..512)
+                .map(|n| {
+                    ForwardRecord::from_tokens(
+                        tid(n / 100, (n % 100 + 1) as u16),
+                        (0..repeats * 2).map(|p| (["common", "filler"][(p % 2) as usize], p + 1)),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let mut timings = [Vec::new(), Vec::new()];
+            for round in 0..12 {
+                for mode in [round % 2, (round + 1) % 2] {
+                    let mut builder = SegmentBuilder::default();
+                    let start = Instant::now();
+                    for record in black_box(&records) {
+                        if mode == 0 {
+                            builder.add_document(record.tid, record.tokens()).unwrap();
+                        } else {
+                            builder.add_record(record).unwrap();
+                        }
+                    }
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    black_box(builder);
+                    if round >= 2 {
+                        timings[mode].push(elapsed);
+                    }
+                }
+            }
+            for times in &mut timings {
+                times.sort_by(f64::total_cmp);
+            }
+            let median = |times: &[f64]| (times[4] + times[5]) / 2.0;
+            eprintln!(
+                "512 docs, {} tokens/doc: token path {:.3} ms, grouped {:.3} ms; sorted samples per path {:?}",
+                repeats * 2,
+                median(&timings[0]),
+                median(&timings[1]),
+                timings
+            );
+        }
     }
 
     #[test]
