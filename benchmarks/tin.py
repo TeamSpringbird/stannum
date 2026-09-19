@@ -425,7 +425,7 @@ def run(args):
                          image['Id'], 'postgres', '-c', f'shared_buffers={args.shared_buffers}',
                          '-c', 'maintenance_work_mem=512MB', '-c', 'work_mem=16MB',
                          '-c', f'max_parallel_workers={args.cpus}', '-c', 'jit=off',
-                         '-c', 'track_io_timing=on'], stdout=subprocess.DEVNULL)
+                         '-c', 'track_io_timing=on', '-c', f'plan_cache_mode={args.plan_cache_mode}'], stdout=subprocess.DEVNULL)
                 deadline = time.monotonic() + 90
                 while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
                     if time.monotonic() > deadline:
@@ -608,7 +608,7 @@ def recorded_source(path):
 
 COMPARISON_SETTINGS = ('rows', 'validation_rows', 'workload', 'style', 'clients',
                        'seconds', 'warmup', 'updates', 'seed', 'cpus', 'memory',
-                       'shared_buffers', 'engines')
+                       'shared_buffers', 'engines', 'plan_cache_mode')
 
 
 def comparison_contract(manifest):
@@ -627,7 +627,7 @@ def comparison_contract(manifest):
     return dict(adapter=manifest['adapter'], corpus=manifest['corpus'],
                 harness_sources=manifest['harness_sources'],
                 runner_sha256=manifest['runner_sha256'],
-                config={k: manifest['config'][k] for k in COMPARISON_SETTINGS},
+                config={k: (manifest['config'].get(k, 'auto') if k == 'plan_cache_mode' else manifest['config'][k]) for k in COMPARISON_SETTINGS},
                 host={k: manifest['host'][k] for k in ('system', 'machine')},
                 docker={k: docker.get(k) for k in
                         ('NCPU', 'MemTotal', 'Architecture', 'OperatingSystem', 'ServerVersion', 'KernelVersion')},
@@ -808,6 +808,7 @@ def main():
     p.add_argument('--cpus', type=bench.positive, default=4)
     p.add_argument('--memory', default='4g')
     p.add_argument('--shared-buffers', default='1GB')
+    p.add_argument('--plan-cache-mode', choices=['auto', 'force_custom_plan', 'force_generic_plan'], default='auto')
     p.add_argument('--setup-timeout-seconds', type=bench.positive, default=1800)
     p.add_argument('--port', type=bench.positive, default=28928)
     p = commands.add_parser('run', parents=[common])
