@@ -24,6 +24,7 @@ import uuid
 
 import dataset
 import run as bench
+import resources
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / 'benchmarks/tin'
@@ -31,7 +32,7 @@ REVISION = 'f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86'
 REPOSITORY = 'https://github.com/planetscale/paradedb-benchmarker.git'
 DEFAULT_DRIVER = ROOT / 'benchmarks/results/tin-driver'
 LOADED_SOURCES = {str(p): dataset.sha256(p) for p in
-                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), *ASSETS.iterdir()]
+                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), Path(resources.__file__), *ASSETS.iterdir()]
                   if p.is_file()}
 
 
@@ -241,6 +242,9 @@ def report(root):
             continue
         exported = json.loads(exports[0].read_text())['runs'][engine]
         elapsed = (exported['endTime'] - exported['startTime']) / 1000
+        resource_summary = resources.summarize(path / 'resources.jsonl',
+                                               exported['startTime'] / 1000, exported['endTime'] / 1000)
+        bench.save(path / 'resource-summary.json', resource_summary)
         samples, groups = [], collections.defaultdict(list)
         queries = collections.defaultdict(list)
         updates = collections.Counter()
@@ -269,6 +273,7 @@ def report(root):
         metrics = exported['queries'][engine]
         rows.append(dict(engine=engine, status='complete', seconds=elapsed,
                          qps=len(samples) / elapsed, **distribution(samples),
+                         resources=resource_summary,
                          families={k: distribution(v) for k, v in groups.items()},
                          queries={k: distribution(v) for k, v in queries.items()},
                          measured_query_forms=len(queries),
@@ -295,6 +300,7 @@ def report(root):
     lines += ['', 'See comparison.json for query-family and individual-query distributions,',
               'semantic differences on the validation sample, and completed updates.',
               'Index read/hit bytes are block accesses, not physical disk traffic.',
+              'Resource summaries in comparison.json and resource-summary.json use samples wholly inside the measured window; boundary gaps are reported.',
               'The full pinned trace may not be traversed during short or slow runs.']
     differences = manifest.get('full_count_differences')
     if differences is None:
@@ -779,10 +785,38 @@ def render_report(args):
         report(args.output)
 
 
+def catalog_command(args):
+    import tin_catalog
+    tin_catalog.run(args)
+
+
+def experiment_command(args):
+    import tin_experiments
+    tin_experiments.run(args)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--driver', type=Path, default=DEFAULT_DRIVER)
     commands = parser.add_subparsers(dest='command', required=True)
+    p = commands.add_parser('catalog', help='observe plans on an existing TIN server using libpq environment')
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--rows', type=int, nargs='+', default=[1000, 10000])
+    p.set_defaults(func=catalog_command)
+    p = commands.add_parser('experiment', help='bounded remote TIN capacity and strategy experiments')
+    p.add_argument('--dataset', type=Path, required=True)
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--rows', type=int, default=100000)
+    p.add_argument('--minutes', type=int, default=45)
+    p.add_argument('--seconds', type=int, default=15)
+    p.add_argument('--repetitions', type=int, default=3)
+    p.add_argument('--max-clients', type=int, default=8)
+    p.add_argument('--skip-synthetic', action='store_true')
+    p.add_argument('--stages', nargs='+', choices=['synthetic','queries','prepared','forced','concurrency','multi','maintenance','projection','planner-settings','ctid-layout'])
+    p.add_argument('--index-segments', type=int, choices=[1,2,4,8])
+    p.add_argument('--vacuum-before-queries', action='store_true')
+    p.add_argument('--build-memory-mb', type=int, choices=[16,64,256,512])
+    p.set_defaults(func=experiment_command)
     commands.add_parser('prepare').set_defaults(func=prepare)
     commands.add_parser('build').set_defaults(func=build)
     p = commands.add_parser('report')
@@ -821,7 +855,7 @@ def main():
         p.add_argument('--' + variant + '-image', required=True)
         p.add_argument('--' + variant + '-source', type=Path, required=True)
     args = parser.parse_args()
-    if args.command in ('prepare', 'report'):
+    if args.command in ('prepare', 'report', 'catalog', 'experiment'):
         args.func(args)
     else:
         # Shared with native pgrx builds/tests across worktrees on this machine.
