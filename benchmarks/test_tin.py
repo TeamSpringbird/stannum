@@ -146,6 +146,7 @@ class PairedMeasurementsTests(unittest.TestCase):
             'source': lambda m, r: m['source'].update(source_sha256='changed'),
             'image': lambda m, r: m.update(image='retagged'),
             'settings': lambda m, r: m['jobs'][0]['settings'].update(work_mem='32MB'),
+            'plan_cache_mode': lambda m, r: m['config'].update(plan_cache_mode='force_generic_plan'),
             'counts': lambda m, r: m['jobs'][0]['full_counts_before'].update({'1:disjunction': 9}),
             'failed': lambda m, r: m.update(status='failed'),
             'ranked': lambda m, r: m['jobs'][0]['ranked_correctness'].update(mismatches=1),

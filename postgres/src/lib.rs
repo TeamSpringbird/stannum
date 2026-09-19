@@ -831,7 +831,7 @@ mod tests {
     }
 
     #[pg_test]
-    fn prepared_ranked_queries_use_bound_custom_plans() {
+    fn prepared_ranked_queries_use_custom_and_generic_ranked_plans() {
         Spi::run(
             "CREATE TABLE prepared_rank(id int, body text);
              INSERT INTO prepared_rank SELECT n, repeat('common ', n % 7 + 1) ||
@@ -841,53 +841,159 @@ mod tests {
              ANALYZE prepared_rank;",
         )
         .unwrap();
-        for mode in ["force_custom_plan", "auto", "force_generic_plan"] {
-            Spi::run(&format!(
-                "SET LOCAL plan_cache_mode = {mode};
+        for scorer in [
+            "stannum.full_score(ctid)",
+            "stannum.score(ctid)",
+            "stannum.score(ctid, k1 => 1.7, b => 0.6)",
+        ] {
+            for mode in ["force_custom_plan", "auto", "force_generic_plan"] {
+                Spi::run(&format!(
+                    "SET LOCAL plan_cache_mode = {mode};
              PREPARE ranked_parameter(text) AS
-               SELECT id, body, stannum.full_score(ctid) AS score FROM prepared_rank
+               SELECT id, body, {scorer} AS score FROM prepared_rank
                WHERE body ==> $1 ORDER BY score DESC LIMIT 10;"
-            ))
-            .unwrap();
-            // Reuse the prepared statement beyond PostgreSQL's first five custom plans.
-            for _ in 0..3 {
-                for query in [
-                    "common OR rare",
-                    "alpha OR missing",
-                    "beta AND filler",
-                    "missing",
-                ] {
-                    let plan = Spi::get_one::<Json>(&format!(
-                        "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE ranked_parameter('{query}')"
-                    ))
-                    .unwrap()
-                    .unwrap()
-                    .0
-                    .to_string();
-                    if mode == "force_custom_plan" {
-                        assert!(plan.contains("\"Order\":\"score DESC\""), "{query}: {plan}");
-                        assert!(plan.contains("\"Top K\":10"), "{query}: {plan}");
-                    }
-                    let scores = |sql: &str| -> Vec<u32> {
-                        Spi::connect(|client| {
-                            client
-                                .select(sql, None, &[])
-                                .unwrap()
-                                .map(|row| row.get::<f32>(3).unwrap().unwrap().to_bits())
-                                .collect()
-                        })
-                    };
-                    let actual = scores(&format!("EXECUTE ranked_parameter('{query}')"));
-                    let expected = scores(&format!(
-                        "WITH all_scores AS MATERIALIZED (SELECT id, body,
-                   stannum.full_score(ctid) AS score FROM prepared_rank WHERE body ==> '{query}')
+                ))
+                .unwrap();
+                // Reuse the prepared statement beyond PostgreSQL's first five custom plans.
+                for _ in 0..3 {
+                    for query in [
+                        "common OR rare",
+                        "alpha OR missing",
+                        "beta AND filler",
+                        "\"rare alpha\"",
+                        "missing",
+                    ] {
+                        let plan = Spi::get_one::<Json>(&format!(
+                            "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE ranked_parameter('{query}')"
+                        ))
+                        .unwrap()
+                        .unwrap()
+                        .0
+                        .to_string();
+                        if mode != "auto" {
+                            assert!(plan.contains("\"Order\":\"score DESC\""), "{query}: {plan}");
+                            assert!(plan.contains("\"Top K\":10"), "{query}: {plan}");
+                            if scorer == "stannum.full_score(ctid)" && query == "common OR rare" {
+                                assert!(plan.contains("\"Pruning\":\"block-max\""), "{plan}");
+                            }
+                        }
+                        let scores = |sql: &str| -> Vec<u32> {
+                            Spi::connect(|client| {
+                                client
+                                    .select(sql, None, &[])
+                                    .unwrap()
+                                    .map(|row| row.get::<f32>(3).unwrap().unwrap().to_bits())
+                                    .collect()
+                            })
+                        };
+                        let actual = scores(&format!("EXECUTE ranked_parameter('{query}')"));
+                        let expected = scores(&format!(
+                            "WITH all_scores AS MATERIALIZED (SELECT id, body,
+                   {scorer} AS score FROM prepared_rank WHERE body ==> '{query}')
                  SELECT id, body, score FROM all_scores ORDER BY score DESC LIMIT 10"
-                    ));
-                    assert_eq!(actual, expected, "{query}");
+                        ));
+                        assert_eq!(actual, expected, "{query}");
+                    }
                 }
+                // NULL must not parse the previous query or retain its results.
+                assert!(ids("EXECUTE ranked_parameter(NULL)").is_empty());
+                assert_eq!(ids("EXECUTE ranked_parameter('rare')").len(), 10);
+                // Plain EXPLAIN initializes executor state without evaluating the
+                // query parameter; malformed TINQL only errors on execution.
+                Spi::run("EXPLAIN EXECUTE ranked_parameter('AND AND')").unwrap();
+                Spi::run(
+                    "DO $$ DECLARE failed boolean := false; BEGIN
+                BEGIN EXECUTE 'EXECUTE ranked_parameter(''AND AND'')';
+                EXCEPTION WHEN OTHERS THEN failed := true; END;
+                IF NOT failed THEN RAISE EXCEPTION 'malformed query unexpectedly succeeded'; END IF;
+                END $$",
+                )
+                .unwrap();
+                assert_eq!(ids("EXECUTE ranked_parameter('rare')").len(), 10);
+                Spi::run("DEALLOCATE ranked_parameter").unwrap();
             }
-            Spi::run("DEALLOCATE ranked_parameter").unwrap();
         }
+    }
+
+    #[pg_test]
+    fn generic_ranked_scan_rescans_and_preserves_remaining_filters() {
+        Spi::run(
+            "CREATE TABLE generic_rescan(id int, body text);
+            INSERT INTO generic_rescan SELECT n, repeat('common ', n % 7 + 1) ||
+                CASE WHEN n % 2 = 0 THEN 'blue' ELSE 'red' END FROM generate_series(1,1000) n;
+            CREATE INDEX generic_rescan_idx ON generic_rescan USING stannum(body);
+            ANALYZE generic_rescan;
+            SET LOCAL plan_cache_mode = force_generic_plan;
+            SET LOCAL enable_seqscan = off;
+            SET LOCAL enable_bitmapscan = off;
+            SET LOCAL enable_indexscan = off;
+            SET LOCAL enable_material = off;
+            SET LOCAL enable_memoize = off;
+            PREPARE generic_loop(text) AS SELECT s.id, s.score, g FROM generate_series(1,3) g
+                CROSS JOIN LATERAL (SELECT id, stannum.full_score(ctid) AS score
+                FROM generic_rescan WHERE body ==> $1 AND id > 900
+                ORDER BY score DESC LIMIT 10 OFFSET g * 0) s;",
+        )
+        .unwrap();
+        for query in ["common OR blue", "red", "missing", "blue"] {
+            let expected: std::collections::HashMap<i32, u32> = Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, stannum.full_score(ctid) AS score
+                    FROM generic_rescan WHERE body ==> '{query}' AND id > 900"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|r| {
+                        (
+                            r.get::<i32>(1).unwrap().unwrap(),
+                            r.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            });
+            let mut best: Vec<u32> = expected.values().copied().collect();
+            best.sort_unstable_by(|a, b| f32::from_bits(*b).total_cmp(&f32::from_bits(*a)));
+            best.truncate(10);
+            let mut actual = [Vec::new(), Vec::new(), Vec::new()];
+            let mut seen = std::collections::HashSet::new();
+            Spi::connect(|client| {
+                for row in client
+                    .select(&format!("EXECUTE generic_loop('{query}')"), None, &[])
+                    .unwrap()
+                {
+                    let id = row.get::<i32>(1).unwrap().unwrap();
+                    let bits = row.get::<f32>(2).unwrap().unwrap().to_bits();
+                    let iteration = row.get::<i32>(3).unwrap().unwrap();
+                    assert_eq!(expected.get(&id), Some(&bits), "{query}: row {id}");
+                    assert!(seen.insert((iteration, id)), "duplicate row within rescan");
+                    actual[(iteration - 1) as usize].push(bits);
+                }
+            });
+            for scores in actual {
+                // Tied boundary rows can differ; exact ordered scores cannot.
+                assert_eq!(scores, best, "{query}");
+            }
+        }
+        let plan =
+            Spi::get_one::<Json>("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE generic_loop('blue')")
+                .unwrap()
+                .unwrap()
+                .0;
+        fn find_scan(plan: &serde_json::Value) -> Option<&serde_json::Value> {
+            if plan["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(plan);
+            }
+            plan.get("Plans")?.as_array()?.iter().find_map(find_scan)
+        }
+        let scan = find_scan(&plan[0]["Plan"])
+            .unwrap_or_else(|| panic!("ranked generic scan beneath lateral limit: {plan}"));
+        assert_eq!(scan["Actual Loops"], 3);
+        assert_eq!(scan["Order"], "score DESC");
+        Spi::run("DEALLOCATE generic_loop").unwrap();
     }
 
     /// Rows of a ranked query as `(id, score bits)` so scores compare exactly.

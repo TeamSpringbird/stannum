@@ -165,7 +165,8 @@ unsafe fn descending(pathkey: *mut pg_sys::PathKey) -> bool {
 struct Match {
     clause: *mut pg_sys::OpExpr,
     index_oid: pg_sys::Oid,
-    query: String,
+    query: Option<String>,
+    query_expr: *mut pg_sys::Node,
 }
 
 /// Top-k ordering the scan can provide: a `score_bound_indexed` sort key.
@@ -208,12 +209,13 @@ unsafe fn const_datum<T: FromDatum>(node: *mut pg_sys::Node) -> Result<Option<T>
     }
 }
 
-/// Finds a `expr ==> 'literal'` restriction on `rel` (in either operator
-/// form) answered by a segmented stannum index whose tokenizer settings are
+/// Finds a constant (or, when allowed, external text parameter) restriction
+/// on `rel` (in either operator form) answered by a segmented stannum index whose tokenizer settings are
 /// the ones the clause is bound to.
 unsafe fn find_match(
     rel: *mut pg_sys::RelOptInfo,
     rte: *mut pg_sys::RangeTblEntry,
+    allow_parameter: bool,
 ) -> Option<Match> {
     unsafe {
         let restrictions = PgList::<pg_sys::RestrictInfo>::from_pg((*rel).baserestrictinfo);
@@ -222,9 +224,23 @@ unsafe fn find_match(
             let Some(search) = crate::operator::search_clause(clause) else {
                 continue;
             };
-            let Some(query) = const_text(search.query) else {
-                continue;
-            };
+            let query = const_text(search.query);
+            if query.is_none() {
+                if !allow_parameter
+                    || search.query.is_null()
+                    || (*search.query).type_ != pg_sys::NodeTag::T_Param
+                {
+                    continue;
+                }
+                let parameter = &*search.query.cast::<pg_sys::Param>();
+                // Only client bind parameters: no outer-row values, subplans,
+                // functions, or expressions with execution-dependent effects.
+                if parameter.paramkind != pg_sys::ParamKind::PARAM_EXTERN
+                    || parameter.paramtype != pg_sys::TEXTOID
+                {
+                    continue;
+                }
+            }
             let candidates = crate::score::matching_stannum_indexes(
                 (*rte).relid,
                 (*rel).relid as i32,
@@ -242,6 +258,7 @@ unsafe fn find_match(
                 clause: clause.cast(),
                 index_oid,
                 query,
+                query_expr: search.query,
             });
         }
         None
@@ -293,13 +310,14 @@ unsafe fn find_ordering(
                 continue;
             }
             let arg = |i: i32| pg_sys::list_nth((*func).args, i).cast::<pg_sys::Node>();
-            let Some(query) = const_text(arg(1)) else {
-                continue;
+            let same_query = match &found.query {
+                Some(query) => const_text(arg(1)).as_ref() == Some(query),
+                None => pg_sys::equal(arg(1).cast(), found.query_expr.cast()),
             };
             let Ok(Some(index_oid)) = const_datum::<i32>(arg(3)) else {
                 continue;
             };
-            if query != found.query || index_oid as u32 != found.index_oid.to_u32() {
+            if !same_query || index_oid as u32 != found.index_oid.to_u32() {
                 continue;
             }
             let Ok(Some(mode)) = const_datum::<i32>(arg(4)) else {
@@ -482,14 +500,23 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
         {
             return;
         }
-        let Some(found) = find_match(rel, rte) else {
+        let Some(mut found) = find_match(rel, rte, true) else {
             return;
         };
-        let ordering = find_ordering(root, rel, &found);
+        let mut ordering = find_ordering(root, rel, &found);
+        // A parameter that cannot supply this ordering must not hide an
+        // existing constant-clause path in a query with multiple restrictions.
+        if found.query.is_none() && ordering.is_none() {
+            let Some(constant) = find_match(rel, rte, false) else {
+                return;
+            };
+            found = constant;
+            ordering = find_ordering(root, rel, &found);
+        }
         let private = Private {
             index_oid: found.index_oid.to_u32(),
             heap_oid: (*rte).relid.to_u32(),
-            query: found.query.clone(),
+            query: found.query.clone().unwrap_or_else(|| "<parameter>".into()),
             ordering,
         };
         let mut path = pgrx::PgBox::<pg_sys::CustomPath>::alloc_node(pg_sys::NodeTag::T_CustomPath);
@@ -510,7 +537,10 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
         // selectivity through the operator's restriction function; the same
         // estimate prices the index read and the heap fetches.
         path.path.rows = (*rel).rows.max(1.0);
-        let estimate = crate::selectivity::estimate_query(found.index_oid, &found.query)
+        let estimate = found
+            .query
+            .as_deref()
+            .and_then(|query| crate::selectivity::estimate_query(found.index_oid, query))
             .unwrap_or(crate::selectivity::FALLBACK);
         let index = crate::selectivity::index_cost(
             root,
@@ -600,7 +630,16 @@ unsafe extern "C-unwind" fn plan_search_path(
         scan.scan.scanrelid = (*rel).relid;
         scan.flags = 0;
         scan.custom_plans = std::ptr::null_mut();
-        scan.custom_exprs = std::ptr::null_mut();
+        // Expressions belong in custom_exprs so PostgreSQL can account for
+        // parameters during plan finalization and copy/serialization.
+        let query = crate::operator::search_clause(clause.cast())
+            .expect("search clause")
+            .query;
+        let mut expressions = PgList::<pg_sys::Node>::new();
+        if (*query).type_ == pg_sys::NodeTag::T_Param {
+            expressions.push(pg_sys::copyObjectImpl(query.cast()).cast());
+        }
+        scan.custom_exprs = expressions.into_pg();
         scan.custom_private = (*best_path).custom_private;
         scan.custom_scan_tlist = std::ptr::null_mut();
         scan.methods = &SEARCH_SCAN_METHODS.0;
@@ -659,13 +698,13 @@ unsafe extern "C-unwind" fn upper_paths_hook(
         if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION || byte((*rte).relkind) != b'r' {
             return;
         }
-        let Some(found) = find_match(input_rel, rte) else {
+        let Some(found) = find_match(input_rel, rte, false) else {
             return;
         };
         let private = Private {
             index_oid: found.index_oid.to_u32(),
             heap_oid: (*rte).relid.to_u32(),
-            query: found.query.clone(),
+            query: found.query.clone().unwrap_or_else(|| "<parameter>".into()),
             ordering: None,
         };
         let mut path = pgrx::PgBox::<pg_sys::CustomPath>::alloc_node(pg_sys::NodeTag::T_CustomPath);
@@ -677,7 +716,10 @@ unsafe extern "C-unwind" fn upper_paths_hook(
         path.path.parallel_aware = false;
         path.path.parallel_workers = 0;
         path.path.rows = 1.0;
-        let estimate = crate::selectivity::estimate_query(found.index_oid, &found.query)
+        let estimate = found
+            .query
+            .as_deref()
+            .and_then(|query| crate::selectivity::estimate_query(found.index_oid, query))
             .unwrap_or(crate::selectivity::FALLBACK);
         let index = crate::selectivity::index_cost(
             root,
@@ -753,6 +795,9 @@ struct ScanExec {
     /// The original `==>` clause, compiled against heap tuples, for rechecks
     /// of inexact plans and for the heap fallback.
     clause: *mut pg_sys::ExprState,
+    runtime_query: *mut pg_sys::ExprState,
+    query_bound: bool,
+    query_null: bool,
     /// Whether this execution scans the heap instead of the index, decided
     /// once on first access (see [`heap_fallback`]).
     heap_fallback: Option<bool>,
@@ -878,10 +923,21 @@ unsafe extern "C-unwind" fn begin_scan(
         } else {
             std::ptr::null_mut()
         };
+        let runtime_query = if (*cscan).custom_exprs.is_null() {
+            std::ptr::null_mut()
+        } else {
+            pg_sys::ExecInitExpr(
+                pg_sys::list_nth((*cscan).custom_exprs, 0).cast(),
+                node.cast(),
+            )
+        };
         let ordered = private.ordering.is_some();
         let exec = ScanExec {
             private,
             clause,
+            runtime_query,
+            query_bound: runtime_query.is_null(),
+            query_null: false,
             heap_fallback: None,
             fetch,
             fetch_slot,
@@ -1170,6 +1226,24 @@ unsafe extern "C-unwind" fn search_access(
         let slot = (*scan).ss_ScanTupleSlot;
         let snapshot = (*(*scan).ps.state).es_snapshot;
         let exec = exec_of(node);
+        if !exec.query_bound {
+            let mut is_null = false;
+            let value = pg_sys::ExecEvalExprSwitchContext(
+                exec.runtime_query,
+                (*scan).ps.ps_ExprContext,
+                &mut is_null,
+            );
+            exec.query_null = is_null;
+            if let Some(query) = String::from_datum(value, is_null) {
+                exec.private.query = query;
+            }
+            exec.query_bound = true;
+        }
+        // ==> is strict: NULL has no matches and must never be parsed as text.
+        if exec.query_null {
+            exec.started = true;
+            return pg_sys::ExecClearTuple(slot);
+        }
         if heap_fallback(exec) {
             return fallback_access(scan, exec, slot);
         }
@@ -1482,6 +1556,19 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let exec = exec_of(node);
         exec.next = 0;
+        if !exec.runtime_query.is_null() {
+            crate::score::forget_scan_scorer(exec.scan_id);
+            exec.query_bound = false;
+            exec.query_null = false;
+            exec.started = false;
+            exec.tids.clear();
+            exec.scores.clear();
+            exec.sorted = 0;
+            exec.pruned = false;
+            exec.recheck = false;
+            exec.candidates = None;
+            exec.scored = None;
+        }
         if let Some(stream) = &mut exec.stream {
             stream.rewind();
             exec.recheck = stream.recheck;
@@ -1489,7 +1576,8 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
         if !exec.fallback.is_null() {
             pg_sys::table_rescan(exec.fallback, std::ptr::null_mut());
         }
-        // Counts re-count; searches rewind their captured stream or ranked rows.
+        // Counts re-count; constant searches rewind their captured results.
+        // Parameterized ranked searches bind again and rebuild their scorer.
         let cscan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
         if (*cscan).scan.scanrelid == 0 {
             exec.started = false;

@@ -375,12 +375,21 @@ DELETE alone does not populate these lists; VACUUM must first identify dead
 versions. Estimates cannot account for those unknown deaths beforehand. The
 write buffer has no dead list. Partial indexes use their indexed population.
 
-Ranked-path recognition needs the search predicate and its bound scoring call
-to expose the same constant query. The scoring support function simplifies the
-query it copies from the parse tree, so custom prepared plans can use bound
-parameter values just as literal queries do. Generic plans retain runtime
-parameters and use the existing fallback; this does not force PostgreSQL to
-choose custom plans. See the [prepared-query diagnosis](../benchmarks/ranked-prepared-queries.md).
+Ranked-path recognition requires the search predicate and its bound scoring
+call to expose the same constant query or the same external text parameter.
+The scoring support function simplifies the query copied from the parse tree
+for custom plans. Generic ranked plans retain a parameter expression in
+`custom_exprs`, allowing PostgreSQL to track it during plan finalization.
+The executor binds it on first access; NULL returns no rows, and rescans clear
+ranked rows and the scan-owned scorer before rebinding. Plain EXPLAIN does not
+evaluate the parameter. Unknown queries use the existing fallback cost estimate.
+
+Arbitrary query expressions, correlated parameters, dynamic scoring settings,
+and parameterized unordered/count custom scans retain their previous paths.
+A runtime LIMIT remains correct but cannot supply the planner's constant top-k
+bound. PostgreSQL still chooses between custom and generic plans normally.
+See the [generic prepared-plan follow-up](../benchmarks/generic-ranked-plans.md)
+and the [original diagnosis](../benchmarks/ranked-prepared-queries.md).
 
 A ranked scan with a known `LIMIT` prunes instead of scoring every candidate
 when the query is a flat `AND` or `OR` of terms (a single term included) whose

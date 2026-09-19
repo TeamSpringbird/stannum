@@ -1,0 +1,143 @@
+{
+  "complete": true,
+  "completed_trials": 4,
+  "invalid_trials": [],
+  "paired": {
+    "p95_speedup": {
+      "cv": 0.00946010983974883,
+      "max": 111.54225352112675,
+      "mean": 110.80107105025698,
+      "median": 110.80107105025698,
+      "min": 110.05988857938719,
+      "n": 2,
+      "stdev": 1.0481903024972454
+    },
+    "qps_ratio": {
+      "cv": 0.003138713841829304,
+      "max": 232.72318790239692,
+      "mean": 232.20782450019843,
+      "median": 232.20782450019843,
+      "min": 231.69246109799994,
+      "n": 2,
+      "stdev": 0.7288339129398427
+    }
+  },
+  "repetitions": 2,
+  "variants": {
+    "baseline": {
+      "p50_ms": {
+        "cv": 0.0031825748516070076,
+        "max": 73.93,
+        "mean": 73.76400000000001,
+        "median": 73.76400000000001,
+        "min": 73.598,
+        "n": 2,
+        "stdev": 0.23475945135393933
+      },
+      "p95_ms": {
+        "cv": 0.0015374023987673221,
+        "max": 79.195,
+        "mean": 79.109,
+        "median": 79.109,
+        "min": 79.023,
+        "n": 2,
+        "stdev": 0.12162236636408408
+      },
+      "qps": {
+        "cv": 0.0018092320620439624,
+        "max": 27.17056008537175,
+        "mean": 27.135844649544495,
+        "median": 27.135844649544495,
+        "min": 27.101129213717236,
+        "n": 2,
+        "stdev": 0.04909504017060001
+      }
+    },
+    "candidate": {
+      "p50_ms": {
+        "cv": 0.003121884243649219,
+        "max": 0.227,
+        "mean": 0.2265,
+        "median": 0.2265,
+        "min": 0.226,
+        "n": 2,
+        "stdev": 0.0007071067811865482
+      },
+      "p95_ms": {
+        "cv": 0.007922765055311464,
+        "max": 0.718,
+        "mean": 0.714,
+        "median": 0.714,
+        "min": 0.71,
+        "n": 2,
+        "stdev": 0.005656854249492385
+      },
+      "qps": {
+        "cv": 0.00494793185505763,
+        "max": 6323.219360161335,
+        "mean": 6301.173343111193,
+        "median": 6301.173343111193,
+        "min": 6279.127326061051,
+        "n": 2,
+        "stdev": 31.17777630861985
+      }
+    }
+  },
+  "config": {
+    "clients": 2,
+    "cpus": 4,
+    "memory": "4g",
+    "plan_cache_mode": "force_generic_plan",
+    "repetitions": 2,
+    "rows": 1000,
+    "seconds": 120,
+    "seed": 1592614637,
+    "shared_buffers": "1GB",
+    "style": "mixed",
+    "warmup": 5,
+    "workload": "topk"
+  },
+  "images": {
+    "baseline": {
+      "id": "sha256:4130e2a2027f9146f45d02350794a0da9ede40c029193b990919e0ad3542b7db",
+      "labels": {
+        "benchmark.recipe_sha256": "21d68269e222f012afe6c21c34dff31f5d832c11a5bfc537caecf3e546298edd",
+        "benchmark.stannum_commit": "9b7b061e9a996460bb8ed1b6fa0ba0cb927c2427",
+        "benchmark.stannum_source_sha256": "46c805ff821b9d5726106a74e8b0d0e0b61f8f52c9f616728c7cd89c4eac7eab",
+        "maintainer": "ParadeDB - https://paradedb.com",
+        "org.opencontainers.image.description": "Search without a second system. One Postgres for your application data, full-text search, vector retrieval, and aggregations.",
+        "org.opencontainers.image.source": "https://github.com/paradedb/paradedb"
+      }
+    },
+    "candidate": {
+      "id": "sha256:b894198dc4d482b91d20344ac2cc6732dd77a79878f0227425a8b82e41c3d611",
+      "labels": {
+        "benchmark.recipe_sha256": "21d68269e222f012afe6c21c34dff31f5d832c11a5bfc537caecf3e546298edd",
+        "benchmark.stannum_commit": "7d441c14fe0000b5d7ab62cb48637b0259911015",
+        "benchmark.stannum_source_sha256": "b9c6548c8c6e09261e03dd5309371b1017e2056e4761a5932221b2653ce180a5",
+        "maintainer": "ParadeDB - https://paradedb.com",
+        "org.opencontainers.image.description": "Search without a second system. One Postgres for your application data, full-text search, vector retrieval, and aggregations.",
+        "org.opencontainers.image.source": "https://github.com/paradedb/paradedb"
+      }
+    }
+  },
+  "source_fingerprints": {
+    "baseline": {
+      "commit": "9b7b061e9a996460bb8ed1b6fa0ba0cb927c2427",
+      "source_sha256": "46c805ff821b9d5726106a74e8b0d0e0b61f8f52c9f616728c7cd89c4eac7eab",
+      "source_dirty": true
+    },
+    "candidate": {
+      "commit": "7d441c14fe0000b5d7ab62cb48637b0259911015",
+      "source_sha256": "b9c6548c8c6e09261e03dd5309371b1017e2056e4761a5932221b2653ce180a5",
+      "source_dirty": false
+    }
+  },
+  "limitations": [
+    "1000-document corpus prefix, not a capacity measurement",
+    "Forced generic plans, not automatic-plan workload",
+    "Two repeated pairs; no confidence interval",
+    "Predates explicit pg_visibility snapshot guard",
+    "Ranked oracle is same-engine exhaustive scoring; separate Lead gate is required"
+  ]
+}
