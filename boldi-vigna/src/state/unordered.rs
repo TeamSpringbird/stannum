@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};

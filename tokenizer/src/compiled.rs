@@ -1,3 +1,8 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+// Based on Lead, copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use crate::folder::{CompiledFolder, lowercase_ascii_from};
 use crate::long_tokens::LongTokenIter;
 use crate::spec::{GraphemeMode, TokenizerPipelineSpec, TokenizerSpec};

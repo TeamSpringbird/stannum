@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! LDP2 storage: a write buffer of forward records folded into immutable
 //! segments, all in ordinary index pages.
 //!

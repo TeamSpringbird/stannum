@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Build immutable, nested Wikipedia search corpora; pyarrow needed only to build."""
 import argparse
 import concurrent.futures

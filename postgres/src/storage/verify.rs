@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! `stannum.verify_index`: walks a whole index and lists every inconsistency
 //! instead of failing on the first one, in the spirit of `amcheck`.
 //!

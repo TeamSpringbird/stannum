@@ -1,3 +1,7 @@
+# Copyright (C) 2026 PlanetScale
+#
+# See LICENSE in the repository root for license terms.
+
 [target.'cfg(target_os = "macos")']
 rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
 

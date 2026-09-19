@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! One document as a single record for a mutable write buffer.
 //!
 //! An insert appends one record, so it needs one WAL record and one lock,

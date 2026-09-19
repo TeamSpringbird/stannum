@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use crate::{Classification, Token};
 use std::marker::PhantomData;
 use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};

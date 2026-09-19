@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Cross-format tests: a fixed document set, a fixture captured from the
 //! writer of each released segment format, and checks that every reader
 //! handles every format.

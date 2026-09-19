@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Failure cleanup must not delete a postmaster that outlived pg_ctl startup."""
 import contextlib
 import io

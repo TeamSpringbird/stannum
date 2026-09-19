@@ -1,3 +1,8 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+// Based on Lead, copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use crate::compiled::CompiledTokenizerPipeline;
 
 /// Smallest byte ceiling that can contain every UTF-8 scalar value.

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Check release SQL drift, snapshot installs, and every retained upgrade path.
 
 Run after cargo pgrx install with matching pg_config/server binaries on PATH.

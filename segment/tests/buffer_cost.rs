@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Cost of turning the write buffer's forward stream into a queryable index.
 //! Run with LEAD_DOCS=/path/to/documents.csv cargo test --release -p segment
 //! --test buffer_cost -- --ignored --nocapture

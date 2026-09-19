@@ -1,3 +1,8 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+// Based on Lead, copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use pgrx::iter::TableIterator;
 use pgrx::{PgRelation, default, iter::SetOfIterator, name, pg_extern};
 use tokenizer::{

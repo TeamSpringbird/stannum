@@ -1,3 +1,8 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+// Based on Lead, copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 //! Query simplification for lowered tinql runtime queries.
 //!
 //! This module owns two simplification profiles over [`Query`]:

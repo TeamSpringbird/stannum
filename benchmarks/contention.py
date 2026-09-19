@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Measure concurrent insert/search tails and sampled waits on a disposable DB.
 
 Requires psql, pgbench, an installed Stannum, and libpq connection settings.

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Attribute single-row INSERT execution latency to folds and merges.
 
 Uses a fresh disposable database on the server selected by libpq environment

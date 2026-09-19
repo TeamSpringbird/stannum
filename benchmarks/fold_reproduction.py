@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Replay paired fold measurements using two already-built release libraries.
 
 Both libraries must match the installed extension SQL. Uses a disposable private

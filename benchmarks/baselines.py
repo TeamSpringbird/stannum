@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Run selected real-corpus baselines sequentially, retaining a frozen harness and logs."""
 import argparse
 import datetime as dt
