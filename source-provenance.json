@@ -92,6 +92,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "benchmarks/sustained.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmark work, built on the existing Ben-authored benchmark modules; no Lead source copied. Private-cluster rate/concurrency campaign using the existing Stannum mutation runner."
+    },
     "benchmarks/test_campaign.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -139,6 +143,10 @@
     "benchmarks/test_server_times.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "benchmarks/test_sustained.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmark work, built on the existing Ben-authored benchmark modules; no Lead source copied. Original tests of mutation accounting, scheduling pressure and repeated campaign ordering."
     },
     "benchmarks/test_vacuum_cleanup.py": {
       "owner": "ben",

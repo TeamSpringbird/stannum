@@ -47,8 +47,9 @@ configuration, not in committed files or build labels.
 The `count`, `ranked` and `mixed` profiles keep the corpus fixed: their writer
 toggles a reserved suffix, so match sets never change and nothing is inserted
 or deleted. `--profile mutation` measures the index under real churn. It runs
-the `mixed` read shapes with the same closed-loop readers while one
-rate-scheduled writer (`--write-rate`, statements per second) draws each
+the `mixed` read shapes with closed-loop readers by default, or a total offered
+`--read-rate`, while `--writers` connections (default one) share the total
+`--write-rate` in statements per second. Each writer draws each
 transaction from a weighted mix (`--mix insert=1,delete=1,update=1`):
 
 | Kind | Statement |
@@ -56,6 +57,12 @@ transaction from a weighted mix (`--mix insert=1,delete=1,update=1`):
 | `insert` | Copies a random dataset document under a fresh id from `benchmark_ids` |
 | `delete` | Deletes the first live row at or above a random id |
 | `update` | Rewrites a row's reserved suffix with the terms of one random query (or none) |
+
+See the [sustained campaign](sustained-mutation.md) for repeated rate/concurrency
+sweeps, affected-row accounting, scheduling pressure, maintenance overlap gates,
+and a separately measured cleanup phase. This controlled mutation profile disables
+table autovacuum; scheduled VACUUM remains explicit. Observer queries use the
+configured finite statement timeout.
 
 Updates append `mutablea` plus a *drift bundle*: the plain terms of one of the
 fixture's non-miss queries, so a document starts or stops matching `rare`,

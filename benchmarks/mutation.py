@@ -67,6 +67,79 @@ def writer_scripts(rows, cases, id_ceiling):
     }
 
 
+def accounted_writer(script, kind):
+    """Count committed single-row effects; a successful transaction can be a no-op.
+
+    The DML and RETURNING count are one autocommit statement. Only no-ops emit a
+    marker, avoiding a shell invocation for every successful mutation. The main
+    runner rejects failed transactions before trusting this accounting.
+    """
+    lines = script.splitlines()
+    prefix = []
+    while lines and lines[0].startswith('\\set '):
+        prefix.append(lines.pop(0))
+    sql = '\n'.join(lines).rstrip().removesuffix(';')
+    return '\n'.join(prefix) + rf"""
+WITH changed AS ({sql} RETURNING 1)
+SELECT count(*) AS affected FROM changed;
+\gset
+\if :affected = 0
+\shell echo STANNUM_NOOP_{kind}
+\endif
+"""
+
+
+def affected_rows(summary, transcript):
+    noops = collections.Counter(line.removeprefix('STANNUM_NOOP_')
+                                for line in transcript.splitlines() if line.startswith('STANNUM_NOOP_'))
+    if summary['failures'] or set(noops) - set(summary['queries']):
+        raise ValueError('cannot account mutations with failed transactions or unknown markers')
+    result = {}
+    for kind, query in summary['queries'].items():
+        completed = query['completed']
+        if noops[kind] > completed:
+            raise ValueError('more no-op markers than completed mutations')
+        result[kind] = dict(completed=completed, noops=noops[kind], affected=completed - noops[kind])
+    return result
+
+
+def traffic_load(paths, rate, seconds):
+    """Scheduled latency includes client lag; execution latency excludes it.
+
+    First/last deciles use scheduled arrival order, not completion order. Nominal
+    arrivals are an expectation for pgbench's Poisson schedule, not an exact
+    offered count; arrivals never emitted at shutdown are not in its logs.
+    """
+    records, failed = [], collections.Counter()
+    for path in paths:
+        for _, status, stamp, lag in read_log(path):
+            if not status.isdigit():
+                failed[status] += 1
+                continue
+            scheduled_ms = int(status) / 1000
+            if lag is not None and (lag < 0 or lag > scheduled_ms):
+                raise ValueError('invalid scheduling lag')
+            records.append((stamp - scheduled_ms / 1000, scheduled_ms, lag or 0))
+    records.sort()
+    tail = max(1, len(records) // 10)
+    def describe_part(part):
+        return dict(scheduled=describe([r[1] for r in part]),
+                    execution=describe([r[1] - r[2] for r in part]),
+                    lag_p95_ms=percentile([r[2] for r in part], .95))
+    return dict(rate=rate, nominal_arrivals=rate * seconds if rate else None,
+                logged=len(records) + sum(failed.values()), completed=len(records), failures=dict(failed),
+                overall=describe_part(records), first_decile=describe_part(records[:tail]),
+                last_decile=describe_part(records[-tail:]),
+                interpretation='Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; '
+                               'lag measures client scheduling pressure, not server queue depth.')
+
+
+def next_tick(due, finished, interval):
+    """Skip missed maintenance slots rather than queue concurrent VACUUM jobs."""
+    missed = max(0, math.floor((finished - due) / interval))
+    return due + (missed + 1) * interval, missed
+
+
 def pool_sql(rows):
     return ("CREATE TABLE benchmark_pool AS SELECT id, body FROM documents; "
             "ALTER TABLE benchmark_pool ADD PRIMARY KEY (id); "
@@ -142,7 +215,8 @@ def read_log(path):
 
 def describe(values):
     return {"completed": len(values), "p50_ms": percentile(values, .5), "p95_ms": percentile(values, .95),
-            "p99_ms": percentile(values, .99), "max_ms": max(values) if values else None}
+            "p99_ms": percentile(values, .99) if len(values) >= 1000 else None,
+            "p99_insufficient_samples": len(values) < 1000, "max_ms": max(values) if values else None}
 
 
 def bucket_logs(paths, names, bucket_seconds, origin):
@@ -183,6 +257,7 @@ def sample_sql(engine, freespace):
     return f"""SELECT json_build_object('index_bytes', pg_relation_size('search_idx'),
  'table_bytes', pg_table_size('documents'), 'rows', (SELECT count(*) FROM documents),
  'fsm_free_pages', {free},
+ 'wal_lsn', pg_current_wal_insert_lsn()::text,
  'table_stats', (SELECT json_build_object('n_live_tup', n_live_tup, 'n_dead_tup', n_dead_tup,
    'n_tup_ins', n_tup_ins, 'n_tup_del', n_tup_del, 'n_tup_upd', n_tup_upd,
    'vacuum_count', vacuum_count, 'autovacuum_count', autovacuum_count)
@@ -200,6 +275,7 @@ class Maintenance:
         self.freespace, self.out = freespace, out
         self.intervals = {"sample": sample_interval, "vacuum": vacuum_interval, "check": check_interval}
         self.samples, self.vacuums, self.checks, self.failures = [], [], [], []
+        self.schedule = []
         self.stop = threading.Event()
         self.origin = None
         self.threads = []
@@ -215,13 +291,19 @@ class Maintenance:
     def loop(self, name, action):
         due = self.origin + self.intervals[name]
         while not self.stop.wait(max(due - time.time(), 0)):
+            started = time.time()
             try:
                 action()
             except Exception as error:  # surfaced by the run loop, which stops traffic
                 self.failures.append({"thread": name, "error": f"{type(error).__name__}: {error}",
                                       "t": time.time() - self.origin})
                 return
-            due = max(due + self.intervals[name], time.time())
+            finished = time.time()
+            next_due, missed = next_tick(due, finished, self.intervals[name])
+            self.schedule.append(dict(kind=name, due=due - self.origin, started=started - self.origin,
+                                      finished=finished - self.origin, lag_ms=(started - due) * 1000,
+                                      missed_slots=missed))
+            due = next_due
 
     def finish(self):
         self.stop.set()
@@ -233,15 +315,16 @@ class Maintenance:
         result = self.sql_json(sql, env)
         return result, (time.monotonic() - start) * 1000
 
-    def sample(self):
+    def sample(self, phase='traffic'):
         result, ms = self.timed(sample_sql(self.engine, self.freespace), self.env)
-        result.update({"t": time.time() - self.origin, "ms": ms})
+        result.update({"t": time.time() - self.origin, "ms": ms, "phase": phase})
         self.samples.append(result)
         return result
 
-    def vacuum(self):
+    def vacuum(self, phase='traffic'):
         before, _ = self.timed(sample_sql(self.engine, self.freespace), self.env)
         start = time.monotonic()
+        started_epoch = time.time()
         proc = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-c",
                                "VACUUM (INDEX_CLEANUP ON, VERBOSE) documents;"],
                               env=self.check_env, capture_output=True, text=True, check=True)
@@ -249,12 +332,15 @@ class Maintenance:
         after, _ = self.timed(sample_sql(self.engine, self.freespace), self.env)
         number = len(self.vacuums) + 1
         (self.out / f"vacuum-{number}.txt").write_text(proc.stderr + proc.stdout)
-        self.vacuums.append({"t": time.time() - self.origin, "ms": ms, "before": before, "after": after})
+        self.vacuums.append({"t": time.time() - self.origin, "ms": ms, "before": before, "after": after,
+                             "started": started_epoch - self.origin, "phase": phase})
 
     def check(self):
         start = time.monotonic()
+        started_epoch = time.time()
         result = check_round(self.psql, self.check_env, self.checks_sql)
-        record = {"t": time.time() - self.origin, "ms": (time.monotonic() - start) * 1000, "queries": result}
+        record = {"t": time.time() - self.origin, "started": started_epoch - self.origin,
+                  "ms": (time.monotonic() - start) * 1000, "queries": result}
         self.checks.append(record)
         return record
 
@@ -292,7 +378,7 @@ def fmt(value, digits=1):
 def render(buckets, kinds, bucket_seconds):
     """A text table with one line per bucket: reader tails, writer maxima, layout, events."""
     head = ["t(s)", "reads/s", "count p50", "count p99", "ranked p50", "ranked p99"]
-    head += [f"{kind} max" for kind in kinds] + ["lag max", "segs", "gen", "buf", "idx MB", "free pg", "events"]
+    head += [f"{kind} max" for kind in kinds] + ["write lag max", "read lag max", "segs", "gen", "buf", "idx MB", "free pg", "events"]
     rows = [head]
     for bucket in buckets:
         shapes = bucket["shapes"]
@@ -302,12 +388,14 @@ def render(buckets, kinds, bucket_seconds):
                fmt(shapes.get("ranked", {}).get("p50_ms")), fmt(shapes.get("ranked", {}).get("p99_ms"))]
         row += [fmt(bucket["queries"].get(kind, {}).get("max_ms")) for kind in kinds]
         row.append(fmt(bucket.get("schedule_lag_max_ms")))
+        row.append(fmt(bucket.get("reader_schedule_lag_max_ms")))
         sample = bucket.get("sample") or {}
         segments = sample.get("segments") or {}
         row += [str(segments.get("immutable", "—")), str(segments.get("max_generation", "—")),
                 str(segments.get("buffer_docs", "—")),
                 fmt(sample["index_bytes"] / 2**20 if sample else None), str(sample.get("fsm_free_pages", "—"))]
-        events = [f"vacuum {v['ms'] / 1000:.1f}s" for v in bucket.get("vacuums", [])]
+        events = [("drain " if v.get('phase') == 'drain' else '') + f"vacuum {v['ms'] / 1000:.1f}s"
+                  for v in bucket.get("vacuums", [])]
         events += [f"check {c['ms'] / 1000:.1f}s ok" for c in bucket.get("checks", [])]
         row.append("; ".join(events))
         rows.append(row)

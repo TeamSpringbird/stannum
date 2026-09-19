@@ -1,0 +1,110 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+from pathlib import Path
+import json
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import mutation
+import run
+import sustained
+
+
+class SustainedTests(unittest.TestCase):
+    def test_successful_noops_are_not_reported_as_mutated_rows(self):
+        summary = dict(failures={}, queries={'insert': {'completed': 5}, 'delete': {'completed': 4}})
+        result = mutation.affected_rows(summary, 'pgbench header\nSTANNUM_NOOP_delete\nSTANNUM_NOOP_delete\n')
+        self.assertEqual(result['insert']['affected'], 5)
+        self.assertEqual(result['delete'], dict(completed=4, noops=2, affected=2))
+        for transcript in ('STANNUM_NOOP_update\n', 'STANNUM_NOOP_delete\n' * 5):
+            with self.assertRaises(ValueError):
+                mutation.affected_rows(summary, transcript)
+        with self.assertRaises(ValueError):
+            mutation.affected_rows(dict(summary, failures={'delete:failed': 1}), '')
+
+    def test_each_writer_counts_effects_in_its_autocommit_statement(self):
+        for kind, original in mutation.writer_scripts(10000, run.CASES, 12000).items():
+            script = mutation.accounted_writer(original, kind)
+            self.assertIn('RETURNING 1)', script)
+            self.assertIn('SELECT count(*) AS affected FROM changed;', script)
+            self.assertIn('\\if :affected = 0\n\\shell echo STANNUM_NOOP_' + kind, script)
+            self.assertTrue(script.startswith('\\set '))
+            self.assertNotIn('BEGIN;', script)
+
+    def test_scheduling_pressure_is_not_confused_with_execution_cost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'log'
+            # Completion order is opposite arrival order. First scheduled at
+            # 100.0, second at 100.5, but the first waits substantially longer.
+            path.write_text('0 1 2000000 0 102 0 1900000\n1 1 100000 0 100 600000 0\n'
+                            '1 2 failed 0 103 0 0\n')
+            result = mutation.traffic_load([path], 10, 2)
+        self.assertEqual(result['nominal_arrivals'], 20)
+        self.assertEqual(result['logged'], 3)
+        self.assertEqual(result['completed'], 2)
+        self.assertEqual(result['failures'], {'failed': 1})
+        self.assertEqual(result['first_decile']['scheduled']['p95_ms'], 2000)
+        self.assertEqual(result['first_decile']['execution']['p95_ms'], 100)
+        self.assertEqual(result['last_decile']['lag_p95_ms'], 0)
+        self.assertIsNone(result['overall']['scheduled']['p99_ms'])
+
+    def test_invalid_lag_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'log'
+            path.write_text('0 1 2000 0 102 0 3000\n')
+            with self.assertRaises(ValueError):
+                mutation.traffic_load([path], 10, 2)
+
+    def test_slow_maintenance_records_missed_slots_without_a_catchup_storm(self):
+        self.assertEqual(mutation.next_tick(10, 11, 5), (15, 0))
+        self.assertEqual(mutation.next_tick(10, 26, 5), (30, 3))
+        self.assertEqual(mutation.next_tick(10, 15, 5), (20, 1))
+
+    def test_repeated_campaign_reverses_rate_and_concurrency_order(self):
+        cases = sustained.schedule([100, 1000], [1, 2], 2)
+        self.assertEqual(len(cases), 8)
+        self.assertEqual([x[1:] for x in cases[:4]], list(reversed([x[1:] for x in cases[4:]])))
+
+    def test_failed_start_and_failed_shutdown_preserve_cluster_evidence(self):
+        for fail_stop in (False, True):
+            with self.subTest(fail_stop=fail_stop), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                library = root / 'stannum.so'
+                library.write_bytes(b'retained release')
+                cluster = root / 'cluster'
+                cluster.mkdir()
+                output = root / 'results'
+                stopped = []
+
+                def execute(argv, **kwargs):
+                    if argv[0] == 'initdb':
+                        (cluster / 'data').mkdir()
+                    if argv[0] == 'pg_ctl' and argv[-1] == 'start':
+                        (cluster / 'data/postmaster.pid').write_text('123')
+                        raise subprocess.TimeoutExpired(argv, 240)
+                    if argv[0] == 'pg_ctl' and argv[-1] == 'stop':
+                        stopped.append(True)
+                        if fail_stop:
+                            raise subprocess.CalledProcessError(1, argv)
+                        (cluster / 'data/postmaster.pid').unlink()
+                    return subprocess.CompletedProcess(argv, 0)
+
+                argv = ['sustained', '--artifact', str(library), '--output', str(output)]
+                with patch('sys.argv', argv), patch.object(sustained.bench, 'command', return_value=str(root)), \
+                     patch.object(sustained.tempfile, 'mkdtemp', return_value=str(cluster)), \
+                     patch.object(sustained.subprocess, 'run', side_effect=execute):
+                    with self.assertRaises((subprocess.TimeoutExpired, subprocess.CalledProcessError)):
+                        sustained.main()
+                self.assertEqual(stopped, [True])
+                self.assertTrue(cluster.exists())
+                result = json.loads((output / 'campaign.json').read_text())
+                self.assertEqual(result['status'], 'failed')
+                self.assertEqual('cleanup_error' in result, fail_stop)
+
+
+if __name__ == '__main__':
+    unittest.main()
