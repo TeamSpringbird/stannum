@@ -70,6 +70,28 @@ def checked_query(query, predicate, aggregate='count(*)'):
     return f"SELECT 1 / CASE WHEN (SELECT {aggregate} FROM docs WHERE body ==> '{query}') IS NOT DISTINCT FROM (SELECT {aggregate} FROM docs WHERE {predicate}) THEN 1 ELSE 0 END;\n"
 
 
+def ranked_check(reference=':reference', eligible=':eligible'):
+    return f"""(SELECT coalesce(json_agg(score ORDER BY score DESC)::jsonb, '[]'::jsonb) FROM top) = ({reference})::jsonb
+ AND (SELECT count(*) = count(DISTINCT id) FROM top)
+ AND NOT EXISTS (SELECT 1 FROM top WHERE (({eligible})::jsonb -> id::text) IS DISTINCT FROM to_jsonb(score))"""
+
+
+def ranked_oracle_selfcheck():
+    # Exercise the exact SQL guard against counterexamples before timing.
+    # IDs 2 and 3 tie at the boundary, so returning ID 3 must remain valid.
+    cases = [
+        ('(1,3),(3,2)', True),
+        ('(1,3),(4,2)', False),  # Correct score multiset attached to wrong ID.
+        ('(1,2),(3,3)', False),  # Correct IDs but scores attached incorrectly.
+        ('(1,3),(1,2)', False),  # Duplicate ID, correct score multiset.
+        ('(1,3)', False),       # Missing result.
+    ]
+    check = ranked_check("'[3,2]'", "'{\"1\":3,\"2\":2,\"3\":2}'")
+    queries = [f"(WITH top(id,score) AS (VALUES {rows}) SELECT ({check}) IS {str(expected).upper()} AS ok)"
+               for rows, expected in cases]
+    return 'SELECT bool_and(ok) FROM (' + ' UNION ALL '.join(queries) + ') checks;'
+
+
 def ranked_script():
     # Force exhaustive scoring for the reference. Materializing IDs alone would
     # lose the CTID-bound scoring state; retain scores while scanning instead.
@@ -77,13 +99,15 @@ def ranked_script():
 SET LOCAL stannum.enable_custom_scan=off;
 WITH all_matches AS MATERIALIZED (
  SELECT id, stannum.full_score(ctid) AS score FROM docs WHERE body ==> 'common OR w7'),
- top AS (SELECT id, score FROM all_matches ORDER BY score DESC, id LIMIT 10)
-SELECT quote_literal(coalesce(json_agg(score ORDER BY score DESC)::text, '[]')) AS reference FROM top
+ top AS MATERIALIZED (SELECT id, score FROM all_matches ORDER BY score DESC, id LIMIT 10)
+SELECT quote_literal(coalesce((SELECT json_agg(score ORDER BY score DESC)::text FROM top), '[]')) AS reference,
+ quote_literal(coalesce((SELECT json_object_agg(id,score)::text FROM all_matches
+ WHERE score >= (SELECT min(score) FROM top)), '{}')) AS eligible
 \gset
 SET LOCAL stannum.enable_custom_scan=on;
 WITH top AS MATERIALIZED (SELECT id, stannum.full_score(ctid) AS score FROM docs
  WHERE body ==> 'common OR w7' ORDER BY stannum.full_score(ctid) DESC LIMIT 10)
-SELECT 1 / CASE WHEN (SELECT coalesce(json_agg(score ORDER BY score DESC)::text, '[]') FROM top) = :reference AND (SELECT count(*) = count(DISTINCT id) FROM top) THEN 1 ELSE 0 END;
+SELECT 1 / CASE WHEN """ + ranked_check() + """ THEN 1 ELSE 0 END;
 COMMIT;
 """
 
@@ -255,6 +279,10 @@ ANALYZE docs;"""
             if name == 'ranked':
                 assert '"Top K": 10' in json.dumps(plan) and '"Order": "score DESC"' in json.dumps(plan), plan
             save(output / f'reader-{name}-plan.json', plan)
+        if args.query_shapes == 'mixed':
+            selfcheck = ranked_oracle_selfcheck()
+            (output / 'ranked-oracle-selfcheck.sql').write_text(selfcheck)
+            assert sql(selfcheck) == 't', 'ranked oracle failed its counterexample checks'
         sql('CHECKPOINT')
         log = (output / 'reader.txt').open('w')
         rate = [] if args.reader_rate is None else ['--rate', str(args.reader_rate), '--random-seed=42']

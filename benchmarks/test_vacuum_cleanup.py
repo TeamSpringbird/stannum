@@ -49,7 +49,7 @@ class TrafficTests(unittest.TestCase):
         script = ranked_script()
         self.assertIn('BEGIN ISOLATION LEVEL REPEATABLE READ', script)
         self.assertLess(script.index('enable_custom_scan=off'), script.index('all_matches AS MATERIALIZED'))
-        self.assertLess(script.index('enable_custom_scan=on'), script.index('top AS MATERIALIZED'))
+        self.assertLess(script.index('enable_custom_scan=on'), script.rindex('top AS MATERIALIZED'))
         self.assertIn('ORDER BY score DESC, id LIMIT 10', script)
 
     def test_membership_oracles_follow_distribution_without_text_search(self):
