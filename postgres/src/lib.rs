@@ -855,6 +855,7 @@ mod tests {
                     "common OR rare",
                     "alpha OR missing",
                     "beta AND filler",
+                    "\"rare alpha\"",
                     "missing",
                 ] {
                     let plan = Spi::get_one::<Json>(&format!(
@@ -886,8 +887,62 @@ mod tests {
                     assert_eq!(actual, expected, "{query}");
                 }
             }
+            // NULL must not parse the previous query or retain its results.
+            assert!(ids("EXECUTE ranked_parameter(NULL)").is_empty());
+            assert_eq!(ids("EXECUTE ranked_parameter('rare')").len(), 10);
+            // Plain EXPLAIN initializes executor state without evaluating the
+            // query parameter; malformed TINQL only errors on execution.
+            Spi::run("EXPLAIN EXECUTE ranked_parameter('AND AND')").unwrap();
             Spi::run("DEALLOCATE ranked_parameter").unwrap();
         }
+    }
+
+    #[pg_test]
+    fn generic_ranked_scan_rescans_and_preserves_remaining_filters() {
+        Spi::run(
+            "CREATE TABLE generic_rescan(id int, body text);
+            INSERT INTO generic_rescan SELECT n, repeat('common ', n % 7 + 1) ||
+                CASE WHEN n % 2 = 0 THEN 'blue' ELSE 'red' END FROM generate_series(1,1000) n;
+            CREATE INDEX generic_rescan_idx ON generic_rescan USING stannum(body);
+            ANALYZE generic_rescan;
+            SET LOCAL plan_cache_mode = force_generic_plan;
+            SET LOCAL enable_seqscan = off;
+            SET LOCAL enable_material = off;
+            SET LOCAL enable_memoize = off;
+            PREPARE generic_loop(text) AS SELECT s.id FROM generate_series(1,3) g
+                CROSS JOIN LATERAL (SELECT id, stannum.full_score(ctid) AS score
+                FROM generic_rescan WHERE body ==> $1 AND id > 900
+                ORDER BY score DESC LIMIT 10 OFFSET g * 0) s;",
+        )
+        .unwrap();
+        for query in ["common OR blue", "red", "missing", "blue"] {
+            let mut actual = ids(&format!("EXECUTE generic_loop('{query}')"));
+            let mut expected = ids(&format!(
+                "WITH all_scores AS MATERIALIZED (
+                SELECT id, stannum.full_score(ctid) AS score FROM generic_rescan
+                WHERE body ==> '{query}' AND id > 900), best AS (
+                SELECT id FROM all_scores ORDER BY score DESC, id LIMIT 10)
+                SELECT id FROM best, generate_series(1,3)"
+            ));
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{query}");
+        }
+        let plan =
+            Spi::get_one::<Json>("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE generic_loop('blue')")
+                .unwrap()
+                .unwrap()
+                .0;
+        fn find_scan(plan: &serde_json::Value) -> Option<&serde_json::Value> {
+            if plan["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(plan);
+            }
+            plan.get("Plans")?.as_array()?.iter().find_map(find_scan)
+        }
+        let scan = find_scan(&plan[0]["Plan"]).expect("ranked generic scan beneath lateral limit");
+        assert_eq!(scan["Actual Loops"], 3);
+        assert_eq!(scan["Order"], "score DESC");
+        Spi::run("DEALLOCATE generic_loop").unwrap();
     }
 
     /// Rows of a ranked query as `(id, score bits)` so scores compare exactly.
