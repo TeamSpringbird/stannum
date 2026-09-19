@@ -230,6 +230,47 @@ def validate_result(text, names):
         raise ValueError('query membership mismatch or incomplete oracle output; see correctness.txt')
 
 
+def workload_state(sql):
+    """Untimed snapshot; VM counts are observed, tuple counts are estimates."""
+    return json.loads(sql("""
+        SELECT json_build_object(
+            'captured_at', clock_timestamp(),
+            'heap_pages', pg_relation_size(c.oid) / current_setting('block_size')::int,
+            'all_visible_pages', v.all_visible, 'all_frozen_pages', v.all_frozen,
+            'catalog_pages', c.relpages, 'catalog_all_visible', c.relallvisible,
+            'estimated_live_tuples', s.n_live_tup, 'estimated_dead_tuples', s.n_dead_tup,
+            'inserts', s.n_tup_ins, 'updates', s.n_tup_upd, 'deletes', s.n_tup_del,
+            'vacuum_count', s.vacuum_count, 'autovacuum_count', s.autovacuum_count,
+            'last_vacuum', s.last_vacuum, 'last_autovacuum', s.last_autovacuum,
+            'table_options', c.reloptions)
+        FROM pg_class c JOIN pg_stat_user_tables s ON s.relid = c.oid
+        CROSS JOIN pg_visibility_map_summary(c.oid) v
+        WHERE c.oid = 'documents'::regclass;
+    """))
+
+
+def workload_state_contract(job, updates):
+    state = job.get('workload_state')
+    if not state or state.get('protocol') != 'postvacuum-observed-v1':
+        raise ValueError('missing workload-state evidence; rerun with visibility capture')
+    keys = ('heap_pages', 'all_visible_pages', 'all_frozen_pages')
+    snapshots = {}
+    for phase in ('after_vacuum', 'before_driver', 'after_restart'):
+        snapshot = state[phase]
+        values = {k: snapshot[k] for k in keys}
+        if any(type(v) is not int or v < 0 for v in values.values()) or not (
+                values['all_frozen_pages'] <= values['all_visible_pages'] <= values['heap_pages']):
+            raise ValueError('invalid observed visibility coverage')
+        snapshots[phase] = values
+    if snapshots['after_vacuum'] != snapshots['before_driver']:
+        raise ValueError('heap visibility changed during untimed validation')
+    if not updates and snapshots['before_driver'] != snapshots['after_restart']:
+        raise ValueError('read-only trial heap visibility changed during driver/restart')
+    # Mutation endpoints are outcomes, not comparable starting conditions.
+    return dict(protocol=state['protocol'], before_driver=snapshots['before_driver'],
+                table_options=state['before_driver']['table_options'])
+
+
 def report(root):
     manifest = json.loads((root / 'manifest.json').read_text())
     rows = []
@@ -302,6 +343,19 @@ def report(root):
               'Index read/hit bytes are block accesses, not physical disk traffic.',
               'Resource summaries in comparison.json and resource-summary.json use samples wholly inside the measured window; boundary gaps are reported.',
               'The full pinned trace may not be traversed during short or slow runs.']
+    lines += ['', 'Workload-state snapshots (after VACUUM / before driver / after restart):']
+    for job in manifest['jobs']:
+        state = job.get('workload_state', {})
+        for phase in ('after_vacuum', 'before_driver', 'after_restart'):
+            observed = state.get(phase)
+            if observed:
+                lines.append(f"- {job['engine']} {phase}: {observed['all_visible_pages']}/"
+                             f"{observed['heap_pages']} heap pages all-visible; "
+                             f"{observed['estimated_dead_tuples']} estimated dead tuples; "
+                             f"{observed['autovacuum_count']} autovacuums.")
+    lines += ['', 'Before-driver capture precedes upstream warmup. After-restart capture follows '
+              'container shutdown/restart and is not an exact end-of-traffic snapshot. '
+              'These observations do not establish cold-cache or pristine-heap conditions.']
     differences = manifest.get('full_count_differences')
     if differences is None:
         lines += ['', 'Full-corpus count comparison was not recorded for this run.']
@@ -439,7 +493,7 @@ def run(args):
                     time.sleep(.5)
                 sampler = ResourceSampler(name, path / 'resources.jsonl')
                 sampler.thread.start()
-                sql('CREATE EXTENSION pg_prewarm; CREATE EXTENSION stannum;')
+                sql('CREATE EXTENSION pg_prewarm; CREATE EXTENSION pg_visibility; CREATE EXTENSION stannum;')
                 with (path / 'driver-regressions.txt').open('w') as log:
                     command([driver / 'pg-driver-test', '-test.v'],
                             env=dict(env, STANNUM_BENCH_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark',
@@ -476,6 +530,8 @@ def run(args):
                 job['index_build_seconds'] = time.monotonic() - started
                 sampler.phase = 'validation'
                 sql('VACUUM ANALYZE documents;', setup=True)
+                job['workload_state'] = dict(protocol='postvacuum-observed-v1',
+                                             after_vacuum=workload_state(sql))
                 job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));"))
                 sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
                 queries = trace_queries(driver)
@@ -514,6 +570,7 @@ def run(args):
                 sql('CHECKPOINT;')
                 job['settings'] = json.loads(sql("SELECT json_object_agg(name,setting) FROM pg_settings;"))
                 job['extensions'] = json.loads(sql('SELECT json_object_agg(extname,extversion) FROM pg_extension;'))
+                job['workload_state']['before_driver'] = workload_state(sql)
                 bench.save(path / 'before-cgroup.json', bench.container_counters(name))
                 # Upstream stops this owned container at phase end. No Makefile
                 # or project-wide cleanup is invoked, and cooldown stays zero.
@@ -533,15 +590,17 @@ def run(args):
                              '--summary-export', path / 'summary.json',
                              driver / 'benchmarks/search.js'], env=run_env, stdout=log, stderr=subprocess.STDOUT)
                 (path / 'post-traffic-container.json').write_text(output(['docker', 'inspect', name]))
+                # Upstream stops the container. This is a post-restart observation,
+                # not an exact end-of-traffic snapshot; it is outside timing.
+                command(['docker', 'start', name], stdout=subprocess.DEVNULL)
+                deadline = time.monotonic() + 90
+                while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('PostgreSQL restart for workload-state capture')
+                    time.sleep(.5)
+                job['workload_state']['after_restart'] = workload_state(sql)
+                bench.save(path / 'workload-state.json', job['workload_state'])
                 if args.updates:
-                    # Upstream owns the measured phase and stops the container.
-                    # Restart only for an untimed post-update correctness check.
-                    command(['docker', 'start', name], stdout=subprocess.DEVNULL)
-                    deadline = time.monotonic() + 90
-                    while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
-                        if time.monotonic() > deadline:
-                            raise TimeoutError('PostgreSQL restart for update validation')
-                        time.sleep(.5)
                     if int(sql('SELECT count(*) FROM documents;')) != args.rows:
                         raise ValueError('update-only phase changed row count')
                     sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
@@ -637,6 +696,7 @@ def comparison_contract(manifest):
                 host={k: manifest['host'][k] for k in ('system', 'machine')},
                 docker={k: docker.get(k) for k in
                         ('NCPU', 'MemTotal', 'Architecture', 'OperatingSystem', 'ServerVersion', 'KernelVersion')},
+                workload_state=workload_state_contract(job, manifest['config']['updates']),
                 input_sha256=job['input_sha256'], settings=job['settings'],
                 extensions=job['extensions'], full_counts=job['full_counts_before'])
 
