@@ -31,7 +31,7 @@ use std::fmt;
 use crate::forward::ForwardRecord;
 use crate::postings::{BLOCK_POSTINGS, BlockBound, Postings};
 use crate::segment::{Format, Segment};
-use crate::set::collect;
+use crate::set::{Cursor, collect};
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Tid};
 
@@ -170,6 +170,28 @@ fn describe(tid: Tid) -> String {
     format!("({},{})", tid.block, tid.offset)
 }
 
+/// Locate increasing postings in an increasing document table. Galloping over
+/// gaps keeps sparse terms logarithmic in their gap size, while adjacent matches
+/// need one comparison instead of searching the whole table for every posting.
+pub(crate) fn ordered_rank(documents: &[Tid], at: &mut usize, target: Tid) -> Option<usize> {
+    let remaining = &documents[*at..];
+    if remaining.first().is_some_and(|tid| *tid < target) {
+        let mut end = 1usize;
+        while end < remaining.len() && remaining[end] < target {
+            end = end.saturating_mul(2);
+        }
+        let end = end.saturating_add(1).min(remaining.len());
+        *at += remaining[..end].partition_point(|tid| *tid < target);
+    }
+    if documents.get(*at) == Some(&target) {
+        let ordinal = *at;
+        *at += 1;
+        Some(ordinal)
+    } else {
+        None
+    }
+}
+
 /// Checks one segment blob completely.
 pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
     let mut report = SegmentReport::default();
@@ -243,7 +265,6 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             ),
         );
     }
-    let rank = |tid: Tid| documents.binary_search(&tid).ok();
 
     // Positions counted per document across every term, to compare with
     // the length table once the dictionary has been walked completely.
@@ -264,10 +285,11 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
     // Reuse per-term scratch across the dictionary, especially for singleton
     // terms. Every consumer clears its state before use, including after a
     // malformed term skips the remaining checks in its iteration.
+    let mut tids = Vec::new();
     let mut ordinals = Vec::new();
     let mut scores: Vec<(u8, u32)> = Vec::new();
-    let mut positions = Vec::new();
     let mut expected = Vec::new();
+    let mut bounds = Vec::new();
     let blocks = dictionary.map_or(0, |d| d.index().blocks());
     for block in 0..blocks {
         let dictionary = dictionary.expect("blocks come from a parsed dictionary");
@@ -383,8 +405,19 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     ),
                 );
             }
-            let tids = match postings.to_vec() {
-                Ok(tids) => tids,
+            tids.clear();
+            let mut posting_cursor = match (|| {
+                let mut cursor = postings.cursor()?;
+                while let Some(tid) = cursor.current() {
+                    tids.push(tid);
+                    cursor.advance()?;
+                }
+                if tids.len() != postings.count() as usize {
+                    return Err(Error::Corrupt("posting count mismatch"));
+                }
+                Ok(cursor)
+            })() {
+                Ok(cursor) => cursor,
                 Err(error) => {
                     findings.error(location(), format!("postings: {error}"));
                     complete = false;
@@ -397,8 +430,13 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             ordinals.clear();
             ordinals.reserve(tids.len());
             let mut unknown = 0usize;
+            let mut document_at = 0;
             for tid in &tids {
-                match rank(*tid) {
+                match if tids.len() == 1 {
+                    documents.binary_search(tid).ok()
+                } else {
+                    ordered_rank(&documents, &mut document_at, *tid)
+                } {
                     Some(ordinal) => ordinals.push(Some(ordinal)),
                     None => {
                         if unknown == 0 {
@@ -447,9 +485,8 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 if index as u32 >= payload.count() {
                     break;
                 }
-                positions.clear();
-                let bucket = match cursor.next_into(&mut positions) {
-                    Ok(bucket) => bucket,
+                let (bucket, position_count) = match cursor.next_count() {
+                    Ok(counted) => counted,
                     Err(error) => {
                         findings.error(
                             location(),
@@ -459,20 +496,20 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                         break;
                     }
                 };
-                let expected = TfBucket::from_count(positions.len() as u32).value();
+                let expected = TfBucket::from_count(position_count as u32).value();
                 if bucket != expected {
                     findings.error(
                         location(),
                         format!(
                             "payload entry {index} for {} has bucket {bucket} but {} positions imply {expected}",
                             describe(*tid),
-                            positions.len()
+                            position_count
                         ),
                     );
                 }
                 max_bucket = max_bucket.max(bucket);
                 if let Some(ordinal) = ordinals[index] {
-                    positions_of[ordinal] += positions.len() as u64;
+                    positions_of[ordinal] += position_count as u64;
                     scores.push((bucket, length_of[ordinal]));
                 }
             }
@@ -492,8 +529,8 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
 
             // Score bounds: what the postings and lengths imply, in the
             // layout the segment's format writes.
-            let bounds = match resolved.cursor().and_then(|mut c| c.block_bounds()) {
-                Ok(bounds) => bounds,
+            match posting_cursor.block_bounds_into(&mut bounds) {
+                Ok(()) => (),
                 Err(error) => {
                     findings.error(location(), format!("block bounds: {error}"));
                     continue;
@@ -1064,6 +1101,19 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+        #[test]
+        fn ordered_membership_matches_independent_search(
+            docs in prop::collection::btree_set(0u32..100_000, 0..500),
+            postings in prop::collection::btree_set(0u32..100_000, 0..500),
+        ) {
+            let documents = docs.into_iter().map(|block| tid(block, 1)).collect::<Vec<_>>();
+            let mut at = 0;
+            for block in postings {
+                let posting = tid(block, 1);
+                prop_assert_eq!(ordered_rank(&documents, &mut at, posting), documents.binary_search(&posting).ok());
+            }
+        }
 
         #[test]
         fn valid_segments_never_yield_findings(documents in documents()) {

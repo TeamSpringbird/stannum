@@ -87,8 +87,14 @@ representable output. These format bounds do not impose a peak-memory cap.
 PostgreSQL defers interrupts while the metadata buffer lock is held. Merge
 checkpoints respect that deferral; insert checks again immediately after
 publication releases the lock. An interrupted pre-publication write may leave
-orphan pages, which VACUUM reclaims. VACUUM's separate unlocked reconstruction and
-revalidation path remains unchanged. See the
+orphan pages, which VACUUM reclaims. VACUUM also uses the validated API for deferred
+merges and deletion rewrites, retaining owned source blobs while unlocked. Its
+checkpoints can deliver cancellation during construction. Decoder failures are
+reported as corruption only if the identity and every captured input still match;
+retired inputs cause a retry. Publication still revalidates the complete entries
+and discards stale output. All-dead inputs have no successor. Oversized aggregate
+inputs retain the previous reconstruction fallback. See the
+[VACUUM measurements](../benchmarks/vacuum-direct-merge.md) and the
 [integration measurements](../benchmarks/direct-merge-integration.md) for validation
 and the limits of the performance evidence.
 

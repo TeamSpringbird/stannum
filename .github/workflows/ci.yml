@@ -10,6 +10,11 @@ on:
         type: boolean
         default: false
 
+      vacuum_performance:
+        description: Compare direct VACUUM merges with main before integration
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -158,6 +163,42 @@ jobs:
         with:
           name: direct-merge-${{ matrix.arch.name }}-pg${{ matrix.postgres }}
           path: ${{ runner.temp }}/direct-merge-comparison/results
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Compare direct VACUUM merges
+        if: github.event_name == 'workflow_dispatch' && inputs.vacuum_performance
+        run: |
+          comparison_dir="$RUNNER_TEMP/vacuum-merge-comparison"
+          mkdir -p "$comparison_dir"
+          installed_library="$(pg_config --pkglibdir)/stannum.so"
+          cp "$installed_library" "$comparison_dir/integrated.so"
+          trap 'cp "$comparison_dir/integrated.so" "$installed_library"' EXIT
+          baseline_commit=80e5f85e05b178c58e24a73d30a794a9004c4a18
+          git fetch --no-tags origin "$baseline_commit"
+          git worktree add --detach "$comparison_dir/baseline-source" "$baseline_commit"
+          (
+            cd "$comparison_dir/baseline-source"
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo pgrx install --release \
+              --package stannum --no-default-features --features "pg${PG_MAJOR}"
+          )
+          cp "$installed_library" "$comparison_dir/baseline.so"
+          cp "$comparison_dir/integrated.so" "$installed_library"
+          for scenario in merge rewrite mixed; do
+            python3 benchmarks/paired_libraries.py \
+              --baseline "$comparison_dir/baseline.so" \
+              --integrated "$comparison_dir/integrated.so" \
+              --installed-library "$installed_library" \
+              --checkpoint-control --workload vacuum --scenario "$scenario" --rounds 3 \
+              --output "$comparison_dir/results/$scenario"
+          done
+
+      - name: Retain VACUUM comparisons
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.vacuum_performance
+        uses: actions/upload-artifact@v4
+        with:
+          name: vacuum-merge-${{ matrix.arch.name }}-pg${{ matrix.postgres }}
+          path: ${{ runner.temp }}/vacuum-merge-comparison/results
           if-no-files-found: warn
           retention-days: 7
 

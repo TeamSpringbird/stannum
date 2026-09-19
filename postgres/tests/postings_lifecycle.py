@@ -370,6 +370,15 @@ def main():
             assert reader.returncode == 0 or cancelled, (feedback, delay, err)
             if delay == '-1' or feedback == 'on':
                 assert matched == 160 and not cancelled, (feedback, delay, matched, cancelled, err)
+            # Reader cancellation/completion does not mean replay caught up.
+            # Inspecting between run allocation and directory publication can
+            # report transient orphan pages. Wait for all primary cleanup WAL
+            # before asserting a structurally clean standby index.
+            target = sql('SELECT pg_current_wal_insert_lsn();')
+            deadline = time.monotonic() + 20
+            while standby_sql(f"SELECT pg_last_wal_replay_lsn() >= '{target}'::pg_lsn;") != 't':
+                assert time.monotonic() < deadline, 'standby cleanup failed to replay'
+                time.sleep(.02)
             verify('standby_churn_idx', env=standby_env)
             return matched, cancelled
 

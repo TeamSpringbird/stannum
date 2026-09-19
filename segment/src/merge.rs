@@ -3,8 +3,9 @@
 //! Inputs are borrowed complete blobs with per-input dead sets. All inputs,
 //! including dead documents, are verified before metadata is reused. The output
 //! uses the current format; old formats remain readable. No index page is written.
-//! PostgreSQL storage calls this API while retaining its metadata lock; page
-//! allocation, WAL and publication remain the caller’s responsibility.
+//! Foreground PostgreSQL merges retain the metadata lock; VACUUM merges owned
+//! snapshots unlocked and revalidates before publication. Page allocation, WAL
+//! and publication remain the caller’s responsibility.
 use crate::dictionary::{DictionaryBuilder, Extent, TermEntry};
 use crate::payload::PayloadBuilder;
 use crate::postings::PostingsBuilder;
@@ -68,12 +69,14 @@ fn check(actual: usize, limit: usize, name: &'static str) -> std::result::Result
     }
 }
 
-fn merge_as(
+/// Apply the same admission and complete input validation used by direct merges.
+/// Alternative executors must additionally reject duplicate live TIDs, enforce
+/// output limits and provide checkpoints while constructing their output.
+pub fn validate_inputs(
     inputs: &[MergeInput<'_>],
     limits: MergeLimits,
-    format: Format,
     mut checkpoint: impl FnMut() -> std::result::Result<(), MergeError>,
-) -> std::result::Result<Vec<u8>, MergeError> {
+) -> std::result::Result<(), MergeError> {
     checkpoint()?;
     check(inputs.len(), limits.max_inputs, "input count")?;
     let mut input_bytes = 0usize;
@@ -118,11 +121,10 @@ fn merge_as(
                 });
             }
         }
-        if input
-            .dead
-            .iter()
-            .any(|tid| report.documents.binary_search(tid).is_err())
-        {
+        let mut document_at = 0;
+        if input.dead.iter().any(|tid| {
+            crate::verify::ordered_rank(&report.documents, &mut document_at, *tid).is_none()
+        }) {
             return Err(MergeError::InvalidInput {
                 index,
                 detail: "dead tuple absent from input document table".into(),
@@ -130,6 +132,41 @@ fn merge_as(
         }
         checkpoint()?;
     }
+    Ok(())
+}
+
+// Dead postings have already been fully validated. Advance them outside the
+// cross-input heap; only live candidates need ordering against other sources.
+// Complete validation proved source membership; the map contains every live
+// document. A missing/mismatched owner therefore denotes this source's dead
+// occurrence, including a TID reused live by another source.
+fn skip_dead(
+    postings: &mut crate::postings::PostingsCursor<'_>,
+    payload: &mut crate::payload::PayloadCursor<'_>,
+    live_lengths: &HashMap<Tid, (u32, usize)>,
+    source: usize,
+    checkpoint: &mut impl FnMut() -> std::result::Result<(), MergeError>,
+) -> std::result::Result<Option<u32>, MergeError> {
+    while let Some(tid) = postings.current() {
+        if let Some(&(length, owner)) = live_lengths.get(&tid)
+            && owner == source
+        {
+            return Ok(Some(length));
+        }
+        checkpoint()?;
+        payload.next_bucket()?;
+        postings.advance()?;
+    }
+    Ok(None)
+}
+
+fn merge_as(
+    inputs: &[MergeInput<'_>],
+    limits: MergeLimits,
+    format: Format,
+    mut checkpoint: impl FnMut() -> std::result::Result<(), MergeError>,
+) -> std::result::Result<Vec<u8>, MergeError> {
+    validate_inputs(inputs, limits, &mut checkpoint)?;
     let segments = inputs
         .iter()
         .map(|input| Segment::parse(input.bytes))
@@ -152,7 +189,7 @@ fn merge_as(
         checkpoint()?;
         if !inputs[i].dead.contains(&tid) {
             let len = segments[i].length_at(docs[i].ordinal())?;
-            if live_lengths.insert(tid, len).is_some() {
+            if live_lengths.insert(tid, (len, i)).is_some() {
                 return Err(Error::Unordered.into());
             }
             doc_builder.push(tid)?;
@@ -166,7 +203,6 @@ fn merge_as(
             heap.push(Reverse((tid, i)));
         }
     }
-    let sources = inputs;
     let mut dictionaries = segments
         .iter()
         .map(|s| Ok(s.dictionary()?.iter()))
@@ -184,24 +220,45 @@ fn merge_as(
     let mut postings_area = Vec::new();
     let mut payload_area = Vec::new();
     let mut positions = Vec::new();
+    let mut term_inputs = Vec::new();
+    let mut cursors = Vec::new();
+    let mut postings_heap = BinaryHeap::new();
     while let Some(Reverse((term, first))) = terms.pop() {
         checkpoint()?;
-        let mut inputs = vec![first];
+        term_inputs.clear();
+        term_inputs.push(first);
         while terms.peek().is_some_and(|Reverse((next, _))| next == &term) {
             // The heap was just peeked and no intervening operation can empty it.
-            inputs.push(terms.pop().expect("peeked term exists").0.1);
+            term_inputs.push(terms.pop().expect("peeked term exists").0.1);
         }
-        let mut cursors = Vec::new();
-        let mut postings_heap = BinaryHeap::new();
-        for &i in &inputs {
+        cursors.clear();
+        postings_heap.clear();
+        for &i in &term_inputs {
             let resolved =
                 segments[i].resolve(entries[i].take().expect("each queued term owns an entry"))?;
-            let postings = resolved.cursor()?;
-            let payload = resolved.payload()?.cursor();
+            let mut postings = resolved.cursor()?;
+            if resolved.df() == 1
+                && postings
+                    .current()
+                    .is_some_and(|tid| live_lengths.get(&tid).is_none_or(|&(_, owner)| owner != i))
+            {
+                // This fully validated source term has no surviving posting.
+                // No payload cursor will be consumed for it.
+                checkpoint()?;
+                continue;
+            }
+            let mut payload = resolved.payload()?.cursor();
+            let length = skip_dead(
+                &mut postings,
+                &mut payload,
+                &live_lengths,
+                i,
+                &mut checkpoint,
+            )?;
             if let Some(tid) = postings.current() {
                 postings_heap.push(Reverse((tid, cursors.len())));
             }
-            cursors.push((i, postings, payload));
+            cursors.push((i, postings, payload, length));
         }
         let mut postings = PostingsBuilder::default();
         let mut payload = PayloadBuilder::default();
@@ -209,23 +266,18 @@ fn merge_as(
         let mut max_bucket = 0;
         while let Some(Reverse((tid, c))) = postings_heap.pop() {
             checkpoint()?;
-            let (i, cursor, positions_cursor) = &mut cursors[c];
-            if sources[*i].dead.contains(&tid) {
-                positions_cursor.next_bucket()?;
-            } else {
-                positions.clear();
-                let bucket = positions_cursor.next_into(&mut positions)?;
-                let len = *live_lengths
-                    .get(&tid)
-                    .ok_or(Error::Corrupt("posting missing document"))?;
-                postings.push_scored(tid, bucket, len)?;
-                payload.push(bucket, &positions)?;
-                count = count
-                    .checked_add(1)
-                    .ok_or(MergeError::Limit("postings count"))?;
-                max_bucket = max_bucket.max(bucket);
-            }
+            let (i, cursor, positions_cursor, length) = &mut cursors[c];
+            positions.clear();
+            let bucket = positions_cursor.next_into(&mut positions)?;
+            let len = length.ok_or(Error::Corrupt("posting missing document"))?;
+            postings.push_scored(tid, bucket, len)?;
+            payload.push(bucket, &positions)?;
+            count = count
+                .checked_add(1)
+                .ok_or(MergeError::Limit("postings count"))?;
+            max_bucket = max_bucket.max(bucket);
             cursor.advance()?;
+            *length = skip_dead(cursor, positions_cursor, &live_lengths, *i, &mut checkpoint)?;
             if let Some(tid) = cursor.current() {
                 postings_heap.push(Reverse((tid, c)));
             }
@@ -263,7 +315,7 @@ fn merge_as(
             postings_area.extend_from_slice(&posting_bytes);
             payload_area.extend_from_slice(&payload_bytes);
         }
-        for i in inputs {
+        for &i in &term_inputs {
             if let Some(item) = dictionaries[i].next() {
                 let (term, entry) = item?;
                 entries[i] = Some(entry);
@@ -401,34 +453,36 @@ mod tests {
 
     #[test]
     fn cancellation_at_every_checkpoint_is_atomic() {
-        let (blobs, dead) = fixture(2, 3, 4, 2, true, 0);
-        let original = blobs.clone();
-        let input = inputs(&blobs, &dead);
-        let mut calls = 0;
-        merge(&input, limits(), || {
-            calls += 1;
-            Ok(())
-        })
-        .unwrap();
-        for stop in 1..=calls {
-            let mut at = 0;
-            assert!(matches!(
-                merge(&input, limits(), || {
-                    at += 1;
-                    if at == stop {
-                        Err(MergeError::Cancelled)
-                    } else {
-                        Ok(())
-                    }
-                }),
-                Err(MergeError::Cancelled)
-            ));
+        for deletion in [0, 1, 2] {
+            let (blobs, dead) = fixture(2, 3, 4, 2, true, deletion);
+            let original = blobs.clone();
+            let input = inputs(&blobs, &dead);
+            let mut calls = 0;
+            merge(&input, limits(), || {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+            for stop in 1..=calls {
+                let mut at = 0;
+                assert!(matches!(
+                    merge(&input, limits(), || {
+                        at += 1;
+                        if at == stop {
+                            Err(MergeError::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    Err(MergeError::Cancelled)
+                ));
+            }
+            assert_eq!(blobs, original);
+            assert_eq!(
+                merge(&input, limits(), || Ok(())).unwrap(),
+                reference(&blobs, &dead, Format::CURRENT).unwrap()
+            );
         }
-        assert_eq!(blobs, original);
-        assert_eq!(
-            merge(&input, limits(), || Ok(())).unwrap(),
-            reference(&blobs, &dead, Format::CURRENT).unwrap()
-        );
     }
 
     #[test]
@@ -451,6 +505,25 @@ mod tests {
             merge(&inputs(&blobs, &dead), limits(), || Ok(())).unwrap(),
             reference(&blobs, &dead, Format::CURRENT).unwrap()
         );
+    }
+
+    #[test]
+    fn live_source_ownership_distinguishes_reused_tids_in_shared_terms() {
+        let (mut blobs, _) = fixture(1, 3, 4, 2, true, 0);
+        blobs.push(blobs[0].clone());
+        let all_dead = crate::set::collect(Segment::parse(&blobs[0]).unwrap().documents().unwrap())
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for dead in [
+            [all_dead.clone(), BTreeSet::new()],
+            [BTreeSet::new(), all_dead.clone()],
+        ] {
+            assert_eq!(
+                merge(&inputs(&blobs, &dead), limits(), || Ok(())).unwrap(),
+                reference(&blobs, &dead, Format::CURRENT).unwrap()
+            );
+        }
     }
 
     #[test]

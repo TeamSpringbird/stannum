@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [direct VACUUM report](vacuum-direct-merge.md) measures deferred merges and
+deletion rewrites with continuously checked readers.
+
 The [fold regression investigation](fold-regression-diagnosis.md) records
 repeat measurements, discarded-build counters and checkpoint controls for PR #10.
 
