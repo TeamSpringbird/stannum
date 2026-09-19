@@ -831,7 +831,7 @@ mod tests {
     }
 
     #[pg_test]
-    fn prepared_ranked_queries_use_bound_custom_plans() {
+    fn prepared_ranked_queries_use_custom_and_generic_ranked_plans() {
         Spi::run(
             "CREATE TABLE prepared_rank(id int, body text);
              INSERT INTO prepared_rank SELECT n, repeat('common ', n % 7 + 1) ||
@@ -864,7 +864,7 @@ mod tests {
                     .unwrap()
                     .0
                     .to_string();
-                    if mode == "force_custom_plan" {
+                    if mode != "auto" {
                         assert!(plan.contains("\"Order\":\"score DESC\""), "{query}: {plan}");
                         assert!(plan.contains("\"Top K\":10"), "{query}: {plan}");
                     }
