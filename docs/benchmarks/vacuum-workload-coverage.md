@@ -55,8 +55,15 @@ and structural verification must produce no findings.
 Ranked transactions use REPEATABLE READ. With custom scans disabled, they
 materialize every match and score, then derive the exhaustive top ten. Custom
 scans are then enabled for the measured top-k path. Its score multiset must
-match the reference, and it may not repeat IDs. Equal-score boundary ties may
-select different IDs. All fixture documents match the broad ranked OR query.
+match the reference, it may not repeat IDs, and every returned ID must carry
+its exhaustive-reference score. The reference includes an ID-to-score map of
+all matches at or above the tenth result’s score, so equal-score boundary ties
+may select different eligible IDs. Incorrect IDs carrying otherwise correct
+scores cannot pass. A large boundary tie expands this map and adds oracle
+overhead, which is included in transaction latency. Before mixed traffic, an
+SQL self-check exercises the exact guard with a valid alternate boundary tie,
+an incorrect ID carrying the correct score, swapped scores, duplicate IDs, and
+a missing result. All fixture documents match the broad ranked OR query.
 EXPLAIN must show score-descending order and `Top K: 10`; an ordinary full scan
 and sort does not satisfy this check. The oracle shares the scorer and index
 with the optimized path, so it tests execution/pruning equivalence, **not an
