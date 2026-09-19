@@ -159,6 +159,36 @@ These workflow artifacts contain the individual paired samples needed to judge
 recurrence and variability. Neither campaign applies a hard timing threshold on
 shared runners, and local gains do not imply gains on every platform/workload.
 
+The rerun passed all 192 comparisons: 144 selective-query, 24 larger mixed-query,
+and 24 forced-strategy trials. Median VACUUM milliseconds (three pairs/cell):
+
+| Profile | ARM PG17 | ARM PG18 | x86 PG17 | x86 PG18 |
+| --- | ---: | ---: | ---: | ---: |
+| Short live merge | 141.98 → 83.84 | 157.40 → 90.86 | 236.94 → 112.38 | 171.25 → 118.41 |
+| Short rewrite | 68.41 → 57.88 | 72.63 → 61.04 | 97.96 → 94.44 | 114.20 → 89.91 |
+| Short mixed | 68.95 → 60.59 | 70.95 → 60.77 | 93.09 → 88.32 | 112.13 → 99.46 |
+| Long live merge | 280.52 → 183.06 | 299.41 → 194.45 | 380.11 → 312.60 | 451.42 → 245.28 |
+| Long rewrite | 123.84 → 124.40 | 130.90 → 128.48 | 217.20 → 160.32 | 216.92 → 194.99 |
+| Long mixed | 127.84 → 124.80 | 134.96 → 126.45 | 225.05 → 174.49 | 227.94 → 156.88 |
+| Larger mixed queries | 398.82 → 276.31 | 455.87 → 331.33 | 464.35 → 318.63 | 622.35 → 468.08 |
+| Direct → validated reconstruction | 59.58 → 85.46 | 60.81 → 87.82 | 65.05 → 100.04 | 67.36 → 102.41 |
+
+The earlier x86/PG17 long-mixed slowdown did not recur: every candidate in the
+new three pairs was faster. However, its baseline median moved from 138.94 to
+225.05 ms between campaigns, while the candidate moved from 162.25 to 174.49 ms.
+The evidence supports a nonreproduced slowdown under substantial shared-runner
+variation, not a proven explanation or a universal performance guarantee. Long
+rewrite on ARM/PG17 was approximately unchanged (+0.5%).
+
+The larger CI workload was overloaded: only 1,337–1,414 transactions completed
+per window versus a nominal 2,400 offered, and p95 scheduling lag was 4.77–5.05
+seconds. Un-emitted arrivals at shutdown are excluded from logged schedules.
+These are oracle-inclusive pressure measurements, not steady-state throughput
+or query-only latency evidence. The smaller forced-strategy profile completed
+2,422 transactions in every window (seeded Poisson traffic), with p95 scheduling
+lag around 6.6–7.8 ms. Fully validated reconstruction was 43–54% slower than
+direct merging in those comparisons.
+
 ## Remaining evidence
 
 The fixed-corpus workload measures one VACUUM alongside readers. It does not
