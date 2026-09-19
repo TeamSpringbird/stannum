@@ -159,7 +159,11 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
     Ok(out)
 }
 
-fn reference(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<Vec<u8>> {
+pub(crate) fn reference(
+    blobs: &[Vec<u8>],
+    dead: &[BTreeSet<Tid>],
+    format: Format,
+) -> Result<Vec<u8>> {
     let mut builder = SegmentBuilder::default();
     for (blob, dead) in blobs.iter().zip(dead) {
         for record in Segment::parse(blob)?.records(|tid| dead.contains(&tid))? {
@@ -169,7 +173,7 @@ fn reference(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Resul
     Ok(builder.finish_as(format))
 }
 
-fn fixture(
+pub(crate) fn fixture(
     parts: usize,
     docs: usize,
     tokens: usize,
