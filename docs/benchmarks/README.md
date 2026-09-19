@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [integrated VACUUM follow-up](vacuum-final-integration.md) records the
+deletion-heavy optimization, explicit strategy controls, and validation evidence.
+
 The [expanded VACUUM coverage](vacuum-workload-coverage.md) adds fixed offered
 reader load, checked query mixes, and configurable deletion/document distributions.
 
