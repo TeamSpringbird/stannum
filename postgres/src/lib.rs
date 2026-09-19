@@ -1415,6 +1415,90 @@ mod tests {
         }
     }
 
+    #[pg_test(error = "canceling statement due to user request")]
+    fn document_tokenization_honors_cancellation_between_rows() {
+        let documents = vec!["beer wine".to_owned(); 100];
+        let mut rows = 0;
+        crate::score::tokenize_documents(&documents, |_| {
+            rows += 1;
+            // Queue the same flags as a query-cancel signal after work starts.
+            // Without an in-loop check, the explicit panic below fails the test.
+            if rows == 1 {
+                unsafe {
+                    pg_sys::QueryCancelPending = 1;
+                    pg_sys::InterruptPending = 1;
+                }
+            }
+        });
+        panic!("document tokenization ignored cancellation");
+    }
+
+    // Adapted from PlanetScale Lead fdffe7b; exercise the explicit heap scorer
+    // too, since temporary indexes now use Stannum's indexed storage path.
+    #[pg_test]
+    fn max_score_excludes_nonmatching_documents() {
+        for (name, matching, nonmatching, query) in [
+            (
+                "boolean",
+                "beer wine",
+                "beer beer beer beer beer",
+                "beer^1 AND wine^0",
+            ),
+            (
+                "phrase",
+                "beer beer wine",
+                "beer noise beer noise beer noise beer noise wine",
+                "\"beer beer\"^1 AND wine^0",
+            ),
+            (
+                "positional",
+                "beer wine",
+                "wine beer beer beer beer beer",
+                "beer BEFORE wine^0",
+            ),
+        ] {
+            for partial in [false, true] {
+                let predicate = if partial { "WHERE active" } else { "" };
+                Spi::run(&format!(
+                    "CREATE TABLE max_match (body text, active boolean);
+                     INSERT INTO max_match VALUES ('{matching}', true), ('{nonmatching}', true);
+                     CREATE INDEX max_match_idx ON max_match USING stannum (body) {predicate};"
+                ))
+                .unwrap();
+                if partial {
+                    Spi::run("INSERT INTO max_match VALUES ('beer beer beer beer wine', false)")
+                        .unwrap();
+                }
+                let (score, max) = Spi::get_two::<f32, f32>(&format!(
+                    "SELECT stannum.full_score(ctid), stannum.max_score(ctid)
+                     FROM max_match WHERE active AND body ==> '{query}'"
+                ))
+                .unwrap();
+                assert!(
+                    score.is_some_and(|score| score > 0.0),
+                    "{name}, partial={partial}"
+                );
+                assert_eq!(max, score, "indexed {name}, partial={partial}");
+                let (score, max) = Spi::get_two::<f32, f32>(&format!(
+                    "SELECT stannum.score_bound(body, '{query}',
+                         'max_match'::regclass::oid::int, 'max_match_idx'::regclass::oid::int,
+                         1, NULL, NULL, NULL, NULL, NULL),
+                        stannum.score_bound(body, '{query}',
+                         'max_match'::regclass::oid::int, 'max_match_idx'::regclass::oid::int,
+                         3, NULL, NULL, NULL, NULL, NULL)
+                     FROM max_match WHERE active AND body ==> '{query}'"
+                ))
+                .unwrap();
+                assert!(
+                    score.is_some_and(|score| score > 0.0),
+                    "{name}, partial={partial}"
+                );
+                assert_eq!(max, score, "fallback {name}, partial={partial}");
+                Spi::run("DROP TABLE max_match").unwrap();
+            }
+        }
+    }
+
     #[pg_test]
     fn scoring_binds_to_expression_indexes() {
         Spi::run(
