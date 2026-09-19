@@ -77,8 +77,10 @@ whether a newly edited file contains an upstream contribution: that remains
 part of code review. For generated release SQL, reapply notices after schema
 generation as described in [the release checklist](RELEASING.md).
 
-Keep mechanical header insertion in its own commit. Add its final SHA to
-`.git-blame-ignore-revs` in a subsequent commit, and use
-`git blame --ignore-revs-file .git-blame-ignore-revs` to follow code history.
-If the migration is rebased or squash-merged, update that entry to the final
-header-only commit; never ignore a squash commit containing behavior changes.
+Keep mechanical header insertion in its own commit for review. This repository
+currently permits squash merges only, so this migration does not install a
+`.git-blame-ignore-revs` entry: the eventual squash will also contain the
+provenance tooling and CI changes. Never ignore that combined commit. Inserting
+headers leaves the existing source lines unchanged, so their ordinary blame
+history is preserved. If a future header-only change lands as a separate
+commit, its final SHA can be added to an ignore file afterward.
