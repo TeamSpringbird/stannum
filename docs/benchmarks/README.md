@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [matched GIN baseline](gin-mutation-baseline.md) compares sustained mutations
+and count/membership searches with GIN buffered updates enabled and disabled.
+
 The [reader-pinned VACUUM diagnosis](vacuum-pinned-cleanup.md) explains deferred
 heap pruning and the corrected physical-versus-live document accounting.
 

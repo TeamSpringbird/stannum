@@ -41,12 +41,28 @@ def schedule(rates, writers, rounds):
             for rate, count in (cases if r % 2 else reversed(cases))]
 
 
+def wal_delta(before, after):
+    def value(lsn):
+        high, low = lsn.split('/')
+        return (int(high, 16) << 32) + int(low, 16)
+    delta = value(after) - value(before)
+    if delta < 0:
+        raise ValueError('WAL position moved backwards')
+    return delta
+
+
 def result_row(directory, repetition, rate, writers):
     summary = json.loads((directory / 'summary.json').read_text())
     manifest = json.loads((directory / 'manifest.json').read_text())
     if manifest['status'] != 'complete':
         raise ValueError('cannot summarize an incomplete run as successful')
-    return dict(directory=str(directory), repetition=repetition, write_rate=rate, writers=writers,
+    before = json.loads((directory / 'before.json').read_text())
+    after = json.loads((directory / 'after.json').read_text())
+    drained = json.loads((directory / 'after-drain.json').read_text())
+    return dict(wal_bytes_traffic_and_observers=wal_delta(before['wal_lsn'], after['wal_lsn']),
+                wal_bytes_drain=wal_delta(after['wal_lsn'], drained['wal_lsn']),
+                directory=str(directory), engine=manifest["engine"], index_definition=manifest["index_definition"],
+                repetition=repetition, write_rate=rate, writers=writers,
                 reader=summary['reader'], writer=summary['writer'], affected_rows=summary['affected_rows'],
                 maintenance=summary['maintenance'], drain=summary['drain'])
 
@@ -55,6 +71,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--artifact', type=Path, required=True)
+    p.add_argument('--engines', default='stannum', help='Comma-separated stannum,gin,gin-no-fastupdate variants')
+    p.add_argument('--profile', choices=('mutation', 'mutation-count'), default='mutation')
     p.add_argument('--rows', type=bench.positive, default=10000)
     p.add_argument('--body-repeat', type=bench.positive, default=1)
     p.add_argument('--dataset', type=Path)
@@ -69,6 +87,11 @@ def main():
     p.add_argument('--check-interval', type=bench.positive, default=15)
     p.add_argument('--set', action='append', default=[])
     args = p.parse_args()
+    engines = args.engines.split(',')
+    if len(set(engines)) != len(engines) or any(e not in ('stannum', 'gin', 'gin-no-fastupdate') for e in engines):
+        p.error('engines must be distinct stannum,gin,gin-no-fastupdate variants')
+    if any(e != 'stannum' for e in engines) and args.profile != 'mutation-count':
+        p.error('GIN comparisons require --profile mutation-count')
     if args.rows % 1000:
         p.error('rows must be a multiple of 1000')
     if args.dataset and args.body_repeat != 1:
@@ -110,14 +133,17 @@ def main():
                          "shared_buffers='512MB'\njit=off\ncheckpoint_timeout='30min'\nmax_wal_size='16GB'\n")
         command(['pg_ctl', '-D', str(cluster / 'data'), '-l', str(cluster / 'server.log'), '-w', 'start'], 'start')
         started = True
-        for repetition, rate, writers in schedule(args.write_rates, args.writer_counts, args.rounds):
+        trials = [(r, rate, count, engine)
+                  for r, rate, count in schedule(args.write_rates, args.writer_counts, args.rounds)
+                  for engine in (engines if r % 2 else list(reversed(engines)))]
+        for repetition, rate, writers, engine in trials:
             verify_binary()
-            label = f'round{repetition}-rate{rate}-writers{writers}'
+            label = f'{engine}-round{repetition}-rate{rate}-writers{writers}'
             database = 'stannum_bench_sustained_' + uuid.uuid4().hex
             command(['createdb', database], label + '-create')
             command(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', 'CHECKPOINT'], label + '-checkpoint')
-            argv = [sys.executable, str(Path(__file__).with_name('run.py')), 'run', '--engine', 'stannum',
-                    '--profile', 'mutation', '--database', database, '--output', str(output / label),
+            argv = [sys.executable, str(Path(__file__).with_name('run.py')), 'run', '--engine', 'stannum' if engine == 'stannum' else 'gin',
+                    '--profile', args.profile, '--database', database, '--output', str(output / label),
                     '--environment', 'private-native-postgres', '--build-id', digest, '--artifact', str(artifact),
                     '--rows', str(args.rows), '--body-repeat', str(args.body_repeat),
                     '--seconds', str(args.seconds), '--warmup', str(args.warmup),
@@ -128,7 +154,9 @@ def main():
                     '--set', 'enable_seqscan=off']
             if args.dataset:
                 argv += ['--dataset', str(args.dataset.resolve())]
-            for setting in settings:
+            if engine != 'stannum':
+                argv += ['--gin-fastupdate', 'off' if engine == 'gin-no-fastupdate' else 'on']
+            for setting in (settings if engine == 'stannum' else args.set):
                 argv += ['--set', setting]
             print('START ' + label, flush=True)
             command(argv, label, timeout=args.seconds + 900)

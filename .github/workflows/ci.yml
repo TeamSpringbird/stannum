@@ -170,6 +170,7 @@ jobs:
           python3 benchmarks/sustained.py \
             --artifact "$(pg_config --pkglibdir)/stannum.so" \
             --output "$RUNNER_TEMP/sustained-smoke" \
+            --engines stannum,gin,gin-no-fastupdate --profile mutation-count \
             --rows 10000 --seconds 20 --warmup 1 --rounds 1 \
             --write-rates 200 --writer-counts 2 --read-rate 100 \
             --vacuum-interval 5 --check-interval 5
