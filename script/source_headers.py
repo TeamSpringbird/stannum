@@ -57,6 +57,8 @@ def rewrite(path, content, owner):
     for known_owner in OWNERS:
         header = notice(path, known_owner)
         if body.startswith(header):
+            if known_owner != owner and owner != "mixed":
+                raise ValueError(f"{path}: refusing to remove an existing copyright holder")
             body = body[len(header):]
             break
     else:

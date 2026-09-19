@@ -25,7 +25,7 @@ verified byte-for-byte against the parent revision after removing only the
 inserted notices; insertion is idempotent, and LICENSE is unchanged. The
 inventory includes 92 Rust files: 38 unchanged inherited, 18 modified inherited
 (including the moved term-frequency module), and 36 Stannum-authored files.
-All 79 benchmark-harness tests and five attribution-tool tests pass. See [source attribution](ATTRIBUTION.md) for the
+All 79 benchmark-harness tests and six attribution-tool tests pass. See [source attribution](ATTRIBUTION.md) for the
 policy and future-file checks.
 
 PR #10 (unlocked fold construction) was still open at audit time. It can
