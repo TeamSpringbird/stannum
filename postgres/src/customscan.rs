@@ -209,8 +209,8 @@ unsafe fn const_datum<T: FromDatum>(node: *mut pg_sys::Node) -> Result<Option<T>
     }
 }
 
-/// Finds a `expr ==> 'literal'` restriction on `rel` (in either operator
-/// form) answered by a segmented stannum index whose tokenizer settings are
+/// Finds a constant (or, when allowed, external text parameter) restriction
+/// on `rel` (in either operator form) answered by a segmented stannum index whose tokenizer settings are
 /// the ones the clause is bound to.
 unsafe fn find_match(
     rel: *mut pg_sys::RelOptInfo,
@@ -500,14 +500,18 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
         {
             return;
         }
-        let Some(found) = find_match(rel, rte, true) else {
+        let Some(mut found) = find_match(rel, rte, true) else {
             return;
         };
-        let ordering = find_ordering(root, rel, &found);
-        // Keep parameter support scoped to ranked scans. Unordered/count
-        // plans retain their existing constant-query rules.
+        let mut ordering = find_ordering(root, rel, &found);
+        // A parameter that cannot supply this ordering must not hide an
+        // existing constant-clause path in a query with multiple restrictions.
         if found.query.is_none() && ordering.is_none() {
-            return;
+            let Some(constant) = find_match(rel, rte, false) else {
+                return;
+            };
+            found = constant;
+            ordering = find_ordering(root, rel, &found);
         }
         let private = Private {
             index_oid: found.index_oid.to_u32(),
@@ -1572,7 +1576,8 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
         if !exec.fallback.is_null() {
             pg_sys::table_rescan(exec.fallback, std::ptr::null_mut());
         }
-        // Counts re-count; searches rewind their captured stream or ranked rows.
+        // Counts re-count; constant searches rewind their captured results.
+        // Parameterized ranked searches bind again and rebuild their scorer.
         let cscan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
         if (*cscan).scan.scanrelid == 0 {
             exec.started = false;

@@ -893,6 +893,15 @@ mod tests {
             // Plain EXPLAIN initializes executor state without evaluating the
             // query parameter; malformed TINQL only errors on execution.
             Spi::run("EXPLAIN EXECUTE ranked_parameter('AND AND')").unwrap();
+            Spi::run(
+                "DO $$ DECLARE failed boolean := false; BEGIN
+                BEGIN EXECUTE 'EXECUTE ranked_parameter(''AND AND'')';
+                EXCEPTION WHEN OTHERS THEN failed := true; END;
+                IF NOT failed THEN RAISE EXCEPTION 'malformed query unexpectedly succeeded'; END IF;
+                END $$",
+            )
+            .unwrap();
+            assert_eq!(ids("EXECUTE ranked_parameter('rare')").len(), 10);
             Spi::run("DEALLOCATE ranked_parameter").unwrap();
         }
     }
@@ -909,24 +918,54 @@ mod tests {
             SET LOCAL enable_seqscan = off;
             SET LOCAL enable_material = off;
             SET LOCAL enable_memoize = off;
-            PREPARE generic_loop(text) AS SELECT s.id FROM generate_series(1,3) g
+            PREPARE generic_loop(text) AS SELECT s.id, s.score, g FROM generate_series(1,3) g
                 CROSS JOIN LATERAL (SELECT id, stannum.full_score(ctid) AS score
                 FROM generic_rescan WHERE body ==> $1 AND id > 900
                 ORDER BY score DESC LIMIT 10 OFFSET g * 0) s;",
         )
         .unwrap();
         for query in ["common OR blue", "red", "missing", "blue"] {
-            let mut actual = ids(&format!("EXECUTE generic_loop('{query}')"));
-            let mut expected = ids(&format!(
-                "WITH all_scores AS MATERIALIZED (
-                SELECT id, stannum.full_score(ctid) AS score FROM generic_rescan
-                WHERE body ==> '{query}' AND id > 900), best AS (
-                SELECT id FROM all_scores ORDER BY score DESC, id LIMIT 10)
-                SELECT id FROM best, generate_series(1,3)"
-            ));
-            actual.sort_unstable();
-            expected.sort_unstable();
-            assert_eq!(actual, expected, "{query}");
+            let expected: std::collections::HashMap<i32, u32> = Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, stannum.full_score(ctid) AS score
+                    FROM generic_rescan WHERE body ==> '{query}' AND id > 900"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|r| {
+                        (
+                            r.get::<i32>(1).unwrap().unwrap(),
+                            r.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            });
+            let mut best: Vec<u32> = expected.values().copied().collect();
+            best.sort_unstable_by(|a, b| f32::from_bits(*b).total_cmp(&f32::from_bits(*a)));
+            best.truncate(10);
+            let mut actual = [Vec::new(), Vec::new(), Vec::new()];
+            let mut seen = std::collections::HashSet::new();
+            Spi::connect(|client| {
+                for row in client
+                    .select(&format!("EXECUTE generic_loop('{query}')"), None, &[])
+                    .unwrap()
+                {
+                    let id = row.get::<i32>(1).unwrap().unwrap();
+                    let bits = row.get::<f32>(2).unwrap().unwrap().to_bits();
+                    let iteration = row.get::<i32>(3).unwrap().unwrap();
+                    assert_eq!(expected.get(&id), Some(&bits), "{query}: row {id}");
+                    assert!(seen.insert((iteration, id)), "duplicate row within rescan");
+                    actual[(iteration - 1) as usize].push(bits);
+                }
+            });
+            for scores in actual {
+                // Tied boundary rows can differ; exact ordered scores cannot.
+                assert_eq!(scores, best, "{query}");
+            }
         }
         let plan =
             Spi::get_one::<Json>("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE generic_loop('blue')")
