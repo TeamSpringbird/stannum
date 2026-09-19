@@ -37,6 +37,7 @@ mod varint;
 pub mod dictionary;
 pub mod forward;
 pub mod index;
+pub mod merge;
 pub mod pages;
 pub mod payload;
 pub mod postings;
