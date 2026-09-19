@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [fold regression investigation](fold-regression-diagnosis.md) records
+repeat measurements, discarded-build counters and checkpoint controls for PR #10.
+
 The [validated merge API](hardened-merge.md) adds input validation, explicit limits
 and cancellation to direct posting merges before PostgreSQL integration.
 

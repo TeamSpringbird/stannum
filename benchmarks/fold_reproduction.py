@@ -95,7 +95,9 @@ def main():
                 print('PASS ' + label, flush=True)
     finally:
         try:
-            if started:
+            # pg_ctl can time out after the postmaster was created. Do not
+            # delete a possibly live cluster merely because startup raised.
+            if started or (cluster / 'data/postmaster.pid').exists():
                 run(['pg_ctl', '-D', str(cluster / 'data'), '-m', 'fast', '-w', 'stop'], 'stop')
             stopped = True
         finally:

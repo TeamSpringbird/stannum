@@ -155,7 +155,8 @@ The proposed order is coordination → metadata → data pages → relation exte
 Readers and VACUUM would retain their existing behavior. Full buffer-state
 validation and bounded fallback remain necessary for VACUUM and writers using
 different caps. This is a design candidate, not implemented or proven faster.
-It needs real two-backend cancellation/error-cleanup tests and comparisons
+PostgreSQL’s [page-lock implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/lmgr/lmgr.c)
+uses transaction-owned heavyweight locks. The candidate needs real two-backend cancellation/error-cleanup tests and comparisons
 against both current implementations before adoption.
 
 Production disk allocation/writes remain under their existing locks; changing
@@ -185,6 +186,9 @@ python3 /tmp/stannum-pgrx-lock.py python3 benchmarks/fold_reproduction.py \
 Omit `--checkpoint-control` to replay the original checkpoint protocol. The lock
 wrapper is machine-local; use the equivalent installation exclusion elsewhere.
 The generalized driver passed a one-pair three-second execution smoke check;
+two mocked failure tests also ensure startup timeout stops a surviving postmaster
+before cleanup, and failed shutdown preserves its data directory. The full Python
+harness suite passed 62 tests.
 those smoke timings are not included above. The reported campaigns used the
 archived original drivers with the same workload and cluster settings.
 
