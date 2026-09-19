@@ -1,0 +1,122 @@
+{
+  "budget_guard": {
+    "budget_seconds": 3,
+    "differences": 0,
+    "elapsed_seconds": 3.0373998330906034,
+    "error": "verification wall-clock budget exhausted",
+    "queries_completed": 23,
+    "queries_expected": 906,
+    "rows": 100,
+    "status": "incomplete"
+  },
+  "budget_seconds": 900,
+  "checks": [
+    "membership",
+    "full_score_bits",
+    "top10"
+  ],
+  "differences": 0,
+  "elapsed_seconds": 851.2057584999129,
+  "headroom_seconds": 48.79424150008708,
+  "host": {
+    "cpu_count": 16,
+    "cpu_model": "Apple M4 Max",
+    "memory_bytes": 137438953472,
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O"
+  },
+  "input_bytes": 19172007,
+  "input_sha256": "f5cd371418959c06c4a646568cb8e1a6c7e97a96f271e70f1a51a9ac2e2827b2",
+  "lead_revision": "bd95c7e51b6afce81396790852ee2f2c169570ad",
+  "nonempty_forms": 629,
+  "pilot": [
+    {
+      "bit_mismatches": 0,
+      "queries": 24,
+      "rows": 100,
+      "sample_seconds": 2.015365577302873,
+      "setup_seconds": 0.21198999974876642
+    },
+    {
+      "bit_mismatches": 0,
+      "queries": 24,
+      "rows": 500,
+      "sample_seconds": 3.844227623194456,
+      "setup_seconds": 0.30494629219174385
+    },
+    {
+      "bit_mismatches": 0,
+      "queries": 24,
+      "rows": 1000,
+      "sample_seconds": 6.375807001255453,
+      "setup_seconds": 0.4518571672961116
+    },
+    {
+      "bit_mismatches": 0,
+      "queries": 24,
+      "rows": 2000,
+      "sample_seconds": 11.15849687717855,
+      "setup_seconds": 0.7984707914292812
+    },
+    {
+      "bit_mismatches": 0,
+      "queries": 24,
+      "rows": 5000,
+      "sample_seconds": 26.078293170779943,
+      "setup_seconds": 1.4969910830259323
+    }
+  ],
+  "queries_completed": 906,
+  "queries_expected": 906,
+  "query_forms": 906,
+  "query_seconds_by_side": {
+    "left": 30.907156793400645,
+    "right": 800.3637715876102,
+    "topk": 16.055141733959317
+  },
+  "raw_observations_sha256": "9fbe19a30456dab64404883ed482ce5c647f36ada2214313bf74e67de647a913",
+  "rows": 5000,
+  "score_exclusions": [],
+  "scored_row_comparisons": 338513,
+  "servers": {
+    "left": {
+      "body_bytes": 19132553,
+      "extension_version": "0.1.0",
+      "rows": 5000,
+      "settings": {
+        "enable_seqscan": "on",
+        "jit": "off",
+        "max_parallel_workers_per_gather": "0",
+        "shared_buffers": "131072",
+        "work_mem": "4096"
+      },
+      "version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit"
+    },
+    "right": {
+      "body_bytes": 19132553,
+      "extension_version": "1.0.3",
+      "rows": 5000,
+      "settings": {
+        "enable_seqscan": "on",
+        "jit": "off",
+        "max_parallel_workers_per_gather": "0",
+        "shared_buffers": "131072",
+        "work_mem": "4096"
+      },
+      "version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit"
+    }
+  },
+  "setup_seconds": 1.9396865833550692,
+  "stannum_commit": "f05158a8dea9cd4009ece27c35ead19239d3de10",
+  "stannum_source_sha256": "46c805ff821b9d5726106a74e8b0d0e0b61f8f52c9f616728c7cd89c4eac7eab",
+  "statement_seconds": 60,
+  "status": "passed",
+  "top10_rows": 4577,
+  "verified_files": {
+    "dataset.py": "4dcc78a37d85809360e2777e8223903f696f0acc60de27f2fe559f7812417e34",
+    "oracle.py": "72b3364e8d0cecebba1c0e732cb4267472efd933725d7ddd00aeff34f0f57254",
+    "queries.json": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb",
+    "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607",
+    "stannum.dylib": "e424278ab5446b74dc0e2181e3f486440a5d8c531ddb7608111ed1b0ed3422cf",
+    "tin.dylib": "f71cb313c9c7d3e51cfc07e8bac77c5b66b7cbb71746236d616b3d848083c7e3"
+  }
+}
