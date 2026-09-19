@@ -59,7 +59,8 @@ existing LICENSE rather than adopting that conflicting wording.
    Do not add a copyright holder solely for a mechanical edit.
 2. Stage new source paths so `git ls-files` includes them, then run
    `python3 script/source_headers.py --write` to apply the reviewed notices.
-   The command preserves existing code bytes and refuses unfamiliar notices.
+   The command preserves existing code bytes, refuses unfamiliar notices, and
+   will not remove an existing copyright holder when reclassifying a file.
 3. Run `python3 script/source_headers.py` and
    `python3 -m unittest discover -s script -p 'test_*.py'`. CI runs both.
 

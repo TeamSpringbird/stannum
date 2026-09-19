@@ -37,6 +37,14 @@ class SourceHeadersTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires review"):
             rewrite("lib.rs", b"// Copyright 2025 Another contributor\nfn main() {}\n", "ben")
 
+    def test_reclassification_cannot_remove_existing_holders(self):
+        for original, replacement in [("mixed", "ben"), ("mixed", "planetscale"),
+                                      ("planetscale", "ben"), ("ben", "planetscale")]:
+            with self.subTest(original=original, replacement=replacement):
+                content = notice("lib.rs", original) + b"fn main() {}\n"
+                with self.assertRaisesRegex(ValueError, "existing copyright holder"):
+                    rewrite("lib.rs", content, replacement)
+
     def test_inventory_requires_review_for_new_files_and_detects_stale_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
