@@ -925,6 +925,8 @@ mod tests {
             ANALYZE generic_rescan;
             SET LOCAL plan_cache_mode = force_generic_plan;
             SET LOCAL enable_seqscan = off;
+            SET LOCAL enable_bitmapscan = off;
+            SET LOCAL enable_indexscan = off;
             SET LOCAL enable_material = off;
             SET LOCAL enable_memoize = off;
             PREPARE generic_loop(text) AS SELECT s.id, s.score, g FROM generate_series(1,3) g
@@ -987,7 +989,8 @@ mod tests {
             }
             plan.get("Plans")?.as_array()?.iter().find_map(find_scan)
         }
-        let scan = find_scan(&plan[0]["Plan"]).expect("ranked generic scan beneath lateral limit");
+        let scan = find_scan(&plan[0]["Plan"])
+            .unwrap_or_else(|| panic!("ranked generic scan beneath lateral limit: {plan}"));
         assert_eq!(scan["Actual Loops"], 3);
         assert_eq!(scan["Order"], "score DESC");
         Spi::run("DEALLOCATE generic_loop").unwrap();
