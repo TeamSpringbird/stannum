@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 
 from foreground_writes import positive
+from vacuum_cleanup import add_workload_arguments
 
 
 def main():
@@ -28,10 +29,13 @@ def main():
     parser.add_argument('--workload', choices=['contention', 'vacuum'], default='contention')
     parser.add_argument('--docs', type=positive, default=32768)
     parser.add_argument('--scenario', choices=['merge', 'rewrite', 'mixed'], default='merge')
+    parser.add_argument('--baseline-vacuum-strategy', choices=['auto', 'direct', 'reconstruct'])
+    parser.add_argument('--integrated-vacuum-strategy', choices=['auto', 'direct', 'reconstruct'])
     parser.add_argument('--writer-rate', type=positive)
     parser.add_argument('--repeat', type=positive, default=200)
     parser.add_argument('--seconds', type=positive, default=20)
     parser.add_argument('--rounds', type=positive, default=3)
+    add_workload_arguments(parser)
     args = parser.parse_args()
     binaries = {name: getattr(args, name).resolve(strict=True)
                 for name in ('baseline', 'integrated')}
@@ -44,7 +48,8 @@ def main():
     metadata = {
         'checkpoint_control': args.checkpoint_control, 'workload': args.workload, 'scenario': args.scenario, 'docs': args.docs,
         'seconds': args.seconds, 'rounds': args.rounds, 'repeat': args.repeat, 'writer_rate': args.writer_rate,
-        'builds': {name: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        'vacuum_config': {key: getattr(args, key) for key in ('delete_percent', 'vocabulary', 'distribution', 'query_shapes', 'reader_rate', 'reader_seconds', 'readers')},
+        'builds': {name: {'vacuum_strategy': getattr(args, name + '_vacuum_strategy'), 'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
                    for name, path in binaries.items()},
         'harness_sha256': hashlib.sha256(harness.read_bytes()).hexdigest(),
     }
@@ -88,13 +93,26 @@ def main():
             order = ['baseline', 'integrated'] if number % 2 else ['integrated', 'baseline']
             for name in order:
                 label = f'round{number}-{name}'
+                # Each postmaster and all children must exit before replacing
+                # a mapped extension library, including background workers.
+                run(['pg_ctl', '-D', str(cluster / 'data'), '-m', 'fast', '-w', 'stop'], label + '-stop')
+                started = False
                 install(binaries[name])
+                run(['pg_ctl', '-D', str(cluster / 'data'), '-l', str(cluster / 'server.log'),
+                     '-w', 'start'], label + '-start')
+                started = True
                 if args.checkpoint_control:
                     run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', 'CHECKPOINT'],
                         label + '-checkpoint')
                 print('START ' + label, flush=True)
                 if args.workload == 'vacuum':
-                    run(['python3', str(harness), '--docs', str(args.docs), '--repeat', str(args.repeat),
+                    strategy = getattr(args, name + '_vacuum_strategy')
+                    workload = [] if strategy is None else ['--vacuum-strategy', strategy]
+                    for key in ('delete_percent', 'vocabulary', 'distribution', 'query_shapes', 'reader_rate', 'reader_seconds', 'readers'):
+                        value = getattr(args, key)
+                        if value is not None:
+                            workload.extend(['--' + key.replace('_', '-'), str(value)])
+                    run(['python3', str(harness), *workload, '--docs', str(args.docs), '--repeat', str(args.repeat),
                          '--scenario', args.scenario, '--artifact', str(library),
                          '--output', str(output / label)], label)
                 else:
@@ -112,7 +130,10 @@ def main():
                 run(['pg_ctl', '-D', str(cluster / 'data'), '-m', 'fast', '-w', 'stop'], 'stop')
             stopped = True
         finally:
-            install(original)
+            if stopped:
+                install(original)
+            else:
+                print('Shutdown unconfirmed; library left in place. Original retained at ' + str(original), flush=True)
             if (cluster / 'server.log').exists():
                 shutil.copy2(cluster / 'server.log', output / 'server.log')
             if stopped:
