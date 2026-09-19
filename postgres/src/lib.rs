@@ -1509,7 +1509,7 @@ mod tests {
         assert_eq!(scan["Pruning"], "block-max");
         assert_eq!(scan["Top-K Completions"], 1);
         assert_eq!(scan["Exhaustive Score Calls"], 1000);
-        assert_eq!(filtered[0]["Plan"]["Actual Rows"], 10);
+        assert_eq!(filtered[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
 
         // An unprunable phrase scores exhaustively without a completion.
         let phrase = explain("\"alpha beta\"", "");
