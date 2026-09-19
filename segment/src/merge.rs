@@ -69,12 +69,14 @@ fn check(actual: usize, limit: usize, name: &'static str) -> std::result::Result
     }
 }
 
-fn merge_as(
+/// Apply the same admission and complete input validation used by direct merges.
+/// Alternative executors must additionally reject duplicate live TIDs, enforce
+/// output limits and provide checkpoints while constructing their output.
+pub fn validate_inputs(
     inputs: &[MergeInput<'_>],
     limits: MergeLimits,
-    format: Format,
     mut checkpoint: impl FnMut() -> std::result::Result<(), MergeError>,
-) -> std::result::Result<Vec<u8>, MergeError> {
+) -> std::result::Result<(), MergeError> {
     checkpoint()?;
     check(inputs.len(), limits.max_inputs, "input count")?;
     let mut input_bytes = 0usize;
@@ -131,6 +133,16 @@ fn merge_as(
         }
         checkpoint()?;
     }
+    Ok(())
+}
+
+fn merge_as(
+    inputs: &[MergeInput<'_>],
+    limits: MergeLimits,
+    format: Format,
+    mut checkpoint: impl FnMut() -> std::result::Result<(), MergeError>,
+) -> std::result::Result<Vec<u8>, MergeError> {
+    validate_inputs(inputs, limits, &mut checkpoint)?;
     let segments = inputs
         .iter()
         .map(|input| Segment::parse(input.bytes))
