@@ -16,5 +16,8 @@ Start with the [project README](../README.md) to build Stannum and run a search.
 - [Benchmark tools](benchmarks/harness.md): individual runners, correctness checks,
   and result files.
 
+- [Source attribution](ATTRIBUTION.md): copyright notices, provenance, and header checks.
+- [Upstream synchronization](UPSTREAM.md): disposition of Lead changes and validation.
+
 Run commands from the repository root. Keep raw results in ignored
 `benchmarks/results/` and connection credentials outside Git.
