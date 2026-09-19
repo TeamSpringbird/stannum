@@ -53,3 +53,55 @@ class StartupCleanupTests(unittest.TestCase):
 
     def test_failed_stop_preserves_cluster(self):
         self.check_startup_timeout(True)
+
+
+class SwapLifecycleTests(unittest.TestCase):
+    def test_each_binary_swap_occurs_only_with_stopped_postmaster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cluster = root / 'cluster'
+            cluster.mkdir()
+            library = root / 'installed'
+            library.write_bytes(b'original')
+            for name in ('baseline', 'integrated'):
+                (root / name).write_bytes(name.encode())
+            state = {'started': False}
+            measured = []
+            swaps = []
+            real_replace = paired_libraries.os.replace
+
+            def replace(source, destination):
+                self.assertFalse(state['started'], 'swapped a live mapped library')
+                swaps.append(Path(source).read_bytes())
+                real_replace(source, destination)
+
+            def run(command, **kwargs):
+                if command[0] == 'initdb':
+                    (cluster / 'data').mkdir()
+                elif command[0] == 'pg_ctl':
+                    if command[-1] == 'start':
+                        self.assertFalse(state['started'])
+                        state['started'] = True
+                        (cluster / 'data/postmaster.pid').write_text('fake')
+                    elif command[-1] == 'stop':
+                        self.assertTrue(state['started'])
+                        state['started'] = False
+                        (cluster / 'data/postmaster.pid').unlink()
+                elif command[0] == 'python3':
+                    self.assertTrue(state['started'])
+                    measured.append(library.read_bytes())
+                return subprocess.CompletedProcess(command, 0)
+
+            argv = ['paired_libraries.py', '--baseline', str(root / 'baseline'),
+                    '--integrated', str(root / 'integrated'), '--installed-library',
+                    str(library), '--output', str(root / 'output'), '--rounds', '2']
+            with (patch('sys.argv', argv),
+                  patch.object(paired_libraries.tempfile, 'mkdtemp', return_value=str(cluster)),
+                  patch.object(paired_libraries.subprocess, 'run', side_effect=run),
+                  patch.object(paired_libraries.os, 'replace', side_effect=replace),
+                  contextlib.redirect_stdout(io.StringIO())):
+                paired_libraries.main()
+            self.assertEqual(measured, [b'baseline', b'integrated', b'integrated', b'baseline'])
+            self.assertEqual(swaps, measured + [b'original'])
+            self.assertEqual(library.read_bytes(), b'original')
+            self.assertFalse(cluster.exists())
