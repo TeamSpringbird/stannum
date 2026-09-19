@@ -1,0 +1,1818 @@
+{
+  "artifact_sha256": "aa228e9fdc68319c5ae3ff55c60ab51d75bce0b2bfe959eb67b13f49fcd98472",
+  "runtime_base": "4beaaa338ebd40307948fb783d5d2128cca8db9a",
+  "host": {
+    "cpus": 16,
+    "machine": "arm64",
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O"
+  },
+  "server_version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit",
+  "settings": [
+    "stannum.write_buffer_docs=256",
+    "stannum.build_segment_docs=2000",
+    "stannum.max_segments=16",
+    "stannum.max_merge_docs=2048"
+  ],
+  "trials": [
+    {
+      "fixture": "short",
+      "case": "round1-rate200-writers1",
+      "rows": 50000,
+      "body_repeat": 1,
+      "seconds": 45,
+      "offered_reads": 500,
+      "offered_writes": 200,
+      "writers": 1,
+      "affected_rows": {
+        "delete": {
+          "affected": 2873,
+          "completed": 2940,
+          "noops": 67
+        },
+        "insert": {
+          "affected": 3167,
+          "completed": 3167,
+          "noops": 0
+        },
+        "update": {
+          "affected": 2911,
+          "completed": 2981,
+          "noops": 70
+        }
+      },
+      "reader": {
+        "completed": 22130,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 25.329,
+            "p50_ms": 0.34700000000000003,
+            "p95_ms": 1.539,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.655
+          },
+          "lag_p95_ms": 4.759,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 27.949,
+            "p50_ms": 1.494,
+            "p95_ms": 5.339,
+            "p99_insufficient_samples": false,
+            "p99_ms": 8.466
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 4.509,
+            "p50_ms": 0.32299999999999995,
+            "p95_ms": 1.053,
+            "p99_insufficient_samples": false,
+            "p99_ms": 1.738
+          },
+          "lag_p95_ms": 4.399,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 10.514,
+            "p50_ms": 1.337,
+            "p95_ms": 4.833,
+            "p99_insufficient_samples": false,
+            "p99_ms": 7.477
+          }
+        },
+        "logged": 22130,
+        "nominal_arrivals": 22500,
+        "overall": {
+          "execution": {
+            "completed": 22130,
+            "max_ms": 25.329,
+            "p50_ms": 0.3400000000000003,
+            "p95_ms": 1.697,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3.441
+          },
+          "lag_p95_ms": 4.79,
+          "scheduled": {
+            "completed": 22130,
+            "max_ms": 27.949,
+            "p50_ms": 1.532,
+            "p95_ms": 5.598,
+            "p99_insufficient_samples": false,
+            "p99_ms": 8.839
+          }
+        },
+        "rate": 500
+      },
+      "writer": {
+        "completed": 9088,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 908,
+            "max_ms": 25.463,
+            "p50_ms": 0.3360000000000001,
+            "p95_ms": 1.099,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 7.619,
+          "scheduled": {
+            "completed": 908,
+            "max_ms": 32.304,
+            "p50_ms": 1.737,
+            "p95_ms": 10.276,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 908,
+            "max_ms": 0.5969999999999998,
+            "p50_ms": 0.12600000000000006,
+            "p95_ms": 0.2410000000000001,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 5.073,
+          "scheduled": {
+            "completed": 908,
+            "max_ms": 10.233,
+            "p50_ms": 1.2,
+            "p95_ms": 5.199,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "logged": 9088,
+        "nominal_arrivals": 9000,
+        "overall": {
+          "execution": {
+            "completed": 9088,
+            "max_ms": 25.463,
+            "p50_ms": 0.18100000000000005,
+            "p95_ms": 0.7089999999999996,
+            "p99_insufficient_samples": false,
+            "p99_ms": 4.191
+          },
+          "lag_p95_ms": 5.478,
+          "scheduled": {
+            "completed": 9088,
+            "max_ms": 32.304,
+            "p50_ms": 1.412,
+            "p95_ms": 6.194,
+            "p99_insufficient_samples": false,
+            "p99_ms": 10.184
+          }
+        },
+        "rate": 200
+      },
+      "vacuums_during_writes": 4,
+      "oracle_rounds_during_writes": 2,
+      "oracle_query_checks": 18,
+      "missed_maintenance_slots": 0,
+      "max_traffic_vacuum_ms": 16.533000394701958,
+      "drain": {
+        "after": {
+          "fsm_free_pages": 152,
+          "index_bytes": 3121152,
+          "ms": 10.907958261668682,
+          "phase": "drain",
+          "rows": 50294,
+          "segments": {
+            "buffer_docs": 90,
+            "dead_docs": 5394,
+            "docs": 55598,
+            "immutable": 12,
+            "live_pages": 206,
+            "max_generation": 5744
+          },
+          "t": 45.31534385681152,
+          "table_bytes": 6897664,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 0,
+            "n_live_tup": 50294,
+            "n_tup_del": 2873,
+            "n_tup_ins": 53167,
+            "n_tup_upd": 2911,
+            "vacuum_count": 7
+          },
+          "wal_lsn": "0/36AB648"
+        },
+        "before": {
+          "fsm_free_pages": 159,
+          "index_bytes": 3121152,
+          "ms": 13.12608364969492,
+          "phase": "drain",
+          "rows": 50294,
+          "segments": {
+            "buffer_docs": 90,
+            "dead_docs": 4799,
+            "docs": 55598,
+            "immutable": 12,
+            "live_pages": 203,
+            "max_generation": 5744
+          },
+          "t": 45.22993493080139,
+          "table_bytes": 6897664,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 713,
+            "n_live_tup": 50299,
+            "n_tup_del": 2873,
+            "n_tup_ins": 53167,
+            "n_tup_upd": 2911,
+            "vacuum_count": 5
+          },
+          "wal_lsn": "0/3697000"
+        },
+        "vacuums": 2
+      },
+      "verification": [],
+      "source_commit": "caa20330ecd622f67de4ecea6ff14692d63d7818",
+      "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+      "harness_sha256": "96bdf1ea137fd5a67fa16111cb4ef24390d063718d5cab85ee399c673a990b97",
+      "fixture_sha256": "548136aec5a6708156cd0f8479713b51587c8037b1ad189a18aeed0d79ffd418",
+      "started_at": "2026-09-19T06:55:34.334821+00:00"
+    },
+    {
+      "fixture": "short",
+      "case": "round1-rate200-writers2",
+      "rows": 50000,
+      "body_repeat": 1,
+      "seconds": 45,
+      "offered_reads": 500,
+      "offered_writes": 200,
+      "writers": 2,
+      "affected_rows": {
+        "delete": {
+          "affected": 2918,
+          "completed": 2991,
+          "noops": 73
+        },
+        "insert": {
+          "affected": 3026,
+          "completed": 3026,
+          "noops": 0
+        },
+        "update": {
+          "affected": 2832,
+          "completed": 2917,
+          "noops": 85
+        }
+      },
+      "reader": {
+        "completed": 22130,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 17.978,
+            "p50_ms": 0.3199999999999994,
+            "p95_ms": 1.394,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.5749999999999997
+          },
+          "lag_p95_ms": 5.266,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 18.402,
+            "p50_ms": 1.478,
+            "p95_ms": 5.849,
+            "p99_insufficient_samples": false,
+            "p99_ms": 9.252
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 10.088999999999999,
+            "p50_ms": 0.5800000000000001,
+            "p95_ms": 1.8840000000000003,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.8810000000000002
+          },
+          "lag_p95_ms": 5.552,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 16.586,
+            "p50_ms": 1.917,
+            "p95_ms": 6.554,
+            "p99_insufficient_samples": false,
+            "p99_ms": 9.349
+          }
+        },
+        "logged": 22130,
+        "nominal_arrivals": 22500,
+        "overall": {
+          "execution": {
+            "completed": 22130,
+            "max_ms": 54.611,
+            "p50_ms": 0.40300000000000047,
+            "p95_ms": 2.075,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3.628
+          },
+          "lag_p95_ms": 5.005,
+          "scheduled": {
+            "completed": 22130,
+            "max_ms": 61.41,
+            "p50_ms": 1.688,
+            "p95_ms": 5.913,
+            "p99_insufficient_samples": false,
+            "p99_ms": 9.16
+          }
+        },
+        "rate": 500
+      },
+      "writer": {
+        "completed": 8934,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 893,
+            "max_ms": 30.569000000000003,
+            "p50_ms": 0.31899999999999995,
+            "p95_ms": 1.152,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 8.53,
+          "scheduled": {
+            "completed": 893,
+            "max_ms": 31.603,
+            "p50_ms": 2.575,
+            "p95_ms": 9.613,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 893,
+            "max_ms": 4.003,
+            "p50_ms": 0.20000000000000018,
+            "p95_ms": 0.7279999999999998,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 8.416,
+          "scheduled": {
+            "completed": 893,
+            "max_ms": 10.978,
+            "p50_ms": 2.428,
+            "p95_ms": 9.067,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "logged": 8934,
+        "nominal_arrivals": 9000,
+        "overall": {
+          "execution": {
+            "completed": 8934,
+            "max_ms": 53.336999999999996,
+            "p50_ms": 0.238,
+            "p95_ms": 0.8089999999999999,
+            "p99_insufficient_samples": false,
+            "p99_ms": 6.057
+          },
+          "lag_p95_ms": 8.46,
+          "scheduled": {
+            "completed": 8934,
+            "max_ms": 67.347,
+            "p50_ms": 2.305,
+            "p95_ms": 9.079,
+            "p99_insufficient_samples": false,
+            "p99_ms": 10.998
+          }
+        },
+        "rate": 200
+      },
+      "vacuums_during_writes": 4,
+      "oracle_rounds_during_writes": 2,
+      "oracle_query_checks": 18,
+      "missed_maintenance_slots": 0,
+      "max_traffic_vacuum_ms": 17.89699960500002,
+      "drain": {
+        "after": {
+          "fsm_free_pages": 158,
+          "index_bytes": 3121152,
+          "ms": 10.52683312445879,
+          "phase": "drain",
+          "rows": 50108,
+          "segments": {
+            "buffer_docs": 122,
+            "dead_docs": 5360,
+            "docs": 55346,
+            "immutable": 11,
+            "live_pages": 203,
+            "max_generation": 5519
+          },
+          "t": 45.29878783226013,
+          "table_bytes": 6881280,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 0,
+            "n_live_tup": 50108,
+            "n_tup_del": 2918,
+            "n_tup_ins": 53026,
+            "n_tup_upd": 2832,
+            "vacuum_count": 7
+          },
+          "wal_lsn": "0/55C4658"
+        },
+        "before": {
+          "fsm_free_pages": 163,
+          "index_bytes": 3121152,
+          "ms": 11.710790917277336,
+          "phase": "drain",
+          "rows": 50108,
+          "segments": {
+            "buffer_docs": 122,
+            "dead_docs": 4791,
+            "docs": 55346,
+            "immutable": 11,
+            "live_pages": 200,
+            "max_generation": 5519
+          },
+          "t": 45.226423025131226,
+          "table_bytes": 6881280,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 634,
+            "n_live_tup": 50105,
+            "n_tup_del": 2918,
+            "n_tup_ins": 53026,
+            "n_tup_upd": 2832,
+            "vacuum_count": 5
+          },
+          "wal_lsn": "0/55B0EE8"
+        },
+        "vacuums": 2
+      },
+      "verification": [],
+      "source_commit": "46df12b3c4550b5c61b94f99e321fd8bceb26e67",
+      "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+      "harness_sha256": "96bdf1ea137fd5a67fa16111cb4ef24390d063718d5cab85ee399c673a990b97",
+      "fixture_sha256": "548136aec5a6708156cd0f8479713b51587c8037b1ad189a18aeed0d79ffd418",
+      "started_at": "2026-09-19T06:56:21.884046+00:00"
+    },
+    {
+      "fixture": "short",
+      "case": "round1-rate2000-writers1",
+      "rows": 50000,
+      "body_repeat": 1,
+      "seconds": 45,
+      "offered_reads": 500,
+      "offered_writes": 2000,
+      "writers": 1,
+      "affected_rows": {
+        "delete": {
+          "affected": 24411,
+          "completed": 29934,
+          "noops": 5523
+        },
+        "insert": {
+          "affected": 30226,
+          "completed": 30226,
+          "noops": 0
+        },
+        "update": {
+          "affected": 24094,
+          "completed": 29668,
+          "noops": 5574
+        }
+      },
+      "reader": {
+        "completed": 22130,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 1.7739999999999998,
+            "p50_ms": 0.14800000000000002,
+            "p95_ms": 1.26,
+            "p99_insufficient_samples": false,
+            "p99_ms": 1.6319999999999997
+          },
+          "lag_p95_ms": 5.575,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 10.548,
+            "p50_ms": 1.524,
+            "p95_ms": 5.926,
+            "p99_insufficient_samples": false,
+            "p99_ms": 7.96
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 3.6189999999999998,
+            "p50_ms": 0.8699999999999999,
+            "p95_ms": 2.435,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3.007
+          },
+          "lag_p95_ms": 4.579,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 12.743,
+            "p50_ms": 2.127,
+            "p95_ms": 5.656,
+            "p99_insufficient_samples": false,
+            "p99_ms": 9.078
+          }
+        },
+        "logged": 22130,
+        "nominal_arrivals": 22500,
+        "overall": {
+          "execution": {
+            "completed": 22130,
+            "max_ms": 21.744,
+            "p50_ms": 0.55,
+            "p95_ms": 4.311,
+            "p99_insufficient_samples": false,
+            "p99_ms": 13.786000000000001
+          },
+          "lag_p95_ms": 13.752,
+          "scheduled": {
+            "completed": 22130,
+            "max_ms": 67.973,
+            "p50_ms": 2.531,
+            "p95_ms": 16.745,
+            "p99_insufficient_samples": false,
+            "p99_ms": 29.703
+          }
+        },
+        "rate": 500
+      },
+      "writer": {
+        "completed": 89828,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 8982,
+            "max_ms": 10.228000000000009,
+            "p50_ms": 0.07899999999997931,
+            "p95_ms": 2.0139999999999816,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.328000000000003
+          },
+          "lag_p95_ms": 304.602,
+          "scheduled": {
+            "completed": 8982,
+            "max_ms": 317.425,
+            "p50_ms": 123.928,
+            "p95_ms": 305.159,
+            "p99_insufficient_samples": false,
+            "p99_ms": 313.436
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 8982,
+            "max_ms": 4.345,
+            "p50_ms": 0.08200000000000002,
+            "p95_ms": 0.15699999999999997,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.453
+          },
+          "lag_p95_ms": 1.553,
+          "scheduled": {
+            "completed": 8982,
+            "max_ms": 7.275,
+            "p50_ms": 0.301,
+            "p95_ms": 1.934,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3.527
+          }
+        },
+        "logged": 89828,
+        "nominal_arrivals": 90000,
+        "overall": {
+          "execution": {
+            "completed": 89828,
+            "max_ms": 29.739999999999952,
+            "p50_ms": 0.07999999999999999,
+            "p95_ms": 2.2590000000000146,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.8500000000001364
+          },
+          "lag_p95_ms": 1100.336,
+          "scheduled": {
+            "completed": 89828,
+            "max_ms": 1163.018,
+            "p50_ms": 3.398,
+            "p95_ms": 1100.864,
+            "p99_insufficient_samples": false,
+            "p99_ms": 1138.96
+          }
+        },
+        "rate": 2000
+      },
+      "vacuums_during_writes": 4,
+      "oracle_rounds_during_writes": 2,
+      "oracle_query_checks": 18,
+      "missed_maintenance_slots": 0,
+      "max_traffic_vacuum_ms": 34.11250002682209,
+      "drain": {
+        "after": {
+          "fsm_free_pages": 529,
+          "index_bytes": 7208960,
+          "ms": 10.413874872028828,
+          "phase": "drain",
+          "rows": 55815,
+          "segments": {
+            "buffer_docs": 22,
+            "dead_docs": 10748,
+            "docs": 66541,
+            "immutable": 9,
+            "live_pages": 274,
+            "max_generation": 49883
+          },
+          "t": 45.32569599151611,
+          "table_bytes": 8224768,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 0,
+            "n_live_tup": 55815,
+            "n_tup_del": 24411,
+            "n_tup_ins": 80226,
+            "n_tup_upd": 24094,
+            "vacuum_count": 7
+          },
+          "wal_lsn": "0/946DD50"
+        },
+        "before": {
+          "fsm_free_pages": 252,
+          "index_bytes": 7208960,
+          "ms": 13.942291960120201,
+          "phase": "drain",
+          "rows": 55815,
+          "segments": {
+            "buffer_docs": 22,
+            "dead_docs": 6246,
+            "docs": 67776,
+            "immutable": 16,
+            "live_pages": 281,
+            "max_generation": 49883
+          },
+          "t": 45.24554705619812,
+          "table_bytes": 8224768,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 5767,
+            "n_live_tup": 55825,
+            "n_tup_del": 24411,
+            "n_tup_ins": 80226,
+            "n_tup_upd": 24094,
+            "vacuum_count": 5
+          },
+          "wal_lsn": "0/93F6850"
+        },
+        "vacuums": 2
+      },
+      "verification": [],
+      "source_commit": "46df12b3c4550b5c61b94f99e321fd8bceb26e67",
+      "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+      "harness_sha256": "96bdf1ea137fd5a67fa16111cb4ef24390d063718d5cab85ee399c673a990b97",
+      "fixture_sha256": "548136aec5a6708156cd0f8479713b51587c8037b1ad189a18aeed0d79ffd418",
+      "started_at": "2026-09-19T06:57:09.343878+00:00"
+    },
+    {
+      "fixture": "short",
+      "case": "round1-rate2000-writers2",
+      "rows": 50000,
+      "body_repeat": 1,
+      "seconds": 45,
+      "offered_reads": 500,
+      "offered_writes": 2000,
+      "writers": 2,
+      "affected_rows": {
+        "delete": {
+          "affected": 24322,
+          "completed": 29877,
+          "noops": 5555
+        },
+        "insert": {
+          "affected": 29748,
+          "completed": 29748,
+          "noops": 0
+        },
+        "update": {
+          "affected": 24150,
+          "completed": 29787,
+          "noops": 5637
+        }
+      },
+      "reader": {
+        "completed": 22130,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 5.452,
+            "p50_ms": 0.1629999999999998,
+            "p95_ms": 1.4740000000000002,
+            "p99_insufficient_samples": false,
+            "p99_ms": 4.915
+          },
+          "lag_p95_ms": 5.31,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 10.851,
+            "p50_ms": 1.511,
+            "p95_ms": 6.072,
+            "p99_insufficient_samples": false,
+            "p99_ms": 8.325
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 3.374,
+            "p50_ms": 0.8590000000000002,
+            "p95_ms": 2.3890000000000002,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.897
+          },
+          "lag_p95_ms": 4.695,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 10.219,
+            "p50_ms": 2.147,
+            "p95_ms": 5.812,
+            "p99_insufficient_samples": false,
+            "p99_ms": 7.9
+          }
+        },
+        "logged": 22130,
+        "nominal_arrivals": 22500,
+        "overall": {
+          "execution": {
+            "completed": 22130,
+            "max_ms": 17.403000000000002,
+            "p50_ms": 0.5969999999999995,
+            "p95_ms": 5.357,
+            "p99_insufficient_samples": false,
+            "p99_ms": 13.453
+          },
+          "lag_p95_ms": 13.512,
+          "scheduled": {
+            "completed": 22130,
+            "max_ms": 69.411,
+            "p50_ms": 2.611,
+            "p95_ms": 16.289,
+            "p99_insufficient_samples": false,
+            "p99_ms": 29.254
+          }
+        },
+        "rate": 500
+      },
+      "writer": {
+        "completed": 89412,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 8941,
+            "max_ms": 7.970000000000001,
+            "p50_ms": 0.07899999999999996,
+            "p95_ms": 3.8569999999999993,
+            "p99_insufficient_samples": false,
+            "p99_ms": 4.9140000000000015
+          },
+          "lag_p95_ms": 138.719,
+          "scheduled": {
+            "completed": 8941,
+            "max_ms": 178.344,
+            "p50_ms": 10.71,
+            "p95_ms": 139.893,
+            "p99_insufficient_samples": false,
+            "p99_ms": 158.458
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 8941,
+            "max_ms": 9.203000000000001,
+            "p50_ms": 0.08300000000000007,
+            "p95_ms": 0.18599999999999994,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.888
+          },
+          "lag_p95_ms": 1.821,
+          "scheduled": {
+            "completed": 8941,
+            "max_ms": 10.1,
+            "p50_ms": 0.455,
+            "p95_ms": 2.308,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3.748
+          }
+        },
+        "logged": 89412,
+        "nominal_arrivals": 90000,
+        "overall": {
+          "execution": {
+            "completed": 89412,
+            "max_ms": 25.353,
+            "p50_ms": 0.08499999999999996,
+            "p95_ms": 3.7179999999999964,
+            "p99_insufficient_samples": false,
+            "p99_ms": 4.784000000000006
+          },
+          "lag_p95_ms": 35.633,
+          "scheduled": {
+            "completed": 89412,
+            "max_ms": 178.344,
+            "p50_ms": 1.245,
+            "p95_ms": 36.747,
+            "p99_insufficient_samples": false,
+            "p99_ms": 122.485
+          }
+        },
+        "rate": 2000
+      },
+      "vacuums_during_writes": 4,
+      "oracle_rounds_during_writes": 2,
+      "oracle_query_checks": 18,
+      "missed_maintenance_slots": 0,
+      "max_traffic_vacuum_ms": 35.60750000178814,
+      "drain": {
+        "after": {
+          "fsm_free_pages": 516,
+          "index_bytes": 7077888,
+          "ms": 11.098207905888557,
+          "phase": "drain",
+          "rows": 55426,
+          "segments": {
+            "buffer_docs": 34,
+            "dead_docs": 10792,
+            "docs": 66184,
+            "immutable": 9,
+            "live_pages": 273,
+            "max_generation": 49378
+          },
+          "t": 45.35278797149658,
+          "table_bytes": 8134656,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 0,
+            "n_live_tup": 55426,
+            "n_tup_del": 24322,
+            "n_tup_ins": 79748,
+            "n_tup_upd": 24150,
+            "vacuum_count": 7
+          },
+          "wal_lsn": "0/D2BAF18"
+        },
+        "before": {
+          "fsm_free_pages": 238,
+          "index_bytes": 7077888,
+          "ms": 14.155625365674496,
+          "phase": "drain",
+          "rows": 55426,
+          "segments": {
+            "buffer_docs": 34,
+            "dead_docs": 6127,
+            "docs": 67213,
+            "immutable": 16,
+            "live_pages": 278,
+            "max_generation": 49378
+          },
+          "t": 45.26786017417908,
+          "table_bytes": 8134656,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 6830,
+            "n_live_tup": 55409,
+            "n_tup_del": 24322,
+            "n_tup_ins": 79748,
+            "n_tup_upd": 24150,
+            "vacuum_count": 5
+          },
+          "wal_lsn": "0/D244990"
+        },
+        "vacuums": 2
+      },
+      "verification": [],
+      "source_commit": "46df12b3c4550b5c61b94f99e321fd8bceb26e67",
+      "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+      "harness_sha256": "99bbe7cd644faa864372f04f0d2c88e9979799e3e5ba0445b86deb96ad73c5d6",
+      "fixture_sha256": "548136aec5a6708156cd0f8479713b51587c8037b1ad189a18aeed0d79ffd418",
+      "started_at": "2026-09-19T06:57:56.927550+00:00"
+    },
+    {
+      "fixture": "short",
+      "case": "round1-rate8000-writers1",
+      "rows": 50000,
+      "body_repeat": 1,
+      "seconds": 45,
+      "offered_reads": 500,
+      "offered_writes": 8000,
+      "writers": 1,
+      "affected_rows": {
+        "delete": {
+          "affected": 5003,
+          "completed": 14767,
+          "noops": 9764
+        },
+        "insert": {
+          "affected": 14919,
+          "completed": 14919,
+          "noops": 0
+        },
+        "update": {
+          "affected": 4983,
+          "completed": 14819,
+          "noops": 9836
+        }
+      },
+      "reader": {
+        "completed": 22130,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 1.629,
+            "p50_ms": 0.11099999999999999,
+            "p95_ms": 0.6199999999999992,
+            "p99_insufficient_samples": false,
+            "p99_ms": 1.0320000000000003
+          },
+          "lag_p95_ms": 5.233,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 10.097,
+            "p50_ms": 1.304,
+            "p95_ms": 5.417,
+            "p99_insufficient_samples": false,
+            "p99_ms": 7.719
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 2.2960000000000003,
+            "p50_ms": 0.3460000000000003,
+            "p95_ms": 1.5739999999999998,
+            "p99_insufficient_samples": false,
+            "p99_ms": 1.98
+          },
+          "lag_p95_ms": 5.794,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 10.633,
+            "p50_ms": 1.727,
+            "p95_ms": 6.385,
+            "p99_insufficient_samples": false,
+            "p99_ms": 9.326
+          }
+        },
+        "logged": 22130,
+        "nominal_arrivals": 22500,
+        "overall": {
+          "execution": {
+            "completed": 22130,
+            "max_ms": 10.059000000000001,
+            "p50_ms": 0.244,
+            "p95_ms": 1.522,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.0580000000000003
+          },
+          "lag_p95_ms": 4.965,
+          "scheduled": {
+            "completed": 22130,
+            "max_ms": 14.128,
+            "p50_ms": 1.488,
+            "p95_ms": 5.391,
+            "p99_insufficient_samples": false,
+            "p99_ms": 8.276
+          }
+        },
+        "rate": 500
+      },
+      "writer": {
+        "completed": 44505,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 4450,
+            "max_ms": 6.098999999999933,
+            "p50_ms": 0.11699999999973443,
+            "p95_ms": 2.1550000000002,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.5349999999998545
+          },
+          "lag_p95_ms": 3665.733,
+          "scheduled": {
+            "completed": 4450,
+            "max_ms": 3828.812,
+            "p50_ms": 1913.056,
+            "p95_ms": 3665.843,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3807.95
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 4450,
+            "max_ms": 24.129000000000815,
+            "p50_ms": 0.0989999999947031,
+            "p95_ms": 2.1310000000012224,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.5709999999962747
+          },
+          "lag_p95_ms": 39218.295,
+          "scheduled": {
+            "completed": 4450,
+            "max_ms": 39416.638,
+            "p50_ms": 37819.215,
+            "p95_ms": 39220.308,
+            "p99_insufficient_samples": false,
+            "p99_ms": 39377.273
+          }
+        },
+        "logged": 44505,
+        "nominal_arrivals": 360000,
+        "overall": {
+          "execution": {
+            "completed": 44505,
+            "max_ms": 25.077000000001135,
+            "p50_ms": 0.12800000000061118,
+            "p95_ms": 2.526000000001659,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3.083999999998923
+          },
+          "lag_p95_ms": 37817.311,
+          "scheduled": {
+            "completed": 44505,
+            "max_ms": 39416.638,
+            "p50_ms": 20252.663,
+            "p95_ms": 37819.215,
+            "p99_insufficient_samples": false,
+            "p99_ms": 39057.329
+          }
+        },
+        "rate": 8000
+      },
+      "vacuums_during_writes": 4,
+      "oracle_rounds_during_writes": 2,
+      "oracle_query_checks": 18,
+      "missed_maintenance_slots": 0,
+      "max_traffic_vacuum_ms": 21.01920824497938,
+      "drain": {
+        "after": {
+          "fsm_free_pages": 155,
+          "index_bytes": 3489792,
+          "ms": 10.419790633022785,
+          "phase": "drain",
+          "rows": 59916,
+          "segments": {
+            "buffer_docs": 77,
+            "dead_docs": 8076,
+            "docs": 67915,
+            "immutable": 12,
+            "live_pages": 249,
+            "max_generation": 19352
+          },
+          "t": 45.32809495925903,
+          "table_bytes": 8216576,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 0,
+            "n_live_tup": 59916,
+            "n_tup_del": 5003,
+            "n_tup_ins": 64919,
+            "n_tup_upd": 4983,
+            "vacuum_count": 7
+          },
+          "wal_lsn": "0/F9AFF28"
+        },
+        "before": {
+          "fsm_free_pages": 58,
+          "index_bytes": 3489792,
+          "ms": 16.708416864275932,
+          "phase": "drain",
+          "rows": 59916,
+          "segments": {
+            "buffer_docs": 77,
+            "dead_docs": 6682,
+            "docs": 67915,
+            "immutable": 12,
+            "live_pages": 246,
+            "max_generation": 19352
+          },
+          "t": 45.2504141330719,
+          "table_bytes": 8216576,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 1394,
+            "n_live_tup": 59917,
+            "n_tup_del": 5003,
+            "n_tup_ins": 64919,
+            "n_tup_upd": 4983,
+            "vacuum_count": 5
+          },
+          "wal_lsn": "0/F98D908"
+        },
+        "vacuums": 2
+      },
+      "verification": [],
+      "source_commit": "46df12b3c4550b5c61b94f99e321fd8bceb26e67",
+      "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+      "harness_sha256": "99bbe7cd644faa864372f04f0d2c88e9979799e3e5ba0445b86deb96ad73c5d6",
+      "fixture_sha256": "548136aec5a6708156cd0f8479713b51587c8037b1ad189a18aeed0d79ffd418",
+      "started_at": "2026-09-19T06:58:44.577918+00:00"
+    },
+    {
+      "fixture": "short",
+      "case": "round1-rate8000-writers2",
+      "rows": 50000,
+      "body_repeat": 1,
+      "seconds": 45,
+      "offered_reads": 500,
+      "offered_writes": 8000,
+      "writers": 2,
+      "affected_rows": {
+        "delete": {
+          "affected": 5239,
+          "completed": 15570,
+          "noops": 10331
+        },
+        "insert": {
+          "affected": 15685,
+          "completed": 15685,
+          "noops": 0
+        },
+        "update": {
+          "affected": 5354,
+          "completed": 15579,
+          "noops": 10225
+        }
+      },
+      "reader": {
+        "completed": 22130,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 1.2810000000000001,
+            "p50_ms": 0.11300000000000043,
+            "p95_ms": 0.6499999999999999,
+            "p99_insufficient_samples": false,
+            "p99_ms": 1.0999999999999999
+          },
+          "lag_p95_ms": 5.285,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 10.32,
+            "p50_ms": 1.41,
+            "p95_ms": 5.595,
+            "p99_insufficient_samples": false,
+            "p99_ms": 8.037
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 2213,
+            "max_ms": 4.44,
+            "p50_ms": 0.3929999999999998,
+            "p95_ms": 1.533,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.287
+          },
+          "lag_p95_ms": 5.042,
+          "scheduled": {
+            "completed": 2213,
+            "max_ms": 10.576,
+            "p50_ms": 1.517,
+            "p95_ms": 5.649,
+            "p99_insufficient_samples": false,
+            "p99_ms": 8.649
+          }
+        },
+        "logged": 22130,
+        "nominal_arrivals": 22500,
+        "overall": {
+          "execution": {
+            "completed": 22130,
+            "max_ms": 9.766,
+            "p50_ms": 0.265,
+            "p95_ms": 1.5620000000000003,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2.1779999999999995
+          },
+          "lag_p95_ms": 4.861,
+          "scheduled": {
+            "completed": 22130,
+            "max_ms": 16.799,
+            "p50_ms": 1.469,
+            "p95_ms": 5.367,
+            "p99_insufficient_samples": false,
+            "p99_ms": 8.376
+          }
+        },
+        "rate": 500
+      },
+      "writer": {
+        "completed": 46834,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 4683,
+            "max_ms": 8.039000000000215,
+            "p50_ms": 0.13000000000010914,
+            "p95_ms": 4.113000000000056,
+            "p99_insufficient_samples": false,
+            "p99_ms": 4.787
+          },
+          "lag_p95_ms": 3534.684,
+          "scheduled": {
+            "completed": 4683,
+            "max_ms": 3892.558,
+            "p50_ms": 1875.194,
+            "p95_ms": 3535.05,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3817.888
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 4683,
+            "max_ms": 10.25,
+            "p50_ms": 0.12199999999575084,
+            "p95_ms": 5.177000000003318,
+            "p99_insufficient_samples": false,
+            "p99_ms": 5.952000000004773
+          },
+          "lag_p95_ms": 38864.953,
+          "scheduled": {
+            "completed": 4683,
+            "max_ms": 39104.289,
+            "p50_ms": 37159.217,
+            "p95_ms": 38869.769,
+            "p99_insufficient_samples": false,
+            "p99_ms": 39029.802
+          }
+        },
+        "logged": 46834,
+        "nominal_arrivals": 360000,
+        "overall": {
+          "execution": {
+            "completed": 46834,
+            "max_ms": 23.92000000000189,
+            "p50_ms": 0.13999999999941792,
+            "p95_ms": 5.030999999995402,
+            "p99_insufficient_samples": false,
+            "p99_ms": 5.95499999999447
+          },
+          "lag_p95_ms": 37156.906,
+          "scheduled": {
+            "completed": 46834,
+            "max_ms": 39104.289,
+            "p50_ms": 19734.307,
+            "p95_ms": 37159.217,
+            "p99_insufficient_samples": false,
+            "p99_ms": 38625.481
+          }
+        },
+        "rate": 8000
+      },
+      "vacuums_during_writes": 4,
+      "oracle_rounds_during_writes": 2,
+      "oracle_query_checks": 18,
+      "missed_maintenance_slots": 0,
+      "max_traffic_vacuum_ms": 21.309416741132736,
+      "drain": {
+        "after": {
+          "fsm_free_pages": 169,
+          "index_bytes": 3629056,
+          "ms": 14.819291420280933,
+          "phase": "drain",
+          "rows": 60446,
+          "segments": {
+            "buffer_docs": 137,
+            "dead_docs": 8393,
+            "docs": 68702,
+            "immutable": 12,
+            "live_pages": 252,
+            "max_generation": 20440
+          },
+          "t": 45.4281370639801,
+          "table_bytes": 8273920,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 0,
+            "n_live_tup": 60446,
+            "n_tup_del": 5239,
+            "n_tup_ins": 65685,
+            "n_tup_upd": 5354,
+            "vacuum_count": 7
+          },
+          "wal_lsn": "0/12158908"
+        },
+        "before": {
+          "fsm_free_pages": 69,
+          "index_bytes": 3629056,
+          "ms": 18.804792314767838,
+          "phase": "drain",
+          "rows": 60446,
+          "segments": {
+            "buffer_docs": 137,
+            "dead_docs": 7100,
+            "docs": 68702,
+            "immutable": 12,
+            "live_pages": 249,
+            "max_generation": 20440
+          },
+          "t": 45.32058811187744,
+          "table_bytes": 8273920,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 1502,
+            "n_live_tup": 60627,
+            "n_tup_del": 5239,
+            "n_tup_ins": 65685,
+            "n_tup_upd": 5354,
+            "vacuum_count": 5
+          },
+          "wal_lsn": "0/12136478"
+        },
+        "vacuums": 2
+      },
+      "verification": [],
+      "source_commit": "46df12b3c4550b5c61b94f99e321fd8bceb26e67",
+      "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+      "harness_sha256": "99bbe7cd644faa864372f04f0d2c88e9979799e3e5ba0445b86deb96ad73c5d6",
+      "fixture_sha256": "548136aec5a6708156cd0f8479713b51587c8037b1ad189a18aeed0d79ffd418",
+      "started_at": "2026-09-19T06:59:32.187351+00:00"
+    },
+    {
+      "fixture": "long",
+      "case": "round1-rate200-writers2",
+      "rows": 10000,
+      "body_repeat": 20,
+      "seconds": 45,
+      "offered_reads": 100,
+      "offered_writes": 200,
+      "writers": 2,
+      "affected_rows": {
+        "delete": {
+          "affected": 2665,
+          "completed": 2991,
+          "noops": 326
+        },
+        "insert": {
+          "affected": 3026,
+          "completed": 3026,
+          "noops": 0
+        },
+        "update": {
+          "affected": 2576,
+          "completed": 2917,
+          "noops": 341
+        }
+      },
+      "reader": {
+        "completed": 4467,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 446,
+            "max_ms": 3.1679999999999993,
+            "p50_ms": 0.3200000000000003,
+            "p95_ms": 1.1560000000000001,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 10.014,
+          "scheduled": {
+            "completed": 446,
+            "max_ms": 11.594,
+            "p50_ms": 3.979,
+            "p95_ms": 10.453,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 446,
+            "max_ms": 9.314,
+            "p50_ms": 0.875,
+            "p95_ms": 4.598,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 10.006,
+          "scheduled": {
+            "completed": 446,
+            "max_ms": 17.264,
+            "p50_ms": 4.603,
+            "p95_ms": 11.84,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "logged": 4467,
+        "nominal_arrivals": 4500,
+        "overall": {
+          "execution": {
+            "completed": 4467,
+            "max_ms": 23.244,
+            "p50_ms": 0.5590000000000002,
+            "p95_ms": 3.6029999999999998,
+            "p99_insufficient_samples": false,
+            "p99_ms": 6.385999999999999
+          },
+          "lag_p95_ms": 10.008,
+          "scheduled": {
+            "completed": 4467,
+            "max_ms": 31.655,
+            "p50_ms": 4.105,
+            "p95_ms": 10.88,
+            "p99_insufficient_samples": false,
+            "p99_ms": 13.432
+          }
+        },
+        "rate": 100
+      },
+      "writer": {
+        "completed": 8934,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 893,
+            "max_ms": 13.836,
+            "p50_ms": 0.2469999999999999,
+            "p95_ms": 5.688000000000001,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 9.721,
+          "scheduled": {
+            "completed": 893,
+            "max_ms": 20.806,
+            "p50_ms": 3.469,
+            "p95_ms": 11.113,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 893,
+            "max_ms": 13.802000000000001,
+            "p50_ms": 0.46300000000000097,
+            "p95_ms": 0.9979999999999993,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 8.594,
+          "scheduled": {
+            "completed": 893,
+            "max_ms": 15.086,
+            "p50_ms": 2.723,
+            "p95_ms": 9.281,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "logged": 8934,
+        "nominal_arrivals": 9000,
+        "overall": {
+          "execution": {
+            "completed": 8934,
+            "max_ms": 30.285999999999998,
+            "p50_ms": 0.31400000000000006,
+            "p95_ms": 4.763,
+            "p99_insufficient_samples": false,
+            "p99_ms": 9.651
+          },
+          "lag_p95_ms": 8.703,
+          "scheduled": {
+            "completed": 8934,
+            "max_ms": 37.049,
+            "p50_ms": 2.738,
+            "p95_ms": 10.211,
+            "p99_insufficient_samples": false,
+            "p99_ms": 14.5
+          }
+        },
+        "rate": 200
+      },
+      "vacuums_during_writes": 4,
+      "oracle_rounds_during_writes": 2,
+      "oracle_query_checks": 18,
+      "missed_maintenance_slots": 0,
+      "max_traffic_vacuum_ms": 16.724458895623684,
+      "drain": {
+        "after": {
+          "fsm_free_pages": 61,
+          "index_bytes": 4620288,
+          "ms": 9.234166704118252,
+          "phase": "drain",
+          "rows": 10361,
+          "segments": {
+            "buffer_docs": 92,
+            "dead_docs": 4931,
+            "docs": 15200,
+            "immutable": 12,
+            "live_pages": 475,
+            "max_generation": 5489
+          },
+          "t": 45.33523416519165,
+          "table_bytes": 20086784,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 0,
+            "n_live_tup": 10361,
+            "n_tup_del": 2665,
+            "n_tup_ins": 13026,
+            "n_tup_upd": 2576,
+            "vacuum_count": 7
+          },
+          "wal_lsn": "0/4DDDBC0"
+        },
+        "before": {
+          "fsm_free_pages": 67,
+          "index_bytes": 4620288,
+          "ms": 10.716624557971954,
+          "phase": "drain",
+          "rows": 10361,
+          "segments": {
+            "buffer_docs": 92,
+            "dead_docs": 4349,
+            "docs": 15200,
+            "immutable": 12,
+            "live_pages": 473,
+            "max_generation": 5489
+          },
+          "t": 45.26828384399414,
+          "table_bytes": 20094976,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 658,
+            "n_live_tup": 10362,
+            "n_tup_del": 2665,
+            "n_tup_ins": 13026,
+            "n_tup_upd": 2576,
+            "vacuum_count": 5
+          },
+          "wal_lsn": "0/4DBE198"
+        },
+        "vacuums": 2
+      },
+      "verification": [],
+      "source_commit": "46df12b3c4550b5c61b94f99e321fd8bceb26e67",
+      "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+      "harness_sha256": "99bbe7cd644faa864372f04f0d2c88e9979799e3e5ba0445b86deb96ad73c5d6",
+      "fixture_sha256": "7229d12d23d51442e18a4dc50c0e773813a6b696b56fcd0e812045334092e9ea",
+      "started_at": "2026-09-19T07:00:20.909632+00:00"
+    },
+    {
+      "fixture": "long",
+      "case": "round1-rate2000-writers2",
+      "rows": 10000,
+      "body_repeat": 20,
+      "seconds": 45,
+      "offered_reads": 100,
+      "offered_writes": 2000,
+      "writers": 2,
+      "affected_rows": {
+        "delete": {
+          "affected": 12302,
+          "completed": 22946,
+          "noops": 10644
+        },
+        "insert": {
+          "affected": 22799,
+          "completed": 22799,
+          "noops": 0
+        },
+        "update": {
+          "affected": 12417,
+          "completed": 22982,
+          "noops": 10565
+        }
+      },
+      "reader": {
+        "completed": 4467,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 446,
+            "max_ms": 1.2550000000000008,
+            "p50_ms": 0.16800000000000015,
+            "p95_ms": 0.6719999999999988,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 10.008,
+          "scheduled": {
+            "completed": 446,
+            "max_ms": 11.263,
+            "p50_ms": 4.909,
+            "p95_ms": 10.295,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 446,
+            "max_ms": 6.568999999999999,
+            "p50_ms": 0.6140000000000003,
+            "p95_ms": 3.7169999999999987,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          },
+          "lag_p95_ms": 10.006,
+          "scheduled": {
+            "completed": 446,
+            "max_ms": 14.524,
+            "p50_ms": 4.895,
+            "p95_ms": 11.92,
+            "p99_insufficient_samples": true,
+            "p99_ms": null
+          }
+        },
+        "logged": 4467,
+        "nominal_arrivals": 4500,
+        "overall": {
+          "execution": {
+            "completed": 4467,
+            "max_ms": 7.803,
+            "p50_ms": 0.3370000000000015,
+            "p95_ms": 2.979,
+            "p99_insufficient_samples": false,
+            "p99_ms": 4.888999999999999
+          },
+          "lag_p95_ms": 10.007,
+          "scheduled": {
+            "completed": 4467,
+            "max_ms": 17.613,
+            "p50_ms": 4.137,
+            "p95_ms": 10.721,
+            "p99_insufficient_samples": false,
+            "p99_ms": 12.885
+          }
+        },
+        "rate": 100
+      },
+      "writer": {
+        "completed": 68727,
+        "failures": {},
+        "first_decile": {
+          "execution": {
+            "completed": 6872,
+            "max_ms": 9.881000000000029,
+            "p50_ms": 0.25700000000006185,
+            "p95_ms": 3.9540000000001783,
+            "p99_insufficient_samples": false,
+            "p99_ms": 4.502999999999929
+          },
+          "lag_p95_ms": 2774.782,
+          "scheduled": {
+            "completed": 6872,
+            "max_ms": 2917.861,
+            "p50_ms": 1554.167,
+            "p95_ms": 2776.193,
+            "p99_insufficient_samples": false,
+            "p99_ms": 2871.886
+          }
+        },
+        "interpretation": "Poisson nominal arrivals are not exact. Un-emitted arrivals are absent; lag measures client scheduling pressure, not server queue depth.",
+        "last_decile": {
+          "execution": {
+            "completed": 6872,
+            "max_ms": 7.912000000000262,
+            "p50_ms": 0.08499999999912689,
+            "p95_ms": 3.6589999999996508,
+            "p99_insufficient_samples": false,
+            "p99_ms": 3.959999999999127
+          },
+          "lag_p95_ms": 11725.791,
+          "scheduled": {
+            "completed": 6872,
+            "max_ms": 11862.304,
+            "p50_ms": 11081.359,
+            "p95_ms": 11726.396,
+            "p99_insufficient_samples": false,
+            "p99_ms": 11820.658
+          }
+        },
+        "logged": 68727,
+        "nominal_arrivals": 90000,
+        "overall": {
+          "execution": {
+            "completed": 68727,
+            "max_ms": 53.55199999999968,
+            "p50_ms": 0.10499999999956344,
+            "p95_ms": 4.5680000000011205,
+            "p99_insufficient_samples": false,
+            "p99_ms": 5.519999999999527
+          },
+          "lag_p95_ms": 12726.108,
+          "scheduled": {
+            "completed": 68727,
+            "max_ms": 12921.688,
+            "p50_ms": 10995.924,
+            "p95_ms": 12727.313,
+            "p99_insufficient_samples": false,
+            "p99_ms": 12888.805
+          }
+        },
+        "rate": 2000
+      },
+      "vacuums_during_writes": 4,
+      "oracle_rounds_during_writes": 2,
+      "oracle_query_checks": 18,
+      "missed_maintenance_slots": 0,
+      "max_traffic_vacuum_ms": 56.98837526142597,
+      "drain": {
+        "after": {
+          "fsm_free_pages": 1157,
+          "index_bytes": 16629760,
+          "ms": 10.75849961489439,
+          "phase": "drain",
+          "rows": 20497,
+          "segments": {
+            "buffer_docs": 132,
+            "dead_docs": 7405,
+            "docs": 27770,
+            "immutable": 12,
+            "live_pages": 855,
+            "max_generation": 34316
+          },
+          "t": 45.54403805732727,
+          "table_bytes": 45481984,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 0,
+            "n_live_tup": 20497,
+            "n_tup_del": 12302,
+            "n_tup_ins": 32799,
+            "n_tup_upd": 12417,
+            "vacuum_count": 7
+          },
+          "wal_lsn": "0/D6D38A8"
+        },
+        "before": {
+          "fsm_free_pages": 0,
+          "index_bytes": 16531456,
+          "ms": 16.93770755082369,
+          "phase": "drain",
+          "rows": 20497,
+          "segments": {
+            "buffer_docs": 132,
+            "dead_docs": 222,
+            "docs": 27770,
+            "immutable": 12,
+            "live_pages": 844,
+            "max_generation": 34316
+          },
+          "t": 45.458154916763306,
+          "table_bytes": 45481984,
+          "table_stats": {
+            "autovacuum_count": 0,
+            "n_dead_tup": 8093,
+            "n_live_tup": 20596,
+            "n_tup_del": 12302,
+            "n_tup_ins": 32799,
+            "n_tup_upd": 12417,
+            "vacuum_count": 5
+          },
+          "wal_lsn": "0/D616BB8"
+        },
+        "vacuums": 2
+      },
+      "verification": [],
+      "source_commit": "46df12b3c4550b5c61b94f99e321fd8bceb26e67",
+      "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+      "harness_sha256": "99bbe7cd644faa864372f04f0d2c88e9979799e3e5ba0445b86deb96ad73c5d6",
+      "fixture_sha256": "7229d12d23d51442e18a4dc50c0e773813a6b696b56fcd0e812045334092e9ea",
+      "started_at": "2026-09-19T07:01:08.426682+00:00"
+    }
+  ]
+}

@@ -5,10 +5,10 @@
 
 """The sustained-mutation profile of run.py. See docs/benchmarks/harness.md.
 
-A rate-scheduled writer inserts copies of dataset documents under fresh ids,
-deletes existing rows, and rewrites the reserved suffix of existing rows with
-a bundle of query terms so match sets drift, while closed-loop readers run the
-count and ranked shapes. VACUUM (INDEX_CLEANUP ON) runs on a schedule, the
+Rate-scheduled writers insert copies of dataset documents under fresh ids,
+delete existing rows, and rewrite the reserved suffix of existing rows with
+a bundle of query terms so match sets drift. Closed-loop or rate-scheduled
+readers run the count and ranked shapes. VACUUM (INDEX_CLEANUP ON) runs on a schedule, the
 index layout is sampled on a schedule, and every check interval the index's
 answer for each query is compared with a regular-expression sequential scan
 inside one snapshot. Any difference fails the run.
@@ -52,7 +52,7 @@ def drift_bundles(cases):
 
 def writer_scripts(rows, cases, id_ceiling):
     """pgbench scripts per mutation kind. Deletes and updates hit the first live row at or
-    above a random id so every statement touches an existing row while ids stay sparse."""
+    above a random id. Gaps beyond the live range and concurrent deletes can cause no-ops."""
     bundles = drift_bundles(cases)
     choose = " ".join(f"WHEN {i} THEN ' {bundle}'" for i, bundle in enumerate(bundles) if bundle)
     locate = "(SELECT id FROM documents WHERE id >= :id ORDER BY id LIMIT 1)"

@@ -93,3 +93,70 @@ maintenance and drain summaries. Each window retains manifests, plans, SQL,
 pgbench logs, timeline, physical samples, oracle results and verification results.
 The regular PG17/18 × ARM/x86 CI matrix runs a 20-second, two-writer smoke. It
 checks the protocol and correctness, not a hardware-independent timing threshold.
+
+## First local load sweep
+
+Eight 45-second windows passed on native PostgreSQL 18.6, macOS arm64 (16 logical
+CPUs). The release was built from runtime base `4beaaa3`, containing PRs #20/#21;
+its SHA-256 is `aa228e9fdc68319c5ae3ff55c60ab51d75bce0b2bfe959eb67b13f49fcd98472`.
+The parent was subsequently rebased after #20 merged, without changing its tree.
+Per-window identities and measurements are retained in
+[sustained-baseline.json](sustained-baseline.json). Raw artifacts remain locally
+under `benchmarks/results/sustained-short` and `benchmarks/results/sustained-long`.
+
+The short fixture had 50,000 documents and 500 offered reads/sec. The long fixture
+had 10,000 documents, 20× repeated filler, and 100 offered reads/sec. Both used two
+reader connections, equal-weight inserts/deletes/updates, one-second warmup,
+VACUUM every 10 seconds and correctness checks every 15 seconds. These are
+single observations per configuration, not repeated statistical estimates.
+
+| Fixture | Offered writes/s | Writers | Actual row changes/s | Reader scheduled p95 (ms) | Writer lag p95, first → last decile (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| short | 200 | 1 | 199 | 5.6 | 7.6 → 5.1 |
+| short | 200 | 2 | 195 | 5.9 | 8.5 → 8.4 |
+| short | 2000 | 1 | 1750 | 16.7 | 304.6 → 1.6 |
+| short | 2000 | 2 | 1738 | 16.3 | 138.7 → 1.8 |
+| short | 8000 | 1 | 553 | 5.4 | 3665.7 → 39218.3 |
+| short | 8000 | 2 | 584 | 5.4 | 3534.7 → 38865.0 |
+| long | 200 | 2 | 184 | 10.9 | 9.7 → 8.6 |
+| long | 2000 | 2 | 1056 | 10.7 | 2774.8 → 11725.8 |
+
+All eight windows completed at least two VACUUM cycles and one oracle round
+wholly within writer traffic. Across their periodic rounds, all 144 query checks
+passed; final checks, committed row-count accounting and post-drain deep index
+verification also passed. No maintenance scheduling slots were missed. The
+largest observed traffic VACUUM duration was 57 ms. Dead entries remained in some
+segments after drain; successful verification does not mean every tombstone was
+physically removed or that a long-term space bound has been proved.
+
+At 2,000 offered writes/sec, the short fixture completed about 1,740–1,750 actual
+row changes/sec and cleared its early scheduling backlog. At 8,000 offered
+writes/sec, lag grew to roughly 39 seconds. This is overload of the tested system
+and workload, not an isolated index capacity limit: random target selection uses
+an ID ceiling based on offered inserts, and roughly 44% of completed transactions
+were no-ops in those high-rate windows. Each no-op also invokes a shell to record
+its marker. That client overhead and the changing useful-work fraction confound
+high-rate capacity estimates. Reader latency staying low in those cases does not
+mean the requested mutation throughput was delivered.
+
+The longer-document 2,000/sec case also accumulated lag. Repeated filler exercises
+position volume but not realistic vocabulary diversity. Neither synthetic fixture
+establishes a production workload limit, a memory bound or a speedup over GIN.
+
+### Next comparison
+
+Add a shared membership/count workload for Stannum, GIN and optionally GiST,
+with identical document text, mutation mix and maintenance policy. The existing
+GIN adapter currently supports count profiles, not this mutation protocol.
+Measure actual changes/sec, reader tails, WAL, index size and backlog through
+multiple cleanup cycles. Include GIN pending-list measurements with `fastupdate`
+on, plus an explicit off variant. PostgreSQL documents the cleanup/read tradeoff
+in its [GIN implementation](https://www.postgresql.org/docs/18/gin.html#GIN-FAST-UPDATE)
+and recommends GIN over the lossy GiST text-search signatures for general text
+search in its [index comparison](https://www.postgresql.org/docs/18/textsearch-indexes.html).
+
+Before calling the resulting plateau capacity, replace or calibrate the per-no-op
+shell accounting and use a target-selection protocol whose useful-work fraction
+does not collapse with offered rate. Compare ranked retrieval separately: native
+PostgreSQL ranking is not the same computation as BM25. Follow the synthetic
+probes with representative documents and longer, repeated windows.
