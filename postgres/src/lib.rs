@@ -830,6 +830,66 @@ mod tests {
         assert!(text.contains("\"Top K\":4"), "{text}");
     }
 
+    #[pg_test]
+    fn prepared_ranked_queries_use_bound_custom_plans() {
+        Spi::run(
+            "CREATE TABLE prepared_rank(id int, body text);
+             INSERT INTO prepared_rank SELECT n, repeat('common ', n % 7 + 1) ||
+               CASE WHEN n % 10 = 0 THEN 'rare alpha' ELSE 'filler beta' END
+               FROM generate_series(1, 1000) n;
+             CREATE INDEX prepared_rank_idx ON prepared_rank USING stannum(body);
+             ANALYZE prepared_rank;",
+        )
+        .unwrap();
+        for mode in ["force_custom_plan", "auto", "force_generic_plan"] {
+            Spi::run(&format!(
+                "SET LOCAL plan_cache_mode = {mode};
+             PREPARE ranked_parameter(text) AS
+               SELECT id, body, stannum.full_score(ctid) AS score FROM prepared_rank
+               WHERE body ==> $1 ORDER BY score DESC LIMIT 10;"
+            ))
+            .unwrap();
+            // Reuse the prepared statement beyond PostgreSQL's first five custom plans.
+            for _ in 0..3 {
+                for query in [
+                    "common OR rare",
+                    "alpha OR missing",
+                    "beta AND filler",
+                    "missing",
+                ] {
+                    let plan = Spi::get_one::<Json>(&format!(
+                        "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE ranked_parameter('{query}')"
+                    ))
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .to_string();
+                    if mode == "force_custom_plan" {
+                        assert!(plan.contains("\"Order\":\"score DESC\""), "{query}: {plan}");
+                        assert!(plan.contains("\"Top K\":10"), "{query}: {plan}");
+                    }
+                    let scores = |sql: &str| -> Vec<u32> {
+                        Spi::connect(|client| {
+                            client
+                                .select(sql, None, &[])
+                                .unwrap()
+                                .map(|row| row.get::<f32>(3).unwrap().unwrap().to_bits())
+                                .collect()
+                        })
+                    };
+                    let actual = scores(&format!("EXECUTE ranked_parameter('{query}')"));
+                    let expected = scores(&format!(
+                        "WITH all_scores AS MATERIALIZED (SELECT id, body,
+                   stannum.full_score(ctid) AS score FROM prepared_rank WHERE body ==> '{query}')
+                 SELECT id, body, score FROM all_scores ORDER BY score DESC LIMIT 10"
+                    ));
+                    assert_eq!(actual, expected, "{query}");
+                }
+            }
+            Spi::run("DEALLOCATE ranked_parameter").unwrap();
+        }
+    }
+
     /// Rows of a ranked query as `(id, score bits)` so scores compare exactly.
     fn ranked(custom: bool, query: &str, order_by: &str, limit: &str) -> Vec<(i32, u32)> {
         Spi::run(&format!(
