@@ -113,6 +113,10 @@ class PairedMeasurementsTests(unittest.TestCase):
                                        ranked_correctness={'mismatches': 0}, post_update_correctness={'mismatches': 0},
                                        input_sha256='input', settings={'work_mem': '16MB'},
                                        extensions={'stannum': '1'}, full_counts_before={'1:disjunction': 10})])
+            manifest['jobs'][0]['workload_state'] = dict(
+                protocol='postvacuum-observed-v1', **{
+                    phase: dict(heap_pages=100, all_visible_pages=99, all_frozen_pages=0, table_options=None)
+                    for phase in ('after_vacuum', 'before_driver', 'after_restart')})
             manifest['config']['workload'] = 'topk'
             tin.bench.save(path / 'manifest.json', manifest)
             # Both pairs improve 2x, but second pair runs on a slower background.
@@ -124,6 +128,31 @@ class PairedMeasurementsTests(unittest.TestCase):
             tin.bench.save(path / 'comparison.json', [row])
         tin.bench.save(root / 'paired.json', campaign)
         return campaign
+
+    def test_visibility_drift_rejected_but_mutation_outcome_is_not_an_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            job = json.loads((root / 'r01-baseline/manifest.json').read_text())['jobs'][0]
+            original = tin.workload_state_contract(job, updates=0)
+            job['workload_state']['after_restart']['all_visible_pages'] = 50
+            with self.assertRaisesRegex(ValueError, 'read-only trial'):
+                tin.workload_state_contract(job, updates=0)
+            self.assertEqual(original, tin.workload_state_contract(job, updates=1))
+            job['workload_state']['before_driver']['all_visible_pages'] = 50
+            with self.assertRaisesRegex(ValueError, 'untimed validation'):
+                tin.workload_state_contract(job, updates=1)
+
+    def test_visibility_requires_actual_valid_map_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            job = json.loads((root / 'r01-baseline/manifest.json').read_text())['jobs'][0]
+            for value in (101, -1, 99.5, None):
+                with self.subTest(value=value):
+                    job['workload_state']['before_driver']['all_visible_pages'] = value
+                    with self.assertRaisesRegex(ValueError, 'invalid observed'):
+                        tin.workload_state_contract(job, updates=1)
 
     def test_alternation_and_paired_ratios(self):
         self.assertEqual([j['variant'] for j in tin.paired_jobs(3)],
@@ -140,6 +169,11 @@ class PairedMeasurementsTests(unittest.TestCase):
 
     def test_incompatible_or_incomplete_trials_withhold_all_ratios(self):
         mutations = {
+            'table_options': lambda m, r: m['jobs'][0]['workload_state']['before_driver'].update(
+                table_options=['autovacuum_enabled=false']),
+            'missing_visibility': lambda m, r: m['jobs'][0].pop('workload_state'),
+            'visibility': lambda m, r: [m['jobs'][0]['workload_state'][phase].update(all_visible_pages=80)
+                                      for phase in ('after_vacuum', 'before_driver', 'after_restart')],
             'dataset': lambda m, r: m['corpus'].update(files={'documents.csv': 'changed'}),
             'input': lambda m, r: m['jobs'][0].update(input_sha256='changed'),
             'driver': lambda m, r: m['adapter'].update(binary_sha256='changed'),

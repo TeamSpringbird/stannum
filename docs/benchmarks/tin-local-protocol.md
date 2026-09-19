@@ -119,3 +119,31 @@ Only revisit remote x86 hardware after the local matrix identifies a specific
 question requiring AVX-512, production-like NVMe behavior, or more capacity
 than this machine can supply. Even then, TIN itself remains unavailable for
 a local head-to-head comparison.
+
+## Observed heap visibility in local trace runs
+
+`tin.py run` requires PostgreSQL's `pg_visibility` extension and records actual
+visibility-map counts in each job's `workload_state` and `workload-state.json`.
+Snapshots run outside timing: after the setup `VACUUM ANALYZE`, immediately
+before the driver (which owns warmup), and after the driver's stopped container
+is restarted. Each records heap pages, all-visible/all-frozen pages, catalog
+estimates, estimated live/dead tuples, mutation counters, maintenance counters,
+and table options. These are observations of the documents heap; they do not
+measure index-internal dead entries or TOAST visibility. Tuple statistics are
+estimates and may lag recent activity.
+
+Repeated comparisons require this evidence and identical initial heap and
+visibility coverage. They withhold aggregate ratios if coverage changed during
+untimed validation, or if a read-only trial's before-driver and post-restart
+coverage differ. Older artifacts remain readable as individual reports, but
+cannot satisfy this stronger paired comparison contract. A missing extension
+fails setup rather than silently substituting the potentially stale
+`pg_class.relallvisible` estimate.
+
+Mutation runs retain their observed final states without requiring equal final
+visibility: completed updates and maintenance are outcomes of those runs.
+Autovacuum remains governed by the recorded server/table settings. Shutdown,
+restart, and warmup lie between the captured boundaries, so these snapshots do
+not prove unchanging visibility throughout the timed window. They also do not
+establish a cold cache or a pristine heap. Controlled dirty/deletion-heavy
+fixtures and exact timed-boundary capture remain follow-up work.
