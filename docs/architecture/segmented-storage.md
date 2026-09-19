@@ -76,7 +76,8 @@ moving their writes outside it requires a separate reservation protocol.
 The [direct-merge architecture decision](../adr/0001-preserve-posting-order-before-changing-encoding.md)
 records the planned move to preserving sorted postings during merges, with a
 separate evidence gate for any SIMD-friendly on-disk format. The experimental
-implementation is test-only; production merges still rebuild forward records.
+implementation remains as a test-only reference. A [validated codec API](../benchmarks/hardened-merge.md)
+is available for integration; production PostgreSQL merges still rebuild forward records.
 
 Each segment belongs to a size tier by document count: tier *t* holds
 segments with `factor^t` to `factor^(t+1) - 1` documents. The lowest full tier

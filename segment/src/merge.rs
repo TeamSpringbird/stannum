@@ -88,6 +88,11 @@ fn merge_as(
             "input bytes",
         )?;
         let parsed = Segment::parse(input.bytes)?;
+        check(
+            input.dead.len(),
+            parsed.document_count() as usize,
+            "dead tuple count",
+        )?;
         input_docs = input_docs
             .checked_add(parsed.document_count() as usize)
             .ok_or(MergeError::Limit("documents"))?;
@@ -151,7 +156,9 @@ fn merge_as(
             }
             doc_builder.push(tid)?;
             length_bytes.extend_from_slice(&len.to_le_bytes());
-            total_length += u64::from(len);
+            total_length = total_length
+                .checked_add(u64::from(len))
+                .ok_or(MergeError::Limit("total document length"))?;
         }
         docs[i].advance()?;
         if let Some(tid) = docs[i].current() {
@@ -180,12 +187,14 @@ fn merge_as(
         checkpoint()?;
         let mut inputs = vec![first];
         while terms.peek().is_some_and(|Reverse((next, _))| next == &term) {
-            inputs.push(terms.pop().unwrap().0.1);
+            // The heap was just peeked and no intervening operation can empty it.
+            inputs.push(terms.pop().expect("peeked term exists").0.1);
         }
         let mut cursors = Vec::new();
         let mut postings_heap = BinaryHeap::new();
         for &i in &inputs {
-            let resolved = segments[i].resolve(entries[i].take().unwrap())?;
+            let resolved =
+                segments[i].resolve(entries[i].take().expect("each queued term owns an entry"))?;
             let postings = resolved.cursor()?;
             let payload = resolved.payload()?.cursor();
             if let Some(tid) = postings.current() {

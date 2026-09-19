@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [validated merge API](hardened-merge.md) adds input validation, explicit limits
+and cancellation to direct posting merges before PostgreSQL integration.
+
 The [direct-merge POC](direct-merge-poc.md) compares ordered posting merges with
 forward-record reconstruction while preserving the current format.
 
