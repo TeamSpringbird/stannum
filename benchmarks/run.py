@@ -24,7 +24,7 @@ ROOT = Path(os.environ.get("STANNUM_BENCH_ROOT", Path(__file__).resolve().parent
 # "tin" targets PlanetScale TIN; "stannum" targets this extension under its own schema.
 ENGINES = ("stannum", "tin", "gin", "paradedb", "pg_textsearch")
 # "mutation" runs the mixed read shapes under inserts, deletes and match-changing updates.
-PROFILES = ("count", "ranked", "mixed", "mutation")
+PROFILES = ("count", "ranked", "mixed", "mutation", "mutation-count")
 SETTINGS_SQL = """SELECT json_object_agg(name, setting) FROM pg_settings
 WHERE name = ANY(ARRAY['server_version','block_size','shared_buffers','work_mem',
  'maintenance_work_mem','effective_cache_size','max_connections','max_worker_processes',
@@ -37,7 +37,7 @@ WHERE name = ANY(ARRAY['server_version','block_size','shared_buffers','work_mem'
  'autovacuum','autovacuum_vacuum_scale_factor','autovacuum_analyze_scale_factor',
  'autovacuum_max_workers','autovacuum_vacuum_cost_limit','autovacuum_vacuum_cost_delay',
  'shared_preload_libraries','default_text_search_config','statement_timeout',
- 'track_io_timing','huge_pages','hash_mem_multiplier',
+ 'track_io_timing','huge_pages','hash_mem_multiplier','gin_pending_list_limit',
  'pg_textsearch.memtable_spill_threshold','pg_textsearch.bulk_load_threshold',
  'pg_textsearch.default_limit','pg_textsearch.compress_segments']) OR name LIKE 'tin.%' OR name LIKE 'stannum.%';"""
 CASES = [
@@ -97,7 +97,7 @@ def workload(engine, profile, cases=CASES):
         where = predicate(engine, case)
         if profile != "ranked":
             queries.append((name + "_count", f"SELECT count(*) FROM documents WHERE {where};"))
-        if profile != "count":
+        if profile not in ("count", "mutation-count"):
             score, order = ranking(engine, case)
             queries.append((name + "_ranked", f"SELECT id, {score} AS score FROM documents "
                             f"WHERE {where} ORDER BY {order} LIMIT 10;"))
@@ -128,7 +128,11 @@ FROM generate_series(1, {rows}) AS n;
 """
 
 
-def index_sql(engine):
+def index_sql(engine, gin_fastupdate=None):
+    if engine == "gin" and gin_fastupdate is not None:
+        if gin_fastupdate not in ("on", "off"):
+            raise ValueError("gin_fastupdate must be on or off")
+        return "CREATE INDEX search_idx ON documents USING gin(to_tsvector('simple', body)) WITH (fastupdate=" + gin_fastupdate + ");"
     return {
         "stannum": "CREATE INDEX search_idx ON documents USING stannum(body);",
         "tin": "CREATE INDEX search_idx ON documents USING tin(body);",
@@ -253,8 +257,8 @@ def provenance(out):
 
 
 def run(args):
-    if args.engine == "gin" and args.profile != "count":
-        raise ValueError("GIN does not implement BM25; use --profile count for equivalent comparisons")
+    if args.engine == "gin" and args.profile not in ("count", "mutation-count"):
+        raise ValueError("GIN does not implement BM25; use --profile count or mutation-count")
     if args.rows < 1000 or args.rows % 1000:
         raise ValueError("--rows must be a positive multiple of 1000")
     corpus = dataset.verify(args.dataset, args.rows) if args.dataset else None
@@ -267,11 +271,13 @@ def run(args):
     if not args.database.startswith("stannum_bench_"):
         raise ValueError("Use a dedicated database named stannum_bench_*; create it before running")
     env["PGOPTIONS"] = env.get("PGOPTIONS", "") + f" -c default_text_search_config=simple -c statement_timeout={args.statement_timeout_ms}"
-    mutating = args.profile == "mutation"
+    mutating = args.profile in ("mutation", "mutation-count")
     for setting in (args.set if mutating else []):
         env["PGOPTIONS"] += " -c " + setting
     queries = workload(args.engine, args.profile, cases)
-    checks = [(case[0], mutation.check_sql(case, predicate(args.engine, case), *ranking(args.engine, case))) for case in cases]
+    checks = [(case[0], mutation.check_sql(case, predicate(args.engine, case),
+               *(ranking(args.engine, case) if args.profile == "mutation" else (None, None))))
+              for case in cases] if mutating else []
     settings = sql_json(SETTINGS_SQL, env)
     manifest = {
         "schema_version": 1, "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -298,7 +304,7 @@ def run(args):
             "mix": mix, "settings": args.set, "check_interval": args.check_interval,
             "vacuum_interval": args.vacuum_interval, "sample_interval": args.sample_interval,
             "drain_vacuums": args.drain_vacuums, "min_vacuums": args.min_vacuums, "min_checks": args.min_checks,
-            "autovacuum": False, "writer_accounting": "live-key-wrap-v2; atomic exactly-one-row assertion",
+            "autovacuum": False, "gin_fastupdate": args.gin_fastupdate if args.engine == "gin" else None, "writer_accounting": "live-key-wrap-v2; atomic exactly-one-row assertion",
             "bucket_seconds": args.bucket_seconds, "oracle": "regex sequential scan in one repeatable-read snapshot"}
         manifest["load_model"] = ("independently rate-scheduled readers when read_rate is set; "
                                   "rate-scheduled writers mixing inserts, deletes and match-changing updates; "
@@ -320,7 +326,7 @@ def run(args):
             manifest["settings"] = sql_json(load + SETTINGS_SQL, env)
         # Never overwrite an existing table. Each repetition uses a fresh dedicated database.
         (out / "fixture.sql").write_text("-- External verified corpus; see dataset.json.\n" if corpus else fixture_sql(args.rows, args.body_repeat))
-        (out / "index.sql").write_text(index_sql(args.engine) + "\n")
+        (out / "index.sql").write_text(index_sql(args.engine, args.gin_fastupdate) + "\n")
         setup_env = dict(env, PGOPTIONS=env["PGOPTIONS"] + " -c statement_timeout=0")
         if corpus:
             save(out / "dataset.json", corpus)
@@ -336,12 +342,14 @@ def run(args):
         else:
             psql(fixture_sql(args.rows, args.body_repeat), setup_env)
         start = time.monotonic()
-        psql(index_sql(args.engine), setup_env)
+        psql(index_sql(args.engine, args.gin_fastupdate), setup_env)
         manifest["index_build_seconds"] = time.monotonic() - start
         manifest["index_definition"] = psql("SELECT pg_get_indexdef('search_idx'::regclass);", env)
         psql("VACUUM ANALYZE documents;", setup_env)
         freespace = False
         if mutating:
+            if args.engine == "gin":
+                psql("CREATE EXTENSION IF NOT EXISTS pgstattuple;", setup_env)
             psql("ALTER TABLE documents SET (autovacuum_enabled=false);", setup_env)
             psql(mutation.pool_sql(args.rows), setup_env)
             probe = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-c",
@@ -355,7 +363,7 @@ def run(args):
                 if not mutation.oracle_plan_is_independent(plan):
                     raise RuntimeError(f"Oracle check for {name} does not separate index and sequential scans; see plan-check-{name}.json")
         save(out / "correctness-before.json", validate(args.engine, args.rows, env, corpus))
-        if args.profile != "count":
+        if args.profile not in ("count", "mutation-count"):
             save(out / "ranked-before.json", validate_ranked(args.engine, args.rows, env, corpus))
         for i, (name, sql) in enumerate(queries):
             (out / f"query-{i}.sql").write_text(sql + "\n")
@@ -481,7 +489,7 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
             print((out / "timeline.txt").read_text())
         else:
             save(out / "correctness-after.json", validate(args.engine, args.rows, env, corpus))
-            if args.profile != "count":
+            if args.profile not in ("count", "mutation-count"):
                 save(out / "ranked-after.json", validate_ranked(args.engine, args.rows, env, corpus))
         traffic = [summary[name] for name in ("reader", "writer") if name in summary]
         if any(s["failures"] for s in traffic):
@@ -544,9 +552,20 @@ def comparison_keys(cross_engine=False):
 
 
 def comparison_mismatches(a, b, cross_engine=False):
-    mismatches = [key for key in comparison_keys(cross_engine) if a.get(key) != b.get(key)]
+    mismatches = [key for key in comparison_keys(cross_engine)
+                  if not (cross_engine and key == 'config') and a.get(key) != b.get(key)]
     if cross_engine:
-        if a["config"]["profile"] != "count" or b["config"]["profile"] != "count":
+        configs = []
+        for manifest in (a, b):
+            config = json.loads(json.dumps(manifest['config']))
+            if 'mutation' in config:
+                config['mutation'].pop('gin_fastupdate', None)
+                config['mutation']['settings'] = [s for s in config['mutation']['settings']
+                                                  if not s.startswith(('stannum.', 'tin.'))]
+            configs.append(config)
+        if configs[0] != configs[1]:
+            mismatches.append('config')
+        if any(m['config']['profile'] not in ('count', 'mutation-count') for m in (a, b)):
             mismatches.append("ranking contract")
         pg_settings = [{k: v for k, v in m["settings"].items() if "." not in k} for m in (a, b)]
         if pg_settings[0] != pg_settings[1]:
@@ -606,6 +625,7 @@ def main():
     sub = parser.add_subparsers(dest="action", required=True)
     r = sub.add_parser("run")
     r.add_argument("--engine", choices=ENGINES, required=True)
+    r.add_argument("--gin-fastupdate", choices=("on", "off"), help="GIN pending-list variant; default is PostgreSQL on")
     r.add_argument("--database", required=True)
     r.add_argument("--output", required=True)
     r.add_argument("--environment", required=True, help="Stable server hardware/resource identity; no credentials")
@@ -648,16 +668,18 @@ def main():
     t.add_argument("--bucket-seconds", type=positive, default=10)
     args = parser.parse_args()
     if args.action == "run":
+        if args.gin_fastupdate is not None and args.engine != "gin":
+            parser.error("gin-fastupdate requires the gin engine")
         if args.dataset and args.body_repeat != 1:
             parser.error("body-repeat applies only to synthetic fixtures")
-        if args.profile != 'mutation' and (args.drain_vacuums or args.min_vacuums or args.min_checks):
+        if args.profile not in ('mutation', 'mutation-count') and (args.drain_vacuums or args.min_vacuums or args.min_checks):
             parser.error("drain and maintenance coverage requirements need the mutation profile")
         if args.write_rate < 0:
             parser.error("--write-rate must be nonnegative")
-        if args.profile == "mutation":
+        if args.profile in ("mutation", "mutation-count"):
             if args.write_rate == 0 or args.vacuum_interval < 0:
                 parser.error("the mutation profile needs a positive --write-rate and a nonnegative --vacuum-interval")
-            if args.engine == "gin":
+            if args.engine == "gin" and args.profile != "mutation-count":
                 parser.error("GIN does not implement BM25; the mutation profile runs ranked shapes")
             mutation.parse_mix(args.mix)
             if args.drain_vacuums < 0 or args.min_vacuums < 0 or args.min_checks < 0:

@@ -140,9 +140,17 @@ def pool_sql(rows):
             f"CREATE SEQUENCE benchmark_ids START {rows + 1};")
 
 
-def check_sql(case, where, score, order):
+def check_sql(case, where, score=None, order=None):
     """One statement, hence one snapshot: index answer, oracle answer, their difference,
     and the ranked top ten from the index, for evaluate_check."""
+    if score is None:
+        return f"""WITH actual AS MATERIALIZED (SELECT id FROM documents WHERE {where}),
+expected AS MATERIALIZED (SELECT id FROM documents WHERE {regex_predicate(case)}),
+delta AS ((SELECT id FROM actual EXCEPT SELECT id FROM expected)
+ UNION ALL (SELECT id FROM expected EXCEPT SELECT id FROM actual))
+SELECT json_build_object('count', (SELECT count(*) FROM actual), 'expected', (SELECT count(*) FROM expected),
+ 'differences', (SELECT count(*) FROM delta), 'delta_sample',
+ (SELECT coalesce(json_agg(d), '[]'::json) FROM (SELECT * FROM delta LIMIT {DELTA_SAMPLE}) d), 'ranked', false);"""
     return f"""WITH actual AS MATERIALIZED (SELECT id FROM documents WHERE {where}),
 expected AS MATERIALIZED (SELECT id FROM documents WHERE {regex_predicate(case)}),
 delta AS ((SELECT id, 'index_only' AS side FROM actual EXCEPT SELECT id, 'index_only' FROM expected)
@@ -161,6 +169,8 @@ def evaluate_check(name, result):
         raise ValueError(f"Index and oracle disagree for {name}: index {result['count']} rows, "
                          f"oracle {result['expected']} rows, {result['differences']} differences, "
                          f"sample {result['delta_sample']}")
+    if result.get('ranked') is False:
+        return {"name": name, "count": result["count"]}
     ids = [row[0] for row in result["top"]]
     scores = [float(row[1]) for row in result["top"]]
     if (len(ids) != min(10, result["count"]) or len(set(ids)) != len(ids) or result["top_outside"]
@@ -247,10 +257,11 @@ def sample_sql(engine, freespace):
                     " 'max_generation', coalesce(max(generation), 0),"
                     " 'buffer_docs', coalesce(sum(docs) FILTER (WHERE kind = 'mutable'), 0))"
                     " FROM stannum.segment_info('search_idx'))")
+    gin = "(SELECT row_to_json(g) FROM pgstatginindex('search_idx') g)" if engine == 'gin' else "NULL"
     free = "(SELECT count(*) FROM pg_freespace('search_idx') WHERE avail > 0)" if freespace else "NULL"
     return f"""SELECT json_build_object('index_bytes', pg_relation_size('search_idx'),
  'table_bytes', pg_table_size('documents'), 'rows', (SELECT count(*) FROM documents),
- 'fsm_free_pages', {free},
+ 'fsm_free_pages', {free}, 'gin_pending', {gin},
  'wal_lsn', pg_current_wal_insert_lsn()::text,
  'table_stats', (SELECT json_build_object('n_live_tup', n_live_tup, 'n_dead_tup', n_dead_tup,
    'n_tup_ins', n_tup_ins, 'n_tup_del', n_tup_del, 'n_tup_upd', n_tup_upd,

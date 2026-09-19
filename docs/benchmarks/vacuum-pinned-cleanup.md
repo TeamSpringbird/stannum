@@ -58,3 +58,19 @@ No runtime index, merge, storage-format or locking code changed. The prevention
 lesson is to distinguish physical entries, known-dead entries and visible heap
 rows, and to state whether a cleanup assertion applies during readers or after
 quiescence.
+
+## RSS sampler startup follow-up
+
+A later x86/PG18 CI run failed before the new GIN smoke because the existing
+VACUUM backend exited before the RSS sampler made its first observation. A
+200 ms delay injected before `ps` deterministically reproduced the same
+`no backend RSS samples captured` assertion. Waiting for one successful baseline
+observation before starting the timed VACUUM fixed that reproduction.
+
+The baseline is not a peak-memory measurement. Results now separate baseline
+RSS, samples whose whole observation interval lies inside the timed VACUUM,
+and the maximum of those in-flight samples (null when none were captured).
+The historical `sampled_backend_rss_max` field remains the maximum across all
+observations, including baseline. Short operations can still have no in-flight
+samples; neither field proves allocator peak memory. A thread-readiness unit
+regression and the delayed-start native reproduction pass with the fix.

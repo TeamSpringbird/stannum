@@ -4,6 +4,7 @@
 
 from pathlib import Path
 import json
+import hashlib
 import subprocess
 import tempfile
 import unittest
@@ -68,6 +69,7 @@ class SustainedTests(unittest.TestCase):
                 root = Path(directory)
                 library = root / 'stannum.so'
                 library.write_bytes(b'retained release')
+                (root / 'postgres').write_bytes(b'postgres executable')
                 cluster = root / 'cluster'
                 cluster.mkdir()
                 output = root / 'results'
@@ -101,3 +103,57 @@ class SustainedTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class GinBaselineTests(unittest.TestCase):
+    def test_count_mutation_does_not_request_ranking(self):
+        for engine in ('gin', 'stannum'):
+            queries = run.workload(engine, 'mutation-count')
+            self.assertEqual(queries, run.workload(engine, 'count'))
+            self.assertTrue(all(name.endswith('_count') for name, _ in queries))
+        case = run.CASES[4]
+        sql = mutation.check_sql(case, run.predicate('gin', case))
+        self.assertIn('EXCEPT SELECT id FROM expected', sql)
+        self.assertNotIn('score', sql)
+        checked = dict(count=4, expected=4, differences=0, delta_sample=[], ranked=False)
+        self.assertEqual(mutation.evaluate_check('phrase', checked)['count'], 4)
+        with self.assertRaises(ValueError):
+            mutation.evaluate_check('phrase', dict(checked, differences=1))
+
+    def test_gin_variant_and_pending_measurement_are_explicit(self):
+        self.assertIn('fastupdate=off', run.index_sql('gin', 'off'))
+        self.assertIn('fastupdate=on', run.index_sql('gin', 'on'))
+        self.assertIn('pgstatginindex', mutation.sample_sql('gin', False))
+        self.assertNotIn('stannum.segment_info', mutation.sample_sql('gin', False))
+
+    def test_wal_accounting_crosses_high_word_boundary(self):
+        self.assertEqual(sustained.wal_delta('1/FFFFFFF0', '2/10'), 32)
+        with self.assertRaises(ValueError):
+            sustained.wal_delta('2/10', '1/FFFFFFF0')
+
+    def test_cross_engine_comparison_keeps_workload_and_server_guards(self):
+        a = dict(status='complete', settings={'shared_buffers': '65536', 'stannum.max_segments': '16'},
+                 config={'profile': 'mutation-count', 'read_rate': 100,
+                         'mutation': {'gin_fastupdate': None, 'settings': ['enable_seqscan=off', 'stannum.max_segments=16']}})
+        b = json.loads(json.dumps(a))
+        b['settings'].pop('stannum.max_segments')
+        b['config']['mutation'] = {'gin_fastupdate': 'on', 'settings': ['enable_seqscan=off']}
+        self.assertEqual(run.comparison_mismatches(a, b, True), [])
+        b['config']['read_rate'] = 101
+        self.assertIn('config', run.comparison_mismatches(a, b, True))
+        b['settings']['shared_buffers'] = '32768'
+        self.assertIn('PostgreSQL settings', run.comparison_mismatches(a, b, True))
+        b['config']['profile'] = 'mutation'
+        self.assertIn('ranking contract', run.comparison_mismatches(a, b, True))
+
+
+class CampaignIdentityTests(unittest.TestCase):
+    def test_editing_sources_invalidates_the_campaign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'runner.py'
+            path.write_text('original')
+            identity = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()}
+            sustained.verify_sources(identity)
+            path.write_text('changed')
+            with self.assertRaisesRegex(RuntimeError, 'source changed'):
+                sustained.verify_sources(identity)
