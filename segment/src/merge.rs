@@ -136,6 +136,22 @@ pub fn validate_inputs(
     Ok(())
 }
 
+// Dead postings have already been fully validated. Advance them outside the
+// cross-input heap; only live candidates need ordering against other sources.
+fn skip_dead(
+    postings: &mut crate::postings::PostingsCursor<'_>,
+    payload: &mut crate::payload::PayloadCursor<'_>,
+    dead: &BTreeSet<Tid>,
+    checkpoint: &mut impl FnMut() -> std::result::Result<(), MergeError>,
+) -> std::result::Result<(), MergeError> {
+    while postings.current().is_some_and(|tid| dead.contains(&tid)) {
+        checkpoint()?;
+        payload.next_bucket()?;
+        postings.advance()?;
+    }
+    Ok(())
+}
+
 fn merge_as(
     inputs: &[MergeInput<'_>],
     limits: MergeLimits,
@@ -209,8 +225,14 @@ fn merge_as(
         for &i in &inputs {
             let resolved =
                 segments[i].resolve(entries[i].take().expect("each queued term owns an entry"))?;
-            let postings = resolved.cursor()?;
-            let payload = resolved.payload()?.cursor();
+            let mut postings = resolved.cursor()?;
+            let mut payload = resolved.payload()?.cursor();
+            skip_dead(
+                &mut postings,
+                &mut payload,
+                sources[i].dead,
+                &mut checkpoint,
+            )?;
             if let Some(tid) = postings.current() {
                 postings_heap.push(Reverse((tid, cursors.len())));
             }
@@ -223,22 +245,19 @@ fn merge_as(
         while let Some(Reverse((tid, c))) = postings_heap.pop() {
             checkpoint()?;
             let (i, cursor, positions_cursor) = &mut cursors[c];
-            if sources[*i].dead.contains(&tid) {
-                positions_cursor.next_bucket()?;
-            } else {
-                positions.clear();
-                let bucket = positions_cursor.next_into(&mut positions)?;
-                let len = *live_lengths
-                    .get(&tid)
-                    .ok_or(Error::Corrupt("posting missing document"))?;
-                postings.push_scored(tid, bucket, len)?;
-                payload.push(bucket, &positions)?;
-                count = count
-                    .checked_add(1)
-                    .ok_or(MergeError::Limit("postings count"))?;
-                max_bucket = max_bucket.max(bucket);
-            }
+            positions.clear();
+            let bucket = positions_cursor.next_into(&mut positions)?;
+            let len = *live_lengths
+                .get(&tid)
+                .ok_or(Error::Corrupt("posting missing document"))?;
+            postings.push_scored(tid, bucket, len)?;
+            payload.push(bucket, &positions)?;
+            count = count
+                .checked_add(1)
+                .ok_or(MergeError::Limit("postings count"))?;
+            max_bucket = max_bucket.max(bucket);
             cursor.advance()?;
+            skip_dead(cursor, positions_cursor, sources[*i].dead, &mut checkpoint)?;
             if let Some(tid) = cursor.current() {
                 postings_heap.push(Reverse((tid, c)));
             }
@@ -414,34 +433,36 @@ mod tests {
 
     #[test]
     fn cancellation_at_every_checkpoint_is_atomic() {
-        let (blobs, dead) = fixture(2, 3, 4, 2, true, 0);
-        let original = blobs.clone();
-        let input = inputs(&blobs, &dead);
-        let mut calls = 0;
-        merge(&input, limits(), || {
-            calls += 1;
-            Ok(())
-        })
-        .unwrap();
-        for stop in 1..=calls {
-            let mut at = 0;
-            assert!(matches!(
-                merge(&input, limits(), || {
-                    at += 1;
-                    if at == stop {
-                        Err(MergeError::Cancelled)
-                    } else {
-                        Ok(())
-                    }
-                }),
-                Err(MergeError::Cancelled)
-            ));
+        for deletion in [0, 1, 2] {
+            let (blobs, dead) = fixture(2, 3, 4, 2, true, deletion);
+            let original = blobs.clone();
+            let input = inputs(&blobs, &dead);
+            let mut calls = 0;
+            merge(&input, limits(), || {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+            for stop in 1..=calls {
+                let mut at = 0;
+                assert!(matches!(
+                    merge(&input, limits(), || {
+                        at += 1;
+                        if at == stop {
+                            Err(MergeError::Cancelled)
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                    Err(MergeError::Cancelled)
+                ));
+            }
+            assert_eq!(blobs, original);
+            assert_eq!(
+                merge(&input, limits(), || Ok(())).unwrap(),
+                reference(&blobs, &dead, Format::CURRENT).unwrap()
+            );
         }
-        assert_eq!(blobs, original);
-        assert_eq!(
-            merge(&input, limits(), || Ok(())).unwrap(),
-            reference(&blobs, &dead, Format::CURRENT).unwrap()
-        );
     }
 
     #[test]
