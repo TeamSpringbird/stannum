@@ -25,8 +25,10 @@ verified byte-for-byte against the parent revision after removing only the
 inserted notices; insertion is idempotent, and LICENSE is unchanged. The
 inventory includes 92 Rust files: 38 unchanged inherited, 18 modified inherited
 (including the moved term-frequency module), and 36 Stannum-authored files.
-All 79 benchmark-harness tests and six attribution-tool tests pass. See [source attribution](ATTRIBUTION.md) for the
-policy and future-file checks.
+All 79 benchmark-harness tests, six attribution-tool tests, and 467 library/doc
+tests pass (six existing tests remain ignored). Formatting and Clippy with
+warnings denied pass for PostgreSQL 17 and 18. See
+[source attribution](ATTRIBUTION.md) for the policy and future-file checks.
 
 PR #10 (unlocked fold construction) was still open at audit time. It can
 update from the attribution change once; any new source files need provenance
