@@ -605,6 +605,8 @@ def paired_report(root):
                 raise ValueError(f'incomplete timed trace coverage ({len(missing)} missing forms); increase --seconds')
             if row['update_errors'] or row['updates_attempted'] != row['updates_completed']:
                 raise ValueError('failed or incomplete update attempts')
+            if manifest['config']['updates'] > 0 and row['updates_completed'] <= 0:
+                raise ValueError('update workload completed no updates')
             for metric in ('qps', 'p50_ms', 'p95_ms'):
                 describe([row[metric]])
             for query in row['queries'].values():

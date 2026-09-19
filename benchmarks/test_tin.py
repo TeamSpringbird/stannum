@@ -135,6 +135,7 @@ class PairedMeasurementsTests(unittest.TestCase):
             'query_coverage': lambda m, r: r['queries'].clear(),
             'extra_query': lambda m, r: r['queries'].update({'2:phrase': {'p50_ms': 1, 'p95_ms': 1}}),
             'updates': lambda m, r: r.update(updates_completed=0),
+            'zero_updates': lambda m, r: r.update(updates_attempted=0, updates_completed=0),
             'nan': lambda m, r: r.update(qps=float('nan')),
         }
         for name, mutate in mutations.items():
@@ -166,6 +167,20 @@ class PairedMeasurementsTests(unittest.TestCase):
                 tin.bench.save(root / 'paired.json', campaign)
                 self.assertFalse(tin.paired_report(root))
                 self.assertFalse(json.loads((root / 'aggregate.json').read_text())['paired'])
+
+    def test_read_only_comparison_allows_zero_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            campaign = self.fixture(root)
+            for job in campaign['jobs']:
+                path = root / job['directory']
+                manifest = json.loads((path / 'manifest.json').read_text())
+                manifest['config']['updates'] = 0
+                rows = json.loads((path / 'comparison.json').read_text())
+                rows[0].update(updates_attempted=0, updates_completed=0)
+                tin.bench.save(path / 'manifest.json', manifest)
+                tin.bench.save(path / 'comparison.json', rows)
+            self.assertTrue(tin.paired_report(root))
 
     def test_source_manifest_checks_file_fingerprint_consistency(self):
         with tempfile.TemporaryDirectory() as tmp:

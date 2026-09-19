@@ -200,7 +200,9 @@ timed style must appear in every trial's samples. A trial that is too short
 to traverse the trace invalidates the comparison; increase `--seconds` and
 start a fresh output directory. Failed, interrupted, incompatible or partially
 covered comparisons retain evidence but publish **no aggregate ratios**.
-Ranked runs also require the exhaustive same-engine top-10 oracle to pass.
+Update workloads must complete at least one update with no failed attempts;
+the offered rate is not asserted as achieved throughput. Ranked runs also
+require the exhaustive same-engine top-10 oracle to pass.
 This does not establish full cross-version ranked-result equivalence.
 
 Regenerate the aggregate without Docker using:
