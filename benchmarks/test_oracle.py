@@ -90,3 +90,45 @@ class OracleHighlightTests(unittest.TestCase):
             self.assertIn(query, oracle.QUERIES)
         self.assertTrue(set(oracle.REFERENCE_UNHIGHLIGHTED) <= set(oracle.QUERIES))
         self.assertTrue(all(oracle.REFERENCE_UNHIGHLIGHTED.values()))
+
+
+class TraceOracleTests(unittest.TestCase):
+    def test_trace_checks_exact_membership_scores_and_topk(self):
+        ref = [[1, '\\x40000000'], [2, '\\x3f800000']]
+        self.assertEqual(oracle.compare_trace(ref, ref, ref), [])
+        self.assertIn('membership', oracle.compare_trace(ref[:1], ref, ref))
+        changed = [[1, '\\x40400000'], ref[1]]
+        self.assertIn('full_score_bits', oracle.compare_trace(changed, ref, ref))
+        self.assertIn('top10', oracle.compare_trace(ref, ref, list(reversed(ref))))
+        self.assertIn('top10', oracle.compare_trace(ref, ref, ref[:1]))
+        self.assertIn('top10', oracle.compare_trace(ref, ref, [[9, ref[0][1]], ref[1]]))
+
+    def test_topk_allows_boundary_ties_but_not_duplicates_or_nonfinite_scores(self):
+        rows = [[n, '\\x3f800000'] for n in range(20)]
+        self.assertEqual(oracle.compare_trace(rows, rows, list(reversed(rows[10:]))), [])
+        for invalid in [rows[:9] + [rows[0]], [[1, '\\x7f800000']], [[1, '\\x7fc00000']]]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                oracle.compare_trace(rows, rows, invalid)
+        self.assertEqual(oracle.compare_trace([], [], []), [])
+
+    def test_trace_keeps_all_forms_and_repeated_text_but_rejects_duplicate_ids(self):
+        import tempfile
+        from pathlib import Path
+        record = {'source_id': 1, 'engines': {'tin': {style: 'same' for style in
+                  ('conjunction', 'disjunction', 'phrase')}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'queries.json'
+            path.write_text(json.dumps({'queries': [record, dict(record, source_id=2)]}))
+            self.assertEqual(len(oracle.trace_queries(path)), 6)
+            path.write_text(json.dumps({'queries': [record, record]}))
+            with self.assertRaises(ValueError):
+                oracle.trace_queries(path)
+
+    def test_trace_sql_projects_all_scores_and_real_topk_without_id_tiebreak(self):
+        query = "can't OR rare"
+        exhaustive = oracle.trace_sql(query, 'tin')
+        ranked = oracle.trace_sql(query, 'stannum', True)
+        self.assertIn("can't".replace("'", "''"), exhaustive)
+        self.assertTrue(exhaustive.endswith('ORDER BY id'))
+        self.assertTrue(ranked.endswith('ORDER BY stannum.full_score(ctid) DESC LIMIT 10'))
+        self.assertIn('float4send(tin.full_score(ctid))', exhaustive)

@@ -10,6 +10,10 @@ issues exposed by the new workload.
 The [ranked prepared-query diagnosis](ranked-prepared-queries.md) explains why
 parameterized disjunctions missed ranked scans and how the planner fix is validated.
 
+The [Lead verification budget](lead-verification-budget.md) calibrates a smaller
+Wikipedia corpus for exact membership, score-bit and top-10 checks against Lead,
+with a 15-minute runtime budget separate from large performance measurements.
+
 The [TIN methodology source audit](tin-benchmark-source-audit.md) and
 [local protocol](tin-local-protocol.md) describe how to broaden our
 benchmarks using PlanetScale's published workload, including a stored-vector

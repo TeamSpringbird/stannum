@@ -16,7 +16,12 @@
 # where Stannum follows TIN.
 #
 #   PGHOST=localhost PGPORT=28818 script/reference-oracle [output-dir]
-#   LEAD_REF=<branch-or-commit> pins the upstream revision (default: main).
+#   LEAD_REF=<branch-or-commit> pins a fresh reference checkout (default: main).
+#   An existing LEAD_REF_DIR is used as-is; the actual revision is recorded.
+#   DATASET=<verified corpus> TRACE=<queries.json> enables the read-only
+#   published-trace oracle instead: exact membership/full_score bits/top-10,
+#   with ROWS=5000 and BUDGET_SECONDS=900 defaults. Build/provisioning time is
+#   outside that verification budget. The result is written under OUT/trace.
 set -eu
 LEAD_REPOSITORY="${LEAD_REPOSITORY:-https://github.com/planetscale/lead.git}"
 LEAD_REF="${LEAD_REF:-main}"
@@ -28,6 +33,9 @@ PG_FEATURE="pg$(pg_config --version | sed -E 's/PostgreSQL ([0-9]+).*/\1/')"
 if [ ! -d "$REF/.git" ] && [ ! -f "$REF/.git" ]; then
   git clone --quiet "$LEAD_REPOSITORY" "$REF"
   git -C "$REF" checkout --quiet "$LEAD_REF"
+fi
+if [ -n "${DATASET:-}" ]; then
+  : "${TRACE:?TRACE must name the published queries.json}"
 fi
 echo "building Lead $(git -C "$REF" rev-parse --short HEAD) as extension 'tin' for $PG_FEATURE"
 ( cd "$REF/postgres" && CARGO_TARGET_DIR="${LEAD_TARGET_DIR:-$REF/target}" \
@@ -49,9 +57,17 @@ LEFT="$(mktemp)"; RIGHT="$(mktemp)"
 printf 'PGDATABASE=reference_oracle_stannum\n' > "$LEFT"
 printf 'PGDATABASE=reference_oracle_lead\n' > "$RIGHT"
 status=0
+if [ -n "${DATASET:-}" ]; then
+  python3 "$ROOT/benchmarks/oracle.py" --left "$LEFT" --left-engine stannum \
+    --right "$RIGHT" --right-engine tin --scores bits --rows "${ROWS:-5000}" \
+    --dataset "$DATASET" --trace "${TRACE:?TRACE must name the published queries.json}" \
+    --reference-source "$REF" --budget-seconds "${BUDGET_SECONDS:-900}" \
+    --output "$OUT/trace" || status=$?
+else
 python3 "$ROOT/benchmarks/oracle.py" --left "$LEFT" --left-engine stannum \
   --right "$RIGHT" --right-engine tin --scores order --rows "${ROWS:-5000}" \
   --output "$OUT" || status=$?
+fi
 rm -f "$LEFT" "$RIGHT"
 dropdb --if-exists reference_oracle_stannum
 dropdb --if-exists reference_oracle_lead
