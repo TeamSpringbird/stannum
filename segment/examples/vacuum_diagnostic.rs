@@ -23,6 +23,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     let directory = Path::new(&args[2]);
+    let realistic = std::env::var("DIAG_LAYOUT").is_ok_and(|layout| layout == "sql");
+    let parts: u32 = std::env::var("DIAG_PARTS")
+        .unwrap_or_else(|_| "8".into())
+        .parse()?;
+    if parts == 0 || parts > 128 {
+        return Err("DIAG_PARTS must be 1..128".into());
+    }
+    let rows_per_block = if realistic { 16 } else { 100 };
     if args[1] == "prepare" {
         if args.len() != 6 {
             return Err("prepare needs DOCS TOKENS VOCAB".into());
@@ -34,14 +42,28 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("fixture bounds: docs 1..100000, tokens 1..10000, vocabulary > 0".into());
         }
         std::fs::create_dir(directory)?;
-        for part in 0..8 {
+        for part in 0..parts {
             let mut builder = SegmentBuilder::default();
             for doc in 0..docs {
-                let id = doc * 8 + part;
-                let tid = Tid::new(id / 100, (id % 100 + 1) as u16)?;
-                let terms = (0..tokens)
-                    .map(|p| format!("term{:04}", (p + id) % vocabulary))
-                    .collect::<Vec<_>>();
+                let id = if realistic {
+                    part * docs + doc
+                } else {
+                    doc * parts + part
+                };
+                let tid = Tid::new(id / rows_per_block, (id % rows_per_block + 1) as u16)?;
+                let terms = if realistic {
+                    let hash = u64::from(id).wrapping_mul(0x9e3779b97f4a7c15);
+                    let mut terms = vec![format!("w{}", id % vocabulary)];
+                    for p in 0..tokens {
+                        terms.push(if p % 2 == 0 { "common" } else { "filler" }.into());
+                    }
+                    terms.push(format!("{:016x}{:016x}", hash, hash.rotate_left(17)));
+                    terms
+                } else {
+                    (0..tokens)
+                        .map(|p| format!("term{:04}", (p + id) % vocabulary))
+                        .collect::<Vec<_>>()
+                };
                 builder.add_document(
                     tid,
                     terms
@@ -64,8 +86,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("DIAG_DELETION must be 0..4".into());
     }
     let is_dead = |tid: Tid| {
-        let id = tid.block * 100 + u32::from(tid.offset) - 1;
-        (id / 8) % 4 < deletion
+        let id = tid.block * rows_per_block + u32::from(tid.offset) - 1;
+        (if realistic { id } else { id / parts }) % 4 < deletion
     };
     let start = Instant::now();
     let out = match args[1].as_str() {
@@ -73,7 +95,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut builder = SegmentBuilder::default();
             // Match production reconstruction: retain only one encoded input
             // at a time while the output builder accumulates all documents.
-            for part in 0..8 {
+            for part in 0..parts {
                 let bytes = std::fs::read(directory.join(format!("input-{part}.segment")))?;
                 let source = Segment::parse(&bytes)?;
                 for record in source.records(is_dead)? {
@@ -83,14 +105,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             builder.finish()
         }
         "validate" => {
-            for part in 0..8 {
+            for part in 0..parts {
                 let bytes = std::fs::read(directory.join(format!("input-{part}.segment")))?;
                 assert!(segment::verify::verify_segment(&bytes).findings.is_empty());
             }
             Vec::new()
         }
         "direct" => {
-            let blobs = (0..8)
+            let blobs = (0..parts)
                 .map(|part| std::fs::read(directory.join(format!("input-{part}.segment"))))
                 .collect::<Result<Vec<_>, _>>()?;
             let dead = blobs
@@ -116,7 +138,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             segment::merge::merge(
                 &inputs,
                 MergeLimits {
-                    max_inputs: 8,
+                    max_inputs: parts as usize,
                     max_input_bytes: u32::MAX as usize,
                     max_documents: u32::MAX as usize,
                     max_output_bytes: u32::MAX as usize,
