@@ -147,7 +147,13 @@ all baseline samples. Dataset, output metadata and WAL matched, and no
 checkpoint overlapped VACUUM. Reader latency and sampled RSS did not explain
 the slowdown; it must not be dismissed merely as shared-runner noise.
 
-The [corrected-protocol rerun](https://github.com/TeamSpringbird/stannum/actions/runs/35424836178)
+The first corrected-oracle CI attempt stopped in the newly added smoke: its
+1,024-document VACUUM finished before RSS sampling on x86 or a complete reader
+transaction on ARM. No performance comparisons ran in that attempt. The smoke
+now uses 32,768 documents and 200 offered transactions/second, preserving the
+sampling and overlap gates instead of waiving them.
+
+The [corrected-protocol rerun](https://github.com/TeamSpringbird/stannum/actions/runs/35425193502)
 retains a fresh matrix plus larger mixed-query and forced-strategy comparisons.
 These workflow artifacts contain the individual paired samples needed to judge
 recurrence and variability. Neither campaign applies a hard timing threshold on
