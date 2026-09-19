@@ -1,0 +1,147 @@
+# Published-trace benchmark
+
+`benchmarks/tin.py` is the local entry point for the pinned PlanetScale fork
+of ParadeDB Benchmarker. The upstream Go/k6 driver owns query traversal,
+warmup, phase deadlines, paced updates, latency samples, and index/WAL counters.
+Our adapter adds Stannum SQL and access-method accounting. The Python wrapper
+owns isolated containers, dataset loading, correctness gates, provenance,
+and a compact report. This is not a local TIN binary or an exact reproduction
+of PlanetScale's published performance numbers.
+
+## Prepare and run
+
+Requirements: Docker, Python 3, and PostgreSQL client tools (`psql`,
+`pg_isready`) on PATH. Node is needed only for the query-adapter tests.
+Go/k6 are built in Docker for the host architecture; no global installation.
+
+```sh
+python3 benchmarks/tin.py prepare
+python3 benchmarks/tin.py build
+python3 benchmarks/tin.py build-image \
+  --image stannum-bench:published-trace \
+  --output benchmarks/results/published-image-01
+
+python3 benchmarks/tin.py run \
+  --dataset "$HOME/Library/Application Support/LeadBenchmarks/datasets/wikipedia-100000" \
+  --image stannum-bench:published-trace \
+  --output benchmarks/results/published-count-01 \
+  --rows 1000 --workload count --style mixed --seconds 60
+```
+
+Use a new output directory each time. The dataset argument expects our
+checksummed `dataset.py` format, not upstream's headered CSV. This first
+integration reuses the public Wikipedia **trace** against our existing corpus.
+The exact public 5-million-document corpus still needs a loader adapter.
+
+Use `--workload topk` for ranked queries, `--style conjunction`, `disjunction`,
+or `phrase` to isolate a family, and `--updates 100` to offer 100 whitespace
+updates per second. The updater uses one serial connection and skips
+missed slots; its actual affected-row count can be lower. Our
+`random-page-live-wrap-v1` patch preserves the initial random-page choice but
+continues forward to a live tuple, then wraps, if that page is empty. The
+unpatched driver failed the 1k write test with 69 empty-page attempts; its
+exactly-one-row assertion remains enabled. A real-server regression reproduced
+the failure and now covers both forward and wrapped selection. This departure
+from the upstream picker is recorded in the adapter manifest. This is not the
+mixed insert/update/delete workload in `sustained.py`.
+
+`--rows 100000 --seconds 60 --clients 2 --memory 4g --shared-buffers 1GB`
+is an initial resident-corpus diagnostic. Increase corpus size and independently
+vary memory and clients before making capacity claims. Only one engine runs at
+a time, in a fresh named volume, with the same extension image and PostgreSQL
+settings. GIN uses a stored generated vector and its normal planner.
+`--engines postgres stannum` reverses order for another repetition.
+
+Build and run commands acquire `/tmp/stannum-pgrx.lock`, shared with native
+installation/timing work. **Do not wrap them in another acquisition of that
+lock.** They remove only their own randomly named containers and volumes.
+Unrelated local services remain running; background load is not eliminated.
+
+## Correctness and semantics
+
+All 302 source records expand to 906 AND/OR/phrase forms, including intentional
+repetitions. Before timing, each form compares exact result sets on a bounded
+validation sample (`--validation-rows`, default 1000). The indexed candidate
+set is materialized from the actual benchmark index before restricting it to
+the sampled IDs. This checks both false positives and false negatives on that
+sample; it does not prove membership for every row of a larger corpus. Full
+counts are also retained for all 906 forms and compared between engines.
+
+Stannum's reference uses raw normalized text with word-boundary predicates.
+GIN's reference uses an unindexed PostgreSQL `tsvector`. Ranked runs also
+compare all 906 top-10 score multisets with exhaustive same-engine scoring,
+allowing arbitrary selection/order among tied documents. This can be expensive
+on large corpora. It proves top-k agreement with that engine's scoring path,
+not the BM25 formula or cross-engine relevance equivalence.
+
+The first attempt using PostgreSQL as Stannum's phrase oracle failed on two
+documents for `"the movement"`. A five-row reproduction established the cause:
+late repeated-word positions are discarded from `tsvector`, whereas Stannum
+and direct text matching retain the phrase. See PostgreSQL's
+[text-search limits](https://www.postgresql.org/docs/18/textsearch-limitations.html).
+The integration retains this regression in `benchmarks/tin/position-limit.sql`.
+
+Cross-engine membership differences on the validation sample are recorded in
+`semantics.txt` and the manifest, separately from each engine's correctness
+gate. Mixed/phrase results with these differences are **not equivalent-result
+speed comparisons**. BM25 and GIN's `ts_rank_cd` are also different rankings.
+The documents are not shortened or filtered to hide either distinction.
+
+Update runs restart the stopped container after measurement and repeat the
+membership checks. This validation is outside the measured interval. The
+update-only phase must also preserve the heap row count and all 906 full-corpus
+query counts. Driver regressions, including query cancellation and live-tuple
+selection, run against the isolated server before each engine's workload.
+
+## Artifacts and interpretation
+
+Each run retains:
+
+- Pinned upstream revision, complete source-file fingerprints, adapter patch,
+  resolved Go dependencies, driver binary hash, image identity, and extension
+  source fingerprint.
+- Corpus identity and exact imported CSV hash, rows, settings, source snapshots,
+  import/vector preparation/index-build timings, and relation sizes.
+- Correctness outputs, semantic differences, representative plans, upstream
+  dashboard JSON, raw compressed k6 samples with query IDs, logs, and Docker
+  resource configuration.
+- `comparison.json` and `report.md`, with overall and per-family/per-query
+  latency distributions, completed updates, and observed query-form coverage.
+
+Per-query p99 is omitted below 1000 samples. A short run can finish without
+traversing the whole trace, especially for slow ranked queries. Consult
+`measured_query_forms`; all forms passing a correctness check does not mean
+all forms were timed. Warmup samples are absent from `query_duration` metrics.
+
+Index read/hit byte counters measure block accesses, not physical disk traffic.
+Read-only and write-active runs have different accounting interference.
+Docker resource ceilings are enforced, but the host may cache the VM disk.
+This initial wrapper captures Docker configuration and upstream CPU/memory
+metrics; precise final cgroup pressure deltas and build peak-memory sampling
+remain to be added before an out-of-memory/pressure study.
+
+The wrapper checks source drift and retains failed attempts. Its report does
+not infer a cross-engine speedup or declare a winner. Native ARM results do
+not measure AVX-512 behavior.
+
+## Consolidation target
+
+New broad search measurements should use this entry point. Do not add another
+campaign launcher. The retirement order is:
+
+| Existing component | Replacement / remaining gate |
+| --- | --- |
+| `baselines.py` (79 lines) | Dataset-size and repeated-run matrix in the new entry point; retain historical reports |
+| `campaign.py` (313 lines) | New container runner plus repetitions, pressure deltas, and remaining engine adapters |
+| `paired.py` (193 lines) | Alternate two immutable image identities with matching input/driver manifests |
+| Read-only portions of `run.py` | Upstream query driver/reporting; extract the provenance/cgroup helpers still shared with mutation tests |
+| `server_times.py` | Generated representative and slow-query plans once those cover its inspection workflow |
+| `sustained.py`, `mutation.py`, `oracle.py`, lifecycle/VACUUM probes | Keep until replacement checks the same mutations, visibility, locking and maintenance invariants |
+
+The first three wrappers total 585 lines, before their tests and the replaced
+read-only runner code. They are deletion candidates, not yet redundant: this
+first slice does not cover all their engines, repetitions, paired-build
+comparisons or mutation contracts. Delete each with its caller/documentation
+migration in the same PR once those gates pass. Preserve measurement history
+and unique correctness regressions; retaining an old report does not require
+retaining its executable harness forever.

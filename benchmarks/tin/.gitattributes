@@ -1,0 +1,2 @@
+# Patch context includes intentional whitespace-only lines.
+upstream.patch -whitespace

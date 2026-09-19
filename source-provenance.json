@@ -152,9 +152,21 @@
       "owner": "ben",
       "evidence": "Original Stannum benchmark work, built on the existing Ben-authored benchmark modules; no Lead source copied. Original tests of mutation accounting, scheduling pressure and repeated campaign ordering."
     },
+    "benchmarks/test_tin.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
+    },
     "benchmarks/test_vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
+    },
+    "benchmarks/tin.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
+    },
+    "benchmarks/tin/position-limit.sql": {
+      "owner": "ben",
+      "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
     },
     "benchmarks/vacuum_cleanup.py": {
       "owner": "ben",

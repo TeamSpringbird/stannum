@@ -1,5 +1,9 @@
 # Run a local benchmark
 
+For new broad search measurements, use the [published-trace runner](published-trace.md).
+This guide retains the older campaign workflow for historical reproduction and
+the coverage still awaiting migration; see the new guide's retirement gates.
+
 Use this guide to measure a Stannum build. The [results summary](README.md)
 explains what has been measured and which comparisons are still planned.
 

@@ -1,0 +1,595 @@
+[
+  {
+    "run": "tin-count-100k-01",
+    "status": "complete",
+    "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+    "image": "sha256:4b8506e6e8facd281c292111d5b6af069768aff73ecf12c8ad48a54acce70341",
+    "driver_revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+    "adapter_patch_sha256": "92b86c62c16dd137ab444e7cf38bb0ccca6a1350c7a3f2679ac82515d35e2b88",
+    "driver_binary_sha256": "dc31ea023ae9b7e6a6eb4100d6497fb64c28cc22d46148871567b07499175093",
+    "runner_sha256": "d94bfa6d40918c21ad6d4aad95669c2bd46631965aa4e659edb4a3193a879905",
+    "query_trace_sha256": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb",
+    "config": {
+      "rows": 100000,
+      "engines": [
+        "stannum",
+        "postgres"
+      ],
+      "workload": "count",
+      "style": "mixed",
+      "clients": 2,
+      "seconds": 60,
+      "warmup": 10,
+      "updates": 0,
+      "memory": "4g",
+      "shared_buffers": "1GB",
+      "cpus": 4,
+      "seed": 1592614637
+    },
+    "full_count_differences": null,
+    "measurements": [
+      {
+        "completed": 198800,
+        "cross_engine_membership_differences": {},
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 66276,
+            "p50_ms": 0.244,
+            "p95_ms": 0.861,
+            "p99_ms": 1.784
+          },
+          "disjunction": {
+            "completed": 66260,
+            "p50_ms": 0.409,
+            "p95_ms": 2.65,
+            "p99_ms": 4.437
+          },
+          "phrase": {
+            "completed": 66264,
+            "p50_ms": 0.305,
+            "p95_ms": 1.494,
+            "p99_ms": 4.177
+          }
+        },
+        "index_bytes": 165806080,
+        "index_hit_bytes": 30441791488,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.3,
+        "p95_ms": 1.991,
+        "p99_ms": 3.661,
+        "qps": 3313.443781459382,
+        "seconds": 59.998,
+        "status": "complete",
+        "total_bytes": 362110976,
+        "updates_completed": 0
+      },
+      {
+        "completed": 55841,
+        "cross_engine_membership_differences": {},
+        "engine": "postgres",
+        "families": {
+          "conjunction": {
+            "completed": 18619,
+            "p50_ms": 0.284,
+            "p95_ms": 1.367,
+            "p99_ms": 3.337
+          },
+          "disjunction": {
+            "completed": 18606,
+            "p50_ms": 2.39,
+            "p95_ms": 14.436,
+            "p99_ms": 17.858
+          },
+          "phrase": {
+            "completed": 18616,
+            "p50_ms": 0.59,
+            "p95_ms": 4.798,
+            "p99_ms": 17.16
+          }
+        },
+        "index_bytes": 115572736,
+        "index_hit_bytes": 7481368576,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.621,
+        "p95_ms": 11.117,
+        "p99_ms": 16.394,
+        "qps": 930.6988449807496,
+        "seconds": 59.999,
+        "status": "complete",
+        "total_bytes": 690520064,
+        "updates_completed": 0
+      }
+    ],
+    "checks": [
+      {
+        "engine": "stannum",
+        "correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "sampled_rows": 1000,
+          "seconds": 18.903445082716644
+        },
+        "index_build_seconds": 16.36253929231316,
+        "vector_preparation_seconds": 9.173527359962463e-07,
+        "import_seconds": 4.077180375345051
+      },
+      {
+        "engine": "postgres",
+        "correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "sampled_rows": 1000,
+          "seconds": 3.669320167042315
+        },
+        "index_build_seconds": 4.168106708675623,
+        "vector_preparation_seconds": 18.587605291977525,
+        "import_seconds": 4.252043750137091
+      }
+    ]
+  },
+  {
+    "run": "tin-count-100k-02",
+    "status": "complete",
+    "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+    "image": "sha256:4b8506e6e8facd281c292111d5b6af069768aff73ecf12c8ad48a54acce70341",
+    "driver_revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+    "adapter_patch_sha256": "0fa6a11db9af01795d0382f747cf48a6b398c0f0bcd92979486892337619fab8",
+    "driver_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a",
+    "runner_sha256": "f0a742cd163d48cff5df77715e9e9734da9b217cb66fe4ea0c394d415ef7b9fd",
+    "query_trace_sha256": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb",
+    "config": {
+      "rows": 100000,
+      "engines": [
+        "postgres",
+        "stannum"
+      ],
+      "workload": "count",
+      "style": "mixed",
+      "clients": 2,
+      "seconds": 60,
+      "warmup": 10,
+      "updates": 0,
+      "memory": "4g",
+      "shared_buffers": "1GB",
+      "cpus": 4,
+      "seed": 1592614637
+    },
+    "full_count_differences": {
+      "126:phrase": {
+        "postgres": 5,
+        "stannum": 6
+      },
+      "135:phrase": {
+        "postgres": 555,
+        "stannum": 588
+      },
+      "183:phrase": {
+        "postgres": 11,
+        "stannum": 12
+      },
+      "201:phrase": {
+        "postgres": 14,
+        "stannum": 15
+      },
+      "229:phrase": {
+        "postgres": 211,
+        "stannum": 217
+      },
+      "261:phrase": {
+        "postgres": 182,
+        "stannum": 183
+      },
+      "269:phrase": {
+        "postgres": 24,
+        "stannum": 26
+      },
+      "42:phrase": {
+        "postgres": 34,
+        "stannum": 35
+      },
+      "43:phrase": {
+        "postgres": 488,
+        "stannum": 491
+      },
+      "46:phrase": {
+        "postgres": 185,
+        "stannum": 187
+      },
+      "58:phrase": {
+        "postgres": 47,
+        "stannum": 50
+      }
+    },
+    "measurements": [
+      {
+        "completed": 54885,
+        "cross_engine_membership_differences": {},
+        "engine": "postgres",
+        "families": {
+          "conjunction": {
+            "completed": 18298,
+            "p50_ms": 0.294,
+            "p95_ms": 1.412,
+            "p99_ms": 3.323
+          },
+          "disjunction": {
+            "completed": 18294,
+            "p50_ms": 2.422,
+            "p95_ms": 14.551,
+            "p99_ms": 17.857
+          },
+          "phrase": {
+            "completed": 18293,
+            "p50_ms": 0.614,
+            "p95_ms": 4.813,
+            "p99_ms": 17.28
+          }
+        },
+        "index_bytes": 115572736,
+        "index_hit_bytes": 7361699840,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.647,
+        "p95_ms": 11.322,
+        "p99_ms": 16.483,
+        "qps": 914.7804926830895,
+        "seconds": 59.998,
+        "status": "complete",
+        "total_bytes": 690520064,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      {
+        "completed": 203785,
+        "cross_engine_membership_differences": {},
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 67921,
+            "p50_ms": 0.239,
+            "p95_ms": 0.841,
+            "p99_ms": 1.685
+          },
+          "disjunction": {
+            "completed": 67933,
+            "p50_ms": 0.401,
+            "p95_ms": 2.61,
+            "p99_ms": 4.269
+          },
+          "phrase": {
+            "completed": 67931,
+            "p50_ms": 0.297,
+            "p95_ms": 1.411,
+            "p99_ms": 4.132
+          }
+        },
+        "index_bytes": 165806080,
+        "index_hit_bytes": 31446188032,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.294,
+        "p95_ms": 1.973,
+        "p99_ms": 3.592,
+        "qps": 3396.4732745545757,
+        "seconds": 59.999,
+        "status": "complete",
+        "total_bytes": 362110976,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      }
+    ],
+    "checks": [
+      {
+        "engine": "postgres",
+        "correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "sampled_rows": 1000,
+          "seconds": 3.638066915795207
+        },
+        "index_build_seconds": 4.276978749781847,
+        "vector_preparation_seconds": 18.59006154257804,
+        "import_seconds": 4.119837749749422
+      },
+      {
+        "engine": "stannum",
+        "correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "sampled_rows": 1000,
+          "seconds": 19.412959875538945
+        },
+        "index_build_seconds": 16.762340041808784,
+        "vector_preparation_seconds": 9.173527359962463e-07,
+        "import_seconds": 4.0829481249675155
+      }
+    ]
+  },
+  {
+    "run": "tin-updates-02",
+    "status": "complete",
+    "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+    "image": "sha256:4b8506e6e8facd281c292111d5b6af069768aff73ecf12c8ad48a54acce70341",
+    "driver_revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+    "adapter_patch_sha256": "0fa6a11db9af01795d0382f747cf48a6b398c0f0bcd92979486892337619fab8",
+    "driver_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a",
+    "runner_sha256": "f0a742cd163d48cff5df77715e9e9734da9b217cb66fe4ea0c394d415ef7b9fd",
+    "query_trace_sha256": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb",
+    "config": {
+      "rows": 1000,
+      "engines": [
+        "stannum",
+        "postgres"
+      ],
+      "workload": "count",
+      "style": "disjunction",
+      "clients": 2,
+      "seconds": 30,
+      "warmup": 5,
+      "updates": 100,
+      "memory": "4g",
+      "shared_buffers": "1GB",
+      "cpus": 4,
+      "seed": 1592614637
+    },
+    "full_count_differences": {
+      "135:phrase": {
+        "postgres": 14,
+        "stannum": 16
+      }
+    },
+    "measurements": [
+      {
+        "completed": 201501,
+        "cross_engine_membership_differences": {
+          "135:phrase": 2
+        },
+        "engine": "stannum",
+        "families": {
+          "disjunction": {
+            "completed": 201501,
+            "p50_ms": 0.227,
+            "p95_ms": 0.597,
+            "p99_ms": 0.893
+          }
+        },
+        "index_bytes": 3145728,
+        "index_hit_bytes": 32134823936,
+        "index_read_bytes": 0,
+        "measured_query_forms": 302,
+        "p50_ms": 0.227,
+        "p95_ms": 0.597,
+        "p99_ms": 0.893,
+        "qps": 6716.923897463249,
+        "seconds": 29.999,
+        "status": "complete",
+        "total_bytes": 6160384,
+        "update_errors": 0,
+        "updates_attempted": 2857,
+        "updates_completed": 2857
+      },
+      {
+        "completed": 113836,
+        "cross_engine_membership_differences": {
+          "135:phrase": 2
+        },
+        "engine": "postgres",
+        "families": {
+          "disjunction": {
+            "completed": 113836,
+            "p50_ms": 0.419,
+            "p95_ms": 1.137,
+            "p99_ms": 1.614
+          }
+        },
+        "index_bytes": 4227072,
+        "index_hit_bytes": 171471486976,
+        "index_read_bytes": 0,
+        "measured_query_forms": 302,
+        "p50_ms": 0.419,
+        "p95_ms": 1.137,
+        "p99_ms": 1.614,
+        "qps": 3794.6598219940665,
+        "seconds": 29.999,
+        "status": "complete",
+        "total_bytes": 13099008,
+        "update_errors": 0,
+        "updates_attempted": 2847,
+        "updates_completed": 2847
+      }
+    ],
+    "checks": [
+      {
+        "engine": "stannum",
+        "correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "sampled_rows": 1000,
+          "seconds": 26.76261662505567
+        },
+        "post_update_correctness": {
+          "mismatches": 0,
+          "queries": 906
+        },
+        "index_build_seconds": 0.24904841650277376,
+        "vector_preparation_seconds": 3.7439167499542236e-07,
+        "import_seconds": 0.09535541664808989
+      },
+      {
+        "engine": "postgres",
+        "correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "sampled_rows": 1000,
+          "seconds": 1.5975764160975814
+        },
+        "post_update_correctness": {
+          "mismatches": 0,
+          "queries": 906
+        },
+        "index_build_seconds": 0.12475533410906792,
+        "vector_preparation_seconds": 0.32907520793378353,
+        "import_seconds": 0.1138955419883132
+      }
+    ]
+  },
+  {
+    "run": "tin-topk-final",
+    "status": "complete",
+    "source_sha256": "04d27d986bb5291d0c84276beee645006753df6666aea9ffe808fdfb0fb54985",
+    "image": "sha256:4b8506e6e8facd281c292111d5b6af069768aff73ecf12c8ad48a54acce70341",
+    "driver_revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+    "adapter_patch_sha256": "0fa6a11db9af01795d0382f747cf48a6b398c0f0bcd92979486892337619fab8",
+    "driver_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a",
+    "runner_sha256": "fe2359a344849dc3305bbfc29211f3cb4cfcce36db493e0d7549526f488beea9",
+    "query_trace_sha256": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb",
+    "config": {
+      "rows": 1000,
+      "engines": [
+        "stannum",
+        "postgres"
+      ],
+      "workload": "topk",
+      "style": "mixed",
+      "clients": 2,
+      "seconds": 10,
+      "warmup": 2,
+      "updates": 0,
+      "memory": "4g",
+      "shared_buffers": "1GB",
+      "cpus": 4,
+      "seed": 1592614637
+    },
+    "full_count_differences": {
+      "135:phrase": {
+        "postgres": 14,
+        "stannum": 16
+      }
+    },
+    "measurements": [
+      {
+        "completed": 1472,
+        "cross_engine_membership_differences": {
+          "135:phrase": 2
+        },
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 492,
+            "p50_ms": 0.327,
+            "p95_ms": 0.864,
+            "p99_ms": null
+          },
+          "disjunction": {
+            "completed": 494,
+            "p50_ms": 66.025,
+            "p95_ms": 71.071,
+            "p99_ms": null
+          },
+          "phrase": {
+            "completed": 486,
+            "p50_ms": 0.261,
+            "p95_ms": 0.706,
+            "p99_ms": null
+          }
+        },
+        "index_bytes": 3145728,
+        "index_hit_bytes": 242245632,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.361,
+        "p95_ms": 68.846,
+        "p99_ms": 72.3,
+        "qps": 147.58371766593143,
+        "seconds": 9.974,
+        "status": "complete",
+        "total_bytes": 6160384,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      {
+        "completed": 22364,
+        "cross_engine_membership_differences": {
+          "135:phrase": 2
+        },
+        "engine": "postgres",
+        "families": {
+          "conjunction": {
+            "completed": 7452,
+            "p50_ms": 0.196,
+            "p95_ms": 0.931,
+            "p99_ms": 2.222
+          },
+          "disjunction": {
+            "completed": 7456,
+            "p50_ms": 1.091,
+            "p95_ms": 6.734,
+            "p99_ms": 11.798
+          },
+          "phrase": {
+            "completed": 7456,
+            "p50_ms": 0.166,
+            "p95_ms": 0.545,
+            "p99_ms": 1.417
+          }
+        },
+        "index_bytes": 4227072,
+        "index_hit_bytes": 1398022144,
+        "index_read_bytes": 0,
+        "measured_query_forms": 906,
+        "p50_ms": 0.251,
+        "p95_ms": 3.777,
+        "p99_ms": 8.609,
+        "qps": 2236.6236623662367,
+        "seconds": 9.999,
+        "status": "complete",
+        "total_bytes": 13099008,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      }
+    ],
+    "checks": [
+      {
+        "engine": "stannum",
+        "correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "sampled_rows": 1000,
+          "seconds": 26.870342374779284
+        },
+        "ranked_correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "reference": "exhaustive same-engine score multiset; ties unordered"
+        },
+        "index_build_seconds": 0.2559384172782302,
+        "vector_preparation_seconds": 2.9243528842926025e-07,
+        "import_seconds": 0.09440708346664906
+      },
+      {
+        "engine": "postgres",
+        "correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "sampled_rows": 1000,
+          "seconds": 1.7424675412476063
+        },
+        "ranked_correctness": {
+          "mismatches": 0,
+          "queries": 906,
+          "reference": "exhaustive same-engine score multiset; ties unordered"
+        },
+        "index_build_seconds": 0.1442012507468462,
+        "vector_preparation_seconds": 0.35132891591638327,
+        "import_seconds": 0.09313537459820509
+      }
+    ]
+  }
+]

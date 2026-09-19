@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+"""Local setup for the pinned PlanetScale benchmarker; upstream owns measurement."""
+import argparse
+import collections
+import csv
+import fcntl
+import gzip
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import time
+import uuid
+
+import dataset
+import run as bench
+
+ROOT = Path(__file__).resolve().parent.parent
+ASSETS = ROOT / 'benchmarks/tin'
+REVISION = 'f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86'
+REPOSITORY = 'https://github.com/planetscale/paradedb-benchmarker.git'
+DEFAULT_DRIVER = ROOT / 'benchmarks/results/tin-driver'
+LOADED_SOURCES = {str(p): dataset.sha256(p) for p in
+                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), *ASSETS.iterdir()]
+                  if p.is_file()}
+
+
+def verify_sources(expected):
+    for name, digest in expected.items():
+        if not Path(name).is_file() or dataset.sha256(name) != digest:
+            raise ValueError('benchmark source changed after process startup: ' + name)
+
+
+def command(args, **kwargs):
+    return subprocess.run([str(a) for a in args], check=True, **kwargs)
+
+
+def output(args, **kwargs):
+    return subprocess.check_output([str(a) for a in args], text=True, **kwargs).strip()
+
+
+def identities(driver):
+    files = output(['git', '-C', driver, 'ls-files', '--cached', '--others', '--exclude-standard', '-z']).rstrip('\0').split('\0')
+    files = [p for p in files if p not in ('stannum-adapter.json', 'pg-driver-test')]
+    return {name: dataset.sha256(driver / name) for name in files}
+
+
+def prepare(args):
+    driver = args.driver.resolve()
+    if driver.exists():
+        raise ValueError('driver directory already exists; use a fresh path')
+    env = dict(os.environ, GIT_LFS_SKIP_SMUDGE='1')
+    command(['git', 'clone', '--no-checkout', REPOSITORY, driver], env=env)
+    command(['git', '-C', driver, 'checkout', '--detach', REVISION], env=env)
+    command(['git', '-C', driver, 'apply', '--check', ASSETS / 'upstream.patch'])
+    command(['git', '-C', driver, 'apply', ASSETS / 'upstream.patch'])
+    for source, target in [('register.go', 'backends/stannum/register.go'),
+                           ('main.go', 'cmd/stannum-k6/main.go'),
+                           ('live_rows_test.go', 'backends/shared/postgres/stannum_live_rows_test.go')]:
+        path = driver / target
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ASSETS / source, path)
+    bench.save(driver / 'stannum-adapter.json', {
+        'repository': REPOSITORY, 'revision': REVISION,
+        'update_target_protocol': 'random-page-live-wrap-v1',
+        'patch_sha256': dataset.sha256(ASSETS / 'upstream.patch'),
+        'files': identities(driver),
+    })
+    print(driver)
+
+
+def verify_driver(driver):
+    manifest = json.loads((driver / 'stannum-adapter.json').read_text())
+    if output(['git', '-C', driver, 'rev-parse', 'HEAD']) != REVISION:
+        raise ValueError('unexpected upstream revision')
+    if manifest['files'] != identities(driver):
+        raise ValueError('prepared adapter changed; prepare/build a fresh driver')
+    if manifest['patch_sha256'] != dataset.sha256(ASSETS / 'upstream.patch'):
+        raise ValueError('repository adapter changed; prepare/build a fresh driver')
+    for source, target in [('register.go', 'backends/stannum/register.go'), ('main.go', 'cmd/stannum-k6/main.go'),
+                           ('live_rows_test.go', 'backends/shared/postgres/stannum_live_rows_test.go')]:
+        if dataset.sha256(ASSETS / source) != manifest['files'][target]:
+            raise ValueError('repository adapter changed; prepare/build a fresh driver')
+    return manifest
+
+
+def build(args):
+    driver = args.driver.resolve()
+    manifest = verify_driver(driver)
+    target_os = {'Darwin': 'darwin', 'Linux': 'linux'}[platform.system()]
+    target_arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'amd64'}[platform.machine()]
+    # Use the pinned module's k6 version, rather than xk6's changing latest default.
+    command(['docker', 'pull', 'golang:1.26.1-bookworm'])
+    image = output(['docker', 'image', 'inspect', 'golang:1.26.1-bookworm', '--format', '{{.Id}}'])
+    builder = ['docker', 'run', '--rm', '--cpus', '4', '--memory', '6g',
+             '-v', f'{driver}:/src', '-w', '/src',
+             '-v', 'stannum-benchmark-go-mod:/go/pkg/mod',
+             '-v', 'stannum-benchmark-go-cache:/root/.cache/go-build',
+             '-e', f'GOOS={target_os}', '-e', f'GOARCH={target_arch}',
+             '-e', 'CGO_ENABLED=0', '-e', 'GOMAXPROCS=4', image]
+    command(builder + ['go', 'build', '-mod=readonly', '-p', '4', '-o', 'k6', './cmd/stannum-k6'])
+    command(builder + ['go', 'test', '-mod=readonly', '-p', '4', '-c', '-o', 'pg-driver-test', './backends/shared/postgres'])
+    if manifest['files'] != identities(driver):
+        raise ValueError('driver source changed while building')
+    manifest.update(binary_sha256=dataset.sha256(driver / 'k6'),
+                    test_binary_sha256=dataset.sha256(driver / 'pg-driver-test'),
+                    build_image=image, target_os=target_os, target_arch=target_arch)
+    bench.save(driver / 'stannum-adapter.json', manifest)
+
+
+def build_image(args):
+    args.output.mkdir(parents=True, exist_ok=False)
+    source = bench.provenance(args.output)
+    bench.save(args.output / 'source.json', source)
+    recipe = bench.digest((ROOT / 'benchmarks/Dockerfile').read_bytes() +
+                          (ROOT / 'benchmarks/Dockerfile.dockerignore').read_bytes())
+    with (args.output / 'build.log').open('w') as log:
+        command(['docker', 'build', '-f', 'benchmarks/Dockerfile',
+                 '--build-arg', 'STANNUM_SOURCE_SHA256=' + source['source_sha256'],
+                 '--build-arg', 'STANNUM_COMMIT=' + source['commit'],
+                 '--build-arg', 'RECIPE_SHA256=' + recipe, '-t', args.image, '.'],
+                cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+    bench.save(args.output / 'image.json', json.loads(output(['docker', 'image', 'inspect', args.image])))
+
+
+def literal(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def trace_queries(driver):
+    records = json.loads((driver / 'datasets/wikipedia/queries.json').read_text())['queries']
+    if any(not re.fullmatch('[a-z]+(?: [a-z]+)*', q['text']) for q in records):
+        raise ValueError('lexical oracle requires normalized ASCII word queries')
+    return [(f"{q['source_id']}:{style}", q['engines']['tin'][style],
+             q['engines']['postgres'][style], q['text'])
+            for q in records for style in ('conjunction', 'disjunction', 'phrase')]
+
+
+def lexical_predicate(name, text):
+    style = name.split(':')[1]
+    if style == 'phrase':
+        return f"body ~ {literal('(^| )' + text + '( |$)')}"
+    terms = [f"body ~ {literal('(^| )' + term + '( |$)')}" for term in text.split()]
+    return '(' + (' OR ' if style == 'disjunction' else ' AND ').join(terms) + ')'
+
+
+def check_sql(queries, engine='stannum'):
+    # Exact set equality, not just equal counts. The reference has no search index.
+    statements = []
+    for name, tin, postgres, text in queries:
+        predicate = (f'body ==> {literal(tin)}' if engine == 'stannum' else
+                     f"body_tsv @@ to_tsquery('simple', {literal(postgres)})")
+        indexed = f'SELECT id FROM documents WHERE {predicate}'
+        actual = 'SELECT id FROM indexed JOIN reference USING(id)'
+        reference = (lexical_predicate(name, text) if engine == 'stannum' else
+                     f"body_tsv @@ to_tsquery('simple', {literal(postgres)})")
+        expected = f'SELECT id FROM reference WHERE {reference}'
+        statements.append(f"WITH indexed AS MATERIALIZED ({indexed}) SELECT {literal(name)}, count(*), "
+                          f"(SELECT count(*) FROM indexed) FROM (({actual} EXCEPT ALL {expected}) "
+                          f"UNION ALL ({expected} EXCEPT ALL {actual})) difference;")
+    return '\n'.join(statements)
+
+
+def ranked_check_sql(queries, engine):
+    statements = []
+    for name, tin, postgres, text in queries:
+        tsquery = f"to_tsquery('simple', {literal(postgres)})"
+        predicate = f'body ==> {literal(tin)}' if engine == 'stannum' else f'body_tsv @@ {tsquery}'
+        score = 'stannum.full_score(ctid)' if engine == 'stannum' else f'ts_rank_cd(body_tsv,{tsquery})'
+        # Compare score multisets, allowing arbitrary document order within ties.
+        # MATERIALIZED forces exhaustive scoring before the reference sort/limit.
+        select = f'SELECT id, {score} AS score FROM documents WHERE {predicate}'
+        statements.append(f"WITH all_scores AS MATERIALIZED ({select}), "
+                          f"expected AS (SELECT score FROM all_scores ORDER BY score DESC LIMIT 10), "
+                          f"actual AS MATERIALIZED ({select} ORDER BY score DESC LIMIT 10) "
+                          f"SELECT {literal(name)}, count(*) FROM ("
+                          '(SELECT score FROM actual EXCEPT ALL SELECT score FROM expected) UNION ALL '
+                          '(SELECT score FROM expected EXCEPT ALL SELECT score FROM actual) UNION ALL '
+                          'SELECT score FROM actual GROUP BY id,score HAVING count(*) > 1 UNION ALL '
+                          "SELECT score FROM actual WHERE score IS NULL OR score::float8 IN ('NaN'::float8,'Infinity'::float8,'-Infinity'::float8)"
+                          ') differences;')
+    return '\n'.join(statements)
+
+
+def semantics_sql(queries):
+    return '\n'.join(
+        f"SELECT {literal(name)}, count(*) FROM reference WHERE "
+        f"({lexical_predicate(name, text)}) IS DISTINCT FROM "
+        f"(body_tsv @@ to_tsquery('simple',{literal(postgres)}));"
+        for name, _, postgres, text in queries)
+
+
+def validate_result(text, names):
+    rows = [line.split('|') for line in text.splitlines() if line]
+    if [row[0] for row in rows] != names or any(
+            len(row) not in (2, 3) or row[1] != '0' or (len(row) == 3 and not row[2].isdigit()) for row in rows):
+        raise ValueError('query membership mismatch or incomplete oracle output; see correctness.txt')
+
+
+def report(root):
+    manifest = json.loads((root / 'manifest.json').read_text())
+    rows = []
+    for job in manifest['jobs']:
+        engine = job['engine']
+        path = root / engine
+        exports = list(path.glob('result_*.json'))
+        if manifest['status'] != 'complete' or job['status'] != 'complete' or len(exports) != 1:
+            rows.append(dict(engine=engine, status='incomplete'))
+            continue
+        exported = json.loads(exports[0].read_text())['runs'][engine]
+        elapsed = (exported['endTime'] - exported['startTime']) / 1000
+        samples, groups = [], collections.defaultdict(list)
+        queries = collections.defaultdict(list)
+        updates = collections.Counter()
+        with gzip.open(path / 'samples.json.gz', 'rt') as records:
+            for line in records:
+                point = json.loads(line)
+                if point['type'] != 'Point':
+                    continue
+                if point['metric'] in ('update_docs', 'update_errors'):
+                    updates[point['metric']] += point['data']['value']
+                if point['metric'] == 'update_duration':
+                    updates['attempted'] += 1
+                if point['metric'] != 'query_duration':
+                    continue
+                data = point['data']
+                query = data['tags']['query_id']
+                samples.append(data['value'])
+                groups[query.split(':')[1]].append(data['value'])
+                queries[query].append(data['value'])
+        if not samples or elapsed <= 0:
+            raise ValueError('completed run has no measured query samples')
+        def distribution(values):
+            return dict(completed=len(values), p50_ms=bench.percentile(values, .5),
+                        p95_ms=bench.percentile(values, .95),
+                        p99_ms=bench.percentile(values, .99) if len(values) >= 1000 else None)
+        metrics = exported['queries'][engine]
+        rows.append(dict(engine=engine, status='complete', seconds=elapsed,
+                         qps=len(samples) / elapsed, **distribution(samples),
+                         families={k: distribution(v) for k, v in groups.items()},
+                         queries={k: distribution(v) for k, v in queries.items()},
+                         measured_query_forms=len(queries),
+                         index_bytes=job['sizes']['index'], total_bytes=job['sizes']['total'],
+                         index_read_bytes=metrics.get('indexReadBytes'),
+                         index_hit_bytes=metrics.get('indexHitBytes'),
+                         updates_completed=updates['update_docs'], updates_attempted=updates['attempted'],
+                         update_errors=updates['update_errors'],
+                         cross_engine_membership_differences=job['cross_engine_membership_differences']))
+    bench.save(root / 'comparison.json', rows)
+    lines = ['# Published-trace local run', '',
+             'Diagnostic measurements, not a capacity claim. Each engine uses its native query semantics.',
+             'GIN ranks with ts_rank_cd; Stannum ranks with BM25. Phrase membership can also differ.',
+             'Percentiles use nearest rank; p99 is omitted below 1,000 samples. No speedup ratio is inferred.', '',
+             '| Engine | QPS | p95 ms | p99 ms | Measured query forms | Index MiB | Total relation MiB |',
+             '| --- | ---: | ---: | ---: | ---: | ---: | ---: |']
+    for row in rows:
+        if row['status'] != 'complete':
+            lines.append(f"| {row['engine']} | incomplete | | | | | |")
+        else:
+            p99 = f"{row['p99_ms']:.3f}" if row['p99_ms'] is not None else '—'
+            lines.append(f"| {row['engine']} | {row['qps']:.1f} | {row['p95_ms']:.3f} | {p99} | "
+                         f"{row['measured_query_forms']} | {row['index_bytes']/2**20:.2f} | {row['total_bytes']/2**20:.2f} |")
+    lines += ['', 'See comparison.json for query-family and individual-query distributions,',
+              'semantic differences on the validation sample, and completed updates.',
+              'Index read/hit bytes are block accesses, not physical disk traffic.',
+              'The full pinned trace may not be traversed during short or slow runs.']
+    differences = manifest.get('full_count_differences')
+    if differences is None:
+        lines += ['', 'Full-corpus count comparison was not recorded for this run.']
+    else:
+        style = manifest['config']['style']
+        timed = sum(style == 'mixed' or name.split(':')[1] == style for name in differences)
+        lines += ['', f'Full-corpus count disagreements: {len(differences)} checked forms, '
+                  f'{timed} in the timed query mix. See manifest.json.']
+    (root / 'report.md').write_text('\n'.join(lines) + '\n')
+
+
+def run(args):
+    verify_sources(LOADED_SOURCES)
+    driver = args.driver.resolve()
+    adapter = verify_driver(driver)
+    if adapter.get('binary_sha256') != dataset.sha256(driver / 'k6'):
+        raise ValueError('driver binary not built from recorded adapter')
+    if adapter.get('test_binary_sha256') != dataset.sha256(driver / 'pg-driver-test'):
+        raise ValueError('driver regression binary does not match recorded build')
+    corpus = dataset.verify(args.dataset)
+    if len(set(args.engines)) != len(args.engines) or not 0 <= args.updates <= 1000000000:
+        raise ValueError('engines must be distinct and updates must be between 0 and 1000000000')
+    if args.rows > corpus['rows']:
+        raise ValueError('requested rows exceed dataset')
+    root = args.output.resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    source = bench.provenance(root)
+    image = json.loads(output(['docker', 'image', 'inspect', args.image]))[0]
+    if image['Architecture'] != {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'amd64'}[platform.machine()]:
+        raise ValueError('image must run natively; emulated timings are not supported')
+    if image['Config'].get('Labels', {}).get('benchmark.stannum_source_sha256') != source['source_sha256']:
+        raise ValueError('image does not match current extension source')
+    recipe = bench.digest((ROOT / 'benchmarks/Dockerfile').read_bytes() +
+                          (ROOT / 'benchmarks/Dockerfile.dockerignore').read_bytes())
+    if image['Config'].get('Labels', {}).get('benchmark.recipe_sha256') != recipe:
+        raise ValueError('image does not match current Docker build recipe')
+    manifest = dict(status='running', adapter=adapter, image=image['Id'], source=source,
+                    corpus=corpus, config={k: str(v) if isinstance(v, Path) else v
+                                          for k, v in vars(args).items() if k != 'func'},
+                    runner_sha256=LOADED_SOURCES[str(Path(__file__))], harness_sources=LOADED_SOURCES, jobs=[])
+    bench.save(root / 'manifest.json', manifest)
+    protocol = root / 'protocol'
+    protocol.mkdir()
+    for filename in ('tin.py', 'run.py', 'dataset.py'):
+        shutil.copy2(ROOT / 'benchmarks' / filename, protocol / filename)
+    shutil.copytree(ASSETS, protocol / 'tin')
+    manifest['host'] = dict(system=platform.platform(), machine=platform.machine(),
+                            docker=json.loads(output(['docker', 'info', '--format', '{{json .}}'])))
+    env = dict(os.environ, PGHOST='127.0.0.1', PGPORT=str(args.port), PGUSER='postgres',
+               PGPASSWORD='postgres', PGDATABASE='benchmark',
+               PGOPTIONS='-c statement_timeout=120000 -c jit=off')
+    for key in ('PGSERVICE', 'PGSERVICEFILE'):
+        env.pop(key, None)
+    def sql(text):
+        return output(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', text], env=env)
+    try:
+        for engine in args.engines:
+            verify_sources(LOADED_SOURCES)
+            if adapter != verify_driver(driver) or adapter['binary_sha256'] != dataset.sha256(driver / 'k6'):
+                raise ValueError('driver changed between engines')
+            name = 'stannum-trace-' + uuid.uuid4().hex[:12]
+            volume = name + '-data'
+            path = root / engine
+            path.mkdir()
+            job = dict(engine=engine, status='running', container=name, volume=volume)
+            manifest['jobs'].append(job)
+            bench.save(root / 'manifest.json', manifest)
+            command(['docker', 'volume', 'create', volume], stdout=subprocess.DEVNULL)
+            try:
+                command(['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus),
+                         '--memory', args.memory, '--memory-swap', args.memory, '--shm-size', '1g',
+                         '-p', f'127.0.0.1:{args.port}:5432',
+                         '-v', f'{volume}:/var/lib/postgresql',
+                         '-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_DB=benchmark',
+                         image['Id'], 'postgres', '-c', f'shared_buffers={args.shared_buffers}',
+                         '-c', 'maintenance_work_mem=512MB', '-c', 'work_mem=16MB',
+                         '-c', f'max_parallel_workers={args.cpus}', '-c', 'jit=off',
+                         '-c', 'track_io_timing=on'], stdout=subprocess.DEVNULL)
+                deadline = time.monotonic() + 90
+                while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('PostgreSQL startup')
+                    time.sleep(.5)
+                sql('CREATE EXTENSION pg_prewarm; CREATE EXTENSION stannum;')
+                with (path / 'driver-regressions.txt').open('w') as log:
+                    command([driver / 'pg-driver-test', '-test.v'],
+                            env=dict(env, STANNUM_BENCH_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark',
+                                     BENCHMARKER_POSTGRES_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark'),
+                            stdout=log, stderr=subprocess.STDOUT)
+                sql((ASSETS / 'position-limit.sql').read_text())
+                sql('CREATE TABLE documents(id bigint PRIMARY KEY, body text NOT NULL);')
+                # COPY streams the immutable prefix; no modified shared dataset.
+                with (path / 'input.csv').open('w') as target, (Path(args.dataset) / 'documents.csv').open() as source_csv:
+                    reader, writer = csv.reader(source_csv), csv.writer(target)
+                    for number, row in enumerate(reader):
+                        if number == args.rows:
+                            break
+                        writer.writerow(row)
+                job['input_sha256'] = dataset.sha256(path / 'input.csv')
+                started = time.monotonic()
+                with (path / 'input.csv').open('rb') as data:
+                    command(['psql', '-Xq', '-v', 'ON_ERROR_STOP=1', '-c',
+                             'COPY documents FROM STDIN WITH (FORMAT csv)'], stdin=data, env=env)
+                job['import_seconds'] = time.monotonic() - started
+                started = time.monotonic()
+                if engine == 'postgres':
+                    sql("ALTER TABLE documents ADD COLUMN body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED;")
+                job['vector_preparation_seconds'] = time.monotonic() - started
+                started = time.monotonic()
+                index = 'documents_body_gin_idx' if engine == 'postgres' else 'documents_body_stannum_idx'
+                expression = 'gin(body_tsv)' if engine == 'postgres' else 'stannum(body)'
+                sql(f'CREATE INDEX {index} ON documents USING {expression};')
+                job['index_build_seconds'] = time.monotonic() - started
+                sql('VACUUM ANALYZE documents;')
+                job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));"))
+                sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
+                queries = trace_queries(driver)
+                oracle = 'SET enable_seqscan=off;\n' + check_sql(queries, engine)
+                (path / 'correctness.sql').write_text(oracle)
+                started = time.monotonic()
+                text = sql(oracle)
+                (path / 'correctness.txt').write_text(text + '\n')
+                validate_result(text, [q[0] for q in queries])
+                job['full_counts_before'] = {name: int(count) for name, _, count in
+                                            (line.split('|') for line in text.splitlines())}
+                job['correctness'] = dict(queries=len(queries), mismatches=0,
+                                          sampled_rows=min(args.rows, args.validation_rows),
+                                          seconds=time.monotonic() - started)
+                semantics = sql(semantics_sql(queries))
+                (path / 'semantics.txt').write_text(semantics + '\n')
+                differences = {name: int(count) for name, count in
+                               (line.split('|') for line in semantics.splitlines()) if int(count)}
+                job['cross_engine_membership_differences'] = differences
+                sql('DROP TABLE reference;')
+                if args.workload == 'topk':
+                    ranked_sql = ranked_check_sql(queries, engine)
+                    (path / 'ranked-correctness.sql').write_text(ranked_sql)
+                    ranked = sql(ranked_sql)
+                    (path / 'ranked-correctness.txt').write_text(ranked + '\n')
+                    validate_result(ranked, [q[0] for q in queries])
+                    job['ranked_correctness'] = dict(queries=len(queries), mismatches=0,
+                                                     reference='exhaustive same-engine score multiset; ties unordered')
+                for query_id, tin, postgres, _ in queries[:6]:
+                    predicate = (f'body ==> {literal(tin)}' if engine == 'stannum' else
+                                 f"body_tsv @@ to_tsquery('simple',{literal(postgres)})")
+                    plan = sql(f'EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) SELECT count(*) FROM documents WHERE {predicate};')
+                    (path / ('plan-' + query_id.replace(':', '-') + '.json')).write_text(plan)
+                sql('CHECKPOINT;')
+                job['settings'] = json.loads(sql("SELECT json_object_agg(name,setting) FROM pg_settings;"))
+                job['extensions'] = json.loads(sql('SELECT json_object_agg(extname,extversion) FROM pg_extension;'))
+                bench.save(path / 'before-cgroup.json', bench.container_counters(name))
+                # Upstream stops this owned container at phase end. No Makefile
+                # or project-wide cleanup is invoked, and cooldown stays zero.
+                run_env = dict(os.environ, BACKENDS=engine, WORKLOAD=args.workload,
+                               QUERY_STYLE=args.style, QUERIES=str(driver / 'datasets/wikipedia/queries.json'),
+                               CONFIG_DIR=str(driver / 'datasets/wikipedia'),
+                               STANNUM_PORT=str(args.port), POSTGRES_PORT=str(args.port),
+                               STANNUM_CONTAINER=name, POSTGRES_CONTAINER=name,
+                               VUS=str(args.clients), DURATION=f'{args.seconds}s',
+                               PREWARM=f'{args.warmup}s', UPDATES_PER_SECOND=str(args.updates),
+                               SEED=str(args.seed), COOLDOWN='0s', TOP_K='10',
+                               DASHBOARD_EXPORT_DIR=str(path), DASHBOARD_EXPORT_PREFIX='result')
+                with (path / 'driver.log').open('w') as log:
+                    command([driver / 'k6', 'run', '--out', 'dashboard=json',
+                             '--out', 'json=' + str(path / 'samples.json.gz'),
+                             '--summary-export', path / 'summary.json',
+                             driver / 'benchmarks/search.js'], env=run_env, stdout=log, stderr=subprocess.STDOUT)
+                (path / 'post-traffic-container.json').write_text(output(['docker', 'inspect', name]))
+                if args.updates:
+                    # Upstream owns the measured phase and stops the container.
+                    # Restart only for an untimed post-update correctness check.
+                    command(['docker', 'start', name], stdout=subprocess.DEVNULL)
+                    deadline = time.monotonic() + 90
+                    while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError('PostgreSQL restart for update validation')
+                        time.sleep(.5)
+                    if int(sql('SELECT count(*) FROM documents;')) != args.rows:
+                        raise ValueError('update-only phase changed row count')
+                    sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
+                    after = sql(oracle)
+                    (path / 'correctness-after.txt').write_text(after + '\n')
+                    validate_result(after, [q[0] for q in queries])
+                    counts_after = {name: int(count) for name, _, count in
+                                    (line.split('|') for line in after.splitlines())}
+                    if counts_after != job['full_counts_before']:
+                        raise ValueError('whitespace-only updates changed full-corpus query counts')
+                    job['post_update_correctness'] = dict(queries=len(queries), mismatches=0)
+                job['status'] = 'complete'
+            except BaseException as error:
+                job.update(status='failed', error=str(error))
+                raise
+            finally:
+                (path / 'server.log').write_text(subprocess.run(['docker', 'logs', name], capture_output=True, text=True).stderr)
+                state = subprocess.run(['docker', 'inspect', name], capture_output=True, text=True)
+                (path / 'container.json').write_text(state.stdout)
+                command(['docker', 'rm', '-f', name], stdout=subprocess.DEVNULL)
+                command(['docker', 'volume', 'rm', volume], stdout=subprocess.DEVNULL)
+                bench.save(root / 'manifest.json', manifest)
+        full_counts = {job['engine']: job['full_counts_before'] for job in manifest['jobs']}
+        if 'stannum' in full_counts and 'postgres' in full_counts:
+            manifest['full_count_differences'] = {
+                name: {engine: counts[name] for engine, counts in full_counts.items()}
+                for name in full_counts['stannum']
+                if full_counts['stannum'][name] != full_counts['postgres'][name]}
+        verify_sources(LOADED_SOURCES)
+        if adapter != verify_driver(driver) or adapter['binary_sha256'] != dataset.sha256(driver / 'k6'):
+            raise ValueError('benchmark source changed during campaign')
+        manifest['status'] = 'complete'
+    except BaseException as error:
+        manifest.update(status='failed', error=str(error))
+        raise
+    finally:
+        bench.save(root / 'manifest.json', manifest)
+        report(root)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--driver', type=Path, default=DEFAULT_DRIVER)
+    commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('prepare').set_defaults(func=prepare)
+    commands.add_parser('build').set_defaults(func=build)
+    p = commands.add_parser('report')
+    p.add_argument('--output', type=Path, required=True)
+    p.set_defaults(func=lambda args: report(args.output))
+    p = commands.add_parser('build-image')
+    p.set_defaults(func=build_image)
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--image', required=True)
+    p = commands.add_parser('run')
+    p.set_defaults(func=run)
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--dataset', type=Path, required=True)
+    p.add_argument('--image', required=True)
+    p.add_argument('--rows', type=bench.positive, default=1000)
+    p.add_argument('--validation-rows', type=bench.positive, default=1000)
+    p.add_argument('--engines', nargs='+', choices=['stannum', 'postgres'], default=['stannum', 'postgres'])
+    p.add_argument('--workload', choices=['count', 'topk'], default='count')
+    p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase'], default='mixed')
+    p.add_argument('--clients', type=bench.positive, default=2)
+    p.add_argument('--seconds', type=bench.positive, default=60)
+    p.add_argument('--warmup', type=bench.positive, default=10)
+    p.add_argument('--updates', type=int, default=0)
+    p.add_argument('--seed', type=int, default=1592614637)
+    p.add_argument('--cpus', type=bench.positive, default=4)
+    p.add_argument('--memory', default='4g')
+    p.add_argument('--shared-buffers', default='1GB')
+    p.add_argument('--port', type=bench.positive, default=28928)
+    args = parser.parse_args()
+    if args.command in ('prepare', 'report'):
+        args.func(args)
+    else:
+        # Shared with native pgrx builds/tests across worktrees on this machine.
+        # Do not wrap this command in another acquisition of the same lock.
+        with open('/tmp/stannum-pgrx.lock', 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            args.func(args)
+
+
+if __name__ == '__main__':
+    main()
