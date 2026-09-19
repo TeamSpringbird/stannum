@@ -47,14 +47,60 @@ on the smaller server, but `Tin Count` on the larger server. A broad six-term
 OR count also chose different provider trees. The tiny fixtures' identical
 plans did not generalize to all larger workloads.
 
-## Follow-up stages
+## Million-document follow-up
 
-The million-document run adds reversed first-five prepared-query histories,
-parameterized LIMIT, multiple TIN indexes, segment snapshots across mutations,
-REINDEX, and a read-only TIN integrity check. Controlled layout runs vary
-initial/target segment count and build memory, and compare output serialization.
-Final results are recorded after these runs complete; partial artifacts must
-not be interpreted as completed experiments.
+The larger database loaded one million articles in 69.73 seconds and built its
+index in 116.32 seconds. The complete relation occupied 3,803,242,496 bytes;
+its indexes occupied 1,643,405,312 bytes. The build produced four immutable
+segments. This exceeds shared_buffers, but does not imply that the full working
+set was absent from the operating-system cache.
+
+The run completed **639 query observations without query errors**, including
+reversed first-five prepared-query histories, dynamic LIMIT, joins and LATERAL,
+and multiple TIN indexes. All 42 forced-ranking score-sequence checks and all
+30 multi-index membership/count comparisons passed. TIN remains an observed
+implementation, not Stannum's correctness oracle; that role stays with Lead.
+
+The 25% filter/LIMIT 10 result reproduced at this scale: automatic generic
+conjunction had a 378.96 ms median; forced TID pushdown had a 254.64 ms median.
+These are three instrumented observations per strategy, not confidence bounds.
+
+The mixed remote-client workload reached approximately 20 queries/sec with
+four clients and 23 with eight; p95 increased from about 0.47 to 0.88 seconds.
+Ascending and descending client-count passes gave similar results. This is
+neither a hardware-independent capacity limit nor a TIN-versus-Stannum benchmark.
+
+### Mutation, maintenance and recovery
+
+After deleting 100,000 rows and updating 50,000 surviving rows, VACUUM completed
+in 7.24 seconds. The post-VACUUM snapshot reported 1,050,000 current indexed
+documents and 150,000 dead documents. `segment_info` also exposes retired
+entries during maintenance; totals across every returned row can double-count
+retired contents. The derived summary separates current and retired entries.
+
+The initial REINDEX **failed with a lock timeout**, and the three-second cleanup
+wait failed too. The original run remains marked failed in its raw manifest;
+its successful earlier observations have not been discarded or relabeled.
+A subsequent lock snapshot found no remaining blockers, consistent with
+transient contention but insufficient to identify its original holder.
+
+Recovery used a 30-second lock wait. REINDEX completed in 99.10 seconds; the
+resulting four current segments contained 900,000 documents and no dead entries.
+`tin.fsck(index, true)` returned no errors in 8.14 seconds. Three post-rebuild
+plans were captured. Cleanup was verified with zero remaining owned schemas.
+The sidecar `recovery.json` records this separately from the failed original run.
+
+A live 100-row lock regression reproduced the timeout with a four-second lock
+holder: the original three-second wait failed with SQLSTATE 55P03, while the
+new maintenance helper succeeded after 4.09 seconds and restored the session's
+original lock timeout. Artifacts are under
+`benchmarks/results/tin-lock-wait-regression`. The helper is now used for
+REINDEX and cleanup. No claim is made that the original blocker was identified.
+
+## Controlled layout and output projection
+
+Follow-up runs vary initial/target segment count and build memory, and compare
+output serialization. Final results will be added once those runs finish.
 
 ## Replay and bounds
 
@@ -87,7 +133,8 @@ concurrency samples and summary events are saved under the output directory.
 
 Each run creates one unique schema, changes only its own session settings,
 and drops its own schema in `finally`, verifying cleanup. Query timeouts are
-60 seconds; builds, loading and selected maintenance operations allow up to
+60 seconds; exclusive maintenance and cleanup allow a 30-second lock wait.
+Builds, loading and selected maintenance operations allow up to
 300 seconds. The wall-clock budget is checked between operations, not a hard
 interrupt inside an operation. Concurrency is capped at eight persistent
 connections. A failed run or failed cleanup is retained and returns nonzero.

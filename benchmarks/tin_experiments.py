@@ -38,6 +38,16 @@ def ranked(table, query, limit=10, predicate=None, offset=0, scoring='full_score
     return result + f' ORDER BY score DESC LIMIT {limit} OFFSET {offset}'
 
 
+def exclusive_sql(conn, statement):
+    """Give owned-fixture maintenance a bounded wait for background index work."""
+    old = conn.execute("SELECT current_setting('lock_timeout')").fetchone()[0]
+    try:
+        conn.execute("SET lock_timeout='30s'")
+        return conn.execute(statement)
+    finally:
+        conn.execute("SELECT set_config('lock_timeout',%s,false)", (old,))
+
+
 class Experiment:
     def __init__(self, args):
         import psycopg
@@ -81,7 +91,10 @@ class Experiment:
         self.number += 1
         (self.root / f'{self.number:05d}-{name}.sql').write_text(statement + ';\n')
         started = time.monotonic()
-        conn.execute(statement)
+        if name == 'reindex':
+            exclusive_sql(conn, statement)
+        else:
+            conn.execute(statement)
         self.event(name, seconds=time.monotonic() - started)
 
     def probe(self, conn, name, statement, settings=None, serialize=False):
@@ -242,7 +255,8 @@ class Experiment:
         columns=[c.name for c in cursor.description]
         rows=[dict(zip(columns,row)) for row in cursor.fetchall()]
         (self.root/f'segments-{phase}.json').write_text(json.dumps(rows,indent=2)+'\n')
-        self.event('segments',phase=phase,segments=len(rows),docs=sum(r['docs'] for r in rows),dead_docs=sum(r['dead_docs'] for r in rows),pages=sum(r['total_pages'] for r in rows))
+        current=[r for r in rows if r['source_state']=='current']
+        self.event('segments',phase=phase,total_entries=len(rows),current_segments=len(current),retired_entries=len(rows)-len(current),current_docs=sum(r['docs'] for r in current),current_dead_docs=sum(r['dead_docs'] for r in current),current_pages=sum(r['total_pages'] for r in current))
 
     def wiki_queries(self, table):
         queries = ['history','telescope','quasar','war AND history','telescope OR astronomy',
@@ -421,7 +435,7 @@ class Experiment:
             if owned:
                 try:
                     with self.connect() as cleanup:
-                        cleanup.execute(f'DROP SCHEMA {self.schema} CASCADE')
+                        exclusive_sql(cleanup, f'DROP SCHEMA {self.schema} CASCADE')
                         self.meta['remaining_owned_schemas']=cleanup.execute('SELECT count(*) FROM pg_namespace WHERE nspname=%s',(self.schema,)).fetchone()[0]
                     self.meta['cleaned']=self.meta['remaining_owned_schemas']==0
                 except Exception as error:
