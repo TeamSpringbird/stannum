@@ -131,19 +131,23 @@ pub(crate) fn skip_positions(reader: &mut Reader<'_>) -> Result<()> {
 
 /// Appends decoded positions to `into` and returns how many were read.
 pub(crate) fn decode_positions(reader: &mut Reader<'_>, into: &mut Vec<u32>) -> Result<usize> {
+    visit_positions(reader, |position| into.push(position))
+}
+
+fn visit_positions(reader: &mut Reader<'_>, mut visit: impl FnMut(u32)) -> Result<usize> {
     let n = reader.varint_u32()?;
     if n == 0 {
         return Err(Error::InvalidPositions);
     }
     let mut position = reader.varint_u32()?;
-    into.push(position);
+    visit(position);
     for _ in 1..n {
         let delta = reader.varint_u32()?;
         position = position
             .checked_add(delta)
             .and_then(|p| p.checked_add(1))
             .ok_or(Error::Corrupt("position overflow"))?;
-        into.push(position);
+        visit(position);
     }
     Ok(n as usize)
 }
@@ -345,6 +349,21 @@ impl PayloadCursor<'_> {
         Ok(byte)
     }
 
+    /// Validate every position and return its count without materializing it.
+    /// Unlike `next_bucket`, this checks cumulative position overflow as well.
+    pub(crate) fn next_count(&mut self) -> Result<(u8, usize)> {
+        if self.next_ordinal >= self.payload.count {
+            return Err(Error::Corrupt("payload read past end"));
+        }
+        let byte = self.reader.u8()?;
+        if byte > MAX_TF_BUCKET {
+            return Err(Error::Corrupt("payload bucket byte"));
+        }
+        let count = visit_positions(&mut self.reader, |_| {})?;
+        self.next_ordinal += 1;
+        Ok((byte, count))
+    }
+
     pub fn next_entry(&mut self) -> Result<Entry> {
         let mut positions = Vec::new();
         let tf_bucket = self.next_into(&mut positions)?;
@@ -457,6 +476,70 @@ mod tests {
             builder.push(entry.tf_bucket, &entry.positions).unwrap();
         }
         builder.finish_as(format)
+    }
+
+    #[test]
+    fn counting_rejects_cumulative_overflow_even_when_each_varint_fits() {
+        // LSG3: one entry, bucket zero, two positions. The second delta is
+        // representable, but adding it and the implicit one overflows u32.
+        let mut bytes = vec![1, 0, 2];
+        varint::put(&mut bytes, u64::from(u32::MAX));
+        varint::put(&mut bytes, 0);
+        let payload = Payload::parse(&bytes).unwrap();
+        let mut cursor = payload.cursor();
+        assert_eq!(
+            cursor.next_count(),
+            Err(Error::Corrupt("position overflow"))
+        );
+        assert_eq!(cursor.next_ordinal(), 0);
+        assert_eq!(payload.cursor().next_bucket(), Ok(0));
+    }
+
+    #[test]
+    fn counted_positions_match_materialized_decode_and_failures() {
+        // Exercise all layouts, skip boundaries, seeks, overflow and truncation.
+        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+            let mut entries = sample(70);
+            entries[3].positions = vec![0, u32::MAX];
+            let bytes = build_as(&entries, format);
+            let compare = |bytes: &[u8]| {
+                let Ok(payload) = Payload::parse_format(bytes, format) else {
+                    return;
+                };
+                for start in [None, Some(0), Some(31), Some(32), Some(64), Some(69)] {
+                    let mut count = payload.cursor();
+                    let mut decode = payload.cursor();
+                    if let Some(start) = start {
+                        let a = count.seek(start);
+                        let b = decode.seek(start);
+                        assert_eq!(a, b);
+                        if a.is_err() {
+                            continue;
+                        }
+                    }
+                    for _ in 0..=entries.len() {
+                        let mut positions = Vec::new();
+                        let expected = decode
+                            .next_into(&mut positions)
+                            .map(|bucket| (bucket, positions.len()));
+                        assert_eq!(count.next_count(), expected);
+                        assert_eq!(count.next_ordinal(), decode.next_ordinal());
+                        if expected.is_err() {
+                            break;
+                        }
+                    }
+                }
+            };
+            compare(&bytes);
+            for at in 0..bytes.len() {
+                compare(&bytes[..at]);
+                for value in [0, 0x80, 0xff] {
+                    let mut corrupted = bytes.clone();
+                    corrupted[at] = value;
+                    compare(&corrupted);
+                }
+            }
+        }
     }
 
     #[test]
