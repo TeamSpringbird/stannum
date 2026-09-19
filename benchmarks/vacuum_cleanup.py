@@ -88,6 +88,11 @@ COMMIT;
 """
 
 
+def require_selective_matches(expected):
+    if expected <= 0:
+        raise ValueError('selective fixture has no live w7 matches; adjust vocabulary, distribution, deletion density, or document count')
+
+
 def phase_lines(paths, start_epoch, end_epoch):
     result = []
     for path in paths:
@@ -218,6 +223,7 @@ ANALYZE docs;"""
         save(output / 'dataset.json', json.loads(sql("SELECT json_build_object('live_docs',count(*),'body_bytes',sum(octet_length(body)),'min_body_bytes',min(octet_length(body)),'max_body_bytes',max(octet_length(body))) FROM docs")))
         term = term_expression(args.vocabulary, args.distribution, 'id')
         expected = int(sql(f'SELECT count(*) FROM docs WHERE {term}=7'))
+        require_selective_matches(expected)
         names = ['selective'] if args.query_shapes == 'selective' else ['count', 'selective', 'phrase', 'ranked']
         scripts = []
         for name in names:

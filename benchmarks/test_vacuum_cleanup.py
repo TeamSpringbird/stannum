@@ -5,7 +5,7 @@ import unittest
 import argparse
 from types import SimpleNamespace
 
-from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage
+from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches
 
 
 class TrafficTests(unittest.TestCase):
@@ -73,3 +73,13 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             percentage('100')
         self.assertEqual(percentage('99'), 99)
+
+
+class FixtureTests(unittest.TestCase):
+    def test_empty_selective_fixture_is_rejected_before_reader_traffic(self):
+        # Hot distribution retains wN only on multiples of five; vocab100
+        # therefore has no w7 documents, even before applying deletion.
+        expected = sum(n % 5 == 0 and n % 100 == 7 for n in range(1, 32769))
+        with self.assertRaisesRegex(ValueError, 'no live w7 matches'):
+            require_selective_matches(expected)
+        require_selective_matches(1)
