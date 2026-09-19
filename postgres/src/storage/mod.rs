@@ -69,6 +69,16 @@ static BUILD_SEGMENT_DOCS: GucSetting<i32> = GucSetting::<i32>::new(32_768);
 static MAX_SEGMENTS_GUC: GucSetting<i32> = GucSetting::<i32>::new(MAX_SEGMENTS as i32);
 /// Segments a size tier holds before they merge into one segment of the next tier.
 static MERGE_TIER_FACTOR: GucSetting<i32> = GucSetting::<i32>::new(8);
+/// Experimental comparison control; Auto has no density heuristic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, pgrx::PostgresGucEnum)]
+enum VacuumMergeStrategy {
+    Auto,
+    Direct,
+    Reconstruct,
+}
+static VACUUM_MERGE_STRATEGY: GucSetting<VacuumMergeStrategy> =
+    GucSetting::<VacuumMergeStrategy>::new(VacuumMergeStrategy::Auto);
+
 /// Smallest `stannum.merge_tier_factor` value; below it every fold would merge.
 pub const MIN_MERGE_TIER_FACTOR: i32 = 2;
 /// Largest `stannum.merge_tier_factor` value that still keeps tiers meaningful.
@@ -77,6 +87,14 @@ pub const MAX_MERGE_TIER_FACTOR: i32 = 64;
 /// Registers the tunables. Low values exist so tests can drive folds,
 /// merges and reclamation at small scale; the defaults are the intended ones.
 pub fn init() {
+    GucRegistry::define_enum_guc(
+        c"stannum.experimental_vacuum_merge_strategy",
+        c"Experimental VACUUM merge strategy for controlled comparisons",
+        c"Auto currently selects direct. Reconstruct performs full validation. Oversized inputs retain the legacy fallback regardless of this setting.",
+        &VACUUM_MERGE_STRATEGY,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
     GucRegistry::define_int_guc(
         c"stannum.write_buffer_bytes",
         c"Encoded bytes buffered before folding into a Stannum segment",
@@ -2423,9 +2441,22 @@ unsafe fn maintenance_merge_blob(
     identity: u64,
     inputs: &[SegmentEntry],
 ) -> Option<Vec<u8>> {
-    let Some(limits) = direct_merge_limits(inputs) else {
-        return unsafe { maintenance_reconstruct_blob(index, identity, inputs) };
+    use segment::merge_strategy::{Facts, Policy, Strategy};
+    let facts = Facts {
+        input_bytes: inputs.iter().map(|entry| u64::from(entry.run.bytes)).sum(),
+        documents: inputs.iter().map(|entry| u64::from(entry.docs)).sum(),
     };
+    let policy = match VACUUM_MERGE_STRATEGY.get() {
+        VacuumMergeStrategy::Auto => Policy::Auto,
+        VacuumMergeStrategy::Direct => Policy::ForceDirect,
+        VacuumMergeStrategy::Reconstruct => Policy::ForceReconstruct,
+    };
+    let plan = segment::merge_strategy::choose(facts, policy);
+    pgrx::debug1!("Stannum VACUUM merge: {:?}: {}", plan.strategy, plan.reason);
+    if plan.strategy == Strategy::LegacyOversized {
+        return unsafe { maintenance_reconstruct_blob(index, identity, inputs) };
+    }
+    let limits = direct_merge_limits(inputs).expect("planner admitted aggregate format limits");
     let mut owned = Vec::with_capacity(inputs.len());
     for entry in inputs {
         pgrx::check_for_interrupts!();
@@ -2443,7 +2474,7 @@ unsafe fn maintenance_merge_blob(
         .iter()
         .map(|(bytes, dead)| segment::merge::MergeInput { bytes, dead })
         .collect::<Vec<_>>();
-    let result = segment::merge::merge(&sources, limits, || {
+    let result = segment::merge_strategy::execute(plan.strategy, &sources, limits, || {
         race_point("maintenance:checkpoint");
         pgrx::check_for_interrupts!();
         Ok(())
