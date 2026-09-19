@@ -3284,6 +3284,30 @@ mod tests {
     }
 
     #[pg_test]
+    fn reconstructed_vacuum_cancels_before_output_and_retries() {
+        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
+        direct_vacuum_cancels_before_output_and_retries();
+    }
+
+    #[pg_test]
+    fn reconstructed_vacuum_discards_retired_inputs() {
+        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
+        direct_vacuum_discards_inputs_retired_during_construction();
+    }
+
+    #[pg_test]
+    fn reconstructed_vacuum_classifies_corruption_and_stale_errors() {
+        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
+        direct_vacuum_distinguishes_corruption_from_retired_inputs();
+    }
+
+    #[pg_test]
+    fn reconstructed_vacuum_removes_all_dead_sources() {
+        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
+        direct_vacuum_removes_all_dead_sources_without_empty_successors();
+    }
+
+    #[pg_test]
     fn direct_vacuum_cancels_before_output_and_retries() {
         use std::{cell::Cell, rc::Rc};
         direct_vacuum_fixture();
