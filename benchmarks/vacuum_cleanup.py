@@ -92,10 +92,18 @@ def ranked_oracle_selfcheck():
     return 'SELECT bool_and(ok) FROM (' + ' UNION ALL '.join(queries) + ') checks;'
 
 
+def ranked_fingerprint():
+    # Complete immutable-directory rows. In this fixed, no-writer/no-DDL
+    # fixture generations never repeat and dead sets only grow.
+    return "coalesce((SELECT jsonb_agg(to_jsonb(s) ORDER BY ordinal) FROM stannum.segment_info('docs_idx') s), '[]'::jsonb)"
+
+
 def ranked_script():
-    # Force exhaustive scoring for the reference. Materializing IDs alone would
-    # lose the CTID-bound scoring state; retain scores while scanning instead.
+    # Fingerprints are SEPARATE statements before reference and after candidate:
+    # expressions in the same SELECT have no reliable evaluation ordering.
     return r"""BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT quote_literal(""" + ranked_fingerprint() + r"""::text) AS scoring_state
+\gset
 SET LOCAL stannum.enable_custom_scan=off;
 WITH all_matches AS MATERIALIZED (
  SELECT id, stannum.full_score(ctid) AS score FROM docs WHERE body ==> 'common OR w7'),
@@ -107,9 +115,31 @@ SELECT quote_literal(coalesce((SELECT json_agg(score ORDER BY score DESC)::text 
 SET LOCAL stannum.enable_custom_scan=on;
 WITH top AS MATERIALIZED (SELECT id, stannum.full_score(ctid) AS score FROM docs
  WHERE body ==> 'common OR w7' ORDER BY stannum.full_score(ctid) DESC LIMIT 10)
-SELECT 1 / CASE WHEN """ + ranked_check() + """ THEN 1 ELSE 0 END;
+SELECT (""" + ranked_check() + r""")::int AS correct,
+ (SELECT count(*) = count(DISTINCT id) FROM top)::int AS unique_ids
+\gset
+SELECT (""" + ranked_fingerprint() + r""" = :scoring_state::jsonb)::int AS stable
+\gset
+\if :stable
+SELECT 1 / :correct;
+\shell echo STANNUM_RANKED_STABLE
+\else
+SELECT 1 / :unique_ids;
+\shell echo STANNUM_RANKED_INVALIDATED
+\endif
 COMMIT;
 """
+
+
+def ranked_accounting(log, completed, require_stable=True):
+    lines = log.splitlines()
+    stable = lines.count('STANNUM_RANKED_STABLE')
+    invalidated = lines.count('STANNUM_RANKED_INVALIDATED')
+    if stable + invalidated != completed:
+        raise ValueError(f'ranked oracle accounting mismatch: stable={stable}, invalidated={invalidated}, completed={completed}')
+    if require_stable and stable == 0:
+        raise ValueError('no stable ranked comparisons completed')
+    return dict(stable_checked=stable, invalidated=invalidated, completed=completed)
 
 
 def verify_strategy(sql, expected):
@@ -248,7 +278,7 @@ ANALYZE docs;"""
             # require a real registered setting before labelling the strategy.
             verify_strategy(sql, args.vacuum_strategy)
         before = json.loads(sql("SELECT json_agg(row_to_json(s)) FROM stannum.segment_info('docs_idx') s"))
-        assert len(before) == segments, before
+        assert len(before) == segments and all(row['kind'] == 'immutable' for row in before), before
         save(output / 'before.json', before)
         save(output / 'server.json', json.loads(sql("SELECT json_build_object('version',version(),'shared_buffers',current_setting('shared_buffers'),'vacuum_cost_delay',current_setting('vacuum_cost_delay'))")))
         remaining = int(sql('SELECT count(*) FROM docs'))
@@ -283,6 +313,17 @@ ANALYZE docs;"""
             selfcheck = ranked_oracle_selfcheck()
             (output / 'ranked-oracle-selfcheck.sql').write_text(selfcheck)
             assert sql(selfcheck) == 't', 'ranked oracle failed its counterexample checks'
+        ranked_proofs = {}
+
+        def stable_ranked_proof(label):
+            transcript = command(['pgbench', '-n', '-c', '1', '-t', '1', '-f', str(output / 'reader-ranked.sql'), database])
+            (output / f'ranked-{label}.txt').write_text(transcript)
+            proof = ranked_accounting(transcript, 1)
+            assert proof['invalidated'] == 0, proof
+            ranked_proofs[label] = proof
+
+        if args.query_shapes == 'mixed':
+            stable_ranked_proof('before')
         sql('CHECKPOINT')
         log = (output / 'reader.txt').open('w')
         rate = [] if args.reader_rate is None else ['--rate', str(args.reader_rate), '--random-seed=42']
@@ -331,10 +372,14 @@ ANALYZE docs;"""
         reader.wait(timeout=180)
         elapsed = time.monotonic() - reader_start
         assert reader.returncode == 0, 'reader failed; see reader.txt'
+        log.flush()
         paths = list(output.glob('reader-log.*'))
         summary = summarize_logs(paths, names, elapsed)
         offered_load = load_metrics(paths, args.reader_rate, args.reader_seconds)
         assert not summary['failures'], summary
+        if args.query_shapes == 'mixed':
+            ranked_proofs['traffic'] = ranked_accounting((output / 'reader.txt').read_text(), summary['queries']['ranked']['completed'])
+            stable_ranked_proof('after')
         overlap = phase_lines(paths, started_epoch, ended_epoch)
         assert overlap, 'no complete reader transactions overlapped VACUUM'
         (output / 'overlap.log').write_text('\n'.join(overlap) + '\n')
@@ -356,7 +401,7 @@ ANALYZE docs;"""
         save(output / 'results.json', dict(status='passed', artifact_sha256=digest, vacuum_seconds=vacuum_seconds,
             vacuum_epoch=[started_epoch, ended_epoch], wal_bytes=wal_bytes, rss_samples=len(samples),
             sampled_backend_rss_max=max((s['rss_bytes'] for s in samples), default=None),
-            reader=summary, offered_load=offered_load, during_vacuum=during,
+            reader=summary, ranked_oracle=ranked_proofs, offered_load=offered_load, during_vacuum=during,
             during_vacuum_load=load_metrics([output / 'overlap.log'], args.reader_rate, vacuum_seconds), expected_matches=expected, live_docs=remaining))
     finally:
         stop.set()

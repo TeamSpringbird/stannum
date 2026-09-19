@@ -5,7 +5,7 @@ import unittest
 import argparse
 from types import SimpleNamespace
 
-from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches, verify_strategy
+from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches, verify_strategy, ranked_accounting
 
 
 class TrafficTests(unittest.TestCase):
@@ -96,3 +96,21 @@ class StrategySettingTests(unittest.TestCase):
         for observed in ('', 'auto'):
             with self.assertRaisesRegex(ValueError, 'not registered'):
                 verify_strategy(lambda statement: observed, 'reconstruct')
+
+
+class RankedAccountingTests(unittest.TestCase):
+    def test_invalidated_comparisons_are_not_counted_as_correct(self):
+        result = ranked_accounting('STANNUM_RANKED_STABLE\nSTANNUM_RANKED_INVALIDATED\n', 2)
+        self.assertEqual(result, dict(stable_checked=1, invalidated=1, completed=2))
+
+    def test_missing_markers_and_no_stable_coverage_fail(self):
+        with self.assertRaisesRegex(ValueError, 'accounting mismatch'):
+            ranked_accounting('STANNUM_RANKED_STABLE\n', 2)
+        with self.assertRaisesRegex(ValueError, 'no stable'):
+            ranked_accounting('STANNUM_RANKED_INVALIDATED\n', 1)
+
+    def test_fingerprint_statements_bracket_candidate(self):
+        script = ranked_script()
+        self.assertLess(script.index('AS scoring_state'), script.index('all_matches AS MATERIALIZED'))
+        self.assertLess(script.index('AS correct'), script.index('AS stable'))
+        self.assertIn('AS unique_ids\n\\gset\nSELECT', script)
