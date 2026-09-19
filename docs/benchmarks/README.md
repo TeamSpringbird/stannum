@@ -1,5 +1,11 @@
 # Benchmarking Stannum
 
+The [reader-pinned VACUUM diagnosis](vacuum-pinned-cleanup.md) explains deferred
+heap pruning and the corrected physical-versus-live document accounting.
+
+The [sustained mixed-write campaign](sustained-mutation.md) measures independently
+scheduled readers and multiple writers through repeated maintenance and cleanup.
+
 The [integrated VACUUM follow-up](vacuum-final-integration.md) records the
 deletion-heavy optimization, explicit strategy controls, and validation evidence.
 

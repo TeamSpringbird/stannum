@@ -136,6 +136,9 @@ jobs:
       - name: Ranked-scan concurrency fuzz (smoke)
         run: python3 postgres/tests/ranked_fuzz.py --smoke
 
+      - name: VACUUM pinned-page regression
+        run: python3 benchmarks/vacuum_cleanup_pins.py
+
       - name: VACUUM workload harness smoke
         run: |
           smoke_dir="$RUNNER_TEMP/vacuum-workload-smoke"
@@ -156,6 +159,24 @@ jobs:
         with:
           name: vacuum-smoke-${{ matrix.arch.name }}-pg${{ matrix.postgres }}
           path: ${{ runner.temp }}/vacuum-workload-smoke/results
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Sustained mixed-write harness smoke
+        run: |
+          python3 benchmarks/sustained.py \
+            --artifact "$(pg_config --pkglibdir)/stannum.so" \
+            --output "$RUNNER_TEMP/sustained-smoke" \
+            --rows 10000 --seconds 20 --warmup 1 --rounds 1 \
+            --write-rates 200 --writer-counts 2 --read-rate 100 \
+            --vacuum-interval 5 --check-interval 5
+
+      - name: Retain sustained mixed-write smoke
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sustained-smoke-${{ matrix.arch.name }}-pg${{ matrix.postgres }}
+          path: ${{ runner.temp }}/sustained-smoke
           if-no-files-found: ignore
           retention-days: 7
 

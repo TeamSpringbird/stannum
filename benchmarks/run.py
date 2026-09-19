@@ -116,10 +116,11 @@ def ranking(engine, case):
     return score, order
 
 
-def fixture_sql(rows):
+def fixture_sql(rows, body_repeat=1):
+    repetitions = '8 + n % 7' if body_repeat == 1 else f'(8 + n % 7) * {body_repeat}'
     return f"""CREATE TABLE documents (id bigint PRIMARY KEY, body text NOT NULL);
 INSERT INTO documents
-SELECT n, 'common ' || repeat('filler ', 8 + n % 7)
+SELECT n, 'common ' || repeat('filler ', {repetitions})
  || CASE WHEN n % 100 = 0 THEN 'rare ' ELSE '' END
  || CASE WHEN n % 1000 = 0 THEN 'alpha beta ' ELSE '' END
  || 'mutablea'
@@ -283,8 +284,8 @@ def run(args):
         "host": {"platform": platform.platform(), "machine": platform.machine(), "cpus": os.cpu_count()},
         "server_version": psql("SELECT version();", env), "settings": settings,
         "pgbench_version": command(["pgbench", "--version"]),
-        "config": {k: getattr(args, k) for k in ("rows", "seconds", "warmup", "clients", "write_rate", "seed", "profile")},
-        "fixture_sha256": digest(canonical(corpus)) if corpus else digest(fixture_sql(args.rows).encode()),
+        "config": {k: getattr(args, k) for k in ("rows", "body_repeat", "seconds", "warmup", "clients", "writers", "read_rate", "write_rate", "seed", "profile")},
+        "fixture_sha256": digest(canonical(corpus)) if corpus else digest(fixture_sql(args.rows, args.body_repeat).encode()),
         "dataset": corpus,
         "sql_sha256": digest(canonical(queries)), "query_names": [q[0] for q in queries],
         "cache_policy": "warm read workload; no OS cache eviction", "load_model": "closed-loop readers; rate-scheduled single writer",
@@ -296,9 +297,12 @@ def run(args):
         manifest["config"]["mutation"] = {
             "mix": mix, "settings": args.set, "check_interval": args.check_interval,
             "vacuum_interval": args.vacuum_interval, "sample_interval": args.sample_interval,
+            "drain_vacuums": args.drain_vacuums, "min_vacuums": args.min_vacuums, "min_checks": args.min_checks,
+            "autovacuum": False, "writer_accounting": "single-row RETURNING plus explicit no-op markers",
             "bucket_seconds": args.bucket_seconds, "oracle": "regex sequential scan in one repeatable-read snapshot"}
-        manifest["load_model"] = ("closed-loop readers; rate-scheduled single writer mixing inserts, deletes and "
-                                  "match-changing updates; scheduled VACUUM; periodic oracle checks")
+        manifest["load_model"] = ("independently rate-scheduled readers when read_rate is set; "
+                                  "rate-scheduled writers mixing inserts, deletes and match-changing updates; "
+                                  "serialized scheduled VACUUM; separate periodic oracle checks")
         manifest["check_sql_sha256"] = digest(canonical(checks))
     save(out / "manifest.json", manifest)
     children = []
@@ -315,7 +319,7 @@ def run(args):
                     "stannum": "DO $$ BEGIN PERFORM stannum.tokenize('load'); END $$; "}.get(extension, f"LOAD '{extension}'; ")
             manifest["settings"] = sql_json(load + SETTINGS_SQL, env)
         # Never overwrite an existing table. Each repetition uses a fresh dedicated database.
-        (out / "fixture.sql").write_text("-- External verified corpus; see dataset.json.\n" if corpus else fixture_sql(args.rows))
+        (out / "fixture.sql").write_text("-- External verified corpus; see dataset.json.\n" if corpus else fixture_sql(args.rows, args.body_repeat))
         (out / "index.sql").write_text(index_sql(args.engine) + "\n")
         setup_env = dict(env, PGOPTIONS=env["PGOPTIONS"] + " -c statement_timeout=0")
         if corpus:
@@ -330,7 +334,7 @@ def run(args):
                                    stdin=source, env=setup_env, check=True)
             psql("ANALYZE benchmark_matches;", setup_env)
         else:
-            psql(fixture_sql(args.rows), setup_env)
+            psql(fixture_sql(args.rows, args.body_repeat), setup_env)
         start = time.monotonic()
         psql(index_sql(args.engine), setup_env)
         manifest["index_build_seconds"] = time.monotonic() - start
@@ -338,6 +342,7 @@ def run(args):
         psql("VACUUM ANALYZE documents;", setup_env)
         freespace = False
         if mutating:
+            psql("ALTER TABLE documents SET (autovacuum_enabled=false);", setup_env)
             psql(mutation.pool_sql(args.rows), setup_env)
             probe = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-c",
                                     "CREATE EXTENSION IF NOT EXISTS pg_freespacemap;"], env=setup_env, capture_output=True)
@@ -366,7 +371,8 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
         if mutating:
             # Deletes and updates may probe ids inserted during the window.
             ceiling = args.rows + args.write_rate * args.seconds * mix["insert"] // sum(mix.values())
-            scripts = mutation.writer_scripts(args.rows, cases, ceiling)
+            scripts = {kind: mutation.accounted_writer(script, kind) for kind, script in
+                       mutation.writer_scripts(args.rows, cases, ceiling).items()}
             writer_files, writer_names = [], kinds
             for kind in kinds:
                 (out / f"writer-{kind}.sql").write_text(scripts[kind])
@@ -379,19 +385,21 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
         for i in range(len(queries)):
             reader += ["-f", str(out / f"query-{i}.sql")]
         (out / "warmup.txt").write_text(command(reader + ["-T", str(args.warmup)], env=env))
+        if args.read_rate:
+            reader += ["-R", str(args.read_rate)]
         save(out / "before.json", snapshot(env))
         if args.container:
             save(out / "cgroup-before.json", container_counters(args.container))
         jobs = [("reader", reader + ["-T", str(args.seconds), "-l", "--log-prefix", str(out / "reader-log")])]
         if args.write_rate:
-            jobs.insert(0, ("writer", base + ["-c", "1", "-j", "1", *writer_files,
+            jobs.insert(0, ("writer", base + ["-c", str(args.writers), "-j", str(min(args.writers, 4)), *writer_files,
                          "-T", str(args.seconds), "-R", str(args.write_rate), "-l", "--log-prefix", str(out / "writer-log")]))
         starts = {}
         handles = []
         manifest["traffic_started_at"] = {}
         manifest["traffic_finished_at"] = {}
         if mutating:
-            check_env = dict(env, PGOPTIONS=env["PGOPTIONS"] + " -c statement_timeout=0")
+            check_env = dict(env)
             maintenance = mutation.Maintenance(psql, sql_json, env, check_env, args.engine, checks, freespace, out,
                                                args.sample_interval, args.vacuum_interval, args.check_interval)
             manifest["traffic_origin_epoch"] = time.time()
@@ -414,6 +422,8 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
                         raise RuntimeError(f"{name} exited {proc.returncode}; see {name}.txt")
                     names = [q[0] for q in queries] if name == "reader" else writer_names
                     summary[name] = summarize_logs(out.glob(f"{name}-log.*"), names, elapsed)
+                    rate = args.read_rate if name == 'reader' else args.write_rate
+                    summary[name]['load'] = mutation.traffic_load(out.glob(f"{name}-log.*"), rate, args.seconds)
                     del pending[name]
             if maintenance and maintenance.failures:
                 raise RuntimeError("Maintenance thread failed: " + json.dumps(maintenance.failures))
@@ -426,10 +436,42 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
             save_maintenance(out, maintenance)
             if maintenance.failures:
                 raise RuntimeError("Maintenance thread failed: " + json.dumps(maintenance.failures))
+            save(out / 'after.json', snapshot(env))
+            affected = mutation.affected_rows(summary['writer'], (out / 'writer.txt').read_text())
+            summary['affected_rows'] = affected
+            # All traffic/check connections have finished. These are quiescent
+            # samples, unlike physical/heap counts sampled during active writes.
+            before_drain = maintenance.sample(phase='drain')
+            expected_rows = args.rows + affected.get('insert', {}).get('affected', 0) - affected.get('delete', {}).get('affected', 0)
+            if before_drain['rows'] != expected_rows:
+                raise RuntimeError('committed mutation accounting disagrees with final heap count')
+            for _ in range(args.drain_vacuums):
+                maintenance.vacuum(phase='drain')
+            after_drain = maintenance.sample(phase='drain')
+            save(out / 'after-drain.json', snapshot(env))
+            summary['drain'] = dict(before=before_drain, after=after_drain, vacuums=args.drain_vacuums)
+            if args.engine == 'stannum' and args.drain_vacuums:
+                findings = sql_json("SELECT coalesce(json_agg(v), '[]'::json) FROM stannum.verify_index('search_idx',true) v", check_env)
+                save(out / 'verification-after.json', findings)
+                if findings:
+                    raise RuntimeError('final index verification found inconsistencies')
+            writer_start = dt.datetime.fromisoformat(manifest['traffic_started_at']['writer']).timestamp() - maintenance.origin
+            writer_end = dt.datetime.fromisoformat(manifest['traffic_finished_at']['writer']).timestamp() - maintenance.origin
+            overlapping = sum(v['phase'] == 'traffic' and writer_start <= v['started'] and v['t'] <= writer_end
+                              for v in maintenance.vacuums)
+            if overlapping < args.min_vacuums:
+                raise RuntimeError(f'only {overlapping} VACUUM cycles completed during writer traffic; require {args.min_vacuums}')
+            overlapping_checks = sum(writer_start <= c['started'] and c['t'] <= writer_end for c in maintenance.checks)
+            if overlapping_checks < args.min_checks:
+                raise RuntimeError(f'only {overlapping_checks} oracle rounds completed during writer traffic; require {args.min_checks}')
+            save_maintenance(out, maintenance)
             summary["maintenance"] = {"samples": len(maintenance.samples), "vacuums": len(maintenance.vacuums),
-                                      "checks": len(maintenance.checks), "reclaim": mutation.reclaim_summary(maintenance.vacuums)}
+                                      "checks": len(maintenance.checks), "writer_overlap_vacuums": overlapping,
+                                      "writer_overlap_checks": overlapping_checks,
+                                      "schedule": maintenance.schedule, "reclaim": mutation.reclaim_summary(maintenance.vacuums)}
         save(out / "summary.json", summary)
-        save(out / "after.json", snapshot(env))
+        if not maintenance:
+            save(out / "after.json", snapshot(env))
         if args.container:
             save(out / "cgroup-after.json", container_counters(args.container))
         if mutating:
@@ -470,6 +512,7 @@ def save_maintenance(out, maintenance):
     save(out / "samples.json", maintenance.samples)
     save(out / "vacuums.json", maintenance.vacuums)
     save(out / "checks.json", maintenance.checks)
+    save(out / "maintenance-schedule.json", maintenance.schedule)
 
 
 def timeline(out, bucket_seconds):
@@ -478,6 +521,8 @@ def timeline(out, bucket_seconds):
     kinds = [k for k in mutation.KINDS if manifest["config"]["mutation"]["mix"][k]]
     origin = manifest["traffic_origin_epoch"]
     buckets = mutation.bucket_logs(sorted(out.glob("reader-log.*")), manifest["query_names"], bucket_seconds, origin)
+    for bucket in buckets:
+        bucket['reader_schedule_lag_max_ms'] = bucket['schedule_lag_max_ms']
     by_number = {b["bucket"]: b for b in buckets}
     for bucket in mutation.bucket_logs(sorted(out.glob("writer-log.*")), kinds, bucket_seconds, origin):
         target = by_number.setdefault(bucket["bucket"], {"bucket": bucket["bucket"], "start_seconds": bucket["start_seconds"],
@@ -576,9 +621,12 @@ def main():
     r.add_argument("--dataset", help="Verified dataset directory from dataset.py")
     r.add_argument("--statement-timeout-ms", type=positive, default=60000)
     r.add_argument("--rows", type=positive, default=10000)
+    r.add_argument("--body-repeat", type=positive, default=1, help="Synthetic filler multiplier; incompatible with dataset")
     r.add_argument("--seconds", type=positive, default=60)
     r.add_argument("--warmup", type=positive, default=10)
     r.add_argument("--clients", type=positive, default=2)
+    r.add_argument("--writers", type=positive, default=1, help="Writer connections sharing the total write rate")
+    r.add_argument("--read-rate", type=positive, help="Total reader transactions/sec; omitted means closed-loop")
     r.add_argument("--write-rate", type=int, default=20)
     r.add_argument("--seed", type=positive, default=1729)
     m = r.add_argument_group("mutation profile")
@@ -588,6 +636,9 @@ def main():
     m.add_argument("--vacuum-interval", type=int, default=60, help="Seconds between VACUUM (INDEX_CLEANUP ON); 0 disables")
     m.add_argument("--sample-interval", type=positive, default=5, help="Seconds between index layout samples")
     m.add_argument("--bucket-seconds", type=positive, default=10, help="Latency bucket width in the timeline")
+    m.add_argument("--drain-vacuums", type=int, default=0, help="Quiescent VACUUM passes after traffic; excluded from traffic latency")
+    m.add_argument("--min-vacuums", type=int, default=0, help="Require this many VACUUM cycles wholly inside writer traffic")
+    m.add_argument("--min-checks", type=int, default=0, help="Require this many oracle rounds wholly inside writer traffic")
     c = sub.add_parser("compare")
     c.add_argument("before")
     c.add_argument("after")
@@ -599,6 +650,10 @@ def main():
     t.add_argument("--bucket-seconds", type=positive, default=10)
     args = parser.parse_args()
     if args.action == "run":
+        if args.dataset and args.body_repeat != 1:
+            parser.error("body-repeat applies only to synthetic fixtures")
+        if args.profile != 'mutation' and (args.drain_vacuums or args.min_vacuums or args.min_checks):
+            parser.error("drain and maintenance coverage requirements need the mutation profile")
         if args.write_rate < 0:
             parser.error("--write-rate must be nonnegative")
         if args.profile == "mutation":
@@ -607,6 +662,10 @@ def main():
             if args.engine == "gin":
                 parser.error("GIN does not implement BM25; the mutation profile runs ranked shapes")
             mutation.parse_mix(args.mix)
+            if args.drain_vacuums < 0 or args.min_vacuums < 0 or args.min_checks < 0:
+                parser.error("drain-vacuums, min-vacuums and min-checks must be nonnegative")
+            if args.min_vacuums and not args.vacuum_interval:
+                parser.error("min-vacuums requires scheduled VACUUM")
             if any("=" not in setting or not setting.split("=", 1)[0] for setting in args.set):
                 parser.error("--set expects NAME=VALUE")
     if args.action == "run":

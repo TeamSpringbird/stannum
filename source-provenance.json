@@ -92,6 +92,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "benchmarks/sustained.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmark work, built on the existing Ben-authored benchmark modules; no Lead source copied. Private-cluster rate/concurrency campaign using the existing Stannum mutation runner."
+    },
     "benchmarks/test_campaign.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -140,6 +144,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "benchmarks/test_sustained.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmark work, built on the existing Ben-authored benchmark modules; no Lead source copied. Original tests of mutation accounting, scheduling pressure and repeated campaign ordering."
+    },
     "benchmarks/test_vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
@@ -147,6 +155,10 @@
     "benchmarks/vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in a70ba90f4658fdc1f3b91cfb313a55429a76810c."
+    },
+    "benchmarks/vacuum_cleanup_pins.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum regression reproducing reader-pinned heap cleanup and validating benchmark accounting."
     },
     "boldi-vigna/Cargo.toml": {
       "owner": "planetscale",
