@@ -147,3 +147,25 @@ restart, and warmup lie between the captured boundaries, so these snapshots do
 not prove unchanging visibility throughout the timed window. They also do not
 establish a cold cache or a pristine heap. Controlled dirty/deletion-heavy
 fixtures and exact timed-boundary capture remain follow-up work.
+
+### Visibility smoke validation
+
+A native PostgreSQL 18 smoke on 2026-09-19 exercised the actual `workload_state`
+SQL and comparison function against a temporary cluster. The fixture had 1,000
+rows containing `repeat('history war ', 20)` and table autovacuum disabled to
+isolate explicit maintenance. This validates capture and comparison behavior,
+not search performance or the Docker driver's complete lifecycle.
+
+| State | Heap pages | All-visible pages | All-frozen pages |
+| --- | ---: | ---: | ---: |
+| After insert | 36 | 0 | 0 |
+| VACUUM ANALYZE | 36 | 36 | 0 |
+| Append ` changed` to IDs 1–100 | 40 | 31 | 0 |
+| Second VACUUM ANALYZE | 40 | 40 | 3 |
+| PostgreSQL restart | 40 | 40 | 3 |
+
+The comparison rejected the first vacuum-to-update transition for a read-only
+trial and accepted that endpoint for a mutation trial. The second vacuum and
+restart snapshots passed the read-only contract. The temporary cluster was
+stopped and removed. Full captured fields, server version, and the rejection
+message are retained in [visibility-controls-smoke.json](visibility-controls-smoke.json).
