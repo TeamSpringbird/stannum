@@ -22,8 +22,8 @@ use std::collections::{BTreeSet, BinaryHeap};
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::plan::{Limits, plan};
 use tinql::runtime::{
-    CompiledRegex, FuzzyMatcher, Query, RangeBound, SpanTermSlot, TokenizedDoc, evaluate,
-    parse_tinql_to_query, range_matches, tokenize_doc,
+    CompiledRegex, FuzzyMatcher, Query, RangeBound, SpanTermSlot, evaluate, parse_tinql_to_query,
+    range_matches, tokenize_doc,
 };
 use tokenizer::Tokenizer;
 
@@ -1389,10 +1389,7 @@ fn build_corpus(
         stop_csv.as_deref().and_then(ScoreStopWords::from_csv)
     };
     let documents = load_documents(heap_oid, index.oid());
-    let positioned: Vec<TokenizedDoc> = documents
-        .iter()
-        .map(|document| tokenize_doc(document, &tokenizer))
-        .collect();
+    let positioned = tokenize_documents(&documents, |document| tokenize_doc(document, &tokenizer));
     let tokenized: Vec<Vec<String>> = positioned.iter().map(|doc| doc.tokens().to_vec()).collect();
     let universe = corpus_universe(&tokenized);
     let mut collected = Collected::default();
@@ -1440,7 +1437,10 @@ fn build_corpus(
             }
         }));
         // The maximum is over matching documents only, as in TIN.
-        if evaluate(&query, doc).is_ok_and(|result| result.matched) {
+        let matched = evaluate(&query, doc)
+            .unwrap_or_else(|error| pgrx::error!("stannum score query evaluation failed: {error}"))
+            .matched;
+        if matched {
             max = max.max(score);
         }
         by_document.insert(document, score);
@@ -1450,6 +1450,24 @@ fn build_corpus(
         by_document,
         max,
     }
+}
+
+// Both heap-scoring paths can spend a long time tokenizing after SPI returns.
+// Keep the interrupt cadence shared while allowing positioned or plain tokens.
+pub(super) fn tokenize_documents<T>(
+    documents: &[String],
+    mut tokenize: impl FnMut(&str) -> T,
+) -> Vec<T> {
+    documents
+        .iter()
+        .enumerate()
+        .map(|(row, document)| {
+            if row.is_multiple_of(10) {
+                pgrx::check_for_interrupts!();
+            }
+            tokenize(document)
+        })
+        .collect()
 }
 
 fn load_documents(heap_oid: pg_sys::Oid, index_oid: pg_sys::Oid) -> Vec<String> {
@@ -1786,15 +1804,12 @@ fn score_inspect(
             .collect::<Vec<_>>()
     } else {
         let docs = load_documents(heap_oid, index.oid());
-        let tokenized = docs
-            .iter()
-            .map(|doc| {
-                tokenizer
-                    .tokenize(doc)
-                    .map(|t| t.text.into_owned())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let tokenized = tokenize_documents(&docs, |doc| {
+            tokenizer
+                .tokenize(doc)
+                .map(|t| t.text.into_owned())
+                .collect::<Vec<_>>()
+        });
         let universe = corpus_universe(&tokenized);
         let owned = collected.resolve(|expansion| {
             let matcher = expansion.matcher();
