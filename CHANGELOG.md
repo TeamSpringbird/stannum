@@ -26,3 +26,6 @@
   validated direct-merge API, retaining existing encoding and publication locks.
   Oversized aggregate inputs retain reconstruction fallback; pending insert
   cancellation is checked after metadata unlock.
+- VACUUM deferred merges and deletion rewrites use validated direct posting
+  merges, with interruptible construction and unchanged stale-input publication
+  checks. All-dead inputs leave no empty successor.

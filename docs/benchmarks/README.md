@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [direct VACUUM report](vacuum-direct-merge.md) measures deferred merges and
+deletion rewrites with continuously checked readers.
+
 The [validated merge API](hardened-merge.md) adds input validation, explicit limits
 and cancellation to direct posting merges before PostgreSQL integration.
 

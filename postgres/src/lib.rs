@@ -3263,6 +3263,169 @@ mod tests {
         assert_clean("insert_race_idx");
     }
 
+    #[pg_extern]
+    fn direct_vacuum_cleanup(index_oid: pg_sys::Oid) {
+        let index = unsafe {
+            pgrx::PgRelation::with_lock(index_oid, pg_sys::ShareUpdateExclusiveLock as _)
+        };
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+    }
+
+    fn direct_vacuum_fixture() {
+        Spi::run(
+            "CREATE TABLE direct_vacuum(id int primary key, body text);
+             CREATE INDEX direct_vacuum_idx ON direct_vacuum USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs=1;
+             SET LOCAL stannum.max_merge_docs=0;
+             INSERT INTO direct_vacuum SELECT n, 'needle common' FROM generate_series(1,17) n;
+             SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn direct_vacuum_cancels_before_output_and_retries() {
+        use std::{cell::Cell, rc::Rc};
+        direct_vacuum_fixture();
+        let before =
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')");
+        let queued = Rc::new(Cell::new(false));
+        let built = Rc::new(Cell::new(false));
+        let q = queued.clone();
+        let b = built.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "maintenance:checkpoint" && !q.replace(true) {
+                unsafe {
+                    let holdoff = pg_sys::InterruptHoldoffCount;
+                    assert_eq!(holdoff, 0);
+                    pg_sys::QueryCancelPending = 1;
+                    pg_sys::InterruptPending = 1;
+                }
+            }
+            if name == "maintenance:built" {
+                b.set(true);
+            }
+        })));
+        Spi::run(
+            "DO $$BEGIN
+            PERFORM tests.direct_vacuum_cleanup('direct_vacuum_idx'::regclass::oid);
+            RAISE EXCEPTION 'cleanup cancellation was not delivered';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(
+            queued.get() && !built.get(),
+            "cancel before writing merge output"
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')"),
+            before
+        );
+        assert_clean("direct_vacuum_idx");
+        Spi::run("SELECT tests.direct_vacuum_cleanup('direct_vacuum_idx'::regclass::oid)").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM direct_vacuum WHERE body ==> 'needle'"),
+            17
+        );
+        assert!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('direct_vacuum_idx') WHERE kind='immutable'"
+            ) < 16
+        );
+        assert_clean("direct_vacuum_idx");
+    }
+
+    #[pg_test]
+    fn direct_vacuum_discards_inputs_retired_during_construction() {
+        use std::{cell::Cell, rc::Rc};
+        direct_vacuum_fixture();
+        let fired = Rc::new(Cell::new(false));
+        let observed = fired.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "maintenance:checkpoint" && !observed.replace(true) {
+                assert_eq!(unsafe { pg_sys::InterruptHoldoffCount }, 0);
+                Spi::run(
+                    "SET LOCAL stannum.max_merge_docs=1000000;
+                    SET LOCAL stannum.max_segments=2;
+                    INSERT INTO direct_vacuum VALUES (18,'needle later'), (19,'needle later');",
+                )
+                .unwrap();
+            }
+        })));
+        Spi::run("SELECT tests.direct_vacuum_cleanup('direct_vacuum_idx'::regclass::oid)").unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(fired.get());
+        assert_eq!(
+            value("SELECT count(*) FROM direct_vacuum WHERE body ==> 'needle'"),
+            19
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')"),
+            19
+        );
+        assert_clean("direct_vacuum_idx");
+    }
+
+    #[pg_test]
+    fn direct_vacuum_distinguishes_corruption_from_retired_inputs() {
+        direct_vacuum_fixture();
+        // Corrupt the owned snapshot, not the on-disk index, so the same
+        // decoder error can be tested against unchanged and retired inputs.
+        crate::storage::testing::CORRUPT_MAINTENANCE_INPUT.with(|flag| flag.set(true));
+        Spi::run(
+            "DO $$BEGIN
+            PERFORM tests.direct_vacuum_cleanup('direct_vacuum_idx'::regclass::oid);
+            RAISE EXCEPTION 'published corruption was not reported';
+            EXCEPTION WHEN index_corrupted THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        assert_clean("direct_vacuum_idx");
+        crate::storage::testing::CORRUPT_MAINTENANCE_INPUT.with(|flag| flag.set(true));
+        insert_at_race_point(
+            "maintenance:loaded",
+            "SET LOCAL stannum.max_merge_docs=1000000;
+            SET LOCAL stannum.max_segments=2;
+            INSERT INTO direct_vacuum VALUES (18,'needle late'),(19,'needle late');",
+        );
+        Spi::run("SELECT tests.direct_vacuum_cleanup('direct_vacuum_idx'::regclass::oid)").unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(!crate::storage::testing::CORRUPT_MAINTENANCE_INPUT.with(|flag| flag.get()));
+        assert_eq!(
+            value("SELECT count(*) FROM direct_vacuum WHERE body ==> 'needle'"),
+            19
+        );
+        assert_clean("direct_vacuum_idx");
+    }
+
+    #[pg_test]
+    fn direct_vacuum_removes_all_dead_sources_without_empty_successors() {
+        direct_vacuum_fixture();
+        let dead = tids("DELETE FROM direct_vacuum RETURNING ctid::text");
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'direct_vacuum_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe {
+            crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead);
+        }
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_eq!(
+            value("SELECT count(*) FROM stannum.segment_info('direct_vacuum_idx')"),
+            0
+        );
+        assert_clean("direct_vacuum_idx");
+        Spi::run("INSERT INTO direct_vacuum VALUES (18,'needle after cleanup')").unwrap();
+        assert_eq!(
+            value("SELECT sum(id)::bigint FROM direct_vacuum WHERE body ==> 'needle'"),
+            18
+        );
+        assert_clean("direct_vacuum_idx");
+    }
+
     #[pg_test]
     fn vacuum_publishes_against_a_directory_inserts_changed_meanwhile() {
         Spi::run(

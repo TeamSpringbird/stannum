@@ -2416,12 +2416,65 @@ unsafe fn mostly_dead(
     None
 }
 
-/// Rewrites `inputs` into one segment of their live documents, unlocked,
-/// and publishes it only if every input is still in the directory, entry
-/// for entry including the dead-list run. Returns whether it published.
-/// Inputs without a live document leave the directory with no successor. A
-/// single input keeps its position; several merge to the end.
-unsafe fn replace_entries(index: pg_sys::Relation, identity: u64, inputs: &[SegmentEntry]) -> bool {
+/// Unlocked sources can be retired/reused while being read. A merge failure
+/// is corruption only when the complete captured input set still applies.
+unsafe fn maintenance_merge_blob(
+    index: pg_sys::Relation,
+    identity: u64,
+    inputs: &[SegmentEntry],
+) -> Option<Vec<u8>> {
+    let Some(limits) = direct_merge_limits(inputs) else {
+        return unsafe { maintenance_reconstruct_blob(index, identity, inputs) };
+    };
+    let mut owned = Vec::with_capacity(inputs.len());
+    for entry in inputs {
+        pgrx::check_for_interrupts!();
+        let label = generation_label(entry.generation);
+        let read = unsafe { try_read_run(index, entry.run, &label) }
+            .and_then(|bytes| unsafe { try_dead_set(index, entry) }.map(|dead| (bytes, dead)));
+        owned.push(unsafe { unlocked(index, identity, entry, read) }?);
+    }
+    race_point("maintenance:loaded");
+    #[cfg(feature = "pg_test")]
+    if testing::CORRUPT_MAINTENANCE_INPUT.with(|flag| flag.replace(false)) {
+        owned[0].0[0] ^= 0xff;
+    }
+    let sources = owned
+        .iter()
+        .map(|(bytes, dead)| segment::merge::MergeInput { bytes, dead })
+        .collect::<Vec<_>>();
+    let result = segment::merge::merge(&sources, limits, || {
+        race_point("maintenance:checkpoint");
+        pgrx::check_for_interrupts!();
+        Ok(())
+    });
+    match result {
+        Ok(blob) => Some(blob),
+        Err(error) => {
+            let (guard, meta) = unsafe { read_meta(index, false) };
+            let applies = meta.identity == identity
+                && inputs.iter().all(|entry| meta.segments.contains(entry));
+            drop(guard);
+            if !applies {
+                return None;
+            }
+            match error {
+                segment::merge::MergeError::Codec(_)
+                | segment::merge::MergeError::InvalidInput { .. } => {
+                    corrupt(format!("VACUUM segment merge: {error}"));
+                }
+                _ => pgrx::error!("Stannum VACUUM segment merge failed: {error}"),
+            }
+        }
+    }
+}
+
+/// Preserve the previous per-source path for oversized aggregate inputs.
+unsafe fn maintenance_reconstruct_blob(
+    index: pg_sys::Relation,
+    identity: u64,
+    inputs: &[SegmentEntry],
+) -> Option<Vec<u8>> {
     let mut builder = SegmentBuilder::default();
     for entry in inputs {
         pgrx::check_for_interrupts!();
@@ -2434,18 +2487,31 @@ unsafe fn replace_entries(index: pg_sys::Relation, identity: u64, inputs: &[Segm
                 .records(|tid| dead.contains(&tid))
                 .map_err(|error| format!("Stannum {label}: {error}"))?;
             for record in records {
+                pgrx::check_for_interrupts!();
                 builder
                     .add_record(&record)
                     .map_err(|error| format!("Stannum {label}: {error}"))?;
             }
             Ok(())
         });
-        if unsafe { unlocked(index, identity, entry, result) }.is_none() {
-            return false;
-        }
+        unsafe { unlocked(index, identity, entry, result) }?;
     }
-    let output = (builder.document_count() > 0).then(|| {
-        let (blob, docs, total_length) = finish_builder(builder);
+    Some(finish_builder(builder).0)
+}
+
+/// Rewrites `inputs` into one segment of their live documents, unlocked,
+/// and publishes it only if every input is still in the directory, entry
+/// for entry including the dead-list run. Returns whether it published.
+/// Inputs without a live document leave the directory with no successor. A
+/// single input keeps its position; several merge to the end.
+unsafe fn replace_entries(index: pg_sys::Relation, identity: u64, inputs: &[SegmentEntry]) -> bool {
+    let Some(blob) = (unsafe { maintenance_merge_blob(index, identity, inputs) }) else {
+        return false;
+    };
+    let segment = codec(Segment::parse(&blob));
+    let docs = segment.document_count();
+    let total_length = segment.total_length();
+    let output = (docs > 0).then(|| {
         let (run, map) = unsafe { write_segment_run(index, &blob) };
         (run, map, docs, total_length)
     });
@@ -2613,6 +2679,7 @@ pub mod testing {
 
     thread_local! {
         pub static RACE_HOOK: RefCell<Option<RaceHook>> = const { RefCell::new(None) };
+        pub static CORRUPT_MAINTENANCE_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Runs `hook` at every race point until it is cleared.
