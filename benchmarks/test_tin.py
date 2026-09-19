@@ -2,10 +2,12 @@
 #
 # See LICENSE in the repository root for license terms.
 
+import argparse
 import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import tin
 
@@ -49,6 +51,173 @@ class TraceCorrectnessTests(unittest.TestCase):
     def test_sql_keeps_query_text_inside_literal(self):
         text = "'quoted' ; DROP TABLE documents; --"
         self.assertEqual(tin.literal(text), "'''quoted'' ; DROP TABLE documents; --'")
+
+class PairedMeasurementsTests(unittest.TestCase):
+    def fixture(self, root):
+        source = {'source_files': {'postgres/lib.rs': 'a' * 64}}
+        source['source_sha256'] = tin.bench.digest(tin.bench.canonical(source['source_files']))
+        campaign = dict(status='complete', repetitions=2, jobs=tin.paired_jobs(2),
+                        sources={v: source for v in ('baseline', 'candidate')},
+                        images={v: {'Id': 'sha256:' + v} for v in ('baseline', 'candidate')},
+                        query_ids=['1:disjunction'])
+        for job in campaign['jobs']:
+            job['status'] = 'complete'
+            path = root / job['directory']
+            path.mkdir()
+            manifest = dict(status='complete', image=campaign['images'][job['variant']]['Id'], source=source,
+                            adapter={'binary_sha256': 'driver'}, corpus={'files': {'documents.csv': 'corpus'}},
+                            harness_sources={'tin.py': 'runner'}, runner_sha256='runner',
+                            config={k: 1 for k in tin.COMPARISON_SETTINGS},
+                            host=dict(system='test', machine='arm64', docker={'NCPU': 4}),
+                            jobs=[dict(status='complete', engine='stannum', correctness={'mismatches': 0},
+                                       ranked_correctness={'mismatches': 0}, post_update_correctness={'mismatches': 0},
+                                       input_sha256='input', settings={'work_mem': '16MB'},
+                                       extensions={'stannum': '1'}, full_counts_before={'1:disjunction': 10})])
+            manifest['config']['workload'] = 'topk'
+            tin.bench.save(path / 'manifest.json', manifest)
+            # Both pairs improve 2x, but second pair runs on a slower background.
+            latency = job['pair'] * (2 if job['variant'] == 'baseline' else 1)
+            row = dict(engine='stannum', status='complete', qps=100 / latency,
+                       p50_ms=latency, p95_ms=latency * 2, update_errors=0,
+                       updates_attempted=1, updates_completed=1,
+                       queries={'1:disjunction': dict(p50_ms=latency, p95_ms=latency * 2)})
+            tin.bench.save(path / 'comparison.json', [row])
+        tin.bench.save(root / 'paired.json', campaign)
+        return campaign
+
+    def test_alternation_and_paired_ratios(self):
+        self.assertEqual([j['variant'] for j in tin.paired_jobs(3)],
+                         ['baseline', 'candidate', 'candidate', 'baseline', 'baseline', 'candidate'])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            self.assertTrue(tin.paired_report(root))
+            result = json.loads((root / 'aggregate.json').read_text())
+            self.assertEqual(result['paired']['qps_ratio']['median'], 2)
+            self.assertEqual(result['paired']['p95_speedup']['median'], 2)
+            self.assertEqual(result['variants']['baseline']['qps']['min'], 25)
+            self.assertGreater(result['variants']['baseline']['qps']['cv'], 0)
+
+    def test_incompatible_or_incomplete_trials_withhold_all_ratios(self):
+        mutations = {
+            'dataset': lambda m, r: m['corpus'].update(files={'documents.csv': 'changed'}),
+            'input': lambda m, r: m['jobs'][0].update(input_sha256='changed'),
+            'driver': lambda m, r: m['adapter'].update(binary_sha256='changed'),
+            'source': lambda m, r: m['source'].update(source_sha256='changed'),
+            'image': lambda m, r: m.update(image='retagged'),
+            'settings': lambda m, r: m['jobs'][0]['settings'].update(work_mem='32MB'),
+            'counts': lambda m, r: m['jobs'][0]['full_counts_before'].update({'1:disjunction': 9}),
+            'failed': lambda m, r: m.update(status='failed'),
+            'ranked': lambda m, r: m['jobs'][0]['ranked_correctness'].update(mismatches=1),
+            'query_coverage': lambda m, r: r['queries'].clear(),
+            'extra_query': lambda m, r: r['queries'].update({'2:phrase': {'p50_ms': 1, 'p95_ms': 1}}),
+            'updates': lambda m, r: r.update(updates_completed=0),
+            'nan': lambda m, r: r.update(qps=float('nan')),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                path = root / 'r02-candidate'
+                manifest = json.loads((path / 'manifest.json').read_text())
+                rows = json.loads((path / 'comparison.json').read_text())
+                mutate(manifest, rows[0])
+                tin.bench.save(path / 'manifest.json', manifest)
+                tin.bench.save(path / 'comparison.json', rows)
+                self.assertFalse(tin.paired_report(root))
+                result = json.loads((root / 'aggregate.json').read_text())
+                self.assertFalse(result['paired'])
+                self.assertTrue(result['invalid_trials'])
+
+    def test_interrupted_and_missing_schedule_do_not_publish_partial_speedups(self):
+        for change in ('status', 'schedule', 'missing'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                campaign = self.fixture(root)
+                if change == 'status':
+                    campaign['status'] = 'failed'
+                elif change == 'schedule':
+                    campaign['jobs'].pop()
+                else:
+                    (root / 'r02-baseline/comparison.json').unlink()
+                tin.bench.save(root / 'paired.json', campaign)
+                self.assertFalse(tin.paired_report(root))
+                self.assertFalse(json.loads((root / 'aggregate.json').read_text())['paired'])
+
+    def test_source_manifest_checks_file_fingerprint_consistency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self.fixture(root)['sources']['baseline']
+            path = root / 'source.json'
+            tin.bench.save(path, source)
+            self.assertEqual(tin.recorded_source(path), source)
+            source['source_files']['postgres/lib.rs'] = 'b' * 64
+            tin.bench.save(path, source)
+            with self.assertRaisesRegex(ValueError, 'inconsistent'):
+                tin.recorded_source(path)
+
+    def test_runner_pins_tags_once_and_alternates_fresh_trials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = root / 'fixture'
+            fixture.mkdir()
+            source = self.fixture(fixture)['sources']['baseline']
+            source_path = root / 'source.json'
+            tin.bench.save(source_path, source)
+            args = argparse.Namespace(repetitions=2, output=root / 'comparison',
+                                      baseline_image='baseline:tag', candidate_image='candidate:tag',
+                                      baseline_source=source_path, candidate_source=source_path,
+                                      driver=root / 'driver', style='disjunction')
+            def inspect(command):
+                variant = command[-1].split(':')[0]
+                return json.dumps([{'Id': 'sha256:' + variant,
+                                    'Config': {'Labels': {'benchmark.stannum_source_sha256': source['source_sha256']}}}])
+            visited = []
+            def run(trial):
+                visited.append((trial.image, trial.output.name, trial.engines))
+                self.assertEqual(tin.recorded_source(trial.source_manifest), source)
+            with patch.object(tin, 'output', side_effect=inspect) as inspect_image, \
+                    patch.object(tin, 'trace_queries', return_value=[('1:disjunction', '', '', '')]), \
+                    patch.object(tin, 'run', side_effect=run), \
+                    patch.object(tin, 'paired_report', return_value=True):
+                tin.compare(args)
+            self.assertEqual(inspect_image.call_count, 2)
+            self.assertEqual(visited, [('sha256:' + v, name, ['stannum']) for v, name in
+                                     [('baseline', 'r01-baseline'), ('candidate', 'r01-candidate'),
+                                      ('candidate', 'r02-candidate'), ('baseline', 'r02-baseline')]])
+            campaign = json.loads((args.output / 'paired.json').read_text())
+            self.assertEqual(campaign['status'], 'complete')
+            self.assertTrue(all(j['status'] == 'complete' for j in campaign['jobs']))
+
+    def test_runner_keeps_failed_trial_and_pending_schedule_on_interruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = root / 'fixture'
+            fixture.mkdir()
+            source = self.fixture(fixture)['sources']['baseline']
+            source_path = root / 'source.json'
+            tin.bench.save(source_path, source)
+            args = argparse.Namespace(repetitions=2, output=root / 'comparison',
+                                      baseline_image='baseline', candidate_image='candidate',
+                                      baseline_source=source_path, candidate_source=source_path,
+                                      driver=root / 'driver', style='mixed')
+            image = json.dumps([{'Id': 'sha256:image', 'Config': {
+                'Labels': {'benchmark.stannum_source_sha256': source['source_sha256']}}}])
+            with patch.object(tin, 'output', return_value=image), \
+                    patch.object(tin, 'trace_queries', return_value=[('1:disjunction', '', '', '')]), \
+                    patch.object(tin, 'run', side_effect=KeyboardInterrupt('stopped')), \
+                    self.assertRaises(KeyboardInterrupt):
+                tin.compare(args)
+            campaign = json.loads((args.output / 'paired.json').read_text())
+            self.assertEqual(campaign['status'], 'failed')
+            self.assertEqual([j['status'] for j in campaign['jobs']], ['failed', 'pending', 'pending', 'pending'])
+            result = json.loads((args.output / 'aggregate.json').read_text())
+            self.assertFalse(result['complete'])
+            self.assertFalse(result['paired'])
+
+    def test_single_repetition_is_not_a_variation_measurement(self):
+        with self.assertRaisesRegex(ValueError, 'at least two'):
+            tin.compare(argparse.Namespace(repetitions=1))
 
 
 if __name__ == '__main__':

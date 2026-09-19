@@ -145,3 +145,62 @@ comparisons or mutation contracts. Delete each with its caller/documentation
 migration in the same PR once those gates pass. Preserve measurement history
 and unique correctness regressions; retaining an old report does not require
 retaining its executable harness forever.
+
+## Repeated before/after comparisons
+
+Use `compare` for two Stannum builds. Build each image from its own checkout
+with `tin.py build-image`, retaining its output directory and `source.json`.
+The baseline can come from an older checkout: unlike a normal `run`, `compare`
+checks each image against its explicit build provenance. The source-file
+fingerprints must hash to the recorded source identity, which must match the
+image label. It retains both manifests and any accompanying `source.patch`;
+these are provenance records, not a complete source archive.
+
+```sh
+python3 benchmarks/tin.py --driver benchmarks/results/tin-driver compare \
+  --dataset /path/to/wikipedia-100000 --rows 1000 \
+  --baseline-image stannum-bench:baseline \
+  --baseline-source /path/to/baseline-build/source.json \
+  --candidate-image stannum-bench:candidate \
+  --candidate-source /path/to/candidate-build/source.json \
+  --workload topk --style mixed --seconds 60 --warmup 10 \
+  --repetitions 5 --output benchmarks/results/ranked-comparison-01
+```
+
+Image tags resolve once to immutable IDs before any trials. Each pair runs
+baseline then candidate; the next runs candidate then baseline. Each trial
+uses a fresh container and volume. The whole comparison holds the existing
+machine timing lock, so do not wrap the command in another acquisition of
+that lock. All trials use the same corpus prefix, driver, query trace, random
+seed, offered update rate, client count and server settings. Two repetitions
+are the minimum; five is the default. An A/A comparison using the same image
+on both sides can help establish machine noise.
+
+`paired.json` records every planned trial, its image and source identity, and
+completion status. Each trial retains the usual raw samples, correctness
+outputs and report. `aggregate.json` reports median, mean, sample standard
+deviation, coefficient of variation, and range across trials, plus paired
+QPS and latency ratios. Query latency ratios use baseline/candidate;
+throughput ratios use candidate/baseline, so values above one favor the
+candidate. These describe observed variation; they are not significance
+claims. Inspect individual-query ratios as well as the overall mix.
+
+All planned trials must complete and share actual PostgreSQL settings,
+extension versions, imported CSV bytes, corpus manifest, driver and harness
+fingerprints, and full-corpus query counts. Every query form in the requested
+timed style must appear in every trial's samples. A trial that is too short
+to traverse the trace invalidates the comparison; increase `--seconds` and
+start a fresh output directory. Failed, interrupted, incompatible or partially
+covered comparisons retain evidence but publish **no aggregate ratios**.
+Ranked runs also require the exhaustive same-engine top-10 oracle to pass.
+This does not establish full cross-version ranked-result equivalence.
+
+Regenerate the aggregate without Docker using:
+
+```sh
+python3 benchmarks/tin.py report --output benchmarks/results/ranked-comparison-01
+```
+
+This supplies the repeated published-trace workflow that will replace
+`paired.py`. Keep that older harness until an end-to-end comparison has passed
+and its remaining callers and synthetic mutation coverage are migrated.
