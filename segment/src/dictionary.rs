@@ -199,7 +199,9 @@ impl<'a> DictionaryIndex<'a> {
         let index_len = reader.varint_u32()? as usize;
         let index_bytes = reader.take(index_len)?;
         let header_len = reader.position();
-        let mut entries = Vec::with_capacity(block_count);
+        // Each index entry needs at least two varints. Do not reserve
+        // from a claimed block count before reading those bytes.
+        let mut entries = Vec::with_capacity(block_count.min(index_bytes.len() / 2));
         let mut index_reader = Reader::new(index_bytes);
         let mut previous: Option<&[u8]> = None;
         for _ in 0..block_count {

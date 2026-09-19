@@ -55,3 +55,6 @@ mod random_tests;
 
 #[cfg(test)]
 mod format_tests;
+
+#[cfg(test)]
+mod direct_merge_poc;

@@ -500,7 +500,9 @@ impl<'a> Postings<'a> {
     /// Decodes every posting. Fails on the first malformed byte.
     pub fn to_vec(&self) -> Result<Vec<Tid>> {
         let mut cursor = self.cursor()?;
-        let mut out = Vec::with_capacity(self.count as usize);
+        // The count is untrusted until the stream has been decoded.
+        // Bound speculative allocation by bytes actually present.
+        let mut out = Vec::with_capacity((self.count as usize).min(self.bytes.len()));
         while let Some(tid) = cursor.current() {
             out.push(tid);
             cursor.advance()?;
@@ -587,7 +589,8 @@ impl<'a> PostingsCursor<'a> {
         let Some(bounds) = self.bounds_mut() else {
             return Ok(Vec::new());
         };
-        let mut all = Vec::with_capacity(bounds.blocks as usize);
+        // A corrupt count can imply millions of bounds in a tiny stream.
+        let mut all = Vec::new();
         for block in 0..bounds.blocks {
             all.push(bounds.entry(block)?.expect("block index is in range"));
         }

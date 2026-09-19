@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [direct-merge POC](direct-merge-poc.md) compares ordered posting merges with
+forward-record reconstruction while preserving the current format.
+
 The [merge-cost probe](merge-costs.md) compares foreground maintenance budgets
 and explains the direct forward-record ingestion optimization.
 

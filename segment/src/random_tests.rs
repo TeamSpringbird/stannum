@@ -497,3 +497,36 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn claimed_counts_do_not_allocate_before_decoding() {
+    // A valid first sparse posting gets cursor() past initialization; to_vec()
+    // must reach the truncated second posting without reserving 32 GiB first.
+    let mut postings = vec![0];
+    crate::varint::put(&mut postings, u32::MAX as u64);
+    postings.extend_from_slice(&[0, 1]);
+    assert!(Postings::parse(&postings).unwrap().to_vec().is_err());
+
+    // A matching huge dictionary count/block count with no index bytes.
+    let mut dictionary = Vec::new();
+    crate::varint::put(&mut dictionary, u32::MAX as u64);
+    crate::varint::put(
+        &mut dictionary,
+        (u32::MAX as usize).div_ceil(crate::dictionary::BLOCK_TERMS) as u64,
+    );
+    crate::varint::put(&mut dictionary, 0);
+    assert!(OwnedDictionary::parse(&dictionary).is_err());
+
+    // One valid bound and one valid posting, followed by missing bounds.
+    // Sparse bound entry: bucket mask, min length, last block/offset, start.
+    let mut bounded = vec![2];
+    crate::varint::put(&mut bounded, u32::MAX as u64);
+    crate::varint::put(&mut bounded, 5);
+    bounded.extend_from_slice(&[1, 1, 0, 1, 0]);
+    bounded.extend_from_slice(&[0, 1]);
+    assert!(
+        Postings::parse(&bounded)
+            .and_then(|p| p.cursor()?.block_bounds())
+            .is_err()
+    );
+}
