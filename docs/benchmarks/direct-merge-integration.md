@@ -112,7 +112,7 @@ large or adversarial inputs, and does not establish PostgreSQL backend peak RSS.
 
 ## Validation status
 
-Local formatting, all 60 harness tests, 454 core unit tests, four documentation
+Local formatting, all 62 harness tests, 454 core unit tests, four documentation
 tests, warnings-denied Clippy for PostgreSQL 17/18, and all 109 tests on each major
 passed. Lifecycle validation passed, including crash/replay, CTID reuse, ranking,
 promotion and 338 standby snapshot comparisons with zero wrong answers.
@@ -125,8 +125,28 @@ unrelated connection errors still fail. PostgreSQL's
 [recovery-conflict handling](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c)
 explicitly supports both outcomes. The full lifecycle rerun passed.
 
-Fixed-work results, ranked fuzz and CI are still being collected. Cross-architecture
+All five ranked-fuzz smoke runs passed (760 ranked comparisons). Fixed-work
+results and CI are still being collected. Cross-architecture
 performance validation remains a promotion gate; local ARM64 timing does not
 establish x86-64 behavior. Raw local samples, binary identities, server logs and
 probe outputs are retained under ignored
 `benchmarks/results/direct-merge-integration/`.
+
+The CI workflow supports an opt-in paired contention campaign across Linux
+ARM64/x86-64 and PostgreSQL 17/18. It compares two release libraries on each
+runner, restores the integrated library, and uploads raw results. Shared-runner
+timings are evidence for review, not a timing assertion in the correctness suite.
+
+```sh
+gh workflow run ci.yml --ref perf/integrate-direct-merge -f direct_merge_performance=true
+```
+
+The portable driver can also compare retained, SQL-compatible libraries on a
+private local cluster (use the development installation lock on a shared host):
+
+```sh
+python3 benchmarks/paired_libraries.py --baseline /tmp/baseline.so \
+  --integrated /tmp/integrated.so --installed-library /path/to/stannum.so \
+  --checkpoint-control --seconds 20 --rounds 3 --repeat 200 \
+  --output benchmarks/results/direct-merge-pairs
+```
