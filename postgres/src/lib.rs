@@ -1466,6 +1466,60 @@ mod tests {
     }
 
     #[pg_test]
+    fn ranked_work_counters_distinguish_filtered_completion() {
+        Spi::run(
+            "CREATE TABLE ranked_work(id int, body text);
+             INSERT INTO ranked_work SELECT n, 'alpha beta' FROM generate_series(1, 1000) n;
+             CREATE INDEX ranked_work_idx ON ranked_work USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = on;
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;",
+        )
+        .unwrap();
+        fn search_scan(node: &serde_json::Value) -> Option<&serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node);
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        let explain = |query: &str, filter: &str| {
+            Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ranked_work
+                 WHERE body ==> '{query}' {filter}
+                 ORDER BY stannum.full_score(ctid) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0
+        };
+        let ordinary = explain("alpha", "");
+        let scan = search_scan(&ordinary[0]["Plan"]).unwrap();
+        assert_eq!(scan["Pruning"], "block-max");
+        assert_eq!(scan["Exhaustive Score Calls"], 0);
+        assert_eq!(scan["Top-K Completions"], 0);
+
+        // Equal scores put the first ten physical rows in the pruned prefix.
+        // None passes the SQL filter, forcing completion of all 1,000 rows.
+        let filtered = explain("alpha", "AND id > 990");
+        let scan = search_scan(&filtered[0]["Plan"]).unwrap();
+        assert_eq!(scan["Pruning"], "block-max");
+        assert_eq!(scan["Top-K Completions"], 1);
+        assert_eq!(scan["Exhaustive Score Calls"], 1000);
+        assert_eq!(filtered[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+
+        // An unprunable phrase scores exhaustively without a completion.
+        let phrase = explain("\"alpha beta\"", "");
+        let scan = search_scan(&phrase[0]["Plan"]).unwrap();
+        assert!(scan["Pruning"].is_null());
+        assert_eq!(scan["Top-K Completions"], 0);
+        assert_eq!(scan["Exhaustive Score Calls"], 1000);
+    }
+
+    #[pg_test]
     fn segment_info_reports_segments_and_the_write_buffer() {
         Spi::run(
             "CREATE TABLE si(id int primary key, body text);

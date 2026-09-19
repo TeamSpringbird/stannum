@@ -894,6 +894,10 @@ struct ScanExec {
     /// counts the candidates a pruned scan scored.
     candidates: Option<usize>,
     scored: Option<usize>,
+    /// Cumulative work across rescans, like `fetched`. Counts calls made by
+    /// exhaustive ranking, not block-max traversal or score projection.
+    exhaustive_score_calls: usize,
+    top_k_completions: usize,
     fetched: usize,
     skipped_pages: usize,
     page_masks: Option<bool>,
@@ -1033,6 +1037,8 @@ unsafe extern "C-unwind" fn begin_scan(
             pruned: false,
             candidates: None,
             scored: None,
+            exhaustive_score_calls: 0,
+            top_k_completions: 0,
             fetched: 0,
             skipped_pages: 0,
             page_masks: None,
@@ -1167,6 +1173,7 @@ fn finish(exec: &mut ScanExec, mut tids: Vec<Tid>, scorer: Option<crate::score::
         let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
         let mut scored: Vec<(f32, Tid)> =
             tids.iter().map(|tid| (scorer.score(*tid), *tid)).collect();
+        exec.exhaustive_score_calls += scored.len();
         // Only the rows the query will consume are ordered now; the rest
         // are ordered on demand should the executor ask for them.
         let sorted = match top_k {
@@ -1198,6 +1205,7 @@ fn finish(exec: &mut ScanExec, mut tids: Vec<Tid>, scorer: Option<crate::score::
 /// consumed rows back into the output.
 unsafe fn complete(exec: &mut ScanExec) {
     unsafe {
+        exec.top_k_completions += 1;
         let ordering = exec
             .private
             .ordering
@@ -1773,6 +1781,20 @@ unsafe extern "C-unwind" fn explain(
                     c"Scored Candidates".as_ptr(),
                     std::ptr::null(),
                     scored as i64,
+                    es,
+                );
+            }
+            if exec.ordered {
+                pg_sys::ExplainPropertyInteger(
+                    c"Exhaustive Score Calls".as_ptr(),
+                    std::ptr::null(),
+                    exec.exhaustive_score_calls as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Top-K Completions".as_ptr(),
+                    std::ptr::null(),
+                    exec.top_k_completions as i64,
                     es,
                 );
             }
