@@ -60,7 +60,7 @@ class Experiment:
         self.number = 0
         self.meta = dict(status='running', schema=self.schema, rows=args.rows,
                          repetitions=args.repetitions, seconds=args.seconds,
-                         max_clients=args.max_clients, stages=getattr(args,'stages',None), index_segments=getattr(args,'index_segments',None), build_memory_mb=getattr(args,'build_memory_mb',None), observations=[], events=[],
+                         max_clients=args.max_clients, vacuum_before_queries=getattr(args,'vacuum_before_queries',False), stages=getattr(args,'stages',None), index_segments=getattr(args,'index_segments',None), build_memory_mb=getattr(args,'build_memory_mb',None), observations=[], events=[],
                          timing_policy='instrumented server execution times; client concurrency includes network latency')
         for module in (Path(__file__), Path(tin_catalog.__file__), Path(dataset.__file__)):
             (self.root / module.name).write_bytes(module.read_bytes())
@@ -245,9 +245,16 @@ class Experiment:
         self.execute(conn,'wiki-index',f'CREATE INDEX wiki_body_idx ON {table} USING tin(body)'+options)
         self.execute(conn,'wiki-analyze',f'ANALYZE {table}')
         conn.execute("SET statement_timeout='60s'")
+        if getattr(self.args,'vacuum_before_queries',False):
+            self.execute(conn,'wiki-visibility-vacuum',f'VACUUM (ANALYZE) {table}')
+        self.visibility_snapshot(conn,table,'before-queries')
         self.event('wiki-sizes',**self.sizes(conn,table))
         self.segment_snapshot(conn, table, 'built')
         return table
+
+    def visibility_snapshot(self,conn,table,phase):
+        row=conn.execute("SELECT c.relpages,c.relallvisible,s.last_vacuum::text,s.last_autovacuum::text FROM pg_class c LEFT JOIN pg_stat_all_tables s ON s.relid=c.oid WHERE c.oid=%s::regclass",(table,)).fetchone()
+        self.event('visibility',phase=phase,heap_pages=row[0],all_visible_pages=row[1],last_vacuum=row[2],last_autovacuum=row[3])
 
     def segment_snapshot(self, conn, table, phase):
         index=table+'_body_idx'
@@ -322,6 +329,49 @@ class Experiment:
                             p50_ms=percentile(durations,.5),p95_ms=percentile(durations,.95),p99_ms=percentile(durations,.99),workers=results)
                 (self.root/f'concurrency-{repetition}-{clients}.json').write_text(json.dumps(record,indent=2)+'\n')
                 self.event('concurrency',**{k:v for k,v in record.items() if k!='workers'},errors=sum(len(r['errors']) for r in results))
+
+    def ctid_layout(self,conn):
+        reference={}
+        for padding in (0,128,1024,2048):
+            table=self.schema+f'.packed{padding}'
+            self.execute(conn,f'ctid-layout-build-{padding}',f"CREATE TABLE {table}(id integer PRIMARY KEY,body text NOT NULL,padding text NOT NULL); ALTER TABLE {table} ALTER COLUMN padding SET STORAGE PLAIN; INSERT INTO {table} SELECT n,repeat('common ',1+n%7) || CASE WHEN n%2=0 THEN 'half ' ELSE 'opposite ' END || CASE WHEN n%1000=0 THEN 'rare ' ELSE '' END || 'alpha beta',repeat('x',{padding}) FROM generate_series(1,{self.args.rows}) n; CREATE INDEX packed{padding}_body_idx ON {table} USING tin(body) WITH (initial_segment_count=1,target_segment_count=1); ANALYZE {table}")
+            self.execute(conn,f'ctid-layout-vacuum-{padding}',f'VACUUM (ANALYZE) {table}')
+            sizes=self.sizes(conn,table)
+            sizes['tin_index']=conn.execute('SELECT pg_relation_size(%s)',(table+'_body_idx',)).fetchone()[0]
+            sizes['heap_pages']=conn.execute('SELECT relpages FROM pg_class WHERE oid=%s::regclass',(table,)).fetchone()[0]
+            self.event('ctid-layout-size',padding_bytes=padding,**sizes)
+            self.segment_snapshot(conn,table,f'padding-{padding}')
+            queries=['rare','common','common OR rare','half AND common','"alpha beta"','alpha NEAR/3 beta']
+            for query in queries:
+                count=f'SELECT count(*) FROM {table} WHERE body ==> {literal(query)}'
+                statement=ranked(table,query)
+                scores=[r[1] for r in conn.execute(statement).fetchall()]
+                members=conn.execute(count).fetchone()[0]
+                if padding==0: reference[query]=(scores,members)
+                self.event('ctid-layout-equivalence',padding_bytes=padding,query=query,same_score_sequence=scores==reference[query][0],same_count=members==reference[query][1],count=members)
+                if scores!=reference[query][0] or members!=reference[query][1]: raise ValueError('CTID geometry changed logical results')
+                for repetition in range(3):
+                    self.probe(conn,f'ctid-layout:{padding}:rank:{query}:r{repetition}',statement)
+                    self.probe(conn,f'ctid-layout:{padding}:count:{query}:r{repetition}',count)
+            for config in ({'tin.debug_disable_count_pushdown':'on'}, {'tin.debug_force_visibility':'Streaming'}, {'tin.debug_force_visibility':'Sorted'}, {'tin.track_page_reuse_stats':'on'}):
+                for repetition in range(3):
+                    self.probe(conn,f'ctid-layout:{padding}:count-strategy:{config}:r{repetition}',f"SELECT count(*) FROM {table} WHERE body ==> 'common'",config)
+            self.execute(conn,f'ctid-layout-drop-{padding}',f'DROP TABLE {table}')
+
+    def planner_settings(self,conn,table):
+        settings=[{}, {'work_mem':'2MB'}, {'effective_cache_size':'203MB'},
+                  {'work_mem':'2MB','effective_cache_size':'203MB'},
+                  {'max_parallel_workers_per_gather':'0'},
+                  {'work_mem':'64kB'}, {'random_page_cost':'4'}]
+        cases=[('history',f"SELECT count(*) FROM {table} WHERE body ==> 'history'"),
+               ('broad-or',f"SELECT count(*) FROM {table} WHERE body ==> 'history OR war OR science OR music OR art OR government'"),
+               ('phrase',f'SELECT count(*) FROM {table} WHERE body ==> '+literal(chr(34)+'united states'+chr(34))),
+               ('ranked-filter',ranked(table,'history OR war',10,f'id <= {self.args.rows//4}'))]
+        for repetition in range(3):
+            order=list(settings);random.Random(810+repetition).shuffle(order)
+            for config in order:
+                for name,statement in cases:
+                    self.probe(conn,f'planner-settings:{name}:{config}:r{repetition}',statement,config)
 
     def projection(self,conn,table):
         for query in ('history OR war','quasar','"united states"'):
@@ -407,7 +457,8 @@ class Experiment:
                 stages=set(getattr(self.args,'stages',None) or ('synthetic','queries','prepared','forced','concurrency','multi','maintenance','projection'))
                 if 'synthetic' in stages and not self.args.skip_synthetic:
                     self.synthetic(conn)
-                table=self.load_wikipedia(conn)
+                table=self.load_wikipedia(conn) if stages-{'synthetic','ctid-layout'} else None
+                if 'ctid-layout' in stages: self.ctid_layout(conn)
                 if 'queries' in stages:
                     self.execute(conn,'allowed-build',f'CREATE TABLE {self.schema}.allowed AS SELECT id FROM {table} WHERE id % 100=1; CREATE UNIQUE INDEX ON {self.schema}.allowed(id); ANALYZE {self.schema}.allowed')
                     cases=self.wiki_queries(table)
@@ -417,12 +468,15 @@ class Experiment:
                         for name,statement in shuffled:
                             self.probe(conn,f'wiki:r{repetition}:{name}',statement)
                         self.event('wiki-repetition',repetition=repetition)
+                        self.visibility_snapshot(conn,table,f'query-repeat-{repetition}')
                 if 'prepared' in stages: self.prepared(conn,table,('quasar','history','history OR war','"united states"'))
                 if 'forced' in stages: self.forced_strategies(conn,table,'history OR war',self.args.rows)
+                if 'planner-settings' in stages: self.planner_settings(conn,table)
                 if 'projection' in stages: self.projection(conn,table)
                 if 'concurrency' in stages: self.concurrency(table)
                 if 'multi' in stages: self.multi_index(conn,table)
                 if 'maintenance' in stages: self.maintenance(conn,table)
+                if table is not None: self.visibility_snapshot(conn,table,'after-queries')
             failures=sum(any(o.get(k) is False for k in ('same_score_sequence_as_auto','same_membership_as_auto','same_count_as_auto')) for o in self.meta['observations'])
             failures+=sum(e.get('reported_errors',0) for e in self.meta['events'] if e['name']=='fsck')
             self.meta.update(status='validation-failed' if failures else 'complete',validation_failures=failures,query_error_count=sum('error' in o for o in self.meta['observations']))

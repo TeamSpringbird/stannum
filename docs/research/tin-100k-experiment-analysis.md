@@ -192,3 +192,101 @@ sequences themselves are not saved when they match. Count-strategy probes
 collect EXPLAIN plans, not independently verified count values. There are no
 recorded concurrency errors. Both manifests report successful cleanup and zero
 remaining owned schemas.
+
+## Follow-up: separate million-row and CTID-layout experiments
+
+These results come from different runs and must not be pooled with the 100k
+timings above. Sources:
+[million-row manifest](../../benchmarks/results/tin-expanded-large-1m/experiment.json),
+[recovery](../../benchmarks/results/tin-expanded-large-1m/recovery.json), and
+[CTID-layout manifest](../../benchmarks/results/tin-ctid-layout/experiment.json).
+
+### Million-row prepared histories and dynamic LIMIT
+
+The million-row run executes 16 calls per prepared configuration, priming the
+first five with either `quasar` or `history`. Auto with literal LIMIT 10 selects
+six custom/ten generic calls after rare-first priming versus five custom/eleven
+generic after common-first priming. At execution index five, the same
+`history`/`id <= 10000` call is custom pushdown at 10.653 ms in artifact 00211
+but generic ranked scan at 26.941 ms in 00243. Both histories subsequently use
+generic scans. This is a modest observed history effect, not a claim of
+indefinitely different stable plans.
+
+With parameterized LIMIT, auto remains custom for all 16 calls under both
+histories. Forced generic planning exposes a large execution penalty:
+
+| Dynamic-LIMIT query | Custom median ms | Generic median ms | Artifacts, six each |
+| --- | ---: | ---: | --- |
+| `history`, first 1% IDs, LIMIT 100 | 10.815 | 224.198 | custom 00291/295/299/323/327/331; generic 00355/359/363/387/391/395 |
+| `history OR war`, all IDs, LIMIT 10 | 17.840 | 459.493 | custom 00292/296/300/324/328/332; generic 00356/360/364/388/392/396 |
+| `"united states"`, first 1% IDs, LIMIT 100 | 26.198 | 210.749 | custom 00293/297/301/325/329/333; generic 00357/361/365/389/393/397 |
+
+Medians aggregate post-priming calls from the two histories. The generic dynamic
+OR plan in 00356 emits 280,091 text rows and sorts them; the literal-LIMIT
+generic plan in 00212 reports `Top K: 10` and emits ten rows. The generic
+dynamic `history` scan in 00355 emits 221,214 rows before filtering to 2,215;
+custom 00291 applies TID pushdown and emits 2,215. Parameterized LIMIT support
+therefore deserves explicit end-to-end coverage in Stannum, including forced
+generic plans. These observations identify lost bounded execution and filtering
+opportunities; they do not show that dynamic LIMIT necessarily makes default
+auto mode slow, since auto avoided the expensive generic plan here.
+
+### Million-row correctness, mutation state, and honest completion status
+
+All 639 recorded query observations succeeded. The original experiment still
+**failed**: REINDEX encountered `55P03` at the three-second lock timeout, and
+cleanup also failed. The separate recovery used a 30-second lock timeout,
+completed REINDEX in 99.104 seconds, found 900,000 live rows, returned no fsck
+findings, and removed the owned schema. Preserve both the failed original
+status and successful recovery rather than rewriting the original as complete.
+
+All 42 forced-ranking score-sequence checks passed. The multi-index fixture
+uses a 10,000-row subset, not the entire million rows. Its six predicates and
+five strategies produced 90 observations; all 30 repetition-zero membership
+and 30 count comparisons against auto passed. Exact artifact IDs are 00543
+through 00630 in steps of three. These checks validate the tested alternative
+results, not Lead compatibility or arbitrary multi-index scoring.
+
+The marker count was 50,000 after updates and after VACUUM, versus zero before
+updates. Maintenance query artifacts are 00633–00635 before, 00637–00639
+deleted, 00641–00643 updated, and 00645–00647 vacuumed. Raw segment snapshots
+must be filtered by `source_state`: the updated snapshot's 309 directory entries
+are **not 309 active segments**. It has 24 current immutable segments containing
+1,050,000 stored documents, one empty current mutable segment, and 284 retired
+entries. The vacuumed snapshot has nine current immutable segments with
+1,050,000 stored documents and 150,000 dead entries, plus an empty mutable
+segment. Recovery REINDEX yields four immutable segments totaling 900,000
+documents and zero dead entries. Do not sum retired and current documents into
+a live corpus count.
+
+### CTID layout: page density is measurable without changing text
+
+This separate 100,000-row synthetic run changes nonindexed padding from 0 to
+128, 1,024, and 2,048 bytes. Each index has one current segment and the tables
+were explicitly vacuumed. All 192 probes succeed; all 24 count and score-sequence
+equivalence events pass. The schema is cleaned up.
+
+| Padding bytes | Heap pages | TIN bytes | `common` full-score median ms | `common` count median ms |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 1,021 | 729,088 | 65.422 | 0.127 |
+| 128 | 2,632 | 720,896 | 67.644 | 0.126 |
+| 1,024 | 14,286 | 688,128 | 83.140 | 0.136 |
+| 2,048 | 33,334 | 876,544 | 97.557 | 0.125 |
+
+Ranking artifact triples are 00009/11/13, 00060/62/64, 00111/13/15, and
+00162/64/66; count triples are 00010/12/14, 00061/63/65, 00112/14/16, and
+00163/65/67. These IDs belong to the CTID-layout directory.
+
+Both endpoint rank plans scan 100,000 text rows and sort. Root shared-buffer
+hits increase from 1,047 to 33,366, while TIN page touches rise only from 33 to
+39. Both report zero shared reads. Endpoint count plans use `Tin Count/Fold`
+with nine index page touches each. This is evidence that heap density affects
+this ranked retrieval path while the specialized count avoids the same scaling
+cost. TIN index size is nonmonotonic across padding values: these measurements
+do not recover an exact bitmap format or compression formula.
+
+Do not combine these explicitly vacuumed layout results with the older
+settings-sweep timing differences. That sweep changed visible count strategy
+and estimated heap work between repetitions under the same settings, so
+visibility/maintenance state is an unresolved confounder until the separate
+controlled visibility experiment is analyzed.

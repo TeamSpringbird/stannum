@@ -15,7 +15,7 @@ checks compare ordered scores while allowing tied row choices; they do not
 establish comprehensive TIN/Lead semantic equivalence.
 
 The [derived results](tin-expanded-results.json) preserve grouped timings,
-plan-provider sequences, errors, source hashes and artifact IDs. Ten
+plan-provider sequences, errors, source hashes and artifact IDs. Twenty-one
 [complete plan examples](tin-expanded-plan-examples.json) retain the SQL and
 full counters for representative comparisons. The
 [offline analysis](../research/tin-100k-experiment-analysis.md) traces the
@@ -52,8 +52,10 @@ plans did not generalize to all larger workloads.
 The larger database loaded one million articles in 69.73 seconds and built its
 index in 116.32 seconds. The complete relation occupied 3,803,242,496 bytes;
 its indexes occupied 1,643,405,312 bytes. The build produced four immutable
-segments. This exceeds shared_buffers, but does not imply that the full working
-set was absent from the operating-system cache.
+segments. This exceeds shared_buffers, but the active query working set can be smaller
+than the complete relation. Twenty-two of the 639 observations recorded shared
+buffer reads, with a maximum of 66,357 blocks in one query. Those reads do not
+establish physical disk I/O because the operating-system cache may serve them.
 
 The run completed **639 query observations without query errors**, including
 reversed first-five prepared-query histories, dynamic LIMIT, joins and LATERAL,
@@ -97,10 +99,91 @@ original lock timeout. Artifacts are under
 `benchmarks/results/tin-lock-wait-regression`. The helper is now used for
 REINDEX and cleanup. No claim is made that the original blocker was identified.
 
-## Controlled layout and output projection
+## Visibility-controlled layouts and output projection
 
-Follow-up runs vary initial/target segment count and build memory, and compare
-output serialization. Final results will be added once those runs finish.
+The initial settings sweep changed the same default `count(history)` query
+from 16.396 ms to 0.175 ms between repetitions, switching from parallel scan
+and aggregation to `Tin Count` with Count Strategy `Fold`. Its estimated heap
+work fell sharply. That is consistent with changing visibility information;
+we did not capture the original transition directly. Consequently, the first
+settings sweep cannot establish a causal effect of the toggled settings.
+
+Three repeats explicitly VACUUMed before measuring and captured visibility
+coverage before the queries, after each repetition, and at the end. Coverage
+remained **9,801 of 9,856 heap pages** throughout every run, with no recorded
+autovacuum. This is stable coverage, not a claim of 100% all-visible pages.
+
+| Layout / build memory | `count(history)` median | Full-score `history` median | Full-score phrase median |
+| --- | ---: | ---: | ---: |
+| 1 segment / 16 MiB | 0.151 ms | 24.391 ms | 23.038 ms |
+| 4 segments / 16 MiB | 0.164 ms | 20.847 ms | 23.112 ms |
+| 4 segments / 512 MiB | 0.163 ms | 20.189 ms | 23.327 ms |
+
+All three now chose `Tin Count` for the count query. Four-segment ranked
+`history` used Gather Merge; the single-segment version did not. The phrase
+query remained serial. Parallelism helped this broad ranked query but did not
+universally help all shapes. Each layout had one build and three query
+observations, so small differences are not established performance wins.
+
+At stable visibility, the 25% filter/LIMIT 10 comparison still favored forced
+pushdown: **18.700 ms versus 29.338 ms**. The earlier pushdown result therefore
+survived this control. Settings and build layout are useful experiment axes,
+but these observations do not recover a universal machine-size threshold.
+
+Returning full bodies also costs more than returning IDs and scores. In the
+initial four-segment/512 MiB layout, the broad OR LIMIT 1000 query had medians
+of 22.668 ms for serialized IDs/scores, 27.747 ms for un-serialized bodies, and
+31.842 ms for serialized bodies. Those initial-layout observations are retained
+as examples, not a replacement for a full application response benchmark.
+
+## CTID geometry
+
+A separate synthetic fixture kept 100,000 indexed document bodies identical
+while changing an unindexed PLAIN-storage padding column. Every layout used
+one segment and explicit VACUUM. All 18 cross-layout count and ordered-score
+comparisons passed; six baseline self-comparisons were also recorded.
+
+| Padding bytes | Heap pages | TIN index bytes | Common-term count median | Common-term ranked median |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 1,021 | 729,088 | 0.127 ms | 65.422 ms |
+| 128 | 2,632 | 720,896 | 0.126 ms | 67.644 ms |
+| 1,024 | 14,286 | 688,128 | 0.136 ms | 83.140 ms |
+| 2,048 | 33,334 | 876,544 | 0.125 ms | 97.557 ms |
+
+A roughly 33-fold increase in heap-page span did not cause proportional index
+growth. Counting stayed nearly flat, while ranking and phrase execution became
+more expensive. This supports testing physical TID density in Stannum's format
+benchmarks. It does **not** identify TIN's compression codec or SIMD instructions;
+index size also includes dictionaries, metadata and liveness structures.
+
+## Outcomes for Stannum
+
+1. Measure filter pushdown/TID intersection against rank-then-filter, with
+   visibility, selectivity, LIMIT and corpus size represented in the workload.
+   Avoid copying TIN's demonstrated suboptimal automatic decisions.
+2. Preserve runtime parameter information, especially LIMIT and SQL filters.
+   In the million-row probes, forced generic dynamic-LIMIT plans were 8–26 times
+   slower than custom plans for some tested shapes; auto avoided those generic
+   plans. Exact cases and limits are in the research analysis.
+3. Treat visibility state as a first-class count benchmark variable. A deployment
+   comparison with unmatched visibility can dwarf the optimization being tested.
+4. Record execution mode, candidate rows, actual page work, segment state and
+   output projection costs separately. More page touches can still be faster
+   when they avoid work on irrelevant rows.
+
+## Completion and cleanup
+
+The main experiments captured **4,893 plan observations**, plus three recovery
+plans, 24 mixed-query concurrency windows, and a live lock-wait regression.
+The separate initial smoke run captured another 294 plans. Four main-suite
+query errors were the invalid-negation syntax probes described above. The
+million-row maintenance failure and successful recovery remain separately
+recorded. All other main runs completed with successful cleanup.
+
+Both databases were subsequently checked: **zero probe schemas and zero
+experiment/recovery sessions remained**. See the
+[cleanup verification](tin-cleanup-verification.json). The temporary larger
+database is no longer needed for this experiment set.
 
 ## Replay and bounds
 
