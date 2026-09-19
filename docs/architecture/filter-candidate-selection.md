@@ -22,6 +22,41 @@ repeat with stable visibility reduced 29.338 ms to 18.700 ms. Three repetitions
 are diagnostic evidence, not confidence intervals or a Stannum speedup claim.
 TIN's pushdown emitted fewer text candidates despite touching more index pages.
 
+The subsequent **local Stannum** runtime-bound experiment in
+[PR #36](https://github.com/TeamSpringbird/stannum/pull/36) reproduced why filter
+eligibility matters. On 100k documents, the initial implementation applied runtime
+top-k hints even with residual SQL quals. In A/B/B/A order, each run's median was:
+
+| Prepared query | Baseline A1 / A2 | Initial candidate B1 / B2 |
+| --- | --- | --- |
+| `history OR war`, runtime LIMIT 10 | 3.220 / 3.240 ms | 1.843 / 1.784 ms |
+| Same query, `id <= 25000` | 3.443 / 3.339 ms | 5.247 / 5.167 ms |
+
+These are instrumented server execution times, not client throughput. Each run
+retained seven interleaved measurements after discarding two. Comparing the
+median of the two run medians gives approximately **44% lower** time for the
+unfiltered OR and **54% higher** time for the filtered shape. The fixture had
+100,000 IDs from 1 through 100,000, so this particular SQL filter selects exactly
+25% of documents, not necessarily 25% of text matches. Raw evidence is recorded
+under `benchmarks/results/runtime-ranked-bounds/r01-baseline`, `r02-candidate`,
+`r03-candidate`, and `r04-baseline` (`server-times.json`, `plans.json`,
+`correctness.json`, and visibility snapshots).
+
+The filtered candidate exhausted its unfiltered ranked prefix and needed the
+complete ordering. Its regression makes filter-aware ranking a concrete next
+experiment; it does **not** prove that eagerly fetching every text candidate to
+evaluate a filter will be faster. That prototype still has to pay and measure
+its additional heap work. The original experiment predates this PR's completion
+counters, so it must not be presented as a counter-measured completion frequency.
+
+Commit `ebe84b0` in PR #36 consequently declines **new runtime bounds** whenever
+residual quals remain. This preserves the prior generic-plan behavior for those
+queries while retaining the unfiltered optimization. It does not change existing
+literal-limit behavior. Re-measure the gated implementation separately rather
+than attributing the initial filtered regression to the final strategy. Until a
+filter-aware strategy passes the gates below, keep this conservative eligibility
+rule; do not substitute an arbitrary selectivity threshold.
+
 Stannum currently ranks before applying residual SQL filters:
 
 | Code location | Existing behavior and implication |
