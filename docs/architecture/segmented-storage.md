@@ -66,9 +66,22 @@ and uses the latest buffer and directory; unrelated appends, folds, or VACUUM do
 not invalidate the prepared record. An identity/settings change retries
 preparation. Current reloptions are not substituted for the persisted pipeline.
 
-This removes text preparation from the exclusive critical section. Folding,
-segment writes, foreground merges, and publication remain locked. In particular,
-orphan reclamation relies on that lock to exclude unpublished foreground runs;
+Text preparation runs outside the exclusive critical section. When an insert
+needs to fold the buffer, it also copies the encoded buffer while locked and
+builds the replacement segment in memory after releasing the lock. Before
+writing it, the insert reacquires exclusive access and validates the index
+identity, persisted tokenizer and complete buffer state, including version,
+epoch, head/tail, byte count and document count. Epoch alone is insufficient:
+a concurrent append changes the buffer without changing its epoch.
+
+Publication uses freshly read metadata, preserving directory/dead-list changes
+that VACUUM made while the buffer itself remained unchanged. A changed buffer
+invalidates the prepared segment; after two speculative attempts, the insert
+folds under the lock to guarantee progress. A competing fold may leave enough
+space that no further fold is needed.
+
+Segment allocation/writes, foreground merges and publication remain locked.
+Orphan reclamation relies on that lock to exclude unpublished foreground runs;
 moving their writes outside it requires a separate reservation protocol.
 
 ### Merge policy
