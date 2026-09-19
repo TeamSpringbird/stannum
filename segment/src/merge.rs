@@ -3,7 +3,8 @@
 //! Inputs are borrowed complete blobs with per-input dead sets. All inputs,
 //! including dead documents, are verified before metadata is reused. The output
 //! uses the current format; old formats remain readable. No index page is written.
-//! This API is not yet connected to the PostgreSQL storage merge path.
+//! PostgreSQL storage calls this API while retaining its metadata lock; page
+//! allocation, WAL and publication remain the caller’s responsibility.
 use crate::dictionary::{DictionaryBuilder, Extent, TermEntry};
 use crate::payload::PayloadBuilder;
 use crate::postings::PostingsBuilder;

@@ -1537,18 +1537,13 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
             old.push(meta.segments.remove(position));
         }
         old.reverse();
-        let mut builder = SegmentBuilder::default();
-        for entry in &old {
-            pgrx::check_for_interrupts!();
-            let label = generation_label(entry.generation);
-            let bytes = read_run(index, entry.run, &label);
-            let segment = codec_in(Segment::parse(&bytes), &label);
-            let dead = dead_set(index, entry);
-            for record in codec_in(segment.records(|tid| dead.contains(&tid)), &label) {
-                codec_in(builder.add_record(&record), &label);
-            }
-        }
-        let (blob, docs, total_length) = finish_builder(builder);
+        let (blob, docs, total_length) = match direct_merge_limits(&old) {
+            Some(limits) => merge_segments_direct(index, &old, limits),
+            // Aggregate input can exceed one run's u32 byte/document limit
+            // while dropping dead tuples still produces a representable run.
+            // Preserve the old per-input reconstruction path in that case.
+            None => merge_segments_reconstructed(index, &old),
+        };
         let (run, map) = write_segment_run(index, &blob);
         let entry = new_entry(meta, run, map, docs, total_length);
         meta.segments.push(entry);
@@ -1556,6 +1551,88 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
             release_entry(index, meta, entry);
         }
     }
+}
+
+/// Admission is based on existing directory metadata, before retaining blobs.
+/// These are format bounds, not a peak-memory budget.
+fn direct_merge_limits(entries: &[SegmentEntry]) -> Option<segment::merge::MergeLimits> {
+    let bytes = entries
+        .iter()
+        .try_fold(0u32, |n, entry| n.checked_add(entry.run.bytes))?;
+    let docs = entries
+        .iter()
+        .try_fold(0u32, |n, entry| n.checked_add(entry.docs))?;
+    Some(segment::merge::MergeLimits {
+        max_inputs: MAX_SEGMENTS,
+        max_input_bytes: bytes as usize,
+        max_documents: docs as usize,
+        max_output_bytes: u32::MAX as usize,
+    })
+}
+
+/// The caller retains exclusive metadata access through construction/publication.
+unsafe fn merge_segments_direct(
+    index: pg_sys::Relation,
+    entries: &[SegmentEntry],
+    limits: segment::merge::MergeLimits,
+) -> (Vec<u8>, u32, u64) {
+    use segment::merge::{MergeError, MergeInput};
+    // Owned input bytes are released when this function returns, before WAL
+    // output allocation. The merger never borrows a PostgreSQL buffer page.
+    let mut owned = Vec::with_capacity(entries.len());
+    for entry in entries {
+        pgrx::check_for_interrupts!();
+        let label = generation_label(entry.generation);
+        owned.push(unsafe { (read_run(index, entry.run, &label), dead_set(index, entry)) });
+    }
+    let inputs = owned
+        .iter()
+        .map(|(bytes, dead)| MergeInput { bytes, dead })
+        .collect::<Vec<_>>();
+    let blob = segment::merge::merge(&inputs, limits, || {
+        // PostgreSQL defers interrupts while the metadata LWLock is held.
+        // Do not bypass that protection; insert checks again after release.
+        race_point("merge:checkpoint");
+        pgrx::check_for_interrupts!();
+        Ok(())
+    })
+    .unwrap_or_else(|error| match error {
+        MergeError::Codec(_) | MergeError::InvalidInput { .. } => {
+            let generations = entries
+                .iter()
+                .map(|entry| entry.generation)
+                .collect::<Vec<_>>();
+            corrupt(format!(
+                "merge of segment generations {generations:?}: {error}"
+            ))
+        }
+        _ => pgrx::error!("Stannum segment merge failed: {error}"),
+    });
+    let segment = codec(Segment::parse(&blob));
+    let docs = segment.document_count();
+    let total_length = segment.total_length();
+    race_point("merge:built");
+    (blob, docs, total_length)
+}
+
+/// Compatibility fallback for aggregate input beyond the direct API's limits.
+unsafe fn merge_segments_reconstructed(
+    index: pg_sys::Relation,
+    entries: &[SegmentEntry],
+) -> (Vec<u8>, u32, u64) {
+    let mut builder = SegmentBuilder::default();
+    for entry in entries {
+        pgrx::check_for_interrupts!();
+        let label = generation_label(entry.generation);
+        let bytes = unsafe { read_run(index, entry.run, &label) };
+        let segment = codec_in(Segment::parse(&bytes), &label);
+        let dead = unsafe { dead_set(index, entry) };
+        for record in codec_in(segment.records(|tid| dead.contains(&tid)), &label) {
+            pgrx::check_for_interrupts!();
+            codec_in(builder.add_record(&record), &label);
+        }
+    }
+    finish_builder(builder)
 }
 
 /// Folds the write buffer into a new segment and empties it.
@@ -1825,6 +1902,10 @@ pub unsafe fn insert(
         append_to_buffer(index, &mut meta.buffer, &bytes);
         meta.buffer.docs += 1;
         write_meta(index, &meta_buffer, &meta);
+        drop(meta_buffer);
+        // Buffer content locks defer PostgreSQL cancel/die interrupts.
+        // Publication is complete; deliver any pending cancel now.
+        pgrx::check_for_interrupts!();
     }
 }
 
@@ -2729,6 +2810,18 @@ pub unsafe fn document_count(index: pg_sys::Relation) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_merge_admission_preserves_oversized_aggregate_fallback() {
+        let mut entry = super::SegmentEntry::default();
+        entry.run.bytes = u32::MAX;
+        entry.docs = 1;
+        assert!(super::direct_merge_limits(&[entry]).is_some());
+        assert!(super::direct_merge_limits(&[entry, entry]).is_none());
+        entry.run.bytes = 1;
+        entry.docs = u32::MAX;
+        assert!(super::direct_merge_limits(&[entry, entry]).is_none());
+    }
+
     use super::{MAX_SEGMENTS, bounded_merge_candidates, merge_candidates, tier};
 
     #[test]

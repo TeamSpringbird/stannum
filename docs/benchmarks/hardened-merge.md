@@ -3,8 +3,9 @@
 `segment::merge::merge` turns the direct-merge experiment into an explicit codec
 API. It borrows complete input blobs paired with their own dead sets, takes caller
 limits and a cancellation callback, and returns a current-format segment or a
-structured error. It has no PostgreSQL publication side effects and is not yet
-connected to the storage merge path.
+structured error. It has no PostgreSQL publication side effects. The subsequent
+[foreground integration](direct-merge-integration.md) calls it under the existing
+metadata lock; the measurements below describe the earlier standalone API.
 
 ## Contract
 
@@ -26,14 +27,15 @@ built blob is returned after a limit failure, invalid input or cancellation.
 The cancellation callback runs at entry, around each whole-input verification,
 and between documents, terms and postings. Existing whole-input verification and
 individual codec calls are not interruptible internally, so this is cooperative
-cancellation, not a bounded-latency guarantee. Future PostgreSQL integration must
-account for those intervals before relying on query cancellation responsiveness.
+cancellation, not a bounded-latency guarantee. PostgreSQL integration must
+also respect interrupt holdoff while buffer content locks are held; callbacks
+alone do not establish query cancellation responsiveness.
 
 These limits are not a peak-memory cap. Input blobs, document-length lookup,
 per-term builders, validation scratch state and output buffers use memory. The
 final output reserve is fallible, but existing codecs use infallible allocation;
-process-wide OOM is not converted to a merge error. Measuring allocation/peak
-memory and defining the PostgreSQL memory policy remain integration gates.
+process-wide OOM is not converted to a merge error. The [integration report](direct-merge-integration.md) records isolated-process
+peak RSS measurements and the PostgreSQL memory-policy limitations.
 
 ## Tests
 
@@ -52,8 +54,8 @@ bound tables grow after successful decoding. A deterministic regression also
 covers huge dictionary and bound-table claims.
 
 Local validation passed 454 core unit tests and four documentation tests,
-formatting and warnings-denied segment Clippy. PostgreSQL integration remains
-unmodified and is covered by CI build/tests rather than a new runtime claim.
+formatting and warnings-denied segment Clippy. At that stage, PostgreSQL integration was
+unmodified and covered by CI build/tests rather than a new runtime claim.
 
 ## Measurement
 
@@ -84,9 +86,9 @@ retained locally in ignored `benchmarks/results/hardened-merge/`.
 
 ## Next integration gate
 
-Keep the existing production merge path until this API passes representative
-memory/cancellation measurements and PostgreSQL lifecycle, ranking, recovery and
-concurrent reader/writer campaigns. In particular, verify that CPU savings reduce
+Promotion of the production merge path requires representative
+memory/cancellation measurements and passing PostgreSQL lifecycle, ranking,
+recovery and concurrent reader/writer campaigns. In particular, verify that CPU savings reduce
 locked merge stalls without worsening reader or writer tails. The unlocked-fold
-experiment remains independent and draft. The on-disk SIMD migration still follows
+experiment remains independent and unmerged. The on-disk SIMD migration still follows
 the separate [architecture decision](../adr/0001-preserve-posting-order-before-changing-encoding.md).

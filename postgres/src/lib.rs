@@ -2875,6 +2875,118 @@ mod tests {
         Spi::get_one::<i64>(sql).unwrap().unwrap()
     }
 
+    fn direct_merge_fixture() {
+        Spi::run(
+            "CREATE TABLE direct_merge_cancel(id int, body text);
+            CREATE INDEX direct_merge_cancel_idx ON direct_merge_cancel USING stannum(body);
+            SET LOCAL stannum.write_buffer_docs=1;
+            SET LOCAL stannum.merge_tier_factor=2;
+            SET LOCAL stannum.max_merge_docs=1024;
+            INSERT INTO direct_merge_cancel VALUES (1,'needle first'),(2,'needle second');
+            SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn direct_merge_error_before_publication_preserves_directory_and_retry() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        direct_merge_fixture();
+        let fired = Rc::new(Cell::new(false));
+        let observed = fired.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "merge:built" && !observed.replace(true) {
+                pgrx::ereport!(
+                    pgrx::PgLogLevel::ERROR,
+                    pgrx::PgSqlErrorCode::ERRCODE_QUERY_CANCELED,
+                    "injected merge cancellation"
+                );
+            }
+        })));
+        Spi::run(
+            "DO $$BEGIN
+            INSERT INTO direct_merge_cancel VALUES (3,'needle third');
+            RAISE EXCEPTION 'merge cancellation was not injected';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(fired.get());
+        assert_eq!(
+            value("SELECT count(*) FROM direct_merge_cancel WHERE body ==> 'needle'"),
+            2
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx')"),
+            2
+        );
+        Spi::run("INSERT INTO direct_merge_cancel VALUES (3,'needle third')").unwrap();
+        assert_eq!(
+            value("SELECT sum(id)::bigint FROM direct_merge_cancel WHERE body ==> 'needle'"),
+            6
+        );
+        // The interrupted fold can leave unpublished run pages. Validate
+        // that these are the only findings, then exercise VACUUM's recovery.
+        let rows = findings("direct_merge_cancel_idx", true);
+        assert!(!rows.is_empty(), "expected unpublished fold pages");
+        assert!(
+            rows.iter().all(|row| row.starts_with("warning: page")
+                && row.ends_with("run page referenced by nothing; VACUUM reclaims it")),
+            "unexpected findings: {rows:?}"
+        );
+        let index = unsafe { pgrx::PgRelation::open_with_name("direct_merge_cancel_idx") }.unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("direct_merge_cancel_idx");
+    }
+
+    #[pg_test]
+    fn direct_merge_pending_cancel_is_delivered_after_metadata_unlock() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        direct_merge_fixture();
+        let queued = Rc::new(Cell::new(false));
+        let built = Rc::new(Cell::new(false));
+        let q = queued.clone();
+        let b = built.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "merge:checkpoint" && !q.replace(true) {
+                unsafe {
+                    assert!(pg_sys::InterruptHoldoffCount > 0);
+                    pg_sys::QueryCancelPending = 1;
+                    pg_sys::InterruptPending = 1;
+                }
+            }
+            if name == "merge:built" {
+                b.set(true);
+            }
+        })));
+        Spi::run(
+            "DO $$BEGIN
+            INSERT INTO direct_merge_cancel VALUES (3,'needle third');
+            RAISE EXCEPTION 'pending cancellation was not delivered';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(
+            queued.get() && built.get(),
+            "cancel must be deferred while the merge lock is held"
+        );
+        assert_eq!(
+            value("SELECT count(*) FROM direct_merge_cancel WHERE body ==> 'needle'"),
+            2
+        );
+        Spi::run("INSERT INTO direct_merge_cancel VALUES (3,'needle third')").unwrap();
+        assert_eq!(
+            value("SELECT sum(id)::bigint FROM direct_merge_cancel WHERE body ==> 'needle'"),
+            6
+        );
+        assert_clean("direct_merge_cancel_idx");
+    }
+
     #[pg_test]
     fn insert_defers_large_merges_and_cleanup_finishes_them() {
         Spi::run(
