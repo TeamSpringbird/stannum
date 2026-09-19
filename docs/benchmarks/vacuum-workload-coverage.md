@@ -121,15 +121,15 @@ these gates to make an undersized or overloaded trial appear valid.
 
 Strategy calibration can use `--baseline-vacuum-strategy` and/or
 `--integrated-vacuum-strategy auto|direct|reconstruct`. Only set these for a binary
-that implements `stannum.experimental_vacuum_merge_strategy`. The probe requires
-a real registered `pg_settings` entry with the requested value; an unknown
+that implements `stannum.experimental_vacuum_merge_strategy`. The probe loads the extension and inspects `pg_settings` in the same backend,
+requiring a real registered `pg_settings` entry with the requested value; an unknown
 custom-GUC placeholder cannot falsely label an old baseline. Strategy choices
 and binary hashes are recorded separately for each build. Omitted choices leave
 the binary's default policy intact.
 
 ## Harness validation
 
-72 Python harness tests passed, including scheduling/phase boundary arithmetic,
+74 Python harness tests passed, including scheduling/phase boundary arithmetic,
 failed/skipped accounting, oracle structure, and library swap lifecycle ordering.
 Local PG18 smoke runs use identical retained candidate libraries on both sides;
 they establish harness functionality, not a speedup. Artifacts are retained in
@@ -145,3 +145,14 @@ The 50% mixed fixture retained 16,369 documents; the hot 75% rewrite retained
 8,192. All final layout/membership/verifier gates passed. Across the four windows,
 schedule-lag p95 was 8.043–10.013 ms and maximum lag 12.879–15.441 ms; these numbers
 illustrate recorded load metrics, not a comparison between different binaries.
+
+The strategy-setting guard also has a targeted PG18 smoke under
+`/tmp/stannum-e2e-forced-strategy-smoke-v2`: 1,024 documents, mixed75, repeat20,
+forced direct then reconstruct against the same new binary. Both passed layout,
+reader, and verifier gates (256 live documents). The old baseline was deliberately
+run with a forced strategy under `/tmp/stannum-e2e-unsupported-strategy-smoke`;
+it correctly failed registration before traffic, despite the custom-GUC
+placeholder. Earlier checker attempts failed setup because the fresh backend
+had not loaded the library and because enum display labels were capitalized.
+The guard now loads and inspects in one backend and compares enum labels without
+case sensitivity. These setup failures and tiny smokes are not performance data.
