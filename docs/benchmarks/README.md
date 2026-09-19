@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [merge-cost probe](merge-costs.md) compares foreground maintenance budgets
+and explains the direct forward-record ingestion optimization.
+
 The [insert-preparation report](insert-preparation.md) validates moving text
 preparation outside the exclusive metadata lock and records paired contention runs.
 
