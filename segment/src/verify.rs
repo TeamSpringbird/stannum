@@ -31,7 +31,7 @@ use std::fmt;
 use crate::forward::ForwardRecord;
 use crate::postings::{BLOCK_POSTINGS, BlockBound, Postings};
 use crate::segment::{Format, Segment};
-use crate::set::collect;
+use crate::set::{Cursor, collect};
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Tid};
 
@@ -285,9 +285,11 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
     // Reuse per-term scratch across the dictionary, especially for singleton
     // terms. Every consumer clears its state before use, including after a
     // malformed term skips the remaining checks in its iteration.
+    let mut tids = Vec::new();
     let mut ordinals = Vec::new();
     let mut scores: Vec<(u8, u32)> = Vec::new();
     let mut expected = Vec::new();
+    let mut bounds = Vec::new();
     let blocks = dictionary.map_or(0, |d| d.index().blocks());
     for block in 0..blocks {
         let dictionary = dictionary.expect("blocks come from a parsed dictionary");
@@ -403,8 +405,19 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     ),
                 );
             }
-            let tids = match postings.to_vec() {
-                Ok(tids) => tids,
+            tids.clear();
+            let mut posting_cursor = match (|| {
+                let mut cursor = postings.cursor()?;
+                while let Some(tid) = cursor.current() {
+                    tids.push(tid);
+                    cursor.advance()?;
+                }
+                if tids.len() != postings.count() as usize {
+                    return Err(Error::Corrupt("posting count mismatch"));
+                }
+                Ok(cursor)
+            })() {
+                Ok(cursor) => cursor,
                 Err(error) => {
                     findings.error(location(), format!("postings: {error}"));
                     complete = false;
@@ -419,7 +432,11 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let mut unknown = 0usize;
             let mut document_at = 0;
             for tid in &tids {
-                match ordered_rank(&documents, &mut document_at, *tid) {
+                match if tids.len() == 1 {
+                    documents.binary_search(tid).ok()
+                } else {
+                    ordered_rank(&documents, &mut document_at, *tid)
+                } {
                     Some(ordinal) => ordinals.push(Some(ordinal)),
                     None => {
                         if unknown == 0 {
@@ -512,8 +529,8 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
 
             // Score bounds: what the postings and lengths imply, in the
             // layout the segment's format writes.
-            let bounds = match resolved.cursor().and_then(|mut c| c.block_bounds()) {
-                Ok(bounds) => bounds,
+            match posting_cursor.block_bounds_into(&mut bounds) {
+                Ok(()) => (),
                 Err(error) => {
                     findings.error(location(), format!("block bounds: {error}"));
                     continue;
