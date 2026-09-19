@@ -103,6 +103,8 @@ def main():
     artifact = args.artifact.resolve(strict=True)
     installed = Path(bench.command(['pg_config', '--pkglibdir'])) / ('stannum' + artifact.suffix)
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    postgres = Path(bench.command(['pg_config', '--bindir'])) / 'postgres'
+    postgres_digest = hashlib.sha256(postgres.read_bytes()).hexdigest()
 
     def verify_binary():
         if hashlib.sha256(installed.read_bytes()).hexdigest() != digest:
@@ -116,6 +118,7 @@ def main():
     settings = ['stannum.write_buffer_docs=256', 'stannum.build_segment_docs=2000',
                 'stannum.max_segments=16', 'stannum.max_merge_docs=2048', *args.set]
     record = dict(status='running', artifact_sha256=digest, installed_library=str(installed),
+                  postgres_sha256=postgres_digest, launcher_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   cluster=str(cluster), config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   settings=settings, trials=[])
     bench.save(output / 'campaign.json', record)
@@ -144,7 +147,9 @@ def main():
             command(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', 'CHECKPOINT'], label + '-checkpoint')
             argv = [sys.executable, str(Path(__file__).with_name('run.py')), 'run', '--engine', 'stannum' if engine == 'stannum' else 'gin',
                     '--profile', args.profile, '--database', database, '--output', str(output / label),
-                    '--environment', 'private-native-postgres', '--build-id', digest, '--artifact', str(artifact),
+                    '--environment', 'private-native-postgres',
+                    '--build-id', digest if engine == 'stannum' else postgres_digest,
+                    '--artifact', str(artifact if engine == 'stannum' else postgres),
                     '--rows', str(args.rows), '--body-repeat', str(args.body_repeat),
                     '--seconds', str(args.seconds), '--warmup', str(args.warmup),
                     '--read-rate', str(args.read_rate), '--write-rate', str(rate), '--writers', str(writers),

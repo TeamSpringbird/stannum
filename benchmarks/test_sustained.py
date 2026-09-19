@@ -68,6 +68,7 @@ class SustainedTests(unittest.TestCase):
                 root = Path(directory)
                 library = root / 'stannum.so'
                 library.write_bytes(b'retained release')
+                (root / 'postgres').write_bytes(b'postgres executable')
                 cluster = root / 'cluster'
                 cluster.mkdir()
                 output = root / 'results'
