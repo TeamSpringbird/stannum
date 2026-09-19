@@ -1,0 +1,2306 @@
+{
+  "fixture": {
+    "rows": 100000,
+    "min_id": 1,
+    "max_id": 100000,
+    "pages": 10496,
+    "all_visible": 10467,
+    "total_bytes": 362110976,
+    "settings": {
+      "server_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+      "shared_buffers": "131072",
+      "work_mem": "16384",
+      "maintenance_work_mem": "524288",
+      "jit": "off",
+      "track_io_timing": "on",
+      "stannum.build_segment_docs": "32768"
+    }
+  },
+  "dataset": {
+    "rows": 100000,
+    "csv_sha256": "d01f490c802313190924a1edd1722d9b1c543793a8ccd0950108d813cb8b7da1"
+  },
+  "image": {
+    "Id": "sha256:a44daedaef674df8718fd5547c79600c771b50e26ba01a61b1b5421f6ce751ed",
+    "RepoTags": [
+      "stannum-bench:early-filter"
+    ],
+    "RepoDigests": [],
+    "Created": "2026-09-19T19:09:49.588170284-04:00",
+    "Labels": {
+      "benchmark.recipe_sha256": "21d68269e222f012afe6c21c34dff31f5d832c11a5bfc537caecf3e546298edd",
+      "benchmark.stannum_commit": "1b3a836bf422c882a1c8cf997c8e5395ce4bdab6",
+      "benchmark.stannum_source_sha256": "bc6ce79d58000af27e111235da0d8b13a30125e7e8c19121a248027c1c5a43fd",
+      "maintainer": "ParadeDB - https://paradedb.com",
+      "org.opencontainers.image.description": "Search without a second system. One Postgres for your application data, full-text search, vector retrieval, and aggregations.",
+      "org.opencontainers.image.source": "https://github.com/paradedb/paradedb"
+    }
+  },
+  "source_commit": "6e26620827a4ae41449b5595a21c9392f20e7404",
+  "method": "Same image, one shared fixture, server restarted between off/on/on/off rounds; nine interleaved repetitions, first two discarded.",
+  "correctness_checks": 144,
+  "visibility": {
+    "r01-off": {
+      "before": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      },
+      "after": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      }
+    },
+    "r02-on": {
+      "before": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      },
+      "after": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      }
+    },
+    "r03-on": {
+      "before": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      },
+      "after": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      }
+    },
+    "r04-off": {
+      "before": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      },
+      "after": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      }
+    }
+  },
+  "rows": [
+    {
+      "name": "or_p0_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.006,
+        "r02-on": 0.007,
+        "r03-on": 0.007,
+        "r04-off": 0.007
+      },
+      "baseline_median_ms": 0.006500000000000001,
+      "candidate_median_ms": 0.007,
+      "change_percent": 7.692307692307687,
+      "paired_candidate_over_baseline": [
+        1.1666666666666667,
+        1.0
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "or_p0_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.007,
+        "r02-on": 0.007,
+        "r03-on": 0.006,
+        "r04-off": 0.008
+      },
+      "baseline_median_ms": 0.0075,
+      "candidate_median_ms": 0.006500000000000001,
+      "change_percent": -13.33333333333332,
+      "paired_candidate_over_baseline": [
+        1.0,
+        0.75
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "or_p1_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 1.783,
+        "r02-on": 1.625,
+        "r03-on": 1.689,
+        "r04-off": 1.753
+      },
+      "baseline_median_ms": 1.7679999999999998,
+      "candidate_median_ms": 1.657,
+      "change_percent": -6.278280542986414,
+      "paired_candidate_over_baseline": [
+        0.9113853056646103,
+        0.9634911580148318
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "or_p1_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 1.827,
+        "r02-on": 1.615,
+        "r03-on": 1.747,
+        "r04-off": 1.949
+      },
+      "baseline_median_ms": 1.888,
+      "candidate_median_ms": 1.681,
+      "change_percent": -10.963983050847448,
+      "paired_candidate_over_baseline": [
+        0.8839627805145047,
+        0.896357106208312
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "or_p10_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 6.168,
+        "r02-on": 5.112,
+        "r03-on": 4.955,
+        "r04-off": 5.611
+      },
+      "baseline_median_ms": 5.8895,
+      "candidate_median_ms": 5.0335,
+      "change_percent": -14.534340775957212,
+      "paired_candidate_over_baseline": [
+        0.8287937743190661,
+        0.883086793797897
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Candidates": 27946,
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 1,
+          "Heap Fetches": 90,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 80
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 2779,
+          "Exhaustive Score Calls": 2779,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 2779,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 2779,
+          "Exhaustive Score Calls": 2779,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 2779,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Candidates": 27946,
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 1,
+          "Heap Fetches": 90,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 80
+        }
+      }
+    },
+    {
+      "name": "or_p10_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.669,
+        "r02-on": 4.883,
+        "r03-on": 5.105,
+        "r04-off": 3.449
+      },
+      "baseline_median_ms": 3.559,
+      "candidate_median_ms": 4.994,
+      "change_percent": 40.32031469513908,
+      "paired_candidate_over_baseline": [
+        1.3308803488689016,
+        1.4801391707741376
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Heap Fetches": 90,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 80
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 2779,
+          "Exhaustive Score Calls": 2779,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 2779,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 2779,
+          "Exhaustive Score Calls": 2779,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 2779,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Heap Fetches": 90,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 80
+        }
+      }
+    },
+    {
+      "name": "or_p25_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 5.683,
+        "r02-on": 5.336,
+        "r03-on": 5.339,
+        "r04-off": 5.305
+      },
+      "baseline_median_ms": 5.494,
+      "candidate_median_ms": 5.3375,
+      "change_percent": -2.848562067710214,
+      "paired_candidate_over_baseline": [
+        0.9389407003343305,
+        1.0064090480678607
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Candidates": 27946,
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 1,
+          "Heap Fetches": 34,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 24
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 6974,
+          "Exhaustive Score Calls": 6974,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 6974,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 6974,
+          "Exhaustive Score Calls": 6974,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 6974,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Candidates": 27946,
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 1,
+          "Heap Fetches": 34,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 24
+        }
+      }
+    },
+    {
+      "name": "or_p25_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.389,
+        "r02-on": 5.385,
+        "r03-on": 5.57,
+        "r04-off": 3.44
+      },
+      "baseline_median_ms": 3.4145,
+      "candidate_median_ms": 5.4775,
+      "change_percent": 60.418802167228016,
+      "paired_candidate_over_baseline": [
+        1.5889642962525818,
+        1.6191860465116281
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Heap Fetches": 34,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 24
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 6974,
+          "Exhaustive Score Calls": 6974,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 6974,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 6974,
+          "Exhaustive Score Calls": 6974,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 6974,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Heap Fetches": 34,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 24
+        }
+      }
+    },
+    {
+      "name": "or_p100_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 1.901,
+        "r02-on": 6.479,
+        "r03-on": 6.452,
+        "r04-off": 1.902
+      },
+      "baseline_median_ms": 1.9015,
+      "candidate_median_ms": 6.4655000000000005,
+      "change_percent": 240.02103602419146,
+      "paired_candidate_over_baseline": [
+        3.408206207259337,
+        3.392218717139853
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 27946,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 27946,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        }
+      }
+    },
+    {
+      "name": "or_p100_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.264,
+        "r02-on": 7.029,
+        "r03-on": 6.846,
+        "r04-off": 3.431
+      },
+      "baseline_median_ms": 3.3475,
+      "candidate_median_ms": 6.9375,
+      "change_percent": 107.24421209858104,
+      "paired_candidate_over_baseline": [
+        2.153492647058824,
+        1.995336636549111
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 27946,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 27946,
+          "Early Filter Heap Fetches": 27946,
+          "Early Filter Survivors": 27946,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 27946,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        }
+      }
+    },
+    {
+      "name": "or_unfiltered_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 1.953,
+        "r02-on": 1.765,
+        "r03-on": 1.761,
+        "r04-off": 1.852
+      },
+      "baseline_median_ms": 1.9025,
+      "candidate_median_ms": 1.763,
+      "change_percent": -7.332457293035488,
+      "paired_candidate_over_baseline": [
+        0.9037378392217101,
+        0.950863930885529
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        }
+      }
+    },
+    {
+      "name": "or_unfiltered_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 1.918,
+        "r02-on": 1.772,
+        "r03-on": 1.778,
+        "r04-off": 1.834
+      },
+      "baseline_median_ms": 1.876,
+      "candidate_median_ms": 1.775,
+      "change_percent": -5.383795309168438,
+      "paired_candidate_over_baseline": [
+        0.9238790406673619,
+        0.9694656488549618
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        }
+      }
+    },
+    {
+      "name": "common_p0_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.009,
+        "r02-on": 0.012,
+        "r03-on": 0.009,
+        "r04-off": 0.007
+      },
+      "baseline_median_ms": 0.008,
+      "candidate_median_ms": 0.010499999999999999,
+      "change_percent": 31.24999999999998,
+      "paired_candidate_over_baseline": [
+        1.3333333333333335,
+        1.2857142857142856
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "common_p0_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.009,
+        "r02-on": 0.007,
+        "r03-on": 0.008,
+        "r04-off": 0.007
+      },
+      "baseline_median_ms": 0.008,
+      "candidate_median_ms": 0.0075,
+      "change_percent": -6.25,
+      "paired_candidate_over_baseline": [
+        0.7777777777777779,
+        1.1428571428571428
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "common_p1_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 1.213,
+        "r02-on": 1.175,
+        "r03-on": 1.208,
+        "r04-off": 1.249
+      },
+      "baseline_median_ms": 1.231,
+      "candidate_median_ms": 1.1915,
+      "change_percent": -3.208773354995942,
+      "paired_candidate_over_baseline": [
+        0.9686727122835944,
+        0.9671737389911929
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "common_p1_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 1.249,
+        "r02-on": 1.221,
+        "r03-on": 1.24,
+        "r04-off": 1.222
+      },
+      "baseline_median_ms": 1.2355,
+      "candidate_median_ms": 1.2305000000000001,
+      "change_percent": -0.40469445568594997,
+      "paired_candidate_over_baseline": [
+        0.977582065652522,
+        1.0147299509001637
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "common_p10_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 2.657,
+        "r02-on": 3.906,
+        "r03-on": 3.72,
+        "r04-off": 2.706
+      },
+      "baseline_median_ms": 2.6814999999999998,
+      "candidate_median_ms": 3.813,
+      "change_percent": 42.196531791907546,
+      "paired_candidate_over_baseline": [
+        1.470079036507339,
+        1.3747228381374723
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Candidates": 22063,
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 1,
+          "Heap Fetches": 68,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 58
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 2215,
+          "Exhaustive Score Calls": 2215,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 2215,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 2215,
+          "Exhaustive Score Calls": 2215,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 2215,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Candidates": 22063,
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 1,
+          "Heap Fetches": 68,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 58
+        }
+      }
+    },
+    {
+      "name": "common_p10_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 2.05,
+        "r02-on": 3.711,
+        "r03-on": 3.716,
+        "r04-off": 2.058
+      },
+      "baseline_median_ms": 2.054,
+      "candidate_median_ms": 3.7135,
+      "change_percent": 80.7935735150925,
+      "paired_candidate_over_baseline": [
+        1.8102439024390244,
+        1.8056365403304182
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Heap Fetches": 68,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 58
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 2215,
+          "Exhaustive Score Calls": 2215,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 2215,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 2215,
+          "Exhaustive Score Calls": 2215,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 2215,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Heap Fetches": 68,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 58
+        }
+      }
+    },
+    {
+      "name": "common_p25_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 2.65,
+        "r02-on": 3.818,
+        "r03-on": 3.945,
+        "r04-off": 2.607
+      },
+      "baseline_median_ms": 2.6285,
+      "candidate_median_ms": 3.8815,
+      "change_percent": 47.66977363515315,
+      "paired_candidate_over_baseline": [
+        1.440754716981132,
+        1.5132336018411967
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Candidates": 22063,
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 1,
+          "Heap Fetches": 38,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 28
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 5551,
+          "Exhaustive Score Calls": 5551,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 5551,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 5551,
+          "Exhaustive Score Calls": 5551,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 5551,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Candidates": 22063,
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 1,
+          "Heap Fetches": 38,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 28
+        }
+      }
+    },
+    {
+      "name": "common_p25_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 2.008,
+        "r02-on": 3.857,
+        "r03-on": 3.954,
+        "r04-off": 2.146
+      },
+      "baseline_median_ms": 2.077,
+      "candidate_median_ms": 3.9055,
+      "change_percent": 88.03562831006259,
+      "paired_candidate_over_baseline": [
+        1.9208167330677293,
+        1.842497670083877
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Heap Fetches": 38,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 28
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 5551,
+          "Exhaustive Score Calls": 5551,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 5551,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 5551,
+          "Exhaustive Score Calls": 5551,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 5551,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Heap Fetches": 38,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 28
+        }
+      }
+    },
+    {
+      "name": "common_p100_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.562,
+        "r02-on": 4.372,
+        "r03-on": 4.274,
+        "r04-off": 0.565
+      },
+      "baseline_median_ms": 0.5635,
+      "candidate_median_ms": 4.323,
+      "change_percent": 667.1694764862467,
+      "paired_candidate_over_baseline": [
+        7.779359430604981,
+        7.564601769911505
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 22063,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 22063,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        }
+      }
+    },
+    {
+      "name": "common_p100_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 1.908,
+        "r02-on": 5.897,
+        "r03-on": 4.781,
+        "r04-off": 1.999
+      },
+      "baseline_median_ms": 1.9535,
+      "candidate_median_ms": 5.339,
+      "change_percent": 173.3043255694907,
+      "paired_candidate_over_baseline": [
+        3.0906708595387844,
+        2.3916958479239616
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 22063,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 22063,
+          "Early Filter Heap Fetches": 22063,
+          "Early Filter Survivors": 22063,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 22063,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        }
+      }
+    },
+    {
+      "name": "common_unfiltered_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.551,
+        "r02-on": 0.545,
+        "r03-on": 0.54,
+        "r04-off": 0.573
+      },
+      "baseline_median_ms": 0.562,
+      "candidate_median_ms": 0.5425,
+      "change_percent": -3.4697508896797236,
+      "paired_candidate_over_baseline": [
+        0.9891107078039927,
+        0.9424083769633509
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        }
+      }
+    },
+    {
+      "name": "common_unfiltered_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.569,
+        "r02-on": 0.559,
+        "r03-on": 0.55,
+        "r04-off": 0.591
+      },
+      "baseline_median_ms": 0.58,
+      "candidate_median_ms": 0.5545,
+      "change_percent": -4.39655172413792,
+      "paired_candidate_over_baseline": [
+        0.9824253075571179,
+        0.9306260575296109
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        }
+      }
+    },
+    {
+      "name": "phrase_p0_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.008,
+        "r02-on": 0.008,
+        "r03-on": 0.009,
+        "r04-off": 0.008
+      },
+      "baseline_median_ms": 0.008,
+      "candidate_median_ms": 0.0085,
+      "change_percent": 6.25,
+      "paired_candidate_over_baseline": [
+        1.0,
+        1.125
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "phrase_p0_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 0.008,
+        "r02-on": 0.009,
+        "r03-on": 0.008,
+        "r04-off": 0.007
+      },
+      "baseline_median_ms": 0.0075,
+      "candidate_median_ms": 0.0085,
+      "change_percent": 13.333333333333353,
+      "paired_candidate_over_baseline": [
+        1.125,
+        1.1428571428571428
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "phrase_p1_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 2.73,
+        "r02-on": 2.708,
+        "r03-on": 2.736,
+        "r04-off": 2.795
+      },
+      "baseline_median_ms": 2.7625,
+      "candidate_median_ms": 2.7220000000000004,
+      "change_percent": -1.46606334841628,
+      "paired_candidate_over_baseline": [
+        0.991941391941392,
+        0.9788908765652953
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "phrase_p1_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 2.732,
+        "r02-on": 2.703,
+        "r03-on": 2.715,
+        "r04-off": 2.823
+      },
+      "baseline_median_ms": 2.7775,
+      "candidate_median_ms": 2.7089999999999996,
+      "change_percent": -2.4662466246624715,
+      "paired_candidate_over_baseline": [
+        0.9893850658857978,
+        0.9617428267800212
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "selected": "non-custom"
+        },
+        "r02-on": {
+          "selected": "non-custom"
+        },
+        "r03-on": {
+          "selected": "non-custom"
+        },
+        "r04-off": {
+          "selected": "non-custom"
+        }
+      }
+    },
+    {
+      "name": "phrase_p10_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.653,
+        "r02-on": 5.453,
+        "r03-on": 5.291,
+        "r04-off": 3.736
+      },
+      "baseline_median_ms": 3.6945,
+      "candidate_median_ms": 5.372,
+      "change_percent": 45.40533225064285,
+      "paired_candidate_over_baseline": [
+        1.492745688475226,
+        1.416220556745182
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 63,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 53
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 1536,
+          "Exhaustive Score Calls": 1536,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 1536,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 1536,
+          "Exhaustive Score Calls": 1536,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 1536,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 63,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 53
+        }
+      }
+    },
+    {
+      "name": "phrase_p10_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.601,
+        "r02-on": 4.615,
+        "r03-on": 4.713,
+        "r04-off": 3.608
+      },
+      "baseline_median_ms": 3.6045,
+      "candidate_median_ms": 4.664,
+      "change_percent": 29.393813288944372,
+      "paired_candidate_over_baseline": [
+        1.2815884476534296,
+        1.3062638580931263
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 63,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 53
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 1536,
+          "Exhaustive Score Calls": 1536,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 1536,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 1536,
+          "Exhaustive Score Calls": 1536,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 1536,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 63,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 53
+        }
+      }
+    },
+    {
+      "name": "phrase_p25_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.541,
+        "r02-on": 5.02,
+        "r03-on": 4.955,
+        "r04-off": 3.735
+      },
+      "baseline_median_ms": 3.638,
+      "candidate_median_ms": 4.9875,
+      "change_percent": 37.09455744914789,
+      "paired_candidate_over_baseline": [
+        1.417678621858232,
+        1.3266398929049532
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 37,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 27
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 3819,
+          "Exhaustive Score Calls": 3819,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 3819,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 3819,
+          "Exhaustive Score Calls": 3819,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 3819,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 37,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 27
+        }
+      }
+    },
+    {
+      "name": "phrase_p25_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.527,
+        "r02-on": 5.114,
+        "r03-on": 4.993,
+        "r04-off": 3.566
+      },
+      "baseline_median_ms": 3.5465,
+      "candidate_median_ms": 5.0535,
+      "change_percent": 42.492598336387985,
+      "paired_candidate_over_baseline": [
+        1.4499574709384746,
+        1.4001682557487383
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 37,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 27
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 3819,
+          "Exhaustive Score Calls": 3819,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 3819,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 3819,
+          "Exhaustive Score Calls": 3819,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 3819,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 37,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 27
+        }
+      }
+    },
+    {
+      "name": "phrase_p100_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.358,
+        "r02-on": 5.686,
+        "r03-on": 5.37,
+        "r04-off": 3.476
+      },
+      "baseline_median_ms": 3.417,
+      "candidate_median_ms": 5.5280000000000005,
+      "change_percent": 61.77933860111211,
+      "paired_candidate_over_baseline": [
+        1.6932698034544371,
+        1.54487917146145
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 15381,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 15381,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        }
+      }
+    },
+    {
+      "name": "phrase_p100_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.563,
+        "r02-on": 6.188,
+        "r03-on": 5.886,
+        "r04-off": 3.497
+      },
+      "baseline_median_ms": 3.5300000000000002,
+      "candidate_median_ms": 6.037,
+      "change_percent": 71.01983002832858,
+      "paired_candidate_over_baseline": [
+        1.736738703339882,
+        1.6831569917071776
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 15381,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidate Strategy": "early integer filter (experimental)",
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Early Filter Candidates": 15381,
+          "Early Filter Heap Fetches": 15381,
+          "Early Filter Survivors": 15381,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0,
+          "Rows Removed by Filter": 0
+        }
+      }
+    },
+    {
+      "name": "phrase_unfiltered_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.182,
+        "r02-on": 3.217,
+        "r03-on": 3.327,
+        "r04-off": 3.435
+      },
+      "baseline_median_ms": 3.3085,
+      "candidate_median_ms": 3.2720000000000002,
+      "change_percent": -1.1032189814115134,
+      "paired_candidate_over_baseline": [
+        1.0109993714644878,
+        0.9685589519650655
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        }
+      }
+    },
+    {
+      "name": "phrase_unfiltered_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-off": 3.096,
+        "r02-on": 3.197,
+        "r03-on": 3.498,
+        "r04-off": 3.392
+      },
+      "baseline_median_ms": 3.2439999999999998,
+      "candidate_median_ms": 3.3475,
+      "change_percent": 3.1905055487053247,
+      "paired_candidate_over_baseline": [
+        1.0326227390180878,
+        1.03125
+      ],
+      "last_plan_counters": {
+        "r01-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r02-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r03-on": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        },
+        "r04-off": {
+          "Node Type": "Custom Scan",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 10,
+          "Actual Rows": 10.0
+        }
+      }
+    }
+  ]
+}
