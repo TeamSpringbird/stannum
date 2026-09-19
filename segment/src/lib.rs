@@ -38,6 +38,7 @@ pub mod dictionary;
 pub mod forward;
 pub mod index;
 pub mod merge;
+pub mod merge_strategy;
 pub mod pages;
 pub mod payload;
 pub mod postings;
