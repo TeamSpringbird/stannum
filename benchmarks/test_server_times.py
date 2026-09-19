@@ -17,6 +17,23 @@ def plan(node_type, ms, child=None, provider=None):
 
 
 class ServerTimesTests(unittest.TestCase):
+    def test_interleaved_session_reorders_plans_for_grouped_summary(self):
+        import json
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        queries = [("a", "EXECUTE a"), ("b", "EXECUTE b")]
+        # Execution order a0, b0, b1, a1; summary must retain a0, a1, b0, b1.
+        response = SimpleNamespace(returncode=0, stderr="", stdout="\n".join(
+            json.dumps(plan("Seq Scan", ms), indent=2) for ms in [1, 2, 3, 4]))
+        with patch.object(server_times.subprocess, "run", return_value=response) as run:
+            plans = server_times.explain_all("stannum", queries, 2, False, {},
+                                             ["PREPARE a AS SELECT 1"], True)
+        self.assertEqual([p[0]["Execution Time"] for p in plans], [1, 4, 2, 3])
+        script = run.call_args.kwargs["input"]
+        self.assertLess(script.index("PREPARE a"), script.index("EXPLAIN"))
+        self.assertEqual(server_times.measurement_order(2, 2, True),
+                         [(0, 0), (1, 0), (1, 1), (0, 1)])
+
     def test_parse_plans_splits_multiline_json_from_psql(self):
         import json
         text = "\n".join(json.dumps(plan("Seq Scan", 1.0), indent=2) for _ in range(3))
