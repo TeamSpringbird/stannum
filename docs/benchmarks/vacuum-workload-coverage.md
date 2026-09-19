@@ -23,7 +23,10 @@ identical fixtures in alternating order. Defaults retain the lightweight
   `wN` term. `--distribution hot` assigns 80% of documents to w0; remaining
   documents retain their vocabulary term. Both variants include common terms,
   the phrase `common filler`, and a unique hash. `dataset.json` records live
-  document/body byte counts and minimum/maximum body bytes.
+  document/body byte counts and minimum/maximum body bytes. The live fixture
+  must contain at least one w7 match; empty selective fixtures fail before
+  reader traffic. For example, hot distribution with a vocabulary divisible
+  by five cannot generate w7, and deletion may remove otherwise valid matches.
 - `--query-shapes mixed`: equally weighted broad count, selective full ID array,
   phrase count, and ranked top ten. Raw pgbench output and per-query results
   record realized counts/shares; probabilistic selection need not yield 25%
@@ -126,7 +129,7 @@ the binary's default policy intact.
 
 ## Harness validation
 
-71 Python harness tests passed, including scheduling/phase boundary arithmetic,
+72 Python harness tests passed, including scheduling/phase boundary arithmetic,
 failed/skipped accounting, oracle structure, and library swap lifecycle ordering.
 Local PG18 smoke runs use identical retained candidate libraries on both sides;
 they establish harness functionality, not a speedup. Artifacts are retained in
