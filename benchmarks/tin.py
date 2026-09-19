@@ -785,10 +785,38 @@ def render_report(args):
         report(args.output)
 
 
+def catalog_command(args):
+    import tin_catalog
+    tin_catalog.run(args)
+
+
+def experiment_command(args):
+    import tin_experiments
+    tin_experiments.run(args)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--driver', type=Path, default=DEFAULT_DRIVER)
     commands = parser.add_subparsers(dest='command', required=True)
+    p = commands.add_parser('catalog', help='observe plans on an existing TIN server using libpq environment')
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--rows', type=int, nargs='+', default=[1000, 10000])
+    p.set_defaults(func=catalog_command)
+    p = commands.add_parser('experiment', help='bounded remote TIN capacity and strategy experiments')
+    p.add_argument('--dataset', type=Path, required=True)
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--rows', type=int, default=100000)
+    p.add_argument('--minutes', type=int, default=45)
+    p.add_argument('--seconds', type=int, default=15)
+    p.add_argument('--repetitions', type=int, default=3)
+    p.add_argument('--max-clients', type=int, default=8)
+    p.add_argument('--skip-synthetic', action='store_true')
+    p.add_argument('--stages', nargs='+', choices=['synthetic','queries','prepared','forced','concurrency','multi','maintenance','projection','planner-settings','ctid-layout'])
+    p.add_argument('--index-segments', type=int, choices=[1,2,4,8])
+    p.add_argument('--vacuum-before-queries', action='store_true')
+    p.add_argument('--build-memory-mb', type=int, choices=[16,64,256,512])
+    p.set_defaults(func=experiment_command)
     commands.add_parser('prepare').set_defaults(func=prepare)
     commands.add_parser('build').set_defaults(func=build)
     p = commands.add_parser('report')
@@ -827,7 +855,7 @@ def main():
         p.add_argument('--' + variant + '-image', required=True)
         p.add_argument('--' + variant + '-source', type=Path, required=True)
     args = parser.parse_args()
-    if args.command in ('prepare', 'report'):
+    if args.command in ('prepare', 'report', 'catalog', 'experiment'):
         args.func(args)
     else:
         # Shared with native pgrx builds/tests across worktrees on this machine.

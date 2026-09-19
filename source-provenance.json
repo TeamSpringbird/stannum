@@ -845,6 +845,22 @@
     "benchmarks/test_resources.py": {
       "owner": "ben",
       "evidence": "Original Stannum resource measurement summarization and regression coverage."
+    },
+    "benchmarks/test_tin_catalog.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
+    },
+    "benchmarks/tin_catalog.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
+    },
+    "benchmarks/tin_experiments.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
+    },
+    "benchmarks/test_tin_experiments.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
     }
   }
 }

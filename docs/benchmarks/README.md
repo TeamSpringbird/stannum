@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [TIN plan catalog](tin-plan-catalog.md) records controlled black-box observations
+from TIN 1.0.2, including generic plans, indexed filters and exposed work counters.
+
 Use the [published-trace benchmark](published-trace.md) for new broad search
 measurements. It runs the pinned PlanetScale/ParadeDB driver with Stannum and
 stored-vector GIN adapters; the guide also lists the old harness retirement gates.
