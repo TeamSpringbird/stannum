@@ -1,5 +1,17 @@
 # Benchmarking Stannum
 
+Use the [published-trace benchmark](published-trace.md) for new broad search
+measurements. It runs the pinned PlanetScale/ParadeDB driver with Stannum and
+stored-vector GIN adapters; the guide also lists the old harness retirement gates.
+The [initial integration results](published-trace-results.md) cover 100k-document
+counts, ranked correctness, and concurrent updates, including two benchmark
+issues exposed by the new workload.
+
+The [TIN methodology source audit](tin-benchmark-source-audit.md) and
+[local protocol](tin-local-protocol.md) describe how to broaden our
+benchmarks using PlanetScale's published workload, including a stored-vector
+GIN baseline and controlled memory pressure. The full matrix remains planned.
+
 The [matched GIN baseline](gin-mutation-baseline.md) compares sustained mutations
 and count/membership searches with GIN buffered updates enabled and disabled.
 [Local results](gin-mutation-results.md) include the verified Wikipedia corpus.

@@ -47,6 +47,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Benchmark harness unit tests
         run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+      - name: Published benchmark query adapter
+        run: |
+          python3 benchmarks/tin.py --driver "$RUNNER_TEMP/stannum-benchmark-driver" prepare
+          BENCHMARK_DRIVER="$RUNNER_TEMP/stannum-benchmark-driver" node --test \
+            benchmarks/tin/adapter.test.mjs \
+            "$RUNNER_TEMP/stannum-benchmark-driver/benchmarks/queries.test.js"
 
   # Both architectures matter: `c_char` is signed on x86-64 and unsigned on
   # AArch64, and both PostgreSQL majors have caught API differences.
