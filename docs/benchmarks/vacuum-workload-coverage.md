@@ -52,7 +52,9 @@ inside the same SQL snapshot. Final selective membership uses `EXCEPT ALL` in
 both directions, layout accounting checks all remaining documents/dead entries,
 and structural verification must produce no findings.
 
-Ranked transactions use REPEATABLE READ. With custom scans disabled, they
+Ranked transactions use REPEATABLE READ for logical heap visibility. VACUUM can
+still change physical index statistics used for BM25 inside that transaction:
+the snapshot alone does not freeze scores. With custom scans disabled, they
 materialize every match and score, then derive the exhaustive top ten. Custom
 scans are then enabled for the measured top-k path. Its score multiset must
 match the reference, it may not repeat IDs, and every returned ID must carry
@@ -67,7 +69,27 @@ a missing result. All fixture documents match the broad ranked OR query.
 EXPLAIN must show score-descending order and `Top K: 10`; an ordinary full scan
 and sort does not satisfy this check. The oracle shares the scorer and index
 with the optimized path, so it tests execution/pruning equivalence, **not an
-independent BM25 implementation**. Oracle execution is included in transaction
+independent BM25 implementation**.
+
+Separate SQL statements bracket the reference and candidate with the complete
+`segment_info` directory, ordered by ordinal: kind, root block, document/dead
+counts, summed document lengths, pages, and generation. The initial fingerprint
+finishes before the reference starts; the final fingerprint starts after the
+candidate finishes. This avoids SQL expression evaluation-order assumptions.
+For this immutable-only fixture with no writers or DDL, generations cannot repeat
+and dead sets only grow, so matching fingerprints establish a stable scoring
+state. This is not a general guard for concurrent inserts, REINDEX, or DDL.
+
+An unchanged fingerprint requires full ranked identity/score equality. A changed
+fingerprint invalidates that score comparison; duplicate IDs still fail. Each
+completed ranked transaction emits exactly one stable or invalidated shell
+marker, and those counts must equal pgbench's ranked completion count. Results
+report invalidations separately, never as successful correctness comparisons.
+At least one stable timed comparison and one stable standalone comparison both
+before and after maintenance are required. Traffic-wide stable counts cannot
+establish phase-specific ranked correctness coverage. Fingerprint reads and
+one shell marker per ranked transaction add symmetric overhead. Oracle execution
+is included in transaction
 latency; mixed-workload timings must not be presented as query-only latency.
 
 Full-window logs include transactions crossing VACUUM boundaries. The phase
@@ -136,7 +158,7 @@ the binary's default policy intact.
 
 ## Harness validation
 
-74 Python harness tests passed, including scheduling/phase boundary arithmetic,
+77 Python harness tests passed, including scheduling/phase boundary arithmetic,
 failed/skipped accounting, oracle structure, and library swap lifecycle ordering.
 Local PG18 smoke runs use identical retained candidate libraries on both sides;
 they establish harness functionality, not a speedup. Artifacts are retained in
@@ -163,3 +185,23 @@ placeholder. Earlier checker attempts failed setup because the fresh backend
 had not loaded the library and because enum display labels were capitalized.
 The guard now loads and inspects in one backend and compares enum labels without
 case sensitivity. These setup failures and tiny smokes are not performance data.
+
+
+The scoring-epoch fix passed a PG18 paired smoke against identical binaries at
+`/tmp/stannum-e2e-scoring-epoch-smoke`: each window had 184 stable timed ranked
+comparisons, zero sampled invalidations, and stable pre/post comparisons. All
+other correctness gates passed. This validates the guard and accounting, not a
+performance improvement.
+
+A separate diagnostic copy under `/tmp/stannum-e2e-epoch-invalidation-harness`
+pauses after capturing the exhaustive reference and waits for that point before
+starting VACUUM. It adds no index locks or database writes. The four-reader
+PG18 paired run under `/tmp/stannum-e2e-epoch-invalidation-smoke-v2` reported
+68 stable comparisons and four invalidations out of 72 ranked completions on
+each side, plus stable pre/post comparisons. All normal harness gates passed.
+This demonstrates actual publication invalidation, rather than treating it as
+successful rank equality. The initial two-reader/20-per-second diagnostic
+observed invalidation but failed the independent complete-reader-overlap gate;
+it is retained separately and is not a passing benchmark. Artificial sleeps
+and coordination exist only in the diagnostic copy, and neither diagnostic
+provides performance evidence.
