@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [expanded VACUUM coverage](vacuum-workload-coverage.md) adds fixed offered
+reader load, checked query mixes, and configurable deletion/document distributions.
+
 The [direct VACUUM report](vacuum-direct-merge.md) measures deferred merges and
 deletion rewrites with continuously checked readers.
 

@@ -184,14 +184,34 @@ jobs:
           )
           cp "$installed_library" "$comparison_dir/baseline.so"
           cp "$comparison_dir/integrated.so" "$installed_library"
-          for scenario in merge rewrite mixed; do
-            python3 benchmarks/paired_libraries.py \
-              --baseline "$comparison_dir/baseline.so" \
-              --integrated "$comparison_dir/integrated.so" \
-              --installed-library "$installed_library" \
-              --checkpoint-control --workload vacuum --scenario "$scenario" --rounds 3 \
-              --output "$comparison_dir/results/$scenario"
+          for repetition in 200 20; do
+            for scenario in merge rewrite mixed; do
+              python3 benchmarks/paired_libraries.py \
+                --baseline "$comparison_dir/baseline.so" \
+                --integrated "$comparison_dir/integrated.so" \
+                --installed-library "$installed_library" \
+                --checkpoint-control --workload vacuum --scenario "$scenario" --rounds 3 \
+                --repeat "$repetition" --output "$comparison_dir/results/repeat$repetition/$scenario"
+            done
           done
+          python3 benchmarks/paired_libraries.py \
+            --baseline "$comparison_dir/baseline.so" \
+            --integrated "$comparison_dir/integrated.so" \
+            --installed-library "$installed_library" \
+            --checkpoint-control --workload vacuum --scenario mixed --rounds 3 \
+            --docs 131072 --repeat 20 --delete-percent 50 --vocabulary 997 --distribution hot \
+            --query-shapes mixed --reader-rate 200 --reader-seconds 12 \
+            --output "$comparison_dir/results/larger-fixed-arrival"
+          # Same release binary, different registered strategies: compare full
+          # validation on both paths rather than the historical reconstruction.
+          python3 benchmarks/paired_libraries.py \
+            --baseline "$comparison_dir/integrated.so" \
+            --integrated "$comparison_dir/integrated.so" \
+            --installed-library "$installed_library" \
+            --baseline-vacuum-strategy direct --integrated-vacuum-strategy reconstruct \
+            --checkpoint-control --workload vacuum --scenario mixed --repeat 20 --rounds 3 \
+            --query-shapes mixed --reader-rate 200 --reader-seconds 12 \
+            --output "$comparison_dir/results/forced-strategies"
 
       - name: Retain VACUUM comparisons
         if: always() && github.event_name == 'workflow_dispatch' && inputs.vacuum_performance
