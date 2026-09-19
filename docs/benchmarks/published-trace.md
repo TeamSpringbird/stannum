@@ -108,6 +108,14 @@ Each run retains:
 - `comparison.json` and `report.md`, with overall and per-family/per-query
   latency distributions, completed updates, and observed query-form coverage.
 
+Representative plans execute the actual parameterized count or top-10
+projection for the first six forms in the selected style, under both
+`force_custom_plan` and `force_generic_plan`. Each plan retains its SQL and
+JSON. These diagnostics run in separate sessions before measurement, with
+explicit deallocation and reset; timed connections keep their normal planner
+settings. Including `id`, `body`, and the score expression in ranked plans is
+necessary to expose parameter-sensitive planner-support failures.
+
 Per-query p99 is omitted below 1000 samples. A short run can finish without
 traversing the whole trace, especially for slow ranked queries. Consult
 `measured_query_forms`; all forms passing a correctness check does not mean

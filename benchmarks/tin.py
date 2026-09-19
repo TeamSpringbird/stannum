@@ -191,6 +191,28 @@ def ranked_check_sql(queries, engine):
     return '\n'.join(statements)
 
 
+def prepared_plan_sql(query, engine, workload, mode):
+    if mode not in ('force_custom_plan', 'force_generic_plan'):
+        raise ValueError('unsupported diagnostic plan mode')
+    _, tin, postgres, _ = query
+    if engine == 'stannum':
+        fields = 'count(*)' if workload == 'count' else 'id, body, stannum.full_score(ctid) AS score'
+        predicate, argument = 'body ==> $1', tin
+    else:
+        fields = ('count(*)' if workload == 'count' else
+                  "id, body, ts_rank_cd(body_tsv, to_tsquery('simple', $1)) AS score")
+        predicate, argument = "body_tsv @@ to_tsquery('simple', $1)", postgres
+    suffix = '' if workload == 'count' else ' ORDER BY score DESC LIMIT 10'
+    # Match the driver's bind parameter and projection. Literal count plans do
+    # not reveal planner-support failures inside parameterized score calls.
+    # Each invocation runs in a separate psql session, outside measured traffic.
+    return (f'SET plan_cache_mode={mode};\n'
+            f'PREPARE stannum_bench_plan AS SELECT {fields} FROM documents WHERE {predicate}{suffix};\n'
+            'EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) '
+            f'EXECUTE stannum_bench_plan({literal(argument)});\n'
+            'DEALLOCATE stannum_bench_plan;\nRESET plan_cache_mode;')
+
+
 def semantics_sql(queries):
     return '\n'.join(
         f"SELECT {literal(name)}, count(*) FROM reference WHERE "
@@ -416,11 +438,13 @@ def run(args):
                     validate_result(ranked, [q[0] for q in queries])
                     job['ranked_correctness'] = dict(queries=len(queries), mismatches=0,
                                                      reference='exhaustive same-engine score multiset; ties unordered')
-                for query_id, tin, postgres, _ in queries[:6]:
-                    predicate = (f'body ==> {literal(tin)}' if engine == 'stannum' else
-                                 f"body_tsv @@ to_tsquery('simple',{literal(postgres)})")
-                    plan = sql(f'EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) SELECT count(*) FROM documents WHERE {predicate};')
-                    (path / ('plan-' + query_id.replace(':', '-') + '.json')).write_text(plan)
+                plan_queries = [q for q in queries if args.style == 'mixed' or q[0].split(':')[1] == args.style]
+                for query in plan_queries[:6]:
+                    for mode in ('force_custom_plan', 'force_generic_plan'):
+                        statement = prepared_plan_sql(query, engine, args.workload, mode)
+                        filename = 'plan-' + query[0].replace(':', '-') + '-' + mode
+                        (path / (filename + '.sql')).write_text(statement + '\n')
+                        (path / (filename + '.json')).write_text(sql(statement))
                 sql('CHECKPOINT;')
                 job['settings'] = json.loads(sql("SELECT json_object_agg(name,setting) FROM pg_settings;"))
                 job['extensions'] = json.loads(sql('SELECT json_object_agg(extname,extversion) FROM pg_extension;'))

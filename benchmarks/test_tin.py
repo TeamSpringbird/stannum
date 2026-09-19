@@ -48,6 +48,29 @@ class TraceCorrectnessTests(unittest.TestCase):
         self.assertEqual([q[0] for q in queries], [f'{i}:{s}' for i in (1, 2)
                          for s in ('conjunction', 'disjunction', 'phrase')])
 
+    def test_plan_diagnostics_match_parameterized_ranked_projection_and_restore_mode(self):
+        query = ('1:disjunction', "'quoted' OR text", 'quoted | text', 'quoted text')
+        for engine in ('stannum', 'postgres'):
+            for mode in ('force_custom_plan', 'force_generic_plan'):
+                with self.subTest(engine=engine, mode=mode):
+                    statement = tin.prepared_plan_sql(query, engine, 'topk', mode)
+                    self.assertIn('SET plan_cache_mode=' + mode, statement)
+                    self.assertIn('PREPARE stannum_bench_plan AS SELECT id, body,', statement)
+                    self.assertIn('ORDER BY score DESC LIMIT 10;', statement)
+                    self.assertIn('DEALLOCATE stannum_bench_plan;\nRESET plan_cache_mode;', statement)
+                    if engine == 'stannum':
+                        self.assertIn('stannum.full_score(ctid) AS score', statement)
+                        self.assertIn('WHERE body ==> $1', statement)
+                        self.assertIn('EXECUTE stannum_bench_plan(' + tin.literal(query[1]) + ')', statement)
+                    else:
+                        self.assertIn("ts_rank_cd(body_tsv, to_tsquery('simple', $1)) AS score", statement)
+                        self.assertIn("WHERE body_tsv @@ to_tsquery('simple', $1)", statement)
+        count = tin.prepared_plan_sql(query, 'stannum', 'count', 'force_custom_plan')
+        self.assertIn('SELECT count(*)', count)
+        self.assertNotIn('ORDER BY', count)
+        with self.assertRaises(ValueError):
+            tin.prepared_plan_sql(query, 'stannum', 'topk', 'invalid')
+
     def test_sql_keeps_query_text_inside_literal(self):
         text = "'quoted' ; DROP TABLE documents; --"
         self.assertEqual(tin.literal(text), "'''quoted'' ; DROP TABLE documents; --'")
