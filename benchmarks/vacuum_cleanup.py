@@ -88,6 +88,14 @@ COMMIT;
 """
 
 
+def verify_strategy(sql, expected):
+    # Each sql() invocation opens a fresh backend. GUC registration is local to
+    # that backend, so LOAD and pg_settings inspection must share one session.
+    observed = sql("LOAD 'stannum'; SELECT setting FROM pg_settings WHERE name='stannum.experimental_vacuum_merge_strategy'")
+    if observed.casefold() != expected.casefold():
+        raise ValueError(f'VACUUM strategy is not registered as {expected!r}: {observed!r}')
+
+
 def require_selective_matches(expected):
     if expected <= 0:
         raise ValueError('selective fixture has no live w7 matches; adjust vocabulary, distribution, deletion density, or document count')
@@ -214,7 +222,7 @@ ANALYZE docs;"""
         if args.vacuum_strategy:
             # Unknown custom-GUC placeholders also pass current_setting();
             # require a real registered setting before labelling the strategy.
-            assert sql("SELECT setting FROM pg_settings WHERE name='stannum.experimental_vacuum_merge_strategy'") == args.vacuum_strategy
+            verify_strategy(sql, args.vacuum_strategy)
         before = json.loads(sql("SELECT json_agg(row_to_json(s)) FROM stannum.segment_info('docs_idx') s"))
         assert len(before) == segments, before
         save(output / 'before.json', before)
