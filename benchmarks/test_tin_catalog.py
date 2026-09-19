@@ -52,6 +52,16 @@ class TinCatalogTests(unittest.TestCase):
                     created = next(s for s in calls if s.startswith('CREATE SCHEMA')).split()[2].rstrip(';')
                     self.assertEqual(drops, [f'DROP SCHEMA {created} CASCADE;'])
 
+    def test_flattened_plans_preserve_execution_strategy_and_parallelism(self):
+        plan = {'Node Type':'Custom Scan','Custom Plan Provider':'Conjunction Scan',
+                'Execution Mode':'TID Filter Pushdown','Pushdown Runs':1,
+                'Plans':[{'Node Type':'Custom Scan','Count Strategy':{'Mode':'Streaming'},'Workers Launched':2}]}
+        nodes = list(tin_catalog.walk(plan))
+        self.assertEqual(nodes[0]['Execution Mode'], 'TID Filter Pushdown')
+        self.assertEqual(nodes[0]['Pushdown Runs'], 1)
+        self.assertEqual(nodes[1]['Count Strategy'], {'Mode':'Streaming'})
+        self.assertEqual(nodes[1]['Workers Launched'], 2)
+
     def test_invalid_sizes_fail_before_creating_output_or_connecting(self):
         with tempfile.TemporaryDirectory() as tmp, patch('tin_catalog.subprocess.run') as run:
             for rows in ([999], [50001], [1000,1000]):

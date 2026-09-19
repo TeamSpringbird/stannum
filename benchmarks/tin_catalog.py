@@ -75,7 +75,10 @@ def walk(plan):
         'Node Type', 'Custom Plan Provider', 'Index', 'Index Cond', 'Query', 'Scoring', 'Elided Terms',
         'Startup Cost', 'Total Cost', 'Shared Hit Blocks', 'Shared Read Blocks', 'Temp Read Blocks', 'Temp Written Blocks',
         'Top K', 'Predicted Work', 'Page Touches', 'Plan Rows', 'Actual Rows', 'Actual Loops',
-        'Filter', 'Rows Removed by Filter', 'Sort Method', 'Join Type')}
+        'Filter', 'Rows Removed by Filter', 'Sort Method', 'Join Type',
+        'Execution Mode', 'Secondary Build', 'Pushdown Runs', 'Fallback Runs',
+        'Secondary TIDs Read', 'Seed', 'Final Visibility', 'Visibility', 'Count Strategy',
+        'Workers Planned', 'Workers Launched', 'Parallel Aware')}
     for child in plan.get('Plans', []):
         yield from walk(child)
 
