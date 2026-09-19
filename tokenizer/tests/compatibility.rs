@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 use tokenizer::{
     Folding, GraphemeMode, LongTokenMode, PositionGapMode, Tokenizer, TokenizerPipelineSpec,
     TokenizerSpec,

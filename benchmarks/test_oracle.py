@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 import json
 import unittest
 from unittest.mock import patch

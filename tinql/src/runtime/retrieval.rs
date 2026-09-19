@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Candidate retrieval from an immutable, in-memory inverted segment.
 //!
 //! This is the retrieval core, not a PostgreSQL access method or a durable file

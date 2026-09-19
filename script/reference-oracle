@@ -1,4 +1,8 @@
 #!/bin/sh
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 # Differential check of Stannum against the original Lead reference.
 #
 # Lead is the deliberately slow, correctness-first implementation this project

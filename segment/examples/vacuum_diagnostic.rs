@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Isolated VACUUM codec diagnostic; excludes PostgreSQL, WAL and readers.
 //! Prepare eight interleaved sources outside the timed process:
 //! `vacuum_diagnostic prepare DIR DOCS_PER_SOURCE TOKENS_PER_DOC VOCABULARY`

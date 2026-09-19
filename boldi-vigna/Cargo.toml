@@ -1,3 +1,7 @@
+# Copyright (C) 2026 PlanetScale
+#
+# See LICENSE in the repository root for license terms.
+
 [package]
 name = "boldi-vigna"
 version.workspace = true

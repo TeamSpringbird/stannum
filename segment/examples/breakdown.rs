@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Where the bytes of a segment go: per section, and per term grouped by
 //! document frequency, split into dictionary entry, postings header, bounds
 //! table, postings body, payload header, payload skip table and payload data.

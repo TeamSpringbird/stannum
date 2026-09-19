@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Isolated-process memory probe. Prepare files in a separate process first.
 //! `merge_memory prepare DIR DOCS_PER_SEGMENT TOKENS_PER_DOC VOCABULARY`
 //! `merge_memory reference|direct DIR OUTPUT`

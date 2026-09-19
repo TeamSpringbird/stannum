@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Explicit maintenance merge policy and equivalent, fully validated executors.
 //!
 //! Auto deliberately selects direct merging for admitted inputs. There is no

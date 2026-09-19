@@ -1,3 +1,10 @@
+<!--
+Copyright (C) 2026 Ben Weis <ben@springbird.app>
+Based on Lead, copyright (C) 2026 PlanetScale
+
+See LICENSE in the repository root for license terms.
+-->
+
 # Proximity
 
 Adapted from [PlanetScale Lead’s query-language documentation](https://github.com/planetscale/lead/tree/3fcf441ac7c3d183de179b1f846ceb0ef83e1358/tinql/docs/src).

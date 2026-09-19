@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Differential oracle: run identical fixtures and queries on two servers and
 diff match sets, scores, and HTML/ANSI highlights.
 

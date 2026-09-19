@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Dump every immutable segment blob of a Stannum index to files.
 
 Reads the index's relation file directly (after a CHECKPOINT), so it needs

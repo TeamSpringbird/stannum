@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Byte layouts for LDP2 index pages. No buffer, lock or WAL code lives here,
 //! so every codec is testable as plain bytes.
 //!

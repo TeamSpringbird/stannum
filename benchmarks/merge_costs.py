@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Repeat fixed-input merge-budget probes using foreground_writes.py.
 
 This measures complete INSERT execution and WAL, not individual merge phases.

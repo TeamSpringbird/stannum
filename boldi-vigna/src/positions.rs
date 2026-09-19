@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 /// Provides sorted token positions for leaf terms in a span query.
 ///
 /// Each term in a [`SpanQuery::Term(i)`](crate::SpanQuery::Term) references

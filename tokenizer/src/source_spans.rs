@@ -1,3 +1,8 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+// Based on Lead, copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 //! Source-span view of a compiled pipeline.
 //!
 //! Highlighting maps match positions — computed against the pipeline's

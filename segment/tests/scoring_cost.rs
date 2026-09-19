@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Timing probe for the scorer's per-row lookup sequence; run with
 //! `cargo test -p segment --release --test scoring_cost -- --ignored --nocapture`.
 use segment::Tid;

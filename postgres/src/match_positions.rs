@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 /// One matched query part over token-position coordinates.
 ///
 /// `start` / `end` are inclusive token positions in the indexed token stream.

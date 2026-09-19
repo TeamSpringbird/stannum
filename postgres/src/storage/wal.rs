@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Removal-horizon WAL records for hot standbys.
 //!
 //! Generic WAL replays page images and deltas but carries no snapshot

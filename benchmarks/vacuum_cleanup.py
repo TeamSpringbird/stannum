@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Measure one VACUUM with concurrent checked readers on a disposable database.
 
 Uses libpq environment settings and an already installed release library. Hold

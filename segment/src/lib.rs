@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Byte-level codecs for the immutable parts of a search index segment.
 //!
 //! This crate has no PostgreSQL dependency. It defines how a segment's

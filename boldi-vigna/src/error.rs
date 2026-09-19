@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 #[derive(Debug, thiserror::Error)]
 pub enum SpanError {
     #[error("term index {index} out of range (num_terms = {num_terms})")]

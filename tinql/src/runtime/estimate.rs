@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Cardinality estimation for a lowered [`Query`] from index statistics.
 //!
 //! The planner asks two questions about a `==>` predicate: how many rows will

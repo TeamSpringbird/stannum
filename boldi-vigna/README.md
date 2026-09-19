@@ -1,3 +1,9 @@
+<!--
+Copyright (C) 2026 PlanetScale
+
+See LICENSE in the repository root for license terms.
+-->
+
 # boldi-vigna
 
 `boldi-vigna` is a small, pure-Rust engine for evaluating positional queries

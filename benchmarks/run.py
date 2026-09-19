@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Small, dependency-free PostgreSQL benchmark recorder. See docs/benchmarks/harness.md."""
 import argparse
 import collections

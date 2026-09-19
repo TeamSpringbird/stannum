@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 /// A positional match: contiguous region [start, end] in a document's
 /// token stream. Both bounds are inclusive 0-indexed token positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

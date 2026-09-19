@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Streaming set operations over exact, nonempty heap-page bitmaps.
 //!
 //! Only the current page of each input is retained. Sparse or positional

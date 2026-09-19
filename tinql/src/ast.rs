@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 /// A parsed query expression.
 ///
 /// This is the syntax tree — it faithfully represents what the user wrote.

@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use crate::{LongTokenMode, LongTokenSpec, MIN_TOKEN_BYTES, PositionGapMode, Token};
 use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;

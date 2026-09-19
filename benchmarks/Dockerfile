@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 # Native ARM64 image: every engine uses exactly this PostgreSQL/runtime build.
 ARG BASE=paradedb/paradedb@sha256:c17153b8b7307734c3aede0393dfe8fa447f4a528ec028b1c3937186ab3ee242
 FROM ${BASE} AS builder

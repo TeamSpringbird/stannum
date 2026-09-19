@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Randomized concurrency fuzzer for Stannum's ranked (top-k) scan.
 
 Starts a throwaway cluster (install stannum first), builds a small corpus with

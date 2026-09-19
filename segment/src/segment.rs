@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! One immutable segment: dictionary, postings area, payload area and a
 //! document table, assembled from documents and read back by term or TID.
 //!

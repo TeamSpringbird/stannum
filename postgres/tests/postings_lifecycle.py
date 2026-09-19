@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Native PG18 lifecycle checks in a disposable private cluster; install stannum first."""
 import json
 import os

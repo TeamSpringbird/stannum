@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! An owning, restartable candidate stream for an unordered custom scan.
 //!
 //! Keep the captured view across FETCH and executor rescans. Reopening storage
