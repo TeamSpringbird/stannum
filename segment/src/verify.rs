@@ -261,6 +261,13 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
     let mut previous: Option<String> = None;
     let mut postings_end = 0u64;
     let mut payload_end = 0u64;
+    // Reuse per-term scratch across the dictionary, especially for singleton
+    // terms. Every consumer clears its state before use, including after a
+    // malformed term skips the remaining checks in its iteration.
+    let mut ordinals = Vec::new();
+    let mut scores: Vec<(u8, u32)> = Vec::new();
+    let mut positions = Vec::new();
+    let mut expected = Vec::new();
     let blocks = dictionary.map_or(0, |d| d.index().blocks());
     for block in 0..blocks {
         let dictionary = dictionary.expect("blocks come from a parsed dictionary");
@@ -294,8 +301,9 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     ),
                 );
             }
-            previous = Some(term.clone());
-            let location = format!("term {term:?}");
+            previous = Some(term);
+            let term = previous.as_ref().expect("just stored the current term");
+            let location = || format!("term {term:?}");
             let postings_extent_end = entry
                 .postings
                 .offset
@@ -307,7 +315,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let mut resolvable = true;
             if postings_extent_end > postings_len as u64 {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!(
                         "postings extent {}+{} exceeds the postings area of {postings_len} bytes",
                         entry.postings.offset, entry.postings.len
@@ -316,7 +324,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 resolvable = false;
             } else if entry.postings.offset < postings_end {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!(
                         "postings extent starts at {} inside the previous term's extent ending at {postings_end}",
                         entry.postings.offset
@@ -325,7 +333,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             }
             if payload_extent_end > payload_len as u64 {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!(
                         "payload extent {}+{} exceeds the payload area of {payload_len} bytes",
                         entry.payload.offset, entry.payload.len
@@ -334,7 +342,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 resolvable = false;
             } else if entry.payload.offset < payload_end {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!(
                         "payload extent starts at {} inside the previous term's extent ending at {payload_end}",
                         entry.payload.offset
@@ -350,7 +358,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let resolved = match segment.resolve(entry) {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    findings.error(location, error);
+                    findings.error(location(), error);
                     complete = false;
                     continue;
                 }
@@ -360,14 +368,14 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let postings = match resolved.postings() {
                 Ok(postings) => postings,
                 Err(error) => {
-                    findings.error(location, format!("postings header: {error}"));
+                    findings.error(location(), format!("postings header: {error}"));
                     complete = false;
                     continue;
                 }
             };
             if postings.count() != entry.df {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!(
                         "dictionary df is {} but the postings hold {}",
                         entry.df,
@@ -378,15 +386,16 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let tids = match postings.to_vec() {
                 Ok(tids) => tids,
                 Err(error) => {
-                    findings.error(location, format!("postings: {error}"));
+                    findings.error(location(), format!("postings: {error}"));
                     complete = false;
                     continue;
                 }
             };
             if tids.is_empty() {
-                findings.error(location.clone(), "term has no postings");
+                findings.error(location(), "term has no postings");
             }
-            let mut ordinals = Vec::with_capacity(tids.len());
+            ordinals.clear();
+            ordinals.reserve(tids.len());
             let mut unknown = 0usize;
             for tid in &tids {
                 match rank(*tid) {
@@ -394,7 +403,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     None => {
                         if unknown == 0 {
                             findings.error(
-                                location.clone(),
+                                location(),
                                 format!("posting {} is not in the document table", describe(*tid)),
                             );
                         }
@@ -405,7 +414,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             }
             if unknown > 1 {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!("{unknown} postings are not in the document table"),
                 );
             }
@@ -414,14 +423,14 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let payload = match resolved.payload() {
                 Ok(payload) => payload,
                 Err(error) => {
-                    findings.error(location, format!("payload header: {error}"));
+                    findings.error(location(), format!("payload header: {error}"));
                     complete = false;
                     continue;
                 }
             };
             if payload.count() != postings.count() {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!(
                         "payload holds {} entries for {} postings",
                         payload.count(),
@@ -430,9 +439,9 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 );
             }
             let mut cursor = payload.cursor();
-            let mut scores: Vec<(u8, u32)> = Vec::with_capacity(tids.len());
+            scores.clear();
+            scores.reserve(tids.len());
             let mut max_bucket = 0u8;
-            let mut positions = Vec::new();
             let mut payload_ok = true;
             for (index, tid) in tids.iter().enumerate() {
                 if index as u32 >= payload.count() {
@@ -443,7 +452,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     Ok(bucket) => bucket,
                     Err(error) => {
                         findings.error(
-                            location.clone(),
+                            location(),
                             format!("payload entry {index} for {}: {error}", describe(*tid)),
                         );
                         payload_ok = false;
@@ -453,7 +462,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 let expected = TfBucket::from_count(positions.len() as u32).value();
                 if bucket != expected {
                     findings.error(
-                        location.clone(),
+                        location(),
                         format!(
                             "payload entry {index} for {} has bucket {bucket} but {} positions imply {expected}",
                             describe(*tid),
@@ -473,7 +482,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             }
             if !tids.is_empty() && max_bucket != entry.max_tf_bucket {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!(
                         "dictionary max_tf_bucket is {} but the largest payload bucket is {max_bucket}",
                         entry.max_tf_bucket
@@ -486,7 +495,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let bounds = match resolved.cursor().and_then(|mut c| c.block_bounds()) {
                 Ok(bounds) => bounds,
                 Err(error) => {
-                    findings.error(location, format!("block bounds: {error}"));
+                    findings.error(location(), format!("block bounds: {error}"));
                     continue;
                 }
             };
@@ -495,7 +504,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             }
             if bounds.is_empty() {
                 if !tids.is_empty() {
-                    findings.error(location, "postings carry no block bounds");
+                    findings.error(location(), "postings carry no block bounds");
                 }
                 continue;
             }
@@ -505,7 +514,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 Format::Lsg2 => {
                     if postings.has_term_bound() {
                         findings.warning(
-                            location.clone(),
+                            location(),
                             "postings carry an LSG3 term bound where LSG2 writes a block table",
                         );
                     }
@@ -513,7 +522,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 Format::Lsg3 => {
                     if one_block && !postings.has_term_bound() {
                         findings.warning(
-                            location.clone(),
+                            location(),
                             "postings of one block carry a block table where LSG3 writes a term bound",
                         );
                     }
@@ -524,14 +533,15 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 // finding above already covers this term.
                 continue;
             }
-            let expected: Vec<BlockBound> = tids
-                .chunks(BLOCK_POSTINGS as usize)
-                .zip(scores.chunks(BLOCK_POSTINGS as usize))
-                .map(|(block, scores)| BlockBound::over(scores, block[block.len() - 1]))
-                .collect();
+            expected.clear();
+            expected.extend(
+                tids.chunks(BLOCK_POSTINGS as usize)
+                    .zip(scores.chunks(BLOCK_POSTINGS as usize))
+                    .map(|(block, scores)| BlockBound::over(scores, block[block.len() - 1])),
+            );
             if bounds.len() != expected.len() {
                 findings.error(
-                    location.clone(),
+                    location(),
                     format!(
                         "{} block bounds for {} blocks of postings",
                         bounds.len(),
@@ -543,7 +553,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             for (index, (found, wanted)) in bounds.iter().zip(&expected).enumerate() {
                 if found != wanted {
                     findings.error(
-                        location.clone(),
+                        location(),
                         format!(
                             "block bound {index} (last {}) disagrees with its postings (last {})",
                             describe(found.last),

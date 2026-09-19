@@ -64,7 +64,7 @@ target/release/examples/merge_memory prepare /tmp/merge-fixture 512 400 400
 cmp /tmp/reference.segment /tmp/direct.segment
 ```
 
-## Local results
+## Initial integration results
 
 Apple M4 Max, ARM64, PostgreSQL 18.6, Rust 1.96.0 release builds. Baseline runtime
 source is `26b9d1e`; integrated runtime source is `a6269f4`. Subsequent lifecycle
@@ -125,8 +125,7 @@ unrelated connection errors still fail. PostgreSQL's
 [recovery-conflict handling](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c)
 explicitly supports both outcomes. The full lifecycle rerun passed.
 
-All five ranked-fuzz smoke runs passed (760 ranked comparisons). Fixed-work
-results and CI are still being collected. Cross-architecture
+All five ranked-fuzz smoke runs passed (760 ranked comparisons). Cross-architecture
 performance validation remains a promotion gate; local ARM64 timing does not
 establish x86-64 behavior. Raw local samples, binary identities, server logs and
 probe outputs are retained under ignored
@@ -150,3 +149,37 @@ python3 benchmarks/paired_libraries.py --baseline /tmp/baseline.so \
   --checkpoint-control --seconds 20 --rounds 3 --repeat 200 \
   --output benchmarks/results/direct-merge-pairs
 ```
+
+## Fixed-work follow-up
+
+The initial integration's fixed-work probe inserted the same 4,161 long documents
+per window, using three alternating build pairs and rotating budgets 0/256/2048.
+All 18 windows passed correctness checks. Median total INSERT execution times:
+
+| Merge budget | Baseline ms | Initial integration ms | Change |
+| ---: | ---: | ---: | ---: |
+| 0 | 151.070 | 148.412 | -1.8% |
+| 256 | 154.554 | 162.775 | +5.3% |
+| 2048 | 189.884 | 169.193 | -10.9% |
+
+Budget zero still incurs two emergency merges at the hard directory bound.
+At budget 256, median total execution time in the 16 fold-and-merge INSERTs rose
+from 19.657 to 21.494 ms. This is a real tradeoff hidden by broader throughput
+medians, although non-merge timing also varied. WAL totals were identical at
+budgets 0 and 256; at 2048 they differed by 34 bytes out of approximately 9.3 MB.
+These are complete INSERT measurements, not isolated merge phase timings.
+
+A separate in-process diagnostic reproduces the smaller-merge overhead when each
+document has a unique term, alongside 400 alternating common/filler positions
+and a term shared by document ID modulo 97. With eight contiguous 32-document
+segments, initial validated merging took 1.002 ms versus reconstruction's 0.937 ms;
+standalone verification took 0.417 ms. This implicates verification overhead and
+the many singleton terms, not just server timing noise. Timings alone do not
+attribute all overhead to verification.
+
+The follow-up reuses verifier ordinals, score tuples, positional scratch and
+expected-bound buffers across terms. It also avoids cloning each dictionary term
+and formats its diagnostic label only when emitting a finding. Every consistency
+check remains, and scratch consumers clear state before use, including after a
+malformed term skips later checks. Full validation and fresh measurements of this
+revised runtime are in progress; the tables above describe the initial build.
