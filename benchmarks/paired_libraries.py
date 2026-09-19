@@ -25,6 +25,7 @@ def main():
     parser.add_argument('--installed-library', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--checkpoint-control', action='store_true')
+    parser.add_argument('--writer-rate', type=positive)
     parser.add_argument('--repeat', type=positive, default=200)
     parser.add_argument('--seconds', type=positive, default=20)
     parser.add_argument('--rounds', type=positive, default=3)
@@ -39,7 +40,7 @@ def main():
     harness = Path(__file__).resolve().with_name('contention.py')
     metadata = {
         'checkpoint_control': args.checkpoint_control,
-        'seconds': args.seconds, 'rounds': args.rounds, 'repeat': args.repeat,
+        'seconds': args.seconds, 'rounds': args.rounds, 'repeat': args.repeat, 'writer_rate': args.writer_rate,
         'builds': {name: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
                    for name, path in binaries.items()},
         'harness_sha256': hashlib.sha256(harness.read_bytes()).hexdigest(),
@@ -89,10 +90,11 @@ def main():
                     run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', 'CHECKPOINT'],
                         label + '-checkpoint')
                 print('START ' + label, flush=True)
+                rate = [] if args.writer_rate is None else ['--writer-rate', str(args.writer_rate)]
                 run(['python3', str(harness), '--seconds', str(args.seconds), '--writers', '2',
                      '--readers', '2', '--write-buffer-docs', '32', '--repeat', str(args.repeat),
                      '--sample-ms', '50', '--max-merge-docs', '1024',
-                     '--artifact', str(library), '--output', str(output / label)], label)
+                     '--artifact', str(library), '--output', str(output / label), *rate], label)
                 print('PASS ' + label, flush=True)
     finally:
         try:

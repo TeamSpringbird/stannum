@@ -106,6 +106,7 @@ def main():
     parser.add_argument('--seconds', type=positive, default=30)
     parser.add_argument('--readers', type=positive, default=2)
     parser.add_argument('--writers', type=positive, default=2)
+    parser.add_argument('--writer-rate', type=positive, help='target INSERT transactions/s; uses a fixed scheduling seed')
     parser.add_argument('--initial-docs', type=positive, default=512)
     parser.add_argument('--repeat', type=positive, default=20, help='body repetition count')
     parser.add_argument('--write-buffer-docs', type=positive, default=32)
@@ -216,6 +217,8 @@ ANALYZE docs;"""
             argv = ['pgbench', '-n', '-M', 'simple', '-c', str(clients), '-j', str(min(clients, 4)),
                     '-T', str(args.seconds), '-f', str(args.output / f'{role}.sql'), '-l',
                     '--log-prefix', str(args.output / f'{role}-log'), database]
+            if role == 'writer' and args.writer_rate is not None:
+                argv.extend(['--rate', str(args.writer_rate), '--random-seed=42'])
             started[role] = time.monotonic()
             proc = subprocess.Popen(argv, env=dict(env, PGAPPNAME=f'stannum-contention-{role}'),
                                     stdout=output, stderr=subprocess.STDOUT)

@@ -1,62 +1,176 @@
 # Foreground direct-merge integration
 
-Foreground merges call `segment::merge::merge` while retaining the existing
-exclusive metadata lock. Tier selection, merge budgets, generation allocation,
-LSG3 output, WAL publication and retirement remain unchanged. VACUUM retains its
-separate unlocked reconstruction/revalidation path. This does not include the
-unlocked-fold experiment in PR #10.
+Foreground merges now call `segment::merge::merge` under the existing exclusive
+metadata lock. They retain tier selection, budgets, generation allocation, LSG3
+output, WAL publication and retirement. VACUUM retains its separate unlocked
+reconstruction/revalidation path. The unlocked-fold experiment in PR #10 is not
+included.
 
-The new path loads each selected source blob and dead set, verifies all sources,
-and traverses their sorted dictionaries and postings. Those owned inputs are
-released before output-run allocation. Aggregate encoded bytes and document
-counts must fit `u32::MAX`; otherwise the existing per-source reconstruction path
-runs. This fallback preserves merges whose aggregate input exceeds one run's
-format limit but whose live output still fits. The admission limits are format
-bounds, not a peak-memory budget. Existing infallible codec allocations remain;
-process-wide OOM is not recoverable through this API.
+Each selected source blob and dead set is owned through validation and ordered
+merging, then released before output-run allocation. Aggregate encoded bytes or
+document counts exceeding `u32::MAX` retain the previous reconstruction fallback:
+deletion can still produce a representable output from oversized aggregate input.
+These format limits are not a peak-memory budget. Existing infallible codec
+allocations remain; process-wide OOM is not recoverable through this API.
 
-## Cancellation and failure recovery
+## Correctness and cancellation
 
-PostgreSQL's buffer content LWLock holds off interrupts. The merge callback
-checks for interrupts but respects that deferral. Insert checks once more after
-metadata publication and lock release. A pending cancellation can therefore
-complete merge construction and publication before aborting the SQL statement.
-This does not promise bounded cancellation latency.
+PostgreSQL defers interrupts while the metadata buffer content lock is held.
+Merge checkpoints respect that deferral; insert checks again after publication
+releases the lock. A pending cancellation can therefore finish construction and
+publication before aborting the SQL statement. This is not bounded-latency
+cancellation.
 
-Two PostgreSQL regression tests exercise distinct cases:
+New PostgreSQL tests cover both a pending cancellation delivered after unlock
+and an injected ERROR after construction, before publication. They verify visible
+results, directory integrity, successful retry and reclamation of unpublished
+fold pages by existing VACUUM cleanup. The codec independently tests cancellation
+at every exposed checkpoint. An admission test covers oversized aggregate fallback.
 
-- An injected ERROR after merge construction, before publication, leaves the
-  directory and visible results intact. A retry succeeds. Unpublished fold pages
-  are the only verifier findings, and existing VACUUM cleanup reclaims them.
-- A pending query cancellation at a merge checkpoint is deferred under the lock,
-  then delivered after unlock. Construction completes; the statement rolls back
-  and the next insert succeeds with correct visible results and a clean index.
+Local validation passed 454 core unit tests, four documentation tests, all 109
+extension/storage tests on each of PostgreSQL 17 and 18, formatting, warnings-denied
+Clippy and 63 Python harness tests. The final runtime passed lifecycle recovery,
+CTID reuse, ranked queries, standby replay and promotion, plus five ranked-fuzz
+smoke runs with 771 comparisons. The
+[Linux validation campaign](https://github.com/TeamSpringbird/stannum/actions/runs/35419912451)
+passed on ARM64 and x86-64 with both PostgreSQL majors, including the upstream
+Lead compatibility oracle and all 48 contention windows.
 
-The codec API independently tests cooperative cancellation at every exposed
-checkpoint. Existing lifecycle tests cover dead lists, CTID reuse, ranked
-queries, crash recovery and standby WAL replay.
+The first local lifecycle run exposed a harness mismatch: it recognized only
+statement cancellation, although PostgreSQL can also terminate a session for a
+recovery conflict. The harness now accepts both exact recovery-conflict messages.
+Unlimited-delay and feedback-enabled cases still require every answer and no
+cancellation; unrelated connection failures still fail. This matches PostgreSQL's
+[recovery-conflict handling](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c).
+The complete lifecycle reruns passed.
 
-## Measurement protocol
+## Runtime and protocol
 
-Compare a release build of main `26b9d1e` against this integration, using retained
-library copies and SHA-256 identities. Run the existing contention harness with
-20-second windows, two writers, two readers, 32-document buffers and a 1,024-document
-merge budget. Use three alternating pairs each for short and long documents
-(repetition counts 20 and 200). The private PostgreSQL 18 cluster uses 512 MB
-shared buffers, a 30-minute checkpoint timeout and 16 GB maximum WAL size, with
-an explicit checkpoint before each harness invocation. Retain the server log to
-check for checkpoints during traffic.
+Baseline runtime: main `26b9d1e`. Final runtime: `154868c`, including verifier
+scratch reuse and lazy diagnostic labels. Later harness/documentation commits do
+not change the extension library. Local release-library SHA-256 identities:
 
-The memory probe runs each method in a separate release process, with fixture
-construction in a prior process. `/usr/bin/time -l` measures peak resident memory
-on macOS. Each fixture contains eight segments with interleaved TIDs and no dead
-documents. Reference reconstruction retains one encoded source at a time;
-direct merging retains all encoded sources. Parsing, file I/O and output
-construction are timed, with output-file writing excluded from the timer but
-included in process RSS. Every output must match byte for byte. These are
-isolated codec-process measurements, not PostgreSQL backend peak-memory figures.
+- Baseline: `ae2b0559b84bd4e2108068a6c88d9b0aba4434c7cba383d8081ccb27eeb5665a`
+- Final: `cac665c501af1154a661a2f04c579deda38f12bac0e27f2abfeb2494c2df46ba`
+
+Each contention campaign uses three alternating pairs of 20-second windows, two
+writers, two readers, 32-document buffers and a 1,024-document merge budget.
+Short/long documents repeat `common filler` 20/200 times, with a shared term and
+a unique term per document. Private clusters use 512 MB shared buffers, a
+30-minute checkpoint timeout and 16 GB maximum WAL size, with an explicit
+checkpoint before each harness invocation. Retained server logs show no checkpoint
+starts or completions inside measured traffic windows. Membership is checked
+during traffic; final insert accounting and index verification must also pass.
+
+These are closed-loop runs against a growing table. Faster writers increase
+reader work, so reader throughput is not a comparison at equal corpus size.
+Wait samples are observations, not metadata-lock durations. Shared CI runners
+also introduce timing noise. Percentages below compare medians of three windows
+per build; they are not universal speedup guarantees or a comparison with TIN.
+
+## Linux results
+
+Changes relative to baseline; negative latency changes are improvements:
+
+| Architecture | PG | Documents | Writer tx/s | Reader tx/s | Writer p99 | Reader p99 |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| x86-64 | 17 | Short | +2.4% | +1.4% | -5.4% | -5.3% |
+| x86-64 | 17 | Long | +2.2% | +1.0% | -8.7% | -5.6% |
+| x86-64 | 18 | Short | +1.0% | +0.2% | -1.9% | -2.9% |
+| x86-64 | 18 | Long | +0.7% | +2.8% | -7.4% | -6.4% |
+| ARM64 | 17 | Short | +7.0% | -6.9% | -23.1% | +4.4% |
+| ARM64 | 17 | Long | -0.2% | +0.5% | -0.4% | -2.1% |
+| ARM64 | 18 | Short | +1.1% | -0.4% | -5.1% | -4.0% |
+| ARM64 | 18 | Long | +2.5% | -2.1% | -7.4% | -6.0% |
+
+The ARM64/PG17 short workload has a mixed tradeoff: more writes, fewer reads and
+higher reader p99. This is not an across-the-board latency improvement. The
+other seven reader p99 medians and all eight writer p99 medians improved.
+
+## Local macOS results and equal-arrival control
+
+Apple M4 Max, ARM64, PostgreSQL 18.6, Rust 1.96.0 release builds:
+
+| Workload | Writer tx/s change | Reader tx/s change | Writer p99 ms, before → after | Reader p99 ms, before → after |
+| --- | ---: | ---: | --- | --- |
+| Long, unrestricted writers | +5.7% | +3.9% | 4.446 → 3.811 | 6.281 → 5.931 |
+| Short, unrestricted writers | +7.4% | -11.9% | 3.124 → 2.674 | 5.088 → 4.768 |
+| Short, writers targeted at 3,000/s | approximately flat | +1.9% | 1.952 → 1.894 | 1.106 → 1.049 |
+
+The additional controlled campaign uses `pgbench --rate 3000 --random-seed=42`
+for writers while readers remain unrestricted. All six windows passed. Final
+corpus sizes were 60,638–60,640 rows, removing almost all corpus-size differences.
+Writer scheduling-lag p95 was 1.007–1.058 ms across builds; rate-limited latency
+includes scheduling delay, which the harness reports separately. This supports
+the growth explanation for the unrestricted reader result, but does not prove
+it for every platform or workload.
+
+## Isolated peak memory
+
+Each method runs in a separate release process; fixture construction runs in a
+prior process. `/usr/bin/time -l` measures peak resident memory on macOS. Eight
+segments have interleaved TIDs and no deletions. Reference reconstruction retains
+one encoded source at a time; direct merging retains every encoded source.
+Parsing, file I/O and construction are timed. Output-file writing is excluded
+from the timer but included in process RSS. Every output matches byte for byte.
+Medians of three alternating pairs, RSS in MiB:
+
+| Docs/segment | Tokens/doc | Vocabulary | Reference ms | Direct ms | Reference peak RSS | Direct peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 40 | 4 | 0.486 | 0.252 | 2.19 | 1.98 |
+| 512 | 400 | 4 | 13.742 | 8.185 | 16.44 | 9.23 |
+| 512 | 400 | 400 | 310.651 | 118.030 | 172.77 | 29.16 |
+
+Retaining encoded sources cost less than reconstructed document state in these
+fixtures. Small-process RSS includes startup overhead. These are codec-process
+measurements, not PostgreSQL backend peak-memory figures or bounds on adversarial
+inputs.
+
+## Small-merge diagnosis and fixed-work limits
+
+The initial integration exposed a smaller-merge cost: at budget 256, median total
+execution time in 16 fold-and-merge INSERTs rose from 19.657 to 21.494 ms. A codec
+probe reproduced the overhead with unique terms: eight contiguous 32-document
+segments took 1.002 ms to validate/merge versus 0.937 ms to reconstruct; standalone
+verification took 0.417 ms. Verification and singleton-term costs were material.
+
+The final runtime reuses verifier ordinals, scores, positional scratch and
+expected-bound buffers across terms, avoids cloning each dictionary term, and
+formats diagnostic labels only when emitting findings. Every consistency check
+remains. Scratch consumers clear state before use, including after a malformed
+term skips later checks. Existing mutation and malformed-input tests pass.
+
+Fixed-work campaigns insert the same 4,161 long documents per window, rotating
+budgets 0/256/2048 over three rounds. The last campaign alternates binaries
+immediately within each budget, rather than running all budgets for one build
+first. All 18 windows passed:
+
+| Budget | Total INSERT ms, baseline → final | Fold-and-merge INSERT ms, baseline → final |
+| ---: | --- | --- |
+| 0 | 146.920 → 166.920 | 1.070 → 1.305 |
+| 256 | 158.657 → 158.531 | 21.105 → 20.102 |
+| 2048 | 177.670 → 181.155 | 37.771 → 32.530 |
+
+Budget zero still forces two emergency merges at the hard directory bound. Its
+approximately 14% total-time variation, mostly outside those merges, and an earlier
+campaign's different totals show substantial noise in complete INSERT timings.
+The final merge-bearing groups at budgets 256 and 2048 improved, but these data
+do **not** establish an overall fixed-work INSERT speedup. WAL medians were equal
+at budgets 0/2048 and differed by 16 bytes out of 7.4 MB at budget 256. These are
+complete INSERT observations, not instrumentation of individual merge phases.
+
+## Reproduction and remaining limits
+
+The opt-in CI campaign builds the pinned baseline and candidate on each runner,
+restores the candidate library, and uploads raw pairs. There is no timing assertion
+on shared CI hardware:
 
 ```sh
+gh workflow run ci.yml --ref perf/integrate-direct-merge -f direct_merge_performance=true
+python3 benchmarks/paired_libraries.py --baseline /tmp/baseline.so \
+  --integrated /tmp/integrated.so --installed-library /path/to/stannum.so \
+  --checkpoint-control --seconds 20 --rounds 3 --repeat 20 --writer-rate 3000 \
+  --output benchmarks/results/direct-merge-pairs
 cargo build --release -p segment --example merge_memory
 target/release/examples/merge_memory prepare /tmp/merge-fixture 512 400 400
 /usr/bin/time -l target/release/examples/merge_memory reference /tmp/merge-fixture /tmp/reference.segment
@@ -64,122 +178,10 @@ target/release/examples/merge_memory prepare /tmp/merge-fixture 512 400 400
 cmp /tmp/reference.segment /tmp/direct.segment
 ```
 
-## Initial integration results
-
-Apple M4 Max, ARM64, PostgreSQL 18.6, Rust 1.96.0 release builds. Baseline runtime
-source is `26b9d1e`; integrated runtime source is `a6269f4`. Subsequent lifecycle
-harness changes do not change either library. Retained library SHA-256 values:
-
-- Baseline: `ae2b0559b84bd4e2108068a6c88d9b0aba4434c7cba383d8081ccb27eeb5665a`
-- Integrated: `03caf61cb9152957dae8d89a7abc939d3fc6e848532569e9d3a7af9f13ec9a3c`
-
-All twelve contention windows passed membership oracles during traffic, final
-insert accounting and index verification. Server logs show no checkpoint starts
-inside the shared traffic windows. Medians of three windows per build:
-
-| Workload | Metric | Baseline | Integrated | Change |
-| --- | --- | ---: | ---: | ---: |
-| Long documents | Writer transactions/s | 7,021 | 7,294 | +3.9% |
-| Long documents | Reader transactions/s | 1,918 | 2,062 | +7.5% |
-| Long documents | Writer p99 ms | 4.649 | 4.259 | -8.4% |
-| Long documents | Reader p99 ms | 6.691 | 6.243 | -6.7% |
-| Short documents | Writer transactions/s | 9,529 | 9,904 | +3.9% |
-| Short documents | Reader transactions/s | 1,709 | 1,689 | -1.1% |
-| Short documents | Writer p99 ms | 2.935 | 2.836 | -3.4% |
-| Short documents | Reader p99 ms | 4.904 | 4.833 | -1.4% |
-
-Writer p95 was approximately unchanged (long: 1.430 → 1.425 ms; short: 1.192 →
-1.185 ms). Reader p95 fell from 4.676 to 4.278 ms for long documents and 4.028 to
-3.961 ms for short documents. The long-document paired writer throughput changes
-were -1.4%, +3.2%, +4.1%; the aggregate median is not a guarantee for every run.
-These are closed-loop tests against a growing table: different throughput means
-different final table sizes and reader work. Wait-event samples do not measure
-metadata-lock duration. This supports a modest local improvement, not a general
-4% throughput guarantee or a comparison with TIN.
-
-Isolated process medians from three alternating pairs, identical output bytes in
-every run (RSS in MiB):
-
-| Docs/segment | Tokens/doc | Vocabulary | Reference ms | Direct ms | Reference peak RSS | Direct peak RSS |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 32 | 40 | 4 | 0.693 | 0.396 | 2.16 | 2.03 |
-| 512 | 400 | 4 | 11.471 | 7.136 | 16.34 | 9.30 |
-| 512 | 400 | 400 | 267.531 | 100.597 | 153.59 | 29.02 |
-
-Retaining encoded sources cost less than reconstructed document state in these
-fixtures. Small-process RSS includes startup overhead. This is not a bound on
-large or adversarial inputs, and does not establish PostgreSQL backend peak RSS.
-
-## Validation status
-
-Local formatting, all 62 harness tests, 454 core unit tests, four documentation
-tests, warnings-denied Clippy for PostgreSQL 17/18, and all 109 tests on each major
-passed. Lifecycle validation passed, including crash/replay, CTID reuse, ranking,
-promotion and 338 standby snapshot comparisons with zero wrong answers.
-
-The first lifecycle run hit a valid PostgreSQL recovery-conflict session
-termination that the harness recognized only as statement cancellation. The
-harness now accepts both exact recovery-conflict messages; unlimited-delay and
-feedback-enabled cases still require all 160 answers and no cancellation, and
-unrelated connection errors still fail. PostgreSQL's
-[recovery-conflict handling](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c)
-explicitly supports both outcomes. The full lifecycle rerun passed.
-
-All five ranked-fuzz smoke runs passed (760 ranked comparisons). Cross-architecture
-performance validation remains a promotion gate; local ARM64 timing does not
-establish x86-64 behavior. Raw local samples, binary identities, server logs and
-probe outputs are retained under ignored
-`benchmarks/results/direct-merge-integration/`.
-
-The CI workflow supports an opt-in paired contention campaign across Linux
-ARM64/x86-64 and PostgreSQL 17/18. It compares two release libraries on each
-runner, restores the integrated library, and uploads raw results. Shared-runner
-timings are evidence for review, not a timing assertion in the correctness suite.
-
-```sh
-gh workflow run ci.yml --ref perf/integrate-direct-merge -f direct_merge_performance=true
-```
-
-The portable driver can also compare retained, SQL-compatible libraries on a
-private local cluster (use the development installation lock on a shared host):
-
-```sh
-python3 benchmarks/paired_libraries.py --baseline /tmp/baseline.so \
-  --integrated /tmp/integrated.so --installed-library /path/to/stannum.so \
-  --checkpoint-control --seconds 20 --rounds 3 --repeat 200 \
-  --output benchmarks/results/direct-merge-pairs
-```
-
-## Fixed-work follow-up
-
-The initial integration's fixed-work probe inserted the same 4,161 long documents
-per window, using three alternating build pairs and rotating budgets 0/256/2048.
-All 18 windows passed correctness checks. Median total INSERT execution times:
-
-| Merge budget | Baseline ms | Initial integration ms | Change |
-| ---: | ---: | ---: | ---: |
-| 0 | 151.070 | 148.412 | -1.8% |
-| 256 | 154.554 | 162.775 | +5.3% |
-| 2048 | 189.884 | 169.193 | -10.9% |
-
-Budget zero still incurs two emergency merges at the hard directory bound.
-At budget 256, median total execution time in the 16 fold-and-merge INSERTs rose
-from 19.657 to 21.494 ms. This is a real tradeoff hidden by broader throughput
-medians, although non-merge timing also varied. WAL totals were identical at
-budgets 0 and 256; at 2048 they differed by 34 bytes out of approximately 9.3 MB.
-These are complete INSERT measurements, not isolated merge phase timings.
-
-A separate in-process diagnostic reproduces the smaller-merge overhead when each
-document has a unique term, alongside 400 alternating common/filler positions
-and a term shared by document ID modulo 97. With eight contiguous 32-document
-segments, initial validated merging took 1.002 ms versus reconstruction's 0.937 ms;
-standalone verification took 0.417 ms. This implicates verification overhead and
-the many singleton terms, not just server timing noise. Timings alone do not
-attribute all overhead to verification.
-
-The follow-up reuses verifier ordinals, score tuples, positional scratch and
-expected-bound buffers across terms. It also avoids cloning each dictionary term
-and formats its diagnostic label only when emitting a finding. Every consistency
-check remains, and scratch consumers clear state before use, including after a
-malformed term skips later checks. Full validation and fresh measurements of this
-revised runtime are in progress; the tables above describe the initial build.
+Use the installation lock on a shared development host. Raw local/CI artifacts
+are retained under ignored `benchmarks/results/direct-merge-integration*`.
+Initial-build measurements remain there; the tables above describe the final
+runtime. Further work should measure backend memory on larger production-shaped
+inputs and equal-arrival workloads on Linux, particularly the ARM64/PG17 reader
+tradeoff. The separately gated SIMD-format POC and unlocked-fold experiment remain
+independent changes.
