@@ -720,6 +720,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--driver', type=Path, default=DEFAULT_DRIVER)
     commands = parser.add_subparsers(dest='command', required=True)
+    p = commands.add_parser('catalog', help='observe plans on an existing TIN server using libpq environment')
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--rows', type=int, nargs='+', default=[1000, 10000])
+    import tin_catalog
+    p.set_defaults(func=tin_catalog.run)
     commands.add_parser('prepare').set_defaults(func=prepare)
     commands.add_parser('build').set_defaults(func=build)
     p = commands.add_parser('report')
@@ -757,7 +762,7 @@ def main():
         p.add_argument('--' + variant + '-image', required=True)
         p.add_argument('--' + variant + '-source', type=Path, required=True)
     args = parser.parse_args()
-    if args.command in ('prepare', 'report'):
+    if args.command in ('prepare', 'report', 'catalog'):
         args.func(args)
     else:
         # Shared with native pgrx builds/tests across worktrees on this machine.
