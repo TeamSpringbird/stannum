@@ -20,9 +20,12 @@ the Linux x86-64/AArch64 matrix. The cancellation test establishes delivery
 between documents; this change does not add cancellation checks inside the
 tokenization of one exceptionally large document.
 
-The attribution layer has no runtime changes. Its mechanical commit must be
-verified by removing only the inserted notices and comparing every remaining
-byte with the parent revision. See [source attribution](ATTRIBUTION.md) for the
+The attribution layer has no runtime changes. All 158 modified files were
+verified byte-for-byte against the parent revision after removing only the
+inserted notices; insertion is idempotent, and LICENSE is unchanged. The
+inventory includes 92 Rust files: 38 unchanged inherited, 18 modified inherited
+(including the moved term-frequency module), and 36 Stannum-authored files.
+All 79 benchmark-harness tests and five attribution-tool tests pass. See [source attribution](ATTRIBUTION.md) for the
 policy and future-file checks.
 
 PR #10 (unlocked fold construction) was still open at audit time. It can
