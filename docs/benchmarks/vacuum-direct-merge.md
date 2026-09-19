@@ -88,3 +88,60 @@ The optional CI `vacuum_performance` dispatch repeats all three scenarios on
 PostgreSQL 17/18 and x86-64/ARM64 against the pinned main baseline, retaining raw
 artifacts. No timing threshold is asserted on shared runners. These synthetic
 measurements do not compare Stannum with Tin or establish production behavior.
+
+## Deletion-density diagnosis
+
+A diagnostic copy of the end-to-end harness changed only the mixed scenario's
+deletion predicate and expected remaining count from 75% dead to 50% dead.
+Three pairs measured 112.81 → 114.26 ms (median, about 1.3% slower), compared
+with 8.5% slower at 75% dead. All checks passed. Artifacts are retained under
+`benchmarks/results/vacuum-direct/diagnostic-half-dead`; the diagnostic harness
+is under `/tmp/stannum-vacuum-density-probe` and its hash is in each manifest.
+
+A separate throwaway codec probe adapted `segment/examples/merge_memory.rs` to
+filter 0%, 50%, or 75% of each source's documents and time the verifier separately.
+Eight sources each contain 4,096 documents with 400 positions over two terms.
+Five alternating trials per deletion density produced identical complete output
+bytes for reconstruction and direct merging. Median times (ms):
+
+| Dead documents | Reconstruction | Validated direct merge | Verifier alone |
+| --- | ---: | ---: | ---: |
+| 0% | 93.14 | 55.60 | 25.10 |
+| 50% | 59.23 | 53.22 | 23.02 |
+| 75% | 47.99 | 47.76 | 22.96 |
+
+This supports the hypothesis that validating all input, including deleted
+postings, creates a fixed cost while reconstruction gets cheaper as fewer
+records survive. It does not isolate all costs in the PostgreSQL mixed scenario:
+the minimized fixture lacks its unique terms, heap/WAL work, and concurrent
+readers. Raw diagnostic results are `/tmp/vacuum-codec-diagnostic.json`; the
+throwaway source is retained outside the repository in the diagnostic directory.
+Validation must remain intact; bypassing checks on dead postings would weaken
+the API's corruption contract.
+
+## Short-document follow-up
+
+Repeating the same three scenarios with 20 repetitions rather than 200 yielded
+these medians of three pairs. All 18 additional trials passed correctness.
+
+| Scenario | VACUUM ms, baseline → candidate | Sampled backend RSS MiB |
+| --- | ---: | ---: |
+| Merge | 88.75 → 65.27 | 66.28 → 50.08 |
+| Rewrite | 48.01 → 52.84 | 47.80 → 40.47 |
+| Mixed | 43.84 → 50.40 | 38.36 → 39.52 |
+
+Live merges still improved by 26%; deletion rewrites slowed by 10% and mixed
+cleanup by 15%. The mixed workload had no sampled-memory benefit. Results are
+under `benchmarks/results/vacuum-direct/short-{merge,rewrite,mixed}`. These findings
+keep promotion blocked pending improvement of the deletion-heavy path while
+preserving full validation. The first cross-platform campaign uses 200 repetitions;
+it must not be described as validating the short-document performance results.
+
+## Standby test synchronization
+
+One initial ARM/PG17 CI lifecycle run reported orphan-page warnings while checking
+the standby immediately after its reader was cancelled for a recovery conflict.
+Reader completion does not imply replay has reached the primary's final cleanup
+WAL. The lifecycle test now waits for that WAL position before requiring a clean
+structural verifier result, preserving the strict empty-findings assertion. This
+changes test synchronization, not storage behavior or query-result checks.
