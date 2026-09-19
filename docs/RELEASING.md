@@ -14,6 +14,10 @@ path. Reload their data into a fresh database and rebuild their indexes.
    SQL and on-disk format versions are independent.
 2. Generate the release schema without the `pg_test` feature:
    `cargo pgrx schema pg18 --package stannum --no-default-features --features pg18 --out postgres/sql/stannum--VERSION.sql`.
+   Add the generated snapshot to `source-provenance.json`, preserving the mixed
+   attribution of its Rust inputs, and stage the new path with `git add`. Run
+   `python3 script/source_headers.py --write` to restore its source notice after
+   each generation (the command operates on tracked/staged paths).
    Commit the full snapshot. Retain every previously tagged snapshot unchanged.
 3. For every supported predecessor, add a SQL migration such as
    `postgres/sql/stannum--0.1.0--0.2.0.sql`, or a chain of migrations leading to
