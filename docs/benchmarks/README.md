@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [fold and merge report](fold-and-merge.md) records independent codec gains,
+correctness validation, and the unlocked-fold performance regression.
+
 The [merge-cost probe](merge-costs.md) compares foreground maintenance budgets
 and explains the direct forward-record ingestion optimization.
 
