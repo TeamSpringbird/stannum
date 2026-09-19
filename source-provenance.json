@@ -156,10 +156,6 @@
       "owner": "ben",
       "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
     },
-    "benchmarks/test_tin_catalog.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
-    },
     "benchmarks/test_vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
@@ -171,10 +167,6 @@
     "benchmarks/tin/position-limit.sql": {
       "owner": "ben",
       "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
-    },
-    "benchmarks/tin_catalog.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
     },
     "benchmarks/vacuum_cleanup.py": {
       "owner": "ben",
@@ -845,6 +837,22 @@
     "tokenizer/tests/compatibility.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 82157ed1e4da3e195b0837dbb868897a8f57ad48."
+    },
+    "benchmarks/resources.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum resource measurement summarization and regression coverage."
+    },
+    "benchmarks/test_resources.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum resource measurement summarization and regression coverage."
+    },
+    "benchmarks/test_tin_catalog.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
+    },
+    "benchmarks/tin_catalog.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
     },
     "benchmarks/tin_experiments.py": {
       "owner": "ben",

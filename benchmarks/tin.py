@@ -19,10 +19,12 @@ import shutil
 import subprocess
 import statistics
 import time
+import threading
 import uuid
 
 import dataset
 import run as bench
+import resources
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / 'benchmarks/tin'
@@ -30,7 +32,7 @@ REVISION = 'f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86'
 REPOSITORY = 'https://github.com/planetscale/paradedb-benchmarker.git'
 DEFAULT_DRIVER = ROOT / 'benchmarks/results/tin-driver'
 LOADED_SOURCES = {str(p): dataset.sha256(p) for p in
-                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), *ASSETS.iterdir()]
+                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), Path(resources.__file__), *ASSETS.iterdir()]
                   if p.is_file()}
 
 
@@ -240,6 +242,9 @@ def report(root):
             continue
         exported = json.loads(exports[0].read_text())['runs'][engine]
         elapsed = (exported['endTime'] - exported['startTime']) / 1000
+        resource_summary = resources.summarize(path / 'resources.jsonl',
+                                               exported['startTime'] / 1000, exported['endTime'] / 1000)
+        bench.save(path / 'resource-summary.json', resource_summary)
         samples, groups = [], collections.defaultdict(list)
         queries = collections.defaultdict(list)
         updates = collections.Counter()
@@ -268,6 +273,7 @@ def report(root):
         metrics = exported['queries'][engine]
         rows.append(dict(engine=engine, status='complete', seconds=elapsed,
                          qps=len(samples) / elapsed, **distribution(samples),
+                         resources=resource_summary,
                          families={k: distribution(v) for k, v in groups.items()},
                          queries={k: distribution(v) for k, v in queries.items()},
                          measured_query_forms=len(queries),
@@ -294,6 +300,7 @@ def report(root):
     lines += ['', 'See comparison.json for query-family and individual-query distributions,',
               'semantic differences on the validation sample, and completed updates.',
               'Index read/hit bytes are block accesses, not physical disk traffic.',
+              'Resource summaries in comparison.json and resource-summary.json use samples wholly inside the measured window; boundary gaps are reported.',
               'The full pinned trace may not be traversed during short or slow runs.']
     differences = manifest.get('full_count_differences')
     if differences is None:
@@ -304,6 +311,55 @@ def report(root):
         lines += ['', f'Full-corpus count disagreements: {len(differences)} checked forms, '
                   f'{timed} in the timed query mix. See manifest.json.']
     (root / 'report.md').write_text('\n'.join(lines) + '\n')
+
+
+CGROUP_METRICS = ('cpu.stat', 'memory.current', 'memory.peak', 'memory.events',
+                  'memory.stat', 'memory.pressure', 'io.stat', 'io.pressure')
+
+
+def resource_snapshot(name):
+    # One short-lived exec per sample, rather than one per counter. These are
+    # Linux VM block-device bytes; they are not macOS host physical disk bytes.
+    script = 'set -e\n' + '\n'.join(f"printf '\n@@{metric}\n'; if test -r /sys/fs/cgroup/{metric}; then cat /sys/fs/cgroup/{metric}; else printf 'unavailable\n'; fi"
+                       for metric in CGROUP_METRICS)
+    started = time.time()
+    result = subprocess.run(['docker', 'exec', name, 'sh', '-c', script],
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip())
+    counters = {}
+    for section in result.stdout.split('\n@@')[1:]:
+        metric, value = section.split('\n', 1)
+        counters[metric] = None if value.strip() == 'unavailable' else value.strip()
+    if set(counters) != set(CGROUP_METRICS) or any(v == '' for v in counters.values()):
+        raise ValueError('incomplete cgroup snapshot')
+    return dict(started=started, finished=time.time(), counters=counters)
+
+
+class ResourceSampler:
+    """Approximate phase samples; never pretend the last sample is an end counter."""
+    def __init__(self, name, path):
+        self.name, self.path = name, path
+        self.phase = 'setup'
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.collect, daemon=True)
+
+    def collect(self):
+        with self.path.open('w') as log:
+            while not self.stop.is_set():
+                phase = self.phase
+                try:
+                    record = resource_snapshot(self.name)
+                except (RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                    record = dict(started=time.time(), error=str(error))
+                record['phase'] = phase
+                log.write(json.dumps(record) + '\n')
+                log.flush()
+                self.stop.wait(2)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
 
 
 def run(args):
@@ -349,8 +405,9 @@ def run(args):
                PGOPTIONS='-c statement_timeout=120000 -c jit=off')
     for key in ('PGSERVICE', 'PGSERVICEFILE'):
         env.pop(key, None)
-    def sql(text):
-        return output(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', text], env=env)
+    def sql(text, setup=False):
+        sql_env = dict(env, PGOPTIONS=f'-c statement_timeout={args.setup_timeout_seconds * 1000} -c jit=off') if setup else env
+        return output(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', text], env=sql_env)
     try:
         for engine in args.engines:
             verify_sources(LOADED_SOURCES)
@@ -364,6 +421,7 @@ def run(args):
             manifest['jobs'].append(job)
             bench.save(root / 'manifest.json', manifest)
             command(['docker', 'volume', 'create', volume], stdout=subprocess.DEVNULL)
+            sampler = None
             try:
                 command(['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus),
                          '--memory', args.memory, '--memory-swap', args.memory, '--shm-size', '1g',
@@ -379,6 +437,8 @@ def run(args):
                     if time.monotonic() > deadline:
                         raise TimeoutError('PostgreSQL startup')
                     time.sleep(.5)
+                sampler = ResourceSampler(name, path / 'resources.jsonl')
+                sampler.thread.start()
                 sql('CREATE EXTENSION pg_prewarm; CREATE EXTENSION stannum;')
                 with (path / 'driver-regressions.txt').open('w') as log:
                     command([driver / 'pg-driver-test', '-test.v'],
@@ -395,21 +455,27 @@ def run(args):
                             break
                         writer.writerow(row)
                 job['input_sha256'] = dataset.sha256(path / 'input.csv')
+                sampler.phase = 'import'
                 started = time.monotonic()
                 with (path / 'input.csv').open('rb') as data:
                     command(['psql', '-Xq', '-v', 'ON_ERROR_STOP=1', '-c',
-                             'COPY documents FROM STDIN WITH (FORMAT csv)'], stdin=data, env=env)
+                             'COPY documents FROM STDIN WITH (FORMAT csv)'], stdin=data, env=dict(env, PGOPTIONS=f'-c statement_timeout={args.setup_timeout_seconds * 1000} -c jit=off'))
                 job['import_seconds'] = time.monotonic() - started
                 started = time.monotonic()
+                sampler.phase = 'vector-preparation'
                 if engine == 'postgres':
-                    sql("ALTER TABLE documents ADD COLUMN body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED;")
+                    sql("ALTER TABLE documents ADD COLUMN body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED;", setup=True)
                 job['vector_preparation_seconds'] = time.monotonic() - started
                 started = time.monotonic()
                 index = 'documents_body_gin_idx' if engine == 'postgres' else 'documents_body_stannum_idx'
                 expression = 'gin(body_tsv)' if engine == 'postgres' else 'stannum(body)'
-                sql(f'CREATE INDEX {index} ON documents USING {expression};')
+                sampler.phase = 'index-build'
+                bench.save(path / 'before-build-cgroup.json', resource_snapshot(name))
+                sql(f'CREATE INDEX {index} ON documents USING {expression};', setup=True)
+                bench.save(path / 'after-build-cgroup.json', resource_snapshot(name))
                 job['index_build_seconds'] = time.monotonic() - started
-                sql('VACUUM ANALYZE documents;')
+                sampler.phase = 'validation'
+                sql('VACUUM ANALYZE documents;', setup=True)
                 job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));"))
                 sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
                 queries = trace_queries(driver)
@@ -460,6 +526,7 @@ def run(args):
                                PREWARM=f'{args.warmup}s', UPDATES_PER_SECOND=str(args.updates),
                                SEED=str(args.seed), COOLDOWN='0s', TOP_K='10',
                                DASHBOARD_EXPORT_DIR=str(path), DASHBOARD_EXPORT_PREFIX='result')
+                sampler.phase = 'driver-warmup-and-measurement'
                 with (path / 'driver.log').open('w') as log:
                     command([driver / 'k6', 'run', '--out', 'dashboard=json',
                              '--out', 'json=' + str(path / 'samples.json.gz'),
@@ -491,6 +558,8 @@ def run(args):
                 job.update(status='failed', error=str(error))
                 raise
             finally:
+                if sampler is not None:
+                    sampler.close()
                 (path / 'server.log').write_text(subprocess.run(['docker', 'logs', name], capture_output=True, text=True).stderr)
                 state = subprocess.run(['docker', 'inspect', name], capture_output=True, text=True)
                 (path / 'container.json').write_text(state.stdout)
@@ -773,6 +842,7 @@ def main():
     p.add_argument('--cpus', type=bench.positive, default=4)
     p.add_argument('--memory', default='4g')
     p.add_argument('--shared-buffers', default='1GB')
+    p.add_argument('--setup-timeout-seconds', type=bench.positive, default=1800)
     p.add_argument('--port', type=bench.positive, default=28928)
     p = commands.add_parser('run', parents=[common])
     p.set_defaults(func=run)

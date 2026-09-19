@@ -13,6 +13,23 @@ import tin
 
 
 class TraceCorrectnessTests(unittest.TestCase):
+    def test_resource_snapshot_rejects_missing_counters_and_failed_exec(self):
+        from subprocess import CompletedProcess
+        raw = ''.join('\n@@' + metric + '\n42\n' for metric in tin.CGROUP_METRICS)
+        with patch('tin.subprocess.run', return_value=CompletedProcess([], 0, raw, '')):
+            result = tin.resource_snapshot('owned-container')
+            self.assertEqual(set(result['counters']), set(tin.CGROUP_METRICS))
+            self.assertGreaterEqual(result['finished'], result['started'])
+        optional = raw.replace('@@memory.pressure\n42', '@@memory.pressure\nunavailable')
+        with patch('tin.subprocess.run', return_value=CompletedProcess([], 0, optional, '')):
+            self.assertIsNone(tin.resource_snapshot('owned-container')['counters']['memory.pressure'])
+        with patch('tin.subprocess.run', return_value=CompletedProcess([], 0, '\n@@cpu.stat\n42', '')):
+            with self.assertRaises(ValueError):
+                tin.resource_snapshot('owned-container')
+        with patch('tin.subprocess.run', return_value=CompletedProcess([], 1, raw, 'stopped')):
+            with self.assertRaises(RuntimeError):
+                tin.resource_snapshot('owned-container')
+
     def test_waiting_runner_rejects_source_edits_and_missing_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / 'runner.py'

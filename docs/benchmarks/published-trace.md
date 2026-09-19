@@ -124,9 +124,27 @@ all forms were timed. Warmup samples are absent from `query_duration` metrics.
 Index read/hit byte counters measure block accesses, not physical disk traffic.
 Read-only and write-active runs have different accounting interference.
 Docker resource ceilings are enforced, but the host may cache the VM disk.
-This initial wrapper captures Docker configuration and upstream CPU/memory
-metrics; precise final cgroup pressure deltas and build peak-memory sampling
-remain to be added before an out-of-memory/pressure study.
+The wrapper samples cgroup counters every two seconds across setup, import,
+index construction, validation, and the driver phase in `resources.jsonl`.
+Each record includes the wall-clock sampling interval and phase. It records
+CPU throttling, memory use/events/reclaim, and Linux VM block-device I/O;
+pressure-stall counters are null when the Docker kernel does not expose them.
+Sampling itself incurs a short Docker exec and its small resource cost is
+included in the observations.
+
+`before-build-cgroup.json` and `after-build-cgroup.json` bracket index creation.
+`memory.peak` is the lifetime container high-water mark, including import; the
+largest sampled `memory.current` in the build phase is only a lower bound on
+that phase's peak. The upstream driver stops its container at phase end, so
+the last periodic sample is **not** an exact final counter. Use samples wholly
+inside the exported measurement interval to compute deltas, and report their
+covered duration and gaps to the interval boundaries. Do not label a delta
+covering warmup or validation as measurement-only I/O.
+
+Import, vector preparation, index creation and VACUUM have a separate
+`--setup-timeout-seconds` limit (default 1800); query correctness and plan
+statements retain the 120-second limit. This permits larger index builds
+without weakening query timeouts.
 
 The wrapper checks source drift and retains failed attempts. Its report does
 not infer a cross-engine speedup or declare a winner. Native ARM results do
