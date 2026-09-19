@@ -212,6 +212,20 @@ def load_metrics(paths, rate, seconds):
                 interpretation='Seeded rate is Poisson, not an exact arrival count. Logged schedules exclude any arrivals never emitted at shutdown. Schedule lag measures client queuing, not server queue depth; latency includes lag with --rate.')
 
 
+def sample_rss(pid, stop, ready, samples, errors):
+    """Signal readiness only after observing the live, idle VACUUM backend."""
+    try:
+        while not stop.is_set():
+            started = time.time()
+            result = subprocess.run(['ps', '-o', 'rss=', '-p', str(pid)], text=True, capture_output=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                samples.append(dict(started_epoch=started, epoch=time.time(), rss_bytes=int(result.stdout.strip()) * 1024))
+                ready.set()
+            stop.wait(.02)
+    except Exception as error:
+        errors.append(str(error))
+
+
 def validate_cleanup(segments, remaining):
     """Validate the quiescent cleanup accounting."""
     assert len(segments) == (1 if remaining else 0), segments
@@ -354,17 +368,10 @@ ANALYZE docs;"""
         vacuum.stdin.write('SELECT pg_backend_pid();\n')
         vacuum.stdin.flush()
         pid = int(vacuum.stdout.readline())
-        def sample():
-            try:
-                while not stop.is_set():
-                    result = subprocess.run(['ps', '-o', 'rss=', '-p', str(pid)], text=True, capture_output=True, timeout=5)
-                    if result.returncode == 0 and result.stdout.strip():
-                        samples.append(dict(epoch=time.time(), rss_bytes=int(result.stdout.strip()) * 1024))
-                    stop.wait(.02)
-            except Exception as error:
-                sample_errors.append(str(error))
-        sampler = threading.Thread(target=sample)
+        sampler_ready = threading.Event()
+        sampler = threading.Thread(target=sample_rss, args=(pid, stop, sampler_ready, samples, sample_errors))
         sampler.start()
+        assert sampler_ready.wait(6) and not sample_errors, f'RSS sampler did not become ready: {sample_errors}'
         wal_before = sql('SELECT pg_current_wal_insert_lsn()')
         started_epoch = time.time()
         started = time.monotonic()
@@ -427,8 +434,11 @@ ANALYZE docs;"""
             stable_ranked_proof('after-cleanup')
         assert hashlib.sha256(args.artifact.read_bytes()).hexdigest() == digest
         save(output / 'rss.json', samples)
+        in_flight_rss = [s for s in samples if started_epoch <= s['started_epoch'] and s['epoch'] <= ended_epoch]
         save(output / 'results.json', dict(status='passed', artifact_sha256=digest, vacuum_seconds=vacuum_seconds,
             vacuum_epoch=[started_epoch, ended_epoch], wal_bytes=wal_bytes, rss_samples=len(samples),
+            rss_baseline_bytes=samples[0]['rss_bytes'], rss_samples_during_vacuum=len(in_flight_rss),
+            sampled_during_vacuum_rss_max=max((s['rss_bytes'] for s in in_flight_rss), default=None),
             sampled_backend_rss_max=max((s['rss_bytes'] for s in samples), default=None),
             post_traffic_cleanup_seconds=cleanup_seconds,
             reader=summary, ranked_oracle=ranked_proofs, offered_load=offered_load, during_vacuum=during,

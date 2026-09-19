@@ -7,9 +7,11 @@ from pathlib import Path
 import tempfile
 import unittest
 import argparse
+import threading
+from unittest.mock import patch
 from types import SimpleNamespace
 
-from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches, verify_strategy, ranked_accounting, validate_cleanup
+from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches, verify_strategy, ranked_accounting, validate_cleanup, sample_rss
 
 
 class TrafficTests(unittest.TestCase):
@@ -129,3 +131,27 @@ class CleanupAccountingTests(unittest.TestCase):
         for docs, dead in ((15, 0), (15, 6), (15, 8), (7, 0), (8, -1), (8, 9)):
             with self.subTest(docs=docs, dead=dead), self.assertRaises(AssertionError):
                 validate_cleanup([dict(docs=docs, dead_docs=dead)], 8)
+
+
+class RssReadinessTests(unittest.TestCase):
+    def test_sampler_waits_for_a_real_observation_before_signalling(self):
+        stop, ready, gate = threading.Event(), threading.Event(), threading.Event()
+        samples, errors = [], []
+        def delayed_ps(*args, **kwargs):
+            assert gate.wait(2)
+            return SimpleNamespace(returncode=0, stdout='4096')
+        with patch('vacuum_cleanup.subprocess.run', side_effect=delayed_ps):
+            thread = threading.Thread(target=sample_rss, args=(123, stop, ready, samples, errors))
+            thread.start()
+            try:
+                self.assertFalse(ready.is_set())
+                gate.set()
+                self.assertTrue(ready.wait(2))
+            finally:
+                stop.set()
+                gate.set()
+                thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(samples[0]['rss_bytes'], 4096*1024)
+        self.assertLessEqual(samples[0]['started_epoch'], samples[0]['epoch'])
