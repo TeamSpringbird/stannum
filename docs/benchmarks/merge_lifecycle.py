@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Deferred-merge checks in a private PG18 cluster; install a release build first.
 
 Run under /tmp/stannum-pgrx-lock.py on a shared development machine.

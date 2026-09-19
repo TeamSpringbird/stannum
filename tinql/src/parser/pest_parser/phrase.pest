@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 // Phrase content grammar — whitespace is significant, no implicit WHITESPACE rule.
 
 phrase_content = { SOI ~ phrase_element* ~ EOI }

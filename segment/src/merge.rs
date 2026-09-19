@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Validated direct posting merges, independent of PostgreSQL publication.
 //!
 //! Inputs are borrowed complete blobs with per-input dead sets. All inputs,

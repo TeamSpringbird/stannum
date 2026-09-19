@@ -1,3 +1,8 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+# Based on Lead, copyright (C) 2026 PlanetScale
+#
+# See LICENSE in the repository root for license terms.
+
 name: CI
 
 on:
@@ -34,6 +39,10 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Install rustfmt
         run: rustup component add rustfmt
+      - name: Source attribution
+        run: |
+          python3 script/source_headers.py
+          python3 -m unittest discover -s script -p 'test_*.py'
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Benchmark harness unit tests

@@ -1,3 +1,10 @@
+<!--
+Copyright (C) 2026 Ben Weis <ben@springbird.app>
+Based on Lead, copyright (C) 2026 PlanetScale
+
+See LICENSE in the repository root for license terms.
+-->
+
 # Stannum
 
 Stannum is an experimental, open-source PostgreSQL search engine with Boolean and

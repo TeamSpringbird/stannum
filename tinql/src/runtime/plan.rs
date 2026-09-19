@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Compiles a lowered [`Query`] into a cursor over one immutable segment.
 //!
 //! Every plan node carries an exactness flag. An exact node's cursor yields

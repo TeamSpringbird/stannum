@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 //! Lowers a `tinql::Expr` into the shared runtime `Query` / `SpanQuery`
 //! representation.
 //!

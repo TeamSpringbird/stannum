@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Set operations over ordered cursors.
 //!
 //! Every operator is itself a [`Cursor`], so plans compose. Intersection

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Sustained-insert latency of a Stannum index, one batch statement at a time.
 
 Inserts short documents in batches through one psql session and records how

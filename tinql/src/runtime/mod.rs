@@ -1,3 +1,8 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+// Based on Lead, copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 //! Shared pure-Rust tinql runtime.
 //!
 //! Owns the lowered query AST, sub-tokenization, lowering, capability

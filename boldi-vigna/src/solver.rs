@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use crate::error::SpanError;
 use crate::interval::Interval;
 use crate::positions::TermPositions;

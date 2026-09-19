@@ -1,3 +1,8 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+// Based on Lead, copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use pgrx::{FromDatum, PgBox, PgMemoryContexts, pg_extern, pg_guard, pg_sys};
 use std::ffi::c_void;
 use tinql::runtime::Query;

@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Sorted, prefix-compressed term dictionary.
 //!
 //! Terms are ordered by their UTF-8 bytes, which is the order TINQL ranges

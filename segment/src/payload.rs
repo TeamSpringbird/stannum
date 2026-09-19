@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Per-posting term-frequency bucket and token positions.
 //!
 //! Entries are in the same order as the term's postings and are addressed by

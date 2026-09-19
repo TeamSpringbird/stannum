@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Where a segment's bytes come from.
 //!
 //! A segment on disk spans many pages; a query touches a few extents of it.

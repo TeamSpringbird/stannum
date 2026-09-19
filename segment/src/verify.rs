@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Whole-blob consistency checks that list every problem found instead of
 //! stopping at the first one.
 //!

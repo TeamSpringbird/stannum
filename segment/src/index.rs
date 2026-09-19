@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! One read interface over immutable segments and the mutable index.
 //!
 //! The planner and scorer only need to resolve terms, expand term windows,

@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use crate::query::{SpanQuery, SpanQueryWithTerms};
 use std::fmt;
 

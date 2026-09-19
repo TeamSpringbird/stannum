@@ -1,3 +1,7 @@
+// Copyright (C) 2026 PlanetScale
+//
+// See LICENSE in the repository root for license terms.
+
 use crate::{Folding, Token};
 use std::borrow::Cow;
 use unicode_normalization::char::{canonical_combining_class, is_combining_mark};

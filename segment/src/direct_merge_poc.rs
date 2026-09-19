@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Experimental, test-only direct merge. No production call sites or new format.
 //! Run: cargo test -p segment --release direct_merge_poc -- --include-ignored --nocapture
 use std::cmp::Reverse;

@@ -1,3 +1,8 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+# Based on Lead, copyright (C) 2026 PlanetScale
+#
+# See LICENSE in the repository root for license terms.
+
 [workspace]
 resolver = "3"
 members = ["boldi-vigna", "postgres", "segment", "tinql", "tokenizer"]
@@ -5,7 +10,7 @@ members = ["boldi-vigna", "postgres", "segment", "tinql", "tokenizer"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-authors = ["PlanetScale"]
+authors = ["PlanetScale", "Ben Weis <ben@springbird.app>"]
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
