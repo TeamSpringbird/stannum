@@ -1,0 +1,365 @@
+{
+  "description": "100k ID-range early-filter crossover workload; generic prepared plans; GUC set before PREPARE.",
+  "cases": [
+    {
+      "name": "or_p0_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p0_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p1_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p1_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p10_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p10_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p25_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p25_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p100_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_p100_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_unfiltered_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "or_unfiltered_runtime",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p0_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p0_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p1_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p1_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p10_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p10_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p25_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p25_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p100_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_p100_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_unfiltered_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "common_unfiltered_runtime",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p0_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p0_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 0,
+      "predicate": "id <= 0::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p1_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p1_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 1,
+      "predicate": "id <= 1000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p10_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p10_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 10,
+      "predicate": "id <= 10000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p25_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p25_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 25,
+      "predicate": "id <= 25000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p100_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_p100_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 100,
+      "predicate": "id <= 100000::bigint",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_unfiltered_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0
+    },
+    {
+      "name": "phrase_unfiltered_runtime",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": null,
+      "predicate": "true",
+      "bound": "runtime",
+      "limit": 10,
+      "offset": 0
+    }
+  ]
+}

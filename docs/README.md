@@ -24,3 +24,5 @@ Run commands from the repository root. Keep raw results in ignored
 
 - [TIN across machine sizes](benchmarks/tin-machine-comparison.md)
 - [Expanded TIN strategy and capacity experiments](benchmarks/tin-expanded-experiments.md)
+- [Early filtering and core bitmap comparison](benchmarks/early-filter-ranking.md):
+  two controlled experiments, negative results, and the next ranked-search target.
