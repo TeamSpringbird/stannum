@@ -212,6 +212,13 @@ def load_metrics(paths, rate, seconds):
                 interpretation='Seeded rate is Poisson, not an exact arrival count. Logged schedules exclude any arrivals never emitted at shutdown. Schedule lag measures client queuing, not server queue depth; latency includes lag with --rate.')
 
 
+def validate_cleanup(segments, remaining):
+    """Validate the quiescent cleanup accounting."""
+    assert len(segments) == (1 if remaining else 0), segments
+    assert all(0 <= s['dead_docs'] <= s['docs'] for s in segments), segments
+    assert sum(s['docs'] - s['dead_docs'] for s in segments) == remaining, segments
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--docs', type=positive, default=32768)
@@ -361,7 +368,7 @@ ANALYZE docs;"""
         wal_before = sql('SELECT pg_current_wal_insert_lsn()')
         started_epoch = time.time()
         started = time.monotonic()
-        stdout, stderr = vacuum.communicate('VACUUM (INDEX_CLEANUP ON) docs;\n', timeout=180)
+        stdout, stderr = vacuum.communicate('VACUUM (INDEX_CLEANUP ON, VERBOSE) docs;\n', timeout=180)
         vacuum_seconds = time.monotonic() - started
         ended_epoch = time.time()
         stop.set()
@@ -389,9 +396,11 @@ ANALYZE docs;"""
         (output / 'overlap.log').write_text('\n'.join(overlap) + '\n')
         during = summarize_logs([output / 'overlap.log'], names, vacuum_seconds)
         after = json.loads(sql("SELECT coalesce(json_agg(row_to_json(s)), '[]'::json) FROM stannum.segment_info('docs_idx') s"))
+        save(output / 'after.json', after)
         assert len(after) == (1 if remaining else 0), after
-        assert sum(s['docs'] for s in after) == remaining, after
-        assert sum(s['dead_docs'] for s in after) == 0, after
+        # A concurrent reader can prevent heap pruning. Those CTIDs were not
+        # reported dead to the index AM, even if their rows are no longer visible.
+        assert remaining <= sum(s['docs'] - s['dead_docs'] for s in after) <= args.docs, after
         assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx',true)") == '0'
         assert sql("SELECT count(*) FROM docs WHERE body ==> 'common AND w7'") == str(expected)
         assert sql(f"""WITH actual AS MATERIALIZED (SELECT id FROM docs WHERE body ==> 'common AND w7'),
@@ -399,12 +408,29 @@ ANALYZE docs;"""
             delta AS ((SELECT * FROM actual EXCEPT ALL SELECT * FROM expected)
               UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM actual))
             SELECT count(*) FROM delta""") == '0'
+        # Drain only after all readers have exited. This is outside the timed
+        # VACUUM/RSS/WAL/reader window, and does not imply maintenance kept up.
+        cleanup_start = time.monotonic()
+        cleanup = subprocess.run(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c',
+                                  'VACUUM (INDEX_CLEANUP ON, VERBOSE) docs;'],
+                                 env=env, capture_output=True, text=True, timeout=180)
+        cleanup_seconds = time.monotonic() - cleanup_start
+        (output / 'cleanup.stdout').write_text(cleanup.stdout)
+        (output / 'cleanup.stderr').write_text(cleanup.stderr)
+        cleanup.check_returncode()
+        drained = json.loads(sql("SELECT coalesce(json_agg(row_to_json(s)), '[]'::json) FROM stannum.segment_info('docs_idx') s"))
+        save(output / 'after-cleanup.json', drained)
+        validate_cleanup(drained, remaining)
+        assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx',true)") == '0'
+        assert sql("SELECT count(*) FROM docs WHERE body ==> 'common'") == str(remaining)
+        if args.query_shapes == 'mixed':
+            stable_ranked_proof('after-cleanup')
         assert hashlib.sha256(args.artifact.read_bytes()).hexdigest() == digest
-        save(output / 'after.json', after)
         save(output / 'rss.json', samples)
         save(output / 'results.json', dict(status='passed', artifact_sha256=digest, vacuum_seconds=vacuum_seconds,
             vacuum_epoch=[started_epoch, ended_epoch], wal_bytes=wal_bytes, rss_samples=len(samples),
             sampled_backend_rss_max=max((s['rss_bytes'] for s in samples), default=None),
+            post_traffic_cleanup_seconds=cleanup_seconds,
             reader=summary, ranked_oracle=ranked_proofs, offered_load=offered_load, during_vacuum=during,
             during_vacuum_load=load_metrics([output / 'overlap.log'], args.reader_rate, vacuum_seconds), expected_matches=expected, live_docs=remaining))
     finally:

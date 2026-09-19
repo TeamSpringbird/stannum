@@ -9,7 +9,7 @@ import unittest
 import argparse
 from types import SimpleNamespace
 
-from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches, verify_strategy, ranked_accounting
+from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches, verify_strategy, ranked_accounting, validate_cleanup
 
 
 class TrafficTests(unittest.TestCase):
@@ -118,3 +118,14 @@ class RankedAccountingTests(unittest.TestCase):
         self.assertLess(script.index('AS scoring_state'), script.index('all_matches AS MATERIALIZED'))
         self.assertLess(script.index('AS correct'), script.index('AS stable'))
         self.assertIn('AS unique_ids\n\\gset\nSELECT', script)
+
+
+class CleanupAccountingTests(unittest.TestCase):
+    def test_sparse_dead_entries_are_not_live_documents(self):
+        validate_cleanup([dict(docs=15, dead_docs=7)], 8)
+        validate_cleanup([], 0)
+
+    def test_unaccounted_or_missing_live_documents_fail(self):
+        for docs, dead in ((15, 0), (15, 6), (15, 8), (7, 0), (8, -1), (8, 9)):
+            with self.subTest(docs=docs, dead=dead), self.assertRaises(AssertionError):
+                validate_cleanup([dict(docs=docs, dead_docs=dead)], 8)

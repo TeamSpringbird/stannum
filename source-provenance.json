@@ -156,6 +156,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in a70ba90f4658fdc1f3b91cfb313a55429a76810c."
     },
+    "benchmarks/vacuum_cleanup_pins.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum regression reproducing reader-pinned heap cleanup and validating benchmark accounting."
+    },
     "boldi-vigna/Cargo.toml": {
       "owner": "planetscale",
       "upstream_path": "boldi-vigna/Cargo.toml",
