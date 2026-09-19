@@ -41,16 +41,18 @@ def load_cases(dataset):
     return [tuple(case) for case in manifest["cases"]]
 
 
-def explain_all(engine, queries, repetitions, disable_seqscan, env):
+def explain_all(engine, queries, repetitions, disable_seqscan, env, setup=(), interleave=False):
     """Runs every query `repetitions` times in one session; returns the plans."""
     load = {"stannum": "DO $$ BEGIN PERFORM stannum.tokenize('load'); END $$;",
             "tin": "DO $$ BEGIN PERFORM tin.tokenize('load'); END $$;"}.get(engine, "")
     script = [load]
     if disable_seqscan:
         script.append("SET enable_seqscan = off;")
-    for _, sql in queries:
-        for _ in range(repetitions):
-            script.append(f"EXPLAIN (ANALYZE, FORMAT JSON) {sql.rstrip(';')};")
+    script.extend(statement.rstrip(';') + ';' for statement in setup)
+    order = measurement_order(len(queries), repetitions, interleave)
+    for i, _ in order:
+        sql = queries[i][1]
+        script.append(f"EXPLAIN (ANALYZE, FORMAT JSON) {sql.rstrip(';')};")
     result = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
                             input="\n".join(script), env=env, text=True, capture_output=True)
     if result.returncode != 0:
@@ -59,7 +61,15 @@ def explain_all(engine, queries, repetitions, disable_seqscan, env):
     expected = len(queries) * repetitions
     if len(plans) != expected:
         raise RuntimeError(f"expected {expected} plans, parsed {len(plans)}")
-    return plans
+    # Preserve the existing grouped report contract even when execution alternates.
+    return [plan for _, plan in sorted(zip(order, plans))]
+
+
+def measurement_order(count, repetitions, interleave):
+    if interleave:
+        return [(i, repeat) for repeat in range(repetitions)
+                for i in (range(count) if repeat % 2 == 0 else reversed(range(count)))]
+    return [(i, repeat) for i in range(count) for repeat in range(repetitions)]
 
 
 def parse_plans(text):
@@ -110,6 +120,9 @@ def main():
     parser.add_argument("--discard", type=int, default=2, help="Leading executions to drop per shape")
     parser.add_argument("--disable-seqscan", action="store_true",
                         help="SET enable_seqscan = off, so a broad term cannot fall back to the heap")
+    parser.add_argument("--sql-cases", help="JSON with setup SQL list and named [name, SQL] queries")
+    parser.add_argument("--interleave", action="store_true",
+                        help="Alternate all cases in forward/reverse order each repetition")
     parser.add_argument("--output", required=True)
     parser.add_argument("--label", default="")
     args = parser.parse_args()
@@ -118,12 +131,24 @@ def main():
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
-    queries = workload(args.engine, args.profile, load_cases(args.dataset))
+    setup = []
+    if args.sql_cases:
+        cases = json.loads(Path(args.sql_cases).read_text())
+        queries, setup = cases["queries"], cases.get("setup", [])
+        if not queries or not all(isinstance(q, list) and len(q) == 2
+                                  and all(isinstance(v, str) for v in q) for q in queries):
+            parser.error("SQL cases must contain nonempty [name, SQL] pairs")
+        if not isinstance(setup, list) or not all(isinstance(s, str) for s in setup):
+            parser.error("SQL setup must be a list of statements")
+    else:
+        queries = workload(args.engine, args.profile, load_cases(args.dataset))
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    plans = explain_all(args.engine, queries, args.repetitions, args.disable_seqscan, env)
+    plans = explain_all(args.engine, queries, args.repetitions, args.disable_seqscan, env, setup, args.interleave)
     rows = summarize(queries, plans, args.repetitions, args.discard)
     report = {
         "engine": args.engine, "label": args.label, "profile": args.profile,
+        "setup": setup, "interleave": args.interleave,
+        "measurement_order": measurement_order(len(queries), args.repetitions, args.interleave),
         "dataset": args.dataset, "repetitions": args.repetitions, "discard": args.discard,
         "disable_seqscan": args.disable_seqscan, "host": env.get("PGHOST", ""),
         "database": env.get("PGDATABASE", ""), "started": started, "queries": rows,

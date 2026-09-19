@@ -916,6 +916,198 @@ mod tests {
     }
 
     #[pg_test]
+    fn generic_ranked_runtime_bounds_preserve_scores_and_sql_semantics() {
+        Spi::run(
+            "CREATE TABLE runtime_rank(id int, body text);
+             INSERT INTO runtime_rank SELECT n, repeat('common ', n % 7 + 1) ||
+                 CASE WHEN n % 2 = 0 THEN 'blue' ELSE 'red' END FROM generate_series(1,1000) n;
+             CREATE INDEX runtime_rank_idx ON runtime_rank USING stannum(body);
+             ANALYZE runtime_rank;
+             SET LOCAL plan_cache_mode = force_generic_plan;
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;
+             SET LOCAL enable_indexscan = off;",
+        )
+        .unwrap();
+        // Constant query text must also acquire a runtime bound. Selective quals
+        // retain exhaustive ranking to avoid a wasted top-k pass and completion.
+        for query in ["$1", "'common OR blue'"] {
+            for filter in ["true", "id > 950"] {
+                Spi::run(&format!(
+                    "PREPARE runtime_bound(text, bigint, bigint) AS
+                     SELECT id, stannum.full_score(ctid) AS score FROM runtime_rank
+                     WHERE body ==> {query} AND {filter}
+                     ORDER BY score DESC LIMIT $2 OFFSET $3"
+                ))
+                .unwrap();
+                for (limit, offset, top_k) in [
+                    ("10", "0", Some(10)),
+                    ("7", "12", Some(19)),
+                    ("10", "NULL", Some(10)),
+                    ("NULL", "3", None),
+                    ("0", "0", None),
+                    ("9223372036854775807", "1", None),
+                    ("10", "0", Some(10)),
+                ] {
+                    let sql = format!("EXECUTE runtime_bound('common OR blue', {limit}, {offset})");
+                    let plan =
+                        Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                            .unwrap()
+                            .unwrap()
+                            .0
+                            .to_string();
+                    if let Some(k) = top_k.filter(|_| filter == "true") {
+                        assert!(plan.contains(&format!("\"Top K\":{k}")), "{plan}");
+                    } else {
+                        assert!(!plan.contains("\"Top K\":"), "{plan}");
+                    }
+                    let expected: std::collections::HashMap<i32, u32> = Spi::connect(|client| {
+                        client
+                            .select(
+                                &format!(
+                                    "SELECT id, stannum.full_score(ctid) AS score
+                            FROM runtime_rank WHERE body ==> 'common OR blue' AND {filter}"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap()
+                            .map(|row| {
+                                (
+                                    row.get::<i32>(1).unwrap().unwrap(),
+                                    row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                                )
+                            })
+                            .collect()
+                    });
+                    let mut scores: Vec<u32> = expected.values().copied().collect();
+                    scores
+                        .sort_unstable_by(|a, b| f32::from_bits(*b).total_cmp(&f32::from_bits(*a)));
+                    let offset = offset.parse::<usize>().unwrap_or(0);
+                    let limit = limit.parse::<usize>().unwrap_or(usize::MAX);
+                    let scores: Vec<_> = scores.into_iter().skip(offset).take(limit).collect();
+                    let mut seen = std::collections::HashSet::new();
+                    let actual: Vec<u32> = Spi::connect(|client| {
+                        client
+                            .select(&sql, None, &[])
+                            .unwrap()
+                            .map(|row| {
+                                let id = row.get::<i32>(1).unwrap().unwrap();
+                                let bits = row.get::<f32>(2).unwrap().unwrap().to_bits();
+                                assert_eq!(expected.get(&id), Some(&bits));
+                                assert!(seen.insert(id));
+                                bits
+                            })
+                            .collect()
+                    });
+                    assert_eq!(actual, scores, "{sql}, filter={filter}");
+                }
+                Spi::run(
+                    "DO $$ BEGIN
+                    BEGIN EXECUTE 'EXECUTE runtime_bound(''common'', -1, 0)';
+                        RAISE EXCEPTION 'negative limit accepted';
+                    EXCEPTION WHEN invalid_row_count_in_limit_clause THEN NULL; END;
+                    BEGIN EXECUTE 'EXECUTE runtime_bound(''common'', 10, -1)';
+                        RAISE EXCEPTION 'negative offset accepted';
+                    EXCEPTION WHEN invalid_row_count_in_result_offset_clause THEN NULL; END;
+                    END $$;
+                    DEALLOCATE runtime_bound;",
+                )
+                .unwrap();
+            }
+        }
+        Spi::run(
+            "SET LOCAL enable_material = off; SET LOCAL enable_memoize = off;
+            PREPARE runtime_rescan(bigint, bigint) AS
+            SELECT s.id, s.score, s.iteration FROM generate_series(1,3) g
+            CROSS JOIN LATERAL (SELECT id, stannum.full_score(ctid) AS score, g AS iteration
+                FROM runtime_rank WHERE body ==> 'common OR blue'
+                ORDER BY score DESC LIMIT $1 OFFSET $2) s",
+        )
+        .unwrap();
+        for (limit, offset) in [(7, 0), (10, 12), (3, 2)] {
+            let sql = format!("EXECUTE runtime_rescan({limit}, {offset})");
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0;
+            fn ranked_scan(value: &serde_json::Value) -> Option<&serde_json::Value> {
+                match value {
+                    serde_json::Value::Object(fields) => {
+                        if fields.get("Order").and_then(|v| v.as_str()) == Some("score DESC") {
+                            return Some(value);
+                        }
+                        fields.values().find_map(ranked_scan)
+                    }
+                    serde_json::Value::Array(items) => items.iter().find_map(ranked_scan),
+                    _ => None,
+                }
+            }
+            let scan = ranked_scan(&plan).expect("ranked custom scan");
+            assert_eq!(scan["Actual Loops"].as_u64(), Some(3), "{plan}");
+            assert_eq!(scan["Top K"].as_i64(), Some(limit + offset), "{plan}");
+            let mut actual = [Vec::new(), Vec::new(), Vec::new()];
+            Spi::connect(|client| {
+                for row in client.select(&sql, None, &[]).unwrap() {
+                    let iteration = row.get::<i32>(3).unwrap().unwrap();
+                    actual[(iteration - 1) as usize]
+                        .push(row.get::<f32>(2).unwrap().unwrap().to_bits());
+                }
+            });
+            assert_eq!(actual[0].len(), limit as usize);
+            assert_eq!(actual[0], actual[1]);
+            assert_eq!(actual[0], actual[2]);
+        }
+        Spi::run("DEALLOCATE runtime_rescan").unwrap();
+
+        // WITH TIES must read beyond k, preserving every row at the boundary.
+        Spi::run(
+            "PREPARE runtime_ties(bigint) AS
+            SELECT id, stannum.full_score(ctid) AS score FROM runtime_rank
+            WHERE body ==> 'common OR blue' ORDER BY score DESC FETCH FIRST $1 ROWS WITH TIES",
+        )
+        .unwrap();
+        let actual = ids("EXECUTE runtime_ties(7)");
+        let expected = ids("WITH scores AS MATERIALIZED (
+            SELECT id, stannum.full_score(ctid) AS score FROM runtime_rank
+            WHERE body ==> 'common OR blue') SELECT id FROM scores ORDER BY score DESC
+            FETCH FIRST 7 ROWS WITH TIES");
+        assert!(actual.len() > 7);
+        assert_eq!(
+            actual
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        Spi::run("DEALLOCATE runtime_ties").unwrap();
+
+        // A bound above an SRF counts projected rows, not matching documents.
+        // Grouping/aggregation also cannot import the outer LIMIT into ranking.
+        for projection in [
+            "SELECT id, stannum.full_score(ctid) AS score, generate_series(1,3) FROM runtime_rank
+             WHERE body ==> 'common OR blue' ORDER BY score DESC LIMIT $1",
+            "SELECT max(stannum.full_score(ctid)) AS score FROM runtime_rank
+             WHERE body ==> 'common OR blue' GROUP BY id ORDER BY score DESC LIMIT $1",
+        ] {
+            Spi::run(&format!(
+                "PREPARE runtime_unsupported(bigint) AS {projection}"
+            ))
+            .unwrap();
+            let plan = Spi::get_one::<Json>(
+                "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE runtime_unsupported(7)",
+            )
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+            assert!(!plan.contains("\"Top K\":"), "{plan}");
+            Spi::run("DEALLOCATE runtime_unsupported").unwrap();
+        }
+    }
+
+    #[pg_test]
     fn generic_ranked_scan_rescans_and_preserves_remaining_filters() {
         Spi::run(
             "CREATE TABLE generic_rescan(id int, body text);
