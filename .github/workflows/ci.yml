@@ -136,6 +136,9 @@ jobs:
       - name: Ranked-scan concurrency fuzz (smoke)
         run: python3 postgres/tests/ranked_fuzz.py --smoke
 
+      - name: VACUUM pinned-page regression
+        run: python3 benchmarks/vacuum_cleanup_pins.py
+
       - name: VACUUM workload harness smoke
         run: |
           smoke_dir="$RUNNER_TEMP/vacuum-workload-smoke"
