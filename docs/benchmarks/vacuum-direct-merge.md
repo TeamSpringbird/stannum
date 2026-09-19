@@ -43,9 +43,13 @@ under `failed-setup`; it produced no performance result.
 
 ## Paired end-to-end protocol
 
-`benchmarks/paired_libraries.py --workload vacuum` swaps retained release binaries
-only while its private server is stopped and restores the original on exit.
-Each scenario runs three alternating pairs against newly created databases.
+The original `benchmarks/paired_libraries.py --workload vacuum` campaign replaced
+retained release binaries between windows, with fresh backend connections while
+the private postmaster remained running, and restored the original on exit.
+An earlier version of this report incorrectly said the server stopped before each
+swap. The expanded coverage driver adds explicit stop/swap/start sequencing;
+new measurements must rerun both baseline and candidate under that protocol.
+Each original scenario ran three alternating pairs against newly created databases.
 There are 32,768 documents, each with 200 repetitions of two common terms, a
 97-way selective term, and a unique hash. No logical writes occur during timing.
 
