@@ -213,19 +213,33 @@ fn merge_as(
     let mut postings_area = Vec::new();
     let mut payload_area = Vec::new();
     let mut positions = Vec::new();
+    let mut term_inputs = Vec::new();
+    let mut cursors = Vec::new();
+    let mut postings_heap = BinaryHeap::new();
     while let Some(Reverse((term, first))) = terms.pop() {
         checkpoint()?;
-        let mut inputs = vec![first];
+        term_inputs.clear();
+        term_inputs.push(first);
         while terms.peek().is_some_and(|Reverse((next, _))| next == &term) {
             // The heap was just peeked and no intervening operation can empty it.
-            inputs.push(terms.pop().expect("peeked term exists").0.1);
+            term_inputs.push(terms.pop().expect("peeked term exists").0.1);
         }
-        let mut cursors = Vec::new();
-        let mut postings_heap = BinaryHeap::new();
-        for &i in &inputs {
+        cursors.clear();
+        postings_heap.clear();
+        for &i in &term_inputs {
             let resolved =
                 segments[i].resolve(entries[i].take().expect("each queued term owns an entry"))?;
             let mut postings = resolved.cursor()?;
+            if resolved.df() == 1
+                && postings
+                    .current()
+                    .is_some_and(|tid| sources[i].dead.contains(&tid))
+            {
+                // This fully validated source term has no surviving posting.
+                // No payload cursor will be consumed for it.
+                checkpoint()?;
+                continue;
+            }
             let mut payload = resolved.payload()?.cursor();
             skip_dead(
                 &mut postings,
@@ -295,7 +309,7 @@ fn merge_as(
             postings_area.extend_from_slice(&posting_bytes);
             payload_area.extend_from_slice(&payload_bytes);
         }
-        for i in inputs {
+        for &i in &term_inputs {
             if let Some(item) = dictionaries[i].next() {
                 let (term, entry) = item?;
                 entries[i] = Some(entry);

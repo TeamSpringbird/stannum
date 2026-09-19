@@ -585,16 +585,24 @@ impl<'a> PostingsCursor<'a> {
 
     /// Every block's bounds, in order; empty when the stream carries none.
     pub fn block_bounds(&mut self) -> Result<Vec<BlockBound>> {
+        let mut all = Vec::new();
+        self.block_bounds_into(&mut all)?;
+        Ok(all)
+    }
+
+    /// Reuse caller scratch while checking and decoding every block bound.
+    /// Scratch is cleared first; on error it can contain a decoded prefix.
+    pub(crate) fn block_bounds_into(&mut self, all: &mut Vec<BlockBound>) -> Result<()> {
+        all.clear();
         self.resolve_term_last()?;
         let Some(bounds) = self.bounds_mut() else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         // A corrupt count can imply millions of bounds in a tiny stream.
-        let mut all = Vec::new();
         for block in 0..bounds.blocks {
             all.push(bounds.entry(block)?.expect("block index is in range"));
         }
-        Ok(all)
+        Ok(())
     }
 
     /// A term bound stores no last location: find the stream's last posting
@@ -1493,6 +1501,37 @@ mod tests {
         assert_eq!(bytes[tag_at], TAG_BITMAP);
         bytes[tag_at] = 7;
         assert!(Postings::parse(&bytes).unwrap().to_vec().is_err());
+    }
+
+    #[test]
+    fn bounds_scratch_is_replaced_after_scans_and_errors() {
+        let mut scratch = Vec::new();
+        for count in [500, 1, 50] {
+            let tids: Vec<_> = (0..count).map(|i| tid(i * 37, 1)).collect();
+            let bytes = build_scored(&tids);
+            let mut cursor = Postings::parse(&bytes).unwrap().cursor().unwrap();
+            while cursor.current().is_some() {
+                cursor.advance().unwrap();
+            }
+            cursor.block_bounds_into(&mut scratch).unwrap();
+            assert_eq!(scratch, expected_bounds(&tids));
+        }
+        let tids: Vec<_> = (0..500).map(|i| tid(i * 37, 1)).collect();
+        let mut corrupted = build_scored(&tids);
+        let at = Postings::parse(&corrupted).unwrap().bounds.unwrap().0;
+        corrupted[at] = 0;
+        let mut cursor = Postings::parse(&corrupted).unwrap().cursor().unwrap();
+        assert!(cursor.block_bounds_into(&mut scratch).is_err());
+        assert!(scratch.is_empty());
+        scratch = expected_bounds(&tids);
+        let unbounded = build(&tids);
+        Postings::parse(&unbounded)
+            .unwrap()
+            .cursor()
+            .unwrap()
+            .block_bounds_into(&mut scratch)
+            .unwrap();
+        assert!(scratch.is_empty());
     }
 
     #[test]
