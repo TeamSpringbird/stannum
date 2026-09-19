@@ -3151,6 +3151,206 @@ mod tests {
         assert_clean("insert_race_idx");
     }
 
+    /// Count every optimistic fold attempt; nested SPI runs with the hook
+    /// temporarily removed by `race_point`, so competing inserts cannot recurse.
+    fn on_fold_built(
+        mut action: impl FnMut(usize) + 'static,
+    ) -> std::rc::Rc<std::cell::Cell<usize>> {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = calls.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "fold:built" {
+                let call = observed.get() + 1;
+                assert!(call <= 8, "optimistic fold failed to bound its retries");
+                observed.set(call);
+                action(call);
+            }
+        })));
+        calls
+    }
+
+    fn fold_race_fixture() {
+        Spi::run(
+            "CREATE TABLE fold_race(id int PRIMARY KEY, body text);
+             CREATE INDEX fold_race_idx ON fold_race USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.write_buffer_docs = 2;
+             SET LOCAL stannum.max_merge_docs = 0;
+             INSERT INTO fold_race VALUES (1, 'needle original'), (2, 'needle original');",
+        )
+        .unwrap();
+    }
+
+    fn assert_fold_race_members(expected: &[i32]) {
+        assert_eq!(
+            ids("SELECT id FROM fold_race WHERE body ==> 'needle' ORDER BY id"),
+            expected
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('fold_race_idx')"),
+            expected.len() as i64
+        );
+        assert_clean("fold_race_idx");
+    }
+
+    #[pg_test]
+    fn fold_retries_an_append_without_an_epoch_change() {
+        fold_race_fixture();
+        let calls = on_fold_built(|call| {
+            if call == 1 {
+                // An append changes buffer version/tail/length but not epoch.
+                // Reading here also proves the exclusive guard was released.
+                assert_eq!(
+                    value("SELECT count(*) FROM fold_race WHERE body ==> 'needle'"),
+                    2
+                );
+                Spi::run(
+                    "SET LOCAL stannum.write_buffer_docs = 100;
+                     INSERT INTO fold_race VALUES (4, 'needle appended');
+                     SET LOCAL stannum.write_buffer_docs = 2;",
+                )
+                .unwrap();
+            }
+        });
+        Spi::run("INSERT INTO fold_race VALUES (3, 'needle outer')").unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert_eq!(calls.get(), 2, "the append must invalidate the first build");
+        assert_fold_race_members(&[1, 2, 3, 4]);
+        assert_eq!(
+            value(
+                "SELECT docs FROM stannum.segment_info('fold_race_idx') WHERE kind = 'immutable'"
+            ),
+            3
+        );
+    }
+
+    #[pg_test]
+    fn fold_discards_work_after_a_competing_fold() {
+        fold_race_fixture();
+        let calls = on_fold_built(|call| {
+            assert_eq!(call, 1);
+            // This insert folds the captured two rows, increments epoch and
+            // leaves just its own row buffered. The outer insert no longer
+            // needs a fold and must preserve the competing segment directory.
+            Spi::run("INSERT INTO fold_race VALUES (4, 'needle competing')").unwrap();
+        });
+        Spi::run("INSERT INTO fold_race VALUES (3, 'needle outer')").unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert_eq!(calls.get(), 1, "competing fold hook did not fire");
+        assert_fold_race_members(&[1, 2, 3, 4]);
+        assert_eq!(
+            value(
+                "SELECT docs FROM stannum.segment_info('fold_race_idx') WHERE kind = 'immutable'"
+            ),
+            2
+        );
+    }
+
+    #[pg_test]
+    fn fold_discards_work_after_vacuum_rewrites_its_buffer() {
+        fold_race_fixture();
+        let dead = tids("DELETE FROM fold_race WHERE id = 1 RETURNING ctid::text");
+        assert_eq!(dead.len(), 1);
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'fold_race_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let calls = on_fold_built(move |call| {
+            assert_eq!(call, 1);
+            unsafe {
+                let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+                assert_eq!(
+                    crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead),
+                    (1, 1)
+                );
+            }
+        });
+        Spi::run("INSERT INTO fold_race VALUES (3, 'needle outer')").unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert_eq!(calls.get(), 1, "VACUUM rewrite hook did not fire");
+        // Checking physical document counts as well as visible membership
+        // catches resurrection of a deleted row from the stale prepared blob.
+        assert_fold_race_members(&[2, 3]);
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('fold_race_idx') WHERE kind = 'immutable'"
+            ),
+            0
+        );
+    }
+
+    #[pg_test]
+    fn fold_preserves_vacuum_dead_lists_when_its_buffer_is_unchanged() {
+        fold_race_fixture();
+        Spi::run("INSERT INTO fold_race VALUES (3, 'needle buffered'), (4, 'needle buffered');")
+            .unwrap();
+        let dead = tids("DELETE FROM fold_race WHERE id = 1 RETURNING ctid::text");
+        assert_eq!(dead.len(), 1);
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'fold_race_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let calls = on_fold_built(move |call| {
+            assert_eq!(call, 1);
+            // Only an immutable segment contains the deleted row. VACUUM
+            // attaches its dead list without changing the captured buffer,
+            // so the prepared fold is still valid but its old Meta is not.
+            unsafe {
+                let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+                assert_eq!(
+                    crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead),
+                    (3, 1)
+                );
+            }
+        });
+        Spi::run("INSERT INTO fold_race VALUES (5, 'needle outer')").unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert_eq!(
+            calls.get(),
+            1,
+            "unchanged buffer must retain its prepared fold"
+        );
+        assert_eq!(
+            ids("SELECT id FROM fold_race WHERE body ==> 'needle' ORDER BY id"),
+            vec![2, 3, 4, 5]
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('fold_race_idx')"),
+            5
+        );
+        assert_eq!(
+            value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('fold_race_idx')"),
+            1
+        );
+        assert_clean("fold_race_idx");
+    }
+
+    #[pg_test]
+    fn fold_uses_a_locked_fallback_after_repeated_invalidation() {
+        fold_race_fixture();
+        let calls = on_fold_built(|call| {
+            Spi::run(&format!(
+                "SET LOCAL stannum.write_buffer_docs = 100;
+                 INSERT INTO fold_race VALUES ({}, 'needle invalidating');
+                 SET LOCAL stannum.write_buffer_docs = 2;",
+                100 + call
+            ))
+            .unwrap();
+        });
+        Spi::run("INSERT INTO fold_race VALUES (3, 'needle outer')").unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert_eq!(
+            calls.get(),
+            2,
+            "fallback must follow two failed preparations"
+        );
+        assert_fold_race_members(&[1, 2, 3, 101, 102]);
+        assert_eq!(
+            value(
+                "SELECT docs FROM stannum.segment_info('fold_race_idx') WHERE kind = 'immutable'"
+            ),
+            4
+        );
+    }
+
     #[pg_test]
     fn vacuum_publishes_against_a_directory_inserts_changed_meanwhile() {
         Spi::run(

@@ -2,7 +2,8 @@
 //! segments, all in ordinary index pages.
 //!
 //! Locking: the meta page (block 0) serializes every structural change.
-//! Writers hold it exclusively for inserts, folds and publication. VACUUM
+//! Writers hold it exclusively for buffer changes and publication; fold CPU
+//! work uses a copied buffer and validates it again before publication. VACUUM
 //! works from a directory captured under a shared lock: it reads runs,
 //! builds segments and dead lists, writes their runs and walks chains with
 //! no meta lock at all, then takes the lock exclusively only to publish,
@@ -1558,25 +1559,39 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
     }
 }
 
-/// Folds the write buffer into a new segment and empties it.
-unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
+/// Builds only in backend memory: no index page is allocated or written.
+fn build_fold(stream: &[u8]) -> (Vec<u8>, u32, u64) {
+    let mut builder = SegmentBuilder::default();
+    for record in segment::forward::records(stream) {
+        pgrx::check_for_interrupts!();
+        codec_in(
+            builder.add_record(&codec_in(record, "write buffer")),
+            "write buffer",
+        );
+    }
+    finish_builder(builder)
+}
+
+/// Writes the prepared segment and empties the buffer it represents.
+///
+/// # Safety
+/// The caller holds the meta page exclusively and has verified that the
+/// complete buffer state still matches the state used to build `blob`.
+unsafe fn publish_fold(
+    index: pg_sys::Relation,
+    meta: &mut Meta,
+    blob: &[u8],
+    docs: u32,
+    total_length: u64,
+) {
     unsafe {
-        if meta.buffer.docs == 0 {
-            return;
-        }
-        let stream = read_buffer_stream(index, &meta.buffer);
-        let mut builder = SegmentBuilder::default();
-        for record in segment::forward::records(&stream) {
-            codec_in(
-                builder.add_record(&codec_in(record, "write buffer")),
-                "write buffer",
-            );
-        }
-        let (blob, docs, total_length) = finish_builder(builder);
+        // Keep run allocation, writes and publication under this lock:
+        // orphan reclamation assumes foreground output is never exposed
+        // unlocked before its directory entry has been published.
         add_segment(
             index,
             meta,
-            &blob,
+            blob,
             docs,
             total_length,
             MAX_MERGE_DOCS.get() as u64,
@@ -1587,6 +1602,18 @@ unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
         meta.buffer.docs = 0;
         meta.buffer.version = meta.buffer.version.wrapping_add(1);
         meta.buffer.epoch = meta.buffer.epoch.wrapping_add(1);
+    }
+}
+
+/// Folds under the exclusive metadata lock after speculative work loses races.
+unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
+    unsafe {
+        if meta.buffer.docs == 0 {
+            return;
+        }
+        let stream = read_buffer_stream(index, &meta.buffer);
+        let (blob, docs, total_length) = build_fold(&stream);
+        publish_fold(index, meta, &blob, docs, total_length);
     }
 }
 
@@ -1782,7 +1809,7 @@ pub unsafe fn insert(
             return;
         }
         let text = String::from_datum(*values, false).expect("non-null indexed text");
-        let (meta_buffer, mut meta, bytes) = loop {
+        'prepare: loop {
             pgrx::check_for_interrupts!();
             let (identity, spec) = {
                 let (guard, captured) = read_meta(index, false);
@@ -1805,26 +1832,53 @@ pub unsafe fn insert(
                 bytes
             };
             race_point("insert:prepared");
-            let (guard, current) = read_meta(index, true);
-            if current.identity == identity && current.spec == spec {
-                // Use the latest buffer/directory. Appends, folds and VACUUM
-                // during preparation do not invalidate this row's encoding.
-                break (guard, current, bytes);
+            let (mut meta_buffer, mut meta) = read_meta(index, true);
+            if meta.identity != identity || meta.spec != spec {
+                // Rebuilds normally conflict with the caller's relation lock;
+                // never publish bytes for a different identity or pipeline.
+                drop(meta_buffer);
+                continue;
             }
-            // Rebuilds normally conflict with the caller's relation lock;
-            // validate the persisted tokenizer nevertheless, never publishing
-            // bytes encoded for a different index identity or pipeline.
-            drop(guard);
-        };
-        if meta.buffer.docs > 0
-            && (meta.buffer.bytes as usize + bytes.len() > WRITE_BUFFER_BYTES.get() as usize
-                || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32)
-        {
-            fold(index, &mut meta);
+            // At most two wasted builds per insert before the locked fallback
+            // guarantees progress. Each attempt owns only one copied buffer
+            // and one segment; normal buffer caps bound their input, except
+            // for the single oversized document already allowed by insertion.
+            let mut attempts = 0;
+            while meta.buffer.docs > 0
+                && (meta.buffer.bytes as usize + bytes.len() > WRITE_BUFFER_BYTES.get() as usize
+                    || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32)
+            {
+                if attempts == 2 {
+                    fold(index, &mut meta);
+                    break;
+                }
+                attempts += 1;
+                let captured = meta.buffer;
+                let stream = read_buffer_stream(index, &captured);
+                drop(meta_buffer);
+                let (blob, docs, total_length) = build_fold(&stream);
+                drop(stream);
+                race_point("fold:built");
+                (meta_buffer, meta) = read_meta(index, true);
+                if meta.identity != identity || meta.spec != spec {
+                    drop(meta_buffer);
+                    continue 'prepare;
+                }
+                if meta.buffer == captured {
+                    // Use the freshly read directory, dead lists and pending
+                    // frees; VACUUM may have changed them during construction.
+                    publish_fold(index, &mut meta, &blob, docs, total_length);
+                    break;
+                }
+                // A concurrent append, fold or VACUUM rewrite invalidates the
+                // whole build. Recheck the latest caps before trying again:
+                // a competing fold usually leaves room for this insert.
+            }
+            append_to_buffer(index, &mut meta.buffer, &bytes);
+            meta.buffer.docs += 1;
+            write_meta(index, &meta_buffer, &meta);
+            return;
         }
-        append_to_buffer(index, &mut meta.buffer, &bytes);
-        meta.buffer.docs += 1;
-        write_meta(index, &meta_buffer, &meta);
     }
 }
 
