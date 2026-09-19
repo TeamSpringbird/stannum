@@ -2,7 +2,10 @@
 
 This follow-up uses the existing `benchmarks/tin.py experiment` entry point to
 probe real TIN databases with persistent sessions and immutable Wikipedia
-corpora. It extends the [small-fixture catalog](tin-plan-catalog.md) and
+corpora. The user confirmed the larger deployment as **PS-160 ARM with EBS,
+2 vCPU and 16 GiB RAM**, with configured disk bounds of 10–4,096 GiB. These
+are provisioned specifications; the disk bounds are not observed disk usage.
+It extends the [small-fixture catalog](tin-plan-catalog.md) and
 [two-machine comparison](tin-machine-comparison.md).
 
 ## First completed wave: 100,000 Wikipedia articles on both machines
@@ -173,8 +176,8 @@ index size also includes dictionaries, metadata and liveness structures.
 
 ## Completion and cleanup
 
-The main experiments captured **4,893 plan observations**, plus three recovery
-plans, 24 mixed-query concurrency windows, and a live lock-wait regression.
+The main experiments recorded **4,893 query probes (4,889 successful plans)**,
+plus three successful recovery plans, 24 mixed-query concurrency windows, and a live lock-wait regression.
 The separate initial smoke run captured another 294 plans. Four main-suite
 query errors were the invalid-negation syntax probes described above. The
 million-row maintenance failure and successful recovery remain separately
@@ -183,7 +186,10 @@ recorded. All other main runs completed with successful cleanup.
 Both databases were subsequently checked: **zero probe schemas and zero
 experiment/recovery sessions remained**. See the
 [cleanup verification](tin-cleanup-verification.json). The temporary larger
-database is no longer needed for this experiment set.
+database is no longer needed for this experiment set. A credential-checked
+archive of the raw evidence is retained locally at
+`benchmarks/results/tin-remote-evidence-20260919.tar.gz` (3,324,660 bytes;
+SHA-256 `c6e36183e5c068c058279800e921f8446a64dad517be911b07aca95938d133b6`).
 
 ## Replay and bounds
 

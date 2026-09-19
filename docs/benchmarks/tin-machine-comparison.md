@@ -22,9 +22,12 @@ and query definitions.
 | random_page_cost | 1.1 | 1.1 |
 | max_parallel_workers_per_gather | 2 | 2 |
 
-These are observed PostgreSQL settings, not independently verified hardware
-allocations or SKU names. The larger database was requested after recommending
-PS-160 ARM, but SQL does not establish which SKU was provisioned.
+The user confirmed the larger deployment as **PS-160 ARM with EBS, 2 vCPU
+and 16 GiB RAM**, with a configured disk minimum of 10 GiB and maximum of
+4,096 GiB. Those are provisioned specifications reported by the user; the
+PostgreSQL settings above were observed through SQL. The disk bounds are not
+measurements of allocated or used storage. The smaller instance's SKU remains
+unconfirmed.
 
 ## Findings
 

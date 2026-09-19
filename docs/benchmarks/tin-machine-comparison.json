@@ -9054,5 +9054,14 @@
       "small_temp_written_blocks": 0,
       "large_temp_written_blocks": 0
     }
-  ]
+  ],
+  "user_confirmed_large_deployment": {
+    "sku": "PS-160 ARM",
+    "storage": "EBS",
+    "vcpus": 2,
+    "memory_gib": 16,
+    "disk_min_gib": 10,
+    "disk_max_gib": 4096,
+    "source": "User confirmation; not inferred from SQL settings"
+  }
 }
