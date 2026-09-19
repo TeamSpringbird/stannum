@@ -22,3 +22,7 @@
   payload skip slot for entry 0, and dictionary entries with gap-encoded
   extents; the 100k Wikipedia index shrinks by about a tenth with the same
   pruning. `LSG1` and `LSG2` segments remain readable; `REINDEX` rewrites.
+- Foreground segment merges preserve dictionary/posting order through the
+  validated direct-merge API, retaining existing encoding and publication locks.
+  Oversized aggregate inputs retain reconstruction fallback; pending insert
+  cancellation is checked after metadata unlock.

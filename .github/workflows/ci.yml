@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      direct_merge_performance:
+        description: Compare direct merges with the pre-integration baseline
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -116,6 +121,45 @@ jobs:
       # plus the regression list, under two minutes.
       - name: Ranked-scan concurrency fuzz (smoke)
         run: python3 postgres/tests/ranked_fuzz.py --smoke
+
+      # Opt-in promotion gate: both binaries run on the same runner. No timing
+      # threshold is asserted on shared CI hardware; retain pairs for review.
+      - name: Compare direct-merge contention
+        if: github.event_name == 'workflow_dispatch' && inputs.direct_merge_performance
+        run: |
+          comparison_dir="$RUNNER_TEMP/direct-merge-comparison"
+          mkdir -p "$comparison_dir"
+          installed_library="$(pg_config --pkglibdir)/stannum.so"
+          cp "$installed_library" "$comparison_dir/integrated.so"
+          trap 'cp "$comparison_dir/integrated.so" "$installed_library"' EXIT
+          # This baseline has the same extension SQL and on-disk format.
+          baseline_commit=26b9d1ec0f2cad8e84386cf26b63afe3dadcd42c
+          git fetch --no-tags origin "$baseline_commit"
+          git worktree add --detach "$comparison_dir/baseline-source" "$baseline_commit"
+          (
+            cd "$comparison_dir/baseline-source"
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo pgrx install --release \
+              --package stannum --no-default-features --features "pg${PG_MAJOR}"
+          )
+          cp "$installed_library" "$comparison_dir/baseline.so"
+          cp "$comparison_dir/integrated.so" "$installed_library"
+          for repetition in 200 20; do
+            python3 benchmarks/paired_libraries.py \
+              --baseline "$comparison_dir/baseline.so" \
+              --integrated "$comparison_dir/integrated.so" \
+              --installed-library "$installed_library" \
+              --checkpoint-control --seconds 20 --rounds 3 --repeat "$repetition" \
+              --output "$comparison_dir/results/repeat$repetition"
+          done
+
+      - name: Retain direct-merge comparisons
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.direct_merge_performance
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-merge-${{ matrix.arch.name }}-pg${{ matrix.postgres }}
+          path: ${{ runner.temp }}/direct-merge-comparison/results
+          if-no-files-found: warn
+          retention-days: 7
 
   # Behavioral regression suite: the same fixture, 47 query shapes and five
   # mutation states on Stannum and on the original Lead, checked out directly

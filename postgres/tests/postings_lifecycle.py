@@ -294,7 +294,11 @@ def main():
         # recovery conflict may instead cancel the query. Both feedback states
         # and both an infinite and a finite max_standby_streaming_delay run.
         totals = {'answers': 0, 'wrong': 0, 'conflicts': 0, 'runs': []}
-        cancel_message = 'canceling statement due to conflict with recovery'
+        # Recovery may terminate an idle-in-transaction session instead of
+        # cancelling a running statement. Both are valid only in the finite
+        # delay/no-feedback case; other failures must still fail this test.
+        cancel_messages = ('canceling statement due to conflict with recovery',
+                           'terminating connection due to conflict with recovery')
         def run_reader(feedback, delay, base):
             standby_sql(f"ALTER SYSTEM SET hot_standby_feedback={feedback};"
                         f"ALTER SYSTEM SET max_standby_streaming_delay='{delay}'; SELECT pg_reload_conf();")
@@ -355,7 +359,7 @@ def main():
                     totals['wrong'] += 1
             # The snapshot is fixed, so the reference answer never changes.
             assert len(refs) <= 1, (feedback, delay, refs)
-            cancelled = cancel_message in err
+            cancelled = any(message in err for message in cancel_messages)
             totals['answers'] += matched
             if cancelled:
                 totals['conflicts'] += 1

@@ -74,10 +74,23 @@ moving their writes outside it requires a separate reservation protocol.
 ### Merge policy
 
 The [direct-merge architecture decision](../adr/0001-preserve-posting-order-before-changing-encoding.md)
-records the planned move to preserving sorted postings during merges, with a
-separate evidence gate for any SIMD-friendly on-disk format. The experimental
-implementation remains as a test-only reference. A [validated codec API](../benchmarks/hardened-merge.md)
-is available for integration; production PostgreSQL merges still rebuild forward records.
+records the move to preserving sorted postings during merges, with a separate
+evidence gate for any SIMD-friendly on-disk format. Foreground merges now invoke
+the [validated codec API](../benchmarks/hardened-merge.md) under the existing
+metadata lock, retaining LSG3 output, merge selection and WAL publication. It
+validates every source and merges ordered dictionaries/postings directly. Source
+blobs and dead sets are retained through construction, then freed before writing
+the output run. Aggregate encoded inputs or document counts beyond `u32::MAX`
+use the previous reconstruction path, since deletion can still yield a
+representable output. These format bounds do not impose a peak-memory cap.
+
+PostgreSQL defers interrupts while the metadata buffer lock is held. Merge
+checkpoints respect that deferral; insert checks again immediately after
+publication releases the lock. An interrupted pre-publication write may leave
+orphan pages, which VACUUM reclaims. VACUUM's separate unlocked reconstruction and
+revalidation path remains unchanged. See the
+[integration measurements](../benchmarks/direct-merge-integration.md) for validation
+and the limits of the performance evidence.
 
 Each segment belongs to a size tier by document count: tier *t* holds
 segments with `factor^t` to `factor^(t+1) - 1` documents. The lowest full tier

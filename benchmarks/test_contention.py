@@ -47,6 +47,16 @@ class ContentionTests(unittest.TestCase):
         self.assertEqual(result['active_backend_observations'], {'writer': 2})
         self.assertEqual(result['active_wait_observations'], {'writer:LWLock:BufferContent': 1})
 
+    def test_rate_limited_logs_keep_latency_and_scheduling_lag_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'writer-log.1'
+            path.write_text('0 1 4000 0 1700000000 100 1000\n'
+                            '1 1 8000 0 1700000000 200 2000\n')
+            result = summarize_logs([path], ['writer'], 2)
+            validate_traffic(result, 2)
+            self.assertEqual(result['queries']['writer']['p50_ms'], 4)
+            self.assertEqual(result['schedule_lag_p95_ms'], 2)
+
     def test_failed_and_incomplete_pgbench_runs_cannot_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'writer-log.1'
