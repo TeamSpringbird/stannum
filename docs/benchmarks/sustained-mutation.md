@@ -14,14 +14,22 @@ write rate and writer connection count; repetitions reverse case order. The
 reader rate is independent of the writer rate. There are no builds or binary
 swaps during a campaign; use the shared installation/timing lock when applicable.
 
-The existing workload has count and ranked forms of term, Boolean, phrase and
-miss queries. Writers choose inserts, deletes and match-changing updates with
-equal weights. Inserts copy corpus documents under new IDs; deletes/updates
-select a live row at or above a random ID. Concurrent deletion or gaps beyond
-the last live ID can cause no-ops. Each DML statement now returns its affected
-row count; only no-ops emit a marker. With failed transactions rejected, completed
-transactions minus no-ops gives actual row changes. The final heap count must
-equal initial rows plus affected inserts minus affected deletes.
+The workload has count and ranked forms of term, Boolean, phrase and miss
+queries. Writers choose inserts, deletes and match-changing updates with equal
+weights. Inserts copy corpus documents under new IDs. Updates/deletes probe the
+current maximum ID, select the first unlocked live row at or above a seeded
+random point in that key range, and wrap around if needed. This samples key
+space, not rows uniformly; sparse gaps can bias selection and the extra lookup
+cost is part of every engine's timed workload.
+
+Each DML statement asserts exactly one returned row in the same autocommit SQL
+statement. Zero or multiple effects raise an error and roll back the statement;
+any failed transaction invalidates the run. This removes per-no-op shell calls.
+Successful logged transactions therefore equal affected rows. If the table is
+empty or every target is locked, the benchmark fails explicitly rather than
+reporting successful no-op throughput. The final heap count must equal initial
+rows plus committed inserts minus committed deletes. The protocol identity is
+`live-key-wrap-v2`; old marker-accounted results are not paired comparisons.
 
 Table autovacuum is disabled for this controlled profile. One scheduler runs
 serial VACUUM operations; it records scheduling delay and missed intervals rather
@@ -94,7 +102,7 @@ pgbench logs, timeline, physical samples, oracle results and verification result
 The regular PG17/18 × ARM/x86 CI matrix runs a 20-second, two-writer smoke. It
 checks the protocol and correctness, not a hardware-independent timing threshold.
 
-## First local load sweep
+## Historical load sweep (original no-op-accounted protocol)
 
 Eight 45-second windows passed on native PostgreSQL 18.6, macOS arm64 (16 logical
 CPUs). The release was built from runtime base `4beaaa3`, containing PRs #20/#21;
@@ -160,3 +168,12 @@ shell accounting and use a target-selection protocol whose useful-work fraction
 does not collapse with offered rate. Compare ranked retrieval separately: native
 PostgreSQL ranking is not the same computation as BM25. Follow the synthetic
 probes with representative documents and longer, repeated windows.
+
+## Live-target generator validation
+
+The v2 generator passed the 30-second PG18 smoke at 8,000 offered mutations/sec
+with two writers, repeated maintenance, row-count accounting, oracle checks and
+deep verification. This is a protocol check, not a capacity result. The native
+`benchmarks/mutation_targets.py` regression exercises sparse billion-scale keys,
+wrapping around a locked maximum, exhaustion rejection and rollback of a
+multi-row mutation. It runs in the PG17/18 × ARM/x86 CI matrix.

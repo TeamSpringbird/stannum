@@ -15,24 +15,17 @@ import sustained
 
 
 class SustainedTests(unittest.TestCase):
-    def test_successful_noops_are_not_reported_as_mutated_rows(self):
+    def test_only_asserted_single_row_completions_are_counted(self):
         summary = dict(failures={}, queries={'insert': {'completed': 5}, 'delete': {'completed': 4}})
-        result = mutation.affected_rows(summary, 'pgbench header\nSTANNUM_NOOP_delete\nSTANNUM_NOOP_delete\n')
-        self.assertEqual(result['insert']['affected'], 5)
-        self.assertEqual(result['delete'], dict(completed=4, noops=2, affected=2))
-        for transcript in ('STANNUM_NOOP_update\n', 'STANNUM_NOOP_delete\n' * 5):
-            with self.assertRaises(ValueError):
-                mutation.affected_rows(summary, transcript)
+        self.assertEqual(mutation.affected_rows(summary)['delete'], dict(completed=4, noops=0, affected=4))
         with self.assertRaises(ValueError):
-            mutation.affected_rows(dict(summary, failures={'delete:failed': 1}), '')
+            mutation.affected_rows(dict(summary, failures={'delete:failed': 1}))
 
-    def test_each_writer_counts_effects_in_its_autocommit_statement(self):
-        for kind, original in mutation.writer_scripts(10000, run.CASES, 12000).items():
+    def test_writers_assert_one_effect_without_shell_calls(self):
+        for kind, original in mutation.writer_scripts(10000, run.CASES).items():
             script = mutation.accounted_writer(original, kind)
-            self.assertIn('RETURNING 1)', script)
-            self.assertIn('SELECT count(*) AS affected FROM changed;', script)
-            self.assertIn('\\if :affected = 0\n\\shell echo STANNUM_NOOP_' + kind, script)
-            self.assertTrue(script.startswith('\\set '))
+            self.assertIn('SELECT 1 / (count(*) = 1)::int FROM changed;', script)
+            self.assertNotIn('\\shell', script)
             self.assertNotIn('BEGIN;', script)
 
     def test_scheduling_pressure_is_not_confused_with_execution_cost(self):

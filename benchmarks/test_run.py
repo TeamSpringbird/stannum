@@ -110,12 +110,12 @@ class MutationProfileTests(unittest.TestCase):
         self.assertTrue(run.digest(run.fixture_sql(10000).encode()).startswith("78858462c7b645cf"))
 
     def test_writer_scripts_cover_every_kind_and_only_drift_toward_real_terms(self):
-        scripts = mutation.writer_scripts(10000, run.CASES, 12000)
+        scripts = mutation.writer_scripts(10000, run.CASES)
         self.assertEqual(set(scripts), set(mutation.KINDS))
         self.assertIn("nextval('benchmark_ids')", scripts["insert"])
         self.assertIn("FROM benchmark_pool WHERE id = :src", scripts["insert"])
-        self.assertIn("random(1, 12000)", scripts["delete"])
-        self.assertIn("WHERE id = (SELECT id FROM documents WHERE id >= :id ORDER BY id LIMIT 1)", scripts["delete"])
+        self.assertIn("coalesce(max(id), 1)", scripts["delete"])
+        self.assertEqual(scripts["delete"].count("FOR UPDATE SKIP LOCKED"), 2)
         bundles = mutation.drift_bundles(run.CASES)
         self.assertEqual(bundles, ["", "rare", "common rare", "common rare", "alpha beta"])
         self.assertIn(f"random(0, {len(bundles) - 1})", scripts["update"])

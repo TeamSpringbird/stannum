@@ -298,7 +298,7 @@ def run(args):
             "mix": mix, "settings": args.set, "check_interval": args.check_interval,
             "vacuum_interval": args.vacuum_interval, "sample_interval": args.sample_interval,
             "drain_vacuums": args.drain_vacuums, "min_vacuums": args.min_vacuums, "min_checks": args.min_checks,
-            "autovacuum": False, "writer_accounting": "single-row RETURNING plus explicit no-op markers",
+            "autovacuum": False, "writer_accounting": "live-key-wrap-v2; atomic exactly-one-row assertion",
             "bucket_seconds": args.bucket_seconds, "oracle": "regex sequential scan in one repeatable-read snapshot"}
         manifest["load_model"] = ("independently rate-scheduled readers when read_rate is set; "
                                   "rate-scheduled writers mixing inserts, deletes and match-changing updates; "
@@ -369,10 +369,8 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
         writer_files = ["-f", str(out / "writer.sql")]
         writer_names = ["update"]
         if mutating:
-            # Deletes and updates may probe ids inserted during the window.
-            ceiling = args.rows + args.write_rate * args.seconds * mix["insert"] // sum(mix.values())
             scripts = {kind: mutation.accounted_writer(script, kind) for kind, script in
-                       mutation.writer_scripts(args.rows, cases, ceiling).items()}
+                       mutation.writer_scripts(args.rows, cases).items()}
             writer_files, writer_names = [], kinds
             for kind in kinds:
                 (out / f"writer-{kind}.sql").write_text(scripts[kind])
@@ -437,7 +435,7 @@ UPDATE documents SET body = CASE WHEN right(body, 8) = 'mutablea'
             if maintenance.failures:
                 raise RuntimeError("Maintenance thread failed: " + json.dumps(maintenance.failures))
             save(out / 'after.json', snapshot(env))
-            affected = mutation.affected_rows(summary['writer'], (out / 'writer.txt').read_text())
+            affected = mutation.affected_rows(summary['writer'])
             summary['affected_rows'] = affected
             # All traffic/check connections have finished. These are quiescent
             # samples, unlike physical/heap counts sampled during active writes.
