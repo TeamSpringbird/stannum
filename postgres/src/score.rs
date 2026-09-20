@@ -753,6 +753,9 @@ impl Walk<'_, '_> {
     /// align the cursors behind it.
     fn any(&mut self) {
         let mut order: Vec<usize> = (0..self.cursors.len()).collect();
+        // At small widths the canonical fold is cheap; avoid the extra cursor
+        // comparison there. The grouping win is measured at 32+ terms.
+        let group_pivots = self.cursors.len() >= 32;
         loop {
             self.tick();
             order.retain(|&i| self.cursors[i].current().is_some());
@@ -771,9 +774,10 @@ impl Walk<'_, '_> {
                 // check below. No intermediate prefix can select a different
                 // pivot, so fold once at the end of this equal-TID group. Keep
                 // the canonical f32 fold rather than summing in cursor order.
-                if order
-                    .get(j + 1)
-                    .is_some_and(|&next| self.cursors[next].current() == self.cursors[i].current())
+                if group_pivots
+                    && order.get(j + 1).is_some_and(|&next| {
+                        self.cursors[next].current() == self.cursors[i].current()
+                    })
                 {
                     continue;
                 }
