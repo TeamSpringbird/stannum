@@ -1315,6 +1315,56 @@ mod tests {
     }
 
     #[pg_test]
+    fn wide_disjunction_pivots_preserve_exact_ranked_results() {
+        let words = (0..128)
+            .map(|i| format!("word{}{}", (b'a' + i / 26) as char, (b'a' + i % 26) as char))
+            .collect::<Vec<_>>();
+        let array = words
+            .iter()
+            .map(|w| format!("'{w}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        Spi::run(&format!("CREATE TABLE bmw(id int PRIMARY KEY, body text);
+            SET LOCAL stannum.build_segment_docs=128;
+            INSERT INTO bmw SELECT n, string_agg(repeat(w || ' ', 1+n%3), ' ' ORDER BY j)
+            FROM generate_series(1,512) n CROSS JOIN unnest(ARRAY[{array}]) WITH ORDINALITY words(w,j)
+            WHERE n%17=0 OR (n*31+j*7)%19<5 GROUP BY n;
+            CREATE INDEX bmw_idx ON bmw USING stannum(body);
+            INSERT INTO bmw VALUES (513, '{}');
+            DELETE FROM bmw WHERE id%23=0;
+            UPDATE bmw SET body=body || ' extra' WHERE id%31=0;", words.join(" "))).unwrap();
+        // Exercise both sides of the grouping cutoff, boosts, ties, segment
+        // boundaries, mutable postings, dead rows, and LIMIT continuation.
+        for width in [31, 32, 33, 128] {
+            let query = words[..width]
+                .iter()
+                .enumerate()
+                .map(|(i, w)| format!("{w}^{}", if i % 2 == 0 { "0.25" } else { "2" }))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            for limit in ["LIMIT 1", "LIMIT 10", "LIMIT 100", "LIMIT 10 OFFSET 20"] {
+                assert_eq!(
+                    ranked(true, &query, "stannum.full_score(ctid)", limit),
+                    ranked(false, &query, "stannum.full_score(ctid)", limit),
+                    "width={width}, {limit}"
+                );
+            }
+        }
+        Spi::run("SET LOCAL stannum.enable_custom_scan=on").unwrap();
+        let query = words.join(" OR ");
+        let plan = Spi::get_one::<Json>(&format!(
+            "EXPLAIN (ANALYZE, FORMAT JSON)
+            SELECT id,stannum.full_score(ctid) AS score FROM bmw WHERE body ==> '{query}'
+            ORDER BY score DESC LIMIT 10"
+        ))
+        .unwrap()
+        .unwrap()
+        .0
+        .to_string();
+        assert!(plan.contains("\"Pruning\":\"block-max\""), "{plan}");
+    }
+
+    #[pg_test]
     fn pruned_top_k_matches_full_scoring_bit_for_bit() {
         // Four build segments of 1,000 documents and a write buffer, with a
         // 60-row pattern of term frequencies and lengths so exact score ties
