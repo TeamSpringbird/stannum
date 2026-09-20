@@ -895,6 +895,8 @@ struct ScanExec {
     /// filtered-out nor previously emitted tuples are visited twice.
     filtered: bool,
     expanded: bool,
+    /// Rows returned after PostgreSQL applies the residual quals.
+    returned: usize,
     /// Explain counters. Candidates are unknown while pruned; `scored`
     /// counts the candidates a pruned scan scored.
     candidates: Option<usize>,
@@ -1043,6 +1045,7 @@ unsafe extern "C-unwind" fn begin_scan(
             pruned: false,
             filtered: !(*cscan).scan.plan.qual.is_null(),
             expanded: false,
+            returned: 0,
             candidates: None,
             scored: None,
             exhaustive_score_calls: 0,
@@ -1240,11 +1243,12 @@ unsafe fn complete(exec: &mut ScanExec) {
         if exec.filtered && !exec.expanded {
             exec.expanded = true;
             let k = ordering.top_k.expect("a pruned scan has a bound");
-            // Enough headroom for moderately selective filters without an
-            // unbounded series of repeated block-max walks. The existing
-            // pruning cap bounds memory and work even for a large OFFSET.
-            let expanded_k = k.saturating_mul(16).min(crate::score::PRUNE_MAX_K);
-            if expanded_k > k {
+            // Retry only small prefixes with observed qualifying rows. A
+            // larger walk lost to exhaustive ranking at larger bounds; no
+            // survivors gives no evidence that expansion will satisfy a filter.
+            // This caps the retained prefix, not the postings the walk visits.
+            let expanded_k = k.saturating_mul(16);
+            if k <= 32 && exec.returned > 0 && expanded_k > k {
                 exec.top_k_expansions += 1;
                 if let Some(top) = scorer.top_k(expanded_k) {
                     exec.scored = Some(exec.scored.unwrap_or(0) + top.scored);
@@ -1521,7 +1525,14 @@ unsafe extern "C-unwind" fn search_recheck(
 unsafe extern "C-unwind" fn exec_search(
     node: *mut pg_sys::CustomScanState,
 ) -> *mut pg_sys::TupleTableSlot {
-    unsafe { pg_sys::ExecScan(&mut (*node).ss, Some(search_access), Some(search_recheck)) }
+    unsafe {
+        let slot = pg_sys::ExecScan(&mut (*node).ss, Some(search_access), Some(search_recheck));
+        if !slot.is_null() && (*slot).tts_flags & pg_sys::TTS_FLAG_EMPTY as u16 == 0 {
+            let exec = exec_of(node);
+            exec.returned += 1;
+        }
+        slot
+    }
 }
 
 /// Counts one exact candidate page; only all-visible pages can bypass the heap.
@@ -1722,8 +1733,15 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let exec = exec_of(node);
         exec.next = 0;
-        if !exec.runtime_query.is_null() || !exec.runtime_limit.is_null() {
-            crate::score::forget_scan_scorer(exec.scan_id);
+        exec.returned = 0;
+        let parameterized = !exec.runtime_query.is_null() || !exec.runtime_limit.is_null();
+        // Completion removed already-consumed roots from the cached arrays.
+        // A constant rescan must rebuild those arrays, retaining its scorer's
+        // frozen view/statistics. Merely rewinding would omit qualifying rows.
+        if parameterized || exec.top_k_completions > 0 {
+            if parameterized {
+                crate::score::forget_scan_scorer(exec.scan_id);
+            }
             exec.query_bound = exec.runtime_query.is_null();
             exec.bounds_bound = exec.runtime_limit.is_null();
             exec.query_null = false;
@@ -1743,7 +1761,7 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
         if !exec.fallback.is_null() {
             pg_sys::table_rescan(exec.fallback, std::ptr::null_mut());
         }
-        // Counts re-count; constant searches rewind their captured results.
+        // Counts re-count; intact constant searches rewind their captured results.
         // Parameterized ranked searches bind again and rebuild their scorer.
         let cscan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
         if (*cscan).scan.scanrelid == 0 {
