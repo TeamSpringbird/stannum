@@ -42,7 +42,10 @@ and teardown; reuse it rather than introducing another harness.
 - CloudFormation owns the temporary EC2 resources, with a lifetime backstop and
   explicit teardown verification in the existing AWS protocol.
 
-A fresh TIN endpoint will still be required when the local gates pass. Old
+TIN is closed source and cannot be installed on our EC2 host. A live comparison
+requires a PlanetScale database running TIN; provision it only when the local
+gates pass and the measurement window is ready. Until then, run Stannum/GIN
+locally or on EC2 and label old TIN figures as historical reference data. Old
 credentials and timing results are not a substitute. Matching vCPU/RAM/storage
 budgets does not establish identical CPU generations or managed-service internals.
 The historical article's query-trace identity is also unresolved; keep a fresh
