@@ -2002,6 +2002,44 @@ mod tests {
     }
 
     #[pg_test]
+    fn ranked_exists_filters_preserve_scores() {
+        Spi::run("CREATE TABLE exists_docs(id int PRIMARY KEY, body text);
+            INSERT INTO exists_docs SELECT n, CASE WHEN n % 3 = 0 THEN 'alpha beta beta' ELSE 'alpha gamma' END FROM generate_series(1,120) n;
+            CREATE INDEX exists_docs_search ON exists_docs USING stannum(body);
+            CREATE TABLE exists_allowed(id int PRIMARY KEY);
+            INSERT INTO exists_allowed SELECT n FROM generate_series(1,120) n WHERE n % 7 = 0;
+            ANALYZE exists_docs; ANALYZE exists_allowed;
+            CREATE TEMP TABLE exists_reference AS SELECT id, stannum.full_score(ctid) AS score FROM exists_docs WHERE body ==> 'alpha OR beta';").unwrap();
+        for filter in [
+            "EXISTS (SELECT 1 FROM exists_allowed a WHERE a.id=d.id)",
+            "NOT EXISTS (SELECT 1 FROM exists_allowed a WHERE a.id=d.id)",
+            "EXISTS (SELECT 1 FROM exists_allowed a WHERE a.id=d.id) AND NOT EXISTS (SELECT 1 FROM exists_allowed a WHERE a.id=d.id+1)",
+            // The inner alias has the same name, but belongs to another query.
+            "EXISTS (SELECT 1 FROM exists_docs d WHERE body ==> 'gamma' OFFSET 0)",
+        ] {
+            for custom in ["on", "off"] {
+                Spi::run(&format!("SET LOCAL stannum.enable_custom_scan={custom}")).unwrap();
+                let actual = Spi::get_one::<pgrx::JsonB>(&format!("SELECT jsonb_agg(to_jsonb(s) ORDER BY score DESC,id) FROM (SELECT d.id,stannum.full_score(d.ctid) AS score FROM exists_docs d WHERE body ==> 'alpha OR beta' AND {filter} ORDER BY score DESC,id LIMIT 10) s")).unwrap();
+                let expected = Spi::get_one::<pgrx::JsonB>(&format!("SELECT jsonb_agg(to_jsonb(s) ORDER BY score DESC,id) FROM (SELECT d.id,d.score FROM exists_reference d WHERE {filter} ORDER BY score DESC,id LIMIT 10) s")).unwrap();
+                let expected = expected.map(|v| v.0);
+                assert_eq!(actual.map(|v| v.0), expected, "{filter}, custom={custom}");
+                for mode in ["force_custom_plan", "force_generic_plan"] {
+                    Spi::run(&format!("SET LOCAL plan_cache_mode={mode};
+                        PREPARE exists_ranked(text) AS SELECT jsonb_agg(to_jsonb(s) ORDER BY score DESC,id)
+                        FROM (SELECT d.id,stannum.full_score(d.ctid) AS score FROM exists_docs d
+                        WHERE body ==> $1 AND {filter} ORDER BY score DESC,id LIMIT 10) s")).unwrap();
+                    let prepared =
+                        Spi::get_one::<pgrx::JsonB>("EXECUTE exists_ranked('alpha OR beta')")
+                            .unwrap()
+                            .map(|v| v.0);
+                    assert_eq!(prepared, expected, "{filter}, custom={custom}, plan={mode}");
+                    Spi::run("DEALLOCATE exists_ranked").unwrap();
+                }
+            }
+        }
+    }
+
+    #[pg_test]
     fn scoring_binds_to_expression_indexes() {
         Spi::run(
             "CREATE TABLE lite_expression_score (id int, s1 text, s2 text);
