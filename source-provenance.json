@@ -913,6 +913,10 @@
     "segment/src/maintenance/dictionary.rs": {
       "owner": "ben",
       "evidence": "Original Stannum bounded maintenance dictionary reader."
+    },
+    "segment/src/maintenance/validate.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum streaming cross-term validation."
     }
   }
 }
