@@ -8,14 +8,17 @@
 //! The payload cursor validates every position, bucket and skip offset, including
 //! entries a caller intends to delete. It does not validate posting ownership,
 //! dictionary extents, document lengths or score bounds; callers must retain the
-//! whole-input verifier until those checks have streaming equivalents. Next,
-//! pair the payload and postings cursors with a bounded dictionary cursor, then feed positions
+//! whole-input verifier until those checks have streaming equivalents. The dictionary cursor now streams the block index and validates term ordering;
+//! next, compose these readers with cross-stream validation and feed positions
 //! to an incremental output codec. Source caches and callback allocations are
 //! outside the cursor's bound; this is not a total merge memory budget. Legacy
 //! LSG1 construction scans its variable-width skip table once to locate data;
 //! `PayloadCursor::new_with_checkpoint` makes that scan cancellable.
 
 use crate::{Error, Result, segment::Format, source::Source, tf_bucket::TfBucket};
+
+mod dictionary;
+pub use dictionary::DictionaryCursor;
 
 mod postings;
 pub use postings::{PostingEntry, PostingsCursor};
