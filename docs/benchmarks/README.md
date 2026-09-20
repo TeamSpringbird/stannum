@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [comparable AWS experiment](aws-comparable-results.md) measures Stannum/TIN
+with GIN controls on both hosts and reproduces TIN's `OFFSET 0` plan sensitivity.
+
 The [performance snapshot graphic](performance-snapshot.md) places recorded local
 GIN comparisons alongside separately labeled remote TIN observations.
 
