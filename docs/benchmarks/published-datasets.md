@@ -135,4 +135,5 @@ Live checks now pass on 100 and 1,000 raw Stack Exchange documents across all
 [results and nonempty coverage](stackexchange-lead-smoke.md). Passing empty
 result sets alone does not prove representative coverage. The timed raw
 Stack Exchange count path now passes a two-engine container smoke; see
-[raw-text validation](raw-text-membership.md). Ranked and larger runs remain.
+[raw-text validation](raw-text-membership.md). Ranked runs now pass at 100 and 10,000 rows; see the
+[ranked rehearsal](raw-ranked-rehearsal.md). Memory pressure and update runs remain.
