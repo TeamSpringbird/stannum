@@ -337,3 +337,41 @@ class PairedMeasurementsTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class RawTextMembershipTests(unittest.TestCase):
+    def test_raw_checks_use_tokenizer_not_ascii_regex(self):
+        queries = [('1:phrase', '"Café Mixed"', 'café <-> mixed', 'Café Mixed')]
+        raw = tin.check_sql(queries, raw_text=True)
+        self.assertIn('SELECT id FROM reference WHERE body ==>', raw)
+        self.assertNotIn('body ~', raw)
+        self.assertIn('EXCEPT ALL', raw)
+        semantics = tin.semantics_sql(queries, raw_text=True)
+        self.assertIn('body ==>', semantics)
+        self.assertNotIn('body ~', semantics)
+        self.assertIn('body_tsv @@', semantics)
+
+    def test_raw_trace_accepts_punctuation_without_changing_query_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'queries.json'
+            record = dict(source_id=1,text='Mixed C++',engines={e:{s:'"Mixed C++"' for s in
+                          ('conjunction','disjunction','phrase')} for e in ('tin','postgres')})
+            path.write_text(json.dumps({'queries':[record]}))
+            with self.assertRaises(ValueError):
+                tin.trace_queries(Path(tmp),path)
+            queries=tin.trace_queries(Path(tmp),path,raw_text=True)
+            self.assertEqual(len(queries),3)
+            self.assertEqual(queries[0][1],'"Mixed C++"')
+
+
+class SqlBatchTransportTests(unittest.TestCase):
+    def test_large_batch_uses_stdin_and_preserves_transaction(self):
+        batch = 'SELECT 1;\n' * 10000
+        with patch.object(tin, 'output', return_value='ok') as call:
+            self.assertEqual(tin.sql_output(batch, {}), 'ok')
+            command = call.call_args.args[0]
+            self.assertNotIn(batch, command)
+            self.assertIn('--single-transaction', command)
+            self.assertEqual(call.call_args.kwargs['input'], batch)
+            tin.sql_output('VACUUM documents', {})
+            self.assertIn('-c', call.call_args.args[0])
+            self.assertNotIn('--single-transaction', call.call_args.args[0])

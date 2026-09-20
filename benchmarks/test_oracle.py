@@ -267,3 +267,14 @@ class PublishedTraceTests(unittest.TestCase):
             with patch.object(oracle.subprocess, 'check_output', return_value=b'different'):
                 with self.assertRaises(ValueError):
                     oracle.published_trace_identity(directory, 'stackexchange', trace)
+
+class RawTextWitnessTests(unittest.TestCase):
+    def test_cases_require_positive_and_negative_results_on_both_paths(self):
+        cases = oracle.raw_text_cases('stannum')
+        self.assertEqual(len(cases), 16)
+        self.assertEqual(sum(bool(c['expected']) for c in cases), 14)
+        for case in cases:
+            self.assertEqual(oracle.lifecycle_check(case, {'rows':case['expected']})[1], [])
+            if case['expected']:
+                self.assertTrue(oracle.lifecycle_check(case, {'rows':[]})[1])
+        self.assertIn('E\'alpha\\nbeta\'', oracle.RAW_TEXT_FIXTURE)
