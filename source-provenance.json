@@ -873,6 +873,22 @@
     "benchmarks/aws/start-postgres.sh": {
       "owner": "ben",
       "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
+    },
+    "benchmarks/query_shapes.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum deterministic query-shape benchmark integration."
+    },
+    "benchmarks/test_query_shapes.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum query-shape coverage and validation regression tests."
+    },
+    "docs/benchmarks/render_query_shapes.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum renderer for synthetic query-shape measurements."
+    },
+    "docs/benchmarks/query-shapes-exists-repro.sql": {
+      "owner": "ben",
+      "evidence": "Original Stannum standalone regression reproduction generated from query-shape suite."
     }
   }
 }

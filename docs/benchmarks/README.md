@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [query-shape suite](query-shapes.md) adds wide Boolean expressions and SQL
+integration cases, with independent membership checks and explicit failure reporting.
+
 The [comparable AWS experiment](aws-comparable-results.md) measures Stannum/TIN
 with GIN controls on both hosts and reproduces TIN's `OFFSET 0` plan sensitivity.
 
