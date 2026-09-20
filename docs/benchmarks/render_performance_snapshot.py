@@ -3,69 +3,124 @@
 #
 # See LICENSE in the repository root for license terms.
 
-"""Render recorded observations; no database access. Requires matplotlib."""
+"""Render matched AWS measurements, using only the committed result JSON."""
 import json
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
+from matplotlib.lines import Line2D
 
 ROOT = Path(__file__).resolve().parent
+DATA = json.loads((ROOT / 'aws-comparable-results.json').read_text())
+SUMMARY = DATA['summary']
+BG, INK, MUTED = '#f5f7fb', '#17243b', '#526078'
+COLORS = {'stannum': '#008779', 'tin': '#c57524', 'gin': '#5375b5'}
+LABELS = [('common', 'history'), ('and', 'history AND war'),
+          ('or', 'history OR war'), ('selective_or', 'telescope OR astronomy'),
+          ('rare', 'quasar')]
+plt.rcParams.update({'font.family': 'DejaVu Sans', 'font.size': 11,
+                     'svg.fonttype': 'none', 'svg.hashsalt': 'stannum-aws-20260920'})
 
-def read(name):
-    return json.loads((ROOT / name).read_text())
 
-count = next(r for r in read("published-trace-results.json") if r["run"] == "tin-count-100k-02")
-engines = {r["engine"]: r for r in count["measurements"]}
-tin = read("tin-expanded-results.json")["runs"]["visible-s4-m16"]
-auto = next(g for g in tin["groups"] if g["name"] == "forced:wiki:0.25:10:r*:{}")
-pushdown = next(g for g in tin["groups"] if g["name"] == "forced:wiki:0.25:10:r*:{'tin.debug_force_conjunction_mode': 'Pushdown'}")
-
-plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11, "svg.fonttype": "none"})
-fig = plt.figure(figsize=(14, 9), facecolor="#f5f7fb")
-fig.text(.055, .948, "Stannum performance: the evidence so far", fontsize=25, weight="bold", color="#17243b")
-fig.text(.055, .910, "100,000 Wikipedia articles · recorded September 2026 · historical builds, not current-head results", fontsize=12, color="#526078")
-fig.text(.055, .850, "A   Same-host count queries", fontsize=16, weight="bold", color="#17243b")
-fig.text(.055, .818, "Client p95 latency · two clients · 302 AND + 302 OR forms within a mixed workload", color="#526078")
-ax = fig.add_axes([.22, .555, .69, .23], facecolor="#f5f7fb")
-colors = {"stannum": "#007f79", "postgres": "#5375b5"}
-for engine, offset, label in [("stannum", .15, "Stannum"), ("postgres", -.15, "Postgres GIN (stored vector)")]:
-    values = [engines[engine]["families"][f]["p95_ms"] for f in ("conjunction", "disjunction")]
-    bars = ax.barh([1 + offset, offset], values, height=.26, color=colors[engine], label=label)
-    ax.bar_label(bars, labels=[f" {v:.3f} ms" for v in values], padding=4, color="#17243b", fontsize=11)
-ax.set_yticks([1, 0], ["AND counts", "OR counts"])
-ax.set_xlim(0, 17.2)
-ax.set_xlabel("Client p95 (ms) — lower is better")
-ax.legend(loc="upper right", frameon=False, fontsize=10)
-fig.text(.055, .479, "Local ARM64 Docker: 4 CPU / 4 GiB limit · PG 18.6 · run tin-count-100k-02", fontsize=10, color="#526078")
-fig.text(.055, .455, "604 full counts agreed; unsampled membership is unproven. Phrase forms omitted because 11 full counts differed.", fontsize=10, color="#526078")
-
-fig.text(.055, .397, "B   TIN only: two strategies on the same server", fontsize=16, weight="bold", color="#17243b")
-fig.text(.055, .365, "Server median · history OR war · id ≤ 25,000 · top 10 IDs + scores · network excluded", color="#526078")
-ax2 = fig.add_axes([.29, .158, .62, .17], facecolor="#f5f7fb")
-values = [auto["median_ms"], pushdown["median_ms"]]
-labels = ["TIN · automatic", "TIN · forced pushdown"]
-for y, v, color in zip([1, 0], values, ["#ab6b2b", "#c99556"]):
-    ax2.scatter(v, y, s=115, color=color, zorder=3)
-    ax2.annotate(f" {v:.3f} ms", (v, y), xytext=(8, 0), textcoords="offset points", va="center", color="#17243b")
-ax2.set_yticks([1, 0], labels)
-ax2.set_ylim(-.5, 1.5)
-ax2.set_xlim(0, 38)
-ax2.set_xticks([0, 10, 20, 30])
-ax2.xaxis.set_major_formatter(ScalarFormatter())
-ax2.set_xlabel("EXPLAIN execution time (ms) — three observations per strategy")
-fig.text(.055, .067, "TIN 1.0.2: PS-160 ARM / EBS, 2 vCPU / 16 GiB. No matched Stannum measurement exists on this server.", fontsize=10, color="#526078")
-fig.text(.055, .042, "Server-only timing removes network, not hardware differences. Sources: docs/benchmarks/performance-snapshot.md", fontsize=10, color="#526078")
-for a in (ax, ax2):
-    a.set_axisbelow(True)
-    a.grid(axis="x", alpha=.18)
-    for spine in a.spines.values():
+def style(ax):
+    ax.set_facecolor(BG)
+    ax.set_axisbelow(True)
+    ax.grid(axis='x', alpha=.18)
+    for spine in ax.spines.values():
         spine.set_visible(False)
-    a.tick_params(length=0, pad=8)
-for suffix in ("svg", "png"):
-    fig.savefig(ROOT / f"performance-snapshot.{suffix}", dpi=180, facecolor=fig.get_facecolor())
-svg = ROOT / "performance-snapshot.svg"
-svg.write_text("\n".join(line.rstrip() for line in svg.read_text().splitlines()) + "\n")
-plt.close(fig)
+    ax.tick_params(length=0, pad=7)
+    ax.set_xlabel('Server execution (ms) · lower is better', color=MUTED)
+
+
+def heading(fig, title, subtitle):
+    fig.set_facecolor(BG)
+    fig.text(.055, .952, title, fontsize=23, weight='bold', color=INK)
+    fig.text(.055, .914, subtitle, fontsize=11, color=MUTED)
+
+
+def footer(fig, sampling):
+    fig.text(.055, .087, sampling, fontsize=10, color=MUTED)
+    fig.text(.055, .061, 'EC2: Graviton4, 2 vCPU / 16 GiB, EBS · PlanetScale: requested PS-160 ARM / EBS, exact CPU unverified.', fontsize=10, color=MUTED)
+    fig.text(.055, .035, '2026-09-20 UTC · Stannum ab1e6db · TIN 1.0.2 · Source: docs/benchmarks/aws-comparable-results.json', fontsize=10, color=MUTED)
+
+
+def save(fig, name):
+    for suffix in ('png', 'svg'):
+        fig.savefig(ROOT / f'{name}.{suffix}', dpi=180,
+                    facecolor=fig.get_facecolor(), metadata={'Date': None} if suffix == 'svg' else {})
+    p = ROOT / f'{name}.svg'
+    p.write_text('\n'.join(line.rstrip() for line in p.read_text().splitlines()) + '\n')
+    plt.close(fig)
+
+
+# Ranked comparisons: identical scale and order across the three query groups.
+fig, axes = plt.subplots(1, 3, figsize=(17, 8.5), sharex=True, sharey=True)
+fig.subplots_adjust(left=.19, right=.97, bottom=.21, top=.765, wspace=.13)
+heading(fig, 'Ranked top ten: where Stannum stands against TIN',
+        '100,000 Wikipedia articles · warm buffers · matching query results and score bits · no OFFSET · network excluded')
+handles = [Line2D([0], [0], color=COLORS[e], lw=9, label=label)
+           for e, label in [('stannum', 'Stannum / EC2'), ('tin', 'TIN / PlanetScale')]]
+fig.legend(handles=handles, loc='upper left', bbox_to_anchor=(.18, .895), ncol=2, frameon=False)
+fig.text(.19, .838, 'Cross-host observations: substantial GIN controls were 1.3–1.6× faster on EC2. Small differences are not definitive engine wins.', fontsize=10, color=MUTED)
+for ax, (cutoff, title) in zip(axes, [('None', 'No SQL filter'), ('25000', 'id <= 25,000'), ('1000', 'id <= 1,000')]):
+    for engine, offset in [('stannum', -.17), ('tin', .17)]:
+        for i, (key, _) in enumerate(LABELS):
+            row = SUMMARY[engine][f'{engine}:rank:{key}:{cutoff}']
+            value = row['median_ms']
+            y = i + offset
+            ax.barh(y, value, height=.28, color=COLORS[engine])
+            rounds = list(row['round_median_ms'].values())
+            # Range of round medians, deliberately not presented as a confidence interval.
+            ax.plot([min(rounds), max(rounds)], [y, y], color=INK, lw=1.5, marker='|', markersize=7)
+            ax.text(max(value, max(rounds)) + .13, y, f'{value:.3f}', va='center', fontsize=10, color=INK)
+    ax.set_title(title, fontsize=14, color=INK, pad=16)
+    ax.set_xlim(0, 11.4)
+    ax.set_xticks([0, 3, 6, 9])
+    style(ax)
+axes[0].set_yticks(range(len(LABELS)), [x[1] for x in LABELS])
+axes[0].invert_yaxis()
+footer(fig, 'Medians of 60 retained samples per case across 3 rounds. Thin marks span round medians, not confidence intervals.')
+save(fig, 'performance-snapshot')
+
+# GIN controls stay on the same host as their respective search extension.
+fig, axes = plt.subplots(2, 3, figsize=(17, 10))
+fig.subplots_adjust(left=.14, right=.96, bottom=.21, top=.82, wspace=.55, hspace=.58)
+heading(fig, 'Count queries: compare each engine with its local GIN control',
+        '100,000 Wikipedia articles · warm buffers · exact matching document sets · server medians · each panel has its own scale')
+series = [('stannum', 'stannum', 'Stannum / EC2'), ('stannum', 'gin', 'GIN / EC2'),
+          ('tin', 'tin', 'TIN / PlanetScale'), ('tin', 'gin', 'GIN / PlanetScale')]
+for ax, (key, title) in zip(axes.flat, LABELS + [('miss', 'Absent term')]):
+    values = [SUMMARY[host][f'{engine}:count:{key}']['median_ms'] for host, engine, _ in series]
+    bars = ax.barh(range(4), values, color=[COLORS[e] for _, e, _ in series], height=.6)
+    bars[3].set_hatch('///')
+    ax.bar_label(bars, labels=[f'{v:.3f}' for v in values], padding=5, fontsize=10, color=INK)
+    ax.set_yticks(range(4), [label for _, _, label in series], fontsize=10)
+    ax.invert_yaxis()
+    ax.set_xlim(0, max(values) * 1.35)
+    ax.set_title(title, fontsize=13, color=INK, pad=12)
+    style(ax)
+footer(fig, '60 retained samples per case. GIN is faster on EC2 too: these hosts are not performance-identical. Do not normalize by one ratio.')
+save(fig, 'performance-counts')
+
+# Same-host intervention explains the historical misleading ranking comparison.
+fig, ax = plt.subplots(figsize=(15, 7.5))
+fig.subplots_adjust(left=.24, right=.94, bottom=.27, top=.79)
+heading(fig, 'OFFSET 0 explains the misleading historical comparison',
+        'Same filtered history OR war query, id <= 25,000, top 10 · only the literal OFFSET 0 changes within each host')
+for engine, offset in [('stannum', -.16), ('tin', .16)]:
+    for i, form in enumerate(('no_offset', 'offset0')):
+        row = DATA['offset_pairs'][engine][form]
+        v = row['median_ms']
+        ax.barh(i + offset, v, height=.27, color=COLORS[engine])
+        ax.plot([row['min_ms'], row['max_ms']], [i + offset, i + offset], color=INK, lw=1.5, marker='|', markersize=7)
+        ax.text(row['max_ms'] + .35, i + offset, f'{v:.2f} ms', va='center', color=INK)
+ax.set_yticks([0, 1], ['LIMIT 10', 'LIMIT 10 OFFSET 0'])
+ax.invert_yaxis()
+ax.set_xlim(0, 35)
+style(ax)
+fig.legend(handles=handles, loc='upper left', bbox_to_anchor=(.23, .89), ncol=2, frameon=False)
+fig.text(.055, .18, 'TIN: bounded top-k scan becomes a conjunction plus top-N sort. Equivalent returned IDs/scores; no correctness failure observed.', fontsize=11, color=INK)
+footer(fig, '20 retained samples per form, alternating order. Thin marks show sample min–max. This is a paired plan sensitivity, not a general engine ranking.')
+save(fig, 'performance-offset-zero')
