@@ -593,11 +593,49 @@ def lifecycle_check(case, observed):
     return rows, ([] if rows == expected else ['documented_membership_or_highlight_or_plan_count'])
 
 
+RAW_TEXT_FIXTURE = """
+CREATE TABLE oracle_raw_docs(id int NOT NULL, body text NOT NULL);
+INSERT INTO oracle_raw_docs VALUES
+ (1, 'Mixed CASE rust postgres'),
+ (2, 'mixed case rust slow postgres'),
+ (3, 'café naïve alpha beta'),
+ (4, 'alpha x beta'),
+ (5, E'alpha\\nbeta'),
+ (6, 'alpha beta alpha'),
+ (7, ''),
+ (8, 'alpha, beta');
+CREATE INDEX oracle_raw_idx ON oracle_raw_docs USING {engine}(body);
+"""
+
+
+def raw_text_cases(engine):
+    cases = []
+    for name, query, ids in [
+        ('case_phrase', '"MIXED case"', [1, 2]),
+        ('adjacency', '"rust postgres"', [1]),
+        ('and_not_adjacency', 'rust AND postgres', [1, 2]),
+        ('newline_punctuation', '"alpha beta"', [3, 5, 6, 8]),
+        ('reverse_phrase', '"beta alpha"', [6]),
+        ('repeated_phrase', '"alpha beta alpha"', [6]),
+        ('unicode_phrase', '"café naïve"', [3]),
+        ('negative_phrase', '"rust naïve"', []),
+    ]:
+        quoted = query.replace("'", "''")
+        for path in ('indexed', 'heap'):
+            settings = ('SET enable_seqscan=off; SET enable_indexscan=on; SET enable_bitmapscan=on;'
+                        if path == 'indexed' else
+                        'SET enable_seqscan=on; SET enable_indexscan=off; SET enable_bitmapscan=off;')
+            settings += f'SET {engine}.enable_custom_scan=off;' if engine == 'stannum' else ''
+            cases.append(dict(name=name + '_' + path, expected=[[i] for i in ids], error=None,
+                sql=settings + "SELECT json_build_array(id) FROM oracle_raw_docs WHERE body ==> '" + quoted + "' ORDER BY id"))
+    return cases
+
+
 def run_boundaries(args):
     return run_contracts(args, lifecycle=False)
 
 
-def run_contracts(args, lifecycle=False):
+def run_contracts(args, lifecycle=False, raw_text=False):
     import dataset
     import run as bench
     if args.budget_seconds <= 0 or args.statement_seconds <= 0:
@@ -608,6 +646,8 @@ def run_contracts(args, lifecycle=False):
     cases = lifecycle_cases if lifecycle else boundary_cases
     check_case = lifecycle_check if lifecycle else boundary_check
     table = 'oracle_lifecycle_docs' if lifecycle else 'oracle_boundary_docs'
+    if raw_text:
+        fixture, cases, check_case, table = RAW_TEXT_FIXTURE, raw_text_cases, lifecycle_check, 'oracle_raw_docs'
     source = Path(args.reference_source).resolve()
     if subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain'], text=True).strip():
         raise ValueError('Lead reference checkout must be clean')
@@ -621,6 +661,9 @@ def run_contracts(args, lifecycle=False):
     if lifecycle:
         report.update(rows=4, checks=['membership', 'exact_implicit_explicit_highlights', 'prepared_plan_counts'],
                       scope='tiny statement lifecycle; DML rolled back; no score-bit or performance claims')
+    if raw_text:
+        report.update(rows=8, checks=['explicit_positive_negative_membership', 'indexed_and_heap_paths'],
+                      scope='raw-text witnesses; no scoring or performance claims')
     report['stannum_source'] = bench.provenance(out)
     libdir = Path(subprocess.check_output(['pg_config', '--pkglibdir'], text=True).strip())
     suffix = '.dylib' if platform.system() == 'Darwin' else '.so'
@@ -653,6 +696,17 @@ def run_contracts(args, lifecycle=False):
             values, issues = {}, {}
             for side, case in [('left', left), ('right', right)]:
                 observed = boundary_observe(case, envs[side])
+                if raw_text:
+                    settings, select = case['sql'].rsplit('SELECT ', 1)
+                    plan = json.loads(run(settings + 'EXPLAIN (FORMAT JSON) SELECT ' + select, envs[side]))
+                    def nodes(node):
+                        return [node] + [n for child in node.get('Plans', []) for n in nodes(child)]
+                    plan_nodes = nodes(plan[0]['Plan'])
+                    indexed = any(n.get('Index Name') == 'oracle_raw_idx' for n in plan_nodes)
+                    heap = any(n['Node Type'] == 'Seq Scan' for n in plan_nodes)
+                    if (case['name'].endswith('_indexed') and not indexed) or (case['name'].endswith('_heap') and (indexed or not heap)):
+                        raise ValueError('raw witness did not exercise requested access path: ' + side + ' ' + case['name'] + ' ' + json.dumps(plan))
+                    observed['plan'] = plan
                 values[side], issues[side] = check_case(case, observed)
                 item['observations'][side] = dict(sql=case['sql'], **observed)
             same = values['left'] == values['right']
@@ -708,7 +762,12 @@ def main():
     parser.add_argument("--lifecycle", action="store_true", help="tiny implicit highlighting and prepared-statement lifecycle suite")
     parser.add_argument('--published-corpus', choices=['wikipedia', 'stackexchange'])
     parser.add_argument('--published-source', type=Path, help='benchmarker Git checkout containing the pinned dataset revision')
+    parser.add_argument('--raw-text', action='store_true', help='positive raw-text phrase/analyzer witnesses')
     args = parser.parse_args()
+    if args.raw_text:
+        if args.dataset or args.trace or args.boundaries or args.lifecycle or args.published_corpus or args.published_source:
+            parser.error('--raw-text cannot be combined with another suite')
+        return run_contracts(args, raw_text=True)
     if bool(args.published_corpus) != bool(args.published_source):
         parser.error('--published-corpus and --published-source must be supplied together')
     if args.published_corpus and (not args.dataset or not args.trace or args.boundaries or args.lifecycle):

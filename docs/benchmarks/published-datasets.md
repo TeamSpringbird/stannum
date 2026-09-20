@@ -34,7 +34,8 @@ under `~/Library/Application Support/LeadBenchmarks/datasets/` and are not commi
 No truncation, normalization, ID remapping or row reordering is applied. This is
 deliberately separate from our existing Hugging Face sample format. Use the explicit `--published-corpus wikipedia` option described below for the
 raw Wikipedia directory. The default `--dataset` format remains the older sample
-format. Stack Exchange timing still requires a tokenizer-aware oracle.
+format. Stack Exchange uses tokenizer-aware heap membership checks; keep the separate
+Lead differential gate for independent semantic validation.
 
 For memory pressure, start with full Wikipedia while varying container memory
 and collecting database/index sizes, memory peaks, reads and latency. Then move
@@ -80,7 +81,8 @@ recorded. Duplicate IDs fail the membership-check precondition.
 
 `--query-file /path/to/queries.json` selects an explicit trace. The runner snapshots
 and hashes that JSON and uses the same snapshot for validation and timed traffic.
-IDs must be unique and records must contain normalized ASCII query text plus TIN
+IDs must be unique. Wikipedia records require normalized ASCII query text; raw
+Stack Exchange records preserve punctuation and case. Both require TIN
 and PostgreSQL forms. The full pinned Wikipedia trace remains the default.
 
 `--validation-queries 0` (default) checks every query form. A positive limit selects
@@ -89,11 +91,15 @@ ranked checks. Selected IDs are saved in the manifest. It does not shrink the ti
 trace, and it does not establish correctness for the unchecked forms. The small
 smoke test still checks every form. Keep the independent Lead oracle separate.
 
-`--published-corpus stackexchange` deliberately stops before starting a database:
-that raw corpus contains mixed case and punctuation, so the current normalized-text
-regex oracle is unsuitable. Acquisition and CSV prefix extraction support its
-format, but timed adoption needs a tokenizer-aware membership oracle. Do not
-normalize the imported documents to make the old oracle pass.
+`--published-corpus stackexchange` selects its own 1,254-sample query file by
+default and preserves raw bodies and query text. Its sampled membership check
+compares indexed results with the same engine's operator on an unindexed table,
+using real tokenizer semantics. This detects index/evaluator disagreement but
+is not independent of the engine: run the separate Lead differential gate too.
+Cross-engine membership diagnostics use the Stannum operator versus GIN's
+`simple` analyzer and retain disagreements; do not report those forms as
+same-result performance comparisons. Wikipedia keeps its independent normalized
+lexical check. Explicit `--query-file` overrides remain recorded and hashed.
 
 `--build-memory 2g --memory 512m` separates index construction from query memory:
 the isolated container starts with the build cap, then switches to the query cap

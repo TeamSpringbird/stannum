@@ -139,11 +139,22 @@ def literal(value):
     return "'" + value.replace("'", "''") + "'"
 
 
-def trace_queries(driver, query_file=None):
+def sql_output(text, env):
+    # Large published traces exceed exec argument limits. -c executes a batch
+    # in one transaction; preserve that with --single-transaction for stdin.
+    if len(text.encode('utf-8')) > 65536:
+        return output(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1',
+                       '--single-transaction', '-f', '-'], input=text, env=env)
+    return output(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', text], env=env)
+
+
+def trace_queries(driver, query_file=None, raw_text=False):
     records = json.loads((Path(query_file) if query_file else driver / 'datasets/wikipedia/queries.json').read_text())['queries']
     if not records or len({q['source_id'] for q in records}) != len(records):
         raise ValueError('trace requires unique source IDs and at least one query')
-    if any(not re.fullmatch('[a-z]+(?: [a-z]+)*', q['text']) for q in records):
+    if any(not isinstance(q['text'], str) or not q['text'].strip() for q in records):
+        raise ValueError('trace text must be nonempty')
+    if not raw_text and any(not re.fullmatch('[a-z]+(?: [a-z]+)*', q['text']) for q in records):
         raise ValueError('lexical oracle requires normalized ASCII word queries')
     return [(f"{q['source_id']}:{style}", q['engines']['tin'][style],
              q['engines']['postgres'][style], q['text'])
@@ -166,7 +177,7 @@ def lexical_predicate(name, text):
     return '(' + (' OR ' if style == 'disjunction' else ' AND ').join(terms) + ')'
 
 
-def check_sql(queries, engine='stannum'):
+def check_sql(queries, engine='stannum', raw_text=False):
     # Exact set equality, not just equal counts. The reference has no search index.
     statements = []
     for name, tin, postgres, text in queries:
@@ -174,7 +185,7 @@ def check_sql(queries, engine='stannum'):
                      f"body_tsv @@ to_tsquery('simple', {literal(postgres)})")
         indexed = f'SELECT id FROM documents WHERE {predicate}'
         actual = 'SELECT id FROM indexed JOIN reference USING(id)'
-        reference = (lexical_predicate(name, text) if engine == 'stannum' else
+        reference = ((f'body ==> {literal(tin)}' if raw_text else lexical_predicate(name, text)) if engine == 'stannum' else
                      f"body_tsv @@ to_tsquery('simple', {literal(postgres)})")
         expected = f'SELECT id FROM reference WHERE {reference}'
         statements.append(f"WITH indexed AS MATERIALIZED ({indexed}) SELECT {literal(name)}, count(*), "
@@ -226,12 +237,12 @@ def prepared_plan_sql(query, engine, workload, mode):
             'DEALLOCATE stannum_bench_plan;\nRESET plan_cache_mode;')
 
 
-def semantics_sql(queries):
+def semantics_sql(queries, raw_text=False):
     return '\n'.join(
         f"SELECT {literal(name)}, count(*) FROM reference WHERE "
-        f"({lexical_predicate(name, text)}) IS DISTINCT FROM "
+        f"({('body ==> ' + literal(tin)) if raw_text else lexical_predicate(name, text)}) IS DISTINCT FROM "
         f"(body_tsv @@ to_tsquery('simple',{literal(postgres)}));"
-        for name, _, postgres, text in queries)
+        for name, tin, postgres, text in queries)
 
 
 def validate_result(text, names):
@@ -436,12 +447,11 @@ def run(args):
     if adapter.get('test_binary_sha256') != dataset.sha256(driver / 'pg-driver-test'):
         raise ValueError('driver regression binary does not match recorded build')
     published = getattr(args, 'published_corpus', None)
-    if published == 'stackexchange':
-        raise ValueError('Stack Exchange timing requires a tokenizer-aware membership oracle; data acquisition is supported')
+    raw_text = published == 'stackexchange'
     corpus = published_dataset.inspect(args.dataset, published, json.loads(
         (driver / 'datasets' / published / 'data-manifest.json').read_text())) if published else dataset.verify(args.dataset)
-    trace_path = Path(getattr(args, 'query_file', None) or driver / 'datasets/wikipedia/queries.json').resolve()
-    queries = trace_queries(driver, trace_path)
+    trace_path = Path(getattr(args, 'query_file', None) or driver / 'datasets' / (published or 'wikipedia') / 'queries.json').resolve()
+    queries = trace_queries(driver, trace_path, raw_text=raw_text)
     if len(set(args.engines)) != len(args.engines) or not 0 <= args.updates <= 1000000000:
         raise ValueError('engines must be distinct and updates must be between 0 and 1000000000')
     if args.rows > corpus['rows']:
@@ -465,7 +475,7 @@ def run(args):
                     runner_sha256=LOADED_SOURCES[str(Path(__file__))], harness_sources=LOADED_SOURCES, jobs=[])
     shutil.copy2(trace_path, root / 'queries.json')
     manifest['trace'] = dict(sha256=dataset.sha256(root / 'queries.json'), forms=len(queries))
-    queries = trace_queries(driver, root / 'queries.json')
+    queries = trace_queries(driver, root / 'queries.json', raw_text=raw_text)
     manifest['trace']['forms'] = len(queries)
     queries = validation_queries(queries, getattr(args, 'validation_queries', 0))
     manifest['validation_query_ids'] = [q[0] for q in queries]
@@ -484,7 +494,7 @@ def run(args):
         env.pop(key, None)
     def sql(text, setup=False):
         sql_env = dict(env, PGOPTIONS=f'-c statement_timeout={args.setup_timeout_seconds * 1000} -c jit=off') if setup else env
-        return output(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c', text], env=sql_env)
+        return sql_output(text, sql_env)
     try:
         for engine in args.engines:
             verify_sources(LOADED_SOURCES)
@@ -584,7 +594,7 @@ def run(args):
                                              after_vacuum=workload_state(sql))
                 job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));"))
                 sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
-                oracle = 'SET enable_seqscan=off;\n' + check_sql(queries, engine)
+                oracle = 'SET enable_seqscan=off;\n' + check_sql(queries, engine, raw_text=raw_text)
                 (path / 'correctness.sql').write_text(oracle)
                 started = time.monotonic()
                 text = sql(oracle)
@@ -593,9 +603,10 @@ def run(args):
                 job['full_counts_before'] = {name: int(count) for name, _, count in
                                             (line.split('|') for line in text.splitlines())}
                 job['correctness'] = dict(queries=len(queries), mismatches=0,
+                                          reference='same-engine-unindexed-tokenizer' if raw_text else 'normalized-lexical-or-gin',
                                           sampled_rows=min(args.rows, args.validation_rows),
                                           seconds=time.monotonic() - started)
-                semantics = sql(semantics_sql(queries))
+                semantics = sql(semantics_sql(queries, raw_text=raw_text))
                 (path / 'semantics.txt').write_text(semantics + '\n')
                 differences = {name: int(count) for name, count in
                                (line.split('|') for line in semantics.splitlines()) if int(count)}
@@ -855,7 +866,9 @@ def compare(args):
         patch = source_path.parent / 'source.patch'
         if patch.exists():
             shutil.copy2(patch, root / (variant + '-source.patch'))
-    queries = trace_queries(args.driver.resolve(), getattr(args, 'query_file', None))
+    queries = trace_queries(args.driver.resolve(), getattr(args, 'query_file', None) or
+                            args.driver.resolve() / 'datasets' / (getattr(args, 'published_corpus', None) or 'wikipedia') / 'queries.json',
+                            raw_text=getattr(args, 'published_corpus', None) == 'stackexchange')
     campaign = dict(status='running', repetitions=args.repetitions, sources=sources, images=images,
                     query_ids=[q[0] for q in queries if args.style == 'mixed' or q[0].split(':')[1] == args.style],
                     jobs=paired_jobs(args.repetitions))
