@@ -1,6 +1,6 @@
 {
   "AWSTemplateFormatVersion": "2010-09-09",
-  "Description": "Ephemeral ARM PostgreSQL benchmark host. No inbound access. Delete stack after exporting results.",
+  "Description": "Ephemeral PostgreSQL benchmark host; ARM managed-TIN comparison or x86 published-reference baseline. No inbound access.",
   "Parameters": {
     "Ami": {
       "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
@@ -11,7 +11,8 @@
       "Default": "r8g.large",
       "AllowedValues": [
         "r8g.large",
-        "r7g.large"
+        "r7g.large",
+        "i7i.8xlarge"
       ]
     },
     "DiskGiB": {
@@ -131,6 +132,38 @@
           {
             "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
           }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "OwnedBenchmarkArtifacts",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:ListBucket"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Artifacts",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${Artifacts.Arn}/*"
+                  }
+                }
+              ]
+            }
+          }
         ]
       }
     },
@@ -183,7 +216,7 @@
         ],
         "UserData": {
           "Fn::Base64": {
-            "Fn::Sub": "#!/bin/bash\nset -euo pipefail\n# Schedule termination before installation so a package failure cannot skip it.\ncat > /etc/systemd/system/benchmark-expiry.service <<'UNIT'\n[Unit]\nDescription=Terminate temporary benchmark instance\n[Service]\nType=oneshot\nExecStart=/usr/sbin/poweroff\nUNIT\ncat > /etc/systemd/system/benchmark-expiry.timer <<'UNIT'\n[Unit]\nDescription=Temporary benchmark lifetime limit\n[Timer]\nOnBootSec=${LifetimeHours}h\nUnit=benchmark-expiry.service\n[Install]\nWantedBy=timers.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now benchmark-expiry.timer\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y docker.io git python3-venv ca-certificates jq\nsystemctl enable --now docker\ninstall -d -m 0755 /opt/stannum-benchmark\nuname -a > /opt/stannum-benchmark/kernel.txt\nlscpu > /opt/stannum-benchmark/cpu.txt\nlsblk -o NAME,SIZE,TYPE,MOUNTPOINTS > /opt/stannum-benchmark/disks.txt\ntouch /opt/stannum-benchmark/bootstrap-ready\n"
+            "Fn::Sub": "#!/bin/bash\nset -euo pipefail\n# Schedule termination before installation so a package failure cannot skip it.\ncat > /etc/systemd/system/benchmark-expiry.service <<'UNIT'\n[Unit]\nDescription=Terminate temporary benchmark instance\n[Service]\nType=oneshot\nExecStart=/usr/sbin/poweroff\nUNIT\ncat > /etc/systemd/system/benchmark-expiry.timer <<'UNIT'\n[Unit]\nDescription=Temporary benchmark lifetime limit\n[Timer]\nOnBootSec=${LifetimeHours}h\nUnit=benchmark-expiry.service\n[Install]\nWantedBy=timers.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now benchmark-expiry.timer\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y docker.io git python3-venv python3-boto3 ca-certificates jq curl unzip postgresql-client\n# A newly created instance owns these otherwise empty instance-store disks.\n# Format only a verified, unmounted Amazon instance-store device, never EBS.\nif [ '${InstanceType}' = 'i7i.8xlarge' ]; then\n  systemctl stop docker.service docker.socket\n  DISK=$(lsblk -dn -o PATH,MODEL | awk '/Amazon EC2 NVMe Instance Storage/ {print $1; exit}')\n  test -n \"$DISK\"\n  test -z \"$(lsblk -n -o MOUNTPOINTS \"$DISK\" | tr -d '[:space:]')\"\n  test -z \"$(blkid -s TYPE -o value \"$DISK\" || true)\"\n  mkfs.ext4 -F \"$DISK\"\n  mkdir -p /mnt/benchmark\n  mount \"$DISK\" /mnt/benchmark\n  UUID=$(blkid -s UUID -o value \"$DISK\")\n  echo \"UUID=$UUID /mnt/benchmark ext4 defaults,nofail 0 2\" >> /etc/fstab\n  mkdir -p /mnt/benchmark/docker /mnt/benchmark/work /etc/docker\n  echo '{\"data-root\":\"/mnt/benchmark/docker\"}' > /etc/docker/daemon.json\n  ln -s /mnt/benchmark/work /opt/stannum-benchmark\nelse\n  install -d -m 0755 /opt/stannum-benchmark\nfi\nsystemctl enable --now docker\nuname -a > /opt/stannum-benchmark/kernel.txt\nlscpu > /opt/stannum-benchmark/cpu.txt\nlsblk -o NAME,SIZE,TYPE,MOUNTPOINTS > /opt/stannum-benchmark/disks.txt\ntouch /opt/stannum-benchmark/bootstrap-ready\n"
           }
         },
         "LaunchTemplate": {
@@ -224,6 +257,44 @@
           ]
         }
       }
+    },
+    "Artifacts": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "ExpireTemporaryEvidence",
+              "Status": "Enabled",
+              "ExpirationInDays": 7,
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "Purpose",
+            "Value": "stannum-tin-benchmark"
+          }
+        ]
+      }
     }
   },
   "Outputs": {
@@ -236,6 +307,21 @@
       "Value": {
         "Ref": "AWS::Region"
       }
+    },
+    "ArtifactBucket": {
+      "Value": {
+        "Ref": "Artifacts"
+      }
+    }
+  },
+  "Conditions": {
+    "PublishedHost": {
+      "Fn::Equals": [
+        {
+          "Ref": "InstanceType"
+        },
+        "i7i.8xlarge"
+      ]
     }
   }
 }

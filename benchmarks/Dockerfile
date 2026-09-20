@@ -2,8 +2,8 @@
 #
 # See LICENSE in the repository root for license terms.
 
-# Native ARM64 image: every engine uses exactly this PostgreSQL/runtime build.
-ARG BASE=paradedb/paradedb@sha256:c17153b8b7307734c3aede0393dfe8fa447f4a528ec028b1c3937186ab3ee242
+# Native x86-64 published-reference baseline; every engine shares this runtime.
+ARG BASE=paradedb/paradedb@sha256:9b7e2540dcb9e6e67825b9a2fa665125af1f0c4e488d50f1afa15ae7dd274359
 FROM ${BASE} AS builder
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
