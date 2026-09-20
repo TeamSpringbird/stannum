@@ -55,6 +55,11 @@ settings. GIN uses a stored generated vector and its normal planner.
 `--build-memory` optionally sets a separate construction cap, switched to
 `--memory` before validation and measurement. Set `--maintenance-work-mem`
 explicitly when shrinking container limits; it defaults to 512MB.
+`--build-segment-docs` overrides Stannum's construction batch size for controlled
+memory experiments. Omit it to use the extension default. The override is
+recorded in the configuration and PostgreSQL settings; it applies only to Stannum,
+and paired image comparisons reject trials with different build batch settings.
+Changing the batch size may change the final segment layout and query cost.
 `--engines postgres stannum` reverses order for another repetition.
 
 Build and run commands acquire `/tmp/stannum-pgrx.lock`, shared with native

@@ -511,7 +511,10 @@ def run(args):
                          image['Id'], 'postgres', '-c', f'shared_buffers={args.shared_buffers}',
                          '-c', 'maintenance_work_mem=' + getattr(args, 'maintenance_work_mem', '512MB'), '-c', 'work_mem=16MB',
                          '-c', f'max_parallel_workers={args.cpus}', '-c', 'jit=off',
-                         '-c', 'track_io_timing=on', '-c', f'plan_cache_mode={args.plan_cache_mode}'], stdout=subprocess.DEVNULL)
+                         '-c', 'track_io_timing=on', '-c', f'plan_cache_mode={args.plan_cache_mode}'] +
+                        (['-c', f'stannum.build_segment_docs={args.build_segment_docs}']
+                         if engine == 'stannum' and getattr(args, 'build_segment_docs', None) is not None else []),
+                        stdout=subprocess.DEVNULL)
                 deadline = time.monotonic() + 90
                 while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
                     if time.monotonic() > deadline:
@@ -557,9 +560,20 @@ def run(args):
                 expression = 'gin(body_tsv)' if engine == 'postgres' else 'stannum(body)'
                 sampler.phase = 'index-build'
                 bench.save(path / 'before-build-cgroup.json', resource_snapshot(name))
-                sql(f'CREATE INDEX {index} ON documents USING {expression};', setup=True)
+                build_sql = f'CREATE INDEX {index} ON documents USING {expression};'
+                if engine == 'stannum':
+                    build_sql += " SELECT current_setting('stannum.build_segment_docs');"
+                build_result = sql(build_sql, setup=True)
+                if engine == 'stannum':
+                    job['build_segment_docs'] = int(build_result)
+                    requested = getattr(args, 'build_segment_docs', None)
+                    if requested is not None and job['build_segment_docs'] != requested:
+                        raise ValueError('effective build batch size differs from requested value')
                 bench.save(path / 'after-build-cgroup.json', resource_snapshot(name))
                 job['index_build_seconds'] = time.monotonic() - started
+                if engine == 'stannum':
+                    job['segments_after_build'] = json.loads(sql(
+                        f"SELECT coalesce(json_agg(s ORDER BY ordinal), '[]'::json) FROM stannum.segment_info('{index}') s;"))
                 if job['resource_limits']['build_memory'] != args.memory:
                     sampler.phase = 'query-memory-transition'
                     command(['docker', 'update', '--memory', args.memory, '--memory-swap', args.memory, name],
@@ -726,7 +740,9 @@ def comparison_contract(manifest):
     if manifest['config']['updates'] and job['post_update_correctness']['mismatches'] != 0:
         raise ValueError('trial post-update correctness failed')
     docker = manifest['host']['docker']
-    return dict(resource_limits=job.get('resource_limits'),
+    return dict(build_segment_docs=manifest['config'].get('build_segment_docs'),
+                effective_build_segment_docs=job.get('build_segment_docs'),
+                resource_limits=job.get('resource_limits'),
                 validation_query_ids=manifest.get('validation_query_ids'), trace=manifest.get('trace'), adapter=manifest['adapter'], corpus=manifest['corpus'],
                 harness_sources=manifest['harness_sources'],
                 runner_sha256=manifest['runner_sha256'],
@@ -945,6 +961,8 @@ def main():
     p.add_argument('--build-memory', help='Optional separate build cap; switch to --memory before validation and queries')
     p.add_argument('--shared-buffers', default='1GB')
     p.add_argument('--maintenance-work-mem', default='512MB')
+    p.add_argument('--build-segment-docs', type=bench.positive,
+                   help='Override Stannum construction batch size; default uses the extension setting')
     p.add_argument('--plan-cache-mode', choices=['auto', 'force_custom_plan', 'force_generic_plan'], default='auto')
     p.add_argument('--setup-timeout-seconds', type=bench.positive, default=1800)
     p.add_argument('--port', type=bench.positive, default=28928)
