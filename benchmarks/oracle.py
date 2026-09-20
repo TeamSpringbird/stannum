@@ -200,7 +200,7 @@ def trace_sql(query, engine, topk=False):
 def checked_scores(rows):
     result = {}
     for row in rows:
-        if (not isinstance(row, list) or len(row) != 2 or type(row[0]) is not int
+        if (not isinstance(row, list) or len(row) != 2 or type(row[0]) not in (int, str)
                 or row[0] in result or not math.isfinite(score_value(row[1]))):
             raise ValueError('invalid, duplicate, or nonfinite scored result')
         result[row[0]] = row[1]
@@ -222,6 +222,35 @@ def compare_trace(left, right, topk):
             or sorted(actual, key=score_value, reverse=True) != expected):
         problems.append('top10')
     return problems
+
+
+def published_trace_identity(source, corpus, trace):
+    """Read identities from immutable Git objects, not mutable checkout files."""
+    import published_dataset
+    def pinned(path):
+        return subprocess.check_output(['git', '-C', str(source), 'show',
+            published_dataset.REVISION + ':' + path])
+    base = 'datasets/' + corpus + '/'
+    if Path(trace).read_bytes() != pinned(base + 'queries.json'):
+        raise ValueError('trace differs from pinned published corpus queries')
+    return json.loads(pinned(base + 'data-manifest.json'))
+
+
+def copy_trace_prefix(dataset_root, target, rows, published=False):
+    if published:
+        import published_dataset
+        published_dataset.prefix(dataset_root, target, rows)
+        return
+    count = 0
+    with (Path(dataset_root) / 'documents.csv').open() as src, Path(target).open('w') as dst:
+        reader, writer = csv.reader(src), csv.writer(dst)
+        for row in reader:
+            if count == rows:
+                break
+            writer.writerow(row)
+            count += 1
+    if count != rows:
+        raise ValueError('corpus prefix is shorter than requested')
 
 
 def run_trace(args):
@@ -270,7 +299,15 @@ def run_trace(args):
         return command(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1'], side, sql=statement)
     save()
     try:
-        report['corpus'] = corpus = dataset.verify(args.dataset)
+        published = getattr(args, 'published_corpus', None)
+        if published:
+            import published_dataset
+            manifest = published_trace_identity(args.published_source, published, args.trace)
+            corpus = published_dataset.inspect(args.dataset, published, manifest)
+        else:
+            corpus = dataset.verify(args.dataset)
+        report['corpus'] = corpus
+        report['id_type'] = 'text' if published else 'bigint'
         if args.rows > corpus['rows']:
             raise ValueError('requested rows exceed verified dataset')
         queries = trace_queries(args.trace)
@@ -286,30 +323,23 @@ def run_trace(args):
         guard_paths = [Path(__file__).resolve(), Path(dataset.__file__).resolve(),
                        Path(bench.__file__).resolve(), Path(args.trace).resolve(),
                        libdir / ('stannum' + suffix), libdir / ('tin' + suffix)]
+        if published:
+            guard_paths.append(Path(published_dataset.__file__).resolve())
         report['files'] = {str(p): dataset.sha256(p) for p in guard_paths}
         protocol = root / 'protocol'
         protocol.mkdir()
-        for path in guard_paths[:4]:
+        for path in guard_paths[:4] + (guard_paths[-1:] if published else []):
             shutil.copy2(path, protocol / path.name)
         report['host'] = dict(platform=platform.platform(), cpu_count=os.cpu_count())
         prefix = root / 'input.csv'
-        count = 0
-        with (Path(args.dataset) / 'documents.csv').open() as src, prefix.open('w') as dst:
-            reader, writer = csv.reader(src), csv.writer(dst)
-            for row in reader:
-                if count == args.rows:
-                    break
-                writer.writerow(row)
-                count += 1
-        if count != args.rows:
-            raise ValueError('corpus prefix is shorter than requested')
+        copy_trace_prefix(args.dataset, prefix, args.rows, bool(published))
         report['input_sha256'] = dataset.sha256(prefix)
         report['input_bytes'] = prefix.stat().st_size
         report['files'][str(prefix)] = report['input_sha256']
         report['servers'] = {}
         for side, engine in engines.items():
             sql(f'CREATE EXTENSION IF NOT EXISTS {engine}', side)
-            sql('CREATE TABLE oracle_trace_docs(id bigint PRIMARY KEY, body text NOT NULL)', side)
+            sql(f"CREATE TABLE oracle_trace_docs(id {report['id_type']} PRIMARY KEY, body text NOT NULL)", side)
             owned.append(side)
             with prefix.open('rb') as data:
                 command(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1', '-c',
@@ -669,14 +699,20 @@ def main():
     parser.add_argument("--scores", choices=("bits", "order"), default="bits",
                         help="bits: scores must match bit for bit (TIN); order: match sets and rank "
                              "order must match (the Lead reference, whose corpus size counts empty documents)")
-    parser.add_argument("--dataset", type=Path, help="verified Wikipedia corpus; enables read-only trace mode")
+    parser.add_argument("--dataset", type=Path, help="verified corpus; enables read-only trace mode")
     parser.add_argument("--trace", type=Path, help="published queries.json with TIN forms")
     parser.add_argument("--reference-source", type=Path, help="clean Lead checkout used to build the installed reference")
     parser.add_argument("--budget-seconds", type=int, default=900)
     parser.add_argument("--statement-seconds", type=int, default=60)
     parser.add_argument("--boundaries", action="store_true", help="100-row documented contract checks; separate from mutation/trace suites")
     parser.add_argument("--lifecycle", action="store_true", help="tiny implicit highlighting and prepared-statement lifecycle suite")
+    parser.add_argument('--published-corpus', choices=['wikipedia', 'stackexchange'])
+    parser.add_argument('--published-source', type=Path, help='benchmarker Git checkout containing the pinned dataset revision')
     args = parser.parse_args()
+    if bool(args.published_corpus) != bool(args.published_source):
+        parser.error('--published-corpus and --published-source must be supplied together')
+    if args.published_corpus and (not args.dataset or not args.trace or args.boundaries or args.lifecycle):
+        parser.error('--published-corpus requires dataset trace mode')
     if args.lifecycle:
         if args.boundaries or args.dataset or args.trace:
             parser.error("--lifecycle cannot be combined with another suite")

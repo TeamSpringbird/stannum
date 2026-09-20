@@ -40,22 +40,23 @@ For memory pressure, start with full Wikipedia while varying container memory
 and collecting database/index sizes, memory peaks, reads and latency. Then move
 to Stack Exchange with explicit build/query resource limits. Acquisition alone
 is not a successful index build or a memory-pressure performance result. The
-published trace identity discrepancy remains unresolved; see the
+maintainer has confirmed the full Stack Exchange trace; see the
 [source audit](tin-benchmark-source-audit.md).
 
 The historical 573-record Stack Exchange trace was recovered from commit
 `4b065a745d14fa34569f3c4afee5a3889f0c7e7c` and retained locally as
 `queries.shortened.historical.json` (SHA-256
 `e2bf0eb5d262134fa0241c5a12de6c998b72224c5ec70e5e6245d80c22053a8c`).
-It expands to the article's 1,719 query forms, but its deletion commit says it
-was never used. Keep it separate from the current 1,254-record trace; neither
-should silently replace the other. The standard downloader acquires the current
+It expands to the article's erroneous 1,719 query forms. The maintainer has
+confirmed that the full 1,254-record trace (3,762 forms) was used instead.
+Keep the shortened file only as historical evidence. The standard downloader acquires the current
 pinned trace, not this historical candidate.
 
 Both full CSVs completed size and SHA-256 verification on September 20, 2026.
 [Verification receipts](published-datasets-verification.json) retain the exact
 pinned revision and CSV identities. This verifies upstream file identity; it
-does not prove which query trace generated the article's charts.
+does not pin every run setting behind the article's charts; the maintainer has
+separately confirmed the full Stack Exchange query file.
 
 ## Load the exact Wikipedia corpus through the benchmark
 
@@ -100,3 +101,30 @@ after CREATE INDEX, before VACUUM/validation/prewarm/timed traffic. Both limits
 and the transition are recorded. Without `--build-memory`, the same cap applies
 to the whole lifecycle. `--maintenance-work-mem` is independent of those caps;
 PostgreSQL's setting is not a bound on all extension allocations.
+
+## Published-corpus Lead compatibility gate
+
+The separate differential oracle now accepts either prepared corpus without
+normalizing bodies or remapping IDs. This uses the real Lead tokenizer and
+compares membership, exact full-score bits and candidate top-ten results:
+
+```sh
+python3 benchmarks/oracle.py --left stannum.env --right lead.env \
+  --dataset /path/to/planetscale-stackexchange \
+  --published-corpus stackexchange --published-source /path/to/pinned-benchmarker \
+  --trace /path/to/planetscale-stackexchange/queries.json \
+  --reference-source /path/to/clean-lead-checkout --rows 100 \
+  --budget-seconds 900 --output benchmarks/results/stackexchange-lead-100
+```
+
+The benchmarker checkout must contain the pinned Git revision; manifest and
+trace are read from that immutable commit. The full CSV is checksum-verified
+before extracting a prefix. Verification time includes that read, which can be
+substantial for the 84.5 GB Stack Exchange CSV. Start with a small prefix to
+measure the cost of all 3,762 forms before choosing a routine corpus size.
+The existing 906-form Wikipedia campaign is unchanged.
+
+This loader is covered by harness tests, but a live published-corpus Lead run
+has not yet been completed. Passing empty result sets alone would not prove
+representative coverage; inspect per-query matched-row counts. The timed
+Stack Exchange guard remains until its membership checks are ready.

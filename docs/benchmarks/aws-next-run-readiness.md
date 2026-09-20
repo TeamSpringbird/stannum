@@ -45,5 +45,6 @@ and teardown; reuse it rather than introducing another harness.
 A fresh TIN endpoint will still be required when the local gates pass. Old
 credentials and timing results are not a substitute. Matching vCPU/RAM/storage
 budgets does not establish identical CPU generations or managed-service internals.
-The historical article's query-trace identity is also unresolved; keep a fresh
-same-workload comparison separate from any comparison with its published chart.
+The maintainer confirmed the full Stack Exchange trace: 1,254 samples and
+3,762 AND/OR/phrase forms. Keep fresh measurements separate from the historical
+chart unless the remaining run settings and hardware are also matched.
