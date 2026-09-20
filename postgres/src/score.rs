@@ -605,14 +605,19 @@ impl Ord for FrontierRange {
 /// Unfinished ranges and decoded rows survive every batch. Nothing is thrown
 /// away when SQL filters reject a prefix, and each range is expanded once.
 /// There are deliberately no borrowed cursors: expansion creates cursors and
-/// seeks straight to that range. The caller must retain the originating scorer
+/// seeks straight to that range. Document ordinals reuse a query-local decoded
+/// vector; disjoint ranges scan it monotonically after a binary search. The
+/// caller must retain the originating scorer
 /// unchanged until this frontier is exhausted or dropped.
 ///
-/// Memory is proportional to range metadata plus buffered exact candidates;
+/// Memory is proportional to all source document TIDs, range metadata, and
+/// buffered exact candidates;
 /// loose bounds can require buffering every match. This is not a bounded-memory
 /// replacement for the production top-k heap.
 pub(crate) struct RankedFrontier {
     combine: Combine,
+    /// Frozen document order, decoded once. Positions are dead-inclusive ordinals.
+    documents: Vec<Tid>,
     ranges: BinaryHeap<FrontierRange>,
     rows: BinaryHeap<std::cmp::Reverse<Ranked>>,
     pub(crate) scored: usize,
@@ -628,6 +633,10 @@ pub(crate) struct RankedFrontier {
 }
 
 impl RankedFrontier {
+    pub(crate) fn document_bytes(&self) -> usize {
+        self.documents.capacity() * std::mem::size_of::<Tid>()
+    }
+
     pub(crate) fn complete(&self) -> bool {
         self.ranges.is_empty() && self.rows.is_empty()
     }
@@ -682,7 +691,7 @@ impl RankedFrontier {
                 exact: None,
             });
         }
-        let mut documents = segment_error_in(source.documents(), label);
+        let mut document_ordinal = None;
         let lengths = source.lengths();
         self.posting_seek_ns += seek_ns;
         self.cursor_setup_ns +=
@@ -703,7 +712,13 @@ impl RankedFrontier {
                     || cursors.iter().all(|cursor| cursor.current() == Some(pivot)))
             {
                 let lookup_started = first_lookup_ns.is_none().then(std::time::Instant::now);
-                let found = segment_error_in(documents.rank(pivot), label);
+                let mut ordinal = *document_ordinal
+                    .get_or_insert_with(|| self.documents.partition_point(|tid| *tid < pivot));
+                while self.documents.get(ordinal).is_some_and(|tid| *tid < pivot) {
+                    ordinal += 1;
+                }
+                document_ordinal = Some(ordinal);
+                let found = (self.documents.get(ordinal) == Some(&pivot)).then_some(ordinal as u32);
                 if let Some(started) = lookup_started {
                     first_lookup_ns = Some(started.elapsed().as_nanos() as usize);
                 }
@@ -769,6 +784,7 @@ impl IndexScorer {
         }
         let mut frontier = RankedFrontier {
             combine,
+            documents: Vec::new(),
             ranges: BinaryHeap::new(),
             rows: BinaryHeap::new(),
             scored: 0,
@@ -835,6 +851,16 @@ impl IndexScorer {
             first = successor(last);
         }
         frontier.total_ranges = frontier.ranges.len();
+        if !frontier.ranges.is_empty() {
+            let mut documents = segment_error_in(source.documents(), label);
+            while let Some(tid) = documents.current() {
+                if frontier.documents.len().is_multiple_of(1024) {
+                    pgrx::check_for_interrupts!();
+                }
+                frontier.documents.push(tid);
+                segment_error_in(documents.advance(), label);
+            }
+        }
         frontier.metadata_ns = metadata_started.elapsed().as_nanos() as usize;
         Some(frontier)
     }

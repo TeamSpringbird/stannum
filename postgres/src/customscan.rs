@@ -1877,6 +1877,7 @@ unsafe extern "C-unwind" fn explain(
                     (c"Frontier Ranges Total", frontier.total_ranges),
                     (c"Frontier Peak Buffered Rows", frontier.peak_buffered_rows),
                     (c"Frontier Batches", exec.frontier_batches),
+                    (c"Frontier Document Cache Bytes", frontier.document_bytes()),
                     (c"Frontier Metadata ns", frontier.metadata_ns),
                     (c"Frontier Cursor Setup ns", frontier.cursor_setup_ns),
                     (c"Frontier Posting Seek ns", frontier.posting_seek_ns),
