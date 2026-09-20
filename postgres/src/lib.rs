@@ -1520,6 +1520,91 @@ mod tests {
     }
 
     #[pg_test]
+    fn filtered_literal_prefix_rescans_preserve_consumed_rows() {
+        Spi::run(
+            "CREATE TABLE prefix_rescan(id int primary key, body text);
+             INSERT INTO prefix_rescan SELECT n, 'alpha beta'
+               FROM generate_series(1, 1000) n;
+             CREATE INDEX prefix_rescan_idx ON prefix_rescan USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_material = off;
+             SET LOCAL enable_memoize = off;",
+        )
+        .unwrap();
+        fn ranked_scan(node: &serde_json::Value) -> Option<&serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node);
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(ranked_scan)
+        }
+        for filter in ["id % 4 = 0", "id % 100 = 0 OR id <= 2"] {
+            Spi::run(
+                "SET LOCAL stannum.enable_custom_scan = off;
+                 SET LOCAL enable_bitmapscan = on;",
+            )
+            .unwrap();
+            let expected: Vec<(i32, u32)> = Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, stannum.full_score(ctid) AS score FROM prefix_rescan
+                             WHERE body ==> 'alpha' AND ({filter})
+                             ORDER BY score DESC, id LIMIT 10"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            });
+            Spi::run(
+                "SET LOCAL stannum.enable_custom_scan = on;
+                 SET LOCAL enable_bitmapscan = off;",
+            )
+            .unwrap();
+            // The outer reference is above the relation scan; the constant
+            // ranked scan itself must rewind on each nested-loop iteration.
+            let sql = format!(
+                "SELECT s.id, s.score, s.iteration FROM generate_series(1,3) g
+                 CROSS JOIN LATERAL (SELECT id, stannum.full_score(ctid) AS score,
+                     g AS iteration FROM prefix_rescan
+                     WHERE body ==> 'alpha' AND ({filter})
+                     ORDER BY score DESC LIMIT 10) s"
+            );
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0;
+            let scan = ranked_scan(&plan[0]["Plan"]).expect("ranked custom scan");
+            assert_eq!(scan["Actual Loops"].as_u64(), Some(3), "{plan}");
+            assert_eq!(scan["Top K"], 10, "{plan}");
+            let mut actual = [Vec::new(), Vec::new(), Vec::new()];
+            Spi::connect(|client| {
+                for row in client.select(&sql, None, &[]).unwrap() {
+                    let iteration = row.get::<i32>(3).unwrap().unwrap();
+                    actual[(iteration - 1) as usize].push((
+                        row.get::<i32>(1).unwrap().unwrap(),
+                        row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                    ));
+                }
+            });
+            for (iteration, rows) in actual.iter().enumerate() {
+                assert_eq!(rows, &expected, "{filter}, iteration {iteration}");
+            }
+        }
+    }
+
+    #[pg_test]
     fn segment_info_reports_segments_and_the_write_buffer() {
         Spi::run(
             "CREATE TABLE si(id int primary key, body text);

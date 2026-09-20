@@ -1677,8 +1677,14 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let exec = exec_of(node);
         exec.next = 0;
-        if !exec.runtime_query.is_null() || !exec.runtime_limit.is_null() {
-            crate::score::forget_scan_scorer(exec.scan_id);
+        let parameterized = !exec.runtime_query.is_null() || !exec.runtime_limit.is_null();
+        // Completion removed already-consumed roots from the cached arrays.
+        // A constant rescan must rebuild those arrays, retaining its scorer's
+        // frozen view/statistics. Merely rewinding would omit qualifying rows.
+        if parameterized || exec.top_k_completions > 0 {
+            if parameterized {
+                crate::score::forget_scan_scorer(exec.scan_id);
+            }
             exec.query_bound = exec.runtime_query.is_null();
             exec.bounds_bound = exec.runtime_limit.is_null();
             exec.query_null = false;
@@ -1698,7 +1704,7 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
         if !exec.fallback.is_null() {
             pg_sys::table_rescan(exec.fallback, std::ptr::null_mut());
         }
-        // Counts re-count; constant searches rewind their captured results.
+        // Counts re-count; intact constant searches rewind their captured results.
         // Parameterized ranked searches bind again and rebuild their scorer.
         let cscan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
         if (*cscan).scan.scanrelid == 0 {
