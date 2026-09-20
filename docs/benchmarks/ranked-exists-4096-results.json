@@ -1,0 +1,866 @@
+{
+  "engine": "stannum",
+  "rows": 4096,
+  "cases": [
+    {
+      "query": "and_2_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa AND wordab'",
+      "median_ms": 0.069,
+      "min_ms": 0.057,
+      "max_ms": 0.172,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.048,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "and_2_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa AND wordab' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.061,
+      "min_ms": 0.059,
+      "max_ms": 0.083,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.046,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "or_2_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab'",
+      "median_ms": 0.137,
+      "min_ms": 0.109,
+      "max_ms": 0.524,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.045,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "or_2_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.137,
+      "min_ms": 0.132,
+      "max_ms": 0.396,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.041,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "and_8_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa AND wordab AND wordac AND wordad AND wordae AND wordaf AND wordag AND wordah'",
+      "median_ms": 0.117,
+      "min_ms": 0.109,
+      "max_ms": 0.149,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.066,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "and_8_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa AND wordab AND wordac AND wordad AND wordae AND wordaf AND wordag AND wordah' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.134,
+      "min_ms": 0.129,
+      "max_ms": 0.34,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.066,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "or_8_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah'",
+      "median_ms": 0.3,
+      "min_ms": 0.241,
+      "max_ms": 0.409,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.065,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "or_8_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.731,
+      "min_ms": 0.656,
+      "max_ms": 0.789,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.067,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "exists_ranked",
+      "sql": "SELECT d.id,stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE (d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah') AND (EXISTS (SELECT 1 FROM shape_allowed a WHERE a.id=d.id)) ORDER BY score DESC LIMIT 10",
+      "median_ms": 1.23,
+      "min_ms": 1.209,
+      "max_ms": 1.984,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.113,
+      "plan_nodes": [
+        "Index Only Scan",
+        "Limit",
+        "Nested Loop",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "not_exists_ranked",
+      "sql": "SELECT d.id,stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE (d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah') AND (NOT EXISTS (SELECT 1 FROM shape_allowed a WHERE a.id=d.id)) ORDER BY score DESC LIMIT 10",
+      "median_ms": 1.286,
+      "min_ms": 1.225,
+      "max_ms": 2.672,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.108,
+      "plan_nodes": [
+        "Index Only Scan",
+        "Limit",
+        "Nested Loop",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "correlated_ranked",
+      "sql": "SELECT d.id,stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE (d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah') AND (d.id <= (SELECT min(a.id)+20 FROM shape_allowed a WHERE a.id >= d.id)) ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.677,
+      "min_ms": 0.649,
+      "max_ms": 2.55,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.082,
+      "plan_nodes": [
+        "Index Only Scan",
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "sparse_ranked",
+      "sql": "SELECT d.id,stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE (d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah') AND (d.id % 101 = 0) ORDER BY score DESC LIMIT 10",
+      "median_ms": 1.261,
+      "min_ms": 1.23,
+      "max_ms": 1.941,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.077,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "join_ranked",
+      "sql": "SELECT d.id,stannum.full_score(d.ctid) AS score FROM shape_documents d JOIN shape_allowed a USING(id) WHERE d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah' ORDER BY score DESC LIMIT 10",
+      "median_ms": 1.293,
+      "min_ms": 1.163,
+      "max_ms": 2.526,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.149,
+      "plan_nodes": [
+        "Index Only Scan",
+        "Limit",
+        "Nested Loop",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "materialized_ranked",
+      "sql": "WITH reference AS MATERIALIZED (SELECT d.id, d.body, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah') SELECT id,score FROM reference WHERE id % 7 = 0 ORDER BY score DESC LIMIT 10",
+      "median_ms": 20.09,
+      "min_ms": 18.316,
+      "max_ms": 26.667,
+      "samples": 5,
+      "node": "Seq Scan",
+      "planning_median_ms": 0.138,
+      "plan_nodes": [
+        "CTE Scan",
+        "Limit",
+        "Seq Scan",
+        "Sort"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "lateral_count",
+      "sql": "SELECT sum(n) AS n FROM generate_series(0,6) g CROSS JOIN LATERAL (SELECT count(*) n FROM shape_documents d WHERE (d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah') AND d.id % 7 = g) s",
+      "median_ms": 127.511,
+      "min_ms": 116.56,
+      "max_ms": 135.758,
+      "samples": 5,
+      "node": "Function Scan",
+      "planning_median_ms": 0.097,
+      "plan_nodes": [
+        "Aggregate",
+        "Function Scan",
+        "Nested Loop",
+        "Seq Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "union_count",
+      "sql": "SELECT sum(n) AS n FROM (SELECT count(*) n FROM shape_documents d WHERE (d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah') AND id % 2=0 UNION ALL SELECT count(*) n FROM shape_documents d WHERE (d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah') AND id % 2=1) s",
+      "median_ms": 36.995,
+      "min_ms": 33.365,
+      "max_ms": 38.217,
+      "samples": 5,
+      "node": "Append",
+      "planning_median_ms": 0.154,
+      "plan_nodes": [
+        "Aggregate",
+        "Append",
+        "Seq Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "and_32_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa AND wordab AND wordac AND wordad AND wordae AND wordaf AND wordag AND wordah AND wordai AND wordaj AND wordak AND wordal AND wordam AND wordan AND wordao AND wordap AND wordaq AND wordar AND wordas AND wordat AND wordau AND wordav AND wordaw AND wordax AND worday AND wordaz AND wordba AND wordbb AND wordbc AND wordbd AND wordbe AND wordbf'",
+      "median_ms": 0.382,
+      "min_ms": 0.324,
+      "max_ms": 0.424,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.161,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "and_32_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa AND wordab AND wordac AND wordad AND wordae AND wordaf AND wordag AND wordah AND wordai AND wordaj AND wordak AND wordal AND wordam AND wordan AND wordao AND wordap AND wordaq AND wordar AND wordas AND wordat AND wordau AND wordav AND wordaw AND wordax AND worday AND wordaz AND wordba AND wordbb AND wordbc AND wordbd AND wordbe AND wordbf' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.467,
+      "min_ms": 0.443,
+      "max_ms": 0.521,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.146,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "or_32_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah OR wordai OR wordaj OR wordak OR wordal OR wordam OR wordan OR wordao OR wordap OR wordaq OR wordar OR wordas OR wordat OR wordau OR wordav OR wordaw OR wordax OR worday OR wordaz OR wordba OR wordbb OR wordbc OR wordbd OR wordbe OR wordbf'",
+      "median_ms": 0.786,
+      "min_ms": 0.65,
+      "max_ms": 0.861,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.141,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "or_32_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah OR wordai OR wordaj OR wordak OR wordal OR wordam OR wordan OR wordao OR wordap OR wordaq OR wordar OR wordas OR wordat OR wordau OR wordav OR wordaw OR wordax OR worday OR wordaz OR wordba OR wordbb OR wordbc OR wordbd OR wordbe OR wordbf' ORDER BY score DESC LIMIT 10",
+      "median_ms": 4.253,
+      "min_ms": 3.88,
+      "max_ms": 4.422,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.153,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "and_128_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa AND wordab AND wordac AND wordad AND wordae AND wordaf AND wordag AND wordah AND wordai AND wordaj AND wordak AND wordal AND wordam AND wordan AND wordao AND wordap AND wordaq AND wordar AND wordas AND wordat AND wordau AND wordav AND wordaw AND wordax AND worday AND wordaz AND wordba AND wordbb AND wordbc AND wordbd AND wordbe AND wordbf AND wordbg AND wordbh AND wordbi AND wordbj AND wordbk AND wordbl AND wordbm AND wordbn AND wordbo AND wordbp AND wordbq AND wordbr AND wordbs AND wordbt AND wordbu AND wordbv AND wordbw AND wordbx AND wordby AND wordbz AND wordca AND wordcb AND wordcc AND wordcd AND wordce AND wordcf AND wordcg AND wordch AND wordci AND wordcj AND wordck AND wordcl AND wordcm AND wordcn AND wordco AND wordcp AND wordcq AND wordcr AND wordcs AND wordct AND wordcu AND wordcv AND wordcw AND wordcx AND wordcy AND wordcz AND wordda AND worddb AND worddc AND worddd AND wordde AND worddf AND worddg AND worddh AND worddi AND worddj AND worddk AND worddl AND worddm AND worddn AND worddo AND worddp AND worddq AND worddr AND wordds AND worddt AND worddu AND worddv AND worddw AND worddx AND worddy AND worddz AND wordea AND wordeb AND wordec AND worded AND wordee AND wordef AND wordeg AND wordeh AND wordei AND wordej AND wordek AND wordel AND wordem AND worden AND wordeo AND wordep AND wordeq AND worder AND wordes AND wordet AND wordeu AND wordev AND wordew AND wordex'",
+      "median_ms": 1.638,
+      "min_ms": 1.463,
+      "max_ms": 1.733,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.694,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "and_128_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa AND wordab AND wordac AND wordad AND wordae AND wordaf AND wordag AND wordah AND wordai AND wordaj AND wordak AND wordal AND wordam AND wordan AND wordao AND wordap AND wordaq AND wordar AND wordas AND wordat AND wordau AND wordav AND wordaw AND wordax AND worday AND wordaz AND wordba AND wordbb AND wordbc AND wordbd AND wordbe AND wordbf AND wordbg AND wordbh AND wordbi AND wordbj AND wordbk AND wordbl AND wordbm AND wordbn AND wordbo AND wordbp AND wordbq AND wordbr AND wordbs AND wordbt AND wordbu AND wordbv AND wordbw AND wordbx AND wordby AND wordbz AND wordca AND wordcb AND wordcc AND wordcd AND wordce AND wordcf AND wordcg AND wordch AND wordci AND wordcj AND wordck AND wordcl AND wordcm AND wordcn AND wordco AND wordcp AND wordcq AND wordcr AND wordcs AND wordct AND wordcu AND wordcv AND wordcw AND wordcx AND wordcy AND wordcz AND wordda AND worddb AND worddc AND worddd AND wordde AND worddf AND worddg AND worddh AND worddi AND worddj AND worddk AND worddl AND worddm AND worddn AND worddo AND worddp AND worddq AND worddr AND wordds AND worddt AND worddu AND worddv AND worddw AND worddx AND worddy AND worddz AND wordea AND wordeb AND wordec AND worded AND wordee AND wordef AND wordeg AND wordeh AND wordei AND wordej AND wordek AND wordel AND wordem AND worden AND wordeo AND wordep AND wordeq AND worder AND wordes AND wordet AND wordeu AND wordev AND wordew AND wordex' ORDER BY score DESC LIMIT 10",
+      "median_ms": 2.177,
+      "min_ms": 1.846,
+      "max_ms": 2.253,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.793,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "or_128_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah OR wordai OR wordaj OR wordak OR wordal OR wordam OR wordan OR wordao OR wordap OR wordaq OR wordar OR wordas OR wordat OR wordau OR wordav OR wordaw OR wordax OR worday OR wordaz OR wordba OR wordbb OR wordbc OR wordbd OR wordbe OR wordbf OR wordbg OR wordbh OR wordbi OR wordbj OR wordbk OR wordbl OR wordbm OR wordbn OR wordbo OR wordbp OR wordbq OR wordbr OR wordbs OR wordbt OR wordbu OR wordbv OR wordbw OR wordbx OR wordby OR wordbz OR wordca OR wordcb OR wordcc OR wordcd OR wordce OR wordcf OR wordcg OR wordch OR wordci OR wordcj OR wordck OR wordcl OR wordcm OR wordcn OR wordco OR wordcp OR wordcq OR wordcr OR wordcs OR wordct OR wordcu OR wordcv OR wordcw OR wordcx OR wordcy OR wordcz OR wordda OR worddb OR worddc OR worddd OR wordde OR worddf OR worddg OR worddh OR worddi OR worddj OR worddk OR worddl OR worddm OR worddn OR worddo OR worddp OR worddq OR worddr OR wordds OR worddt OR worddu OR worddv OR worddw OR worddx OR worddy OR worddz OR wordea OR wordeb OR wordec OR worded OR wordee OR wordef OR wordeg OR wordeh OR wordei OR wordej OR wordek OR wordel OR wordem OR worden OR wordeo OR wordep OR wordeq OR worder OR wordes OR wordet OR wordeu OR wordev OR wordew OR wordex'",
+      "median_ms": 2.866,
+      "min_ms": 2.477,
+      "max_ms": 3.036,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.702,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "or_128_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa OR wordab OR wordac OR wordad OR wordae OR wordaf OR wordag OR wordah OR wordai OR wordaj OR wordak OR wordal OR wordam OR wordan OR wordao OR wordap OR wordaq OR wordar OR wordas OR wordat OR wordau OR wordav OR wordaw OR wordax OR worday OR wordaz OR wordba OR wordbb OR wordbc OR wordbd OR wordbe OR wordbf OR wordbg OR wordbh OR wordbi OR wordbj OR wordbk OR wordbl OR wordbm OR wordbn OR wordbo OR wordbp OR wordbq OR wordbr OR wordbs OR wordbt OR wordbu OR wordbv OR wordbw OR wordbx OR wordby OR wordbz OR wordca OR wordcb OR wordcc OR wordcd OR wordce OR wordcf OR wordcg OR wordch OR wordci OR wordcj OR wordck OR wordcl OR wordcm OR wordcn OR wordco OR wordcp OR wordcq OR wordcr OR wordcs OR wordct OR wordcu OR wordcv OR wordcw OR wordcx OR wordcy OR wordcz OR wordda OR worddb OR worddc OR worddd OR wordde OR worddf OR worddg OR worddh OR worddi OR worddj OR worddk OR worddl OR worddm OR worddn OR worddo OR worddp OR worddq OR worddr OR wordds OR worddt OR worddu OR worddv OR worddw OR worddx OR worddy OR worddz OR wordea OR wordeb OR wordec OR worded OR wordee OR wordef OR wordeg OR wordeh OR wordei OR wordej OR wordek OR wordel OR wordem OR worden OR wordeo OR wordep OR wordeq OR worder OR wordes OR wordet OR wordeu OR wordev OR wordew OR wordex' ORDER BY score DESC LIMIT 10",
+      "median_ms": 37.41,
+      "min_ms": 33.574,
+      "max_ms": 39.456,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.723,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "nested_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> '(wordaa OR wordab) AND (wordac OR wordad)'",
+      "median_ms": 0.146,
+      "min_ms": 0.143,
+      "max_ms": 0.233,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.06,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "nested_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> '(wordaa OR wordab) AND (wordac OR wordad)' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.207,
+      "min_ms": 0.2,
+      "max_ms": 0.23,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.056,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "exclude_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> '(wordaa OR wordab) AND NOT (wordac OR wordad)'",
+      "median_ms": 0.228,
+      "min_ms": 0.185,
+      "max_ms": 0.321,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.05,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "exclude_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> '(wordaa OR wordab) AND NOT (wordac OR wordad)' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.252,
+      "min_ms": 0.217,
+      "max_ms": 0.342,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.058,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "redundant_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa OR (wordaa AND wordab)'",
+      "median_ms": 0.109,
+      "min_ms": 0.1,
+      "max_ms": 0.145,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.048,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "redundant_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa OR (wordaa AND wordab)' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.14,
+      "min_ms": 0.129,
+      "max_ms": 0.167,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.048,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "contradiction_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa AND NOT wordaa'",
+      "median_ms": 0.072,
+      "min_ms": 0.071,
+      "max_ms": 0.087,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.039,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "contradiction_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa AND NOT wordaa' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.08,
+      "min_ms": 0.074,
+      "max_ms": 0.085,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.043,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "phrase_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> '\"wordaa wordab\"'",
+      "median_ms": 0.098,
+      "min_ms": 0.09,
+      "max_ms": 0.109,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.042,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "phrase_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> '\"wordaa wordab\"' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.12,
+      "min_ms": 0.11,
+      "max_ms": 0.14,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.04,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "phrase_or_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> '\"wordaa wordab\" OR wordac'",
+      "median_ms": 0.165,
+      "min_ms": 0.145,
+      "max_ms": 0.235,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.04,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "phrase_or_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> '\"wordaa wordab\" OR wordac' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.208,
+      "min_ms": 0.176,
+      "max_ms": 0.236,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.046,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "prefix_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'worda*'",
+      "median_ms": 0.636,
+      "min_ms": 0.522,
+      "max_ms": 0.717,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.13,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "prefix_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'worda*' ORDER BY score DESC LIMIT 10",
+      "median_ms": 1.51,
+      "min_ms": 1.397,
+      "max_ms": 1.703,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.111,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "rare_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'raretoken'",
+      "median_ms": 0.018,
+      "min_ms": 0.017,
+      "max_ms": 0.022,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.035,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "rare_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'raretoken' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.026,
+      "min_ms": 0.023,
+      "max_ms": 0.03,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.042,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "common_rare_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'wordaa OR raretoken'",
+      "median_ms": 0.089,
+      "min_ms": 0.076,
+      "max_ms": 0.117,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.04,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "common_rare_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'wordaa OR raretoken' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.048,
+      "min_ms": 0.037,
+      "max_ms": 0.117,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.048,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "absent_count",
+      "sql": "SELECT count(*) AS n FROM shape_documents d WHERE d.body ==> 'missingtoken'",
+      "median_ms": 0.01,
+      "min_ms": 0.009,
+      "max_ms": 0.012,
+      "samples": 5,
+      "node": "Stannum Count",
+      "planning_median_ms": 0.038,
+      "plan_nodes": [
+        "Stannum Count"
+      ],
+      "strategies": []
+    },
+    {
+      "query": "absent_ranked",
+      "sql": "SELECT d.id, stannum.full_score(d.ctid) AS score FROM shape_documents d WHERE d.body ==> 'missingtoken' ORDER BY score DESC LIMIT 10",
+      "median_ms": 0.013,
+      "min_ms": 0.011,
+      "max_ms": 0.017,
+      "samples": 5,
+      "node": "Stannum Text Search Scan",
+      "planning_median_ms": 0.039,
+      "plan_nodes": [
+        "Limit",
+        "Result",
+        "Stannum Text Search Scan"
+      ],
+      "strategies": []
+    }
+  ],
+  "correctness": [
+    {
+      "case": "and_2_count",
+      "status": "passed"
+    },
+    {
+      "case": "and_2_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "or_2_count",
+      "status": "passed"
+    },
+    {
+      "case": "or_2_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "and_8_count",
+      "status": "passed"
+    },
+    {
+      "case": "and_8_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "or_8_count",
+      "status": "passed"
+    },
+    {
+      "case": "or_8_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "exists_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "not_exists_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "correlated_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "sparse_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "join_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "materialized_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "lateral_count",
+      "status": "passed"
+    },
+    {
+      "case": "union_count",
+      "status": "passed"
+    },
+    {
+      "case": "and_32_count",
+      "status": "passed"
+    },
+    {
+      "case": "and_32_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "or_32_count",
+      "status": "passed"
+    },
+    {
+      "case": "or_32_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "and_128_count",
+      "status": "passed"
+    },
+    {
+      "case": "and_128_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "or_128_count",
+      "status": "passed"
+    },
+    {
+      "case": "or_128_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "nested_count",
+      "status": "passed"
+    },
+    {
+      "case": "nested_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "exclude_count",
+      "status": "passed"
+    },
+    {
+      "case": "exclude_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "redundant_count",
+      "status": "passed"
+    },
+    {
+      "case": "redundant_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "contradiction_count",
+      "status": "passed"
+    },
+    {
+      "case": "contradiction_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "phrase_count",
+      "status": "passed"
+    },
+    {
+      "case": "phrase_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "phrase_or_count",
+      "status": "passed"
+    },
+    {
+      "case": "phrase_or_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "prefix_count",
+      "status": "passed"
+    },
+    {
+      "case": "prefix_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "rare_count",
+      "status": "passed"
+    },
+    {
+      "case": "rare_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "common_rare_count",
+      "status": "passed"
+    },
+    {
+      "case": "common_rare_ranked",
+      "status": "passed"
+    },
+    {
+      "case": "absent_count",
+      "status": "passed"
+    },
+    {
+      "case": "absent_ranked",
+      "status": "passed"
+    }
+  ],
+  "repetitions": 7,
+  "discard": 2,
+  "catalog_sha256": "fccd02623b6091e2859b9d5011fd7612e27e41cc5b918f052488e0382f808f81",
+  "sources": {
+    "query_shapes.py": "9636251f93beb6f95a99b8d1555de3dc9202c517249347c0c277e76300dfb287",
+    "server_times.py": "e25ba33a72e11711d3287a25f8eef30faaa2922e35daeb0b59cbc2288d601d79"
+  },
+  "caveat": "Synthetic temporary-table fixture; warm single-client diagnostics, not capacity or LED equivalence."
+}
