@@ -1,0 +1,224 @@
+{
+  "extension_source_commit": "5864c40",
+  "artifact_sha256": "a1328294afd17445369e776d646071a9884a346528477bb864019e4ba902788e",
+  "runs": [
+    {
+      "seed": 104,
+      "seconds": 30.0,
+      "writers": 2,
+      "readers": 2,
+      "corpus": 400,
+      "wide": true,
+      "wide_coverage": {
+        "wide_or_31": 32,
+        "wide_or_32": 33,
+        "wide_or_128": 33,
+        "wide_or_33": 30
+      },
+      "status": "passed",
+      "stats": {
+        "episodes": 128,
+        "comparisons": 128,
+        "rows_compared": 11290,
+        "cursor_fetches": 258,
+        "writer_ops": 880,
+        "pruned_plans": 128,
+        "custom_plans": 128,
+        "unstable_skipped": 0,
+        "benign_errors": 0,
+        "vacuums": 130,
+        "reindexes": 0,
+        "folds_observed": 12,
+        "seconds": 30.3
+      }
+    },
+    {
+      "seed": 105,
+      "seconds": 45.0,
+      "writers": 3,
+      "readers": 2,
+      "corpus": 2000,
+      "wide": true,
+      "wide_coverage": {
+        "wide_or_31": 20,
+        "wide_or_32": 18,
+        "wide_or_33": 22,
+        "wide_or_128": 16
+      },
+      "status": "passed",
+      "stats": {
+        "episodes": 76,
+        "comparisons": 76,
+        "rows_compared": 5931,
+        "cursor_fetches": 168,
+        "writer_ops": 600,
+        "pruned_plans": 76,
+        "custom_plans": 76,
+        "unstable_skipped": 0,
+        "benign_errors": 0,
+        "vacuums": 114,
+        "reindexes": 0,
+        "folds_observed": 5,
+        "seconds": 46.3
+      }
+    }
+  ],
+  "smoke": [
+    {
+      "seed": 1,
+      "seconds": 35,
+      "writers": 2,
+      "readers": 2,
+      "corpus": 700,
+      "wide": false,
+      "wide_coverage": {},
+      "status": "passed",
+      "stats": {
+        "episodes": 360,
+        "comparisons": 360,
+        "rows_compared": 34287,
+        "cursor_fetches": 333,
+        "writer_ops": 2105,
+        "pruned_plans": 194,
+        "custom_plans": 194,
+        "unstable_skipped": 0,
+        "benign_errors": 0,
+        "vacuums": 325,
+        "reindexes": 0,
+        "folds_observed": 9,
+        "seconds": 35.0
+      }
+    },
+    {
+      "seed": 1,
+      "seconds": 10,
+      "writers": 3,
+      "readers": 2,
+      "corpus": 800,
+      "wide": false,
+      "wide_coverage": {},
+      "status": "passed",
+      "stats": {
+        "episodes": 112,
+        "comparisons": 112,
+        "rows_compared": 9751,
+        "cursor_fetches": 114,
+        "writer_ops": 682,
+        "pruned_plans": 49,
+        "custom_plans": 49,
+        "unstable_skipped": 0,
+        "benign_errors": 0,
+        "vacuums": 110,
+        "reindexes": 1,
+        "folds_observed": 23,
+        "seconds": 10.5
+      }
+    },
+    {
+      "seed": 101,
+      "seconds": 8,
+      "writers": 2,
+      "readers": 1,
+      "corpus": 300,
+      "wide": false,
+      "wide_coverage": {},
+      "status": "passed",
+      "stats": {
+        "episodes": 111,
+        "comparisons": 111,
+        "rows_compared": 6814,
+        "cursor_fetches": 153,
+        "writer_ops": 689,
+        "pruned_plans": 30,
+        "custom_plans": 30,
+        "unstable_skipped": 0,
+        "benign_errors": 0,
+        "vacuums": 123,
+        "reindexes": 1,
+        "folds_observed": 17,
+        "seconds": 8.1
+      }
+    },
+    {
+      "seed": 102,
+      "seconds": 8,
+      "writers": 2,
+      "readers": 2,
+      "corpus": 600,
+      "wide": false,
+      "wide_coverage": {},
+      "status": "passed",
+      "stats": {
+        "episodes": 86,
+        "comparisons": 86,
+        "rows_compared": 6112,
+        "cursor_fetches": 118,
+        "writer_ops": 548,
+        "pruned_plans": 20,
+        "custom_plans": 20,
+        "unstable_skipped": 0,
+        "benign_errors": 0,
+        "vacuums": 78,
+        "reindexes": 0,
+        "folds_observed": 66,
+        "seconds": 8.0
+      }
+    },
+    {
+      "seed": 103,
+      "seconds": 8,
+      "writers": 3,
+      "readers": 2,
+      "corpus": 400,
+      "wide": false,
+      "wide_coverage": {},
+      "status": "passed",
+      "stats": {
+        "episodes": 145,
+        "comparisons": 145,
+        "rows_compared": 12224,
+        "cursor_fetches": 98,
+        "writer_ops": 771,
+        "pruned_plans": 86,
+        "custom_plans": 86,
+        "unstable_skipped": 0,
+        "benign_errors": 0,
+        "vacuums": 111,
+        "reindexes": 0,
+        "folds_observed": 81,
+        "seconds": 8.1
+      }
+    },
+    {
+      "seed": 104,
+      "seconds": 20,
+      "writers": 2,
+      "readers": 2,
+      "corpus": 400,
+      "wide": true,
+      "wide_coverage": {
+        "wide_or_31": 25,
+        "wide_or_32": 25,
+        "wide_or_128": 25,
+        "wide_or_33": 23
+      },
+      "status": "passed",
+      "stats": {
+        "episodes": 98,
+        "comparisons": 98,
+        "rows_compared": 8837,
+        "cursor_fetches": 188,
+        "writer_ops": 658,
+        "pruned_plans": 98,
+        "custom_plans": 98,
+        "unstable_skipped": 0,
+        "benign_errors": 0,
+        "vacuums": 85,
+        "reindexes": 0,
+        "folds_observed": 12,
+        "seconds": 28.0
+      }
+    }
+  ],
+  "note": "Native PostgreSQL 18; concurrent dataset downloads. Correctness only, not timings."
+}

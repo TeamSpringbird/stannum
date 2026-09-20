@@ -45,6 +45,7 @@ PORT = '28938'
 STATEMENT_TIMEOUT_MS = 120_000
 
 VOCABULARY = ['alpha', 'beta', 'gamma', 'delta', 'echo', 'fox', 'golf', 'hotel', 'india', 'juliet']
+WIDE_WORDS = [f'word{chr(97+i//26)}{chr(97+i%26)}' for i in range(128)]
 RARE = ['zed', 'quux']
 FILLER = 'pad'
 
@@ -62,6 +63,8 @@ REGRESSIONS = [
     # Tiny write buffers with reused heap space: retained scorers must keep
     # each document's own length after the buffer index is refreshed.
     dict(seed=103, seconds=8, writers=3, readers=2, corpus=400, fold_bias=True),
+    # Wide OR cursor state across the grouped-pivot boundary.
+    dict(seed=104, seconds=20, writers=2, readers=2, corpus=400, wide=True),
 ]
 
 
@@ -164,8 +167,9 @@ class Session:
 class Corpus:
     """Documents from a few templates so exact score ties abound."""
 
-    def __init__(self, rng):
+    def __init__(self, rng, wide=False):
         self.rng = rng
+        self.wide = wide
         self.templates = []
         for _ in range(14):
             words = []
@@ -187,6 +191,9 @@ class Corpus:
             rng.shuffle(words)
         if rng.random() < 0.2:
             pad = rng.choice([0, 1, 3, 7, 40, 200])
+        if self.wide:
+            # Dense documents exercise many scoring cursors per source; vary overlap.
+            words += WIDE_WORDS if rng.random() < 0.25 else rng.sample(WIDE_WORDS, 32)
         return ' '.join(words + [FILLER] * pad)
 
     def new_ids(self, n):
@@ -214,7 +221,7 @@ class Query:
         self.shape = shape
 
     @staticmethod
-    def generate(rng):
+    def generate(rng, width=None):
         def word():
             pool = VOCABULARY + RARE + ['missing']
             return rng.choice(pool) if rng.random() < 0.15 else rng.choice(VOCABULARY)
@@ -224,6 +231,11 @@ class Query:
 
         def boost():
             return rng.choice(['', '', '', '^2', '^0.5', '^3', '^0', '^1.5'])
+
+        if width is not None:
+            ws = WIDE_WORDS[:width]
+            tinql = ' OR '.join(w + rng.choice(['', '^0.25', '^2']) for w in ws)
+            return Query(tinql, '(' + ' OR '.join(term_regex(w) for w in ws) + ')', f'wide_or_{width}')
 
         shape = rng.choices(
             ['term', 'or2', 'or3', 'and2', 'and3', 'boosted_or', 'boosted_and', 'phrase',
@@ -316,13 +328,15 @@ class Fuzzer:
         for name in ('PGSERVICE', 'PGSERVICEFILE', 'PGPASSWORD'):
             self.env.pop(name, None)
         self.trace = []
-        self.corpus = Corpus(self.rng)
+        self.corpus = Corpus(self.rng, wide=args.wide)
         self.writers = []
         self.readers = []
         self.stats = dict(episodes=0, comparisons=0, rows_compared=0, cursor_fetches=0, writer_ops=0,
                           pruned_plans=0, custom_plans=0, unstable_skipped=0, benign_errors=0,
                           vacuums=0, reindexes=0, folds_observed=0)
         self.schema = []
+        self.wide_queries = 0
+        self.wide_coverage = {}
 
     # -- cluster --------------------------------------------------------------------
     def command(self, args, **kw):
@@ -514,7 +528,11 @@ class Fuzzer:
     # -- readers ----------------------------------------------------------------------
     def reader_query(self, rng):
         """Chooses the SQL for one episode; returns a dict describing it."""
-        query = Query.generate(rng)
+        width = None
+        if self.args.wide:
+            width = (31, 32, 33, 128)[self.wide_queries % 4]
+            self.wide_queries += 1
+        query = Query.generate(rng, width=width)
         scorer = rng.choice(['stannum.full_score(d.ctid)', 'stannum.full_score(d.ctid)', 'stannum.score(d.ctid)'])
         limit = rng.choice(LIMITS)
         offset = rng.choice(OFFSETS)
@@ -525,6 +543,10 @@ class Fuzzer:
         weights = dict(plain=50, cursor=getattr(self.args, 'cursor_weight', 40),
                        twin=getattr(self.args, 'twin_weight', 6))
         mode = rng.choices(list(weights), weights=list(weights.values()))[0]
+        if self.args.wide:
+            scorer = 'stannum.full_score(d.ctid)'
+            mode = rng.choice(['cursor', 'cursor', 'twin'])
+            limit = rng.choice([10, 31, 127, 128, 129])
         isolation = rng.choice(['REPEATABLE READ', 'REPEATABLE READ', 'REPEATABLE READ', 'READ COMMITTED'])
         from_clause = 'docs d JOIN keep k USING (id)' if join else 'docs d'
         where = f"d.body ==> {sql_literal(query.tinql)}"
@@ -612,6 +634,14 @@ class Fuzzer:
         oracle, visible, roots, failure = self.oracle_of(spec, by_statement)
         if failure:
             return failure
+        if self.args.wide:
+            # Assert the intended path, independently of result equality.
+            planned = reader.run(['EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) ' + spec['custom']])
+            plan = json.loads('\n'.join(planned[0][1]))[0]['Plan']
+            self.note_plan(plan)
+            if not has_node(plan, 'block-max', key='Pruning'):
+                return Failure('wide query did not exercise block-max pruning', spec=describe(spec), plan=plan)
+            self.wide_coverage[spec['query'].shape] = self.wide_coverage.get(spec['query'].shape, 0) + 1
         expected = oracle[spec['offset']:spec['offset'] + spec['limit']]
         self.stats['comparisons'] += 1
         if spec['mode'] == 'plain':
@@ -827,7 +857,7 @@ class Fuzzer:
             self.stats['seconds'] = round(time.monotonic() - started, 1)
             report = self.report(failure)
             self.stop_cluster()
-            if failure is None and not args.keep:
+            if report['status'] == 'passed' and not args.keep:
                 shutil.rmtree(self.root, ignore_errors=True)
         return report
 
@@ -841,8 +871,12 @@ class Fuzzer:
 
     def report(self, failure):
         args = self.args
+        if self.args.wide and failure is None and set(self.wide_coverage) != {
+                f'wide_or_{n}' for n in (31, 32, 33, 128)}:
+            failure = Failure('wide-query coverage incomplete; increase duration', coverage=self.wide_coverage)
         summary = dict(seed=args.seed, seconds=args.seconds, writers=args.writers, readers=args.readers,
-                       corpus=args.corpus, status='failed' if failure else 'passed', stats=self.stats)
+                       corpus=args.corpus, wide=args.wide, wide_coverage=self.wide_coverage,
+                       status='failed' if failure else 'passed', stats=self.stats)
         if failure:
             summary['failure'] = failure.what
             summary['detail'] = {k: v for k, v in failure.detail.items()}
@@ -851,7 +885,7 @@ class Fuzzer:
                 f.write(f'-- Stannum ranked-scan fuzz failure: {failure.what}\n')
                 f.write(f'-- Reproduce: python3 postgres/tests/ranked_fuzz.py --seed {args.seed} '
                         f'--seconds {args.seconds} --writers {args.writers} --readers {args.readers} '
-                        f'--corpus {args.corpus}\n')
+                        f'--corpus {args.corpus}' + (' --wide' if args.wide else '') + '\n')
                 for key, value in failure.detail.items():
                     f.write(f'-- {key}: {json.dumps(value, default=str)}\n')
                 f.write('-- Statements in issue order; each session is a separate connection.\n')
@@ -903,6 +937,7 @@ def build_parser():
     parser.add_argument('--corpus', type=int, default=1500, help='initial documents')
     parser.add_argument('--port', default=PORT)
     parser.add_argument('--stop-at', type=int, default=0, help='stop after this many episodes')
+    parser.add_argument('--wide', action='store_true', help='Cursor/twin episodes with 31/32/33/128 distinct OR terms')
     parser.add_argument('--keep', action='store_true', help='keep the cluster directory on success')
     parser.add_argument('--smoke', action='store_true', help='fixed seeds and the regression list, under two minutes')
     return parser

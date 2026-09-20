@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [exact published dataset acquisition](published-datasets.md) prepares the
+Wikipedia and Stack Exchange corpora for larger working-set experiments.
+
 The [concurrent wide-query experiment](wide-contention.md) extends the paired
 optimization measurements to competing readers and match-changing writes.
 

@@ -1,0 +1,22 @@
+{
+  "wikipedia": {
+    "revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+    "corpus": "wikipedia",
+    "csv": {
+      "file": "data.csv",
+      "bytes": 8093810896,
+      "sha256": "7e4cba73338f9aba3a344de9f7d63007fa51f0f4ee85d70d7bd34fe95ff6e9a8"
+    },
+    "status": "verified"
+  },
+  "stackexchange": {
+    "revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+    "corpus": "stackexchange",
+    "csv": {
+      "file": "data.csv",
+      "bytes": 84521226768,
+      "sha256": "47ce825b89b8acaefc7b3b5b17fdaddf61ec0788bc075b88a5750f06fe34d03b"
+    },
+    "status": "verified"
+  }
+}
