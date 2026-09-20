@@ -917,6 +917,30 @@
     "segment/src/maintenance/validate.rs": {
       "owner": "ben",
       "evidence": "Original Stannum streaming cross-term validation."
+    },
+    "benchmarks/aws/count-probe.sh": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/count_probe.py": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "segment/examples/count_paths.rs": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/count_visibility.py": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/query_comparison.py": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/test_query_comparison.py": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
     }
   }
 }

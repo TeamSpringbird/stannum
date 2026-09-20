@@ -1,6 +1,8 @@
 #!/bin/bash
 # Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
 # See LICENSE in the repository root for license terms.
+
 # Run only after the benchmark sweep has finished on the owned temporary host.
 set -euo pipefail
 BENCH_ROOT=/opt/stannum-benchmark
