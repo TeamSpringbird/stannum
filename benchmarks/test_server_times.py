@@ -31,6 +31,7 @@ class ServerTimesTests(unittest.TestCase):
         self.assertEqual([p[0]["Execution Time"] for p in plans], [1, 4, 2, 3])
         script = run.call_args.kwargs["input"]
         self.assertLess(script.index("PREPARE a"), script.index("EXPLAIN"))
+        self.assertEqual(script.count("EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING OFF, FORMAT JSON)"), 4)
         self.assertEqual(server_times.measurement_order(2, 2, True),
                          [(0, 0), (1, 0), (1, 1), (0, 1)])
 

@@ -52,7 +52,7 @@ def explain_all(engine, queries, repetitions, disable_seqscan, env, setup=(), in
     order = measurement_order(len(queries), repetitions, interleave)
     for i, _ in order:
         sql = queries[i][1]
-        script.append(f"EXPLAIN (ANALYZE, FORMAT JSON) {sql.rstrip(';')};")
+        script.append(f"EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING OFF, FORMAT JSON) {sql.rstrip(';')};")
     result = subprocess.run(["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
                             input="\n".join(script), env=env, text=True, capture_output=True)
     if result.returncode != 0:

@@ -102,8 +102,8 @@ is a separate resource: the user deletes that database after results are exporte
    verification separate. GIN ranking is not a BM25-equivalent baseline.
 6. Use identical `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING OFF, FORMAT JSON)`
    on both systems. Save every raw plan, planning time, execution time and client
-   elapsed time separately. Existing server_times.py still defaults to node timing
-   on; align it or use the existing tin_experiments.py collector before running.
+   elapsed time separately. Both server_times.py and tin_experiments.py now use this instrumentation
+   policy; preserve collector revisions because historical runs used different options.
 7. Start with a warmed, single-client run: five warmups then at least 20 retained
    repetitions per query, alternating query order, across three independent rounds.
    Report medians and spread. Do not label warmed runs as cold-cache tests. Managed
