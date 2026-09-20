@@ -28,3 +28,5 @@ Run commands from the repository root. Keep raw results in ignored
   two controlled experiments, negative results, and the next ranked-search target.
 - [Filtered top-k retry experiments](benchmarks/filtered-prefix-ranking.md):
   targeted wins, adversarial regressions, and limits of repeated ranking.
+
+- [TIN documentation contracts and test gaps](research/tin-search-documentation.md): September 2026 review of language, scoring, SQL shapes, operations and targeted oracle follow-ups.
