@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [wide-disjunction optimization](grouped-wand.md) records repeated synthetic
+and Wikipedia measurements, following the [ranked EXISTS fix](ranked-exists.md).
+
 The [query-shape suite](query-shapes.md) adds wide Boolean expressions and SQL
 integration cases, with independent membership checks and explicit failure reporting.
 
