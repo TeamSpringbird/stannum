@@ -1,20 +1,58 @@
-# Performance priorities after the wide-disjunction optimization
+# Performance and benchmark burndown
 
-This is a task order, not a percentage of TIN implemented. Correctness against
-upstream Lead remains a separate gate; GIN and remote TIN timings alone cannot
-establish compatibility or production capacity.
+Updated 2026-09-20. This is an ordered work list, not a percentage of TIN
+implemented. Lead remains the independent semantic oracle. Published TIN,
+managed-service observations, and local measurements are separate evidence.
 
-| Priority | Task | Evidence required to call it done |
+## Current state
+
+- PR #77 is merged: ranked correctness is checked again after concurrent updates.
+- Both published corpora are downloaded and checksum-verified. The confirmed
+  Stack Exchange trace contains 1,254 samples / 3,762 AND/OR/phrase forms.
+- The 1,000-document Stack Exchange Lead run passed all 3,762 forms. Larger
+  same-engine membership and exhaustive ranked checks also have retained receipts.
+- A four-workload local campaign is running: each engine gets 600 seconds on
+  100,000-document prefixes, with four CPUs, 2 GiB memory and two clients.
+  It checks 90 selected forms; that is not full-trace correctness verification.
+  Builds and engines are serialized, but this is a shared development machine.
+  Interactive site work during the campaign is a source of uncontrolled load.
+- The article preserves published series and explicitly synthetic local fixtures.
+  Completed measurements are imported separately; fixtures are not benchmark data.
+- Draft PRs #61, #63 and #69 remain experimental merge-spill work. Draft #45
+  remains a filtered top-K experiment with known regressions. None is a release gate
+  for measuring current main, and none should merge simply to clear the queue.
+
+## Ordered priorities
+
+| Rank | Work | Evidence required to call it done |
 |---|---|---|
-| 1 | Reduce remaining merge retention, then bound execution memory | [Output allocation reuse](merge-output-reuse.md) cuts the measured merge peak from 1,298 to 831 MiB and lets the million-row small-batch case complete at 2 GiB. Both versions still OOM on the default 500k build at 1.25 GiB. [Earlier publication-buffer release](release-published-segment.md) also preserves correctness but still OOMs at 1.25 GiB. Next budget retained inputs/output and account for allocator retention, directory limits and read amplification. Keep the existing batch default. |
-| 2 | Profile hot ranked OR cursor work, retaining broad cache-pressure controls | The [focused trace](targeted-memory.md) removes the observed low-memory penalty and scales from 286 to 578 QPS with two versus four readers. The long OR remains about 36 ms while scoring only 134 candidates. Attribute cursor/bound work, then prove a candidate change with repeated hot and broad-trace controls. Keep larger-working-set and mixed-write capacity separate. |
-| 3 | Close the query-shape coverage gaps | Add fuzzy/regex/proximity, deeply nested Boolean trees, large K/OFFSET and secondary sorts, partitioned ranked queries, and cross-session snapshot/locking scenarios. Keep the routine Lead oracle within its roughly 15-minute budget; use larger same-engine checks for scale. |
-| 4 | Sustain wide ranked queries with mixed writes and maintenance | The [bounded concurrency diagnostic](wide-contention.md) and 31/32/33/128-term cursor fuzzer pass. Extend to larger working sets, inserts/deletes/updates and VACUUM, reporting actual writes, read tails and errors. Quiescent exact ranking and live membership checks remain separate because score statistics are not MVCC-frozen. |
-| 5 | Revisit filtered top-K continuation | Preserve the fast initial top-K search; activate continuation only after filter shortfall. Prove bounded memory, multi-source correctness and concurrent behavior, and repeat both winning and regressing controls before enabling it. Draft PR #45 and the decoded-document cache prototype are not ready to merge. |
-| 6 | Reproduce the published benchmark environment and prepare publication | Use exact prepared data, confirmed query traces and matching hardware/settings. Rerun open-source baselines alongside Stannum; distinguish those measurements from published TIN reference numbers. Preserve disagreements and failures. Do not assume access to a local TIN binary. |
-| 7 | Consolidate benchmark entry points | Retire old harnesses only after their distinct correctness, mutation and maintenance coverage is represented in the retained tools. Keep the Lead oracle separate from large-scale throughput tests. |
+| 1 | Finish and audit the four ten-minute local workloads | Both engines complete each workload; retain failures, query errors, actual durations, distinct query-form coverage, achieved update counts, validation scope and resource samples. Check the mixed AND/OR/phrase, AND+phrase, OR+updates and Wikipedia OR-count configurations. Verify exported charts against receipts before replacing fixtures. Never pad a short run or silently omit a failed engine. |
+| 2 | Establish repeatability and complete workload coverage | Reuse existing repeated/paired measurement support. Run at least three quiet repetitions of the workloads that will support claims, alternating engine order. Report run-to-run spread, p50/p95/p99, throughput and coverage. If a 600-second window misses forms, keep the time-limited result and add a separately labeled coverage-complete run; do not substitute its aggregate silently. Measure timing without profilers or concurrent builds. |
+| 3 | Move beyond the resident 100k subsets | Start with the verified 5,032,104-row Wikipedia corpus, keeping construction and query limits separate. Record load/build time, heap/index/WAL sizes, build/query memory, reads, OOMs and temporary/spill usage where available. Vary memory around the measured working set. Then use increasing Stack Exchange prefixes, with full 150-million-row construction reserved for appropriately sized infrastructure. Retain the broad trace, not only hot queries. |
+| 4 | Finish bounded merge memory where scale measurements justify it | Compose the existing streaming dictionary/postings/payload readers with whole-segment and document ownership validation; then integrate incremental output and account for document maps, source caches and retained inputs/output. Demonstrate a measured peak-memory bound, cancellation, rollback, orphan cleanup and crash recovery. Output-buffer spilling alone does not bound the entire operation. Reuse drafts #61/#63/#69 rather than promote them prematurely. |
+| 5 | Profile the expensive ranked query families | Use the completed per-family/per-query evidence to choose targets, with wide OR the current candidate. Attribute time to cursor advance, block bounds, decoding, scoring, filtering and heap work in separate diagnostic runs. Implement one change at a time, prove it against repeated broad-trace controls, and check AND/phrase regressions. Keep draft #45 disabled until its losing cases are understood. |
+| 6 | Expand semantic and concurrent-maintenance coverage | Keep the routine Lead gate near 15 minutes and pinned to an upstream revision. Add focused fuzzy/regex/proximity, nested Boolean, large K/OFFSET, secondary-sort and partition cases; extend current whitespace updates with inserts, deletes, indexed/non-indexed updates and VACUUM. Test snapshot/locking behavior separately. Require no incorrect rows or crashes; use quiescent ranked checks where concurrent corpus statistics prevent a stable score oracle. Track shared Lead bugs as diagnostics rather than silently changing compatibility. |
+| 7 | Run the controlled AWS comparison | Freeze candidate image/source, driver, data/query hashes and settings. For comparison with published TIN, use the documented published hardware/resource target and open-source baselines; this does not require a live TIN server. A fresh live TIN comparison is a separate managed PlanetScale experiment. Preserve server execution time separately from client time, repeat measurements, export raw evidence, then verify teardown. State remaining CPU/storage/settings differences; do not scale TIN numbers by a GIN ratio. |
+| 8 | Finish the article and consolidate tooling | Replace fixtures only with audited measured series and unambiguous provenance. Show original published results separately from local/AWS runs, including unsupported workloads and failures. Retire harnesses only after mapping and preserving their distinct correctness, mutation, maintenance and recovery coverage. Keep Lead checks separate from throughput tests. |
 
-Already demonstrated: PR #51 fixes ranked EXISTS/NOT EXISTS; all 44 query-shape
-cases pass. PR #52 reduces the measured 128-term synthetic OR from about 147 to
-57 ms, and a 32-term Wikipedia OR from about 52 to 46 ms. Those are single-client
-observations, not a claim of being faster than TIN. See [the paired evidence](grouped-wand.md).
+## Parallel work and decision rules
+
+While the current timed campaign runs, work on the evidence inventory, review
+existing profiles, plan coverage and audit documentation. Do not launch another
+benchmark, compilation or heavy verification job on this host.
+
+After it finishes, prioritize #2 and #3 over speculative query optimizations.
+If larger construction fails due to retained merge memory, #4 becomes the next
+implementation task. If the working set fits comfortably and ranked OR dominates,
+#5 moves ahead. A confirmed correctness failure takes precedence over either.
+The measurement and correctness tracks may have independent code owners, but
+their local execution still shares the benchmark/test lock.
+
+No remaining optimization is a prerequisite to taking an honest AWS baseline
+of current main. Repeated local measurements and an explicit resource/run plan
+reduce wasted cloud time; they are not reasons to withhold existing results.
+
+See [AWS readiness](aws-next-run-readiness.md),
+[raw scale/update receipts](raw-scale-and-updates.md),
+[published-trace protocol](published-trace.md), and
+[verified datasets](published-datasets.md).
