@@ -1605,6 +1605,168 @@ mod tests {
     }
 
     #[pg_test]
+    fn ranked_frontier_preserves_filtered_order_and_continuation() {
+        Spi::run(
+            "CREATE TABLE frontier_docs(id int primary key, body text, eligible bool)
+               WITH (fillfactor=50);
+             INSERT INTO frontier_docs SELECT n,
+               repeat('alpha ',1+n%5) || CASE WHEN n%3=0 THEN 'beta beta' ELSE 'gamma' END,
+               CASE WHEN n%7=0 THEN NULL ELSE n%4=0 END FROM generate_series(1,1200) n;
+             CREATE INDEX frontier_docs_idx ON frontier_docs USING stannum(body);
+             UPDATE frontier_docs SET eligible=false WHERE id=4;
+             UPDATE frontier_docs SET eligible=true WHERE id=5;
+             DELETE FROM frontier_docs WHERE id=8;
+             SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+        fn rows(sql: &str) -> Vec<(i32, u32)> {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        }
+        fn scan(node: &serde_json::Value) -> Option<&serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node);
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(scan)
+        }
+        assert_eq!(
+            Spi::get_one::<String>("SHOW stannum.experimental_ranked_frontier")
+                .unwrap()
+                .as_deref(),
+            Some("off")
+        );
+        for query in [
+            "alpha",
+            "alpha OR beta",
+            "alpha AND beta",
+            "alpha AND absentword",
+        ] {
+            for (filter, bound) in [
+                ("eligible", "LIMIT 10"),
+                ("id > 0", "LIMIT 10"),
+                ("id % 100 = 0 OR id <= 2", "LIMIT 10"),
+                ("id > 1190", "LIMIT 10"),
+                ("id > 1200", "LIMIT 10"),
+                ("eligible", "LIMIT 1100 OFFSET 7"),
+            ] {
+                let base = format!(
+                    "SELECT id, stannum.full_score(ctid) AS score FROM frontier_docs WHERE body ==> '{query}' AND ({filter}) ORDER BY score DESC"
+                );
+                Spi::run(
+                    "SET LOCAL stannum.enable_custom_scan=off; SET LOCAL enable_bitmapscan=on;",
+                )
+                .unwrap();
+                let expected = rows(&format!("{base}, id {bound}"));
+                Spi::run("SET LOCAL stannum.enable_custom_scan=on; SET LOCAL enable_bitmapscan=off; SET LOCAL stannum.experimental_ranked_frontier=on;").unwrap();
+                let sql = format!("{base} {bound}");
+                assert_eq!(rows(&sql), expected, "{query} {filter} {bound}");
+                let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                let node = scan(&plan[0]["Plan"]).expect("ranked scan");
+                assert_eq!(
+                    node["Candidate Strategy"], "resumable ranked frontier (experimental)",
+                    "{plan}"
+                );
+                assert_eq!(node["Exhaustive Score Calls"], 0);
+                assert_eq!(node["Top-K Completions"], 0);
+                assert!(
+                    node["Frontier Ranges Expanded"].as_u64().unwrap()
+                        <= node["Frontier Ranges Total"].as_u64().unwrap()
+                );
+                assert!(node["Frontier Score Calls"].as_u64().unwrap() <= 1200);
+                Spi::run(&format!("DECLARE frontier_cursor CURSOR FOR {sql}")).unwrap();
+                let mut actual = rows("FETCH 2 FROM frontier_cursor");
+                actual.extend(rows("FETCH 3 FROM frontier_cursor"));
+                actual.extend(rows("FETCH ALL FROM frontier_cursor"));
+                assert_eq!(actual, expected, "cursor {query} {filter}");
+                Spi::run("CLOSE frontier_cursor").unwrap();
+            }
+        }
+        // Repeated constant scans rewind all captured rows and then resume any
+        // unfinished frontier, without dropping rows consumed by an earlier loop.
+        Spi::run("SET LOCAL enable_material=off; SET LOCAL enable_memoize=off;").unwrap();
+        let expected = rows(
+            "SELECT id, stannum.full_score(ctid) AS score FROM frontier_docs WHERE body ==> 'alpha' AND eligible ORDER BY score DESC LIMIT 10",
+        );
+        let mut actual = [Vec::new(), Vec::new(), Vec::new()];
+        Spi::connect(|client| {
+            for row in client.select("SELECT s.id,s.score,s.iteration FROM generate_series(1,3) g CROSS JOIN LATERAL (SELECT id,stannum.full_score(ctid) AS score,g AS iteration FROM frontier_docs WHERE body ==> 'alpha' AND eligible ORDER BY score DESC LIMIT 10) s",None,&[]).unwrap() {
+                actual[(row.get::<i32>(3).unwrap().unwrap()-1) as usize].push((row.get::<i32>(1).unwrap().unwrap(),row.get::<f32>(2).unwrap().unwrap().to_bits()));
+            }
+        });
+        for result in actual {
+            assert_eq!(result, expected);
+        }
+        // A phrase and a second source must retain the production fallback.
+        for query in ["\"alpha beta\"", "alpha"] {
+            if query == "alpha" {
+                Spi::run("INSERT INTO frontier_docs VALUES (2000,'alpha beta',true)").unwrap();
+            }
+            let plan=Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM frontier_docs WHERE body ==> '{query}' AND eligible ORDER BY stannum.full_score(ctid) DESC LIMIT 10")).unwrap().unwrap().0;
+            assert!(
+                scan(&plan[0]["Plan"]).unwrap()["Candidate Strategy"].is_null(),
+                "{plan}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn ranked_frontier_cursor_keeps_frozen_scores() {
+        Spi::run(
+            "CREATE TABLE frontier_twin(id int primary key,body text);
+            INSERT INTO frontier_twin SELECT n,'alpha beta' FROM generate_series(1,1000) n;
+            CREATE INDEX frontier_twin_idx ON frontier_twin USING stannum(body);
+            SET LOCAL enable_seqscan=off;",
+        )
+        .unwrap();
+        fn rows(sql: &str) -> Vec<(i32, u32)> {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        }
+        let base = "SELECT id,stannum.full_score(ctid) AS score FROM frontier_twin WHERE body ==> 'alpha' AND id%4=0 ORDER BY score DESC";
+        Spi::run("SET LOCAL stannum.enable_custom_scan=off").unwrap();
+        let before = rows(&format!("{base},id LIMIT 12"));
+        Spi::run(&format!("SET LOCAL stannum.enable_custom_scan=on; SET LOCAL enable_bitmapscan=off; SET LOCAL stannum.experimental_ranked_frontier=on; DECLARE frontier_a CURSOR FOR {base} LIMIT 12")).unwrap();
+        let mut actual_a = rows("FETCH 2 FROM frontier_a");
+        Spi::run("INSERT INTO frontier_twin SELECT n,'alpha alpha alpha alpha' FROM generate_series(2001,2200) n; SET LOCAL stannum.enable_custom_scan=off; SET LOCAL enable_bitmapscan=on").unwrap();
+        let after = rows(&format!("{base},id LIMIT 12"));
+        assert_ne!(before, after);
+        Spi::run(&format!("SET LOCAL stannum.enable_custom_scan=on; SET LOCAL enable_bitmapscan=off; DECLARE frontier_b CURSOR FOR {base} LIMIT 12")).unwrap();
+        let mut actual_b = rows("FETCH 2 FROM frontier_b");
+        actual_a.extend(rows("FETCH ALL FROM frontier_a"));
+        actual_b.extend(rows("FETCH ALL FROM frontier_b"));
+        assert_eq!(actual_a, before);
+        assert_eq!(actual_b, after);
+        Spi::run("CLOSE frontier_a; CLOSE frontier_b").unwrap();
+    }
+
+    #[pg_test]
     fn segment_info_reports_segments_and_the_write_buffer() {
         Spi::run(
             "CREATE TABLE si(id int primary key, body text);

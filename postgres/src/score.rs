@@ -573,6 +573,242 @@ impl Ord for Ranked {
     }
 }
 
+/// A disjoint, not-yet-decoded range of one frozen source. Heap order puts
+/// the highest admissible bound first, breaking ties by its earliest TID.
+struct FrontierRange {
+    first: Tid,
+    last: Tid,
+    bound: f32,
+}
+
+impl PartialEq for FrontierRange {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for FrontierRange {}
+impl PartialOrd for FrontierRange {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for FrontierRange {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.bound
+            .total_cmp(&other.bound)
+            .then(other.first.cmp(&self.first))
+    }
+}
+
+/// Experimental exact ranked continuation over a single frozen source.
+///
+/// Unfinished ranges and decoded rows survive every batch. Nothing is thrown
+/// away when SQL filters reject a prefix, and each range is expanded once.
+/// There are deliberately no borrowed cursors: expansion creates cursors and
+/// seeks straight to that range. The caller must retain the originating scorer
+/// unchanged until this frontier is exhausted or dropped.
+///
+/// Memory is proportional to range metadata plus buffered exact candidates;
+/// loose bounds can require buffering every match. This is not a bounded-memory
+/// replacement for the production top-k heap.
+pub(crate) struct RankedFrontier {
+    combine: Combine,
+    ranges: BinaryHeap<FrontierRange>,
+    rows: BinaryHeap<std::cmp::Reverse<Ranked>>,
+    pub(crate) scored: usize,
+    pub(crate) expanded_ranges: usize,
+    pub(crate) total_ranges: usize,
+    pub(crate) peak_buffered_rows: usize,
+}
+
+impl RankedFrontier {
+    pub(crate) fn complete(&self) -> bool {
+        self.ranges.is_empty() && self.rows.is_empty()
+    }
+
+    /// Return the next exact ranked rows, preserving score bits and TID ties.
+    pub(crate) fn next_batch(&mut self, scorer: &IndexScorer, count: usize) -> Vec<(f32, Tid)> {
+        let mut output = Vec::with_capacity(count);
+        while output.len() < count {
+            pgrx::check_for_interrupts!();
+            let ready = self.rows.peek().is_some_and(|row| {
+                self.ranges.peek().is_none_or(|range| {
+                    rank(&(row.0.0, row.0.1), &(range.bound, range.first)) != Ordering::Greater
+                })
+            });
+            if ready {
+                let std::cmp::Reverse(Ranked(score, tid)) = self.rows.pop().expect("head exists");
+                output.push((score, tid));
+            } else if let Some(range) = self.ranges.pop() {
+                self.expand(scorer, range);
+            } else {
+                break;
+            }
+        }
+        output
+    }
+
+    fn expand(&mut self, scorer: &IndexScorer, range: FrontierRange) {
+        self.expanded_ranges += 1;
+        let source = &*scorer.view.sources[0].0;
+        let label = scorer.view.labels[0].as_str();
+        let mut cursors = Vec::with_capacity(scorer.terms.len());
+        for (slot, (name, _)) in scorer.terms.iter().enumerate() {
+            let Some(term) = segment_error_in(source.term(name), label) else {
+                if self.combine == Combine::All {
+                    return;
+                }
+                continue;
+            };
+            let mut postings = segment_error_in(term.cursor(), label);
+            segment_error_in(postings.seek(range.first), label);
+            cursors.push(TermCursor {
+                slot,
+                postings,
+                payload: segment_error_in(term.payload(), label).cursor(),
+                count: term.df(),
+                term_max: 0.0,
+                cached: None,
+                exact: None,
+            });
+        }
+        let mut documents = segment_error_in(source.documents(), label);
+        let lengths = source.lengths();
+        let mut iterations = 0usize;
+        while let Some(pivot) = cursors.iter().filter_map(TermCursor::current).min() {
+            if pivot > range.last {
+                break;
+            }
+            iterations += 1;
+            if iterations.is_multiple_of(1024) {
+                pgrx::check_for_interrupts!();
+            }
+            if !scorer.dead[0].contains(&pivot)
+                && (self.combine == Combine::Any
+                    || cursors.iter().all(|cursor| cursor.current() == Some(pivot)))
+            {
+                let ordinal = segment_error_in(documents.rank(pivot), label).unwrap_or_else(|| {
+                    crate::storage::corrupt(format!(
+                        "Stannum {label}: posted document ({},{}) is missing",
+                        pivot.block, pivot.offset
+                    ))
+                });
+                let length = segment_error_in(lengths.get(ordinal), label);
+                let mut score = 0.0_f32;
+                for cursor in &mut cursors {
+                    if cursor.current() == Some(pivot) {
+                        let bucket = cursor.bucket();
+                        score += scorer.terms[cursor.slot].1.score_bucket(bucket, length);
+                    }
+                }
+                self.scored += 1;
+                self.rows.push(std::cmp::Reverse(Ranked(score, pivot)));
+                self.peak_buffered_rows = self.peak_buffered_rows.max(self.rows.len());
+            }
+            for cursor in &mut cursors {
+                if cursor.current() == Some(pivot) {
+                    segment_error_in(cursor.postings.advance(), label);
+                }
+            }
+        }
+    }
+}
+
+impl IndexScorer {
+    /// Build a resumable best-first frontier, or leave unsupported shapes and
+    /// multiple sources to the existing path. Single-source scope preserves the
+    /// scorer's first-live-source ownership rule without a duplicate-TID map.
+    pub(crate) fn frontier(&self) -> Option<RankedFrontier> {
+        if self.view.sources.len() != 1 {
+            return None;
+        }
+        let (combine, leaves) = prunable_shape(&self.query)?;
+        if self
+            .terms
+            .iter()
+            .any(|(term, _)| leaves.binary_search(&term.as_str()).is_err())
+        {
+            return None;
+        }
+        let source = &*self.view.sources[0].0;
+        let label = self.view.labels[0].as_str();
+        let mut empty = false;
+        for leaf in leaves {
+            if self.terms.iter().any(|(term, _)| term == leaf) {
+                continue;
+            }
+            if segment_error_in(source.term(leaf), label).is_some() {
+                return None;
+            }
+            empty |= combine == Combine::All;
+        }
+        let mut frontier = RankedFrontier {
+            combine,
+            ranges: BinaryHeap::new(),
+            rows: BinaryHeap::new(),
+            scored: 0,
+            expanded_ranges: 0,
+            total_ranges: 0,
+            peak_buffered_rows: 0,
+        };
+        if empty {
+            return Some(frontier);
+        }
+        let mut term_bounds = Vec::with_capacity(self.terms.len());
+        let mut endpoints = Vec::new();
+        for (name, scorer) in &self.terms {
+            let Some(term) = segment_error_in(source.term(name), label) else {
+                if combine == Combine::All {
+                    return Some(frontier);
+                }
+                term_bounds.push(Vec::new());
+                continue;
+            };
+            let mut postings = segment_error_in(term.cursor(), label);
+            let bounds = segment_error_in(postings.block_bounds(), label);
+            if bounds.is_empty() {
+                return None;
+            }
+            let bounds: Vec<_> = bounds
+                .into_iter()
+                .map(|block| {
+                    endpoints.push(block.last);
+                    (block.last, scorer.bound(&block))
+                })
+                .collect();
+            term_bounds.push(bounds);
+        }
+        endpoints.sort_unstable();
+        endpoints.dedup();
+        let mut positions = vec![0usize; term_bounds.len()];
+        let mut first = Tid {
+            block: 0,
+            offset: 1,
+        };
+        for last in endpoints {
+            pgrx::check_for_interrupts!();
+            let mut bound = 0.0_f32;
+            let mut possible = true;
+            for (blocks, position) in term_bounds.iter().zip(&mut positions) {
+                while blocks.get(*position).is_some_and(|(end, _)| *end < first) {
+                    *position += 1;
+                }
+                if let Some((_, term_bound)) = blocks.get(*position) {
+                    bound += term_bound;
+                } else if combine == Combine::All {
+                    possible = false;
+                }
+            }
+            if possible {
+                frontier.ranges.push(FrontierRange { first, last, bound });
+            }
+            first = successor(last);
+        }
+        frontier.total_ranges = frontier.ranges.len();
+        Some(frontier)
+    }
+}
+
 /// One scoring term's cursors in one source, for the pruned scan.
 struct TermCursor<'a> {
     /// Index into the scorer's lexically ordered terms.
@@ -1194,6 +1430,13 @@ pub(crate) fn scorer_for_scan(
 /// SQL score functions to project from until the scan ends.
 pub(crate) fn publish_scan_scorer(scan: u64, mut scorer: IndexScorer, ranked: &[(f32, Tid)]) {
     scorer.known.clear();
+    publish_frontier_scorer(scan, scorer, ranked);
+}
+
+/// Publish one additional frontier batch without rebuilding the previously
+/// captured score map. Earlier rows remain available for constant rescans and
+/// cursor projections after more batches have been requested.
+pub(crate) fn publish_frontier_scorer(scan: u64, mut scorer: IndexScorer, ranked: &[(f32, Tid)]) {
     scorer
         .known
         .extend(ranked.iter().map(|(score, tid)| (*tid, *score)));
