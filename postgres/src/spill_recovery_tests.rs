@@ -128,3 +128,32 @@ mod spill_recovery {
         );
     }
 }
+
+/// Scratch-cluster coordination only; not exported in production builds.
+/// A caller must kill or restart its own disposable cluster within 60 seconds.
+#[pgrx::pg_extern(schema = "tests")]
+fn arm_spill_crash(point: &str, flush_wal: bool) {
+    assert!(matches!(point, "spill:appended" | "spill:page-written"));
+    let point = point.to_owned();
+    crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+        if name != point {
+            return;
+        }
+        if flush_wal {
+            // Deliberately test durable WAL for unpublished pages, without
+            // claiming that an ordinary merge flushes WAL at this point.
+            unsafe { pgrx::pg_sys::XLogFlush(pgrx::pg_sys::GetXLogInsertRecPtr()) };
+        }
+        pgrx::log!(
+            "STANNUM_SPILL_CRASH_READY point={} pid={} flush_wal={}",
+            name,
+            unsafe { pgrx::pg_sys::MyProcPid },
+            flush_wal
+        );
+        for _ in 0..600 {
+            unsafe { pgrx::pg_sys::pg_usleep(100_000) };
+            pgrx::check_for_interrupts!();
+        }
+        pgrx::error!("scratch spill crash harness did not terminate backend within 60 seconds");
+    })));
+}

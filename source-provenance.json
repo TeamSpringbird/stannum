@@ -909,6 +909,14 @@
     "postgres/src/spill_recovery_tests.rs": {
       "owner": "ben",
       "evidence": "New Stannum spill transaction-abort and resource-cleanup tests."
+    },
+    "benchmarks/spill_crash_recovery.py": {
+      "owner": "ben",
+      "evidence": "New Stannum isolated spill crash-recovery harness and process-target checks."
+    },
+    "benchmarks/test_spill_crash_recovery.py": {
+      "owner": "ben",
+      "evidence": "New Stannum isolated spill crash-recovery harness and process-target checks."
     }
   }
 }

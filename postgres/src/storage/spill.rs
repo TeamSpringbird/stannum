@@ -129,6 +129,10 @@ impl OutputSink for SpillSink {
         }
         self.postings.append(postings);
         self.payload.append(payload);
+        #[cfg(feature = "pg_test")]
+        if matches!(self.postings, Area::Disk { .. }) {
+            race_point("spill:appended");
+        }
         Ok(())
     }
     fn finish(

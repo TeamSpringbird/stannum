@@ -1,0 +1,206 @@
+{
+  "date": "2026-09-20",
+  "build": {
+    "base_commit": "f76f135b93651b1cd1469757d222604204be4cc1",
+    "source_sha256": {
+      "postgres/src/storage/spill.rs": "23926d632df56e98d794498b38778dfa2e42b8b12adf7de6bfb3079d9183775f",
+      "postgres/src/spill_recovery_tests.rs": "5d2faa03714b5162c3d56896d7104bd4df8a5a9e3b0cee7239a9e09c6a10ec23"
+    }
+  },
+  "library_sha256": "906498d2c44c1b92db3175b79c89508fa7f6c52787ba6397ac9f3ef12f120ece",
+  "harness_sha256": "31e3ee8f250cbd0942164566e4edebfb5a80a105dd2df663653b8086827a6bc9",
+  "server": {
+    "version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit",
+    "fsync": "on",
+    "full_page_writes": "on",
+    "synchronous_commit": "on"
+  },
+  "cases": [
+    {
+      "wal": "ordinary",
+      "mode": "backend-sigkill",
+      "phase": "spill:appended",
+      "temp_bytes_at_pause": 16384,
+      "orphans_before_vacuum": 6,
+      "orphan_warning_kinds": [
+        "unreferenced and unreadable: not a Stannum LDP2 page"
+      ],
+      "committed_ids_after_recovery": [
+        1,
+        2
+      ],
+      "ids_after_retry": [
+        1,
+        2,
+        3
+      ],
+      "temp_files_after_recovery": [],
+      "findings_after_vacuum": [],
+      "passed": true,
+      "artifact": "benchmarks/results/spill-crash-ordinary-final/backend-sigkill-appended"
+    },
+    {
+      "wal": "ordinary",
+      "mode": "backend-sigkill",
+      "phase": "spill:page-written",
+      "temp_bytes_at_pause": 80019,
+      "orphans_before_vacuum": 7,
+      "orphan_warning_kinds": [
+        "run page referenced by nothing; VACUUM reclaims it",
+        "unreferenced and unreadable: not a Stannum LDP2 page"
+      ],
+      "committed_ids_after_recovery": [
+        1,
+        2
+      ],
+      "ids_after_retry": [
+        1,
+        2,
+        3
+      ],
+      "temp_files_after_recovery": [],
+      "findings_after_vacuum": [],
+      "passed": true,
+      "artifact": "benchmarks/results/spill-crash-ordinary-final/backend-sigkill-page-written"
+    },
+    {
+      "wal": "ordinary",
+      "mode": "server-immediate",
+      "phase": "spill:appended",
+      "temp_bytes_at_pause": 16384,
+      "orphans_before_vacuum": 6,
+      "orphan_warning_kinds": [
+        "run page referenced by nothing; VACUUM reclaims it",
+        "unreferenced and unreadable: not a Stannum LDP2 page"
+      ],
+      "committed_ids_after_recovery": [
+        1,
+        2
+      ],
+      "ids_after_retry": [
+        1,
+        2,
+        3
+      ],
+      "temp_files_after_recovery": [],
+      "findings_after_vacuum": [],
+      "passed": true,
+      "artifact": "benchmarks/results/spill-crash-ordinary-final/server-immediate-appended"
+    },
+    {
+      "wal": "ordinary",
+      "mode": "server-immediate",
+      "phase": "spill:page-written",
+      "temp_bytes_at_pause": 80019,
+      "orphans_before_vacuum": 7,
+      "orphan_warning_kinds": [
+        "unreferenced and unreadable: not a Stannum LDP2 page"
+      ],
+      "committed_ids_after_recovery": [
+        1,
+        2
+      ],
+      "ids_after_retry": [
+        1,
+        2,
+        3
+      ],
+      "temp_files_after_recovery": [],
+      "findings_after_vacuum": [],
+      "passed": true,
+      "artifact": "benchmarks/results/spill-crash-ordinary-final/server-immediate-page-written"
+    },
+    {
+      "wal": "flushed",
+      "mode": "backend-sigkill",
+      "phase": "spill:appended",
+      "temp_bytes_at_pause": 16384,
+      "orphans_before_vacuum": 6,
+      "orphan_warning_kinds": [
+        "run page referenced by nothing; VACUUM reclaims it"
+      ],
+      "committed_ids_after_recovery": [
+        1,
+        2
+      ],
+      "ids_after_retry": [
+        1,
+        2,
+        3
+      ],
+      "temp_files_after_recovery": [],
+      "findings_after_vacuum": [],
+      "passed": true,
+      "artifact": "benchmarks/results/spill-crash-flushed-final/backend-sigkill-appended"
+    },
+    {
+      "wal": "flushed",
+      "mode": "backend-sigkill",
+      "phase": "spill:page-written",
+      "temp_bytes_at_pause": 80019,
+      "orphans_before_vacuum": 7,
+      "orphan_warning_kinds": [
+        "run page referenced by nothing; VACUUM reclaims it"
+      ],
+      "committed_ids_after_recovery": [
+        1,
+        2
+      ],
+      "ids_after_retry": [
+        1,
+        2,
+        3
+      ],
+      "temp_files_after_recovery": [],
+      "findings_after_vacuum": [],
+      "passed": true,
+      "artifact": "benchmarks/results/spill-crash-flushed-final/backend-sigkill-page-written"
+    },
+    {
+      "wal": "flushed",
+      "mode": "server-immediate",
+      "phase": "spill:appended",
+      "temp_bytes_at_pause": 16384,
+      "orphans_before_vacuum": 6,
+      "orphan_warning_kinds": [
+        "run page referenced by nothing; VACUUM reclaims it"
+      ],
+      "committed_ids_after_recovery": [
+        1,
+        2
+      ],
+      "ids_after_retry": [
+        1,
+        2,
+        3
+      ],
+      "temp_files_after_recovery": [],
+      "findings_after_vacuum": [],
+      "passed": true,
+      "artifact": "benchmarks/results/spill-crash-flushed-final/server-immediate-appended"
+    },
+    {
+      "wal": "flushed",
+      "mode": "server-immediate",
+      "phase": "spill:page-written",
+      "temp_bytes_at_pause": 80019,
+      "orphans_before_vacuum": 7,
+      "orphan_warning_kinds": [
+        "run page referenced by nothing; VACUUM reclaims it"
+      ],
+      "committed_ids_after_recovery": [
+        1,
+        2
+      ],
+      "ids_after_retry": [
+        1,
+        2,
+        3
+      ],
+      "temp_files_after_recovery": [],
+      "findings_after_vacuum": [],
+      "passed": true,
+      "artifact": "benchmarks/results/spill-crash-flushed-final/server-immediate-page-written"
+    }
+  ]
+}
