@@ -889,6 +889,18 @@
     "docs/benchmarks/query-shapes-exists-repro.sql": {
       "owner": "ben",
       "evidence": "Original Stannum standalone regression reproduction generated from query-shape suite."
+    },
+    "benchmarks/published_dataset.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum checksummed downloader for public benchmark data; no upstream code copied."
+    },
+    "benchmarks/test_published_dataset.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum split-stream and integrity regression tests."
+    },
+    "benchmarks/test_wide_cursor.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum wide-query fuzzer generation regression tests."
     }
   }
 }

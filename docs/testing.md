@@ -106,3 +106,30 @@ The earlier two bugs remain covered by
 `a_completed_ranked_scan_does_not_repeat_the_rows_it_emitted` and
 `buffered_scoring_keeps_document_lengths_when_heap_space_is_reused`, and by
 the fuzzer's cursor episodes, which exercise both interleavings continuously.
+
+## Wide disjunction cursors
+
+`--wide` uses 31, 32, 33 and 128 distinct alphabetic terms with positive boosts,
+cycling across the grouped-pivot threshold. Documents mix dense 128-term bodies
+with sparse 32-term bodies. Queries use `full_score` so common-term elision does
+not remove the intended scoring terms. Episodes use cursors or two open cursors,
+with limits around the posting-block boundary, offsets, filters and joins.
+
+```sh
+python3 postgres/tests/ranked_fuzz.py --wide --seed 104 --seconds 30 \
+  --corpus 400 --writers 2 --readers 2
+```
+
+The existing quiescent oracle capture and subsequent concurrent writer churn
+remain unchanged. An extra EXPLAIN ANALYZE checks block-max pruning while the
+first cursor is open. This also exercises another statement's scorer without
+allowing it to change the retained cursor's scores. Reports count exercised
+widths; missing any of the four widths fails the run rather than silently passing
+an empty or incomplete campaign. A fixed wide scenario is included in `--smoke`.
+These are correctness stress tests, not performance measurements.
+
+Local validation of the wide mode: seeds 104/105 completed 204 comparisons,
+426 cursor fetches, 1,480 writer operations and 244 VACUUM operations, with all
+four widths exercised and no skipped comparisons. The six-scenario smoke suite
+passed 912 comparisons. These counts are scheduling-dependent observations,
+not fixed expected counts. [Recorded results](benchmarks/wide-cursor-results.json).
