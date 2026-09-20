@@ -1,0 +1,1901 @@
+{
+  "resources": {
+    "cpus": 4,
+    "memory_gib": 4,
+    "rows": 16384,
+    "seconds_per_window": 20,
+    "order": [
+      "baseline",
+      "candidate",
+      "candidate",
+      "baseline"
+    ],
+    "platform": "local Docker ARM64; unrelated host services running"
+  },
+  "images": {
+    "baseline": "sha256:c15b037b26cf0a3043b144af566b4ba86e06f4976d57070673c73be02535126b",
+    "candidate": "sha256:fdec056bd4a363c03eb43aa543f4bf5b964c5710180adff22a5802b688f9881f"
+  },
+  "summary": [
+    {
+      "readers": 1,
+      "write_rate": 0,
+      "baseline": {
+        "read_qps": 16.5656968478482,
+        "p95_ms": {
+          "or_2_ranked": 1.587,
+          "or_32_ranked": 19.859,
+          "or_128_ranked": 213.1495
+        },
+        "write_qps": null
+      },
+      "candidate": {
+        "read_qps": 39.6515839770954,
+        "p95_ms": {
+          "or_2_ranked": 1.5354999999999999,
+          "or_32_ranked": 16.2015,
+          "or_128_ranked": 66.512
+        },
+        "write_qps": null
+      },
+      "qps_ratio": 2.393595895257852
+    },
+    {
+      "readers": 4,
+      "write_rate": 0,
+      "baseline": {
+        "read_qps": 67.57315436639654,
+        "p95_ms": {
+          "or_2_ranked": 1.6885,
+          "or_32_ranked": 19.697499999999998,
+          "or_128_ranked": 238.55450000000002
+        },
+        "write_qps": null
+      },
+      "candidate": {
+        "read_qps": 149.0188800775427,
+        "p95_ms": {
+          "or_2_ranked": 1.9140000000000001,
+          "or_32_ranked": 16.5705,
+          "or_128_ranked": 72.9005
+        },
+        "write_qps": null
+      },
+      "qps_ratio": 2.2052970809906176
+    },
+    {
+      "readers": 4,
+      "write_rate": 50,
+      "baseline": {
+        "read_qps": 63.56243664477191,
+        "p95_ms": {
+          "or_2_ranked": 2.18,
+          "or_32_ranked": 25.7965,
+          "or_128_ranked": 214.864
+        },
+        "write_qps": 51.16086986611443
+      },
+      "candidate": {
+        "read_qps": 145.7040209247195,
+        "p95_ms": {
+          "or_2_ranked": 2.716,
+          "or_32_ranked": 18.4055,
+          "or_128_ranked": 74.3725
+        },
+        "write_qps": 49.76047821735479
+      },
+      "qps_ratio": 2.2922975992724757
+    }
+  ],
+  "rounds": [
+    {
+      "name": "r01-baseline-c1-w0",
+      "readers": 1,
+      "write_rate": 0,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 120,
+            "completed_per_second": 5.9865346620094275,
+            "p50_ms": 0.752,
+            "p95_ms": 1.96,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 109,
+            "completed_per_second": 5.437768984658564,
+            "p50_ms": 16.166,
+            "p95_ms": 19.983,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 118,
+            "completed_per_second": 5.88675908430927,
+            "p50_ms": 144.39,
+            "p95_ms": 162.386,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.04498541727662
+      },
+      "writer": null,
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8742335420101881
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.6294678337872028
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 1.074318832717836
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": null
+      }
+    },
+    {
+      "name": "r01-baseline-c4-w0",
+      "readers": 4,
+      "write_rate": 0,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 454,
+            "completed_per_second": 22.553356431615764,
+            "p50_ms": 0.767,
+            "p95_ms": 1.673,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 450,
+            "completed_per_second": 22.354648445434126,
+            "p50_ms": 17.316,
+            "p95_ms": 20.31,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 441,
+            "completed_per_second": 21.907555476525445,
+            "p50_ms": 153.96,
+            "p95_ms": 237.133,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.130041458643973
+      },
+      "writer": null,
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8500252915546298
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.8043791251257062
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8406947925686836
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": null
+      }
+    },
+    {
+      "name": "r01-baseline-c4-w50",
+      "readers": 4,
+      "write_rate": 50,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 396,
+            "completed_per_second": 19.632919762962977,
+            "p50_ms": 0.827,
+            "p95_ms": 1.977,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 433,
+            "completed_per_second": 21.46730873071457,
+            "p50_ms": 18.067,
+            "p95_ms": 29.461,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 400,
+            "completed_per_second": 19.831232083800987,
+            "p50_ms": 159.335,
+            "p95_ms": 227.656,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.170204166322947
+      },
+      "writer": {
+        "queries": {
+          "update": {
+            "completed": 1062,
+            "completed_per_second": 52.651896057013666,
+            "p50_ms": 6.309,
+            "p95_ms": 34.92,
+            "p99_ms": 116.18,
+            "p99_insufficient_samples": false
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": 17.387,
+        "wall_seconds": 20.170213791541755
+      },
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8636826248839498
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "0154272128542504c0d3b8a6bc54936f"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.8146882085129619
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "2492931c4bf303febf2af136e41b2777"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 1.1438894998282194
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": 0
+      }
+    },
+    {
+      "name": "r02-candidate-c1-w0",
+      "readers": 1,
+      "write_rate": 0,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 279,
+            "completed_per_second": 13.917160198542359,
+            "p50_ms": 0.738,
+            "p95_ms": 2.138,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 263,
+            "completed_per_second": 13.119043484647456,
+            "p50_ms": 13.525,
+            "p95_ms": 16.65,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 261,
+            "completed_per_second": 13.019278895410594,
+            "p50_ms": 56.233,
+            "p95_ms": 66.777,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.047193250618875
+      },
+      "writer": null,
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.755304042249918
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.7317749159410596
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.7925162091851234
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": null
+      }
+    },
+    {
+      "name": "r02-candidate-c4-w0",
+      "readers": 4,
+      "write_rate": 0,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 1038,
+            "completed_per_second": 51.66243502830953,
+            "p50_ms": 0.756,
+            "p95_ms": 1.712,
+            "p99_ms": 8.821,
+            "p99_insufficient_samples": false
+          },
+          "or_32_ranked": {
+            "completed": 1027,
+            "completed_per_second": 51.11495257617908,
+            "p50_ms": 14.358,
+            "p95_ms": 16.997,
+            "p99_ms": 34.482,
+            "p99_insufficient_samples": false
+          },
+          "or_128_ranked": {
+            "completed": 998,
+            "completed_per_second": 49.67158974783517,
+            "p50_ms": 60.101,
+            "p95_ms": 71.588,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.09196816664189
+      },
+      "writer": null,
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.7572807082906365
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.7560925828292966
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8154587494209409
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": null
+      }
+    },
+    {
+      "name": "r02-candidate-c4-w50",
+      "readers": 4,
+      "write_rate": 50,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 970,
+            "completed_per_second": 48.18417152713851,
+            "p50_ms": 0.862,
+            "p95_ms": 2.737,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 932,
+            "completed_per_second": 46.29654418896195,
+            "p50_ms": 14.888,
+            "p95_ms": 18.679,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 981,
+            "completed_per_second": 48.73058996713699,
+            "p50_ms": 61.994,
+            "p95_ms": 74.861,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.13109220843762
+      },
+      "writer": {
+        "queries": {
+          "update": {
+            "completed": 1004,
+            "completed_per_second": 49.873072659047516,
+            "p50_ms": 6.976,
+            "p95_ms": 90.187,
+            "p99_ms": 149.057,
+            "p99_insufficient_samples": false
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": 65.346,
+        "wall_seconds": 20.131103749386966
+      },
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.7703611245378852
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "e061cd17bad31b782af2456f68f2e7e3"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.6775914169847965
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b22ad20ce0db2f5b487697234b670fb8"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.7881902502849698
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": 0
+      }
+    },
+    {
+      "name": "r03-candidate-c1-w0",
+      "readers": 1,
+      "write_rate": 0,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 249,
+            "completed_per_second": 12.40187012502793,
+            "p50_ms": 0.742,
+            "p95_ms": 0.933,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 279,
+            "completed_per_second": 13.896071344910814,
+            "p50_ms": 13.753,
+            "p95_ms": 15.753,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 260,
+            "completed_per_second": 12.949743905651655,
+            "p50_ms": 57.08,
+            "p95_ms": 66.247,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.077617124654353
+      },
+      "writer": null,
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.7932115001603961
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.522278000600636
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.7711047921329737
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": null
+      }
+    },
+    {
+      "name": "r03-candidate-c4-w0",
+      "readers": 4,
+      "write_rate": 0,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 960,
+            "completed_per_second": 47.7993267751885,
+            "p50_ms": 0.758,
+            "p95_ms": 2.116,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 942,
+            "completed_per_second": 46.90308939815371,
+            "p50_ms": 14.425,
+            "p95_ms": 16.144,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 1022,
+            "completed_per_second": 50.88636662941942,
+            "p50_ms": 60.105,
+            "p95_ms": 74.213,
+            "p99_ms": 168.063,
+            "p99_insufficient_samples": false
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.083964874967933
+      },
+      "writer": null,
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8905700836330652
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.6744579998776317
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.772873249836266
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": null
+      }
+    },
+    {
+      "name": "r03-candidate-c4-w50",
+      "readers": 4,
+      "write_rate": 50,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 1004,
+            "completed_per_second": 49.99647953994163,
+            "p50_ms": 0.811,
+            "p95_ms": 2.695,
+            "p99_ms": 13.04,
+            "p99_insufficient_samples": false
+          },
+          "or_32_ranked": {
+            "completed": 1008,
+            "completed_per_second": 50.19566870145535,
+            "p50_ms": 14.977,
+            "p95_ms": 18.132,
+            "p99_ms": 46.16,
+            "p99_insufficient_samples": false
+          },
+          "or_128_ranked": {
+            "completed": 964,
+            "completed_per_second": 48.00458792480452,
+            "p50_ms": 62.222,
+            "p95_ms": 73.884,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.081413916312158
+      },
+      "writer": {
+        "queries": {
+          "update": {
+            "completed": 997,
+            "completed_per_second": 49.647883775662066,
+            "p50_ms": 6.165,
+            "p95_ms": 51.412,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": 35.207,
+        "wall_seconds": 20.08141987491399
+      },
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.7462074160575867
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "d1af2190fd90698ded51c89c78e0488d"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.6785850832238793
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "351ccfd4eca74061a84a54d37d0be62a"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.9985360419377685
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": 0
+      }
+    },
+    {
+      "name": "r04-baseline-c1-w0",
+      "readers": 1,
+      "write_rate": 0,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 95,
+            "completed_per_second": 4.711383829618552,
+            "p50_ms": 0.781,
+            "p95_ms": 1.214,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 107,
+            "completed_per_second": 5.30650599757037,
+            "p50_ms": 16.857,
+            "p95_ms": 19.735,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 117,
+            "completed_per_second": 5.802441137530217,
+            "p50_ms": 148.029,
+            "p95_ms": 263.913,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.163927082903683
+      },
+      "writer": null,
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8172348756343126
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.6438543749973178
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 1.1701946668326855
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": null
+      }
+    },
+    {
+      "name": "r04-baseline-c4-w0",
+      "readers": 4,
+      "write_rate": 0,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 480,
+            "completed_per_second": 23.818997256372196,
+            "p50_ms": 0.781,
+            "p95_ms": 1.704,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 459,
+            "completed_per_second": 22.776916126405915,
+            "p50_ms": 17.348,
+            "p95_ms": 19.085,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 438,
+            "completed_per_second": 21.73483499643963,
+            "p50_ms": 154.333,
+            "p95_ms": 239.976,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.15198183339089
+      },
+      "writer": null,
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8154976665973663
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.856963999569416
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8352076252922416
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": null
+      }
+    },
+    {
+      "name": "r04-baseline-c4-w50",
+      "readers": 4,
+      "write_rate": 50,
+      "sources": {
+        "query_shapes.py": "96f37edb34a2e19c8462e9c235882ffe3b1a5f258eae5cfe0af76042606d2e4c",
+        "run.py": "060ed2f015aa02b97f918887ee53f6e16d20e525827a0be4b2f53a50bddb2607"
+      },
+      "reader": {
+        "queries": {
+          "or_2_ranked": {
+            "completed": 457,
+            "completed_per_second": 22.67645398007034,
+            "p50_ms": 0.827,
+            "p95_ms": 2.383,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_32_ranked": {
+            "completed": 450,
+            "completed_per_second": 22.32911223420493,
+            "p50_ms": 18.032,
+            "p95_ms": 22.132,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          },
+          "or_128_ranked": {
+            "completed": 427,
+            "completed_per_second": 21.187846497790012,
+            "p50_ms": 158.514,
+            "p95_ms": 202.072,
+            "p99_ms": null,
+            "p99_insufficient_samples": true
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": null,
+        "wall_seconds": 20.153062749654055
+      },
+      "writer": {
+        "queries": {
+          "update": {
+            "completed": 1001,
+            "completed_per_second": 49.6698436752152,
+            "p50_ms": 6.609,
+            "p95_ms": 43.655,
+            "p99_ms": 140.643,
+            "p99_insufficient_samples": false
+          }
+        },
+        "failures": {},
+        "schedule_lag_p95_ms": 24.05,
+        "wall_seconds": 20.1530732922256
+      },
+      "correctness": {
+        "before": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "b856cf60bd57c3301672764c5b151a59"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.9841164583340287
+        },
+        "during": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "24a88f01d6789d79151fc8d9c8bb1f6d"
+          },
+          "comparison": "membership-cardinality-finite-scores",
+          "wall_seconds": 0.7982846666127443
+        },
+        "after": {
+          "checks": [
+            {
+              "case": "or_2_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_32_ranked",
+              "status": "passed"
+            },
+            {
+              "case": "or_128_ranked",
+              "status": "passed"
+            }
+          ],
+          "metadata": {
+            "version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+            "settings": {
+              "jit": "off",
+              "work_mem": "4096",
+              "block_size": "8192",
+              "shared_buffers": "16384",
+              "max_parallel_workers_per_gather": "2"
+            },
+            "extensions": {
+              "plpgsql": "1.0",
+              "stannum": "0.1.0"
+            },
+            "fixture_md5": "3697dcf9bbe13f27328389883d8a36aa"
+          },
+          "comparison": "exact-score-multiset",
+          "wall_seconds": 0.8922839593142271
+        }
+      },
+      "exit_codes": {
+        "reader": 0,
+        "writer": 0
+      }
+    }
+  ],
+  "archive_sha256": "9e0a44109cf289778e4eca4a641ae5068596924455778b8f24753e0339264ee2"
+}

@@ -8,7 +8,7 @@ capacity or reproduce PlanetScale's published results.
 ## Run
 
 Install the extension in an existing disposable database, then use libpq environment
-variables for the connection. The suite creates only session-local temporary tables.
+variables for the connection. The default serial mode creates only session-local temporary tables.
 It does not create extensions, overwrite application tables, or provision servers.
 
 ```sh
@@ -146,3 +146,33 @@ completed for Stannum and GIN, exercising all 906 trace forms. One count
 disagreement means this is not an equivalent-result performance comparison.
 
 Raw evidence archive: `benchmarks/results/query-shapes-evidence.tar.gz`, SHA-256 `56da2d8b0dd5f8b46cfc778b29736f4c36d3cb68a41bfb5a32ae7e5c44cb1951`. It contains full plans, SQL catalogs, failures, fingerprints, and upstream outputs.
+
+## Concurrent wide-query diagnostic
+
+Reuse the same catalog and the existing pgbench log recorder with:
+
+```sh
+python3 benchmarks/query_shapes.py --rows 16384 --readers 4 --seconds 20 \
+  --write-rate 50 --output benchmarks/results/shapes-concurrent-01
+```
+
+This mode requires `pgbench` and CREATE SCHEMA privileges in a disposable database.
+It creates regular tables in a randomly named private schema and drops that schema
+when finished. It samples the 2-, 32- and 128-term ranked OR cases with equal
+pgbench weights, using closed-loop readers and one rate-limited writer. Updates
+toggle the first vocabulary term, changing membership and scores while keeping
+row count fixed. This is not a full insert/delete/VACUUM campaign.
+
+Before and after traffic, all three queries undergo exact score-multiset and
+membership checks. Once during traffic, a repeatable-read transaction checks
+membership, unique IDs, top-10 cardinality and finite scores. Index scoring
+statistics are not frozen by the row snapshot, so separate statements cannot
+serve as exact score oracles while writers run. The live oracle adds load; its
+duration is retained. This mode does not prove exact ranking under active writes;
+the [existing cursor concurrency fuzzer](../testing.md) supports that check by
+capturing an oracle during a quiescent batch, then fetching while writers churn. Plans must show
+block-max pruning before traffic. Reports preserve completed transactions, failure
+counts, per-query p50/p95, p99 only with at least 1,000 samples, writer schedule lag,
+and process exit status. These are local client latencies including transport,
+not server-only EXPLAIN timings. Preflight EXPLAIN warms each query once; measured
+traffic includes connection startup and subsequent warm-up effects.

@@ -38,6 +38,24 @@ class QueryShapesTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'incomplete'):
                 shapes.validate(cases+[cases[0]],[],{})
 
+    def test_live_checks_do_not_compare_moving_index_statistics(self):
+        case = next(c for c in shapes.catalog('stannum') if c['name']=='or_128_ranked')
+        live = shapes.checks(case, compare_scores=False)
+        self.assertNotIn('shape_reference', live)
+        self.assertNotIn('float4send', live)
+        self.assertIn('ranked cardinality mismatch', live)
+        self.assertIn('ranked membership mismatch', live)
+        self.assertIn('duplicate ranked IDs', live)
+        self.assertIn('invalid score', live)
+        self.assertIn('shape_reference', shapes.checks(case))
+
+    def test_shared_fixture_keeps_default_session_local(self):
+        self.assertIn('CREATE TEMP TABLE shape_documents', ';'.join(shapes.fixture(128,'stannum')))
+        shared = ';'.join(shapes.fixture(128,'stannum',temporary=False))
+        self.assertNotIn('TEMP TABLE', shared)
+        self.assertIn('CREATE TABLE shape_documents', shared)
+        self.assertIn('CREATE TABLE shape_allowed', shared)
+
     def test_ranked_oracle_materializes_unlimited_scores(self):
         case = next(c for c in shapes.catalog('stannum') if c['name']=='or_128_ranked')
         self.assertIn('AS MATERIALIZED',case['reference'])

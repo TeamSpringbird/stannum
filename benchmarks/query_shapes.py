@@ -5,7 +5,8 @@
 
 """Deterministic query-shape suite using the existing server-side timer.
 
-Uses session-local tables only. Requires an installed stannum or tin extension.
+Serial mode uses session-local tables; concurrent mode uses a private schema.
+Requires an installed stannum or tin extension.
 The synthetic corpus tests query complexity, not production capacity.
 """
 import argparse
@@ -15,6 +16,11 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+import run as recorder
 
 import server_times
 
@@ -54,19 +60,20 @@ def expressions():
     return result
 
 
-def fixture(rows, engine):
+def fixture(rows, engine, temporary=True):
     if engine not in ('stannum', 'tin') or rows < 128:
         raise ValueError('engine must be stannum/tin and rows >= 128')
+    table = 'TEMP TABLE' if temporary else 'TABLE'
     vocabulary = ','.join(literal(w) for w in WORDS)
     return [
         'SET statement_timeout=120000', 'SET jit=off',
-        "CREATE TEMP TABLE shape_documents(id bigint PRIMARY KEY, body text NOT NULL)",
+        f"CREATE {table} shape_documents(id bigint PRIMARY KEY, body text NOT NULL)",
         f"INSERT INTO shape_documents SELECT n, string_agg(w, ' ' ORDER BY j) || "
         "CASE WHEN n % 97 = 0 THEN ' raretoken' ELSE '' END "
         f"FROM generate_series(1,{rows}) n CROSS JOIN unnest(ARRAY[{vocabulary}]) "
         "WITH ORDINALITY words(w,j) WHERE n % 17 = 0 OR (n*31+j*7)%19 < 5 GROUP BY n",
         f'CREATE INDEX shape_search ON shape_documents USING {engine}(body)',
-        'CREATE TEMP TABLE shape_allowed(id bigint PRIMARY KEY)',
+        f'CREATE {table} shape_allowed(id bigint PRIMARY KEY)',
         f'INSERT INTO shape_allowed SELECT n FROM generate_series(1,{rows}) n WHERE n % 7 = 0',
         'ANALYZE shape_documents', 'ANALYZE shape_allowed',
     ]
@@ -120,11 +127,12 @@ def difference(left, right):
     return f'(({left}) EXCEPT ALL ({right})) UNION ALL (({right}) EXCEPT ALL ({left}))'
 
 
-def checks(case):
+def checks(case, compare_scores=True):
     # Materialize each original statement separately: wrapping a ranked query
     # inside EXCEPT/PLpgSQL expression planning can change scorer binding.
-    statements = [f"CREATE TEMP TABLE shape_actual AS {case['sql']}",
-                  f"CREATE TEMP TABLE shape_reference AS {case['reference']}"]
+    statements = [f"CREATE TEMP TABLE shape_actual AS {case['sql']}"]
+    if compare_scores:
+        statements.append(f"CREATE TEMP TABLE shape_reference AS {case['reference']}")
     left, right = case['membership']
     statements.append(f"IF EXISTS ({difference(left, right)}) THEN RAISE EXCEPTION 'membership mismatch'; END IF")
     if case['mode'] == 'ranked':
@@ -134,12 +142,23 @@ def checks(case):
         statements.append(f"IF EXISTS ((SELECT id FROM shape_actual) EXCEPT ({case['membership'][1]})) THEN RAISE EXCEPTION 'ranked membership mismatch'; END IF")
     else:
         left, right = 'TABLE shape_actual', 'TABLE shape_reference'
-    statements.append(f"IF EXISTS ({difference(left, right)}) THEN RAISE EXCEPTION 'result mismatch'; END IF")
-    statements += ['DROP TABLE shape_actual', 'DROP TABLE shape_reference']
+    if compare_scores:
+        statements.append(f"IF EXISTS ({difference(left, right)}) THEN RAISE EXCEPTION 'result mismatch'; END IF")
+        statements.append('DROP TABLE shape_reference')
+    else:
+        if case['mode'] != 'ranked':
+            raise ValueError('live membership-only validation requires ranked cases')
+        statements.append(f"IF (SELECT count(*) FROM shape_actual) <> "
+                          f"(SELECT least(10,count(*)) FROM ({case['membership'][1]}) expected) "
+                          "THEN RAISE EXCEPTION 'ranked cardinality mismatch'; END IF")
+        statements.append("IF EXISTS (SELECT 1 FROM shape_actual WHERE score IS NULL OR "
+                          "score::text IN ('NaN','Infinity','-Infinity')) "
+                          "THEN RAISE EXCEPTION 'invalid score'; END IF")
+    statements.append('DROP TABLE shape_actual')
     return '; '.join(statements) + ';'
 
 
-def validate(cases, setup, env):
+def validate(cases, setup, env, compare_scores=True):
     script = setup + ["""SELECT jsonb_build_object('metadata',jsonb_build_object(
  'version',version(),
  'extensions',(SELECT jsonb_object_agg(extname,extversion) FROM pg_extension),
@@ -153,7 +172,7 @@ EXCEPTION WHEN OTHERS THEN
  RETURN jsonb_build_object('case',name,'status','failed','sqlstate',SQLSTATE,'error',SQLERRM);
 END $$"""]
     for case in cases:
-        block = 'DO $verify$ BEGIN ' + checks(case) + ' END $verify$'
+        block = 'DO $verify$ BEGIN ' + checks(case, compare_scores=compare_scores) + ' END $verify$'
         script.append(f"SELECT pg_temp.shape_check({literal(case['name'])},{literal(block)})")
     response = subprocess.run(['psql','-XqAt','-v','ON_ERROR_STOP=1'],
                               input=';\n'.join(script)+';',env=env,text=True,capture_output=True)
@@ -172,6 +191,111 @@ def nodes(node):
         yield from nodes(child)
 
 
+def concurrent(args, cases):
+    """Use the existing pgbench recorder against a private, cross-session schema."""
+    schema = 'shape_' + uuid.uuid4().hex
+    env = dict(os.environ)
+    env['PGOPTIONS'] = (env.get('PGOPTIONS', '') +
+                        f' -c search_path={schema},public -c jit=off -c statement_timeout=120000')
+    selected = [c for c in cases if c['name'] in
+                ('or_2_ranked', 'or_32_ranked', 'or_128_ranked')]
+    setup = fixture(args.rows, args.engine, temporary=False)
+    processes = []
+    handles = []
+    results = {'sources': {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                           for p in (Path(__file__), Path(recorder.__file__))},
+               'rows': args.rows, 'readers': args.readers, 'write_rate': args.write_rate,
+               'seconds': args.seconds, 'queries': selected,
+               'caveat': 'Local pgbench client latency includes transport. Closed-loop readers; '
+                         'one rate-limited match-changing UPDATE writer. Concurrent membership '
+                         'oracle adds load. Synthetic fixture; not a production capacity claim.'}
+    def save():
+        (args.output/'results.json').write_text(json.dumps(results, indent=2)+'\n')
+    def check(label):
+        started = time.monotonic()
+        checks, metadata = validate(selected, ['BEGIN ISOLATION LEVEL REPEATABLE READ'], env,
+                                    compare_scores=label != 'during')
+        # Connection close rolls back the verification transaction and its temporary tables.
+        report = dict(checks=checks, metadata=metadata,
+                      comparison='membership-cardinality-finite-scores' if label == 'during' else 'exact-score-multiset',
+                      wall_seconds=time.monotonic()-started)
+        (args.output/(label+'-correctness.json')).write_text(json.dumps(report, indent=2)+'\n')
+        return report
+    def launch(role, clients, scripts, rate=0):
+        command = ['pgbench', '-n', '-M', 'prepared', '-c', str(clients), '-j', str(clients),
+                   '-T', str(args.seconds), '-l', '--log-prefix', str(args.output/role)]
+        if rate:
+            command += ['-R', str(rate)]
+        for script in scripts:
+            command += ['-f', str(script)]
+        log = (args.output/(role+'.txt')).open('w')
+        handles.append(log)
+        proc = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+        processes.append(proc)
+        return proc
+    recorder.psql(f'CREATE SCHEMA {schema}', env)
+    try:
+        recorder.psql(';\n'.join(setup)+';', env)
+        results['before'] = check('before')
+        if any(c['status'] != 'passed' for c in results['before']['checks']):
+            raise RuntimeError('before correctness failed')
+        plans = server_times.explain_all(args.engine,
+                    [(c['name'], c['sql']) for c in selected], 1, False, env, [], True)
+        (args.output/'plans.json').write_text(json.dumps(plans)+'\n')
+        if len(plans) != len(selected) or not all(
+                any(n.get('Pruning') == 'block-max' for n in nodes(p[0]['Plan'])) for p in plans):
+            raise RuntimeError('Expected ranked custom scan missing; inspect plans.json')
+        scripts = []
+        for c in selected:
+            script = args.output/(c['name']+'.sql')
+            script.write_text(c['sql']+';\n')
+            scripts.append(script)
+        writer = args.output/'update.sql'
+        writer.write_text(f"\\set row random(1, {args.rows})\n"
+            "UPDATE shape_documents SET body = CASE WHEN body LIKE 'wordaa %' "
+            "THEN substr(body,8) ELSE 'wordaa ' || body END WHERE id=:row;\n")
+        started = time.monotonic()
+        reader = launch('reader', args.readers, scripts)
+        write = launch('writer', 1, [writer], args.write_rate) if args.write_rate else None
+        # Check live membership on one snapshot; index scoring statistics are not MVCC-frozen.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def during():
+                time.sleep(args.seconds/3)
+                return check('during')
+            future = pool.submit(during)
+            reader_status = reader.wait()
+            elapsed = time.monotonic()-started
+            writer_status = write.wait() if write else None
+            writer_elapsed = time.monotonic()-started
+            results['during'] = future.result()
+        results['reader'] = recorder.summarize_logs(
+            sorted(args.output.glob('reader.*[0-9]')), [c['name'] for c in selected], elapsed)
+        if write:
+            results['writer'] = recorder.summarize_logs(
+                sorted(args.output.glob('writer.*[0-9]')), ['update'], writer_elapsed)
+        results['exit_codes'] = dict(reader=reader_status, writer=writer_status)
+        results['after'] = check('after')
+        save()
+        if any(c['status'] != 'passed' for phase in ('before', 'during', 'after')
+               for c in results[phase]['checks']):
+            raise RuntimeError('correctness failed; see results.json')
+        for role in ('reader', 'writer'):
+            if role not in results:
+                continue
+            if results['exit_codes'][role] or results[role]['failures'] or not all(
+                    q['completed'] for q in results[role]['queries'].values()):
+                raise RuntimeError(f'{role} traffic failed; see results.json')
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait()
+        for handle in handles:
+            handle.close()
+        save()
+        recorder.psql(f'DROP SCHEMA {schema} CASCADE', env)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--engine', choices=['stannum', 'tin'], default='stannum')
@@ -180,7 +304,16 @@ def main():
     parser.add_argument('--discard', type=int, default=2)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--generate-only', action='store_true')
+    parser.add_argument('--readers', type=int, default=0, help='Run concurrent pgbench instead of serial timing')
+    parser.add_argument('--seconds', type=int, default=30)
+    parser.add_argument('--write-rate', type=int, default=0, help='Target UPDATE transactions/second')
     args = parser.parse_args()
+    if args.readers < 0 or args.write_rate < 0 or args.seconds < 5:
+        parser.error('readers/write-rate must be nonnegative; seconds >= 5')
+    if args.readers and (args.engine != 'stannum' or args.generate_only):
+        parser.error('concurrent mode requires stannum and cannot use generate-only')
+    if args.write_rate and not args.readers:
+        parser.error('write-rate requires readers')
     if not 0 <= args.discard < args.repetitions:
         parser.error('require 0 <= discard < repetitions')
     setup = fixture(args.rows, args.engine)
@@ -192,6 +325,9 @@ def main():
     timing = dict(setup=setup, queries=[[c['name'], c['sql']] for c in cases])
     (args.output / 'server-cases.json').write_text(json.dumps(timing, indent=2)+'\n')
     if args.generate_only:
+        return
+    if args.readers:
+        concurrent(args, cases)
         return
     validation, metadata = validate(cases, setup, dict(os.environ))
     (args.output/'server.json').write_text(json.dumps(metadata,indent=2)+'\n')

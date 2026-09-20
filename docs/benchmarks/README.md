@@ -1,5 +1,10 @@
 # Benchmarking Stannum
 
+The [concurrent wide-query experiment](wide-contention.md) extends the paired
+optimization measurements to competing readers and match-changing writes.
+
+The [current priorities](priorities.md) rank the next performance and validation work.
+
 The [wide-disjunction optimization](grouped-wand.md) records repeated synthetic
 and Wikipedia measurements, following the [ranked EXISTS fix](ranked-exists.md).
 
