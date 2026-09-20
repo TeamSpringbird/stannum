@@ -50,6 +50,51 @@ mod tests {
     use pgrx::prelude::*;
 
     #[pg_test]
+    fn spilled_merge_outputs_preserve_bytes_limits_and_cancellation() {
+        crate::storage::testing::check_spilled_output();
+    }
+
+    #[pg_test]
+    fn spilled_merges_preserve_build_fold_and_reindex_results() {
+        Spi::run("SET LOCAL stannum.experimental_merge_output_kb = 1;").unwrap();
+        write_buffer_folds_and_merges_keep_results_exact();
+        tiered_merges_keep_results_exact_across_deletes_and_updates();
+        Spi::run("SET LOCAL stannum.build_segment_docs = 16; REINDEX INDEX tiered_idx;").unwrap();
+        assert_index_matches_seqscan("tiered", TIERED_QUERIES);
+        assert_clean("tiered_idx");
+    }
+
+    #[pg_test]
+    fn spilled_build_obeys_temp_file_limit_and_retries_after_rollback() {
+        Spi::run(
+            "SET LOCAL stannum.experimental_merge_output_kb = 1;
+            SET LOCAL stannum.build_segment_docs = 32;
+            SET LOCAL stannum.merge_tier_factor = 2;
+            CREATE TABLE spill_limit AS SELECT n AS id, repeat('common rare ', 50) AS body
+                FROM generate_series(1,1000) n;
+            SET LOCAL temp_file_limit = 0;
+            DO $$BEGIN
+                CREATE INDEX spill_limit_idx ON spill_limit USING stannum(body);
+                RAISE EXCEPTION 'spill unexpectedly succeeded with no temporary space';
+            EXCEPTION WHEN configuration_limit_exceeded THEN NULL;
+            END$$;",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT to_regclass('spill_limit_idx') IS NULL").unwrap(),
+            Some(true)
+        );
+        Spi::run(
+            "SET LOCAL temp_file_limit = -1;
+            CREATE INDEX spill_limit_idx ON spill_limit USING stannum(body);",
+        )
+        .unwrap();
+        assert_clean("spill_limit_idx");
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off").unwrap();
+        assert_index_matches_seqscan("spill_limit", &["common", "rare", "common THEN/0 rare"]);
+    }
+
+    #[pg_test]
     fn bitmap_index_rechecks_heap_pages_without_preloading() {
         assert_eq!(
             Spi::get_one::<String>("SHOW shared_preload_libraries").unwrap(),

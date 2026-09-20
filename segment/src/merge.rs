@@ -164,12 +164,90 @@ fn skip_dead(
     Ok(None)
 }
 
+/// Destination for the two growing encoded areas. A spill implementation may
+/// retain these outside RAM. Other merge allocations remain caller-budgeted.
+/// Lengths must exactly track successful appends. Finish must preserve section
+/// order and enforce the complete output limit before publishing any bytes.
+pub trait OutputSink {
+    type Output;
+    fn lengths(&self) -> (usize, usize);
+    fn append(&mut self, postings: &[u8], payload: &[u8]) -> std::result::Result<(), MergeError>;
+    fn finish(
+        self,
+        header: Vec<u8>,
+        dictionary: Vec<u8>,
+        documents: Vec<u8>,
+        lengths: Vec<u8>,
+        limit: usize,
+    ) -> std::result::Result<Self::Output, MergeError>;
+}
+
+#[derive(Default)]
+struct MemoryOutput {
+    postings: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+impl OutputSink for MemoryOutput {
+    type Output = Vec<u8>;
+    fn lengths(&self) -> (usize, usize) {
+        (self.postings.len(), self.payload.len())
+    }
+    fn append(&mut self, postings: &[u8], payload: &[u8]) -> std::result::Result<(), MergeError> {
+        self.postings.extend_from_slice(postings);
+        self.payload.extend_from_slice(payload);
+        Ok(())
+    }
+    fn finish(
+        self,
+        header: Vec<u8>,
+        dictionary: Vec<u8>,
+        documents: Vec<u8>,
+        lengths: Vec<u8>,
+        limit: usize,
+    ) -> std::result::Result<Vec<u8>, MergeError> {
+        assemble(
+            [
+                header,
+                dictionary,
+                self.postings,
+                self.payload,
+                documents,
+                lengths,
+            ],
+            limit,
+        )
+    }
+}
+
+/// Same validated merge as `merge`, with caller-owned output storage. No index
+/// publication occurs here. Errors and cancellation may leave partial bytes in
+/// the sink; its owner must discard them. Input validation is never bypassed.
+pub fn merge_into<S: OutputSink>(
+    inputs: &[MergeInput<'_>],
+    limits: MergeLimits,
+    sink: S,
+    checkpoint: impl FnMut() -> std::result::Result<(), MergeError>,
+) -> std::result::Result<S::Output, MergeError> {
+    merge_with_sink(inputs, limits, Format::CURRENT, sink, checkpoint)
+}
+
 fn merge_as(
     inputs: &[MergeInput<'_>],
     limits: MergeLimits,
     format: Format,
-    mut checkpoint: impl FnMut() -> std::result::Result<(), MergeError>,
+    checkpoint: impl FnMut() -> std::result::Result<(), MergeError>,
 ) -> std::result::Result<Vec<u8>, MergeError> {
+    merge_with_sink(inputs, limits, format, MemoryOutput::default(), checkpoint)
+}
+
+fn merge_with_sink<S: OutputSink>(
+    inputs: &[MergeInput<'_>],
+    limits: MergeLimits,
+    format: Format,
+    mut sink: S,
+    mut checkpoint: impl FnMut() -> std::result::Result<(), MergeError>,
+) -> std::result::Result<S::Output, MergeError> {
     validate_inputs(inputs, limits, &mut checkpoint)?;
     let segments = inputs
         .iter()
@@ -221,8 +299,6 @@ fn merge_as(
         }
     }
     let mut dictionary = DictionaryBuilder::with_format(format);
-    let mut postings_area = Vec::new();
-    let mut payload_area = Vec::new();
     let mut positions = Vec::new();
     let mut term_inputs = Vec::new();
     let mut cursors = Vec::new();
@@ -289,10 +365,10 @@ fn merge_as(
         if count != 0 {
             let posting_bytes = postings.finish_as(format);
             let payload_bytes = payload.finish_as(format);
+            let (postings_len, payload_len) = sink.lengths();
             check(
-                postings_area
-                    .len()
-                    .checked_add(payload_area.len())
+                postings_len
+                    .checked_add(payload_len)
                     .and_then(|n| n.checked_add(posting_bytes.len()))
                     .and_then(|n| n.checked_add(payload_bytes.len()))
                     .ok_or(MergeError::Limit("output bytes"))?,
@@ -305,19 +381,18 @@ fn merge_as(
                     df: count,
                     max_tf_bucket: max_bucket,
                     postings: Extent {
-                        offset: postings_area.len() as u64,
+                        offset: postings_len as u64,
                         len: u32::try_from(posting_bytes.len())
                             .map_err(|_| MergeError::Limit("posting extent"))?,
                     },
                     payload: Extent {
-                        offset: payload_area.len() as u64,
+                        offset: payload_len as u64,
                         len: u32::try_from(payload_bytes.len())
                             .map_err(|_| MergeError::Limit("payload extent"))?,
                     },
                 },
             )?;
-            postings_area.extend_from_slice(&posting_bytes);
-            payload_area.extend_from_slice(&payload_bytes);
+            sink.append(&posting_bytes, &payload_bytes)?;
         }
         for &i in &term_inputs {
             if let Some(item) = dictionaries[i].next() {
@@ -335,26 +410,33 @@ fn merge_as(
         live_lengths.len() as u64,
         total_length,
         dictionary.len() as u64,
-        postings_area.len() as u64,
-        payload_area.len() as u64,
+        sink.lengths().0 as u64,
+        sink.lengths().1 as u64,
         documents.len() as u64,
     ] {
         varint::put(&mut header, n);
     }
+    let output_len = [
+        header.len(),
+        dictionary.len(),
+        sink.lengths().0,
+        sink.lengths().1,
+        documents.len(),
+        length_bytes.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, len| total.checked_add(len))
+    .ok_or(MergeError::Limit("output bytes"))?;
+    check(output_len, limits.max_output_bytes, "output bytes")?;
     drop(live_lengths);
-    let out = assemble(
-        [
-            header,
-            dictionary,
-            postings_area,
-            payload_area,
-            documents,
-            length_bytes,
-        ],
+    let out = sink.finish(
+        header,
+        dictionary,
+        documents,
+        length_bytes,
         limits.max_output_bytes,
     )?;
     checkpoint()?;
-    check(out.len(), limits.max_output_bytes, "output bytes")?;
     Ok(out)
 }
 

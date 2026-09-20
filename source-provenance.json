@@ -901,6 +901,10 @@
     "benchmarks/test_wide_cursor.py": {
       "owner": "ben",
       "evidence": "Original Stannum wide-query fuzzer generation regression tests."
+    },
+    "postgres/src/storage/spill.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum experimental merge-output spilling implementation."
     }
   }
 }

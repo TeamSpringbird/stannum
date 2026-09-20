@@ -29,6 +29,7 @@
 //! standbys serve segmented reads only then (see [`index_reads_allowed`]).
 
 pub mod layout;
+mod spill;
 pub mod verify;
 pub mod wal;
 
@@ -63,6 +64,8 @@ static WRITE_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1024 * 1024)
 /// Total input documents ordinary insert-side merges may rewrite per fold.
 static MAX_MERGE_DOCS: GucSetting<i32> = GucSetting::<i32>::new(1024);
 const BITMAP_BATCH: usize = 1024;
+// Experimental budget for retained merge output areas; zero keeps direct Vec output.
+static MERGE_OUTPUT_KB: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 /// Documents the write buffer holds before folding into a segment.
 static WRITE_BUFFER_DOCS: GucSetting<i32> = GucSetting::<i32>::new(512);
@@ -91,6 +94,12 @@ pub const MAX_MERGE_TIER_FACTOR: i32 = 64;
 /// Registers the tunables. Low values exist so tests can drive folds,
 /// merges and reclamation at small scale; the defaults are the intended ones.
 pub fn init() {
+    GucRegistry::define_int_guc(
+        c"stannum.experimental_merge_output_kb",
+        c"Experimental retained postings/payload output budget in KiB (zero disables spilling)",
+        c"Not a total merge budget: inputs, metadata, and individual terms remain in memory. Foreground merges only.",
+        &MERGE_OUTPUT_KB, 0, 1024 * 1024, GucContext::Userset, GucFlags::default(),
+    );
     GucRegistry::define_enum_guc(
         c"stannum.experimental_vacuum_merge_strategy",
         c"Experimental VACUUM merge strategy for controlled comparisons",
@@ -1562,14 +1571,24 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
             old.push(meta.segments.remove(position));
         }
         old.reverse();
-        let (blob, docs, total_length) = match direct_merge_limits(&old) {
-            Some(limits) => merge_segments_direct(index, &old, limits),
-            // Aggregate input can exceed one run's u32 byte/document limit
-            // while dropping dead tuples still produces a representable run.
-            // Preserve the old per-input reconstruction path in that case.
-            None => merge_segments_reconstructed(index, &old),
+        let (run, map, docs, total_length) = if MERGE_OUTPUT_KB.get() > 0
+            && let Some(limits) = direct_merge_limits(&old)
+        {
+            let output = merge_segments_spilled(index, &old, limits);
+            let reader = codec(Reader::new(&output));
+            let docs = reader.document_count();
+            let total_length = reader.total_length();
+            drop(reader);
+            let (run, map) = spill::write(index, &output);
+            (run, map, docs, total_length)
+        } else {
+            let (blob, docs, total_length) = match direct_merge_limits(&old) {
+                Some(limits) => merge_segments_direct(index, &old, limits),
+                None => merge_segments_reconstructed(index, &old),
+            };
+            let (run, map) = write_segment_run(index, &blob);
+            (run, map, docs, total_length)
         };
-        let (run, map) = write_segment_run(index, &blob);
         let entry = new_entry(meta, run, map, docs, total_length);
         meta.segments.push(entry);
         for entry in old {
@@ -1596,6 +1615,44 @@ fn direct_merge_limits(entries: &[SegmentEntry]) -> Option<segment::merge::Merge
 }
 
 /// The caller retains exclusive metadata access through construction/publication.
+unsafe fn merge_segments_spilled(
+    index: pg_sys::Relation,
+    entries: &[SegmentEntry],
+    limits: segment::merge::MergeLimits,
+) -> spill::Output {
+    let owned = entries
+        .iter()
+        .map(|entry| unsafe {
+            (
+                read_run(index, entry.run, &generation_label(entry.generation)),
+                dead_set(index, entry),
+            )
+        })
+        .collect::<Vec<_>>();
+    let inputs = owned
+        .iter()
+        .map(|(bytes, dead)| segment::merge::MergeInput { bytes, dead })
+        .collect::<Vec<_>>();
+    let output = segment::merge::merge_into(
+        &inputs,
+        limits,
+        spill::SpillSink::new(MERGE_OUTPUT_KB.get() as usize * 1024),
+        || {
+            race_point("merge:checkpoint");
+            pgrx::check_for_interrupts!();
+            Ok(())
+        },
+    )
+    .unwrap_or_else(|error| match error {
+        segment::merge::MergeError::Codec(_) | segment::merge::MergeError::InvalidInput { .. } => {
+            corrupt(format!("Spilled segment merge: {error}"))
+        }
+        _ => pgrx::error!("Stannum spilled segment merge failed: {error}"),
+    });
+    race_point("merge:built");
+    output
+}
+
 unsafe fn merge_segments_direct(
     index: pg_sys::Relation,
     entries: &[SegmentEntry],
@@ -2711,6 +2768,10 @@ unsafe fn reclaim_orphans(index: pg_sys::Relation) {
 #[cfg(feature = "pg_test")]
 pub mod testing {
     use super::*;
+
+    pub fn check_spilled_output() {
+        spill::check_spilled_output();
+    }
 
     /// Called at every race point of VACUUM's maintenance with its name.
     pub type RaceHook = Box<dyn FnMut(&'static str)>;
