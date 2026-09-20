@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [performance snapshot graphic](performance-snapshot.md) places recorded local
+GIN comparisons alongside separately labeled remote TIN observations.
+
 The [TIN plan catalog](tin-plan-catalog.md) records controlled black-box observations
 from TIN 1.0.2, including generic plans, indexed filters and exposed work counters.
 
