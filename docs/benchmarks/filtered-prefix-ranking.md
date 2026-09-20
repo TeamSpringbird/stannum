@@ -188,6 +188,10 @@ PR. Size: 2,183,502 bytes; SHA256:
 `20dca108327a64633e404fa07373ad7b57929964f2c198b1f55101328b716f8c`.
 Checked-in summaries and representative plans remain available without it.
 
-The retry prototype is not being promoted to main. A separate correctness fix
-for rescanning a completed ranked scan can be reviewed independently; it does
-not ship the speculative retry or claim these prototype speedups for main.
+The retry prototype is not being promoted to main. [PR #43](https://github.com/TeamSpringbird/stannum/pull/43)
+independently fixes a pre-existing correctness bug exposed during review:
+exhaustive completion removes consumed roots from the cached array, and a later
+constant rescan merely rewound that incomplete array. A three-loop regression
+reproduced missing qualifying rows on main. The fix rebuilds those arrays while
+retaining the scorer's frozen statistics. It does not ship the speculative retry
+or claim these prototype speedups for main.
