@@ -46,10 +46,12 @@ declarations remain first. The current templates use 2026, the year of these
 contributions. Extend the templates deliberately when later years or other
 copyright holders apply; do not erase existing notices to satisfy the check.
 
-License terms are unchanged. Workspace metadata still says `AGPL-3.0-only`.
-Lead's newer Rust boilerplate says “or any later version”; clarification is
-pending, so this migration copies the copyright credit and references the
-existing LICENSE rather than adopting that conflicting wording.
+Workspace metadata uses `AGPL-3.0-or-later`, following Lead's upstream
+[license clarification](https://github.com/planetscale/lead/commit/0d261de92c5f2d972b82c760894c68412d9e446e).
+That change aligns the metadata with Lead's “or any later version” boilerplate
+and resolves the discrepancy noted during the initial attribution migration.
+The root LICENSE retains the AGPL version 3 text; existing copyright notices
+and source-header references remain intact.
 
 ## Maintenance
 
