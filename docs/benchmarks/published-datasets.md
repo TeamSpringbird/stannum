@@ -133,5 +133,6 @@ The existing 906-form Wikipedia campaign is unchanged.
 Live checks now pass on 100 and 1,000 raw Stack Exchange documents across all
 3,762 forms; the 1,000-row run took 421 seconds with zero differences. See the
 [results and nonempty coverage](stackexchange-lead-smoke.md). Passing empty
-result sets alone does not prove representative coverage. The timed Stack
-Exchange guard remains until its membership checks are ready.
+result sets alone does not prove representative coverage. The timed raw
+Stack Exchange count path now passes a two-engine container smoke; see
+[raw-text validation](raw-text-membership.md). Ranked and larger runs remain.
