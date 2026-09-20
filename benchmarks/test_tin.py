@@ -12,6 +12,32 @@ from unittest.mock import patch
 import tin
 
 
+class ExportTimingTests(unittest.TestCase):
+    def test_report_rejects_idle_timeout_that_excludes_real_queries(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'postgres'
+            path.mkdir()
+            (root / 'manifest.json').write_text(json.dumps(dict(status='complete', jobs=[dict(engine='postgres', status='complete', sizes={'index': 1, 'total': 2}, cross_engine_membership_differences=0)])))
+            (path / 'result_test.json').write_text(json.dumps({'runs': {'postgres': {'startTime': 1000, 'endTime': 1268, 'queries': {'postgres': {}}}}}))
+            with gzip.open(path / 'samples.json.gz', 'wt') as out:
+                out.write(json.dumps(dict(type='Point', metric='query_duration', data=dict(time='1970-01-01T00:10:00.950999Z', value=4000, tags={'query_id':'1:disjunction'})))+'\n')
+            with patch('tin.resources.summarize', return_value={}):
+                with self.assertRaisesRegex(ValueError, 'outside exported measurement window'):
+                    tin.report(root)
+            self.assertFalse((root / 'comparison.json').exists())
+            export = path / 'result_test.json'
+            value = json.loads(export.read_text())
+            value['runs']['postgres']['endTime'] = 600950
+            export.write_text(json.dumps(value))
+            with patch('tin.resources.summarize', return_value={}):
+                tin.report(root)
+            result = json.loads((root / 'comparison.json').read_text())[0]
+            self.assertEqual(result['seconds'], 599.95)
+            self.assertAlmostEqual(result['qps'], 1 / 599.95)
+
+
 class TraceCorrectnessTests(unittest.TestCase):
     def test_resource_snapshot_rejects_missing_counters_and_failed_exec(self):
         from subprocess import CompletedProcess

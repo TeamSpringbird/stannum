@@ -7,6 +7,7 @@
 import argparse
 import collections
 import csv
+import datetime
 import fcntl
 import gzip
 import json
@@ -68,7 +69,8 @@ def prepare(args):
     command(['git', '-C', driver, 'apply', ASSETS / 'upstream.patch'])
     for source, target in [('register.go', 'backends/stannum/register.go'),
                            ('main.go', 'cmd/stannum-k6/main.go'),
-                           ('live_rows_test.go', 'backends/shared/postgres/stannum_live_rows_test.go')]:
+                           ('live_rows_test.go', 'backends/shared/postgres/stannum_live_rows_test.go'),
+                           ('timing_test.go', 'dashboard/stannum_timing_test.go')]:
         path = driver / target
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ASSETS / source, path)
@@ -90,7 +92,8 @@ def verify_driver(driver):
     if manifest['patch_sha256'] != dataset.sha256(ASSETS / 'upstream.patch'):
         raise ValueError('repository adapter changed; prepare/build a fresh driver')
     for source, target in [('register.go', 'backends/stannum/register.go'), ('main.go', 'cmd/stannum-k6/main.go'),
-                           ('live_rows_test.go', 'backends/shared/postgres/stannum_live_rows_test.go')]:
+                           ('live_rows_test.go', 'backends/shared/postgres/stannum_live_rows_test.go'),
+                           ('timing_test.go', 'dashboard/stannum_timing_test.go')]:
         if dataset.sha256(ASSETS / source) != manifest['files'][target]:
             raise ValueError('repository adapter changed; prepare/build a fresh driver')
     return manifest
@@ -110,6 +113,8 @@ def build(args):
              '-v', 'stannum-benchmark-go-cache:/root/.cache/go-build',
              '-e', f'GOOS={target_os}', '-e', f'GOARCH={target_arch}',
              '-e', 'CGO_ENABLED=0', '-e', 'GOMAXPROCS=4', image]
+    # Run dashboard tests inside Linux even when cross-compiling the driver for macOS.
+    command(builder + ['env', '-u', 'GOOS', '-u', 'GOARCH', 'go', 'test', '-mod=readonly', '-p', '4', './dashboard'])
     command(builder + ['go', 'build', '-mod=readonly', '-p', '4', '-o', 'k6', './cmd/stannum-k6'])
     command(builder + ['go', 'test', '-mod=readonly', '-p', '4', '-c', '-o', 'pg-driver-test', './backends/shared/postgres'])
     if manifest['files'] != identities(driver):
@@ -305,9 +310,6 @@ def report(root):
             continue
         exported = json.loads(exports[0].read_text())['runs'][engine]
         elapsed = (exported['endTime'] - exported['startTime']) / 1000
-        resource_summary = resources.summarize(path / 'resources.jsonl',
-                                               exported['startTime'] / 1000, exported['endTime'] / 1000)
-        bench.save(path / 'resource-summary.json', resource_summary)
         samples, groups = [], collections.defaultdict(list)
         queries = collections.defaultdict(list)
         updates = collections.Counter()
@@ -323,12 +325,19 @@ def report(root):
                 if point['metric'] != 'query_duration':
                     continue
                 data = point['data']
+                timestamp_ms = datetime.datetime.fromisoformat(data['time'].replace('Z', '+00:00')).timestamp() * 1000
+                # The driver truncates timestamps to integer milliseconds.
+                if not exported['startTime'] <= timestamp_ms < exported['endTime'] + 1:
+                    raise ValueError('query sample outside exported measurement window; regenerate the export from raw evidence')
                 query = data['tags']['query_id']
                 samples.append(data['value'])
                 groups[query.split(':')[1]].append(data['value'])
                 queries[query].append(data['value'])
         if not samples or elapsed <= 0:
             raise ValueError('completed run has no measured query samples')
+        resource_summary = resources.summarize(path / 'resources.jsonl',
+                                               exported['startTime'] / 1000, exported['endTime'] / 1000)
+        bench.save(path / 'resource-summary.json', resource_summary)
         def distribution(values):
             return dict(completed=len(values), p50_ms=bench.percentile(values, .5),
                         p95_ms=bench.percentile(values, .95),
