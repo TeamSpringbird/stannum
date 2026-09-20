@@ -71,3 +71,28 @@ bucket; a future host needs a read-only grant to the cache prefix before using
 this restore command (and uses its instance role rather than a local profile).
 Fresh database loads and index construction remain part of each run's setup;
 caching inputs does not replace those steps or alter timed queries.
+
+## Active campaign amendment: concurrency sweep
+
+After the first Stannum measurement, sampled CPU usage averaged 1.97 cores under
+an eight-CPU quota. On user instruction, the remaining two paired repetitions
+were superseded by a Stannum-only concurrency sweep. Finish the original
+Stannum/GIN pair at two clients unchanged, then measure 4, 8, 16, and if needed
+32 clients. Preserve fresh construction, 10-second warmup, 600-second timing,
+all 302 OR forms, memory limits, source/image, and correctness checks.
+
+At eight or more clients, less than 10% throughput gain over the preceding level
+is a candidate plateau. Repeat the highest-throughput observed client count;
+confirmation within 10% is reported as a stable candidate, not a universal
+capacity bound. If throughput keeps growing through 32 clients, report that
+saturation was not established. CPU utilization, throttling, memory and I/O
+counters, and latency percentiles accompany each result. Do not combine these
+runs into baseline-repetition averages or silently replace first-run chart data.
+
+The replacement lifecycle controller uses the existing instance and expiry.
+It leaves the in-flight first pair unchanged and exports evidence before resource
+cleanup. No new run starts with fewer than 55 minutes remaining before expiry.
+The sweep's exact script and decision receipt are retained in the evidence
+archive, with summaries checkpointed to S3 after each run. Duplicate input.csv
+files are excluded from that archive; input hashes remain in each manifest and
+the exact source corpus is retained separately in the reusable cache.
