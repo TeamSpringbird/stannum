@@ -1,0 +1,5045 @@
+{
+  "status": "mismatch",
+  "rows": 100,
+  "cases": [
+    {
+      "name": "density_nine",
+      "documented": {
+        "count": 9,
+        "zero": false
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        }
+      }
+    },
+    {
+      "name": "pinned_nine",
+      "documented": {
+        "count": 9,
+        "zero": false
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine^1' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine^1' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        }
+      }
+    },
+    {
+      "name": "density_ten",
+      "documented": {
+        "count": 10,
+        "zero": true
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'ten' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              2,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              3,
+              "\\x3fd5a154",
+              "\\x4003906b"
+            ],
+            [
+              4,
+              "\\x4003906b",
+              "\\x4003906b"
+            ],
+            [
+              5,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ],
+            [
+              6,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              7,
+              "\\x3fd5a154",
+              "\\x4003906b"
+            ],
+            [
+              8,
+              "\\x4003906b",
+              "\\x4003906b"
+            ],
+            [
+              9,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ],
+            [
+              10,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'ten' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              2,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              3,
+              "\\x3fd5a154",
+              "\\x4003906b"
+            ],
+            [
+              4,
+              "\\x4003906b",
+              "\\x4003906b"
+            ],
+            [
+              5,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ],
+            [
+              6,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              7,
+              "\\x3fd5a154",
+              "\\x4003906b"
+            ],
+            [
+              8,
+              "\\x4003906b",
+              "\\x4003906b"
+            ],
+            [
+              9,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ],
+            [
+              10,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "documented_density"
+        ],
+        "right": [
+          "documented_density"
+        ]
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        }
+      }
+    },
+    {
+      "name": "pinned_ten",
+      "documented": {
+        "count": 10,
+        "zero": false
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'ten^1' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              2,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              3,
+              "\\x3fd5a154",
+              "\\x4003906b"
+            ],
+            [
+              4,
+              "\\x4003906b",
+              "\\x4003906b"
+            ],
+            [
+              5,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ],
+            [
+              6,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              7,
+              "\\x3fd5a154",
+              "\\x4003906b"
+            ],
+            [
+              8,
+              "\\x4003906b",
+              "\\x4003906b"
+            ],
+            [
+              9,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ],
+            [
+              10,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'ten^1' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              2,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              3,
+              "\\x3fd5a154",
+              "\\x4003906b"
+            ],
+            [
+              4,
+              "\\x4003906b",
+              "\\x4003906b"
+            ],
+            [
+              5,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ],
+            [
+              6,
+              "\\x3fe3ec04",
+              "\\x4003906b"
+            ],
+            [
+              7,
+              "\\x3fd5a154",
+              "\\x4003906b"
+            ],
+            [
+              8,
+              "\\x4003906b",
+              "\\x4003906b"
+            ],
+            [
+              9,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ],
+            [
+              10,
+              "\\x3ff44358",
+              "\\x4003906b"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        }
+      }
+    },
+    {
+      "name": "density_eleven",
+      "documented": {
+        "count": 11,
+        "zero": true
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'eleven' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              2,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              3,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              4,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              5,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              6,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              7,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              8,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              9,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              10,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              11,
+              "\\x00000000",
+              "\\x00000000"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'eleven' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              2,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              3,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              4,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              5,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              6,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              7,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              8,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              9,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              10,
+              "\\x00000000",
+              "\\x00000000"
+            ],
+            [
+              11,
+              "\\x00000000",
+              "\\x00000000"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "rank": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "zero": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "max_ok": true
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "rank": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "zero": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "max_ok": true
+        }
+      }
+    },
+    {
+      "name": "pinned_eleven",
+      "documented": {
+        "count": 11,
+        "zero": false
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'eleven^1' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fdac339",
+              "\\x3ffc8ddb"
+            ],
+            [
+              2,
+              "\\x3fdac339",
+              "\\x3ffc8ddb"
+            ],
+            [
+              3,
+              "\\x3fcd0b91",
+              "\\x3ffc8ddb"
+            ],
+            [
+              4,
+              "\\x3ffc8ddb",
+              "\\x3ffc8ddb"
+            ],
+            [
+              5,
+              "\\x3fea7270",
+              "\\x3ffc8ddb"
+            ],
+            [
+              6,
+              "\\x3fdac339",
+              "\\x3ffc8ddb"
+            ],
+            [
+              7,
+              "\\x3fcd0b91",
+              "\\x3ffc8ddb"
+            ],
+            [
+              8,
+              "\\x3ffc8ddb",
+              "\\x3ffc8ddb"
+            ],
+            [
+              9,
+              "\\x3fea7270",
+              "\\x3ffc8ddb"
+            ],
+            [
+              10,
+              "\\x3fea7270",
+              "\\x3ffc8ddb"
+            ],
+            [
+              11,
+              "\\x3fea7270",
+              "\\x3ffc8ddb"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'eleven^1' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fdac339",
+              "\\x3ffc8ddb"
+            ],
+            [
+              2,
+              "\\x3fdac339",
+              "\\x3ffc8ddb"
+            ],
+            [
+              3,
+              "\\x3fcd0b91",
+              "\\x3ffc8ddb"
+            ],
+            [
+              4,
+              "\\x3ffc8ddb",
+              "\\x3ffc8ddb"
+            ],
+            [
+              5,
+              "\\x3fea7270",
+              "\\x3ffc8ddb"
+            ],
+            [
+              6,
+              "\\x3fdac339",
+              "\\x3ffc8ddb"
+            ],
+            [
+              7,
+              "\\x3fcd0b91",
+              "\\x3ffc8ddb"
+            ],
+            [
+              8,
+              "\\x3ffc8ddb",
+              "\\x3ffc8ddb"
+            ],
+            [
+              9,
+              "\\x3fea7270",
+              "\\x3ffc8ddb"
+            ],
+            [
+              10,
+              "\\x3fea7270",
+              "\\x3ffc8ddb"
+            ],
+            [
+              11,
+              "\\x3fea7270",
+              "\\x3ffc8ddb"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            11,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            11,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": true
+        }
+      }
+    },
+    {
+      "name": "density_disabled",
+      "documented": {
+        "count": 11,
+        "zero": false
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid, dense_ratio => 1.1))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'eleven' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              2,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              3,
+              "\\x3fcd0b91",
+              "\\x00000000"
+            ],
+            [
+              4,
+              "\\x3ffc8ddb",
+              "\\x00000000"
+            ],
+            [
+              5,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              6,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              7,
+              "\\x3fcd0b91",
+              "\\x00000000"
+            ],
+            [
+              8,
+              "\\x3ffc8ddb",
+              "\\x00000000"
+            ],
+            [
+              9,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              10,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              11,
+              "\\x3fea7270",
+              "\\x00000000"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid, dense_ratio => 1.1))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'eleven' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              2,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              3,
+              "\\x3fcd0b91",
+              "\\x00000000"
+            ],
+            [
+              4,
+              "\\x3ffc8ddb",
+              "\\x00000000"
+            ],
+            [
+              5,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              6,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              7,
+              "\\x3fcd0b91",
+              "\\x00000000"
+            ],
+            [
+              8,
+              "\\x3ffc8ddb",
+              "\\x00000000"
+            ],
+            [
+              9,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              10,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              11,
+              "\\x3fea7270",
+              "\\x00000000"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "max_score_invariant"
+        ],
+        "right": [
+          "max_score_invariant"
+        ]
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            11,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": false
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            11,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": false
+        }
+      }
+    },
+    {
+      "name": "term_add",
+      "documented": {
+        "count": 9
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid, term_add => ARRAY['gamma']))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x40a575e0",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid, term_add => ARRAY['gamma']))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x40a575e0",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "max_score_invariant"
+        ],
+        "right": [
+          "max_score_invariant"
+        ]
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            1,
+            4,
+            8,
+            5,
+            9,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": false
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            1,
+            4,
+            8,
+            5,
+            9,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": false
+        }
+      }
+    },
+    {
+      "name": "term_replace",
+      "documented": {
+        "count": 9
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid, term_replace => ARRAY['gamma']))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x4053ebea",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x00000000",
+              "\\x4009617a"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid, term_replace => ARRAY['gamma']))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x4053ebea",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x00000000",
+              "\\x4009617a"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "max_score_invariant"
+        ],
+        "right": [
+          "max_score_invariant"
+        ]
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "zero": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "max_ok": false
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "zero": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "max_ok": false
+        }
+      }
+    },
+    {
+      "name": "term_conflict",
+      "documented": null,
+      "expected_error": true,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid, term_add => ARRAY['gamma'], term_replace => ARRAY['beta']))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "error": "ERROR:  XX000: stannum.score(): term_add and term_replace cannot both be non-NULL\nLOCATION:  stannum::score::build_index_scorer::{{closure}}, score.rs:1255",
+          "sqlstate": "XX000"
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid, term_add => ARRAY['gamma'], term_replace => ARRAY['beta']))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "error": "ERROR:  XX000: tin.score(): term_add and term_replace cannot both be non-NULL\nLOCATION:  tin::score::build_corpus::{{closure}}, score.rs:176",
+          "sqlstate": "XX000"
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "error": "XX000"
+        },
+        "right": {
+          "error": "XX000"
+        }
+      }
+    },
+    {
+      "name": "empty_text",
+      "documented": {
+        "count": 0
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> '' ORDER BY id",
+          "rows": []
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> '' ORDER BY id",
+          "rows": []
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "ids": [],
+          "rank": [],
+          "zero": [],
+          "max_ok": true
+        },
+        "right": {
+          "ids": [],
+          "rank": [],
+          "zero": [],
+          "max_ok": true
+        }
+      }
+    },
+    {
+      "name": "punctuation",
+      "documented": {
+        "count": 0
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> '!!!' ORDER BY id",
+          "rows": []
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> '!!!' ORDER BY id",
+          "rows": []
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "ids": [],
+          "rank": [],
+          "zero": [],
+          "max_ok": true
+        },
+        "right": {
+          "ids": [],
+          "rank": [],
+          "zero": [],
+          "max_ok": true
+        }
+      }
+    },
+    {
+      "name": "empty_phrase",
+      "documented": null,
+      "expected_error": true,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> '\"\"' ORDER BY id",
+          "error": "ERROR:  XX000: invalid ==> query: parse error: empty phrase (at byte 0)\nLOCATION:  stannum::operator::stannum_text_cmpfunc_indexed::{{closure}}, operator.rs:162",
+          "sqlstate": "XX000"
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> '\"\"' ORDER BY id",
+          "error": "ERROR:  XX000: invalid ==> query: empty phrase (at byte 0)\nLOCATION:  tin::operator::tin_text_cmpfunc::{{closure}}, operator.rs:37",
+          "sqlstate": "XX000"
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "error": "XX000"
+        },
+        "right": {
+          "error": "XX000"
+        }
+      }
+    },
+    {
+      "name": "empty_alternatives",
+      "documented": null,
+      "expected_error": true,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> '[]' ORDER BY id",
+          "error": "ERROR:  XX000: invalid ==> query: parse error: empty alternatives (at byte 0)\nLOCATION:  stannum::operator::stannum_text_cmpfunc_indexed::{{closure}}, operator.rs:162",
+          "sqlstate": "XX000"
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> '[]' ORDER BY id",
+          "error": "ERROR:  XX000: invalid ==> query: empty alternatives (at byte 0)\nLOCATION:  tin::operator::tin_text_cmpfunc::{{closure}}, operator.rs:37",
+          "sqlstate": "XX000"
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "error": "XX000"
+        },
+        "right": {
+          "error": "XX000"
+        }
+      }
+    },
+    {
+      "name": "standalone_not",
+      "documented": null,
+      "expected_error": true,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,float4send(stannum.score(ctid))::text,float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'NOT nine' ORDER BY id",
+          "error": "ERROR:  XX000: invalid ==> query: parse error: expected expected kw_TO (at byte 4), found unexpected input\nLOCATION:  stannum::operator::stannum_text_cmpfunc_indexed::{{closure}}, operator.rs:162",
+          "sqlstate": "XX000"
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,float4send(tin.score(ctid))::text,float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'NOT nine' ORDER BY id",
+          "error": "ERROR:  XX000: invalid ==> query: expected expected kw_TO (at byte 4), found unexpected input\nLOCATION:  tin::operator::tin_text_cmpfunc::{{closure}}, operator.rs:37",
+          "sqlstate": "XX000"
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": {
+          "error": "XX000"
+        },
+        "right": {
+          "error": "XX000"
+        }
+      }
+    },
+    {
+      "name": "argument_conflict",
+      "documented": null,
+      "expected_error": true,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(stannum.score(ctid,dense_ratio=>0.1),stannum.score(ctid,dense_ratio=>0.2)) FROM oracle_boundary_docs WHERE body ==> 'nine'",
+          "rows": [
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(tin.score(ctid,dense_ratio=>0.1),tin.score(ctid,dense_ratio=>0.2)) FROM oracle_boundary_docs WHERE body ==> 'nine'",
+          "rows": [
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "expected_error"
+        ],
+        "right": [
+          "expected_error"
+        ]
+      },
+      "compared": {
+        "left": [
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ]
+        ],
+        "right": [
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ]
+        ]
+      }
+    },
+    {
+      "name": "score_full_conflict",
+      "documented": null,
+      "expected_error": true,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(stannum.score(ctid),stannum.full_score(ctid)) FROM oracle_boundary_docs WHERE body ==> 'nine'",
+          "rows": [
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(tin.score(ctid),tin.full_score(ctid)) FROM oracle_boundary_docs WHERE body ==> 'nine'",
+          "rows": [
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "expected_error"
+        ],
+        "right": [
+          "expected_error"
+        ]
+      },
+      "compared": {
+        "left": [
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ]
+        ],
+        "right": [
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ]
+        ]
+      }
+    },
+    {
+      "name": "highlight_labels",
+      "documented": null,
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,stannum.highlight(body,'<i class=\"$QUERY_LABEL\" title=\"$QUERY_PART\">','</i>',query=>'alpha OR beta')) FROM oracle_boundary_docs WHERE body ==> 'alpha OR beta' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "padding extra nine ten eleven <i class=\"alpha\" title=\"alpha\">alpha</i> <i class=\"beta\" title=\"beta\">beta</i> gamma"
+            ],
+            [
+              2,
+              "padding extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              3,
+              "padding extra extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              4,
+              "padding nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              5,
+              "padding extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              6,
+              "padding extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              7,
+              "padding extra extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              8,
+              "padding nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              9,
+              "padding extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              10,
+              "padding extra extra ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              11,
+              "padding extra extra extra eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              12,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              13,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              14,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              15,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              16,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              17,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              18,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              19,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              20,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              21,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              22,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              23,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              24,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              25,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              26,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              27,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              28,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              29,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              30,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              31,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              32,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              33,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              34,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              35,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              36,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              37,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              38,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              39,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              40,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              41,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              42,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              43,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              44,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              45,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              46,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              47,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              48,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              49,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              50,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              51,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              52,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              53,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              54,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              55,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              56,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              57,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              58,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              59,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              60,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              61,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              62,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              63,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              64,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              65,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              66,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              67,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              68,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              69,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              70,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              71,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              72,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              73,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              74,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              75,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              76,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              77,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              78,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              79,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              80,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              81,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              82,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              83,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              84,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              85,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              86,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              87,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              88,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              89,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              90,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              91,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              92,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              93,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              94,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              95,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              96,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              97,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              98,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              99,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              100,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,tin.highlight(body,'<i class=\"$QUERY_LABEL\" title=\"$QUERY_PART\">','</i>',query=>'alpha OR beta')) FROM oracle_boundary_docs WHERE body ==> 'alpha OR beta' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "padding extra nine ten eleven <i class=\"alpha\" title=\"alpha\">alpha</i> <i class=\"beta\" title=\"beta\">beta</i> gamma"
+            ],
+            [
+              2,
+              "padding extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              3,
+              "padding extra extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              4,
+              "padding nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              5,
+              "padding extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              6,
+              "padding extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              7,
+              "padding extra extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              8,
+              "padding nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              9,
+              "padding extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              10,
+              "padding extra extra ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              11,
+              "padding extra extra extra eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              12,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              13,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              14,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              15,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              16,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              17,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              18,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              19,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              20,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              21,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              22,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              23,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              24,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              25,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              26,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              27,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              28,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              29,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              30,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              31,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              32,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              33,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              34,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              35,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              36,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              37,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              38,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              39,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              40,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              41,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              42,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              43,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              44,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              45,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              46,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              47,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              48,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              49,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              50,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              51,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              52,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              53,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              54,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              55,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              56,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              57,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              58,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              59,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              60,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              61,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              62,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              63,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              64,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              65,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              66,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              67,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              68,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              69,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              70,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              71,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              72,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              73,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              74,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              75,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              76,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              77,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              78,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              79,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              80,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              81,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              82,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              83,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              84,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              85,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              86,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              87,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              88,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              89,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              90,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              91,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              92,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              93,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              94,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              95,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              96,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              97,
+              "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              98,
+              "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              99,
+              "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ],
+            [
+              100,
+              "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": [
+          [
+            1,
+            "padding extra nine ten eleven <i class=\"alpha\" title=\"alpha\">alpha</i> <i class=\"beta\" title=\"beta\">beta</i> gamma"
+          ],
+          [
+            2,
+            "padding extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            3,
+            "padding extra extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            4,
+            "padding nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            5,
+            "padding extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            6,
+            "padding extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            7,
+            "padding extra extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            8,
+            "padding nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            9,
+            "padding extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            10,
+            "padding extra extra ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            11,
+            "padding extra extra extra eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            12,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            13,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            14,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            15,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            16,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            17,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            18,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            19,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            20,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            21,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            22,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            23,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            24,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            25,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            26,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            27,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            28,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            29,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            30,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            31,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            32,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            33,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            34,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            35,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            36,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            37,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            38,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            39,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            40,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            41,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            42,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            43,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            44,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            45,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            46,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            47,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            48,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            49,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            50,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            51,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            52,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            53,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            54,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            55,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            56,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            57,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            58,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            59,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            60,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            61,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            62,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            63,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            64,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            65,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            66,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            67,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            68,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            69,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            70,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            71,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            72,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            73,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            74,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            75,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            76,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            77,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            78,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            79,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            80,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            81,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            82,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            83,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            84,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            85,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            86,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            87,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            88,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            89,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            90,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            91,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            92,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            93,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            94,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            95,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            96,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            97,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            98,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            99,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            100,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ]
+        ],
+        "right": [
+          [
+            1,
+            "padding extra nine ten eleven <i class=\"alpha\" title=\"alpha\">alpha</i> <i class=\"beta\" title=\"beta\">beta</i> gamma"
+          ],
+          [
+            2,
+            "padding extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            3,
+            "padding extra extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            4,
+            "padding nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            5,
+            "padding extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            6,
+            "padding extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            7,
+            "padding extra extra extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            8,
+            "padding nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            9,
+            "padding extra nine ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            10,
+            "padding extra extra ten eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            11,
+            "padding extra extra extra eleven <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            12,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            13,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            14,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            15,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            16,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            17,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            18,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            19,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            20,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            21,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            22,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            23,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            24,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            25,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            26,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            27,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            28,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            29,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            30,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            31,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            32,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            33,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            34,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            35,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            36,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            37,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            38,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            39,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            40,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            41,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            42,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            43,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            44,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            45,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            46,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            47,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            48,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            49,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            50,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            51,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            52,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            53,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            54,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            55,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            56,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            57,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            58,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            59,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            60,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            61,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            62,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            63,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            64,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            65,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            66,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            67,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            68,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            69,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            70,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            71,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            72,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            73,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            74,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            75,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            76,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            77,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            78,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            79,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            80,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            81,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            82,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            83,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            84,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            85,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            86,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            87,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            88,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            89,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            90,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            91,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            92,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            93,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            94,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            95,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            96,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            97,
+            "padding extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            98,
+            "padding extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            99,
+            "padding extra extra extra <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ],
+          [
+            100,
+            "padding <i class=\"beta\" title=\"beta\">beta</i> <i class=\"alpha\" title=\"alpha\">alpha</i>"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "highlight_before",
+      "documented": null,
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT json_build_array(id,stannum.highlight(body,query=>'alpha BEFORE gamma')) FROM oracle_boundary_docs WHERE body ==> 'alpha BEFORE gamma' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "padding extra nine ten eleven <b>alpha</b> beta <b>gamma</b>"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT json_build_array(id,tin.highlight(body,query=>'alpha BEFORE gamma')) FROM oracle_boundary_docs WHERE body ==> 'alpha BEFORE gamma' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "padding extra nine ten eleven <b>alpha</b> beta <b>gamma</b>"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "agreement",
+      "problems": {
+        "left": [],
+        "right": []
+      },
+      "compared": {
+        "left": [
+          [
+            1,
+            "padding extra nine ten eleven <b>alpha</b> beta <b>gamma</b>"
+          ]
+        ],
+        "right": [
+          [
+            1,
+            "padding extra nine ten eleven <b>alpha</b> beta <b>gamma</b>"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "density_disabled_top_level",
+      "documented": {
+        "count": 11,
+        "zero": false
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT id,to_json(float4send(stannum.score(ctid,dense_ratio=>1.1))::text),to_json(float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'eleven' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              2,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              3,
+              "\\x3fcd0b91",
+              "\\x00000000"
+            ],
+            [
+              4,
+              "\\x3ffc8ddb",
+              "\\x00000000"
+            ],
+            [
+              5,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              6,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              7,
+              "\\x3fcd0b91",
+              "\\x00000000"
+            ],
+            [
+              8,
+              "\\x3ffc8ddb",
+              "\\x00000000"
+            ],
+            [
+              9,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              10,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              11,
+              "\\x3fea7270",
+              "\\x00000000"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT id,to_json(float4send(tin.score(ctid,dense_ratio=>1.1))::text),to_json(float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'eleven' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              2,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              3,
+              "\\x3fcd0b91",
+              "\\x00000000"
+            ],
+            [
+              4,
+              "\\x3ffc8ddb",
+              "\\x00000000"
+            ],
+            [
+              5,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              6,
+              "\\x3fdac339",
+              "\\x00000000"
+            ],
+            [
+              7,
+              "\\x3fcd0b91",
+              "\\x00000000"
+            ],
+            [
+              8,
+              "\\x3ffc8ddb",
+              "\\x00000000"
+            ],
+            [
+              9,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              10,
+              "\\x3fea7270",
+              "\\x00000000"
+            ],
+            [
+              11,
+              "\\x3fea7270",
+              "\\x00000000"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "max_score_invariant"
+        ],
+        "right": [
+          "max_score_invariant"
+        ]
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            11,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": false
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11
+          ],
+          "rank": [
+            4,
+            8,
+            5,
+            9,
+            10,
+            11,
+            1,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": false
+        }
+      }
+    },
+    {
+      "name": "term_add_top_level",
+      "documented": {
+        "count": 9
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT id,to_json(float4send(stannum.score(ctid,term_add=>ARRAY['gamma']))::text),to_json(float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x40a575e0",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT id,to_json(float4send(tin.score(ctid,term_add=>ARRAY['gamma']))::text),to_json(float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x40a575e0",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x3fedffaa",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x3fdf1339",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x4009617a",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x3fff0ff1",
+              "\\x4009617a"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "max_score_invariant"
+        ],
+        "right": [
+          "max_score_invariant"
+        ]
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            1,
+            4,
+            8,
+            5,
+            9,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": false
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            1,
+            4,
+            8,
+            5,
+            9,
+            2,
+            6,
+            3,
+            7
+          ],
+          "zero": [],
+          "max_ok": false
+        }
+      }
+    },
+    {
+      "name": "term_replace_top_level",
+      "documented": {
+        "count": 9
+      },
+      "expected_error": false,
+      "observations": {
+        "left": {
+          "sql": "SELECT id,to_json(float4send(stannum.score(ctid,term_replace=>ARRAY['gamma']))::text),to_json(float4send(stannum.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x4053ebea",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x00000000",
+              "\\x4009617a"
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT id,to_json(float4send(tin.score(ctid,term_replace=>ARRAY['gamma']))::text),to_json(float4send(tin.max_score(ctid))::text) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1,
+              "\\x4053ebea",
+              "\\x4009617a"
+            ],
+            [
+              2,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              3,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              4,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              5,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              6,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              7,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              8,
+              "\\x00000000",
+              "\\x4009617a"
+            ],
+            [
+              9,
+              "\\x00000000",
+              "\\x4009617a"
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "max_score_invariant"
+        ],
+        "right": [
+          "max_score_invariant"
+        ]
+      },
+      "compared": {
+        "left": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "zero": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "max_ok": false
+        },
+        "right": {
+          "ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "rank": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "zero": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "max_ok": false
+        }
+      }
+    },
+    {
+      "name": "argument_conflict_top_level",
+      "documented": null,
+      "expected_error": true,
+      "observations": {
+        "left": {
+          "sql": "SELECT stannum.score(ctid,dense_ratio=>0.1),stannum.score(ctid,dense_ratio=>0.2) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT tin.score(ctid,dense_ratio=>0.1),tin.score(ctid,dense_ratio=>0.2) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "expected_error"
+        ],
+        "right": [
+          "expected_error"
+        ]
+      },
+      "compared": {
+        "left": [
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ]
+        ],
+        "right": [
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ]
+        ]
+      }
+    },
+    {
+      "name": "score_full_conflict_top_level",
+      "documented": null,
+      "expected_error": true,
+      "observations": {
+        "left": {
+          "sql": "SELECT stannum.score(ctid),stannum.full_score(ctid) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ]
+          ]
+        },
+        "right": {
+          "sql": "SELECT tin.score(ctid),tin.full_score(ctid) FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id",
+          "rows": [
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ],
+            [
+              1.8593647,
+              1.8593647
+            ],
+            [
+              1.7427741,
+              1.7427741
+            ],
+            [
+              2.1465745,
+              2.1465745
+            ],
+            [
+              1.992674,
+              1.992674
+            ]
+          ]
+        }
+      },
+      "same": true,
+      "classification": "both_vs_documentation_or_invariant",
+      "problems": {
+        "left": [
+          "expected_error"
+        ],
+        "right": [
+          "expected_error"
+        ]
+      },
+      "compared": {
+        "left": [
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ]
+        ],
+        "right": [
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ],
+          [
+            1.8593647,
+            1.8593647
+          ],
+          [
+            1.7427741,
+            1.7427741
+          ],
+          [
+            2.1465745,
+            2.1465745
+          ],
+          [
+            1.992674,
+            1.992674
+          ]
+        ]
+      }
+    }
+  ],
+  "checks": [
+    "membership",
+    "rank",
+    "zero_mask",
+    "max_score_invariant",
+    "error_sqlstate",
+    "exact_highlights"
+  ],
+  "lead_revision": "bd95c7e51b6afce81396790852ee2f2c169570ad",
+  "scope": "small synthetic boundaries; no mutation or performance claims",
+  "servers": {
+    "left": {
+      "version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit",
+      "functions": [
+        "stannum.amhandler(internal)",
+        "stannum.bind_query(text,oid)",
+        "stannum.full_score(tid)",
+        "stannum.full_score(tid,real,real)",
+        "stannum.highlight(text,text,text,stannum.indexed_query)",
+        "stannum.highlight(text,text,text,text)",
+        "stannum.highlight_ansi(text,integer,stannum.indexed_query)",
+        "stannum.highlight_ansi(text,integer,text)",
+        "stannum.highlight_support(internal)",
+        "stannum.index_reads_allowed(regclass)",
+        "stannum.indexed_query_in(cstring)",
+        "stannum.indexed_query_out(stannum.indexed_query)",
+        "stannum.logs_removal_horizons(regclass)",
+        "stannum.max_score(tid)",
+        "stannum.maybe_quote(text)",
+        "stannum.ql_parse(text,boolean,text,text,text,text,integer,text,text)",
+        "stannum.score(tid,real,real,real,text[],text[])",
+        "stannum.score_bound(text,text,integer,integer,integer,real,real,real,text[],text[])",
+        "stannum.score_bound_indexed(tid,text,integer,integer,integer,real,real,real,text[],text[])",
+        "stannum.score_inspect(regclass,text,real,text[],text[])",
+        "stannum.score_support(internal)",
+        "stannum.segment_info(regclass)",
+        "stannum.stannum_text_cmpfunc(text,text)",
+        "stannum.stannum_text_cmpfunc_indexed(text,stannum.indexed_query)",
+        "stannum.stannum_text_cmpfunc_support(internal)",
+        "stannum.stannum_text_restrict(internal,oid,internal,integer)",
+        "stannum.tokenize(text,text,text,text,text,integer,text,text)",
+        "stannum.verify_index(regclass,boolean)",
+        "stannum.version()",
+        "stannum.wal_rmgr_id()"
+      ]
+    },
+    "right": {
+      "version": "PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit",
+      "functions": [
+        "tin.amhandler(internal)",
+        "tin.full_score(tid)",
+        "tin.full_score(tid,real,real)",
+        "tin.highlight(text,text,text,text)",
+        "tin.highlight_ansi(text,integer,text)",
+        "tin.highlight_support(internal)",
+        "tin.max_score(tid)",
+        "tin.maybe_quote(text)",
+        "tin.ql_parse(text,boolean,text,text,text,text,integer,text,text)",
+        "tin.score(tid,real,real,real,text[],text[])",
+        "tin.score_bound(text,text,integer,integer,integer,real,real,real,text[],text[])",
+        "tin.score_inspect(regclass,text,real,text[],text[])",
+        "tin.score_support(internal)",
+        "tin.tin_text_cmpfunc(text,text)",
+        "tin.tokenize(text,text,text,text,text,integer,text,text)"
+      ]
+    }
+  },
+  "stannum_source": {
+    "commit": "9085f8ff0529a4a8a487e8ddf34eb67ff8aff73b",
+    "tags": [],
+    "source_sha256": "177bb8028d4164797f618a7344d9252d148bf76914750ec98114a13daeb6a4c8",
+    "source_files": {
+      ".cargo/config.toml": "1b8f975a191ca681a13bc370e94a5b8b3c8b5d3145db4432bae873b9b341211c",
+      "Cargo.lock": "0fce9f1d55708bdc4e2e8f11ca310176a66ba71f3d958a19c3d7e1b64f8d6681",
+      "Cargo.toml": "be9602a816f378a7aca1260d093cef93d26b8aa949080d9b8637baa399729ad0",
+      "boldi-vigna/Cargo.toml": "3f755e803e5b30e242865aed93ad4e8997acb0bf261d8425d39027c2609de3dd",
+      "boldi-vigna/README.md": "50bfb97ab25c9acb2871af521792ec7e73ddb4698765887cfe2697fadbfb852e",
+      "boldi-vigna/src/display.rs": "4d6a663199d75b2b36d26c04f73678e1334aef894c58bb913dae5703a86a5812",
+      "boldi-vigna/src/error.rs": "5e31195abde4485bf0f0015978c3a6bf7dabe62602d48375628a6096d8f14ba6",
+      "boldi-vigna/src/interval.rs": "44e6ca394e6eba83d5a0fdf7b463c7d9c867bb3b39bb8aaf827a077e0d88924f",
+      "boldi-vigna/src/lib.rs": "eb36196876217dbd15f13a831a4bd359e351e47b7ddd69e60e92f85b20ab3669",
+      "boldi-vigna/src/positions.rs": "94ba37b0d2a0b8a5210c1d720ac4c426fd93899a42332a43dd5305d1b7fc8473",
+      "boldi-vigna/src/query.rs": "6a6bc4d1274ec988a57a7d796269eec40016e187ea67bd0f415aa28b0da0651a",
+      "boldi-vigna/src/solver.rs": "0cc2b0fd3b50023611db63a74835596cc80ed38a62d382602927bc77e914e67f",
+      "boldi-vigna/src/state/disjunction.rs": "0ced0694a539a1691baac71aacaffca48cd4be3c18f6e4e15280e1f0f062c565",
+      "boldi-vigna/src/state/empty.rs": "923ed1c88535e5be9df5c7f98aea3a21afea0d926e23496fd0617da90df01b5d",
+      "boldi-vigna/src/state/filter.rs": "1f56917cf92b4b24b1498a107755ffc2327efbd88bee6bd64825228ab00b37e8",
+      "boldi-vigna/src/state/mod.rs": "16a9e734923fc0ce5d40152eeeed91fbfeb9e67a0f369b7732191d549a4429de",
+      "boldi-vigna/src/state/ordered.rs": "419d8849906e15f0094d061ffdb9cb9f88ded8f4e1a27a119189bc409e4526a9",
+      "boldi-vigna/src/state/phrase.rs": "1d12c6e8c732f1c1e33d187ed8791331fdd1920468f77020278113904ccf8de4",
+      "boldi-vigna/src/state/relation.rs": "c4b4deab5c55306effc5ac6898fd745db365e5d4713cec530316bdc04f9a3902",
+      "boldi-vigna/src/state/term.rs": "ad88417af8bbb5f8a4142beaa03db8fdac82594b5fc166573a0f7f9f0a9b2172",
+      "boldi-vigna/src/state/unordered.rs": "5486525fe20277c979db1ad4d3ea1ee62e30f4a8f6f914ef75450e28642da291",
+      "postgres/Cargo.toml": "6fc4d57c763c0a701070bbb3093d952e2dd6782b15aa90ece5a4f5fc3b1bf27e",
+      "postgres/sql/stannum--0.1.0.sql": "3a6c13c8036bf8a847c5b0ec03911542bcadb2d7ca511e31f8dcb686ae713981",
+      "postgres/src/am.rs": "e56ffbb0832dffe26f0c1f01d209e4ccbbb5af4e41ea4f78b49cd393d1ba091b",
+      "postgres/src/bm25.rs": "ff74ae95c91a04c06d00dc8951d776168b2e7df2a89440c646ce3120bb18b808",
+      "postgres/src/customscan.rs": "63bf07a70f9b8ef0393af5c24dc933d48e5e2b71f473241c10d3ca28d73f08a6",
+      "postgres/src/highlight.rs": "4f78b0292c18c87985b80aa32232a49b8a8c6109e38a9707b743d16fa9d22237",
+      "postgres/src/highlight_udfs.rs": "df5cea509c2a5262fbcafb91a564f34a82c517c247512777dec181464a1dd13f",
+      "postgres/src/lib.rs": "6aa586d95d72c123e399f1ae0c6e4dd3b9f3c28ef0ec8cb9ab79ecd82275f5f3",
+      "postgres/src/match_positions.rs": "8ba75187d7993dfa7593da34d9f9fec2ba29e8ced71e4113ec95c7e1db603f54",
+      "postgres/src/operator.rs": "c283a1ec7207eef0dab8f4a7d060237015d0f246d9bae2e62f4131db01598d13",
+      "postgres/src/options.rs": "49722013436d28e6b0df58b915a702c22f3591742e56fde4f4737fd6b8e139b6",
+      "postgres/src/score.rs": "4c8ca5ef170389140e82ce3bcf8d0804ab37673817a6904f6dc20b283a2e93e7",
+      "postgres/src/selectivity.rs": "51718c959d0c163d0a0afd56ac6ae97f156a84d24b4d7aa0ba98cc4d025dd532",
+      "postgres/src/storage/layout.rs": "ad2ab6b51f73dc8465556b3763f0ff6916006e7176e669403c301d159ab458e3",
+      "postgres/src/storage/mod.rs": "34412154f3cf0072de3c04a86a66c1d503cc55a09b43624f7a7266d9072f4705",
+      "postgres/src/storage/verify.rs": "ab2e9fbb198cbc7498b19b4a34ef4056bc9db2ac9aba5e8d25eaf944eafffab0",
+      "postgres/src/storage/wal.rs": "2d983635e68b497cb7e1a6c321a809dea31865a862ec1d2526d29bf334f15fd4",
+      "postgres/src/stream.rs": "55c5e0eee31eaa8e43698eedab43f1a340b0d2f28143f2001b6c62621cc1ee92",
+      "postgres/src/udfs.rs": "669e14490648c4f5ceb8ec1e5ebdcf9246ad9571e1b7bf22efb645c8d162ee5b",
+      "postgres/stannum.control": "cce5c19682078bedc88f75e6d9d77bac6cb74fdd5fb8e19c617761470c34b0aa",
+      "postgres/tests/extension_upgrade.py": "062237307ad84059fad7f4f8a859366ba22625fc3916ff45e05d1606f68e798e",
+      "postgres/tests/postings_lifecycle.py": "23fbdf3708c25f67c8f8c9aceee681ad062953b81c9fea52f8b817206f8835bc",
+      "postgres/tests/ranked_fuzz.py": "1eb49763f3ea4913d31535308cdffd4c64970b4921e4eae7e86fdd9b264695ad",
+      "rust-toolchain.toml": "bbc102aff7a81d768ad125655bd14fbdd30a245153f22bcc20cc1707f4a97fb3",
+      "segment/Cargo.toml": "a90620dc87d19e20271b429d545d144ece77210ef0eb03bbb72a446cc75579d1",
+      "segment/examples/breakdown.rs": "fa3b9756bd842ac52906d6d04a866f45205074cf9bbb450b89bb7ef5845e13a9",
+      "segment/examples/merge_memory.rs": "2cacd739f43bd1429d388251552d9504274ca64c80f4017ef9247a7d8f004284",
+      "segment/examples/vacuum_diagnostic.rs": "230dd2b45e15cba480297792d54567bcfe9608ddf42388f0e84818f2d576a651",
+      "segment/proptest-regressions/random_tests.txt": "d48f0784a4a7f1a00ef54a74b77baa51853d0fd536358ccf3a363e14489e77e0",
+      "segment/proptest-regressions/verify.txt": "97249d46e3befb2cc09e0d85759b123ce2772f06a84dcdd1041fec8c7bb49edf",
+      "segment/src/dictionary.rs": "5dc3e4e518c378669a21c9e7e0c76ee564102df99e9d0d720d9e8e3827c85588",
+      "segment/src/direct_merge_poc.rs": "327430bb38782d818b859f23a9d4bfbb0d0537101f77712fac37f591b7575ad5",
+      "segment/src/error.rs": "65796e0b85dfcc3d470bdf61afffa9d731b04cb5ddfaa9b61097e5a5780d3d2f",
+      "segment/src/format_tests.rs": "013da069d8d40548c9cfecb84ba19510ab1ceb1a7ef1d69bd1b3ced702c84a7b",
+      "segment/src/forward.rs": "fef9afdffb7f3100e9fe1c96495e7b4efd833d29d3cc02f62d89d2a36b225be8",
+      "segment/src/index.rs": "3026ae1db51489061f3108923e3bcf284cb664b8b6d862a3d45e292a654b1635",
+      "segment/src/lib.rs": "473b41453a971e966092c9a53cd5f329542665aa61ec230c9a60935edb570a1e",
+      "segment/src/merge.rs": "d1d518bdf200a1d34a470f970bc65416e119292263b4aa308e7ff43f63b4d8a3",
+      "segment/src/merge_strategy.rs": "d7f625aee97aa1de7bb96f33f628d9851100170a2bd0b6d25d55dfa726d45a7b",
+      "segment/src/pages.rs": "2d384194c076be0d021b7bb5732bffee084def6f9ee0b918fbb606c96f95017c",
+      "segment/src/payload.rs": "c17e153a4d40fa8e716fc4f41de880c82d8071cf954e0921907b85c4734720e9",
+      "segment/src/postings.rs": "b73c09be32be112a80ee9f010c99d8454880c3eaeaa615d36c1f018e9b310e3d",
+      "segment/src/random_tests.rs": "0caee6e66d5bce504fb43ff1299e0826784e32e8493ef9d1c70bed70e7e582b3",
+      "segment/src/reader.rs": "2e6cf9eb8143f80ff8055737a705f8dffa6b2e36a68a272719c8880ad49799f0",
+      "segment/src/segment.rs": "9f9e87a7296f59a3e64d39e0c7814ad024768ca959465445d16e5aef3d70621d",
+      "segment/src/set.rs": "fda5cd8249a4ecb4c8d3726c4a029ab2ed1cfc6dde80a0c08a2ee1ee6bfff773",
+      "segment/src/source.rs": "c136976e6e69d5aea291c325cd56ec43c5261d32876b615cd9432c78208decdd",
+      "segment/src/tf_bucket.rs": "ee33c92e4b4bcbfba9c0d2bd2c2e88bbf048ff07ee437350bcb8d0b1aa10f67f",
+      "segment/src/tid.rs": "841be7b204afe67401b3f8afd512c121f78ec683ac15448a06fe2bdc70615264",
+      "segment/src/varint.rs": "dedea092e5b7779ca013a923450445c9c3db703ec5e60a6a198728f62807da70",
+      "segment/src/verify.rs": "b4619fb485ebbe67305a0322a8bca6d8fec9e8b86b2c7a72c94a7790124856d4",
+      "segment/tests/buffer_cost.rs": "b9b673009c8f475d5f991311e06f79c7ac86ab59e631d53030c796ca2e5dafc4",
+      "segment/tests/fixtures/lsg2.segment": "5afb2a326918e935bc675f24a6f4708f55c50e6f8dd285a563b3adfc1715a73f",
+      "segment/tests/scoring_cost.rs": "d9bbc0bf41ff5257222e3307200c1b86337308086ac9a74cdb0e0bf8f70ac9bb",
+      "tinql/Cargo.toml": "430fdf83e653d338be5230a27218f59245f513ca8165ba241356afa319a362a0",
+      "tinql/src/ast.rs": "0e606401474d9fb4b1f3ef8e35d26f162edd32794f9c8d5a970203303ebf083b",
+      "tinql/src/error.rs": "0ee8736a1e856597f07e2facdfe668bce97011e6044b30fd8f5d36abac54b363",
+      "tinql/src/lib.rs": "d8422827447151df7d1aac4bc4a63aadd8b9e9587395145534495bd4c2bca1f3",
+      "tinql/src/parser/mod.rs": "e77748581ea93ce9471d144600e76ec674ae65be7878229622469e93dd6a5017",
+      "tinql/src/parser/pest_parser/grammar.pest": "665feda4a26e53af2d27f63fbcde40e47686f9fc386da3ebb1128d8ffc0a7eb4",
+      "tinql/src/parser/pest_parser/mod.rs": "b361db5ed4c6644068100490e338e6f0a58931964145f16128fd178474d85b61",
+      "tinql/src/parser/pest_parser/phrase.pest": "eec92854b393e78ae9eb403639222e17a86670d5d368d1e65b5b362e8c3823e1",
+      "tinql/src/parser/pest_parser/phrase_grammar.rs": "f169e0bbab38bba71769a1e226b610a76d702a01d63145608e24195bc7eab82c",
+      "tinql/src/quote.rs": "26f050761db89123f5ebea00f379c3d3167a7f1f466217453a0c1da6fea3e9b3",
+      "tinql/src/runtime/capability.rs": "47ed5192da60539ce2953e109ae7d9e590732910d74e5df3cd23e14945139182",
+      "tinql/src/runtime/display.rs": "aa7030ea1001674b6029b36986723253c8552b3e9e3fc96e14e01a20e8c845d5",
+      "tinql/src/runtime/estimate.rs": "221349b18b506c7244f1444a219134cee249b112116c4f3954b1f788e14a546f",
+      "tinql/src/runtime/eval.rs": "bcc01348bd737bf463a4e28697c8ee0281da718742779a2f56f273023697d8ee",
+      "tinql/src/runtime/lower.rs": "ebd67420f8f82e3baadf6b8131602768bb1b01460508144865604b5fb3dfce62",
+      "tinql/src/runtime/mod.rs": "0d7e68280e5e7d5150607c5f1f0b1d9fe7c432a329d0283ad80bffe3f2993add",
+      "tinql/src/runtime/plan.rs": "f3ca4c4571f1dc7eb485bfa230e804036fae63a1d892ca21ebd6c36c072b204f",
+      "tinql/src/runtime/position_filter.rs": "4d21e601179a21baa25b5d8bb19380bd557cc32234dc6a4c0d57a69646f6b562",
+      "tinql/src/runtime/regex.rs": "14922a2125771c98eb477c6fde470cc54e5443393dce656e6b3df328bd2fffa4",
+      "tinql/src/runtime/retrieval.rs": "2a7edc93c16c1bb3008a71ffd0b5ccff17eec315641ee61198fc644a7b4cd245",
+      "tinql/src/runtime/simplify.rs": "70053a1db1e23b42fe0c230e4b01ae36c6091c94609fb2f22e07ddce9f769fc9",
+      "tinql/src/runtime/span_expr.rs": "3fc6a8f14dcbc61c300e3373c3503b3ba2621fd7d2462bd1f55352d48fc465a5",
+      "tinql/src/runtime/subtokenize.rs": "6e9ac2f14b222bfa85e4f61f35cf7d0bf816f15fce10f2922c95082d455aa8e9",
+      "tinql/src/tests.rs": "3bdc701e0ea108bde9824f30af989299787603b36c9007d47d35da0b2c7c9843",
+      "tinql/src/util.rs": "f0479bcd717e996d6109b0a5f07ec3ac9b4b610ca173bbdd20fe61d72a571631",
+      "tokenizer/Cargo.toml": "a6d048e138f0684ce1345c2949e011595d411c5d4be2b96ccea3d48b5a656c90",
+      "tokenizer/src/compiled.rs": "2beedbdb99834ddd225ad2304f6d4b3bbd0da4fd47228fcf4a96fecba913ad40",
+      "tokenizer/src/folder.rs": "6ee1a543ce47be090a867c2be34315fed18abd8db1bede4c9d51a0e6d1e82a52",
+      "tokenizer/src/lib.rs": "884dce7c69664114bc6a745da4c7672b485cf9dcafb0d4e38e9b6e0c55538b8a",
+      "tokenizer/src/long_tokens.rs": "1bcdd436c6eeea1ab114f175feea6ad20a2ea2f40ec3474cc731c979273955fb",
+      "tokenizer/src/presets.rs": "6b06cd67a2bc635d9410c0b93e6926a59bf5cbab5ea9be445105cf6a1247aceb",
+      "tokenizer/src/source_spans.rs": "c4ca745343bb955b45ae8b48043850aa92c0b98b188996e6d7348fa4fc51420f",
+      "tokenizer/src/spec.rs": "e3d80046bd7e91fe71c1b91ed4c58f7bfeb3396b9b4ddb84d6bf655f4a439c26",
+      "tokenizer/src/tokenizers.rs": "61b4647967404d5a2c3f6df84b2f5fa45b412c5f1db56448b7421b7ed1ba1ea9",
+      "tokenizer/src/tokenizers/unicode.rs": "7a9b5d3752c4f278c9a08a076b665e999849ead5070ed5a518fce72049b750b9",
+      "tokenizer/src/tokenizers/whitespace.rs": "4d164c13a89fccca2ad6e771ccb7c25590d7f74bb8b2311116d0bcddc43745bc",
+      "tokenizer/tests/compatibility.rs": "ae3ce22ec846544a72bb511b3354badab846cea6f2050a2d6f8ad7ea9bc110f1"
+    },
+    "source_dirty": false,
+    "working_tree_dirty": true
+  },
+  "files": {
+    "/Users/uri/.t3/worktrees/lead/stannum-contract-boundaries/benchmarks/oracle.py": "f0bddd4f8ed862bb4437ef6fc6882e1d29b7cac2d965843be05224b730958f4a",
+    "/opt/homebrew/lib/postgresql@18/stannum.dylib": "7b1a6e9d6b86da1dded639f33a894bc335307345d9e03005cba9afb8a674680d",
+    "/opt/homebrew/lib/postgresql@18/tin.dylib": "e78abaa787d25fbbb94df6a40a441503c5ef5e3a7997cb996d71e9283ee63fde"
+  },
+  "elapsed_seconds": 1.5507248751819134,
+  "differences": 11
+}

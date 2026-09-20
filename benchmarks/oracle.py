@@ -379,6 +379,205 @@ def run_trace(args):
     return 0 if report['status'] == 'passed' else 1
 
 
+
+# Deliberately independent of QUERIES/STATES and the published trace budget.
+# Exactly 100 nonempty documents make the documented 10% boundary unambiguous.
+BOUNDARY_FIXTURE = """
+CREATE TABLE oracle_boundary_docs(id int PRIMARY KEY, body text);
+INSERT INTO oracle_boundary_docs
+SELECT n, 'padding ' || repeat('extra ', n % 4) ||
+ CASE WHEN n <= 9 THEN 'nine ' ELSE '' END ||
+ CASE WHEN n <= 10 THEN 'ten ' ELSE '' END ||
+ CASE WHEN n <= 11 THEN 'eleven ' ELSE '' END ||
+ CASE WHEN n = 1 THEN 'alpha beta gamma' ELSE 'beta alpha' END
+FROM generate_series(1,100) n;
+CREATE INDEX oracle_boundary_idx ON oracle_boundary_docs USING {engine}(body);
+"""
+
+
+def boundary_cases(engine):
+    cases = []
+    def score(name, query, args='', expected=None, error=False):
+        q = query.replace("'", "''")
+        cases.append(dict(name=name, kind='score', expected=expected, error=error,
+            sql=f"SELECT json_build_array(id,float4send({engine}.score(ctid{args}))::text,"
+                f"float4send({engine}.max_score(ctid))::text) FROM oracle_boundary_docs "
+                f"WHERE body ==> '{q}' ORDER BY id"))
+    for term, count in [('nine', 9), ('ten', 10), ('eleven', 11)]:
+        score('density_' + term, term, expected=dict(count=count, zero=count >= 10))
+        score('pinned_' + term, term + '^1', expected=dict(count=count, zero=False))
+    score('density_disabled', 'eleven', ', dense_ratio => 1.1', dict(count=11, zero=False))
+    score('term_add', 'nine', ", term_add => ARRAY['gamma']", dict(count=9))
+    score('term_replace', 'nine', ", term_replace => ARRAY['gamma']", dict(count=9))
+    score('term_conflict', 'nine', ", term_add => ARRAY['gamma'], term_replace => ARRAY['beta']", error=True)
+    for name, query, error in [('empty_text', '', False), ('punctuation', '!!!', False),
+            ('empty_phrase', '""', True), ('empty_alternatives', '[]', True),
+            ('standalone_not', 'NOT nine', True)]:
+        score(name, query, expected=None if error else dict(count=0), error=error)
+    for name, expression in [
+        ('argument_conflict', f'{engine}.score(ctid,dense_ratio=>0.1),{engine}.score(ctid,dense_ratio=>0.2)'),
+        ('score_full_conflict', f'{engine}.score(ctid),{engine}.full_score(ctid)')]:
+        cases.append(dict(name=name, kind='rows', error=True, expected=None,
+            sql=f"SELECT json_build_array({expression}) FROM oracle_boundary_docs WHERE body ==> 'nine'"))
+    for name, query, tags in [('labels', 'alpha OR beta', "'<i class=\"$QUERY_LABEL\" title=\"$QUERY_PART\">','</i>',"),
+                              ('before', 'alpha BEFORE gamma', '')]:
+        cases.append(dict(name='highlight_' + name, kind='rows', error=False, expected=None,
+            sql=f"SELECT json_build_array(id,{engine}.highlight(body,{tags}query=>'{query}')) "
+                f"FROM oracle_boundary_docs WHERE body ==> '{query}' ORDER BY id"))
+    # Repeat policy probes with top-level target entries: failures must not be
+    # attributed to json_build_array hiding scorer calls from planner binding.
+    for name, args in [('density_disabled', ',dense_ratio=>1.1'),
+                       ('term_add', ",term_add=>ARRAY['gamma']"),
+                       ('term_replace', ",term_replace=>ARRAY['gamma']")]:
+        original = next(case for case in cases if case['name'] == name)
+        query = 'eleven' if name == 'density_disabled' else 'nine'
+        cases.append(dict(original, name=name + '_top_level', columns=True,
+            sql=f"SELECT id,to_json(float4send({engine}.score(ctid{args}))::text),"
+                f"to_json(float4send({engine}.max_score(ctid))::text) FROM oracle_boundary_docs "
+                f"WHERE body ==> '{query}' ORDER BY id"))
+    for name, expression in [
+        ('argument_conflict', f'{engine}.score(ctid,dense_ratio=>0.1),{engine}.score(ctid,dense_ratio=>0.2)'),
+        ('score_full_conflict', f'{engine}.score(ctid),{engine}.full_score(ctid)')]:
+        original = next(case for case in cases if case['name'] == name)
+        cases.append(dict(original, name=name + '_top_level', columns=True,
+            sql=f"SELECT {expression} FROM oracle_boundary_docs WHERE body ==> 'nine' ORDER BY id"))
+    return cases
+
+
+def boundary_observe(case, env):
+    # VERBOSITY provides stable SQLSTATE while retaining full diagnostics.
+    result = psql('\\set VERBOSITY verbose\n' + case['sql'] + ';', env)
+    if result.returncode:
+        import re
+        match = re.search(r'ERROR:\s+([0-9A-Z]{5}):', result.stderr)
+        return dict(error=result.stderr.strip(), sqlstate=match.group(1) if match else None)
+    return dict(rows=[([json.loads(field) for field in line.split('|')] if case.get('columns')
+                       else json.loads(line)) for line in result.stdout.splitlines()])
+
+
+def boundary_check(case, observed):
+    """Cross-engine normalization plus independent documented invariants.
+
+    Never compare cross-engine score bits: rank, zero masks and same-engine
+    max_score equality detect meaningful failures without corpus-stat assumptions.
+    """
+    problems = []
+    if 'error' in observed:
+        if not case['error']:
+            problems.append('unexpected_error')
+        if not observed['sqlstate']:
+            problems.append('missing_sqlstate')
+        elif case['error'] and observed['sqlstate'] != 'XX000':
+            # Pinned Lead emits XX000 for these extension-level validation
+            # failures. Undefined functions/relations and timeouts cannot pass
+            # merely because both servers rejected the statement.
+            problems.append('unexpected_error_sqlstate')
+        return dict(error=observed['sqlstate']), problems
+    if case['error']:
+        problems.append('expected_error')
+    rows = observed['rows']
+    if case['kind'] != 'score':
+        return rows, problems
+    scores = checked_scores([row[:2] for row in rows])
+    zero = [id_ for id_, bits in scores.items() if score_value(bits) == 0]
+    # max_score must be constant and equal the exhaustive score maximum, not
+    # merely agree in rank with another engine's potentially wrong maximum.
+    maxima = [row[2] for row in rows]
+    expected_max = max(map(score_value, scores.values()), default=None)
+    max_ok = all(bits is not None and score_value(bits) == expected_max for bits in maxima)
+    if not max_ok:
+        problems.append('max_score_invariant')
+    expected = case['expected'] or {}
+    if 'count' in expected and len(rows) != expected['count']:
+        problems.append('documented_membership')
+    if 'zero' in expected and any((score_value(bits) == 0) != expected['zero'] for bits in scores.values()):
+        problems.append('documented_density')
+    return dict(ids=list(scores), rank=ranking(list(scores.items())), zero=zero, max_ok=max_ok), problems
+
+
+def run_boundaries(args):
+    import dataset
+    import run as bench
+    if args.budget_seconds <= 0 or args.statement_seconds <= 0:
+        raise ValueError('boundary time budgets must be positive')
+    if not args.reference_source or args.left_engine != 'stannum' or args.right_engine != 'tin':
+        raise ValueError('boundaries require --reference-source and Stannum/Lead engines')
+    source = Path(args.reference_source).resolve()
+    if subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain'], text=True).strip():
+        raise ValueError('Lead reference checkout must be clean')
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
+    report = dict(status='running', rows=100, cases=[], checks=['membership', 'rank', 'zero_mask',
+                  'max_score_invariant', 'error_sqlstate', 'exact_highlights'],
+                  lead_revision=subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip(),
+                  scope='small synthetic boundaries; no mutation or performance claims', servers={})
+    report['stannum_source'] = bench.provenance(out)
+    libdir = Path(subprocess.check_output(['pg_config', '--pkglibdir'], text=True).strip())
+    suffix = '.dylib' if platform.system() == 'Darwin' else '.so'
+    guarded = [Path(__file__).resolve(), libdir / ('stannum' + suffix), libdir / ('tin' + suffix)]
+    report['files'] = {str(path): dataset.sha256(path) for path in guarded}
+    shutil.copy2(__file__, out / 'protocol.py')
+    envs = dict(left=load_env(args.left), right=load_env(args.right))
+    engines = dict(left='stannum', right='tin')
+    owned = []
+    def save():
+        report['elapsed_seconds'] = time.monotonic() - started
+        (out / 'oracle.json').write_text(json.dumps(report, indent=2) + '\n')
+    try:
+        for side, env in envs.items():
+            env['PGOPTIONS'] += f' -c statement_timeout={args.statement_seconds * 1000}'
+            engine = engines[side]
+            run(f'CREATE EXTENSION IF NOT EXISTS {engine}', env)
+            # Record all callable signatures; an absent capability is a reported
+            # disagreement, never a reason to silently remove a case.
+            report['servers'][side] = dict(version=run('SELECT version()', env).strip(),
+                functions=run("SELECT p.oid::regprocedure::text FROM pg_proc p JOIN pg_namespace n "
+                              f"ON n.oid=p.pronamespace WHERE n.nspname='{engine}' ORDER BY 1", env).splitlines())
+            # Transactional setup avoids leaking a table on partial failure.
+            run('BEGIN;' + BOUNDARY_FIXTURE.format(engine=engine) + 'COMMIT;', env)
+            owned.append(side)
+        for left, right in zip(boundary_cases('stannum'), boundary_cases('tin')):
+            if time.monotonic() - started > args.budget_seconds:
+                raise TimeoutError('boundary verification budget exhausted')
+            item = dict(name=left['name'], documented=left['expected'], expected_error=left['error'], observations={})
+            values, issues = {}, {}
+            for side, case in [('left', left), ('right', right)]:
+                observed = boundary_observe(case, envs[side])
+                values[side], issues[side] = boundary_check(case, observed)
+                item['observations'][side] = dict(sql=case['sql'], **observed)
+            same = values['left'] == values['right']
+            # These are triage classifications, not automatic assignment of blame.
+            classification = ('agreement' if same and not any(issues.values()) else
+                'both_vs_documentation_or_invariant' if issues['left'] and issues['right'] else
+                'stannum_vs_documentation_or_invariant' if issues['left'] else
+                'lead_vs_documentation_or_invariant' if issues['right'] else 'engine_disagreement')
+            item.update(same=same, classification=classification, problems=issues, compared=values)
+            report['cases'].append(item)
+            save()
+        for path, digest in report['files'].items():
+            if dataset.sha256(path) != digest:
+                raise ValueError('protocol or installed binary changed during verification: ' + path)
+        if time.monotonic() - started > args.budget_seconds:
+            raise TimeoutError('boundary verification exceeded wall-clock budget')
+        report['differences'] = sum(item['classification'] != 'agreement' for item in report['cases'])
+        report['status'] = 'mismatch' if report['differences'] else 'passed'
+    except Exception as error:
+        report.update(status='incomplete', error=str(error))
+    finally:
+        for side in owned:
+            if not args.keep:
+                try:
+                    run('DROP TABLE oracle_boundary_docs', envs[side])
+                except Exception as error:
+                    report.setdefault('cleanup_errors', []).append(str(error))
+        if report.get('cleanup_errors'):
+            report['status'] = 'incomplete'
+        save()
+    print(f"{report['status']}: {len(report['cases'])} boundary cases in {report['elapsed_seconds']:.1f}s; {out / 'oracle.json'}")
+    return 0 if report['status'] == 'passed' else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--left", required=True, help="env file for the first server (libpq variables)")
@@ -396,7 +595,12 @@ def main():
     parser.add_argument("--reference-source", type=Path, help="clean Lead checkout used to build the installed reference")
     parser.add_argument("--budget-seconds", type=int, default=900)
     parser.add_argument("--statement-seconds", type=int, default=60)
+    parser.add_argument("--boundaries", action="store_true", help="100-row documented contract checks; separate from mutation/trace suites")
     args = parser.parse_args()
+    if args.boundaries:
+        if args.dataset or args.trace:
+            parser.error("--boundaries cannot be combined with --dataset or --trace")
+        return run_boundaries(args)
     if args.dataset:
         return run_trace(args)
     if args.trace or args.reference_source:

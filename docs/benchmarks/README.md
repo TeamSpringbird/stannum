@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [small TIN contract oracle](tin-contract-boundaries.md) separates Lead agreement
+from documented density, scoring-policy and highlighting boundaries.
+
 The [merge output allocation reuse](merge-output-reuse.md) reduces the measured
 live-allocation peak and enables the previously failing million-document merge.
 
