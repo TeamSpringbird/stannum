@@ -37,3 +37,37 @@ The 150-million-row Stack Exchange corpus is a subsequent capacity experiment,
 not part of this initial baseline. Published TIN timings remain historical;
 no fresh TIN binary or managed endpoint is involved. Do not infer a TIN speedup
 or apply a GIN-based hardware multiplier from this baseline.
+
+## Reusable dataset cache
+
+The September 20 campaign keeps compressed parts and the extracted CSV on its
+NVMe filesystem and reuses them across all rounds. A separate private, AES256
+encrypted S3 bucket preserves the Wikipedia inputs beyond EC2/stack teardown:
+
+`s3://springbird-dev-stannum-corpus-cache-860510875764/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/wikipedia/`
+
+It contains the pinned upstream manifests, query file, source attribution,
+verification receipt, compressed parts, and uncompressed CSV. Objects expire
+after 30 days; incomplete multipart uploads expire after one day. This bucket
+is deliberately outside the temporary stack and holds public benchmark inputs,
+not database credentials. Upload status and file hashes are recorded locally in
+`benchmarks/results/aws-corpus-cache.json`; do not assume an incomplete upload
+is a usable cache.
+
+Restore from an authorized AWS identity before starting measured traffic:
+
+```sh
+aws --profile springbird-development --region us-east-1 s3 cp \
+  s3://springbird-dev-stannum-corpus-cache-860510875764/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/wikipedia/ \
+  /path/to/datasets/wikipedia/ --recursive
+python3 benchmarks/published_dataset.py --corpus wikipedia \
+  --output /path/to/datasets/wikipedia
+```
+
+The acquisition command verifies the restored CSV against the pinned upstream
+SHA256 before reusing it. If cache objects have expired, use the normal upstream
+acquisition path. The current EC2 role only has access to its temporary artifact
+bucket; a future host needs a read-only grant to the cache prefix before using
+this restore command (and uses its instance role rather than a local profile).
+Fresh database loads and index construction remain part of each run's setup;
+caching inputs does not replace those steps or alter timed queries.
