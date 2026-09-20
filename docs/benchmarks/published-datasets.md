@@ -124,7 +124,8 @@ substantial for the 84.5 GB Stack Exchange CSV. Start with a small prefix to
 measure the cost of all 3,762 forms before choosing a routine corpus size.
 The existing 906-form Wikipedia campaign is unchanged.
 
-This loader is covered by harness tests, but a live published-corpus Lead run
-has not yet been completed. Passing empty result sets alone would not prove
-representative coverage; inspect per-query matched-row counts. The timed
-Stack Exchange guard remains until its membership checks are ready.
+Live checks now pass on 100 and 1,000 raw Stack Exchange documents across all
+3,762 forms; the 1,000-row run took 421 seconds with zero differences. See the
+[results and nonempty coverage](stackexchange-lead-smoke.md). Passing empty
+result sets alone does not prove representative coverage. The timed Stack
+Exchange guard remains until its membership checks are ready.
