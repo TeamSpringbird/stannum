@@ -129,6 +129,22 @@ index d901e5a..ecb07c3 100644
    phases.run(
      name,
      name === "elasticsearch" ? 0 : vus,
+diff --git a/dashboard/output.go b/dashboard/output.go
+index d883e99..dfe45ad 100644
+--- a/dashboard/output.go
++++ b/dashboard/output.go
+@@ -705,6 +705,11 @@ func (o *Output) flush() {
+ 		for _, qm := range rm.Queries {
+ 			o.updateQueryTimeline(qm)
+ 		}
++		// An idle timeout is provisional: slow queries or delayed batches can
++		// produce samples after it. Never freeze the exported end at an old gap.
++		if rm.EndTime > 0 && rm.LastUpdateTime > rm.EndTime {
++			rm.EndTime = 0
++		}
+ 		// Mark run ended after inactivity timeout.
+ 		if rm.EndTime == 0 && rm.LastUpdateTime > 0 && (now-rm.LastUpdateTime) > runEndTimeoutMs {
+ 			rm.EndTime = rm.LastUpdateTime
 diff --git a/go.mod b/go.mod
 index 56b8f47..f0d23f9 100644
 --- a/go.mod
