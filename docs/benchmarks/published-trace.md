@@ -245,3 +245,27 @@ python3 benchmarks/tin.py report --output benchmarks/results/ranked-comparison-0
 This supplies the repeated published-trace workflow that will replace
 `paired.py`. Keep that older harness until an end-to-end comparison has passed
 and its remaining callers and synthetic mutation coverage are migrated.
+
+## Ten-minute local article rehearsal
+
+`--style conjunction-phrase` runs both AND and phrase forms, excluding OR,
+with the same seeded shuffle as the other styles. This matches the family mix
+of the article's second chart; it is not an AND-only surrogate.
+
+The four local article workloads use 100,000-document prefixes, two clients,
+four CPUs, 2 GiB container memory, 128 MiB shared buffers and 64 MiB maintenance
+memory. Each engine runs sequentially for 600 measured seconds after ten seconds
+warmup. Ranked workloads use the raw Stack Exchange trace; disjunction counts
+use the published Wikipedia trace. The disjunction ranked/write workload targets
+1,000 updates per second and reports completed updates and errors separately.
+These local subsets and resource limits are not the published full-corpus AWS
+configuration. Preserve the original GIN and all other published series.
+
+This iteration validates 90 explicitly selected forms against a 1,000-row
+membership sample and exhaustive same-engine ranking, where applicable. All
+forms remain in the timed trace; retain actual timed coverage and post-update
+validation. Earlier full-trace correctness receipts remain separate evidence.
+The marketing importer only accepts complete campaigns with at least 599 seconds
+of recorded measurement per engine (the upstream stop boundary can be fractional).
+One-second points are not extended to fill unmeasured time; run summaries come
+from the retained samples and reports. There is no GIN-based hardware multiplier.

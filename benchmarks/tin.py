@@ -161,6 +161,12 @@ def trace_queries(driver, query_file=None, raw_text=False):
             for q in records for style in ('conjunction', 'disjunction', 'phrase')]
 
 
+def selected_style(query_id, style):
+    family = query_id.split(':')[1]
+    return style == 'mixed' or family == style or (
+        style == 'conjunction-phrase' and family in ('conjunction', 'phrase'))
+
+
 def validation_queries(queries, limit):
     if limit < 0:
         raise ValueError('validation-queries must be nonnegative')
@@ -620,7 +626,7 @@ def run(args):
                     validate_result(ranked, [q[0] for q in queries])
                     job['ranked_correctness'] = dict(queries=len(queries), mismatches=0,
                                                      reference='exhaustive same-engine score multiset; ties unordered')
-                plan_queries = [q for q in queries if args.style == 'mixed' or q[0].split(':')[1] == args.style]
+                plan_queries = [q for q in queries if selected_style(q[0], args.style)]
                 for query in plan_queries[:6]:
                     for mode in ('force_custom_plan', 'force_generic_plan'):
                         statement = prepared_plan_sql(query, engine, args.workload, mode)
@@ -882,7 +888,7 @@ def compare(args):
                             args.driver.resolve() / 'datasets' / (getattr(args, 'published_corpus', None) or 'wikipedia') / 'queries.json',
                             raw_text=getattr(args, 'published_corpus', None) == 'stackexchange')
     campaign = dict(status='running', repetitions=args.repetitions, sources=sources, images=images,
-                    query_ids=[q[0] for q in queries if args.style == 'mixed' or q[0].split(':')[1] == args.style],
+                    query_ids=[q[0] for q in queries if selected_style(q[0], args.style)],
                     jobs=paired_jobs(args.repetitions))
     bench.save(root / 'paired.json', campaign)
     try:
@@ -975,7 +981,7 @@ def main():
     p.add_argument('--validation-rows', type=bench.positive, default=1000)
     p.add_argument('--validation-queries', type=int, default=0, help='Evenly spaced query-form sample for untimed checks; 0 checks every form')
     p.add_argument('--workload', choices=['count', 'topk'], default='count')
-    p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase'], default='mixed')
+    p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase', 'conjunction-phrase'], default='mixed')
     p.add_argument('--clients', type=bench.positive, default=2)
     p.add_argument('--seconds', type=bench.positive, default=60)
     p.add_argument('--warmup', type=bench.positive, default=10)

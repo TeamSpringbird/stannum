@@ -48,7 +48,7 @@ index 9535787..c419175 100644
  
  // CaptureConfig captures database configuration and registers it with metrics.
 diff --git a/benchmarks/queries.js b/benchmarks/queries.js
-index 8f40f68..4617e22 100644
+index 8f40f68..bf511ec 100644
 --- a/benchmarks/queries.js
 +++ b/benchmarks/queries.js
 @@ -1,4 +1,5 @@
@@ -57,6 +57,34 @@ index 8f40f68..4617e22 100644
    "paradedb",
    "pg_textsearch",
    "postgres",
+@@ -19,9 +20,9 @@ export function selectBackends(value, workload, style, updatesPerSecond = 0) {
+   if (!["topk", "count"].includes(workload)) {
+     throw new Error("WORKLOAD must be topk or count");
+   }
+-  if (![...queryStyles, "mixed"].includes(style)) {
++  if (![...queryStyles, "mixed", "conjunction-phrase"].includes(style)) {
+     throw new Error(
+-      "QUERY_STYLE must be conjunction, disjunction, phrase, or mixed",
++      "QUERY_STYLE must be conjunction, disjunction, phrase, mixed, or conjunction-phrase",
+     );
+   }
+   const names = value.split(/[\s,]+/).filter(Boolean);
+@@ -52,13 +53,13 @@ export function selectQueries(contents, style, seed) {
+   if (!Array.isArray(contents.queries) || contents.queries.length === 0) {
+     throw new Error("The query file must contain a nonempty queries array");
+   }
+-  if (![...queryStyles, "mixed"].includes(style)) {
++  if (![...queryStyles, "mixed", "conjunction-phrase"].includes(style)) {
+     throw new Error(`Unknown query style: ${style}`);
+   }
+   if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
+     throw new Error("SEED must be an integer between 0 and 4294967295");
+   }
+-  const styles = style === "mixed" ? queryStyles : [style];
++  const styles = style === "mixed" ? queryStyles : style === "conjunction-phrase" ? ["conjunction", "phrase"] : [style];
+   const entries = contents.queries.flatMap((record) =>
+     styles.map((queryStyle) => ({ record, style: queryStyle })),
+   );
 @@ -115,6 +116,13 @@ export function buildRequest(backend, workload, entry, topK) {
        argument(entry, backend, match ? "match" : entry.style),
      ];
