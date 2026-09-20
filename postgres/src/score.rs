@@ -1860,6 +1860,34 @@ unsafe extern "C-unwind" fn find_qual(node: *mut pg_sys::Node, context: *mut c_v
     unsafe { pg_sys::expression_tree_walker(node, Some(find_qual), context) }
 }
 
+/// Pulling EXISTS/NOT EXISTS up can wrap the original FromExpr in a join,
+/// leaving the new top-level FromExpr with no quals. Keep finding its WHERE
+/// clauses without treating JOIN ON expressions or nested query scopes as
+/// additional scoring predicates. Visit parent quals first to retain binding order.
+unsafe fn find_where_quals(node: *mut pg_sys::Node, binding: &mut QualBinding) {
+    unsafe {
+        if node.is_null() {
+            return;
+        }
+        pg_sys::check_stack_depth();
+        match (*node).type_ {
+            pg_sys::NodeTag::T_FromExpr => {
+                let from = &*node.cast::<pg_sys::FromExpr>();
+                find_qual(from.quals, (binding as *mut QualBinding).cast());
+                for i in 0..pg_sys::list_length(from.fromlist) {
+                    find_where_quals(pg_sys::list_nth(from.fromlist, i).cast(), binding);
+                }
+            }
+            pg_sys::NodeTag::T_JoinExpr => {
+                let join = &*node.cast::<pg_sys::JoinExpr>();
+                find_where_quals(join.larg, binding);
+                find_where_quals(join.rarg, binding);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The index a clause bound to `bound` should be answered by, among
 /// `candidates` (in OID order): the bound index when it is one of them,
 /// otherwise the first with the same tokenizer settings, so an index scan
@@ -2029,8 +2057,7 @@ fn score_support(request: Internal) -> Internal {
         let mut binding = QualBinding {
             matches: Vec::new(),
         };
-        let quals = (*(*parse).jointree).quals.cast::<pg_sys::Node>();
-        find_qual(quals, (&mut binding as *mut QualBinding).cast());
+        find_where_quals((*parse).jointree.cast(), &mut binding);
         let rte = pg_sys::list_nth((*parse).rtable, (ctid.varno - 1) as i32)
             .cast::<pg_sys::RangeTblEntry>();
         if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
