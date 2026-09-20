@@ -1,5 +1,10 @@
 # Benchmarking Stannum
 
+The [repeated memory-pressure measurements](repeated-memory.md) separate
+run-to-run variation from query-family effects. The
+[construction-memory investigation](build-memory-investigation.md) records
+falsifiable hypotheses for the retained build OOM.
+
 The [published Wikipedia memory pilot](published-memory.md) tests a 500,000-row
 prefix with separate build and query limits, including a retained build OOM.
 
