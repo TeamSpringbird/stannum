@@ -38,6 +38,8 @@ use tinql::runtime::plan::{Limits, plan};
 use crate::score::rank;
 
 static ENABLE: GucSetting<bool> = GucSetting::<bool>::new(true);
+// Experimental diagnostic control: preserve production selection unless requested.
+static FORCE_COUNT_PAGES: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Method tables hold C string pointers; they are immutable and never
 /// touched off the backend's main thread.
@@ -104,6 +106,14 @@ static COUNT_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
     });
 
 pub fn init() {
+    GucRegistry::define_bool_guc(
+        c"stannum.force_count_pages",
+        c"Force the page-bitmap count strategy for diagnostic comparisons",
+        c"Off retains automatic selection; visibility checks and rechecks remain enabled.",
+        &FORCE_COUNT_PAGES,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
     GucRegistry::define_bool_guc(
         c"stannum.enable_custom_scan",
         c"Enable Stannum's custom scan nodes for ==> queries",
@@ -1562,8 +1572,11 @@ unsafe extern "C-unwind" fn exec_count(
                 tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
                     .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
             let view = crate::storage::view(index_oid);
-            let mut use_pages = false;
+            let mut use_pages = FORCE_COUNT_PAGES.get();
             for (source, _) in &view.sources {
+                if use_pages {
+                    break;
+                }
                 use_pages |= tinql::runtime::plan::prefers_pages(&query, source)
                     .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
                 if use_pages {

@@ -46,3 +46,34 @@ for the contiguous bitmap / SIMD path. Start with current bytes, compare an
 end-to-end scalar baseline, and introduce format migration only after evidence
 justifies it. Fix the GIN duration export separately before using its reported QPS;
 that defect does not explain Stannum's retained per-query p95 samples.
+
+## Real-query probe implementation
+
+The experimental branch exposes `stannum.force_count_pages`, default off. This
+only bypasses the strategy heuristic in the custom count executor. Snapshot
+visibility, dead-posting subtraction, exactness and heap rechecks remain intact.
+Generic-plan fallback is unchanged. The targeted PostgreSQL regression first
+failed because the unmodified executor still chose scalar; after adding the
+switch it passed through HOT updates, deletes and indexed text changes.
+
+`benchmarks/count_probe.py` compares six fixed published OR queries, including
+302 and 88 from the slow tail, in alternating default/forced order. Full counts
+must agree; both strategies also undergo exact-ID membership comparison against
+an unindexed lexical reference of 1,000 rows. Seven repetitions retain all JSON
+plans and server execution times. These are diagnostic single-client per-query
+measurements, not a new aggregate workload p95 or published chart series.
+
+The runner was smoke-tested on a separate local PostgreSQL 18 database with
+1,000 actual Wikipedia rows. All six shapes and both modes passed. Those timings
+are too small and differently scaled to establish a production improvement.
+
+`benchmarks/aws/count-probe.sh` builds an isolated image and fresh full-Wikipedia
+index only after measured sweep traffic has ended. Query limits remain eight
+CPUs/32 GiB, with 64 GiB for construction. It profiles the two expensive shapes
+in both modes using `perf record` at 99 Hz, separately from paired timings. The
+container shares the host PID namespace so PostgreSQL PIDs are valid perf targets;
+container binaries are copied to a symbol root for report resolution. Raw profiles,
+reports, plans and source/image provenance are retained. Profile failures are
+explicit; timings remain saved but the probe reports failure rather than pretending
+CPU attribution succeeded. No new probe starts with less than 75 minutes before
+instance expiry. The temporary container and volume are removed on exit.

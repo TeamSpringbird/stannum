@@ -4690,6 +4690,45 @@ mod tests {
         assert_eq!(plan[0]["Plan"]["Count Strategy"], "page bitmaps");
     }
 
+    #[pg_test]
+    fn forced_count_pages_preserve_sparse_results_and_visibility() {
+        Spi::run(
+            "CREATE TABLE force_count_pages(id int, body text, payload int) WITH (fillfactor=60);
+             INSERT INTO force_count_pages SELECT n,
+               CASE WHEN n % 100 = 0 THEN 'needle red' ELSE 'common blue' END, 0
+               FROM generate_series(1, 2000) n;
+             CREATE INDEX ON force_count_pages USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.enable_custom_scan = on;",
+        )
+        .unwrap();
+        for mutation in [
+            "SELECT 1",
+            "UPDATE force_count_pages SET payload=1 WHERE id % 200=0",
+            "DELETE FROM force_count_pages WHERE id % 300=0",
+            "UPDATE force_count_pages SET body='needle red' WHERE id % 101=0",
+        ] {
+            Spi::run(mutation).unwrap();
+            let reference =
+                value("SELECT count(*) FROM force_count_pages WHERE body LIKE '%needle%'");
+            for (setting, strategy) in [("off", "scalar"), ("on", "page bitmaps")] {
+                Spi::run(&format!("SET LOCAL stannum.force_count_pages={setting}")).unwrap();
+                assert_eq!(
+                    value("SELECT count(*) FROM force_count_pages WHERE body ==> 'needle'"),
+                    reference
+                );
+                let plan = Spi::get_one::<Json>(
+                    "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM force_count_pages WHERE body ==> 'needle'"
+                ).unwrap().unwrap().0;
+                assert_eq!(plan[0]["Plan"]["Custom Plan Provider"], "Stannum Count");
+                assert_eq!(
+                    plan[0]["Plan"]["Count Strategy"], strategy,
+                    "{mutation}: {setting}"
+                );
+            }
+        }
+    }
+
     /// Index and sequential-scan answers for `query`, which must agree, with
     /// the custom scan path enabled.
     fn exact_count(table: &str, query: &str) -> i64 {
