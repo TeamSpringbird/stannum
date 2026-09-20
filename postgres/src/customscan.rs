@@ -890,6 +890,11 @@ struct ScanExec {
     fallback: *mut pg_sys::TableScanDescData,
     /// `tids` holds only the pruned top k; the rest are produced on demand.
     pruned: bool,
+    /// Try one larger prefix after a filtered scan consumes the initial one.
+    /// Keep consumed roots in `tids` until exhaustive completion so neither
+    /// filtered-out nor previously emitted tuples are visited twice.
+    filtered: bool,
+    expanded: bool,
     /// Explain counters. Candidates are unknown while pruned; `scored`
     /// counts the candidates a pruned scan scored.
     candidates: Option<usize>,
@@ -898,6 +903,7 @@ struct ScanExec {
     /// exhaustive ranking, not block-max traversal or score projection.
     exhaustive_score_calls: usize,
     top_k_completions: usize,
+    top_k_expansions: usize,
     fetched: usize,
     skipped_pages: usize,
     page_masks: Option<bool>,
@@ -1035,10 +1041,13 @@ unsafe extern "C-unwind" fn begin_scan(
             started: false,
             fallback: std::ptr::null_mut(),
             pruned: false,
+            filtered: !(*cscan).scan.plan.qual.is_null(),
+            expanded: false,
             candidates: None,
             scored: None,
             exhaustive_score_calls: 0,
             top_k_completions: 0,
+            top_k_expansions: 0,
             fetched: 0,
             skipped_pages: 0,
             page_masks: None,
@@ -1061,6 +1070,7 @@ unsafe fn gather(exec: &mut ScanExec) {
     unsafe {
         exec.scores.clear();
         exec.pruned = false;
+        exec.expanded = false;
         exec.scored = None;
         let mut scorer = exec.private.ordering.as_ref().map(|ordering| {
             crate::score::scorer_for_scan(
@@ -1197,15 +1207,18 @@ fn finish(exec: &mut ScanExec, mut tids: Vec<Tid>, scorer: Option<crate::score::
     exec.tids = tids;
 }
 
-/// Replaces a pruned top k with the complete ordering once the executor
-/// reads past it. The locations already consumed are removed from the
+/// Extends an exhausted filtered prefix once before falling back to the
+/// complete ordering. A bounded retry leaves scans satisfied by the first
+/// prefix unchanged and caps the extra work for very selective filters.
+///
+/// Exhaustive completion replaces the pruned prefix with the full ordering.
+/// The locations already consumed are removed from the
 /// complete ordering rather than skipped by position: documents indexed
 /// since the top k was built (invisible to the snapshot, but present in the
 /// index and scored) can rank above them and would otherwise shift the
 /// consumed rows back into the output.
 unsafe fn complete(exec: &mut ScanExec) {
     unsafe {
-        exec.top_k_completions += 1;
         let ordering = exec
             .private
             .ordering
@@ -1224,6 +1237,38 @@ unsafe fn complete(exec: &mut ScanExec) {
             ordering.term_replace.clone(),
         );
         let consumed: FxHashSet<Tid> = exec.tids[..exec.next].iter().copied().collect();
+        if exec.filtered && !exec.expanded {
+            exec.expanded = true;
+            let k = ordering.top_k.expect("a pruned scan has a bound");
+            // Enough headroom for moderately selective filters without an
+            // unbounded series of repeated block-max walks. The existing
+            // pruning cap bounds memory and work even for a large OFFSET.
+            let expanded_k = k.saturating_mul(16).min(crate::score::PRUNE_MAX_K);
+            if expanded_k > k {
+                exec.top_k_expansions += 1;
+                if let Some(top) = scorer.top_k(expanded_k) {
+                    exec.scored = Some(exec.scored.unwrap_or(0) + top.scored);
+                    exec.candidates = top.complete.then_some(top.rows.len());
+                    for (score, tid) in top.rows {
+                        if !consumed.contains(&tid) {
+                            exec.tids.push(tid);
+                            exec.scores.push(score);
+                        }
+                    }
+                    exec.sorted = exec.tids.len();
+                    exec.pruned = !top.complete;
+                    let ranked: Vec<_> = exec
+                        .scores
+                        .iter()
+                        .copied()
+                        .zip(exec.tids.iter().copied())
+                        .collect();
+                    crate::score::publish_scan_scorer(exec.scan_id, scorer, &ranked);
+                    return;
+                }
+            }
+        }
+        exec.top_k_completions += 1;
         let tids = candidates(exec);
         finish(exec, tids, Some(scorer));
         let mut kept = 0;
@@ -1388,7 +1433,7 @@ unsafe extern "C-unwind" fn search_access(
                     if !exec.pruned {
                         break;
                     }
-                    // The executor reads past the pruned top k: score everything.
+                    // Try one larger filtered prefix, then complete if needed.
                     complete(exec);
                     continue;
                 }
@@ -1789,6 +1834,12 @@ unsafe extern "C-unwind" fn explain(
                     c"Exhaustive Score Calls".as_ptr(),
                     std::ptr::null(),
                     exec.exhaustive_score_calls as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Top-K Expansions".as_ptr(),
+                    std::ptr::null(),
+                    exec.top_k_expansions as i64,
                     es,
                 );
                 pg_sys::ExplainPropertyInteger(

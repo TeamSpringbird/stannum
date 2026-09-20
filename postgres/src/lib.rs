@@ -1501,6 +1501,13 @@ mod tests {
         assert_eq!(scan["Pruning"], "block-max");
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(scan["Top-K Completions"], 0);
+        assert_eq!(scan["Top-K Expansions"], 0);
+
+        let all_pass = explain("alpha", "AND id > 0");
+        let scan = search_scan(&all_pass[0]["Plan"]).unwrap();
+        assert_eq!(scan["Top-K Expansions"], 0);
+        assert_eq!(scan["Top-K Completions"], 0);
+        assert_eq!(scan["Exhaustive Score Calls"], 0);
 
         // Equal scores put the first ten physical rows in the pruned prefix.
         // None passes the SQL filter, forcing completion of all 1,000 rows.
@@ -1517,6 +1524,154 @@ mod tests {
         assert!(scan["Pruning"].is_null());
         assert_eq!(scan["Top-K Completions"], 0);
         assert_eq!(scan["Exhaustive Score Calls"], 1000);
+    }
+
+    #[pg_test]
+    fn filtered_prefix_expansion_preserves_ranked_results() {
+        Spi::run(
+            "CREATE TABLE prefix_filter(id int primary key, body text, eligible boolean)
+               WITH (fillfactor = 50);
+             INSERT INTO prefix_filter SELECT n, 'alpha beta',
+               CASE WHEN n % 7 = 0 THEN NULL ELSE n % 4 = 0 END
+               FROM generate_series(1, 1000) n;
+             CREATE INDEX prefix_filter_idx ON prefix_filter USING stannum(body);
+             UPDATE prefix_filter SET eligible = false WHERE id = 4;
+             UPDATE prefix_filter SET eligible = true WHERE id = 5;
+             DELETE FROM prefix_filter WHERE id = 8;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        fn rows(sql: &str) -> Vec<(i32, u32)> {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        }
+        fn scan(node: &serde_json::Value) -> Option<&serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node);
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(scan)
+        }
+        for (filter, bound, expansions, completions) in [
+            ("eligible", "LIMIT 10", 1, 0),
+            ("eligible", "LIMIT 10 OFFSET 7", 1, 0),
+            ("id > 0", "LIMIT 10", 1, 0),
+            ("id > 10", "LIMIT 10", 1, 0),
+            ("id % 100 = 0 OR id <= 2", "LIMIT 10", 1, 1),
+            ("id > 990", "LIMIT 10", 1, 1),
+            ("id > 1000", "LIMIT 10", 1, 1),
+        ] {
+            let base = format!(
+                "SELECT id, stannum.full_score(ctid) AS score FROM prefix_filter
+                 WHERE body ==> 'alpha' AND ({filter}) ORDER BY score DESC"
+            );
+            Spi::run(
+                "SET LOCAL stannum.enable_custom_scan = off;
+                 SET LOCAL enable_bitmapscan = on;",
+            )
+            .unwrap();
+            // IDs follow indexed root order, including the updated members.
+            let expected = rows(&format!("{base}, id {bound}"));
+            Spi::run(
+                "SET LOCAL stannum.enable_custom_scan = on;
+                 SET LOCAL enable_bitmapscan = off;",
+            )
+            .unwrap();
+            let sql = format!("{base} {bound}");
+            assert_eq!(rows(&sql), expected, "{filter} {bound}");
+            let explain = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0;
+            let scan = scan(&explain[0]["Plan"]).expect("custom ranked scan");
+            assert_eq!(scan["Top-K Expansions"], expansions, "{filter}: {scan}");
+            assert_eq!(scan["Top-K Completions"], completions, "{filter}: {scan}");
+            if completions == 0 {
+                assert_eq!(scan["Exhaustive Score Calls"], 0, "{filter}: {scan}");
+            }
+            // Incremental cursor reads span the original prefix, expansion and
+            // (for sparse predicates) exhaustive fallback without duplicates.
+            Spi::run(&format!("DECLARE prefix_cursor CURSOR FOR {sql}")).unwrap();
+            let mut actual = rows("FETCH 2 FROM prefix_cursor");
+            actual.extend(rows("FETCH 3 FROM prefix_cursor"));
+            actual.extend(rows("FETCH ALL FROM prefix_cursor"));
+            assert_eq!(actual, expected, "cursor: {filter} {bound}");
+            assert!(rows("FETCH ALL FROM prefix_cursor").is_empty());
+            Spi::run("CLOSE prefix_cursor").unwrap();
+        }
+    }
+
+    #[pg_test]
+    fn filtered_prefix_cursors_keep_frozen_scores() {
+        Spi::run(
+            "CREATE TABLE prefix_cursors(id int primary key, body text);
+             INSERT INTO prefix_cursors SELECT n, 'needle pad'
+               FROM generate_series(1, 1000) n;
+             CREATE INDEX prefix_cursors_idx ON prefix_cursors USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let rows = |sql: &str| {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let query = "SELECT id, stannum.full_score(ctid) AS score FROM prefix_cursors
+                     WHERE body ==> 'needle' AND id % 4 = 0 ORDER BY score DESC";
+        Spi::run("SET LOCAL stannum.enable_custom_scan = off;").unwrap();
+        let before = rows(&format!("{query}, id LIMIT 12"));
+        Spi::run(&format!(
+            "SET LOCAL stannum.enable_custom_scan = on;
+             SET LOCAL enable_bitmapscan = off;
+             DECLARE prefix_a CURSOR FOR {query} LIMIT 12;"
+        ))
+        .unwrap();
+        // Only three of the initial twelve roots qualify. Pause before the
+        // executor exhausts that prefix and requests its expansion.
+        let mut from_a = rows("FETCH 2 FROM prefix_a");
+        Spi::run(
+            "INSERT INTO prefix_cursors SELECT n, repeat('needle ', 8)
+               FROM generate_series(2001, 2200) n;
+             SET LOCAL stannum.enable_custom_scan = off;
+             SET LOCAL enable_bitmapscan = on;",
+        )
+        .unwrap();
+        let after = rows(&format!("{query}, id LIMIT 12"));
+        assert_ne!(before, after);
+        Spi::run(&format!(
+            "SET LOCAL stannum.enable_custom_scan = on;
+             SET LOCAL enable_bitmapscan = off;
+             DECLARE prefix_b CURSOR FOR {query} LIMIT 12;"
+        ))
+        .unwrap();
+        let mut from_b = rows("FETCH 5 FROM prefix_b");
+        from_a.extend(rows("FETCH ALL FROM prefix_a"));
+        from_b.extend(rows("FETCH ALL FROM prefix_b"));
+        assert_eq!(from_a, before);
+        assert_eq!(from_b, after);
+        Spi::run("CLOSE prefix_a; CLOSE prefix_b;").unwrap();
     }
 
     #[pg_test]
