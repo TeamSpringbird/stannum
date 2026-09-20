@@ -22,8 +22,13 @@
 #   published-trace oracle instead: exact membership/full_score bits/top-10,
 #   with ROWS=5000 and BUDGET_SECONDS=900 defaults. Build/provisioning time is
 #   outside that verification budget. The result is written under OUT/trace.
+#   LIFECYCLE=1 enables the separate four-row SQL lifecycle suite.
 #   BOUNDARIES=1 enables the separate 100-row documented contract suite.
 set -eu
+if [ "${LIFECYCLE:-0}" = 1 ] && { [ "${BOUNDARIES:-0}" = 1 ] || [ -n "${DATASET:-}" ]; }; then
+  echo 'LIFECYCLE cannot be combined with BOUNDARIES or DATASET' >&2
+  exit 2
+fi
 if [ "${BOUNDARIES:-0}" = 1 ] && [ -n "${DATASET:-}" ]; then
   echo 'BOUNDARIES and DATASET are mutually exclusive' >&2
   exit 2
@@ -62,7 +67,11 @@ LEFT="$(mktemp)"; RIGHT="$(mktemp)"
 printf 'PGDATABASE=reference_oracle_stannum\n' > "$LEFT"
 printf 'PGDATABASE=reference_oracle_lead\n' > "$RIGHT"
 status=0
-if [ "${BOUNDARIES:-0}" = 1 ]; then
+if [ "${LIFECYCLE:-0}" = 1 ]; then
+  python3 "$ROOT/benchmarks/oracle.py" --left "$LEFT" --right "$RIGHT" \
+    --lifecycle --reference-source "$REF" --budget-seconds "${BUDGET_SECONDS:-120}" \
+    --output "$OUT/lifecycle" || status=$?
+elif [ "${BOUNDARIES:-0}" = 1 ]; then
   python3 "$ROOT/benchmarks/oracle.py" --left "$LEFT" --right "$RIGHT" \
     --boundaries --reference-source "$REF" --budget-seconds "${BUDGET_SECONDS:-120}" \
     --output "$OUT/boundaries" || status=$?

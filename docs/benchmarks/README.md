@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [SQL lifecycle oracle](tin-sql-lifecycle.md) checks implicit highlights through
+DML/CTEs and changed prepared parameters against pinned Lead.
+
 The [small TIN contract oracle](tin-contract-boundaries.md) separates Lead agreement
 from documented density, scoring-policy and highlighting boundaries.
 

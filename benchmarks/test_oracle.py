@@ -184,3 +184,45 @@ class BoundaryOracleTests(unittest.TestCase):
         with patch.object(oracle, 'psql', return_value=CompletedProcess([], 0, payload)):
             self.assertEqual(oracle.boundary_observe(case, {})['rows'],
                              [[1, '\\x3f800000', '\\x40000000']])
+
+
+class LifecycleOracleTests(unittest.TestCase):
+    def test_lifecycle_checks_keep_duplicates_and_exact_highlights(self):
+        case = next(c for c in oracle.lifecycle_cases('tin') if c['name'] == 'prepared_custom')
+        expected = case['expected']
+        self.assertEqual(oracle.lifecycle_check(case, {'rows': list(reversed(expected))})[1], [])
+        self.assertTrue(oracle.lifecycle_check(case, {'rows': expected[:-1]})[1])
+        changed = [list(row) for row in expected]
+        changed[0][-2] = 'alpha red'
+        self.assertTrue(oracle.lifecycle_check(case, {'rows': changed})[1])
+        deduplicated = [list(row) for row in dict.fromkeys(tuple(row) for row in expected)]
+        self.assertTrue(oracle.lifecycle_check(case, {'rows': deduplicated})[1])
+
+    def test_lifecycle_expected_empty_and_changed_parameters_are_executed(self):
+        cases = {case['name']: case for case in oracle.lifecycle_cases('stannum')}
+        for mode in ['custom', 'generic']:
+            case = cases['prepared_' + mode]
+            self.assertIn(f'plan_cache_mode=force_{mode}_plan', case['sql'])
+            for query in ['alpha', 'beta', '', 'absenttoken', 'eclair']:
+                self.assertIn(f"EXECUTE oracle_lifecycle('{query}')", case['sql'])
+            self.assertEqual(case['sql'].count('EXECUTE oracle_lifecycle'), 6)
+            self.assertEqual(case['expected'][-1], ['plans', 6 if mode == 'generic' else 0,
+                                                   6 if mode == 'custom' else 0])
+        self.assertEqual(len(cases), 14)
+        self.assertTrue(all('stannum.highlight' in c['sql'] for c in cases.values()))
+        self.assertTrue(all('BEGIN;' in cases[name]['sql'] and cases[name]['sql'].endswith('ROLLBACK')
+                            for name in ['update_returning', 'update_cte']))
+
+    def test_lifecycle_errors_and_equal_empty_outputs_never_silently_pass(self):
+        case = oracle.lifecycle_cases('tin')[0]
+        self.assertEqual(oracle.lifecycle_check(case, {'error': 'unsupported', 'sqlstate': 'XX000'})[1],
+                         ['unexpected_error'])
+        self.assertTrue(oracle.lifecycle_check(case, {'rows': []})[1])
+
+    def test_failed_implicit_shapes_have_independent_explicit_controls(self):
+        cases = {case['name']: case for case in oracle.lifecycle_cases('tin')}
+        for name in ['cte_inline', 'cte_materialized', 'subquery_binding', 'update_cte']:
+            implicit, explicit = cases[name], cases[name + '_explicit']
+            self.assertIn('tin.highlight(body)', implicit['sql'])
+            self.assertNotIn('tin.highlight(body)', explicit['sql'])
+            self.assertEqual(implicit['expected'], explicit['expected'])
