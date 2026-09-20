@@ -901,6 +901,10 @@
     "benchmarks/test_wide_cursor.py": {
       "owner": "ben",
       "evidence": "Original Stannum wide-query fuzzer generation regression tests."
+    },
+    "segment/src/maintenance.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum maintenance cursor implementation; no upstream source copied."
     }
   }
 }
