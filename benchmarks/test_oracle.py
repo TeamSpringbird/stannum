@@ -132,3 +132,55 @@ class TraceOracleTests(unittest.TestCase):
         self.assertTrue(exhaustive.endswith('ORDER BY id'))
         self.assertTrue(ranked.endswith('ORDER BY stannum.full_score(ctid) DESC LIMIT 10'))
         self.assertIn('float4send(tin.full_score(ctid))', exhaustive)
+
+
+class BoundaryOracleTests(unittest.TestCase):
+    def test_maximum_is_checked_independently_of_cross_engine_bits(self):
+        case = oracle.boundary_cases('stannum')[0]
+        case = dict(case, expected={'count': 2})
+        good = {'rows': [[1, '\\x3f800000', '\\x40000000'], [2, '\\x40000000', '\\x40000000']]}
+        normalized, issues = oracle.boundary_check(case, good)
+        self.assertEqual(issues, [])
+        self.assertTrue(normalized['max_ok'])
+        for rows in [[[1, '\\x3f800000', '\\x3f800000'], [2, '\\x40000000', '\\x40000000']],
+                     [[1, '\\x3f800000', None], [2, '\\x40000000', None]]]:
+            self.assertIn('max_score_invariant', oracle.boundary_check(case, {'rows': rows})[1])
+
+    def test_density_and_error_expectations_cannot_pass_vacuously(self):
+        cases = {c['name']: c for c in oracle.boundary_cases('tin')}
+        self.assertIn('documented_membership', oracle.boundary_check(cases['density_nine'], {'rows': []})[1])
+        self.assertIn('documented_density', oracle.boundary_check(cases['density_nine'],
+            {'rows': [[n, '\\x00000000', '\\x00000000'] for n in range(9)]})[1])
+        self.assertIn('expected_error', oracle.boundary_check(cases['empty_phrase'], {'rows': []})[1])
+        self.assertIn('unexpected_error', oracle.boundary_check(cases['empty_text'],
+            {'error': 'failed', 'sqlstate': 'XX000'})[1])
+        self.assertIn('unexpected_error_sqlstate', oracle.boundary_check(cases['empty_phrase'],
+            {'error': 'missing function', 'sqlstate': '42883'})[1])
+        self.assertEqual(oracle.boundary_check(cases['empty_phrase'],
+            {'error': 'parse failed', 'sqlstate': 'XX000'})[1], [])
+
+    def test_boundary_errors_retain_diagnostics_and_sqlstate(self):
+        case = oracle.boundary_cases('tin')[0]
+        with patch.object(oracle, 'psql', return_value=CompletedProcess([], 1, '',
+                'ERROR:  22023: invalid argument\nDETAIL: preserved')):
+            observed = oracle.boundary_observe(case, {})
+        self.assertEqual(observed['sqlstate'], '22023')
+        self.assertIn('DETAIL: preserved', observed['error'])
+
+    def test_boundary_fixture_does_not_change_existing_campaigns(self):
+        left, right = oracle.boundary_cases('stannum'), oracle.boundary_cases('tin')
+        self.assertEqual(len(left), 24)
+        self.assertEqual([x['name'] for x in left], [x['name'] for x in right])
+        self.assertEqual(len(set(x['name'] for x in left)), len(left))
+        self.assertEqual(len(oracle.QUERIES), 47)
+        self.assertEqual(len(oracle.STATES), 5)
+        self.assertIn('generate_series(1,100)', oracle.BOUNDARY_FIXTURE)
+        self.assertTrue(all('stannum.' in c['sql'] for c in left))
+        self.assertTrue(all('tin.' in c['sql'] for c in right))
+
+    def test_top_level_control_preserves_scored_columns(self):
+        case = next(c for c in oracle.boundary_cases('tin') if c['name'] == 'term_add_top_level')
+        payload = '1|' + json.dumps('\\x3f800000') + '|' + json.dumps('\\x40000000') + '\n'
+        with patch.object(oracle, 'psql', return_value=CompletedProcess([], 0, payload)):
+            self.assertEqual(oracle.boundary_observe(case, {})['rows'],
+                             [[1, '\\x3f800000', '\\x40000000']])

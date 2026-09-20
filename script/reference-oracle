@@ -22,7 +22,12 @@
 #   published-trace oracle instead: exact membership/full_score bits/top-10,
 #   with ROWS=5000 and BUDGET_SECONDS=900 defaults. Build/provisioning time is
 #   outside that verification budget. The result is written under OUT/trace.
+#   BOUNDARIES=1 enables the separate 100-row documented contract suite.
 set -eu
+if [ "${BOUNDARIES:-0}" = 1 ] && [ -n "${DATASET:-}" ]; then
+  echo 'BOUNDARIES and DATASET are mutually exclusive' >&2
+  exit 2
+fi
 LEAD_REPOSITORY="${LEAD_REPOSITORY:-https://github.com/planetscale/lead.git}"
 LEAD_REF="${LEAD_REF:-main}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -57,7 +62,11 @@ LEFT="$(mktemp)"; RIGHT="$(mktemp)"
 printf 'PGDATABASE=reference_oracle_stannum\n' > "$LEFT"
 printf 'PGDATABASE=reference_oracle_lead\n' > "$RIGHT"
 status=0
-if [ -n "${DATASET:-}" ]; then
+if [ "${BOUNDARIES:-0}" = 1 ]; then
+  python3 "$ROOT/benchmarks/oracle.py" --left "$LEFT" --right "$RIGHT" \
+    --boundaries --reference-source "$REF" --budget-seconds "${BUDGET_SECONDS:-120}" \
+    --output "$OUT/boundaries" || status=$?
+elif [ -n "${DATASET:-}" ]; then
   python3 "$ROOT/benchmarks/oracle.py" --left "$LEFT" --left-engine stannum \
     --right "$RIGHT" --right-engine tin --scores bits --rows "${ROWS:-5000}" \
     --dataset "$DATASET" --trace "${TRACE:?TRACE must name the published queries.json}" \
