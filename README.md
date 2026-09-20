@@ -14,7 +14,7 @@ index, query execution, scoring, and storage implementation live in this reposit
 Stannum is an independent fork of [PlanetScale Lead](https://github.com/planetscale/lead),
 which provides a correctness-oriented substitute for PlanetScale TIN. We are
 building an indexed search engine on that foundation. The project uses the TINQL
-query language and retains the inherited [AGPL-3.0 license](LICENSE).
+query language and retains the inherited [AGPL-3.0-or-later license](LICENSE).
 
 **Stannum is development software.** Local 100k-document benchmarks show substantial
 progress over Lead, but reliability and broader compatibility are still being

@@ -11,7 +11,7 @@ members = ["boldi-vigna", "postgres", "segment", "tinql", "tokenizer"]
 version = "0.1.0"
 edition = "2024"
 authors = ["PlanetScale", "Ben Weis <ben@springbird.app>"]
-license = "AGPL-3.0-only"
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 hashbrown = "0.16.1"
