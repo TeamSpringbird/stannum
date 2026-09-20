@@ -4,7 +4,16 @@
 
 # Native x86-64 published-reference baseline; every engine shares this runtime.
 ARG BASE=paradedb/paradedb@sha256:9b7e2540dcb9e6e67825b9a2fa665125af1f0c4e488d50f1afa15ae7dd274359
-FROM ${BASE} AS builder
+FROM ${BASE} AS runtime
+USER root
+# Pin both compilation and measurement to the published PostgreSQL minor version.
+ARG PG_PACKAGE_VERSION=18.6-1.pgdg13+2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-18="${PG_PACKAGE_VERSION}" postgresql-client-18="${PG_PACKAGE_VERSION}" \
+    && rm -rf /var/lib/apt/lists/* \
+    && /usr/lib/postgresql/18/bin/postgres --version | grep -F 'PostgreSQL) 18.6'
+
+FROM runtime AS builder
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential clang libclang-dev pkg-config libssl-dev curl ca-certificates git \
@@ -31,7 +40,7 @@ COPY boldi-vigna boldi-vigna
 COPY segment segment
 RUN cargo pgrx install --package stannum --no-default-features --features pg18 --release
 
-FROM ${BASE}
+FROM runtime
 USER root
 ARG STANNUM_SOURCE_SHA256=unknown
 ARG STANNUM_COMMIT=unknown

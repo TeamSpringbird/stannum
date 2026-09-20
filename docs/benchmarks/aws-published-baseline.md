@@ -28,7 +28,10 @@ The client count and warmup are explicit local protocol choices; they are not
 confirmed historical PlanetScale parameters. Storage filesystem/striping, CPU
 allocation and service/kernel versions must be retained, not assumed identical.
 The runtime base is pinned to ParadeDB 0.25.2's amd64 PG18 image; record the actual
-PostgreSQL minor version before timing. Never emulate the prior ARM image.
+PostgreSQL minor version before timing. Upgrade that shared runtime to the pinned
+PGDG PostgreSQL 18.6-1.pgdg13+2 package before compilation; the original image
+contains 18.4. Builder and both measured engines inherit this same runtime.
+Never emulate the prior ARM image.
 
 The 150-million-row Stack Exchange corpus is a subsequent capacity experiment,
 not part of this initial baseline. Published TIN timings remain historical;
