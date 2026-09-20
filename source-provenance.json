@@ -905,6 +905,10 @@
     "segment/src/maintenance.rs": {
       "owner": "ben",
       "evidence": "Original Stannum maintenance cursor implementation; no upstream source copied."
+    },
+    "segment/src/maintenance/postings.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum bounded maintenance postings cursor; shares Stannum codec definitions."
     }
   }
 }
