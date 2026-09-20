@@ -88,6 +88,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
     },
+    "benchmarks/resources.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum resource measurement summarization and regression coverage."
+    },
     "benchmarks/run.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -140,6 +144,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
     },
+    "benchmarks/test_resources.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum resource measurement summarization and regression coverage."
+    },
     "benchmarks/test_run.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -156,6 +164,14 @@
       "owner": "ben",
       "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
     },
+    "benchmarks/test_tin_catalog.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
+    },
+    "benchmarks/test_tin_experiments.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
+    },
     "benchmarks/test_vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
@@ -167,6 +183,14 @@
     "benchmarks/tin/position-limit.sql": {
       "owner": "ben",
       "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
+    },
+    "benchmarks/tin_catalog.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
+    },
+    "benchmarks/tin_experiments.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
     },
     "benchmarks/vacuum_cleanup.py": {
       "owner": "ben",
@@ -287,6 +311,10 @@
     "docs/benchmarks/merge_lifecycle.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in aa870ad9470babeafa5ac2cf10f38eed5983efbf."
+    },
+    "docs/benchmarks/render_performance_snapshot.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum chart renderer added for the recorded GIN/TIN performance snapshot; reads existing benchmark JSON without copied upstream implementation."
     },
     "docs/query-language/README.md": {
       "owner": "mixed",
@@ -837,30 +865,6 @@
     "tokenizer/tests/compatibility.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 82157ed1e4da3e195b0837dbb868897a8f57ad48."
-    },
-    "benchmarks/resources.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum resource measurement summarization and regression coverage."
-    },
-    "benchmarks/test_resources.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum resource measurement summarization and regression coverage."
-    },
-    "benchmarks/test_tin_catalog.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
-    },
-    "benchmarks/tin_catalog.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation for controlled remote EXPLAIN probes and their cleanup/redaction tests; introduced in 4a7cb44. No upstream source copied."
-    },
-    "benchmarks/tin_experiments.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
-    },
-    "benchmarks/test_tin_experiments.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
     }
   }
 }
