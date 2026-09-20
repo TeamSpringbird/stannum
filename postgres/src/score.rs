@@ -624,12 +624,6 @@ pub(crate) struct RankedFrontier {
     pub(crate) expanded_ranges: usize,
     pub(crate) total_ranges: usize,
     pub(crate) peak_buffered_rows: usize,
-    /// Diagnostic phase timings; instrumentation overhead is not subtracted.
-    pub(crate) metadata_ns: usize,
-    pub(crate) cursor_setup_ns: usize,
-    pub(crate) posting_seek_ns: usize,
-    pub(crate) first_document_lookup_ns: usize,
-    pub(crate) range_work_ns: usize,
 }
 
 impl RankedFrontier {
@@ -665,8 +659,6 @@ impl RankedFrontier {
 
     fn expand(&mut self, scorer: &IndexScorer, range: FrontierRange) {
         self.expanded_ranges += 1;
-        let setup_started = std::time::Instant::now();
-        let mut seek_ns = 0usize;
         let source = &*scorer.view.sources[0].0;
         let label = scorer.view.labels[0].as_str();
         let mut cursors = Vec::with_capacity(scorer.terms.len());
@@ -678,9 +670,7 @@ impl RankedFrontier {
                 continue;
             };
             let mut postings = segment_error_in(term.cursor(), label);
-            let seek_started = std::time::Instant::now();
             segment_error_in(postings.seek(range.first), label);
-            seek_ns += seek_started.elapsed().as_nanos() as usize;
             cursors.push(TermCursor {
                 slot,
                 postings,
@@ -693,11 +683,6 @@ impl RankedFrontier {
         }
         let mut document_ordinal = None;
         let lengths = source.lengths();
-        self.posting_seek_ns += seek_ns;
-        self.cursor_setup_ns +=
-            (setup_started.elapsed().as_nanos() as usize).saturating_sub(seek_ns);
-        let work_started = std::time::Instant::now();
-        let mut first_lookup_ns = None;
         let mut iterations = 0usize;
         while let Some(pivot) = cursors.iter().filter_map(TermCursor::current).min() {
             if pivot > range.last {
@@ -711,7 +696,6 @@ impl RankedFrontier {
                 && (self.combine == Combine::Any
                     || cursors.iter().all(|cursor| cursor.current() == Some(pivot)))
             {
-                let lookup_started = first_lookup_ns.is_none().then(std::time::Instant::now);
                 let mut ordinal = *document_ordinal
                     .get_or_insert_with(|| self.documents.partition_point(|tid| *tid < pivot));
                 while self.documents.get(ordinal).is_some_and(|tid| *tid < pivot) {
@@ -719,9 +703,6 @@ impl RankedFrontier {
                 }
                 document_ordinal = Some(ordinal);
                 let found = (self.documents.get(ordinal) == Some(&pivot)).then_some(ordinal as u32);
-                if let Some(started) = lookup_started {
-                    first_lookup_ns = Some(started.elapsed().as_nanos() as usize);
-                }
                 let ordinal = found.unwrap_or_else(|| {
                     crate::storage::corrupt(format!(
                         "Stannum {label}: posted document ({},{}) is missing",
@@ -746,10 +727,6 @@ impl RankedFrontier {
                 }
             }
         }
-        let first_lookup_ns = first_lookup_ns.unwrap_or(0);
-        self.first_document_lookup_ns += first_lookup_ns;
-        self.range_work_ns +=
-            (work_started.elapsed().as_nanos() as usize).saturating_sub(first_lookup_ns);
     }
 }
 
@@ -758,7 +735,6 @@ impl IndexScorer {
     /// multiple sources to the existing path. Single-source scope preserves the
     /// scorer's first-live-source ownership rule without a duplicate-TID map.
     pub(crate) fn frontier(&self) -> Option<RankedFrontier> {
-        let metadata_started = std::time::Instant::now();
         if self.view.sources.len() != 1 {
             return None;
         }
@@ -791,11 +767,6 @@ impl IndexScorer {
             expanded_ranges: 0,
             total_ranges: 0,
             peak_buffered_rows: 0,
-            metadata_ns: 0,
-            cursor_setup_ns: 0,
-            posting_seek_ns: 0,
-            first_document_lookup_ns: 0,
-            range_work_ns: 0,
         };
         if empty {
             return Some(frontier);
@@ -861,7 +832,6 @@ impl IndexScorer {
                 segment_error_in(documents.advance(), label);
             }
         }
-        frontier.metadata_ns = metadata_started.elapsed().as_nanos() as usize;
         Some(frontier)
     }
 }
