@@ -1,0 +1,9 @@
+{
+  "host": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "base_commit": "f46899f1c2c7500fa012f53b83507e95205a2afb",
+  "example_sha256": "daec33652747242af38be5bf2bb0074f7335d0d738cde88b0b8bccafaece5b6f",
+  "repetitions": 9,
+  "notes": "Shared local ARM workstation; no PostgreSQL, visibility checks or SIMD kernels; construction and exact-ID checks excluded."
+}
