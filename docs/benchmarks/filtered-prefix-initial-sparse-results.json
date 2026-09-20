@@ -1,0 +1,751 @@
+{
+  "fixture": {
+    "rows": 100000,
+    "min_id": 1,
+    "max_id": 100000,
+    "pages": 10496,
+    "all_visible": 10467,
+    "total_bytes": 362110976,
+    "settings": {
+      "server_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+      "shared_buffers": "131072",
+      "work_mem": "16384",
+      "maintenance_work_mem": "524288",
+      "jit": "off",
+      "track_io_timing": "on",
+      "stannum.build_segment_docs": "32768"
+    }
+  },
+  "dataset": {
+    "rows": 100000,
+    "csv_sha256": "d01f490c802313190924a1edd1722d9b1c543793a8ccd0950108d813cb8b7da1"
+  },
+  "images": {
+    "baseline": {
+      "Id": "sha256:c6aea7a71b0db925b9a6a008360fa391c1d1688329a6aa72abc4d6004669e286",
+      "RepoTags": [
+        "stannum-bench:prefix-baseline"
+      ],
+      "RepoDigests": [],
+      "Created": "2026-09-19T20:22:57.850065367-04:00",
+      "Labels": {
+        "benchmark.recipe_sha256": "21d68269e222f012afe6c21c34dff31f5d832c11a5bfc537caecf3e546298edd",
+        "benchmark.stannum_commit": "07fedc69f049c34ce302c660c5cb5edf19e5d96d",
+        "benchmark.stannum_source_sha256": "e6d2d2f2d8ac20677911528827bc0ade9e4aa21ccd70ed59318678efdb7bdcde",
+        "maintainer": "ParadeDB - https://paradedb.com",
+        "org.opencontainers.image.description": "Search without a second system. One Postgres for your application data, full-text search, vector retrieval, and aggregations.",
+        "org.opencontainers.image.source": "https://github.com/paradedb/paradedb"
+      }
+    },
+    "candidate": {
+      "Id": "sha256:b8f842015b8451193715be53f6cb99d39bce47c9e7df1a3573a4d32b3093e423",
+      "RepoTags": [
+        "stannum-bench:prefix-expanded"
+      ],
+      "RepoDigests": [],
+      "Created": "2026-09-19T20:26:49.917344889-04:00",
+      "Labels": {
+        "benchmark.recipe_sha256": "21d68269e222f012afe6c21c34dff31f5d832c11a5bfc537caecf3e546298edd",
+        "benchmark.stannum_commit": "394af890efc93f490e8463ce0210629d903e9007",
+        "benchmark.stannum_source_sha256": "11747c357d41b13743a52f14740bccbab4ce3f183531791c67d21b5c406e9eed",
+        "maintainer": "ParadeDB - https://paradedb.com",
+        "org.opencontainers.image.description": "Search without a second system. One Postgres for your application data, full-text search, vector retrieval, and aggregations.",
+        "org.opencontainers.image.source": "https://github.com/paradedb/paradedb"
+      }
+    }
+  },
+  "build_sources": {
+    "baseline": {
+      "commit": "07fedc69f049c34ce302c660c5cb5edf19e5d96d",
+      "source_dirty": false,
+      "source_sha256": "e6d2d2f2d8ac20677911528827bc0ade9e4aa21ccd70ed59318678efdb7bdcde",
+      "tags": [],
+      "working_tree_dirty": false
+    },
+    "candidate": {
+      "commit": "394af890efc93f490e8463ce0210629d903e9007",
+      "source_dirty": false,
+      "source_sha256": "11747c357d41b13743a52f14740bccbab4ce3f183531791c67d21b5c406e9eed",
+      "tags": [],
+      "working_tree_dirty": false
+    }
+  },
+  "source_commit": "394af890efc93f490e8463ce0210629d903e9007",
+  "comparison": {
+    "baseline": "main 07fedc6",
+    "candidate": "filtered prefix optimization",
+    "both": "stannum.enable_custom_scan=on"
+  },
+  "method": "Separate frozen baseline/candidate images, one baseline-built shared fixture, server restarted between baseline/candidate/candidate/baseline rounds; nine interleaved repetitions, first two discarded.",
+  "correctness_checks": 24,
+  "visibility": {
+    "r01-baseline": {
+      "before": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      },
+      "after": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      }
+    },
+    "r02-candidate": {
+      "before": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      },
+      "after": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      }
+    },
+    "r03-candidate": {
+      "before": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      },
+      "after": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      }
+    },
+    "r04-baseline": {
+      "before": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      },
+      "after": {
+        "all_visible": 10467,
+        "all_frozen": 0
+      }
+    }
+  },
+  "rows": [
+    {
+      "name": "or_mod100_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 1.0,
+      "predicate": "id % 100 = 0",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-baseline": 5.291,
+        "r02-candidate": 7.616,
+        "r03-candidate": 7.755,
+        "r04-baseline": 6.005
+      },
+      "baseline_median_ms": 5.648,
+      "candidate_median_ms": 7.685499999999999,
+      "change_percent": 36.074716713881,
+      "paired_candidate_over_baseline": [
+        1.4394254394254393,
+        1.2914238134887595
+      ],
+      "last_plan_counters": {
+        "r01-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 730,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history OR war",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 1,
+          "Heap Fetches": 740
+        },
+        "r02-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 730,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history OR war",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Pruning": "block-max",
+          "Scored Candidates": 3318,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Expansions": 1,
+          "Top-K Completions": 1,
+          "Heap Fetches": 740
+        },
+        "r03-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 730,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history OR war",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Pruning": "block-max",
+          "Scored Candidates": 3318,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Expansions": 1,
+          "Top-K Completions": 1,
+          "Heap Fetches": 740
+        },
+        "r04-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 730,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history OR war",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 1,
+          "Heap Fetches": 740
+        }
+      }
+    },
+    {
+      "name": "or_mod1000_literal",
+      "shape": "or",
+      "query": "history OR war",
+      "selectivity_percent": 0.1,
+      "predicate": "id % 1000 = 0",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-baseline": 6.367,
+        "r02-candidate": 9.108,
+        "r03-candidate": 9.012,
+        "r04-baseline": 7.87
+      },
+      "baseline_median_ms": 7.1185,
+      "candidate_median_ms": 9.06,
+      "change_percent": 27.274004354850035,
+      "paired_candidate_over_baseline": [
+        1.4305010208889588,
+        1.1451080050825921
+      ],
+      "last_plan_counters": {
+        "r01-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 6811,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history OR war",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 1,
+          "Heap Fetches": 6821
+        },
+        "r02-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 6811,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history OR war",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Pruning": "block-max",
+          "Scored Candidates": 3318,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Expansions": 1,
+          "Top-K Completions": 1,
+          "Heap Fetches": 6821
+        },
+        "r03-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 6811,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history OR war",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Pruning": "block-max",
+          "Scored Candidates": 3318,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Expansions": 1,
+          "Top-K Completions": 1,
+          "Heap Fetches": 6821
+        },
+        "r04-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 6811,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history OR war",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 27946,
+          "Pruning": "block-max",
+          "Scored Candidates": 570,
+          "Exhaustive Score Calls": 27946,
+          "Top-K Completions": 1,
+          "Heap Fetches": 6821
+        }
+      }
+    },
+    {
+      "name": "common_mod100_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 1.0,
+      "predicate": "id % 100 = 0",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-baseline": 2.769,
+        "r02-candidate": 4.461,
+        "r03-candidate": 4.621,
+        "r04-baseline": 3.15
+      },
+      "baseline_median_ms": 2.9595000000000002,
+      "candidate_median_ms": 4.541,
+      "change_percent": 53.43808075688461,
+      "paired_candidate_over_baseline": [
+        1.6110509209100758,
+        1.466984126984127
+      ],
+      "last_plan_counters": {
+        "r01-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 725,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 1,
+          "Heap Fetches": 735
+        },
+        "r02-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 725,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Pruning": "block-max",
+          "Scored Candidates": 14221,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Expansions": 1,
+          "Top-K Completions": 1,
+          "Heap Fetches": 735
+        },
+        "r03-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 725,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Pruning": "block-max",
+          "Scored Candidates": 14221,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Expansions": 1,
+          "Top-K Completions": 1,
+          "Heap Fetches": 735
+        },
+        "r04-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 725,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 1,
+          "Heap Fetches": 735
+        }
+      }
+    },
+    {
+      "name": "common_mod1000_literal",
+      "shape": "common",
+      "query": "history",
+      "selectivity_percent": 0.1,
+      "predicate": "id % 1000 = 0",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-baseline": 4.553,
+        "r02-candidate": 6.221,
+        "r03-candidate": 6.474,
+        "r04-baseline": 6.132
+      },
+      "baseline_median_ms": 5.342499999999999,
+      "candidate_median_ms": 6.3475,
+      "change_percent": 18.81141787552645,
+      "paired_candidate_over_baseline": [
+        1.3663518559191743,
+        1.0557729941291587
+      ],
+      "last_plan_counters": {
+        "r01-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 8527,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 1,
+          "Heap Fetches": 8537
+        },
+        "r02-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 8527,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Pruning": "block-max",
+          "Scored Candidates": 14221,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Expansions": 1,
+          "Top-K Completions": 1,
+          "Heap Fetches": 8537
+        },
+        "r03-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 8527,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Pruning": "block-max",
+          "Scored Candidates": 14221,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Expansions": 1,
+          "Top-K Completions": 1,
+          "Heap Fetches": 8537
+        },
+        "r04-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 8527,
+          "Index": "documents_body_stannum_idx",
+          "Query": "history",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 22063,
+          "Pruning": "block-max",
+          "Scored Candidates": 2504,
+          "Exhaustive Score Calls": 22063,
+          "Top-K Completions": 1,
+          "Heap Fetches": 8537
+        }
+      }
+    },
+    {
+      "name": "phrase_mod100_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 1.0,
+      "predicate": "id % 100 = 0",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-baseline": 3.833,
+        "r02-candidate": 3.83,
+        "r03-candidate": 3.77,
+        "r04-baseline": 4.384
+      },
+      "baseline_median_ms": 4.1085,
+      "candidate_median_ms": 3.8,
+      "change_percent": -7.5088231714737885,
+      "paired_candidate_over_baseline": [
+        0.9992173232454996,
+        0.8599452554744524
+      ],
+      "last_plan_counters": {
+        "r01-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 571,
+          "Index": "documents_body_stannum_idx",
+          "Query": "\"united states\"",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 581
+        },
+        "r02-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 571,
+          "Index": "documents_body_stannum_idx",
+          "Query": "\"united states\"",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Expansions": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 581
+        },
+        "r03-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 571,
+          "Index": "documents_body_stannum_idx",
+          "Query": "\"united states\"",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Expansions": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 581
+        },
+        "r04-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 571,
+          "Index": "documents_body_stannum_idx",
+          "Query": "\"united states\"",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 581
+        }
+      }
+    },
+    {
+      "name": "phrase_mod1000_literal",
+      "shape": "phrase",
+      "query": "\"united states\"",
+      "selectivity_percent": 0.1,
+      "predicate": "id % 1000 = 0",
+      "bound": "literal",
+      "limit": 10,
+      "offset": 0,
+      "run_median_ms": {
+        "r01-baseline": 4.553,
+        "r02-candidate": 4.891,
+        "r03-candidate": 4.78,
+        "r04-baseline": 5.617
+      },
+      "baseline_median_ms": 5.085,
+      "candidate_median_ms": 4.8355,
+      "change_percent": -4.906588003933143,
+      "paired_candidate_over_baseline": [
+        1.0742367669668351,
+        0.8509880719245149
+      ],
+      "last_plan_counters": {
+        "r01-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 4893,
+          "Index": "documents_body_stannum_idx",
+          "Query": "\"united states\"",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 4903
+        },
+        "r02-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 4893,
+          "Index": "documents_body_stannum_idx",
+          "Query": "\"united states\"",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Expansions": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 4903
+        },
+        "r03-candidate": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 4893,
+          "Index": "documents_body_stannum_idx",
+          "Query": "\"united states\"",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Expansions": 0,
+          "Top-K Completions": 0,
+          "Heap Fetches": 4903
+        },
+        "r04-baseline": {
+          "Node Type": "Custom Scan",
+          "Parent Relationship": "Outer",
+          "Custom Plan Provider": "Stannum Text Search Scan",
+          "Relation Name": "documents",
+          "Alias": "documents",
+          "Actual Rows": 10.0,
+          "Disabled": false,
+          "Rows Removed by Filter": 4893,
+          "Index": "documents_body_stannum_idx",
+          "Query": "\"united states\"",
+          "Order": "score DESC",
+          "Top K": 10,
+          "Candidates": 15381,
+          "Exhaustive Score Calls": 15381,
+          "Top-K Completions": 0,
+          "Heap Fetches": 4903
+        }
+      }
+    }
+  ]
+}

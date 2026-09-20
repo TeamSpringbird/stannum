@@ -26,3 +26,5 @@ Run commands from the repository root. Keep raw results in ignored
 - [Expanded TIN strategy and capacity experiments](benchmarks/tin-expanded-experiments.md)
 - [Early filtering and core bitmap comparison](benchmarks/early-filter-ranking.md):
   two controlled experiments, negative results, and the next ranked-search target.
+- [Filtered top-k retry experiments](benchmarks/filtered-prefix-ranking.md):
+  targeted wins, adversarial regressions, and limits of repeated ranking.
