@@ -1,11 +1,12 @@
 # Performance snapshot: GIN and remote TIN
 
-Stannum is in a useful latency range on these recorded workloads: lower count
-p95 than stored-vector GIN on the same host, and milliseconds to tens of
-milliseconds for a selected filtered-ranking query across the local and remote
-setups. This is **not** a current-head benchmark, a TIN speedup claim, a capacity
-estimate, or a percentage of performance parity. One query cannot characterize
-an engine. New optimizations need their own repeated measurements.
+The same-host count observations show lower p95 for Stannum than stored-vector
+GIN on the measured historical build. The TIN panel compares two strategies
+**within TIN on one remote server**. There is no shared Stannum/TIN timing axis:
+the earlier version's shared axis invited an unsupported engine ranking.
+Server-only timing already excludes network, but hardware, settings and query
+execution differ. These observations cannot establish that Stannum is faster
+than TIN, performance parity, or current-head performance.
 
 ![Recorded Stannum, GIN and TIN observations](performance-snapshot.svg)
 
@@ -43,7 +44,7 @@ The measurement predates later planner improvements. Frozen source SHA-256:
 Image and driver identities remain in the source JSON. A fresh paired run on
 current main is required before describing these as current release numbers.
 
-## B. Remote TIN as a scale reference
+## B. Remote TIN: same-server strategy observations
 
 The selected query returns IDs and scores for `history OR war`, restricted to
 `id <= 25000`, ordered by descending score with literal LIMIT 10 and OFFSET 0.
@@ -53,11 +54,11 @@ The filter selects 25% of the corpus before text matching. Both datasets have
 
 | Observation | Server execution time | Sampling |
 | --- | ---: | --- |
-| Stannum baseline `07fedc6` | 5.178 ms | Median of run medians 5.100 / 5.256 ms; seven retained samples each |
 | TIN 1.0.2 automatic | 29.338 ms | Three observations; 29.006–30.750 ms |
 | TIN 1.0.2 forced TID pushdown | 18.700 ms | Three observations; 18.669–18.785 ms |
 
-Stannum comes from `or_p25_literal` in
+For audit continuity only, the removed local marker was 5.178 ms, from
+`or_p25_literal` in
 [filtered-prefix-results.json](filtered-prefix-results.json). It is the baseline,
 **not the rejected retry candidate**. TIN comes from run `visible-s4-m16` in
 [tin-expanded-results.json](tin-expanded-results.json), groups
@@ -93,12 +94,75 @@ checked against exhaustive same-engine scoring in that campaign; TIN's forced
 strategies are checked against its own score sequences. Lead remains the
 independent compatibility oracle.
 
-The right conclusion is narrow: **this selected shape is in the millisecond to
-tens-of-milliseconds range in both setups**, so it is useful evidence that we are
-investigating a plausible performance range. It cannot tell us which engine would
-win on identical machines, or whether Stannum matches TIN across workloads.
-For broader remote observations, including one million articles, see
+The remote panel answers which of these two TIN strategies was faster for
+this shape on that server. It does not rank Stannum against TIN. For broader
+remote observations, including one million articles, see
 [the expanded experiment report](tin-expanded-experiments.md).
+
+## Server-only audit and a better comparison
+
+The six remote raw JSON files above contain these `Execution Time` values:
+automatic **29.338, 29.006, 30.750 ms**; pushdown **18.785, 18.669,
+18.700 ms**. Their SQL uses `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON,
+TIMING OFF)`, with no `SERIALIZE`. All six call `tin.full_score(ctid)` and use the
+literal query/filter/bound described above. Only the pushdown observations set
+`tin.debug_force_conjunction_mode='Pushdown'`; all use 2 MiB work_mem.
+
+The local raw `plans.json` files in
+`benchmarks/results/filtered-prefix-gated-100k/r01-baseline` and `r04-baseline`
+contain retained execution times **4.951, 5.352, 5.246, 5.036, 5.415, 5.065,
+5.100 ms** and **5.691, 5.286, 5.769, 4.900, 5.256, 5.194, 5.199 ms**.
+Their medians reproduce 5.100 and 5.256 ms. `cases-baseline.json` records the
+forced-generic prepared `stannum.full_score(ctid)` SQL. Local IDs are bigint;
+TIN fixture IDs are integer. That contributes to different row widths and
+physical layout. Both scoring calls request their engine's full score; there
+is no cross-engine score-equivalence check in this experiment.
+
+The plotted TIN times, and the removed local point, were **already server-only
+execution times**, not remote client round trips. Planning time is separate.
+`TIMING OFF` disables node-level clocks while PostgreSQL still measures overall
+execution. `SERIALIZE` can measure output conversion, but EXPLAIN does not send
+the query's result rows across the network. See
+[PostgreSQL EXPLAIN documentation](https://www.postgresql.org/docs/18/sql-explain.html).
+Thus subtracting network latency would not change these measurements.
+
+For a concrete example, TIN artifact `00294` records **29.338 ms execution**,
+**0.610 ms planning** and **62.407 ms client elapsed** in `experiment.json`.
+Pushdown artifact `00293` records **18.785 / 1.260 / 51.827 ms**, respectively.
+The client/server difference includes planning, EXPLAIN output generation and
+transfer, client overhead and network; it is not an isolated network estimate.
+The figure uses the execution field only.
+
+A search of the retained remote SQL artifacts and both TIN collector sources
+found no GIN/tsvector benchmark measurements to use as a same-host anchor.
+A new remote session could answer a better-defined question:
+
+1. On the remote server, load the pinned corpus once and compare TIN with a
+   stored-vector GIN baseline. Locally, compare the current Stannum build with
+   the same GIN baseline. Pin PostgreSQL version, text configuration, input
+   column types, normalization and query semantics as closely as possible.
+2. Start with AND/OR count queries whose full counts **and membership** agree.
+   Use identical literal/custom/generic plan modes as separate experiments,
+   matched `EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING OFF, FORMAT JSON)`,
+   identical projection and ID types, explicit VACUUM, before/after visibility
+   snapshots, a documented warmup,
+   interleaved repeated runs and retained raw SQL/plans. Time output conversion
+   separately with `SERIALIZE TEXT` if that matters to the application. Store
+   `Execution Time`, `Planning Time` and client elapsed as separate fields;
+   never silently substitute a client measurement for a server timer.
+3. Compare each search engine with GIN **on its own host**, reporting per-query
+   distributions, plan choices, CPU/memory/storage and index/heap sizes.
+   Ratios relative to GIN are a useful reference, not a hardware correction:
+   different engines can scale differently with CPU, caches, I/O and parallelism.
+4. Keep BM25 ranked queries separate. GIN plus `ts_rank_cd` is not an identical
+   scorer, so ranking ratios would conflate execution and scoring algorithms.
+   A direct Stannum/TIN ranking comparison still needs matched scoring/query
+   semantics and a matched environment; otherwise publish separate observations.
+
+This protocol makes a temporary remote session useful without presenting an
+uncontrolled raw latency ratio as an engine speedup. It has not been run.
+Prepare and validate the collector locally before provisioning another paid
+database; the recorded timing audit does not require recreating one.
 
 ## Re-render
 
