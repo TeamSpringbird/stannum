@@ -1,0 +1,182 @@
+[
+  {
+    "case": "and_2_count",
+    "status": "passed"
+  },
+  {
+    "case": "and_2_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "or_2_count",
+    "status": "passed"
+  },
+  {
+    "case": "or_2_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "and_8_count",
+    "status": "passed"
+  },
+  {
+    "case": "and_8_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "or_8_count",
+    "status": "passed"
+  },
+  {
+    "case": "or_8_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "exists_ranked",
+    "error": "stannum.full_score() requires a stannum index scan and cannot be used in this query context",
+    "status": "failed",
+    "sqlstate": "XX000"
+  },
+  {
+    "case": "not_exists_ranked",
+    "error": "stannum.full_score() requires a stannum index scan and cannot be used in this query context",
+    "status": "failed",
+    "sqlstate": "XX000"
+  },
+  {
+    "case": "correlated_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "sparse_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "join_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "materialized_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "lateral_count",
+    "status": "passed"
+  },
+  {
+    "case": "union_count",
+    "status": "passed"
+  },
+  {
+    "case": "and_32_count",
+    "status": "passed"
+  },
+  {
+    "case": "and_32_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "or_32_count",
+    "status": "passed"
+  },
+  {
+    "case": "or_32_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "and_128_count",
+    "status": "passed"
+  },
+  {
+    "case": "and_128_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "or_128_count",
+    "status": "passed"
+  },
+  {
+    "case": "or_128_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "nested_count",
+    "status": "passed"
+  },
+  {
+    "case": "nested_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "exclude_count",
+    "status": "passed"
+  },
+  {
+    "case": "exclude_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "redundant_count",
+    "status": "passed"
+  },
+  {
+    "case": "redundant_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "contradiction_count",
+    "status": "passed"
+  },
+  {
+    "case": "contradiction_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "phrase_count",
+    "status": "passed"
+  },
+  {
+    "case": "phrase_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "phrase_or_count",
+    "status": "passed"
+  },
+  {
+    "case": "phrase_or_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "prefix_count",
+    "status": "passed"
+  },
+  {
+    "case": "prefix_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "rare_count",
+    "status": "passed"
+  },
+  {
+    "case": "rare_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "common_rare_count",
+    "status": "passed"
+  },
+  {
+    "case": "common_rare_ranked",
+    "status": "passed"
+  },
+  {
+    "case": "absent_count",
+    "status": "passed"
+  },
+  {
+    "case": "absent_ranked",
+    "status": "passed"
+  }
+]
