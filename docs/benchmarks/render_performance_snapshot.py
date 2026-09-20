@@ -19,8 +19,6 @@ def read(name):
 
 count = next(r for r in read("published-trace-results.json") if r["run"] == "tin-count-100k-02")
 engines = {r["engine"]: r for r in count["measurements"]}
-prefix = read("filtered-prefix-results.json")
-local = next(r for r in prefix["rows"] if r["name"] == "or_p25_literal")
 tin = read("tin-expanded-results.json")["runs"]["visible-s4-m16"]
 auto = next(g for g in tin["groups"] if g["name"] == "forced:wiki:0.25:10:r*:{}")
 pushdown = next(g for g in tin["groups"] if g["name"] == "forced:wiki:0.25:10:r*:{'tin.debug_force_conjunction_mode': 'Pushdown'}")
@@ -44,23 +42,22 @@ ax.legend(loc="upper right", frameon=False, fontsize=10)
 fig.text(.055, .479, "Local ARM64 Docker: 4 CPU / 4 GiB limit · PG 18.6 · run tin-count-100k-02", fontsize=10, color="#526078")
 fig.text(.055, .455, "604 full counts agreed; unsampled membership is unproven. Phrase forms omitted because 11 full counts differed.", fontsize=10, color="#526078")
 
-fig.text(.055, .397, "B   Filtered ranking: scale check, different machines", fontsize=16, weight="bold", color="#17243b")
-fig.text(.055, .365, "Server median · history OR war · id ≤ 25,000 · top 10 IDs + scores · no cross-engine speedup claim", color="#526078")
+fig.text(.055, .397, "B   TIN only: two strategies on the same server", fontsize=16, weight="bold", color="#17243b")
+fig.text(.055, .365, "Server median · history OR war · id ≤ 25,000 · top 10 IDs + scores · network excluded", color="#526078")
 ax2 = fig.add_axes([.29, .158, .62, .17], facecolor="#f5f7fb")
-values = [local["baseline_median_ms"], auto["median_ms"], pushdown["median_ms"]]
-labels = ["Stannum · local baseline", "TIN · automatic", "TIN · forced pushdown"]
-for y, v, color in zip([2, 1, 0], values, ["#007f79", "#ab6b2b", "#c99556"]):
+values = [auto["median_ms"], pushdown["median_ms"]]
+labels = ["TIN · automatic", "TIN · forced pushdown"]
+for y, v, color in zip([1, 0], values, ["#ab6b2b", "#c99556"]):
     ax2.scatter(v, y, s=115, color=color, zorder=3)
     ax2.annotate(f" {v:.3f} ms", (v, y), xytext=(8, 0), textcoords="offset points", va="center", color="#17243b")
-ax2.set_yticks([2, 1, 0], labels)
-ax2.set_ylim(-.5, 2.5)
-ax2.set_xscale("log")
-ax2.set_xlim(1, 90)
-ax2.set_xticks([1, 3, 10, 30])
+ax2.set_yticks([1, 0], labels)
+ax2.set_ylim(-.5, 1.5)
+ax2.set_xlim(0, 38)
+ax2.set_xticks([0, 10, 20, 30])
 ax2.xaxis.set_major_formatter(ScalarFormatter())
-ax2.set_xlabel("EXPLAIN execution time (ms, log scale) — hardware / settings / timing differ")
-fig.text(.055, .067, "Local: 4 CPU / 4 GiB Docker, baseline 07fedc6. TIN 1.0.2: PS-160 ARM / EBS, 2 vCPU / 16 GiB.", fontsize=10, color="#526078")
-fig.text(.055, .042, "These are workload snapshots, not a percent-to-parity score. Sources + limitations: docs/benchmarks/performance-snapshot.md", fontsize=10, color="#526078")
+ax2.set_xlabel("EXPLAIN execution time (ms) — three observations per strategy")
+fig.text(.055, .067, "TIN 1.0.2: PS-160 ARM / EBS, 2 vCPU / 16 GiB. No matched Stannum measurement exists on this server.", fontsize=10, color="#526078")
+fig.text(.055, .042, "Server-only timing removes network, not hardware differences. Sources: docs/benchmarks/performance-snapshot.md", fontsize=10, color="#526078")
 for a in (ax, ax2):
     a.set_axisbelow(True)
     a.grid(axis="x", alpha=.18)
@@ -69,4 +66,6 @@ for a in (ax, ax2):
     a.tick_params(length=0, pad=8)
 for suffix in ("svg", "png"):
     fig.savefig(ROOT / f"performance-snapshot.{suffix}", dpi=180, facecolor=fig.get_facecolor())
+svg = ROOT / "performance-snapshot.svg"
+svg.write_text("\n".join(line.rstrip() for line in svg.read_text().splitlines()) + "\n")
 plt.close(fig)
