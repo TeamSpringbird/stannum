@@ -495,13 +495,89 @@ def boundary_check(case, observed):
     return dict(ids=list(scores), rank=ranking(list(scores.items())), zero=zero, max_ok=max_ok), problems
 
 
+
+LIFECYCLE_FIXTURE = """
+CREATE TABLE oracle_lifecycle_docs(id int PRIMARY KEY, body text);
+INSERT INTO oracle_lifecycle_docs VALUES
+ (1,'alpha red'),(2,'beta blue'),(3,'alpha beta'),(4,'Éclair green');
+CREATE INDEX oracle_lifecycle_idx ON oracle_lifecycle_docs USING {engine}(body);
+"""
+
+
+def lifecycle_cases(engine):
+    alpha = [[1, '<b>alpha</b> red', '<b>alpha</b> red'],
+             [3, '<b>alpha</b> beta', '<b>alpha</b> beta']]
+    projection = (f"json_build_array(id,{engine}.highlight(body),"
+                  f"{engine}.highlight(body,query=>'alpha'))")
+    cases = []
+    def add(name, sql, expected):
+        cases.append(dict(name=name, kind='lifecycle', error=False, expected=expected, sql=sql))
+    add('select_binding', f"SELECT {projection} FROM oracle_lifecycle_docs WHERE body ==> 'alpha'", alpha)
+    for materialization in ['', 'MATERIALIZED']:
+        add('cte_' + ('materialized' if materialization else 'inline'),
+            f"WITH hits AS {materialization} (SELECT id,body FROM oracle_lifecycle_docs "
+            f"WHERE body ==> 'alpha') SELECT {projection} FROM hits", alpha)
+    add('subquery_binding', f"SELECT {projection} FROM (SELECT id,body FROM oracle_lifecycle_docs "
+        "WHERE body ==> 'alpha') hits", alpha)
+    touched = [[row[0], row[1] + ' touched', row[2] + ' touched'] for row in alpha]
+    add('update_returning', "BEGIN; UPDATE oracle_lifecycle_docs SET body=body || ' touched' "
+        f"WHERE body ==> 'alpha' RETURNING {projection}; ROLLBACK", touched)
+    add('update_cte', "BEGIN; WITH changed AS (UPDATE oracle_lifecycle_docs SET body=body || ' touched' "
+        f"WHERE body ==> 'alpha' RETURNING id,body) SELECT {projection} FROM changed; ROLLBACK", touched)
+    # Separate controls still execute if the implicit projection errors.
+    for original in list(cases):
+        if original['name'] in ['cte_inline', 'cte_materialized', 'subquery_binding', 'update_cte']:
+            add(original['name'] + '_explicit', original['sql'].replace(
+                f'{engine}.highlight(body)', f"{engine}.highlight(body,query=>'alpha')"), original['expected'])
+    add('cte_inner_projection', f"WITH hits AS MATERIALIZED (SELECT {projection} AS rendered "
+        "FROM oracle_lifecycle_docs WHERE body ==> 'alpha') SELECT rendered FROM hits", alpha)
+    add('update_cte_inner_projection', "BEGIN; WITH changed AS (UPDATE oracle_lifecycle_docs "
+        "SET body=body || ' touched' WHERE body ==> 'alpha' "
+        f"RETURNING {projection} AS rendered) SELECT rendered FROM changed; ROLLBACK", touched)
+    queries = ['alpha', 'beta', 'absenttoken', '', 'eclair', 'alpha']
+    highlights = {'alpha': alpha, 'beta': [[2, '<b>beta</b> blue', '<b>beta</b> blue'],
+                   [3, 'alpha <b>beta</b>', 'alpha <b>beta</b>']],
+                  'absenttoken': [], '': [], 'eclair': [[4, '<b>Éclair</b> green', '<b>Éclair</b> green']]}
+    for mode in ['custom', 'generic']:
+        sql = (f"SET plan_cache_mode=force_{mode}_plan; PREPARE oracle_lifecycle(text) AS "
+               f"SELECT json_build_array($1,id,{engine}.highlight(body),"
+               f"{engine}.highlight(body,query=>$1)) FROM oracle_lifecycle_docs WHERE body ==> $1;")
+        for query in queries:
+            sql += f" EXECUTE oracle_lifecycle('{query}');"
+        sql += (" SELECT json_build_array('plans',generic_plans,custom_plans) "
+                "FROM pg_prepared_statements WHERE name='oracle_lifecycle'; DEALLOCATE oracle_lifecycle")
+        expected = [[query, *row] for query in queries for row in highlights[query]]
+        expected.append(['plans', len(queries) if mode == 'generic' else 0,
+                         len(queries) if mode == 'custom' else 0])
+        add('prepared_' + mode, sql, expected)
+    return cases
+
+
+def lifecycle_check(case, observed):
+    if 'error' in observed:
+        return dict(error=observed['sqlstate']), ['unexpected_error']
+    # DML RETURNING has no defined row order. Keep duplicate observations from
+    # repeated EXECUTEs while canonicalizing order; no set-based deduplication.
+    rows = sorted(observed['rows'], key=lambda row: json.dumps(row, ensure_ascii=False))
+    expected = sorted(case['expected'], key=lambda row: json.dumps(row, ensure_ascii=False))
+    return rows, ([] if rows == expected else ['documented_membership_or_highlight_or_plan_count'])
+
+
 def run_boundaries(args):
+    return run_contracts(args, lifecycle=False)
+
+
+def run_contracts(args, lifecycle=False):
     import dataset
     import run as bench
     if args.budget_seconds <= 0 or args.statement_seconds <= 0:
         raise ValueError('boundary time budgets must be positive')
     if not args.reference_source or args.left_engine != 'stannum' or args.right_engine != 'tin':
-        raise ValueError('boundaries require --reference-source and Stannum/Lead engines')
+        raise ValueError('contract suites require --reference-source and Stannum/Lead engines')
+    fixture = LIFECYCLE_FIXTURE if lifecycle else BOUNDARY_FIXTURE
+    cases = lifecycle_cases if lifecycle else boundary_cases
+    check_case = lifecycle_check if lifecycle else boundary_check
+    table = 'oracle_lifecycle_docs' if lifecycle else 'oracle_boundary_docs'
     source = Path(args.reference_source).resolve()
     if subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain'], text=True).strip():
         raise ValueError('Lead reference checkout must be clean')
@@ -512,6 +588,9 @@ def run_boundaries(args):
                   'max_score_invariant', 'error_sqlstate', 'exact_highlights'],
                   lead_revision=subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip(),
                   scope='small synthetic boundaries; no mutation or performance claims', servers={})
+    if lifecycle:
+        report.update(rows=4, checks=['membership', 'exact_implicit_explicit_highlights', 'prepared_plan_counts'],
+                      scope='tiny statement lifecycle; DML rolled back; no score-bit or performance claims')
     report['stannum_source'] = bench.provenance(out)
     libdir = Path(subprocess.check_output(['pg_config', '--pkglibdir'], text=True).strip())
     suffix = '.dylib' if platform.system() == 'Darwin' else '.so'
@@ -535,16 +614,16 @@ def run_boundaries(args):
                 functions=run("SELECT p.oid::regprocedure::text FROM pg_proc p JOIN pg_namespace n "
                               f"ON n.oid=p.pronamespace WHERE n.nspname='{engine}' ORDER BY 1", env).splitlines())
             # Transactional setup avoids leaking a table on partial failure.
-            run('BEGIN;' + BOUNDARY_FIXTURE.format(engine=engine) + 'COMMIT;', env)
+            run('BEGIN;' + fixture.format(engine=engine) + 'COMMIT;', env)
             owned.append(side)
-        for left, right in zip(boundary_cases('stannum'), boundary_cases('tin')):
+        for left, right in zip(cases('stannum'), cases('tin')):
             if time.monotonic() - started > args.budget_seconds:
                 raise TimeoutError('boundary verification budget exhausted')
             item = dict(name=left['name'], documented=left['expected'], expected_error=left['error'], observations={})
             values, issues = {}, {}
             for side, case in [('left', left), ('right', right)]:
                 observed = boundary_observe(case, envs[side])
-                values[side], issues[side] = boundary_check(case, observed)
+                values[side], issues[side] = check_case(case, observed)
                 item['observations'][side] = dict(sql=case['sql'], **observed)
             same = values['left'] == values['right']
             # These are triage classifications, not automatic assignment of blame.
@@ -568,13 +647,13 @@ def run_boundaries(args):
         for side in owned:
             if not args.keep:
                 try:
-                    run('DROP TABLE oracle_boundary_docs', envs[side])
+                    run('DROP TABLE ' + table, envs[side])
                 except Exception as error:
                     report.setdefault('cleanup_errors', []).append(str(error))
         if report.get('cleanup_errors'):
             report['status'] = 'incomplete'
         save()
-    print(f"{report['status']}: {len(report['cases'])} boundary cases in {report['elapsed_seconds']:.1f}s; {out / 'oracle.json'}")
+    print(f"{report['status']}: {len(report['cases'])} contract cases in {report['elapsed_seconds']:.1f}s; {out / 'oracle.json'}")
     return 0 if report['status'] == 'passed' else 1
 
 
@@ -596,7 +675,12 @@ def main():
     parser.add_argument("--budget-seconds", type=int, default=900)
     parser.add_argument("--statement-seconds", type=int, default=60)
     parser.add_argument("--boundaries", action="store_true", help="100-row documented contract checks; separate from mutation/trace suites")
+    parser.add_argument("--lifecycle", action="store_true", help="tiny implicit highlighting and prepared-statement lifecycle suite")
     args = parser.parse_args()
+    if args.lifecycle:
+        if args.boundaries or args.dataset or args.trace:
+            parser.error("--lifecycle cannot be combined with another suite")
+        return run_contracts(args, lifecycle=True)
     if args.boundaries:
         if args.dataset or args.trace:
             parser.error("--boundaries cannot be combined with --dataset or --trace")
