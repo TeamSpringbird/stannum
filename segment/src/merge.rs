@@ -329,8 +329,8 @@ fn merge_as(
     }
     let dictionary = dictionary.finish();
     let documents = doc_builder.finish();
-    let mut out = Vec::new();
-    out.extend_from_slice(format.magic());
+    let mut header = Vec::new();
+    header.extend_from_slice(format.magic());
     for n in [
         live_lengths.len() as u64,
         total_length,
@@ -339,26 +339,49 @@ fn merge_as(
         payload_area.len() as u64,
         documents.len() as u64,
     ] {
-        varint::put(&mut out, n);
+        varint::put(&mut header, n);
     }
-    for bytes in [
-        &dictionary,
-        &postings_area,
-        &payload_area,
-        &documents,
-        &length_bytes,
-    ] {
-        let next = out
-            .len()
-            .checked_add(bytes.len())
-            .ok_or(MergeError::Limit("output bytes"))?;
-        check(next, limits.max_output_bytes, "output bytes")?;
-        out.try_reserve(bytes.len())
-            .map_err(|_| MergeError::Allocation)?;
-        out.extend_from_slice(bytes);
-    }
+    drop(live_lengths);
+    let out = assemble(
+        [
+            header,
+            dictionary,
+            postings_area,
+            payload_area,
+            documents,
+            length_bytes,
+        ],
+        limits.max_output_bytes,
+    )?;
     checkpoint()?;
     check(out.len(), limits.max_output_bytes, "output bytes")?;
+    Ok(out)
+}
+
+/// Preserve the byte layout while reusing the largest allocation. Reserving a
+/// separate output would retain a second complete copy of the encoded areas.
+fn assemble(mut parts: [Vec<u8>; 6], limit: usize) -> std::result::Result<Vec<u8>, MergeError> {
+    let mut offsets = [0; 6];
+    let mut total = 0usize;
+    for (offset, part) in offsets.iter_mut().zip(&parts) {
+        *offset = total;
+        total = total
+            .checked_add(part.len())
+            .ok_or(MergeError::Limit("output bytes"))?;
+    }
+    check(total, limit, "output bytes")?;
+    let largest = (0..parts.len())
+        .max_by_key(|&i| parts[i].capacity())
+        .unwrap();
+    let mut out = std::mem::take(&mut parts[largest]);
+    let old_len = out.len();
+    out.try_reserve_exact(total - old_len)
+        .map_err(|_| MergeError::Allocation)?;
+    out.resize(total, 0);
+    out.copy_within(0..old_len, offsets[largest]);
+    for (part, offset) in parts.into_iter().zip(offsets) {
+        out[offset..offset + part.len()].copy_from_slice(&part);
+    }
     Ok(out)
 }
 
@@ -381,6 +404,34 @@ mod tests {
             .zip(dead)
             .map(|(bytes, dead)| MergeInput { bytes, dead })
             .collect()
+    }
+
+    #[test]
+    fn assembly_preserves_order_and_reuses_every_possible_area() {
+        for largest in 0..6 {
+            for empty_mask in 0..64 {
+                let mut parts: [Vec<u8>; 6] = std::array::from_fn(|i| {
+                    if empty_mask & (1 << i) != 0 {
+                        Vec::new()
+                    } else {
+                        vec![i as u8 + 1; i * 3 + 1]
+                    }
+                });
+                let expected = parts.concat();
+                parts[largest].reserve_exact(256);
+                let allocation = parts[largest].as_ptr();
+                let actual = assemble(parts, expected.len()).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(actual.as_ptr(), allocation);
+            }
+        }
+        let parts = std::array::from_fn(|i| vec![i as u8; i + 1]);
+        assert!(matches!(
+            assemble(parts, 20),
+            Err(MergeError::Limit("output bytes"))
+        ));
+        let parts = std::array::from_fn(|i| vec![i as u8; i + 1]);
+        assert_eq!(assemble(parts.clone(), 21).unwrap(), parts.concat());
     }
 
     #[test]

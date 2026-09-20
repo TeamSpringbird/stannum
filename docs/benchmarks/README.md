@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [merge output allocation reuse](merge-output-reuse.md) reduces the measured
+live-allocation peak and enables the previously failing million-document merge.
+
 The [focused query-memory and reader-scaling probes](targeted-memory.md)
 separate broad working-set pressure from hot ranked OR traversal cost.
 
