@@ -38,6 +38,7 @@ use tinql::runtime::plan::{Limits, plan};
 use crate::score::rank;
 
 static ENABLE: GucSetting<bool> = GucSetting::<bool>::new(true);
+static RANKED_FRONTIER: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Method tables hold C string pointers; they are immutable and never
 /// touched off the backend's main thread.
@@ -104,6 +105,14 @@ static COUNT_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
     });
 
 pub fn init() {
+    GucRegistry::define_bool_guc(
+        c"stannum.experimental_ranked_frontier",
+        c"Use an experimental resumable frontier for bounded filtered ranking.",
+        c"Captured at executor start; unsupported queries retain the normal path.",
+        &RANKED_FRONTIER,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
     GucRegistry::define_bool_guc(
         c"stannum.enable_custom_scan",
         c"Enable Stannum's custom scan nodes for ==> queries",
@@ -890,6 +899,9 @@ struct ScanExec {
     fallback: *mut pg_sys::TableScanDescData,
     /// `tids` holds only the pruned top k; the rest are produced on demand.
     pruned: bool,
+    use_frontier: bool,
+    frontier: Option<crate::score::RankedFrontier>,
+    frontier_batches: usize,
     /// Explain counters. Candidates are unknown while pruned; `scored`
     /// counts the candidates a pruned scan scored.
     candidates: Option<usize>,
@@ -1035,6 +1047,9 @@ unsafe extern "C-unwind" fn begin_scan(
             started: false,
             fallback: std::ptr::null_mut(),
             pruned: false,
+            use_frontier: RANKED_FRONTIER.get() && !(*cscan).scan.plan.qual.is_null(),
+            frontier: None,
+            frontier_batches: 0,
             candidates: None,
             scored: None,
             exhaustive_score_calls: 0,
@@ -1077,6 +1092,17 @@ unsafe fn gather(exec: &mut ScanExec) {
             )
         });
         let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
+        if exec.use_frontier
+            && top_k.is_some_and(|k| k > 0 && k <= crate::score::PRUNE_MAX_K)
+            && let Some(frontier) = scorer.as_ref().and_then(|scorer| scorer.frontier())
+        {
+            exec.frontier = Some(frontier);
+            exec.tids.clear();
+            capture_frontier_batch(exec, scorer.take().expect("a frontier has a scorer"), true);
+            exec.next = 0;
+            exec.started = true;
+            return;
+        }
         if let Some(k) = top_k
             && k <= crate::score::PRUNE_MAX_K
             && let Some(top) = scorer.as_ref().and_then(|scorer| scorer.top_k(k))
@@ -1098,6 +1124,47 @@ unsafe fn gather(exec: &mut ScanExec) {
         exec.next = 0;
         exec.started = true;
     }
+}
+
+/// Keep yielded rows for constant rescans; the frontier owns unfinished work.
+/// Publish only new scores, avoiding a quadratic rewrite of the captured prefix.
+fn capture_frontier_batch(exec: &mut ScanExec, scorer: crate::score::IndexScorer, first: bool) {
+    let k = exec
+        .private
+        .ordering
+        .as_ref()
+        .and_then(|o| o.top_k)
+        .expect("bounded frontier");
+    let count = if first {
+        k.clamp(1, 128)
+    } else {
+        k.clamp(32, 128)
+    };
+    let frontier = exec.frontier.as_mut().expect("frontier initialized");
+    let rows = frontier.next_batch(&scorer, count);
+    exec.frontier_batches += 1;
+    exec.tids.extend(rows.iter().map(|(_, tid)| *tid));
+    exec.scores.extend(rows.iter().map(|(score, _)| *score));
+    exec.sorted = exec.tids.len();
+    exec.candidates = frontier.complete().then_some(exec.tids.len());
+    crate::score::publish_frontier_scorer(exec.scan_id, scorer, &rows);
+}
+
+unsafe fn resume_frontier(exec: &mut ScanExec) {
+    let ordering = exec.private.ordering.as_ref().expect("ranked frontier");
+    let scorer = crate::score::scorer_for_scan(
+        exec.scan_id,
+        exec.private.heap_oid,
+        exec.private.index_oid,
+        &exec.private.query,
+        ordering.full,
+        ordering.dense_ratio,
+        ordering.k1,
+        ordering.b,
+        ordering.term_add.clone(),
+        ordering.term_replace.clone(),
+    );
+    capture_frontier_batch(exec, scorer, false);
 }
 
 unsafe fn scan_query(exec: &ScanExec) -> Query {
@@ -1385,6 +1452,13 @@ unsafe extern "C-unwind" fn search_access(
                 tid
             } else {
                 if exec.next >= exec.tids.len() {
+                    if let Some(frontier) = &exec.frontier {
+                        if frontier.complete() {
+                            break;
+                        }
+                        resume_frontier(exec);
+                        continue;
+                    }
                     if !exec.pruned {
                         break;
                     }
@@ -1689,6 +1763,7 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
             exec.bounds_bound = exec.runtime_limit.is_null();
             exec.query_null = false;
             exec.started = false;
+            exec.frontier = None;
             exec.tids.clear();
             exec.scores.clear();
             exec.sorted = 0;
@@ -1789,6 +1864,27 @@ unsafe extern "C-unwind" fn explain(
                     scored as i64,
                     es,
                 );
+            }
+            if let Some(frontier) = &exec.frontier {
+                pg_sys::ExplainPropertyText(
+                    c"Candidate Strategy".as_ptr(),
+                    c"resumable ranked frontier (experimental)".as_ptr(),
+                    es,
+                );
+                for (name, value) in [
+                    (c"Frontier Score Calls", frontier.scored),
+                    (c"Frontier Ranges Expanded", frontier.expanded_ranges),
+                    (c"Frontier Ranges Total", frontier.total_ranges),
+                    (c"Frontier Peak Buffered Rows", frontier.peak_buffered_rows),
+                    (c"Frontier Batches", exec.frontier_batches),
+                ] {
+                    pg_sys::ExplainPropertyInteger(
+                        name.as_ptr(),
+                        std::ptr::null(),
+                        value as i64,
+                        es,
+                    );
+                }
             }
             if exec.ordered {
                 pg_sys::ExplainPropertyInteger(
