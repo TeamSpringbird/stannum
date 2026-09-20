@@ -17,6 +17,8 @@ mod operator;
 pub(crate) mod options;
 mod score;
 mod selectivity;
+#[cfg(feature = "pg_test")]
+mod spill_recovery_tests;
 mod storage;
 mod stream;
 mod tf_bucket {

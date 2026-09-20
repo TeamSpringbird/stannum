@@ -15,6 +15,7 @@ impl TempFile {
     }
     fn append(&mut self, bytes: &[u8]) {
         unsafe { pg_sys::BufFileWrite(self.0, bytes.as_ptr().cast(), bytes.len()) };
+        race_point("spill:written");
     }
     fn read(&mut self, at: usize, bytes: &mut [u8]) -> segment::Result<()> {
         if unsafe { pg_sys::BufFileSeek(self.0, 0, at as _, 0) } != 0 {
@@ -24,6 +25,7 @@ impl TempFile {
         if count != bytes.len() {
             pgrx::error!("Stannum temporary merge output is truncated");
         }
+        race_point("spill:read");
         Ok(())
     }
 }
@@ -122,6 +124,7 @@ impl OutputSink for SpillSink {
             if capacity > self.budget || a.capacity().saturating_add(b.capacity()) > self.budget {
                 self.postings.spill();
                 self.payload.spill();
+                race_point("spill:ready");
             }
         }
         self.postings.append(postings);
@@ -214,6 +217,7 @@ pub(super) unsafe fn write(index: pg_sys::Relation, output: &Output) -> (Run, Ru
                 KIND_RUN,
                 &layout::chain_payload(next, &bytes),
             );
+            race_point("spill:page-written");
             next = buffer.block();
             pages.push(next);
         }

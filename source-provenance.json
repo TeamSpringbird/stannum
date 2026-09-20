@@ -905,6 +905,10 @@
     "postgres/src/storage/spill.rs": {
       "owner": "ben",
       "evidence": "Original Stannum experimental merge-output spilling implementation."
+    },
+    "postgres/src/spill_recovery_tests.rs": {
+      "owner": "ben",
+      "evidence": "New Stannum spill transaction-abort and resource-cleanup tests."
     }
   }
 }
