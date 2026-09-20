@@ -1,7 +1,8 @@
 # Comparable EC2 / PlanetScale experiment
 
-Status: infrastructure recipe prepared; not deployed or benchmarked. Account selection
-and a fresh PlanetScale endpoint are pending. This is a read-only search experiment,
+Status: stack deployed in springbird-development/us-east-1 on 2026-09-20 UTC;
+bootstrap and expiry timer verified. Image build is running. A fresh PlanetScale
+endpoint is pending; no comparative measurements have run. This is a read-only search experiment,
 not a comparison of availability, durability, or replicated write throughput.
 
 ## Provisioning target
@@ -122,3 +123,26 @@ Lifecycle references:
 [AWS instance shutdown behavior](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_ChangingInstanceInitiatedShutdownBehavior.html),
 [CloudFormation instance properties](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ec2-instance.html),
 [Ubuntu AMI parameters](https://documentation.ubuntu.com/aws/aws-how-to/instances/build-cloudformation-templates/).
+
+## First deployment record
+
+Stack: `stannum-tin-benchmark`. Instance: `i-0fe89ebbba95cf4e3`.
+Expiry verified as 2026-09-20 09:22:08 UTC (05:22:08 America/New_York).
+AWS Pricing API quoted Linux shared-tenancy r8g.large at $0.11782/hour in
+us-east-1, excluding EBS, public IPv4 and transfer. Local ignored artifacts under
+`benchmarks/results/aws-comparable` retain the pricing response and resource inventory.
+
+After bootstrap, the SSM command executes `build-image.sh` as a transient
+`stannum-image-build` service. It builds the existing Docker recipe at main commit
+`ab1e6db87e7c5bafbfc5c121ac66d879d48bbd3b` and records source/image provenance.
+`start-postgres.sh` runs as `stannum-postgres-start`, waits for successful build
+artifacts, then starts PostgreSQL and creates the Stannum extension. Initial memory
+settings (2 GiB shared_buffers, 2 MiB work_mem) are provisional pending live TIN
+settings. The container uses the host CPU/memory budget, a 3 GiB shared-memory
+mount, and a Docker volume on the root gp3 disk. Localhost-only trust authentication
+is for this disposable fixture; SSM access is privileged and no database port is public.
+
+Inspect build logs using `journalctl -u stannum-image-build`; require
+`/opt/stannum-benchmark/postgres-ready.txt` before declaring PostgreSQL ready.
+Source build and PostgreSQL start scripts are one-shot scripts, not idempotent
+reconfiguration tools. Match the remote minor version before beginning measurements.

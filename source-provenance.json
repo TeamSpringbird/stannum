@@ -865,6 +865,14 @@
     "tokenizer/tests/compatibility.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 82157ed1e4da3e195b0837dbb868897a8f57ad48."
+    },
+    "benchmarks/aws/build-image.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
+    },
+    "benchmarks/aws/start-postgres.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
     }
   }
 }
