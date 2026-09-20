@@ -9,13 +9,16 @@
 //! entries a caller intends to delete. It does not validate posting ownership,
 //! dictionary extents, document lengths or score bounds; callers must retain the
 //! whole-input verifier until those checks have streaming equivalents. Next,
-//! pair this cursor with bounded postings/dictionary cursors, then feed positions
+//! pair the payload and postings cursors with a bounded dictionary cursor, then feed positions
 //! to an incremental output codec. Source caches and callback allocations are
 //! outside the cursor's bound; this is not a total merge memory budget. Legacy
 //! LSG1 construction scans its variable-width skip table once to locate data;
-//! that scan is bounded in memory but currently has no cancellation callback.
+//! `PayloadCursor::new_with_checkpoint` makes that scan cancellable.
 
 use crate::{Error, Result, segment::Format, source::Source, tf_bucket::TfBucket};
+
+mod postings;
+pub use postings::{PostingEntry, PostingsCursor};
 
 struct Window<'a, S: Source + ?Sized> {
     source: &'a S,
@@ -121,6 +124,20 @@ impl<'a, S: Source + ?Sized> PayloadCursor<'a, S> {
         format: Format,
         window_bytes: usize,
     ) -> Result<Self> {
+        Self::new_with_checkpoint(source, start, len, format, window_bytes, || Ok(()))
+    }
+
+    /// As `new`, with a checkpoint before parsing and for each legacy LSG1
+    /// skip-table slot. Use this for cancellable maintenance of large terms.
+    pub fn new_with_checkpoint(
+        source: &'a S,
+        start: u64,
+        len: u64,
+        format: Format,
+        window_bytes: usize,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<Self> {
+        checkpoint()?;
         let end = start.checked_add(len).ok_or(Error::Truncated)?;
         let mut header = Window::new(source, start, end, window_bytes)?;
         let count = header.u32()?;
@@ -137,6 +154,7 @@ impl<'a, S: Source + ?Sized> PayloadCursor<'a, S> {
         let skips_start = header.at;
         if format == Format::Lsg1 {
             for _ in 0..slots {
+                checkpoint()?;
                 header.varint()?;
             }
         } else {
@@ -399,6 +417,32 @@ mod tests {
             for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
                 let _ = validate(&bytes, format, window);
             }
+        }
+    }
+
+    #[test]
+    fn legacy_header_scan_can_cancel_at_every_skip() {
+        let bytes = build(Format::Lsg1, 257, 3);
+        for cancel_at in 0..=5 {
+            let mut calls = 0;
+            let result = PayloadCursor::new_with_checkpoint(
+                &bytes,
+                0,
+                bytes.len() as u64,
+                Format::Lsg1,
+                1,
+                || {
+                    let cancel = calls == cancel_at;
+                    calls += 1;
+                    if cancel {
+                        Err(Error::Corrupt("cancelled"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(matches!(result, Err(Error::Corrupt("cancelled"))));
+            assert_eq!(calls, cancel_at + 1);
         }
     }
 
