@@ -32,11 +32,9 @@ The initial host had approximately 3.1 TiB free. Local dataset directories are
 under `~/Library/Application Support/LeadBenchmarks/datasets/` and are not committed.
 
 No truncation, normalization, ID remapping or row reordering is applied. This is
-deliberately separate from our existing Hugging Face sample format. The current
-`tin.py run --dataset` expects that older format: do not point it at these raw
-upstream directories yet. Next, add a loader preserving their text IDs and exact
-body bytes, make Wikipedia/Stack Exchange trace selection explicit, and separate
-bounded correctness validation from the full-scale performance run.
+deliberately separate from our existing Hugging Face sample format. Use the explicit `--published-corpus wikipedia` option described below for the
+raw Wikipedia directory. The default `--dataset` format remains the older sample
+format. Stack Exchange timing still requires a tokenizer-aware oracle.
 
 For memory pressure, start with full Wikipedia while varying container memory
 and collecting database/index sizes, memory peaks, reads and latency. Then move
@@ -58,3 +56,47 @@ Both full CSVs completed size and SHA-256 verification on September 20, 2026.
 [Verification receipts](published-datasets-verification.json) retain the exact
 pinned revision and CSV identities. This verifies upstream file identity; it
 does not prove which query trace generated the article's charts.
+
+## Load the exact Wikipedia corpus through the benchmark
+
+The published Wikipedia format is now supported directly:
+
+```sh
+python3 benchmarks/tin.py --driver /path/to/prepared-driver run \
+  --published-corpus wikipedia --dataset /path/to/datasets/planetscale-wikipedia \
+  --image stannum-bench:published-corpus --output benchmarks/results/published-01 \
+  --rows 500000 --workload topk --style mixed --seconds 30 \
+  --validation-rows 1000 --validation-queries 18 \
+  --memory 2g --shared-buffers 128MB --maintenance-work-mem 64MB
+```
+
+The loader verifies the full CSV against the manifest in the pinned, verified
+upstream driver. It imports the requested prefix in original order using text
+IDs, without a primary-key index, matching the upstream table layout. CSV quoting
+may change in the bounded import file; decoded field contents, embedded newlines,
+Unicode and empty strings do not. Both full-source and imported-prefix hashes are
+recorded. Duplicate IDs fail the membership-check precondition.
+
+`--query-file /path/to/queries.json` selects an explicit trace. The runner snapshots
+and hashes that JSON and uses the same snapshot for validation and timed traffic.
+IDs must be unique and records must contain normalized ASCII query text plus TIN
+and PostgreSQL forms. The full pinned Wikipedia trace remains the default.
+
+`--validation-queries 0` (default) checks every query form. A positive limit selects
+evenly spaced forms for untimed membership, full-corpus counts and exhaustive
+ranked checks. Selected IDs are saved in the manifest. It does not shrink the timed
+trace, and it does not establish correctness for the unchecked forms. The small
+smoke test still checks every form. Keep the independent Lead oracle separate.
+
+`--published-corpus stackexchange` deliberately stops before starting a database:
+that raw corpus contains mixed case and punctuation, so the current normalized-text
+regex oracle is unsuitable. Acquisition and CSV prefix extraction support its
+format, but timed adoption needs a tokenizer-aware membership oracle. Do not
+normalize the imported documents to make the old oracle pass.
+
+`--build-memory 2g --memory 512m` separates index construction from query memory:
+the isolated container starts with the build cap, then switches to the query cap
+after CREATE INDEX, before VACUUM/validation/prewarm/timed traffic. Both limits
+and the transition are recorded. Without `--build-memory`, the same cap applies
+to the whole lifecycle. `--maintenance-work-mem` is independent of those caps;
+PostgreSQL's setting is not a bound on all extension allocations.
