@@ -10,6 +10,7 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use('Agg')
+matplotlib.rcParams['svg.hashsalt'] = 'stannum-query-shapes'
 import matplotlib.pyplot as plt
 
 
@@ -42,7 +43,10 @@ def main():
     fig.tight_layout(rect=(0,.12,1,.93))
     args.output.parent.mkdir(parents=True,exist_ok=True)
     for extension in ['png','svg']:
-        fig.savefig(args.output.with_suffix('.'+extension),dpi=160)
+        path = args.output.with_suffix('.'+extension)
+        fig.savefig(path, dpi=160, metadata={'Date': None} if extension == 'svg' else {})
+        if extension == 'svg':
+            path.write_text('\n'.join(line.rstrip() for line in path.read_text().splitlines())+'\n')
 
 
 if __name__ == '__main__':
