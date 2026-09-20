@@ -173,3 +173,11 @@ Verified evidence archive: `benchmarks/results/aws-comparable-evidence.tar.gz`,
 2,836,675 bytes, 8,449 verified files, SHA-256
 `76d364ec3a5d4bddf3f86e674a95a47527f45c8a30c647b98c1b5df3dd045f63`.
 The archive is retained locally, not uploaded to the public repository.
+
+Cleanup completed after export: CloudFormation stack deletion finished successfully,
+EC2 instance `i-0fe89ebbba95cf4e3` reports terminated, and its EBS volume
+`vol-08c1c3f6f8f4bc9e0` returns InvalidVolume.NotFound. No AWS benchmark server or
+disk remains. The temporary local connection file was removed. PlanetScale database
+deletion remains with its owner; the user was told the measurements are saved and
+it is safe to delete. Local cleanup verification is stored separately in
+`benchmarks/results/aws-comparable-cleanup.json`, after the evidence archive was frozen.

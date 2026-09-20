@@ -2,7 +2,8 @@
 
 Status: experiment completed on 2026-09-20 UTC; see the
 [results and controlled OFFSET 0 reproduction](aws-comparable-results.md).
-Raw evidence is exported and checksum-verified; AWS teardown is in progress. This is a read-only search experiment,
+Raw evidence is exported and checksum-verified. AWS stack deletion completed;
+the instance is terminated and its EBS volume is confirmed deleted. This is a read-only search experiment,
 not a comparison of availability, durability, or replicated write throughput.
 
 ## Provisioning target
