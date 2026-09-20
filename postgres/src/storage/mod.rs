@@ -1420,13 +1420,16 @@ unsafe fn release_entry(index: pg_sys::Relation, meta: &mut Meta, entry: Segment
 unsafe fn add_segment(
     index: pg_sys::Relation,
     meta: &mut Meta,
-    blob: &[u8],
+    blob: Vec<u8>,
     docs: u32,
     total_length: u64,
     budget: u64,
 ) {
     unsafe {
-        let (run, map) = write_segment_run(index, blob);
+        let (run, map) = write_segment_run(index, &blob);
+        // Maintenance reads published segments into owned buffers. Release the
+        // caller's encoded copy before that read and any subsequent merge.
+        drop(blob);
         let entry = new_entry(meta, run, map, docs, total_length);
         meta.segments.push(entry);
         maintain(index, meta, budget);
@@ -1675,7 +1678,7 @@ unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
         add_segment(
             index,
             meta,
-            &blob,
+            blob,
             docs,
             total_length,
             MAX_MERGE_DOCS.get() as u64,
@@ -1851,7 +1854,7 @@ impl Builder {
         let (blob, docs, total_length) = finish_builder(builder);
         unsafe {
             let (meta_buffer, mut meta) = read_meta(index, true);
-            add_segment(index, &mut meta, &blob, docs, total_length, u64::MAX);
+            add_segment(index, &mut meta, blob, docs, total_length, u64::MAX);
             write_meta(index, &meta_buffer, &meta);
         }
     }

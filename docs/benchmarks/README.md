@@ -209,3 +209,5 @@ are more useful than increasing the dataset size at this stage.
 
 See the [harness reference](harness.md) and [local campaign guide](local.md) for
 commands, configuration, and result collection.
+
+- [Release published segment buffers](release-published-segment.md): earlier buffer release, a retained 1.25 GiB OOM, and 2 GiB correctness/performance observations.
