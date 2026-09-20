@@ -1,5 +1,11 @@
 # Benchmarking Stannum
 
+The [focused query-memory and reader-scaling probes](targeted-memory.md)
+separate broad working-set pressure from hot ranked OR traversal cost.
+
+The [build-batch and merge-memory diagnosis](build-memory-results.md) identifies
+a live merge-allocation peak and a larger-data counterexample to smaller batches.
+
 The [repeated memory-pressure measurements](repeated-memory.md) separate
 run-to-run variation from query-family effects. The
 [construction-memory investigation](build-memory-investigation.md) records

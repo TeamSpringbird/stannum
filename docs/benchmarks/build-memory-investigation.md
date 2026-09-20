@@ -1,5 +1,11 @@
 # Construction memory: hypotheses and next probes
 
+Follow-up [measurements and allocation profiling](build-memory-results.md) now
+identify a 1,298 MiB requested-allocation peak inside merging. Smaller batches
+help the 500k case but OOM at one million rows under a cap where the default
+passes. The hypotheses below are the original investigation plan, not a claim
+that lowering the batch size is a generally safe fix.
+
 The 500,000-document published Wikipedia pilot was OOM-killed during CREATE
 INDEX with a 512 MiB container limit, while construction at 2 GiB completed.
 The same index subsequently answered the full query trace under 512 MiB.

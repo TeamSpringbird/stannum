@@ -1,0 +1,1316 @@
+{
+  "trace": {
+    "source": {
+      "derivation": "Exploratory subset: two pressure-sensitive source queries plus common-term control; order places sensitive forms in diagnostic plans",
+      "parent_sha256": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb",
+      "source_ids": [
+        302,
+        169,
+        1
+      ]
+    },
+    "queries": [
+      {
+        "source_id": 302,
+        "token_bucket": 21,
+        "text": "a search engine is an information retrieval software system designed to help find information stored on one or more computer systems",
+        "conjunction": "a AND search AND engine AND is AND an AND information AND retrieval AND software AND system AND designed AND to AND help AND find AND information AND stored AND on AND one AND or AND more AND computer AND systems",
+        "disjunction": "a OR search OR engine OR is OR an OR information OR retrieval OR software OR system OR designed OR to OR help OR find OR information OR stored OR on OR one OR or OR more OR computer OR systems",
+        "phrase": "\"a search engine is an information retrieval software system designed to help find information stored on one or more computer systems\"",
+        "engines": {
+          "tin": {
+            "conjunction": "a AND search AND engine AND is AND an AND information AND retrieval AND software AND system AND designed AND to AND help AND find AND information AND stored AND on AND one AND or AND more AND computer AND systems",
+            "disjunction": "a OR search OR engine OR is OR an OR information OR retrieval OR software OR system OR designed OR to OR help OR find OR information OR stored OR on OR one OR or OR more OR computer OR systems",
+            "phrase": "\"a search engine is an information retrieval software system designed to help find information stored on one or more computer systems\""
+          },
+          "paradedb": {
+            "conjunction": "a AND search AND engine AND is AND an AND information AND retrieval AND software AND system AND designed AND to AND help AND find AND information AND stored AND on AND one AND or AND more AND computer AND systems",
+            "disjunction": "a OR search OR engine OR is OR an OR information OR retrieval OR software OR system OR designed OR to OR help OR find OR information OR stored OR on OR one OR or OR more OR computer OR systems",
+            "phrase": "\"a search engine is an information retrieval software system designed to help find information stored on one or more computer systems\"",
+            "match": "a search engine is an information retrieval software system designed to help find information stored on one or more computer systems"
+          },
+          "pg_textsearch": {
+            "disjunction": "a search engine is an information retrieval software system designed to help find information stored on one or more computer systems"
+          },
+          "postgres": {
+            "conjunction": "'a' & 'search' & 'engine' & 'is' & 'an' & 'information' & 'retrieval' & 'software' & 'system' & 'designed' & 'to' & 'help' & 'find' & 'information' & 'stored' & 'on' & 'one' & 'or' & 'more' & 'computer' & 'systems'",
+            "disjunction": "'a' | 'search' | 'engine' | 'is' | 'an' | 'information' | 'retrieval' | 'software' | 'system' | 'designed' | 'to' | 'help' | 'find' | 'information' | 'stored' | 'on' | 'one' | 'or' | 'more' | 'computer' | 'systems'",
+            "phrase": "'a' <-> 'search' <-> 'engine' <-> 'is' <-> 'an' <-> 'information' <-> 'retrieval' <-> 'software' <-> 'system' <-> 'designed' <-> 'to' <-> 'help' <-> 'find' <-> 'information' <-> 'stored' <-> 'on' <-> 'one' <-> 'or' <-> 'more' <-> 'computer' <-> 'systems'"
+          },
+          "elasticsearch": {
+            "conjunction": "a AND search AND engine AND is AND an AND information AND retrieval AND software AND system AND designed AND to AND help AND find AND information AND stored AND on AND one AND or AND more AND computer AND systems",
+            "disjunction": "a OR search OR engine OR is OR an OR information OR retrieval OR software OR system OR designed OR to OR help OR find OR information OR stored OR on OR one OR or OR more OR computer OR systems",
+            "phrase": "\"a search engine is an information retrieval software system designed to help find information stored on one or more computer systems\""
+          }
+        }
+      },
+      {
+        "source_id": 169,
+        "token_bucket": 3,
+        "text": "time in denver",
+        "conjunction": "time AND in AND denver",
+        "disjunction": "time OR in OR denver",
+        "phrase": "\"time in denver\"",
+        "engines": {
+          "tin": {
+            "conjunction": "time AND in AND denver",
+            "disjunction": "time OR in OR denver",
+            "phrase": "\"time in denver\""
+          },
+          "paradedb": {
+            "conjunction": "time AND in AND denver",
+            "disjunction": "time OR in OR denver",
+            "phrase": "\"time in denver\"",
+            "match": "time in denver"
+          },
+          "pg_textsearch": {
+            "disjunction": "time in denver"
+          },
+          "postgres": {
+            "conjunction": "'time' & 'in' & 'denver'",
+            "disjunction": "'time' | 'in' | 'denver'",
+            "phrase": "'time' <-> 'in' <-> 'denver'"
+          },
+          "elasticsearch": {
+            "conjunction": "time AND in AND denver",
+            "disjunction": "time OR in OR denver",
+            "phrase": "\"time in denver\""
+          }
+        }
+      },
+      {
+        "source_id": 1,
+        "token_bucket": 1,
+        "text": "the",
+        "conjunction": "the",
+        "disjunction": "the",
+        "phrase": "\"the\"",
+        "engines": {
+          "tin": {
+            "conjunction": "the",
+            "disjunction": "the",
+            "phrase": "\"the\""
+          },
+          "paradedb": {
+            "conjunction": "the",
+            "disjunction": "the",
+            "phrase": "\"the\"",
+            "match": "the"
+          },
+          "pg_textsearch": {
+            "disjunction": "the"
+          },
+          "postgres": {
+            "conjunction": "'the'",
+            "disjunction": "'the'",
+            "phrase": "'the'"
+          },
+          "elasticsearch": {
+            "conjunction": "the",
+            "disjunction": "the",
+            "phrase": "\"the\""
+          }
+        }
+      }
+    ]
+  },
+  "trials": [
+    {
+      "name": "2g-2",
+      "image": "sha256:d68955b039473f7366183ca35ae5e0e6a577b19788231eece652006cb178f364",
+      "source_sha256": "c65846a7867e2b415cea4ffc35c31a6eaedcb5d4d19c4f6f2add1972eac4515a",
+      "trace": {
+        "forms": 9,
+        "sha256": "2e37e19c36c1c87f5e59da0ac88b74a650b549eeb34294b07b95aa4fb92e1ed3"
+      },
+      "corpus": {
+        "corpus": "wikipedia",
+        "csv": {
+          "bytes": 8093810896,
+          "file": "data.csv",
+          "sha256": "7e4cba73338f9aba3a344de9f7d63007fa51f0f4ee85d70d7bd34fe95ff6e9a8"
+        },
+        "format": "planetscale-prepared-v1",
+        "revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+        "rows": 5032104
+      },
+      "config": {
+        "build_memory": "2g",
+        "build_segment_docs": null,
+        "clients": 2,
+        "command": "run",
+        "cpus": 4,
+        "dataset": "/Users/uri/Library/Application Support/LeadBenchmarks/datasets/planetscale-wikipedia",
+        "driver": "/Users/uri/.t3/worktrees/lead/stannum-sustained-mutation/benchmarks/results/tin-driver",
+        "engines": [
+          "stannum"
+        ],
+        "image": "stannum-bench:published-corpus",
+        "maintenance_work_mem": "64MB",
+        "memory": "2g",
+        "output": "/Users/uri/.t3/worktrees/lead/stannum-published-loader/benchmarks/results/targeted-memory-readers/2g-2",
+        "plan_cache_mode": "auto",
+        "port": 28928,
+        "published_corpus": "wikipedia",
+        "query_file": "/Users/uri/.t3/worktrees/lead/stannum-published-loader/benchmarks/results/targeted-memory-queries.json",
+        "rows": 500000,
+        "seconds": 90,
+        "seed": 1592614637,
+        "setup_timeout_seconds": 1800,
+        "shared_buffers": "128MB",
+        "style": "mixed",
+        "updates": 0,
+        "validation_queries": 0,
+        "validation_rows": 1000,
+        "warmup": 15,
+        "workload": "topk"
+      },
+      "input_sha256": "aeee9cd5b2c84a09ed40b125594c2bc32b2ce100eaf5115cd2e31cc99d23a64a",
+      "correctness": {
+        "mismatches": 0,
+        "queries": 9,
+        "sampled_rows": 1000,
+        "seconds": 1.733152374625206
+      },
+      "ranked_correctness": {
+        "mismatches": 0,
+        "queries": 9,
+        "reference": "exhaustive same-engine score multiset; ties unordered"
+      },
+      "comparison": {
+        "completed": 25755,
+        "cross_engine_membership_differences": {},
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 8585,
+            "p50_ms": 2.924,
+            "p95_ms": 3.626,
+            "p99_ms": 9.229
+          },
+          "disjunction": {
+            "completed": 8584,
+            "p50_ms": 3.407,
+            "p95_ms": 40.769,
+            "p99_ms": 46.445
+          },
+          "phrase": {
+            "completed": 8586,
+            "p50_ms": 3.055,
+            "p95_ms": 4.561,
+            "p99_ms": 10.497
+          }
+        },
+        "index_bytes": 803217408,
+        "index_hit_bytes": 728170496,
+        "index_read_bytes": 0,
+        "measured_query_forms": 9,
+        "p50_ms": 3.108,
+        "p95_ms": 36.428,
+        "p99_ms": 43.299,
+        "qps": 286.16984633162593,
+        "queries": {
+          "169:conjunction": {
+            "completed": 2862,
+            "p50_ms": 2.972,
+            "p95_ms": 3.766,
+            "p99_ms": 10.697
+          },
+          "169:disjunction": {
+            "completed": 2861,
+            "p50_ms": 3.346,
+            "p95_ms": 4.116,
+            "p99_ms": 13.87
+          },
+          "169:phrase": {
+            "completed": 2862,
+            "p50_ms": 3.862,
+            "p95_ms": 4.945,
+            "p99_ms": 12.151
+          },
+          "1:conjunction": {
+            "completed": 2861,
+            "p50_ms": 3.104,
+            "p95_ms": 3.977,
+            "p99_ms": 10.905
+          },
+          "1:disjunction": {
+            "completed": 2862,
+            "p50_ms": 3.073,
+            "p95_ms": 3.925,
+            "p99_ms": 12.435
+          },
+          "1:phrase": {
+            "completed": 2862,
+            "p50_ms": 3.047,
+            "p95_ms": 3.912,
+            "p99_ms": 11.914
+          },
+          "302:conjunction": {
+            "completed": 2862,
+            "p50_ms": 1.51,
+            "p95_ms": 2.21,
+            "p99_ms": 6.569
+          },
+          "302:disjunction": {
+            "completed": 2861,
+            "p50_ms": 36.233,
+            "p95_ms": 44.329,
+            "p99_ms": 109.495
+          },
+          "302:phrase": {
+            "completed": 2862,
+            "p50_ms": 0.421,
+            "p95_ms": 0.876,
+            "p99_ms": 6.61
+          }
+        },
+        "resources": {
+          "build_sampled_peak_bytes": 2145628160,
+          "covered_seconds": 88.36975812911987,
+          "cpu_delta": {
+            "burst_usec": 0,
+            "nice_usec": 0,
+            "nr_bursts": 0,
+            "nr_periods": 883,
+            "nr_throttled": 0,
+            "system_usec": 2941101,
+            "throttled_usec": 0,
+            "usage_usec": 162747012,
+            "user_usec": 159805911
+          },
+          "end_gap_seconds": 0.4366030693054199,
+          "io_delta": {
+            "dbytes": 0,
+            "dios": 0,
+            "rbytes": 16691200,
+            "rios": 157,
+            "wbytes": 208896,
+            "wios": 9
+          },
+          "largest_sample_interval_seconds": 2.1738991737365723,
+          "lifetime_peak_bytes": 2147483648,
+          "max_collection_seconds": 0.17019414901733398,
+          "measurement_samples": 44,
+          "memory_counters_delta": {
+            "pgmajfault": 27,
+            "pgscan": 81853,
+            "pgsteal": 81392,
+            "workingset_refault_file": 2295
+          },
+          "memory_events_delta": {
+            "high": 0,
+            "low": 0,
+            "max": 0,
+            "oom": 0,
+            "oom_group_kill": 0,
+            "oom_kill": 0,
+            "sock_throttled": 0
+          },
+          "pressure_available": false,
+          "sampled_peak_bytes": 961982464,
+          "sampling_errors": 1,
+          "start_gap_seconds": 1.143326997756958,
+          "status": "sampled"
+        },
+        "seconds": 89.999,
+        "status": "complete",
+        "total_bytes": 1477017600,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      "plans": {
+        "plan-169-phrase-force_custom_plan": {
+          "execution_ms": 5.219,
+          "scans": [
+            {
+              "Actual Total Time": 5.187,
+              "Actual Rows": 2.0,
+              "Candidates": 2,
+              "Exhaustive Score Calls": 2,
+              "Heap Fetches": 2,
+              "Shared Hit Blocks": 1028,
+              "Shared Read Blocks": 2,
+              "Shared I/O Read Time": 0.015
+            }
+          ]
+        },
+        "plan-169-phrase-force_generic_plan": {
+          "execution_ms": 6.023,
+          "scans": [
+            {
+              "Actual Total Time": 5.989,
+              "Actual Rows": 2.0,
+              "Candidates": 2,
+              "Exhaustive Score Calls": 2,
+              "Heap Fetches": 2,
+              "Shared Hit Blocks": 1155,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-conjunction-force_custom_plan": {
+          "execution_ms": 11.543,
+          "scans": [
+            {
+              "Actual Total Time": 11.502,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 33,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 594,
+              "Shared Read Blocks": 912,
+              "Shared I/O Read Time": 6.434
+            }
+          ]
+        },
+        "plan-302-conjunction-force_generic_plan": {
+          "execution_ms": 7.567,
+          "scans": [
+            {
+              "Actual Total Time": 7.533,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Pruning": "block-max",
+              "Scored Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3286,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-disjunction-force_generic_plan": {
+          "execution_ms": 43.772,
+          "scans": [
+            {
+              "Actual Total Time": 43.729,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 134,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 3952,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-phrase-force_custom_plan": {
+          "execution_ms": 4.716,
+          "scans": [
+            {
+              "Actual Total Time": 4.688,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3041,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-disjunction-force_custom_plan": {
+          "execution_ms": 5.682,
+          "scans": [
+            {
+              "Actual Total Time": 5.649,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 191,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1569,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-disjunction-force_generic_plan": {
+          "execution_ms": 5.934,
+          "scans": [
+            {
+              "Actual Total Time": 5.897,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 191,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1694,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-conjunction-force_generic_plan": {
+          "execution_ms": 5.283,
+          "scans": [
+            {
+              "Actual Total Time": 5.25,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 33,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1631,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-conjunction-force_custom_plan": {
+          "execution_ms": 32.868,
+          "scans": [
+            {
+              "Actual Total Time": 32.827,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Pruning": "block-max",
+              "Scored Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 16,
+              "Shared Read Blocks": 3023,
+              "Shared I/O Read Time": 25.992
+            }
+          ]
+        },
+        "plan-302-disjunction-force_custom_plan": {
+          "execution_ms": 45.435,
+          "scans": [
+            {
+              "Actual Total Time": 45.384,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 134,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 3471,
+              "Shared Read Blocks": 234,
+              "Shared I/O Read Time": 2.192
+            }
+          ]
+        },
+        "plan-302-phrase-force_generic_plan": {
+          "execution_ms": 6.15,
+          "scans": [
+            {
+              "Actual Total Time": 6.117,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3288,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        }
+      },
+      "adapter_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a"
+    },
+    {
+      "name": "512m-2",
+      "image": "sha256:d68955b039473f7366183ca35ae5e0e6a577b19788231eece652006cb178f364",
+      "source_sha256": "c65846a7867e2b415cea4ffc35c31a6eaedcb5d4d19c4f6f2add1972eac4515a",
+      "trace": {
+        "forms": 9,
+        "sha256": "2e37e19c36c1c87f5e59da0ac88b74a650b549eeb34294b07b95aa4fb92e1ed3"
+      },
+      "corpus": {
+        "corpus": "wikipedia",
+        "csv": {
+          "bytes": 8093810896,
+          "file": "data.csv",
+          "sha256": "7e4cba73338f9aba3a344de9f7d63007fa51f0f4ee85d70d7bd34fe95ff6e9a8"
+        },
+        "format": "planetscale-prepared-v1",
+        "revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+        "rows": 5032104
+      },
+      "config": {
+        "build_memory": "2g",
+        "build_segment_docs": null,
+        "clients": 2,
+        "command": "run",
+        "cpus": 4,
+        "dataset": "/Users/uri/Library/Application Support/LeadBenchmarks/datasets/planetscale-wikipedia",
+        "driver": "/Users/uri/.t3/worktrees/lead/stannum-sustained-mutation/benchmarks/results/tin-driver",
+        "engines": [
+          "stannum"
+        ],
+        "image": "stannum-bench:published-corpus",
+        "maintenance_work_mem": "64MB",
+        "memory": "512m",
+        "output": "/Users/uri/.t3/worktrees/lead/stannum-published-loader/benchmarks/results/targeted-memory-readers/512m-2",
+        "plan_cache_mode": "auto",
+        "port": 28928,
+        "published_corpus": "wikipedia",
+        "query_file": "/Users/uri/.t3/worktrees/lead/stannum-published-loader/benchmarks/results/targeted-memory-queries.json",
+        "rows": 500000,
+        "seconds": 90,
+        "seed": 1592614637,
+        "setup_timeout_seconds": 1800,
+        "shared_buffers": "128MB",
+        "style": "mixed",
+        "updates": 0,
+        "validation_queries": 0,
+        "validation_rows": 1000,
+        "warmup": 15,
+        "workload": "topk"
+      },
+      "input_sha256": "aeee9cd5b2c84a09ed40b125594c2bc32b2ce100eaf5115cd2e31cc99d23a64a",
+      "correctness": {
+        "mismatches": 0,
+        "queries": 9,
+        "sampled_rows": 1000,
+        "seconds": 2.2964393328875303
+      },
+      "ranked_correctness": {
+        "mismatches": 0,
+        "queries": 9,
+        "reference": "exhaustive same-engine score multiset; ties unordered"
+      },
+      "comparison": {
+        "completed": 26319,
+        "cross_engine_membership_differences": {},
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 8772,
+            "p50_ms": 2.91,
+            "p95_ms": 3.533,
+            "p99_ms": 11.38
+          },
+          "disjunction": {
+            "completed": 8773,
+            "p50_ms": 3.385,
+            "p95_ms": 37.137,
+            "p99_ms": 43.354
+          },
+          "phrase": {
+            "completed": 8774,
+            "p50_ms": 3.031,
+            "p95_ms": 4.577,
+            "p99_ms": 11.774
+          }
+        },
+        "index_bytes": 803217408,
+        "index_hit_bytes": 738164736,
+        "index_read_bytes": 0,
+        "measured_query_forms": 9,
+        "p50_ms": 3.091,
+        "p95_ms": 35.972,
+        "p99_ms": 38.092,
+        "qps": 292.4495805322518,
+        "queries": {
+          "169:conjunction": {
+            "completed": 2924,
+            "p50_ms": 2.959,
+            "p95_ms": 3.616,
+            "p99_ms": 10.48
+          },
+          "169:disjunction": {
+            "completed": 2925,
+            "p50_ms": 3.338,
+            "p95_ms": 4.122,
+            "p99_ms": 13.037
+          },
+          "169:phrase": {
+            "completed": 2924,
+            "p50_ms": 3.834,
+            "p95_ms": 4.982,
+            "p99_ms": 14.58
+          },
+          "1:conjunction": {
+            "completed": 2924,
+            "p50_ms": 3.09,
+            "p95_ms": 3.757,
+            "p99_ms": 13.883
+          },
+          "1:disjunction": {
+            "completed": 2925,
+            "p50_ms": 3.057,
+            "p95_ms": 3.809,
+            "p99_ms": 13.167
+          },
+          "1:phrase": {
+            "completed": 2925,
+            "p50_ms": 3.022,
+            "p95_ms": 3.783,
+            "p99_ms": 12.881
+          },
+          "302:conjunction": {
+            "completed": 2924,
+            "p50_ms": 1.505,
+            "p95_ms": 2.164,
+            "p99_ms": 8.319
+          },
+          "302:disjunction": {
+            "completed": 2923,
+            "p50_ms": 35.818,
+            "p95_ms": 39.101,
+            "p99_ms": 91.25
+          },
+          "302:phrase": {
+            "completed": 2925,
+            "p50_ms": 0.414,
+            "p95_ms": 0.764,
+            "p99_ms": 5.459
+          }
+        },
+        "resources": {
+          "build_sampled_peak_bytes": 2147254272,
+          "covered_seconds": 88.71101379394531,
+          "cpu_delta": {
+            "burst_usec": 0,
+            "nice_usec": 0,
+            "nr_bursts": 0,
+            "nr_periods": 887,
+            "nr_throttled": 0,
+            "system_usec": 2836133,
+            "throttled_usec": 0,
+            "usage_usec": 163887569,
+            "user_usec": 161051436
+          },
+          "end_gap_seconds": 1.1381609439849854,
+          "io_delta": {
+            "dbytes": 0,
+            "dios": 0,
+            "rbytes": 2174976,
+            "rios": 113,
+            "wbytes": 69632,
+            "wios": 14
+          },
+          "largest_sample_interval_seconds": 2.236971855163574,
+          "lifetime_peak_bytes": 2147483648,
+          "max_collection_seconds": 0.23523688316345215,
+          "measurement_samples": 44,
+          "memory_counters_delta": {
+            "pgmajfault": 0,
+            "pgscan": 2579,
+            "pgsteal": 2550,
+            "workingset_refault_file": 479
+          },
+          "memory_events_delta": {
+            "high": 0,
+            "low": 0,
+            "max": 0,
+            "oom": 0,
+            "oom_group_kill": 0,
+            "oom_kill": 0,
+            "sock_throttled": 0
+          },
+          "pressure_available": false,
+          "sampled_peak_bytes": 332587008,
+          "sampling_errors": 0,
+          "start_gap_seconds": 0.10395216941833496,
+          "status": "sampled"
+        },
+        "seconds": 89.995,
+        "status": "complete",
+        "total_bytes": 1477017600,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      "plans": {
+        "plan-169-phrase-force_custom_plan": {
+          "execution_ms": 4.923,
+          "scans": [
+            {
+              "Actual Total Time": 4.89,
+              "Actual Rows": 2.0,
+              "Candidates": 2,
+              "Exhaustive Score Calls": 2,
+              "Heap Fetches": 2,
+              "Shared Hit Blocks": 1028,
+              "Shared Read Blocks": 2,
+              "Shared I/O Read Time": 0.015
+            }
+          ]
+        },
+        "plan-169-phrase-force_generic_plan": {
+          "execution_ms": 5.977,
+          "scans": [
+            {
+              "Actual Total Time": 5.941,
+              "Actual Rows": 2.0,
+              "Candidates": 2,
+              "Exhaustive Score Calls": 2,
+              "Heap Fetches": 2,
+              "Shared Hit Blocks": 1155,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-conjunction-force_custom_plan": {
+          "execution_ms": 10.622,
+          "scans": [
+            {
+              "Actual Total Time": 10.586,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 33,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 594,
+              "Shared Read Blocks": 912,
+              "Shared I/O Read Time": 5.614
+            }
+          ]
+        },
+        "plan-302-conjunction-force_generic_plan": {
+          "execution_ms": 7.401,
+          "scans": [
+            {
+              "Actual Total Time": 7.358,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Pruning": "block-max",
+              "Scored Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3286,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-disjunction-force_generic_plan": {
+          "execution_ms": 41.307,
+          "scans": [
+            {
+              "Actual Total Time": 41.266,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 134,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 3952,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-phrase-force_custom_plan": {
+          "execution_ms": 6.129,
+          "scans": [
+            {
+              "Actual Total Time": 6.09,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3041,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-disjunction-force_custom_plan": {
+          "execution_ms": 4.967,
+          "scans": [
+            {
+              "Actual Total Time": 4.933,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 191,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1569,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-disjunction-force_generic_plan": {
+          "execution_ms": 5.624,
+          "scans": [
+            {
+              "Actual Total Time": 5.589,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 191,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1694,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-conjunction-force_generic_plan": {
+          "execution_ms": 5.597,
+          "scans": [
+            {
+              "Actual Total Time": 5.554,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 33,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1631,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-conjunction-force_custom_plan": {
+          "execution_ms": 25.207,
+          "scans": [
+            {
+              "Actual Total Time": 25.168,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Pruning": "block-max",
+              "Scored Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 16,
+              "Shared Read Blocks": 3023,
+              "Shared I/O Read Time": 18.88
+            }
+          ]
+        },
+        "plan-302-disjunction-force_custom_plan": {
+          "execution_ms": 43.427,
+          "scans": [
+            {
+              "Actual Total Time": 43.377,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 134,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 3471,
+              "Shared Read Blocks": 234,
+              "Shared I/O Read Time": 1.906
+            }
+          ]
+        },
+        "plan-302-phrase-force_generic_plan": {
+          "execution_ms": 6.271,
+          "scans": [
+            {
+              "Actual Total Time": 6.239,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3288,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        }
+      },
+      "adapter_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a"
+    },
+    {
+      "name": "2g-4",
+      "image": "sha256:d68955b039473f7366183ca35ae5e0e6a577b19788231eece652006cb178f364",
+      "source_sha256": "c65846a7867e2b415cea4ffc35c31a6eaedcb5d4d19c4f6f2add1972eac4515a",
+      "trace": {
+        "forms": 9,
+        "sha256": "2e37e19c36c1c87f5e59da0ac88b74a650b549eeb34294b07b95aa4fb92e1ed3"
+      },
+      "corpus": {
+        "corpus": "wikipedia",
+        "csv": {
+          "bytes": 8093810896,
+          "file": "data.csv",
+          "sha256": "7e4cba73338f9aba3a344de9f7d63007fa51f0f4ee85d70d7bd34fe95ff6e9a8"
+        },
+        "format": "planetscale-prepared-v1",
+        "revision": "f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86",
+        "rows": 5032104
+      },
+      "config": {
+        "build_memory": "2g",
+        "build_segment_docs": null,
+        "clients": 4,
+        "command": "run",
+        "cpus": 4,
+        "dataset": "/Users/uri/Library/Application Support/LeadBenchmarks/datasets/planetscale-wikipedia",
+        "driver": "/Users/uri/.t3/worktrees/lead/stannum-sustained-mutation/benchmarks/results/tin-driver",
+        "engines": [
+          "stannum"
+        ],
+        "image": "stannum-bench:published-corpus",
+        "maintenance_work_mem": "64MB",
+        "memory": "2g",
+        "output": "/Users/uri/.t3/worktrees/lead/stannum-published-loader/benchmarks/results/targeted-memory-readers/2g-4",
+        "plan_cache_mode": "auto",
+        "port": 28928,
+        "published_corpus": "wikipedia",
+        "query_file": "/Users/uri/.t3/worktrees/lead/stannum-published-loader/benchmarks/results/targeted-memory-queries.json",
+        "rows": 500000,
+        "seconds": 90,
+        "seed": 1592614637,
+        "setup_timeout_seconds": 1800,
+        "shared_buffers": "128MB",
+        "style": "mixed",
+        "updates": 0,
+        "validation_queries": 0,
+        "validation_rows": 1000,
+        "warmup": 15,
+        "workload": "topk"
+      },
+      "input_sha256": "aeee9cd5b2c84a09ed40b125594c2bc32b2ce100eaf5115cd2e31cc99d23a64a",
+      "correctness": {
+        "mismatches": 0,
+        "queries": 9,
+        "sampled_rows": 1000,
+        "seconds": 1.4110271241515875
+      },
+      "ranked_correctness": {
+        "mismatches": 0,
+        "queries": 9,
+        "reference": "exhaustive same-engine score multiset; ties unordered"
+      },
+      "comparison": {
+        "completed": 52015,
+        "cross_engine_membership_differences": {},
+        "engine": "stannum",
+        "families": {
+          "conjunction": {
+            "completed": 17339,
+            "p50_ms": 2.952,
+            "p95_ms": 3.911,
+            "p99_ms": 11.624
+          },
+          "disjunction": {
+            "completed": 17336,
+            "p50_ms": 3.425,
+            "p95_ms": 37.736,
+            "p99_ms": 43.78
+          },
+          "phrase": {
+            "completed": 17340,
+            "p50_ms": 3.092,
+            "p95_ms": 4.487,
+            "p99_ms": 11.914
+          }
+        },
+        "index_bytes": 803217408,
+        "index_hit_bytes": 1472978944,
+        "index_read_bytes": 0,
+        "measured_query_forms": 9,
+        "p50_ms": 3.115,
+        "p95_ms": 36.336,
+        "p99_ms": 38.692,
+        "qps": 577.9637099014411,
+        "queries": {
+          "169:conjunction": {
+            "completed": 5780,
+            "p50_ms": 2.993,
+            "p95_ms": 4.036,
+            "p99_ms": 12.482
+          },
+          "169:disjunction": {
+            "completed": 5779,
+            "p50_ms": 3.368,
+            "p95_ms": 4.997,
+            "p99_ms": 14.616
+          },
+          "169:phrase": {
+            "completed": 5780,
+            "p50_ms": 3.67,
+            "p95_ms": 4.95,
+            "p99_ms": 15.275
+          },
+          "1:conjunction": {
+            "completed": 5779,
+            "p50_ms": 3.088,
+            "p95_ms": 4.549,
+            "p99_ms": 13.516
+          },
+          "1:disjunction": {
+            "completed": 5779,
+            "p50_ms": 3.063,
+            "p95_ms": 4.61,
+            "p99_ms": 12.988
+          },
+          "1:phrase": {
+            "completed": 5780,
+            "p50_ms": 3.083,
+            "p95_ms": 5.24,
+            "p99_ms": 13.304
+          },
+          "302:conjunction": {
+            "completed": 5780,
+            "p50_ms": 1.466,
+            "p95_ms": 2.315,
+            "p99_ms": 8.292
+          },
+          "302:disjunction": {
+            "completed": 5778,
+            "p50_ms": 36.169,
+            "p95_ms": 40.174,
+            "p99_ms": 87.431
+          },
+          "302:phrase": {
+            "completed": 5780,
+            "p50_ms": 0.408,
+            "p95_ms": 1.322,
+            "p99_ms": 5.543
+          }
+        },
+        "resources": {
+          "build_sampled_peak_bytes": 2144538624,
+          "covered_seconds": 88.46824479103088,
+          "cpu_delta": {
+            "burst_usec": 0,
+            "nice_usec": 0,
+            "nr_bursts": 0,
+            "nr_periods": 885,
+            "nr_throttled": 18,
+            "system_usec": 5556386,
+            "throttled_usec": 59503,
+            "usage_usec": 323680577,
+            "user_usec": 318124190
+          },
+          "end_gap_seconds": 1.2564857006072998,
+          "io_delta": {
+            "dbytes": 0,
+            "dios": 0,
+            "rbytes": 1335296,
+            "rios": 42,
+            "wbytes": 233472,
+            "wios": 15
+          },
+          "largest_sample_interval_seconds": 2.184359073638916,
+          "lifetime_peak_bytes": 2147483648,
+          "max_collection_seconds": 0.17503690719604492,
+          "measurement_samples": 44,
+          "memory_counters_delta": {
+            "pgmajfault": 4,
+            "pgscan": 280755,
+            "pgsteal": 280687,
+            "workingset_refault_file": 294
+          },
+          "memory_events_delta": {
+            "high": 0,
+            "low": 0,
+            "max": 0,
+            "oom": 0,
+            "oom_group_kill": 0,
+            "oom_kill": 0,
+            "sock_throttled": 0
+          },
+          "pressure_available": false,
+          "sampled_peak_bytes": 1882959872,
+          "sampling_errors": 0,
+          "start_gap_seconds": 0.22549223899841309,
+          "status": "sampled"
+        },
+        "seconds": 89.997,
+        "status": "complete",
+        "total_bytes": 1477017600,
+        "update_errors": 0,
+        "updates_attempted": 0,
+        "updates_completed": 0
+      },
+      "plans": {
+        "plan-169-phrase-force_custom_plan": {
+          "execution_ms": 5.192,
+          "scans": [
+            {
+              "Actual Total Time": 5.161,
+              "Actual Rows": 2.0,
+              "Candidates": 2,
+              "Exhaustive Score Calls": 2,
+              "Heap Fetches": 2,
+              "Shared Hit Blocks": 1028,
+              "Shared Read Blocks": 2,
+              "Shared I/O Read Time": 0.013
+            }
+          ]
+        },
+        "plan-169-phrase-force_generic_plan": {
+          "execution_ms": 5.748,
+          "scans": [
+            {
+              "Actual Total Time": 5.713,
+              "Actual Rows": 2.0,
+              "Candidates": 2,
+              "Exhaustive Score Calls": 2,
+              "Heap Fetches": 2,
+              "Shared Hit Blocks": 1155,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-conjunction-force_custom_plan": {
+          "execution_ms": 12.156,
+          "scans": [
+            {
+              "Actual Total Time": 12.12,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 33,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 594,
+              "Shared Read Blocks": 912,
+              "Shared I/O Read Time": 7.536
+            }
+          ]
+        },
+        "plan-302-conjunction-force_generic_plan": {
+          "execution_ms": 6.853,
+          "scans": [
+            {
+              "Actual Total Time": 6.82,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Pruning": "block-max",
+              "Scored Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3286,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-disjunction-force_generic_plan": {
+          "execution_ms": 42.692,
+          "scans": [
+            {
+              "Actual Total Time": 42.649,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 134,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 3952,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-phrase-force_custom_plan": {
+          "execution_ms": 5.188,
+          "scans": [
+            {
+              "Actual Total Time": 5.156,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3041,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-disjunction-force_custom_plan": {
+          "execution_ms": 5.617,
+          "scans": [
+            {
+              "Actual Total Time": 5.583,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 191,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1569,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-disjunction-force_generic_plan": {
+          "execution_ms": 5.368,
+          "scans": [
+            {
+              "Actual Total Time": 5.333,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 191,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1694,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-169-conjunction-force_generic_plan": {
+          "execution_ms": 5.358,
+          "scans": [
+            {
+              "Actual Total Time": 5.32,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 33,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 1631,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        },
+        "plan-302-conjunction-force_custom_plan": {
+          "execution_ms": 32.117,
+          "scans": [
+            {
+              "Actual Total Time": 32.05,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Pruning": "block-max",
+              "Scored Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 16,
+              "Shared Read Blocks": 3023,
+              "Shared I/O Read Time": 25.758
+            }
+          ]
+        },
+        "plan-302-disjunction-force_custom_plan": {
+          "execution_ms": 44.943,
+          "scans": [
+            {
+              "Actual Total Time": 44.9,
+              "Actual Rows": 10.0,
+              "Pruning": "block-max",
+              "Scored Candidates": 134,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 10,
+              "Shared Hit Blocks": 3471,
+              "Shared Read Blocks": 234,
+              "Shared I/O Read Time": 2.359
+            }
+          ]
+        },
+        "plan-302-phrase-force_generic_plan": {
+          "execution_ms": 5.801,
+          "scans": [
+            {
+              "Actual Total Time": 5.768,
+              "Actual Rows": 0.0,
+              "Candidates": 0,
+              "Exhaustive Score Calls": 0,
+              "Heap Fetches": 0,
+              "Shared Hit Blocks": 3288,
+              "Shared Read Blocks": 0,
+              "Shared I/O Read Time": 0.0
+            }
+          ]
+        }
+      },
+      "adapter_binary_sha256": "3dd48f68f1be4bef22c56ba454dca0497048486043d91d3b0ee5f64f07fb1d6a"
+    }
+  ]
+}
