@@ -672,6 +672,12 @@ def run(args):
                     if counts_after != job['full_counts_before']:
                         raise ValueError('whitespace-only updates changed full-corpus query counts')
                     job['post_update_correctness'] = dict(queries=len(queries), mismatches=0)
+                    if args.workload == 'topk':
+                        after_ranked = sql(ranked_sql)
+                        (path / 'ranked-correctness-after.txt').write_text(after_ranked + '\n')
+                        validate_result(after_ranked, [q[0] for q in queries])
+                        job['post_update_ranked_correctness'] = dict(queries=len(queries), mismatches=0,
+                            reference='exhaustive same-engine score multiset after updates; ties unordered')
                 job['status'] = 'complete'
             except BaseException as error:
                 job.update(status='failed', error=str(error))
@@ -750,6 +756,12 @@ def comparison_contract(manifest):
         raise ValueError('trial ranked correctness failed')
     if manifest['config']['updates'] and job['post_update_correctness']['mismatches'] != 0:
         raise ValueError('trial post-update correctness failed')
+    if manifest['config']['updates'] and manifest['config']['workload'] == 'topk':
+        ranked_after = job.get('post_update_ranked_correctness')
+        if (not ranked_after or ranked_after.get('mismatches') != 0
+                or type(ranked_after.get('queries')) is not int or ranked_after['queries'] <= 0
+                or ranked_after['queries'] != job['ranked_correctness'].get('queries')):
+            raise ValueError('trial post-update ranked correctness missing or failed')
     docker = manifest['host']['docker']
     return dict(build_segment_docs=manifest['config'].get('build_segment_docs'),
                 effective_build_segment_docs=job.get('build_segment_docs'),
