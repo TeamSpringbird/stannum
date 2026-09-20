@@ -1,0 +1,241 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Ephemeral ARM PostgreSQL benchmark host. No inbound access. Delete stack after exporting results.",
+  "Parameters": {
+    "Ami": {
+      "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
+      "Default": "/aws/service/canonical/ubuntu/server/noble/stable/current/arm64/hvm/ebs-gp3/ami-id"
+    },
+    "InstanceType": {
+      "Type": "String",
+      "Default": "r8g.large",
+      "AllowedValues": [
+        "r8g.large",
+        "r7g.large"
+      ]
+    },
+    "DiskGiB": {
+      "Type": "Number",
+      "Default": 100,
+      "MinValue": 30,
+      "MaxValue": 200
+    },
+    "LifetimeHours": {
+      "Type": "Number",
+      "Default": 8,
+      "MinValue": 1,
+      "MaxValue": 12
+    }
+  },
+  "Resources": {
+    "Vpc": {
+      "Type": "AWS::EC2::VPC",
+      "Properties": {
+        "CidrBlock": "10.93.0.0/24",
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true
+      }
+    },
+    "Gateway": {
+      "Type": "AWS::EC2::InternetGateway",
+      "Properties": {}
+    },
+    "GatewayAttachment": {
+      "Type": "AWS::EC2::VPCGatewayAttachment",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "InternetGatewayId": {
+          "Ref": "Gateway"
+        }
+      }
+    },
+    "Subnet": {
+      "Type": "AWS::EC2::Subnet",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "CidrBlock": "10.93.0.0/26",
+        "MapPublicIpOnLaunch": true
+      }
+    },
+    "Routes": {
+      "Type": "AWS::EC2::RouteTable",
+      "Properties": {
+        "VpcId": {
+          "Ref": "Vpc"
+        }
+      }
+    },
+    "InternetRoute": {
+      "Type": "AWS::EC2::Route",
+      "Properties": {
+        "RouteTableId": {
+          "Ref": "Routes"
+        },
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "GatewayId": {
+          "Ref": "Gateway"
+        }
+      },
+      "DependsOn": "GatewayAttachment"
+    },
+    "RouteAssociation": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "Subnet"
+        },
+        "RouteTableId": {
+          "Ref": "Routes"
+        }
+      }
+    },
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Temporary benchmark: SSM only, no inbound ports",
+        "VpcId": {
+          "Ref": "Vpc"
+        },
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "Role": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "ec2.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+          }
+        ]
+      }
+    },
+    "Profile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": {
+        "Roles": [
+          {
+            "Ref": "Role"
+          }
+        ]
+      }
+    },
+    "Server": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": {
+          "Ref": "Ami"
+        },
+        "InstanceType": {
+          "Ref": "InstanceType"
+        },
+        "IamInstanceProfile": {
+          "Ref": "Profile"
+        },
+        "SubnetId": {
+          "Ref": "Subnet"
+        },
+        "SecurityGroupIds": [
+          {
+            "Ref": "SecurityGroup"
+          }
+        ],
+        "MetadataOptions": {
+          "HttpTokens": "required",
+          "HttpEndpoint": "enabled"
+        },
+        "InstanceInitiatedShutdownBehavior": "terminate",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": {
+              "Ref": "AWS::StackName"
+            }
+          },
+          {
+            "Key": "Purpose",
+            "Value": "stannum-tin-benchmark"
+          }
+        ],
+        "UserData": {
+          "Fn::Base64": {
+            "Fn::Sub": "#!/bin/bash\nset -euo pipefail\n# Schedule termination before installation so a package failure cannot skip it.\ncat > /etc/systemd/system/benchmark-expiry.service <<'UNIT'\n[Unit]\nDescription=Terminate temporary benchmark instance\n[Service]\nType=oneshot\nExecStart=/usr/sbin/poweroff\nUNIT\ncat > /etc/systemd/system/benchmark-expiry.timer <<'UNIT'\n[Unit]\nDescription=Temporary benchmark lifetime limit\n[Timer]\nOnBootSec=${LifetimeHours}h\nUnit=benchmark-expiry.service\n[Install]\nWantedBy=timers.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now benchmark-expiry.timer\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y docker.io git python3-venv ca-certificates jq\nsystemctl enable --now docker\ninstall -d -m 0755 /opt/stannum-benchmark\nuname -a > /opt/stannum-benchmark/kernel.txt\nlscpu > /opt/stannum-benchmark/cpu.txt\nlsblk -o NAME,SIZE,TYPE,MOUNTPOINTS > /opt/stannum-benchmark/disks.txt\ntouch /opt/stannum-benchmark/bootstrap-ready\n"
+          }
+        },
+        "LaunchTemplate": {
+          "LaunchTemplateId": {
+            "Ref": "DiskTemplate"
+          },
+          "Version": {
+            "Fn::GetAtt": [
+              "DiskTemplate",
+              "LatestVersionNumber"
+            ]
+          }
+        }
+      },
+      "DependsOn": [
+        "InternetRoute",
+        "RouteAssociation"
+      ]
+    },
+    "DiskTemplate": {
+      "Type": "AWS::EC2::LaunchTemplate",
+      "Properties": {
+        "LaunchTemplateData": {
+          "BlockDeviceMappings": [
+            {
+              "DeviceName": "/dev/sda1",
+              "Ebs": {
+                "VolumeType": "gp3",
+                "VolumeSize": {
+                  "Ref": "DiskGiB"
+                },
+                "Iops": 3000,
+                "Throughput": 125,
+                "Encrypted": true,
+                "DeleteOnTermination": true
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "InstanceId": {
+      "Value": {
+        "Ref": "Server"
+      }
+    },
+    "Region": {
+      "Value": {
+        "Ref": "AWS::Region"
+      }
+    }
+  }
+}
