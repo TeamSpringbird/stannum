@@ -136,4 +136,5 @@ Live checks now pass on 100 and 1,000 raw Stack Exchange documents across all
 result sets alone does not prove representative coverage. The timed raw
 Stack Exchange count path now passes a two-engine container smoke; see
 [raw-text validation](raw-text-membership.md). Ranked runs now pass at 100 and 10,000 rows; see the
-[ranked rehearsal](raw-ranked-rehearsal.md). Memory pressure and update runs remain.
+[ranked rehearsal](raw-ranked-rehearsal.md). The [100,000-row and concurrent-update checks](raw-scale-and-updates.md) also
+pass. Full GIN timed-trace coverage and memory-pressure runs remain.

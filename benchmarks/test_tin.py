@@ -133,7 +133,8 @@ class PairedMeasurementsTests(unittest.TestCase):
                             config={k: 1 for k in tin.COMPARISON_SETTINGS},
                             host=dict(system='test', machine='arm64', docker={'NCPU': 4}),
                             jobs=[dict(status='complete', engine='stannum', correctness={'mismatches': 0},
-                                       ranked_correctness={'mismatches': 0}, post_update_correctness={'mismatches': 0},
+                                       ranked_correctness={'mismatches': 0, 'queries': 1}, post_update_correctness={'mismatches': 0},
+                                       post_update_ranked_correctness={'mismatches': 0, 'queries': 1},
                                        input_sha256='input', settings={'work_mem': '16MB'},
                                        extensions={'stannum': '1'}, full_counts_before={'1:disjunction': 10})])
             manifest['jobs'][0]['workload_state'] = dict(
@@ -209,6 +210,10 @@ class PairedMeasurementsTests(unittest.TestCase):
             'counts': lambda m, r: m['jobs'][0]['full_counts_before'].update({'1:disjunction': 9}),
             'failed': lambda m, r: m.update(status='failed'),
             'ranked': lambda m, r: m['jobs'][0]['ranked_correctness'].update(mismatches=1),
+            'ranked_after': lambda m, r: m['jobs'][0]['post_update_ranked_correctness'].update(mismatches=1),
+            'partial_ranked_after': lambda m, r: m['jobs'][0]['post_update_ranked_correctness'].update(queries=0),
+            'different_ranked_after': lambda m, r: m['jobs'][0]['post_update_ranked_correctness'].update(queries=2),
+            'missing_ranked_after': lambda m, r: m['jobs'][0].pop('post_update_ranked_correctness'),
             'query_coverage': lambda m, r: r['queries'].clear(),
             'extra_query': lambda m, r: r['queries'].update({'2:phrase': {'p50_ms': 1, 'p95_ms': 1}}),
             'updates': lambda m, r: r.update(updates_completed=0),
