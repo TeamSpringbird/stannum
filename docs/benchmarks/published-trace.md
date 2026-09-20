@@ -31,7 +31,9 @@ python3 benchmarks/tin.py run \
 Use a new output directory each time. The dataset argument expects our
 checksummed `dataset.py` format, not upstream's headered CSV. This first
 integration reuses the public Wikipedia **trace** against our existing corpus.
-The exact public 5-million-document corpus still needs a loader adapter.
+The exact public 5-million-document corpus is supported with
+`--published-corpus wikipedia`; see [dataset loading](published-datasets.md).
+`--query-file` selects an explicit trace, which is copied and hashed into the run.
 
 Use `--workload topk` for ranked queries, `--style conjunction`, `disjunction`,
 or `phrase` to isolate a family, and `--updates 100` to offer 100 whitespace
@@ -50,6 +52,9 @@ is an initial resident-corpus diagnostic. Increase corpus size and independently
 vary memory and clients before making capacity claims. Only one engine runs at
 a time, in a fresh named volume, with the same extension image and PostgreSQL
 settings. GIN uses a stored generated vector and its normal planner.
+`--build-memory` optionally sets a separate construction cap, switched to
+`--memory` before validation and measurement. Set `--maintenance-work-mem`
+explicitly when shrinking container limits; it defaults to 512MB.
 `--engines postgres stannum` reverses order for another repetition.
 
 Build and run commands acquire `/tmp/stannum-pgrx.lock`, shared with native
@@ -60,16 +65,19 @@ Unrelated local services remain running; background load is not eliminated.
 ## Correctness and semantics
 
 All 302 source records expand to 906 AND/OR/phrase forms, including intentional
-repetitions. Before timing, each form compares exact result sets on a bounded
+repetitions. By default, before timing each form compares exact result sets on a bounded
 validation sample (`--validation-rows`, default 1000). The indexed candidate
 set is materialized from the actual benchmark index before restricting it to
 the sampled IDs. This checks both false positives and false negatives on that
 sample; it does not prove membership for every row of a larger corpus. Full
-counts are also retained for all 906 forms and compared between engines.
+counts are also retained for all checked forms and compared between engines.
+For larger corpora, `--validation-queries N` explicitly samples N evenly spaced
+forms for these untimed checks, recording their IDs in the manifest. The timed
+trace remains complete; unchecked forms are not correctness-verified.
 
 Stannum's reference uses raw normalized text with word-boundary predicates.
 GIN's reference uses an unindexed PostgreSQL `tsvector`. Ranked runs also
-compare all 906 top-10 score multisets with exhaustive same-engine scoring,
+compare the checked forms' top-10 score multisets with exhaustive same-engine scoring,
 allowing arbitrary selection/order among tied documents. This can be expensive
 on large corpora. It proves top-k agreement with that engine's scoring path,
 not the BM25 formula or cross-engine relevance equivalence.

@@ -3,6 +3,7 @@
 # See LICENSE in the repository root for license terms.
 
 import gzip
+import csv
 import hashlib
 import io
 import json
@@ -43,6 +44,36 @@ class PublishedDatasetTests(unittest.TestCase):
                 self.assertEqual(curl.call_count,2)
             self.assertFalse((root/'joined.csv.gz.partial').exists())
             self.assertEqual(json.loads((root/'verification.json').read_text())['status'],'verified')
+
+    def test_prefix_preserves_url_ids_empty_bodies_and_embedded_newlines(self):
+        rows = [['https://example.test/ü', ''], ['two', 'line one\r\n"quoted", café'], ['three', 'last']]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (root/'data.csv').open('w',newline='',encoding='utf-8') as f:
+                writer = csv.writer(f,quoting=csv.QUOTE_ALL)
+                writer.writerow(['id','body'])
+                writer.writerows(rows)
+            data.prefix(root,root/'prefix.csv',2)
+            with (root/'prefix.csv').open(newline='',encoding='utf-8') as f:
+                self.assertEqual(list(csv.reader(f)),rows[:2])
+            self.assertIn(',""', (root/'prefix.csv').read_text())
+            with self.assertRaisesRegex(ValueError,'incomplete'):
+                data.prefix(root,root/'short.csv',4)
+
+    def test_inspection_requires_pinned_manifest_and_actual_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blob = b'id,body\n"url",""\n'
+            manifest = dict(csv=dict(file='data.csv',**identity(blob)))
+            (root/'data.csv').write_bytes(blob)
+            (root/'data-manifest.json').write_text(json.dumps(manifest))
+            (root/'verification.json').write_text(json.dumps(dict(revision=data.REVISION,corpus='wikipedia',csv=manifest['csv'])))
+            self.assertEqual(data.inspect(root,'wikipedia',manifest)['rows'],5032104)
+            with self.assertRaisesRegex(ValueError,'pinned upstream'):
+                data.inspect(root,'wikipedia',{})
+            (root/'data.csv').write_bytes(b'changed')
+            with self.assertRaisesRegex(ValueError,'checksum'):
+                data.inspect(root,'wikipedia',manifest)
 
     def test_same_size_corruption_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

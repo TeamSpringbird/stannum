@@ -23,6 +23,7 @@ import threading
 import uuid
 
 import dataset
+import published_dataset
 import run as bench
 import resources
 
@@ -32,7 +33,7 @@ REVISION = 'f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86'
 REPOSITORY = 'https://github.com/planetscale/paradedb-benchmarker.git'
 DEFAULT_DRIVER = ROOT / 'benchmarks/results/tin-driver'
 LOADED_SOURCES = {str(p): dataset.sha256(p) for p in
-                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), Path(resources.__file__), *ASSETS.iterdir()]
+                  [Path(__file__), Path(bench.__file__), Path(dataset.__file__), Path(published_dataset.__file__), Path(resources.__file__), *ASSETS.iterdir()]
                   if p.is_file()}
 
 
@@ -138,13 +139,23 @@ def literal(value):
     return "'" + value.replace("'", "''") + "'"
 
 
-def trace_queries(driver):
-    records = json.loads((driver / 'datasets/wikipedia/queries.json').read_text())['queries']
+def trace_queries(driver, query_file=None):
+    records = json.loads((Path(query_file) if query_file else driver / 'datasets/wikipedia/queries.json').read_text())['queries']
+    if not records or len({q['source_id'] for q in records}) != len(records):
+        raise ValueError('trace requires unique source IDs and at least one query')
     if any(not re.fullmatch('[a-z]+(?: [a-z]+)*', q['text']) for q in records):
         raise ValueError('lexical oracle requires normalized ASCII word queries')
     return [(f"{q['source_id']}:{style}", q['engines']['tin'][style],
              q['engines']['postgres'][style], q['text'])
             for q in records for style in ('conjunction', 'disjunction', 'phrase')]
+
+
+def validation_queries(queries, limit):
+    if limit < 0:
+        raise ValueError('validation-queries must be nonnegative')
+    if not limit or limit >= len(queries):
+        return queries
+    return [queries[i * len(queries) // limit] for i in range(limit)]
 
 
 def lexical_predicate(name, text):
@@ -424,7 +435,13 @@ def run(args):
         raise ValueError('driver binary not built from recorded adapter')
     if adapter.get('test_binary_sha256') != dataset.sha256(driver / 'pg-driver-test'):
         raise ValueError('driver regression binary does not match recorded build')
-    corpus = dataset.verify(args.dataset)
+    published = getattr(args, 'published_corpus', None)
+    if published == 'stackexchange':
+        raise ValueError('Stack Exchange timing requires a tokenizer-aware membership oracle; data acquisition is supported')
+    corpus = published_dataset.inspect(args.dataset, published, json.loads(
+        (driver / 'datasets' / published / 'data-manifest.json').read_text())) if published else dataset.verify(args.dataset)
+    trace_path = Path(getattr(args, 'query_file', None) or driver / 'datasets/wikipedia/queries.json').resolve()
+    queries = trace_queries(driver, trace_path)
     if len(set(args.engines)) != len(args.engines) or not 0 <= args.updates <= 1000000000:
         raise ValueError('engines must be distinct and updates must be between 0 and 1000000000')
     if args.rows > corpus['rows']:
@@ -446,10 +463,16 @@ def run(args):
                     corpus=corpus, config={k: str(v) if isinstance(v, Path) else v
                                           for k, v in vars(args).items() if k != 'func'},
                     runner_sha256=LOADED_SOURCES[str(Path(__file__))], harness_sources=LOADED_SOURCES, jobs=[])
+    shutil.copy2(trace_path, root / 'queries.json')
+    manifest['trace'] = dict(sha256=dataset.sha256(root / 'queries.json'), forms=len(queries))
+    queries = trace_queries(driver, root / 'queries.json')
+    manifest['trace']['forms'] = len(queries)
+    queries = validation_queries(queries, getattr(args, 'validation_queries', 0))
+    manifest['validation_query_ids'] = [q[0] for q in queries]
     bench.save(root / 'manifest.json', manifest)
     protocol = root / 'protocol'
     protocol.mkdir()
-    for filename in ('tin.py', 'run.py', 'dataset.py'):
+    for filename in ('tin.py', 'run.py', 'dataset.py', 'published_dataset.py'):
         shutil.copy2(ROOT / 'benchmarks' / filename, protocol / filename)
     shutil.copytree(ASSETS, protocol / 'tin')
     manifest['host'] = dict(system=platform.platform(), machine=platform.machine(),
@@ -471,19 +494,22 @@ def run(args):
             volume = name + '-data'
             path = root / engine
             path.mkdir()
-            job = dict(engine=engine, status='running', container=name, volume=volume)
+            job = dict(engine=engine, status='running', container=name, volume=volume,
+                       resource_limits=dict(build_memory=getattr(args, 'build_memory', None) or args.memory,
+                                            query_memory=args.memory))
             manifest['jobs'].append(job)
             bench.save(root / 'manifest.json', manifest)
             command(['docker', 'volume', 'create', volume], stdout=subprocess.DEVNULL)
             sampler = None
             try:
                 command(['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus),
-                         '--memory', args.memory, '--memory-swap', args.memory, '--shm-size', '1g',
+                         '--memory', job['resource_limits']['build_memory'],
+                         '--memory-swap', job['resource_limits']['build_memory'], '--shm-size', '1g',
                          '-p', f'127.0.0.1:{args.port}:5432',
                          '-v', f'{volume}:/var/lib/postgresql',
                          '-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_DB=benchmark',
                          image['Id'], 'postgres', '-c', f'shared_buffers={args.shared_buffers}',
-                         '-c', 'maintenance_work_mem=512MB', '-c', 'work_mem=16MB',
+                         '-c', 'maintenance_work_mem=' + getattr(args, 'maintenance_work_mem', '512MB'), '-c', 'work_mem=16MB',
                          '-c', f'max_parallel_workers={args.cpus}', '-c', 'jit=off',
                          '-c', 'track_io_timing=on', '-c', f'plan_cache_mode={args.plan_cache_mode}'], stdout=subprocess.DEVNULL)
                 deadline = time.monotonic() + 90
@@ -500,14 +526,18 @@ def run(args):
                                      BENCHMARKER_POSTGRES_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark'),
                             stdout=log, stderr=subprocess.STDOUT)
                 sql((ASSETS / 'position-limit.sql').read_text())
-                sql('CREATE TABLE documents(id bigint PRIMARY KEY, body text NOT NULL);')
-                # COPY streams the immutable prefix; no modified shared dataset.
-                with (path / 'input.csv').open('w') as target, (Path(args.dataset) / 'documents.csv').open() as source_csv:
-                    reader, writer = csv.reader(source_csv), csv.writer(target)
-                    for number, row in enumerate(reader):
-                        if number == args.rows:
-                            break
-                        writer.writerow(row)
+                sql('CREATE TABLE documents(id text NOT NULL, body text NOT NULL);' if published else
+                    'CREATE TABLE documents(id bigint PRIMARY KEY, body text NOT NULL);')
+                # Published IDs remain text, matching the upstream schema without a PK.
+                if published:
+                    published_dataset.prefix(args.dataset, path / 'input.csv', args.rows)
+                else:
+                    with (path / 'input.csv').open('w') as target, (Path(args.dataset) / 'documents.csv').open() as source_csv:
+                        reader, writer = csv.reader(source_csv), csv.writer(target)
+                        for number, row in enumerate(reader):
+                            if number == args.rows:
+                                break
+                            writer.writerow(row)
                 job['input_sha256'] = dataset.sha256(path / 'input.csv')
                 sampler.phase = 'import'
                 started = time.monotonic()
@@ -515,6 +545,8 @@ def run(args):
                     command(['psql', '-Xq', '-v', 'ON_ERROR_STOP=1', '-c',
                              'COPY documents FROM STDIN WITH (FORMAT csv)'], stdin=data, env=dict(env, PGOPTIONS=f'-c statement_timeout={args.setup_timeout_seconds * 1000} -c jit=off'))
                 job['import_seconds'] = time.monotonic() - started
+                if published and sql('SELECT count(*) = count(DISTINCT id) FROM documents;') != 't':
+                    raise ValueError('membership validation requires unique source IDs')
                 started = time.monotonic()
                 sampler.phase = 'vector-preparation'
                 if engine == 'postgres':
@@ -528,13 +560,16 @@ def run(args):
                 sql(f'CREATE INDEX {index} ON documents USING {expression};', setup=True)
                 bench.save(path / 'after-build-cgroup.json', resource_snapshot(name))
                 job['index_build_seconds'] = time.monotonic() - started
+                if job['resource_limits']['build_memory'] != args.memory:
+                    sampler.phase = 'query-memory-transition'
+                    command(['docker', 'update', '--memory', args.memory, '--memory-swap', args.memory, name],
+                            stdout=subprocess.DEVNULL)
                 sampler.phase = 'validation'
                 sql('VACUUM ANALYZE documents;', setup=True)
                 job['workload_state'] = dict(protocol='postvacuum-observed-v1',
                                              after_vacuum=workload_state(sql))
                 job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));"))
                 sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
-                queries = trace_queries(driver)
                 oracle = 'SET enable_seqscan=off;\n' + check_sql(queries, engine)
                 (path / 'correctness.sql').write_text(oracle)
                 started = time.monotonic()
@@ -575,7 +610,7 @@ def run(args):
                 # Upstream stops this owned container at phase end. No Makefile
                 # or project-wide cleanup is invoked, and cooldown stays zero.
                 run_env = dict(os.environ, BACKENDS=engine, WORKLOAD=args.workload,
-                               QUERY_STYLE=args.style, QUERIES=str(driver / 'datasets/wikipedia/queries.json'),
+                               QUERY_STYLE=args.style, QUERIES=str(root / 'queries.json'),
                                CONFIG_DIR=str(driver / 'datasets/wikipedia'),
                                STANNUM_PORT=str(args.port), POSTGRES_PORT=str(args.port),
                                STANNUM_CONTAINER=name, POSTGRES_CONTAINER=name,
@@ -632,6 +667,8 @@ def run(args):
                 for name in full_counts['stannum']
                 if full_counts['stannum'][name] != full_counts['postgres'][name]}
         verify_sources(LOADED_SOURCES)
+        if dataset.sha256(root / 'queries.json') != manifest['trace']['sha256']:
+            raise ValueError('query trace changed during campaign')
         if adapter != verify_driver(driver) or adapter['binary_sha256'] != dataset.sha256(driver / 'k6'):
             raise ValueError('benchmark source changed during campaign')
         manifest['status'] = 'complete'
@@ -689,7 +726,8 @@ def comparison_contract(manifest):
     if manifest['config']['updates'] and job['post_update_correctness']['mismatches'] != 0:
         raise ValueError('trial post-update correctness failed')
     docker = manifest['host']['docker']
-    return dict(adapter=manifest['adapter'], corpus=manifest['corpus'],
+    return dict(resource_limits=job.get('resource_limits'),
+                validation_query_ids=manifest.get('validation_query_ids'), trace=manifest.get('trace'), adapter=manifest['adapter'], corpus=manifest['corpus'],
                 harness_sources=manifest['harness_sources'],
                 runner_sha256=manifest['runner_sha256'],
                 config={k: (manifest['config'].get(k, 'auto') if k == 'plan_cache_mode' else manifest['config'][k]) for k in COMPARISON_SETTINGS},
@@ -801,7 +839,7 @@ def compare(args):
         patch = source_path.parent / 'source.patch'
         if patch.exists():
             shutil.copy2(patch, root / (variant + '-source.patch'))
-    queries = trace_queries(args.driver.resolve())
+    queries = trace_queries(args.driver.resolve(), getattr(args, 'query_file', None))
     campaign = dict(status='running', repetitions=args.repetitions, sources=sources, images=images,
                     query_ids=[q[0] for q in queries if args.style == 'mixed' or q[0].split(':')[1] == args.style],
                     jobs=paired_jobs(args.repetitions))
@@ -890,8 +928,11 @@ def main():
     p = common
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--dataset', type=Path, required=True)
+    p.add_argument('--published-corpus', choices=['wikipedia', 'stackexchange'])
+    p.add_argument('--query-file', type=Path, help='Explicit trace; snapshotted and hashed for every run')
     p.add_argument('--rows', type=bench.positive, default=1000)
     p.add_argument('--validation-rows', type=bench.positive, default=1000)
+    p.add_argument('--validation-queries', type=int, default=0, help='Evenly spaced query-form sample for untimed checks; 0 checks every form')
     p.add_argument('--workload', choices=['count', 'topk'], default='count')
     p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase'], default='mixed')
     p.add_argument('--clients', type=bench.positive, default=2)
@@ -901,7 +942,9 @@ def main():
     p.add_argument('--seed', type=int, default=1592614637)
     p.add_argument('--cpus', type=bench.positive, default=4)
     p.add_argument('--memory', default='4g')
+    p.add_argument('--build-memory', help='Optional separate build cap; switch to --memory before validation and queries')
     p.add_argument('--shared-buffers', default='1GB')
+    p.add_argument('--maintenance-work-mem', default='512MB')
     p.add_argument('--plan-cache-mode', choices=['auto', 'force_custom_plan', 'force_generic_plan'], default='auto')
     p.add_argument('--setup-timeout-seconds', type=bench.positive, default=1800)
     p.add_argument('--port', type=bench.positive, default=28928)

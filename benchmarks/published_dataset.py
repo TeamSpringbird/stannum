@@ -5,6 +5,7 @@
 
 """Download and checksum the exact prepared PlanetScale benchmark corpus."""
 import argparse
+import csv
 import gzip
 import hashlib
 import json
@@ -70,6 +71,39 @@ def acquire(corpus, root):
         print(f'{corpus}: verified full CSV ({csv.stat().st_size} bytes)', flush=True)
     finally:
         joined.unlink(missing_ok=True)
+
+
+def inspect(root, corpus, expected_manifest):
+    """Verify CSV identity before loading; never trust a stale receipt alone."""
+    root = Path(root)
+    manifest = json.loads((root / 'data-manifest.json').read_text())
+    if manifest != expected_manifest:
+        raise ValueError('dataset manifest differs from pinned upstream driver')
+    receipt = json.loads((root / 'verification.json').read_text())
+    if receipt.get('revision') != REVISION or receipt.get('corpus') != corpus or receipt.get('csv') != manifest['csv']:
+        raise ValueError('published dataset identity mismatch')
+    if not verify(root / 'data.csv', manifest['csv']):
+        raise ValueError('published CSV checksum mismatch')
+    return dict(format='planetscale-prepared-v1', revision=REVISION, corpus=corpus,
+                rows={'wikipedia':5032104, 'stackexchange':150000000}[corpus], csv=manifest['csv'])
+
+
+def prefix(root, target, rows):
+    """Preserve field contents, order and empty strings in a bounded COPY file."""
+    if rows < 1:
+        raise ValueError('rows must be positive')
+    # Some published documents exceed Python's default 128 KiB field limit.
+    csv.field_size_limit(1024 * 1024 * 1024)
+    with (Path(root) / 'data.csv').open(encoding='utf-8', newline='') as source, Path(target).open('w', encoding='utf-8', newline='') as output:
+        reader = csv.reader(source)
+        if next(reader, None) != ['id', 'body']:
+            raise ValueError('expected id,body CSV header')
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL)
+        for _ in range(rows):
+            row = next(reader, None)
+            if row is None or len(row) != 2:
+                raise ValueError('incomplete or malformed published CSV')
+            writer.writerow(row)
 
 
 def main():

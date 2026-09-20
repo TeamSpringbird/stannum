@@ -1,5 +1,8 @@
 # Benchmarking Stannum
 
+The [published Wikipedia memory pilot](published-memory.md) tests a 500,000-row
+prefix with separate build and query limits, including a retained build OOM.
+
 The [exact published dataset acquisition](published-datasets.md) prepares the
 Wikipedia and Stack Exchange corpora for larger working-set experiments.
 

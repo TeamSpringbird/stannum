@@ -65,6 +65,29 @@ class TraceCorrectnessTests(unittest.TestCase):
         self.assertEqual([q[0] for q in queries], [f'{i}:{s}' for i in (1, 2)
                          for s in ('conjunction', 'disjunction', 'phrase')])
 
+    def test_validation_sampling_is_explicit_deterministic_and_bounded(self):
+        queries = list(range(906))
+        self.assertEqual(tin.validation_queries(queries,0),queries)
+        sample = tin.validation_queries(queries,18)
+        self.assertEqual(len(sample),18)
+        self.assertEqual(len(set(sample)),18)
+        self.assertEqual(sample,tin.validation_queries(queries,18))
+        self.assertEqual(len(queries),906)
+        with self.assertRaises(ValueError):
+            tin.validation_queries(queries,-1)
+
+    def test_explicit_trace_is_used_and_duplicate_ids_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace = root/'alternate.json'
+            entry = dict(source_id=99,text='alpha',engines={engine:{style:'alpha' for style in
+                         ('conjunction','disjunction','phrase')} for engine in ('tin','postgres')})
+            trace.write_text(json.dumps({'queries':[entry]}))
+            self.assertEqual(tin.trace_queries(root,trace)[0][0],'99:conjunction')
+            trace.write_text(json.dumps({'queries':[entry,entry]}))
+            with self.assertRaisesRegex(ValueError,'unique'):
+                tin.trace_queries(root,trace)
+
     def test_plan_diagnostics_match_parameterized_ranked_projection_and_restore_mode(self):
         query = ('1:disjunction', "'quoted' OR text", 'quoted | text', 'quoted text')
         for engine in ('stannum', 'postgres'):
