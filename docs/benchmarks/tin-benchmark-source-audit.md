@@ -44,28 +44,19 @@ we reuse this query trace. The prepared Wikipedia CSV SHA-256 is
 [manifest](https://github.com/planetscale/paradedb-benchmarker/blob/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/datasets/wikipedia/data-manifest.json),
 [trace](https://github.com/planetscale/paradedb-benchmarker/blob/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/datasets/wikipedia/queries.json)
 
-**Trace identity gap (history checked September 20):** the article describes 1,719 total requests derived
-from 2–15-term substrings. The published Stack Exchange JSON instead contains
-1,254 base records; the current runner expands a mixed workload to 3,762
-record/style pairs, including single-term records. We can reproduce the
-published source revision, but cannot call it the article's exact trace
-without the missing run manifest. The corpus sampling/preparation is described,
-but the original sampling procedure is not rerun by the Makefile.
-[Stack Exchange trace](https://github.com/planetscale/paradedb-benchmarker/blob/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/datasets/stackexchange/queries.json),
-[query expansion](https://github.com/planetscale/paradedb-benchmarker/blob/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/benchmarks/queries.js)
+**Trace identity resolved by maintainer clarification, relayed by the user:**
+PlanetScale used `datasets/stackexchange/queries.json`: 1,254 random samples,
+each expanded into AND/OR/phrase, yielding 3,762 forms for engines supporting
+all three styles. The maintainer confirmed the article's 1,719 total was wrong.
+Our pinned file contains exactly 1,254 records and matches this clarification.
+This confirms the trace path and count, not the exact benchmark binary or every
+run setting.
 
-The deleted `queries.shortened.json` is recoverable at parent commit
-[`4b065a7`](https://github.com/planetscale/paradedb-benchmarker/blob/4b065a745d14fa34569f3c4afee5a3889f0c7e7c/datasets/stackexchange/queries.shortened.json).
-It contains **573 distinct records**, yielding **1,719 record/style pairs**,
-exactly matching the article's total. Historical SOURCES.md records selection
-seed `118538803`. However, deletion commit
-[`2bf5cdd`](https://github.com/planetscale/paradedb-benchmarker/commit/2bf5cdd1b13805b287cc1274614c7fb34c1b9be8)
-says **“remove shortened queries list -- was never used.”** One of its records
-also contains only one term, while the article describes 2–15 terms. The full
-trace was already 1,254 unique records when first committed in `62a0aa4`; this
-is not an accidental duplicate count. Both trace candidates are recoverable;
-which generated the charts is still unconfirmed. Preserve both and ask that
-specific question, rather than asking for datasets we already have.
+[Confirmed trace](https://github.com/planetscale/paradedb-benchmarker/blob/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/datasets/stackexchange/queries.json).
+The recovered 573-record `queries.shortened.json` is historical only; do not use
+it for article comparison. Its deletion commit already said it was never used.
+Existing local Wikipedia measurements used 302 samples / 906 forms and remain
+separate from this Stack Exchange workload.
 
 ## SQL and baseline fairness
 

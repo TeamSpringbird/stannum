@@ -226,3 +226,44 @@ class LifecycleOracleTests(unittest.TestCase):
             self.assertIn('tin.highlight(body)', implicit['sql'])
             self.assertNotIn('tin.highlight(body)', explicit['sql'])
             self.assertEqual(implicit['expected'], explicit['expected'])
+
+
+class PublishedTraceTests(unittest.TestCase):
+    def test_published_prefix_preserves_raw_text_and_string_ids(self):
+        import csv
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [['site/001', 'C++ & café\nMixed CASE'], ['002', ''], ['unused', 'later']]
+            with (root / 'data.csv').open('w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(['id', 'body'])
+                writer.writerows(rows)
+            oracle.copy_trace_prefix(root, root / 'input.csv', 2, True)
+            with (root / 'input.csv').open(newline='') as stream:
+                self.assertEqual(list(csv.reader(stream)), rows[:2])
+            with self.assertRaises(ValueError):
+                oracle.copy_trace_prefix(root, root / 'short.csv', 4, True)
+
+    def test_string_ids_keep_identity_in_membership_and_ranking(self):
+        rows = [['site/001', '\\x3f800000'], ['001', '\\x3f800000']]
+        self.assertEqual(oracle.compare_trace(rows, rows, rows), [])
+        self.assertIn('membership', oracle.compare_trace(rows, rows[:1], rows))
+        for invalid in [[[True, '\\x3f800000']], [[None, '\\x3f800000']], rows + rows[:1]]:
+            with self.assertRaises(ValueError):
+                oracle.checked_scores(invalid)
+
+    def test_trace_identity_uses_pinned_git_objects_and_rejects_other_trace(self):
+        import tempfile
+        from pathlib import Path
+        import published_dataset
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / 'queries.json'
+            trace.write_bytes(b'{"queries": []}')
+            with patch.object(oracle.subprocess, 'check_output', side_effect=[trace.read_bytes(), b'{"csv": {}}']) as call:
+                self.assertEqual(oracle.published_trace_identity(directory, 'stackexchange', trace), {'csv': {}})
+                self.assertEqual(call.call_args_list[0].args[0][-1], published_dataset.REVISION + ':datasets/stackexchange/queries.json')
+            with patch.object(oracle.subprocess, 'check_output', return_value=b'different'):
+                with self.assertRaises(ValueError):
+                    oracle.published_trace_identity(directory, 'stackexchange', trace)
