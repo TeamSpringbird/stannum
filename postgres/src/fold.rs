@@ -282,7 +282,7 @@ pub fn count_segment(
     let mut tids = None;
     let mut offsets = Vec::new();
     let mut sure = 0u64;
-    ordinals::for_each_chunk(&node, &streams, |chunk, words| {
+    ordinals::for_each_chunk(&node, &streams, |chunk, words, members| {
         let low = u32::from(chunk) << 16;
         let high = low.saturating_add(ordinals::CHUNK).min(documents);
         let from = dead.partition_point(|ordinal| *ordinal < low);
@@ -299,7 +299,12 @@ pub fn count_segment(
             live = cleared;
             &live
         };
-        let matched: u32 = words.iter().map(|word| word.count_ones()).sum();
+        // Only a chunk with dead documents was changed since it was counted.
+        let matched = if from == to {
+            members
+        } else {
+            ordinals::count(words)
+        };
         if matched == 0 {
             return Ok(());
         }

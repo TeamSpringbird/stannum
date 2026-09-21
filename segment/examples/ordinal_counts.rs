@@ -240,7 +240,7 @@ fn fold(segments: &[Segment], terms: &[usize], dead: &[Vec<u32>], visible: &[u64
                 Ok((stream.count() > 0).then_some(stream))
             })
             .collect::<Result<Vec<_>>>()?;
-        ordinals::for_each_chunk(&node, &streams, |key, words| {
+        ordinals::for_each_chunk(&node, &streams, |key, words, members| {
             let low = u32::from(key) << 16;
             let from = dead.partition_point(|ordinal| *ordinal < low);
             let gone = dead[from..]
@@ -251,7 +251,6 @@ fn fold(segments: &[Segment], terms: &[usize], dead: &[Vec<u32>], visible: &[u64
                     words[bit / 64] >> (bit % 64) & 1 == 1
                 })
                 .count();
-            let members: u32 = words.iter().map(|word| word.count_ones()).sum();
             count += u64::from(members) - gone as u64;
             Ok(())
         })?;

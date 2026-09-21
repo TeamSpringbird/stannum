@@ -268,13 +268,10 @@ impl<'a> Ordinals<'a> {
                         .map(|low| usize::from(u16::from_le_bytes([low[0], low[1]])));
                     apply_lows(lows, op, out);
                 } else {
-                    let words = bytes
-                        .chunks_exact(8)
-                        .map(|word| u64::from_le_bytes(word.try_into().unwrap()));
                     match op {
-                        Op::Assign => out.iter_mut().zip(words).for_each(|(o, w)| *o = w),
-                        Op::Or => out.iter_mut().zip(words).for_each(|(o, w)| *o |= w),
-                        Op::And => out.iter_mut().zip(words).for_each(|(o, w)| *o &= w),
+                        Op::Assign => kernels::assign_bytes(out, bytes),
+                        Op::Or => kernels::or_bytes(out, bytes),
+                        Op::And => kernels::and_bytes(out, bytes),
                     }
                 }
                 Ok(true)
@@ -379,6 +376,103 @@ fn apply_lows(lows: impl Iterator<Item = usize>, op: Op, out: &mut Words) {
     }
 }
 
+/// The number of members of a chunk.
+pub fn count(words: &Words) -> u32 {
+    kernels::count(words)
+}
+
+/// The word loops of a fold. An x86-64 build targets a baseline without a
+/// population-count instruction or wide vectors, so each loop is also compiled
+/// for the features a fold profits from and chosen by what the CPU reports;
+/// the bodies are the same safe code throughout. Other architectures' baselines
+/// already include what these loops use.
+mod kernels {
+    use super::Words;
+
+    macro_rules! kernel {
+        ($(#[$doc:meta])* $name:ident, $body:ident, ($($arg:ident: $ty:ty),*) $(-> $ret:ty)?) => {
+            $(#[$doc])*
+            pub fn $name($($arg: $ty),*) $(-> $ret)? {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    #[target_feature(enable = "avx512f,avx512bw,avx512vpopcntdq,popcnt")]
+                    unsafe fn widest($($arg: $ty),*) $(-> $ret)? {
+                        $body($($arg),*)
+                    }
+                    #[target_feature(enable = "avx2,popcnt")]
+                    unsafe fn wide($($arg: $ty),*) $(-> $ret)? {
+                        $body($($arg),*)
+                    }
+                    if std::arch::is_x86_feature_detected!("avx512f")
+                        && std::arch::is_x86_feature_detected!("avx512bw")
+                        && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+                    {
+                        // SAFETY: the CPU reports every feature `widest` enables.
+                        return unsafe { widest($($arg),*) };
+                    }
+                    if std::arch::is_x86_feature_detected!("avx2")
+                        && std::arch::is_x86_feature_detected!("popcnt")
+                    {
+                        // SAFETY: the CPU reports every feature `wide` enables.
+                        return unsafe { wide($($arg),*) };
+                    }
+                }
+                $body($($arg),*)
+            }
+        };
+    }
+
+    fn word(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    #[inline(always)]
+    fn assign_bytes_body(out: &mut Words, bytes: &[u8]) {
+        out.iter_mut()
+            .zip(bytes.chunks_exact(8))
+            .for_each(|(o, w)| *o = word(w));
+    }
+
+    #[inline(always)]
+    fn or_bytes_body(out: &mut Words, bytes: &[u8]) {
+        out.iter_mut()
+            .zip(bytes.chunks_exact(8))
+            .for_each(|(o, w)| *o |= word(w));
+    }
+
+    #[inline(always)]
+    fn and_bytes_body(out: &mut Words, bytes: &[u8]) {
+        out.iter_mut()
+            .zip(bytes.chunks_exact(8))
+            .for_each(|(o, w)| *o &= word(w));
+    }
+
+    #[inline(always)]
+    fn or_words_body(out: &mut Words, other: &Words) {
+        out.iter_mut().zip(other).for_each(|(o, w)| *o |= w);
+    }
+
+    #[inline(always)]
+    fn and_words_body(out: &mut Words, other: &Words) {
+        out.iter_mut().zip(other).for_each(|(o, w)| *o &= w);
+    }
+
+    #[inline(always)]
+    fn count_body(words: &Words) -> u32 {
+        words.iter().map(|word| word.count_ones()).sum()
+    }
+
+    kernel!(
+        /// Overwrites `out` with a bitmap chunk's little-endian words.
+        assign_bytes, assign_bytes_body, (out: &mut Words, bytes: &[u8])
+    );
+    kernel!(or_bytes, or_bytes_body, (out: &mut Words, bytes: &[u8]));
+    kernel!(and_bytes, and_bytes_body, (out: &mut Words, bytes: &[u8]));
+    kernel!(or_words, or_words_body, (out: &mut Words, other: &Words));
+    kernel!(and_words, and_words_body, (out: &mut Words, other: &Words));
+    kernel!(count, count_body, (words: &Words) -> u32);
+}
+
 /// Appends the ordinals set in `words`, offset by `base`.
 pub fn members(words: &Words, base: u32, out: &mut Vec<u32>) {
     for (i, word) in words.iter().enumerate() {
@@ -443,7 +537,7 @@ impl Evaluator<'_, '_> {
                         let mut other = self.lend(depth);
                         let present = self.assign(child, key, depth + 1, &mut other)?;
                         if present {
-                            out.iter_mut().zip(other.iter()).for_each(|(o, w)| *o &= w);
+                            kernels::and_words(out, &other);
                         }
                         self.scratch[depth] = Some(other);
                         present
@@ -471,7 +565,7 @@ impl Evaluator<'_, '_> {
                 let mut other = self.lend(depth);
                 let present = self.assign(node, key, depth + 1, &mut other)?;
                 if present {
-                    out.iter_mut().zip(other.iter()).for_each(|(o, w)| *o |= w);
+                    kernels::or_words(out, &other);
                 }
                 self.scratch[depth] = Some(other);
                 Ok(present)
@@ -491,11 +585,12 @@ impl Evaluator<'_, '_> {
 
 /// Evaluates `node` over `streams` one chunk at a time, in ascending chunk
 /// order, visiting only chunks where the tree has members. `visit` receives
-/// the chunk key and its membership; an ordinal is `key << 16 | bit index`.
+/// the chunk key, its membership and the member count; an ordinal is
+/// `key << 16 | bit index`.
 pub fn for_each_chunk(
     node: &Node,
     streams: &[Option<Ordinals<'_>>],
-    mut visit: impl FnMut(u16, &Words) -> Result<()>,
+    mut visit: impl FnMut(u16, &Words, u32) -> Result<()>,
 ) -> Result<()> {
     let mut keys = BTreeSet::new();
     for stream in streams.iter().flatten() {
@@ -508,8 +603,11 @@ pub fn for_each_chunk(
     };
     let mut out = Box::new([0u64; WORDS]);
     for key in keys {
-        if evaluator.assign(node, key, 0, &mut out)? && out.iter().any(|word| *word != 0) {
-            visit(key, &out)?;
+        if evaluator.assign(node, key, 0, &mut out)? {
+            let members = count(&out);
+            if members != 0 {
+                visit(key, &out, members)?;
+            }
         }
     }
     Ok(())
@@ -610,10 +708,12 @@ mod tests {
             .collect();
         let mut out = Vec::new();
         let mut last = None;
-        for_each_chunk(node, &streams, |key, words| {
+        for_each_chunk(node, &streams, |key, words, members_in_chunk| {
             assert!(last.is_none_or(|last| last < key));
             last = Some(key);
+            let before = out.len();
             members(words, u32::from(key) << 16, &mut out);
+            assert_eq!(out.len() - before, members_in_chunk as usize);
             Ok(())
         })
         .unwrap();
