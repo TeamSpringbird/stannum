@@ -466,7 +466,27 @@ impl<'a> Postings<'a> {
             crate::pages::Cursor::advance(&mut pages)?;
             Ok(Box::new(pages))
         } else {
-            Ok(Box::new(crate::pages::Rows::new(self.cursor_with(false)?)?))
+            let mut inner = self.sparse_cursor(None);
+            inner.load_next()?;
+            let mut pages = SparsePages {
+                inner,
+                current: None,
+            };
+            crate::pages::Cursor::advance(&mut pages)?;
+            Ok(Box::new(pages))
+        }
+    }
+
+    fn sparse_cursor(&self, bounds: Option<Bounds<'a>>) -> SparseCursor<'a> {
+        SparseCursor {
+            reader: Reader::at(self.bytes, self.body_at),
+            body_at: self.body_at,
+            total: self.count,
+            remaining: self.count,
+            last_block: 0,
+            current: None,
+            ordinal: 0,
+            bounds,
         }
     }
 
@@ -486,16 +506,7 @@ impl<'a> Postings<'a> {
             grouped.bounds = bounds;
             PostingsCursor::Grouped(grouped)
         } else {
-            PostingsCursor::Sparse(SparseCursor {
-                reader: Reader::at(self.bytes, self.body_at),
-                body_at: self.body_at,
-                total: self.count,
-                remaining: self.count,
-                last_block: 0,
-                current: None,
-                ordinal: 0,
-                bounds,
-            })
+            PostingsCursor::Sparse(self.sparse_cursor(bounds))
         };
         cursor.start()?;
         Ok(cursor)
@@ -819,6 +830,46 @@ impl SparseCursor<'_> {
         self.last_block = block;
         self.remaining -= 1;
         self.current = Some(tid);
+        Ok(())
+    }
+}
+
+/// Groups sparse postings directly, without the enum cursor and ordinal work
+/// used by scalar scoring. Validation remains in SparseCursor::load_next.
+struct SparsePages<'a> {
+    inner: SparseCursor<'a>,
+    current: Option<crate::pages::Page>,
+}
+
+impl crate::pages::Cursor for SparsePages<'_> {
+    fn current(&self) -> Option<crate::pages::Page> {
+        self.current
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.current = None;
+        if let Some(first) = self.inner.current {
+            let mut offsets = crate::pages::Offsets::default();
+            while let Some(tid) = self.inner.current {
+                if tid.block != first.block {
+                    break;
+                }
+                offsets.insert(tid.offset);
+                self.inner.load_next()?;
+            }
+            self.current = Some(crate::pages::Page {
+                block: first.block,
+                offsets,
+            });
+        }
+        Ok(())
+    }
+
+    fn seek(&mut self, block: u32) -> Result<()> {
+        if self.current.is_some_and(|page| page.block < block) {
+            self.inner.seek(Tid { block, offset: 1 })?;
+            self.advance()?;
+        }
         Ok(())
     }
 }
@@ -1213,6 +1264,72 @@ mod tests {
             builder.push_scored(*tid, bucket, len).unwrap();
         }
         builder.finish()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn sparse_pages_match_scalar_grouping_under_seek(
+            values in proptest::collection::vec((0u32..10000, 1u16..292), 0..300),
+            targets in proptest::collection::vec(proptest::option::of(0u32..11000), 0..40),
+        ) {
+            use crate::pages::Cursor as _;
+            let mut tids: Vec<_> = values.into_iter().map(|(block, offset)| tid(block, offset)).collect();
+            tids.sort_unstable(); tids.dedup();
+            let bytes = encode_sparse(&tids, None, Format::CURRENT);
+            let postings = Postings::parse(&bytes).unwrap();
+            let mut actual = postings.pages().unwrap();
+            let mut reference = crate::pages::Rows::new(crate::set::Slice::new(&tids)).unwrap();
+            for target in targets {
+                proptest::prop_assert_eq!(actual.current(), reference.current());
+                match target {
+                    Some(block) => { actual.seek(block).unwrap(); reference.seek(block).unwrap(); }
+                    None => { actual.advance().unwrap(); reference.advance().unwrap(); }
+                }
+            }
+            loop {
+                proptest::prop_assert_eq!(actual.current(), reference.current());
+                if actual.current().is_none() { break; }
+                actual.advance().unwrap(); reference.advance().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_pages_keep_validation_and_boundary_offsets() {
+        use crate::pages::Cursor as _;
+        let tids = [
+            tid(0, 1),
+            tid(0, 291),
+            tid(crate::tid::MAX_BLOCK, 1),
+            tid(crate::tid::MAX_BLOCK, 291),
+        ];
+        for format in [Format::Lsg2, Format::CURRENT] {
+            let scores = vec![(0, 1); tids.len()];
+            let bytes = encode_sparse(&tids, Some(&scores), format);
+            let postings = Postings::parse(&bytes).unwrap();
+            let mut pages = postings.pages().unwrap();
+            assert_eq!(pages.current().unwrap().offsets.count(), 2);
+            pages.seek(crate::tid::MAX_BLOCK).unwrap();
+            assert_eq!(pages.current().unwrap().block, crate::tid::MAX_BLOCK);
+            assert_eq!(pages.current().unwrap().offsets.count(), 2);
+            pages.advance().unwrap();
+            assert!(pages.current().is_none());
+            // Every truncated body must fail either when opening or consuming.
+            for end in postings.body_at..bytes.len() {
+                let result = Postings::parse(&bytes[..end]).and_then(|p| {
+                    let mut pages = p.pages()?;
+                    while pages.current().is_some() {
+                        pages.advance()?;
+                    }
+                    Ok(())
+                });
+                assert!(result.is_err());
+            }
+        }
+        // Zero offsets and duplicate postings are invalid even without scores.
+        for bytes in [vec![0, 1, 0, 0], vec![0, 2, 0, 1, 0, 1]] {
+            assert!(Postings::parse(&bytes).unwrap().pages().is_err());
+        }
     }
 
     fn expected_bounds(tids: &[Tid]) -> Vec<BlockBound> {
