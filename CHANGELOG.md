@@ -28,6 +28,12 @@
   dead list meanwhile; earlier builds could count a tuple VACUUM had removed
   from a page it then marked all-visible.
 - Counts check the matches of a heap page under one buffer lock.
+- Ranked scans name a scored document through its term's ordinal stream
+  instead of ranking its TID in the segment's document table, which has no
+  skip structure and was decoded from the start by every ranked query: about
+  15 ms per query at five million documents, growing with the corpus. Median
+  top-10 latency over the published Wikipedia queries falls from 17 to 2.5 ms
+  (OR), 16 to 1.1 ms (AND) and 17 to 1.7 ms (phrase).
 - Segment format `LSG3`: one term bound for postings that fit a block, no
   payload skip slot for entry 0, and dictionary entries with gap-encoded
   extents; the 100k Wikipedia index shrinks by about a tenth with the same

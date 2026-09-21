@@ -87,6 +87,9 @@ struct SourceReader {
 struct TermReader {
     postings: segment::postings::PostingsCursor<'static>,
     payload: segment::payload::PayloadCursor<'static>,
+    /// The term's documents as ordinals, parallel to `postings`, where the
+    /// source stores them.
+    ordinals: Option<segment::ordinals::Ordinals<'static>>,
 }
 
 impl SourceReader {
@@ -103,6 +106,7 @@ impl SourceReader {
                 segment_error(segment.term(term)).map(|term| TermReader {
                     postings: segment_error(term.cursor()),
                     payload: segment_error(term.payload()).cursor(),
+                    ordinals: segment_error(term.ordinals()),
                 })
             })
             .collect();
@@ -427,17 +431,50 @@ impl IndexScorer {
             let label = self.view.labels[i].as_str();
             let reader = &mut self.sources[i];
             reader.last = Some(tid);
-            let Some(ordinal) = segment_error_in(reader.documents.rank(tid), label) else {
-                continue;
+            // Each term's posting of the document, if any. A source with
+            // ordinal streams names the document through the first of them;
+            // the document table has no skip structure, so ranking `tid` in
+            // it decodes every document before it.
+            let postings: Vec<Option<u32>> = reader
+                .terms
+                .iter_mut()
+                .map(|slot| {
+                    let term = slot.as_mut()?;
+                    segment_error_in(term.postings.rank(tid), label)
+                })
+                .collect();
+            let selected = reader
+                .terms
+                .iter()
+                .zip(&postings)
+                .find_map(|(slot, posting)| Some((slot.as_ref()?.ordinals.as_ref()?, (*posting)?)));
+            let ordinal = match selected {
+                Some((ordinals, posting)) => segment_error_in(ordinals.select(posting), label),
+                None if reader
+                    .terms
+                    .iter()
+                    .flatten()
+                    .all(|term| term.ordinals.is_some())
+                    && reader.terms.iter().any(Option::is_some) =>
+                {
+                    // Every present term has a stream and none lists `tid`.
+                    continue;
+                }
+                None => match segment_error_in(reader.documents.rank(tid), label) {
+                    Some(ordinal) => ordinal,
+                    None => continue,
+                },
             };
             let length = segment_error_in(reader.lengths.get(ordinal), label);
             // Left-to-right f32 fold in lexical term order, as production does.
             let mut total = 0.0_f32;
-            for (slot, (_, scorer)) in reader.terms.iter_mut().zip(&self.terms) {
+            for ((slot, (_, scorer)), posting) in
+                reader.terms.iter_mut().zip(&self.terms).zip(&postings)
+            {
                 let Some(term) = slot else {
                     continue;
                 };
-                let Some(posting) = segment_error_in(term.postings.rank(tid), label) else {
+                let Some(posting) = *posting else {
                     continue;
                 };
                 segment_error_in(term.payload.seek(posting), label);
@@ -579,6 +616,9 @@ struct TermCursor<'a> {
     slot: usize,
     postings: PostingsCursor<'a>,
     payload: PayloadCursor<'a>,
+    /// The term's documents as ordinals, parallel to `postings`, where the
+    /// source stores them.
+    ordinals: Option<segment::ordinals::Ordinals<'a>>,
     /// Postings in this source; the rarest term drives a conjunction.
     count: u32,
     /// Upper bound on the term's contribution anywhere in the source.
@@ -695,11 +735,23 @@ impl Walk<'_, '_> {
         if self.dead.contains(&pivot) {
             return;
         }
-        let Some(ordinal) = segment_error(self.documents.rank(pivot)) else {
-            crate::storage::corrupt(format!(
-                "Stannum index data: document ({},{}) is posted but missing from the document table",
-                pivot.block, pivot.offset
-            ))
+        // A cursor on the pivot names its document through the term's ordinal
+        // stream; the document table has no skip structure, so ranking the
+        // pivot in it decodes every document before it.
+        let selected = self
+            .cursors
+            .iter()
+            .filter(|cursor| cursor.current() == Some(pivot))
+            .find_map(|cursor| Some((cursor.ordinals.as_ref()?, cursor.postings.ordinal())));
+        let ordinal = match selected {
+            Some((ordinals, posting)) => segment_error(ordinals.select(posting)),
+            None => match segment_error(self.documents.rank(pivot)) {
+                Some(ordinal) => ordinal,
+                None => crate::storage::corrupt(format!(
+                    "Stannum index data: document ({},{}) is posted but missing from the document table",
+                    pivot.block, pivot.offset
+                )),
+            },
         };
         let length = segment_error(self.lengths.get(ordinal));
         let mut pending: Vec<usize> = (0..self.cursors.len())
@@ -1047,6 +1099,7 @@ impl IndexScorer {
                 slot,
                 postings,
                 payload: segment_error_in(term.payload(), label).cursor(),
+                ordinals: segment_error_in(term.ordinals(), label),
                 count: term.df(),
                 term_max: scorer.bound(&whole),
                 cached: None,

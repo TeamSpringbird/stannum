@@ -128,6 +128,8 @@ enum Body<'a> {
         directory: &'a [u8],
         /// Where the first chunk starts in the stream.
         chunks_at: u64,
+        /// Members before each chunk, computed when first selected from.
+        before: std::cell::OnceCell<Vec<u32>>,
     },
 }
 
@@ -186,6 +188,7 @@ impl<'a> Ordinals<'a> {
             Body::Chunked {
                 directory: source.fetch(at as u64, (chunks as usize) * ENTRY)?,
                 chunks_at,
+                before: std::cell::OnceCell::new(),
             }
         };
         Ok(Self {
@@ -243,6 +246,7 @@ impl<'a> Ordinals<'a> {
             Body::Chunked {
                 directory,
                 chunks_at,
+                ..
             } => {
                 let entry = |i: usize| &directory[i * ENTRY..(i + 1) * ENTRY];
                 let chunks = directory.len() / ENTRY;
@@ -276,6 +280,62 @@ impl<'a> Ordinals<'a> {
                 Ok(true)
             }
         }
+    }
+
+    /// The ordinal at `index` of the stream: the document of the term's
+    /// `index`-th posting, since the stream parallels the term's postings.
+    pub fn select(&self, index: u32) -> Result<u32> {
+        if index >= self.count {
+            return Err(Error::Corrupt("posting beyond the ordinal stream"));
+        }
+        let (directory, chunks_at, before) = match &self.body {
+            Body::List(list) => return Ok(list[index as usize]),
+            Body::Chunked {
+                directory,
+                chunks_at,
+                before,
+            } => (directory, *chunks_at, before),
+        };
+        let before = before.get_or_init(|| {
+            let mut total = 0u32;
+            directory
+                .chunks_exact(ENTRY)
+                .map(|entry| {
+                    let start = total;
+                    total = total.saturating_add(entry_chunk(entry).0 as u32);
+                    start
+                })
+                .collect()
+        });
+        let chunk = before.partition_point(|start| *start <= index) - 1;
+        let entry = &directory[chunk * ENTRY..(chunk + 1) * ENTRY];
+        let (cardinality, offset, size, bitmap) = entry_chunk(entry);
+        let mut within = (index - before[chunk]) as usize;
+        if within >= cardinality {
+            return Err(Error::Corrupt("ordinal count differs from its chunks"));
+        }
+        let start = chunks_at + offset;
+        if start + size as u64 > self.len {
+            return Err(Error::Truncated);
+        }
+        let bytes = self.source.fetch(start, size)?;
+        let base = u32::from(entry_key(entry)) << 16;
+        if !bitmap {
+            let at = within * 2;
+            return Ok(base | u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])));
+        }
+        for (i, word) in bytes.chunks_exact(8).enumerate() {
+            let mut word = u64::from_le_bytes(word.try_into().unwrap());
+            let set = word.count_ones() as usize;
+            if within < set {
+                for _ in 0..within {
+                    word &= word - 1;
+                }
+                return Ok(base | (i as u32 * 64 + word.trailing_zeros()));
+            }
+            within -= set;
+        }
+        Err(Error::Corrupt("ordinal bitmap cardinality"))
     }
 
     /// Every ordinal, for verification and tests.
@@ -465,6 +525,7 @@ pub fn validate(bytes: &[u8], count: u32, documents: u32) -> Result<()> {
     if let Body::Chunked {
         directory,
         chunks_at,
+        ..
     } = &stream.body
     {
         let mut expected = 0u64;
@@ -577,6 +638,14 @@ mod tests {
             let stream = Ordinals::parse(&bytes).unwrap();
             assert_eq!(stream.count() as usize, list.len());
             assert_eq!(stream.to_vec().unwrap(), list);
+            // A stride keeps the dense lists quick while crossing every chunk.
+            for index in (0..list.len()).step_by(list.len() / 997 + 1) {
+                assert_eq!(stream.select(index as u32).unwrap(), list[index]);
+            }
+            if let Some(last) = list.len().checked_sub(1) {
+                assert_eq!(stream.select(last as u32).unwrap(), list[last]);
+            }
+            assert!(stream.select(list.len() as u32).is_err());
         }
         // A rare term costs a few bytes.
         assert!(encode(&[documents - 1]).len() <= 5);
