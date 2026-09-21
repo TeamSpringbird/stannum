@@ -89,13 +89,23 @@ fn scalar_rows(inputs: &Inputs, heap_terms: bool) -> Result<HeapUnion<'_>> {
     Ok(HeapUnion::new(segment_rows(inputs, heap_terms)?))
 }
 
-fn page_rows(inputs: &Inputs) -> Result<pages::Union<Box<dyn PageCursor + '_>>> {
+fn page_rows(
+    inputs: &Inputs,
+    scalar_adapter: bool,
+) -> Result<pages::Union<Box<dyn PageCursor + '_>>> {
     let sources = inputs
         .iter()
         .map(|terms| {
             let cursors = terms
                 .iter()
-                .map(|bytes| Postings::parse(bytes)?.pages())
+                .map(|bytes| {
+                    let postings = Postings::parse(bytes)?;
+                    if scalar_adapter && !postings.is_grouped() {
+                        Ok(Box::new(pages::Rows::new(postings.cursor()?)?) as Box<dyn PageCursor>)
+                    } else {
+                        postings.pages()
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(Box::new(pages::Union::new(cursors)) as Box<dyn PageCursor>)
         })
@@ -145,8 +155,8 @@ fn measure(inputs: &Inputs, strategy: usize) -> Result<(u64, u64)> {
             Ok((tids.len() as u64, pages))
         }
         1 => scalar_count(scalar_rows(inputs, false)?),
-        2 => {
-            let mut cursor = page_rows(inputs)?;
+        2 | 4 => {
+            let mut cursor = page_rows(inputs, strategy == 4)?;
             let (mut count, mut pages) = (0, 0);
             while let Some(page) = cursor.current() {
                 count += u64::from(page.offsets.count());
@@ -171,16 +181,18 @@ fn verify(inputs: &Inputs, expected: &[Tid]) -> Result<()> {
         }
         assert_eq!(actual, expected);
     }
-    let mut cursor = page_rows(inputs)?;
-    let mut actual = Vec::new();
-    while let Some(page) = cursor.current() {
-        actual.extend(page.offsets.iter().map(|offset| Tid {
-            block: page.block,
-            offset,
-        }));
-        cursor.advance()?;
+    for scalar_adapter in [false, true] {
+        let mut cursor = page_rows(inputs, scalar_adapter)?;
+        let mut actual = Vec::new();
+        while let Some(page) = cursor.current() {
+            actual.extend(page.offsets.iter().map(|offset| Tid {
+                block: page.block,
+                offset,
+            }));
+            cursor.advance()?;
+        }
+        assert_eq!(actual, expected);
     }
-    assert_eq!(actual, expected);
     Ok(())
 }
 
@@ -276,10 +288,10 @@ fn main() -> Result<()> {
         };
         let answer = measure(&inputs, 0)?;
         let bytes: usize = inputs.iter().flatten().map(Vec::len).sum();
-        let mut samples: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+        let mut samples: [Vec<f64>; 5] = std::array::from_fn(|_| Vec::new());
         for repetition in 0..repeats {
-            for i in 0..4 {
-                let strategy = (i + repetition) % 4;
+            for i in 0..5 {
+                let strategy = (i + repetition) % 5;
                 let start = Instant::now();
                 let actual = black_box(measure(black_box(&inputs), strategy)?);
                 let elapsed = start.elapsed().as_secs_f64() * 1000.;
@@ -292,6 +304,7 @@ fn main() -> Result<()> {
             "stream-heap-segments",
             "page-bitmaps",
             "stream-heap-terms",
+            "page-scalar-adapter",
         ]
         .into_iter()
         .zip(samples)
