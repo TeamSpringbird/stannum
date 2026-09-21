@@ -85,7 +85,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('snapshot-run','queries','output'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--states',nargs='+',choices=('clean','mutated'),default=['clean','mutated'])
-    p.add_argument('--clients',nargs='+',type=int,default=[1,2,4,8]);p.add_argument('--seconds',type=float,default=20)
+    p.add_argument('--clients',nargs='+',type=int,default=[8]);p.add_argument('--seconds',type=float,default=20)
     p.add_argument('--rounds',type=int,default=3);p.add_argument('--port',type=int,default=29438)
     a=p.parse_args()
     if a.seconds<=0 or a.rounds<1 or any(n<1 for n in a.clients):p.error('Durations, rounds and clients must be positive')

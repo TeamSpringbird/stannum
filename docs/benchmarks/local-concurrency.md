@@ -1,15 +1,16 @@
 # Local concurrent snapshot comparison
 
-The next local experiment measures real completed requests with 1, 2, 4 and 8
+The next local experiment measures real completed requests with eight total
 clients, using the same clean/mutated million-row snapshots as the single-client
 count experiments. Compare main, candidate default and forced bitmaps. Three
-rounds rotate variant order; client-count order reverses on alternating rounds.
+rounds rotate variant order. Eight clients are fixed to match the user-confirmed
+published PlanetScale read benchmark client count.
 Each trial restores a fresh physical snapshot and starts a new server.
 
-A 100k, 1/2-client, two-second smoke matrix runs first. It is harness validation,
+A 100k, eight-client, two-second smoke matrix runs first. It is harness validation,
 not a performance claim. Only if it passes does the full matrix run: two states,
-four client counts, three variants, three rounds, 20 seconds each (72 trials;
-24 minutes of timed windows, plus substantial restore/warmup overhead).
+one client count, three variants, three rounds, 20 seconds each (18 trials;
+six minutes of timed windows, plus substantial restore/warmup overhead).
 
 Every trial checks all 302 counts and custom-plan selection before timing. Each
 client has its own persistent PostgreSQL connection and deterministic shuffled
@@ -45,7 +46,7 @@ Run manually:
 ```sh
 python benchmarks/snapshot_load_local.py --snapshot-run <validated-million-run> \
   --queries <queries.json> --output <new-directory> \
-  --states clean mutated --clients 1 2 4 8 --seconds 20 --rounds 3
+  --states clean mutated --clients 8 --seconds 20 --rounds 3
 ```
 
 The durable queue lives at `benchmarks/results/concurrent-loop-r1/`. It waits for
@@ -55,3 +56,8 @@ experiment; a failed count prerequisite or smoke test does block it. Each trial
 retains plans, per-client JSONL request samples, summary and manifest. Completed
 campaigns produce `report.md` and `summary.csv` with repeated QPS/p95/p99 results.
 No incomplete campaign gets a final aggregate report.
+
+The original not-yet-started client sweep queue was superseded before any trials.
+The active queue is `concurrent-loop-r1/queue-eight/`, using
+`queue-eight-clients.json`. Diagnostic serial EXPLAIN experiments remain separate
+from these eight-client throughput comparisons.
