@@ -626,7 +626,10 @@ def run(args):
                 if args.workload == 'topk':
                     ranked_sql = ranked_check_sql(queries, engine)
                     (path / 'ranked-correctness.sql').write_text(ranked_sql)
-                    ranked = sql(ranked_sql)
+                    # Exhaustive references over the full table are setup work: one
+                    # stopword-heavy disjunction over 15 million rows outlasts the
+                    # timeout measured queries run under.
+                    ranked = sql(ranked_sql, setup=True)
                     (path / 'ranked-correctness.txt').write_text(ranked + '\n')
                     validate_result(ranked, [q[0] for q in queries])
                     job['ranked_correctness'] = dict(queries=len(queries), mismatches=0,
