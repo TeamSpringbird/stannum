@@ -158,8 +158,17 @@ pub struct Union<C> {
 
 impl<C: Cursor> Union<C> {
     pub fn new(cursors: Vec<C>) -> Self {
-        let heads: Vec<_> = cursors.iter().map(Cursor::current).collect();
-        let current = heads.iter().copied().flatten().min();
+        // Tiny unions retain the allocation-free head-selection loop.
+        let heads: Vec<_> = if cursors.len() > 2 {
+            cursors.iter().map(Cursor::current).collect()
+        } else {
+            Vec::new()
+        };
+        let current = if heads.is_empty() {
+            cursors.iter().filter_map(Cursor::current).min()
+        } else {
+            heads.iter().copied().flatten().min()
+        };
         Self {
             cursors,
             heads,
@@ -177,6 +186,15 @@ impl<C: Cursor> Cursor for Union<C> {
         let Some(current) = self.current else {
             return Ok(());
         };
+        if self.heads.is_empty() {
+            for cursor in &mut self.cursors {
+                if cursor.current() == Some(current) {
+                    cursor.advance()?;
+                }
+            }
+            self.current = self.cursors.iter().filter_map(Cursor::current).min();
+            return Ok(());
+        }
         let mut next: Option<Tid> = None;
         for (cursor, head) in self.cursors.iter_mut().zip(&mut self.heads) {
             if *head == Some(current) {
@@ -193,6 +211,13 @@ impl<C: Cursor> Cursor for Union<C> {
 
     fn seek(&mut self, target: Tid) -> Result<()> {
         if self.current.is_none_or(|current| current >= target) {
+            return Ok(());
+        }
+        if self.heads.is_empty() {
+            for cursor in &mut self.cursors {
+                cursor.seek(target)?;
+            }
+            self.current = self.cursors.iter().filter_map(Cursor::current).min();
             return Ok(());
         }
         for (cursor, head) in self.cursors.iter_mut().zip(&mut self.heads) {

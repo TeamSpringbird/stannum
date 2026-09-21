@@ -34,10 +34,11 @@ def selector_report(output):
     manifest=json.loads((output/'manifest.json').read_text())
     if manifest['status']!='complete':raise ValueError('Incomplete selector campaign')
     records=json.loads((output/'results.json').read_text())
-    if len(records)!=302*len(manifest['rounds']):raise ValueError('Incomplete query coverage')
+    query_count=manifest.get('query_count',302)
+    if len(records)!=query_count*len(manifest['rounds']):raise ValueError('Incomplete query coverage')
     for trial in manifest['rounds']:
         ids=[r['id'] for r in records if r['round']==trial['round'] and r['variant']==trial['variant']]
-        if len(ids)!=302 or len(set(ids))!=302:raise ValueError('Duplicate or missing query results')
+        if len(ids)!=query_count or len(set(ids))!=query_count:raise ValueError('Duplicate or missing query results')
     variants=sorted({r['variant'] for r in records})
     summary=[]
     strategies={}
@@ -91,8 +92,10 @@ def main():
     parser.add_argument('--queries',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--state',choices=('clean','mutated'),default='clean')
+    parser.add_argument('--query-ids',type=int,nargs='+',help='Explicit diagnostic subset; full trace remains the default')
     parser.add_argument('--profile-ids',type=int,nargs='*',default=[],help='macOS sample profiles, collected after the final timed trial of each variant')
     parser.add_argument('--port',type=int,default=29436)
+    parser.add_argument('--force-pages',action='store_true',help='Force pages in both binaries to isolate page execution changes')
     parser.add_argument('--control-library',type=Path,help='Override archived candidate control with a pinned compatible binary')
     parser.add_argument('--selector-library',type=Path,help='Compare original candidate, instrumentation only, and shadow estimation')
     parser.add_argument('--selector-threshold',type=int,default=0,help='Optional experimental threshold arm; zero omits it')
@@ -102,6 +105,7 @@ def main():
     if args.rounds < 1 or args.repetitions < 1 or args.selector_threshold < 0:parser.error('Invalid repetition count or threshold')
     if args.selector_threshold and not args.selector_library:parser.error('Threshold requires selector library')
     if args.profile_ids and sys.platform!='darwin':parser.error('Native sampling currently requires macOS')
+    if args.force_pages and (not args.selector_library or args.selector_threshold):parser.error('Forced-page comparison requires selector library and no threshold')
     root=args.snapshot_run.resolve();out=args.output.resolve()
     manifest=json.loads((root/'manifest.json').read_text());assert manifest['status']=='complete'
     out.mkdir(parents=True,exist_ok=False);shutil.copy2(__file__,out/'protocol.py')
@@ -119,12 +123,15 @@ def main():
     expected={r['id']:r['count'] for r in json.loads((root/expected_file).read_text())}
     queries=json.loads(args.queries.read_text())['queries'];assert len(queries)==302
     assert digest(args.queries)==manifest['queries_sha256']
+    if args.query_ids:
+        assert set(args.query_ids) <= {q['source_id'] for q in queries}
+        queries=[q for q in queries if q['source_id'] in set(args.query_ids)]
     assert set(args.profile_ids) <= {q['source_id'] for q in queries}
-    state=dict(status='running',snapshot_state=args.state,source_manifest=manifest,rounds=[],repetitions=args.repetitions,
+    state=dict(status='running',query_count=len(queries),query_ids=args.query_ids,force_pages=args.force_pages,snapshot_state=args.state,source_manifest=manifest,rounds=[],repetitions=args.repetitions,
                control_sha256=digest(control_source) if control_source else None,
                selector_sha256=digest(selector_source) if selector_source else None,selector_threshold=args.selector_threshold,
                metric='Server EXPLAIN ANALYZE Execution Time; single client; one warmup per query; fresh physical snapshot per variant',
-               percentile='nearest rank of the 302 per-query medians, equal weight per query; not concurrent-load or request-weighted p95')
+               percentile=f'nearest rank of the {len(queries)} per-query medians, equal weight per query; not concurrent-load or request-weighted p95')
     def save():(out/'manifest.json').write_text(json.dumps(state,indent=2)+'\n')
     def cmd(*args):return subprocess.check_output(args,text=True).strip()
     def start():cmd('pg_ctl','-D',str(data),'-l',str(out/'server.log'),'-o',f'-p {args.port} -h 127.0.0.1 -c shared_buffers=256MB -c work_mem=16MB -c jit=off -c autovacuum=off','start')
@@ -133,7 +140,7 @@ def main():
     variants=('main','candidate-default','candidate-bitmaps')
     # Latin-square order balances each variant's position across three rounds.
     if selector_source:
-        variants=('candidate-default','instrumented','shadow')
+        variants=('candidate-default','instrumented') if args.force_pages else ('candidate-default','instrumented','shadow')
         if args.selector_threshold:variants+=('selected','selector-bitmaps')
     orders=[variants[i%len(variants):]+variants[:i%len(variants)] for i in range(args.rounds)]
     results=[];save()
@@ -169,6 +176,7 @@ def main():
                             conn.execute('SET stannum.profile_count_selection='+('on' if variant=='shadow' else 'off'))
                             conn.execute('SET stannum.count_page_threshold='+str(args.selector_threshold if variant=='selected' else 0))
                             conn.execute('SET stannum.force_count_pages='+('on' if variant=='selector-bitmaps' else 'off'))
+                        if args.force_pages:conn.execute('SET stannum.force_count_pages=on')
                         for q in shuffled:
                             query=q['engines']['tin']['disjunction']
                             count=conn.execute('SELECT count(*) FROM documents WHERE body ==> %s',(query,)).fetchone()[0]
@@ -177,7 +185,7 @@ def main():
                             for repetition in range(args.repetitions):
                                 plan=conn.execute('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT count(*) FROM documents WHERE body ==> %s',(query,)).fetchone()[0][0]
                                 node=plan['Plan'];assert node.get('Custom Plan Provider')=='Stannum Count'
-                                if variant in ('candidate-bitmaps','selector-bitmaps'):assert node['Count Strategy']=='page bitmaps'
+                                if args.force_pages or variant in ('candidate-bitmaps','selector-bitmaps'):assert node['Count Strategy']=='page bitmaps'
                                 if variant in ('instrumented','shadow','selected','selector-bitmaps'):
                                     assert node['Count Selection Calls']==1
                                     assert node['Count Selection Time']>=node['Count Estimation Time']>=0
