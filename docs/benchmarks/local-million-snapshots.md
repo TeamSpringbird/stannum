@@ -92,3 +92,18 @@ Full corpus size tests scale; it does not reproduce AWS CPU, storage or OS cache
 behavior. `shared_buffers=256MB` is not a total memory cap. A later explicitly
 constrained-memory run is needed to claim memory-pressure coverage. Retain the
 million-row tier for fast diagnosis and use this tier for merge candidates.
+
+### Rerun corrections
+
+The full published CSV includes an `id,body` header; extracted prefix CSVs do not.
+Use `--csv-header` for the published source. The first attempt correctly stopped
+on 5,032,105 loaded rows. `compatibility-r2` passed all 2,718 count checks with
+5,032,104 rows plus the focused visibility suite, and retains both images.
+
+The initial release comparison was stopped because a shared Cargo target cache
+reused identical library bytes across separate worktrees. Its results are invalid
+as optimization evidence. `merge-validation-r3.json` gives each source worktree
+its own target directory, freezes hashes, and rejects identical artifacts before
+load trials. The load harness now rejects identical explicit control/candidate
+binaries unless `--allow-identical-binaries` requests an intentional A/A control.
+The r3 campaign restores the completed r2 snapshots; no index rebuild is needed.

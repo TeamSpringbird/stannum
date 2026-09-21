@@ -89,6 +89,7 @@ def main():
     p.add_argument('--rounds',type=int,default=3);p.add_argument('--port',type=int,default=29438)
     p.add_argument('--control-library',type=Path)
     p.add_argument('--candidate-library',type=Path)
+    p.add_argument('--allow-identical-binaries',action='store_true',help='Explicitly allow an A/A harness control; never use as optimization evidence')
     a=p.parse_args()
     if bool(a.control_library)!=bool(a.candidate_library):p.error('Both comparison libraries are required')
     if a.seconds<=0 or a.rounds<1 or any(n<1 for n in a.clients):p.error('Durations, rounds and clients must be positive')
@@ -105,7 +106,10 @@ def main():
         for name,path in [('control',a.control_library),('candidate',a.candidate_library)]:
             frozen=out/(name+'-source.dylib');shutil.copy2(path,frozen)
             comparison[name]=dict(path=str(frozen),sha256=hashlib.sha256(frozen.read_bytes()).hexdigest())
+        if comparison['control']['sha256']==comparison['candidate']['sha256'] and not a.allow_identical_binaries:
+            raise ValueError('Identical comparison binaries; rebuild in isolated target directories or explicitly request an A/A control')
         state['comparison_libraries']=comparison
+        state['allow_identical_binaries']=a.allow_identical_binaries
     def save():
         temp=out/'manifest.tmp';temp.write_text(json.dumps(state,indent=2)+'\n');temp.replace(out/'manifest.json')
     def cmd(*args):return subprocess.check_output(args,text=True).strip()
