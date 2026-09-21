@@ -31,15 +31,18 @@ def main():
     parser.add_argument('--snapshot-run',type=Path,required=True)
     parser.add_argument('--queries',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--state',choices=('clean','mutated'),default='clean')
     parser.add_argument('--port',type=int,default=29436)
     args=parser.parse_args();root=args.snapshot_run.resolve();out=args.output.resolve()
     manifest=json.loads((root/'manifest.json').read_text());assert manifest['status']=='complete'
     out.mkdir(parents=True,exist_ok=False);shutil.copy2(__file__,out/'protocol.py')
     lib=out/'stannum.dylib';data=out/'data'
-    expected={r['id']:r['count'] for r in json.loads((root/'baseline-results.json').read_text())}
+    expected_file='baseline-results.json' if args.state=='clean' else 'candidate-mutated-results.json'
+    snapshot_name='snapshot' if args.state=='clean' else 'snapshot-mutated'
+    expected={r['id']:r['count'] for r in json.loads((root/expected_file).read_text())}
     queries=json.loads(args.queries.read_text())['queries'];assert len(queries)==302
     assert digest(args.queries)==manifest['queries_sha256']
-    state=dict(status='running',source_manifest=manifest,rounds=[],repetitions=9,
+    state=dict(status='running',snapshot_state=args.state,source_manifest=manifest,rounds=[],repetitions=9,
                metric='Server EXPLAIN ANALYZE Execution Time; single client; one warmup per query; fresh physical snapshot per variant',
                percentile='nearest rank of the 302 per-query medians, equal weight per query; not concurrent-load or request-weighted p95')
     def save():(out/'manifest.json').write_text(json.dumps(state,indent=2)+'\n')
@@ -59,7 +62,7 @@ def main():
                 for variant in order:
                     print(f'Round {round_id+1}: {variant}',flush=True)
                     if data.exists():shutil.rmtree(data)
-                    shutil.copytree(root/'snapshot',data)
+                    shutil.copytree(root/snapshot_name,data)
                     kind='baseline' if variant=='main' else 'candidate'
                     source=root/'libraries'/(kind+'.dylib')
                     assert digest(source)==manifest[kind+'_sha256']

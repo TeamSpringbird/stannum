@@ -3,7 +3,7 @@
 #
 # See LICENSE in the repository root for license terms.
 
-"""100k native PostgreSQL physical-snapshot/binary compatibility rehearsal.
+"""Native PostgreSQL physical-snapshot/binary compatibility rehearsal.
 
 Uses private library copies and an owned cluster; never replaces installed libs.
 The baseline and candidate must have identical extension SQL interfaces.
@@ -31,6 +31,8 @@ def main():
     for name in ('input','queries','output','baseline_library','candidate_library'):
         p.add_argument('--'+name.replace('_','-'),type=Path,required=True)
     for name in ('baseline_commit','candidate_commit'):p.add_argument('--'+name.replace('_','-'),required=True)
+    p.add_argument('--rows',type=int,default=100000)
+    p.add_argument('--aws-mutations',action='store_true',help='Use the AWS hash-selected 5%% id updates, 10%% whitespace updates, 1/101 deletes')
     p.add_argument('--port',type=int,default=29435)
     args=p.parse_args();out=args.output.resolve();out.mkdir(parents=True,exist_ok=False)
     shutil.copy2(__file__,out/'protocol.py')
@@ -41,7 +43,7 @@ def main():
     queries=json.loads(args.queries.read_text())['queries'];assert len(queries)==302
     env=dict(os.environ,PGHOST='127.0.0.1',PGPORT=str(args.port),PGDATABASE='postgres',PGUSER=os.environ['USER'])
     for key in ('PGOPTIONS','PGSERVICE','PGSERVICEFILE','PGPASSWORD'):env.pop(key,None)
-    state=dict(status='starting',phases=[],baseline_commit=args.baseline_commit,candidate_commit=args.candidate_commit,
+    state=dict(status='starting',expected_rows=args.rows,aws_mutations=args.aws_mutations,phases=[],baseline_commit=args.baseline_commit,candidate_commit=args.candidate_commit,
                baseline_sha256=sha(libs/'baseline.dylib'),candidate_sha256=sha(libs/'candidate.dylib'),
                input_sha256=sha(args.input),queries_sha256=sha(args.queries))
     def save(): (out/'manifest.json').write_text(json.dumps(state,indent=2)+'\n')
@@ -63,9 +65,11 @@ def main():
             # Independent full-corpus lexical oracle for these normalized OR queries.
             terms={t for q in queries for t in q['text'].split()}
             postings={t:set() for t in terms}
-            rows=conn.execute('SELECT body FROM documents').fetchall()
-            for n,(body,) in enumerate(rows):
-                for term in set(body.split()) & terms:postings[term].add(n)
+            with conn.transaction(), conn.cursor(name='oracle_documents') as documents:
+                documents.itersize=2000
+                documents.execute('SELECT body FROM documents')
+                for n,(body,) in enumerate(documents):
+                    for term in set(body.split()) & terms:postings[term].add(n)
             expected=[len(set().union(*(postings[t] for t in q['text'].split()))) for q in queries]
             conn.execute('SET enable_seqscan=off; SET statement_timeout=120000; SET plan_cache_mode=force_custom_plan')
             actual=[]
@@ -101,7 +105,7 @@ def main():
             sql('CREATE TABLE documents(id text NOT NULL,body text NOT NULL) WITH(autovacuum_enabled=false)')
             with args.input.open('rb') as stream:
                 subprocess.run(['psql','-Xq','-v','ON_ERROR_STOP=1','-c','COPY documents FROM STDIN WITH(FORMAT csv)'],stdin=stream,env=env,check=True)
-            assert int(sql('SELECT count(*) FROM documents'))==100000
+            assert int(sql('SELECT count(*) FROM documents'))==args.rows
             print('Building baseline index',flush=True)
             sql('CREATE INDEX documents_idx ON documents USING stannum(body)');sql('VACUUM ANALYZE documents')
             before=check('baseline',False)
@@ -117,12 +121,19 @@ def main():
             if state['phases'][0]['fingerprint']!=state['phases'][1]['fingerprint']:raise ValueError('Physical baseline state changed on restore')
             if restored!=before:raise ValueError('Candidate changed baseline answers')
             with connect() as conn:
-                conn.execute('SET stannum.write_buffer_docs=64; SET stannum.merge_tier_factor=2')
-                conn.execute("UPDATE documents SET id=id WHERE hashtextextended(id,0)%20=0")
-                conn.execute("UPDATE documents SET body=body || ' database' WHERE hashtextextended(id,0)%100=1")
-                conn.execute('DELETE FROM documents WHERE hashtextextended(id,0)%101=0')
-                conn.execute("INSERT INTO documents SELECT 'snapshot-check-'||n, 'database postgres snapshot' FROM generate_series(1,1024) n")
+                if args.aws_mutations:
+                    conn.execute("UPDATE documents SET id=id WHERE hashtextextended(id,0)%20=0")
+                    conn.execute("UPDATE documents SET body=body || ' ' WHERE (hashtextextended(id,0) & 9223372036854775807)%10=1")
+                    conn.execute('DELETE FROM documents WHERE hashtextextended(id,0)%101=0')
+                else:
+                    conn.execute('SET stannum.write_buffer_docs=64; SET stannum.merge_tier_factor=2')
+                    conn.execute("UPDATE documents SET id=id WHERE hashtextextended(id,0)%20=0")
+                    conn.execute("UPDATE documents SET body=body || ' database' WHERE hashtextextended(id,0)%100=1")
+                    conn.execute('DELETE FROM documents WHERE hashtextextended(id,0)%101=0')
+                    conn.execute("INSERT INTO documents SELECT 'snapshot-check-'||n, 'database postgres snapshot' FROM generate_series(1,1024) n")
             check('candidate-mutated',True)
+            sql('CHECKPOINT');stop()
+            shutil.copytree(data,out/'snapshot-mutated');start()
             sql('VACUUM ANALYZE documents');check('candidate-vacuumed',True)
             stop();start();check('candidate-restarted',True)
             # Existing focused suite asserts both strategies across two-session snapshots.
