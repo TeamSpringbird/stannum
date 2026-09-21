@@ -231,3 +231,50 @@ selected execution against a text predicate through HOT updates, deletes and
 indexed-text changes, verifies timing fields and forced-mode precedence, and
 ensures plain EXPLAIN does not report execution timings. These are correctness
 checks, not evidence of a profitable threshold or negligible overhead.
+
+## Completed AWS crossover (2026-09-21)
+
+Full Wikipedia: 5,032,104 initial documents, 302 OR queries, nine timings per mode per phase. Server EXPLAIN execution times; serial diagnostics, not concurrent request percentiles or a fresh TIN comparison.
+
+| State | Default p50 ms | Bitmap p50 ms | Default p95 ms | Bitmap p95 ms |
+|---|---:|---:|---:|---:|
+| vacuumed | 6.552 | 11.284 | 133.077 | 69.210 |
+| vacuumed-repeat | 6.559 | 11.311 | 131.969 | 69.330 |
+| mutated | 60.094 | 136.594 | 912.977 | 1012.557 |
+| revacuumed | 17.102 | 24.177 | 269.545 | 109.282 |
+
+Forced bitmap execution improves the clean/revacuumed tail while worsening typical-query latency. It worsens both median and tail after mutations. Mutations also increased immutable segment count from 9 to 128; these results do not isolate visibility effects from segmentation. A posting-count-only threshold cannot be presumed transferable across these states.
+
+The controller verified the downloaded evidence archive and deleted the temporary stack. Direct AWS checks confirmed the instance terminated and root EBS volume absent. The reusable snapshot cache remains intentionally retained. Raw results: `benchmarks/results/aws-crossover-controller-r4/export/checkpoint/`.
+
+## Selector overhead loop
+
+`benchmarks/snapshot_latency_local.py --selector-library PATH` compares the
+archived pre-selector candidate with the new binary in instrumentation-only
+and shadow modes. `--selector-threshold N` adds selected and forced-page arms.
+Use as many rounds as arms for balanced execution order. Every query's untimed
+count is checked against the snapshot oracle; raw timed plans preserve all
+selector counters. `selector_report(output)` additionally verifies that shadow
+and instrumentation modes retain the old decisions and that selected execution
+matches the configured rule. Reports reject incomplete campaigns.
+
+Initial optimized-build measurements (same restored physical snapshots):
+
+| Corpus | Rounds | Timings/query/arm | Estimation median us | Estimation p95 us | Estimation share of summed server execution |
+|---|---:|---:|---:|---:|---:|
+| 100k clean | 3 | 5 | 0.209 | 0.417 | 0.0874% |
+| 1m clean | 3 | 3 | 0.416 | 1.083 | 0.0160% |
+
+These counters suggest cheap feature collection on clean snapshots, but do
+not establish the total instrumentation overhead: binary-to-binary execution
+timings still vary. They also do not prove that the resulting strategy decision
+is useful. Raw evidence and per-arm summaries are in
+`benchmarks/results/selector-overhead-100k-r1/` and
+`benchmarks/results/selector-overhead-million-clean-r1/`.
+
+A retrospective 100k development fit selected a threshold of 23,174 summed
+input postings, minimizing summed measured query medians over query IDs not
+divisible by five. The remaining IDs are an already-observed retrospective
+check, not fresh validation. The predicted saving must be reproduced with
+actual selected execution and evaluated for individual regressions before
+adopting any threshold. This value is a trial parameter, not a default.
