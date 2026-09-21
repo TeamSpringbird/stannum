@@ -1021,6 +1021,18 @@
     "benchmarks/test_snapshot_load_local.py": {
       "owner": "ben",
       "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
+    },
+    "postgres/src/fold.rs": {
+      "owner": "ben",
+      "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
+    },
+    "segment/examples/ordinal_counts.rs": {
+      "owner": "ben",
+      "evidence": "Original replay of the published count queries over TID and ordinal encodings."
+    },
+    "segment/src/ordinals.rs": {
+      "owner": "ben",
+      "evidence": "Original ordinal stream codec and chunked Boolean evaluator, written for Stannum."
     }
   }
 }
