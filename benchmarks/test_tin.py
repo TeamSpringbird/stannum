@@ -99,7 +99,7 @@ class TraceCorrectnessTests(unittest.TestCase):
                     self.assertIn('ORDER BY score DESC LIMIT 10;', statement)
                     self.assertIn('DEALLOCATE stannum_bench_plan;\nRESET plan_cache_mode;', statement)
                     if engine == 'stannum':
-                        self.assertIn('stannum.full_score(ctid) AS score', statement)
+                        self.assertIn('stannum.score(ctid) AS score', statement)
                         self.assertIn('WHERE body ==> $1', statement)
                         self.assertIn('EXECUTE stannum_bench_plan(' + tin.literal(query[1]) + ')', statement)
                     else:

@@ -90,7 +90,7 @@ index 8f40f68..bf511ec 100644
      ];
    }
 +  if (backend === "stannum") {
-+    const fields = count ? "count(*)" : "id, body, stannum.full_score(ctid) AS score";
++    const fields = count ? "count(*)" : "id, body, stannum.score(ctid) AS score";
 +    return [
 +      `SELECT ${fields} FROM documents WHERE body ==> $1${count ? "" : ` ORDER BY score DESC LIMIT ${topK}`}`,
 +      argument(entry, "tin"),

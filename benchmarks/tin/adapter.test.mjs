@@ -22,7 +22,7 @@ test('all published Stannum forms retain upstream ordering and bound parameters'
     assert.equal(argument, entry.record.engines.tin[entry.style]);
     const [ranked, rankedArgument] = buildRequest('stannum', 'topk', entry, 10);
     assert.equal(rankedArgument, argument);
-    assert.equal(ranked, 'SELECT id, body, stannum.full_score(ctid) AS score FROM documents WHERE body ==> $1 ORDER BY score DESC LIMIT 10');
+    assert.equal(ranked, 'SELECT id, body, stannum.score(ctid) AS score FROM documents WHERE body ==> $1 ORDER BY score DESC LIMIT 10');
     const [gin] = buildRequest('postgres', 'count', entry, 10);
     assert.equal(gin, "SELECT count(*) FROM documents WHERE body_tsv @@ to_tsquery('simple', $1)");
   }

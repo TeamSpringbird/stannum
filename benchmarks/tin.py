@@ -205,7 +205,7 @@ def ranked_check_sql(queries, engine):
     for name, tin, postgres, text in queries:
         tsquery = f"to_tsquery('simple', {literal(postgres)})"
         predicate = f'body ==> {literal(tin)}' if engine == 'stannum' else f'body_tsv @@ {tsquery}'
-        score = 'stannum.full_score(ctid)' if engine == 'stannum' else f'ts_rank_cd(body_tsv,{tsquery})'
+        score = 'stannum.score(ctid)' if engine == 'stannum' else f'ts_rank_cd(body_tsv,{tsquery})'
         # Compare score multisets, allowing arbitrary document order within ties.
         # MATERIALIZED forces exhaustive scoring before the reference sort/limit.
         select = f'SELECT id, {score} AS score FROM documents WHERE {predicate}'
@@ -226,7 +226,7 @@ def prepared_plan_sql(query, engine, workload, mode):
         raise ValueError('unsupported diagnostic plan mode')
     _, tin, postgres, _ = query
     if engine == 'stannum':
-        fields = 'count(*)' if workload == 'count' else 'id, body, stannum.full_score(ctid) AS score'
+        fields = 'count(*)' if workload == 'count' else 'id, body, stannum.score(ctid) AS score'
         predicate, argument = 'body ==> $1', tin
     else:
         fields = ('count(*)' if workload == 'count' else
