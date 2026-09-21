@@ -40,3 +40,27 @@ per-query regressions and eight-client clean/mutated loads. Only if evidence
 supports different winners should a cheap pre-execution feature gate be tested
 on fresh query identities, charging decision time to execution. Preserve sparse
 fallback and do not enable a globally tuned rule from retrospective winners.
+
+## Real-query first-loop result and second-loop refinement
+
+Four alternating forced-page million-row rounds (302 queries, five timings each)
+reduced median-round summed query medians 991.688 -> 916.855 ms (7.5%), and
+serial p95 9.817 -> 8.984 ms (8.5%). All counts and strategy checks passed.
+Focused six-round replays did not reproduce regression flags 49/82: medians
+1.5640/1.5795 ms and 6.2985/6.0695 ms respectively.
+
+Normal-policy three-round results were neutral: summed work 748.361 -> 740.885 ms
+(1.0%) and p95 10.376 -> 10.395 ms. Four scalar-path identities 99/125/133/240
+crossed the regression screen with large run-to-run swings; they remain unresolved
+measurement checks. Do not claim a general end-to-end win or promote this code.
+Receipts: `benchmarks/results/fused-sparse-r1/{forced-pages,default-policy,regression-replay}`.
+
+The second loop initializes the output page and previous Tid before processing
+its remaining entries, removing repeated optional-page checks. Randomized and
+malformed-stream tests pass. At 36,000 pages and nine rotated repetitions, gains
+versus the original adapter are 14.7% common-short, 19.4% common-wide and 16.8%
+overlapping-segments. Sparse-wide is 0.8% slower; grouped dense-wide is unchanged
+within noise. [Raw second-loop timings](fused-sparse-second-loop-micro.csv).
+These separate pilot runs are not a paired proof of incremental improvement over
+loop one. The next comparison freezes loop one as control and loop two as candidate
+on the real-query snapshot, after the full-corpus release validation completes.

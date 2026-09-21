@@ -873,15 +873,12 @@ impl crate::pages::Cursor for SparsePages<'_> {
 
     fn advance(&mut self) -> Result<()> {
         self.current = None;
-        let mut page = self.pending.take().map(|tid| {
-            let mut offsets = crate::pages::Offsets::default();
-            offsets.insert(tid.offset);
-            crate::pages::Page {
-                block: tid.block,
-                offsets,
+        let first = if let Some(tid) = self.pending.take() {
+            tid
+        } else {
+            if self.remaining == 0 {
+                return Ok(());
             }
-        });
-        while self.remaining != 0 {
             let delta = self.reader.varint_u32()?;
             let block = self
                 .previous
@@ -893,19 +890,36 @@ impl crate::pages::Cursor for SparsePages<'_> {
             if self.previous.is_some_and(|previous| previous >= tid) {
                 return Err(Error::Corrupt("sparse postings not increasing"));
             }
-            self.previous = Some(tid);
             self.remaining -= 1;
-            let output = page.get_or_insert_with(|| crate::pages::Page {
-                block,
-                offsets: crate::pages::Offsets::default(),
-            });
-            if output.block != block {
+            tid
+        };
+        let mut offsets = crate::pages::Offsets::default();
+        offsets.insert(first.offset);
+        let mut previous = first;
+        while self.remaining != 0 {
+            let delta = self.reader.varint_u32()?;
+            let block = previous
+                .block
+                .checked_add(delta)
+                .ok_or(Error::Corrupt("block overflow"))?;
+            let offset = u16::try_from(self.reader.varint_u32()?).map_err(|_| Error::InvalidTid)?;
+            let tid = Tid::new(block, offset)?;
+            if previous >= tid {
+                return Err(Error::Corrupt("sparse postings not increasing"));
+            }
+            previous = tid;
+            self.remaining -= 1;
+            if block != first.block {
                 self.pending = Some(tid);
                 break;
             }
-            output.offsets.insert(offset);
+            offsets.insert(offset);
         }
-        self.current = page;
+        self.previous = Some(previous);
+        self.current = Some(crate::pages::Page {
+            block: first.block,
+            offsets,
+        });
         Ok(())
     }
 }
