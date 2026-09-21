@@ -47,3 +47,38 @@ Validation: five unit tests cover weighting, coverage mismatch, identity,
 invalid samples, stale exports, and timed errors. An identity comparison against
 the saved full AWS eight-client run covered all 302 forms with exactly zero
 weighted change. This does not yet demonstrate a performance gain.
+
+## Seeded Boolean and mutation fuzzing
+
+`count_fuzz.py` builds an AST for each generated AND/OR expression, renders that
+AST as TINQL, and evaluates it independently in Python against token sets read
+from the reader's snapshot. Both exact IDs and custom COUNT results must agree.
+It runs default selection and forced page counting; default selection can itself
+choose pages, so the receipt records actual plan strategies rather than assuming
+that force-off means scalar. Generated expressions have depth up to five and
+include dense, sparse, repeated and absent terms.
+
+```sh
+python benchmarks/count_fuzz.py --seed 20260920 --seeds 3 --output NEW_OUTPUT
+python benchmarks/count_fuzz.py --replay NEW_OUTPUT/20260920-fixture.json --output REPLAY_OUTPUT
+```
+
+Run under the same installation lock and disposable PostgreSQL environment as
+the deterministic visibility check. Fixtures are written before execution and
+include documents, ASTs, write-buffer size and the complete mutation schedule.
+Failures preserve the active seed, phase, query, mode and error; a unique schema
+is dropped afterward. Replay reads the saved fixture directly. Inputs must be
+trusted locally generated fixtures.
+
+The default schedule performs two committed mutation batches and one rolled-back
+batch, with insertion, deletion, indexed-text and HOT-eligible payload updates.
+It vacuums while a repeatable-read snapshot is retained, then checks a fresh
+snapshot and vacuums again after releasing the old one. These are deterministic
+interleavings, not a scheduler-race or long-running production stress test.
+
+Local PostgreSQL 18 validation passed 6,264 checks across seeds 20260920–20260922,
+87 expressions per seed, three mutation rounds and four snapshot phases. The
+fixtures used different segment layouts. Raw receipts and fixtures are retained
+in `benchmarks/results/count-fuzz-analyzed/`. A saved-fixture replay is retained
+in `benchmarks/results/count-fuzz-replay/`. No production strategy or storage
+format changed, and this does not establish performance or full TINQL coverage.

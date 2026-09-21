@@ -941,6 +941,14 @@
     "benchmarks/test_query_comparison.py": {
       "owner": "ben",
       "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/count_fuzz.py": {
+      "owner": "ben",
+      "evidence": "New Stannum seeded Boolean and concurrent-snapshot correctness harness; not copied from Lead."
+    },
+    "benchmarks/test_count_fuzz.py": {
+      "owner": "ben",
+      "evidence": "New Stannum seeded Boolean and concurrent-snapshot correctness harness; not copied from Lead."
     }
   }
 }
