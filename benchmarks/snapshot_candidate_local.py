@@ -9,6 +9,7 @@ Uses private library copies and an owned cluster; never replaces installed libs.
 The baseline and candidate must have identical extension SQL interfaces.
 """
 import argparse
+import csv
 import fcntl
 import hashlib
 import json
@@ -32,6 +33,7 @@ def main():
         p.add_argument('--'+name.replace('_','-'),type=Path,required=True)
     for name in ('baseline_commit','candidate_commit'):p.add_argument('--'+name.replace('_','-'),required=True)
     p.add_argument('--rows',type=int,default=100000)
+    p.add_argument('--csv-header',action='store_true',help='Input starts with the published id,body CSV header')
     p.add_argument('--aws-mutations',action='store_true',help='Use the AWS hash-selected 5%% id updates, 10%% whitespace updates, 1/101 deletes')
     p.add_argument('--port',type=int,default=29435)
     args=p.parse_args();out=args.output.resolve();out.mkdir(parents=True,exist_ok=False)
@@ -43,7 +45,7 @@ def main():
     queries=json.loads(args.queries.read_text())['queries'];assert len(queries)==302
     env=dict(os.environ,PGHOST='127.0.0.1',PGPORT=str(args.port),PGDATABASE='postgres',PGUSER=os.environ['USER'])
     for key in ('PGOPTIONS','PGSERVICE','PGSERVICEFILE','PGPASSWORD'):env.pop(key,None)
-    state=dict(status='starting',expected_rows=args.rows,aws_mutations=args.aws_mutations,phases=[],baseline_commit=args.baseline_commit,candidate_commit=args.candidate_commit,
+    state=dict(status='starting',expected_rows=args.rows,csv_header=args.csv_header,aws_mutations=args.aws_mutations,phases=[],baseline_commit=args.baseline_commit,candidate_commit=args.candidate_commit,
                baseline_sha256=sha(libs/'baseline.dylib'),candidate_sha256=sha(libs/'candidate.dylib'),
                input_sha256=None,queries_sha256=sha(args.queries))
     def save(): (out/'manifest.json').write_text(json.dumps(state,indent=2)+'\n')
@@ -107,9 +109,17 @@ def main():
             sql("UPDATE pg_proc SET probin='"+str(runtime).replace("'","''")+"' WHERE oid IN (SELECT objid FROM pg_depend WHERE refobjid=(SELECT oid FROM pg_extension WHERE extname='stannum') AND classid='pg_proc'::regclass AND deptype='e') AND prolang=(SELECT oid FROM pg_language WHERE lanname='c');")
             stop();start()
             sql('CREATE TABLE documents(id text NOT NULL,body text NOT NULL) WITH(autovacuum_enabled=false)')
+            if args.csv_header:
+                with args.input.open(newline='') as source:
+                    if next(csv.reader(source), None)!=['id','body']:
+                        raise ValueError('Expected id,body CSV header')
+            copy_sql='COPY documents FROM STDIN WITH(FORMAT csv'+(', HEADER true' if args.csv_header else '')+')'
             with args.input.open('rb') as stream:
-                subprocess.run(['psql','-Xq','-v','ON_ERROR_STOP=1','-c','COPY documents FROM STDIN WITH(FORMAT csv)'],stdin=stream,env=env,check=True)
-            assert int(sql('SELECT count(*) FROM documents'))==args.rows
+                subprocess.run(['psql','-Xq','-v','ON_ERROR_STOP=1','-c',copy_sql],stdin=stream,env=env,check=True)
+            actual_rows=int(sql('SELECT count(*) FROM documents'))
+            state['loaded_rows']=actual_rows;save()
+            if actual_rows!=args.rows:
+                raise ValueError(f'Loaded {actual_rows} rows, expected {args.rows}; csv_header={args.csv_header}')
             print('Building baseline index',flush=True)
             sql('CREATE INDEX documents_idx ON documents USING stannum(body)');sql('VACUUM ANALYZE documents')
             before=check('baseline',False)
