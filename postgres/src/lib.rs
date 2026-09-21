@@ -1534,7 +1534,9 @@ mod tests {
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
         assert_eq!(scan["Pruning"], "block-max");
-        assert!(scan["Candidates"].as_i64().unwrap() > 3, "{scan}");
+        // The scan deepened its pruned search rather than score every match.
+        assert!(scan["Top-K Completions"].as_i64().unwrap() >= 1, "{scan}");
+        assert_eq!(scan["Exhaustive Score Calls"], 0, "{scan}");
         assert_eq!(
             ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3"),
             ranked(false, "delta", "stannum.full_score(ctid)", "LIMIT 3")
@@ -1584,12 +1586,13 @@ mod tests {
         assert_eq!(scan["Top-K Completions"], 0);
 
         // Equal scores put the first ten physical rows in the pruned prefix.
-        // None passes the SQL filter, forcing completion of all 1,000 rows.
+        // None passes the SQL filter, so the pruned search deepens to 40, 160,
+        // 640 and 2,560 rows; the last holds all 1,000 and the ten that pass.
         let filtered = explain("alpha", "AND id > 990");
         let scan = search_scan(&filtered[0]["Plan"]).unwrap();
         assert_eq!(scan["Pruning"], "block-max");
-        assert_eq!(scan["Top-K Completions"], 1);
-        assert_eq!(scan["Exhaustive Score Calls"], 1000);
+        assert_eq!(scan["Top-K Completions"], 4);
+        assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(filtered[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
 
         // An unprunable phrase scores exhaustively without a completion.

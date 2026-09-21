@@ -33,6 +33,14 @@
   them. Whole extents were copied per term and query, which for frequent terms
   ran to megabytes and emptied the reader cache; the median phrase query over
   15 million Stack Exchange rows falls from 11 to 3 ms.
+- A pruned ranked scan that must read past its top k deepens the pruned search
+  to 4k, 16k and so on before it scores every match. An update leaves its old
+  version in the index beside the new one with the same score, so under
+  steady updates a growing share of top tens held a row the snapshot could not
+  see, and each such query scored millions of documents: eight clients ranking
+  disjunctions over 15 million rows beside 1,000 updates a second fell to 2
+  queries a second with a p99 of 20 s. They now sustain 125 with a p99 of
+  208 ms.
 - Ranked conjunctions with elided dense terms are pruned: an elided term's
   cursor joins the walk as a filter without a score bound. Over 15 million
   Stack Exchange rows the p99 of published AND queries falls from 165 to 38 ms.

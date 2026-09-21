@@ -931,6 +931,10 @@ struct ScanExec {
     fallback: *mut pg_sys::TableScanDescData,
     /// `tids` holds only the pruned top k; the rest are produced on demand.
     pruned: bool,
+    /// The k the pruned rows were found for, which a completion deepens.
+    pruned_k: usize,
+    /// Every location emitted before a completion, across completions.
+    emitted: FxHashSet<Tid>,
     /// Explain counters. Candidates are unknown while pruned; `scored`
     /// counts the candidates a pruned scan scored.
     candidates: Option<usize>,
@@ -1083,6 +1087,8 @@ unsafe extern "C-unwind" fn begin_scan(
             started: false,
             fallback: std::ptr::null_mut(),
             pruned: false,
+            pruned_k: 0,
+            emitted: FxHashSet::default(),
             candidates: None,
             scored: None,
             exhaustive_score_calls: 0,
@@ -1159,6 +1165,7 @@ unsafe fn gather(exec: &mut ScanExec) {
                 exec.tids = rows.iter().map(|(_, tid)| *tid).collect();
                 exec.sorted = exec.tids.len();
                 exec.pruned = !complete;
+                exec.pruned_k = k;
                 let scorer = scorer.take().expect("checked above");
                 crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);
                 exec.next = 0;
@@ -1176,6 +1183,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             exec.tids = top.rows.iter().map(|(_, tid)| *tid).collect();
             exec.sorted = exec.tids.len();
             exec.pruned = !top.complete;
+            exec.pruned_k = k;
             let scorer = scorer.take().expect("a top k needs a scorer");
             crate::score::publish_scan_scorer(exec.scan_id, scorer, &top.rows);
             exec.next = 0;
@@ -1312,7 +1320,46 @@ unsafe fn complete(exec: &mut ScanExec) {
             ordering.term_add.clone(),
             ordering.term_replace.clone(),
         );
-        let consumed: FxHashSet<Tid> = exec.tids[..exec.next].iter().copied().collect();
+        // A scan can complete more than once, so the consumed locations accumulate.
+        let emitted: Vec<Tid> = exec.tids[..exec.next].to_vec();
+        exec.emitted.extend(emitted);
+        let consumed = exec.emitted.clone();
+        // Rows of the top k that the snapshot cannot see, such as the dead
+        // version an update leaves in the index beside its successor with the
+        // same score, send the parent past k. The same scorer's top 4k, 16k
+        // and so on extend the rows already emitted, so the search deepens
+        // before it gives up pruning and scores every match.
+        let deeper = exec.pruned_k.saturating_mul(4).max(40);
+        if exec.pruned_k > 0 && deeper <= crate::score::PRUNE_MAX_K {
+            let rows = if scorer.scores_nothing() {
+                let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
+                let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+                (!stream.recheck).then(|| {
+                    let mut rows = Vec::with_capacity(deeper);
+                    while rows.len() < deeper {
+                        match stream.next() {
+                            Some(tid) => rows.push((0.0_f32, tid)),
+                            None => break,
+                        }
+                    }
+                    let complete = rows.len() < deeper;
+                    (rows, complete)
+                })
+            } else {
+                scorer.top_k(deeper).map(|top| (top.rows, top.complete))
+            };
+            if let Some((mut rows, complete)) = rows {
+                crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);
+                rows.retain(|(_, tid)| !consumed.contains(tid));
+                exec.scores = rows.iter().map(|(score, _)| *score).collect();
+                exec.tids = rows.iter().map(|(_, tid)| *tid).collect();
+                exec.sorted = exec.tids.len();
+                exec.next = 0;
+                exec.pruned = !complete;
+                exec.pruned_k = deeper;
+                return;
+            }
+        }
         let tids = candidates(exec);
         finish(exec, tids, Some(scorer));
         let mut kept = 0;
@@ -1965,6 +2012,8 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
             exec.scores.clear();
             exec.sorted = 0;
             exec.pruned = false;
+            exec.pruned_k = 0;
+            exec.emitted.clear();
             exec.recheck = false;
             exec.candidates = None;
             exec.scored = None;
