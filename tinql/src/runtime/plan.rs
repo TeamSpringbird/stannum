@@ -25,7 +25,7 @@ use segment::index::{Expanded, Index, Window};
 use segment::payload::PayloadCursor;
 use segment::postings::PostingsCursor;
 use segment::segment::{Lengths, Term};
-use segment::set::{AtLeast, Cursor, Difference, Empty, Intersection, Union};
+use segment::set::{AtLeast, Cursor, Difference, Empty, Intersection, union};
 
 use super::eval::FuzzyMatcher;
 use super::span_expr::SpanExpr;
@@ -332,7 +332,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
             .min(u64::from(self.segment.document_count()));
         let cursors = children.into_iter().map(|child| child.cursor).collect();
         Ok(Plan {
-            cursor: Box::new(Union::new(cursors)),
+            cursor: union(cursors),
             exact,
             estimate,
         })

@@ -151,24 +151,64 @@ impl<C: Cursor> Cursor for Intersection<C> {
 /// Postings present in any input.
 pub struct Union<C> {
     cursors: Vec<C>,
-    // Inputs can only move through this union, so unchanged heads stay valid.
-    heads: Vec<Option<Tid>>,
     current: Option<Tid>,
 }
 
 impl<C: Cursor> Union<C> {
     pub fn new(cursors: Vec<C>) -> Self {
-        // Tiny unions retain the allocation-free head-selection loop.
-        let heads: Vec<_> = if cursors.len() > 2 {
-            cursors.iter().map(Cursor::current).collect()
-        } else {
-            Vec::new()
+        let mut this = Self {
+            cursors,
+            current: None,
         };
-        let current = if heads.is_empty() {
-            cursors.iter().filter_map(Cursor::current).min()
-        } else {
-            heads.iter().copied().flatten().min()
+        this.align();
+        this
+    }
+
+    fn align(&mut self) {
+        self.current = self.cursors.iter().filter_map(Cursor::current).min();
+    }
+}
+
+impl<C: Cursor> Cursor for Union<C> {
+    fn current(&self) -> Option<Tid> {
+        self.current
+    }
+    fn advance(&mut self) -> Result<()> {
+        let Some(current) = self.current else {
+            return Ok(());
         };
+        for cursor in &mut self.cursors {
+            if cursor.current() == Some(current) {
+                cursor.advance()?;
+            }
+        }
+        self.align();
+        Ok(())
+    }
+    fn seek(&mut self, target: Tid) -> Result<()> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(());
+        }
+        for cursor in &mut self.cursors {
+            cursor.seek(target)?;
+        }
+        self.align();
+        Ok(())
+    }
+}
+
+/// Union with cached input heads for wider query nodes.
+pub struct CachedUnion<C> {
+    cursors: Vec<C>,
+    // Inputs can only move through this union, so unchanged heads stay valid.
+    heads: Vec<Option<Tid>>,
+    current: Option<Tid>,
+}
+
+impl<C: Cursor> CachedUnion<C> {
+    pub fn new(cursors: Vec<C>) -> Self {
+        let heads: Vec<_> = cursors.iter().map(Cursor::current).collect();
+        let current = heads.iter().copied().flatten().min();
         Self {
             cursors,
             heads,
@@ -177,7 +217,7 @@ impl<C: Cursor> Union<C> {
     }
 }
 
-impl<C: Cursor> Cursor for Union<C> {
+impl<C: Cursor> Cursor for CachedUnion<C> {
     fn current(&self) -> Option<Tid> {
         self.current
     }
@@ -186,15 +226,6 @@ impl<C: Cursor> Cursor for Union<C> {
         let Some(current) = self.current else {
             return Ok(());
         };
-        if self.heads.is_empty() {
-            for cursor in &mut self.cursors {
-                if cursor.current() == Some(current) {
-                    cursor.advance()?;
-                }
-            }
-            self.current = self.cursors.iter().filter_map(Cursor::current).min();
-            return Ok(());
-        }
         let mut next: Option<Tid> = None;
         for (cursor, head) in self.cursors.iter_mut().zip(&mut self.heads) {
             if *head == Some(current) {
@@ -213,13 +244,6 @@ impl<C: Cursor> Cursor for Union<C> {
         if self.current.is_none_or(|current| current >= target) {
             return Ok(());
         }
-        if self.heads.is_empty() {
-            for cursor in &mut self.cursors {
-                cursor.seek(target)?;
-            }
-            self.current = self.cursors.iter().filter_map(Cursor::current).min();
-            return Ok(());
-        }
         for (cursor, head) in self.cursors.iter_mut().zip(&mut self.heads) {
             if head.is_some_and(|tid| tid < target) {
                 cursor.seek(target)?;
@@ -228,6 +252,15 @@ impl<C: Cursor> Cursor for Union<C> {
         }
         self.current = self.heads.iter().copied().flatten().min();
         Ok(())
+    }
+}
+
+/// Select the cursor once, keeping the narrow union hot loop unchanged.
+pub fn union<'a, C: Cursor + 'a>(cursors: Vec<C>) -> Box<dyn Cursor + 'a> {
+    if cursors.len() > 2 {
+        Box::new(CachedUnion::new(cursors))
+    } else {
+        Box::new(Union::new(cursors))
     }
 }
 
@@ -432,7 +465,7 @@ mod tests {
         }
         let inputs = [tids(&[1, 3, 5]), tids(&[2, 3, 6]), tids(&[])];
         let reads = Cell::new(0);
-        let union = Union::new(
+        let union = CachedUnion::new(
             inputs
                 .iter()
                 .map(|input| Observed {
@@ -459,7 +492,7 @@ mod tests {
             let mut expected: Vec<Tid> = lists.iter().flatten().copied().collect();
             expected.sort_unstable(); expected.dedup();
             let mut reference = Slice::new(&expected);
-            let mut actual = Union::new(lists.iter().map(|list| Slice::new(list)).collect());
+            let mut actual = union(lists.iter().map(|list| Slice::new(list)).collect());
             for op in operations {
                 proptest::prop_assert_eq!(actual.current(), reference.current());
                 match op {
