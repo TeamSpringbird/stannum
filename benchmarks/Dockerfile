@@ -53,5 +53,7 @@ COPY --from=builder /usr/lib/postgresql/18/lib/pg_textsearch.so /usr/lib/postgre
 COPY --from=builder /usr/share/postgresql/18/extension/pg_textsearch* /usr/share/postgresql/18/extension/
 # The campaign owns settings/extension creation; omit the distribution's auto-tuner
 # and unrelated extension bootstrap (which otherwise requires pg_cron).
-RUN rm /docker-entrypoint-initdb.d/10_bootstrap_paradedb.sh \
+# The script exists only in the ParadeDB base; another BASE, such as a
+# multi-arch postgres image for native ARM rehearsals, has nothing to remove.
+RUN rm -f /docker-entrypoint-initdb.d/10_bootstrap_paradedb.sh \
     && mkdir /benchmark && dpkg-query -W > /benchmark/packages.txt
