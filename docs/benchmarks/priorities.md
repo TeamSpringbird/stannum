@@ -206,3 +206,30 @@ The full-trace rerun of `8d0a332` retained lower aggregate time, but 12 queries
 crossed the >10% and >0.05 ms regression screen, mostly narrow unions. The next
 revision moves narrow/wide dispatch to cursor construction rather than checking
 it per posting; replay the same controls before promoting that revision.
+
+### Construction-time dispatch result
+
+`fac1ca3` chooses the original cursor for at most two inputs and a cached-head
+cursor for wider unions once during planning. Three balanced full-trace rounds:
+p50 0.813 -> 0.810 ms, p95 13.936 -> 12.016 ms, summed query medians
+972.928 -> 830.672 ms. Three queries (19, 100, 289) still crossed the >10% and
+>0.05 ms screen; targeted confirmation remains a promotion gate.
+
+Four alternating 20-second rounds per state at eight clients then completed:
+
+| Snapshot | Control QPS | Candidate QPS | Control request p95 ms | Candidate request p95 ms |
+|---|---:|---:|---:|---:|
+| Clean million rows | 2193.8 | 2419.1 | 15.469 | 13.899 |
+| Mutated | 67.6 | 67.9 | 329.316 | 320.185 |
+
+Clean throughput improved 10.3% and request p95 fell 10.1%. Mutated throughput
+is effectively unchanged and latency ranges overlap. All correctness warmups
+and request counts passed; timed query coverage was 302 clean and at least 300
+mutated. This is a local pilot, not evidence of equivalent AWS or TIN throughput.
+Frozen binaries, raw requests and reports are under
+`benchmarks/results/cached-union-r1/{planned-full-trace,planned-load}`.
+
+The next isolated experiment packs cached heads into u64 values, preserving Tid
+order with a disjoint exhaustion sentinel. It changes only in-memory comparison,
+not the disk format, and adds no explicit SIMD instructions. Compare against
+`fac1ca3` to measure incremental value rather than crediting earlier gains twice.
