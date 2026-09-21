@@ -26,6 +26,11 @@
       "Default": 8,
       "MinValue": 1,
       "MaxValue": 12
+    },
+    "AvailabilityZone": {
+      "Type": "AWS::EC2::AvailabilityZone::Name",
+      "Default": "us-east-1a",
+      "Description": "i7i.8xlarge is not offered in every zone, such as us-east-1e."
     }
   },
   "Resources": {
@@ -59,7 +64,10 @@
           "Ref": "Vpc"
         },
         "CidrBlock": "10.93.0.0/26",
-        "MapPublicIpOnLaunch": true
+        "MapPublicIpOnLaunch": true,
+        "AvailabilityZone": {
+          "Ref": "AvailabilityZone"
+        }
       }
     },
     "Routes": {
