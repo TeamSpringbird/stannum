@@ -258,3 +258,16 @@ control/candidate times were query 2 0.1095/0.1015 ms, 19 0.9430/0.9765 ms,
 initial screen without establishing statistical equivalence. Packed-head load
 validation is running; its four flagged identities have a six-round replay
 queued behind it under the same exclusive benchmark lock.
+
+Packed-head eight-client pilot completed: clean QPS 2404.3 -> 2651.6,
+request p95 13.899 -> 12.233 ms. Mutated QPS 68.6 -> 67.8 and request p95
+320.189 -> 324.492 ms with overlapping trial ranges; no dirty-state gain claim.
+All request counts passed. Six-round focused replay of 125/165/179/291 produced
+control/candidate medians 0.9205/0.8720, 0.8265/0.8500, 0.2735/0.2755 and
+0.5740/0.5670 ms; none crossed the combined regression screen.
+
+Isolated release PRs #81/#82 now exclude experimental selector instrumentation.
+Their exact builds are queued for full-corpus local sustained validation; see
+[full-corpus local tier](local-million-snapshots.md#full-corpus-local-merge-validation-tier).
+No merge decision is implied by the pilot receipts. Next execution experiment
+remains actual batch/page decoding, since wrapper-only specialization was neutral.
