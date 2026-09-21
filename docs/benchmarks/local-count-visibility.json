@@ -1,0 +1,1488 @@
+{
+  "protocol": "local-count-visibility-v1",
+  "build_profile": "release",
+  "source_commit": "54c2d9e52fe5bbabc38e0e98829207d62b1f48cf",
+  "library_sha256": "53440a7e26db6416df6e083746ea3e5e804d5eb9679e2e9165b88be412e2071a",
+  "input_sha256": "656bf88b412a91d2148a4628831814586e07a67ff74e684426e6db4a3890c7c6",
+  "rows": 100000,
+  "server_version": "18.6 (Homebrew)",
+  "host": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "phases": [
+    {
+      "name": "vacuumed",
+      "before": {
+        "rows": 100000,
+        "visibility": {
+          "all_visible": 10258,
+          "all_frozen": 0
+        },
+        "segments": [
+          {
+            "ordinal": 0,
+            "kind": "immutable",
+            "root_block": 2868,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5970834,
+            "total_pages": 2867,
+            "generation": 1
+          },
+          {
+            "ordinal": 1,
+            "kind": "immutable",
+            "root_block": 5689,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5910198,
+            "total_pages": 2819,
+            "generation": 2
+          },
+          {
+            "ordinal": 2,
+            "kind": "immutable",
+            "root_block": 8707,
+            "docs": 28381,
+            "dead_docs": 0,
+            "sum_doc_lengths": 6422123,
+            "total_pages": 3016,
+            "generation": 3
+          }
+        ]
+      },
+      "after": {
+        "rows": 100000,
+        "visibility": {
+          "all_visible": 10258,
+          "all_frozen": 0
+        },
+        "segments": [
+          {
+            "ordinal": 0,
+            "kind": "immutable",
+            "root_block": 2868,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5970834,
+            "total_pages": 2867,
+            "generation": 1
+          },
+          {
+            "ordinal": 1,
+            "kind": "immutable",
+            "root_block": 5689,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5910198,
+            "total_pages": 2819,
+            "generation": 2
+          },
+          {
+            "ordinal": 2,
+            "kind": "immutable",
+            "root_block": 8707,
+            "docs": 28381,
+            "dead_docs": 0,
+            "sum_doc_lengths": 6422123,
+            "total_pages": 3016,
+            "generation": 3
+          }
+        ]
+      },
+      "queries": [
+        {
+          "id": "302:disjunction",
+          "text": "a search engine is an information retrieval software system designed to help find information stored on one or more computer systems",
+          "exact_count": 91121,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 6.666,
+              "min_ms": 6.44,
+              "max_ms": 7.7,
+              "heap_fetches": 0,
+              "shared_hits": 151,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 3.556,
+              "min_ms": 3.442,
+              "max_ms": 3.783,
+              "heap_fetches": 0,
+              "shared_hits": 151,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.8745781777277841
+        },
+        {
+          "id": "88:disjunction",
+          "text": "american academy of child and adolescent psychiatry",
+          "exact_count": 81380,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 2.359,
+              "min_ms": 2.324,
+              "max_ms": 2.623,
+              "heap_fetches": 0,
+              "shared_hits": 65,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 1.527,
+              "min_ms": 1.495,
+              "max_ms": 1.792,
+              "heap_fetches": 0,
+              "shared_hits": 65,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.5448592010478062
+        },
+        {
+          "id": "301:disjunction",
+          "text": "to be or not to be",
+          "exact_count": 59278,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 1.734,
+              "min_ms": 1.624,
+              "max_ms": 1.825,
+              "heap_fetches": 0,
+              "shared_hits": 42,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 1.393,
+              "min_ms": 1.35,
+              "max_ms": 1.665,
+              "heap_fetches": 0,
+              "shared_hits": 42,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.2447954055994257
+        },
+        {
+          "id": "222:disjunction",
+          "text": "ambassador of italy",
+          "exact_count": 73531,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 1.359,
+              "min_ms": 1.238,
+              "max_ms": 1.553,
+              "heap_fetches": 0,
+              "shared_hits": 32,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 1.022,
+              "min_ms": 0.906,
+              "max_ms": 1.147,
+              "heap_fetches": 0,
+              "shared_hits": 32,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.3297455968688845
+        },
+        {
+          "id": "197:disjunction",
+          "text": "ford parts",
+          "exact_count": 2077,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 0.134,
+              "min_ms": 0.118,
+              "max_ms": 0.179,
+              "heap_fetches": 0,
+              "shared_hits": 10,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 0.176,
+              "min_ms": 0.155,
+              "max_ms": 0.208,
+              "heap_fetches": 0,
+              "shared_hits": 10,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 0.7613636363636365
+        },
+        {
+          "id": "251:disjunction",
+          "text": "foam mattress",
+          "exact_count": 40,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 0.081,
+              "min_ms": 0.068,
+              "max_ms": 0.164,
+              "heap_fetches": 0,
+              "shared_hits": 10,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 0.082,
+              "min_ms": 0.066,
+              "max_ms": 0.113,
+              "heap_fetches": 0,
+              "shared_hits": 10,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 0.9878048780487805
+        }
+      ]
+    },
+    {
+      "name": "vacuumed-repeat",
+      "before": {
+        "rows": 100000,
+        "visibility": {
+          "all_visible": 10258,
+          "all_frozen": 0
+        },
+        "segments": [
+          {
+            "ordinal": 0,
+            "kind": "immutable",
+            "root_block": 2868,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5970834,
+            "total_pages": 2867,
+            "generation": 1
+          },
+          {
+            "ordinal": 1,
+            "kind": "immutable",
+            "root_block": 5689,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5910198,
+            "total_pages": 2819,
+            "generation": 2
+          },
+          {
+            "ordinal": 2,
+            "kind": "immutable",
+            "root_block": 8707,
+            "docs": 28381,
+            "dead_docs": 0,
+            "sum_doc_lengths": 6422123,
+            "total_pages": 3016,
+            "generation": 3
+          }
+        ]
+      },
+      "after": {
+        "rows": 100000,
+        "visibility": {
+          "all_visible": 10258,
+          "all_frozen": 0
+        },
+        "segments": [
+          {
+            "ordinal": 0,
+            "kind": "immutable",
+            "root_block": 2868,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5970834,
+            "total_pages": 2867,
+            "generation": 1
+          },
+          {
+            "ordinal": 1,
+            "kind": "immutable",
+            "root_block": 5689,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5910198,
+            "total_pages": 2819,
+            "generation": 2
+          },
+          {
+            "ordinal": 2,
+            "kind": "immutable",
+            "root_block": 8707,
+            "docs": 28381,
+            "dead_docs": 0,
+            "sum_doc_lengths": 6422123,
+            "total_pages": 3016,
+            "generation": 3
+          }
+        ]
+      },
+      "queries": [
+        {
+          "id": "302:disjunction",
+          "text": "a search engine is an information retrieval software system designed to help find information stored on one or more computer systems",
+          "exact_count": 91121,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 6.622,
+              "min_ms": 6.493,
+              "max_ms": 6.919,
+              "heap_fetches": 0,
+              "shared_hits": 151,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 3.479,
+              "min_ms": 3.427,
+              "max_ms": 3.864,
+              "heap_fetches": 0,
+              "shared_hits": 151,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.9034205231388328
+        },
+        {
+          "id": "88:disjunction",
+          "text": "american academy of child and adolescent psychiatry",
+          "exact_count": 81380,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 2.348,
+              "min_ms": 2.331,
+              "max_ms": 3.218,
+              "heap_fetches": 0,
+              "shared_hits": 65,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 1.508,
+              "min_ms": 1.492,
+              "max_ms": 1.572,
+              "heap_fetches": 0,
+              "shared_hits": 65,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.5570291777188328
+        },
+        {
+          "id": "301:disjunction",
+          "text": "to be or not to be",
+          "exact_count": 59278,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 1.535,
+              "min_ms": 1.522,
+              "max_ms": 1.577,
+              "heap_fetches": 0,
+              "shared_hits": 42,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 1.292,
+              "min_ms": 1.283,
+              "max_ms": 1.369,
+              "heap_fetches": 0,
+              "shared_hits": 42,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.188080495356037
+        },
+        {
+          "id": "222:disjunction",
+          "text": "ambassador of italy",
+          "exact_count": 73531,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 1.178,
+              "min_ms": 1.151,
+              "max_ms": 1.202,
+              "heap_fetches": 0,
+              "shared_hits": 32,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 0.874,
+              "min_ms": 0.865,
+              "max_ms": 0.883,
+              "heap_fetches": 0,
+              "shared_hits": 32,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.3478260869565217
+        },
+        {
+          "id": "197:disjunction",
+          "text": "ford parts",
+          "exact_count": 2077,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 0.112,
+              "min_ms": 0.107,
+              "max_ms": 0.132,
+              "heap_fetches": 0,
+              "shared_hits": 10,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 0.15,
+              "min_ms": 0.146,
+              "max_ms": 0.153,
+              "heap_fetches": 0,
+              "shared_hits": 10,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 0.7466666666666667
+        },
+        {
+          "id": "251:disjunction",
+          "text": "foam mattress",
+          "exact_count": 40,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 0.062,
+              "min_ms": 0.06,
+              "max_ms": 0.066,
+              "heap_fetches": 0,
+              "shared_hits": 10,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 0.061,
+              "min_ms": 0.059,
+              "max_ms": 0.077,
+              "heap_fetches": 0,
+              "shared_hits": 10,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.0163934426229508
+        }
+      ]
+    },
+    {
+      "name": "mutated",
+      "before": {
+        "rows": 99010,
+        "visibility": {
+          "all_visible": 1123,
+          "all_frozen": 0
+        },
+        "segments": [
+          {
+            "ordinal": 0,
+            "kind": "immutable",
+            "root_block": 2868,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5970834,
+            "total_pages": 2867,
+            "generation": 1
+          },
+          {
+            "ordinal": 1,
+            "kind": "immutable",
+            "root_block": 5689,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5910198,
+            "total_pages": 2819,
+            "generation": 2
+          },
+          {
+            "ordinal": 2,
+            "kind": "immutable",
+            "root_block": 8707,
+            "docs": 28381,
+            "dead_docs": 0,
+            "sum_doc_lengths": 6422123,
+            "total_pages": 3016,
+            "generation": 3
+          },
+          {
+            "ordinal": 3,
+            "kind": "immutable",
+            "root_block": 8851,
+            "docs": 483,
+            "dead_docs": 0,
+            "sum_doc_lengths": 108200,
+            "total_pages": 78,
+            "generation": 4
+          },
+          {
+            "ordinal": 4,
+            "kind": "immutable",
+            "root_block": 8909,
+            "docs": 489,
+            "dead_docs": 0,
+            "sum_doc_lengths": 68945,
+            "total_pages": 57,
+            "generation": 5
+          },
+          {
+            "ordinal": 5,
+            "kind": "immutable",
+            "root_block": 8978,
+            "docs": 480,
+            "dead_docs": 0,
+            "sum_doc_lengths": 93429,
+            "total_pages": 68,
+            "generation": 6
+          },
+          {
+            "ordinal": 6,
+            "kind": "immutable",
+            "root_block": 9045,
+            "docs": 481,
+            "dead_docs": 0,
+            "sum_doc_lengths": 88544,
+            "total_pages": 66,
+            "generation": 7
+          },
+          {
+            "ordinal": 7,
+            "kind": "immutable",
+            "root_block": 9112,
+            "docs": 478,
+            "dead_docs": 0,
+            "sum_doc_lengths": 90059,
+            "total_pages": 66,
+            "generation": 8
+          },
+          {
+            "ordinal": 8,
+            "kind": "immutable",
+            "root_block": 9169,
+            "docs": 480,
+            "dead_docs": 0,
+            "sum_doc_lengths": 71683,
+            "total_pages": 56,
+            "generation": 9
+          },
+          {
+            "ordinal": 9,
+            "kind": "immutable",
+            "root_block": 9238,
+            "docs": 492,
+            "dead_docs": 0,
+            "sum_doc_lengths": 91892,
+            "total_pages": 68,
+            "generation": 10
+          },
+          {
+            "ordinal": 10,
+            "kind": "immutable",
+            "root_block": 9305,
+            "docs": 498,
+            "dead_docs": 0,
+            "sum_doc_lengths": 92658,
+            "total_pages": 66,
+            "generation": 11
+          },
+          {
+            "ordinal": 11,
+            "kind": "immutable",
+            "root_block": 9371,
+            "docs": 484,
+            "dead_docs": 0,
+            "sum_doc_lengths": 88859,
+            "total_pages": 65,
+            "generation": 12
+          },
+          {
+            "ordinal": 12,
+            "kind": "immutable",
+            "root_block": 9434,
+            "docs": 479,
+            "dead_docs": 0,
+            "sum_doc_lengths": 85514,
+            "total_pages": 62,
+            "generation": 13
+          },
+          {
+            "ordinal": 13,
+            "kind": "immutable",
+            "root_block": 9499,
+            "docs": 477,
+            "dead_docs": 0,
+            "sum_doc_lengths": 85975,
+            "total_pages": 64,
+            "generation": 14
+          },
+          {
+            "ordinal": 14,
+            "kind": "immutable",
+            "root_block": 9565,
+            "docs": 479,
+            "dead_docs": 0,
+            "sum_doc_lengths": 88921,
+            "total_pages": 65,
+            "generation": 15
+          },
+          {
+            "ordinal": 15,
+            "kind": "immutable",
+            "root_block": 9636,
+            "docs": 479,
+            "dead_docs": 0,
+            "sum_doc_lengths": 96767,
+            "total_pages": 70,
+            "generation": 16
+          },
+          {
+            "ordinal": 16,
+            "kind": "immutable",
+            "root_block": 9698,
+            "docs": 488,
+            "dead_docs": 0,
+            "sum_doc_lengths": 79754,
+            "total_pages": 61,
+            "generation": 17
+          },
+          {
+            "ordinal": 17,
+            "kind": "immutable",
+            "root_block": 9767,
+            "docs": 484,
+            "dead_docs": 0,
+            "sum_doc_lengths": 93212,
+            "total_pages": 68,
+            "generation": 18
+          },
+          {
+            "ordinal": 18,
+            "kind": "immutable",
+            "root_block": 9843,
+            "docs": 472,
+            "dead_docs": 0,
+            "sum_doc_lengths": 104406,
+            "total_pages": 75,
+            "generation": 19
+          },
+          {
+            "ordinal": 19,
+            "kind": "immutable",
+            "root_block": 9927,
+            "docs": 466,
+            "dead_docs": 0,
+            "sum_doc_lengths": 118059,
+            "total_pages": 81,
+            "generation": 20
+          },
+          {
+            "ordinal": 20,
+            "kind": "immutable",
+            "root_block": 10023,
+            "docs": 485,
+            "dead_docs": 0,
+            "sum_doc_lengths": 131849,
+            "total_pages": 89,
+            "generation": 21
+          },
+          {
+            "ordinal": 21,
+            "kind": "immutable",
+            "root_block": 10096,
+            "docs": 479,
+            "dead_docs": 0,
+            "sum_doc_lengths": 100174,
+            "total_pages": 72,
+            "generation": 22
+          },
+          {
+            "ordinal": 22,
+            "kind": "mutable",
+            "root_block": 1,
+            "docs": 422,
+            "dead_docs": 0,
+            "sum_doc_lengths": 91264,
+            "total_pages": 54,
+            "generation": 10169
+          }
+        ]
+      },
+      "after": {
+        "rows": 99010,
+        "visibility": {
+          "all_visible": 1123,
+          "all_frozen": 0
+        },
+        "segments": [
+          {
+            "ordinal": 0,
+            "kind": "immutable",
+            "root_block": 2868,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5970834,
+            "total_pages": 2867,
+            "generation": 1
+          },
+          {
+            "ordinal": 1,
+            "kind": "immutable",
+            "root_block": 5689,
+            "docs": 32768,
+            "dead_docs": 0,
+            "sum_doc_lengths": 5910198,
+            "total_pages": 2819,
+            "generation": 2
+          },
+          {
+            "ordinal": 2,
+            "kind": "immutable",
+            "root_block": 8707,
+            "docs": 28381,
+            "dead_docs": 0,
+            "sum_doc_lengths": 6422123,
+            "total_pages": 3016,
+            "generation": 3
+          },
+          {
+            "ordinal": 3,
+            "kind": "immutable",
+            "root_block": 8851,
+            "docs": 483,
+            "dead_docs": 0,
+            "sum_doc_lengths": 108200,
+            "total_pages": 78,
+            "generation": 4
+          },
+          {
+            "ordinal": 4,
+            "kind": "immutable",
+            "root_block": 8909,
+            "docs": 489,
+            "dead_docs": 0,
+            "sum_doc_lengths": 68945,
+            "total_pages": 57,
+            "generation": 5
+          },
+          {
+            "ordinal": 5,
+            "kind": "immutable",
+            "root_block": 8978,
+            "docs": 480,
+            "dead_docs": 0,
+            "sum_doc_lengths": 93429,
+            "total_pages": 68,
+            "generation": 6
+          },
+          {
+            "ordinal": 6,
+            "kind": "immutable",
+            "root_block": 9045,
+            "docs": 481,
+            "dead_docs": 0,
+            "sum_doc_lengths": 88544,
+            "total_pages": 66,
+            "generation": 7
+          },
+          {
+            "ordinal": 7,
+            "kind": "immutable",
+            "root_block": 9112,
+            "docs": 478,
+            "dead_docs": 0,
+            "sum_doc_lengths": 90059,
+            "total_pages": 66,
+            "generation": 8
+          },
+          {
+            "ordinal": 8,
+            "kind": "immutable",
+            "root_block": 9169,
+            "docs": 480,
+            "dead_docs": 0,
+            "sum_doc_lengths": 71683,
+            "total_pages": 56,
+            "generation": 9
+          },
+          {
+            "ordinal": 9,
+            "kind": "immutable",
+            "root_block": 9238,
+            "docs": 492,
+            "dead_docs": 0,
+            "sum_doc_lengths": 91892,
+            "total_pages": 68,
+            "generation": 10
+          },
+          {
+            "ordinal": 10,
+            "kind": "immutable",
+            "root_block": 9305,
+            "docs": 498,
+            "dead_docs": 0,
+            "sum_doc_lengths": 92658,
+            "total_pages": 66,
+            "generation": 11
+          },
+          {
+            "ordinal": 11,
+            "kind": "immutable",
+            "root_block": 9371,
+            "docs": 484,
+            "dead_docs": 0,
+            "sum_doc_lengths": 88859,
+            "total_pages": 65,
+            "generation": 12
+          },
+          {
+            "ordinal": 12,
+            "kind": "immutable",
+            "root_block": 9434,
+            "docs": 479,
+            "dead_docs": 0,
+            "sum_doc_lengths": 85514,
+            "total_pages": 62,
+            "generation": 13
+          },
+          {
+            "ordinal": 13,
+            "kind": "immutable",
+            "root_block": 9499,
+            "docs": 477,
+            "dead_docs": 0,
+            "sum_doc_lengths": 85975,
+            "total_pages": 64,
+            "generation": 14
+          },
+          {
+            "ordinal": 14,
+            "kind": "immutable",
+            "root_block": 9565,
+            "docs": 479,
+            "dead_docs": 0,
+            "sum_doc_lengths": 88921,
+            "total_pages": 65,
+            "generation": 15
+          },
+          {
+            "ordinal": 15,
+            "kind": "immutable",
+            "root_block": 9636,
+            "docs": 479,
+            "dead_docs": 0,
+            "sum_doc_lengths": 96767,
+            "total_pages": 70,
+            "generation": 16
+          },
+          {
+            "ordinal": 16,
+            "kind": "immutable",
+            "root_block": 9698,
+            "docs": 488,
+            "dead_docs": 0,
+            "sum_doc_lengths": 79754,
+            "total_pages": 61,
+            "generation": 17
+          },
+          {
+            "ordinal": 17,
+            "kind": "immutable",
+            "root_block": 9767,
+            "docs": 484,
+            "dead_docs": 0,
+            "sum_doc_lengths": 93212,
+            "total_pages": 68,
+            "generation": 18
+          },
+          {
+            "ordinal": 18,
+            "kind": "immutable",
+            "root_block": 9843,
+            "docs": 472,
+            "dead_docs": 0,
+            "sum_doc_lengths": 104406,
+            "total_pages": 75,
+            "generation": 19
+          },
+          {
+            "ordinal": 19,
+            "kind": "immutable",
+            "root_block": 9927,
+            "docs": 466,
+            "dead_docs": 0,
+            "sum_doc_lengths": 118059,
+            "total_pages": 81,
+            "generation": 20
+          },
+          {
+            "ordinal": 20,
+            "kind": "immutable",
+            "root_block": 10023,
+            "docs": 485,
+            "dead_docs": 0,
+            "sum_doc_lengths": 131849,
+            "total_pages": 89,
+            "generation": 21
+          },
+          {
+            "ordinal": 21,
+            "kind": "immutable",
+            "root_block": 10096,
+            "docs": 479,
+            "dead_docs": 0,
+            "sum_doc_lengths": 100174,
+            "total_pages": 72,
+            "generation": 22
+          },
+          {
+            "ordinal": 22,
+            "kind": "mutable",
+            "root_block": 1,
+            "docs": 422,
+            "dead_docs": 0,
+            "sum_doc_lengths": 91264,
+            "total_pages": 54,
+            "generation": 10169
+          }
+        ]
+      },
+      "queries": [
+        {
+          "id": "302:disjunction",
+          "text": "a search engine is an information retrieval software system designed to help find information stored on one or more computer systems",
+          "exact_count": 90225,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 22.993,
+              "min_ms": 22.398,
+              "max_ms": 23.98,
+              "heap_fetches": 83122,
+              "shared_hits": 9912,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 19.706,
+              "min_ms": 19.411,
+              "max_ms": 21.674,
+              "heap_fetches": 83122,
+              "shared_hits": 9912,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.1668019892418553
+        },
+        {
+          "id": "88:disjunction",
+          "text": "american academy of child and adolescent psychiatry",
+          "exact_count": 80577,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 15.549,
+              "min_ms": 13.603,
+              "max_ms": 15.789,
+              "heap_fetches": 73858,
+              "shared_hits": 9567,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 13.838,
+              "min_ms": 12.983,
+              "max_ms": 15.043,
+              "heap_fetches": 73858,
+              "shared_hits": 9567,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.1236450354097414
+        },
+        {
+          "id": "301:disjunction",
+          "text": "to be or not to be",
+          "exact_count": 58690,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 11.698,
+              "min_ms": 10.517,
+              "max_ms": 12.72,
+              "heap_fetches": 53230,
+              "shared_hits": 9518,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 11.363,
+              "min_ms": 10.356,
+              "max_ms": 12.605,
+              "heap_fetches": 53230,
+              "shared_hits": 9518,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.0294816509724545
+        },
+        {
+          "id": "222:disjunction",
+          "text": "ambassador of italy",
+          "exact_count": 72796,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 13.004,
+              "min_ms": 11.378,
+              "max_ms": 16.243,
+              "heap_fetches": 66520,
+              "shared_hits": 9488,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 11.604,
+              "min_ms": 11.134,
+              "max_ms": 13.689,
+              "heap_fetches": 66520,
+              "shared_hits": 9488,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.1206480523957256
+        },
+        {
+          "id": "197:disjunction",
+          "text": "ford parts",
+          "exact_count": 2051,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 1.794,
+              "min_ms": 1.538,
+              "max_ms": 1.94,
+              "heap_fetches": 1876,
+              "shared_hits": 1800,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 1.939,
+              "min_ms": 1.67,
+              "max_ms": 2.179,
+              "heap_fetches": 1876,
+              "shared_hits": 1800,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 0.925219185146983
+        },
+        {
+          "id": "251:disjunction",
+          "text": "foam mattress",
+          "exact_count": 40,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 0.15,
+              "min_ms": 0.136,
+              "max_ms": 0.16,
+              "heap_fetches": 35,
+              "shared_hits": 49,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 0.155,
+              "min_ms": 0.132,
+              "max_ms": 0.186,
+              "heap_fetches": 35,
+              "shared_hits": 49,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 0.9677419354838709
+        }
+      ]
+    },
+    {
+      "name": "revacuumed",
+      "before": {
+        "rows": 99010,
+        "visibility": {
+          "all_visible": 10522,
+          "all_frozen": 0
+        },
+        "segments": [
+          {
+            "ordinal": 0,
+            "kind": "immutable",
+            "root_block": 2868,
+            "docs": 32768,
+            "dead_docs": 3617,
+            "sum_doc_lengths": 5970834,
+            "total_pages": 2868,
+            "generation": 1
+          },
+          {
+            "ordinal": 1,
+            "kind": "immutable",
+            "root_block": 5689,
+            "docs": 32768,
+            "dead_docs": 3616,
+            "sum_doc_lengths": 5910198,
+            "total_pages": 2820,
+            "generation": 2
+          },
+          {
+            "ordinal": 2,
+            "kind": "immutable",
+            "root_block": 8707,
+            "docs": 28381,
+            "dead_docs": 3134,
+            "sum_doc_lengths": 6422123,
+            "total_pages": 3017,
+            "generation": 3
+          },
+          {
+            "ordinal": 3,
+            "kind": "immutable",
+            "root_block": 9927,
+            "docs": 466,
+            "dead_docs": 4,
+            "sum_doc_lengths": 118059,
+            "total_pages": 82,
+            "generation": 20
+          },
+          {
+            "ordinal": 4,
+            "kind": "immutable",
+            "root_block": 10023,
+            "docs": 485,
+            "dead_docs": 5,
+            "sum_doc_lengths": 131849,
+            "total_pages": 90,
+            "generation": 21
+          },
+          {
+            "ordinal": 5,
+            "kind": "immutable",
+            "root_block": 10096,
+            "docs": 479,
+            "dead_docs": 4,
+            "sum_doc_lengths": 100174,
+            "total_pages": 73,
+            "generation": 22
+          },
+          {
+            "ordinal": 6,
+            "kind": "immutable",
+            "root_block": 10521,
+            "docs": 3842,
+            "dead_docs": 0,
+            "sum_doc_lengths": 698965,
+            "total_pages": 402,
+            "generation": 23
+          },
+          {
+            "ordinal": 7,
+            "kind": "immutable",
+            "root_block": 10926,
+            "docs": 3802,
+            "dead_docs": 0,
+            "sum_doc_lengths": 715148,
+            "total_pages": 404,
+            "generation": 24
+          },
+          {
+            "ordinal": 8,
+            "kind": "mutable",
+            "root_block": 1,
+            "docs": 418,
+            "dead_docs": 0,
+            "sum_doc_lengths": 90370,
+            "total_pages": 54,
+            "generation": 10171
+          }
+        ]
+      },
+      "after": {
+        "rows": 99010,
+        "visibility": {
+          "all_visible": 10522,
+          "all_frozen": 0
+        },
+        "segments": [
+          {
+            "ordinal": 0,
+            "kind": "immutable",
+            "root_block": 2868,
+            "docs": 32768,
+            "dead_docs": 3617,
+            "sum_doc_lengths": 5970834,
+            "total_pages": 2868,
+            "generation": 1
+          },
+          {
+            "ordinal": 1,
+            "kind": "immutable",
+            "root_block": 5689,
+            "docs": 32768,
+            "dead_docs": 3616,
+            "sum_doc_lengths": 5910198,
+            "total_pages": 2820,
+            "generation": 2
+          },
+          {
+            "ordinal": 2,
+            "kind": "immutable",
+            "root_block": 8707,
+            "docs": 28381,
+            "dead_docs": 3134,
+            "sum_doc_lengths": 6422123,
+            "total_pages": 3017,
+            "generation": 3
+          },
+          {
+            "ordinal": 3,
+            "kind": "immutable",
+            "root_block": 9927,
+            "docs": 466,
+            "dead_docs": 4,
+            "sum_doc_lengths": 118059,
+            "total_pages": 82,
+            "generation": 20
+          },
+          {
+            "ordinal": 4,
+            "kind": "immutable",
+            "root_block": 10023,
+            "docs": 485,
+            "dead_docs": 5,
+            "sum_doc_lengths": 131849,
+            "total_pages": 90,
+            "generation": 21
+          },
+          {
+            "ordinal": 5,
+            "kind": "immutable",
+            "root_block": 10096,
+            "docs": 479,
+            "dead_docs": 4,
+            "sum_doc_lengths": 100174,
+            "total_pages": 73,
+            "generation": 22
+          },
+          {
+            "ordinal": 6,
+            "kind": "immutable",
+            "root_block": 10521,
+            "docs": 3842,
+            "dead_docs": 0,
+            "sum_doc_lengths": 698965,
+            "total_pages": 402,
+            "generation": 23
+          },
+          {
+            "ordinal": 7,
+            "kind": "immutable",
+            "root_block": 10926,
+            "docs": 3802,
+            "dead_docs": 0,
+            "sum_doc_lengths": 715148,
+            "total_pages": 404,
+            "generation": 24
+          },
+          {
+            "ordinal": 8,
+            "kind": "mutable",
+            "root_block": 1,
+            "docs": 418,
+            "dead_docs": 0,
+            "sum_doc_lengths": 90370,
+            "total_pages": 54,
+            "generation": 10171
+          }
+        ]
+      },
+      "queries": [
+        {
+          "id": "302:disjunction",
+          "text": "a search engine is an information retrieval software system designed to help find information stored on one or more computer systems",
+          "exact_count": 90225,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 9.192,
+              "min_ms": 8.836,
+              "max_ms": 10.168,
+              "heap_fetches": 0,
+              "shared_hits": 162,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 5.296,
+              "min_ms": 5.194,
+              "max_ms": 5.718,
+              "heap_fetches": 0,
+              "shared_hits": 162,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.7356495468277946
+        },
+        {
+          "id": "88:disjunction",
+          "text": "american academy of child and adolescent psychiatry",
+          "exact_count": 80577,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 4.141,
+              "min_ms": 3.983,
+              "max_ms": 4.348,
+              "heap_fetches": 0,
+              "shared_hits": 70,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 2.754,
+              "min_ms": 2.454,
+              "max_ms": 2.848,
+              "heap_fetches": 0,
+              "shared_hits": 70,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.5036310820624545
+        },
+        {
+          "id": "301:disjunction",
+          "text": "to be or not to be",
+          "exact_count": 58690,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 2.744,
+              "min_ms": 2.605,
+              "max_ms": 3.051,
+              "heap_fetches": 0,
+              "shared_hits": 53,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 2.009,
+              "min_ms": 1.956,
+              "max_ms": 2.177,
+              "heap_fetches": 0,
+              "shared_hits": 53,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.3658536585365855
+        },
+        {
+          "id": "222:disjunction",
+          "text": "ambassador of italy",
+          "exact_count": 72796,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 2.349,
+              "min_ms": 2.305,
+              "max_ms": 2.934,
+              "heap_fetches": 0,
+              "shared_hits": 34,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 1.471,
+              "min_ms": 1.434,
+              "max_ms": 1.841,
+              "heap_fetches": 0,
+              "shared_hits": 34,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.5968728755948336
+        },
+        {
+          "id": "197:disjunction",
+          "text": "ford parts",
+          "exact_count": 2051,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 0.19,
+              "min_ms": 0.182,
+              "max_ms": 0.198,
+              "heap_fetches": 0,
+              "shared_hits": 8,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 0.28,
+              "min_ms": 0.274,
+              "max_ms": 0.411,
+              "heap_fetches": 0,
+              "shared_hits": 8,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 0.6785714285714285
+        },
+        {
+          "id": "251:disjunction",
+          "text": "foam mattress",
+          "exact_count": 40,
+          "modes": {
+            "off": {
+              "strategy": "scalar",
+              "median_ms": 0.106,
+              "min_ms": 0.095,
+              "max_ms": 0.16,
+              "heap_fetches": 0,
+              "shared_hits": 5,
+              "shared_reads": 0
+            },
+            "on": {
+              "strategy": "page bitmaps",
+              "median_ms": 0.102,
+              "min_ms": 0.096,
+              "max_ms": 0.126,
+              "heap_fetches": 0,
+              "shared_hits": 5,
+              "shared_reads": 0
+            }
+          },
+          "default_over_forced": 1.0392156862745099
+        }
+      ]
+    }
+  ]
+}

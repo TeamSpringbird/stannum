@@ -949,6 +949,10 @@
     "benchmarks/test_count_fuzz.py": {
       "owner": "ben",
       "evidence": "New Stannum seeded Boolean and concurrent-snapshot correctness harness; not copied from Lead."
+    },
+    "benchmarks/count_local.py": {
+      "owner": "ben",
+      "evidence": "New owned local count execution and visibility diagnostic runner; not copied from Lead."
     }
   }
 }
