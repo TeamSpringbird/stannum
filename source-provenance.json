@@ -993,6 +993,10 @@
     "benchmarks/snapshot_candidate_local.py": {
       "owner": "ben",
       "evidence": "Original native PostgreSQL physical snapshot and candidate-binary compatibility rehearsal."
+    },
+    "benchmarks/snapshot_latency_local.py": {
+      "owner": "ben",
+      "evidence": "Original balanced local snapshot latency comparison harness."
     }
   }
 }
