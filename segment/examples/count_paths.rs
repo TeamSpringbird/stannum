@@ -200,6 +200,8 @@ fn fixture(
         let source = ((u64::from(block) * 9) / u64::from(pages)) as usize;
         for offset in 1..=per_page {
             let tid = Tid { block, offset };
+            // `term` indexes two sources' builders and seeds the hash.
+            #[allow(clippy::needless_range_loop)]
             for term in 0..width {
                 let mut hash = (u64::from(block) * 317 + u64::from(offset))
                     .wrapping_add(term as u64 * 0x9e3779b9);
