@@ -104,6 +104,76 @@ pub fn prefers_pages<I: Index + ?Sized>(query: &Query, segment: &I) -> Result<bo
     })
 }
 
+/// Bounded, metadata-only features for experimental count selection. Counts
+/// include duplicates and dead entries: they estimate input work, not results.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CountEstimate {
+    pub leaves: usize,
+    pub sources: usize,
+    pub lookups: usize,
+    pub postings: u64,
+    pub min_postings: Option<u32>,
+    pub supported: bool,
+}
+
+impl CountEstimate {
+    /// Zero disables the experimental rule. This is a calibration parameter,
+    /// not a validated universal crossover. Never overrides an existing page choice.
+    pub fn choose_pages(&self, default_pages: bool, threshold: u64) -> bool {
+        default_pages || (self.supported && threshold > 0 && self.postings >= threshold)
+    }
+}
+
+/// Only plain term ORs are eligible. Bound tree traversal and dictionary reads;
+/// no expansion, posting decode, visibility reads, or sampling is performed.
+pub fn estimate_count_disjunction<I: Index + ?Sized>(
+    query: &Query,
+    sources: &[&I],
+) -> Result<CountEstimate> {
+    let mut estimate = CountEstimate {
+        sources: sources.len(),
+        ..Default::default()
+    };
+    let mut pending = vec![query];
+    let mut terms = Vec::new();
+    let mut visited = 0;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > 256 {
+            return Ok(estimate);
+        }
+        match node {
+            Query::Term(term) => terms.push(term),
+            Query::Or(a, b) => {
+                pending.push(a);
+                pending.push(b);
+            }
+            Query::Disjunction { min: 1, children } | Query::AtLeast { min: 1, children } => {
+                if children.len() + pending.len() > 256 {
+                    return Ok(estimate);
+                }
+                pending.extend(children);
+            }
+            Query::Boost { inner, .. } => pending.push(inner),
+            _ => return Ok(estimate),
+        }
+    }
+    estimate.leaves = terms.len();
+    if terms.len() < 2 || terms.len().saturating_mul(sources.len()) > 1024 {
+        return Ok(estimate);
+    }
+    for source in sources {
+        for term in &terms {
+            let df = source.term(term)?.map_or(0, |term| term.df());
+            estimate.lookups += 1;
+            estimate.postings += u64::from(df);
+            estimate.min_postings = Some(estimate.min_postings.map_or(df, |min| min.min(df)));
+        }
+    }
+    estimate.supported = true;
+    Ok(estimate)
+}
+
 /// A page-oriented plan. Exactness has the same meaning as [`Plan`].
 pub struct PagePlan<'a> {
     pub cursor: Box<dyn segment::pages::Cursor + 'a>,
@@ -1089,6 +1159,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn count_estimation_is_bounded_and_falls_back() {
+        let bytes = build(&["alpha beta", "alpha", "gamma"]);
+        let segment = Segment::parse(&bytes).unwrap();
+        let query = Query::Or(
+            Box::new(Query::Term("alpha".into())),
+            Box::new(Query::Term("beta".into())),
+        );
+        let estimate = estimate_count_disjunction(&query, &[&segment]).unwrap();
+        assert!(estimate.supported);
+        assert_eq!(estimate.postings, 3);
+        assert_eq!(estimate.min_postings, Some(1));
+        assert_eq!(estimate.lookups, 2);
+        assert!(!estimate.choose_pages(false, 0));
+        assert!(!estimate.choose_pages(false, 4));
+        assert!(estimate.choose_pages(false, 3));
+        assert!(estimate.choose_pages(true, 0));
+        let unsupported = Query::Not(Box::new(query.clone()));
+        let estimate = estimate_count_disjunction(&unsupported, &[&segment]).unwrap();
+        assert!(!estimate.supported);
+        assert_eq!(estimate.lookups, 0);
+        assert!(!estimate.choose_pages(false, 1));
+        let wide = Query::Disjunction {
+            min: 1,
+            children: vec![query.clone(); 257],
+        };
+        assert!(
+            !estimate_count_disjunction(&wide, &[&segment])
+                .unwrap()
+                .supported
+        );
+        let sources = vec![&segment; 513];
+        let estimate = estimate_count_disjunction(&query, &sources).unwrap();
+        assert!(!estimate.supported);
+        assert_eq!(estimate.lookups, 0);
+        let absent = Query::Or(
+            Box::new(Query::Term("missing".into())),
+            Box::new(Query::Term("absent".into())),
+        );
+        let estimate = estimate_count_disjunction(&absent, &[&segment]).unwrap();
+        assert!(estimate.supported);
+        assert_eq!(estimate.postings, 0);
+        assert!(!estimate.choose_pages(false, 1));
     }
 
     #[test]

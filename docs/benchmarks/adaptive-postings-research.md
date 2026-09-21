@@ -184,3 +184,50 @@ oracle chosen from timings is an evaluation bound, not an executable selector.
 Promote only if the protected small-query cases and independently measured tail
 both meet predefined tolerances. No source above supplies those tolerances or
 proves the proposed model will transfer.
+
+## First implementation: bounded count experiment
+
+The count node now reports `Count Selection Time` (milliseconds, cumulative
+across executions/rescans) and `Count Selection Calls` under EXPLAIN ANALYZE.
+This measures the existing `prefers_pages` policy plus any experimental work.
+It excludes shared query parsing, opening the index view, and actual execution.
+Two monotonic clock reads are added even with experimental selection disabled;
+compare against the previous binary to measure that instrumentation cost too.
+
+`SET stannum.profile_count_selection = on` enables shadow feature collection.
+`Count Estimation Time` includes source-list allocation, AST traversal,
+dictionary lookups, feature aggregation, the decision, and temporary cleanup.
+It is a subset of selection time, not an additional execution-time component.
+`Count Estimation Calls` accumulates over rescans; feature fields marked `(Last)`
+represent only the most recent execution. Plain EXPLAIN emits no measured times.
+
+Collection supports plain term disjunctions (including boosts), at most 256
+visited AST nodes, 512 sources and 1,024 term/source lookups. It records input
+posting counts, not output cardinality; duplicates and dead entries can inflate
+these values. It performs no posting decoding, expansion or visibility probes.
+Unsupported shapes retain the previous strategy. Shadow profiling leaves the
+previous strategy unchanged.
+
+`SET stannum.count_page_threshold = N` with N > 0 enables an **uncalibrated
+experimental** rule: supported ORs whose summed input posting count reaches N
+use page counts. Zero (default) disables the rule. This parameter exists for
+paired calibration, not as a recommended production threshold or a complete
+cost model. Existing page choices are preserved, and `force_count_pages` takes
+precedence and bypasses estimation entirely. Execution, visibility, dead-list
+handling, and on-disk formats are unchanged.
+
+Next validation: compare previous binary, instrumentation-only, shadow and
+threshold modes on identical physical snapshots; report estimator time per
+call and as a fraction of total server time, paired net savings, regret and
+small-query regressions. Use fixed eight-client load runs separately from
+serial EXPLAIN diagnostics. Freeze a threshold on development data before
+fresh held-out evaluation. No threshold is enabled by default until that gate
+passes. Follow-up features (operator skew, local density, conversion costs)
+need their own measured collection budgets before expanding this policy.
+
+Initial validation: the metadata-budget/fallback unit test and PostgreSQL 18
+integration test passed locally. The integration test checks shadow versus
+selected execution against a text predicate through HOT updates, deletes and
+indexed-text changes, verifies timing fields and forced-mode precedence, and
+ensures plain EXPLAIN does not report execution timings. These are correctness
+checks, not evidence of a profitable threshold or negligible overhead.

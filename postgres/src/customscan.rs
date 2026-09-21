@@ -39,6 +39,8 @@ use crate::score::rank;
 
 static ENABLE: GucSetting<bool> = GucSetting::<bool>::new(true);
 // Experimental diagnostic control: preserve production selection unless requested.
+static PROFILE_COUNT_SELECTION: GucSetting<bool> = GucSetting::<bool>::new(false);
+static COUNT_PAGE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
 static FORCE_COUNT_PAGES: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Method tables hold C string pointers; they are immutable and never
@@ -106,6 +108,20 @@ static COUNT_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
     });
 
 pub fn init() {
+    GucRegistry::define_bool_guc(
+        c"stannum.profile_count_selection",
+        c"Collect bounded count-selector features without changing the default strategy",
+        c"Estimation timing includes feature collection; counters accumulate over rescans.",
+        &PROFILE_COUNT_SELECTION,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.count_page_threshold",
+        c"Experimental OR input-posting threshold for page counts; zero disables",
+        c"Uncalibrated diagnostic rule. Unsupported shapes retain automatic selection; force_count_pages takes precedence.",
+        &COUNT_PAGE_THRESHOLD, 0, i32::MAX, GucContext::Userset, GucFlags::default(),
+    );
     GucRegistry::define_bool_guc(
         c"stannum.force_count_pages",
         c"Force the page-bitmap count strategy for diagnostic comparisons",
@@ -911,6 +927,12 @@ struct ScanExec {
     fetched: usize,
     skipped_pages: usize,
     page_masks: Option<bool>,
+    selection_calls: usize,
+    selection_time: std::time::Duration,
+    estimation_time: std::time::Duration,
+    estimation_calls: usize,
+    selection_threshold: i32,
+    count_estimate: Option<tinql::runtime::plan::CountEstimate>,
     ordered: bool,
     /// Identity under which the scan publishes its scorer.
     scan_id: u64,
@@ -1052,6 +1074,12 @@ unsafe extern "C-unwind" fn begin_scan(
             fetched: 0,
             skipped_pages: 0,
             page_masks: None,
+            selection_calls: 0,
+            selection_time: std::time::Duration::ZERO,
+            estimation_time: std::time::Duration::ZERO,
+            estimation_calls: 0,
+            selection_threshold: 0,
+            count_estimate: None,
             ordered,
             scan_id: crate::score::scan_id(),
         };
@@ -1572,6 +1600,8 @@ unsafe extern "C-unwind" fn exec_count(
                 tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
                     .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
             let view = crate::storage::view(index_oid);
+            // Time the existing policy too, so paired runs expose incremental cost.
+            let selection_start = std::time::Instant::now();
             let mut use_pages = FORCE_COUNT_PAGES.get();
             for (source, _) in &view.sources {
                 if use_pages {
@@ -1583,6 +1613,30 @@ unsafe extern "C-unwind" fn exec_count(
                     break;
                 }
             }
+            exec.count_estimate = None;
+            exec.selection_threshold = COUNT_PAGE_THRESHOLD.get();
+            if !FORCE_COUNT_PAGES.get()
+                && (PROFILE_COUNT_SELECTION.get() || COUNT_PAGE_THRESHOLD.get() > 0)
+            {
+                // Start before allocating the source list or reading any metadata.
+                let estimation_start = std::time::Instant::now();
+                let estimate = if view.sources.len() > 512 {
+                    tinql::runtime::plan::CountEstimate {
+                        sources: view.sources.len(),
+                        ..Default::default()
+                    }
+                } else {
+                    let sources: Vec<_> = view.sources.iter().map(|(source, _)| source).collect();
+                    tinql::runtime::plan::estimate_count_disjunction(&query, &sources)
+                        .unwrap_or_else(|error| pgrx::error!("Stannum count estimation: {error}"))
+                };
+                use_pages = estimate.choose_pages(use_pages, exec.selection_threshold as u64);
+                exec.count_estimate = Some(estimate);
+                exec.estimation_calls += 1;
+                exec.estimation_time += estimation_start.elapsed();
+            }
+            exec.selection_calls += 1;
+            exec.selection_time += selection_start.elapsed();
             exec.page_masks = Some(use_pages);
             let mut vmbuf = pg_sys::InvalidBuffer as pg_sys::Buffer;
             let mut candidates = 0usize;
@@ -1774,6 +1828,63 @@ unsafe extern "C-unwind" fn explain(
                     exec.stream_visits as i64,
                     es,
                 );
+            }
+            if exec.selection_calls > 0 {
+                pg_sys::ExplainPropertyInteger(
+                    c"Count Estimation Calls".as_ptr(),
+                    std::ptr::null(),
+                    exec.estimation_calls as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Count Page Threshold (Last)".as_ptr(),
+                    std::ptr::null(),
+                    exec.selection_threshold as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Count Selection Calls".as_ptr(),
+                    std::ptr::null(),
+                    exec.selection_calls as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyFloat(
+                    c"Count Selection Time".as_ptr(),
+                    c"ms".as_ptr(),
+                    exec.selection_time.as_secs_f64() * 1000.0,
+                    6,
+                    es,
+                );
+                pg_sys::ExplainPropertyFloat(
+                    c"Count Estimation Time".as_ptr(),
+                    c"ms".as_ptr(),
+                    exec.estimation_time.as_secs_f64() * 1000.0,
+                    6,
+                    es,
+                );
+            }
+            if let Some(estimate) = exec.count_estimate {
+                pg_sys::ExplainPropertyBool(
+                    c"Count Estimate Supported (Last)".as_ptr(),
+                    estimate.supported,
+                    es,
+                );
+                if let Some(minimum) = estimate.min_postings {
+                    pg_sys::ExplainPropertyInteger(
+                        c"Count Estimate Minimum DF (Last)".as_ptr(),
+                        std::ptr::null(),
+                        i64::from(minimum),
+                        es,
+                    );
+                }
+                for (label, value) in [
+                    (c"Count Estimate Leaves (Last)", estimate.leaves as i64),
+                    (c"Count Estimate Sources (Last)", estimate.sources as i64),
+                    (c"Count Estimate Lookups (Last)", estimate.lookups as i64),
+                    (c"Count Estimate Postings (Last)", estimate.postings as i64),
+                ] {
+                    pg_sys::ExplainPropertyInteger(label.as_ptr(), std::ptr::null(), value, es);
+                }
             }
             if let Some(pages) = exec.page_masks {
                 pg_sys::ExplainPropertyText(

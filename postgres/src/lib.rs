@@ -4691,6 +4691,62 @@ mod tests {
     }
 
     #[pg_test]
+    fn count_selector_reports_cost_and_preserves_visibility() {
+        Spi::run("CREATE TABLE selector_counts(id int, body text, payload int) WITH (fillfactor=60);
+            INSERT INTO selector_counts SELECT n, CASE WHEN n % 100=0 THEN 'needle red' ELSE 'common blue' END, 0 FROM generate_series(1,2000) n;
+            CREATE INDEX ON selector_counts USING stannum(body);
+            SET LOCAL enable_seqscan=off;
+            SET LOCAL stannum.enable_custom_scan=on;
+            SET LOCAL stannum.profile_count_selection=on;").unwrap();
+        for mutation in [
+            "SELECT 1",
+            "UPDATE selector_counts SET payload=1 WHERE id%200=0",
+            "DELETE FROM selector_counts WHERE id%300=0",
+            "UPDATE selector_counts SET body='needle red' WHERE id%101=0",
+        ] {
+            Spi::run(mutation).unwrap();
+            let reference =
+                value("SELECT count(*) FROM selector_counts WHERE body LIKE '%needle%'");
+            for threshold in [0, 1] {
+                Spi::run(&format!(
+                    "SET LOCAL stannum.count_page_threshold={threshold}"
+                ))
+                .unwrap();
+                assert_eq!(
+                    value("SELECT count(*) FROM selector_counts WHERE body ==> 'needle OR absent'"),
+                    reference
+                );
+                let plan = Spi::get_one::<Json>("EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM selector_counts WHERE body ==> 'needle OR absent'").unwrap().unwrap().0;
+                let node = &plan[0]["Plan"];
+                assert_eq!(node["Count Selection Calls"], 1);
+                assert_eq!(node["Count Estimate Supported (Last)"], true);
+                assert_eq!(
+                    node["Count Strategy"],
+                    if threshold == 0 {
+                        "scalar"
+                    } else {
+                        "page bitmaps"
+                    }
+                );
+                let total = node["Count Selection Time"].as_f64().unwrap();
+                let estimation = node["Count Estimation Time"].as_f64().unwrap();
+                assert!(total >= estimation && estimation >= 0.0);
+            }
+        }
+        let unexecuted = Spi::get_one::<Json>("EXPLAIN (FORMAT JSON) SELECT count(*) FROM selector_counts WHERE body ==> 'needle OR absent'").unwrap().unwrap().0;
+        assert!(unexecuted[0]["Plan"].get("Count Estimation Time").is_none());
+        Spi::run("SET LOCAL stannum.force_count_pages=on").unwrap();
+        let plan = Spi::get_one::<Json>("EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM selector_counts WHERE body ==> 'needle OR absent'").unwrap().unwrap().0;
+        assert_eq!(plan[0]["Plan"]["Count Strategy"], "page bitmaps");
+        assert!(
+            plan[0]["Plan"]
+                .get("Count Estimate Supported (Last)")
+                .is_none()
+        );
+        assert_eq!(plan[0]["Plan"]["Count Estimation Time"].as_f64(), Some(0.0));
+    }
+
+    #[pg_test]
     fn forced_count_pages_preserve_sparse_results_and_visibility() {
         Spi::run(
             "CREATE TABLE force_count_pages(id int, body text, payload int) WITH (fillfactor=60);
