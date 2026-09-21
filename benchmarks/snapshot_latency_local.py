@@ -91,6 +91,7 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--state',choices=('clean','mutated'),default='clean')
     parser.add_argument('--port',type=int,default=29436)
+    parser.add_argument('--control-library',type=Path,help='Override archived candidate control with a pinned compatible binary')
     parser.add_argument('--selector-library',type=Path,help='Compare original candidate, instrumentation only, and shadow estimation')
     parser.add_argument('--selector-threshold',type=int,default=0,help='Optional experimental threshold arm; zero omits it')
     parser.add_argument('--rounds',type=int,default=3)
@@ -102,6 +103,10 @@ def main():
     manifest=json.loads((root/'manifest.json').read_text());assert manifest['status']=='complete'
     out.mkdir(parents=True,exist_ok=False);shutil.copy2(__file__,out/'protocol.py')
     lib=out/'stannum.dylib';data=out/'data'
+    control_source=None
+    if args.control_library:
+        control_source=out/'control-source.dylib'
+        shutil.copy2(args.control_library,control_source)
     selector_source=None
     if args.selector_library:
         selector_source=out/'selector-source.dylib'
@@ -112,6 +117,7 @@ def main():
     queries=json.loads(args.queries.read_text())['queries'];assert len(queries)==302
     assert digest(args.queries)==manifest['queries_sha256']
     state=dict(status='running',snapshot_state=args.state,source_manifest=manifest,rounds=[],repetitions=args.repetitions,
+               control_sha256=digest(control_source) if control_source else None,
                selector_sha256=digest(selector_source) if selector_source else None,selector_threshold=args.selector_threshold,
                metric='Server EXPLAIN ANALYZE Execution Time; single client; one warmup per query; fresh physical snapshot per variant',
                percentile='nearest rank of the 302 per-query medians, equal weight per query; not concurrent-load or request-weighted p95')
@@ -139,6 +145,9 @@ def main():
                     kind='baseline' if variant=='main' else 'candidate'
                     source=root/'libraries'/(kind+'.dylib')
                     assert digest(source)==manifest[kind+'_sha256']
+                    if variant=='candidate-default' and control_source:
+                        source=control_source
+                        assert digest(source)==state['control_sha256']
                     if variant in ('instrumented','shadow','selected','selector-bitmaps'):
                         source=selector_source
                         assert digest(source)==state['selector_sha256']

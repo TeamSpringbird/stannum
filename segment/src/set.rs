@@ -151,21 +151,20 @@ impl<C: Cursor> Cursor for Intersection<C> {
 /// Postings present in any input.
 pub struct Union<C> {
     cursors: Vec<C>,
+    // Inputs can only move through this union, so unchanged heads stay valid.
+    heads: Vec<Option<Tid>>,
     current: Option<Tid>,
 }
 
 impl<C: Cursor> Union<C> {
     pub fn new(cursors: Vec<C>) -> Self {
-        let mut this = Self {
+        let heads: Vec<_> = cursors.iter().map(Cursor::current).collect();
+        let current = heads.iter().copied().flatten().min();
+        Self {
             cursors,
-            current: None,
-        };
-        this.align();
-        this
-    }
-
-    fn align(&mut self) {
-        self.current = self.cursors.iter().filter_map(Cursor::current).min();
+            heads,
+            current,
+        }
     }
 }
 
@@ -173,26 +172,36 @@ impl<C: Cursor> Cursor for Union<C> {
     fn current(&self) -> Option<Tid> {
         self.current
     }
+
     fn advance(&mut self) -> Result<()> {
         let Some(current) = self.current else {
             return Ok(());
         };
-        for cursor in &mut self.cursors {
-            if cursor.current() == Some(current) {
+        let mut next: Option<Tid> = None;
+        for (cursor, head) in self.cursors.iter_mut().zip(&mut self.heads) {
+            if *head == Some(current) {
                 cursor.advance()?;
+                *head = cursor.current();
+            }
+            if let Some(tid) = *head {
+                next = Some(next.map_or(tid, |value| value.min(tid)));
             }
         }
-        self.align();
+        self.current = next;
         Ok(())
     }
+
     fn seek(&mut self, target: Tid) -> Result<()> {
-        if self.current.is_some_and(|current| current >= target) {
+        if self.current.is_none_or(|current| current >= target) {
             return Ok(());
         }
-        for cursor in &mut self.cursors {
-            cursor.seek(target)?;
+        for (cursor, head) in self.cursors.iter_mut().zip(&mut self.heads) {
+            if head.is_some_and(|tid| tid < target) {
+                cursor.seek(target)?;
+                *head = cursor.current();
+            }
         }
-        self.align();
+        self.current = self.heads.iter().copied().flatten().min();
         Ok(())
     }
 }
@@ -375,6 +384,66 @@ mod tests {
             0
         );
         assert_eq!(count(Union::new(vec![Empty, Empty])).unwrap(), 0);
+    }
+
+    #[test]
+    fn union_reads_each_head_only_when_its_input_moves() {
+        use std::cell::Cell;
+        struct Observed<'a> {
+            inner: Slice<'a>,
+            reads: &'a Cell<usize>,
+        }
+        impl Cursor for Observed<'_> {
+            fn current(&self) -> Option<Tid> {
+                self.reads.set(self.reads.get() + 1);
+                self.inner.current()
+            }
+            fn advance(&mut self) -> Result<()> {
+                self.inner.advance()
+            }
+            fn seek(&mut self, target: Tid) -> Result<()> {
+                self.inner.seek(target)
+            }
+        }
+        let inputs = [tids(&[1, 3, 5]), tids(&[2, 3, 6]), tids(&[])];
+        let reads = Cell::new(0);
+        let union = Union::new(
+            inputs
+                .iter()
+                .map(|input| Observed {
+                    inner: Slice::new(input),
+                    reads: &reads,
+                })
+                .collect(),
+        );
+        assert_eq!(collect(union).unwrap(), tids(&[1, 2, 3, 5, 6]));
+        assert!(
+            reads.get() <= inputs.len() + inputs.iter().map(Vec::len).sum::<usize>(),
+            "head reads: {}",
+            reads.get()
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn union_cached_heads_preserve_interleaved_seek_and_advance(
+            lists in proptest::collection::vec(proptest::collection::vec(0u32..1000, 0..40), 0..20),
+            operations in proptest::collection::vec(proptest::option::of(0u32..1100), 0..60),
+        ) {
+            let lists: Vec<Vec<Tid>> = lists.into_iter().map(|mut input| { input.sort_unstable(); input.dedup(); tids(&input) }).collect();
+            let mut expected: Vec<Tid> = lists.iter().flatten().copied().collect();
+            expected.sort_unstable(); expected.dedup();
+            let mut reference = Slice::new(&expected);
+            let mut actual = Union::new(lists.iter().map(|list| Slice::new(list)).collect());
+            for op in operations {
+                proptest::prop_assert_eq!(actual.current(), reference.current());
+                match op {
+                    Some(block) => { let target = Tid::new(block, 1).unwrap(); actual.seek(target).unwrap(); reference.seek(target).unwrap(); }
+                    None => { actual.advance().unwrap(); reference.advance().unwrap(); }
+                }
+            }
+            proptest::prop_assert_eq!(collect(actual).unwrap(), collect(reference).unwrap());
+        }
     }
 
     #[test]
