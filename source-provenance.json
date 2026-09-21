@@ -997,6 +997,22 @@
     "benchmarks/snapshot_latency_local.py": {
       "owner": "ben",
       "evidence": "Original balanced local snapshot latency comparison harness."
+    },
+    "benchmarks/experiment_queue.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
+    },
+    "benchmarks/experiment_report.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
+    },
+    "benchmarks/frontier_snapshot_experiment.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
+    },
+    "benchmarks/test_experiment_report.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
     }
   }
 }
