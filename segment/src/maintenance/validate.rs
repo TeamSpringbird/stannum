@@ -6,7 +6,7 @@ use super::{DictionaryCursor, PayloadCursor, PostingsCursor, Window};
 use crate::{
     Error, Result, Tid,
     dictionary::Extent,
-    ordinals::{ARRAY_MAX, CHUNK, LIST_MAX, WORDS},
+    ordinals::{CHUNK, LIST_MAX, WORDS},
     postings::BLOCK_POSTINGS,
     segment::Format,
     source::Source,
@@ -203,13 +203,16 @@ fn check_ordinals<S: Source + ?Sized>(
         checkpoint()?;
         let key = head.u16le()?;
         let cardinality = usize::from(head.u16le()?) + 1;
+        // The top bit of the offset marks a bitmap chunk.
+        let at = head.fixed()?;
+        let bitmap = at & (1 << 31) != 0;
         if previous_key.is_some_and(|previous| previous >= key)
-            || head.fixed()? != body.at - chunks_at
+            || at & !(1 << 31) != body.at - chunks_at
         {
             return Err(Error::Corrupt("ordinal directory order"));
         }
         previous_key = Some(key);
-        if cardinality < ARRAY_MAX {
+        if !bitmap {
             let mut last = None;
             for _ in 0..cardinality {
                 let low = body.u16le()?;
