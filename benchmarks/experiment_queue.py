@@ -22,10 +22,13 @@ def main():
     save()
     try:
         deadline=time.monotonic()+spec.get('wait_seconds',14400)
-        for path in spec.get('wait_for',[]):
+        dependencies=[(path,False) for path in spec.get('wait_for',[])]+[(path,True) for path in spec.get('wait_for_terminal',[])]
+        for path,allow_failed in dependencies:
             while True:
-                ready=json.loads(Path(path).read_text()) if Path(path).exists() else {}
-                if ready.get('status')=='complete':break
+                try:ready=json.loads(Path(path).read_text()) if Path(path).exists() else {}
+                except json.JSONDecodeError:ready={}
+                if ready.get('status')=='complete' or (allow_failed and ready.get('status')=='failed'):
+                    state.setdefault('prerequisites',[]).append(dict(path=path,status=ready['status']));save();break
                 if ready.get('status')=='failed':raise RuntimeError('Prerequisite failed: '+path)
                 if time.monotonic()>deadline:raise RuntimeError('Prerequisite deadline: '+path)
                 time.sleep(15)

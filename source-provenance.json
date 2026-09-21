@@ -1013,6 +1013,14 @@
     "benchmarks/test_experiment_report.py": {
       "owner": "ben",
       "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
+    },
+    "benchmarks/snapshot_load_local.py": {
+      "owner": "ben",
+      "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
+    },
+    "benchmarks/test_snapshot_load_local.py": {
+      "owner": "ben",
+      "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
     }
   }
 }
