@@ -107,3 +107,15 @@ its own target directory, freezes hashes, and rejects identical artifacts before
 load trials. The load harness now rejects identical explicit control/candidate
 binaries unless `--allow-identical-binaries` requests an intentional A/A control.
 The r3 campaign restores the completed r2 snapshots; no index rebuild is needed.
+
+The isolated r3 builds produced three distinct hashes and the packed release
+candidate passed all 126 local PostgreSQL integration tests. Its first load
+attempt found the cancelled r2 server still occupying port 29438; that owned
+server was stopped. `merge-validation-r4` resumes only the distinctness gate and
+timed comparisons from the frozen r3 binaries, reusing `compatibility-r2`.
+Outputs are `cached-v-main-r4` and `packed-v-cached-r4`. No r2/r3 failed timing
+attempt is valid performance evidence.
+
+Separate page-decoder experiments on `perf/fused-page-loop` completed focused
+fixtures and million-row first-loop timings. The second-loop real-query queue
+waits for `merge-validation-r4` to complete, preventing competition for the host.
