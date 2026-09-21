@@ -1407,6 +1407,7 @@ mod tests {
             "alpha OR gamma",
             "alpha OR beta OR gamma",
             "delta OR gamma",
+            "delta OR alpha",
             "alpha OR missing",
             "alpha^2 OR beta",
             "(alpha AND beta)^0.5",
@@ -1483,9 +1484,10 @@ mod tests {
         }
         // `score` elides `alpha`, which most documents hold. The disjunction
         // is still pruned, over `delta` alone, because its top three all
-        // score above the zero of a document holding only `alpha`; asking for
-        // more rows than `delta` has leaves the ordering to full scoring.
-        for (limit, pruned) in [(3, true), (5000, false)] {
+        // score above the zero of a document holding only `alpha`. Asked for
+        // more rows than `delta` has, the scan fills the rest from documents
+        // holding only `alpha`, in heap order, without scoring them.
+        for (limit, pruned) in [(3, true), (200, true), (5000, false)] {
             let plan = Spi::get_one::<Json>(&format!(
                 "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM bmw WHERE body ==> 'delta OR alpha'
                  ORDER BY stannum.score(ctid) DESC LIMIT {limit}"

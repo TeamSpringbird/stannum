@@ -1175,7 +1175,7 @@ unsafe fn gather(exec: &mut ScanExec) {
         }
         if let Some(k) = top_k
             && k <= crate::score::PRUNE_MAX_K
-            && let Some(top) = scorer.as_ref().and_then(|scorer| scorer.top_k(k))
+            && let Some(top) = scorer.as_ref().and_then(|scorer| top_rows(exec, scorer, k))
         {
             exec.candidates = top.complete.then_some(top.rows.len());
             exec.scored = Some(top.scored);
@@ -1195,6 +1195,38 @@ unsafe fn gather(exec: &mut ScanExec) {
         exec.next = 0;
         exec.started = true;
     }
+}
+
+/// The scorer's pruned top `k`. When a disjunction's positive scores are
+/// fewer than `k`, the rest are matches of its elided terms alone: they tie at
+/// zero and rank in heap order, which is the order the candidate stream
+/// yields, so they are read from it instead of scoring every match. A query
+/// of common words and one rare word otherwise scored millions of rows as
+/// soon as an updated row's dead version took a place in the first top k.
+unsafe fn top_rows(
+    exec: &ScanExec,
+    scorer: &crate::score::IndexScorer,
+    k: usize,
+) -> Option<crate::score::TopK> {
+    let mut top = scorer.top_k(k)?;
+    if top.zero_fill {
+        let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
+        let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
+        if stream.recheck {
+            return None;
+        }
+        let positive: FxHashSet<Tid> = top.rows.iter().map(|(_, tid)| *tid).collect();
+        while top.rows.len() < k {
+            pgrx::check_for_interrupts!();
+            match stream.next() {
+                Some(tid) if positive.contains(&tid) => {}
+                Some(tid) => top.rows.push((0.0, tid)),
+                None => break,
+            }
+        }
+        top.complete = top.rows.len() < k;
+    }
+    Some(top)
 }
 
 unsafe fn scan_query(exec: &ScanExec) -> Query {
@@ -1346,7 +1378,7 @@ unsafe fn complete(exec: &mut ScanExec) {
                     (rows, complete)
                 })
             } else {
-                scorer.top_k(deeper).map(|top| (top.rows, top.complete))
+                top_rows(exec, &scorer, deeper).map(|top| (top.rows, top.complete))
             };
             if let Some((mut rows, complete)) = rows {
                 crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);

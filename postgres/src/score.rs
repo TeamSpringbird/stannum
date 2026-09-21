@@ -537,13 +537,18 @@ pub(crate) const PRUNE_MAX_K: usize = 4096;
 
 /// The best rows of a pruned ranked scan.
 pub(crate) struct TopK {
-    /// In output order; fewer than `k` only when the query matched fewer.
+    /// In output order; fewer than `k` only when the query matched fewer, or
+    /// when `zero_fill` is set.
     pub(crate) rows: Vec<(f32, Tid)>,
     /// Candidates whose score was computed.
     pub(crate) scored: usize,
     /// True when `rows` holds every candidate: the threshold never formed,
     /// so nothing was skipped.
     pub(crate) complete: bool,
+    /// `rows` holds every match with a positive score and they are fewer than
+    /// `k`: the rest of the top k are matches of elided terms alone, which tie
+    /// at zero and rank in heap order. The caller streams them.
+    pub(crate) zero_fill: bool,
 }
 
 /// How a query's leaf terms combine into its candidate set.
@@ -1029,9 +1034,9 @@ impl IndexScorer {
         // then adds nothing to a disjunction and empties a conjunction. A
         // present leaf without a scorer is an elided dense term. In a
         // disjunction its documents score zero unless a scoring term also
-        // lists them, so the walk over the scoring terms is exact as long as
-        // it fills the top k with positive scores; otherwise the caller
-        // scores every candidate. In a conjunction the elided term adds
+        // lists them, so the walk over the scoring terms is exact as far as
+        // its positive scores reach; when they are fewer than k the caller
+        // fills the rest from the zero-scoring matches. In a conjunction the elided term adds
         // nothing to a score but still filters, so its cursor joins the walk
         // without a bound.
         if self
@@ -1088,15 +1093,17 @@ impl IndexScorer {
         if !rows.iter().all(|(_, tid)| seen.insert(*tid)) {
             return None;
         }
-        if elided && (rows.len() < k || rows.last().is_some_and(|(score, _)| *score <= 0.0)) {
+        if elided && rows.last().is_some_and(|(score, _)| *score <= 0.0) {
             // Documents holding only elided terms tie at zero and belong here.
             return None;
         }
-        let complete = rows.len() < k;
+        let zero_fill = elided && rows.len() < k;
+        let complete = rows.len() < k && !zero_fill;
         Some(TopK {
             rows,
             scored,
             complete,
+            zero_fill,
         })
     }
 

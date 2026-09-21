@@ -81,3 +81,8 @@
 - `target_segment_count`, `max_mutable_segment_size`, `max_merged_segment_size`
   and `dead_percent_threshold` now shape maintenance for the index that sets
   them instead of being ignored; unset, the `stannum.*` settings apply.
+- A pruned disjunction whose scoring terms match fewer than k documents fills
+  the rest of its top k from the matches of its elided terms, which tie at
+  zero in heap order, instead of scoring every match. In the same write
+  workload the longest query went from 10 s to 0.55 s and throughput from 156
+  to 180 queries a second.
