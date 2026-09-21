@@ -233,3 +233,20 @@ The next isolated experiment packs cached heads into u64 values, preserving Tid
 order with a disjoint exhaustion sentinel. It changes only in-memory comparison,
 not the disk format, and adds no explicit SIMD instructions. Compare against
 `fac1ca3` to measure incremental value rather than crediting earlier gains twice.
+
+### Packed-head pilot
+
+`a02453d` passed 122 segment tests (four manual probes ignored), 310 TinQL tests
+and four PostgreSQL count/visibility tests. Against frozen `fac1ca3`, three
+balanced million-row rounds yielded median-round p50 0.813 -> 0.798 ms,
+p95 12.177 -> 10.542 ms and summed query medians 843.111 -> 737.494 ms:
+12.5% less summed work and 13.4% lower serial p95. Counts and strategy checks
+passed. Four query identities (125, 165, 179, 291) crossed the regression screen;
+focused replay is still required. Shadow estimation median/p95 was 0.375/0.792 us,
+0.0176% of summed execution. No automatic bitmap rule was enabled.
+
+Evidence: `benchmarks/results/packed-union-r1/full-trace`, with frozen binary
+hashes in the parent directory. Eight-client clean/mutated validation is queued;
+this remains an experimental branch, with no AWS transfer or production promotion
+claim. Separately, `cached-union-r1/planned-regression-replay` rechecks the earlier
+construction-time candidate against the original control on queries 2/19/100/289.
