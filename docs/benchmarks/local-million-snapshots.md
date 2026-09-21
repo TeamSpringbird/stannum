@@ -39,3 +39,13 @@ snapshots are in `compatibility/`; comparison outputs are `latency-clean/` and
 `latency-mutated/`. Retain failed phases explicitly. AWS remains necessary to
 check results against the published PlanetScale hardware/workload target; local
 experiments screen candidates and narrow the work worth spending cloud time on.
+
+## Compatibility result
+
+The one-million-row compatibility gate completed successfully: 302 baseline
+checks plus 604 candidate checks in each of restored, mutated, vacuumed and
+restarted states (2,718 total), followed by the 56-check visibility suite.
+The mutated corpus has 990,189 rows. Clean and mutated snapshots occupy about
+4.0GB and 4.6GB respectively. [Receipt](local-million-compatibility.json).
+Repeated latency comparisons started after this gate; the compatibility receipt
+alone is not a latency result.
