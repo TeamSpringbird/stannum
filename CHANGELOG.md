@@ -33,6 +33,11 @@
   them. Whole extents were copied per term and query, which for frequent terms
   ran to megabytes and emptied the reader cache; the median phrase query over
   15 million Stack Exchange rows falls from 11 to 3 ms.
+- A merge takes at most 3 GiB of input, dropping its largest members until it
+  fits, and writing a segment longer than a run's 32-bit length is an error.
+  Selection counted documents only, so at 50 million rows a tier merged into a
+  segment over 4 GiB whose length wrapped: the build succeeded and every query
+  then reported a corrupt segment.
 - A pruned ranked scan that must read past its top k deepens the pruned search
   to 4k, 16k and so on before it scores every match. An update leaves its old
   version in the index beside the new one with the same score, so under

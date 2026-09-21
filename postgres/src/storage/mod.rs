@@ -642,6 +642,16 @@ unsafe fn write_run(index: pg_sys::Relation, data: &[u8]) -> Run {
 
 /// Writes a run and returns its block numbers in order.
 unsafe fn write_run_with_map(index: pg_sys::Relation, data: &[u8]) -> (Run, Vec<u32>) {
+    // A run records its length in 32 bits. Merge selection keeps segments
+    // under `SEGMENT_BYTES_CAP`; a longer blob must fail here rather than be
+    // written with a wrapped length, which reads back as a corrupt segment.
+    if u32::try_from(data.len()).is_err() {
+        pgrx::error!(
+            "Stannum segment of {} bytes exceeds the 4 GiB a run can hold; \
+             lower stannum.build_segment_docs or maintenance_work_mem and rebuild",
+            data.len()
+        );
+    }
     unsafe {
         let chunks: Vec<&[u8]> = if data.is_empty() {
             vec![&[][..]]
@@ -1488,6 +1498,28 @@ fn smallest_entries(docs: &[u32], limit: usize) -> Vec<usize> {
     by_size
 }
 
+/// The most input bytes a merge takes. A run holds under 4 GiB, and a merged
+/// segment is at most about as large as its inputs.
+const SEGMENT_BYTES_CAP: u64 = 3 << 30;
+
+/// `positions` without its largest members until the rest fit
+/// [`SEGMENT_BYTES_CAP`]; `None` when fewer than two remain, which leaves the
+/// directory as it is. Segment selection counts documents, and at tens of
+/// millions of rows a tier's members outgrow what one run can record.
+fn within_run(mut positions: Vec<usize>, bytes: &[u32]) -> Option<Vec<usize>> {
+    positions.sort_by_key(|position| (bytes[*position], *position));
+    let mut total = 0u64;
+    let fit = positions
+        .iter()
+        .take_while(|position| {
+            total += u64::from(bytes[**position]);
+            total <= SEGMENT_BYTES_CAP
+        })
+        .count();
+    positions.truncate(fit);
+    (positions.len() >= 2).then_some(positions)
+}
+
 /// The directory positions VACUUM combines next, if any: the lowest full
 /// tier, else the cheapest merge of a directory over `limit`. `None` means
 /// the directory is in shape.
@@ -1543,7 +1575,18 @@ unsafe fn maintain(index: pg_sys::Relation, meta: &mut Meta, mut budget: u64) {
     loop {
         pgrx::check_for_interrupts!();
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-        match bounded_merge_candidates(&docs, factor, limit, budget) {
+        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let candidates = bounded_merge_candidates(&docs, factor, limit, budget);
+        if candidates.is_some() && docs.len() > MAX_SEGMENTS {
+            // The one merge that cannot be skipped must still fit a run.
+            if within_run(candidates.clone().expect("checked"), &bytes).is_none() {
+                pgrx::error!(
+                    "Stannum index directory is full of segments too large to merge; \
+                     VACUUM the table, or REINDEX"
+                );
+            }
+        }
+        match candidates.and_then(|positions| within_run(positions, &bytes)) {
             Some(positions) => {
                 let work: u64 = positions.iter().map(|p| u64::from(docs[*p])).sum();
                 budget = budget.saturating_sub(work);
@@ -2446,14 +2489,17 @@ unsafe fn maintain_segments(index: pg_sys::Relation) {
         pgrx::check_for_interrupts!();
         let meta = unsafe { read_meta(index, false) }.1;
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-        let inputs: Vec<SegmentEntry> =
-            if let Some(positions) = merge_candidates(&docs, factor, limit) {
-                positions.iter().map(|p| meta.segments[*p]).collect()
-            } else if let Some(entry) = unsafe { mostly_dead(index, &meta, &mut considered) } {
-                vec![entry]
-            } else {
-                return;
-            };
+        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let inputs: Vec<SegmentEntry> = if let Some(positions) =
+            merge_candidates(&docs, factor, limit)
+                .and_then(|positions| within_run(positions, &bytes))
+        {
+            positions.iter().map(|p| meta.segments[*p]).collect()
+        } else if let Some(entry) = unsafe { mostly_dead(index, &meta, &mut considered) } {
+            vec![entry]
+        } else {
+            return;
+        };
         unsafe { replace_entries(index, meta.identity, &inputs) };
     }
 }
@@ -2970,7 +3016,7 @@ mod tests {
         assert!(super::direct_merge_limits(&[entry, entry]).is_none());
     }
 
-    use super::{MAX_SEGMENTS, bounded_merge_candidates, merge_candidates, tier};
+    use super::{MAX_SEGMENTS, bounded_merge_candidates, merge_candidates, tier, within_run};
 
     #[test]
     fn merge_budget_is_cumulative_and_overflow_merges_are_budgeted() {
@@ -3042,6 +3088,25 @@ mod tests {
         // The lowest due tier goes first even when a higher one is also due.
         let docs = [64, 64, 8, 8, 64];
         assert_eq!(merge_candidates(&docs, 2, 128), Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn a_merge_is_trimmed_to_what_one_run_can_hold() {
+        let gib = 1u32 << 30;
+        // Everything fits: the set is kept, smallest first.
+        assert_eq!(
+            within_run(vec![2, 0, 1], &[gib, gib / 2, gib / 4]),
+            Some(vec![2, 1, 0])
+        );
+        // The largest members go until the rest fit 3 GiB.
+        assert_eq!(
+            within_run(vec![0, 1, 2, 3], &[gib, gib, gib, 2 * gib]),
+            Some(vec![0, 1, 2])
+        );
+        // Fewer than two admissible members is no merge at all.
+        assert_eq!(within_run(vec![0, 1], &[2 * gib, 2 * gib]), None);
+        assert_eq!(within_run(vec![0], &[1]), None);
+        assert_eq!(within_run(vec![], &[]), None);
     }
 
     #[test]
