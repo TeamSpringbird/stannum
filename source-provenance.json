@@ -965,6 +965,22 @@
     "benchmarks/test_count_crossover.py": {
       "owner": "ben",
       "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
+    },
+    "benchmarks/count_oracle.py": {
+      "owner": "ben",
+      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
+    },
+    "benchmarks/test_count_oracle.py": {
+      "owner": "ben",
+      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
+    },
+    "benchmarks/aws/crossover.sh": {
+      "owner": "ben",
+      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
+    },
+    "benchmarks/aws/crossover_campaign.py": {
+      "owner": "ben",
+      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
     }
   }
 }

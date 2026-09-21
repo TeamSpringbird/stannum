@@ -163,6 +163,21 @@
                 }
               ]
             }
+          },
+          {
+            "PolicyName": "ReadPinnedWikipediaCache",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject"
+                  ],
+                  "Resource": "arn:aws:s3:::springbird-dev-stannum-corpus-cache-860510875764/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/wikipedia/*"
+                }
+              ]
+            }
           }
         ]
       }

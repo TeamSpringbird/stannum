@@ -15,6 +15,9 @@ from pathlib import Path
 import random
 import re
 import statistics
+import time
+
+import count_oracle
 
 KNOWN = {302,88,301,222,197,251}
 
@@ -45,7 +48,8 @@ def main():
         conn.execute('SET jit=off; SET statement_timeout=120000; SET plan_cache_mode=force_custom_plan; SET enable_seqscan=off')
         relation=conn.execute("SELECT relpages,reltuples FROM pg_class WHERE oid='documents'::regclass").fetchone()
         segments=conn.execute("SELECT count(*) FROM stannum.segment_info('documents_idx') WHERE kind='immutable'").fetchone()[0]
-        reference={n:set(body.split()) for n,body in conn.execute('SELECT n,body FROM documents ORDER BY n LIMIT 1000')}
+        reference=count_oracle.capture(conn)
+        (args.output/'reference.json').write_text(json.dumps(reference)+'\n')
         def estimate(text):
             return conn.execute('EXPLAIN (FORMAT JSON) SELECT id FROM documents WHERE body ==> %s',(text,)).fetchone()[0][0]['Plan']['Plan Rows']
         terms={t for q in queries for t in q['text'].split()}
@@ -58,13 +62,15 @@ def main():
             for number,q in enumerate(queries):
                 query=q['engines']['tin']['disjunction']
                 unique=set(q['text'].split())
-                expected_ids=sorted(n for n,tokens in reference.items() if unique & tokens)
+                (args.output/'progress.json').write_text(json.dumps(dict(id=q['source_id'],stage='index-oracle',completed=number))+'\n')
+                oracle_start=time.perf_counter()
+                oracle_plan=count_oracle.check(conn,reference,query,unique)
+                oracle_ms=(time.perf_counter()-oracle_start)*1000
+                plans.write(json.dumps(dict(id=q['source_id'],oracle_plan=oracle_plan))+'\n')
                 counts=[]
                 for mode in ('off','on'):
                     conn.execute('SET stannum.force_count_pages='+mode)
                     counts.append(conn.execute('SELECT count(*) FROM documents WHERE body ==> %s',(query,)).fetchone()[0])
-                    actual=sorted(r[0] for r in conn.execute('SELECT n FROM documents WHERE n=ANY(%s) AND body ==> %s',(list(reference),query)))
-                    assert actual==expected_ids,(q['source_id'],mode,'membership mismatch')
                 assert counts[0]==counts[1],(q['source_id'],'count mismatch',counts)
                 runs=[]
                 for repetition in range(args.repetitions):
@@ -80,7 +86,7 @@ def main():
                 result=dict(id=q['source_id'],text=q['text'],partition=partition(q),exact_count=counts[0],
                             features=dict(unique_terms=len(unique),estimated_postings=total,estimated_query_rows=estimate(query),
                                           postings_per_heap_page=total/max(1,relation[0]),heap_pages=relation[0],immutable_segments=segments),
-                            runs=runs,median_ms={mode:statistics.median(r['execution_ms'] for r in runs if r['mode']==mode) for mode in ('off','on')})
+                            oracle_wall_ms=oracle_ms,runs=runs,median_ms={mode:statistics.median(r['execution_ms'] for r in runs if r['mode']==mode) for mode in ('off','on')})
                 results.append(result)
                 (args.output/'comparison.json').write_text(json.dumps(results,indent=2)+'\n')
                 if (number+1)%25==0: print(f'{number+1}/302 queries complete',flush=True)

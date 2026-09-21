@@ -16,6 +16,8 @@ import statistics
 import subprocess
 import time
 
+import count_oracle
+
 
 def literal(text):
     return "'" + text.replace("'", "''") + "'"
@@ -35,17 +37,17 @@ def paired(queries, root, repetitions):
         count = 'SELECT count(*) FROM documents WHERE ' + predicate
         expected = int(sql(count))
         assert int(sql(count, 'on')) == expected, query['id']
-        # Independent lexical check on a bounded reference set, plus full-count
-        # agreement across the two strategies. No claim of exhaustive oracle coverage.
-        lexical = ' OR '.join('body ~ ' + literal('(^| )' + term + '( |$)') for term in query['text'].split())
-        reference = ('WITH reference AS MATERIALIZED (SELECT id,body FROM documents ORDER BY id LIMIT 1000), '
-                     'indexed AS MATERIALIZED (SELECT id FROM documents WHERE ' + predicate + ') '
-                     'SELECT count(*) FROM ((SELECT id FROM indexed JOIN reference USING(id) '
-                     'EXCEPT ALL SELECT id FROM reference WHERE ' + lexical + ') UNION ALL '
-                     '(SELECT id FROM reference WHERE ' + lexical + ' EXCEPT ALL '
-                     'SELECT id FROM indexed JOIN reference USING(id))) differences;')
-        for mode in ('off', 'on'):
-            assert int(sql(reference, mode)) == 0, query['id']
+        # Check bounded membership through the full-corpus bitmap index path.
+        # Persist the exact reference sample and avoid a full-ID materialized CTE.
+        import psycopg
+        with psycopg.connect('', autocommit=True, prepare_threshold=None) as conn:
+            conn.execute('SET statement_timeout=120000; SET plan_cache_mode=force_custom_plan')
+            sample = count_oracle.capture(conn)
+            (root/(query['id'].replace(':','-')+'-reference.json')).write_text(json.dumps(sample)+'\n')
+            index = conn.execute("SELECT indexrelid::regclass::text FROM pg_index JOIN pg_class ON pg_class.oid=indexrelid JOIN pg_am ON pg_am.oid=relam WHERE indrelid='documents'::regclass AND amname='stannum'").fetchone()[0]
+            # EXPLAIN's Index Name is unqualified for this public-schema fixture.
+            oracle_plan = count_oracle.check(conn, sample, query['tinql'], query['text'].split(), index.split('.')[-1])
+            (root/(query['id'].replace(':','-')+'-oracle-plan.json')).write_text(json.dumps(oracle_plan,indent=2)+'\n')
         runs = []
         for repetition in range(repetitions):
             for mode in (('off', 'on') if repetition % 2 == 0 else ('on', 'off')):

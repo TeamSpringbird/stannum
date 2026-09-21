@@ -34,6 +34,10 @@ def main():
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
+    protocol = out/'protocol'
+    protocol.mkdir()
+    for name in ('count_local.py','count_probe.py','count_crossover.py','count_oracle.py'):
+        shutil.copy2(Path(__file__).with_name(name),protocol/name)
     with args.input.open('rb') as source:
         digest = hashlib.file_digest(source, 'sha256').hexdigest()
     env = dict(os.environ, PGHOST='127.0.0.1', PGPORT=str(args.port), PGDATABASE='postgres', PGUSER=os.environ['USER'])
@@ -81,7 +85,7 @@ def main():
                 print('Starting '+phase,flush=True)
                 with (out/(phase+'.log')).open('w') as log:
                     probe = 'count_crossover.py' if args.crossover_queries else 'count_probe.py'
-                    command = [sys.executable,str(Path(__file__).with_name(probe)),
+                    command = [sys.executable,str(protocol/probe),
                                '--output',str(out/phase),'--repetitions','9']
                     if args.crossover_queries:
                         command += ['--queries',str(args.crossover_queries.resolve())]
@@ -96,9 +100,6 @@ def main():
         finally:
             save()
             subprocess.run(['pg_ctl','-D',str(data),'-m','immediate','stop'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    shutil.copy2(__file__,out/'count_local.py')
-    for name in ('count_probe.py','count_crossover.py'):
-        shutil.copy2(Path(__file__).with_name(name),out/name)
 
 
 if __name__ == '__main__':
