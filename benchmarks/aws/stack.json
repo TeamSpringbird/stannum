@@ -192,6 +192,20 @@
                     "s3:AbortMultipartUpload"
                   ],
                   "Resource": "arn:aws:s3:::springbird-dev-stannum-corpus-cache-860510875764/postgres-snapshots/*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:ListBucket"
+                  ],
+                  "Resource": "arn:aws:s3:::springbird-dev-stannum-corpus-cache-860510875764",
+                  "Condition": {
+                    "StringLike": {
+                      "s3:prefix": [
+                        "postgres-snapshots/*"
+                      ]
+                    }
+                  }
                 }
               ]
             }

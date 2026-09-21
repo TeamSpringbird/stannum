@@ -167,12 +167,10 @@ def transfer(args):
     if args.command=='publish':
         manifest=json.loads((args.directory/'manifest.json').read_text())
         verify_files(args.directory,manifest)
-        from botocore.exceptions import ClientError
-        try:
-            s3.head_object(Bucket=args.bucket,Key=prefix+'manifest.json')
-        except ClientError as error:
-            if error.response['Error']['Code'] not in ('404','NoSuchKey'):raise
-        else:raise ValueError('Snapshot already published; choose a new prefix')
+        # Prefix-scoped listing avoids HeadObject's unscoped ListBucket requirement
+        # for distinguishing an absent key from access denied.
+        existing=s3.list_objects_v2(Bucket=args.bucket,Prefix=prefix,MaxKeys=1)
+        if existing.get('KeyCount',0):raise ValueError('Snapshot prefix already exists; choose a new prefix')
         for name in manifest['files']:
             s3.upload_file(str(args.directory/name),args.bucket,prefix+name)
         manifest['upload_seconds']=time.monotonic()-started
