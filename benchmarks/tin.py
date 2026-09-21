@@ -640,7 +640,8 @@ def run(args):
                         statement = prepared_plan_sql(query, engine, args.workload, mode)
                         filename = 'plan-' + query[0].replace(':', '-') + '-' + mode
                         (path / (filename + '.sql')).write_text(statement + '\n')
-                        (path / (filename + '.json')).write_text(sql(statement))
+                        # Diagnostics, not measurements: a forced generic plan may scan the heap.
+                        (path / (filename + '.json')).write_text(sql(statement, setup=True))
                 sql('CHECKPOINT;')
                 job['settings'] = json.loads(sql("SELECT json_object_agg(name,setting) FROM pg_settings;"))
                 job['extensions'] = json.loads(sql('SELECT json_object_agg(extname,extversion) FROM pg_extension;'))
