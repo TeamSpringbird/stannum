@@ -62,6 +62,9 @@ use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 static WRITE_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1024 * 1024);
 /// Total input documents ordinary insert-side merges may rewrite per fold.
 static MAX_MERGE_DOCS: GucSetting<i32> = GucSetting::<i32>::new(1024);
+/// Total input documents of the one merge an insert may run after a fold,
+/// outside the metadata lock.
+static DEFERRED_MERGE_DOCS: GucSetting<i32> = GucSetting::<i32>::new(262_144);
 const BITMAP_BATCH: usize = 1024;
 
 /// Documents the write buffer holds before folding into a segment.
@@ -114,6 +117,16 @@ pub fn init() {
         c"Document budget for ordinary merges performed by one inserting backend per fold",
         c"Larger merges wait for VACUUM, including those that bring the directory back under max_segments; only the 128-entry on-disk bound forces the two smallest entries to merge above this budget. Zero defers every budgeted merge.",
         &MAX_MERGE_DOCS,
+        0,
+        i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.deferred_merge_docs",
+        c"Document budget for the one merge an inserting backend may run after a fold, outside the metadata lock",
+        c"A due merge over max_merge_docs and within this budget is built without the lock and published if its inputs are unchanged; only the inserting backend waits for it. Larger merges wait for VACUUM. Zero disables these merges.",
+        &DEFERRED_MERGE_DOCS,
         0,
         i32::MAX,
         GucContext::Userset,
@@ -1967,10 +1980,10 @@ pub unsafe fn insert(
             // bytes encoded for a different index identity or pipeline.
             drop(guard);
         };
-        if meta.buffer.docs > 0
+        let folded = meta.buffer.docs > 0
             && (meta.buffer.bytes as usize + bytes.len() > WRITE_BUFFER_BYTES.get() as usize
-                || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32)
-        {
+                || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32);
+        if folded {
             fold(index, &mut meta);
         }
         append_to_buffer(index, &mut meta.buffer, &bytes);
@@ -1980,6 +1993,50 @@ pub unsafe fn insert(
         // Buffer content locks defer PostgreSQL cancel/die interrupts.
         // Publication is complete; deliver any pending cancel now.
         pgrx::check_for_interrupts!();
+        if folded {
+            merge_deferred(index);
+        }
+    }
+}
+
+/// After a fold, merges one due tier that the inline budget left behind,
+/// without the meta lock: the segment is built from the inputs as VACUUM builds
+/// its merges and published only if the directory still lists them. Readers and
+/// other writers proceed meanwhile; only this insert waits.
+///
+/// The inline budget keeps an insert's time under the exclusive lock short,
+/// but a due tier costs `merge_tier_factor` folds, which exceeds it, so under
+/// sustained writes nothing merged until VACUUM ran and the directory filled:
+/// at 1,000 updates a second, in about a minute. One backend merges at a time,
+/// serialized by a heavyweight lock on the meta page that the transaction
+/// releases if the merge fails.
+///
+/// # Safety
+/// `index` is an open LDP2 index the caller may write; no buffer is locked.
+unsafe fn merge_deferred(index: pg_sys::Relation) {
+    unsafe {
+        let ceiling = DEFERRED_MERGE_DOCS.get().max(0) as u64;
+        let lock = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
+        if !pg_sys::ConditionalLockPage(index, 0, lock) {
+            return;
+        }
+        // Retired runs are otherwise freed only by VACUUM, or under the meta
+        // lock once the pending list fills: a walk over every retired page
+        // that held the lock for half a minute in the published write workload.
+        reclaim_pending(index);
+        let meta = read_meta(index, false).1;
+        let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
+        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        if let Some(positions) = merge_candidates(&docs, merge_tier_factor(), max_segments())
+            .and_then(|positions| within_run(positions, &bytes))
+            .filter(|positions| {
+                positions.iter().map(|p| u64::from(docs[*p])).sum::<u64>() <= ceiling
+            })
+        {
+            let inputs: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
+            replace_entries(index, meta.identity, &inputs);
+        }
+        pg_sys::UnlockPage(index, 0, lock);
     }
 }
 

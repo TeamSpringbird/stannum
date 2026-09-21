@@ -45,6 +45,7 @@ would change scores midway through a ranked scan.
 | `stannum.write_buffer_docs` | 512 | Documents before folding the write buffer |
 | `stannum.write_buffer_bytes` | 1,048,576 | Encoded forward-record bytes before folding |
 | `stannum.max_merge_docs` | 1,024 | Total input documents ordinary insert merges may rewrite per fold |
+| `stannum.deferred_merge_docs` | 262,144 | Input documents of the one merge an insert may run after a fold, outside the metadata lock |
 | `stannum.merge_tier_factor` | 8 | Segments per size tier before they merge |
 | `stannum.max_segments` | 128 | Soft bound on directory entries; 128 is the hard on-disk bound |
 
@@ -110,6 +111,17 @@ across the entire fold, including cascades. A due merge that exceeds the
 remaining budget waits for VACUUM, and the directory can therefore hold more
 than `factor - 1` entries in a tier. Zero defers all ordinary insert merges.
 Index construction retains unrestricted tier maintenance.
+
+After a fold has published and the metadata lock is released, the inserting
+backend first frees retired runs no snapshot can still read, then merges one
+due tier of at most `deferred_merge_docs` input documents the way VACUUM does:
+built from a captured directory without the lock and published only if every
+input is still listed. One backend does this at a time, under a heavyweight
+lock on the metadata page taken conditionally; the others skip it. Only that
+insert waits. Without it, a table autovacuum had not reached yet filled its
+directory in about a minute at 1,000 updates a second, and the full pending
+list was then freed under the metadata lock, stalling every query for half a
+minute. Zero disables it.
 
 `max_segments` is a soft bound. A directory over it merges its smallest
 `entry_count - max_segments + 1` entries (normally two), which is the cheapest

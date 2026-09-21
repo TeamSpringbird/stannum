@@ -3703,6 +3703,7 @@ mod tests {
              SET LOCAL stannum.write_buffer_docs = 1;
              SET LOCAL stannum.merge_tier_factor = 2;
              SET LOCAL stannum.max_merge_docs = 4;
+             SET LOCAL stannum.deferred_merge_docs = 0;
              INSERT INTO merge_budget SELECT 'needle common' FROM generate_series(1,5);",
         )
         .unwrap();
@@ -3766,6 +3767,7 @@ mod tests {
              SET LOCAL stannum.write_buffer_docs = 1;
              SET LOCAL stannum.merge_tier_factor = 2;
              SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
              INSERT INTO merge_full SELECT 'needle' FROM generate_series(1,130);",
         )
         .unwrap();
@@ -3843,6 +3845,7 @@ mod tests {
              SET LOCAL stannum.merge_tier_factor = 8;
              SET LOCAL stannum.max_segments = 4;
              SET LOCAL stannum.max_merge_docs = 2;
+             SET LOCAL stannum.deferred_merge_docs = 0;
              INSERT INTO merge_soft SELECT 'needle' FROM generate_series(1,9);",
         )
         .unwrap();
@@ -3887,6 +3890,41 @@ mod tests {
         assert_eq!(
             value("SELECT count(*) FROM merge_soft WHERE body ==> 'needle'"),
             18
+        );
+    }
+
+    #[pg_test]
+    fn insert_merges_a_due_tier_over_its_inline_budget_outside_the_lock() {
+        Spi::run(
+            "CREATE TABLE merge_deferred(body text);
+             CREATE INDEX merge_deferred_idx ON merge_deferred USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.merge_tier_factor = 8;
+             SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 8;
+             INSERT INTO merge_deferred SELECT 'needle' FROM generate_series(1,20);",
+        )
+        .unwrap();
+        // Nineteen folds: two tiers of eight merged, three singletons since.
+        assert_eq!(
+            Spi::get_one::<String>(
+                "SELECT array_agg(docs ORDER BY docs)::text FROM stannum.segment_info('merge_deferred_idx') WHERE kind = 'immutable'"
+            ),
+            Ok(Some("{1,1,1,8,8}".into()))
+        );
+        // Eight eights are due next, and cost more than this budget allows.
+        Spi::run("INSERT INTO merge_deferred SELECT 'needle' FROM generate_series(1,48)").unwrap();
+        assert_eq!(
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_deferred_idx') WHERE kind = 'immutable'"
+            ),
+            8
+        );
+        assert_clean("merge_deferred_idx");
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM merge_deferred WHERE body ==> 'needle'"),
+            68
         );
     }
 
@@ -3985,6 +4023,7 @@ mod tests {
              CREATE INDEX direct_vacuum_idx ON direct_vacuum USING stannum(body);
              SET LOCAL stannum.write_buffer_docs=1;
              SET LOCAL stannum.max_merge_docs=0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
              INSERT INTO direct_vacuum SELECT n, 'needle common' FROM generate_series(1,17) n;
              SET LOCAL enable_seqscan=off;",
         )
@@ -4165,6 +4204,7 @@ mod tests {
              CREATE INDEX vac_race_idx ON vac_race USING stannum(body);
              SET LOCAL stannum.write_buffer_docs = 1;
              SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
              INSERT INTO vac_race
                SELECT n, CASE WHEN n % 3 = 0 THEN 'needle common' ELSE 'other common' END
                FROM generate_series(1, 30) n;",

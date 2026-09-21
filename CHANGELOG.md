@@ -73,3 +73,8 @@
 - VACUUM deferred merges and deletion rewrites use validated direct posting
   merges, with interruptible construction and unchanged stale-input publication
   checks. All-dead inputs leave no empty successor.
+- After a fold, an insert frees reclaimable runs and merges one due tier of
+  up to `stannum.deferred_merge_docs` documents outside the metadata lock.
+  At 1,000 updates a second against 15 million Stack Exchange rows for ten
+  minutes, ranked disjunctions went from 120 to 156 queries a second, the
+  directory from 129 segments to 34 and the longest query from 34 s to 11 s.
