@@ -151,3 +151,20 @@ See [AWS readiness](aws-next-run-readiness.md),
 [raw scale/update receipts](raw-scale-and-updates.md),
 [published-trace protocol](published-trace.md), and
 [verified datasets](published-datasets.md).
+
+## Iteration 1: cached union heads
+
+Implemented on `perf/cached-union-heads` at `104ff38`. The union caches input
+heads and refreshes only moved inputs; advance selects the next head in the
+same pass. No encoding or strategy-selection change. A deterministic probe
+went from 33 head reads to at most 9. Segment tests (123 passed, 2 ignored),
+all 310 tinql tests and four PostgreSQL count/visibility tests passed.
+
+Three balanced million-row clean rounds, 302 queries, five timings per query:
+median-round p95 13.828 -> 11.790 ms, p50 0.773 -> 0.739 ms; summed per-query
+medians 922.593 -> 821.437 ms. These are serial diagnostics, not concurrent
+request percentiles. All counts and strategy comparisons passed. Optimized
+control/candidate binaries are frozen with SHA checks; native profiles for
+queries 302 and 88 were collected after timed trials. Evidence:
+`benchmarks/results/cached-union-r1/million-clean/`. Eight-client clean/dirty
+validation is running before any promotion decision.

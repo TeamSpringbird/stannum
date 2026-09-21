@@ -15,6 +15,7 @@ import random
 import shutil
 import statistics
 import subprocess
+import sys
 import time
 
 import psycopg
@@ -90,6 +91,7 @@ def main():
     parser.add_argument('--queries',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--state',choices=('clean','mutated'),default='clean')
+    parser.add_argument('--profile-ids',type=int,nargs='*',default=[],help='macOS sample profiles, collected after the final timed trial of each variant')
     parser.add_argument('--port',type=int,default=29436)
     parser.add_argument('--control-library',type=Path,help='Override archived candidate control with a pinned compatible binary')
     parser.add_argument('--selector-library',type=Path,help='Compare original candidate, instrumentation only, and shadow estimation')
@@ -99,6 +101,7 @@ def main():
     args=parser.parse_args();
     if args.rounds < 1 or args.repetitions < 1 or args.selector_threshold < 0:parser.error('Invalid repetition count or threshold')
     if args.selector_threshold and not args.selector_library:parser.error('Threshold requires selector library')
+    if args.profile_ids and sys.platform!='darwin':parser.error('Native sampling currently requires macOS')
     root=args.snapshot_run.resolve();out=args.output.resolve()
     manifest=json.loads((root/'manifest.json').read_text());assert manifest['status']=='complete'
     out.mkdir(parents=True,exist_ok=False);shutil.copy2(__file__,out/'protocol.py')
@@ -116,6 +119,7 @@ def main():
     expected={r['id']:r['count'] for r in json.loads((root/expected_file).read_text())}
     queries=json.loads(args.queries.read_text())['queries'];assert len(queries)==302
     assert digest(args.queries)==manifest['queries_sha256']
+    assert set(args.profile_ids) <= {q['source_id'] for q in queries}
     state=dict(status='running',snapshot_state=args.state,source_manifest=manifest,rounds=[],repetitions=args.repetitions,
                control_sha256=digest(control_source) if control_source else None,
                selector_sha256=digest(selector_source) if selector_source else None,selector_threshold=args.selector_threshold,
@@ -180,6 +184,23 @@ def main():
                                     assert node['Count Estimation Calls']==(1 if variant in ('shadow','selected') else 0)
                                 samples.append(plan['Execution Time']);raw.write(json.dumps(dict(id=q['source_id'],repetition=repetition,plan=plan))+'\n')
                             results.append(dict(round=round_id+1,variant=variant,id=q['source_id'],text=q['text'],median_ms=statistics.median(samples)))
+                        if args.profile_ids and round_id==len(orders)-1:
+                            for q in queries:
+                                if q['source_id'] not in args.profile_ids:continue
+                                path=out/f"profile-{variant}-{q['source_id']}.txt"
+                                pid=conn.execute('SELECT pg_backend_pid()').fetchone()[0]
+                                with (out/f"profile-{variant}-{q['source_id']}.log").open('w') as log:
+                                    sampler=subprocess.Popen(['sample',str(pid),'5','1','-file',str(path)],stdout=log,stderr=subprocess.STDOUT)
+                                    deadline=time.monotonic()+20
+                                    try:
+                                        while sampler.poll() is None:
+                                            if time.monotonic()>deadline:raise TimeoutError('Sampler exceeded budget')
+                                            count=conn.execute('SELECT count(*) FROM documents WHERE body ==> %s',(q['engines']['tin']['disjunction'],)).fetchone()[0]
+                                            assert count==expected[q['source_id']]
+                                        if sampler.returncode!=0 or not path.exists():raise RuntimeError('Native profile failed; inspect sampler log')
+                                    finally:
+                                        if sampler.poll() is None:sampler.kill()
+                                        sampler.wait()
                     stop()
                     times=[r['median_ms'] for r in results if r['round']==round_id+1 and r['variant']==variant]
                     state['rounds'].append(dict(round=round_id+1,variant=variant,p50_ms=percentile(times,.5),p95_ms=percentile(times,.95),p99_ms=percentile(times,.99),sum_ms=sum(times)))
