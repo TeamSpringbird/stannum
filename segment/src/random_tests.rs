@@ -223,6 +223,7 @@ proptest! {
                         max_tf_bucket: bucket,
                         postings: Extent { offset, len },
                         payload: Extent { offset: offset * 2, len: len / 2 },
+                        ordinals: Default::default(),
                     },
                 )
             })

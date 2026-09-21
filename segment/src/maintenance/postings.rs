@@ -96,8 +96,8 @@ impl<'a, S: Source + ?Sized> PostingsCursor<'a, S> {
         let compact = form & 4 != 0;
         if scored
             && (format == Format::Lsg1
-                || (compact && (format != Format::Lsg3 || count == 0 || count > BLOCK_POSTINGS))
-                || (!compact && format == Format::Lsg3 && count <= BLOCK_POSTINGS))
+                || (compact && (format < Format::Lsg3 || count == 0 || count > BLOCK_POSTINGS))
+                || (!compact && format >= Format::Lsg3 && count <= BLOCK_POSTINGS))
         {
             return Err(Error::Corrupt("postings bounds layout for format"));
         }

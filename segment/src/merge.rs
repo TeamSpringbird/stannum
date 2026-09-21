@@ -147,15 +147,15 @@ pub fn validate_inputs(
 fn skip_dead(
     postings: &mut crate::postings::PostingsCursor<'_>,
     payload: &mut crate::payload::PayloadCursor<'_>,
-    live_lengths: &HashMap<Tid, (u32, usize)>,
+    live_lengths: &HashMap<Tid, (u32, usize, u32)>,
     source: usize,
     checkpoint: &mut impl FnMut() -> std::result::Result<(), MergeError>,
-) -> std::result::Result<Option<u32>, MergeError> {
+) -> std::result::Result<Option<(u32, u32)>, MergeError> {
     while let Some(tid) = postings.current() {
-        if let Some(&(length, owner)) = live_lengths.get(&tid)
+        if let Some(&(length, owner, ordinal)) = live_lengths.get(&tid)
             && owner == source
         {
-            return Ok(Some(length));
+            return Ok(Some((length, ordinal)));
         }
         checkpoint()?;
         payload.next_bucket()?;
@@ -186,6 +186,7 @@ fn merge_as(
         }
     }
     let mut live_lengths = HashMap::new();
+    let mut page_documents = Vec::new();
     let mut doc_builder = PostingsBuilder::default();
     let mut length_bytes = Vec::new();
     let mut total_length = 0u64;
@@ -193,7 +194,10 @@ fn merge_as(
         checkpoint()?;
         if !inputs[i].dead.contains(&tid) {
             let len = segments[i].length_at(docs[i].ordinal())?;
-            if live_lengths.insert(tid, (len, i)).is_some() {
+            let ordinal = u32::try_from(live_lengths.len())
+                .map_err(|_| MergeError::Limit("document count"))?;
+            page_documents.push(tid);
+            if live_lengths.insert(tid, (len, i, ordinal)).is_some() {
                 return Err(Error::Unordered.into());
             }
             doc_builder.push(tid)?;
@@ -223,6 +227,8 @@ fn merge_as(
     let mut dictionary = DictionaryBuilder::with_format(format);
     let mut postings_area = Vec::new();
     let mut payload_area = Vec::new();
+    let mut ordinals_area = Vec::new();
+    let mut ordinals = Vec::new();
     let mut positions = Vec::new();
     let mut term_inputs = Vec::new();
     let mut cursors = Vec::new();
@@ -242,9 +248,11 @@ fn merge_as(
                 segments[i].resolve(entries[i].take().expect("each queued term owns an entry"))?;
             let mut postings = resolved.cursor()?;
             if resolved.df() == 1
-                && postings
-                    .current()
-                    .is_some_and(|tid| live_lengths.get(&tid).is_none_or(|&(_, owner)| owner != i))
+                && postings.current().is_some_and(|tid| {
+                    live_lengths
+                        .get(&tid)
+                        .is_none_or(|&(_, owner, _)| owner != i)
+                })
             {
                 // This fully validated source term has no surviving posting.
                 // No payload cursor will be consumed for it.
@@ -268,12 +276,14 @@ fn merge_as(
         let mut payload = PayloadBuilder::default();
         let mut count = 0u32;
         let mut max_bucket = 0;
+        ordinals.clear();
         while let Some(Reverse((tid, c))) = postings_heap.pop() {
             checkpoint()?;
             let (i, cursor, positions_cursor, length) = &mut cursors[c];
             positions.clear();
             let bucket = positions_cursor.next_into(&mut positions)?;
-            let len = length.ok_or(Error::Corrupt("posting missing document"))?;
+            let (len, ordinal) = length.ok_or(Error::Corrupt("posting missing document"))?;
+            ordinals.push(ordinal);
             postings.push_scored(tid, bucket, len)?;
             payload.push(bucket, &positions)?;
             count = count
@@ -287,14 +297,21 @@ fn merge_as(
             }
         }
         if count != 0 {
-            let posting_bytes = postings.finish_as(format);
-            let payload_bytes = payload.finish_as(format);
+            let posting_bytes = postings.finish_as(format.streams());
+            let payload_bytes = payload.finish_as(format.streams());
+            let ordinal_bytes = if format.has_ordinals() {
+                crate::ordinals::encode(&ordinals)
+            } else {
+                Vec::new()
+            };
             check(
                 postings_area
                     .len()
                     .checked_add(payload_area.len())
                     .and_then(|n| n.checked_add(posting_bytes.len()))
                     .and_then(|n| n.checked_add(payload_bytes.len()))
+                    .and_then(|n| n.checked_add(ordinals_area.len()))
+                    .and_then(|n| n.checked_add(ordinal_bytes.len()))
                     .ok_or(MergeError::Limit("output bytes"))?,
                 limits.max_output_bytes,
                 "output bytes",
@@ -314,10 +331,16 @@ fn merge_as(
                         len: u32::try_from(payload_bytes.len())
                             .map_err(|_| MergeError::Limit("payload extent"))?,
                     },
+                    ordinals: Extent {
+                        offset: ordinals_area.len() as u64,
+                        len: u32::try_from(ordinal_bytes.len())
+                            .map_err(|_| MergeError::Limit("ordinal extent"))?,
+                    },
                 },
             )?;
             postings_area.extend_from_slice(&posting_bytes);
             payload_area.extend_from_slice(&payload_bytes);
+            ordinals_area.extend_from_slice(&ordinal_bytes);
         }
         for &i in &term_inputs {
             if let Some(item) = dictionaries[i].next() {
@@ -341,6 +364,16 @@ fn merge_as(
     ] {
         varint::put(&mut header, n);
     }
+    let pages = if format.has_ordinals() {
+        crate::segment::page_table(page_documents.iter().copied())
+    } else {
+        Vec::new()
+    };
+    drop(page_documents);
+    if format.has_ordinals() {
+        varint::put(&mut header, ordinals_area.len() as u64);
+        varint::put(&mut header, pages.len() as u64);
+    }
     drop(live_lengths);
     let out = assemble(
         [
@@ -350,6 +383,8 @@ fn merge_as(
             payload_area,
             documents,
             length_bytes,
+            ordinals_area,
+            pages,
         ],
         limits.max_output_bytes,
     )?;
@@ -360,8 +395,8 @@ fn merge_as(
 
 /// Preserve the byte layout while reusing the largest allocation. Reserving a
 /// separate output would retain a second complete copy of the encoded areas.
-fn assemble(mut parts: [Vec<u8>; 6], limit: usize) -> std::result::Result<Vec<u8>, MergeError> {
-    let mut offsets = [0; 6];
+fn assemble(mut parts: [Vec<u8>; 8], limit: usize) -> std::result::Result<Vec<u8>, MergeError> {
+    let mut offsets = [0; 8];
     let mut total = 0usize;
     for (offset, part) in offsets.iter_mut().zip(&parts) {
         *offset = total;
@@ -388,7 +423,7 @@ fn assemble(mut parts: [Vec<u8>; 6], limit: usize) -> std::result::Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::direct_merge_poc::{fixture, reference};
+    use crate::direct_merge_poc::{FORMATS, fixture, reference};
 
     fn limits() -> MergeLimits {
         MergeLimits {
@@ -408,9 +443,9 @@ mod tests {
 
     #[test]
     fn assembly_preserves_order_and_reuses_every_possible_area() {
-        for largest in 0..6 {
-            for empty_mask in 0..64 {
-                let mut parts: [Vec<u8>; 6] = std::array::from_fn(|i| {
+        for largest in 0..8 {
+            for empty_mask in 0..256 {
+                let mut parts: [Vec<u8>; 8] = std::array::from_fn(|i| {
                     if empty_mask & (1 << i) != 0 {
                         Vec::new()
                     } else {
@@ -425,21 +460,22 @@ mod tests {
                 assert_eq!(actual.as_ptr(), allocation);
             }
         }
+        // Eight parts of 1..=8 bytes: the limit is the exact total.
         let parts = std::array::from_fn(|i| vec![i as u8; i + 1]);
         assert!(matches!(
-            assemble(parts, 20),
+            assemble(parts, 35),
             Err(MergeError::Limit("output bytes"))
         ));
         let parts = std::array::from_fn(|i| vec![i as u8; i + 1]);
-        assert_eq!(assemble(parts.clone(), 21).unwrap(), parts.concat());
+        assert_eq!(assemble(parts.clone(), 36).unwrap(), parts.concat());
     }
 
     #[test]
     fn validated_merge_matches_reference_for_all_formats() {
         for interleaved in [false, true] {
             for deletion in [0, 1, 7] {
-                let (blobs, dead) = fixture(3, 65, 40, 67, interleaved, deletion);
-                for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+                let (blobs, dead) = fixture(4, 65, 40, 67, interleaved, deletion);
+                for format in FORMATS {
                     assert_eq!(
                         merge_as(&inputs(&blobs, &dead), limits(), format, || Ok(())).unwrap(),
                         reference(&blobs, &dead, format).unwrap()
@@ -581,21 +617,137 @@ mod tests {
         }
     }
 
+    /// Every term's ordinal stream against its postings and the document
+    /// table, and the page table against the documents, read independently of
+    /// the verifier.
+    fn assert_ordinals_name_postings(bytes: &[u8]) {
+        let segment = Segment::parse(bytes).unwrap();
+        let documents = crate::set::collect(segment.documents().unwrap()).unwrap();
+        for item in segment.dictionary().unwrap().iter() {
+            let (term, entry) = item.unwrap();
+            let resolved = segment.resolve(entry).unwrap();
+            let named: Vec<Tid> = resolved
+                .ordinals()
+                .unwrap()
+                .unwrap()
+                .to_vec()
+                .unwrap()
+                .into_iter()
+                .map(|ordinal| documents[ordinal as usize])
+                .collect();
+            assert_eq!(
+                named,
+                resolved.postings().unwrap().to_vec().unwrap(),
+                "{term}"
+            );
+        }
+        let mut pages = Vec::new();
+        for (ordinal, tid) in documents.iter().enumerate() {
+            if ordinal == 0 || documents[ordinal - 1].block != tid.block {
+                pages.push((tid.block, ordinal as u32));
+            }
+        }
+        let stored: Vec<(u32, u32)> = segment
+            .page_table()
+            .unwrap()
+            .chunks_exact(crate::segment::PAGE_ENTRY)
+            .map(|entry| {
+                (
+                    u32::from_le_bytes(entry[..4].try_into().unwrap()),
+                    u32::from_le_bytes(entry[4..].try_into().unwrap()),
+                )
+            })
+            .collect();
+        assert_eq!(stored, pages);
+    }
+
+    #[test]
+    fn lsg4_merges_renumber_ordinals_and_pages_across_deletions_and_tid_reuse() {
+        // Eight inputs in every format, 4,800 documents on 48 pages. Dropping
+        // every seventh document shifts each later ordinal; the shared terms
+        // span list, array and bitmap containers.
+        for interleaved in [false, true] {
+            let (mut blobs, mut dead) = fixture(8, 600, 6, 5, interleaved, 7);
+            assert!(dead.iter().all(|dead| !dead.is_empty()));
+            // A further `LSG4` input reuses TIDs that are dead in the inputs
+            // above, under a term of its own and the most common shared one.
+            let mut reuse = crate::segment::SegmentBuilder::default();
+            for (n, tid) in dead.iter().flatten().step_by(3).enumerate() {
+                let rare = format!("rare{:02}", n % 40);
+                reuse
+                    .add_document(*tid, [("reused", 1), ("term0000", 2), (rare.as_str(), 3)])
+                    .unwrap();
+            }
+            blobs.push(reuse.finish_as(Format::Lsg4));
+            dead.push(BTreeSet::new());
+            let output = merge(&inputs(&blobs, &dead), limits(), || Ok(())).unwrap();
+            assert_eq!(&output[..4], b"LSG4");
+            assert_eq!(output, reference(&blobs, &dead, Format::Lsg4).unwrap());
+            let report = crate::verify::verify_segment(&output);
+            assert!(report.is_clean(), "{:?}", report.findings);
+            assert_ordinals_name_postings(&output);
+            let segment = Segment::parse(&output).unwrap();
+            let common = segment.term("term0000").unwrap().unwrap();
+            assert!(common.df() as usize >= crate::ordinals::ARRAY_MAX);
+            let reused = segment.term("reused").unwrap().unwrap();
+            assert!(reused.df() as usize > crate::ordinals::LIST_MAX);
+            let rare = segment.term("rare00").unwrap().unwrap();
+            assert!((2..=crate::ordinals::LIST_MAX).contains(&(rare.df() as usize)));
+            // Merging the merged segment again, with more deletions, renumbers
+            // from `LSG4` ordinals rather than carrying them over.
+            let again_dead = [report.documents.iter().copied().step_by(5).collect()];
+            let again_blobs = [output];
+            let again = merge(&inputs(&again_blobs, &again_dead), limits(), || Ok(())).unwrap();
+            assert_eq!(
+                again,
+                reference(&again_blobs, &again_dead, Format::Lsg4).unwrap()
+            );
+            assert!(crate::verify::verify_segment(&again).is_clean());
+            assert_ordinals_name_postings(&again);
+        }
+    }
+
     #[test]
     fn corrupt_lengths_are_rejected_even_for_dead_documents() {
-        let (mut blobs, mut dead) = fixture(1, 1, 4, 2, true, 0);
-        // Length table is the final u32 for the only document. Its header total
-        // and actual positions still say four, so trusting it would corrupt BM25.
-        let n = blobs[0].len();
-        blobs[0][n - 4..].copy_from_slice(&5u32.to_le_bytes());
-        for deleted in [false, true] {
-            if deleted {
-                dead[0].insert(Tid::new(0, 1).unwrap());
+        for format in FORMATS {
+            let (sources, mut dead) = fixture(1, 1, 4, 2, true, 0);
+            let mut blobs = vec![reference(&sources, &dead, format).unwrap()];
+            // The length table holds one u32 for the only document, ahead of
+            // the sections `LSG4` appends. Its header total and actual positions
+            // still say four, so trusting it would corrupt BM25.
+            let sections = Segment::parse(&blobs[0]).unwrap().sections();
+            let n = blobs[0].len() - sections.ordinals - sections.pages;
+            assert_eq!(blobs[0][n - 4..n], 4u32.to_le_bytes());
+            blobs[0][n - 4..n].copy_from_slice(&5u32.to_le_bytes());
+            for deleted in [false, true] {
+                if deleted {
+                    dead[0].insert(Tid::new(0, 1).unwrap());
+                }
+                assert!(matches!(
+                    merge(&inputs(&blobs, &dead), limits(), || Ok(())),
+                    Err(MergeError::InvalidInput { index: 0, .. })
+                ));
             }
-            assert!(matches!(
-                merge(&inputs(&blobs, &dead), limits(), || Ok(())),
-                Err(MergeError::InvalidInput { index: 0, .. })
-            ));
+        }
+    }
+
+    #[test]
+    fn corrupt_ordinals_and_pages_are_rejected_even_though_a_merge_rebuilds_them() {
+        let (sources, dead) = fixture(1, 3, 4, 2, true, 0);
+        let blob = reference(&sources, &dead, Format::Lsg4).unwrap();
+        let sections = Segment::parse(&blob).unwrap().sections();
+        let appended = sections.ordinals + sections.pages;
+        assert!(sections.ordinals != 0 && sections.pages != 0);
+        for at in blob.len() - appended..blob.len() {
+            let mut changed = blob.clone();
+            changed[at] ^= 1;
+            assert!(
+                matches!(
+                    merge(&inputs(&[changed], &dead), limits(), || Ok(())),
+                    Err(MergeError::InvalidInput { index: 0, .. })
+                ),
+                "byte {at}"
+            );
         }
     }
 

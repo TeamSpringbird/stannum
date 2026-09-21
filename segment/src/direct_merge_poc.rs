@@ -32,16 +32,20 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
             heap.push(Reverse((tid, i)));
         }
     }
+    // Each live document's length and its ordinal in the output table.
     let mut live_lengths = HashMap::new();
+    let mut live_documents = Vec::new();
     let mut doc_builder = PostingsBuilder::default();
     let mut length_bytes = Vec::new();
     let mut total_length = 0u64;
     while let Some(Reverse((tid, i))) = heap.pop() {
         if !dead[i].contains(&tid) {
             let len = segments[i].length_at(docs[i].ordinal())?;
-            if live_lengths.insert(tid, len).is_some() {
+            let ordinal = live_documents.len() as u32;
+            if live_lengths.insert(tid, (len, ordinal)).is_some() {
                 return Err(Error::Unordered);
             }
+            live_documents.push(tid);
             doc_builder.push(tid)?;
             length_bytes.extend_from_slice(&len.to_le_bytes());
             total_length += u64::from(len);
@@ -67,6 +71,8 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
     let mut dictionary = DictionaryBuilder::with_format(format);
     let mut postings_area = Vec::new();
     let mut payload_area = Vec::new();
+    let mut ordinals_area = Vec::new();
+    let mut ordinals = Vec::new();
     let mut positions = Vec::new();
     while let Some(Reverse((term, first))) = terms.pop() {
         let mut inputs = vec![first];
@@ -88,6 +94,7 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
         let mut payload = PayloadBuilder::default();
         let mut count = 0u32;
         let mut max_bucket = 0;
+        ordinals.clear();
         while let Some(Reverse((tid, c))) = postings_heap.pop() {
             let (i, cursor, positions_cursor) = &mut cursors[c];
             if dead[*i].contains(&tid) {
@@ -95,9 +102,10 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
             } else {
                 positions.clear();
                 let bucket = positions_cursor.next_into(&mut positions)?;
-                let len = *live_lengths
+                let (len, ordinal) = *live_lengths
                     .get(&tid)
                     .ok_or(Error::Corrupt("posting missing document"))?;
+                ordinals.push(ordinal);
                 postings.push_scored(tid, bucket, len)?;
                 payload.push(bucket, &positions)?;
                 count += 1;
@@ -109,8 +117,13 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
             }
         }
         if count != 0 {
-            let posting_bytes = postings.finish_as(format);
-            let payload_bytes = payload.finish_as(format);
+            let posting_bytes = postings.finish_as(format.streams());
+            let payload_bytes = payload.finish_as(format.streams());
+            let ordinal_bytes = if format.has_ordinals() {
+                crate::ordinals::encode(&ordinals)
+            } else {
+                Vec::new()
+            };
             dictionary.push(
                 &term,
                 TermEntry {
@@ -124,10 +137,15 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
                         offset: payload_area.len() as u64,
                         len: payload_bytes.len() as u32,
                     },
+                    ordinals: Extent {
+                        offset: ordinals_area.len() as u64,
+                        len: ordinal_bytes.len() as u32,
+                    },
                 },
             )?;
             postings_area.extend_from_slice(&posting_bytes);
             payload_area.extend_from_slice(&payload_bytes);
+            ordinals_area.extend_from_slice(&ordinal_bytes);
         }
         for i in inputs {
             if let Some(item) = dictionaries[i].next() {
@@ -151,12 +169,24 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
     ] {
         varint::put(&mut out, n);
     }
+    let pages = if format.has_ordinals() {
+        crate::segment::page_table(live_documents.iter().copied())
+    } else {
+        Vec::new()
+    };
+    if format.has_ordinals() {
+        varint::put(&mut out, ordinals_area.len() as u64);
+        varint::put(&mut out, pages.len() as u64);
+    }
+    // The two sections `LSG4` appends are empty before it.
     for bytes in [
         &dictionary,
         &postings_area,
         &payload_area,
         &documents,
         &length_bytes,
+        &ordinals_area,
+        &pages,
     ] {
         out.extend_from_slice(bytes);
     }
@@ -176,6 +206,9 @@ pub(crate) fn reference(
     }
     Ok(builder.finish_as(format))
 }
+
+/// Every format, so fixtures mix inputs and tests write each of them.
+pub(crate) const FORMATS: [Format; 4] = [Format::Lsg1, Format::Lsg2, Format::Lsg3, Format::Lsg4];
 
 pub(crate) fn fixture(
     parts: usize,
@@ -213,7 +246,7 @@ pub(crate) fn fixture(
                 deleted.insert(tid);
             }
         }
-        blobs.push(builder.finish_as([Format::Lsg1, Format::Lsg2, Format::Lsg3][part % 3]));
+        blobs.push(builder.finish_as(FORMATS[part % FORMATS.len()]));
         dead.push(deleted);
     }
     (blobs, dead)
@@ -240,7 +273,7 @@ fn direct_merge_poc_matches_all_formats_and_deletions() {
     for interleaved in [false, true] {
         for deletion in [0, 1, 7] {
             let (blobs, dead) = fixture(8, 65, 40, 67, interleaved, deletion);
-            for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+            for format in FORMATS {
                 let actual = direct(&blobs, &dead, format).unwrap();
                 assert_eq!(actual, reference(&blobs, &dead, format).unwrap());
                 assert_verified(&actual, format);
@@ -279,17 +312,17 @@ fn direct_merge_poc_duplicate_live_tid_fails_but_dead_reuse_survives() {
 #[test]
 fn direct_merge_poc_sparse_tids_unicode_and_disjoint_vocabulary() {
     let mut blobs = Vec::new();
-    for part in 0..3 {
+    for part in 0..4 {
         let mut builder = SegmentBuilder::default();
         for doc in 0..150 {
-            let id = doc * 3 + part;
+            let id = doc * 4 + part;
             let tid = Tid::new(
-                if id == 449 {
+                if id == 599 {
                     crate::tid::MAX_BLOCK
                 } else {
                     id * 1024
                 },
-                if id == 449 { crate::tid::MAX_OFFSET } else { 1 },
+                if id == 599 { crate::tid::MAX_OFFSET } else { 1 },
             )
             .unwrap();
             let unique = format!("独自{part}-{doc}");
@@ -297,10 +330,10 @@ fn direct_merge_poc_sparse_tids_unicode_and_disjoint_vocabulary() {
                 .add_document(tid, [("café", 1), (unique.as_str(), 257), ("café", 65536)])
                 .unwrap();
         }
-        blobs.push(builder.finish_as([Format::Lsg1, Format::Lsg2, Format::Lsg3][part as usize]));
+        blobs.push(builder.finish_as(FORMATS[part as usize]));
     }
     let dead = vec![BTreeSet::new(); blobs.len()];
-    for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+    for format in FORMATS {
         let actual = direct(&blobs, &dead, format).unwrap();
         assert_eq!(actual, reference(&blobs, &dead, format).unwrap());
         assert_verified(&actual, format);

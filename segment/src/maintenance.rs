@@ -94,6 +94,10 @@ impl<'a, S: Source + ?Sized> Window<'a, S> {
         u32::try_from(self.varint()?).map_err(|_| Error::Corrupt("value exceeds 32 bits"))
     }
 
+    fn u16le(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes([self.byte()?, self.byte()?]))
+    }
+
     fn fixed(&mut self) -> Result<u64> {
         Ok(u32::from_le_bytes([self.byte()?, self.byte()?, self.byte()?, self.byte()?]) as u64)
     }
@@ -150,7 +154,7 @@ impl<'a, S: Source + ?Sized> PayloadCursor<'a, S> {
         let count = header.u32()?;
         let interval = if format == Format::Lsg1 { 64 } else { 32 };
         let slots = count.div_ceil(interval);
-        let slots = if format == Format::Lsg3 {
+        let slots = if format >= Format::Lsg3 {
             slots.saturating_sub(1)
         } else {
             if header.u32()? != slots {
@@ -224,7 +228,7 @@ impl<'a, S: Source + ?Sized> PayloadCursor<'a, S> {
             return Ok(None);
         }
         if self.ordinal.is_multiple_of(self.interval)
-            && (self.ordinal != 0 || self.format != Format::Lsg3)
+            && (self.ordinal != 0 || self.format < Format::Lsg3)
         {
             self.skip_offset = if self.format == Format::Lsg1 {
                 self.skip_offset
@@ -405,10 +409,10 @@ mod tests {
             extra.push(0);
             assert!(validate(&extra, format, 1).is_err());
             let mut wrong_skip = bytes.clone();
-            let skips_at = if format == Format::Lsg3 { 1 } else { 2 };
+            let skips_at = if format >= Format::Lsg3 { 1 } else { 2 };
             wrong_skip[skips_at] ^= 1;
             assert!(validate(&wrong_skip, format, 1).is_err());
-            if format != Format::Lsg3 {
+            if format < Format::Lsg3 {
                 let mut wrong_size = bytes.clone();
                 wrong_size[1] += 1;
                 assert!(validate(&wrong_size, format, 1).is_err());

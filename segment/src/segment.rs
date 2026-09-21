@@ -6,13 +6,22 @@
 //! document table, assembled from documents and read back by term or TID.
 //!
 //! ```text
-//! blob   := magic "LSG3", doc_count varint, total_length varint,
+//! blob   := magic "LSG4", doc_count varint, total_length varint,
 //!           dictionary_len varint, postings_len varint, payload_len varint,
-//!           docs_len varint,
-//!           dictionary, postings_area, payload_area, docs, lengths
+//!           docs_len varint, ordinals_len varint, pages_len varint,
+//!           dictionary, postings_area, payload_area, docs, lengths,
+//!           ordinals_area, pages
 //! docs   := a `postings` stream of every document TID in the segment
 //! lengths:= u32le per document, in TID order (addressed by docs ordinal)
+//! pages  := (block u32le, first u32le)* per heap block holding a document,
+//!           ascending; `first` is the ordinal of the block's first document
 //! ```
+//!
+//! The ordinals area concatenates an [`crate::ordinals`] stream per term: the
+//! term's documents as ordinals into `docs`, which Boolean counts fold without
+//! touching TIDs. `pages` maps between ordinals and heap blocks for the
+//! visibility checks of such a count. Both follow `lengths` and are absent
+//! before `LSG4`.
 //!
 //! The postings and payload areas are concatenations of per-term streams;
 //! each dictionary entry's extents locate them. Document frequency is the
@@ -60,21 +69,25 @@ pub enum Format {
     /// for entry 0; dictionary entries pack `df` with the bucket and store
     /// extents as gaps from the previous entry's.
     Lsg3,
+    /// `Lsg3` streams, plus an ordinal stream per term (see
+    /// [`crate::ordinals`]) and a table of the heap pages the documents span.
+    Lsg4,
 }
 
 impl Format {
-    pub const CURRENT: Self = Self::Lsg3;
+    pub const CURRENT: Self = Self::Lsg4;
 
     pub const fn magic(self) -> &'static [u8; 4] {
         match self {
             Self::Lsg1 => b"LSG1",
             Self::Lsg2 => b"LSG2",
             Self::Lsg3 => b"LSG3",
+            Self::Lsg4 => b"LSG4",
         }
     }
 
     pub fn from_magic(magic: &[u8]) -> Option<Self> {
-        [Self::Lsg1, Self::Lsg2, Self::Lsg3]
+        [Self::Lsg1, Self::Lsg2, Self::Lsg3, Self::Lsg4]
             .into_iter()
             .find(|format| format.magic() == magic)
     }
@@ -82,6 +95,20 @@ impl Format {
     /// True when term postings carry score bounds a ranked scan can prune with.
     pub const fn has_bounds(self) -> bool {
         !matches!(self, Self::Lsg1)
+    }
+
+    /// True when terms carry ordinal streams and the segment a page table.
+    pub const fn has_ordinals(self) -> bool {
+        matches!(self, Self::Lsg4)
+    }
+
+    /// The layout of postings, payload and dictionary streams: `Lsg4` writes
+    /// them as `Lsg3` did.
+    pub const fn streams(self) -> Self {
+        match self {
+            Self::Lsg4 => Self::Lsg3,
+            other => other,
+        }
     }
 }
 
@@ -243,10 +270,12 @@ impl SegmentBuilder {
     /// Encodes with the signature of one format and the stream layouts of
     /// others, so the verifier's layout checks can be exercised.
     pub(crate) fn finish_mixed(self, magic: Format, postings: Format, payload: Format) -> Vec<u8> {
-        let (postings_format, payload_format) = (postings, payload);
+        let (postings_format, payload_format) = (postings.streams(), payload.streams());
         let mut dictionary = DictionaryBuilder::with_format(magic);
         let mut postings_area = Vec::new();
         let mut payload_area = Vec::new();
+        let mut ordinals_area = Vec::new();
+        let documents: Vec<Tid> = self.lengths.keys().copied().collect();
         for (term, mut occurrences) in self.terms {
             occurrences.sort_unstable_by_key(|occurrence| occurrence.tid);
             let mut postings = PostingsBuilder::default();
@@ -264,6 +293,20 @@ impl SegmentBuilder {
             }
             let postings_bytes = postings.finish_as(postings_format);
             let payload_bytes = payload.finish_as(payload_format);
+            let ordinals_bytes = if magic.has_ordinals() {
+                let ordinals: Vec<u32> = occurrences
+                    .iter()
+                    .map(|occurrence| {
+                        documents
+                            .binary_search(&occurrence.tid)
+                            .expect("every occurrence belongs to a recorded document")
+                            as u32
+                    })
+                    .collect();
+                crate::ordinals::encode(&ordinals)
+            } else {
+                Vec::new()
+            };
             let entry = TermEntry {
                 df: occurrences.len() as u32,
                 max_tf_bucket,
@@ -275,9 +318,14 @@ impl SegmentBuilder {
                     offset: payload_area.len() as u64,
                     len: payload_bytes.len() as u32,
                 },
+                ordinals: Extent {
+                    offset: ordinals_area.len() as u64,
+                    len: ordinals_bytes.len() as u32,
+                },
             };
             postings_area.extend_from_slice(&postings_bytes);
             payload_area.extend_from_slice(&payload_bytes);
+            ordinals_area.extend_from_slice(&ordinals_bytes);
             dictionary
                 .push(&term, entry)
                 .expect("terms come from an ordered map");
@@ -292,6 +340,7 @@ impl SegmentBuilder {
             total_length += u64::from(*doc_len);
         }
         let docs_bytes = docs.finish();
+        let pages = page_table(documents.iter().copied());
 
         let mut out = Vec::new();
         out.extend_from_slice(magic.magic());
@@ -301,13 +350,38 @@ impl SegmentBuilder {
         varint::put(&mut out, postings_area.len() as u64);
         varint::put(&mut out, payload_area.len() as u64);
         varint::put(&mut out, docs_bytes.len() as u64);
+        if magic.has_ordinals() {
+            varint::put(&mut out, ordinals_area.len() as u64);
+            varint::put(&mut out, pages.len() as u64);
+        }
         out.extend_from_slice(&dictionary_bytes);
         out.extend_from_slice(&postings_area);
         out.extend_from_slice(&payload_area);
         out.extend_from_slice(&docs_bytes);
         out.extend_from_slice(&lengths);
+        if magic.has_ordinals() {
+            out.extend_from_slice(&ordinals_area);
+            out.extend_from_slice(&pages);
+        }
         out
     }
+}
+
+/// Bytes per entry of the page table.
+pub const PAGE_ENTRY: usize = 8;
+
+/// The page table over documents in TID order.
+pub fn page_table(documents: impl Iterator<Item = Tid>) -> Vec<u8> {
+    let mut pages = Vec::new();
+    let mut previous = None;
+    for (ordinal, tid) in documents.enumerate() {
+        if previous != Some(tid.block) {
+            pages.extend_from_slice(&tid.block.to_le_bytes());
+            pages.extend_from_slice(&(ordinal as u32).to_le_bytes());
+            previous = Some(tid.block);
+        }
+    }
+    pages
 }
 
 /// A term resolved against a segment. Postings and payload bytes are fetched
@@ -336,9 +410,34 @@ impl<'a> Term<'a> {
         self.postings()?.cursor()
     }
 
+    /// The term's documents as ordinals, where the source stores them.
+    pub fn ordinals(&self) -> Result<Option<crate::ordinals::Ordinals<'a>>> {
+        if !self.areas.format().has_ordinals() || self.entry.ordinals.len == 0 {
+            return Ok(None);
+        }
+        let fetch = OrdinalsFetch {
+            areas: self.areas,
+            base: self.entry.ordinals.offset,
+        };
+        crate::ordinals::Ordinals::open(fetch, u64::from(self.entry.ordinals.len)).map(Some)
+    }
+
     pub fn payload(&self) -> Result<Payload<'a>> {
         let bytes = self.areas.payload_bytes(self.entry.payload)?;
         Payload::parse_format(bytes, self.areas.format())
+    }
+}
+
+/// One term's stream within the ordinals area, fetched a range at a time.
+struct OrdinalsFetch<'a> {
+    areas: &'a dyn AreaFetch,
+    base: u64,
+}
+
+impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
+    fn fetch(&self, offset: u64, len: usize) -> Result<&'a [u8]> {
+        let at = self.base.checked_add(offset).ok_or(Error::Truncated)?;
+        self.areas.ordinals_bytes(at, len)
     }
 }
 
@@ -346,6 +445,10 @@ impl<'a> Term<'a> {
 pub trait AreaFetch {
     fn postings_bytes(&self, extent: Extent) -> Result<&[u8]>;
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]>;
+    /// Bytes of the ordinals area; sources without one have no streams.
+    fn ordinals_bytes(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
+        Err(Error::Corrupt("segment has no ordinal streams"))
+    }
     fn length(&self, ordinal: u32) -> Result<u32>;
     /// The format the streams were written in.
     fn format(&self) -> Format {
@@ -367,6 +470,10 @@ struct Header {
     docs_at: u64,
     docs_len: usize,
     lengths_at: u64,
+    ordinals_at: u64,
+    ordinals_len: usize,
+    pages_at: u64,
+    pages_len: usize,
 }
 
 /// Reads a segment from any [`Source`], fetching only the extents a query
@@ -393,6 +500,8 @@ pub struct Sections {
     pub payload: usize,
     pub docs: usize,
     pub lengths: usize,
+    pub ordinals: usize,
+    pub pages: usize,
 }
 
 /// Fetched extents by (offset, len).
@@ -423,12 +532,19 @@ impl<S: Source> Reader<S> {
         let postings_len = reader.varint_u32()? as usize;
         let payload_len = reader.varint_u32()? as usize;
         let docs_len = reader.varint_u32()? as usize;
+        let (ordinals_len, pages_len) = if format.has_ordinals() {
+            (reader.varint_u32()? as usize, reader.varint_u32()? as usize)
+        } else {
+            (0, 0)
+        };
         let dictionary_at = reader.position() as u64;
         let postings_at = dictionary_at + dictionary_len as u64;
         let payload_at = postings_at + postings_len as u64;
         let docs_at = payload_at + payload_len as u64;
         let lengths_at = docs_at + docs_len as u64;
-        if lengths_at + u64::from(doc_count) * 4 != total {
+        let ordinals_at = lengths_at + u64::from(doc_count) * 4;
+        let pages_at = ordinals_at + ordinals_len as u64;
+        if pages_at + pages_len as u64 != total || !pages_len.is_multiple_of(PAGE_ENTRY) {
             return Err(Error::Corrupt("segment length"));
         }
         Ok(Self {
@@ -446,6 +562,10 @@ impl<S: Source> Reader<S> {
                 docs_at,
                 docs_len,
                 lengths_at,
+                ordinals_at,
+                ordinals_len,
+                pages_at,
+                pages_len,
             },
             arena: RefCell::new(HashMap::new()),
             arena_bytes: Cell::new(0),
@@ -512,7 +632,14 @@ impl<S: Source> Reader<S> {
             payload: self.header.payload_len,
             docs: self.header.docs_len,
             lengths: self.header.doc_count as usize * 4,
+            ordinals: self.header.ordinals_len,
+            pages: self.header.pages_len,
         }
+    }
+
+    /// The page table, empty before `LSG4`: see the module documentation.
+    pub fn page_table(&self) -> Result<&[u8]> {
+        self.load(self.header.pages_at, self.header.pages_len)
     }
 
     fn dictionary_index(&self) -> Result<&DictionaryIndex<'_>> {
@@ -562,6 +689,7 @@ impl<S: Source> Reader<S> {
         };
         if !within(entry.postings, self.header.postings_len)
             || !within(entry.payload, self.header.payload_len)
+            || !within(entry.ordinals, self.header.ordinals_len)
         {
             return Err(Error::Truncated);
         }
@@ -677,6 +805,16 @@ impl<S: Source> AreaFetch for Reader<S> {
 
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]> {
         self.load(self.header.payload_at + extent.offset, extent.len as usize)
+    }
+
+    fn ordinals_bytes(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.header.ordinals_len as u64)
+        {
+            return Err(Error::Truncated);
+        }
+        self.load(self.header.ordinals_at + offset, len)
     }
 
     fn format(&self) -> Format {
@@ -869,7 +1007,7 @@ mod tests {
 
     #[test]
     fn grouped_records_match_token_rebuild_in_every_format() {
-        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3, Format::Lsg4] {
             let mut grouped = SegmentBuilder::default();
             let mut tokens_builder = SegmentBuilder::default();
             for n in (0..140).rev() {
@@ -1032,36 +1170,70 @@ mod tests {
         assert!(segment.term("x").unwrap().is_none());
         assert_eq!(segment.documents().unwrap().current(), None);
         assert!(Segment::parse(&bytes[..bytes.len() - 1]).is_err());
+        assert!(Segment::parse(b"LSG4").is_err());
         assert!(Segment::parse(b"LSG3").is_err());
         assert!(Segment::parse(b"LSG1").is_err());
         assert_eq!(&bytes[..4], Format::CURRENT.magic());
         // An unknown signature is rejected outright.
         let mut future = bytes.clone();
-        future[..4].copy_from_slice(b"LSG4");
+        future[..4].copy_from_slice(b"LSG5");
         assert_eq!(
             Segment::parse(&future).err(),
             Some(Error::Corrupt("segment magic"))
         );
-        // Earlier signatures are still readable.
-        for format in [Format::Lsg1, Format::Lsg2] {
-            let mut old = bytes.clone();
-            old[..4].copy_from_slice(format.magic());
+        // Earlier signatures are still readable. Their headers lack the two
+        // lengths `LSG4` added, so an `LSG4` blob under an older signature is
+        // not a segment.
+        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+            let old = SegmentBuilder::default().finish_as(format);
+            assert_eq!(old.len() + 2, bytes.len());
             let segment = Segment::parse(&old).unwrap();
             assert_eq!(segment.document_count(), 0);
             assert_eq!(segment.format(), format);
             assert_eq!(segment.is_legacy(), format == Format::Lsg1);
+            assert_eq!(segment.page_table().unwrap(), b"");
+            let mut relabelled = bytes.clone();
+            relabelled[..4].copy_from_slice(format.magic());
+            assert_eq!(
+                Segment::parse(&relabelled).err(),
+                Some(Error::Corrupt("segment length"))
+            );
         }
-        let mut builder = SegmentBuilder::default();
-        builder.add_document(tid(1, 1), tokens("a b c")).unwrap();
-        let mut bytes = builder.finish();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0x80; // Corrupt the length table.
-        let segment = Segment::parse(&bytes).unwrap();
-        assert_eq!(
-            segment.document_length(tid(1, 1)).unwrap(),
-            Some(3 | 0x8000_0000)
-        );
-        bytes.push(0);
-        assert!(Segment::parse(&bytes).is_err());
+        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3, Format::Lsg4] {
+            let mut builder = SegmentBuilder::default();
+            builder.add_document(tid(1, 1), tokens("a b c")).unwrap();
+            let mut bytes = builder.finish_as(format);
+            let sections = Segment::parse(&bytes).unwrap().sections();
+            // The length table ends the blob until `LSG4` appends its sections.
+            assert_eq!(
+                (sections.ordinals != 0, sections.pages),
+                (
+                    format.has_ordinals(),
+                    usize::from(format.has_ordinals()) * PAGE_ENTRY
+                ),
+                "{format}"
+            );
+            let last = bytes.len() - sections.ordinals - sections.pages - 1;
+            bytes[last] ^= 0x80; // Corrupt the length table.
+            let segment = Segment::parse(&bytes).unwrap();
+            assert_eq!(
+                segment.document_length(tid(1, 1)).unwrap(),
+                Some(3 | 0x8000_0000)
+            );
+            bytes.push(0);
+            assert!(Segment::parse(&bytes).is_err());
+            // A page table is whole entries.
+            if format.has_ordinals() {
+                bytes.pop();
+                let pages_len_at = sections.header - 1;
+                assert_eq!(bytes[pages_len_at] as usize, PAGE_ENTRY);
+                bytes[pages_len_at] -= 1;
+                bytes.pop();
+                assert_eq!(
+                    Segment::parse(&bytes).err(),
+                    Some(Error::Corrupt("segment length"))
+                );
+            }
+        }
     }
 }

@@ -52,11 +52,24 @@ pub trait Index {
     /// Every document in the index, in TID order.
     fn documents(&self) -> Result<PostingsCursor<'_>>;
     fn lengths(&self) -> Lengths<'_>;
+    /// The segment's page table where terms carry ordinal streams; `None`
+    /// for sources counted through their TID postings.
+    fn page_table(&self) -> Result<Option<&[u8]>> {
+        Ok(None)
+    }
 }
 
 impl<S: Source> Index for Reader<S> {
     fn document_count(&self) -> u32 {
         Reader::document_count(self)
+    }
+
+    fn page_table(&self) -> Result<Option<&[u8]>> {
+        if self.format().has_ordinals() {
+            Reader::page_table(self).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn total_length(&self) -> u64 {
@@ -126,6 +139,9 @@ impl<I: Index + ?Sized> Index for &I {
     fn lengths(&self) -> Lengths<'_> {
         (**self).lengths()
     }
+    fn page_table(&self) -> Result<Option<&[u8]>> {
+        (**self).page_table()
+    }
 }
 
 impl<I: Index + ?Sized> Index for Box<I> {
@@ -152,6 +168,9 @@ impl<I: Index + ?Sized> Index for Box<I> {
     fn lengths(&self) -> Lengths<'_> {
         (**self).lengths()
     }
+    fn page_table(&self) -> Result<Option<&[u8]>> {
+        (**self).page_table()
+    }
 }
 
 impl<I: Index + ?Sized> Index for std::rc::Rc<I> {
@@ -177,6 +196,9 @@ impl<I: Index + ?Sized> Index for std::rc::Rc<I> {
     }
     fn lengths(&self) -> Lengths<'_> {
         (**self).lengths()
+    }
+    fn page_table(&self) -> Result<Option<&[u8]>> {
+        (**self).page_table()
     }
 }
 
@@ -356,6 +378,8 @@ impl MutableIndex {
             max_tf_bucket,
             postings: encoded.push(postings.finish()),
             payload: encoded.push(payload.finish()),
+            // The write buffer is counted through its TID postings.
+            ordinals: Extent::default(),
         };
         encoded.terms.insert(term.to_owned(), entry);
         entry

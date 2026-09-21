@@ -27,6 +27,7 @@ pub struct DictionaryCursor<'a, S: Source + ?Sized> {
     format: Format,
     postings_end: u64,
     payload_end: u64,
+    ordinals_end: u64,
     failed: bool,
 }
 
@@ -64,6 +65,7 @@ impl<'a, S: Source + ?Sized> DictionaryCursor<'a, S> {
             format,
             postings_end: 0,
             payload_end: 0,
+            ordinals_end: 0,
             failed: false,
         })
     }
@@ -116,6 +118,7 @@ impl<'a, S: Source + ?Sized> DictionaryCursor<'a, S> {
             self.read_index_term(len, checkpoint)?;
             self.postings_end = 0;
             self.payload_end = 0;
+            self.ordinals_end = 0;
         }
         let shared = self.data.u32()? as usize;
         let suffix = self.data.u32()? as usize;
@@ -151,7 +154,7 @@ impl<'a, S: Source + ?Sized> DictionaryCursor<'a, S> {
         }
         let term = std::str::from_utf8(&self.scratch)
             .map_err(|_| Error::Corrupt("dictionary term is not UTF-8"))?;
-        let (df, max_tf_bucket) = if self.format == Format::Lsg3 {
+        let (df, max_tf_bucket) = if self.format >= Format::Lsg3 {
             let packed = self.data.varint()?;
             (
                 u32::try_from(packed >> 4).map_err(|_| Error::Corrupt("dictionary df"))?,
@@ -165,6 +168,11 @@ impl<'a, S: Source + ?Sized> DictionaryCursor<'a, S> {
         }
         let postings = Self::extent(&mut self.data, self.format, &mut self.postings_end)?;
         let payload = Self::extent(&mut self.data, self.format, &mut self.payload_end)?;
+        let ordinals = if self.format.has_ordinals() {
+            Self::extent(&mut self.data, self.format, &mut self.ordinals_end)?
+        } else {
+            Extent::default()
+        };
         visit(
             term,
             TermEntry {
@@ -172,6 +180,7 @@ impl<'a, S: Source + ?Sized> DictionaryCursor<'a, S> {
                 max_tf_bucket,
                 postings,
                 payload,
+                ordinals,
             },
         )?;
         std::mem::swap(&mut self.term, &mut self.scratch);
@@ -199,7 +208,7 @@ impl<'a, S: Source + ?Sized> DictionaryCursor<'a, S> {
 
     fn extent(data: &mut Window<'a, S>, format: Format, end: &mut u64) -> Result<Extent> {
         let encoded = data.varint()?;
-        let offset = if format == Format::Lsg3 {
+        let offset = if format >= Format::Lsg3 {
             let gap = ((encoded >> 1) as i64) ^ -((encoded & 1) as i64);
             end.checked_add_signed(gap)
                 .ok_or(Error::Corrupt("dictionary extent gap"))?
@@ -237,6 +246,7 @@ mod tests {
                             offset: u64::from(i) * 7,
                             len: 7,
                         },
+                        ordinals: Default::default(),
                     },
                 )
                 .unwrap();
@@ -400,6 +410,7 @@ mod tests {
                         len: 1,
                     },
                     payload: Extent::default(),
+                    ordinals: Default::default(),
                 },
             )
             .unwrap();

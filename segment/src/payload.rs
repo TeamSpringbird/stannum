@@ -91,7 +91,7 @@ impl PayloadBuilder {
                     out.extend_from_slice(&fixed_skip(*skip).to_le_bytes());
                 }
             }
-            Format::Lsg3 => {
+            Format::Lsg3 | Format::Lsg4 => {
                 for skip in self.skips.iter().skip(1) {
                     out.extend_from_slice(&fixed_skip(*skip).to_le_bytes());
                 }
@@ -189,7 +189,7 @@ impl<'a> Payload<'a> {
     pub fn parse_format(bytes: &'a [u8], format: Format) -> Result<Self> {
         let interval = match format {
             Format::Lsg1 => LEGACY_SKIP_INTERVAL,
-            Format::Lsg2 | Format::Lsg3 => SKIP_INTERVAL,
+            Format::Lsg2 | Format::Lsg3 | Format::Lsg4 => SKIP_INTERVAL,
         };
         let mut reader = Reader::new(bytes);
         let count = reader.varint_u32()?;
@@ -202,7 +202,7 @@ impl<'a> Payload<'a> {
                 }
                 skip_count
             }
-            Format::Lsg3 => slots.saturating_sub(1),
+            Format::Lsg3 | Format::Lsg4 => slots.saturating_sub(1),
         };
         let skips_at = reader.position();
         match format {
@@ -211,7 +211,7 @@ impl<'a> Payload<'a> {
                     reader.varint()?;
                 }
             }
-            Format::Lsg2 | Format::Lsg3 => reader.skip(slots * 4)?,
+            Format::Lsg2 | Format::Lsg3 | Format::Lsg4 => reader.skip(slots * 4)?,
         }
         Ok(Self {
             bytes,
@@ -261,7 +261,7 @@ impl<'a> Payload<'a> {
                 offset
             }
             Format::Lsg2 => fixed(slot),
-            Format::Lsg3 => match slot.checked_sub(1) {
+            Format::Lsg3 | Format::Lsg4 => match slot.checked_sub(1) {
                 Some(slot) => fixed(slot),
                 None => 0,
             },

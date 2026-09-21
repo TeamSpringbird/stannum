@@ -10,7 +10,7 @@ use crate::Tid;
 use crate::forward::ForwardRecord;
 use crate::payload::SKIP_INTERVAL;
 use crate::postings::{BLOCK_POSTINGS, BlockBound};
-use crate::segment::{Format, Segment, SegmentBuilder};
+use crate::segment::{Format, PAGE_ENTRY, Segment, SegmentBuilder};
 use crate::verify::{Severity, verify_segment};
 
 /// The blob `write_current_fixture` produced when `LSG2` was current.
@@ -179,20 +179,134 @@ fn lsg2_fixture_reads_like_the_current_format() {
     assert_eq!(report.format, Some(Format::Lsg2));
     assert!(!report.legacy);
 
-    let current = build_current(&documents);
-    assert_eq!(&current[..4], Format::Lsg3.magic());
-    let report = verify_segment(&current);
-    assert!(report.is_clean(), "{}", messages(&report));
-    assert_eq!(report.format, Some(Format::Lsg3));
-    assert!(current.len() < LSG2_FIXTURE.len());
-
     // Same documents, and the same bounds for every term: a ranked scan
-    // prunes an LSG2 segment and its LSG3 rewrite identically.
+    // prunes an LSG2 segment and its rewrite in a later format identically.
     let (old_records, old_bounds) = contents(LSG2_FIXTURE).unwrap();
-    let (new_records, new_bounds) = contents(&current).unwrap();
-    assert_eq!(old_records, new_records);
-    assert_eq!(old_bounds, new_bounds);
-    assert!(new_bounds.iter().all(|(_, bounds)| !bounds.is_empty()));
+    for format in [Format::Lsg3, Format::CURRENT] {
+        let rewrite = build_as(&documents, format);
+        assert_eq!(&rewrite[..4], format.magic());
+        let report = verify_segment(&rewrite);
+        assert!(report.is_clean(), "{}", messages(&report));
+        assert_eq!(report.format, Some(format));
+        let (new_records, new_bounds) = contents(&rewrite).unwrap();
+        assert_eq!(old_records, new_records);
+        assert_eq!(old_bounds, new_bounds);
+        assert!(new_bounds.iter().all(|(_, bounds)| !bounds.is_empty()));
+    }
+    // The LSG3 stream layouts are smaller; LSG4 spends some of that on its
+    // ordinals area and page table, and nothing else.
+    let lsg3 = build_as(&documents, Format::Lsg3);
+    let current = build_current(&documents);
+    assert_eq!(&current[..4], Format::Lsg4.magic());
+    assert!(lsg3.len() < LSG2_FIXTURE.len());
+    let (old, new) = (
+        Segment::parse(&lsg3).unwrap().sections(),
+        Segment::parse(&current).unwrap().sections(),
+    );
+    assert_eq!(
+        (new.postings, new.payload, new.docs, new.lengths),
+        (old.postings, old.payload, old.docs, old.lengths)
+    );
+    assert_eq!(
+        current.len() - lsg3.len(),
+        new.ordinals + new.pages + (new.header - old.header) + (new.dictionary - old.dictionary)
+    );
+}
+
+#[test]
+fn lsg4_appends_an_ordinal_stream_per_term_and_a_page_table() {
+    let documents = fixture_documents();
+    let current = build_current(&documents);
+    assert_eq!(Format::CURRENT, Format::Lsg4);
+    assert_eq!(&current[..4], b"LSG4");
+    let segment = Segment::parse(&current).unwrap();
+    let sections = segment.sections();
+    assert!(sections.ordinals != 0 && sections.pages != 0);
+    assert_eq!(
+        sections.header
+            + sections.dictionary
+            + sections.postings
+            + sections.payload
+            + sections.docs
+            + sections.lengths
+            + sections.ordinals
+            + sections.pages,
+        current.len()
+    );
+
+    // Every term's stream names its postings' documents by table ordinal, in
+    // order, and the streams tile the ordinals area in dictionary order.
+    let table = crate::set::collect(segment.documents().unwrap()).unwrap();
+    let mut ordinals_end = 0;
+    for item in segment.dictionary().unwrap().iter() {
+        let (term, entry) = item.unwrap();
+        assert_eq!(entry.ordinals.offset, ordinals_end, "{term}");
+        ordinals_end += u64::from(entry.ordinals.len);
+        let resolved = segment.resolve(entry).unwrap();
+        let expected: Vec<u32> = resolved
+            .postings()
+            .unwrap()
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|tid| table.binary_search(tid).unwrap() as u32)
+            .collect();
+        let stream = resolved.ordinals().unwrap().unwrap();
+        assert_eq!(stream.count(), entry.df, "{term}");
+        assert_eq!(stream.to_vec().unwrap(), expected, "{term}");
+    }
+    assert_eq!(ordinals_end, sections.ordinals as u64);
+
+    // A rare term costs a few bytes: its count and one ordinal.
+    let rare = segment.term("u0448").unwrap().unwrap();
+    assert_eq!(rare.df(), 1);
+    assert!(rare.entry.ordinals.len <= 3, "{}", rare.entry.ordinals.len);
+    assert_eq!(rare.ordinals().unwrap().unwrap().to_vec().unwrap(), [448]);
+    // A term in every document is one array chunk: two bytes a document.
+    let common = segment.term("common").unwrap().unwrap();
+    assert!(common.entry.ordinals.len <= 450 * 2 + 16);
+
+    // The page table: a (block, first ordinal) entry per heap block, ascending.
+    let pages: Vec<(u32, u32)> = segment
+        .page_table()
+        .unwrap()
+        .chunks_exact(PAGE_ENTRY)
+        .map(|entry| {
+            (
+                u32::from_le_bytes(entry[..4].try_into().unwrap()),
+                u32::from_le_bytes(entry[4..].try_into().unwrap()),
+            )
+        })
+        .collect();
+    assert_eq!(pages.len() * PAGE_ENTRY, sections.pages);
+    assert_eq!(pages.len(), 3 + 150);
+    assert_eq!(pages[..4], [(0, 0), (1, 100), (2, 200), (1000, 300)]);
+    assert_eq!(pages[152], (1000 + 149 * 37, 449));
+
+    // The same documents written as LSG3 carry neither section, and their
+    // terms report no ordinals rather than failing.
+    let older = build_as(&documents, Format::Lsg3);
+    assert_eq!(&older[..4], b"LSG3");
+    let segment = Segment::parse(&older).unwrap();
+    assert_eq!(
+        (segment.sections().ordinals, segment.sections().pages),
+        (0, 0)
+    );
+    assert_eq!(segment.page_table().unwrap(), b"");
+    for item in segment.dictionary().unwrap().iter() {
+        let (term, entry) = item.unwrap();
+        assert_eq!(entry.ordinals, crate::dictionary::Extent::default());
+        assert!(
+            segment
+                .resolve(entry)
+                .unwrap()
+                .ordinals()
+                .unwrap()
+                .is_none(),
+            "{term}"
+        );
+    }
+    assert!(verify_segment(&older).is_clean());
 }
 
 #[test]
@@ -229,9 +343,15 @@ fn lsg1_segments_read_without_bounds() {
 
 #[test]
 fn stream_layouts_follow_the_format() {
+    let lsg3 = build_as(&fixture_documents(), Format::Lsg3);
     let current = build_current(&fixture_documents());
-    for (bytes, format) in [(LSG2_FIXTURE, Format::Lsg2), (&current[..], Format::Lsg3)] {
+    for (bytes, format) in [
+        (LSG2_FIXTURE, Format::Lsg2),
+        (&lsg3[..], Format::Lsg3),
+        (&current[..], Format::Lsg4),
+    ] {
         let segment = Segment::parse(bytes).unwrap();
+        assert_eq!(segment.format(), format);
         let mut term_bounds = 0;
         let mut tables = 0;
         let mut multi_block = 0;
@@ -243,7 +363,7 @@ fn stream_layouts_follow_the_format() {
             let one_block = postings.count() <= BLOCK_POSTINGS;
             assert_eq!(
                 postings.has_term_bound(),
-                format == Format::Lsg3 && one_block,
+                format.streams() == Format::Lsg3 && one_block,
                 "{format} {term}"
             );
             term_bounds += usize::from(postings.has_term_bound());
@@ -251,7 +371,7 @@ fn stream_layouts_follow_the_format() {
             multi_block += usize::from(!one_block);
             let payload = resolved.payload().unwrap();
             let slots = (entry.df as usize).div_ceil(SKIP_INTERVAL as usize);
-            let expected = if format == Format::Lsg3 {
+            let expected = if format.streams() == Format::Lsg3 {
                 slots - 1
             } else {
                 slots
@@ -259,7 +379,7 @@ fn stream_layouts_follow_the_format() {
             assert_eq!(payload.skip_table_len(), expected * 4, "{format} {term}");
         }
         assert!(multi_block >= 4, "{multi_block}");
-        match format {
+        match format.streams() {
             Format::Lsg3 => assert!(term_bounds > 300 && tables == multi_block),
             _ => assert!(term_bounds == 0 && tables > 300),
         }

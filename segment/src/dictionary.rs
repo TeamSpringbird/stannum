@@ -16,7 +16,8 @@
 //! index  := (block_offset varint, first_len varint, first_bytes)* block_count
 //! entry  := shared varint, suffix_len varint, suffix, df_bucket varint,
 //!           postings_gap varint, postings_len varint,
-//!           payload_gap varint, payload_len varint
+//!           payload_gap varint, payload_len varint,
+//!           (ordinals_gap varint, ordinals_len varint) from `LSG4` on
 //! df_bucket := df << 4 | max_tf_bucket
 //! gap    := zigzag(offset - previous_end): the extent's distance from the end
 //!           of the previous entry's extent in the same area, 0 at a block start
@@ -42,7 +43,7 @@ fn unzigzag(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
-/// Location of a byte range in a segment's postings or payload area.
+/// Location of a byte range in a segment's postings, payload or ordinals area.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Extent {
     pub offset: u64,
@@ -57,6 +58,8 @@ pub struct TermEntry {
     pub max_tf_bucket: u8,
     pub postings: Extent,
     pub payload: Extent,
+    /// The term's ordinal stream; empty before [`Format::Lsg4`].
+    pub ordinals: Extent,
 }
 
 #[derive(Debug)]
@@ -69,6 +72,7 @@ pub struct DictionaryBuilder {
     /// Where the previous entry's extents ended, for the gaps.
     postings_end: u64,
     payload_end: u64,
+    ordinals_end: u64,
 }
 
 impl Default for DictionaryBuilder {
@@ -89,6 +93,7 @@ impl DictionaryBuilder {
             last: Vec::new(),
             postings_end: 0,
             payload_end: 0,
+            ordinals_end: 0,
         }
     }
 
@@ -109,6 +114,7 @@ impl DictionaryBuilder {
             self.index.extend_from_slice(term.as_bytes());
             self.postings_end = 0;
             self.payload_end = 0;
+            self.ordinals_end = 0;
             0
         } else {
             common_prefix(&self.last, term.as_bytes())
@@ -126,7 +132,7 @@ impl DictionaryBuilder {
                 varint::put(&mut self.blocks, entry.payload.offset);
                 varint::put(&mut self.blocks, u64::from(entry.payload.len));
             }
-            Format::Lsg3 => {
+            Format::Lsg3 | Format::Lsg4 => {
                 varint::put(
                     &mut self.blocks,
                     u64::from(entry.df) << 4 | u64::from(entry.max_tf_bucket),
@@ -142,8 +148,19 @@ impl DictionaryBuilder {
                     gap(entry.payload.offset, self.payload_end),
                 );
                 varint::put(&mut self.blocks, u64::from(entry.payload.len));
+                if self.format.has_ordinals() {
+                    varint::put(
+                        &mut self.blocks,
+                        gap(entry.ordinals.offset, self.ordinals_end),
+                    );
+                    varint::put(&mut self.blocks, u64::from(entry.ordinals.len));
+                }
             }
         }
+        self.ordinals_end = entry
+            .ordinals
+            .offset
+            .wrapping_add(u64::from(entry.ordinals.len));
         self.postings_end = entry
             .postings
             .offset
@@ -396,6 +413,7 @@ impl<'a> Dictionary<'a> {
             term: Vec::new(),
             postings_end: 0,
             payload_end: 0,
+            ordinals_end: 0,
         })
     }
 
@@ -501,6 +519,7 @@ struct Walker<'a> {
     /// Where the previous entry's extents ended, for the gaps.
     postings_end: u64,
     payload_end: u64,
+    ordinals_end: u64,
 }
 
 impl<'a> Walker<'a> {
@@ -517,6 +536,7 @@ impl<'a> Walker<'a> {
         if self.term.is_empty() || (!previous.is_empty() && previous >= self.term) {
             return Err(Error::Corrupt("dictionary term order"));
         }
+        let mut ordinals = Extent::default();
         let (df, max_tf_bucket, postings, payload) = match self.dictionary.format {
             Format::Lsg1 | Format::Lsg2 => {
                 let df = self.reader.varint_u32()?;
@@ -531,7 +551,7 @@ impl<'a> Walker<'a> {
                 };
                 (df, max_tf_bucket, postings, payload)
             }
-            Format::Lsg3 => {
+            Format::Lsg3 | Format::Lsg4 => {
                 let df_bucket = self.reader.varint()?;
                 let df =
                     u32::try_from(df_bucket >> 4).map_err(|_| Error::Corrupt("dictionary df"))?;
@@ -550,6 +570,13 @@ impl<'a> Walker<'a> {
                     offset: offset(self.payload_end, payload_gap)?,
                     len: self.reader.varint_u32()?,
                 };
+                if self.dictionary.format.has_ordinals() {
+                    let ordinals_gap = unzigzag(self.reader.varint()?);
+                    ordinals = Extent {
+                        offset: offset(self.ordinals_end, ordinals_gap)?,
+                        len: self.reader.varint_u32()?,
+                    };
+                }
                 (df, max_tf_bucket, postings, payload)
             }
         };
@@ -558,12 +585,14 @@ impl<'a> Walker<'a> {
         }
         self.postings_end = postings.offset.wrapping_add(u64::from(postings.len));
         self.payload_end = payload.offset.wrapping_add(u64::from(payload.len));
+        self.ordinals_end = ordinals.offset.wrapping_add(u64::from(ordinals.len));
         self.remaining_in_block -= 1;
         Ok(TermEntry {
             df,
             max_tf_bucket,
             postings,
             payload,
+            ordinals,
         })
     }
 
@@ -661,6 +690,10 @@ mod tests {
             payload: Extent {
                 offset: u64::from(i) * 1000,
                 len: i * 7,
+            },
+            ordinals: Extent {
+                offset: u64::from(i) * 10,
+                len: i * 2,
             },
         }
     }
@@ -836,6 +869,7 @@ mod tests {
                     offset: payload_at,
                     len: 10 + i,
                 },
+                ordinals: Default::default(),
             };
             postings_at += u64::from(entry.postings.len);
             payload_at += u64::from(entry.payload.len);
