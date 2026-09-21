@@ -1,0 +1,545 @@
+{
+  "manifest": {
+    "status": "complete",
+    "phases": [
+      {
+        "name": "baseline",
+        "checks": 302,
+        "library_sha256": "9b2095393030749059104a522e9a6123516206848d3010a4921e545f41bf086a",
+        "seconds": 2.0848204577341676,
+        "fingerprint": {
+          "rows": 100000,
+          "visibility": {
+            "all_visible": 7946,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2860,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5965112,
+              "total_pages": 2859,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5681,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5918812,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8694,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6419231,
+              "total_pages": 3011,
+              "generation": 3
+            }
+          ]
+        }
+      },
+      {
+        "name": "candidate-restored",
+        "checks": 604,
+        "library_sha256": "53440a7e26db6416df6e083746ea3e5e804d5eb9679e2e9165b88be412e2071a",
+        "seconds": 2.351132582873106,
+        "fingerprint": {
+          "rows": 100000,
+          "visibility": {
+            "all_visible": 7946,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2860,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5965112,
+              "total_pages": 2859,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5681,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5918812,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8694,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6419231,
+              "total_pages": 3011,
+              "generation": 3
+            }
+          ]
+        }
+      },
+      {
+        "name": "candidate-mutated",
+        "checks": 604,
+        "library_sha256": "53440a7e26db6416df6e083746ea3e5e804d5eb9679e2e9165b88be412e2071a",
+        "seconds": 2.864732375368476,
+        "fingerprint": {
+          "rows": 100041,
+          "visibility": {
+            "all_visible": 3103,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2860,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5965112,
+              "total_pages": 2859,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5681,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5918812,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8694,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6419231,
+              "total_pages": 3011,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 9307,
+              "docs": 818,
+              "dead_docs": 0,
+              "sum_doc_lengths": 136774,
+              "total_pages": 96,
+              "generation": 29
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 9818,
+              "docs": 752,
+              "dead_docs": 0,
+              "sum_doc_lengths": 114305,
+              "total_pages": 84,
+              "generation": 53
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 10335,
+              "docs": 753,
+              "dead_docs": 0,
+              "sum_doc_lengths": 122757,
+              "total_pages": 87,
+              "generation": 75
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 11016,
+              "docs": 875,
+              "dead_docs": 0,
+              "sum_doc_lengths": 157654,
+              "total_pages": 107,
+              "generation": 102
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 11111,
+              "docs": 63,
+              "dead_docs": 0,
+              "sum_doc_lengths": 14983,
+              "total_pages": 14,
+              "generation": 107
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 11402,
+              "docs": 571,
+              "dead_docs": 0,
+              "sum_doc_lengths": 95898,
+              "total_pages": 71,
+              "generation": 119
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 11576,
+              "docs": 512,
+              "dead_docs": 0,
+              "sum_doc_lengths": 42831,
+              "total_pages": 35,
+              "generation": 134
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 11607,
+              "docs": 512,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1536,
+              "total_pages": 2,
+              "generation": 149
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 11613,
+              "docs": 128,
+              "dead_docs": 0,
+              "sum_doc_lengths": 384,
+              "total_pages": 1,
+              "generation": 152
+            },
+            {
+              "ordinal": 12,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 61,
+              "dead_docs": 0,
+              "sum_doc_lengths": 183,
+              "total_pages": 1,
+              "generation": 5196
+            }
+          ]
+        }
+      },
+      {
+        "name": "candidate-vacuumed",
+        "checks": 604,
+        "library_sha256": "53440a7e26db6416df6e083746ea3e5e804d5eb9679e2e9165b88be412e2071a",
+        "seconds": 2.524548916146159,
+        "fingerprint": {
+          "rows": 100041,
+          "visibility": {
+            "all_visible": 8239,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2860,
+              "docs": 32768,
+              "dead_docs": 1677,
+              "sum_doc_lengths": 5965112,
+              "total_pages": 2860,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5681,
+              "docs": 32768,
+              "dead_docs": 1708,
+              "sum_doc_lengths": 5918812,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8694,
+              "docs": 28381,
+              "dead_docs": 1489,
+              "sum_doc_lengths": 6419231,
+              "total_pages": 3012,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 9307,
+              "docs": 818,
+              "dead_docs": 10,
+              "sum_doc_lengths": 136774,
+              "total_pages": 97,
+              "generation": 29
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 9818,
+              "docs": 752,
+              "dead_docs": 12,
+              "sum_doc_lengths": 114305,
+              "total_pages": 85,
+              "generation": 53
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 10335,
+              "docs": 753,
+              "dead_docs": 7,
+              "sum_doc_lengths": 122757,
+              "total_pages": 88,
+              "generation": 75
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 11016,
+              "docs": 875,
+              "dead_docs": 12,
+              "sum_doc_lengths": 157654,
+              "total_pages": 108,
+              "generation": 102
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 11111,
+              "docs": 63,
+              "dead_docs": 2,
+              "sum_doc_lengths": 14983,
+              "total_pages": 15,
+              "generation": 107
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 11402,
+              "docs": 571,
+              "dead_docs": 5,
+              "sum_doc_lengths": 95898,
+              "total_pages": 72,
+              "generation": 119
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 11576,
+              "docs": 512,
+              "dead_docs": 1,
+              "sum_doc_lengths": 42831,
+              "total_pages": 36,
+              "generation": 134
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 11607,
+              "docs": 512,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1536,
+              "total_pages": 2,
+              "generation": 149
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 11613,
+              "docs": 128,
+              "dead_docs": 0,
+              "sum_doc_lengths": 384,
+              "total_pages": 1,
+              "generation": 152
+            },
+            {
+              "ordinal": 12,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 61,
+              "dead_docs": 0,
+              "sum_doc_lengths": 183,
+              "total_pages": 1,
+              "generation": 5196
+            }
+          ]
+        }
+      },
+      {
+        "name": "candidate-restarted",
+        "checks": 604,
+        "library_sha256": "53440a7e26db6416df6e083746ea3e5e804d5eb9679e2e9165b88be412e2071a",
+        "seconds": 2.5080553330481052,
+        "fingerprint": {
+          "rows": 100041,
+          "visibility": {
+            "all_visible": 8239,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2860,
+              "docs": 32768,
+              "dead_docs": 1677,
+              "sum_doc_lengths": 5965112,
+              "total_pages": 2860,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5681,
+              "docs": 32768,
+              "dead_docs": 1708,
+              "sum_doc_lengths": 5918812,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8694,
+              "docs": 28381,
+              "dead_docs": 1489,
+              "sum_doc_lengths": 6419231,
+              "total_pages": 3012,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 9307,
+              "docs": 818,
+              "dead_docs": 10,
+              "sum_doc_lengths": 136774,
+              "total_pages": 97,
+              "generation": 29
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 9818,
+              "docs": 752,
+              "dead_docs": 12,
+              "sum_doc_lengths": 114305,
+              "total_pages": 85,
+              "generation": 53
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 10335,
+              "docs": 753,
+              "dead_docs": 7,
+              "sum_doc_lengths": 122757,
+              "total_pages": 88,
+              "generation": 75
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 11016,
+              "docs": 875,
+              "dead_docs": 12,
+              "sum_doc_lengths": 157654,
+              "total_pages": 108,
+              "generation": 102
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 11111,
+              "docs": 63,
+              "dead_docs": 2,
+              "sum_doc_lengths": 14983,
+              "total_pages": 15,
+              "generation": 107
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 11402,
+              "docs": 571,
+              "dead_docs": 5,
+              "sum_doc_lengths": 95898,
+              "total_pages": 72,
+              "generation": 119
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 11576,
+              "docs": 512,
+              "dead_docs": 1,
+              "sum_doc_lengths": 42831,
+              "total_pages": 36,
+              "generation": 134
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 11607,
+              "docs": 512,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1536,
+              "total_pages": 2,
+              "generation": 149
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 11613,
+              "docs": 128,
+              "dead_docs": 0,
+              "sum_doc_lengths": 384,
+              "total_pages": 1,
+              "generation": 152
+            },
+            {
+              "ordinal": 12,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 61,
+              "dead_docs": 0,
+              "sum_doc_lengths": 183,
+              "total_pages": 1,
+              "generation": 5196
+            }
+          ]
+        }
+      }
+    ],
+    "baseline_commit": "750872d",
+    "candidate_commit": "54c2d9e",
+    "baseline_sha256": "9b2095393030749059104a522e9a6123516206848d3010a4921e545f41bf086a",
+    "candidate_sha256": "53440a7e26db6416df6e083746ea3e5e804d5eb9679e2e9165b88be412e2071a",
+    "input_sha256": "656bf88b412a91d2148a4628831814586e07a67ff74e684426e6db4a3890c7c6",
+    "queries_sha256": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb"
+  },
+  "visibility": {
+    "status": "passed",
+    "immutable_segments": 16,
+    "checks": 56
+  },
+  "raw_results": "benchmarks/results/local-snapshot-candidate-100k-r2",
+  "scope": "Native macOS ARM PostgreSQL 18.6; no Linux snapshot portability claim; correctness and compatibility, not capacity performance"
+}

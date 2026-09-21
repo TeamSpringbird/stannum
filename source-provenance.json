@@ -989,6 +989,10 @@
     "benchmarks/test_database_snapshot.py": {
       "owner": "ben",
       "evidence": "Original Stannum benchmark snapshot capture, restore, and validation implementation."
+    },
+    "benchmarks/snapshot_candidate_local.py": {
+      "owner": "ben",
+      "evidence": "Original native PostgreSQL physical snapshot and candidate-binary compatibility rehearsal."
     }
   }
 }
