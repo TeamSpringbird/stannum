@@ -1481,6 +1481,25 @@ mod tests {
             assert_eq!(scan["Pruning"], "block-max", "{query}");
             assert!(scan["Scored Candidates"].as_i64().unwrap() < 1500, "{scan}");
         }
+        // `score` elides `alpha`, which most documents hold. The disjunction
+        // is still pruned, over `delta` alone, because its top three all
+        // score above the zero of a document holding only `alpha`; asking for
+        // more rows than `delta` has leaves the ordering to full scoring.
+        for (limit, pruned) in [(3, true), (5000, false)] {
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM bmw WHERE body ==> 'delta OR alpha'
+                 ORDER BY stannum.score(ctid) DESC LIMIT {limit}"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            let scan = search_scan(&plan[0]["Plan"]).unwrap();
+            assert_eq!(
+                scan["Pruning"] == "block-max",
+                pruned,
+                "LIMIT {limit}: {scan}"
+            );
+        }
         // Rows deleted after the top k was built are invisible, so the parent
         // reads past k and the scan completes the ordering from scratch.
         let top: Vec<i32> = ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3")

@@ -1005,8 +1005,12 @@ impl IndexScorer {
         // Every scoring term must be a leaf (no added terms), and a leaf that
         // is not a scoring term must be absent from the index altogether: it
         // then adds nothing to a disjunction and empties a conjunction. A
-        // present leaf without a scorer (an elided dense term) would give
-        // its documents a score of zero, which this walk cannot bound.
+        // present leaf without a scorer is an elided dense term. In a
+        // disjunction its documents score zero unless a scoring term also
+        // lists them, so the walk over the scoring terms is exact as long as
+        // it fills the top k with positive scores; otherwise, and in a
+        // conjunction, where the elided term still filters, the caller scores
+        // every candidate.
         if self
             .terms
             .iter()
@@ -1015,6 +1019,7 @@ impl IndexScorer {
             return None;
         }
         let mut absent = false;
+        let mut elided = false;
         for leaf in &leaves {
             if self.terms.iter().any(|(term, _)| term == leaf) {
                 continue;
@@ -1025,7 +1030,11 @@ impl IndexScorer {
                 .iter()
                 .any(|(source, _)| segment_error(source.term(leaf)).is_some())
             {
-                return None;
+                if combine != Combine::Any {
+                    return None;
+                }
+                elided = true;
+                continue;
             }
             absent = true;
         }
@@ -1052,6 +1061,10 @@ impl IndexScorer {
         // the unpruned path; leave that case to it.
         let mut seen = FxHashSet::default();
         if !rows.iter().all(|(_, tid)| seen.insert(*tid)) {
+            return None;
+        }
+        if elided && (rows.len() < k || rows.last().is_some_and(|(score, _)| *score <= 0.0)) {
+            // Documents holding only elided terms tie at zero and belong here.
             return None;
         }
         let complete = rows.len() < k;

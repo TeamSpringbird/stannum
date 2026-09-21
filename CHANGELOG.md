@@ -28,6 +28,10 @@
   dead list meanwhile; earlier builds could count a tuple VACUUM had removed
   from a page it then marked all-visible.
 - Counts check the matches of a heap page under one buffer lock.
+- Ranked disjunctions ordered by `stannum.score` are pruned when dense terms
+  are elided: the walk covers the scoring terms and is exact whenever the top k
+  score above zero. They were scored exhaustively before, 6.4 s at the median
+  over 15 million Stack Exchange comments against 21 ms now.
 - Ranked scans name a scored document through its term's ordinal stream
   instead of ranking its TID in the segment's document table, which has no
   skip structure and was decoded from the start by every ranked query: about
