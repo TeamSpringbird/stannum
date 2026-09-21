@@ -981,6 +981,14 @@
     "benchmarks/aws/crossover_campaign.py": {
       "owner": "ben",
       "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
+    },
+    "benchmarks/aws/database_snapshot.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmark snapshot capture, restore, and validation implementation."
+    },
+    "benchmarks/test_database_snapshot.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmark snapshot capture, restore, and validation implementation."
     }
   }
 }
