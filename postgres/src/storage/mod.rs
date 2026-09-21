@@ -873,8 +873,10 @@ impl Index for MemoizedSegment {
 type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
 
 /// `stannum.reader_cache_mb`: fetched bytes across a backend's cached readers
-/// before the cache is emptied.
-pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(64);
+/// before the cache is emptied. Emptying is wholesale, so the budget should
+/// hold a workload's hot terms: the published Wikipedia count queries touch
+/// about 100 MiB of ordinal chunks, and at 64 MiB they ran a fifth slower.
+pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(256);
 
 thread_local! {
     static SEGMENT_READERS: RefCell<SegmentReaders> = RefCell::new(HashMap::new());
