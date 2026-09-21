@@ -45,7 +45,7 @@ def main():
     for key in ('PGOPTIONS','PGSERVICE','PGSERVICEFILE','PGPASSWORD'):env.pop(key,None)
     state=dict(status='starting',expected_rows=args.rows,aws_mutations=args.aws_mutations,phases=[],baseline_commit=args.baseline_commit,candidate_commit=args.candidate_commit,
                baseline_sha256=sha(libs/'baseline.dylib'),candidate_sha256=sha(libs/'candidate.dylib'),
-               input_sha256=sha(args.input),queries_sha256=sha(args.queries))
+               input_sha256=None,queries_sha256=sha(args.queries))
     def save(): (out/'manifest.json').write_text(json.dumps(state,indent=2)+'\n')
     def command(*cmd):return subprocess.check_output(cmd,env=env,text=True).strip()
     def sql(query):return command('psql','-XqAt','-v','ON_ERROR_STOP=1','-c',query)
@@ -95,6 +95,10 @@ def main():
     with open('/tmp/stannum-pgrx.lock','a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         try:
+            # Hashing the full corpus is substantial I/O; keep it inside the
+            # machine-wide benchmark lock alongside loading and indexing.
+            state['input_sha256']=sha(args.input)
+            save()
             command('initdb','-D',str(data),'-A','trust')
             start()
             sql('CREATE EXTENSION stannum; CREATE EXTENSION pg_visibility;')

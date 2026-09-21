@@ -49,3 +49,46 @@ The mutated corpus has 990,189 rows. Clean and mutated snapshots occupy about
 4.0GB and 4.6GB respectively. [Receipt](local-million-compatibility.json).
 Repeated latency comparisons started after this gate; the compatibility receipt
 alone is not a latency result.
+
+## Full-corpus local merge-validation tier
+
+The same native snapshot protocol is now queued for all 5,032,104 Wikipedia
+rows. This host has 128 GiB RAM, 16 logical CPUs and approximately 2.9 TiB free
+at setup. The verified CSV is 8,093,810,896 bytes, SHA-256
+`7e4cba73338f9aba3a344de9f7d63007fa51f0f4ee85d70d7bd34fe95ff6e9a8`.
+No new corpus download or AWS instance is needed.
+
+The reusable local image is a cleanly stopped native PostgreSQL physical
+snapshot plus its pinned extension libraries, source/binary hashes, query hash,
+settings and correctness receipt. It is macOS ARM specific, not a portable
+Docker image or a copy of an AWS cluster. Clean and pre-VACUUM mutated snapshots
+are retained separately. Load/index construction runs once; each trial restores
+a copy and binds a private library before restarting PostgreSQL.
+
+Artifacts live under `benchmarks/results/local-full-campaign/`:
+
+- `compatibility/`: full corpus load/index, independent OR-count oracle,
+  candidate restore/mutations/VACUUM/restart checks and snapshot images.
+- `merge-validation.json`: pinned build/test/run recipe consumed by the existing
+  `benchmarks/experiment_queue.py`, with absolute host-local artifact paths.
+- `merge-validation/status.json` and numbered logs: fail-closed queue progress.
+- `merge-binaries/`: separately rebuilt main/cached/packed binaries and hashes.
+- `cached-v-main/` and `packed-v-cached/`: two alternating rounds per variant
+  and clean/mutated state, 600 seconds each, always eight clients.
+
+The two comparisons contain 160 minutes of timed load in total, excluding
+setup, compilation, correctness and warmups. The queue waits for full snapshot
+compatibility and the million-row regression replay. Builds and tests share
+the exclusive benchmark lock; timed runners acquire it themselves. Comparison
+mode does not set experimental strategy GUCs on main-only release binaries.
+The older pilot instrumentation is excluded from the two proposed release PRs.
+
+PR #81 (`f5b41ff`) and #82 (`0db1479`) isolate cached and packed heads onto main
+`750872d`. They remain drafts until exact-build performance, regression screens,
+full correctness and cross-platform CI pass. A complete queue is measurement
+evidence, not an automatic performance approval or automatic merge.
+
+Full corpus size tests scale; it does not reproduce AWS CPU, storage or OS cache
+behavior. `shared_buffers=256MB` is not a total memory cap. A later explicitly
+constrained-memory run is needed to claim memory-pressure coverage. Retain the
+million-row tier for fast diagnosis and use this tier for merge candidates.

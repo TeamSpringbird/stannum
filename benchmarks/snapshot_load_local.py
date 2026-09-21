@@ -139,7 +139,7 @@ def main():
                             stop();start()
                             def configured():
                                 conn=connect();conn.execute('SET enable_seqscan=off; SET statement_timeout=120000; SET plan_cache_mode=force_custom_plan')
-                                if variant!='main':conn.execute('SET stannum.force_count_pages='+('on' if variant=='candidate-bitmaps' else 'off'))
+                                if not comparison and variant!='main':conn.execute('SET stannum.force_count_pages='+('on' if variant=='candidate-bitmaps' else 'off'))
                                 return conn
                             with configured() as conn,(folder/'plans.jsonl').open('w') as plans:
                                 bindings=conn.execute("SELECT DISTINCT probin FROM pg_proc WHERE probin LIKE %s",(str(out)+'%',)).fetchall();assert bindings==[(str(lib),)]
