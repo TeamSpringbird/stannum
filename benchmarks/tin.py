@@ -687,7 +687,7 @@ def run(args):
                         raise ValueError('whitespace-only updates changed full-corpus query counts')
                     job['post_update_correctness'] = dict(queries=len(queries), mismatches=0)
                     if args.workload == 'topk':
-                        after_ranked = sql(ranked_sql)
+                        after_ranked = sql(ranked_sql, setup=True)
                         (path / 'ranked-correctness-after.txt').write_text(after_ranked + '\n')
                         validate_result(after_ranked, [q[0] for q in queries])
                         job['post_update_ranked_correctness'] = dict(queries=len(queries), mismatches=0,
