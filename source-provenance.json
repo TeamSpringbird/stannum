@@ -941,6 +941,10 @@
     "benchmarks/test_query_comparison.py": {
       "owner": "ben",
       "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "segment/examples/decode_postings.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum current-codec decoding diagnostic, following count_paths.rs timing methodology; no upstream source copied."
     }
   }
 }

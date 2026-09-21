@@ -1,0 +1,21 @@
+{
+  "base_revision": "eda28ea94d75cf3f6d7c93d1bf977423275a1b3a",
+  "source": "segment/examples/decode_postings.rs",
+  "source_sha256": "355888fb1c95a0fccf61410675d59b48aa3108976ad4ba459a25d328c6301628",
+  "machine": "Apple M4 Max arm64, shared workstation",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "profile": "release",
+  "build_jobs": 2,
+  "runs": [
+    {
+      "command": "cargo run -p segment --release --example decode_postings -- 12000 9 4",
+      "csv": "docs/benchmarks/postings-decode/pages-12000.csv",
+      "sha256": "189406094c62bc75561ba3e7cffdb424026c4115aa6e5e73d0ec5ee47efbacc5"
+    },
+    {
+      "command": "cargo run -p segment --release --example decode_postings -- 36000 9 4",
+      "csv": "docs/benchmarks/postings-decode/pages-36000.csv",
+      "sha256": "33b8a93d876b90a604f7e8e3d598e04e69a70ce28e3ed73badc28b516a00e76e"
+    }
+  ]
+}
