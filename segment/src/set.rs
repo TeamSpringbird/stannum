@@ -197,18 +197,30 @@ impl<C: Cursor> Cursor for Union<C> {
     }
 }
 
-/// Union with cached input heads for wider query nodes.
+/// Union with cached input heads for wider query nodes. Packed heads preserve
+/// heap order and let the minimum scan compare one integer per input.
 pub struct CachedUnion<C> {
     cursors: Vec<C>,
-    // Inputs can only move through this union, so unchanged heads stay valid.
-    heads: Vec<Option<Tid>>,
-    current: Option<Tid>,
+    heads: Vec<u64>,
+    current: u64,
+}
+
+// A Tid occupies 48 bits; this sentinel cannot collide with any input Tid.
+const EXHAUSTED_HEAD: u64 = u64::MAX;
+
+fn pack_head(tid: Option<Tid>) -> u64 {
+    tid.map_or(EXHAUSTED_HEAD, |tid| {
+        (u64::from(tid.block) << 16) | u64::from(tid.offset)
+    })
 }
 
 impl<C: Cursor> CachedUnion<C> {
     pub fn new(cursors: Vec<C>) -> Self {
-        let heads: Vec<_> = cursors.iter().map(Cursor::current).collect();
-        let current = heads.iter().copied().flatten().min();
+        let heads: Vec<_> = cursors
+            .iter()
+            .map(|cursor| pack_head(cursor.current()))
+            .collect();
+        let current = heads.iter().copied().min().unwrap_or(EXHAUSTED_HEAD);
         Self {
             cursors,
             heads,
@@ -219,38 +231,40 @@ impl<C: Cursor> CachedUnion<C> {
 
 impl<C: Cursor> Cursor for CachedUnion<C> {
     fn current(&self) -> Option<Tid> {
-        self.current
+        (self.current != EXHAUSTED_HEAD).then_some(Tid {
+            block: (self.current >> 16) as u32,
+            offset: self.current as u16,
+        })
     }
 
     fn advance(&mut self) -> Result<()> {
-        let Some(current) = self.current else {
+        if self.current == EXHAUSTED_HEAD {
             return Ok(());
-        };
-        let mut next: Option<Tid> = None;
+        }
+        let mut next = EXHAUSTED_HEAD;
         for (cursor, head) in self.cursors.iter_mut().zip(&mut self.heads) {
-            if *head == Some(current) {
+            if *head == self.current {
                 cursor.advance()?;
-                *head = cursor.current();
+                *head = pack_head(cursor.current());
             }
-            if let Some(tid) = *head {
-                next = Some(next.map_or(tid, |value| value.min(tid)));
-            }
+            next = next.min(*head);
         }
         self.current = next;
         Ok(())
     }
 
     fn seek(&mut self, target: Tid) -> Result<()> {
-        if self.current.is_none_or(|current| current >= target) {
+        let packed_target = pack_head(Some(target));
+        if self.current >= packed_target {
             return Ok(());
         }
         for (cursor, head) in self.cursors.iter_mut().zip(&mut self.heads) {
-            if head.is_some_and(|tid| tid < target) {
+            if *head < packed_target {
                 cursor.seek(target)?;
-                *head = cursor.current();
+                *head = pack_head(cursor.current());
             }
         }
-        self.current = self.heads.iter().copied().flatten().min();
+        self.current = self.heads.iter().copied().min().unwrap_or(EXHAUSTED_HEAD);
         Ok(())
     }
 }
@@ -442,6 +456,31 @@ mod tests {
             0
         );
         assert_eq!(count(Union::new(vec![Empty, Empty])).unwrap(), 0);
+    }
+
+    #[test]
+    fn packed_heads_preserve_high_blocks_and_exhaustion() {
+        let a = [
+            Tid::new(0, 291).unwrap(),
+            Tid::new(65535, 291).unwrap(),
+            Tid::new(crate::tid::MAX_BLOCK, 291).unwrap(),
+        ];
+        let b = [
+            Tid::new(65536, 1).unwrap(),
+            Tid::new(crate::tid::MAX_BLOCK, 1).unwrap(),
+        ];
+        let mut expected: Vec<_> = a.iter().chain(&b).copied().collect();
+        expected.sort_unstable();
+        let mut cursor = union(vec![Slice::new(&a), Slice::new(&b), Slice::new(&[])]);
+        for tid in expected {
+            assert_eq!(cursor.current(), Some(tid));
+            cursor.seek(tid).unwrap();
+            assert_eq!(cursor.current(), Some(tid));
+            cursor.advance().unwrap();
+        }
+        cursor.seek(Tid::new(0, 1).unwrap()).unwrap();
+        cursor.advance().unwrap();
+        assert_eq!(cursor.current(), None);
     }
 
     #[test]
