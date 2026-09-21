@@ -466,7 +466,15 @@ impl<'a> Postings<'a> {
             crate::pages::Cursor::advance(&mut pages)?;
             Ok(Box::new(pages))
         } else {
-            Ok(Box::new(crate::pages::Rows::new(self.cursor_with(false)?)?))
+            let mut pages = SparsePages {
+                reader: Reader::at(self.bytes, self.body_at),
+                remaining: self.count,
+                previous: None,
+                pending: None,
+                current: None,
+            };
+            crate::pages::Cursor::advance(&mut pages)?;
+            Ok(Box::new(pages))
         }
     }
 
@@ -847,6 +855,61 @@ pub struct GroupedCursor<'a> {
     bounds: Option<Bounds<'a>>,
 }
 
+// Experimental fused sparse decoder: consume compressed entries directly into
+// a page mask, retaining only one lookahead Tid. No scalar cursor or ordinal
+// bookkeeping is needed by page consumers. Stored bytes remain unchanged.
+struct SparsePages<'a> {
+    reader: Reader<'a>,
+    remaining: u32,
+    previous: Option<Tid>,
+    pending: Option<Tid>,
+    current: Option<crate::pages::Page>,
+}
+
+impl crate::pages::Cursor for SparsePages<'_> {
+    fn current(&self) -> Option<crate::pages::Page> {
+        self.current
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        self.current = None;
+        let mut page = self.pending.take().map(|tid| {
+            let mut offsets = crate::pages::Offsets::default();
+            offsets.insert(tid.offset);
+            crate::pages::Page {
+                block: tid.block,
+                offsets,
+            }
+        });
+        while self.remaining != 0 {
+            let delta = self.reader.varint_u32()?;
+            let block = self
+                .previous
+                .map_or(0, |tid| tid.block)
+                .checked_add(delta)
+                .ok_or(Error::Corrupt("block overflow"))?;
+            let offset = u16::try_from(self.reader.varint_u32()?).map_err(|_| Error::InvalidTid)?;
+            let tid = Tid::new(block, offset)?;
+            if self.previous.is_some_and(|previous| previous >= tid) {
+                return Err(Error::Corrupt("sparse postings not increasing"));
+            }
+            self.previous = Some(tid);
+            self.remaining -= 1;
+            let output = page.get_or_insert_with(|| crate::pages::Page {
+                block,
+                offsets: crate::pages::Offsets::default(),
+            });
+            if output.block != block {
+                self.pending = Some(tid);
+                break;
+            }
+            output.offsets.insert(offset);
+        }
+        self.current = page;
+        Ok(())
+    }
+}
+
 struct GroupedPages<'a> {
     inner: GroupedCursor<'a>,
     current: Option<crate::pages::Page>,
@@ -1185,6 +1248,64 @@ impl<'a> GroupedCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    proptest::proptest! {
+        #[test]
+        fn fused_sparse_pages_match_scalar_adapter(
+            raw in proptest::collection::vec((0u32..10000, 1u16..292), 0..800),
+            seeks in proptest::collection::vec(0u32..10001, 0..30),
+        ) {
+            use crate::pages::Cursor as _;
+            let mut tids: Vec<_> = raw.into_iter().map(|(block, offset)| tid(block, offset)).collect();
+            tids.sort_unstable();
+            tids.dedup();
+            let bytes = encode_sparse(&tids, None, Format::Lsg3);
+            let postings = Postings::parse(&bytes).unwrap();
+            let mut complete = postings.pages().unwrap();
+            let mut decoded = Vec::new();
+            while let Some(page) = complete.current() {
+                decoded.extend(page.offsets.iter().map(|offset| tid(page.block, offset)));
+                complete.advance().unwrap();
+            }
+            proptest::prop_assert_eq!(decoded, tids);
+            let mut fused = postings.pages().unwrap();
+            let mut reference = crate::pages::Rows::new(postings.cursor().unwrap()).unwrap();
+            for block in seeks {
+                fused.seek(block).unwrap(); reference.seek(block).unwrap();
+                proptest::prop_assert_eq!(fused.current(), reference.current());
+                fused.advance().unwrap(); reference.advance().unwrap();
+            }
+            loop {
+                proptest::prop_assert_eq!(fused.current(), reference.current());
+                if fused.current().is_none() { break; }
+                fused.advance().unwrap(); reference.advance().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn fused_sparse_pages_reject_invalid_offsets_order_and_truncation() {
+        // Sparse form, count, then (block delta, offset) varints.
+        let cases = [
+            vec![0, 1, 0, 0],       // zero offset
+            vec![0, 2, 0, 1, 0, 1], // duplicate
+            vec![0, 2, 0, 2, 0, 1], // decreasing offset
+            vec![0, 1, 0],          // missing offset
+            vec![0, 1, 0x80],       // truncated block varint
+            vec![0, 1, 0, 0xa4, 2], // offset 292
+        ];
+        for bytes in cases {
+            let postings = Postings::parse(&bytes).unwrap();
+            assert!(postings.to_vec().is_err());
+            let result = postings.pages().and_then(|mut pages| {
+                while pages.current().is_some() {
+                    pages.advance()?;
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "accepted {bytes:?}");
+        }
+    }
 
     fn tid(block: u32, offset: u16) -> Tid {
         Tid::new(block, offset).unwrap()
