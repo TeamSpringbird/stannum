@@ -29,6 +29,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--release-library', type=Path, required=True, help='Release artifact whose hash must match the installed extension')
     parser.add_argument('--rows', type=int, default=100000)
+    parser.add_argument('--crossover-queries', type=Path, help='Run all 302 published queries using the crossover probe')
     parser.add_argument('--port', type=int, default=29430)
     args = parser.parse_args()
     out = args.output.resolve()
@@ -79,8 +80,12 @@ def main():
                 save()
                 print('Starting '+phase,flush=True)
                 with (out/(phase+'.log')).open('w') as log:
-                    subprocess.run([sys.executable,str(Path(__file__).with_name('count_probe.py')),
-                                    '--output',str(out/phase),'--repetitions','9'],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
+                    probe = 'count_crossover.py' if args.crossover_queries else 'count_probe.py'
+                    command = [sys.executable,str(Path(__file__).with_name(probe)),
+                               '--output',str(out/phase),'--repetitions','9']
+                    if args.crossover_queries:
+                        command += ['--queries',str(args.crossover_queries.resolve())]
+                    subprocess.run(command,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
                 meta['phases'][-1].update(status='complete',after=capture())
                 save()
                 print('Completed '+phase,flush=True)
@@ -92,7 +97,8 @@ def main():
             save()
             subprocess.run(['pg_ctl','-D',str(data),'-m','immediate','stop'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     shutil.copy2(__file__,out/'count_local.py')
-    shutil.copy2(Path(__file__).with_name('count_probe.py'),out/'count_probe.py')
+    for name in ('count_probe.py','count_crossover.py'):
+        shutil.copy2(Path(__file__).with_name(name),out/name)
 
 
 if __name__ == '__main__':

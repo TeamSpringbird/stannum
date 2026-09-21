@@ -953,6 +953,18 @@
     "benchmarks/count_local.py": {
       "owner": "ben",
       "evidence": "New owned local count execution and visibility diagnostic runner; not copied from Lead."
+    },
+    "benchmarks/count_crossover.py": {
+      "owner": "ben",
+      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
+    },
+    "benchmarks/count_crossover_report.py": {
+      "owner": "ben",
+      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
+    },
+    "benchmarks/test_count_crossover.py": {
+      "owner": "ben",
+      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
     }
   }
 }

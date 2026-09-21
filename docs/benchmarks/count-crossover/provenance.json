@@ -1,0 +1,2752 @@
+{
+  "100k": {
+    "input_sha256": "656bf88b412a91d2148a4628831814586e07a67ff74e684426e6db4a3890c7c6",
+    "library_sha256": "53440a7e26db6416df6e083746ea3e5e804d5eb9679e2e9165b88be412e2071a",
+    "expected_rows": 100000,
+    "server_version": "18.6 (Homebrew)",
+    "host": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "phases": [
+      {
+        "name": "vacuumed",
+        "before": {
+          "rows": 100000,
+          "visibility": {
+            "all_visible": 10258,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2868,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5970834,
+              "total_pages": 2867,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5689,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910198,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8707,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6422123,
+              "total_pages": 3016,
+              "generation": 3
+            }
+          ]
+        },
+        "after": {
+          "rows": 100000,
+          "visibility": {
+            "all_visible": 10258,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2868,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5970834,
+              "total_pages": 2867,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5689,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910198,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8707,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6422123,
+              "total_pages": 3016,
+              "generation": 3
+            }
+          ]
+        }
+      },
+      {
+        "name": "vacuumed-repeat",
+        "before": {
+          "rows": 100000,
+          "visibility": {
+            "all_visible": 10258,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2868,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5970834,
+              "total_pages": 2867,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5689,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910198,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8707,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6422123,
+              "total_pages": 3016,
+              "generation": 3
+            }
+          ]
+        },
+        "after": {
+          "rows": 100000,
+          "visibility": {
+            "all_visible": 10258,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2868,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5970834,
+              "total_pages": 2867,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5689,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910198,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8707,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6422123,
+              "total_pages": 3016,
+              "generation": 3
+            }
+          ]
+        }
+      },
+      {
+        "name": "mutated",
+        "before": {
+          "rows": 99010,
+          "visibility": {
+            "all_visible": 1123,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2868,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5970834,
+              "total_pages": 2867,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5689,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910198,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8707,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6422123,
+              "total_pages": 3016,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 8851,
+              "docs": 483,
+              "dead_docs": 0,
+              "sum_doc_lengths": 108200,
+              "total_pages": 78,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 8909,
+              "docs": 489,
+              "dead_docs": 0,
+              "sum_doc_lengths": 68945,
+              "total_pages": 57,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 8978,
+              "docs": 480,
+              "dead_docs": 0,
+              "sum_doc_lengths": 93429,
+              "total_pages": 68,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 9045,
+              "docs": 481,
+              "dead_docs": 0,
+              "sum_doc_lengths": 88544,
+              "total_pages": 66,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 9112,
+              "docs": 478,
+              "dead_docs": 0,
+              "sum_doc_lengths": 90059,
+              "total_pages": 66,
+              "generation": 8
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 9169,
+              "docs": 480,
+              "dead_docs": 0,
+              "sum_doc_lengths": 71683,
+              "total_pages": 56,
+              "generation": 9
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 9238,
+              "docs": 492,
+              "dead_docs": 0,
+              "sum_doc_lengths": 91892,
+              "total_pages": 68,
+              "generation": 10
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 9305,
+              "docs": 498,
+              "dead_docs": 0,
+              "sum_doc_lengths": 92658,
+              "total_pages": 66,
+              "generation": 11
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 9371,
+              "docs": 484,
+              "dead_docs": 0,
+              "sum_doc_lengths": 88859,
+              "total_pages": 65,
+              "generation": 12
+            },
+            {
+              "ordinal": 12,
+              "kind": "immutable",
+              "root_block": 9434,
+              "docs": 479,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85514,
+              "total_pages": 62,
+              "generation": 13
+            },
+            {
+              "ordinal": 13,
+              "kind": "immutable",
+              "root_block": 9499,
+              "docs": 477,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85975,
+              "total_pages": 64,
+              "generation": 14
+            },
+            {
+              "ordinal": 14,
+              "kind": "immutable",
+              "root_block": 9565,
+              "docs": 479,
+              "dead_docs": 0,
+              "sum_doc_lengths": 88921,
+              "total_pages": 65,
+              "generation": 15
+            },
+            {
+              "ordinal": 15,
+              "kind": "immutable",
+              "root_block": 9636,
+              "docs": 479,
+              "dead_docs": 0,
+              "sum_doc_lengths": 96767,
+              "total_pages": 70,
+              "generation": 16
+            },
+            {
+              "ordinal": 16,
+              "kind": "immutable",
+              "root_block": 9698,
+              "docs": 488,
+              "dead_docs": 0,
+              "sum_doc_lengths": 79754,
+              "total_pages": 61,
+              "generation": 17
+            },
+            {
+              "ordinal": 17,
+              "kind": "immutable",
+              "root_block": 9767,
+              "docs": 484,
+              "dead_docs": 0,
+              "sum_doc_lengths": 93212,
+              "total_pages": 68,
+              "generation": 18
+            },
+            {
+              "ordinal": 18,
+              "kind": "immutable",
+              "root_block": 9843,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 104406,
+              "total_pages": 75,
+              "generation": 19
+            },
+            {
+              "ordinal": 19,
+              "kind": "immutable",
+              "root_block": 9927,
+              "docs": 466,
+              "dead_docs": 0,
+              "sum_doc_lengths": 118059,
+              "total_pages": 81,
+              "generation": 20
+            },
+            {
+              "ordinal": 20,
+              "kind": "immutable",
+              "root_block": 10023,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 131849,
+              "total_pages": 89,
+              "generation": 21
+            },
+            {
+              "ordinal": 21,
+              "kind": "immutable",
+              "root_block": 10096,
+              "docs": 479,
+              "dead_docs": 0,
+              "sum_doc_lengths": 100174,
+              "total_pages": 72,
+              "generation": 22
+            },
+            {
+              "ordinal": 22,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 422,
+              "dead_docs": 0,
+              "sum_doc_lengths": 91264,
+              "total_pages": 54,
+              "generation": 10169
+            }
+          ]
+        },
+        "after": {
+          "rows": 99010,
+          "visibility": {
+            "all_visible": 1123,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2868,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5970834,
+              "total_pages": 2867,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5689,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910198,
+              "total_pages": 2819,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8707,
+              "docs": 28381,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6422123,
+              "total_pages": 3016,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 8851,
+              "docs": 483,
+              "dead_docs": 0,
+              "sum_doc_lengths": 108200,
+              "total_pages": 78,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 8909,
+              "docs": 489,
+              "dead_docs": 0,
+              "sum_doc_lengths": 68945,
+              "total_pages": 57,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 8978,
+              "docs": 480,
+              "dead_docs": 0,
+              "sum_doc_lengths": 93429,
+              "total_pages": 68,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 9045,
+              "docs": 481,
+              "dead_docs": 0,
+              "sum_doc_lengths": 88544,
+              "total_pages": 66,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 9112,
+              "docs": 478,
+              "dead_docs": 0,
+              "sum_doc_lengths": 90059,
+              "total_pages": 66,
+              "generation": 8
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 9169,
+              "docs": 480,
+              "dead_docs": 0,
+              "sum_doc_lengths": 71683,
+              "total_pages": 56,
+              "generation": 9
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 9238,
+              "docs": 492,
+              "dead_docs": 0,
+              "sum_doc_lengths": 91892,
+              "total_pages": 68,
+              "generation": 10
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 9305,
+              "docs": 498,
+              "dead_docs": 0,
+              "sum_doc_lengths": 92658,
+              "total_pages": 66,
+              "generation": 11
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 9371,
+              "docs": 484,
+              "dead_docs": 0,
+              "sum_doc_lengths": 88859,
+              "total_pages": 65,
+              "generation": 12
+            },
+            {
+              "ordinal": 12,
+              "kind": "immutable",
+              "root_block": 9434,
+              "docs": 479,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85514,
+              "total_pages": 62,
+              "generation": 13
+            },
+            {
+              "ordinal": 13,
+              "kind": "immutable",
+              "root_block": 9499,
+              "docs": 477,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85975,
+              "total_pages": 64,
+              "generation": 14
+            },
+            {
+              "ordinal": 14,
+              "kind": "immutable",
+              "root_block": 9565,
+              "docs": 479,
+              "dead_docs": 0,
+              "sum_doc_lengths": 88921,
+              "total_pages": 65,
+              "generation": 15
+            },
+            {
+              "ordinal": 15,
+              "kind": "immutable",
+              "root_block": 9636,
+              "docs": 479,
+              "dead_docs": 0,
+              "sum_doc_lengths": 96767,
+              "total_pages": 70,
+              "generation": 16
+            },
+            {
+              "ordinal": 16,
+              "kind": "immutable",
+              "root_block": 9698,
+              "docs": 488,
+              "dead_docs": 0,
+              "sum_doc_lengths": 79754,
+              "total_pages": 61,
+              "generation": 17
+            },
+            {
+              "ordinal": 17,
+              "kind": "immutable",
+              "root_block": 9767,
+              "docs": 484,
+              "dead_docs": 0,
+              "sum_doc_lengths": 93212,
+              "total_pages": 68,
+              "generation": 18
+            },
+            {
+              "ordinal": 18,
+              "kind": "immutable",
+              "root_block": 9843,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 104406,
+              "total_pages": 75,
+              "generation": 19
+            },
+            {
+              "ordinal": 19,
+              "kind": "immutable",
+              "root_block": 9927,
+              "docs": 466,
+              "dead_docs": 0,
+              "sum_doc_lengths": 118059,
+              "total_pages": 81,
+              "generation": 20
+            },
+            {
+              "ordinal": 20,
+              "kind": "immutable",
+              "root_block": 10023,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 131849,
+              "total_pages": 89,
+              "generation": 21
+            },
+            {
+              "ordinal": 21,
+              "kind": "immutable",
+              "root_block": 10096,
+              "docs": 479,
+              "dead_docs": 0,
+              "sum_doc_lengths": 100174,
+              "total_pages": 72,
+              "generation": 22
+            },
+            {
+              "ordinal": 22,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 422,
+              "dead_docs": 0,
+              "sum_doc_lengths": 91264,
+              "total_pages": 54,
+              "generation": 10169
+            }
+          ]
+        }
+      },
+      {
+        "name": "revacuumed",
+        "before": {
+          "rows": 99010,
+          "visibility": {
+            "all_visible": 10522,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2868,
+              "docs": 32768,
+              "dead_docs": 3617,
+              "sum_doc_lengths": 5970834,
+              "total_pages": 2868,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5689,
+              "docs": 32768,
+              "dead_docs": 3616,
+              "sum_doc_lengths": 5910198,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8707,
+              "docs": 28381,
+              "dead_docs": 3134,
+              "sum_doc_lengths": 6422123,
+              "total_pages": 3017,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 9927,
+              "docs": 466,
+              "dead_docs": 4,
+              "sum_doc_lengths": 118059,
+              "total_pages": 82,
+              "generation": 20
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 10023,
+              "docs": 485,
+              "dead_docs": 5,
+              "sum_doc_lengths": 131849,
+              "total_pages": 90,
+              "generation": 21
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 10096,
+              "docs": 479,
+              "dead_docs": 4,
+              "sum_doc_lengths": 100174,
+              "total_pages": 73,
+              "generation": 22
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 10521,
+              "docs": 3842,
+              "dead_docs": 0,
+              "sum_doc_lengths": 698965,
+              "total_pages": 402,
+              "generation": 23
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 10926,
+              "docs": 3802,
+              "dead_docs": 0,
+              "sum_doc_lengths": 715148,
+              "total_pages": 404,
+              "generation": 24
+            },
+            {
+              "ordinal": 8,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 418,
+              "dead_docs": 0,
+              "sum_doc_lengths": 90370,
+              "total_pages": 54,
+              "generation": 10171
+            }
+          ]
+        },
+        "after": {
+          "rows": 99010,
+          "visibility": {
+            "all_visible": 10522,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2868,
+              "docs": 32768,
+              "dead_docs": 3617,
+              "sum_doc_lengths": 5970834,
+              "total_pages": 2868,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5689,
+              "docs": 32768,
+              "dead_docs": 3616,
+              "sum_doc_lengths": 5910198,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 8707,
+              "docs": 28381,
+              "dead_docs": 3134,
+              "sum_doc_lengths": 6422123,
+              "total_pages": 3017,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 9927,
+              "docs": 466,
+              "dead_docs": 4,
+              "sum_doc_lengths": 118059,
+              "total_pages": 82,
+              "generation": 20
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 10023,
+              "docs": 485,
+              "dead_docs": 5,
+              "sum_doc_lengths": 131849,
+              "total_pages": 90,
+              "generation": 21
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 10096,
+              "docs": 479,
+              "dead_docs": 4,
+              "sum_doc_lengths": 100174,
+              "total_pages": 73,
+              "generation": 22
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 10521,
+              "docs": 3842,
+              "dead_docs": 0,
+              "sum_doc_lengths": 698965,
+              "total_pages": 402,
+              "generation": 23
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 10926,
+              "docs": 3802,
+              "dead_docs": 0,
+              "sum_doc_lengths": 715148,
+              "total_pages": 404,
+              "generation": 24
+            },
+            {
+              "ordinal": 8,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 418,
+              "dead_docs": 0,
+              "sum_doc_lengths": 90370,
+              "total_pages": 54,
+              "generation": 10171
+            }
+          ]
+        }
+      }
+    ],
+    "raw_directory": "benchmarks/results/local-count-crossover-100k",
+    "query_sha256": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb"
+  },
+  "250k": {
+    "input_sha256": "96272f6be56013859e370bc5c3e3aa3625b8f365e1a0917157521dbf42d0c04e",
+    "library_sha256": "53440a7e26db6416df6e083746ea3e5e804d5eb9679e2e9165b88be412e2071a",
+    "expected_rows": 250000,
+    "server_version": "18.6 (Homebrew)",
+    "host": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "phases": [
+      {
+        "name": "vacuumed",
+        "before": {
+          "rows": 250000,
+          "visibility": {
+            "all_visible": 26579,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2869,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5972165,
+              "total_pages": 2868,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5691,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910378,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 9209,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7550014,
+              "total_pages": 3516,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 13000,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8216247,
+              "total_pages": 3789,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 16817,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8256587,
+              "total_pages": 3815,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 20147,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7030113,
+              "total_pages": 3328,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 23389,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6844427,
+              "total_pages": 3240,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 24129,
+              "docs": 4378,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1480008,
+              "total_pages": 738,
+              "generation": 8
+            }
+          ]
+        },
+        "after": {
+          "rows": 250000,
+          "visibility": {
+            "all_visible": 26579,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2869,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5972165,
+              "total_pages": 2868,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5691,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910378,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 9209,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7550014,
+              "total_pages": 3516,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 13000,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8216247,
+              "total_pages": 3789,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 16817,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8256587,
+              "total_pages": 3815,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 20147,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7030113,
+              "total_pages": 3328,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 23389,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6844427,
+              "total_pages": 3240,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 24129,
+              "docs": 4378,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1480008,
+              "total_pages": 738,
+              "generation": 8
+            }
+          ]
+        }
+      },
+      {
+        "name": "vacuumed-repeat",
+        "before": {
+          "rows": 250000,
+          "visibility": {
+            "all_visible": 26579,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2869,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5972165,
+              "total_pages": 2868,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5691,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910378,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 9209,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7550014,
+              "total_pages": 3516,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 13000,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8216247,
+              "total_pages": 3789,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 16817,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8256587,
+              "total_pages": 3815,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 20147,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7030113,
+              "total_pages": 3328,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 23389,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6844427,
+              "total_pages": 3240,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 24129,
+              "docs": 4378,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1480008,
+              "total_pages": 738,
+              "generation": 8
+            }
+          ]
+        },
+        "after": {
+          "rows": 250000,
+          "visibility": {
+            "all_visible": 26579,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2869,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5972165,
+              "total_pages": 2868,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5691,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910378,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 9209,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7550014,
+              "total_pages": 3516,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 13000,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8216247,
+              "total_pages": 3789,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 16817,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8256587,
+              "total_pages": 3815,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 20147,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7030113,
+              "total_pages": 3328,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 23389,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6844427,
+              "total_pages": 3240,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 24129,
+              "docs": 4378,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1480008,
+              "total_pages": 738,
+              "generation": 8
+            }
+          ]
+        }
+      },
+      {
+        "name": "mutated",
+        "before": {
+          "rows": 247525,
+          "visibility": {
+            "all_visible": 3386,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2869,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5972165,
+              "total_pages": 2868,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5691,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910378,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 9209,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7550014,
+              "total_pages": 3516,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 13000,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8216247,
+              "total_pages": 3789,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 16817,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8256587,
+              "total_pages": 3815,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 20147,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7030113,
+              "total_pages": 3328,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 23389,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6844427,
+              "total_pages": 3240,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 24129,
+              "docs": 4378,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1480008,
+              "total_pages": 738,
+              "generation": 8
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 24342,
+              "docs": 500,
+              "dead_docs": 0,
+              "sum_doc_lengths": 162870,
+              "total_pages": 114,
+              "generation": 9
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 24401,
+              "docs": 480,
+              "dead_docs": 0,
+              "sum_doc_lengths": 74814,
+              "total_pages": 58,
+              "generation": 10
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 24464,
+              "docs": 491,
+              "dead_docs": 0,
+              "sum_doc_lengths": 78146,
+              "total_pages": 62,
+              "generation": 11
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 24533,
+              "docs": 473,
+              "dead_docs": 0,
+              "sum_doc_lengths": 93230,
+              "total_pages": 68,
+              "generation": 12
+            },
+            {
+              "ordinal": 12,
+              "kind": "immutable",
+              "root_block": 24597,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 82558,
+              "total_pages": 63,
+              "generation": 13
+            },
+            {
+              "ordinal": 13,
+              "kind": "immutable",
+              "root_block": 24662,
+              "docs": 480,
+              "dead_docs": 0,
+              "sum_doc_lengths": 86207,
+              "total_pages": 64,
+              "generation": 14
+            },
+            {
+              "ordinal": 14,
+              "kind": "immutable",
+              "root_block": 24724,
+              "docs": 478,
+              "dead_docs": 0,
+              "sum_doc_lengths": 79373,
+              "total_pages": 61,
+              "generation": 15
+            },
+            {
+              "ordinal": 15,
+              "kind": "immutable",
+              "root_block": 24792,
+              "docs": 501,
+              "dead_docs": 0,
+              "sum_doc_lengths": 93019,
+              "total_pages": 67,
+              "generation": 16
+            },
+            {
+              "ordinal": 16,
+              "kind": "immutable",
+              "root_block": 24861,
+              "docs": 490,
+              "dead_docs": 0,
+              "sum_doc_lengths": 94283,
+              "total_pages": 68,
+              "generation": 17
+            },
+            {
+              "ordinal": 17,
+              "kind": "immutable",
+              "root_block": 24926,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85473,
+              "total_pages": 64,
+              "generation": 18
+            },
+            {
+              "ordinal": 18,
+              "kind": "immutable",
+              "root_block": 24990,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 84666,
+              "total_pages": 63,
+              "generation": 19
+            },
+            {
+              "ordinal": 19,
+              "kind": "immutable",
+              "root_block": 25054,
+              "docs": 476,
+              "dead_docs": 0,
+              "sum_doc_lengths": 84041,
+              "total_pages": 63,
+              "generation": 20
+            },
+            {
+              "ordinal": 20,
+              "kind": "immutable",
+              "root_block": 25126,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 99659,
+              "total_pages": 71,
+              "generation": 21
+            },
+            {
+              "ordinal": 21,
+              "kind": "immutable",
+              "root_block": 25191,
+              "docs": 477,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85757,
+              "total_pages": 64,
+              "generation": 22
+            },
+            {
+              "ordinal": 22,
+              "kind": "immutable",
+              "root_block": 25256,
+              "docs": 492,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85552,
+              "total_pages": 64,
+              "generation": 23
+            },
+            {
+              "ordinal": 23,
+              "kind": "immutable",
+              "root_block": 25334,
+              "docs": 481,
+              "dead_docs": 0,
+              "sum_doc_lengths": 106245,
+              "total_pages": 77,
+              "generation": 24
+            },
+            {
+              "ordinal": 24,
+              "kind": "immutable",
+              "root_block": 25409,
+              "docs": 457,
+              "dead_docs": 0,
+              "sum_doc_lengths": 104191,
+              "total_pages": 74,
+              "generation": 25
+            },
+            {
+              "ordinal": 25,
+              "kind": "immutable",
+              "root_block": 25490,
+              "docs": 483,
+              "dead_docs": 0,
+              "sum_doc_lengths": 113645,
+              "total_pages": 80,
+              "generation": 26
+            },
+            {
+              "ordinal": 26,
+              "kind": "immutable",
+              "root_block": 25578,
+              "docs": 487,
+              "dead_docs": 0,
+              "sum_doc_lengths": 128879,
+              "total_pages": 87,
+              "generation": 27
+            },
+            {
+              "ordinal": 27,
+              "kind": "immutable",
+              "root_block": 25652,
+              "docs": 474,
+              "dead_docs": 0,
+              "sum_doc_lengths": 100678,
+              "total_pages": 73,
+              "generation": 28
+            },
+            {
+              "ordinal": 28,
+              "kind": "immutable",
+              "root_block": 25745,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 130624,
+              "total_pages": 92,
+              "generation": 29
+            },
+            {
+              "ordinal": 29,
+              "kind": "immutable",
+              "root_block": 25822,
+              "docs": 486,
+              "dead_docs": 0,
+              "sum_doc_lengths": 107556,
+              "total_pages": 76,
+              "generation": 30
+            },
+            {
+              "ordinal": 30,
+              "kind": "immutable",
+              "root_block": 25901,
+              "docs": 475,
+              "dead_docs": 0,
+              "sum_doc_lengths": 110391,
+              "total_pages": 78,
+              "generation": 31
+            },
+            {
+              "ordinal": 31,
+              "kind": "immutable",
+              "root_block": 25977,
+              "docs": 469,
+              "dead_docs": 0,
+              "sum_doc_lengths": 102510,
+              "total_pages": 75,
+              "generation": 32
+            },
+            {
+              "ordinal": 32,
+              "kind": "immutable",
+              "root_block": 26060,
+              "docs": 474,
+              "dead_docs": 0,
+              "sum_doc_lengths": 117558,
+              "total_pages": 82,
+              "generation": 33
+            },
+            {
+              "ordinal": 33,
+              "kind": "immutable",
+              "root_block": 26143,
+              "docs": 476,
+              "dead_docs": 0,
+              "sum_doc_lengths": 117402,
+              "total_pages": 82,
+              "generation": 34
+            },
+            {
+              "ordinal": 34,
+              "kind": "immutable",
+              "root_block": 26223,
+              "docs": 478,
+              "dead_docs": 0,
+              "sum_doc_lengths": 110165,
+              "total_pages": 79,
+              "generation": 35
+            },
+            {
+              "ordinal": 35,
+              "kind": "immutable",
+              "root_block": 26318,
+              "docs": 468,
+              "dead_docs": 0,
+              "sum_doc_lengths": 140889,
+              "total_pages": 94,
+              "generation": 36
+            },
+            {
+              "ordinal": 36,
+              "kind": "immutable",
+              "root_block": 26406,
+              "docs": 465,
+              "dead_docs": 0,
+              "sum_doc_lengths": 126005,
+              "total_pages": 87,
+              "generation": 37
+            },
+            {
+              "ordinal": 37,
+              "kind": "immutable",
+              "root_block": 26493,
+              "docs": 466,
+              "dead_docs": 0,
+              "sum_doc_lengths": 121486,
+              "total_pages": 86,
+              "generation": 38
+            },
+            {
+              "ordinal": 38,
+              "kind": "immutable",
+              "root_block": 26574,
+              "docs": 477,
+              "dead_docs": 0,
+              "sum_doc_lengths": 113024,
+              "total_pages": 80,
+              "generation": 39
+            },
+            {
+              "ordinal": 39,
+              "kind": "immutable",
+              "root_block": 26652,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 105821,
+              "total_pages": 77,
+              "generation": 40
+            },
+            {
+              "ordinal": 40,
+              "kind": "immutable",
+              "root_block": 26732,
+              "docs": 475,
+              "dead_docs": 0,
+              "sum_doc_lengths": 110564,
+              "total_pages": 79,
+              "generation": 41
+            },
+            {
+              "ordinal": 41,
+              "kind": "immutable",
+              "root_block": 26813,
+              "docs": 471,
+              "dead_docs": 0,
+              "sum_doc_lengths": 110485,
+              "total_pages": 80,
+              "generation": 42
+            },
+            {
+              "ordinal": 42,
+              "kind": "immutable",
+              "root_block": 26910,
+              "docs": 470,
+              "dead_docs": 0,
+              "sum_doc_lengths": 140514,
+              "total_pages": 96,
+              "generation": 43
+            },
+            {
+              "ordinal": 43,
+              "kind": "immutable",
+              "root_block": 27005,
+              "docs": 468,
+              "dead_docs": 0,
+              "sum_doc_lengths": 138630,
+              "total_pages": 94,
+              "generation": 44
+            },
+            {
+              "ordinal": 44,
+              "kind": "immutable",
+              "root_block": 27084,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 105643,
+              "total_pages": 78,
+              "generation": 45
+            },
+            {
+              "ordinal": 45,
+              "kind": "immutable",
+              "root_block": 27160,
+              "docs": 487,
+              "dead_docs": 0,
+              "sum_doc_lengths": 102017,
+              "total_pages": 75,
+              "generation": 46
+            },
+            {
+              "ordinal": 46,
+              "kind": "immutable",
+              "root_block": 27224,
+              "docs": 471,
+              "dead_docs": 0,
+              "sum_doc_lengths": 80995,
+              "total_pages": 63,
+              "generation": 47
+            },
+            {
+              "ordinal": 47,
+              "kind": "immutable",
+              "root_block": 27298,
+              "docs": 486,
+              "dead_docs": 0,
+              "sum_doc_lengths": 102434,
+              "total_pages": 73,
+              "generation": 48
+            },
+            {
+              "ordinal": 48,
+              "kind": "immutable",
+              "root_block": 27374,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 103281,
+              "total_pages": 75,
+              "generation": 49
+            },
+            {
+              "ordinal": 49,
+              "kind": "immutable",
+              "root_block": 27445,
+              "docs": 477,
+              "dead_docs": 0,
+              "sum_doc_lengths": 92098,
+              "total_pages": 70,
+              "generation": 50
+            },
+            {
+              "ordinal": 50,
+              "kind": "immutable",
+              "root_block": 27526,
+              "docs": 465,
+              "dead_docs": 0,
+              "sum_doc_lengths": 113798,
+              "total_pages": 80,
+              "generation": 51
+            },
+            {
+              "ordinal": 51,
+              "kind": "immutable",
+              "root_block": 27591,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85352,
+              "total_pages": 64,
+              "generation": 52
+            },
+            {
+              "ordinal": 52,
+              "kind": "immutable",
+              "root_block": 27671,
+              "docs": 483,
+              "dead_docs": 0,
+              "sum_doc_lengths": 111292,
+              "total_pages": 79,
+              "generation": 53
+            },
+            {
+              "ordinal": 53,
+              "kind": "immutable",
+              "root_block": 27740,
+              "docs": 483,
+              "dead_docs": 0,
+              "sum_doc_lengths": 89682,
+              "total_pages": 68,
+              "generation": 54
+            },
+            {
+              "ordinal": 54,
+              "kind": "immutable",
+              "root_block": 27806,
+              "docs": 486,
+              "dead_docs": 0,
+              "sum_doc_lengths": 86514,
+              "total_pages": 65,
+              "generation": 55
+            },
+            {
+              "ordinal": 55,
+              "kind": "immutable",
+              "root_block": 27890,
+              "docs": 484,
+              "dead_docs": 0,
+              "sum_doc_lengths": 120691,
+              "total_pages": 83,
+              "generation": 56
+            },
+            {
+              "ordinal": 56,
+              "kind": "immutable",
+              "root_block": 27969,
+              "docs": 488,
+              "dead_docs": 0,
+              "sum_doc_lengths": 108028,
+              "total_pages": 78,
+              "generation": 57
+            },
+            {
+              "ordinal": 57,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 290,
+              "dead_docs": 0,
+              "sum_doc_lengths": 90480,
+              "total_pages": 51,
+              "generation": 25427
+            }
+          ]
+        },
+        "after": {
+          "rows": 247525,
+          "visibility": {
+            "all_visible": 3386,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2869,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5972165,
+              "total_pages": 2868,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5691,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 5910378,
+              "total_pages": 2820,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 9209,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7550014,
+              "total_pages": 3516,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 13000,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8216247,
+              "total_pages": 3789,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 16817,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 8256587,
+              "total_pages": 3815,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 20147,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 7030113,
+              "total_pages": 3328,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 23389,
+              "docs": 32768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 6844427,
+              "total_pages": 3240,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 24129,
+              "docs": 4378,
+              "dead_docs": 0,
+              "sum_doc_lengths": 1480008,
+              "total_pages": 738,
+              "generation": 8
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 24342,
+              "docs": 500,
+              "dead_docs": 0,
+              "sum_doc_lengths": 162870,
+              "total_pages": 114,
+              "generation": 9
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 24401,
+              "docs": 480,
+              "dead_docs": 0,
+              "sum_doc_lengths": 74814,
+              "total_pages": 58,
+              "generation": 10
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 24464,
+              "docs": 491,
+              "dead_docs": 0,
+              "sum_doc_lengths": 78146,
+              "total_pages": 62,
+              "generation": 11
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 24533,
+              "docs": 473,
+              "dead_docs": 0,
+              "sum_doc_lengths": 93230,
+              "total_pages": 68,
+              "generation": 12
+            },
+            {
+              "ordinal": 12,
+              "kind": "immutable",
+              "root_block": 24597,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 82558,
+              "total_pages": 63,
+              "generation": 13
+            },
+            {
+              "ordinal": 13,
+              "kind": "immutable",
+              "root_block": 24662,
+              "docs": 480,
+              "dead_docs": 0,
+              "sum_doc_lengths": 86207,
+              "total_pages": 64,
+              "generation": 14
+            },
+            {
+              "ordinal": 14,
+              "kind": "immutable",
+              "root_block": 24724,
+              "docs": 478,
+              "dead_docs": 0,
+              "sum_doc_lengths": 79373,
+              "total_pages": 61,
+              "generation": 15
+            },
+            {
+              "ordinal": 15,
+              "kind": "immutable",
+              "root_block": 24792,
+              "docs": 501,
+              "dead_docs": 0,
+              "sum_doc_lengths": 93019,
+              "total_pages": 67,
+              "generation": 16
+            },
+            {
+              "ordinal": 16,
+              "kind": "immutable",
+              "root_block": 24861,
+              "docs": 490,
+              "dead_docs": 0,
+              "sum_doc_lengths": 94283,
+              "total_pages": 68,
+              "generation": 17
+            },
+            {
+              "ordinal": 17,
+              "kind": "immutable",
+              "root_block": 24926,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85473,
+              "total_pages": 64,
+              "generation": 18
+            },
+            {
+              "ordinal": 18,
+              "kind": "immutable",
+              "root_block": 24990,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 84666,
+              "total_pages": 63,
+              "generation": 19
+            },
+            {
+              "ordinal": 19,
+              "kind": "immutable",
+              "root_block": 25054,
+              "docs": 476,
+              "dead_docs": 0,
+              "sum_doc_lengths": 84041,
+              "total_pages": 63,
+              "generation": 20
+            },
+            {
+              "ordinal": 20,
+              "kind": "immutable",
+              "root_block": 25126,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 99659,
+              "total_pages": 71,
+              "generation": 21
+            },
+            {
+              "ordinal": 21,
+              "kind": "immutable",
+              "root_block": 25191,
+              "docs": 477,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85757,
+              "total_pages": 64,
+              "generation": 22
+            },
+            {
+              "ordinal": 22,
+              "kind": "immutable",
+              "root_block": 25256,
+              "docs": 492,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85552,
+              "total_pages": 64,
+              "generation": 23
+            },
+            {
+              "ordinal": 23,
+              "kind": "immutable",
+              "root_block": 25334,
+              "docs": 481,
+              "dead_docs": 0,
+              "sum_doc_lengths": 106245,
+              "total_pages": 77,
+              "generation": 24
+            },
+            {
+              "ordinal": 24,
+              "kind": "immutable",
+              "root_block": 25409,
+              "docs": 457,
+              "dead_docs": 0,
+              "sum_doc_lengths": 104191,
+              "total_pages": 74,
+              "generation": 25
+            },
+            {
+              "ordinal": 25,
+              "kind": "immutable",
+              "root_block": 25490,
+              "docs": 483,
+              "dead_docs": 0,
+              "sum_doc_lengths": 113645,
+              "total_pages": 80,
+              "generation": 26
+            },
+            {
+              "ordinal": 26,
+              "kind": "immutable",
+              "root_block": 25578,
+              "docs": 487,
+              "dead_docs": 0,
+              "sum_doc_lengths": 128879,
+              "total_pages": 87,
+              "generation": 27
+            },
+            {
+              "ordinal": 27,
+              "kind": "immutable",
+              "root_block": 25652,
+              "docs": 474,
+              "dead_docs": 0,
+              "sum_doc_lengths": 100678,
+              "total_pages": 73,
+              "generation": 28
+            },
+            {
+              "ordinal": 28,
+              "kind": "immutable",
+              "root_block": 25745,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 130624,
+              "total_pages": 92,
+              "generation": 29
+            },
+            {
+              "ordinal": 29,
+              "kind": "immutable",
+              "root_block": 25822,
+              "docs": 486,
+              "dead_docs": 0,
+              "sum_doc_lengths": 107556,
+              "total_pages": 76,
+              "generation": 30
+            },
+            {
+              "ordinal": 30,
+              "kind": "immutable",
+              "root_block": 25901,
+              "docs": 475,
+              "dead_docs": 0,
+              "sum_doc_lengths": 110391,
+              "total_pages": 78,
+              "generation": 31
+            },
+            {
+              "ordinal": 31,
+              "kind": "immutable",
+              "root_block": 25977,
+              "docs": 469,
+              "dead_docs": 0,
+              "sum_doc_lengths": 102510,
+              "total_pages": 75,
+              "generation": 32
+            },
+            {
+              "ordinal": 32,
+              "kind": "immutable",
+              "root_block": 26060,
+              "docs": 474,
+              "dead_docs": 0,
+              "sum_doc_lengths": 117558,
+              "total_pages": 82,
+              "generation": 33
+            },
+            {
+              "ordinal": 33,
+              "kind": "immutable",
+              "root_block": 26143,
+              "docs": 476,
+              "dead_docs": 0,
+              "sum_doc_lengths": 117402,
+              "total_pages": 82,
+              "generation": 34
+            },
+            {
+              "ordinal": 34,
+              "kind": "immutable",
+              "root_block": 26223,
+              "docs": 478,
+              "dead_docs": 0,
+              "sum_doc_lengths": 110165,
+              "total_pages": 79,
+              "generation": 35
+            },
+            {
+              "ordinal": 35,
+              "kind": "immutable",
+              "root_block": 26318,
+              "docs": 468,
+              "dead_docs": 0,
+              "sum_doc_lengths": 140889,
+              "total_pages": 94,
+              "generation": 36
+            },
+            {
+              "ordinal": 36,
+              "kind": "immutable",
+              "root_block": 26406,
+              "docs": 465,
+              "dead_docs": 0,
+              "sum_doc_lengths": 126005,
+              "total_pages": 87,
+              "generation": 37
+            },
+            {
+              "ordinal": 37,
+              "kind": "immutable",
+              "root_block": 26493,
+              "docs": 466,
+              "dead_docs": 0,
+              "sum_doc_lengths": 121486,
+              "total_pages": 86,
+              "generation": 38
+            },
+            {
+              "ordinal": 38,
+              "kind": "immutable",
+              "root_block": 26574,
+              "docs": 477,
+              "dead_docs": 0,
+              "sum_doc_lengths": 113024,
+              "total_pages": 80,
+              "generation": 39
+            },
+            {
+              "ordinal": 39,
+              "kind": "immutable",
+              "root_block": 26652,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 105821,
+              "total_pages": 77,
+              "generation": 40
+            },
+            {
+              "ordinal": 40,
+              "kind": "immutable",
+              "root_block": 26732,
+              "docs": 475,
+              "dead_docs": 0,
+              "sum_doc_lengths": 110564,
+              "total_pages": 79,
+              "generation": 41
+            },
+            {
+              "ordinal": 41,
+              "kind": "immutable",
+              "root_block": 26813,
+              "docs": 471,
+              "dead_docs": 0,
+              "sum_doc_lengths": 110485,
+              "total_pages": 80,
+              "generation": 42
+            },
+            {
+              "ordinal": 42,
+              "kind": "immutable",
+              "root_block": 26910,
+              "docs": 470,
+              "dead_docs": 0,
+              "sum_doc_lengths": 140514,
+              "total_pages": 96,
+              "generation": 43
+            },
+            {
+              "ordinal": 43,
+              "kind": "immutable",
+              "root_block": 27005,
+              "docs": 468,
+              "dead_docs": 0,
+              "sum_doc_lengths": 138630,
+              "total_pages": 94,
+              "generation": 44
+            },
+            {
+              "ordinal": 44,
+              "kind": "immutable",
+              "root_block": 27084,
+              "docs": 472,
+              "dead_docs": 0,
+              "sum_doc_lengths": 105643,
+              "total_pages": 78,
+              "generation": 45
+            },
+            {
+              "ordinal": 45,
+              "kind": "immutable",
+              "root_block": 27160,
+              "docs": 487,
+              "dead_docs": 0,
+              "sum_doc_lengths": 102017,
+              "total_pages": 75,
+              "generation": 46
+            },
+            {
+              "ordinal": 46,
+              "kind": "immutable",
+              "root_block": 27224,
+              "docs": 471,
+              "dead_docs": 0,
+              "sum_doc_lengths": 80995,
+              "total_pages": 63,
+              "generation": 47
+            },
+            {
+              "ordinal": 47,
+              "kind": "immutable",
+              "root_block": 27298,
+              "docs": 486,
+              "dead_docs": 0,
+              "sum_doc_lengths": 102434,
+              "total_pages": 73,
+              "generation": 48
+            },
+            {
+              "ordinal": 48,
+              "kind": "immutable",
+              "root_block": 27374,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 103281,
+              "total_pages": 75,
+              "generation": 49
+            },
+            {
+              "ordinal": 49,
+              "kind": "immutable",
+              "root_block": 27445,
+              "docs": 477,
+              "dead_docs": 0,
+              "sum_doc_lengths": 92098,
+              "total_pages": 70,
+              "generation": 50
+            },
+            {
+              "ordinal": 50,
+              "kind": "immutable",
+              "root_block": 27526,
+              "docs": 465,
+              "dead_docs": 0,
+              "sum_doc_lengths": 113798,
+              "total_pages": 80,
+              "generation": 51
+            },
+            {
+              "ordinal": 51,
+              "kind": "immutable",
+              "root_block": 27591,
+              "docs": 485,
+              "dead_docs": 0,
+              "sum_doc_lengths": 85352,
+              "total_pages": 64,
+              "generation": 52
+            },
+            {
+              "ordinal": 52,
+              "kind": "immutable",
+              "root_block": 27671,
+              "docs": 483,
+              "dead_docs": 0,
+              "sum_doc_lengths": 111292,
+              "total_pages": 79,
+              "generation": 53
+            },
+            {
+              "ordinal": 53,
+              "kind": "immutable",
+              "root_block": 27740,
+              "docs": 483,
+              "dead_docs": 0,
+              "sum_doc_lengths": 89682,
+              "total_pages": 68,
+              "generation": 54
+            },
+            {
+              "ordinal": 54,
+              "kind": "immutable",
+              "root_block": 27806,
+              "docs": 486,
+              "dead_docs": 0,
+              "sum_doc_lengths": 86514,
+              "total_pages": 65,
+              "generation": 55
+            },
+            {
+              "ordinal": 55,
+              "kind": "immutable",
+              "root_block": 27890,
+              "docs": 484,
+              "dead_docs": 0,
+              "sum_doc_lengths": 120691,
+              "total_pages": 83,
+              "generation": 56
+            },
+            {
+              "ordinal": 56,
+              "kind": "immutable",
+              "root_block": 27969,
+              "docs": 488,
+              "dead_docs": 0,
+              "sum_doc_lengths": 108028,
+              "total_pages": 78,
+              "generation": 57
+            },
+            {
+              "ordinal": 57,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 290,
+              "dead_docs": 0,
+              "sum_doc_lengths": 90480,
+              "total_pages": 51,
+              "generation": 25427
+            }
+          ]
+        }
+      },
+      {
+        "name": "revacuumed",
+        "before": {
+          "rows": 247525,
+          "visibility": {
+            "all_visible": 27271,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2869,
+              "docs": 32768,
+              "dead_docs": 3619,
+              "sum_doc_lengths": 5972165,
+              "total_pages": 2869,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5691,
+              "docs": 32768,
+              "dead_docs": 3615,
+              "sum_doc_lengths": 5910378,
+              "total_pages": 2821,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 9209,
+              "docs": 32768,
+              "dead_docs": 3624,
+              "sum_doc_lengths": 7550014,
+              "total_pages": 3517,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 13000,
+              "docs": 32768,
+              "dead_docs": 3640,
+              "sum_doc_lengths": 8216247,
+              "total_pages": 3790,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 16817,
+              "docs": 32768,
+              "dead_docs": 3596,
+              "sum_doc_lengths": 8256587,
+              "total_pages": 3816,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 20147,
+              "docs": 32768,
+              "dead_docs": 3592,
+              "sum_doc_lengths": 7030113,
+              "total_pages": 3329,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 23389,
+              "docs": 32768,
+              "dead_docs": 3615,
+              "sum_doc_lengths": 6844427,
+              "total_pages": 3241,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 24129,
+              "docs": 4378,
+              "dead_docs": 482,
+              "sum_doc_lengths": 1480008,
+              "total_pages": 739,
+              "generation": 8
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 27969,
+              "docs": 488,
+              "dead_docs": 5,
+              "sum_doc_lengths": 108028,
+              "total_pages": 79,
+              "generation": 57
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 28456,
+              "docs": 3848,
+              "dead_docs": 0,
+              "sum_doc_lengths": 743413,
+              "total_pages": 429,
+              "generation": 58
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 28864,
+              "docs": 3817,
+              "dead_docs": 0,
+              "sum_doc_lengths": 717192,
+              "total_pages": 407,
+              "generation": 59
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 29354,
+              "docs": 3768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 888106,
+              "total_pages": 489,
+              "generation": 60
+            },
+            {
+              "ordinal": 12,
+              "kind": "immutable",
+              "root_block": 29871,
+              "docs": 3738,
+              "dead_docs": 0,
+              "sum_doc_lengths": 946164,
+              "total_pages": 516,
+              "generation": 61
+            },
+            {
+              "ordinal": 13,
+              "kind": "immutable",
+              "root_block": 30362,
+              "docs": 3761,
+              "dead_docs": 0,
+              "sum_doc_lengths": 883910,
+              "total_pages": 490,
+              "generation": 62
+            },
+            {
+              "ordinal": 14,
+              "kind": "immutable",
+              "root_block": 30810,
+              "docs": 3808,
+              "dead_docs": 0,
+              "sum_doc_lengths": 797156,
+              "total_pages": 447,
+              "generation": 63
+            },
+            {
+              "ordinal": 15,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 287,
+              "dead_docs": 0,
+              "sum_doc_lengths": 89854,
+              "total_pages": 51,
+              "generation": 25429
+            }
+          ]
+        },
+        "after": {
+          "rows": 247525,
+          "visibility": {
+            "all_visible": 27271,
+            "all_frozen": 0
+          },
+          "segments": [
+            {
+              "ordinal": 0,
+              "kind": "immutable",
+              "root_block": 2869,
+              "docs": 32768,
+              "dead_docs": 3619,
+              "sum_doc_lengths": 5972165,
+              "total_pages": 2869,
+              "generation": 1
+            },
+            {
+              "ordinal": 1,
+              "kind": "immutable",
+              "root_block": 5691,
+              "docs": 32768,
+              "dead_docs": 3615,
+              "sum_doc_lengths": 5910378,
+              "total_pages": 2821,
+              "generation": 2
+            },
+            {
+              "ordinal": 2,
+              "kind": "immutable",
+              "root_block": 9209,
+              "docs": 32768,
+              "dead_docs": 3624,
+              "sum_doc_lengths": 7550014,
+              "total_pages": 3517,
+              "generation": 3
+            },
+            {
+              "ordinal": 3,
+              "kind": "immutable",
+              "root_block": 13000,
+              "docs": 32768,
+              "dead_docs": 3640,
+              "sum_doc_lengths": 8216247,
+              "total_pages": 3790,
+              "generation": 4
+            },
+            {
+              "ordinal": 4,
+              "kind": "immutable",
+              "root_block": 16817,
+              "docs": 32768,
+              "dead_docs": 3596,
+              "sum_doc_lengths": 8256587,
+              "total_pages": 3816,
+              "generation": 5
+            },
+            {
+              "ordinal": 5,
+              "kind": "immutable",
+              "root_block": 20147,
+              "docs": 32768,
+              "dead_docs": 3592,
+              "sum_doc_lengths": 7030113,
+              "total_pages": 3329,
+              "generation": 6
+            },
+            {
+              "ordinal": 6,
+              "kind": "immutable",
+              "root_block": 23389,
+              "docs": 32768,
+              "dead_docs": 3615,
+              "sum_doc_lengths": 6844427,
+              "total_pages": 3241,
+              "generation": 7
+            },
+            {
+              "ordinal": 7,
+              "kind": "immutable",
+              "root_block": 24129,
+              "docs": 4378,
+              "dead_docs": 482,
+              "sum_doc_lengths": 1480008,
+              "total_pages": 739,
+              "generation": 8
+            },
+            {
+              "ordinal": 8,
+              "kind": "immutable",
+              "root_block": 27969,
+              "docs": 488,
+              "dead_docs": 5,
+              "sum_doc_lengths": 108028,
+              "total_pages": 79,
+              "generation": 57
+            },
+            {
+              "ordinal": 9,
+              "kind": "immutable",
+              "root_block": 28456,
+              "docs": 3848,
+              "dead_docs": 0,
+              "sum_doc_lengths": 743413,
+              "total_pages": 429,
+              "generation": 58
+            },
+            {
+              "ordinal": 10,
+              "kind": "immutable",
+              "root_block": 28864,
+              "docs": 3817,
+              "dead_docs": 0,
+              "sum_doc_lengths": 717192,
+              "total_pages": 407,
+              "generation": 59
+            },
+            {
+              "ordinal": 11,
+              "kind": "immutable",
+              "root_block": 29354,
+              "docs": 3768,
+              "dead_docs": 0,
+              "sum_doc_lengths": 888106,
+              "total_pages": 489,
+              "generation": 60
+            },
+            {
+              "ordinal": 12,
+              "kind": "immutable",
+              "root_block": 29871,
+              "docs": 3738,
+              "dead_docs": 0,
+              "sum_doc_lengths": 946164,
+              "total_pages": 516,
+              "generation": 61
+            },
+            {
+              "ordinal": 13,
+              "kind": "immutable",
+              "root_block": 30362,
+              "docs": 3761,
+              "dead_docs": 0,
+              "sum_doc_lengths": 883910,
+              "total_pages": 490,
+              "generation": 62
+            },
+            {
+              "ordinal": 14,
+              "kind": "immutable",
+              "root_block": 30810,
+              "docs": 3808,
+              "dead_docs": 0,
+              "sum_doc_lengths": 797156,
+              "total_pages": 447,
+              "generation": 63
+            },
+            {
+              "ordinal": 15,
+              "kind": "mutable",
+              "root_block": 1,
+              "docs": 287,
+              "dead_docs": 0,
+              "sum_doc_lengths": 89854,
+              "total_pages": 51,
+              "generation": 25429
+            }
+          ]
+        }
+      }
+    ],
+    "raw_directory": "benchmarks/results/local-count-crossover-250k-r3",
+    "query_sha256": "87657144eb4b78339c2e15ff4ec19b4c2fc96625e6462e7db8a26bf1df433aeb"
+  }
+}

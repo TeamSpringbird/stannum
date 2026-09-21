@@ -1,0 +1,164 @@
+{
+  "rule": {
+    "density": 4,
+    "width": 1
+  },
+  "training_phases": [],
+  "fixed_rule_source": "/Users/uri/.t3/worktrees/lead/stannum-gin-timing-fix/benchmarks/results/local-count-crossover-fit/selection.json",
+  "regression_guard": "slower by more than both 10% and 0.05ms",
+  "caveat": "Offline simulation, equal weight per query; not measured selector throughput. Features use existing planner estimates; no actual candidate counts used.",
+  "evaluations": {
+    "vacuumed": {
+      "train": {
+        "queries": 215,
+        "forced_queries": 28,
+        "summed_default_medians_ms": 163.229,
+        "summed_selected_medians_ms": 137.196,
+        "simulated_ratio": 1.1897504300416923,
+        "material_regressions": [
+          {
+            "id": 146,
+            "text": "pump it up",
+            "default_ms": 2.251,
+            "selected_ms": 2.58
+          },
+          {
+            "id": 1,
+            "text": "the",
+            "default_ms": 1.587,
+            "selected_ms": 1.951
+          }
+        ],
+        "oracle_summed_medians_ms": 136.402
+      },
+      "heldout": {
+        "queries": 87,
+        "forced_queries": 13,
+        "summed_default_medians_ms": 66.415,
+        "summed_selected_medians_ms": 58.162,
+        "simulated_ratio": 1.1418967710876518,
+        "material_regressions": [
+          {
+            "id": 139,
+            "text": "books on cd",
+            "default_ms": 1.877,
+            "selected_ms": 2.195
+          }
+        ],
+        "oracle_summed_medians_ms": 57.844
+      }
+    },
+    "vacuumed-repeat": {
+      "train": {
+        "queries": 215,
+        "forced_queries": 28,
+        "summed_default_medians_ms": 162.25,
+        "summed_selected_medians_ms": 139.469,
+        "simulated_ratio": 1.163340957488761,
+        "material_regressions": [
+          {
+            "id": 43,
+            "text": "secretary of state",
+            "default_ms": 6.294,
+            "selected_ms": 7.498
+          },
+          {
+            "id": 146,
+            "text": "pump it up",
+            "default_ms": 2.369,
+            "selected_ms": 2.816
+          },
+          {
+            "id": 1,
+            "text": "the",
+            "default_ms": 1.744,
+            "selected_ms": 2.174
+          }
+        ],
+        "oracle_summed_medians_ms": 137.265
+      },
+      "heldout": {
+        "queries": 87,
+        "forced_queries": 13,
+        "summed_default_medians_ms": 68.616,
+        "summed_selected_medians_ms": 60.774,
+        "simulated_ratio": 1.1290354427880342,
+        "material_regressions": [
+          {
+            "id": 139,
+            "text": "books on cd",
+            "default_ms": 1.959,
+            "selected_ms": 2.27
+          }
+        ],
+        "oracle_summed_medians_ms": 60.463
+      }
+    },
+    "mutated": {
+      "train": {
+        "queries": 215,
+        "forced_queries": 28,
+        "summed_default_medians_ms": 1208.559,
+        "summed_selected_medians_ms": 1232.14,
+        "simulated_ratio": 0.9808617527229048,
+        "material_regressions": [
+          {
+            "id": 146,
+            "text": "pump it up",
+            "default_ms": 21.893,
+            "selected_ms": 26.071
+          },
+          {
+            "id": 95,
+            "text": "time for kids",
+            "default_ms": 20.982,
+            "selected_ms": 24.802
+          }
+        ],
+        "oracle_summed_medians_ms": 1202.662
+      },
+      "heldout": {
+        "queries": 87,
+        "forced_queries": 13,
+        "summed_default_medians_ms": 554.85,
+        "summed_selected_medians_ms": 568.446,
+        "simulated_ratio": 0.9760821608384965,
+        "material_regressions": [
+          {
+            "id": 202,
+            "text": "immigration to mexico",
+            "default_ms": 24.317,
+            "selected_ms": 26.805
+          },
+          {
+            "id": 139,
+            "text": "books on cd",
+            "default_ms": 19.672,
+            "selected_ms": 22.92
+          }
+        ],
+        "oracle_summed_medians_ms": 554.85
+      }
+    },
+    "revacuumed": {
+      "train": {
+        "queries": 215,
+        "forced_queries": 28,
+        "summed_default_medians_ms": 339.038,
+        "summed_selected_medians_ms": 264.25600000000003,
+        "simulated_ratio": 1.282990736255752,
+        "material_regressions": [],
+        "oracle_summed_medians_ms": 264.229
+      },
+      "heldout": {
+        "queries": 87,
+        "forced_queries": 13,
+        "summed_default_medians_ms": 145.10999999999999,
+        "summed_selected_medians_ms": 116.751,
+        "simulated_ratio": 1.2429015597296809,
+        "material_regressions": [],
+        "oracle_summed_medians_ms": 116.751
+      }
+    }
+  }
+}
