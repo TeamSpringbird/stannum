@@ -78,3 +78,6 @@
   At 1,000 updates a second against 15 million Stack Exchange rows for ten
   minutes, ranked disjunctions went from 120 to 156 queries a second, the
   directory from 129 segments to 34 and the longest query from 34 s to 11 s.
+- `target_segment_count`, `max_mutable_segment_size`, `max_merged_segment_size`
+  and `dead_percent_threshold` now shape maintenance for the index that sets
+  them instead of being ignored; unset, the `stannum.*` settings apply.

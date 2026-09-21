@@ -49,6 +49,12 @@ would change scores midway through a ranked scan.
 | `stannum.merge_tier_factor` | 8 | Segments per size tier before they merge |
 | `stannum.max_segments` | 128 | Soft bound on directory entries; 128 is the hard on-disk bound |
 
+An index may override three of these for itself with the TIN-named storage
+options: `max_mutable_segment_size` (bytes) for `write_buffer_bytes`,
+`target_segment_count` for `max_segments`, and `max_merged_segment_size`
+(megabytes) for the merge input ceiling. `dead_percent_threshold` sets the dead
+fraction at which VACUUM rewrites a segment, 0.5 by default.
+
 The next insert folds a nonempty buffer before appending a record that would
 exceed either cap. A single document may exceed the byte cap: it remains one
 record and is folded before the following insert. The two caps bound document

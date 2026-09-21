@@ -32,19 +32,19 @@ version or script; the exact Stannum behavior and remaining uncertainty follow.
 | `b` | real `0..1`; `0.75` | BM25 length normalization | Same | Matches; query-time setting, no rebuild |
 | `score_stop_words` | comma-separated text; unset | Exact analyzed terms omitted from default scoring | Same | Matches; entries are not tokenized; does not remove indexed tokens or change matching; full scoring ignores this list |
 | `initial_segment_count` | integer `1..4096`; available parallelism | Build partitions; default target count | `1..4096`; stored default `1` | Accepted **and ignored, with warning**; expanded previous `1..1024` domain |
-| `target_segment_count` | integer `1..4096`; initial count | Background maintenance target | Same range; inert stored default `1` | Newly accepted **and ignored, with warning** |
-| `max_mutable_segment_size` | integer `>=131072`; `4194304` bytes | Promotion trigger; also 16,384 docs | Signed 32-bit integer `131072..2147483647`; `4194304` | Newly accepted **and ignored, with warning**; public docs give no explicit upper bound beyond `int` |
-| `max_merged_segment_size` | integer `>=100`; `2000` MB | Segment merge-size ceiling | Signed 32-bit integer `100..2147483647`; `2000` | Newly accepted **and ignored, with warning**; public docs give no explicit upper bound beyond `int` |
-| `dead_percent_threshold` | real `0..1`; `0.5` | Dead-entry rewrite threshold | Same | Newly accepted **and ignored, with warning** |
+| `target_segment_count` | integer `1..4096`; initial count | Background maintenance target | `0..4096`; `0` | Applied per index as the soft directory bound in place of `stannum.max_segments`; `0` (unset) uses the setting. Enforced by inserts within their merge budgets and by VACUUM; no background worker |
+| `max_mutable_segment_size` | integer `>=131072`; `4194304` bytes | Promotion trigger; also 16,384 docs | `0..2147483647`; `0` | Applied per index as the write buffer's fold size in place of `stannum.write_buffer_bytes`; `0` (unset) uses the setting. `stannum.write_buffer_docs` still applies |
+| `max_merged_segment_size` | integer `>=100`; `2000` MB | Segment merge-size ceiling | `0..2147483647`; `0` | Applied per index as the most input megabytes one merge takes, within the 3 GiB a run can record; `0` (unset) uses that ceiling |
+| `dead_percent_threshold` | real `0..1`; `0.5` | Dead-entry rewrite threshold | Same | Applied per index: VACUUM rewrites a segment once this fraction of its documents is dead |
 
-The five storage options are accepted for portable DDL, with a warning whenever
-explicitly validated by CREATE/ALTER INDEX. Stannum still uses its own documented
-[storage and maintenance settings](architecture/segmented-storage.md). In
-particular, setting a compatibility option does not enforce a memory limit,
-create workers, or change the rewrite threshold. Default values in the catalog
-are inert; no background maintenance is introduced. The new fields are only
-PostgreSQL reloptions data, not serialized segment or meta-page fields. There
-is no new SQL function, upgrade script, or on-disk format change.
+`initial_segment_count` is accepted for portable DDL and ignored, with a
+warning. The other four storage options shape maintenance for the index that
+sets them, because the right write buffer and merge ceiling depend on the
+documents; an index that leaves them unset follows the
+[storage and maintenance settings](architecture/segmented-storage.md). They are
+PostgreSQL reloptions only, read when maintenance runs, so `ALTER INDEX ... SET`
+takes effect without a rebuild. None of them enforces a memory limit or creates
+workers.
 
 No documented tokenizer behavior is missing from the pipeline. The reference
 lists neither a stemming option nor a language selector nor indexing-time stop

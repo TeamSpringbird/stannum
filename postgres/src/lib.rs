@@ -3426,6 +3426,55 @@ mod tests {
     }
 
     #[pg_test]
+    fn maintenance_options_apply_to_their_own_index() {
+        let immutable = |index: &str| {
+            value(&format!(
+                "SELECT count(*) FROM stannum.segment_info('{index}') WHERE kind = 'immutable'"
+            ))
+        };
+        // The write buffer folds at the index's own size.
+        Spi::run(
+            "CREATE TABLE per_index(body text);
+             CREATE INDEX per_index_default ON per_index USING stannum(body);
+             CREATE INDEX per_index_small ON per_index USING stannum(body)
+                 WITH (max_mutable_segment_size=2000);
+             INSERT INTO per_index SELECT 'needle number ' || n FROM generate_series(1,200) n;",
+        )
+        .unwrap();
+        assert_eq!(immutable("per_index_default"), 0);
+        assert!(immutable("per_index_small") > 0);
+        // VACUUM's cleanup brings each directory under its own bound.
+        Spi::run(
+            "CREATE TABLE per_bound(body text);
+             CREATE INDEX per_bound_default ON per_bound USING stannum(body);
+             CREATE INDEX per_bound_two ON per_bound USING stannum(body) WITH (target_segment_count=2);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.merge_tier_factor = 64;
+             SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
+             INSERT INTO per_bound SELECT 'needle' FROM generate_series(1,10);",
+        )
+        .unwrap();
+        for index in ["per_bound_default", "per_bound_two"] {
+            let oid = Spi::get_one::<pg_sys::Oid>(&format!("SELECT '{index}'::regclass::oid"))
+                .unwrap()
+                .unwrap();
+            unsafe {
+                let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+                crate::storage::cleanup(index.as_ptr());
+            }
+            assert_clean(index);
+        }
+        assert_eq!(immutable("per_bound_default"), 9);
+        assert!(immutable("per_bound_two") <= 2);
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM per_bound WHERE body ==> 'needle'"),
+            10
+        );
+    }
+
+    #[pg_test]
     fn tokenizer_audit_inputs_use_index_options_for_matching_and_highlighting() {
         Spi::run("CREATE TABLE audit_tokens(id int, body text);
             INSERT INTO audit_tokens VALUES (1, 'Éclair Éclair Ελληνικά 東京 👩‍💻 3.14 can''t wi-fi https://Example.com/a');").unwrap();

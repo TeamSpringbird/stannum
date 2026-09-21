@@ -112,17 +112,30 @@ pub fn init() {
             4096,
             lock,
         );
-        for (name, default, minimum, maximum) in [
-            (c"target_segment_count", 1, 1, 4096),
-            (c"max_mutable_segment_size", 4_194_304, 131_072, i32::MAX),
-            (c"max_merged_segment_size", 2000, 100, i32::MAX),
+        // Zero, the default, leaves the matching `stannum.*` setting in charge.
+        for (name, description, maximum) in [
+            (
+                c"target_segment_count",
+                c"Soft bound on segments; 0 uses stannum.max_segments",
+                4096,
+            ),
+            (
+                c"max_mutable_segment_size",
+                c"Write buffer bytes before a fold; 0 uses stannum.write_buffer_bytes",
+                i32::MAX,
+            ),
+            (
+                c"max_merged_segment_size",
+                c"Most input megabytes a merge takes; 0 uses the 3 GiB format ceiling",
+                i32::MAX,
+            ),
         ] {
             pg_sys::add_int_reloption(
                 kind,
                 name.as_ptr(),
-                c"Accepted for TIN DDL compatibility; ignored by Stannum".as_ptr(),
-                default,
-                minimum,
+                description.as_ptr(),
+                0,
+                0,
                 maximum,
                 lock,
             );
@@ -130,7 +143,7 @@ pub fn init() {
         pg_sys::add_real_reloption(
             kind,
             c"dead_percent_threshold".as_ptr(),
-            c"Accepted for TIN DDL compatibility; ignored by Stannum".as_ptr(),
+            c"Fraction of a segment's documents dead before VACUUM rewrites it".as_ptr(),
             0.5,
             0.0,
             1.0,
@@ -341,14 +354,7 @@ pub unsafe extern "C-unwind" fn amoptions(
                     .iter_ptr()
             {
                 let name = CStr::from_ptr((*option).defname).to_string_lossy();
-                if matches!(
-                    name.as_ref(),
-                    "initial_segment_count"
-                        | "target_segment_count"
-                        | "max_mutable_segment_size"
-                        | "max_merged_segment_size"
-                        | "dead_percent_threshold"
-                ) {
+                if name == "initial_segment_count" {
                     pgrx::warning!(
                         "Stannum accepts {name} for TIN compatibility but ignores it; Stannum's storage and maintenance settings apply"
                     );
@@ -364,6 +370,30 @@ unsafe fn parsed(index: pg_sys::Relation) -> Option<&'static IndexOptions> {
         return None;
     }
     unsafe { (*index).rd_options.cast::<IndexOptions>().as_ref() }
+}
+
+/// The index's soft bound on directory entries, when it sets one.
+pub unsafe fn target_segment_count(index: pg_sys::Relation) -> Option<usize> {
+    let count = unsafe { parsed(index) }?.target_segment_count;
+    (count > 0).then_some(count as usize)
+}
+
+/// The index's write buffer size in bytes, when it sets one.
+pub unsafe fn mutable_segment_bytes(index: pg_sys::Relation) -> Option<usize> {
+    let bytes = unsafe { parsed(index) }?.max_mutable_segment_size;
+    (bytes > 0).then_some(bytes as usize)
+}
+
+/// The index's ceiling on a merge's input bytes, when it sets one. The option
+/// is in megabytes.
+pub unsafe fn merged_segment_bytes(index: pg_sys::Relation) -> Option<u64> {
+    let megabytes = unsafe { parsed(index) }?.max_merged_segment_size;
+    (megabytes > 0).then_some((megabytes as u64) << 20)
+}
+
+/// The dead fraction of a segment at which VACUUM rewrites it.
+pub unsafe fn dead_fraction(index: pg_sys::Relation) -> f64 {
+    unsafe { parsed(index) }.map_or(0.5, |options| options.dead_percent_threshold)
 }
 
 pub unsafe fn tokenizer_spec(index: pg_sys::Relation) -> TokenizerPipelineSpec {
