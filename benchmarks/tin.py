@@ -523,6 +523,8 @@ def run(args):
                          '--memory-swap', job['resource_limits']['build_memory'], '--shm-size', '1g',
                          '-p', f'127.0.0.1:{args.port}:5432',
                          '-v', f'{volume}:/var/lib/postgresql',
+                         # The server reads the prepared CSV itself: see the import below.
+                         '-v', f'{path.resolve()}:/import:ro',
                          '-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_DB=benchmark',
                          image['Id'], 'postgres', '-c', f'shared_buffers={args.shared_buffers}',
                          '-c', 'maintenance_work_mem=' + getattr(args, 'maintenance_work_mem', '512MB'), '-c', 'work_mem=16MB',
@@ -560,9 +562,12 @@ def run(args):
                 job['input_sha256'] = dataset.sha256(path / 'input.csv')
                 sampler.phase = 'import'
                 started = time.monotonic()
-                with (path / 'input.csv').open('rb') as data:
-                    command(['psql', '-Xq', '-v', 'ON_ERROR_STOP=1', '-c',
-                             'COPY documents FROM STDIN WITH (FORMAT csv)'], stdin=data, env=dict(env, PGOPTIONS=f'-c statement_timeout={args.setup_timeout_seconds * 1000} -c jit=off'))
+                # Not COPY FROM STDIN: psql ends the data at a line holding only
+                # `\.`, even inside a quoted field, and a published Stack
+                # Exchange document has such a line in a code block. PostgreSQL
+                # 18 reads a CSV file without that marker.
+                (path / 'input.csv').chmod(0o644)
+                sql("COPY documents FROM '/import/input.csv' WITH (FORMAT csv);", setup=True)
                 job['import_seconds'] = time.monotonic() - started
                 if published and sql('SELECT count(*) = count(DISTINCT id) FROM documents;') != 't':
                     raise ValueError('membership validation requires unique source IDs')
