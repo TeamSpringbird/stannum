@@ -1500,6 +1500,17 @@ mod tests {
                 "LIMIT {limit}: {scan}"
             );
         }
+        // In a conjunction the elided `alpha` still filters: its cursor joins
+        // the walk that `delta` drives.
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM bmw WHERE body ==> 'alpha AND delta'
+             ORDER BY stannum.score(ctid) DESC LIMIT 3",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        let scan = search_scan(&plan[0]["Plan"]).unwrap();
+        assert_eq!(scan["Pruning"], "block-max", "{scan}");
         // Rows deleted after the top k was built are invisible, so the parent
         // reads past k and the scan completes the ordering from scratch.
         let top: Vec<i32> = ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3")

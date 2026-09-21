@@ -33,6 +33,9 @@
   them. Whole extents were copied per term and query, which for frequent terms
   ran to megabytes and emptied the reader cache; the median phrase query over
   15 million Stack Exchange rows falls from 11 to 3 ms.
+- Ranked conjunctions with elided dense terms are pruned: an elided term's
+  cursor joins the walk as a filter without a score bound. Over 15 million
+  Stack Exchange rows the p99 of published AND queries falls from 165 to 38 ms.
 - A ranked query whose terms are all elided or absent takes its top k from
   the heap-ordered candidate stream: every match scores zero and ties rank in
   heap order, so nothing is collected or sorted.

@@ -684,6 +684,9 @@ struct Walk<'a, 's> {
     scorer: &'s IndexScorer,
     /// In slot order.
     cursors: Vec<TermCursor<'a>>,
+    /// A conjunction's elided terms: a match must hold them, and they add
+    /// nothing to its score.
+    filters: Vec<PostingsCursor<'a>>,
     documents: PostingsCursor<'a>,
     lengths: Lengths<'a>,
     dead: &'s BTreeSet<Tid>,
@@ -934,6 +937,19 @@ impl Walk<'_, '_> {
                     Some(_) => {}
                 }
             }
+            if next == pivot {
+                for filter in &mut self.filters {
+                    segment_error(filter.seek(pivot));
+                    match filter.current() {
+                        None => return,
+                        Some(found) if found > pivot => {
+                            next = found;
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
             if next > pivot {
                 segment_error(self.cursors[lead].postings.seek(next));
                 continue;
@@ -1014,9 +1030,10 @@ impl IndexScorer {
         // present leaf without a scorer is an elided dense term. In a
         // disjunction its documents score zero unless a scoring term also
         // lists them, so the walk over the scoring terms is exact as long as
-        // it fills the top k with positive scores; otherwise, and in a
-        // conjunction, where the elided term still filters, the caller scores
-        // every candidate.
+        // it fills the top k with positive scores; otherwise the caller
+        // scores every candidate. In a conjunction the elided term adds
+        // nothing to a score but still filters, so its cursor joins the walk
+        // without a bound.
         if self
             .terms
             .iter()
@@ -1026,6 +1043,7 @@ impl IndexScorer {
         }
         let mut absent = false;
         let mut elided = false;
+        let mut filters: Vec<&str> = Vec::new();
         for leaf in &leaves {
             if self.terms.iter().any(|(term, _)| term == leaf) {
                 continue;
@@ -1036,10 +1054,10 @@ impl IndexScorer {
                 .iter()
                 .any(|(source, _)| segment_error(source.term(leaf)).is_some())
             {
-                if combine != Combine::Any {
-                    return None;
+                match combine {
+                    Combine::Any => elided = true,
+                    Combine::All => filters.push(leaf),
                 }
-                elided = true;
                 continue;
             }
             absent = true;
@@ -1053,6 +1071,7 @@ impl IndexScorer {
                     &self.view.labels[i],
                     &self.dead[i],
                     combine,
+                    &filters,
                     k,
                     &mut heap,
                     &mut scored,
@@ -1092,6 +1111,7 @@ impl IndexScorer {
         label: &str,
         dead: &BTreeSet<Tid>,
         combine: Combine,
+        filters: &[&str],
         k: usize,
         heap: &mut BinaryHeap<Ranked>,
         scored: &mut usize,
@@ -1125,12 +1145,21 @@ impl IndexScorer {
                 exact: None,
             });
         }
+        let mut filter_cursors = Vec::with_capacity(filters.len());
+        for name in filters {
+            match segment_error_in(source.term(name), label) {
+                Some(term) => filter_cursors.push(segment_error_in(term.cursor(), label)),
+                // A missing term empties the conjunction in this source.
+                None => return Some(true),
+            }
+        }
         if cursors.is_empty() {
             return Some(true);
         }
         let mut walk = Walk {
             scorer: self,
             cursors,
+            filters: filter_cursors,
             documents: segment_error_in(source.documents(), label),
             lengths: source.lengths(),
             dead,
