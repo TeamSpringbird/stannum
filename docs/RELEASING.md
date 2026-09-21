@@ -56,7 +56,7 @@ against a database and representative indexes created by the previous tagged
 
 | Extension | Page signature/version read | Segment signatures read | Formats written |
 | --- | --- | --- | --- |
-| 0.1.0 | LDP2, VERSION 2 only | LSG1, LSG2 and LSG3 | LDP2 VERSION 2; LSG3 |
+| 0.1.0 | LDP2, VERSION 2 only | LSG1, LSG2, LSG3 and LSG4 | LDP2 VERSION 2; LSG4 |
 
 `VERSION` is the special-area byte on every page, including the meta page.
 The write-buffer's `version` counter is a cache invalidation generation, not a

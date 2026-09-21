@@ -18,6 +18,16 @@
   budget; only the 128-entry on-disk bound forces an unbudgeted merge.
 - VACUUM reclaims pages a crash left unreferenced (`page N` warnings of
   `stannum.verify_index`) instead of requiring REINDEX.
+- Segment format `LSG4`: every term also stores its documents as ordinals
+  into the segment's document table, and `COUNT(*)` over Boolean term queries
+  folds those streams a chunk at a time instead of visiting each match. The
+  302 published Wikipedia count queries sum to 39 ms instead of 3,767 ms in
+  the replay harness. Earlier segments remain readable and are counted the
+  old way; `REINDEX` rewrites. `stannum.count_fold = off` disables the path.
+- Counts read the visibility map once and start over if VACUUM published a
+  dead list meanwhile; earlier builds could count a tuple VACUUM had removed
+  from a page it then marked all-visible.
+- Counts check the matches of a heap page under one buffer lock.
 - Segment format `LSG3`: one term bound for postings that fit a block, no
   payload skip slot for entry 0, and dictionary entries with gap-encoded
   extents; the 100k Wikipedia index shrinks by about a tenth with the same

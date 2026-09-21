@@ -228,7 +228,22 @@ custom scan nodes:
   sort all candidate CTIDs before returning the first row. `LIMIT` stops the
   traversal after enough visible rows pass the remaining SQL filters. For
   supported ranked queries the existing scorer selects the top results.
-- **Count** uses page masks when a Boolean term has grouped postings averaging at
+- **Count** of a Boolean combination of plain terms folds document ordinals.
+  `LSG4` segments store each term's documents as ordinals into the segment's
+  TID-ordered document table: a short list for rare terms, otherwise
+  65,536-document chunks that are sorted arrays or bitmaps. The count combines
+  the terms' chunks word by word in fixed scratch buffers, visits only chunks
+  some term occupies, clears the segment's dead documents and counts set bits.
+  The visibility map is read once, after the view; if a dead list was published
+  in between, the count starts over, because a page VACUUM marked all-visible
+  may hold tuples the older view still lists. Matches on pages that are not
+  all-visible are mapped back to TIDs through the segment's page table and
+  checked a heap page at a time under one buffer lock. The write buffer and
+  segments older than `LSG4` are counted through their TID postings, always
+  against the heap. Per-source counts are summed: a location is live in one
+  source only. `stannum.count_fold = off` selects the strategies below for
+  these queries too.
+- **Other counts** use page masks when a Boolean term has grouped postings averaging at
   least four tuples per occupied page; purely sparse or positional plans keep
   the scalar path. The bulk path streams exact offset masks in heap-page order.
   Dense grouped postings decode directly into five machine words; Boolean AND/OR/NOT combine
@@ -458,7 +473,7 @@ referenced through the pending list until reclaimed, only FREE pages are ever
 allocated, and a crash ends every session. The number reclaimed is written
 to the server log.
 
-The page and segment format signatures are `LDP2` and `LSG3`. Their definitions
+The page and segment format signatures are `LDP2` and `LSG4`. Their definitions
 live in `postgres/src/storage/layout.rs` and the `segment` crate. `LSG2` added
 per-block score bounds to term postings and fixed-width payload skip offsets.
 `LSG3` keeps the same bounds in less space: a term whose postings fit one
@@ -467,8 +482,11 @@ bound without the per-block last location and byte offset, the payload skip
 table omits the always-zero slot for entry 0, and dictionary entries store
 each term's extents as gaps from the previous term's (zero, since streams
 are laid out back to back) with `df` and `max_tf_bucket` packed into one
-varint. `LSG2` and `LSG1` segments are still read; ranked scans over `LSG2`
-prune exactly as over `LSG3`, and over `LSG1` score every candidate.
+varint. `LSG4` keeps those streams and adds, per term, the ordinal stream
+Boolean counts fold, and per segment a page table from heap block to first
+ordinal. `LSG3`, `LSG2` and `LSG1` segments are still read, their Boolean
+counts through TID postings; ranked scans over `LSG2` prune exactly as over
+`LSG3`, and over `LSG1` score every candidate.
 Unsupported old formats require rebuilding the index.
 `script/dump-segments.py` writes an index's segment blobs to files and
 `cargo run -p segment --release --example breakdown -- --reencode <blobs>`
