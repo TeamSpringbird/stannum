@@ -990,6 +990,12 @@ fn successor(tid: Tid) -> Tid {
 }
 
 impl IndexScorer {
+    /// True when no term scores: every leaf is absent or an elided dense
+    /// term, so every match scores zero and ranks in heap order.
+    pub(crate) fn scores_nothing(&self) -> bool {
+        self.terms.is_empty()
+    }
+
     /// The `k` best candidates of the scan's query in output order, found
     /// with block-max pruning: the sources are walked in tuple order with
     /// one cursor per scoring term, the `k`-th best score so far is the

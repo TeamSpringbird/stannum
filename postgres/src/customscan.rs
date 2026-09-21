@@ -1134,6 +1134,40 @@ unsafe fn gather(exec: &mut ScanExec) {
         let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
         if let Some(k) = top_k
             && k <= crate::score::PRUNE_MAX_K
+            && scorer
+                .as_ref()
+                .is_some_and(|scorer| scorer.scores_nothing())
+        {
+            // Every match scores zero and ties rank in heap order, so the
+            // best k are the first k of the heap-ordered stream: a sentence of
+            // stopwords need not collect and sort its million matches.
+            let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
+            let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+            if !stream.recheck {
+                let mut rows = Vec::with_capacity(k);
+                while rows.len() < k {
+                    pgrx::check_for_interrupts!();
+                    match stream.next() {
+                        Some(tid) => rows.push((0.0_f32, tid)),
+                        None => break,
+                    }
+                }
+                let complete = rows.len() < k;
+                exec.candidates = complete.then_some(rows.len());
+                exec.scored = Some(0);
+                exec.scores = vec![0.0; rows.len()];
+                exec.tids = rows.iter().map(|(_, tid)| *tid).collect();
+                exec.sorted = exec.tids.len();
+                exec.pruned = !complete;
+                let scorer = scorer.take().expect("checked above");
+                crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);
+                exec.next = 0;
+                exec.started = true;
+                return;
+            }
+        }
+        if let Some(k) = top_k
+            && k <= crate::score::PRUNE_MAX_K
             && let Some(top) = scorer.as_ref().and_then(|scorer| scorer.top_k(k))
         {
             exec.candidates = top.complete.then_some(top.rows.len());

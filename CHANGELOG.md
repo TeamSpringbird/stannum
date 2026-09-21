@@ -28,6 +28,9 @@
   dead list meanwhile; earlier builds could count a tuple VACUUM had removed
   from a page it then marked all-visible.
 - Counts check the matches of a heap page under one buffer lock.
+- A ranked query whose terms are all elided or absent takes its top k from
+  the heap-ordered candidate stream: every match scores zero and ties rank in
+  heap order, so nothing is collected or sorted.
 - Ranked disjunctions ordered by `stannum.score` are pruned when dense terms
   are elided: the walk covers the scoring terms and is exact whenever the top k
   score above zero. They were scored exhaustively before, 6.4 s at the median
