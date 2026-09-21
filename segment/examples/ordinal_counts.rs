@@ -341,6 +341,20 @@ fn main() -> Result<()> {
             query.text
         );
     }
+    // Back-to-back repetitions keep a query's streams in cache. A pass over
+    // every query in turn, as a server sees them, reads them from memory.
+    let mut passes = Vec::new();
+    for _ in 0..repeats {
+        let start = Instant::now();
+        for query in &queries {
+            black_box(fold(black_box(&segments), &query.terms, &dead, &visible)?);
+        }
+        passes.push(start.elapsed().as_secs_f64() * 1000. / queries.len() as f64);
+    }
+    eprintln!(
+        "ordinal fold, queries in turn (ms per query): median pass {:.3}",
+        median(&mut passes)
+    );
     folds.sort_by(f64::total_cmp);
     eprintln!(
         "summed medians over {} queries (ms): AWS default {:.0}, AWS page {:.0}, materialize {:.0}, page masks {:.0}, ordinal fold {:.1}",

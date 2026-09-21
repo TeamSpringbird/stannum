@@ -71,7 +71,14 @@ pub struct Visibility {
     visible: Vec<u64>,
     /// Every block is all-visible, so no match needs the heap.
     pub all: bool,
+    /// The blocks that are not all-visible, ascending, when they are few: a
+    /// vacuumed table keeps a handful, such as its last pages, and a count
+    /// should pay for those rather than test every page it matches on.
+    few: Option<Vec<u32>>,
 }
+
+/// More blocks than this are found by testing the pages a chunk covers.
+const FEW_BLOCKS: u64 = 512;
 
 impl Visibility {
     /// No page is trusted: every match is checked against the heap.
@@ -79,6 +86,7 @@ impl Visibility {
         Self {
             visible: Vec::new(),
             all: false,
+            few: None,
         }
     }
 
@@ -156,9 +164,24 @@ impl Visibility {
             unsafe { pg_sys::ReleaseBuffer(vmbuf) };
         }
         let set: u64 = visible.iter().map(|w| u64::from(w.count_ones())).sum();
+        let few = (u64::from(blocks) - set <= FEW_BLOCKS).then(|| {
+            let mut few = Vec::new();
+            for (i, word) in visible.iter().enumerate() {
+                let mut clear = !word;
+                while clear != 0 {
+                    let block = i as u32 * 64 + clear.trailing_zeros();
+                    if block < blocks {
+                        few.push(block);
+                    }
+                    clear &= clear - 1;
+                }
+            }
+            few
+        });
         Self {
             all: set == u64::from(blocks),
             visible,
+            few,
         }
     }
 }
@@ -228,6 +251,20 @@ impl Pages<'_> {
         u32::from_le_bytes(self.0[at..at + 4].try_into().unwrap())
     }
 
+    /// The entry of `block`, if the segment has documents on it.
+    fn entry_for(&self, block: u32) -> Option<usize> {
+        let (mut low, mut high) = (0, self.len());
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.block(middle) < block {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        (low < self.len() && self.block(low) == block).then_some(low)
+    }
+
     /// The entry holding `ordinal`.
     fn entry_of(&self, ordinal: u32, documents: u32) -> usize {
         let (mut low, mut high) = (0, self.len());
@@ -279,6 +316,19 @@ pub fn count_segment(
         });
     }
     let dead = dead_ordinals(key, source, dead_set)?;
+    // The segment's page-table entries among a short list of blocks that are
+    // not all-visible; ascending, like the ordinals they cover.
+    let listed: Option<Vec<usize>> = visibility.few.as_ref().map(|few| {
+        if pages.len() == 0 {
+            return Vec::new();
+        }
+        let from = few.partition_point(|block| *block < pages.block(0));
+        few[from..]
+            .iter()
+            .take_while(|block| **block <= pages.block(pages.len() - 1))
+            .filter_map(|block| pages.entry_for(*block))
+            .collect()
+    });
     let mut tids = None;
     let mut offsets = Vec::new();
     let mut sure = 0u64;
@@ -314,7 +364,14 @@ pub fn count_segment(
         }
         // The heap pages to check: those holding a match and not all-visible.
         let mut unchecked: Vec<usize> = Vec::new();
-        if matched <= SPARSE_CHUNK {
+        if let Some(listed) = &listed {
+            let from = listed.partition_point(|entry| pages.first(entry + 1, documents) <= low);
+            unchecked.extend(
+                listed[from..]
+                    .iter()
+                    .take_while(|entry| pages.first(**entry, documents) < high),
+            );
+        } else if matched <= SPARSE_CHUNK {
             let mut members = Vec::with_capacity(matched as usize);
             ordinals::members(words, low, &mut members);
             for ordinal in members {
