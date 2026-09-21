@@ -10,6 +10,7 @@ use pgrx::pg_guard;
 mod am;
 mod bm25;
 mod customscan;
+mod fold;
 mod highlight;
 mod highlight_udfs;
 mod match_positions;
@@ -3250,7 +3251,7 @@ mod tests {
         };
         assert_eq!(
             &read_page(root as u32)[DATA_AT as usize..DATA_AT as usize + 4],
-            b"LSG3"
+            segment::segment::Format::CURRENT.magic()
         );
         drop(index);
         corrupt("release_format_idx", 0, KIND_AT + 1, "ff");
@@ -4672,15 +4673,19 @@ mod tests {
                     "body <> '' AND body NOT LIKE '%common%'",
                 ),
             ] {
-                assert_eq!(
-                    value(&format!(
-                        "SELECT count(*) FROM page_counts WHERE body ==> '{query}'"
-                    )),
-                    value(&format!(
-                        "SELECT count(*) FROM page_counts WHERE {predicate}"
-                    )),
-                    "{mutation}: {query}",
-                );
+                // Boolean term queries fold ordinals unless told otherwise.
+                for fold in ["on", "off"] {
+                    Spi::run(&format!("SET LOCAL stannum.count_fold={fold}")).unwrap();
+                    assert_eq!(
+                        value(&format!(
+                            "SELECT count(*) FROM page_counts WHERE body ==> '{query}'"
+                        )),
+                        value(&format!(
+                            "SELECT count(*) FROM page_counts WHERE {predicate}"
+                        )),
+                        "{mutation}: {query} (count_fold={fold})",
+                    );
+                }
             }
         }
         let plan = Spi::get_one::<Json>(
@@ -4755,7 +4760,8 @@ mod tests {
                FROM generate_series(1, 2000) n;
              CREATE INDEX ON force_count_pages USING stannum(body);
              SET LOCAL enable_seqscan = off;
-             SET LOCAL stannum.enable_custom_scan = on;",
+             SET LOCAL stannum.enable_custom_scan = on;
+             SET LOCAL stannum.count_fold = off;",
         )
         .unwrap();
         for mutation in [
@@ -4782,6 +4788,63 @@ mod tests {
                     "{mutation}: {setting}"
                 );
             }
+        }
+    }
+
+    #[pg_test]
+    fn count_fold_agrees_with_scalar_counts_across_mutations() {
+        Spi::run(
+            "CREATE TABLE fold_counts(id int, body text, payload int) WITH (fillfactor=60);
+             INSERT INTO fold_counts SELECT n,
+               CASE WHEN n % 100 = 0 THEN 'needle red'
+                    WHEN n % 3 = 0 THEN 'common red'
+                    ELSE 'common blue' END, 0
+               FROM generate_series(1, 3000) n;
+             CREATE INDEX ON fold_counts USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.enable_custom_scan = on;",
+        )
+        .unwrap();
+        for mutation in [
+            "SELECT 1",
+            "UPDATE fold_counts SET payload=1 WHERE id % 200=0",
+            "DELETE FROM fold_counts WHERE id % 7=0",
+            "UPDATE fold_counts SET body='needle blue' WHERE id % 101=0",
+            // Rows that reach the write buffer rather than a segment.
+            "INSERT INTO fold_counts SELECT n, 'needle common green', 0 FROM generate_series(3001, 3050) n",
+        ] {
+            Spi::run(mutation).unwrap();
+            for query in [
+                "needle",
+                "needle OR blue",
+                "needle AND red",
+                "common AND (red OR green)",
+                "absent OR needle OR green",
+                "absent AND common",
+            ] {
+                let sql = format!("SELECT count(*) FROM fold_counts WHERE body ==> '{query}'");
+                Spi::run("SET LOCAL stannum.count_fold=off").unwrap();
+                let reference = value(&sql);
+                Spi::run("SET LOCAL stannum.count_fold=on").unwrap();
+                assert_eq!(value(&sql), reference, "{mutation}: {query}");
+                let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                assert_eq!(plan[0]["Plan"]["Count Strategy"], "ordinal fold", "{query}");
+            }
+            assert_eq!(
+                value("SELECT count(*) FROM fold_counts WHERE body ==> 'needle'"),
+                value("SELECT count(*) FROM fold_counts WHERE body LIKE '%needle%'")
+            );
+            // Positional queries keep the existing strategies.
+            let plan = Spi::get_one::<Json>(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM fold_counts WHERE body ==> '\"common red\"'",
+            )
+            .unwrap()
+            .unwrap()
+            .0;
+            assert_ne!(plan[0]["Plan"]["Count Strategy"], "ordinal fold");
         }
     }
 

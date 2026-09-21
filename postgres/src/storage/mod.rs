@@ -864,13 +864,17 @@ impl Index for MemoizedSegment {
     fn lengths(&self) -> Lengths<'_> {
         self.reader.lengths()
     }
+    fn page_table(&self) -> segment::Result<Option<&[u8]>> {
+        Index::page_table(&*self.reader)
+    }
 }
 
 /// Cached readers by (index identity, segment generation).
 type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
 
-/// Fetched bytes across cached readers before the cache is emptied.
-const READER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// `stannum.reader_cache_mb`: fetched bytes across a backend's cached readers
+/// before the cache is emptied.
+pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(64);
 
 thread_local! {
     static SEGMENT_READERS: RefCell<SegmentReaders> = RefCell::new(HashMap::new());
@@ -959,7 +963,7 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
             *id != identity || meta.segments.iter().any(|e| e.generation == *generation)
         });
         let bytes: usize = readers.values().map(|c| c.reader.cached_bytes()).sum();
-        if bytes > READER_CACHE_BYTES {
+        if bytes > READER_CACHE_MB.get() as usize * 1024 * 1024 {
             readers.clear();
         }
     });
@@ -1955,6 +1959,35 @@ pub struct View {
     /// Each source's dead list as a set, decoded once per backend and dead
     /// run rather than once per statement; empty for the write buffer.
     pub dead_sets: Vec<DeadSet>,
+    /// Index identity and generation per immutable source.
+    pub keys: Vec<(u64, u32)>,
+    /// The dead run each immutable source's dead list was read from.
+    dead_runs: Vec<Run>,
+}
+
+/// Whether the directory still lists exactly `view`'s segments with the dead
+/// lists the view read. VACUUM publishes a dead list before it may mark a heap
+/// page all-visible, so a count that read the visibility map after capturing
+/// its view and then finds the view current saw no all-visible bit that
+/// postdates a tuple removal the view lacks.
+///
+/// # Safety
+/// `index_oid` names a live LDP2 index the caller may open.
+pub unsafe fn view_is_current(index_oid: pg_sys::Oid, view: &View) -> bool {
+    unsafe {
+        let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
+        let (_buffer, meta) = read_meta(relation.as_ptr(), false);
+        meta.segments.len() == view.keys.len()
+            && meta
+                .segments
+                .iter()
+                .zip(view.keys.iter().zip(&view.dead_runs))
+                .all(|(entry, ((identity, generation), dead))| {
+                    *identity == meta.identity
+                        && entry.generation == *generation
+                        && entry.dead == *dead
+                })
+    }
 }
 
 /// During recovery the view is served only when [`index_reads_allowed`]
@@ -2008,6 +2041,12 @@ pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
             let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
             let mut labels = Vec::with_capacity(meta.segments.len() + 1);
             let mut dead_sets = Vec::with_capacity(meta.segments.len() + 1);
+            let keys = meta
+                .segments
+                .iter()
+                .map(|entry| (meta.identity, entry.generation))
+                .collect();
+            let dead_runs = meta.segments.iter().map(|entry| entry.dead).collect();
             trim_reader_cache(meta.identity, &meta);
             for entry in &meta.segments {
                 pgrx::check_for_interrupts!();
@@ -2032,6 +2071,8 @@ pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
                 immutable_sources,
                 labels,
                 dead_sets,
+                keys,
+                dead_runs,
             };
         }
     }
