@@ -157,7 +157,7 @@ See [AWS readiness](aws-next-run-readiness.md),
 Implemented on `perf/cached-union-heads` at `104ff38`. The union caches input
 heads and refreshes only moved inputs; advance selects the next head in the
 same pass. No encoding or strategy-selection change. A deterministic probe
-went from 33 head reads to at most 9. Segment tests (123 passed, 2 ignored),
+went from 33 head reads to at most 9. The segment test suite,
 all 310 tinql tests and four PostgreSQL count/visibility tests passed.
 
 Three balanced million-row clean rounds, 302 queries, five timings per query:
@@ -168,3 +168,41 @@ control/candidate binaries are frozen with SHA checks; native profiles for
 queries 302 and 88 were collected after timed trials. Evidence:
 `benchmarks/results/cached-union-r1/million-clean/`. Eight-client clean/dirty
 validation is running before any promotion decision.
+
+### Iteration 1 load result and refinement
+
+Four alternating 20-second trials per binary/state at eight clients completed:
+clean QPS 2205.2 -> 2290.8 (3.9% higher), request p95 15.384 -> 15.038 ms;
+mutated QPS 67.8 -> 67.7 (effectively unchanged), p95 331.886 -> 321.505 ms
+with overlapping trial ranges. Warmups checked all 302 queries; dirty timed
+trials covered at least 300 forms each. No count errors. This is a local pilot,
+not a ten-minute AWS/published-TIN comparison.
+
+Query 2 (`griffith observatory`) crossed the per-query regression guard. A
+six-round focused replay reproduced a slower cached version (median-round
+0.137 versus 0.101 ms), so that version was not promoted. Keeping the original
+loop for unions of at most two inputs (`8d0a332`) restored the sparse case:
+six-round medians 0.0905 versus 0.1015 ms; broad query 302 remained faster,
+58.890 versus 70.1255 ms, and query 88 was 22.859 versus 23.6385 ms.
+The revised policy still needs a complete trace and load rerun before promotion.
+Raw evidence: `benchmarks/results/cached-union-r1/{load,sparse-replay,selective-replay}`.
+
+Iteration 2 preserves sparse bytes but specializes page consumption, eliminating
+scalar enum/ordinal handling while retaining the existing decoder validation.
+Segment/tinql and four PostgreSQL count tests pass. Forced-page paired timing
+will isolate this change from strategy selection; no format migration is needed.
+
+### Iteration 2 decision: park wrapper-only specialization
+
+Four balanced forced-page rounds on the million-row clean snapshot show
+median-round summed query medians 966.373 -> 966.178 ms, effectively unchanged.
+p95 is 9.689 -> 9.380 ms, insufficient evidence of worthwhile overall gain.
+The profiles still attribute heavy work to per-posting decoding/grouping and
+page union selection. Keep `f07c669` as an experimental reference; do not promote
+this wrapper-only specialization. Actual batching is the next experiment.
+Raw timings and profiles: `benchmarks/results/direct-sparse-pages-r1/million-clean`.
+
+The full-trace rerun of `8d0a332` retained lower aggregate time, but 12 queries
+crossed the >10% and >0.05 ms regression screen, mostly narrow unions. The next
+revision moves narrow/wide dispatch to cursor construction rather than checking
+it per posting; replay the same controls before promoting that revision.
