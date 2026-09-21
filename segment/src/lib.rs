@@ -44,6 +44,7 @@ pub mod index;
 pub mod maintenance;
 pub mod merge;
 pub mod merge_strategy;
+pub mod ordinals;
 pub mod pages;
 pub mod payload;
 pub mod postings;
