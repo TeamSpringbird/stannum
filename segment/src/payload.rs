@@ -163,9 +163,39 @@ pub struct Entry {
     pub positions: Vec<u32>,
 }
 
+/// Where a stream's bytes come from. A paged source hands out ranges, so a
+/// cursor reads the header and skip table once and then only the spans of
+/// entries it visits; a frequent term's positions run to megabytes and a
+/// phrase touches a sliver of them.
+#[derive(Clone, Copy)]
+enum Bytes<'a> {
+    Whole(&'a [u8]),
+    Ranged {
+        areas: &'a dyn crate::segment::AreaFetch,
+        /// The stream's offset in the payload area.
+        base: u64,
+        len: usize,
+    },
+}
+
+impl std::fmt::Debug for Bytes<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Whole(bytes) => write!(f, "Whole({} bytes)", bytes.len()),
+            Self::Ranged { base, len, .. } => write!(f, "Ranged({base}, {len} bytes)"),
+        }
+    }
+}
+
+/// Skip slots per fetched span of a ranged stream: about 2,048 entries.
+const SPAN_SLOTS: usize = 64;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Payload<'a> {
-    bytes: &'a [u8],
+    source: Bytes<'a>,
+    /// The stream up to its first entry: the count and the skip table.
+    head: &'a [u8],
+    len: usize,
     count: u32,
     skips_at: usize,
     data_at: usize,
@@ -183,6 +213,35 @@ impl<'a> Payload<'a> {
     /// Parses the `LSG1` layout: varint delta skips every 64 entries.
     pub fn parse_legacy(bytes: &'a [u8]) -> Result<Self> {
         Self::parse_format(bytes, Format::Lsg1)
+    }
+
+    /// Opens a stream of `len` bytes at `base` of a paged source's payload
+    /// area, reading only its header and skip table.
+    pub(crate) fn open(
+        areas: &'a dyn crate::segment::AreaFetch,
+        base: u64,
+        len: usize,
+        format: Format,
+    ) -> Result<Self> {
+        // The count decides how long the skip table is.
+        let probe = areas.payload_range(base, len.min(8))?;
+        let count = Reader::new(probe).varint_u32()?;
+        let head_len = Self::parse_format(probe, format).map_or_else(
+            |_| {
+                let slots = (count as usize).div_ceil(SKIP_INTERVAL as usize);
+                // Count varint, an explicit slot count for `LSG2`, the table.
+                (10 + slots * 4).min(len)
+            },
+            |parsed| parsed.data_at,
+        );
+        let head = areas.payload_range(base, head_len)?;
+        let parsed = Self::parse_format(head, format)?;
+        Ok(Self {
+            source: Bytes::Ranged { areas, base, len },
+            head: &head[..parsed.data_at],
+            len,
+            ..parsed
+        })
     }
 
     /// Parses the layout written by segments of `format`.
@@ -213,11 +272,14 @@ impl<'a> Payload<'a> {
             }
             Format::Lsg2 | Format::Lsg3 | Format::Lsg4 => reader.skip(slots * 4)?,
         }
+        let data_at = reader.position();
         Ok(Self {
-            bytes,
+            source: Bytes::Whole(bytes),
+            head: &bytes[..data_at],
+            len: bytes.len(),
             count,
             skips_at,
-            data_at: reader.position(),
+            data_at,
             interval,
             format,
         })
@@ -234,7 +296,7 @@ impl<'a> Payload<'a> {
 
     /// Bytes of the entries after the header and skip table.
     pub const fn data_len(&self) -> usize {
-        self.bytes.len() - self.data_at
+        self.len - self.data_at
     }
 
     /// Byte position of the skip-table entry containing `ordinal`, and the
@@ -246,12 +308,12 @@ impl<'a> Payload<'a> {
         let slot = (ordinal / self.interval) as usize;
         let fixed = |slot: usize| {
             let at = self.skips_at + slot * 4;
-            let bytes = &self.bytes[at..at + 4];
+            let bytes = &self.head[at..at + 4];
             u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
         };
         let offset = match self.format {
             Format::Lsg1 => {
-                let mut reader = Reader::at(self.bytes, self.skips_at);
+                let mut reader = Reader::at(self.head, self.skips_at);
                 let mut offset = 0usize;
                 for _ in 0..=slot {
                     offset = offset
@@ -269,15 +331,29 @@ impl<'a> Payload<'a> {
         let at = self
             .data_at
             .checked_add(offset)
-            .filter(|at| *at <= self.bytes.len())
+            .filter(|at| *at <= self.len)
             .ok_or(Error::Truncated)?;
         Ok((at, slot as u32 * self.interval))
     }
 
+    /// Where skip slot `slot` starts in the stream; past the last, its end.
+    fn slot_at(&self, slot: usize) -> Result<usize> {
+        if slot >= (self.count as usize).div_ceil(self.interval as usize) {
+            return Ok(self.len);
+        }
+        self.skip_to(slot as u32 * self.interval).map(|(at, _)| at)
+    }
+
     pub fn cursor(&self) -> PayloadCursor<'a> {
+        let reader = match self.source {
+            Bytes::Whole(bytes) => Reader::at(bytes, self.data_at),
+            Bytes::Ranged { .. } => Reader::new(&[]),
+        };
         PayloadCursor {
             payload: *self,
-            reader: Reader::at(self.bytes, self.data_at),
+            reader,
+            span: None,
+            span_at: 0,
             next_ordinal: 0,
         }
     }
@@ -294,7 +370,11 @@ impl<'a> Payload<'a> {
 #[derive(Clone, Debug)]
 pub struct PayloadCursor<'a> {
     payload: Payload<'a>,
+    /// Over the whole stream, or over the loaded span of a ranged one.
     reader: Reader<'a>,
+    /// The loaded span of a ranged stream and where it starts in the stream.
+    span: Option<usize>,
+    span_at: usize,
     next_ordinal: u32,
 }
 
@@ -302,6 +382,27 @@ impl PayloadCursor<'_> {
     /// Ordinal the next `next()` call will decode.
     pub const fn next_ordinal(&self) -> u32 {
         self.next_ordinal
+    }
+
+    /// Makes the reader cover the entry at `next_ordinal`: nothing to do for
+    /// a whole stream; a ranged one fetches the span of skip slots holding it.
+    fn load(&mut self) -> Result<()> {
+        let Bytes::Ranged { areas, base, .. } = self.payload.source else {
+            return Ok(());
+        };
+        let span = (self.next_ordinal / self.payload.interval) as usize / SPAN_SLOTS;
+        if self.span == Some(span) {
+            return Ok(());
+        }
+        let start = self.payload.slot_at(span * SPAN_SLOTS)?;
+        let end = self.payload.slot_at((span + 1) * SPAN_SLOTS)?;
+        if end < start {
+            return Err(Error::Corrupt("payload skip order"));
+        }
+        self.reader = Reader::new(areas.payload_range(base + start as u64, end - start)?);
+        self.span = Some(span);
+        self.span_at = start;
+        Ok(())
     }
 
     /// Positions so the next decode returns entry `ordinal`.
@@ -315,8 +416,9 @@ impl PayloadCursor<'_> {
             && ordinal / interval == self.next_ordinal / interval;
         if !forward_only {
             let (at, start) = self.payload.skip_to(ordinal)?;
-            self.reader.seek(at)?;
             self.next_ordinal = start;
+            self.load()?;
+            self.reader.seek(at - self.span_at)?;
         }
         while self.next_ordinal < ordinal {
             self.next_bucket()?;
@@ -329,6 +431,7 @@ impl PayloadCursor<'_> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));
         }
+        self.load()?;
         let byte = self.reader.u8()?;
         if byte > MAX_TF_BUCKET {
             return Err(Error::Corrupt("payload bucket byte"));
@@ -344,6 +447,7 @@ impl PayloadCursor<'_> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));
         }
+        self.load()?;
         let byte = self.reader.u8()?;
         if byte > MAX_TF_BUCKET {
             return Err(Error::Corrupt("payload bucket byte"));
@@ -359,6 +463,7 @@ impl PayloadCursor<'_> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));
         }
+        self.load()?;
         let byte = self.reader.u8()?;
         if byte > MAX_TF_BUCKET {
             return Err(Error::Corrupt("payload bucket byte"));
@@ -397,6 +502,86 @@ mod tests {
             builder.push(entry.tf_bucket, &entry.positions).unwrap();
         }
         builder.finish()
+    }
+
+    /// A paged payload area holding one stream after some padding, counting
+    /// the bytes it hands out.
+    struct Area {
+        bytes: Vec<u8>,
+        fetched: std::cell::Cell<usize>,
+    }
+
+    impl crate::segment::AreaFetch for Area {
+        fn postings_bytes(&self, _: crate::dictionary::Extent) -> Result<&[u8]> {
+            unreachable!()
+        }
+        fn payload_bytes(&self, _: crate::dictionary::Extent) -> Result<&[u8]> {
+            unreachable!()
+        }
+        fn length(&self, _: u32) -> Result<u32> {
+            unreachable!()
+        }
+        fn ranged_payloads(&self) -> bool {
+            true
+        }
+        fn payload_range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+            self.fetched.set(self.fetched.get() + len);
+            self.bytes
+                .get(offset as usize..offset as usize + len)
+                .ok_or(Error::Truncated)
+        }
+    }
+
+    #[test]
+    fn ranged_streams_read_like_whole_ones_and_fetch_only_what_they_visit() {
+        // Several spans of skip slots, with a short last one.
+        let entries = sample(5 * SPAN_SLOTS as u32 * SKIP_INTERVAL + 77);
+        let stream = build(&entries);
+        let mut bytes = vec![0xAB; 13];
+        bytes.extend_from_slice(&stream);
+        bytes.extend_from_slice(&[0xCD; 9]);
+        let area = Area {
+            bytes,
+            fetched: std::cell::Cell::new(0),
+        };
+        let payload = Payload::open(&area, 13, stream.len(), Format::CURRENT).unwrap();
+        assert_eq!(payload.count(), entries.len() as u32);
+        assert_eq!(
+            payload.data_len(),
+            Payload::parse(&stream).unwrap().data_len()
+        );
+        let mut cursor = payload.cursor();
+        for entry in &entries {
+            assert_eq!(&cursor.next_entry().unwrap(), entry);
+        }
+        assert!(cursor.next_entry().is_err());
+        // Backwards, across spans, to the last entry, and within a slot.
+        for ordinal in [
+            entries.len() as u32 - 1,
+            3,
+            2 * SPAN_SLOTS as u32 * SKIP_INTERVAL - 1,
+            2 * SPAN_SLOTS as u32 * SKIP_INTERVAL,
+            2 * SPAN_SLOTS as u32 * SKIP_INTERVAL + 5,
+            0,
+        ] {
+            cursor.seek(ordinal).unwrap();
+            assert_eq!(
+                cursor.next_entry().unwrap(),
+                entries[ordinal as usize],
+                "{ordinal}"
+            );
+        }
+        // One lookup costs the head and one span, not the stream.
+        area.fetched.set(0);
+        let payload = Payload::open(&area, 13, stream.len(), Format::CURRENT).unwrap();
+        assert_eq!(payload.get(40).unwrap(), entries[40]);
+        assert!(
+            area.fetched.get() < stream.len() / 3,
+            "{}",
+            area.fetched.get()
+        );
+        // A stream shorter than its table says is an error, not a panic.
+        assert!(Payload::open(&area, 13, 6, Format::CURRENT).is_err());
     }
 
     #[test]

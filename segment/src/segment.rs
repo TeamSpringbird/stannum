@@ -423,8 +423,13 @@ impl<'a> Term<'a> {
     }
 
     pub fn payload(&self) -> Result<Payload<'a>> {
+        let format = self.areas.format();
+        if self.areas.ranged_payloads() && format != Format::Lsg1 {
+            let extent = self.entry.payload;
+            return Payload::open(self.areas, extent.offset, extent.len as usize, format);
+        }
         let bytes = self.areas.payload_bytes(self.entry.payload)?;
-        Payload::parse_format(bytes, self.areas.format())
+        Payload::parse_format(bytes, format)
     }
 }
 
@@ -445,6 +450,15 @@ impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
 pub trait AreaFetch {
     fn postings_bytes(&self, extent: Extent) -> Result<&[u8]>;
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]>;
+    /// Whether payload streams are read a range at a time through
+    /// [`AreaFetch::payload_range`] rather than as whole extents.
+    fn ranged_payloads(&self) -> bool {
+        false
+    }
+    /// Bytes of the payload area.
+    fn payload_range(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
+        Err(Error::Corrupt("source has no ranged payloads"))
+    }
     /// Bytes of the ordinals area; sources without one have no streams.
     fn ordinals_bytes(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
         Err(Error::Corrupt("segment has no ordinal streams"))
@@ -805,6 +819,19 @@ impl<S: Source> AreaFetch for Reader<S> {
 
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]> {
         self.load(self.header.payload_at + extent.offset, extent.len as usize)
+    }
+
+    fn ranged_payloads(&self) -> bool {
+        true
+    }
+
+    fn payload_range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.payload_len as u64 => {
+                self.load(self.header.payload_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
     }
 
     fn ordinals_bytes(&self, offset: u64, len: usize) -> Result<&[u8]> {

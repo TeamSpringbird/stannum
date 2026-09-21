@@ -28,6 +28,11 @@
   dead list meanwhile; earlier builds could count a tuple VACUUM had removed
   from a page it then marked all-visible.
 - Counts check the matches of a heap page under one buffer lock.
+- Position payloads are read a span at a time from paged segments: the header
+  and skip table, then entry-aligned spans of 64 skip slots as a cursor visits
+  them. Whole extents were copied per term and query, which for frequent terms
+  ran to megabytes and emptied the reader cache; the median phrase query over
+  15 million Stack Exchange rows falls from 11 to 3 ms.
 - A ranked query whose terms are all elided or absent takes its top k from
   the heap-ordered candidate stream: every match scores zero and ties rank in
   heap order, so nothing is collected or sorted.
