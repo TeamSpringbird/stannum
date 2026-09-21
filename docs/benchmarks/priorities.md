@@ -250,3 +250,11 @@ hashes in the parent directory. Eight-client clean/mutated validation is queued;
 this remains an experimental branch, with no AWS transfer or production promotion
 claim. Separately, `cached-union-r1/planned-regression-replay` rechecks the earlier
 construction-time candidate against the original control on queries 2/19/100/289.
+
+The six-round construction-time regression replay completed: median per-query
+control/candidate times were query 2 0.1095/0.1015 ms, 19 0.9430/0.9765 ms,
+100 1.0800/1.0780 ms and 289 0.4355/0.4630 ms. None reproduced the combined
+>10% and >0.05 ms screen. Round variance was substantial, so these resolve the
+initial screen without establishing statistical equivalence. Packed-head load
+validation is running; its four flagged identities have a six-round replay
+queued behind it under the same exclusive benchmark lock.
