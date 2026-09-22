@@ -25,7 +25,7 @@
       "Type": "Number",
       "Default": 8,
       "MinValue": 1,
-      "MaxValue": 12
+      "MaxValue": 24
     },
     "AvailabilityZone": {
       "Type": "AWS::EC2::AvailabilityZone::Name",

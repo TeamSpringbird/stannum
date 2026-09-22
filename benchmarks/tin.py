@@ -7,6 +7,7 @@
 import argparse
 import collections
 import csv
+import datetime
 import fcntl
 import gzip
 import json
@@ -130,7 +131,9 @@ def build_image(args):
         command(['docker', 'build', '-f', 'benchmarks/Dockerfile',
                  '--build-arg', 'STANNUM_SOURCE_SHA256=' + source['source_sha256'],
                  '--build-arg', 'STANNUM_COMMIT=' + source['commit'],
-                 '--build-arg', 'RECIPE_SHA256=' + recipe, '-t', args.image, '.'],
+                 '--build-arg', 'RECIPE_SHA256=' + recipe] +
+                (['--build-arg', 'BASE=' + args.base] if getattr(args, 'base', None) else []) +
+                ['-t', args.image, '.'],
                 cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     bench.save(args.output / 'image.json', json.loads(output(['docker', 'image', 'inspect', args.image])))
 
@@ -198,6 +201,13 @@ def check_sql(queries, engine='stannum', raw_text=False):
                           f"(SELECT count(*) FROM indexed) FROM (({actual} EXCEPT ALL {expected}) "
                           f"UNION ALL ({expected} EXCEPT ALL {actual})) difference;")
     return '\n'.join(statements)
+
+
+def copy_volume(image, source, target):
+    """Copies one mount's tree onto another with the benchmark image's cp, so
+    a database moves between a volume and a host directory with ownership kept."""
+    command(['docker', 'run', '--rm', '--entrypoint', 'cp', '-v', source, '-v', target, image,
+             '-a', '/from/.', '/to/'], stdout=subprocess.DEVNULL)
 
 
 def ranked_check_sql(queries, engine):
@@ -371,6 +381,11 @@ def report(root):
               'Index read/hit bytes are block accesses, not physical disk traffic.',
               'Resource summaries in comparison.json and resource-summary.json use samples wholly inside the measured window; boundary gaps are reported.',
               'The full pinned trace may not be traversed during short or slow runs.']
+    for job in manifest['jobs']:
+        if job.get('database_from'):
+            origin = job['database_from']
+            lines += ['', f"- {job['engine']}: database copied from run {origin['source_run']} "
+                          f"(saved {origin['saved_at']}); import and index build were not repeated."]
     lines += ['', 'Workload-state snapshots (after VACUUM / before driver / after restart):']
     for job in manifest['jobs']:
         state = job.get('workload_state', {})
@@ -517,6 +532,16 @@ def run(args):
             bench.save(root / 'manifest.json', manifest)
             command(['docker', 'volume', 'create', volume], stdout=subprocess.DEVNULL)
             sampler = None
+            loaded = None
+            if getattr(args, 'load_database', None):
+                # A saved database is what a fresh run holds after its build,
+                # VACUUM and checks: the same corpus prefix in the same engine.
+                loaded = json.loads((args.load_database / 'snapshot.json').read_text())
+                for key, want in (('engine', engine), ('published_corpus', args.published_corpus),
+                                  ('rows', args.rows), ('image', image['Id'])):
+                    if loaded.get(key) != want:
+                        raise ValueError(f'saved database {key} {loaded.get(key)!r} does not match {want!r}')
+                copy_volume(image['Id'], f'{args.load_database.resolve()}:/from:ro', f'{volume}:/to')
             try:
                 command(['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus),
                          '--memory', job['resource_limits']['build_memory'],
@@ -540,67 +565,80 @@ def run(args):
                     time.sleep(.5)
                 sampler = ResourceSampler(name, path / 'resources.jsonl')
                 sampler.thread.start()
-                sql('CREATE EXTENSION pg_prewarm; CREATE EXTENSION pg_visibility; CREATE EXTENSION stannum;')
+                if loaded is None:
+                    sql('CREATE EXTENSION pg_prewarm; CREATE EXTENSION pg_visibility; CREATE EXTENSION stannum;')
                 with (path / 'driver-regressions.txt').open('w') as log:
                     command([driver / 'pg-driver-test', '-test.v'],
                             env=dict(env, STANNUM_BENCH_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark',
                                      BENCHMARKER_POSTGRES_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark'),
                             stdout=log, stderr=subprocess.STDOUT)
-                sql((ASSETS / 'position-limit.sql').read_text())
-                sql('CREATE TABLE documents(id text NOT NULL, body text NOT NULL);' if published else
-                    'CREATE TABLE documents(id bigint PRIMARY KEY, body text NOT NULL);')
-                # Published IDs remain text, matching the upstream schema without a PK.
-                if published:
-                    published_dataset.prefix(args.dataset, path / 'input.csv', args.rows)
-                else:
-                    with (path / 'input.csv').open('w') as target, (Path(args.dataset) / 'documents.csv').open() as source_csv:
-                        reader, writer = csv.reader(source_csv), csv.writer(target)
-                        for number, row in enumerate(reader):
-                            if number == args.rows:
-                                break
-                            writer.writerow(row)
-                job['input_sha256'] = dataset.sha256(path / 'input.csv')
-                sampler.phase = 'import'
-                started = time.monotonic()
-                # Not COPY FROM STDIN: psql ends the data at a line holding only
-                # `\.`, even inside a quoted field, and a published Stack
-                # Exchange document has such a line in a code block. PostgreSQL
-                # 18 reads a CSV file without that marker.
-                (path / 'input.csv').chmod(0o644)
-                sql("COPY documents FROM '/import/input.csv' WITH (FORMAT csv);", setup=True)
-                job['import_seconds'] = time.monotonic() - started
-                if published and sql('SELECT count(*) = count(DISTINCT id) FROM documents;') != 't':
-                    raise ValueError('membership validation requires unique source IDs')
-                started = time.monotonic()
-                sampler.phase = 'vector-preparation'
-                if engine == 'postgres':
-                    sql("ALTER TABLE documents ADD COLUMN body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED;", setup=True)
-                job['vector_preparation_seconds'] = time.monotonic() - started
-                started = time.monotonic()
                 index = 'documents_body_gin_idx' if engine == 'postgres' else 'documents_body_stannum_idx'
-                expression = 'gin(body_tsv)' if engine == 'postgres' else 'stannum(body)'
-                sampler.phase = 'index-build'
-                bench.save(path / 'before-build-cgroup.json', resource_snapshot(name))
-                build_sql = f'CREATE INDEX {index} ON documents USING {expression};'
-                if engine == 'stannum':
-                    build_sql += " SELECT current_setting('stannum.build_segment_docs');"
-                build_result = sql(build_sql, setup=True)
-                if engine == 'stannum':
-                    job['build_segment_docs'] = int(build_result)
-                    requested = getattr(args, 'build_segment_docs', None)
-                    if requested is not None and job['build_segment_docs'] != requested:
-                        raise ValueError('effective build batch size differs from requested value')
-                bench.save(path / 'after-build-cgroup.json', resource_snapshot(name))
-                job['index_build_seconds'] = time.monotonic() - started
-                if engine == 'stannum':
-                    job['segments_after_build'] = json.loads(sql(
-                        f"SELECT coalesce(json_agg(s ORDER BY ordinal), '[]'::json) FROM stannum.segment_info('{index}') s;"))
+                if loaded is not None:
+                    for key in ('input_sha256', 'import_seconds', 'index_build_seconds',
+                                'build_segment_docs', 'segments_after_build'):
+                        if key in loaded:
+                            job[key] = loaded[key]
+                    job['database_from'] = dict(path=str(args.load_database.resolve()),
+                                                source_run=loaded['source_run'], saved_at=loaded['saved_at'])
+                    if int(sql('SELECT count(*) FROM documents;')) != args.rows:
+                        raise ValueError('saved database row count differs from --rows')
+                if loaded is None:
+                    sql((ASSETS / 'position-limit.sql').read_text())
+                    sql('CREATE TABLE documents(id text NOT NULL, body text NOT NULL);' if published else
+                        'CREATE TABLE documents(id bigint PRIMARY KEY, body text NOT NULL);')
+                if loaded is None:
+                    # Published IDs remain text, matching the upstream schema without a PK.
+                    if published:
+                        published_dataset.prefix(args.dataset, path / 'input.csv', args.rows)
+                    else:
+                        with (path / 'input.csv').open('w') as target, (Path(args.dataset) / 'documents.csv').open() as source_csv:
+                            reader, writer = csv.reader(source_csv), csv.writer(target)
+                            for number, row in enumerate(reader):
+                                if number == args.rows:
+                                    break
+                                writer.writerow(row)
+                    job['input_sha256'] = dataset.sha256(path / 'input.csv')
+                    sampler.phase = 'import'
+                    started = time.monotonic()
+                    # Not COPY FROM STDIN: psql ends the data at a line holding only
+                    # `\.`, even inside a quoted field, and a published Stack
+                    # Exchange document has such a line in a code block. PostgreSQL
+                    # 18 reads a CSV file without that marker.
+                    (path / 'input.csv').chmod(0o644)
+                    sql("COPY documents FROM '/import/input.csv' WITH (FORMAT csv);", setup=True)
+                    job['import_seconds'] = time.monotonic() - started
+                    if published and sql('SELECT count(*) = count(DISTINCT id) FROM documents;') != 't':
+                        raise ValueError('membership validation requires unique source IDs')
+                    started = time.monotonic()
+                    sampler.phase = 'vector-preparation'
+                    if engine == 'postgres':
+                        sql("ALTER TABLE documents ADD COLUMN body_tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED;", setup=True)
+                    job['vector_preparation_seconds'] = time.monotonic() - started
+                    started = time.monotonic()
+                    expression = 'gin(body_tsv)' if engine == 'postgres' else 'stannum(body)'
+                    sampler.phase = 'index-build'
+                    bench.save(path / 'before-build-cgroup.json', resource_snapshot(name))
+                    build_sql = f'CREATE INDEX {index} ON documents USING {expression};'
+                    if engine == 'stannum':
+                        build_sql += " SELECT current_setting('stannum.build_segment_docs');"
+                    build_result = sql(build_sql, setup=True)
+                    if engine == 'stannum':
+                        job['build_segment_docs'] = int(build_result)
+                        requested = getattr(args, 'build_segment_docs', None)
+                        if requested is not None and job['build_segment_docs'] != requested:
+                            raise ValueError('effective build batch size differs from requested value')
+                    bench.save(path / 'after-build-cgroup.json', resource_snapshot(name))
+                    job['index_build_seconds'] = time.monotonic() - started
+                    if engine == 'stannum':
+                        job['segments_after_build'] = json.loads(sql(
+                            f"SELECT coalesce(json_agg(s ORDER BY ordinal), '[]'::json) FROM stannum.segment_info('{index}') s;"))
                 if job['resource_limits']['build_memory'] != args.memory:
                     sampler.phase = 'query-memory-transition'
                     command(['docker', 'update', '--memory', args.memory, '--memory-swap', args.memory, name],
                             stdout=subprocess.DEVNULL)
                 sampler.phase = 'validation'
-                sql('VACUUM ANALYZE documents;', setup=True)
+                if loaded is None:
+                    sql('VACUUM ANALYZE documents;', setup=True)
                 job['workload_state'] = dict(protocol='postvacuum-observed-v1',
                                              after_vacuum=workload_state(sql))
                 job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));"))
@@ -624,15 +662,16 @@ def run(args):
                 job['cross_engine_membership_differences'] = differences
                 sql('DROP TABLE reference;')
                 if args.workload == 'topk':
-                    ranked_sql = ranked_check_sql(queries, engine)
+                    ranked_queries = validation_queries(queries, getattr(args, 'ranked_validation_queries', 0))
+                    ranked_sql = ranked_check_sql(ranked_queries, engine)
                     (path / 'ranked-correctness.sql').write_text(ranked_sql)
                     # Exhaustive references over the full table are setup work: one
                     # stopword-heavy disjunction over 15 million rows outlasts the
                     # timeout measured queries run under.
                     ranked = sql(ranked_sql, setup=True)
                     (path / 'ranked-correctness.txt').write_text(ranked + '\n')
-                    validate_result(ranked, [q[0] for q in queries])
-                    job['ranked_correctness'] = dict(queries=len(queries), mismatches=0,
+                    validate_result(ranked, [q[0] for q in ranked_queries])
+                    job['ranked_correctness'] = dict(queries=len(ranked_queries), mismatches=0,
                                                      reference='exhaustive same-engine score multiset; ties unordered')
                 plan_queries = [q for q in queries if selected_style(q[0], args.style)]
                 for query in plan_queries[:6]:
@@ -643,6 +682,30 @@ def run(args):
                         # Diagnostics, not measurements: a forced generic plan may scan the heap.
                         (path / (filename + '.json')).write_text(sql(statement, setup=True))
                 sql('CHECKPOINT;')
+                if getattr(args, 'save_database', None):
+                    # The state every workload starts from, copied out of the
+                    # stopped container so the files are consistent.
+                    sampler.phase = 'save-database'
+                    target = args.save_database.resolve()
+                    if target.exists() and any(target.iterdir()):
+                        raise ValueError(f'--save-database {target} is not empty')
+                    target.mkdir(parents=True, exist_ok=True)
+                    command(['docker', 'stop', '-t', '600', name], stdout=subprocess.DEVNULL)
+                    copy_volume(image['Id'], f'{volume}:/from:ro', f'{target}:/to')
+                    (target / 'snapshot.json').write_text(json.dumps(dict(
+                        engine=engine, published_corpus=args.published_corpus, rows=args.rows,
+                        image=image['Id'], source_run=root.name,
+                        saved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        **{k: job[k] for k in ('input_sha256', 'import_seconds', 'index_build_seconds',
+                                               'build_segment_docs', 'segments_after_build', 'sizes') if k in job}),
+                        indent=1))
+                    command(['docker', 'start', name], stdout=subprocess.DEVNULL)
+                    deadline = time.monotonic() + 90
+                    while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError('PostgreSQL restart after saving the database')
+                        time.sleep(.5)
+                    job['database_saved'] = str(target)
                 job['settings'] = json.loads(sql("SELECT json_object_agg(name,setting) FROM pg_settings;"))
                 job['extensions'] = json.loads(sql('SELECT json_object_agg(extname,extversion) FROM pg_extension;'))
                 job['workload_state']['before_driver'] = workload_state(sql)
@@ -690,8 +753,8 @@ def run(args):
                     if args.workload == 'topk':
                         after_ranked = sql(ranked_sql, setup=True)
                         (path / 'ranked-correctness-after.txt').write_text(after_ranked + '\n')
-                        validate_result(after_ranked, [q[0] for q in queries])
-                        job['post_update_ranked_correctness'] = dict(queries=len(queries), mismatches=0,
+                        validate_result(after_ranked, [q[0] for q in ranked_queries])
+                        job['post_update_ranked_correctness'] = dict(queries=len(ranked_queries), mismatches=0,
                             reference='exhaustive same-engine score multiset after updates; ties unordered')
                 job['status'] = 'complete'
             except BaseException as error:
@@ -980,6 +1043,7 @@ def main():
     p.set_defaults(func=build_image)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--image', required=True)
+    p.add_argument('--base', help='Base image for a rehearsal on another architecture; the published runs use the pinned ParadeDB image')
     common = argparse.ArgumentParser(add_help=False)
     p = common
     p.add_argument('--output', type=Path, required=True)
@@ -989,6 +1053,12 @@ def main():
     p.add_argument('--rows', type=bench.positive, default=1000)
     p.add_argument('--validation-rows', type=bench.positive, default=1000)
     p.add_argument('--validation-queries', type=int, default=0, help='Evenly spaced query-form sample for untimed checks; 0 checks every form')
+    p.add_argument('--ranked-validation-queries', type=int, default=0,
+                   help='Sample of the validation queries for the exhaustive ranked check, which scores every match; 0 checks them all')
+    p.add_argument('--save-database', type=Path,
+                   help='After the build and its checks, copy the data volume here for later runs to start from')
+    p.add_argument('--load-database', type=Path,
+                   help='Start from a database saved by --save-database, skipping import and index build')
     p.add_argument('--workload', choices=['count', 'topk'], default='count')
     p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase', 'conjunction-phrase'], default='mixed')
     p.add_argument('--clients', type=bench.positive, default=2)

@@ -95,3 +95,9 @@
   of folding every prefix, and a sparse stream seeks through its bounds
   table without decoding the first posting of each block it skips. Mixed
   ranked queries at eight clients on 15 million rows: 313 to 340 a second.
+- Benchmark harness: `--save-database` copies a built, vacuumed and checked
+  database out of its container and `--load-database` starts a later run
+  from that copy, so one build serves every workload of a campaign;
+  `--ranked-validation-queries` samples the exhaustive ranked check;
+  `build-image --base` builds a native image for rehearsals; a benchmark
+  stack may live up to 24 hours.
