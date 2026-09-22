@@ -284,7 +284,7 @@ def workload_state(sql):
         FROM pg_class c JOIN pg_stat_user_tables s ON s.relid = c.oid
         CROSS JOIN pg_visibility_map_summary(c.oid) v
         WHERE c.oid = 'documents'::regclass;
-    """))
+    """, setup=True))
 
 
 def workload_state_contract(job, updates):
@@ -580,7 +580,7 @@ def run(args):
                             job[key] = loaded[key]
                     job['database_from'] = dict(path=str(args.load_database.resolve()),
                                                 source_run=loaded['source_run'], saved_at=loaded['saved_at'])
-                    if int(sql('SELECT count(*) FROM documents;')) != args.rows:
+                    if int(sql('SELECT count(*) FROM documents;', setup=True)) != args.rows:
                         raise ValueError('saved database row count differs from --rows')
                 if loaded is None:
                     sql((ASSETS / 'position-limit.sql').read_text())
@@ -607,7 +607,7 @@ def run(args):
                     (path / 'input.csv').chmod(0o644)
                     sql("COPY documents FROM '/import/input.csv' WITH (FORMAT csv);", setup=True)
                     job['import_seconds'] = time.monotonic() - started
-                    if published and sql('SELECT count(*) = count(DISTINCT id) FROM documents;') != 't':
+                    if published and sql('SELECT count(*) = count(DISTINCT id) FROM documents;', setup=True) != 't':
                         raise ValueError('membership validation requires unique source IDs')
                     started = time.monotonic()
                     sampler.phase = 'vector-preparation'
@@ -641,8 +641,8 @@ def run(args):
                     sql('VACUUM ANALYZE documents;', setup=True)
                 job['workload_state'] = dict(protocol='postvacuum-observed-v1',
                                              after_vacuum=workload_state(sql))
-                job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));"))
-                sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
+                job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));", setup=True))
+                sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};", setup=True)
                 oracle = 'SET enable_seqscan=off;\n' + check_sql(queries, engine, raw_text=raw_text)
                 (path / 'correctness.sql').write_text(oracle)
                 started = time.monotonic()
@@ -739,9 +739,9 @@ def run(args):
                 job['workload_state']['after_restart'] = workload_state(sql)
                 bench.save(path / 'workload-state.json', job['workload_state'])
                 if args.updates:
-                    if int(sql('SELECT count(*) FROM documents;')) != args.rows:
+                    if int(sql('SELECT count(*) FROM documents;', setup=True)) != args.rows:
                         raise ValueError('update-only phase changed row count')
-                    sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};")
+                    sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};", setup=True)
                     after = sql(oracle)
                     (path / 'correctness-after.txt').write_text(after + '\n')
                     validate_result(after, [q[0] for q in queries])
