@@ -43,7 +43,6 @@
 use std::collections::BTreeMap;
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
 
 use crate::dictionary::{
     BlockFetch, Blocks, Dictionary, DictionaryBuilder, DictionaryIndex, Extent, TermEntry,
@@ -403,6 +402,10 @@ impl<'a> Term<'a> {
     }
 
     pub fn postings(&self) -> Result<Postings<'a>> {
+        if self.areas.ranged_postings() {
+            let extent = self.entry.postings;
+            return Postings::open(self.areas, extent.offset, extent.len as usize);
+        }
         Postings::parse(self.areas.postings_bytes(self.entry.postings)?)
     }
 
@@ -454,6 +457,15 @@ pub trait AreaFetch {
     /// [`AreaFetch::payload_range`] rather than as whole extents.
     fn ranged_payloads(&self) -> bool {
         false
+    }
+    /// Whether postings streams are read a window at a time through
+    /// [`AreaFetch::postings_range`] rather than as whole extents.
+    fn ranged_postings(&self) -> bool {
+        false
+    }
+    /// Bytes of the postings area.
+    fn postings_range(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
+        Err(Error::Corrupt("source has no ranged postings"))
     }
     /// Bytes of the payload area.
     fn payload_range(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
@@ -519,7 +531,9 @@ pub struct Sections {
 }
 
 /// Fetched extents by (offset, len).
-type Arena = HashMap<(u64, usize), Box<[u8]>>;
+/// Fetched byte ranges by (offset, len). A ranged cursor fetches thousands
+/// of windows per query, so the hash is the cheap one.
+type Arena = rustc_hash::FxHashMap<(u64, usize), Box<[u8]>>;
 
 /// Granularity at which document lengths are fetched from a paged source.
 const LENGTH_CHUNK: u64 = 4096;
@@ -581,7 +595,7 @@ impl<S: Source> Reader<S> {
                 pages_at,
                 pages_len,
             },
-            arena: RefCell::new(HashMap::new()),
+            arena: RefCell::new(Arena::default()),
             arena_bytes: Cell::new(0),
             dictionary: OnceCell::new(),
             last_chunk: Cell::new(None),
@@ -823,6 +837,19 @@ impl<S: Source> AreaFetch for Reader<S> {
 
     fn ranged_payloads(&self) -> bool {
         true
+    }
+
+    fn ranged_postings(&self) -> bool {
+        true
+    }
+
+    fn postings_range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.postings_len as u64 => {
+                self.load(self.header.postings_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
     }
 
     fn payload_range(&self, offset: u64, len: usize) -> Result<&[u8]> {

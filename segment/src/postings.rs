@@ -312,11 +312,210 @@ fn encode_grouped(tids: &[Tid], scores: Option<&[(u8, u32)]>, format: Format) ->
     out
 }
 
+/// Where a stream's bytes come from. A paged source hands out windows, so a
+/// cursor reads the header and bounds table once and then only the bytes of
+/// the blocks and groups it visits: a frequent term's postings run to
+/// megabytes per segment, and a pruned ranked walk skips most of them.
+#[derive(Clone, Copy)]
+enum Bytes<'a> {
+    Whole(&'a [u8]),
+    Ranged {
+        areas: &'a dyn crate::segment::AreaFetch,
+        /// The stream's offset in the postings area.
+        base: u64,
+        len: usize,
+    },
+}
+
+impl std::fmt::Debug for Bytes<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Whole(bytes) => write!(f, "Whole({} bytes)", bytes.len()),
+            Self::Ranged { base, len, .. } => write!(f, "Ranged({base}, {len} bytes)"),
+        }
+    }
+}
+
+impl<'a> Bytes<'a> {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Whole(bytes) => bytes.len(),
+            Self::Ranged { len, .. } => *len,
+        }
+    }
+
+    /// `len` bytes from `at`, which must lie within the stream.
+    fn range(&self, at: usize, len: usize) -> Result<&'a [u8]> {
+        let end = at.checked_add(len).ok_or(Error::Truncated)?;
+        match self {
+            Self::Whole(bytes) => bytes.get(at..end).ok_or(Error::Truncated),
+            Self::Ranged {
+                areas,
+                base,
+                len: total,
+            } => {
+                if end > *total {
+                    return Err(Error::Truncated);
+                }
+                areas.postings_range(base.checked_add(at as u64).ok_or(Error::Truncated)?, len)
+            }
+        }
+    }
+}
+
+/// Bytes of a ranged stream fetched to parse its header: the form, count,
+/// and either the table length or a term bound of every bucket.
+const PROBE: usize = 16 + BUCKET_COUNT * 5;
+
+/// Bytes a ranged stream fetches at a time, aligned within the stream so
+/// that every cursor over the same bytes, in this query or a later one,
+/// asks its source for the same windows and finds them cached.
+const WINDOW: usize = 16 * 1024;
+
+/// Bounds-checked sequential reads over a stream, fetched a window at a
+/// time; the whole of an in-memory stream is one window. The API of
+/// [`Reader`], over either source.
+#[derive(Clone, Copy)]
+struct Stream<'a> {
+    source: Bytes<'a>,
+    /// The stream's length.
+    end: usize,
+    at: usize,
+    window: &'a [u8],
+    window_at: usize,
+    window_end: usize,
+}
+
+impl std::fmt::Debug for Stream<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Stream({:?} at {})", self.source, self.at)
+    }
+}
+
+impl<'a> Stream<'a> {
+    const fn at(source: Bytes<'a>, at: usize) -> Self {
+        Self {
+            source,
+            end: source.len(),
+            at,
+            window: &[],
+            window_at: 0,
+            window_end: 0,
+        }
+    }
+
+    const fn position(&self) -> usize {
+        self.at
+    }
+
+    const fn remaining(&self) -> usize {
+        self.end - self.at
+    }
+
+    /// The next `len` bytes, without consuming them.
+    #[inline]
+    fn need(&mut self, len: usize) -> Result<&'a [u8]> {
+        let end = self.at.checked_add(len).ok_or(Error::Truncated)?;
+        if end > self.end {
+            return Err(Error::Truncated);
+        }
+        if self.at < self.window_at || end > self.window_end {
+            self.fetch(len, end)?;
+        }
+        let from = self.at - self.window_at;
+        Ok(&self.window[from..from + len])
+    }
+
+    /// Fetches a window holding the `len` bytes at the position.
+    #[cold]
+    fn fetch(&mut self, len: usize, end: usize) -> Result<()> {
+        {
+            let (start, span) = match self.source {
+                Bytes::Whole(_) => (0, self.source.len()),
+                Bytes::Ranged { .. } => {
+                    let start = self.at - self.at % WINDOW;
+                    let span = WINDOW.min(self.source.len() - start);
+                    // An item across a window boundary is fetched on its own.
+                    if end > start + span {
+                        (self.at, len)
+                    } else {
+                        (start, span)
+                    }
+                }
+            };
+            self.window = self.source.range(start, span)?;
+            self.window_at = start;
+            self.window_end = start + span;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn u8(&mut self) -> Result<u8> {
+        let byte = self.need(1)?[0];
+        self.at += 1;
+        Ok(byte)
+    }
+
+    #[inline]
+    fn varint(&mut self) -> Result<u64> {
+        // Decoded in place while the window holds a whole value's bytes, so
+        // the hot loops over a stream cost what they did over one slice.
+        let from = self.at.wrapping_sub(self.window_at);
+        if self.at >= self.window_at && from + varint::MAX_LEN <= self.window.len() {
+            let mut at = from;
+            let value = varint::get(self.window, &mut at)?;
+            self.at += at - from;
+            return Ok(value);
+        }
+        let bytes = self.need(varint::MAX_LEN.min(self.remaining()))?;
+        let mut at = 0;
+        let value = varint::get(bytes, &mut at)?;
+        self.at += at;
+        Ok(value)
+    }
+
+    #[inline]
+    fn varint_u32(&mut self) -> Result<u32> {
+        u32::try_from(self.varint()?).map_err(|_| Error::Corrupt("value exceeds 32 bits"))
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let slice = self.need(len)?;
+        self.at += len;
+        Ok(slice)
+    }
+
+    fn skip(&mut self, len: usize) -> Result<()> {
+        // Skipped bytes need not be fetched.
+        let end = self.at.checked_add(len).ok_or(Error::Truncated)?;
+        if end > self.end {
+            return Err(Error::Truncated);
+        }
+        self.at = end;
+        Ok(())
+    }
+
+    /// Moves to an absolute position that must not exceed the end of input.
+    fn seek(&mut self, at: usize) -> Result<()> {
+        if at > self.end {
+            return Err(Error::Truncated);
+        }
+        self.at = at;
+        Ok(())
+    }
+}
+
+/// The form, count, bounds table location and body offset of a stream.
+type Head = (u8, u32, Option<(usize, usize)>, usize);
+
 /// A parsed stream header. Parsing reads only the header; bodies are validated
 /// as cursors traverse them.
 #[derive(Clone, Copy, Debug)]
 pub struct Postings<'a> {
-    bytes: &'a [u8],
+    source: Bytes<'a>,
+    /// The stream up to its body: the header and any bounds table.
+    head: &'a [u8],
     form: u8,
     count: u32,
     /// Where the bounds table is, when the stream carries one.
@@ -326,6 +525,41 @@ pub struct Postings<'a> {
 
 impl<'a> Postings<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
+        let (form, count, bounds, body_at) = Self::parse_head(bytes, bytes.len())?;
+        Ok(Self {
+            source: Bytes::Whole(bytes),
+            head: &bytes[..body_at],
+            form,
+            count,
+            bounds,
+            body_at,
+        })
+    }
+
+    /// A stream of `len` bytes at `base` in a source's postings area, read a
+    /// window at a time. Only the header and bounds table are fetched here.
+    pub(crate) fn open(
+        areas: &'a dyn crate::segment::AreaFetch,
+        base: u64,
+        len: usize,
+    ) -> Result<Self> {
+        let source = Bytes::Ranged { areas, base, len };
+        // The form, count and table length or term bound: a bounded prefix.
+        let probe = source.range(0, PROBE.min(len))?;
+        let (form, count, bounds, body_at) = Self::parse_head(probe, len)?;
+        Ok(Self {
+            source,
+            head: source.range(0, body_at)?,
+            form,
+            count,
+            bounds,
+            body_at,
+        })
+    }
+
+    /// The header fields from the stream's first bytes, of which `bytes`
+    /// holds at least the header and term bound; `len` is the whole stream.
+    fn parse_head(bytes: &[u8], len: usize) -> Result<Head> {
         let mut reader = Reader::new(bytes);
         let form = reader.u8()?;
         let layout = form & !FORM_FLAGS;
@@ -336,10 +570,12 @@ impl<'a> Postings<'a> {
         }
         let count = reader.varint_u32()?;
         let bounds = if form & FORM_BOUNDED != 0 {
-            let len = reader.varint_u32()? as usize;
+            let table = reader.varint_u32()? as usize;
             let at = reader.position();
-            reader.skip(len)?;
-            Some((at, len))
+            if at.checked_add(table).is_none_or(|end| end > len) {
+                return Err(Error::Truncated);
+            }
+            Some((at, table))
         } else if form & FORM_TERM_BOUND != 0 {
             if count == 0 || count > BLOCK_POSTINGS {
                 return Err(Error::Corrupt("term bound on a stream of several blocks"));
@@ -350,13 +586,11 @@ impl<'a> Postings<'a> {
         } else {
             None
         };
-        Ok(Self {
-            bytes,
-            form,
-            count,
-            bounds,
-            body_at: reader.position(),
-        })
+        let body_at = match bounds {
+            Some((at, table)) => at + table,
+            None => reader.position(),
+        };
+        Ok((form, count, bounds, body_at))
     }
 
     /// Number of postings, from the header.
@@ -388,19 +622,19 @@ impl<'a> Postings<'a> {
 
     /// Bytes of the body after the header and bounds table.
     pub const fn body_len(&self) -> usize {
-        self.bytes.len() - self.body_at
+        self.source.len() - self.body_at
     }
 
     fn bounds_table(&self) -> Option<Bounds<'a>> {
         self.bounds.map(|(at, len)| Bounds {
-            reader: Reader::new(&self.bytes[at..at + len]),
+            reader: Reader::new(&self.head[at..at + len]),
             blocks: self.count.div_ceil(BLOCK_POSTINGS),
             starts: if self.is_grouped() || self.has_term_bound() {
                 None
             } else {
                 Some(Vec::new())
             },
-            body_len: self.bytes.len() - self.body_at,
+            body_len: self.source.len() - self.body_at,
             entries: Vec::new(),
             stream: *self,
             compact: self.has_term_bound(),
@@ -409,7 +643,7 @@ impl<'a> Postings<'a> {
     }
 
     fn grouped(&self) -> Result<GroupedCursor<'a>> {
-        let mut reader = Reader::at(self.bytes, self.body_at);
+        let mut reader = Stream::at(self.source, self.body_at);
         let groups_left = reader.varint_u32()?;
         Ok(GroupedCursor {
             reader,
@@ -487,7 +721,7 @@ impl<'a> Postings<'a> {
             PostingsCursor::Grouped(grouped)
         } else {
             PostingsCursor::Sparse(SparseCursor {
-                reader: Reader::at(self.bytes, self.body_at),
+                reader: Stream::at(self.source, self.body_at),
                 body_at: self.body_at,
                 total: self.count,
                 remaining: self.count,
@@ -506,7 +740,7 @@ impl<'a> Postings<'a> {
         let mut cursor = self.cursor()?;
         // The count is untrusted until the stream has been decoded.
         // Bound speculative allocation by bytes actually present.
-        let mut out = Vec::with_capacity((self.count as usize).min(self.bytes.len()));
+        let mut out = Vec::with_capacity((self.count as usize).min(self.source.len()));
         while let Some(tid) = cursor.current() {
             out.push(tid);
             cursor.advance()?;
@@ -749,7 +983,7 @@ impl Bounds<'_> {
 
 #[derive(Clone, Debug)]
 pub struct SparseCursor<'a> {
-    reader: Reader<'a>,
+    reader: Stream<'a>,
     body_at: usize,
     total: u32,
     remaining: u32,
@@ -771,33 +1005,46 @@ impl SparseCursor<'_> {
         Ok(())
     }
 
-    /// Jumps over whole blocks whose last posting is before `target`.
+    /// Jumps over whole blocks whose last posting is before `target`,
+    /// through the bounds table alone: the body is read again only at the
+    /// first block that can hold the target.
     fn skip_blocks_before(&mut self, target: Tid) -> Result<()> {
-        while self.current.is_some() {
-            let bounds = self.bounds.as_mut().expect("bounded stream");
-            let block = self.ordinal / BLOCK_POSTINGS;
-            let entry = bounds
-                .entry(block)?
-                .ok_or(Error::Corrupt("posting beyond block bounds"))?;
-            if entry.last >= target {
-                return Ok(());
-            }
-            if bounds.entry(block + 1)?.is_none() {
-                self.current = None;
-                self.remaining = 0;
-                self.ordinal = self.total;
-                return Ok(());
-            }
-            let start =
-                bounds.starts.as_ref().expect("sparse bounds track starts")[block as usize + 1];
-            self.reader.seek(self.body_at + start)?;
-            self.last_block = entry.last.block;
-            self.ordinal = (block + 1) * BLOCK_POSTINGS;
-            self.remaining = self.total - self.ordinal;
-            self.current = Some(entry.last);
-            self.load_next()?;
+        if self.current.is_none() {
+            return Ok(());
         }
-        Ok(())
+        let bounds = self.bounds.as_mut().expect("bounded stream");
+        let from = self.ordinal / BLOCK_POSTINGS;
+        let mut block = from;
+        let mut entry = bounds
+            .entry(block)?
+            .ok_or(Error::Corrupt("posting beyond block bounds"))?;
+        while entry.last < target {
+            match bounds.entry(block + 1)? {
+                Some(next) => {
+                    block += 1;
+                    entry = next;
+                }
+                None => {
+                    self.current = None;
+                    self.remaining = 0;
+                    self.ordinal = self.total;
+                    return Ok(());
+                }
+            }
+        }
+        if block == from {
+            return Ok(());
+        }
+        let previous = bounds
+            .entry(block - 1)?
+            .expect("decoded on the way to the target block");
+        let start = bounds.starts.as_ref().expect("sparse bounds track starts")[block as usize];
+        self.reader.seek(self.body_at + start)?;
+        self.last_block = previous.last.block;
+        self.ordinal = block * BLOCK_POSTINGS;
+        self.remaining = self.total - self.ordinal;
+        self.current = Some(previous.last);
+        self.load_next()
     }
 
     fn load_next(&mut self) -> Result<()> {
@@ -825,7 +1072,7 @@ impl SparseCursor<'_> {
 
 #[derive(Clone, Debug)]
 pub struct GroupedCursor<'a> {
-    reader: Reader<'a>,
+    reader: Stream<'a>,
     total: u32,
     groups_left: u32,
     previous_gid: Option<u32>,
@@ -968,7 +1215,7 @@ impl<'a> GroupedCursor<'a> {
             .find(|bit| self.page_bitmap[usize::from(bit / 8)] & (1 << (bit % 8)) != 0)
     }
 
-    fn page_reader(&self) -> Result<Reader<'a>> {
+    fn page_reader(&self) -> Result<Stream<'a>> {
         if self.reader.position() >= self.body_end {
             return Err(Error::Corrupt("page beyond group body"));
         }
@@ -1010,8 +1257,8 @@ impl<'a> GroupedCursor<'a> {
                     return Err(Error::Corrupt("offset list length"));
                 }
                 let mut previous = 0;
-                for _ in 0..n {
-                    let offset = reader.u16_le()?;
+                for pair in reader.take(n as usize * 2)?.chunks_exact(2) {
+                    let offset = u16::from_le_bytes([pair[0], pair[1]]);
                     if offset == 0 || offset > MAX_OFFSET || offset <= previous {
                         return Err(Error::Corrupt("offset list not increasing"));
                     }
@@ -1595,5 +1842,95 @@ mod tests {
                 .and_then(|p| p.cursor()?.block_bounds())
                 .is_err()
         );
+    }
+    /// The postings area of a segment held in memory, handed out a range at
+    /// a time, counting the fetches.
+    struct RangedArea {
+        bytes: Vec<u8>,
+        fetches: std::cell::Cell<usize>,
+        fetched: std::cell::Cell<usize>,
+    }
+
+    impl crate::segment::AreaFetch for RangedArea {
+        fn postings_bytes(&self, _extent: crate::dictionary::Extent) -> Result<&[u8]> {
+            unreachable!("ranged sources are not read whole")
+        }
+        fn payload_bytes(&self, _extent: crate::dictionary::Extent) -> Result<&[u8]> {
+            unreachable!()
+        }
+        fn ranged_postings(&self) -> bool {
+            true
+        }
+        fn postings_range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+            self.fetches.set(self.fetches.get() + 1);
+            self.fetched.set(self.fetched.get() + len);
+            let at = offset as usize;
+            self.bytes.get(at..at + len).ok_or(Error::Truncated)
+        }
+        fn length(&self, _ordinal: u32) -> Result<u32> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn ranged_streams_read_the_same_postings_through_windows() {
+        // Sparse and grouped streams several windows long, at an offset.
+        for (name, tids) in [
+            (
+                "sparse",
+                (0..60_000u32)
+                    .map(|i| Tid::new(i * 7 + 1, 1 + (i % 5) as u16).unwrap())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "grouped",
+                (0..200_000u32)
+                    .map(|i| Tid::new(i / 40, 1 + (i % 40) as u16 * 3).unwrap())
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let encoded = build_scored(&tids);
+            let whole = Postings::parse(&encoded).unwrap();
+            assert_eq!(whole.is_grouped(), name == "grouped", "{name}");
+            let mut bytes = vec![0xAA; 1_000];
+            bytes.extend_from_slice(&encoded);
+            bytes.extend_from_slice(&[0x55; 300]);
+            let area = RangedArea {
+                bytes,
+                fetches: Default::default(),
+                fetched: Default::default(),
+            };
+            let ranged = Postings::open(&area, 1_000, encoded.len()).unwrap();
+            assert_eq!(ranged.count(), whole.count());
+            assert_eq!(ranged.to_vec().unwrap(), tids, "{name}");
+            // A seek near the end reads only the head and the tail's windows.
+            area.fetches.set(0);
+            area.fetched.set(0);
+            let mut cursor = ranged.cursor().unwrap();
+            let target = tids[tids.len() - 10];
+            cursor.seek(target).unwrap();
+            assert_eq!(cursor.current(), Some(target), "{name}");
+            let mut whole_cursor = whole.cursor().unwrap();
+            whole_cursor.seek(target).unwrap();
+            assert_eq!(cursor.ordinal(), whole_cursor.ordinal(), "{name}");
+            // A sparse stream seeks through its bounds table; a grouped one
+            // reads each group header on the way, one window at a time.
+            let windows = encoded.len().div_ceil(WINDOW);
+            assert!(
+                if name == "sparse" {
+                    area.fetched.get() < encoded.len() / 2
+                } else {
+                    area.fetches.get() <= windows + 2
+                },
+                "{name}: fetched {} of {} bytes in {} fetches",
+                area.fetched.get(),
+                encoded.len(),
+                area.fetches.get()
+            );
+            assert_eq!(
+                ranged.cursor().unwrap().block_bounds().unwrap(),
+                whole.cursor().unwrap().block_bounds().unwrap()
+            );
+        }
     }
 }
