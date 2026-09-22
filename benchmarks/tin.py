@@ -513,7 +513,11 @@ def run(args):
                PGOPTIONS='-c statement_timeout=120000 -c jit=off')
     for key in ('PGSERVICE', 'PGSERVICEFILE'):
         env.pop(key, None)
-    def sql(text, setup=False):
+    # Every statement the harness itself runs is setup or validation, never
+    # a measurement: the driver measures. Under the query timeout a check
+    # over the full corpus, such as materializing a stopword disjunction's
+    # matches at 150 million rows, ended a campaign after a four-hour build.
+    def sql(text, setup=True):
         sql_env = dict(env, PGOPTIONS=f'-c statement_timeout={args.setup_timeout_seconds * 1000} -c jit=off') if setup else env
         return sql_output(text, sql_env)
     try:
