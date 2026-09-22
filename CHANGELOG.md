@@ -91,3 +91,7 @@
   takes a place and the scan no longer deepens for it. With 300,000 of 15
   million Stack Exchange rows updated, one ranked disjunction in six had
   needed that second walk; none does now, and their total time fell 12%.
+- The pruned disjunction walk sums its terms' maxima once per step instead
+  of folding every prefix, and a sparse stream seeks through its bounds
+  table without decoding the first posting of each block it skips. Mixed
+  ranked queries at eight clients on 15 million rows: 313 to 340 a second.

@@ -823,36 +823,40 @@ impl Walk<'_, '_> {
     /// align the cursors behind it.
     fn any(&mut self) {
         let mut order: Vec<usize> = (0..self.cursors.len()).collect();
-        // At small widths the canonical fold is cheap; avoid the extra cursor
-        // comparison there. The grouping win is measured at 32+ terms.
-        let group_pivots = self.cursors.len() >= 32;
+        let mut at: Vec<Option<Tid>> = vec![None; self.cursors.len()];
         loop {
             self.tick();
-            order.retain(|&i| self.cursors[i].current().is_some());
+            for (i, cursor) in self.cursors.iter().enumerate() {
+                at[i] = cursor.current();
+            }
+            order.retain(|&i| at[i].is_some());
             if order.is_empty() {
                 return;
             }
-            order.sort_by_key(|&i| self.cursors[i].current());
+            order.sort_unstable_by_key(|&i| at[i]);
             let threshold = self.threshold();
             let mut p = None;
             for cursor in &mut self.cursors {
                 cursor.exact = None;
             }
+            // The terms' maxima are summed once in location order, in f64 and
+            // inflated by more than the rounding of a fold of up to 256 f32
+            // values, so the running sum is never below the canonical fold
+            // that bounds a score. A prefix that cannot reach the threshold
+            // this way cannot reach it that way either.
+            let mut reach = 0.0_f64;
             for (j, &i) in order.iter().enumerate() {
                 self.cursors[i].exact = Some(self.cursors[i].term_max);
+                reach += f64::from(self.cursors[i].term_max);
                 // Every cursor at one TID is included before the block-bound
-                // check below. No intermediate prefix can select a different
-                // pivot, so fold once at the end of this equal-TID group. Keep
-                // the canonical f32 fold rather than summing in cursor order.
-                if group_pivots
-                    && order.get(j + 1).is_some_and(|&next| {
-                        self.cursors[next].current() == self.cursors[i].current()
-                    })
-                {
+                // check below; no intermediate prefix can select a different
+                // pivot.
+                if order.get(j + 1).is_some_and(|&next| at[next] == at[i]) {
                     continue;
                 }
-                let reach = fold(&self.cursors, |c| c.exact);
-                if threshold.is_none_or(|(threshold, _)| reach >= threshold) {
+                if threshold.is_none_or(|(threshold, _)| {
+                    reach * (1.0 + f64::from(f32::EPSILON) * 256.0) >= f64::from(threshold)
+                }) {
                     p = Some(j);
                     break;
                 }
@@ -862,10 +866,8 @@ impl Walk<'_, '_> {
                 // threshold: nothing left in this source can enter.
                 return;
             };
-            let pivot = self.cursors[order[p]]
-                .current()
-                .expect("retained cursors are positioned");
-            while p + 1 < order.len() && self.cursors[order[p + 1]].current() == Some(pivot) {
+            let pivot = at[order[p]].expect("retained cursors are positioned");
+            while p + 1 < order.len() && at[order[p + 1]] == Some(pivot) {
                 p += 1;
             }
             // The block-level bound over the range starting at the pivot.

@@ -771,33 +771,46 @@ impl SparseCursor<'_> {
         Ok(())
     }
 
-    /// Jumps over whole blocks whose last posting is before `target`.
+    /// Jumps over whole blocks whose last posting is before `target`,
+    /// through the bounds table alone: the body is read again only at the
+    /// first block that can hold the target.
     fn skip_blocks_before(&mut self, target: Tid) -> Result<()> {
-        while self.current.is_some() {
-            let bounds = self.bounds.as_mut().expect("bounded stream");
-            let block = self.ordinal / BLOCK_POSTINGS;
-            let entry = bounds
-                .entry(block)?
-                .ok_or(Error::Corrupt("posting beyond block bounds"))?;
-            if entry.last >= target {
-                return Ok(());
-            }
-            if bounds.entry(block + 1)?.is_none() {
-                self.current = None;
-                self.remaining = 0;
-                self.ordinal = self.total;
-                return Ok(());
-            }
-            let start =
-                bounds.starts.as_ref().expect("sparse bounds track starts")[block as usize + 1];
-            self.reader.seek(self.body_at + start)?;
-            self.last_block = entry.last.block;
-            self.ordinal = (block + 1) * BLOCK_POSTINGS;
-            self.remaining = self.total - self.ordinal;
-            self.current = Some(entry.last);
-            self.load_next()?;
+        if self.current.is_none() {
+            return Ok(());
         }
-        Ok(())
+        let bounds = self.bounds.as_mut().expect("bounded stream");
+        let from = self.ordinal / BLOCK_POSTINGS;
+        let mut block = from;
+        let mut entry = bounds
+            .entry(block)?
+            .ok_or(Error::Corrupt("posting beyond block bounds"))?;
+        while entry.last < target {
+            match bounds.entry(block + 1)? {
+                Some(next) => {
+                    block += 1;
+                    entry = next;
+                }
+                None => {
+                    self.current = None;
+                    self.remaining = 0;
+                    self.ordinal = self.total;
+                    return Ok(());
+                }
+            }
+        }
+        if block == from {
+            return Ok(());
+        }
+        let previous = bounds
+            .entry(block - 1)?
+            .expect("decoded on the way to the target block");
+        let start = bounds.starts.as_ref().expect("sparse bounds track starts")[block as usize];
+        self.reader.seek(self.body_at + start)?;
+        self.last_block = previous.last.block;
+        self.ordinal = block * BLOCK_POSTINGS;
+        self.remaining = self.total - self.ordinal;
+        self.current = Some(previous.last);
+        self.load_next()
     }
 
     fn load_next(&mut self) -> Result<()> {
