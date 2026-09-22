@@ -118,3 +118,10 @@
   runs at 436 queries a second instead of 347. The index grows 5% and builds
   2% slower. `LSG4` and earlier segments remain readable and rank through
   their TID postings; `REINDEX` rewrites.
+- Ranked conjunctions walk the ordinal streams too: the rarest term leads
+  through its chunks, the others and any elided terms are aligned to each,
+  and the shared members are tested by bit. On 15 million rows the
+  published conjunctions take 1.25 ms at the median instead of 3.0 with the
+  same rows and scores; at eight clients the conjunction-phrase workload
+  runs at 500 queries a second instead of 437 and the mixed workload at
+  479 instead of 343.

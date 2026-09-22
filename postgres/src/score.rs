@@ -1096,9 +1096,16 @@ impl IndexScorer {
                 // them with bounds; the write buffer and older segments walk
                 // their TID postings into the same heap.
                 if RANK_BY_ORDINAL.get()
-                    && combine == Combine::Any
                     && self
-                        .walk_by_ordinal(i, &mut visibility, k, &mut heap, &mut scored)
+                        .walk_by_ordinal(
+                            i,
+                            combine,
+                            &filters,
+                            &mut visibility,
+                            k,
+                            &mut heap,
+                            &mut scored,
+                        )
                         .is_some()
                 {
                     ordinal = true;
@@ -1146,9 +1153,15 @@ impl IndexScorer {
     /// heap. `None`, with the heap untouched, when the source has no page
     /// table, a term's stream carries no bounds, or its dead documents cannot
     /// be mapped to ordinals: the caller walks its TID postings instead.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site; the arguments are the walk's state"
+    )]
     fn walk_by_ordinal(
         &self,
         i: usize,
+        combine: Combine,
+        filters: &[&str],
         visibility: &mut Visibility,
         k: usize,
         heap: &mut BinaryHeap<Ranked>,
@@ -1175,62 +1188,22 @@ impl IndexScorer {
             let mut terms = Vec::with_capacity(self.terms.len());
             for (slot, (name, scorer)) in self.terms.iter().enumerate() {
                 let Some(term) = segment_error_in(source.term(name), label) else {
-                    continue;
-                };
-                let ordinals = segment_error_in(term.ordinals(), label)?;
-                if ordinals.bounds().is_empty() {
-                    return None;
-                }
-                let whole = ordinals
-                    .bounds()
-                    .iter()
-                    .map(|bound| BlockBound {
-                        min_len: bound.min_len,
-                        last: Tid {
-                            block: 0,
-                            offset: 1,
-                        },
-                    })
-                    .reduce(|merged, block| merged.merge(&block))
-                    .expect("checked");
-                let (keys, list) = match ordinals.list() {
-                    Some(list) => {
-                        let mut keys: Vec<u16> = list.iter().map(|o| (o >> 16) as u16).collect();
-                        keys.dedup();
-                        (keys, Some(list.to_vec()))
+                    match combine {
+                        // A missing term empties the conjunction in this source.
+                        Combine::All => return Some(()),
+                        Combine::Any => continue,
                     }
-                    None => (
-                        (0..ordinals.chunk_count())
-                            .map(|c| ordinals.chunk_key(c))
-                            .collect(),
-                        None,
-                    ),
                 };
-                // The stored bound per chunk, or a list's one bound for every
-                // chunk it touches; a stream without bounds cannot be walked.
-                let mut bounds = Vec::with_capacity(keys.len());
-                let mut sub_bounds = Vec::with_capacity(keys.len());
-                for i in 0..keys.len() {
-                    let bound = ordinals.chunk_bound(i)?;
-                    bounds.push(bound.min_len);
-                    sub_bounds.push(bound.subs);
+                terms.push(Self::ordinal_term(&term, slot, Some(scorer), label)?);
+            }
+            let mut filter_terms = Vec::with_capacity(filters.len());
+            for name in filters {
+                match segment_error_in(source.term(name), label) {
+                    Some(term) => {
+                        filter_terms.push(Self::ordinal_term(&term, usize::MAX, None, label)?)
+                    }
+                    None => return Some(()),
                 }
-                terms.push(OrdinalTerm {
-                    slot,
-                    ordinals,
-                    payload: segment_error_in(term.payload(), label).cursor(),
-                    keys,
-                    list,
-                    bounds,
-                    sub_bounds,
-                    bound_scores: Vec::new(),
-                    pos: 0,
-                    term_max: scorer.bound(&whole),
-                    words: Box::new([0; segment::ordinals::WORDS]),
-                    members: Vec::new(),
-                    dense: false,
-                    rank_base: 0,
-                });
             }
             if terms.is_empty() {
                 return Some(());
@@ -1238,6 +1211,7 @@ impl IndexScorer {
             let mut walk = OrdinalWalk {
                 scorer: self,
                 terms,
+                filters: filter_terms,
                 pages: PageTable(pages),
                 documents: segment_error_in(source.documents(), label),
                 document_count: source.document_count(),
@@ -1249,9 +1223,77 @@ impl IndexScorer {
                 scored,
                 iterations: 0,
             };
-            walk.any();
+            match combine {
+                Combine::Any => walk.any(),
+                Combine::All => walk.all(),
+            }
         }
         Some(())
+    }
+
+    /// A term's streams in one source for the walk over ordinals; `None`
+    /// when the term's ordinal stream is missing or carries no bounds. A
+    /// filter has no scorer: it is a member test only.
+    fn ordinal_term<'a>(
+        term: &segment::segment::Term<'a>,
+        slot: usize,
+        scorer: Option<&TermScorer>,
+        label: &str,
+    ) -> Option<OrdinalTerm<'a>> {
+        let ordinals = segment_error_in(term.ordinals(), label)?;
+        if ordinals.bounds().is_empty() {
+            return None;
+        }
+        let whole = ordinals
+            .bounds()
+            .iter()
+            .map(|bound| BlockBound {
+                min_len: bound.min_len,
+                last: Tid {
+                    block: 0,
+                    offset: 1,
+                },
+            })
+            .reduce(|merged, block| merged.merge(&block))
+            .expect("checked");
+        let (keys, list) = match ordinals.list() {
+            Some(list) => {
+                let mut keys: Vec<u16> = list.iter().map(|o| (o >> 16) as u16).collect();
+                keys.dedup();
+                (keys, Some(list.to_vec()))
+            }
+            None => (
+                (0..ordinals.chunk_count())
+                    .map(|c| ordinals.chunk_key(c))
+                    .collect(),
+                None,
+            ),
+        };
+        // The stored bound per chunk, or a list's one bound for every chunk
+        // it touches.
+        let mut bounds = Vec::with_capacity(keys.len());
+        let mut sub_bounds = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let bound = ordinals.chunk_bound(i)?;
+            bounds.push(bound.min_len);
+            sub_bounds.push(bound.subs);
+        }
+        Some(OrdinalTerm {
+            slot,
+            ordinals,
+            payload: segment_error_in(term.payload(), label).cursor(),
+            keys,
+            list,
+            bounds,
+            sub_bounds,
+            bound_scores: Vec::new(),
+            pos: 0,
+            term_max: scorer.map_or(0.0, |scorer| scorer.bound(&whole)),
+            words: Box::new([0; segment::ordinals::WORDS]),
+            members: Vec::new(),
+            dense: false,
+            rank_base: 0,
+        })
     }
 
     /// Walks one source. Returns `Ok(false)` when the source cannot be pruned.
@@ -1479,6 +1521,9 @@ struct OrdinalWalk<'a, 's> {
     scorer: &'s IndexScorer,
     /// In slot order.
     terms: Vec<OrdinalTerm<'a>>,
+    /// A conjunction's elided terms: a match must hold them, and they add
+    /// nothing to its score.
+    filters: Vec<OrdinalTerm<'a>>,
     pages: PageTable<'a>,
     documents: PostingsCursor<'a>,
     document_count: u32,
@@ -1608,6 +1653,229 @@ impl OrdinalWalk<'_, '_> {
             self.evaluate(pivot, &present, &mut set);
             for &t in &present {
                 self.terms[t].pos += 1;
+            }
+        }
+    }
+
+    /// A conjunction: the rarest stream leads through its chunks; the others
+    /// and the filters are aligned to each, and a chunk every stream holds is
+    /// folded to the members they share.
+    fn all(&mut self) {
+        let lead = (0..self.terms.len())
+            .min_by_key(|&t| self.terms[t].keys.len())
+            .expect("a conjunction has terms");
+        let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
+        loop {
+            self.iterations = self.iterations.wrapping_add(1);
+            if self.iterations.is_multiple_of(64) {
+                pgrx::check_for_interrupts!();
+            }
+            let Some(key) = self.terms[lead].key() else {
+                return;
+            };
+            // Every other stream moves to `key` or past it; the furthest
+            // one is where the lead goes next.
+            let mut next = key;
+            for t in 0..self.terms.len() {
+                if t == lead {
+                    continue;
+                }
+                let term = &mut self.terms[t];
+                term.pos += term.keys[term.pos..].partition_point(|k| *k < key);
+                match term.key() {
+                    None => return,
+                    Some(found) => next = next.max(found),
+                }
+            }
+            for filter in &mut self.filters {
+                filter.pos += filter.keys[filter.pos..].partition_point(|k| *k < key);
+                match filter.key() {
+                    None => return,
+                    Some(found) => next = next.max(found),
+                }
+            }
+            if next > key {
+                let term = &mut self.terms[lead];
+                term.pos += term.keys[term.pos..].partition_point(|k| *k < next);
+                continue;
+            }
+            // Conjunction members share one document, so every term's bound
+            // holds at the longest of the chunks' shortest documents.
+            let min_length = (0..self.terms.len())
+                .map(|t| self.terms[t].bound_block(self.terms[t].pos).shortest())
+                .max()
+                .expect("a conjunction has terms");
+            let mut bound = 0.0_f32;
+            for t in 0..self.terms.len() {
+                let term = &self.terms[t];
+                let scorer = &self.scorer.terms[term.slot].1;
+                bound += scorer.bound_with_min_length(&term.bound_block(term.pos), min_length);
+            }
+            let base = u32::from(key) << 16;
+            if self.threshold().is_some() && !self.can_beat(bound, base) {
+                self.step_all();
+                continue;
+            }
+            self.evaluate_all(key, lead, min_length, &mut set);
+            self.step_all();
+        }
+    }
+
+    /// Moves every term and filter past its current chunk.
+    fn step_all(&mut self) {
+        for term in &mut self.terms {
+            term.pos += 1;
+        }
+        for filter in &mut self.filters {
+            filter.pos += 1;
+        }
+    }
+
+    /// Scores the documents of chunk `key` that every term and filter holds.
+    fn evaluate_all(
+        &mut self,
+        key: u16,
+        lead: usize,
+        min_length: u32,
+        set: &mut segment::ordinals::Words,
+    ) {
+        let base = u32::from(key) << 16;
+        for term in &mut self.terms {
+            term.load();
+        }
+        for filter in &mut self.filters {
+            filter.load();
+        }
+        // The shared members: the lead's array tested against the others'
+        // bits, or the words of every stream combined.
+        let sparse = !self.terms[lead].dense;
+        let mut lows: Vec<u16> = Vec::new();
+        if sparse {
+            lows.extend(self.terms[lead].members.iter().copied().filter(|low| {
+                let (word, bit) = (usize::from(low / 64), low % 64);
+                self.terms
+                    .iter()
+                    .chain(&self.filters)
+                    .all(|term| term.words[word] & (1 << bit) != 0)
+            }));
+        } else {
+            set.copy_from_slice(&*self.terms[lead].words);
+            for term in self.terms.iter().chain(&self.filters) {
+                for (out, word) in set.iter_mut().zip(term.words.iter()) {
+                    *out &= *word;
+                }
+            }
+        }
+        let from = self.dead.partition_point(|o| *o < base);
+        for dead in &self.dead[from..] {
+            if *dead >= base + segment::ordinals::CHUNK {
+                break;
+            }
+            let low = (dead - base) as usize;
+            if sparse {
+                if let Ok(at) = lows.binary_search(&(low as u16)) {
+                    lows.remove(at);
+                }
+            } else {
+                set[low / 64] &= !(1 << (low % 64));
+            }
+        }
+        let pruning = self.threshold().is_some();
+        // Per sub-block, the best a shared document could score: each term's
+        // largest bucket there at the shared shortest length; a sub-block
+        // some term lacks holds no shared document.
+        let mut sub_scores = [0.0_f32; SUBS];
+        let mut sub_empty = [false; SUBS];
+        for term in &self.terms {
+            let scorer = &self.scorer.terms[term.slot].1;
+            for (i, (sub, score)) in term.sub_bounds[term.pos]
+                .iter()
+                .zip(sub_scores.iter_mut())
+                .enumerate()
+            {
+                if *sub == 0 {
+                    sub_empty[i] = true;
+                } else {
+                    let bucket = TfBucket::new(*sub - 1).expect("bucket from a chunk bound");
+                    *score += scorer.score_bucket(bucket, min_length);
+                }
+            }
+        }
+        let mut sparse_at = 0usize;
+        let mut skip_sub = false;
+        #[expect(
+            clippy::needless_range_loop,
+            reason = "the index addresses the sub-block and the sparse members too"
+        )]
+        for i in 0..segment::ordinals::WORDS {
+            if i % (SUB / 64) == 0 {
+                let sub = i / (SUB / 64);
+                skip_sub = sub_empty[sub]
+                    || (pruning && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32));
+            }
+            let mut word = if sparse {
+                let mut word = 0u64;
+                while sparse_at < lows.len() && usize::from(lows[sparse_at] / 64) == i {
+                    word |= 1 << (lows[sparse_at] % 64);
+                    sparse_at += 1;
+                }
+                word
+            } else {
+                set[i]
+            };
+            if word == 0 || skip_sub {
+                continue;
+            }
+            while word != 0 {
+                let low = (i * 64) as u16 + word.trailing_zeros() as u16;
+                word &= word - 1;
+                let ordinal = base + u32::from(low);
+                let length = segment_error(self.lengths.get(ordinal));
+                if pruning {
+                    let mut bound = 0.0_f32;
+                    for term in &self.terms {
+                        let scorer = &self.scorer.terms[term.slot].1;
+                        bound += scorer.bound_for_length(&term.bound_block(term.pos), length);
+                    }
+                    if !self.can_beat(bound, ordinal) {
+                        continue;
+                    }
+                }
+                let mut total = 0.0_f32;
+                for t in 0..self.terms.len() {
+                    let Some(rank) = self.terms[t].rank(low) else {
+                        crate::storage::corrupt(format!(
+                            "Stannum index data: ordinal {ordinal} is missing from a term's chunk"
+                        ))
+                    };
+                    let term = &mut self.terms[t];
+                    segment_error(term.payload.seek(rank));
+                    let bucket = segment_error(term.payload.next_bucket());
+                    let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
+                        crate::storage::corrupt(format!(
+                            "Stannum index data: term-frequency bucket {bucket} out of range"
+                        ))
+                    });
+                    total += self.scorer.terms[term.slot].1.score_bucket(bucket, length);
+                }
+                *self.scored += 1;
+                let admit =
+                    self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
+                if !admit {
+                    continue;
+                }
+                let tid = self.resolve(ordinal);
+                let candidate = Ranked(total, tid);
+                if self.heap.len() < self.k {
+                    if self.visibility.visible(tid) {
+                        self.heap.push(candidate);
+                    }
+                } else if self.heap.peek().is_some_and(|w| candidate < *w)
+                    && self.visibility.visible(tid)
+                {
+                    self.heap.pop();
+                    self.heap.push(candidate);
+                }
             }
         }
     }

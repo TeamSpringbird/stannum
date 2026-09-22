@@ -268,9 +268,10 @@ custom scan nodes:
   the threshold; the other terms are tested by bit. A candidate's
   term-frequency bucket is the payload entry at its rank in the term's
   stream, its length a table lookup by ordinal, and its TID is resolved only
-  when it enters the top k. Conjunctions, phrases and other shapes walk the
-  TID postings with block bounds, as do segments older than `LSG5` and the
-  write buffer. `stannum.count_fold = off` selects the strategies below for
+  when it enters the top k. A conjunction is led by its rarest term through
+  the chunks every term and elided filter holds, testing the shared members
+  by bit. Phrases and other shapes walk the TID postings with block bounds,
+  as do segments older than `LSG5` and the write buffer. `stannum.count_fold = off` selects the strategies below for
   these queries too.
 - **Other counts** use page masks when a Boolean term has grouped postings averaging at
   least four tuples per occupied page; purely sparse or positional plans keep

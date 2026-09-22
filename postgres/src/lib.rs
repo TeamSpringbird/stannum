@@ -1480,10 +1480,7 @@ mod tests {
         let scored = scan["Scored Candidates"].as_i64().unwrap();
         assert!(scored > 0 && scored < 1500, "{scan}");
         // ...and the conjunction and disjunction too.
-        for (query, pruning) in [
-            ("alpha AND beta", "block-max"),
-            ("alpha OR gamma", "ordinal"),
-        ] {
+        for (query, pruning) in [("alpha AND beta", "ordinal"), ("alpha OR gamma", "ordinal")] {
             let scan = explain(query);
             assert_eq!(scan["Pruning"], pruning, "{query}");
             assert!(scan["Scored Candidates"].as_i64().unwrap() < 1500, "{scan}");
@@ -1518,7 +1515,7 @@ mod tests {
         .unwrap()
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "block-max", "{scan}");
+        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
         // Rows deleted after the top k was built are invisible, so the parent
         // reads past k and the scan completes the ordering from scratch.
         let top: Vec<i32> = ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3")
