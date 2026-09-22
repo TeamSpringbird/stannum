@@ -1536,8 +1536,9 @@ mod tests {
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
         assert_eq!(scan["Pruning"], "block-max");
-        // The scan deepened its pruned search rather than score every match.
-        assert!(scan["Top-K Completions"].as_i64().unwrap() >= 1, "{scan}");
+        // The walk checks visibility as rows enter its top k, so the deleted
+        // rows never take a place and the scan needs no completion.
+        assert_eq!(scan["Top-K Completions"], 0, "{scan}");
         assert_eq!(scan["Exhaustive Score Calls"], 0, "{scan}");
         assert_eq!(
             ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3"),

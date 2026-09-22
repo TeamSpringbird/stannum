@@ -86,3 +86,8 @@
   zero in heap order, instead of scoring every match. In the same write
   workload the longest query went from 10 s to 0.55 s and throughput from 156
   to 180 queries a second.
+- The pruned ranked walk checks a row's snapshot visibility as it enters the
+  top k, so the dead version an update leaves beside its successor never
+  takes a place and the scan no longer deepens for it. With 300,000 of 15
+  million Stack Exchange rows updated, one ranked disjunction in six had
+  needed that second walk; none does now, and their total time fell 12%.
