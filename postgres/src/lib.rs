@@ -875,7 +875,7 @@ mod tests {
                             assert!(plan.contains("\"Order\":\"score DESC\""), "{query}: {plan}");
                             assert!(plan.contains("\"Top K\":10"), "{query}: {plan}");
                             if scorer == "stannum.full_score(ctid)" && query == "common OR rare" {
-                                assert!(plan.contains("\"Pruning\":\"block-max\""), "{plan}");
+                                assert!(plan.contains("\"Pruning\":\"ordinal\""), "{plan}");
                             }
                         }
                         let scores = |sql: &str| -> Vec<u32> {
@@ -1362,7 +1362,7 @@ mod tests {
         .unwrap()
         .0
         .to_string();
-        assert!(plan.contains("\"Pruning\":\"block-max\""), "{plan}");
+        assert!(plan.contains("\"Pruning\":\"ordinal\""), "{plan}");
     }
 
     #[pg_test]
@@ -1471,15 +1471,21 @@ mod tests {
         let scan = explain("alpha");
         assert_eq!(scan["Custom Plan Provider"], "Stannum Text Search Scan");
         assert_eq!(scan["Top K"], 10);
-        assert_eq!(scan["Pruning"], "block-max");
+        // A disjunction, of one term here, walks the ordinal streams; a
+        // conjunction walks the TID postings with block bounds.
+        assert_eq!(scan["Pruning"], "ordinal");
         // The ten best rows share the best score and are the earliest such
-        // rows, so once they are found every later block is skipped.
+        // rows, so once they are found every later sub-block of 1,024
+        // ordinals is skipped; the first ones are scored to the last tie.
         let scored = scan["Scored Candidates"].as_i64().unwrap();
-        assert!(scored > 0 && scored < 1000, "{scan}");
+        assert!(scored > 0 && scored < 1500, "{scan}");
         // ...and the conjunction and disjunction too.
-        for query in ["alpha AND beta", "alpha OR gamma"] {
+        for (query, pruning) in [
+            ("alpha AND beta", "block-max"),
+            ("alpha OR gamma", "ordinal"),
+        ] {
             let scan = explain(query);
-            assert_eq!(scan["Pruning"], "block-max", "{query}");
+            assert_eq!(scan["Pruning"], pruning, "{query}");
             assert!(scan["Scored Candidates"].as_i64().unwrap() < 1500, "{scan}");
         }
         // `score` elides `alpha`, which most documents hold. The disjunction
@@ -1497,7 +1503,7 @@ mod tests {
             .0;
             let scan = search_scan(&plan[0]["Plan"]).unwrap();
             assert_eq!(
-                scan["Pruning"] == "block-max",
+                scan["Pruning"] == "ordinal",
                 pruned,
                 "LIMIT {limit}: {scan}"
             );
@@ -1535,7 +1541,7 @@ mod tests {
         .unwrap()
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "block-max");
+        assert_eq!(scan["Pruning"], "ordinal");
         // The walk checks visibility as rows enter its top k, so the deleted
         // rows never take a place and the scan needs no completion.
         assert_eq!(scan["Top-K Completions"], 0, "{scan}");
@@ -1584,7 +1590,7 @@ mod tests {
         };
         let ordinary = explain("alpha", "");
         let scan = search_scan(&ordinary[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "block-max");
+        assert_eq!(scan["Pruning"], "ordinal");
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(scan["Top-K Completions"], 0);
 
@@ -1593,7 +1599,7 @@ mod tests {
         // 640 and 2,560 rows; the last holds all 1,000 and the ten that pass.
         let filtered = explain("alpha", "AND id > 990");
         let scan = search_scan(&filtered[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "block-max");
+        assert_eq!(scan["Pruning"], "ordinal");
         assert_eq!(scan["Top-K Completions"], 4);
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(filtered[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));

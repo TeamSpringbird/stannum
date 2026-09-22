@@ -229,6 +229,7 @@ fn merge_as(
     let mut payload_area = Vec::new();
     let mut ordinals_area = Vec::new();
     let mut ordinals = Vec::new();
+    let mut scores: Vec<(u8, u32)> = Vec::new();
     let mut positions = Vec::new();
     let mut term_inputs = Vec::new();
     let mut cursors = Vec::new();
@@ -277,6 +278,7 @@ fn merge_as(
         let mut count = 0u32;
         let mut max_bucket = 0;
         ordinals.clear();
+        scores.clear();
         while let Some(Reverse((tid, c))) = postings_heap.pop() {
             checkpoint()?;
             let (i, cursor, positions_cursor, length) = &mut cursors[c];
@@ -284,6 +286,7 @@ fn merge_as(
             let bucket = positions_cursor.next_into(&mut positions)?;
             let (len, ordinal) = length.ok_or(Error::Corrupt("posting missing document"))?;
             ordinals.push(ordinal);
+            scores.push((bucket, len));
             postings.push_scored(tid, bucket, len)?;
             payload.push(bucket, &positions)?;
             count = count
@@ -299,7 +302,9 @@ fn merge_as(
         if count != 0 {
             let posting_bytes = postings.finish_as(format.streams());
             let payload_bytes = payload.finish_as(format.streams());
-            let ordinal_bytes = if format.has_ordinals() {
+            let ordinal_bytes = if format.has_chunk_bounds() {
+                crate::ordinals::encode_scored(&ordinals, &scores)
+            } else if format.has_ordinals() {
                 crate::ordinals::encode(&ordinals)
             } else {
                 Vec::new()
@@ -681,8 +686,8 @@ mod tests {
             blobs.push(reuse.finish_as(Format::Lsg4));
             dead.push(BTreeSet::new());
             let output = merge(&inputs(&blobs, &dead), limits(), || Ok(())).unwrap();
-            assert_eq!(&output[..4], b"LSG4");
-            assert_eq!(output, reference(&blobs, &dead, Format::Lsg4).unwrap());
+            assert_eq!(&output[..4], Format::CURRENT.magic());
+            assert_eq!(output, reference(&blobs, &dead, Format::CURRENT).unwrap());
             let report = crate::verify::verify_segment(&output);
             assert!(report.is_clean(), "{:?}", report.findings);
             assert_ordinals_name_postings(&output);
@@ -700,7 +705,7 @@ mod tests {
             let again = merge(&inputs(&again_blobs, &again_dead), limits(), || Ok(())).unwrap();
             assert_eq!(
                 again,
-                reference(&again_blobs, &again_dead, Format::Lsg4).unwrap()
+                reference(&again_blobs, &again_dead, Format::CURRENT).unwrap()
             );
             assert!(crate::verify::verify_segment(&again).is_clean());
             assert_ordinals_name_postings(&again);

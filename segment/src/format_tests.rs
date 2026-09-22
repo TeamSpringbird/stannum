@@ -8,6 +8,7 @@
 
 use crate::Tid;
 use crate::forward::ForwardRecord;
+use crate::ordinals;
 use crate::payload::SKIP_INTERVAL;
 use crate::postings::{BLOCK_POSTINGS, BlockBound};
 use crate::segment::{Format, PAGE_ENTRY, Segment, SegmentBuilder};
@@ -197,7 +198,7 @@ fn lsg2_fixture_reads_like_the_current_format() {
     // ordinals area and page table, and nothing else.
     let lsg3 = build_as(&documents, Format::Lsg3);
     let current = build_current(&documents);
-    assert_eq!(&current[..4], Format::Lsg4.magic());
+    assert_eq!(&current[..4], Format::CURRENT.magic());
     assert!(lsg3.len() < LSG2_FIXTURE.len());
     let (old, new) = (
         Segment::parse(&lsg3).unwrap().sections(),
@@ -217,8 +218,8 @@ fn lsg2_fixture_reads_like_the_current_format() {
 fn lsg4_appends_an_ordinal_stream_per_term_and_a_page_table() {
     let documents = fixture_documents();
     let current = build_current(&documents);
-    assert_eq!(Format::CURRENT, Format::Lsg4);
-    assert_eq!(&current[..4], b"LSG4");
+    assert_eq!(Format::CURRENT, Format::Lsg5);
+    assert_eq!(&current[..4], b"LSG5");
     let segment = Segment::parse(&current).unwrap();
     let sections = segment.sections();
     assert!(sections.ordinals != 0 && sections.pages != 0);
@@ -257,14 +258,20 @@ fn lsg4_appends_an_ordinal_stream_per_term_and_a_page_table() {
     }
     assert_eq!(ordinals_end, sections.ordinals as u64);
 
-    // A rare term costs a few bytes: its count and one ordinal.
+    // A rare term costs a few bytes: its count, one ordinal and its bound,
+    // most of which is the byte per sub-block.
     let rare = segment.term("u0448").unwrap().unwrap();
     assert_eq!(rare.df(), 1);
-    assert!(rare.entry.ordinals.len <= 3, "{}", rare.entry.ordinals.len);
+    assert!(
+        rare.entry.ordinals.len <= 3 + 5,
+        "{}",
+        rare.entry.ordinals.len
+    );
     assert_eq!(rare.ordinals().unwrap().unwrap().to_vec().unwrap(), [448]);
-    // A term in every document is one array chunk: two bytes a document.
+    // A term in every document is one array chunk: two bytes a document, and
+    // one bound.
     let common = segment.term("common").unwrap().unwrap();
-    assert!(common.entry.ordinals.len <= 450 * 2 + 16);
+    assert!(common.entry.ordinals.len as usize <= 450 * 2 + 16 + 90 + ordinals::SUBS + 10);
 
     // The page table: a (block, first ordinal) entry per heap block, ascending.
     let pages: Vec<(u32, u32)> = segment
@@ -348,7 +355,7 @@ fn stream_layouts_follow_the_format() {
     for (bytes, format) in [
         (LSG2_FIXTURE, Format::Lsg2),
         (&lsg3[..], Format::Lsg3),
-        (&current[..], Format::Lsg4),
+        (&current[..], Format::Lsg5),
     ] {
         let segment = Segment::parse(bytes).unwrap();
         assert_eq!(segment.format(), format);

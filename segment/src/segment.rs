@@ -72,10 +72,13 @@ pub enum Format {
     /// `Lsg3` streams, plus an ordinal stream per term (see
     /// [`crate::ordinals`]) and a table of the heap pages the documents span.
     Lsg4,
+    /// `Lsg4`, with a score bound per chunk and sub-block of every ordinal
+    /// stream, so a ranked scan prunes over the ordinals.
+    Lsg5,
 }
 
 impl Format {
-    pub const CURRENT: Self = Self::Lsg4;
+    pub const CURRENT: Self = Self::Lsg5;
 
     pub const fn magic(self) -> &'static [u8; 4] {
         match self {
@@ -83,11 +86,12 @@ impl Format {
             Self::Lsg2 => b"LSG2",
             Self::Lsg3 => b"LSG3",
             Self::Lsg4 => b"LSG4",
+            Self::Lsg5 => b"LSG5",
         }
     }
 
     pub fn from_magic(magic: &[u8]) -> Option<Self> {
-        [Self::Lsg1, Self::Lsg2, Self::Lsg3, Self::Lsg4]
+        [Self::Lsg1, Self::Lsg2, Self::Lsg3, Self::Lsg4, Self::Lsg5]
             .into_iter()
             .find(|format| format.magic() == magic)
     }
@@ -99,14 +103,19 @@ impl Format {
 
     /// True when terms carry ordinal streams and the segment a page table.
     pub const fn has_ordinals(self) -> bool {
-        matches!(self, Self::Lsg4)
+        matches!(self, Self::Lsg4 | Self::Lsg5)
     }
 
-    /// The layout of postings, payload and dictionary streams: `Lsg4` writes
-    /// them as `Lsg3` did.
+    /// True when ordinal streams carry score bounds per chunk and sub-block.
+    pub const fn has_chunk_bounds(self) -> bool {
+        matches!(self, Self::Lsg5)
+    }
+
+    /// The layout of postings, payload and dictionary streams: `Lsg4` and
+    /// `Lsg5` write them as `Lsg3` did.
     pub const fn streams(self) -> Self {
         match self {
-            Self::Lsg4 => Self::Lsg3,
+            Self::Lsg4 | Self::Lsg5 => Self::Lsg3,
             other => other,
         }
     }
@@ -281,9 +290,11 @@ impl SegmentBuilder {
             let mut postings = PostingsBuilder::default();
             let mut payload = PayloadBuilder::default();
             let mut max_tf_bucket = 0;
+            let mut scores = Vec::with_capacity(occurrences.len());
             for occurrence in &occurrences {
                 let bucket = TfBucket::from_count(occurrence.positions.len() as u32).value();
                 max_tf_bucket = max_tf_bucket.max(bucket);
+                scores.push((bucket, occurrence.doc_len));
                 postings
                     .push_scored(occurrence.tid, bucket, occurrence.doc_len)
                     .expect("occurrences are unique per document and sorted");
@@ -303,7 +314,11 @@ impl SegmentBuilder {
                             as u32
                     })
                     .collect();
-                crate::ordinals::encode(&ordinals)
+                if magic.has_chunk_bounds() {
+                    crate::ordinals::encode_scored(&ordinals, &scores)
+                } else {
+                    crate::ordinals::encode(&ordinals)
+                }
             } else {
                 Vec::new()
             };
@@ -419,7 +434,12 @@ impl<'a> Term<'a> {
             areas: self.areas,
             base: self.entry.ordinals.offset,
         };
-        crate::ordinals::Ordinals::open(fetch, u64::from(self.entry.ordinals.len)).map(Some)
+        crate::ordinals::Ordinals::open(
+            fetch,
+            u64::from(self.entry.ordinals.len),
+            self.areas.format().has_chunk_bounds(),
+        )
+        .map(Some)
     }
 
     pub fn payload(&self) -> Result<Payload<'a>> {
@@ -1209,7 +1229,7 @@ mod tests {
         assert_eq!(&bytes[..4], Format::CURRENT.magic());
         // An unknown signature is rejected outright.
         let mut future = bytes.clone();
-        future[..4].copy_from_slice(b"LSG5");
+        future[..4].copy_from_slice(b"LSG6");
         assert_eq!(
             Segment::parse(&future).err(),
             Some(Error::Corrupt("segment magic"))

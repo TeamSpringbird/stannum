@@ -132,7 +132,7 @@ impl DictionaryBuilder {
                 varint::put(&mut self.blocks, entry.payload.offset);
                 varint::put(&mut self.blocks, u64::from(entry.payload.len));
             }
-            Format::Lsg3 | Format::Lsg4 => {
+            Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => {
                 varint::put(
                     &mut self.blocks,
                     u64::from(entry.df) << 4 | u64::from(entry.max_tf_bucket),
@@ -551,7 +551,7 @@ impl<'a> Walker<'a> {
                 };
                 (df, max_tf_bucket, postings, payload)
             }
-            Format::Lsg3 | Format::Lsg4 => {
+            Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => {
                 let df_bucket = self.reader.varint()?;
                 let df =
                     u32::try_from(df_bucket >> 4).map_err(|_| Error::Corrupt("dictionary df"))?;

@@ -73,6 +73,7 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
     let mut payload_area = Vec::new();
     let mut ordinals_area = Vec::new();
     let mut ordinals = Vec::new();
+    let mut scores: Vec<(u8, u32)> = Vec::new();
     let mut positions = Vec::new();
     while let Some(Reverse((term, first))) = terms.pop() {
         let mut inputs = vec![first];
@@ -95,6 +96,7 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
         let mut count = 0u32;
         let mut max_bucket = 0;
         ordinals.clear();
+        scores.clear();
         while let Some(Reverse((tid, c))) = postings_heap.pop() {
             let (i, cursor, positions_cursor) = &mut cursors[c];
             if dead[*i].contains(&tid) {
@@ -106,6 +108,7 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
                     .get(&tid)
                     .ok_or(Error::Corrupt("posting missing document"))?;
                 ordinals.push(ordinal);
+                scores.push((bucket, len));
                 postings.push_scored(tid, bucket, len)?;
                 payload.push(bucket, &positions)?;
                 count += 1;
@@ -119,7 +122,9 @@ fn direct(blobs: &[Vec<u8>], dead: &[BTreeSet<Tid>], format: Format) -> Result<V
         if count != 0 {
             let posting_bytes = postings.finish_as(format.streams());
             let payload_bytes = payload.finish_as(format.streams());
-            let ordinal_bytes = if format.has_ordinals() {
+            let ordinal_bytes = if format.has_chunk_bounds() {
+                crate::ordinals::encode_scored(&ordinals, &scores)
+            } else if format.has_ordinals() {
                 crate::ordinals::encode(&ordinals)
             } else {
                 Vec::new()
@@ -208,7 +213,13 @@ pub(crate) fn reference(
 }
 
 /// Every format, so fixtures mix inputs and tests write each of them.
-pub(crate) const FORMATS: [Format; 4] = [Format::Lsg1, Format::Lsg2, Format::Lsg3, Format::Lsg4];
+pub(crate) const FORMATS: [Format; 5] = [
+    Format::Lsg1,
+    Format::Lsg2,
+    Format::Lsg3,
+    Format::Lsg4,
+    Format::Lsg5,
+];
 
 pub(crate) fn fixture(
     parts: usize,

@@ -38,9 +38,27 @@
 //!
 //! [`for_each_chunk`] evaluates a Boolean tree one 65,536-document chunk at a
 //! time in fixed scratch buffers, visiting only chunks some term occupies.
+//!
+//! From `LSG5` a stream also carries score bounds a ranked walk prunes with:
+//!
+//! ```text
+//! stream    := count varint, bound, delta varint * count            count <= LIST_MAX
+//!            | count varint, chunk_count varint, bounds_len varint,
+//!              entry * chunk_count, bound * chunk_count, chunk*
+//! bound     := buckets varint, min_len varint per set bucket ascending,
+//!              occupied varint, sub u8 per set bit of occupied ascending
+//! ```
+//!
+//! A bound names the term-frequency buckets that occur among the members it
+//! covers with the shortest document per bucket, as a postings block bound
+//! does, and per occupied sub-block of `SUB` ordinals one past the largest
+//! bucket there; `occupied` has a bit per sub-block, so a chunk of a few
+//! members costs a few bytes. A list's one bound covers every chunk it
+//! touches, its sub-blocks folded together.
 
 use std::collections::BTreeSet;
 
+use crate::tf_bucket::BUCKET_COUNT;
 use crate::{Error, Result, varint};
 
 /// Ordinals per chunk.
@@ -54,18 +72,123 @@ const BITMAP: u32 = 1 << 31;
 /// Streams of at most this many ordinals are a plain delta list.
 pub const LIST_MAX: usize = 64;
 const ENTRY: usize = 8;
-/// Bytes that hold a stream's count and chunk count.
-const HEAD: usize = 12;
+/// Bytes that hold a stream's count, chunk count and bounds length.
+const HEAD: usize = 16;
 
 /// One chunk's membership.
 pub type Words = [u64; WORDS];
 
-/// Encodes strictly ascending ordinals.
+/// Ordinals per sub-block of a chunk, the grain of a chunk bound's buckets.
+pub const SUB: u32 = 1024;
+/// Sub-blocks per chunk.
+pub const SUBS: usize = (CHUNK / SUB) as usize;
+
+/// The score bound over the members of one chunk, or of a whole list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkBound {
+    /// Per term-frequency bucket, the shortest document among the members
+    /// with that bucket; `u32::MAX` where the bucket does not occur.
+    pub min_len: [u32; BUCKET_COUNT],
+    /// Per sub-block, one past the largest bucket among its members; zero
+    /// where there are none.
+    pub subs: [u8; SUBS],
+}
+
+impl ChunkBound {
+    fn empty() -> Self {
+        Self {
+            min_len: [u32::MAX; BUCKET_COUNT],
+            subs: [0; SUBS],
+        }
+    }
+
+    fn add(&mut self, low: u32, bucket: u8, len: u32) {
+        let slot = &mut self.min_len[usize::from(bucket)];
+        *slot = (*slot).min(len.min(u32::MAX - 1));
+        let sub = &mut self.subs[(low / SUB) as usize];
+        *sub = (*sub).max(bucket + 1);
+    }
+
+    fn put(&self, out: &mut Vec<u8>) {
+        let buckets = self
+            .min_len
+            .iter()
+            .enumerate()
+            .filter(|(_, len)| **len != u32::MAX)
+            .fold(0u64, |mask, (bucket, _)| mask | 1 << bucket);
+        varint::put(out, buckets);
+        for len in self.min_len.iter().filter(|len| **len != u32::MAX) {
+            varint::put(out, u64::from(*len));
+        }
+        let occupied = self
+            .subs
+            .iter()
+            .enumerate()
+            .filter(|(_, sub)| **sub != 0)
+            .fold(0u64, |mask, (i, _)| mask | 1 << i);
+        varint::put(out, occupied);
+        out.extend(self.subs.iter().filter(|sub| **sub != 0));
+    }
+
+    fn get(bytes: &[u8], at: &mut usize) -> Result<Self> {
+        // A bound covers at least one member: some bucket and some sub-block.
+        let buckets = varint::get(bytes, at)?;
+        if buckets == 0 || buckets >> BUCKET_COUNT != 0 {
+            return Err(Error::Corrupt("chunk bound buckets"));
+        }
+        let mut bound = Self::empty();
+        for bucket in 0..BUCKET_COUNT {
+            if buckets & (1 << bucket) != 0 {
+                let len = varint::get_u32(bytes, at)?;
+                if len == u32::MAX {
+                    return Err(Error::Corrupt("chunk bound length"));
+                }
+                bound.min_len[bucket] = len;
+            }
+        }
+        let occupied = varint::get(bytes, at)?;
+        if occupied == 0 {
+            return Err(Error::Corrupt("chunk bound sub-blocks"));
+        }
+        for i in 0..SUBS {
+            if occupied & (1 << i) == 0 {
+                continue;
+            }
+            let byte = *bytes.get(*at).ok_or(Error::Truncated)?;
+            if byte == 0 || usize::from(byte) > BUCKET_COUNT {
+                return Err(Error::Corrupt("chunk bound sub-block bucket"));
+            }
+            bound.subs[i] = byte;
+            *at += 1;
+        }
+        Ok(bound)
+    }
+}
+
+/// Encodes strictly ascending ordinals with a bound per chunk, from each
+/// member's term-frequency bucket and document length.
+pub fn encode_scored(ordinals: &[u32], scores: &[(u8, u32)]) -> Vec<u8> {
+    assert_eq!(ordinals.len(), scores.len());
+    encode_with(ordinals, Some(scores))
+}
+
+/// Encodes strictly ascending ordinals without bounds.
 pub fn encode(ordinals: &[u32]) -> Vec<u8> {
+    encode_with(ordinals, None)
+}
+
+fn encode_with(ordinals: &[u32], scores: Option<&[(u8, u32)]>) -> Vec<u8> {
     debug_assert!(ordinals.windows(2).all(|pair| pair[0] < pair[1]));
     let mut out = Vec::new();
     varint::put(&mut out, ordinals.len() as u64);
     if ordinals.len() <= LIST_MAX {
+        if let Some(scores) = scores {
+            let mut bound = ChunkBound::empty();
+            for (ordinal, (bucket, len)) in ordinals.iter().zip(scores) {
+                bound.add(ordinal & 0xffff, *bucket, *len);
+            }
+            bound.put(&mut out);
+        }
         let mut previous = None;
         for ordinal in ordinals {
             varint::put(
@@ -77,9 +200,19 @@ pub fn encode(ordinals: &[u32]) -> Vec<u8> {
         return out;
     }
     let mut directory = Vec::new();
+    let mut bounds = Vec::new();
     let mut body = Vec::new();
     let mut chunks = 0u64;
+    let mut scored = 0usize;
     for members in ordinals.chunk_by(|a, b| a >> 16 == b >> 16) {
+        if let Some(scores) = scores {
+            let mut bound = ChunkBound::empty();
+            for (ordinal, (bucket, len)) in members.iter().zip(&scores[scored..]) {
+                bound.add(ordinal & 0xffff, *bucket, *len);
+            }
+            bound.put(&mut bounds);
+            scored += members.len();
+        }
         directory.extend_from_slice(&((members[0] >> 16) as u16).to_le_bytes());
         directory.extend_from_slice(&((members.len() - 1) as u16).to_le_bytes());
         let bitmap = members.len() >= ARRAY_MAX;
@@ -102,7 +235,11 @@ pub fn encode(ordinals: &[u32]) -> Vec<u8> {
         chunks += 1;
     }
     varint::put(&mut out, chunks);
+    if scores.is_some() {
+        varint::put(&mut out, bounds.len() as u64);
+    }
     out.extend_from_slice(&directory);
+    out.extend_from_slice(&bounds);
     out.extend_from_slice(&body);
     out
 }
@@ -139,6 +276,8 @@ pub struct Ordinals<'a> {
     len: u64,
     count: u32,
     body: Body<'a>,
+    /// One per chunk, or one for a list; empty for a stream without bounds.
+    bounds: Vec<ChunkBound>,
 }
 
 fn entry_key(entry: &[u8]) -> u16 {
@@ -156,13 +295,18 @@ fn entry_chunk(entry: &[u8]) -> (usize, u64, usize, bool) {
 }
 
 impl<'a> Ordinals<'a> {
-    /// Opens the stream of `len` bytes behind `source`.
-    pub fn open(source: impl Fetch<'a> + 'a, len: u64) -> Result<Self> {
+    /// Opens the stream of `len` bytes behind `source`; `bounded` says the
+    /// stream carries chunk bounds (`LSG5`).
+    pub fn open(source: impl Fetch<'a> + 'a, len: u64, bounded: bool) -> Result<Self> {
         let head = source.fetch(0, len.min(HEAD as u64) as usize)?;
         let mut at = 0;
         let count = varint::get_u32(head, &mut at)?;
+        let mut bounds = Vec::new();
         let body = if count as usize <= LIST_MAX {
             let bytes = source.fetch(0, len as usize)?;
+            if bounded {
+                bounds.push(ChunkBound::get(bytes, &mut at)?);
+            }
             let mut list = Vec::with_capacity(count as usize);
             let mut previous: Option<u32> = None;
             for _ in 0..count {
@@ -181,9 +325,25 @@ impl<'a> Ordinals<'a> {
             Body::List(list)
         } else {
             let chunks = u64::from(varint::get_u32(head, &mut at)?);
-            let chunks_at = at as u64 + chunks * ENTRY as u64;
+            let bounds_len = if bounded {
+                u64::from(varint::get_u32(head, &mut at)?)
+            } else {
+                0
+            };
+            let bounds_at = at as u64 + chunks * ENTRY as u64;
+            let chunks_at = bounds_at + bounds_len;
             if chunks == 0 || chunks > u64::from(CHUNK) || chunks_at > len {
                 return Err(Error::Corrupt("ordinal directory"));
+            }
+            if bounded {
+                let bytes = source.fetch(bounds_at, bounds_len as usize)?;
+                let mut at = 0;
+                for _ in 0..chunks {
+                    bounds.push(ChunkBound::get(bytes, &mut at)?);
+                }
+                if at != bytes.len() {
+                    return Err(Error::Corrupt("chunk bounds length"));
+                }
             }
             Body::Chunked {
                 directory: source.fetch(at as u64, (chunks as usize) * ENTRY)?,
@@ -196,12 +356,26 @@ impl<'a> Ordinals<'a> {
             len,
             count,
             body,
+            bounds,
         })
     }
 
-    /// Opens a stream held in memory.
+    /// Opens a stream held in memory, without bounds.
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        Self::open(bytes, bytes.len() as u64)
+        Self::open(bytes, bytes.len() as u64, false)
+    }
+
+    /// The bounds the stream carries: one per chunk, or one for a list.
+    pub fn bounds(&self) -> &[ChunkBound] {
+        &self.bounds
+    }
+
+    /// The bound over chunk `i`, or over the whole list, when stored.
+    pub fn chunk_bound(&self, i: usize) -> Option<&ChunkBound> {
+        match &self.body {
+            Body::List(_) => self.bounds.first(),
+            Body::Chunked { .. } => self.bounds.get(i),
+        }
     }
 
     pub fn count(&self) -> u32 {
@@ -764,9 +938,9 @@ pub fn for_each_chunk(
 }
 
 /// Checks a stream against its term: `count` ordinals, strictly ascending,
-/// below `documents`, in canonical containers.
-pub fn validate(bytes: &[u8], count: u32, documents: u32) -> Result<()> {
-    let stream = Ordinals::parse(bytes)?;
+/// below `documents`, in canonical containers, with bounds when `bounded`.
+pub fn validate(bytes: &[u8], count: u32, documents: u32, bounded: bool) -> Result<()> {
+    let stream = Ordinals::open(bytes, bytes.len() as u64, bounded)?;
     if stream.count() != count {
         return Err(Error::Corrupt("ordinal count differs from the term"));
     }
@@ -884,7 +1058,7 @@ mod tests {
             (0..documents).collect(),
         ] {
             let bytes = encode(&list);
-            validate(&bytes, list.len() as u32, documents).unwrap();
+            validate(&bytes, list.len() as u32, documents, false).unwrap();
             let stream = Ordinals::parse(&bytes).unwrap();
             assert_eq!(stream.count() as usize, list.len());
             assert_eq!(stream.to_vec().unwrap(), list);
@@ -937,9 +1111,17 @@ mod tests {
         let documents = 2 * CHUNK;
         let list = sample(documents, 2, 3);
         let bytes = encode(&list);
-        assert!(validate(&bytes[..bytes.len() - 9], list.len() as u32, documents).is_err());
-        assert!(validate(&bytes, list.len() as u32 - 1, documents).is_err());
-        assert!(validate(&bytes, list.len() as u32, CHUNK).is_err());
+        assert!(
+            validate(
+                &bytes[..bytes.len() - 9],
+                list.len() as u32,
+                documents,
+                false
+            )
+            .is_err()
+        );
+        assert!(validate(&bytes, list.len() as u32 - 1, documents, false).is_err());
+        assert!(validate(&bytes, list.len() as u32, CHUNK, false).is_err());
         // Sparse enough for array chunks, where order is checked.
         let sparse = sample(documents, 200, 3);
         assert!(sparse.len() > LIST_MAX && sparse.len() / 2 < ARRAY_MAX);
@@ -948,7 +1130,7 @@ mod tests {
         // Exchange the final two array entries.
         swapped.swap(last - 1, last - 3);
         swapped.swap(last, last - 2);
-        assert!(validate(&swapped, sparse.len() as u32, documents).is_err());
+        assert!(validate(&swapped, sparse.len() as u32, documents, false).is_err());
         assert!(Ordinals::parse(&[]).is_err());
         assert!(Ordinals::parse(&[200, 1, 0]).is_err());
         for cut in 0..bytes.len().min(64) {
@@ -985,6 +1167,65 @@ mod tests {
                 .collect();
             let expected: Vec<u32> = reference(&node, &lists).into_iter().collect();
             prop_assert_eq!(evaluate(&node, &lists), expected);
+        }
+    }
+    #[test]
+    fn bounded_streams_carry_a_bound_per_chunk_and_reject_corrupt_ones() {
+        for (name, ordinals) in [
+            ("list", (0..40u32).map(|i| i * 3000).collect::<Vec<_>>()),
+            ("chunked", sample(300_000, 3, 7)),
+        ] {
+            let scores: Vec<(u8, u32)> = ordinals
+                .iter()
+                .map(|o| ((o % 5) as u8, 10 + o % 300))
+                .collect();
+            let bytes = encode_scored(&ordinals, &scores);
+            let stream = Ordinals::open(&bytes[..], bytes.len() as u64, true).unwrap();
+            assert_eq!(stream.to_vec().unwrap(), ordinals, "{name}");
+            validate(&bytes, ordinals.len() as u32, 300_000, true).unwrap();
+            let expected_chunks = if stream.list().is_some() {
+                1
+            } else {
+                stream.chunk_count()
+            };
+            assert_eq!(stream.bounds().len(), expected_chunks, "{name}");
+            // Every member's bucket and length are covered by its chunk's bound.
+            for (o, (bucket, len)) in ordinals.iter().zip(&scores) {
+                let bound = match stream.list() {
+                    Some(_) => stream.chunk_bound(0).unwrap(),
+                    None => {
+                        let i = (0..stream.chunk_count())
+                            .find(|i| stream.chunk_key(*i) == (o >> 16) as u16)
+                            .unwrap();
+                        stream.chunk_bound(i).unwrap()
+                    }
+                };
+                assert!(bound.min_len[usize::from(*bucket)] <= *len, "{name} {o}");
+                assert!(
+                    bound.subs[((o & 0xffff) / SUB) as usize] > *bucket,
+                    "{name} {o}"
+                );
+            }
+            // The same members without bounds are a different, shorter stream.
+            assert!(encode(&ordinals).len() < bytes.len());
+            assert!(
+                Ordinals::open(&bytes[..], bytes.len() as u64, false).is_err()
+                    || validate(&bytes, ordinals.len() as u32, 300_000, false).is_err(),
+                "{name}"
+            );
+            // A sub-block byte past the bucket range is rejected.
+            let mut corrupt = bytes.clone();
+            let at = if stream.list().is_some() {
+                2
+            } else {
+                3 + stream.chunk_count() * ENTRY
+            };
+            corrupt[at + 1] = 0xff;
+            assert!(
+                Ordinals::open(&corrupt[..], corrupt.len() as u64, true).is_err()
+                    || validate(&corrupt, ordinals.len() as u32, 300_000, true).is_err(),
+                "{name}"
+            );
         }
     }
 }

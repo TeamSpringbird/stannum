@@ -109,3 +109,12 @@
   disjunctions over 15 million rows, at 10.7 ms median instead of 18.1 and
   65 ms at the 99th percentile instead of 154; the mixed workload at eight
   clients went from 345 to 417 queries a second.
+- Segment format `LSG5`: every ordinal stream stores a score bound per chunk
+  and per occupied 1,024-document sub-block, and ranked disjunctions walk the
+  ordinal streams by default (`stannum.rank_by_ordinal`), see ADR 0003. On
+  15 million Stack Exchange rows the published disjunctions take 8.9 ms at
+  the median instead of 17.3 and 58 ms at the 99th percentile instead of
+  154, with the same rows and scores; the mixed workload at eight clients
+  runs at 436 queries a second instead of 347. The index grows 5% and builds
+  2% slower. `LSG4` and earlier segments remain readable and rank through
+  their TID postings; `REINDEX` rewrites.

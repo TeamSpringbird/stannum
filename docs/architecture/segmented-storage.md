@@ -259,7 +259,18 @@ custom scan nodes:
   checked a heap page at a time under one buffer lock. The write buffer and
   segments older than `LSG4` are counted through their TID postings, always
   against the heap. Per-source counts are summed: a location is live in one
-  source only. `stannum.count_fold = off` selects the strategies below for
+  source only.
+- **Ranked disjunctions** over `LSG5` segments walk the same ordinal streams
+  (`stannum.rank_by_ordinal`, on by default): block-max WAND over the terms'
+  chunks with the score bounds each stream stores per chunk and per
+  1,024-document sub-block, and within an admitted chunk only the members of
+  the essential terms are visited, those without which the rest cannot reach
+  the threshold; the other terms are tested by bit. A candidate's
+  term-frequency bucket is the payload entry at its rank in the term's
+  stream, its length a table lookup by ordinal, and its TID is resolved only
+  when it enters the top k. Conjunctions, phrases and other shapes walk the
+  TID postings with block bounds, as do segments older than `LSG5` and the
+  write buffer. `stannum.count_fold = off` selects the strategies below for
   these queries too.
 - **Other counts** use page masks when a Boolean term has grouped postings averaging at
   least four tuples per occupied page; purely sparse or positional plans keep
@@ -491,7 +502,7 @@ referenced through the pending list until reclaimed, only FREE pages are ever
 allocated, and a crash ends every session. The number reclaimed is written
 to the server log.
 
-The page and segment format signatures are `LDP2` and `LSG4`. Their definitions
+The page and segment format signatures are `LDP2` and `LSG5`. Their definitions
 live in `postgres/src/storage/layout.rs` and the `segment` crate. `LSG2` added
 per-block score bounds to term postings and fixed-width payload skip offsets.
 `LSG3` keeps the same bounds in less space: a term whose postings fit one
@@ -502,9 +513,13 @@ each term's extents as gaps from the previous term's (zero, since streams
 are laid out back to back) with `df` and `max_tf_bucket` packed into one
 varint. `LSG4` keeps those streams and adds, per term, the ordinal stream
 Boolean counts fold, and per segment a page table from heap block to first
-ordinal. `LSG3`, `LSG2` and `LSG1` segments are still read, their Boolean
-counts through TID postings; ranked scans over `LSG2` prune exactly as over
-`LSG3`, and over `LSG1` score every candidate.
+ordinal. `LSG5` adds to every ordinal stream a score bound per chunk and per
+sub-block, in the block bound's encoding plus a byte per sub-block, so ranked
+disjunctions prune over the ordinals. `LSG4`, `LSG3`, `LSG2` and `LSG1`
+segments are still read: Boolean counts over `LSG4` fold ordinals and over
+older formats use TID postings; ranked scans over `LSG4` and earlier walk the
+TID postings, pruning over `LSG2` exactly as over `LSG3`, and over `LSG1`
+scoring every candidate.
 Unsupported old formats require rebuilding the index.
 `script/dump-segments.py` writes an index's segment blobs to files and
 `cargo run -p segment --release --example breakdown -- --reencode <blobs>`

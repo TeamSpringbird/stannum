@@ -133,6 +133,7 @@ pub fn validate_terms<S: Source + ?Sized>(
                         areas.ordinals,
                         entry.ordinals,
                         entry.df,
+                        areas.format.has_chunk_bounds(),
                         window_bytes,
                         || (checkpoint.borrow_mut())(),
                     )?;
@@ -162,10 +163,36 @@ const DIRECTORY_ENTRY: u64 = 8;
 
 /// The form of one ordinal stream (see [`crate::ordinals`]), read forward
 /// through one window over its head and directory and one over its chunks.
+/// Reads past one chunk bound: the bucket mask, a length per set bucket and
+/// a byte per sub-block.
+fn skip_chunk_bound<S: Source + ?Sized>(window: &mut Window<'_, S>) -> Result<()> {
+    let buckets = window.varint()?;
+    if buckets == 0 || buckets >> crate::tf_bucket::BUCKET_COUNT != 0 {
+        return Err(Error::Corrupt("chunk bound buckets"));
+    }
+    for _ in 0..buckets.count_ones() {
+        if window.u32()? == u32::MAX {
+            return Err(Error::Corrupt("chunk bound length"));
+        }
+    }
+    let occupied = window.varint()?;
+    if occupied == 0 {
+        return Err(Error::Corrupt("chunk bound sub-blocks"));
+    }
+    for _ in 0..occupied.count_ones() {
+        let byte = window.byte()?;
+        if byte == 0 || usize::from(byte) > crate::tf_bucket::BUCKET_COUNT {
+            return Err(Error::Corrupt("chunk bound sub-block bucket"));
+        }
+    }
+    Ok(())
+}
+
 fn check_ordinals<S: Source + ?Sized>(
     source: &S,
     extent: Extent,
     df: u32,
+    bounded: bool,
     window_bytes: usize,
     mut checkpoint: impl FnMut() -> Result<()>,
 ) -> Result<()> {
@@ -175,6 +202,9 @@ fn check_ordinals<S: Source + ?Sized>(
         return Err(Error::Corrupt("ordinal count differs from the term"));
     }
     if df as usize <= LIST_MAX {
+        if bounded {
+            skip_chunk_bound(&mut head)?;
+        }
         let mut last: Option<u32> = None;
         for _ in 0..df {
             let delta = head.u32()?;
@@ -192,9 +222,21 @@ fn check_ordinals<S: Source + ?Sized>(
         return Ok(());
     }
     let chunks = u64::from(head.u32()?);
-    let chunks_at = head.at + chunks * DIRECTORY_ENTRY;
+    let bounds_len = if bounded { u64::from(head.u32()?) } else { 0 };
+    let bounds_at = head.at + chunks * DIRECTORY_ENTRY;
+    let chunks_at = bounds_at + bounds_len;
     if chunks == 0 || chunks > u64::from(CHUNK) || chunks_at > end {
         return Err(Error::Corrupt("ordinal directory"));
+    }
+    if bounded {
+        let mut bounds = Window::new(source, bounds_at, chunks_at, window_bytes)?;
+        for _ in 0..chunks {
+            checkpoint()?;
+            skip_chunk_bound(&mut bounds)?;
+        }
+        if bounds.at != chunks_at {
+            return Err(Error::Corrupt("chunk bounds length"));
+        }
     }
     let mut body = Window::new(source, chunks_at, end, window_bytes)?;
     let mut previous_key = None;
@@ -270,7 +312,12 @@ mod tests {
         let postings = postings.finish_as(format.streams());
         let payload = payload.finish_as(format.streams());
         // The fixture's documents are consecutive, so posting `i` is ordinal `i`.
-        let ordinals = if format.has_ordinals() {
+        let ordinals = if format.has_chunk_bounds() {
+            let scores: Vec<(u8, u32)> = (0..count)
+                .map(|i| (TfBucket::from_count(i % 7 + 1).value(), 20))
+                .collect();
+            crate::ordinals::encode_scored(&(0..count).collect::<Vec<_>>(), &scores)
+        } else if format.has_ordinals() {
             crate::ordinals::encode(&(0..count).collect::<Vec<_>>())
         } else {
             Vec::new()
@@ -311,7 +358,13 @@ mod tests {
 
     #[test]
     fn validates_common_terms_all_formats_and_score_block_boundaries() {
-        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3, Format::Lsg4] {
+        for format in [
+            Format::Lsg1,
+            Format::Lsg2,
+            Format::Lsg3,
+            Format::Lsg4,
+            Format::Lsg5,
+        ] {
             for count in [1, 127, 128, 129, 10_000] {
                 let f = fixture(format, count);
                 let mut seen = 0;
@@ -460,7 +513,7 @@ mod tests {
                     .ok_or(Error::Truncated)
             }
         }
-        for format in [Format::Lsg3, Format::Lsg4] {
+        for format in [Format::Lsg3, Format::Lsg4, Format::Lsg5] {
             // From `LSG4` on, two bitmap chunks of ordinals, each far larger
             // than the window.
             let f = fixture(format, 100_000);
@@ -514,113 +567,130 @@ mod tests {
 
     #[test]
     fn lsg4_ordinal_extents_are_bounded_and_streams_checked_for_form() {
-        let validate =
-            |f: &Areas| validate_terms(areas(f, Format::Lsg4), 5, 64, || Ok(()), |_, _| Ok(20));
-        // A list, an array chunk, and a bitmap chunk followed by an array.
-        for count in [1, 64, 65, 129, 4095, 4096, 70_000] {
-            let f = fixture(Format::Lsg4, count);
-            validate(&f).unwrap();
-            // The streaming check accepts exactly the streams the in-memory
-            // one does, whichever byte is damaged.
-            let step = (f.3.len() / 600).max(1);
-            for at in (0..f.3.len()).step_by(step).chain(f.3.len() - 2..f.3.len()) {
-                let mut flipped = f.clone();
-                flipped.3[at] ^= 0x55;
+        for format in [Format::Lsg4, Format::Lsg5] {
+            let validate =
+                |f: &Areas| validate_terms(areas(f, format), 5, 64, || Ok(()), |_, _| Ok(20));
+            // A list, an array chunk, and a bitmap chunk followed by an array.
+            for count in [1, 64, 65, 129, 4095, 4096, 70_000] {
+                let f = fixture(format, count);
+                validate(&f).unwrap();
+                // The streaming check accepts exactly the streams the in-memory
+                // one does, whichever byte is damaged.
+                let step = (f.3.len() / 600).max(1);
+                for at in (0..f.3.len()).step_by(step).chain(f.3.len() - 2..f.3.len()) {
+                    let mut flipped = f.clone();
+                    flipped.3[at] ^= 0x55;
+                    assert_eq!(
+                        validate(&flipped).is_ok(),
+                        crate::ordinals::validate(
+                            &flipped.3,
+                            count,
+                            u32::MAX,
+                            format.has_chunk_bounds()
+                        )
+                        .is_ok(),
+                        "{count} documents, byte {at}: streaming {:?} in-memory {:?} bytes {:?}",
+                        validate(&flipped).err(),
+                        crate::ordinals::validate(
+                            &flipped.3,
+                            count,
+                            u32::MAX,
+                            format.has_chunk_bounds()
+                        )
+                        .err(),
+                        &flipped.3[..flipped.3.len().min(24)]
+                    );
+                }
+                // Extents must end inside the area and hold the stream exactly.
+                let entry = |ordinals: Extent| {
+                    let mut d = DictionaryBuilder::with_format(format);
+                    d.push(
+                        "common",
+                        TermEntry {
+                            df: count,
+                            max_tf_bucket: TfBucket::from_count(count.min(7)).value(),
+                            postings: Extent {
+                                offset: 0,
+                                len: f.1.len() as u32,
+                            },
+                            payload: Extent {
+                                offset: 0,
+                                len: f.2.len() as u32,
+                            },
+                            ordinals,
+                        },
+                    )
+                    .unwrap();
+                    d.finish()
+                };
+                let len = f.3.len() as u32;
+                for (offset, len, padding, good) in [
+                    (0, len, 0, true),
+                    (0, len, 1, true),
+                    (1, len, 1, false),
+                    (0, len + 1, 1, false),
+                    (0, len + 1, 0, false),
+                    (0, len - 1, 0, false),
+                    (0, 0, 0, false),
+                    (u64::MAX, 1, 0, false),
+                ] {
+                    let mut moved = f.clone();
+                    moved.0 = entry(Extent { offset, len });
+                    moved.3.resize(f.3.len() + padding, 0);
+                    assert_eq!(validate(&moved).is_ok(), good, "{count}: {offset}+{len}");
+                }
+            }
+            // A second term may not start inside the first one's stream.
+            let f = fixture(format, 129);
+            for (second, good) in [
+                (f.3.len() as u64, true),
+                (f.3.len() as u64 - 1, false),
+                (0, false),
+            ] {
+                let mut d = DictionaryBuilder::with_format(format);
+                for (term, postings, payload, ordinals) in [
+                    ("a", 0, 0, 0),
+                    ("b", f.1.len() as u64, f.2.len() as u64, second),
+                ] {
+                    d.push(
+                        term,
+                        TermEntry {
+                            df: 129,
+                            max_tf_bucket: 3,
+                            postings: Extent {
+                                offset: postings,
+                                len: f.1.len() as u32,
+                            },
+                            payload: Extent {
+                                offset: payload,
+                                len: f.2.len() as u32,
+                            },
+                            ordinals: Extent {
+                                offset: ordinals,
+                                len: f.3.len() as u32,
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+                let combined = (d.finish(), f.1.repeat(2), f.2.repeat(2), f.3.repeat(2));
                 assert_eq!(
-                    validate(&flipped).is_ok(),
-                    crate::ordinals::validate(&flipped.3, count, u32::MAX).is_ok(),
-                    "{count} documents, byte {at}"
+                    validate(&combined).is_ok(),
+                    good,
+                    "second stream at {second}"
                 );
             }
-            // Extents must end inside the area and hold the stream exactly.
-            let entry = |ordinals: Extent| {
-                let mut d = DictionaryBuilder::with_format(Format::Lsg4);
-                d.push(
-                    "common",
-                    TermEntry {
-                        df: count,
-                        max_tf_bucket: TfBucket::from_count(count.min(7)).value(),
-                        postings: Extent {
-                            offset: 0,
-                            len: f.1.len() as u32,
-                        },
-                        payload: Extent {
-                            offset: 0,
-                            len: f.2.len() as u32,
-                        },
-                        ordinals,
-                    },
-                )
-                .unwrap();
-                d.finish()
-            };
-            let len = f.3.len() as u32;
-            for (offset, len, padding, good) in [
-                (0, len, 0, true),
-                (0, len, 1, true),
-                (1, len, 1, false),
-                (0, len + 1, 1, false),
-                (0, len + 1, 0, false),
-                (0, len - 1, 0, false),
-                (0, 0, 0, false),
-                (u64::MAX, 1, 0, false),
-            ] {
-                let mut moved = f.clone();
-                moved.0 = entry(Extent { offset, len });
-                moved.3.resize(f.3.len() + padding, 0);
-                assert_eq!(validate(&moved).is_ok(), good, "{count}: {offset}+{len}");
-            }
+            // Before `LSG4` the ordinals area is never read.
+            let mut old = fixture(Format::Lsg3, 129);
+            old.3 = vec![0xff; 16];
+            validate_terms(areas(&old, Format::Lsg3), 5, 64, || Ok(()), |_, _| Ok(20)).unwrap();
         }
-        // A second term may not start inside the first one's stream.
-        let f = fixture(Format::Lsg4, 129);
-        for (second, good) in [
-            (f.3.len() as u64, true),
-            (f.3.len() as u64 - 1, false),
-            (0, false),
-        ] {
-            let mut d = DictionaryBuilder::with_format(Format::Lsg4);
-            for (term, postings, payload, ordinals) in [
-                ("a", 0, 0, 0),
-                ("b", f.1.len() as u64, f.2.len() as u64, second),
-            ] {
-                d.push(
-                    term,
-                    TermEntry {
-                        df: 129,
-                        max_tf_bucket: 3,
-                        postings: Extent {
-                            offset: postings,
-                            len: f.1.len() as u32,
-                        },
-                        payload: Extent {
-                            offset: payload,
-                            len: f.2.len() as u32,
-                        },
-                        ordinals: Extent {
-                            offset: ordinals,
-                            len: f.3.len() as u32,
-                        },
-                    },
-                )
-                .unwrap();
-            }
-            let combined = (d.finish(), f.1.repeat(2), f.2.repeat(2), f.3.repeat(2));
-            assert_eq!(
-                validate(&combined).is_ok(),
-                good,
-                "second stream at {second}"
-            );
-        }
-        // Before `LSG4` the ordinals area is never read.
-        let mut old = fixture(Format::Lsg3, 129);
-        old.3 = vec![0xff; 16];
-        validate_terms(areas(&old, Format::Lsg3), 5, 64, || Ok(()), |_, _| Ok(20)).unwrap();
     }
 
     #[test]
     fn every_checkpoint_can_cancel_without_success() {
         let mut previous = 0;
-        for format in [Format::Lsg3, Format::Lsg4] {
+        for format in [Format::Lsg3, Format::Lsg4, Format::Lsg5] {
             let f = fixture(format, 129);
             let mut calls = 0;
             validate_terms(

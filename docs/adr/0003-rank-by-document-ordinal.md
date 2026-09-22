@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 extends: 0002
 ---
 # Rank by document ordinal
@@ -46,7 +46,13 @@ layout if the measurement asks for it.
 
 The format is `LSG5`: `LSG4` segments remain readable and rank the old way;
 `REINDEX` upgrades. The TID postings stay for streaming, positional and
-Boolean scans and for the write buffer.
+Boolean scans, for conjunctions and for the write buffer.
+
+Measured on the 300 published Stack Exchange disjunctions over 15 million
+rows, with the same rows and scores as the postings walk: 8.9 ms at the
+median instead of 17.3 and 58 ms at the 99th percentile instead of 154; the
+mixed workload at eight clients went from 347 to 436 queries a second. The
+bounds add 5% to the index and 2% to the build.
 
 ## Consequences
 

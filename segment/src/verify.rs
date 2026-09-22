@@ -217,6 +217,9 @@ fn check_ordinals(
     expected: &[Option<usize>],
     documents: &[Tid],
     doc_count: u32,
+    // The postings' buckets and lengths, for a stream that carries chunk
+    // bounds; `None` for a stream without them.
+    scores: Option<&[(u8, u32)]>,
 ) -> Result<(), Finding> {
     let expected: Option<Vec<u32>> = expected
         .iter()
@@ -225,17 +228,35 @@ fn check_ordinals(
     // The encoding is canonical, so the stream the writer would produce for
     // these postings is the only one that passes every check below. Comparing
     // with it first spares a sound term, the common case, a second decoding.
-    if expected
+    let canonical = expected.as_deref().map(|expected| match scores {
+        Some(scores) if scores.len() == expected.len() => ordinals::encode_scored(expected, scores),
+        Some(_) => Vec::new(),
+        None => ordinals::encode(expected),
+    });
+    if canonical
         .as_deref()
-        .is_some_and(|expected| ordinals::encode(expected) == bytes)
+        .is_some_and(|canonical| canonical == bytes)
     {
         return Ok(());
     }
+    let bounded = scores.is_some();
     let malformed = |error: Error| Finding::error("", format!("ordinals: {error}"));
-    ordinals::validate(bytes, tids.len() as u32, doc_count).map_err(malformed)?;
-    let found = Ordinals::parse(bytes)
+    ordinals::validate(bytes, tids.len() as u32, doc_count, bounded).map_err(malformed)?;
+    let found = Ordinals::open(bytes, bytes.len() as u64, bounded)
         .and_then(|stream| stream.to_vec())
         .map_err(malformed)?;
+    if let (Some(scores), Some(expected)) = (scores, expected.as_deref())
+        && scores.len() == expected.len()
+        && let Some(canonical) = canonical.as_deref()
+        && let Ok(stream) = Ordinals::open(bytes, bytes.len() as u64, true)
+        && let Ok(wanted) = Ordinals::open(canonical, canonical.len() as u64, true)
+        && stream.bounds() != wanted.bounds()
+    {
+        return Err(Finding::error(
+            "",
+            "ordinal chunk bounds disagree with the postings and lengths",
+        ));
+    }
     let Some(expected) = expected else {
         return Ok(());
     };
@@ -604,24 +625,6 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 );
             }
 
-            // Ordinals: the same documents as the postings, by table ordinal.
-            if let Some(extent) = ordinals_extent
-                && let Err(finding) = segment
-                    .ordinals_bytes(extent.offset, extent.len as usize)
-                    .map_err(|error| Finding::error("", format!("ordinals: {error}")))
-                    .and_then(|bytes| {
-                        check_ordinals(
-                            bytes,
-                            &tids,
-                            &ordinals,
-                            &documents,
-                            segment.document_count(),
-                        )
-                    })
-            {
-                findings.push(finding.within(&location()));
-            }
-
             // Payload: one entry per posting, buckets matching positions.
             let payload = match resolved.payload() {
                 Ok(payload) => payload,
@@ -692,6 +695,25 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 );
             }
 
+            // Ordinals: the same documents as the postings, by table ordinal.
+            if let Some(extent) = ordinals_extent
+                && let Err(finding) = segment
+                    .ordinals_bytes(extent.offset, extent.len as usize)
+                    .map_err(|error| Finding::error("", format!("ordinals: {error}")))
+                    .and_then(|bytes| {
+                        check_ordinals(
+                            bytes,
+                            &tids,
+                            &ordinals,
+                            &documents,
+                            segment.document_count(),
+                            format.has_chunk_bounds().then_some(&scores[..]),
+                        )
+                    })
+            {
+                findings.push(finding.within(&location()));
+            }
+
             // Score bounds: what the postings and lengths imply, in the
             // layout the segment's format writes.
             match posting_cursor.block_bounds_into(&mut bounds) {
@@ -721,7 +743,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                         );
                     }
                 }
-                Format::Lsg3 | Format::Lsg4 => {
+                Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => {
                     if one_block && !postings.has_term_bound() {
                         findings.warning(
                             location(),
@@ -1190,8 +1212,9 @@ mod tests {
             ["ordinals: corrupt segment data: ordinal array order"]
         );
         // A list stream counting more ordinals than it holds, or fewer.
+        // One member: the count, its chunk bound and one delta.
         let stream = ordinal_stream(&bytes, "term0003");
-        assert_eq!(stream.len(), 3);
+        assert!((5..=10).contains(&stream.len()), "{}", stream.len());
         for (count, problem) in [
             (2, "ordinals: truncated segment data"),
             (0, "ordinals: corrupt segment data: ordinal list length"),
@@ -1254,7 +1277,7 @@ mod tests {
             found,
             [
                 "error: term \"term0003\": ordinal 0 is 304 and names (1012,1) but posting 0 is (1009,1); 1 of 1 ordinals differ from their postings",
-                "error: term \"term0004\": ordinals extent starts at 2172 inside the previous term's extent ending at 2178",
+                "error: term \"term0004\": ordinals extent starts at 2217 inside the previous term's extent ending at 2231",
                 "error: term \"term0004\": ordinal 0 is 303 and names (1009,1) but posting 0 is (1012,1); 1 of 1 ordinals differ from their postings",
             ]
         );

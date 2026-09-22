@@ -538,7 +538,7 @@ pub(crate) const PRUNE_MAX_K: usize = 4096;
 /// Whether pruned disjunctions rank over the ordinal streams rather than
 /// the TID postings (ADR 0003). A prototype: chunk bounds are derived from
 /// the block bounds at query time until the format stores them.
-pub(crate) static RANK_BY_ORDINAL: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
+pub(crate) static RANK_BY_ORDINAL: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 
 /// The best rows of a pruned ranked scan.
 pub(crate) struct TopK {
@@ -1086,19 +1086,24 @@ impl IndexScorer {
             }
             absent = true;
         }
-        if RANK_BY_ORDINAL.get()
-            && combine == Combine::Any
-            && k > 0
-            && !self.terms.is_empty()
-            && let Some(top) = self.top_k_by_ordinal(k, elided)
-        {
-            return Some(top);
-        }
         let mut heap = BinaryHeap::with_capacity(k + 1);
         let mut scored = 0usize;
+        let mut ordinal = false;
         if k > 0 && !(absent && combine == Combine::All) {
             let mut visibility = unsafe { Visibility::open(pg_sys::Oid::from(self.key.heap_oid)) };
             for (i, (source, _)) in self.view.sources.iter().enumerate() {
+                // A disjunction walks a source's ordinal streams when it has
+                // them with bounds; the write buffer and older segments walk
+                // their TID postings into the same heap.
+                if RANK_BY_ORDINAL.get()
+                    && combine == Combine::Any
+                    && self
+                        .walk_by_ordinal(i, &mut visibility, k, &mut heap, &mut scored)
+                        .is_some()
+                {
+                    ordinal = true;
+                    continue;
+                }
                 if !self.prune_source(
                     &**source,
                     &self.view.labels[i],
@@ -1133,17 +1138,24 @@ impl IndexScorer {
             scored,
             complete,
             zero_fill,
-            ordinal: false,
+            ordinal,
         })
     }
 
-    /// [`Self::top_k`] over the ordinal streams, for a flat disjunction of
-    /// the scoring terms. `None` when a source cannot be walked this way.
-    fn top_k_by_ordinal(&self, k: usize, elided: bool) -> Option<TopK> {
-        let mut heap = BinaryHeap::with_capacity(k + 1);
-        let mut scored = 0usize;
-        let mut visibility = unsafe { Visibility::open(pg_sys::Oid::from(self.key.heap_oid)) };
-        for (i, (source, _)) in self.view.sources.iter().enumerate() {
+    /// Walks source `i` over its ordinal streams (ADR 0003) into the shared
+    /// heap. `None`, with the heap untouched, when the source has no page
+    /// table, a term's stream carries no bounds, or its dead documents cannot
+    /// be mapped to ordinals: the caller walks its TID postings instead.
+    fn walk_by_ordinal(
+        &self,
+        i: usize,
+        visibility: &mut Visibility,
+        k: usize,
+        heap: &mut BinaryHeap<Ranked>,
+        scored: &mut usize,
+    ) -> Option<()> {
+        {
+            let source = &self.view.sources[i].0;
             let label = &self.view.labels[i];
             let pages = segment_error_in(source.page_table(), label)?;
             let dead = if i < self.view.keys.len() {
@@ -1166,14 +1178,19 @@ impl IndexScorer {
                     continue;
                 };
                 let ordinals = segment_error_in(term.ordinals(), label)?;
-                let mut postings = segment_error_in(term.cursor(), label);
-                let blocks = segment_error_in(postings.block_bounds(), label);
-                if blocks.is_empty() {
+                if ordinals.bounds().is_empty() {
                     return None;
                 }
-                let whole = blocks
+                let whole = ordinals
+                    .bounds()
                     .iter()
-                    .copied()
+                    .map(|bound| BlockBound {
+                        min_len: bound.min_len,
+                        last: Tid {
+                            block: 0,
+                            offset: 1,
+                        },
+                    })
                     .reduce(|merged, block| merged.merge(&block))
                     .expect("checked");
                 let (keys, list) = match ordinals.list() {
@@ -1189,39 +1206,14 @@ impl IndexScorer {
                         None,
                     ),
                 };
-                // Prototype: each block's bound covers the chunks and the
-                // sub-blocks its heap blocks' ordinals fall in; stored bounds
-                // replace this.
-                let table = PageTable(pages);
-                let mut bounds = vec![[u32::MAX; BUCKET_COUNT]; keys.len()];
-                let mut sub_bounds: Vec<[u8; SUBS]> = vec![[0; SUBS]; keys.len()];
-                let mut start = 0u32;
-                for block in &blocks {
-                    // The block's postings lie between the heap block holding
-                    // the previous block's last posting and the one holding
-                    // its own, inclusive: a conservative range of ordinals.
-                    let end = table.end_of_block(block.last.block, self.view_documents(i));
-                    let last = end.max(start + 1) - 1;
-                    let (from, to) = ((start >> 16) as u16, (last >> 16) as u16);
-                    let first = keys.partition_point(|key| *key < from);
-                    let max_bucket = block.max_tf_bucket();
-                    for (offset, key) in keys[first..].iter().enumerate() {
-                        if *key > to {
-                            break;
-                        }
-                        for (mine, theirs) in bounds[first + offset].iter_mut().zip(&block.min_len)
-                        {
-                            *mine = (*mine).min(*theirs);
-                        }
-                        let base = u32::from(*key) << 16;
-                        let sub_from = (start.max(base) - base) as usize / SUB;
-                        let sub_to =
-                            (last.min(base + segment::ordinals::CHUNK - 1) - base) as usize / SUB;
-                        for sub in &mut sub_bounds[first + offset][sub_from..=sub_to] {
-                            *sub = (*sub).max(max_bucket + 1);
-                        }
-                    }
-                    start = table.start_of_block(block.last.block, self.view_documents(i));
+                // The stored bound per chunk, or a list's one bound for every
+                // chunk it touches; a stream without bounds cannot be walked.
+                let mut bounds = Vec::with_capacity(keys.len());
+                let mut sub_bounds = Vec::with_capacity(keys.len());
+                for i in 0..keys.len() {
+                    let bound = ordinals.chunk_bound(i)?;
+                    bounds.push(bound.min_len);
+                    sub_bounds.push(bound.subs);
                 }
                 terms.push(OrdinalTerm {
                     slot,
@@ -1241,7 +1233,7 @@ impl IndexScorer {
                 });
             }
             if terms.is_empty() {
-                continue;
+                return Some(());
             }
             let mut walk = OrdinalWalk {
                 scorer: self,
@@ -1251,36 +1243,15 @@ impl IndexScorer {
                 document_count: source.document_count(),
                 lengths: source.lengths(),
                 dead: &dead,
-                visibility: &mut visibility,
+                visibility,
                 k,
-                heap: &mut heap,
-                scored: &mut scored,
+                heap,
+                scored,
                 iterations: 0,
             };
             walk.any();
         }
-        let mut rows: Vec<(f32, Tid)> = heap.into_iter().map(|Ranked(s, t)| (s, t)).collect();
-        rows.sort_by(rank);
-        let mut seen = FxHashSet::default();
-        if !rows.iter().all(|(_, tid)| seen.insert(*tid)) {
-            return None;
-        }
-        if elided && rows.last().is_some_and(|(score, _)| *score <= 0.0) {
-            return None;
-        }
-        let zero_fill = elided && rows.len() < k;
-        let complete = rows.len() < k && !zero_fill;
-        Some(TopK {
-            rows,
-            scored,
-            complete,
-            zero_fill,
-            ordinal: true,
-        })
-    }
-
-    fn view_documents(&self, i: usize) -> u32 {
-        self.view.sources[i].0.document_count()
+        Some(())
     }
 
     /// Walks one source. Returns `Ok(false)` when the source cannot be pruned.
@@ -1383,35 +1354,6 @@ impl PageTable<'_> {
         u32::from_le_bytes(self.0[at..at + 4].try_into().unwrap())
     }
 
-    /// The entry of the first block at or after `block`.
-    fn entry_at_or_after(&self, block: u32) -> usize {
-        let (mut low, mut high) = (0, self.len());
-        while low < high {
-            let middle = (low + high) / 2;
-            if self.block(middle) < block {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        low
-    }
-
-    /// One past the last ordinal on `block`.
-    fn end_of_block(&self, block: u32, documents: u32) -> u32 {
-        let entry = self.entry_at_or_after(block);
-        if entry < self.len() && self.block(entry) == block {
-            self.first(entry + 1, documents)
-        } else {
-            self.first(entry, documents)
-        }
-    }
-
-    /// The first ordinal on `block`, or after it when the segment has none there.
-    fn start_of_block(&self, block: u32, documents: u32) -> u32 {
-        self.first(self.entry_at_or_after(block), documents)
-    }
-
     /// The entry holding `ordinal`.
     fn entry_of(&self, ordinal: u32, documents: u32) -> usize {
         let (mut low, mut high) = (0, self.len());
@@ -1428,9 +1370,9 @@ impl PageTable<'_> {
 }
 
 /// Ordinals per sub-block of a chunk, at which a walk prunes within a chunk.
-const SUB: usize = 1024;
+const SUB: usize = segment::ordinals::SUB as usize;
 /// Sub-blocks per chunk.
-const SUBS: usize = segment::ordinals::CHUNK as usize / SUB;
+const SUBS: usize = segment::ordinals::SUBS;
 
 /// One scoring term's streams in one source, for the walk over ordinals.
 struct OrdinalTerm<'a> {
@@ -1559,11 +1501,21 @@ impl OrdinalWalk<'_, '_> {
         }
     }
 
-    /// Whether a document scoring at most `bound` could enter the top k; its
-    /// location is not known yet, so a tie is taken as beatable.
-    fn can_beat(&self, bound: f32) -> bool {
-        self.threshold()
-            .is_none_or(|(threshold, _)| bound >= threshold)
+    /// Whether a document at or after `ordinal` scoring at most `bound`
+    /// could enter the top k: it must beat the k-th row's score, or tie it
+    /// from an earlier location. Ordinals ascend with locations, so the
+    /// location of `ordinal` is the earliest of every document from it on;
+    /// it is resolved only when a tie asks for it.
+    fn can_beat(&mut self, bound: f32, ordinal: u32) -> bool {
+        match self.threshold() {
+            None => true,
+            Some((threshold, holder)) => {
+                bound > threshold
+                    || (bound == threshold
+                        && ordinal < self.document_count
+                        && self.resolve(ordinal) < holder)
+            }
+        }
     }
 
     /// The heap location of the document at `ordinal`.
@@ -1745,7 +1697,19 @@ impl OrdinalWalk<'_, '_> {
             }
         }
         let mut sparse_at = 0usize;
+        // A sub-block is judged once, at its first word: the walk resolves
+        // locations in ordinal order, so the judgement cannot be repeated
+        // after a candidate of the sub-block has been resolved.
+        let mut skip_sub = false;
+        #[expect(
+            clippy::needless_range_loop,
+            reason = "the index addresses the sub-block and the sparse members too"
+        )]
         for i in 0..segment::ordinals::WORDS {
+            if i % (SUB / 64) == 0 {
+                let sub = i / (SUB / 64);
+                skip_sub = pruning && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32);
+            }
             let mut word = if sparse {
                 let mut word = 0u64;
                 while sparse_at < lows.len() && usize::from(lows[sparse_at] / 64) == i {
@@ -1756,7 +1720,7 @@ impl OrdinalWalk<'_, '_> {
             } else {
                 set[i]
             };
-            if word == 0 || (pruning && !self.can_beat(sub_scores[i / (SUB / 64)])) {
+            if word == 0 || skip_sub {
                 continue;
             }
             while word != 0 {
@@ -1773,7 +1737,7 @@ impl OrdinalWalk<'_, '_> {
                             bound += scorer.bound_for_length(&term.bound_block(term.pos), length);
                         }
                     }
-                    if !self.can_beat(bound) {
+                    if !self.can_beat(bound, ordinal) {
                         continue;
                     }
                 }
