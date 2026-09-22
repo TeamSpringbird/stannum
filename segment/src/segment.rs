@@ -752,9 +752,15 @@ impl<S: Source> Reader<S> {
         let len = self.header.doc_count as usize * 4;
         match self.source.slice(self.header.lengths_at, len) {
             Some(bytes) => Lengths::Bytes(bytes),
-            None => Lengths::Lazy {
-                fetch: self,
-                count: self.header.doc_count,
+            // A paged source hands out the table once, cached with the reader:
+            // a ranked walk looks a length up per candidate, and one fetch per
+            // lookup cost more than the scoring.
+            None => match self.load(self.header.lengths_at, len) {
+                Ok(bytes) => Lengths::Bytes(bytes),
+                Err(_) => Lengths::Lazy {
+                    fetch: self,
+                    count: self.header.doc_count,
+                },
             },
         }
     }

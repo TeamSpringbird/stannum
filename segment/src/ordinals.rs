@@ -279,6 +279,76 @@ impl<'a> Ordinals<'a> {
         }
     }
 
+    /// The stream as a list, when it is short enough to be stored as one.
+    pub fn list(&self) -> Option<&[u32]> {
+        match &self.body {
+            Body::List(list) => Some(list),
+            Body::Chunked { .. } => None,
+        }
+    }
+
+    /// Chunks of a chunked stream; zero for a list.
+    pub fn chunk_count(&self) -> usize {
+        match &self.body {
+            Body::List(_) => 0,
+            Body::Chunked { directory, .. } => directory.len() / ENTRY,
+        }
+    }
+
+    /// The key of chunk `i` of a chunked stream.
+    pub fn chunk_key(&self, i: usize) -> u16 {
+        match &self.body {
+            Body::List(_) => unreachable!("a list has no chunks"),
+            Body::Chunked { directory, .. } => entry_key(&directory[i * ENTRY..(i + 1) * ENTRY]),
+        }
+    }
+
+    /// Members in the chunks before chunk `i` of a chunked stream.
+    fn before(&self, i: usize) -> u32 {
+        let Body::Chunked {
+            directory, before, ..
+        } = &self.body
+        else {
+            unreachable!("a list has no chunks")
+        };
+        before.get_or_init(|| {
+            let mut total = 0u32;
+            directory
+                .chunks_exact(ENTRY)
+                .map(|entry| {
+                    let start = total;
+                    total = total.saturating_add(entry_chunk(entry).0 as u32);
+                    start
+                })
+                .collect()
+        })[i]
+    }
+
+    /// Chunk `i` of a chunked stream, with its body fetched.
+    pub fn chunk(&self, i: usize) -> Result<Chunk<'a>> {
+        let Body::Chunked {
+            directory,
+            chunks_at,
+            ..
+        } = &self.body
+        else {
+            return Err(Error::Corrupt("a list has no chunks"));
+        };
+        let entry = &directory[i * ENTRY..(i + 1) * ENTRY];
+        let (cardinality, offset, size, bitmap) = entry_chunk(entry);
+        let start = chunks_at + offset;
+        if start + size as u64 > self.len {
+            return Err(Error::Truncated);
+        }
+        Ok(Chunk {
+            key: entry_key(entry),
+            cardinality: cardinality as u32,
+            before: self.before(i),
+            bytes: self.source.fetch(start, size)?,
+            bitmap,
+        })
+    }
+
     /// The ordinal at `index` of the stream: the document of the term's
     /// `index`-th posting, since the stream parallels the term's postings.
     pub fn select(&self, index: u32) -> Result<u32> {
@@ -372,6 +442,86 @@ fn apply_lows(lows: impl Iterator<Item = usize>, op: Op, out: &mut Words) {
             let mut kept = [0u64; WORDS];
             lows.for_each(|low| kept[low / 64] |= out[low / 64] & (1 << (low % 64)));
             *out = kept;
+        }
+    }
+}
+
+/// One chunk of a chunked stream: its members within `key << 16 ..`.
+pub struct Chunk<'a> {
+    pub key: u16,
+    pub cardinality: u32,
+    /// Members of the stream before this chunk: the rank of its first member.
+    pub before: u32,
+    bytes: &'a [u8],
+    bitmap: bool,
+}
+
+impl Chunk<'_> {
+    /// The first ordinal the chunk can hold.
+    pub fn base(&self) -> u32 {
+        u32::from(self.key) << 16
+    }
+
+    /// The rank within the chunk of the member with low bits `low`, if any.
+    pub fn rank(&self, low: u16) -> Option<u32> {
+        if self.bitmap {
+            let word = usize::from(low / 64);
+            let bit = low % 64;
+            let bytes = &self.bytes[word * 8..word * 8 + 8];
+            let value = u64::from_le_bytes(bytes.try_into().unwrap());
+            if value & (1 << bit) == 0 {
+                return None;
+            }
+            let before: u32 = self.bytes[..word * 8]
+                .chunks_exact(8)
+                .map(|w| u64::from_le_bytes(w.try_into().unwrap()).count_ones())
+                .sum();
+            Some(before + (value & ((1u64 << bit) - 1)).count_ones())
+        } else {
+            let lows = self.bytes.chunks_exact(2);
+            let count = lows.len();
+            let (mut lo, mut hi) = (0usize, count);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let at = &self.bytes[mid * 2..mid * 2 + 2];
+                let value = u16::from_le_bytes([at[0], at[1]]);
+                match value.cmp(&low) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Greater => hi = mid,
+                    std::cmp::Ordering::Equal => return Some(mid as u32),
+                }
+            }
+            None
+        }
+    }
+
+    /// Whether the chunk is a bitmap rather than an array of members.
+    pub fn is_bitmap(&self) -> bool {
+        self.bitmap
+    }
+
+    /// Appends the low bits of an array chunk's members, ascending; nothing
+    /// for a bitmap.
+    pub fn members(&self, out: &mut Vec<u16>) {
+        if !self.bitmap {
+            out.extend(
+                self.bytes
+                    .chunks_exact(2)
+                    .map(|low| u16::from_le_bytes([low[0], low[1]])),
+            );
+        }
+    }
+
+    /// Sets `out` to the chunk's members.
+    pub fn words(&self, out: &mut Words) {
+        if self.bitmap {
+            kernels::assign_bytes(out, self.bytes);
+        } else {
+            out.fill(0);
+            for low in self.bytes.chunks_exact(2) {
+                let low = usize::from(u16::from_le_bytes([low[0], low[1]]));
+                out[low / 64] |= 1 << (low % 64);
+            }
         }
     }
 }

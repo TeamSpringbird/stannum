@@ -101,3 +101,11 @@
   `--ranked-validation-queries` samples the exhaustive ranked check;
   `build-image --base` builds a native image for rehearsals; a benchmark
   stack may live up to 24 hours.
+- Prototype of ranking over the ordinal streams (ADR 0003), behind
+  `stannum.rank_by_ordinal` (off): block-max WAND over the terms' chunks
+  with only the essential terms' members visited within a chunk. Chunk
+  bounds are derived from block bounds at query time until the format
+  stores them. Same rows and scores as the postings walk on the published
+  disjunctions over 15 million rows, at 10.7 ms median instead of 18.1 and
+  65 ms at the 99th percentile instead of 154; the mixed workload at eight
+  clients went from 345 to 417 queries a second.

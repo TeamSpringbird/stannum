@@ -195,7 +195,7 @@ thread_local! {
     static DEAD: RefCell<HashMap<(u64, u32), DeadOrdinals>> = RefCell::new(HashMap::new());
 }
 
-fn dead_ordinals(
+pub(crate) fn dead_ordinals(
     key: (u64, u32),
     source: &dyn Index,
     dead_set: &Rc<BTreeSet<Tid>>,

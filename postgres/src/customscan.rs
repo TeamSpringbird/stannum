@@ -110,6 +110,14 @@ static COUNT_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
 
 pub fn init() {
     GucRegistry::define_bool_guc(
+        c"stannum.rank_by_ordinal",
+        c"Rank pruned disjunctions over the ordinal streams instead of the TID postings",
+        c"A prototype of ADR 0003; chunk bounds are derived from block bounds at query time.",
+        &crate::score::RANK_BY_ORDINAL,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"stannum.profile_count_selection",
         c"Collect bounded count-selector features without changing the default strategy",
         c"Estimation timing includes feature collection; counters accumulate over rescans.",
@@ -933,6 +941,8 @@ struct ScanExec {
     pruned: bool,
     /// The k the pruned rows were found for, which a completion deepens.
     pruned_k: usize,
+    /// The pruned walk ran over the ordinal streams.
+    ordinal_walk: bool,
     /// Every location emitted before a completion, across completions.
     emitted: FxHashSet<Tid>,
     /// Explain counters. Candidates are unknown while pruned; `scored`
@@ -1088,6 +1098,7 @@ unsafe extern "C-unwind" fn begin_scan(
             fallback: std::ptr::null_mut(),
             pruned: false,
             pruned_k: 0,
+            ordinal_walk: false,
             emitted: FxHashSet::default(),
             candidates: None,
             scored: None,
@@ -1184,6 +1195,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             exec.sorted = exec.tids.len();
             exec.pruned = !top.complete;
             exec.pruned_k = k;
+            exec.ordinal_walk = top.ordinal;
             let scorer = scorer.take().expect("a top k needs a scorer");
             crate::score::publish_scan_scorer(exec.scan_id, scorer, &top.rows);
             exec.next = 0;
@@ -2198,7 +2210,15 @@ unsafe extern "C-unwind" fn explain(
                 );
             }
             if let Some(scored) = exec.scored {
-                pg_sys::ExplainPropertyText(c"Pruning".as_ptr(), c"block-max".as_ptr(), es);
+                pg_sys::ExplainPropertyText(
+                    c"Pruning".as_ptr(),
+                    if exec.ordinal_walk {
+                        c"ordinal".as_ptr()
+                    } else {
+                        c"block-max".as_ptr()
+                    },
+                    es,
+                );
                 pg_sys::ExplainPropertyInteger(
                     c"Scored Candidates".as_ptr(),
                     std::ptr::null(),

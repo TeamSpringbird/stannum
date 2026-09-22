@@ -19,7 +19,7 @@ use segment::payload::PayloadCursor;
 use segment::postings::{BlockBound, PostingsCursor};
 use segment::segment::Lengths;
 use segment::set::Cursor as _;
-use segment::tf_bucket::TfBucket;
+use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tid::MAX_OFFSET;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
@@ -535,6 +535,11 @@ pub(crate) fn rank(a: &(f32, Tid), b: &(f32, Tid)) -> Ordering {
 /// the scoring it saves, and the scan scores every candidate instead.
 pub(crate) const PRUNE_MAX_K: usize = 4096;
 
+/// Whether pruned disjunctions rank over the ordinal streams rather than
+/// the TID postings (ADR 0003). A prototype: chunk bounds are derived from
+/// the block bounds at query time until the format stores them.
+pub(crate) static RANK_BY_ORDINAL: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
+
 /// The best rows of a pruned ranked scan.
 pub(crate) struct TopK {
     /// In output order; fewer than `k` only when the query matched fewer, or
@@ -549,6 +554,8 @@ pub(crate) struct TopK {
     /// `k`: the rest of the top k are matches of elided terms alone, which tie
     /// at zero and rank in heap order. The caller streams them.
     pub(crate) zero_fill: bool,
+    /// The walk ran over the ordinal streams.
+    pub(crate) ordinal: bool,
 }
 
 /// How a query's leaf terms combine into its candidate set.
@@ -1079,6 +1086,14 @@ impl IndexScorer {
             }
             absent = true;
         }
+        if RANK_BY_ORDINAL.get()
+            && combine == Combine::Any
+            && k > 0
+            && !self.terms.is_empty()
+            && let Some(top) = self.top_k_by_ordinal(k, elided)
+        {
+            return Some(top);
+        }
         let mut heap = BinaryHeap::with_capacity(k + 1);
         let mut scored = 0usize;
         if k > 0 && !(absent && combine == Combine::All) {
@@ -1118,7 +1133,154 @@ impl IndexScorer {
             scored,
             complete,
             zero_fill,
+            ordinal: false,
         })
+    }
+
+    /// [`Self::top_k`] over the ordinal streams, for a flat disjunction of
+    /// the scoring terms. `None` when a source cannot be walked this way.
+    fn top_k_by_ordinal(&self, k: usize, elided: bool) -> Option<TopK> {
+        let mut heap = BinaryHeap::with_capacity(k + 1);
+        let mut scored = 0usize;
+        let mut visibility = unsafe { Visibility::open(pg_sys::Oid::from(self.key.heap_oid)) };
+        for (i, (source, _)) in self.view.sources.iter().enumerate() {
+            let label = &self.view.labels[i];
+            let pages = segment_error_in(source.page_table(), label)?;
+            let dead = if i < self.view.keys.len() {
+                segment_error_in(
+                    crate::fold::dead_ordinals(
+                        self.view.keys[i],
+                        &**source,
+                        &self.view.dead_sets[i],
+                    ),
+                    label,
+                )
+            } else if self.dead[i].is_empty() {
+                std::rc::Rc::default()
+            } else {
+                return None;
+            };
+            let mut terms = Vec::with_capacity(self.terms.len());
+            for (slot, (name, scorer)) in self.terms.iter().enumerate() {
+                let Some(term) = segment_error_in(source.term(name), label) else {
+                    continue;
+                };
+                let ordinals = segment_error_in(term.ordinals(), label)?;
+                let mut postings = segment_error_in(term.cursor(), label);
+                let blocks = segment_error_in(postings.block_bounds(), label);
+                if blocks.is_empty() {
+                    return None;
+                }
+                let whole = blocks
+                    .iter()
+                    .copied()
+                    .reduce(|merged, block| merged.merge(&block))
+                    .expect("checked");
+                let (keys, list) = match ordinals.list() {
+                    Some(list) => {
+                        let mut keys: Vec<u16> = list.iter().map(|o| (o >> 16) as u16).collect();
+                        keys.dedup();
+                        (keys, Some(list.to_vec()))
+                    }
+                    None => (
+                        (0..ordinals.chunk_count())
+                            .map(|c| ordinals.chunk_key(c))
+                            .collect(),
+                        None,
+                    ),
+                };
+                // Prototype: each block's bound covers the chunks and the
+                // sub-blocks its heap blocks' ordinals fall in; stored bounds
+                // replace this.
+                let table = PageTable(pages);
+                let mut bounds = vec![[u32::MAX; BUCKET_COUNT]; keys.len()];
+                let mut sub_bounds: Vec<[u8; SUBS]> = vec![[0; SUBS]; keys.len()];
+                let mut start = 0u32;
+                for block in &blocks {
+                    // The block's postings lie between the heap block holding
+                    // the previous block's last posting and the one holding
+                    // its own, inclusive: a conservative range of ordinals.
+                    let end = table.end_of_block(block.last.block, self.view_documents(i));
+                    let last = end.max(start + 1) - 1;
+                    let (from, to) = ((start >> 16) as u16, (last >> 16) as u16);
+                    let first = keys.partition_point(|key| *key < from);
+                    let max_bucket = block.max_tf_bucket();
+                    for (offset, key) in keys[first..].iter().enumerate() {
+                        if *key > to {
+                            break;
+                        }
+                        for (mine, theirs) in bounds[first + offset].iter_mut().zip(&block.min_len)
+                        {
+                            *mine = (*mine).min(*theirs);
+                        }
+                        let base = u32::from(*key) << 16;
+                        let sub_from = (start.max(base) - base) as usize / SUB;
+                        let sub_to =
+                            (last.min(base + segment::ordinals::CHUNK - 1) - base) as usize / SUB;
+                        for sub in &mut sub_bounds[first + offset][sub_from..=sub_to] {
+                            *sub = (*sub).max(max_bucket + 1);
+                        }
+                    }
+                    start = table.start_of_block(block.last.block, self.view_documents(i));
+                }
+                terms.push(OrdinalTerm {
+                    slot,
+                    ordinals,
+                    payload: segment_error_in(term.payload(), label).cursor(),
+                    keys,
+                    list,
+                    bounds,
+                    sub_bounds,
+                    bound_scores: Vec::new(),
+                    pos: 0,
+                    term_max: scorer.bound(&whole),
+                    words: Box::new([0; segment::ordinals::WORDS]),
+                    members: Vec::new(),
+                    dense: false,
+                    rank_base: 0,
+                });
+            }
+            if terms.is_empty() {
+                continue;
+            }
+            let mut walk = OrdinalWalk {
+                scorer: self,
+                terms,
+                pages: PageTable(pages),
+                documents: segment_error_in(source.documents(), label),
+                document_count: source.document_count(),
+                lengths: source.lengths(),
+                dead: &dead,
+                visibility: &mut visibility,
+                k,
+                heap: &mut heap,
+                scored: &mut scored,
+                iterations: 0,
+            };
+            walk.any();
+        }
+        let mut rows: Vec<(f32, Tid)> = heap.into_iter().map(|Ranked(s, t)| (s, t)).collect();
+        rows.sort_by(rank);
+        let mut seen = FxHashSet::default();
+        if !rows.iter().all(|(_, tid)| seen.insert(*tid)) {
+            return None;
+        }
+        if elided && rows.last().is_some_and(|(score, _)| *score <= 0.0) {
+            return None;
+        }
+        let zero_fill = elided && rows.len() < k;
+        let complete = rows.len() < k && !zero_fill;
+        Some(TopK {
+            rows,
+            scored,
+            complete,
+            zero_fill,
+            ordinal: true,
+        })
+    }
+
+    fn view_documents(&self, i: usize) -> u32 {
+        self.view.sources[i].0.document_count()
     }
 
     /// Walks one source. Returns `Ok(false)` when the source cannot be pruned.
@@ -1196,6 +1358,460 @@ impl IndexScorer {
             Combine::All => walk.all(),
         }
         Some(true)
+    }
+}
+
+/// A segment's page table: heap blocks ascending with each block's first ordinal.
+struct PageTable<'a>(&'a [u8]);
+
+impl PageTable<'_> {
+    fn len(&self) -> usize {
+        self.0.len() / segment::segment::PAGE_ENTRY
+    }
+
+    fn block(&self, i: usize) -> u32 {
+        let at = i * segment::segment::PAGE_ENTRY;
+        u32::from_le_bytes(self.0[at..at + 4].try_into().unwrap())
+    }
+
+    /// The first ordinal of entry `i`; past the end, `documents`.
+    fn first(&self, i: usize, documents: u32) -> u32 {
+        if i >= self.len() {
+            return documents;
+        }
+        let at = i * segment::segment::PAGE_ENTRY + 4;
+        u32::from_le_bytes(self.0[at..at + 4].try_into().unwrap())
+    }
+
+    /// The entry of the first block at or after `block`.
+    fn entry_at_or_after(&self, block: u32) -> usize {
+        let (mut low, mut high) = (0, self.len());
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.block(middle) < block {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
+
+    /// One past the last ordinal on `block`.
+    fn end_of_block(&self, block: u32, documents: u32) -> u32 {
+        let entry = self.entry_at_or_after(block);
+        if entry < self.len() && self.block(entry) == block {
+            self.first(entry + 1, documents)
+        } else {
+            self.first(entry, documents)
+        }
+    }
+
+    /// The first ordinal on `block`, or after it when the segment has none there.
+    fn start_of_block(&self, block: u32, documents: u32) -> u32 {
+        self.first(self.entry_at_or_after(block), documents)
+    }
+
+    /// The entry holding `ordinal`.
+    fn entry_of(&self, ordinal: u32, documents: u32) -> usize {
+        let (mut low, mut high) = (0, self.len());
+        while low < high {
+            let middle = (low + high) / 2;
+            if self.first(middle + 1, documents) <= ordinal {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
+}
+
+/// Ordinals per sub-block of a chunk, at which a walk prunes within a chunk.
+const SUB: usize = 1024;
+/// Sub-blocks per chunk.
+const SUBS: usize = segment::ordinals::CHUNK as usize / SUB;
+
+/// One scoring term's streams in one source, for the walk over ordinals.
+struct OrdinalTerm<'a> {
+    slot: usize,
+    ordinals: segment::ordinals::Ordinals<'a>,
+    payload: PayloadCursor<'a>,
+    /// Keys of the chunks the term occupies, ascending.
+    keys: Vec<u16>,
+    /// The stream as a list, when it is one.
+    list: Option<Vec<u32>>,
+    /// Per key: the shortest document per bucket among the term's postings there.
+    bounds: Vec<[u32; BUCKET_COUNT]>,
+    /// Per key and sub-block: one past the largest bucket the term has there,
+    /// zero where it has no posting.
+    sub_bounds: Vec<[u8; SUBS]>,
+    /// Per key: the score bound, once asked for.
+    bound_scores: Vec<Option<f32>>,
+    /// Index into `keys` of the current chunk.
+    pos: usize,
+    term_max: f32,
+    /// The current chunk's members, once loaded.
+    words: Box<segment::ordinals::Words>,
+    /// The current chunk's members as low bits when it is not a bitmap.
+    members: Vec<u16>,
+    dense: bool,
+    /// The rank of the current chunk's first member.
+    rank_base: u32,
+}
+
+impl OrdinalTerm<'_> {
+    fn key(&self) -> Option<u16> {
+        self.keys.get(self.pos).copied()
+    }
+
+    fn bound_block(&self, pos: usize) -> BlockBound {
+        BlockBound {
+            min_len: self.bounds[pos],
+            last: Tid {
+                block: 0,
+                offset: 1,
+            },
+        }
+    }
+
+    fn bound_score(&mut self, pos: usize, scorer: &TermScorer) -> f32 {
+        if self.bound_scores.len() < self.keys.len() {
+            self.bound_scores.resize(self.keys.len(), None);
+        }
+        if let Some(score) = self.bound_scores[pos] {
+            return score;
+        }
+        let score = scorer.bound(&self.bound_block(pos)).min(self.term_max);
+        self.bound_scores[pos] = Some(score);
+        score
+    }
+
+    /// Loads the current chunk's members and the rank of its first member.
+    fn load(&mut self) {
+        let key = self.keys[self.pos];
+        self.members.clear();
+        match &self.list {
+            Some(list) => {
+                self.words.fill(0);
+                let start = list.partition_point(|o| ((*o >> 16) as u16) < key);
+                self.rank_base = start as u32;
+                for o in &list[start..] {
+                    if (*o >> 16) as u16 != key {
+                        break;
+                    }
+                    let low = (*o & 0xffff) as usize;
+                    self.words[low / 64] |= 1 << (low % 64);
+                    self.members.push(low as u16);
+                }
+                self.dense = false;
+            }
+            None => {
+                let chunk = segment_error(self.ordinals.chunk(self.pos));
+                chunk.words(&mut self.words);
+                chunk.members(&mut self.members);
+                self.dense = chunk.is_bitmap();
+                self.rank_base = chunk.before;
+            }
+        }
+    }
+
+    /// Whether the loaded chunk holds `low`, and the member's rank in the stream.
+    fn rank(&self, low: u16) -> Option<u32> {
+        let word = self.words[usize::from(low / 64)];
+        if word & (1 << (low % 64)) == 0 {
+            return None;
+        }
+        let before: u32 = self.words[..usize::from(low / 64)]
+            .iter()
+            .map(|w| w.count_ones())
+            .sum();
+        Some(self.rank_base + before + (word & ((1u64 << (low % 64)) - 1)).count_ones())
+    }
+}
+
+/// One source walked over its ordinal streams (ADR 0003): block-max WAND
+/// over the terms' chunks, then a fold of each admitted chunk into a
+/// candidate set scored in ordinal order.
+struct OrdinalWalk<'a, 's> {
+    scorer: &'s IndexScorer,
+    /// In slot order.
+    terms: Vec<OrdinalTerm<'a>>,
+    pages: PageTable<'a>,
+    documents: PostingsCursor<'a>,
+    document_count: u32,
+    lengths: Lengths<'a>,
+    /// Dead ordinals, ascending.
+    dead: &'s [u32],
+    visibility: &'s mut Visibility,
+    k: usize,
+    heap: &'s mut BinaryHeap<Ranked>,
+    scored: &'s mut usize,
+    iterations: u32,
+}
+
+impl OrdinalWalk<'_, '_> {
+    fn threshold(&self) -> Option<(f32, Tid)> {
+        if self.heap.len() == self.k {
+            self.heap.peek().map(|w| (w.0, w.1))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a document scoring at most `bound` could enter the top k; its
+    /// location is not known yet, so a tie is taken as beatable.
+    fn can_beat(&self, bound: f32) -> bool {
+        self.threshold()
+            .is_none_or(|(threshold, _)| bound >= threshold)
+    }
+
+    /// The heap location of the document at `ordinal`.
+    fn resolve(&mut self, ordinal: u32) -> Tid {
+        let entry = self.pages.entry_of(ordinal, self.document_count);
+        let block = self.pages.block(entry);
+        // Admissions come in ordinal order, so the cursor only moves forward:
+        // to the block through the page table, then posting by posting.
+        segment_error(self.documents.seek(Tid { block, offset: 1 }));
+        while self.documents.current().is_some() && self.documents.ordinal() < ordinal {
+            segment_error(self.documents.advance());
+        }
+        match self.documents.current() {
+            Some(tid) if tid.block == block && self.documents.ordinal() == ordinal => tid,
+            _ => crate::storage::corrupt(format!(
+                "Stannum index data: ordinal {ordinal} is not on heap block {block}"
+            )),
+        }
+    }
+
+    fn any(&mut self) {
+        let mut order: Vec<usize> = (0..self.terms.len()).collect();
+        let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
+        let mut present: Vec<usize> = Vec::with_capacity(self.terms.len());
+        loop {
+            self.iterations = self.iterations.wrapping_add(1);
+            if self.iterations.is_multiple_of(64) {
+                pgrx::check_for_interrupts!();
+            }
+            order.retain(|&t| self.terms[t].key().is_some());
+            if order.is_empty() {
+                return;
+            }
+            order.sort_unstable_by_key(|&t| self.terms[t].key());
+            let threshold = self.threshold();
+            // The pivot: the first chunk at which the terms up to it could
+            // together reach the threshold, by their whole-term maxima.
+            let mut reach = 0.0_f64;
+            let mut p = None;
+            for (j, &t) in order.iter().enumerate() {
+                reach += f64::from(self.terms[t].term_max);
+                if order
+                    .get(j + 1)
+                    .is_some_and(|&next| self.terms[next].key() == self.terms[t].key())
+                {
+                    continue;
+                }
+                if threshold.is_none_or(|(threshold, _)| {
+                    reach * (1.0 + f64::from(f32::EPSILON) * 256.0) >= f64::from(threshold)
+                }) {
+                    p = Some(j);
+                    break;
+                }
+            }
+            let Some(p) = p else {
+                // Even every remaining term together cannot reach the threshold.
+                return;
+            };
+            let pivot = self.terms[order[p]].key().expect("retained");
+            if self.terms[order[0]].key() != Some(pivot) {
+                // Move the terms behind the pivot chunk up to it.
+                for &t in &order[..p] {
+                    let term = &mut self.terms[t];
+                    if term.key() < Some(pivot) {
+                        term.pos += term.keys[term.pos..].partition_point(|key| *key < pivot);
+                    }
+                }
+                continue;
+            }
+            // Every term of the prefix is on the pivot chunk. Its bounds decide
+            // whether anything in it can enter the top k.
+            let mut bound = 0.0_f64;
+            for &t in &order[..=p] {
+                let pos = self.terms[t].pos;
+                let scorer = &self.scorer.terms[self.terms[t].slot].1;
+                bound += f64::from(self.terms[t].bound_score(pos, scorer));
+            }
+            if threshold.is_some_and(|(threshold, _)| {
+                bound * (1.0 + f64::from(f32::EPSILON) * 256.0) < f64::from(threshold)
+            }) {
+                for &t in &order[..=p] {
+                    self.terms[t].pos += 1;
+                }
+                continue;
+            }
+            // Every term of the prefix is on the pivot chunk: fold and score it.
+            present.clear();
+            present.extend(order[..=p].iter().copied());
+            present.sort_unstable();
+            self.evaluate(pivot, &present, &mut set);
+            for &t in &present {
+                self.terms[t].pos += 1;
+            }
+        }
+    }
+
+    /// Scores the documents of chunk `key` that the terms `present` (in slot
+    /// order) hold, against the bounds of those terms' chunks.
+    fn evaluate(&mut self, key: u16, present: &[usize], set: &mut segment::ordinals::Words) {
+        let base = u32::from(key) << 16;
+        for (n, &t) in present.iter().enumerate() {
+            self.terms[t].load();
+            if n == 0 {
+                set.copy_from_slice(&*self.terms[t].words);
+            } else {
+                for (out, word) in set.iter_mut().zip(self.terms[t].words.iter()) {
+                    *out |= *word;
+                }
+            }
+        }
+        let from = self.dead.partition_point(|o| *o < base);
+        for dead in &self.dead[from..] {
+            if *dead >= base + segment::ordinals::CHUNK {
+                break;
+            }
+            let low = (dead - base) as usize;
+            set[low / 64] &= !(1 << (low % 64));
+        }
+        let pruning = self.threshold().is_some();
+        // The essential terms: sorted by chunk bound, the fewest whose absence
+        // leaves the rest unable to reach the threshold. A candidate holds at
+        // least one of them, so only their members are visited; the other
+        // terms are tested by bit. Without a threshold every term is essential.
+        let mut by_bound: Vec<(f32, usize)> = present
+            .iter()
+            .map(|&t| {
+                let pos = self.terms[t].pos;
+                let scorer = &self.scorer.terms[self.terms[t].slot].1;
+                (self.terms[t].bound_score(pos, scorer), t)
+            })
+            .collect();
+        by_bound.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut essential = by_bound.len();
+        if let Some((threshold, _)) = self.threshold() {
+            let mut tail = 0.0_f64;
+            while essential > 0 {
+                let next = tail + f64::from(by_bound[essential - 1].0);
+                if next * (1.0 + f64::from(f32::EPSILON) * 256.0) >= f64::from(threshold) {
+                    break;
+                }
+                tail = next;
+                essential -= 1;
+            }
+            essential = essential.max(1);
+        }
+        let sparse = by_bound[..essential]
+            .iter()
+            .all(|(_, t)| !self.terms[*t].dense);
+        let mut lows: Vec<u16> = Vec::new();
+        if sparse {
+            for (_, t) in &by_bound[..essential] {
+                lows.extend_from_slice(&self.terms[*t].members);
+            }
+            lows.sort_unstable();
+            lows.dedup();
+        } else {
+            set.fill(0);
+            for (_, t) in &by_bound[..essential] {
+                for (out, word) in set.iter_mut().zip(self.terms[*t].words.iter()) {
+                    *out |= *word;
+                }
+            }
+        }
+        // Per sub-block, the best a candidate could score: the sum over the
+        // present terms of their largest bucket there at the chunk's shortest
+        // document; sub-blocks that cannot reach the threshold are skipped.
+        let mut sub_scores = [0.0_f32; SUBS];
+        if pruning {
+            for &t in present {
+                let term = &self.terms[t];
+                let scorer = &self.scorer.terms[term.slot].1;
+                let shortest = term.bound_block(term.pos).shortest();
+                for (sub, score) in term.sub_bounds[term.pos].iter().zip(sub_scores.iter_mut()) {
+                    if *sub > 0 {
+                        let bucket = TfBucket::new(*sub - 1).expect("bucket from a block bound");
+                        *score += scorer.score_bucket(bucket, shortest);
+                    }
+                }
+            }
+        }
+        let mut sparse_at = 0usize;
+        for i in 0..segment::ordinals::WORDS {
+            let mut word = if sparse {
+                let mut word = 0u64;
+                while sparse_at < lows.len() && usize::from(lows[sparse_at] / 64) == i {
+                    word |= 1 << (lows[sparse_at] % 64);
+                    sparse_at += 1;
+                }
+                word
+            } else {
+                set[i]
+            };
+            if word == 0 || (pruning && !self.can_beat(sub_scores[i / (SUB / 64)])) {
+                continue;
+            }
+            while word != 0 {
+                let low = (i * 64) as u16 + word.trailing_zeros() as u16;
+                word &= word - 1;
+                let ordinal = base + u32::from(low);
+                let length = segment_error(self.lengths.get(ordinal));
+                if pruning {
+                    let mut bound = 0.0_f32;
+                    for &t in present {
+                        let term = &self.terms[t];
+                        if term.words[usize::from(low / 64)] & (1 << (low % 64)) != 0 {
+                            let scorer = &self.scorer.terms[term.slot].1;
+                            bound += scorer.bound_for_length(&term.bound_block(term.pos), length);
+                        }
+                    }
+                    if !self.can_beat(bound) {
+                        continue;
+                    }
+                }
+                let mut total = 0.0_f32;
+                for &t in present {
+                    let Some(rank) = self.terms[t].rank(low) else {
+                        continue;
+                    };
+                    let term = &mut self.terms[t];
+                    segment_error(term.payload.seek(rank));
+                    let bucket = segment_error(term.payload.next_bucket());
+                    let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
+                        crate::storage::corrupt(format!(
+                            "Stannum index data: term-frequency bucket {bucket} out of range"
+                        ))
+                    });
+                    total += self.scorer.terms[term.slot].1.score_bucket(bucket, length);
+                }
+                *self.scored += 1;
+                let admit =
+                    self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
+                if !admit {
+                    continue;
+                }
+                let tid = self.resolve(ordinal);
+                let candidate = Ranked(total, tid);
+                if self.heap.len() < self.k {
+                    if self.visibility.visible(tid) {
+                        self.heap.push(candidate);
+                    }
+                } else if self.heap.peek().is_some_and(|w| candidate < *w)
+                    && self.visibility.visible(tid)
+                {
+                    self.heap.pop();
+                    self.heap.push(candidate);
+                }
+            }
+        }
     }
 }
 
