@@ -131,8 +131,11 @@
   fetched range stayed in the reader's arena until the query ended (a
   phrase of common words held 480 MB per backend at 15 million rows, and
   the 150 million row run was killed for memory). The ranges are shared
-  through a least-recently-used cache of `stannum.read_cache_mb` (128 MiB)
-  per backend, so frequent terms' chunks stay warm. A cursor over a term's
+  through a least-recently-used cache of `stannum.read_cache_mb` (64 MiB)
+  per backend, so frequent terms' chunks stay warm; `stannum.reader_cache_mb`
+  defaults to 160 MiB, and a segment's dictionary index is held at every
+  sixteenth block rather than whole, so eight backends fit beside 24 GiB of
+  shared buffers in a 32 GiB container at 150 million rows. A cursor over a term's
   TID postings streams its block-bound table the same way and keeps only
   the bounds between its block and its lookahead, where it decoded and kept
   every block it passed (500 MB for one phrase at 150 million rows). Ranked queries the

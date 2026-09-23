@@ -297,7 +297,7 @@ Reads from a segment are bounded per cursor: a payload cursor holds one span
 of skip slots, an ordinal cursor one chunk, a lengths cursor one window of
 16,384 documents and a postings cursor one 16 KiB window, each replaced by
 the next. Those ranges are shared through a per-backend least-recently-used
-cache of `stannum.read_cache_mb` (128 MiB), so the hot chunks of frequent
+cache of `stannum.read_cache_mb` (64 MiB), so the hot chunks of frequent
 terms stay resident across queries while a sweep of a long stream displaces
 only itself. Block-bound tables are streamed the same way, and a cursor keeps only the
 bounds between its block and its furthest lookahead. Only headers, dictionary

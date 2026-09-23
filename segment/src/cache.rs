@@ -46,7 +46,7 @@ struct Cache {
 
 /// The default budget: enough for the hot streams of a benchmark workload
 /// across a segment directory.
-pub const DEFAULT_BUDGET: usize = 128 * 1024 * 1024;
+pub const DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 
 thread_local! {
     static CACHE: RefCell<Cache> = RefCell::new(Cache {

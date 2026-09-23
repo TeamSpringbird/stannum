@@ -198,13 +198,25 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
-/// The decoded block index: where each block starts and its first term.
+/// Index entries held decoded, out of every `SAMPLE`: a segment of millions
+/// of terms has hundreds of thousands of blocks, and a backend holds the
+/// index of every segment it reads, so the rest are parsed from the index
+/// bytes on demand, at most `SAMPLE` entries per lookup.
+const SAMPLE: usize = 16;
+
+/// The block index: where each block starts and its first term, decoded at
+/// every `SAMPLE`th block and parsed between those on demand.
 #[derive(Clone, Debug)]
 pub struct DictionaryIndex<'a> {
     count: usize,
     /// Byte length of the header and index, so callers can locate the blocks.
     pub header_len: usize,
-    entries: Vec<(&'a [u8], usize)>,
+    /// The index entries as written.
+    index_bytes: &'a [u8],
+    blocks: usize,
+    /// Every `SAMPLE`th entry: its first term, its block's offset and where
+    /// the entry starts in `index_bytes`.
+    samples: Vec<(&'a [u8], usize, usize)>,
 }
 
 impl<'a> DictionaryIndex<'a> {
@@ -222,20 +234,21 @@ impl<'a> DictionaryIndex<'a> {
         let header_len = reader.position();
         // Each index entry needs at least two varints. Do not reserve
         // from a claimed block count before reading those bytes.
-        let mut entries = Vec::with_capacity(block_count.min(index_bytes.len() / 2));
+        let mut samples = Vec::with_capacity(block_count.min(index_bytes.len() / 2) / SAMPLE + 1);
         let mut index_reader = Reader::new(index_bytes);
-        let mut previous: Option<&[u8]> = None;
-        for _ in 0..block_count {
+        let mut previous: Option<(&[u8], usize)> = None;
+        for block in 0..block_count {
+            let at = index_reader.position();
             let offset = index_reader.varint_u32()? as usize;
             let len = index_reader.varint_u32()? as usize;
             let first = index_reader.take(len)?;
-            if previous.is_some_and(|p| p >= first)
-                || entries.last().is_some_and(|(_, o)| *o >= offset)
-            {
+            if previous.is_some_and(|(p, o)| p >= first || o >= offset) {
                 return Err(Error::Corrupt("dictionary index order"));
             }
-            entries.push((first, offset));
-            previous = Some(first);
+            if block.is_multiple_of(SAMPLE) {
+                samples.push((first, offset, at));
+            }
+            previous = Some((first, offset));
         }
         if index_reader.remaining() != 0 {
             return Err(Error::Corrupt("dictionary index length"));
@@ -243,8 +256,27 @@ impl<'a> DictionaryIndex<'a> {
         Ok(Self {
             count,
             header_len,
-            entries,
+            index_bytes,
+            blocks: block_count,
+            samples,
         })
+    }
+
+    /// Entry `block`: its first term and its block's offset. Parsed forward
+    /// from the nearest sample; the bytes were validated when parsed.
+    fn entry(&self, block: usize) -> Option<(&'a [u8], usize)> {
+        if block >= self.blocks {
+            return None;
+        }
+        let (first, offset, at) = self.samples[block / SAMPLE];
+        let mut entry = (first, offset);
+        let mut reader = Reader::at(self.index_bytes, at);
+        for _ in 0..block % SAMPLE + 1 {
+            let offset = reader.varint_u32().ok()? as usize;
+            let len = reader.varint_u32().ok()? as usize;
+            entry = (reader.take(len).ok()?, offset);
+        }
+        Some(entry)
     }
 
     /// How many bytes of a stream are needed to parse the index: the header
@@ -265,21 +297,32 @@ impl<'a> DictionaryIndex<'a> {
         self.count == 0
     }
 
-    pub fn blocks(&self) -> usize {
-        self.entries.len()
+    pub const fn blocks(&self) -> usize {
+        self.blocks
     }
 
     /// First term of block `block`, as recorded in the index.
     pub fn block_first(&self, block: usize) -> Option<&'a [u8]> {
-        self.entries.get(block).map(|(first, _)| *first)
+        self.entry(block).map(|(first, _)| first)
     }
 
     /// Index of the block that could contain `term`, if any block starts at or
     /// before it.
     fn block_for(&self, term: &[u8]) -> Option<usize> {
-        self.entries
-            .partition_point(|(first, _)| *first <= term)
-            .checked_sub(1)
+        // The last sample at or before the term, then the last entry at or
+        // before it among the ones up to the next sample.
+        let sample = self
+            .samples
+            .partition_point(|(first, _, _)| *first <= term)
+            .checked_sub(1)?;
+        let mut block = sample * SAMPLE;
+        for next in block + 1..(block + SAMPLE).min(self.blocks) {
+            match self.entry(next) {
+                Some((first, _)) if first <= term => block = next,
+                _ => break,
+            }
+        }
+        Some(block)
     }
 
     fn block_terms(&self, block: usize) -> usize {
@@ -288,11 +331,10 @@ impl<'a> DictionaryIndex<'a> {
 
     /// Byte range of block `block` within the blocks area.
     fn block_range(&self, block: usize, blocks_len: usize) -> (usize, usize) {
-        let start = self.entries[block].1;
+        let start = self.entry(block).expect("block index is in range").1;
         let end = self
-            .entries
-            .get(block + 1)
-            .map_or(blocks_len, |(_, offset)| *offset);
+            .entry(block + 1)
+            .map_or(blocks_len, |(_, offset)| offset);
         (start, end)
     }
 }
@@ -843,7 +885,7 @@ mod tests {
         let sizes = owned.view().block_sizes(1).unwrap();
         assert_eq!(sizes.len(), 6);
         let last_at = owned.index.header_len
-            + owned.index.entries[1].1
+            + owned.index.entry(1).unwrap().1
             + sizes[..5].iter().map(|(_, _, n)| n).sum::<usize>();
         let mut tampered = bytes.clone();
         assert_eq!(tampered[last_at + 2], b'9');
