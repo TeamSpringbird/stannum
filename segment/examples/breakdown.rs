@@ -86,6 +86,8 @@ impl Breakdown {
         self.sections.payload += sections.payload;
         self.sections.docs += sections.docs;
         self.sections.lengths += sections.lengths;
+        self.sections.ordinals += sections.ordinals;
+        self.sections.pages += sections.pages;
         let dictionary = segment.dictionary()?;
         for block in 0..dictionary.index().blocks() {
             for (_, entry, entry_len) in dictionary.block_sizes(block)? {
@@ -123,6 +125,8 @@ impl Breakdown {
             ("payload", self.sections.payload),
             ("docs", self.sections.docs),
             ("lengths", self.sections.lengths),
+            ("ordinals", self.sections.ordinals),
+            ("pages", self.sections.pages),
         ] {
             println!("  {name:<12} {n:>12} {:>6.1}%", share(n));
         }
