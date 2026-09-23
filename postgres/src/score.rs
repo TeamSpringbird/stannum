@@ -1457,6 +1457,7 @@ impl PageTable<'_> {
 
 /// Ordinals per sub-block of a chunk, at which a walk prunes within a chunk.
 const SUB: usize = segment::ordinals::SUB as usize;
+
 /// Sub-blocks per chunk.
 const SUBS: usize = segment::ordinals::SUBS;
 
@@ -1784,28 +1785,52 @@ impl OrdinalWalk<'_, '_> {
         set: &mut segment::ordinals::Words,
     ) {
         let base = u32::from(key) << 16;
-        for term in &mut self.terms {
-            term.load();
-        }
-        for filter in &mut self.filters {
-            filter.load();
-        }
         // The shared members: the lead's array tested against the others'
-        // bits, or the words of every stream combined.
+        // bits, or the words of every stream combined. Streams are loaded
+        // rarest first and only while members remain, so a conjunction of
+        // common words with a rare one reads the common words' chunks only
+        // where the rare one has documents that survive.
+        self.terms[lead].load();
         let sparse = !self.terms[lead].dense;
         let mut lows: Vec<u16> = Vec::new();
         if sparse {
-            lows.extend(self.terms[lead].members.iter().copied().filter(|low| {
-                let (word, bit) = (usize::from(low / 64), low % 64);
-                self.terms
-                    .iter()
-                    .chain(&self.filters)
-                    .all(|term| term.words[word] & (1 << bit) != 0)
-            }));
+            lows.extend_from_slice(&self.terms[lead].members);
         } else {
             set.copy_from_slice(&*self.terms[lead].words);
-            for term in self.terms.iter().chain(&self.filters) {
+        }
+        let mut order: Vec<usize> = (0..self.terms.len()).filter(|&t| t != lead).collect();
+        order.sort_by_key(|&t| self.terms[t].keys.len());
+        for t in order {
+            if if sparse {
+                lows.is_empty()
+            } else {
+                set.iter().all(|w| *w == 0)
+            } {
+                return;
+            }
+            let term = &mut self.terms[t];
+            term.load();
+            if sparse {
+                lows.retain(|low| term.words[usize::from(low / 64)] & (1 << (low % 64)) != 0);
+            } else {
                 for (out, word) in set.iter_mut().zip(term.words.iter()) {
+                    *out &= *word;
+                }
+            }
+        }
+        for filter in &mut self.filters {
+            if if sparse {
+                lows.is_empty()
+            } else {
+                set.iter().all(|w| *w == 0)
+            } {
+                return;
+            }
+            filter.load();
+            if sparse {
+                lows.retain(|low| filter.words[usize::from(low / 64)] & (1 << (low % 64)) != 0);
+            } else {
+                for (out, word) in set.iter_mut().zip(filter.words.iter()) {
                     *out &= *word;
                 }
             }
@@ -1875,34 +1900,12 @@ impl OrdinalWalk<'_, '_> {
                 word &= word - 1;
                 let ordinal = base + u32::from(low);
                 let length = segment_error(self.lengths.get(ordinal));
-                if pruning {
-                    let mut bound = 0.0_f32;
-                    for term in &self.terms {
-                        let scorer = &self.scorer.terms[term.slot].1;
-                        bound += scorer.bound_for_length(&term.bound_block(term.pos), length);
-                    }
-                    if !self.can_beat(bound, ordinal) {
-                        continue;
-                    }
-                }
-                let mut total = 0.0_f32;
-                for t in 0..self.terms.len() {
-                    let Some(rank) = self.terms[t].rank(low) else {
-                        crate::storage::corrupt(format!(
-                            "Stannum index data: ordinal {ordinal} is missing from a term's chunk"
-                        ))
-                    };
-                    let term = &mut self.terms[t];
-                    segment_error(term.payload.seek(rank));
-                    let bucket = segment_error(term.payload.next_bucket());
-                    let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
-                        crate::storage::corrupt(format!(
-                            "Stannum index data: term-frequency bucket {bucket} out of range"
-                        ))
-                    });
-                    total += self.scorer.terms[term.slot].1.score_bucket(bucket, length);
-                }
-                *self.scored += 1;
+                let sub = usize::from(low) / SUB;
+                let all: Vec<usize> = (0..self.terms.len()).collect();
+                let Some(total) = self.score_candidate(&all, low, ordinal, length, sub, pruning)
+                else {
+                    continue;
+                };
                 let admit =
                     self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
                 if !admit {
@@ -1926,6 +1929,77 @@ impl OrdinalWalk<'_, '_> {
 
     /// Scores the documents of chunk `key` that the terms `present` (in slot
     /// order) hold, against the bounds of those terms' chunks.
+    /// The score of the document `low` of the current chunk, or `None` when
+    /// it cannot reach the threshold. Of the terms `present` (in slot order)
+    /// those holding the document are bounded by their sub-block's largest
+    /// bucket at the document's length, which costs no read; the payloads
+    /// are then read largest bound first and abandoned as soon as the exact
+    /// contributions so far and the bounds of the rest fall short. Every sum
+    /// is folded in slot order, as the exhaustive path folds the total, so
+    /// the bound of a fully read candidate is its exact score, bit for bit.
+    fn score_candidate(
+        &mut self,
+        present: &[usize],
+        low: u16,
+        ordinal: u32,
+        length: u32,
+        sub: usize,
+        pruning: bool,
+    ) -> Option<f32> {
+        // Per term of `present`: its bound, replaced by its exact score once
+        // read; and the terms holding the document by descending bound.
+        let mut values: Vec<f32> = vec![0.0; present.len()];
+        let mut uppers: Vec<(f32, usize)> = Vec::with_capacity(present.len());
+        for (n, &t) in present.iter().enumerate() {
+            let term = &self.terms[t];
+            if term.words[usize::from(low / 64)] & (1 << (low % 64)) == 0 {
+                continue;
+            }
+            // The tighter of the sub-block's largest bucket at this length
+            // and the chunk bound, whose shortest document per bucket rules
+            // out the buckets no document this short has.
+            let scorer = &self.scorer.terms[term.slot].1;
+            let top = term.sub_bounds[term.pos][sub];
+            let upper = if top == 0 {
+                0.0
+            } else {
+                let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
+                scorer
+                    .score_bucket(bucket, length)
+                    .min(scorer.bound_for_length(&term.bound_block(term.pos), length))
+            };
+            values[n] = upper;
+            uppers.push((upper, n));
+        }
+        let fold = |values: &[f32]| values.iter().fold(0.0_f32, |sum, v| sum + v);
+        if pruning && !self.can_beat(fold(&values), ordinal) {
+            return None;
+        }
+        *self.scored += 1;
+        uppers.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for &(_, n) in &uppers {
+            let t = present[n];
+            let term = &mut self.terms[t];
+            let rank = term.rank(low).unwrap_or_else(|| {
+                crate::storage::corrupt(format!(
+                    "Stannum index data: ordinal {ordinal} is missing from a term's chunk"
+                ))
+            });
+            segment_error(term.payload.seek(rank));
+            let bucket = segment_error(term.payload.next_bucket());
+            let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
+                crate::storage::corrupt(format!(
+                    "Stannum index data: term-frequency bucket {bucket} out of range"
+                ))
+            });
+            values[n] = self.scorer.terms[term.slot].1.score_bucket(bucket, length);
+            if pruning && !self.can_beat(fold(&values), ordinal) {
+                return None;
+            }
+        }
+        Some(fold(&values))
+    }
+
     fn evaluate(&mut self, key: u16, present: &[usize], set: &mut segment::ordinals::Words) {
         let base = u32::from(key) << 16;
         for (n, &t) in present.iter().enumerate() {
@@ -2040,35 +2114,11 @@ impl OrdinalWalk<'_, '_> {
                 word &= word - 1;
                 let ordinal = base + u32::from(low);
                 let length = segment_error(self.lengths.get(ordinal));
-                if pruning {
-                    let mut bound = 0.0_f32;
-                    for &t in present {
-                        let term = &self.terms[t];
-                        if term.words[usize::from(low / 64)] & (1 << (low % 64)) != 0 {
-                            let scorer = &self.scorer.terms[term.slot].1;
-                            bound += scorer.bound_for_length(&term.bound_block(term.pos), length);
-                        }
-                    }
-                    if !self.can_beat(bound, ordinal) {
-                        continue;
-                    }
-                }
-                let mut total = 0.0_f32;
-                for &t in present {
-                    let Some(rank) = self.terms[t].rank(low) else {
-                        continue;
-                    };
-                    let term = &mut self.terms[t];
-                    segment_error(term.payload.seek(rank));
-                    let bucket = segment_error(term.payload.next_bucket());
-                    let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
-                        crate::storage::corrupt(format!(
-                            "Stannum index data: term-frequency bucket {bucket} out of range"
-                        ))
-                    });
-                    total += self.scorer.terms[term.slot].1.score_bucket(bucket, length);
-                }
-                *self.scored += 1;
+                let sub = usize::from(low) / SUB;
+                let Some(total) = self.score_candidate(present, low, ordinal, length, sub, pruning)
+                else {
+                    continue;
+                };
                 let admit =
                     self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
                 if !admit {
