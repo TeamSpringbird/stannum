@@ -1300,6 +1300,7 @@ unsafe fn scan_query(exec: &ScanExec) -> Query {
 
 unsafe fn start_stream(exec: &mut ScanExec) {
     unsafe {
+        crate::score::reset_walk_blocks();
         let query = scan_query(exec);
         let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
         let stream = crate::stream::CandidateStream::new(view, query);
@@ -1908,6 +1909,7 @@ unsafe extern "C-unwind" fn exec_count(
         }
         let mut count = 0i64;
         let fetch_slot = exec.fetch_slot;
+        crate::score::reset_walk_blocks();
         if heap_fallback(exec) {
             // Count through a heap scan with the original clause.
             let scan = pg_sys::table_beginscan(exec.heap, snapshot, 0, std::ptr::null_mut());
@@ -2287,57 +2289,51 @@ unsafe extern "C-unwind" fn explain(
                         exec.walk_blocks.1,
                         es,
                     );
-                    pg_sys::ExplainPropertyInteger(
-                        c"Visibility Checks".as_ptr(),
-                        std::ptr::null(),
-                        crate::score::visibility_checks(),
-                        es,
-                    );
-                    pg_sys::ExplainPropertyInteger(
-                        c"Chunks Loaded".as_ptr(),
-                        std::ptr::null(),
-                        crate::score::chunk_loads(),
-                        es,
-                    );
-                    let area_bytes = crate::score::area_bytes();
-                    let area_disk = crate::score::area_disk();
-                    let fetched = area_bytes
-                        .iter()
-                        .zip(segment::cache::AREA_NAMES)
-                        .filter(|(bytes, _)| **bytes != 0)
-                        .map(|(bytes, name)| format!("{name} {bytes}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if let Ok(text) = CString::new(fetched) {
-                        pg_sys::ExplainPropertyText(c"Bytes Fetched".as_ptr(), text.as_ptr(), es);
-                    }
-                    let from_disk = area_disk
-                        .iter()
-                        .zip(segment::cache::AREA_NAMES)
-                        .filter(|(pages, _)| **pages != 0)
-                        .map(|(pages, name)| format!("{name} {pages}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if let Ok(text) = CString::new(from_disk) {
-                        pg_sys::ExplainPropertyText(
-                            c"Disk Pages By Area".as_ptr(),
-                            text.as_ptr(),
-                            es,
-                        );
-                    }
-                    let phases = crate::score::phase_disk()
-                        .iter()
-                        .map(|(name, pages)| format!("{name} {pages}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if let Ok(text) = CString::new(phases) {
-                        pg_sys::ExplainPropertyText(
-                            c"Disk Pages By Phase".as_ptr(),
-                            text.as_ptr(),
-                            es,
-                        );
-                    }
                 }
+            }
+            // Read accounting for every scan that ran, pruned or not: a phrase
+            // scored from the candidate stream reads as much as any walk.
+            pg_sys::ExplainPropertyInteger(
+                c"Visibility Checks".as_ptr(),
+                std::ptr::null(),
+                crate::score::visibility_checks(),
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
+                c"Chunks Loaded".as_ptr(),
+                std::ptr::null(),
+                crate::score::chunk_loads(),
+                es,
+            );
+            let area_bytes = crate::score::area_bytes();
+            let area_disk = crate::score::area_disk();
+            let fetched = area_bytes
+                .iter()
+                .zip(segment::cache::AREA_NAMES)
+                .filter(|(bytes, _)| **bytes != 0)
+                .map(|(bytes, name)| format!("{name} {bytes}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(fetched) {
+                pg_sys::ExplainPropertyText(c"Bytes Fetched".as_ptr(), text.as_ptr(), es);
+            }
+            let from_disk = area_disk
+                .iter()
+                .zip(segment::cache::AREA_NAMES)
+                .filter(|(pages, _)| **pages != 0)
+                .map(|(pages, name)| format!("{name} {pages}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(from_disk) {
+                pg_sys::ExplainPropertyText(c"Disk Pages By Area".as_ptr(), text.as_ptr(), es);
+            }
+            let phases = crate::score::phase_disk()
+                .iter()
+                .map(|(name, pages)| format!("{name} {pages}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(phases) {
+                pg_sys::ExplainPropertyText(c"Disk Pages By Phase".as_ptr(), text.as_ptr(), es);
             }
             if exec.ordered {
                 pg_sys::ExplainPropertyInteger(

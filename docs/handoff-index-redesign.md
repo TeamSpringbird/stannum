@@ -64,11 +64,24 @@ pages. `af24e4c` bounds reclamation per insert, which fixes the latency spike it
 caused, but not the space.
 
 Disk reads per ranked query in steady state on the mock (2 GB shared buffers
-against a 21.7 GB index, 360 distinct published queries): 319 pages, 2.43 MB.
-By relation, index 92% and heap 8%. The heap is entirely 49 random reads per
-query for row visibility. Within the index, by area: ordinals 26%, payload 20%,
-scorer setup 13% (capturing the view plus a dictionary lookup per term per
-segment), postings 6%.
+against a 21.7 GB index, 360 distinct published queries, 120 per style): 318
+pages, 2.43 MB. By relation, index 92% and heap 8%. The heap is 49 visibility
+checks per query, 25 of them random reads. Within the index, by area, now that
+every scan reports its counters (see below): payload 42%, ordinals 28%, TID
+postings 27%, and 2% planning. Scorer setup (capturing the view plus a
+dictionary lookup per term per segment) is 14%, inside those areas.
+
+| style | index pages | ordinals | payload | postings | heap | visibility checks |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| conjunction | 307 | 154 | 76 | 56 | 16 | 20 |
+| disjunction | 205 | 90 | 115 | 0 | 58 | 125 |
+| phrase | 368 | 1 | 182 | 184 | 1 | 0 |
+
+Phrase queries are the heaviest readers and read only the two areas the
+redesign removes or moves: the TID postings and the interleaved positions.
+Disjunctions read no postings at all; their payload reads are the frequency
+buckets the scorer needs, dragged in with positions. Measured with
+`benchmarks/local/attrib.py`.
 
 ### Negative results worth not repeating
 
@@ -124,12 +137,16 @@ per-query read count comes from.
 
 ## Order of work
 
-1. **Close the attribution gap first.** PostgreSQL reports 105,532 index page
-   reads where every buffer read in the extension accounts for 58,335. It is not
-   autovacuum, which was disabled and re-measured, and not planning, which is 2%.
-   Something reads our index that we do not call. Forty percent is large enough
-   to reorder this list, so resolve it before committing to the format. The
-   counters to extend are already in place; see below.
+1. **Close the attribution gap first.** Done 2026-09-23. PostgreSQL reported
+   105,532 index page reads where the extension's counters accounted for
+   58,335. Nothing unknown was reading the index: the EXPLAIN callback printed
+   the area and phase counters only for scans that pruned by ordinal, so every
+   phrase query (scored from the candidate stream) and every conjunction that
+   fell back reported nothing. With the counters printed for every scan and
+   reset at the start of unordered and count scans too, the extension accounts
+   for 103,038 of the 105,522 pages and planning for the other 2,484. The
+   table above is the corrected breakdown; the previous one understated payload
+   and postings by leaving phrase queries out entirely.
 2. Delete the TID postings (item 1). Measure size and reads.
 3. Split positions out and put frequency inline (items 2 and 3). Measure.
 4. Liveness bitmap and compact lengths (items 4 and 5). Measure.
@@ -159,6 +176,12 @@ the measurement starts.
 - Per-query detail: `benchmarks/local/mock-probe.py IMAGE LABEL [N]` reports
   pages touched, candidates scored, disk read and time with the cache dropped
   before each query.
+- Read attribution: `benchmarks/local/attrib.py IMAGE [WARM] [STEADY]` runs a
+  warm-up slice and then a disjoint steady slice of the published queries and
+  reconciles three views of every page read: `pg_statio` by relation, the
+  EXPLAIN node counters, and the extension's area and phase counters, per
+  style. It needs `psycopg`; `/tmp/stannum-venv/bin/python` has it on this
+  machine.
 - An iteration is a new image plus a five-minute run:
   `python3 benchmarks/tin.py build-image --image stannum-bench:arm64-<tag> --base postgres:18-trixie --output /tmp/<tag>`.
 
