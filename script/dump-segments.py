@@ -80,9 +80,11 @@ def main():
     parser.add_argument("--dbname", required=True)
     parser.add_argument("--index", required=True)
     parser.add_argument("--out", required=True, help="directory for gen<N>.segment files")
+    parser.add_argument("--data-directory", help="the server's data directory as this host sees it, "
+                        "for a server in a container whose directory is bind-mounted")
     args = parser.parse_args()
     psql(args.dbname, "CHECKPOINT")
-    data_directory = psql(args.dbname, "SHOW data_directory")
+    data_directory = args.data_directory or psql(args.dbname, "SHOW data_directory")
     relative = psql(args.dbname, f"SELECT pg_relation_filepath('{args.index}')")
     relation = Relation(Path(data_directory) / relative)
     kind, meta = relation.page(0)

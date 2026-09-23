@@ -61,6 +61,75 @@ thread_local! {
     static NEXT_READER: Cell<u64> = const { Cell::new(1) };
 }
 
+/// Areas of a segment, in blob order, for read accounting.
+pub const AREAS: usize = 8;
+/// Names of [`AREAS`], in order.
+pub const AREA_NAMES: [&str; AREAS] = [
+    "header",
+    "dictionary",
+    "postings",
+    "payload",
+    "documents",
+    "lengths",
+    "ordinals",
+    "pages",
+];
+
+thread_local! {
+    static AREA_BYTES: Cell<[u64; AREAS]> = const { Cell::new([0; AREAS]) };
+    static AREA_DISK: Cell<[u64; AREAS]> = const { Cell::new([0; AREAS]) };
+    /// The host's count of pages read from storage, where it offers one.
+    static DISK_PROBE: Cell<Option<fn() -> u64>> = const { Cell::new(None) };
+}
+
+/// Installs the host's counter of pages read from storage, so fetches can be
+/// attributed to the area that caused them.
+pub fn set_disk_probe(probe: fn() -> u64) {
+    DISK_PROBE.set(Some(probe));
+}
+
+/// The host's count of pages read from storage; zero without a probe.
+pub fn disk_pages() -> u64 {
+    DISK_PROBE.get().map_or(0, |probe| probe())
+}
+
+/// Records pages `area` caused to be read from storage.
+pub fn note_disk(area: usize, pages: u64) {
+    if pages == 0 {
+        return;
+    }
+    AREA_DISK.with(|counts| {
+        let mut all = counts.get();
+        all[area.min(AREAS - 1)] += pages;
+        counts.set(all);
+    });
+}
+
+/// Pages read from storage per area since the last reset.
+pub fn area_disk() -> [u64; AREAS] {
+    AREA_DISK.with(Cell::get)
+}
+
+/// Records bytes fetched from a segment's `area`, counted only where the
+/// caches missed and the source was actually read.
+pub fn note_read(area: usize, bytes: usize) {
+    AREA_BYTES.with(|counts| {
+        let mut all = counts.get();
+        all[area.min(AREAS - 1)] += bytes as u64;
+        counts.set(all);
+    });
+}
+
+/// Bytes fetched per area since the last reset.
+pub fn area_bytes() -> [u64; AREAS] {
+    AREA_BYTES.with(Cell::get)
+}
+
+pub fn reset_areas() {
+    AREA_BYTES.with(|counts| counts.set([0; AREAS]));
+    AREA_DISK.with(|counts| counts.set([0; AREAS]));
+}
+
 /// A fresh identity for a reader, so its ranges never collide with another
 /// reader's over the same offsets.
 pub fn reader_id() -> u64 {

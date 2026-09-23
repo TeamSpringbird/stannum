@@ -245,7 +245,7 @@ impl Buffer {
     /// `index` is a live index relation; `block` is an existing block.
     unsafe fn read(index: pg_sys::Relation, block: u32, exclusive: bool) -> Self {
         unsafe {
-            let buffer = pg_sys::ReadBuffer(index, block);
+            let buffer = crate::score::charging("buffer read", || pg_sys::ReadBuffer(index, block));
             pg_sys::LockBuffer(
                 buffer,
                 if exclusive {
@@ -792,6 +792,12 @@ impl segment::source::Source for RunSource {
     }
 
     fn read(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
+        crate::score::charging("run source", || self.read_inner(offset, len))
+    }
+}
+
+impl RunSource {
+    fn read_inner(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
         let end = offset
             .checked_add(len as u64)
             .filter(|end| *end <= u64::from(self.run.bytes))
@@ -925,6 +931,12 @@ pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new
 /// `stannum.read_cache_mb`: the budget of [`segment::cache`], the least
 /// recently used ranges cursors sweep, applied whenever a view is captured.
 pub static READ_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(64);
+
+/// `stannum.reclaim_pages`: pages of retired runs an insert frees after a
+/// fold. A merge of a large segment retires millions of pages, and freeing
+/// them all at once blocked the inserting backend for minutes; the rest wait
+/// for the next fold or for VACUUM.
+pub static RECLAIM_PAGES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(2048);
 
 thread_local! {
     static SEGMENT_READERS: RefCell<SegmentReaders> = RefCell::new(HashMap::new());
@@ -2130,6 +2142,12 @@ pub unsafe fn view_is_current(index_oid: pg_sys::Oid, view: &View) -> bool {
 /// # Safety
 /// `index_oid` names a live LDP2 index the caller may open.
 pub unsafe fn view(index_oid: pg_sys::Oid) -> View {
+    // Capturing a view reads the meta page, each segment's page table and
+    // each dead list: index pages no segment reader accounts for.
+    crate::score::charging("view capture", || unsafe { view_inner(index_oid) })
+}
+
+unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
     unsafe {
         let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
         let index = relation.as_ptr();
@@ -2770,29 +2788,60 @@ unsafe fn replace_entries(index: pg_sys::Relation, identity: u64, inputs: &[Segm
 /// found unchanged was neither, so the pages walked are still its own. A
 /// crash between publication and freeing leaves orphans for the next cleanup.
 unsafe fn reclaim_pending(index: pg_sys::Relation) {
+    let budget = RECLAIM_PAGES.get().max(1) as usize;
     let captured = unsafe { read_meta(index, false) }.1;
-    let mut removable: Vec<(Pending, Vec<u32>)> = Vec::new();
+    // Each entry: what it was, the prefix of its chain to free, and where the
+    // rest of the chain continues.
+    let mut removable: Vec<(Pending, Vec<u32>, u32)> = Vec::new();
+    let mut left = budget;
     for pending in &captured.pending {
+        if left == 0 {
+            break;
+        }
         let xid = pg_sys::TransactionId::from(pending.xid);
         if !unsafe { pg_sys::GlobalVisCheckRemovableXid(index, xid) } {
             continue;
         }
-        let (pages, _) =
-            unsafe { verify::chain_pages(index, pending.run.first, pending.run.blocks, KIND_RUN) };
-        removable.push((*pending, pages));
+        // Only a bounded prefix per call: a run retired by a merge of a large
+        // segment is millions of pages, and walking and freeing all of them
+        // held up the insert that triggered the fold for minutes.
+        let limit = pending.run.blocks.min(left as u32);
+        let (pages, next) =
+            unsafe { verify::chain_pages(index, pending.run.first, limit, KIND_RUN) };
+        left -= pages.len().min(left);
+        removable.push((*pending, pages, next));
     }
-    if removable.is_empty() {
+    if removable.iter().all(|(_, pages, _)| pages.is_empty()) {
         return;
     }
     race_point("reclaim:collected");
     let (guard, mut meta) = unsafe { read_meta(index, true) };
     let mut freeing = Vec::new();
     if meta.identity == captured.identity {
-        for (pending, pages) in removable {
-            if let Some(position) = meta.pending.iter().position(|p| *p == pending) {
-                meta.pending.remove(position);
-                freeing.push((pending.xid, pages));
+        for (pending, pages, next) in removable {
+            if pages.is_empty() {
+                continue;
             }
+            let Some(position) = meta.pending.iter().position(|p| *p == pending) else {
+                continue;
+            };
+            let freed = pages.len() as u32;
+            let rest = pending.run.blocks - freed;
+            if rest == 0 || next == NONE {
+                meta.pending.remove(position);
+            } else {
+                // The chain from `next` is untouched, so the remainder stands
+                // on its own and the next call carries on from there.
+                meta.pending[position].run = Run {
+                    first: next,
+                    blocks: rest,
+                    bytes: pending
+                        .run
+                        .bytes
+                        .saturating_sub(freed.saturating_mul(CHAIN_CAPACITY as u32)),
+                };
+            }
+            freeing.push((pending.xid, pages));
         }
     }
     if freeing.is_empty() {

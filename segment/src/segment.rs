@@ -480,6 +480,11 @@ impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
 }
 
 /// Document lengths per window of the length table a paged source hands out.
+/// One lookup needs four bytes, and the table of a large segment is far
+/// bigger than a backend's read cache, so a wide window evicted everything
+/// else to serve one value. The window is a fraction of a page and is not
+/// cached privately: the table is already in shared buffers, which every
+/// backend shares.
 const LENGTH_WINDOW: u32 = 2048;
 
 /// Fetches extents of the postings and payload areas and document lengths.
@@ -671,6 +676,39 @@ impl<S: Source> Reader<S> {
 
     /// Bytes `[offset, offset + len)` of the source, borrowed for as long as
     /// this reader lives.
+    /// Which area of the blob `offset` lies in, for read accounting.
+    fn area_of(&self, offset: u64) -> usize {
+        let header = &self.header;
+        match offset {
+            _ if offset >= header.pages_at => 7,
+            _ if offset >= header.ordinals_at => 6,
+            _ if offset >= header.lengths_at => 5,
+            _ if offset >= header.docs_at => 4,
+            _ if offset >= header.payload_at => 3,
+            _ if offset >= header.postings_at => 2,
+            _ if offset >= header.dictionary_at => 1,
+            _ => 0,
+        }
+    }
+
+    /// A range read straight from the source, kept by the caller alone: for
+    /// a table that shared buffers already cache, where a private copy would
+    /// only evict what nothing else holds.
+    fn read_uncached(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        if let Some(slice) = self.source.slice(offset, len) {
+            return Ok(Rc::from(slice));
+        }
+        let area = self.area_of(offset);
+        crate::cache::note_read(area, len);
+        let before = crate::cache::disk_pages();
+        let bytes = self.source.read(offset, len)?;
+        crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        if bytes.len() != len {
+            return Err(Error::Truncated);
+        }
+        Ok(Rc::from(bytes))
+    }
+
     /// A range a cursor sweeps, through the bounded cache rather than the
     /// arena.
     fn read_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
@@ -680,10 +718,14 @@ impl<S: Source> Reader<S> {
         if let Some(bytes) = crate::cache::get(self.id, offset, len) {
             return Ok(bytes);
         }
+        let area = self.area_of(offset);
+        let before = crate::cache::disk_pages();
         let bytes = self.source.read(offset, len)?;
+        crate::cache::note_disk(area, crate::cache::disk_pages() - before);
         if bytes.len() != len {
             return Err(Error::Truncated);
         }
+        crate::cache::note_read(area, len);
         Ok(crate::cache::insert(self.id, offset, bytes))
     }
 
@@ -696,7 +738,11 @@ impl<S: Source> Reader<S> {
             // SAFETY: as below; the box stays in the arena for `self`'s life.
             return Ok(unsafe { &*pointer });
         }
+        let area = self.area_of(offset);
+        crate::cache::note_read(area, len);
+        let before = crate::cache::disk_pages();
         let bytes = self.source.read(offset, len)?.into_boxed_slice();
+        crate::cache::note_disk(area, crate::cache::disk_pages() - before);
         let pointer: *const [u8] = &*bytes;
         self.arena_bytes.set(self.arena_bytes.get() + bytes.len());
         self.arena.borrow_mut().insert((offset, len), bytes);
@@ -964,7 +1010,7 @@ impl<S: Source> AreaFetch for Reader<S> {
         }
         let first = ordinal - ordinal % LENGTH_WINDOW;
         let len = ((self.header.doc_count - first).min(LENGTH_WINDOW) as usize) * 4;
-        let bytes = self.read_owned(self.header.lengths_at + u64::from(first) * 4, len)?;
+        let bytes = self.read_uncached(self.header.lengths_at + u64::from(first) * 4, len)?;
         Ok(Some((bytes, first)))
     }
 

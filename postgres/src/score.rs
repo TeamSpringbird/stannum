@@ -540,6 +540,116 @@ pub(crate) const PRUNE_MAX_K: usize = 4096;
 /// the block bounds at query time until the format stores them.
 pub(crate) static RANK_BY_ORDINAL: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 
+/// `stannum.debug_seed_score`: a measurement aid. When not negative, a pruned
+/// walk prunes against this score from its first candidate, as if the top k
+/// were already known: the pages and candidates it then costs are what a
+/// walk seeded from per-term champion lists would cost.
+pub(crate) static DEBUG_SEED_SCORE: pgrx::GucSetting<f64> = pgrx::GucSetting::<f64>::new(-1.0);
+
+thread_local! {
+    /// Index pages read while building a walk's per-term state, and while
+    /// walking. A pruned walk cannot skip what it reads before it starts, so
+    /// the split says whether tighter bounds or cheaper setup is the work.
+    static SETUP_BLOCKS: Cell<i64> = const { Cell::new(0) };
+    static WALK_BLOCKS: Cell<i64> = const { Cell::new(0) };
+    /// Chunks of a term's ordinal stream expanded into members.
+    static CHUNK_LOADS: Cell<i64> = const { Cell::new(0) };
+    /// Heap visibility checks, each a random read of the table.
+    static VISIBILITY_CHECKS: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Pages this backend has read from storage so far.
+pub(crate) fn disk_pages() -> i64 {
+    // SAFETY: a read of the backend's own instrumentation counters.
+    unsafe {
+        let usage = &raw const pg_sys::pgBufferUsage;
+        (*usage).shared_blks_read
+    }
+}
+
+thread_local! {
+    /// Pages read from storage per named phase of a scan, for accounting
+    /// that segment areas do not cover: the heap, and the index structures
+    /// storage reads without a segment reader.
+    static PHASE_DISK: RefCell<Vec<(&'static str, i64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `body`, charging the pages it reads from storage to `label`.
+pub(crate) fn charging<T>(label: &'static str, body: impl FnOnce() -> T) -> T {
+    let before = disk_pages();
+    let value = body();
+    let pages = disk_pages() - before;
+    if pages != 0 {
+        PHASE_DISK.with_borrow_mut(|phases| {
+            match phases.iter_mut().find(|(name, _)| *name == label) {
+                Some(entry) => entry.1 += pages,
+                None => phases.push((label, pages)),
+            }
+        });
+    }
+    value
+}
+
+/// Pages read from storage per phase since the counters were reset.
+pub(crate) fn phase_disk() -> Vec<(&'static str, i64)> {
+    PHASE_DISK.with_borrow(Clone::clone)
+}
+
+/// Index pages this backend has read or hit so far.
+fn blocks_used() -> i64 {
+    // SAFETY: a read of the backend's own instrumentation counters.
+    unsafe {
+        let usage = &raw const pg_sys::pgBufferUsage;
+        (*usage).shared_blks_hit + (*usage).shared_blks_read
+    }
+}
+
+/// Pages read from storage per segment area since the counters were reset.
+pub(crate) fn area_disk() -> [u64; segment::cache::AREAS] {
+    segment::cache::area_disk()
+}
+
+/// Bytes fetched per segment area since the walk counters were reset.
+pub(crate) fn area_bytes() -> [u64; segment::cache::AREAS] {
+    segment::cache::area_bytes()
+}
+
+pub(crate) fn reset_walk_blocks() {
+    segment::cache::reset_areas();
+    SETUP_BLOCKS.set(0);
+    WALK_BLOCKS.set(0);
+    CHUNK_LOADS.set(0);
+    VISIBILITY_CHECKS.set(0);
+    PHASE_DISK.with_borrow_mut(Vec::clear);
+}
+
+/// Heap visibility checks since the last reset.
+pub(crate) fn visibility_checks() -> i64 {
+    VISIBILITY_CHECKS.get()
+}
+
+/// Chunks loaded since the last reset.
+pub(crate) fn chunk_loads() -> i64 {
+    CHUNK_LOADS.get()
+}
+
+/// Pages spent on walk setup and on the walk itself since the last reset.
+pub(crate) fn walk_blocks() -> (i64, i64) {
+    (SETUP_BLOCKS.get(), WALK_BLOCKS.get())
+}
+
+/// The seeded threshold, if any: ties are admitted, as the latest location.
+fn seeded_threshold() -> Option<(f32, Tid)> {
+    let seed = DEBUG_SEED_SCORE.get();
+    (seed >= 0.0).then_some((
+        seed as f32,
+        Tid {
+            block: u32::MAX,
+            offset: MAX_OFFSET,
+        },
+    ))
+}
+
 /// The best rows of a pruned ranked scan.
 pub(crate) struct TopK {
     /// In output order; fewer than `k` only when the query matched fewer, or
@@ -728,10 +838,15 @@ impl Walk<'_, '_> {
 
     /// The k-th best row so far, once there are k.
     fn threshold(&self) -> Option<(f32, Tid)> {
-        if self.heap.len() == self.k {
+        let real = if self.heap.len() == self.k {
             self.heap.peek().map(|w| (w.0, w.1))
         } else {
             None
+        };
+        match (real, seeded_threshold()) {
+            (Some(real), Some(seed)) if seed.0 > real.0 => Some(seed),
+            (None, seed) => seed,
+            (real, _) => real,
         }
     }
 
@@ -1212,6 +1327,7 @@ impl IndexScorer {
         scored: &mut usize,
     ) -> Option<()> {
         {
+            let started = blocks_used();
             let source = &self.view.sources[i].0;
             let label = &self.view.labels[i];
             let pages = segment_error_in(source.page_table(), label)?;
@@ -1252,6 +1368,8 @@ impl IndexScorer {
             if terms.is_empty() {
                 return Some(());
             }
+            let ready = blocks_used();
+            SETUP_BLOCKS.set(SETUP_BLOCKS.get() + ready - started);
             let mut walk = OrdinalWalk {
                 scorer: self,
                 terms,
@@ -1271,6 +1389,7 @@ impl IndexScorer {
                 Combine::Any => walk.any(),
                 Combine::All => walk.all(),
             }
+            WALK_BLOCKS.set(WALK_BLOCKS.get() + blocks_used() - ready);
         }
         Some(())
     }
@@ -1518,6 +1637,7 @@ impl OrdinalTerm<'_> {
 
     /// Loads the current chunk's members and the rank of its first member.
     fn load(&mut self) {
+        CHUNK_LOADS.set(CHUNK_LOADS.get() + 1);
         let key = self.keys[self.pos];
         self.members.clear();
         match &self.list {
@@ -1584,10 +1704,15 @@ struct OrdinalWalk<'a, 's> {
 
 impl OrdinalWalk<'_, '_> {
     fn threshold(&self) -> Option<(f32, Tid)> {
-        if self.heap.len() == self.k {
+        let real = if self.heap.len() == self.k {
             self.heap.peek().map(|w| (w.0, w.1))
         } else {
             None
+        };
+        match (real, seeded_threshold()) {
+            (Some(real), Some(seed)) if seed.0 > real.0 => Some(seed),
+            (None, seed) => seed,
+            (real, _) => real,
         }
     }
 
@@ -1899,10 +2024,10 @@ impl OrdinalWalk<'_, '_> {
                 let low = (i * 64) as u16 + word.trailing_zeros() as u16;
                 word &= word - 1;
                 let ordinal = base + u32::from(low);
-                let length = segment_error(self.lengths.get(ordinal));
                 let sub = usize::from(low) / SUB;
                 let all: Vec<usize> = (0..self.terms.len()).collect();
-                let Some(total) = self.score_candidate(&all, low, ordinal, length, sub, pruning)
+                let Some(total) =
+                    self.score_candidate(&all, low, ordinal, sub, pruning, Some(min_length))
                 else {
                     continue;
                 };
@@ -1942,22 +2067,25 @@ impl OrdinalWalk<'_, '_> {
         present: &[usize],
         low: u16,
         ordinal: u32,
-        length: u32,
         sub: usize,
         pruning: bool,
+        floor: Option<u32>,
     ) -> Option<f32> {
         // Per term of `present`: its bound, replaced by its exact score once
         // read; and the terms holding the document by descending bound.
         let mut values: Vec<f32> = vec![0.0; present.len()];
         let mut uppers: Vec<(f32, usize)> = Vec::with_capacity(present.len());
+        // First at the shortest document the bounds allow, which costs no
+        // read: the length table is one page per 2,048 documents and
+        // candidates are scattered, so reading a length before the bound
+        // rejects the candidate was a page per candidate.
         for (n, &t) in present.iter().enumerate() {
             let term = &self.terms[t];
             if term.words[usize::from(low / 64)] & (1 << (low % 64)) == 0 {
                 continue;
             }
-            // The tighter of the sub-block's largest bucket at this length
-            // and the chunk bound, whose shortest document per bucket rules
-            // out the buckets no document this short has.
+            let block = term.bound_block(term.pos);
+            let shortest = floor.unwrap_or_else(|| block.shortest());
             let scorer = &self.scorer.terms[term.slot].1;
             let top = term.sub_bounds[term.pos][sub];
             let upper = if top == 0 {
@@ -1965,8 +2093,8 @@ impl OrdinalWalk<'_, '_> {
             } else {
                 let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
                 scorer
-                    .score_bucket(bucket, length)
-                    .min(scorer.bound_for_length(&term.bound_block(term.pos), length))
+                    .score_bucket(bucket, shortest)
+                    .min(scorer.bound_with_min_length(&block, shortest))
             };
             values[n] = upper;
             uppers.push((upper, n));
@@ -1975,7 +2103,29 @@ impl OrdinalWalk<'_, '_> {
         if pruning && !self.can_beat(fold(&values), ordinal) {
             return None;
         }
+        // The document's own length tightens every bound; only now is it worth
+        // the page it may cost.
+        let length = segment_error(self.lengths.get(ordinal));
+        for &(_, n) in &uppers {
+            let term = &self.terms[present[n]];
+            let scorer = &self.scorer.terms[term.slot].1;
+            let top = term.sub_bounds[term.pos][sub];
+            values[n] = if top == 0 {
+                0.0
+            } else {
+                let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
+                scorer
+                    .score_bucket(bucket, length)
+                    .min(scorer.bound_for_length(&term.bound_block(term.pos), length))
+            };
+        }
+        if pruning && !self.can_beat(fold(&values), ordinal) {
+            return None;
+        }
         *self.scored += 1;
+        for entry in &mut uppers {
+            entry.0 = values[entry.1];
+        }
         uppers.sort_by(|a, b| b.0.total_cmp(&a.0));
         for &(_, n) in &uppers {
             let t = present[n];
@@ -2113,9 +2263,8 @@ impl OrdinalWalk<'_, '_> {
                 let low = (i * 64) as u16 + word.trailing_zeros() as u16;
                 word &= word - 1;
                 let ordinal = base + u32::from(low);
-                let length = segment_error(self.lengths.get(ordinal));
                 let sub = usize::from(low) / SUB;
-                let Some(total) = self.score_candidate(present, low, ordinal, length, sub, pruning)
+                let Some(total) = self.score_candidate(present, low, ordinal, sub, pruning, None)
                 else {
                     continue;
                 };
@@ -2168,6 +2317,11 @@ impl Visibility {
 
     /// Whether the snapshot sees a tuple at `tid` or on its HOT chain.
     fn visible(&mut self, tid: Tid) -> bool {
+        VISIBILITY_CHECKS.set(VISIBILITY_CHECKS.get() + 1);
+        charging("heap visibility", || self.visible_inner(tid))
+    }
+
+    fn visible_inner(&mut self, tid: Tid) -> bool {
         let mut pointer = pg_sys::ItemPointerData {
             ip_blkid: pg_sys::BlockIdData {
                 bi_hi: (tid.block >> 16) as u16,
@@ -2319,6 +2473,18 @@ pub(crate) fn publish_scan_scorer(scan: u64, mut scorer: IndexScorer, ranked: &[
 }
 
 fn build_index_scorer(
+    key: CacheKey,
+    k1: Option<f32>,
+    b: Option<f32>,
+    term_add: Option<Vec<String>>,
+    term_replace: Option<Vec<String>>,
+) -> IndexScorer {
+    charging("scorer setup", || {
+        build_index_scorer_inner(key, k1, b, term_add, term_replace)
+    })
+}
+
+fn build_index_scorer_inner(
     key: CacheKey,
     k1: Option<f32>,
     b: Option<f32>,

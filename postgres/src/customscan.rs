@@ -23,7 +23,7 @@
 //! replays them (see `storage::index_reads_allowed`). The bitmap index scan
 //! path remains available; `stannum.enable_custom_scan` disables these nodes.
 
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, CString, c_void};
 
 use pgrx::{
     FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgList, PgMemoryContexts, pg_guard,
@@ -109,6 +109,21 @@ static COUNT_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
     });
 
 pub fn init() {
+    // Attribute pages read from storage to the segment area that asked for them.
+    segment::cache::set_disk_probe(|| unsafe {
+        let usage = &raw const pg_sys::pgBufferUsage;
+        (*usage).shared_blks_read as u64
+    });
+    GucRegistry::define_float_guc(
+        c"stannum.debug_seed_score",
+        c"Measurement aid: prune a ranked walk against this score from the start; negative disables",
+        c"What a walk seeded with the final top-k threshold would cost in pages and candidates.",
+        &crate::score::DEBUG_SEED_SCORE,
+        -1.0,
+        f64::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
     GucRegistry::define_bool_guc(
         c"stannum.rank_by_ordinal",
         c"Rank pruned disjunctions over the ordinal streams instead of the TID postings",
@@ -152,6 +167,12 @@ pub fn init() {
         c"Per-backend memory for bytes fetched from immutable segments",
         c"The cache is emptied when its readers hold more; dense terms' ordinal chunks make a larger cache worthwhile.",
         &crate::storage::READER_CACHE_MB, 1, 1024 * 1024, GucContext::Userset, GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.reclaim_pages",
+        c"Pages of retired runs an insert frees after a fold",
+        c"The rest wait for the next fold or VACUUM; freeing a large merge's pages at once stalls the insert.",
+        &crate::storage::RECLAIM_PAGES, 1, 1024 * 1024, GucContext::Userset, GucFlags::default(),
     );
     GucRegistry::define_int_guc(
         c"stannum.read_cache_mb",
@@ -949,6 +970,8 @@ struct ScanExec {
     pruned_k: usize,
     /// The pruned walk ran over the ordinal streams.
     ordinal_walk: bool,
+    /// Index pages the ordinal walk spent before it started, and walking.
+    walk_blocks: (i64, i64),
     /// Every location emitted before a completion, across completions.
     emitted: FxHashSet<Tid>,
     /// Explain counters. Candidates are unknown while pruned; `scored`
@@ -1105,6 +1128,7 @@ unsafe extern "C-unwind" fn begin_scan(
             pruned: false,
             pruned_k: 0,
             ordinal_walk: false,
+            walk_blocks: (0, 0),
             emitted: FxHashSet::default(),
             candidates: None,
             scored: None,
@@ -1137,6 +1161,7 @@ unsafe extern "C-unwind" fn begin_scan(
 /// bound enumerate and score every candidate; unordered scans use a stream.
 unsafe fn gather(exec: &mut ScanExec) {
     unsafe {
+        crate::score::reset_walk_blocks();
         exec.scores.clear();
         exec.pruned = false;
         exec.scored = None;
@@ -1207,6 +1232,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             exec.pruned = !top.complete;
             exec.pruned_k = k;
             exec.ordinal_walk = top.ordinal;
+            exec.walk_blocks = crate::score::walk_blocks();
             let scorer = scorer.take().expect("a top k needs a scorer");
             crate::score::publish_scan_scorer(exec.scan_id, scorer, &top.rows);
             exec.next = 0;
@@ -2248,6 +2274,70 @@ unsafe extern "C-unwind" fn explain(
                     scored as i64,
                     es,
                 );
+                if exec.ordinal_walk {
+                    pg_sys::ExplainPropertyInteger(
+                        c"Walk Setup Blocks".as_ptr(),
+                        std::ptr::null(),
+                        exec.walk_blocks.0,
+                        es,
+                    );
+                    pg_sys::ExplainPropertyInteger(
+                        c"Walk Body Blocks".as_ptr(),
+                        std::ptr::null(),
+                        exec.walk_blocks.1,
+                        es,
+                    );
+                    pg_sys::ExplainPropertyInteger(
+                        c"Visibility Checks".as_ptr(),
+                        std::ptr::null(),
+                        crate::score::visibility_checks(),
+                        es,
+                    );
+                    pg_sys::ExplainPropertyInteger(
+                        c"Chunks Loaded".as_ptr(),
+                        std::ptr::null(),
+                        crate::score::chunk_loads(),
+                        es,
+                    );
+                    let area_bytes = crate::score::area_bytes();
+                    let area_disk = crate::score::area_disk();
+                    let fetched = area_bytes
+                        .iter()
+                        .zip(segment::cache::AREA_NAMES)
+                        .filter(|(bytes, _)| **bytes != 0)
+                        .map(|(bytes, name)| format!("{name} {bytes}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if let Ok(text) = CString::new(fetched) {
+                        pg_sys::ExplainPropertyText(c"Bytes Fetched".as_ptr(), text.as_ptr(), es);
+                    }
+                    let from_disk = area_disk
+                        .iter()
+                        .zip(segment::cache::AREA_NAMES)
+                        .filter(|(pages, _)| **pages != 0)
+                        .map(|(pages, name)| format!("{name} {pages}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if let Ok(text) = CString::new(from_disk) {
+                        pg_sys::ExplainPropertyText(
+                            c"Disk Pages By Area".as_ptr(),
+                            text.as_ptr(),
+                            es,
+                        );
+                    }
+                    let phases = crate::score::phase_disk()
+                        .iter()
+                        .map(|(name, pages)| format!("{name} {pages}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if let Ok(text) = CString::new(phases) {
+                        pg_sys::ExplainPropertyText(
+                            c"Disk Pages By Phase".as_ptr(),
+                            text.as_ptr(),
+                            es,
+                        );
+                    }
+                }
             }
             if exec.ordered {
                 pg_sys::ExplainPropertyInteger(
