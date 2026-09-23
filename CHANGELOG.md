@@ -125,3 +125,13 @@
   same rows and scores; at eight clients the conjunction-phrase workload
   runs at 500 queries a second instead of 437 and the mixed workload at
   479 instead of 343.
+- A backend's private memory no longer grows with what a query reads:
+  payload spans, ordinal chunks, document lengths and postings windows are
+  read into buffers the cursor owns and replaces, where earlier every
+  fetched range stayed in the reader's arena until the query ended (a
+  phrase of common words held 480 MB per backend at 15 million rows, and
+  the 150 million row run was killed for memory). The ranges are shared
+  through a least-recently-used cache of `stannum.read_cache_mb` (128 MiB)
+  per backend, so frequent terms' chunks stay warm. Ranked queries the
+  scorer cannot prune, such as phrases, score candidates as the stream
+  yields them and keep only the top `k` rows instead of every match.

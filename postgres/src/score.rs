@@ -556,6 +556,9 @@ pub(crate) struct TopK {
     pub(crate) zero_fill: bool,
     /// The walk ran over the ordinal streams.
     pub(crate) ordinal: bool,
+    /// Every candidate was scored from the stream (see
+    /// [`IndexScorer::top_k_streamed`]): nothing was pruned.
+    pub(crate) streamed: bool,
 }
 
 /// How a query's leaf terms combine into its candidate set.
@@ -1036,6 +1039,46 @@ impl IndexScorer {
         self.terms.is_empty()
     }
 
+    /// The `k` best of every candidate `stream` yields, scored as they
+    /// arrive: only the heap of `k` rows is held. Scoring every candidate
+    /// first held every match, its score and a map of both for the
+    /// projection, which for a phrase of common words at scale was hundreds
+    /// of megabytes per backend. Bit-identical to that, including tie order.
+    ///
+    /// `None` when the stream is a superset that needs rechecking.
+    pub(crate) fn top_k_streamed(
+        &mut self,
+        stream: &mut crate::stream::CandidateStream,
+        k: usize,
+    ) -> Option<TopK> {
+        if stream.recheck {
+            return None;
+        }
+        let mut heap = BinaryHeap::with_capacity(k + 1);
+        let mut scored = 0usize;
+        while let Some(tid) = stream.next() {
+            pgrx::check_for_interrupts!();
+            scored += 1;
+            let entry = Ranked(self.score(tid), tid);
+            if heap.len() < k {
+                heap.push(entry);
+            } else if heap.peek().is_some_and(|worst| entry < *worst) {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
+        let mut rows: Vec<(f32, Tid)> = heap.into_iter().map(|Ranked(s, t)| (s, t)).collect();
+        rows.sort_by(rank);
+        Some(TopK {
+            complete: rows.len() < k,
+            rows,
+            scored,
+            zero_fill: false,
+            ordinal: false,
+            streamed: true,
+        })
+    }
+
     /// The `k` best candidates of the scan's query in output order, found
     /// with block-max pruning: the sources are walked in tuple order with
     /// one cursor per scoring term, the `k`-th best score so far is the
@@ -1146,6 +1189,7 @@ impl IndexScorer {
             complete,
             zero_fill,
             ordinal,
+            streamed: false,
         })
     }
 

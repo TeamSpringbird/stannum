@@ -921,6 +921,10 @@ type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
 /// about 100 MiB of ordinal chunks, and at 64 MiB they ran a fifth slower.
 pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(256);
 
+/// `stannum.read_cache_mb`: the budget of [`segment::cache`], the least
+/// recently used ranges cursors sweep, applied whenever a view is captured.
+pub static READ_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(128);
+
 thread_local! {
     static SEGMENT_READERS: RefCell<SegmentReaders> = RefCell::new(HashMap::new());
 }
@@ -1003,6 +1007,7 @@ unsafe fn cached_segment(
 /// reader once the fetched bytes exceed the budget. Live views keep their
 /// own references, so dropping here only releases what nothing else holds.
 fn trim_reader_cache(identity: u64, meta: &Meta) {
+    segment::cache::set_budget(READ_CACHE_MB.get() as usize * 1024 * 1024);
     SEGMENT_READERS.with_borrow_mut(|readers| {
         readers.retain(|(id, generation), _| {
             *id != identity || meta.segments.iter().any(|e| e.generation == *generation)

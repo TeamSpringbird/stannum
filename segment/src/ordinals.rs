@@ -248,6 +248,10 @@ fn encode_with(ordinals: &[u32], scores: Option<&[(u8, u32)]>) -> Vec<u8> {
 pub trait Fetch<'a> {
     /// `len` bytes at `offset` from the start of the stream.
     fn fetch(&self, offset: u64, len: usize) -> Result<&'a [u8]>;
+    /// An owned copy that the source need not keep: a chunk a walk visits.
+    fn fetch_owned(&self, offset: u64, len: usize) -> Result<std::rc::Rc<[u8]>> {
+        self.fetch(offset, len).map(std::rc::Rc::from)
+    }
 }
 
 impl<'a> Fetch<'a> for &'a [u8] {
@@ -435,7 +439,7 @@ impl<'a> Ordinals<'a> {
                 if start + size as u64 > self.len {
                     return Err(Error::Truncated);
                 }
-                let bytes = self.source.fetch(start, size)?;
+                let bytes = self.source.fetch_owned(start, size)?;
                 if !bitmap {
                     let lows = bytes
                         .chunks_exact(2)
@@ -443,9 +447,9 @@ impl<'a> Ordinals<'a> {
                     apply_lows(lows, op, out);
                 } else {
                     match op {
-                        Op::Assign => kernels::assign_bytes(out, bytes),
-                        Op::Or => kernels::or_bytes(out, bytes),
-                        Op::And => kernels::and_bytes(out, bytes),
+                        Op::Assign => kernels::assign_bytes(out, &bytes),
+                        Op::Or => kernels::or_bytes(out, &bytes),
+                        Op::And => kernels::and_bytes(out, &bytes),
                     }
                 }
                 Ok(true)
@@ -499,7 +503,7 @@ impl<'a> Ordinals<'a> {
     }
 
     /// Chunk `i` of a chunked stream, with its body fetched.
-    pub fn chunk(&self, i: usize) -> Result<Chunk<'a>> {
+    pub fn chunk(&self, i: usize) -> Result<Chunk> {
         let Body::Chunked {
             directory,
             chunks_at,
@@ -518,7 +522,7 @@ impl<'a> Ordinals<'a> {
             key: entry_key(entry),
             cardinality: cardinality as u32,
             before: self.before(i),
-            bytes: self.source.fetch(start, size)?,
+            bytes: self.source.fetch_owned(start, size)?,
             bitmap,
         })
     }
@@ -559,7 +563,7 @@ impl<'a> Ordinals<'a> {
         if start + size as u64 > self.len {
             return Err(Error::Truncated);
         }
-        let bytes = self.source.fetch(start, size)?;
+        let bytes = self.source.fetch_owned(start, size)?;
         let base = u32::from(entry_key(entry)) << 16;
         if !bitmap {
             let at = within * 2;
@@ -621,16 +625,16 @@ fn apply_lows(lows: impl Iterator<Item = usize>, op: Op, out: &mut Words) {
 }
 
 /// One chunk of a chunked stream: its members within `key << 16 ..`.
-pub struct Chunk<'a> {
+pub struct Chunk {
     pub key: u16,
     pub cardinality: u32,
     /// Members of the stream before this chunk: the rank of its first member.
     pub before: u32,
-    bytes: &'a [u8],
+    bytes: std::rc::Rc<[u8]>,
     bitmap: bool,
 }
 
-impl Chunk<'_> {
+impl Chunk {
     /// The first ordinal the chunk can hold.
     pub fn base(&self) -> u32 {
         u32::from(self.key) << 16
@@ -689,7 +693,7 @@ impl Chunk<'_> {
     /// Sets `out` to the chunk's members.
     pub fn words(&self, out: &mut Words) {
         if self.bitmap {
-            kernels::assign_bytes(out, self.bytes);
+            kernels::assign_bytes(out, &self.bytes);
         } else {
             out.fill(0);
             for low in self.bytes.chunks_exact(2) {

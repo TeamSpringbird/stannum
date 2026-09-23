@@ -38,6 +38,7 @@ mod error;
 mod reader;
 mod varint;
 
+pub mod cache;
 pub mod dictionary;
 pub mod forward;
 pub mod index;

@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::dictionary::{
     BlockFetch, Blocks, Dictionary, DictionaryBuilder, DictionaryIndex, Extent, TermEntry,
@@ -418,6 +418,15 @@ impl<'a> Term<'a> {
     }
 
     pub fn postings(&self) -> Result<Postings<'a>> {
+        if self.areas.ranged_postings() {
+            let extent = self.entry.postings;
+            return Postings::open(
+                self.areas,
+                crate::postings::Area::Postings,
+                extent.offset,
+                extent.len as usize,
+            );
+        }
         Postings::parse(self.areas.postings_bytes(self.entry.postings)?)
     }
 
@@ -464,7 +473,14 @@ impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
         let at = self.base.checked_add(offset).ok_or(Error::Truncated)?;
         self.areas.ordinals_bytes(at, len)
     }
+    fn fetch_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        let at = self.base.checked_add(offset).ok_or(Error::Truncated)?;
+        self.areas.ordinals_range_owned(at, len)
+    }
 }
+
+/// Document lengths per window of the length table a paged source hands out.
+const LENGTH_WINDOW: u32 = 16 * 1024;
 
 /// Fetches extents of the postings and payload areas and document lengths.
 pub trait AreaFetch {
@@ -475,6 +491,41 @@ pub trait AreaFetch {
     fn ranged_payloads(&self) -> bool {
         false
     }
+    /// Whether postings streams are read a window at a time through
+    /// [`AreaFetch::postings_range`] rather than as whole extents.
+    fn ranged_postings(&self) -> bool {
+        false
+    }
+    /// Bytes of the postings area.
+    fn postings_range(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
+        Err(Error::Corrupt("source has no ranged postings"))
+    }
+    /// Bytes of the document table.
+    fn documents_range(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
+        Err(Error::Corrupt("source has no ranged document table"))
+    }
+    /// Ranges a cursor reads and moves on from, shared through the bounded
+    /// [`crate::cache`] rather than kept with the reader, so a query that
+    /// sweeps a frequent term's streams holds one span of each at a time.
+    fn payload_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        self.payload_range(offset, len).map(Rc::from)
+    }
+    fn postings_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        self.postings_range(offset, len).map(Rc::from)
+    }
+    fn documents_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        self.documents_range(offset, len).map(Rc::from)
+    }
+    fn ordinals_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        self.ordinals_bytes(offset, len).map(Rc::from)
+    }
+    /// The window of the length table holding `ordinal` as an owned copy,
+    /// with the window's first ordinal; `None` for a source whose table is
+    /// held whole.
+    fn length_window_owned(&self, _ordinal: u32) -> Result<Option<(Rc<[u8]>, u32)>> {
+        Ok(None)
+    }
+
     /// Bytes of the payload area.
     fn payload_range(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
         Err(Error::Corrupt("source has no ranged payloads"))
@@ -517,6 +568,8 @@ struct Header {
 pub struct Reader<S: Source> {
     source: S,
     header: Header,
+    /// Identity in the [`crate::cache`].
+    id: u64,
     arena: RefCell<Arena>,
     arena_bytes: Cell<usize>,
     dictionary: OnceCell<DictionaryIndex<'static>>,
@@ -539,7 +592,9 @@ pub struct Sections {
 }
 
 /// Fetched extents by (offset, len).
-type Arena = HashMap<(u64, usize), Box<[u8]>>;
+/// Fetched byte ranges by (offset, len). A ranged cursor fetches thousands
+/// of windows per query, so the hash is the cheap one.
+type Arena = rustc_hash::FxHashMap<(u64, usize), Box<[u8]>>;
 
 /// Granularity at which document lengths are fetched from a paged source.
 const LENGTH_CHUNK: u64 = 4096;
@@ -601,7 +656,8 @@ impl<S: Source> Reader<S> {
                 pages_at,
                 pages_len,
             },
-            arena: RefCell::new(HashMap::new()),
+            id: crate::cache::reader_id(),
+            arena: RefCell::new(Arena::default()),
             arena_bytes: Cell::new(0),
             dictionary: OnceCell::new(),
             last_chunk: Cell::new(None),
@@ -615,6 +671,22 @@ impl<S: Source> Reader<S> {
 
     /// Bytes `[offset, offset + len)` of the source, borrowed for as long as
     /// this reader lives.
+    /// A range a cursor sweeps, through the bounded cache rather than the
+    /// arena.
+    fn read_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        if let Some(slice) = self.source.slice(offset, len) {
+            return Ok(Rc::from(slice));
+        }
+        if let Some(bytes) = crate::cache::get(self.id, offset, len) {
+            return Ok(bytes);
+        }
+        let bytes = self.source.read(offset, len)?;
+        if bytes.len() != len {
+            return Err(Error::Truncated);
+        }
+        Ok(crate::cache::insert(self.id, offset, bytes))
+    }
+
     fn load(&self, offset: u64, len: usize) -> Result<&[u8]> {
         if let Some(slice) = self.source.slice(offset, len) {
             return Ok(slice);
@@ -748,8 +820,22 @@ impl<S: Source> Reader<S> {
         })
     }
 
-    /// Cursor over every document in the segment, the universe for NOT.
+    /// Cursor over every document in the segment, the universe for NOT. A
+    /// paged source reads it a window at a time.
     pub fn documents(&self) -> Result<PostingsCursor<'_>> {
+        if self
+            .source
+            .slice(self.header.docs_at, self.header.docs_len)
+            .is_none()
+        {
+            return Postings::open(
+                self,
+                crate::postings::Area::Documents,
+                0,
+                self.header.docs_len,
+            )?
+            .cursor();
+        }
         Postings::parse(self.load(self.header.docs_at, self.header.docs_len)?)?.cursor()
     }
 
@@ -772,15 +858,14 @@ impl<S: Source> Reader<S> {
         let len = self.header.doc_count as usize * 4;
         match self.source.slice(self.header.lengths_at, len) {
             Some(bytes) => Lengths::Bytes(bytes),
-            // A paged source hands out the table once, cached with the reader:
-            // a ranked walk looks a length up per candidate, and one fetch per
-            // lookup cost more than the scoring.
-            None => match self.load(self.header.lengths_at, len) {
-                Ok(bytes) => Lengths::Bytes(bytes),
-                Err(_) => Lengths::Lazy {
-                    fetch: self,
-                    count: self.header.doc_count,
-                },
+            // A paged source hands the table out in windows, cached with the
+            // reader: a walk looks lengths up per candidate, one fetch per
+            // lookup cost more than the scoring, and the whole table of a
+            // large segment is megabytes a query rarely needs.
+            None => Lengths::Lazy {
+                fetch: self,
+                count: self.header.doc_count,
+                window: std::cell::RefCell::new(None),
             },
         }
     }
@@ -851,6 +936,75 @@ impl<S: Source> AreaFetch for Reader<S> {
         true
     }
 
+    fn ranged_postings(&self) -> bool {
+        true
+    }
+
+    fn postings_range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.postings_len as u64 => {
+                self.load(self.header.postings_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
+    }
+
+    fn documents_range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.docs_len as u64 => {
+                self.load(self.header.docs_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
+    }
+
+    fn length_window_owned(&self, ordinal: u32) -> Result<Option<(Rc<[u8]>, u32)>> {
+        if ordinal >= self.header.doc_count {
+            return Err(Error::Corrupt("document ordinal out of range"));
+        }
+        let first = ordinal - ordinal % LENGTH_WINDOW;
+        let len = ((self.header.doc_count - first).min(LENGTH_WINDOW) as usize) * 4;
+        let bytes = self.read_owned(self.header.lengths_at + u64::from(first) * 4, len)?;
+        Ok(Some((bytes, first)))
+    }
+
+    fn payload_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.payload_len as u64 => {
+                self.read_owned(self.header.payload_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
+    }
+
+    fn postings_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.postings_len as u64 => {
+                self.read_owned(self.header.postings_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
+    }
+
+    fn documents_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.docs_len as u64 => {
+                self.read_owned(self.header.docs_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
+    }
+
+    fn ordinals_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.header.ordinals_len as u64)
+        {
+            return Err(Error::Truncated);
+        }
+        self.read_owned(self.header.ordinals_at + offset, len)
+    }
+
     fn payload_range(&self, offset: u64, len: usize) -> Result<&[u8]> {
         match offset.checked_add(len as u64) {
             Some(end) if end <= self.header.payload_len as u64 => {
@@ -909,12 +1063,14 @@ impl<S: Source> AreaFetch for Reader<S> {
 }
 
 /// Document lengths addressed by document ordinal.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Lengths<'a> {
     Bytes(&'a [u8]),
     Lazy {
         fetch: &'a dyn AreaFetch,
         count: u32,
+        /// The window last read, as (first ordinal, bytes).
+        window: std::cell::RefCell<Option<(u32, Rc<[u8]>)>>,
     },
 }
 
@@ -928,11 +1084,28 @@ impl Lengths<'_> {
                     .ok_or(Error::Corrupt("document ordinal out of range"))?;
                 Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             }
-            Self::Lazy { fetch, count } => {
+            Self::Lazy {
+                fetch,
+                count,
+                window,
+            } => {
                 if ordinal >= *count {
                     return Err(Error::Corrupt("document ordinal out of range"));
                 }
-                fetch.length(ordinal)
+                let mut held = window.borrow_mut();
+                let hit = held.as_ref().is_some_and(|(first, bytes)| {
+                    ordinal >= *first && ((ordinal - first) as usize) * 4 + 4 <= bytes.len()
+                });
+                if !hit {
+                    match fetch.length_window_owned(ordinal)? {
+                        Some((bytes, first)) => *held = Some((first, bytes)),
+                        None => return fetch.length(ordinal),
+                    }
+                }
+                let (first, bytes) = held.as_ref().expect("window loaded");
+                let at = (ordinal - first) as usize * 4;
+                let bytes = bytes.get(at..at + 4).ok_or(Error::Truncated)?;
+                Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             }
         }
     }

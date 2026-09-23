@@ -153,6 +153,12 @@ pub fn init() {
         c"The cache is emptied when its readers hold more; dense terms' ordinal chunks make a larger cache worthwhile.",
         &crate::storage::READER_CACHE_MB, 1, 1024 * 1024, GucContext::Userset, GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        c"stannum.read_cache_mb",
+        c"Per-backend memory for the ranges cursors sweep: postings windows, ordinal chunks, payload spans",
+        c"Least recently used ranges are evicted beyond this; the reader cache holds headers and tables separately.",
+        &crate::storage::READ_CACHE_MB, 1, 1024 * 1024, GucContext::Userset, GucFlags::default(),
+    );
     GucRegistry::define_bool_guc(
         c"stannum.enable_custom_scan",
         c"Enable Stannum's custom scan nodes for ==> queries",
@@ -1186,10 +1192,15 @@ unsafe fn gather(exec: &mut ScanExec) {
         }
         if let Some(k) = top_k
             && k <= crate::score::PRUNE_MAX_K
-            && let Some(top) = scorer.as_ref().and_then(|scorer| top_rows(exec, scorer, k))
+            && let Some(top) = scorer.as_mut().and_then(|scorer| top_rows(exec, scorer, k))
         {
             exec.candidates = top.complete.then_some(top.rows.len());
-            exec.scored = Some(top.scored);
+            if top.streamed {
+                exec.candidates = Some(top.scored);
+                exec.exhaustive_score_calls += top.scored;
+            } else {
+                exec.scored = Some(top.scored);
+            }
             exec.scores = top.rows.iter().map(|(score, _)| *score).collect();
             exec.tids = top.rows.iter().map(|(_, tid)| *tid).collect();
             exec.sorted = exec.tids.len();
@@ -1215,12 +1226,19 @@ unsafe fn gather(exec: &mut ScanExec) {
 /// yields, so they are read from it instead of scoring every match. A query
 /// of common words and one rare word otherwise scored millions of rows as
 /// soon as an updated row's dead version took a place in the first top k.
+///
+/// A query the scorer cannot prune, such as a phrase, is scored from the
+/// candidate stream instead, holding only the top `k`.
 unsafe fn top_rows(
     exec: &ScanExec,
-    scorer: &crate::score::IndexScorer,
+    scorer: &mut crate::score::IndexScorer,
     k: usize,
 ) -> Option<crate::score::TopK> {
-    let mut top = scorer.top_k(k)?;
+    let Some(mut top) = scorer.top_k(k) else {
+        let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
+        let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
+        return scorer.top_k_streamed(&mut stream, k);
+    };
     if top.zero_fill {
         let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
         let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
@@ -1352,7 +1370,7 @@ unsafe fn complete(exec: &mut ScanExec) {
             .ordering
             .as_ref()
             .expect("pruned scans are ordered");
-        let scorer = crate::score::scorer_for_scan(
+        let mut scorer = crate::score::scorer_for_scan(
             exec.scan_id,
             exec.private.heap_oid,
             exec.private.index_oid,
@@ -1390,7 +1408,12 @@ unsafe fn complete(exec: &mut ScanExec) {
                     (rows, complete)
                 })
             } else {
-                top_rows(exec, &scorer, deeper).map(|top| (top.rows, top.complete))
+                top_rows(exec, &mut scorer, deeper).map(|top| {
+                    if top.streamed {
+                        exec.exhaustive_score_calls += top.scored;
+                    }
+                    (top.rows, top.complete)
+                })
             };
             if let Some((mut rows, complete)) = rows {
                 crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);

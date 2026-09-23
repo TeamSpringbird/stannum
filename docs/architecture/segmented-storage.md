@@ -293,6 +293,18 @@ postings bytes can still be fetched up front; streaming bounds decoded candidate
 buffering, not all index memory or I/O. Planner startup cost continues to include
 estimated index I/O and moves only candidate traversal CPU into run cost.
 
+Reads from a segment are bounded per cursor: a payload cursor holds one span
+of skip slots, an ordinal cursor one chunk, a lengths cursor one window of
+16,384 documents and a postings cursor one 16 KiB window, each replaced by
+the next. Those ranges are shared through a per-backend least-recently-used
+cache of `stannum.read_cache_mb` (128 MiB), so the hot chunks of frequent
+terms stay resident across queries while a sweep of a long stream displaces
+only itself. Only headers, dictionary blocks, bounds tables and page tables
+stay in the reader's arena, whose total across a backend's cached readers is
+bounded by `stannum.reader_cache_mb`. Ranked queries the scorer cannot prune,
+such as phrases, score the candidate stream as it arrives and keep only the
+top `k`; reading past `k` rows completes the ordering as a pruned scan does.
+
 Ranked retrieval and PostgreSQL bitmap scans retain their existing execution
 strategies. The word operations are portable Rust; no architecture-specific
 SIMD dispatch or on-disk format change is required.

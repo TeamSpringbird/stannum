@@ -19,6 +19,9 @@ pub fn put(out: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Decodes one integer starting at `*at`, advancing it past the bytes read.
+/// Bytes a 64-bit value takes at most.
+pub const MAX_LEN: usize = 10;
+
 pub fn get(bytes: &[u8], at: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     let mut shift = 0u32;

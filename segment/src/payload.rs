@@ -352,6 +352,8 @@ impl<'a> Payload<'a> {
         PayloadCursor {
             payload: *self,
             reader,
+            owned: std::rc::Rc::from(Vec::new()),
+            owned_at: 0,
             span: None,
             span_at: 0,
             next_ordinal: 0,
@@ -370,8 +372,12 @@ impl<'a> Payload<'a> {
 #[derive(Clone, Debug)]
 pub struct PayloadCursor<'a> {
     payload: Payload<'a>,
-    /// Over the whole stream, or over the loaded span of a ranged one.
+    /// Over the whole stream; unused for a ranged one.
     reader: Reader<'a>,
+    /// The loaded span of a ranged stream, owned: it is read once and
+    /// replaced by the next, so a sweep of a frequent term holds one span.
+    owned: std::rc::Rc<[u8]>,
+    owned_at: usize,
     /// The loaded span of a ranged stream and where it starts in the stream.
     span: Option<usize>,
     span_at: usize,
@@ -399,10 +405,43 @@ impl PayloadCursor<'_> {
         if end < start {
             return Err(Error::Corrupt("payload skip order"));
         }
-        self.reader = Reader::new(areas.payload_range(base + start as u64, end - start)?);
+        self.owned = areas.payload_range_owned(base + start as u64, end - start)?;
+        self.owned_at = 0;
         self.span = Some(span);
         self.span_at = start;
         Ok(())
+    }
+
+    fn ranged(&self) -> bool {
+        matches!(self.payload.source, Bytes::Ranged { .. })
+    }
+
+    fn set_position(&mut self, at: usize) -> Result<()> {
+        if self.ranged() {
+            if at > self.owned.len() {
+                return Err(Error::Truncated);
+            }
+            self.owned_at = at;
+            Ok(())
+        } else {
+            self.reader.seek(at)
+        }
+    }
+
+    /// Decodes at the position, over the whole stream or the loaded span.
+    fn decode<R>(&mut self, f: impl FnOnce(&mut Reader<'_>) -> Result<R>) -> Result<R> {
+        if self.ranged() {
+            let mut reader = Reader::at(&self.owned, self.owned_at);
+            let value = f(&mut reader)?;
+            let at = reader.position();
+            self.owned_at = at;
+            Ok(value)
+        } else {
+            let mut reader = self.reader;
+            let value = f(&mut reader)?;
+            self.reader = reader;
+            Ok(value)
+        }
     }
 
     /// Positions so the next decode returns entry `ordinal`.
@@ -418,7 +457,7 @@ impl PayloadCursor<'_> {
             let (at, start) = self.payload.skip_to(ordinal)?;
             self.next_ordinal = start;
             self.load()?;
-            self.reader.seek(at - self.span_at)?;
+            self.set_position(at - self.span_at)?;
         }
         while self.next_ordinal < ordinal {
             self.next_bucket()?;
@@ -432,11 +471,14 @@ impl PayloadCursor<'_> {
             return Err(Error::Corrupt("payload read past end"));
         }
         self.load()?;
-        let byte = self.reader.u8()?;
-        if byte > MAX_TF_BUCKET {
-            return Err(Error::Corrupt("payload bucket byte"));
-        }
-        skip_positions(&mut self.reader)?;
+        let byte = self.decode(|reader| {
+            let byte = reader.u8()?;
+            if byte > MAX_TF_BUCKET {
+                return Err(Error::Corrupt("payload bucket byte"));
+            }
+            skip_positions(reader)?;
+            Ok(byte)
+        })?;
         self.next_ordinal += 1;
         Ok(byte)
     }
@@ -448,11 +490,14 @@ impl PayloadCursor<'_> {
             return Err(Error::Corrupt("payload read past end"));
         }
         self.load()?;
-        let byte = self.reader.u8()?;
-        if byte > MAX_TF_BUCKET {
-            return Err(Error::Corrupt("payload bucket byte"));
-        }
-        decode_positions(&mut self.reader, positions)?;
+        let byte = self.decode(|reader| {
+            let byte = reader.u8()?;
+            if byte > MAX_TF_BUCKET {
+                return Err(Error::Corrupt("payload bucket byte"));
+            }
+            decode_positions(reader, positions)?;
+            Ok(byte)
+        })?;
         self.next_ordinal += 1;
         Ok(byte)
     }
@@ -464,11 +509,14 @@ impl PayloadCursor<'_> {
             return Err(Error::Corrupt("payload read past end"));
         }
         self.load()?;
-        let byte = self.reader.u8()?;
-        if byte > MAX_TF_BUCKET {
-            return Err(Error::Corrupt("payload bucket byte"));
-        }
-        let count = visit_positions(&mut self.reader, |_| {})?;
+        let (byte, count) = self.decode(|reader| {
+            let byte = reader.u8()?;
+            if byte > MAX_TF_BUCKET {
+                return Err(Error::Corrupt("payload bucket byte"));
+            }
+            let count = visit_positions(reader, |_| {})?;
+            Ok((byte, count))
+        })?;
         self.next_ordinal += 1;
         Ok((byte, count))
     }

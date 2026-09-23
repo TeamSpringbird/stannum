@@ -54,11 +54,6 @@ impl<'a> Reader<'a> {
         self.take(len).map(|_| ())
     }
 
-    pub fn u16_le(&mut self) -> Result<u16> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
     /// Moves to an absolute position that must not exceed the end of input.
     pub fn seek(&mut self, at: usize) -> Result<()> {
         if at > self.bytes.len() {
