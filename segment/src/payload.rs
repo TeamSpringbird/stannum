@@ -187,7 +187,10 @@ impl std::fmt::Debug for Bytes<'_> {
     }
 }
 
-/// Skip slots per fetched span of a ranged stream: about 2,048 entries.
+/// Most skip slots per fetched span of a ranged stream: about 2,048
+/// entries. A cursor that jumps fetches one slot; one that sweeps doubles
+/// its span up to this, so scoring a candidate costs a page or two of
+/// payload and a phrase over a frequent term still reads in long runs.
 const SPAN_SLOTS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
@@ -354,7 +357,7 @@ impl<'a> Payload<'a> {
             reader,
             owned: std::rc::Rc::from(Vec::new()),
             owned_at: 0,
-            span: None,
+            slots: (0, 0),
             span_at: 0,
             next_ordinal: 0,
         }
@@ -378,8 +381,9 @@ pub struct PayloadCursor<'a> {
     /// replaced by the next, so a sweep of a frequent term holds one span.
     owned: std::rc::Rc<[u8]>,
     owned_at: usize,
-    /// The loaded span of a ranged stream and where it starts in the stream.
-    span: Option<usize>,
+    /// The loaded span of a ranged stream as (first skip slot, slots), and
+    /// where it starts in the stream.
+    slots: (usize, usize),
     span_at: usize,
     next_ordinal: u32,
 }
@@ -396,18 +400,25 @@ impl PayloadCursor<'_> {
         let Bytes::Ranged { areas, base, .. } = self.payload.source else {
             return Ok(());
         };
-        let span = (self.next_ordinal / self.payload.interval) as usize / SPAN_SLOTS;
-        if self.span == Some(span) {
+        let slot = (self.next_ordinal / self.payload.interval) as usize;
+        let (first, count) = self.slots;
+        if count != 0 && slot >= first && slot < first + count {
             return Ok(());
         }
-        let start = self.payload.slot_at(span * SPAN_SLOTS)?;
-        let end = self.payload.slot_at((span + 1) * SPAN_SLOTS)?;
+        let sequential = count != 0 && slot == first + count;
+        let count = if sequential {
+            (count * 2).min(SPAN_SLOTS)
+        } else {
+            1
+        };
+        let start = self.payload.slot_at(slot)?;
+        let end = self.payload.slot_at(slot + count)?;
         if end < start {
             return Err(Error::Corrupt("payload skip order"));
         }
         self.owned = areas.payload_range_owned(base + start as u64, end - start)?;
         self.owned_at = 0;
-        self.span = Some(span);
+        self.slots = (slot, count);
         self.span_at = start;
         Ok(())
     }

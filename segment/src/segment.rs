@@ -480,7 +480,7 @@ impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
 }
 
 /// Document lengths per window of the length table a paged source hands out.
-const LENGTH_WINDOW: u32 = 16 * 1024;
+const LENGTH_WINDOW: u32 = 2048;
 
 /// Fetches extents of the postings and payload areas and document lengths.
 pub trait AreaFetch {
