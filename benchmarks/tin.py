@@ -542,9 +542,12 @@ def run(args):
                 # VACUUM and checks: the same corpus prefix in the same engine.
                 loaded = json.loads((args.load_database / 'snapshot.json').read_text())
                 for key, want in (('engine', engine), ('published_corpus', args.published_corpus),
-                                  ('rows', args.rows), ('image', image['Id'])):
+                                  ('rows', args.rows)):
                     if loaded.get(key) != want:
                         raise ValueError(f'saved database {key} {loaded.get(key)!r} does not match {want!r}')
+                # A database built by another image is usable as long as this
+                # image reads its segment format, which the directory check
+                # after startup proves; the origin is recorded either way.
                 copy_volume(image['Id'], f'{args.load_database.resolve()}:/from:ro', f'{volume}:/to')
             try:
                 command(['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus),
@@ -586,6 +589,11 @@ def run(args):
                                                 source_run=loaded['source_run'], saved_at=loaded['saved_at'])
                     if int(sql('SELECT count(*) FROM documents;', setup=True)) != args.rows:
                         raise ValueError('saved database row count differs from --rows')
+                    if engine == 'stannum':
+                        job['segments_after_build'] = json.loads(sql(
+                            f"SELECT coalesce(json_agg(s ORDER BY ordinal), '[]'::json) FROM stannum.segment_info('{index}') s;"))
+                        job['database_from']['image'] = loaded.get('image')
+                        job['database_from']['commit'] = loaded.get('commit')
                 if loaded is None:
                     sql((ASSETS / 'position-limit.sql').read_text())
                     sql('CREATE TABLE documents(id text NOT NULL, body text NOT NULL);' if published else
