@@ -132,6 +132,9 @@
   phrase of common words held 480 MB per backend at 15 million rows, and
   the 150 million row run was killed for memory). The ranges are shared
   through a least-recently-used cache of `stannum.read_cache_mb` (128 MiB)
-  per backend, so frequent terms' chunks stay warm. Ranked queries the
+  per backend, so frequent terms' chunks stay warm. A cursor over a term's
+  TID postings streams its block-bound table the same way and keeps only
+  the bounds between its block and its lookahead, where it decoded and kept
+  every block it passed (500 MB for one phrase at 150 million rows). Ranked queries the
   scorer cannot prune, such as phrases, score candidates as the stream
   yields them and keep only the top `k` rows instead of every match.

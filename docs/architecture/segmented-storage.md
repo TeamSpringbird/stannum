@@ -299,8 +299,9 @@ of skip slots, an ordinal cursor one chunk, a lengths cursor one window of
 the next. Those ranges are shared through a per-backend least-recently-used
 cache of `stannum.read_cache_mb` (128 MiB), so the hot chunks of frequent
 terms stay resident across queries while a sweep of a long stream displaces
-only itself. Only headers, dictionary blocks, bounds tables and page tables
-stay in the reader's arena, whose total across a backend's cached readers is
+only itself. Block-bound tables are streamed the same way, and a cursor keeps only the
+bounds between its block and its furthest lookahead. Only headers, dictionary
+blocks and page tables stay in the reader's arena, whose total across a backend's cached readers is
 bounded by `stannum.reader_cache_mb`. Ranked queries the scorer cannot prune,
 such as phrases, score the candidate stream as it arrives and keep only the
 top `k`; reading past `k` rows completes the ordering as a pruned scan does.

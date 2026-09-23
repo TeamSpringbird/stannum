@@ -473,6 +473,18 @@ impl<'a> Stream<'a> {
         }
     }
 
+    /// Over `[at, end)` of the stream only.
+    const fn range(source: Bytes<'a>, at: usize, end: usize) -> Self {
+        Self {
+            source,
+            end,
+            at,
+            window: Window::Borrowed(&[]),
+            window_at: 0,
+            window_end: 0,
+        }
+    }
+
     const fn position(&self) -> usize {
         self.at
     }
@@ -598,8 +610,6 @@ type Head = (u8, u32, Option<(usize, usize)>, usize);
 #[derive(Clone, Copy, Debug)]
 pub struct Postings<'a> {
     source: Bytes<'a>,
-    /// The stream up to its body: the header and any bounds table.
-    head: &'a [u8],
     form: u8,
     count: u32,
     /// Where the bounds table is, when the stream carries one.
@@ -612,7 +622,6 @@ impl<'a> Postings<'a> {
         let (form, count, bounds, body_at) = Self::parse_head(bytes, bytes.len())?;
         Ok(Self {
             source: Bytes::Whole(bytes),
-            head: &bytes[..body_at],
             form,
             count,
             bounds,
@@ -637,9 +646,11 @@ impl<'a> Postings<'a> {
         // The form, count and table length or term bound: a bounded prefix.
         let probe = source.range(0, PROBE.min(len))?;
         let (form, count, bounds, body_at) = Self::parse_head(probe, len)?;
+        // The bounds table is not held: a cursor streams it through the
+        // bounded cache as it moves, so a frequent term's table of tens of
+        // thousands of blocks per segment costs a window at a time.
         Ok(Self {
             source,
-            head: source.range(0, body_at)?,
             form,
             count,
             bounds,
@@ -717,15 +728,15 @@ impl<'a> Postings<'a> {
 
     fn bounds_table(&self) -> Option<Bounds<'a>> {
         self.bounds.map(|(at, len)| Bounds {
-            reader: Reader::new(&self.head[at..at + len]),
+            reader: Stream::range(self.source, at, at + len),
             blocks: self.count.div_ceil(BLOCK_POSTINGS),
-            starts: if self.is_grouped() || self.has_term_bound() {
-                None
-            } else {
-                Some(Vec::new())
-            },
+            starts: !self.is_grouped() && !self.has_term_bound(),
             body_len: self.source.len() - self.body_at,
-            entries: Vec::new(),
+            entries: std::collections::VecDeque::new(),
+            first: 0,
+            decoded: 0,
+            previous: None,
+            previous_start: None,
             stream: *self,
             compact: self.has_term_bound(),
             term_last: None,
@@ -895,13 +906,14 @@ impl<'a> PostingsCursor<'a> {
             return Ok(None);
         };
         let target = target.max(current);
-        let mut block = self.ordinal() / BLOCK_POSTINGS;
+        let floor = self.ordinal() / BLOCK_POSTINGS;
+        let mut block = floor;
         self.resolve_term_last()?;
         let Some(bounds) = self.bounds_mut() else {
             return Ok(None);
         };
         loop {
-            let Some(entry) = bounds.entry(block)? else {
+            let Some(entry) = bounds.entry(block, floor)? else {
                 return Ok(None);
             };
             if entry.last >= target {
@@ -923,12 +935,23 @@ impl<'a> PostingsCursor<'a> {
     pub(crate) fn block_bounds_into(&mut self, all: &mut Vec<BlockBound>) -> Result<()> {
         all.clear();
         self.resolve_term_last()?;
-        let Some(bounds) = self.bounds_mut() else {
+        let Some(live) = self.bounds_mut() else {
             return Ok(());
         };
+        // Over a fresh decoder, so the cursor's own window still starts at
+        // its block.
+        let mut bounds = live
+            .stream
+            .bounds_table()
+            .expect("the cursor's stream carries bounds");
+        bounds.term_last = live.term_last;
         // A corrupt count can imply millions of bounds in a tiny stream.
         for block in 0..bounds.blocks {
-            all.push(bounds.entry(block)?.expect("block index is in range"));
+            all.push(
+                bounds
+                    .entry(block, block)?
+                    .expect("block index is in range"),
+            );
         }
         Ok(())
     }
@@ -984,15 +1007,32 @@ impl Cursor for PostingsCursor<'_> {
 
 /// Decodes a term bound: the bucket mask and the shortest document per
 /// bucket that occurs.
-fn decode_term_bound(reader: &mut Reader<'_>) -> Result<[u32; BUCKET_COUNT]> {
-    let buckets = reader.varint_u32()?;
+/// Sequential varint reads, over a whole slice or a stream.
+trait Varints {
+    fn next_u32(&mut self) -> Result<u32>;
+}
+
+impl Varints for Reader<'_> {
+    fn next_u32(&mut self) -> Result<u32> {
+        self.varint_u32()
+    }
+}
+
+impl Varints for Stream<'_> {
+    fn next_u32(&mut self) -> Result<u32> {
+        self.varint_u32()
+    }
+}
+
+fn decode_term_bound(reader: &mut impl Varints) -> Result<[u32; BUCKET_COUNT]> {
+    let buckets = reader.next_u32()?;
     if buckets == 0 || buckets >> BUCKET_COUNT != 0 {
         return Err(Error::Corrupt("block bound buckets"));
     }
     let mut min_len = [u32::MAX; BUCKET_COUNT];
     for (bucket, len) in min_len.iter_mut().enumerate() {
         if buckets & (1 << bucket) != 0 {
-            *len = reader.varint_u32()?;
+            *len = reader.next_u32()?;
             if *len == u32::MAX {
                 return Err(Error::Corrupt("block bound length"));
             }
@@ -1001,17 +1041,28 @@ fn decode_term_bound(reader: &mut Reader<'_>) -> Result<[u32; BUCKET_COUNT]> {
     Ok(min_len)
 }
 
-/// The bounds table, decoded one entry at a time as the cursor moves.
+/// The bounds table, decoded one entry at a time as the cursor moves. Only
+/// the entries from the cursor's block to the furthest it has looked ahead
+/// are held: a cursor never asks about a block it has passed, and a frequent
+/// term's table runs to tens of thousands of blocks per segment.
 #[derive(Clone, Debug)]
 struct Bounds<'a> {
     /// Positioned at the next undecoded entry.
-    reader: Reader<'a>,
+    reader: Stream<'a>,
     blocks: u32,
-    /// Sparse streams with a table only: byte offset of each block's first
-    /// posting.
-    starts: Option<Vec<usize>>,
+    /// Sparse streams with a table only: the table also carries the byte
+    /// offset of each block's first posting.
+    starts: bool,
     body_len: usize,
-    entries: Vec<BlockBound>,
+    /// Entries `first..first + entries.len()`, each with its block's start
+    /// (zero where the table carries none).
+    entries: std::collections::VecDeque<(BlockBound, usize)>,
+    first: u32,
+    /// Entries decoded so far.
+    decoded: u32,
+    /// The last entry decoded and its start, for delta decoding.
+    previous: Option<BlockBound>,
+    previous_start: Option<usize>,
     /// The stream, so a term bound's last location can be found.
     stream: Postings<'a>,
     /// True for a term bound: one entry, without a stored last location.
@@ -1023,19 +1074,39 @@ struct Bounds<'a> {
 
 impl Bounds<'_> {
     /// Decodes up to and including entry `block`; `None` when out of range.
-    fn entry(&mut self, block: u32) -> Result<Option<BlockBound>> {
+    /// Entries before `floor`, the cursor's block, are released.
+    fn entry(&mut self, block: u32, floor: u32) -> Result<Option<BlockBound>> {
         if block >= self.blocks {
             return Ok(None);
         }
-        while self.entries.len() <= block as usize {
+        while self.first < floor && !self.entries.is_empty() {
+            self.entries.pop_front();
+            self.first += 1;
+        }
+        if self.entries.is_empty() {
+            self.first = self.decoded.max(floor);
+        }
+        if block < self.first {
+            return Err(Error::Corrupt("block bound behind the cursor"));
+        }
+        while self.decoded <= block {
             self.decode()?;
         }
-        Ok(Some(self.entries[block as usize]))
+        Ok(Some(self.entries[(block - self.first) as usize].0))
+    }
+
+    /// Byte offset of block `block`'s first posting, once decoded.
+    fn start(&self, block: u32) -> Option<usize> {
+        block
+            .checked_sub(self.first)
+            .and_then(|i| self.entries.get(i as usize))
+            .map(|(_, start)| *start)
     }
 
     fn decode(&mut self) -> Result<()> {
         let min_len = decode_term_bound(&mut self.reader)?;
-        let previous = self.entries.last().copied();
+        let previous = self.previous;
+        let mut start = 0;
         let last = if self.compact {
             self.term_last
                 .expect("a term bound's last location is resolved before decoding")
@@ -1049,9 +1120,9 @@ impl Bounds<'_> {
             if previous.is_some_and(|entry| entry.last >= last) {
                 return Err(Error::Corrupt("block bounds not increasing"));
             }
-            if let Some(starts) = self.starts.as_mut() {
-                let previous_start = starts.last().copied();
-                let start = previous_start
+            if self.starts {
+                let previous_start = self.previous_start;
+                start = previous_start
                     .unwrap_or(0)
                     .checked_add(self.reader.varint()? as usize)
                     .filter(|start| *start < self.body_len)
@@ -1059,12 +1130,19 @@ impl Bounds<'_> {
                 if previous_start.is_some_and(|previous| previous >= start) {
                     return Err(Error::Corrupt("block starts not increasing"));
                 }
-                starts.push(start);
+                self.previous_start = Some(start);
             }
             last
         };
-        self.entries.push(BlockBound { min_len, last });
-        if self.entries.len() == self.blocks as usize && self.reader.remaining() != 0 {
+        let entry = BlockBound { min_len, last };
+        self.previous = Some(entry);
+        // Entries the cursor has passed since the last request are released
+        // by the next `entry` call; here the window only grows.
+        if self.decoded >= self.first {
+            self.entries.push_back((entry, start));
+        }
+        self.decoded += 1;
+        if self.decoded == self.blocks && self.reader.remaining() != 0 {
             return Err(Error::Corrupt("block bounds length"));
         }
         Ok(())
@@ -1085,7 +1163,7 @@ pub struct SparseCursor<'a> {
 
 impl SparseCursor<'_> {
     fn seek(&mut self, target: Tid) -> Result<()> {
-        if self.bounds.as_ref().is_some_and(|b| b.starts.is_some()) {
+        if self.bounds.as_ref().is_some_and(|b| b.starts) {
             self.skip_blocks_before(target)?;
         }
         while self.current.is_some_and(|current| current < target) {
@@ -1140,10 +1218,10 @@ impl SparseCursor<'_> {
         let from = self.ordinal / BLOCK_POSTINGS;
         let mut block = from;
         let mut entry = bounds
-            .entry(block)?
+            .entry(block, from)?
             .ok_or(Error::Corrupt("posting beyond block bounds"))?;
         while entry.last < target {
-            match bounds.entry(block + 1)? {
+            match bounds.entry(block + 1, from)? {
                 Some(next) => {
                     block += 1;
                     entry = next;
@@ -1160,9 +1238,11 @@ impl SparseCursor<'_> {
             return Ok(());
         }
         let previous = bounds
-            .entry(block - 1)?
+            .entry(block - 1, from)?
             .expect("decoded on the way to the target block");
-        let start = bounds.starts.as_ref().expect("sparse bounds track starts")[block as usize];
+        let start = bounds
+            .start(block)
+            .expect("decoded on the way to the target block");
         self.reader.seek(self.body_at + start)?;
         self.last_block = previous.last.block;
         self.ordinal = block * BLOCK_POSTINGS;
