@@ -17,6 +17,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import shlex
 import subprocess
 import statistics
 import time
@@ -550,7 +551,10 @@ def run(args):
                 # after startup proves; the origin is recorded either way.
                 copy_volume(image['Id'], f'{args.load_database.resolve()}:/from:ro', f'{volume}:/to')
             try:
-                command(['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus),
+                # Extra `docker run` flags for local rehearsals, such as read throttling that
+                # stands in for a slower disk: STANNUM_DOCKER_RUN_ARGS="--device-read-iops /dev/vdb:20000".
+                extra = shlex.split(os.environ.get('STANNUM_DOCKER_RUN_ARGS', ''))
+                command(['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus), *extra,
                          '--memory', job['resource_limits']['build_memory'],
                          '--memory-swap', job['resource_limits']['build_memory'], '--shm-size', '1g',
                          '-p', f'127.0.0.1:{args.port}:5432',
