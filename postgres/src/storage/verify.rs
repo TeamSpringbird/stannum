@@ -259,6 +259,16 @@ impl Checker {
                 format!("last page links on to page {block}, which no reader follows"),
             );
         }
+        if complete && visited.last().is_some_and(|last| *last != run.last) {
+            self.error(
+                owner.to_owned(),
+                format!(
+                    "the run records page {} as its last; the chain ends at page {}",
+                    run.last,
+                    visited.last().expect("a complete chain has a page")
+                ),
+            );
+        }
         if out.len() != run.bytes as usize {
             if complete {
                 self.error(

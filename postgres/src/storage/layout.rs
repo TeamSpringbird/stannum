@@ -54,7 +54,7 @@ pub const FLAG_REMOVAL_HORIZONS: u16 = 1;
 const FLAGS: usize = PAGE_SIZE - SPECIAL_SIZE + 6;
 
 /// Directory entries the meta page can hold before a merge is forced.
-pub const MAX_SEGMENTS: usize = 128;
+pub const MAX_SEGMENTS: usize = 96;
 /// Runs the meta page can hold while they wait for readers to drain: what
 /// fits beside a full directory.
 pub const MAX_PENDING: usize = 48;
@@ -160,6 +160,10 @@ pub struct Run {
     pub first: u32,
     pub blocks: u32,
     pub bytes: u32,
+    /// The chain's last page, so joining two retired chains writes one
+    /// page instead of walking a run that may be millions of pages, under
+    /// the exclusive meta lock.
+    pub last: u32,
 }
 
 impl Run {
@@ -167,6 +171,7 @@ impl Run {
         first: NONE,
         blocks: 0,
         bytes: 0,
+        last: NONE,
     };
 
     pub const fn is_empty(&self) -> bool {
@@ -189,7 +194,8 @@ pub struct SegmentEntry {
     pub generation: u32,
 }
 
-const ENTRY_BYTES: usize = 12 + 12 + 12 + 4 + 4 + 8 + 4;
+const RUN_BYTES: usize = 16;
+const ENTRY_BYTES: usize = RUN_BYTES * 3 + 4 + 4 + 8 + 4;
 
 /// A run waiting until every scan that could still read it has finished.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -199,7 +205,7 @@ pub struct Pending {
     pub xid: u32,
 }
 
-const PENDING_BYTES: usize = 12 + 4;
+const PENDING_BYTES: usize = RUN_BYTES + 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BufferState {
@@ -234,6 +240,7 @@ fn put_run(out: &mut Vec<u8>, run: Run) {
     out.extend_from_slice(&run.first.to_le_bytes());
     out.extend_from_slice(&run.blocks.to_le_bytes());
     out.extend_from_slice(&run.bytes.to_le_bytes());
+    out.extend_from_slice(&run.last.to_le_bytes());
 }
 
 fn get_run(bytes: &[u8], at: usize) -> Run {
@@ -241,6 +248,7 @@ fn get_run(bytes: &[u8], at: usize) -> Run {
         first: u32_at(bytes, at),
         blocks: u32_at(bytes, at + 4),
         bytes: u32_at(bytes, at + 8),
+        last: u32_at(bytes, at + 12),
     }
 }
 
@@ -315,12 +323,12 @@ impl Meta {
         for _ in 0..segment_count {
             let entry = SegmentEntry {
                 run: get_run(bytes, at),
-                map: get_run(bytes, at + 12),
-                dead: get_run(bytes, at + 24),
-                dead_stamp: u32_at(bytes, at + 36),
-                docs: u32_at(bytes, at + 40),
-                total_length: u64_at(bytes, at + 44),
-                generation: u32_at(bytes, at + 52),
+                map: get_run(bytes, at + RUN_BYTES),
+                dead: get_run(bytes, at + 2 * RUN_BYTES),
+                dead_stamp: u32_at(bytes, at + 3 * RUN_BYTES),
+                docs: u32_at(bytes, at + 3 * RUN_BYTES + 4),
+                total_length: u64_at(bytes, at + 3 * RUN_BYTES + 8),
+                generation: u32_at(bytes, at + 3 * RUN_BYTES + 16),
             };
             if entry.run.is_empty() || entry.run.blocks == 0 {
                 return Err("invalid Stannum segment entry");
@@ -332,7 +340,7 @@ impl Meta {
         for _ in 0..pending_count {
             pending.push(Pending {
                 run: get_run(bytes, at),
-                xid: u32_at(bytes, at + 12),
+                xid: u32_at(bytes, at + RUN_BYTES),
             });
             at += PENDING_BYTES;
         }
@@ -371,11 +379,13 @@ mod tests {
                         first: 2,
                         blocks: 5,
                         bytes: 40_123,
+                        last: 6,
                     },
                     map: Run {
                         first: 12,
                         blocks: 1,
                         bytes: 20,
+                        last: 12,
                     },
                     dead: Run::EMPTY,
                     dead_stamp: 0,
@@ -388,12 +398,14 @@ mod tests {
                         first: 9,
                         blocks: 1,
                         bytes: 12,
+                        last: 9,
                     },
                     map: Run::EMPTY,
                     dead: Run {
                         first: 10,
                         blocks: 1,
                         bytes: 5,
+                        last: 10,
                     },
                     dead_stamp: 7,
                     docs: 1,
@@ -406,6 +418,7 @@ mod tests {
                     first: 11,
                     blocks: 2,
                     bytes: 9_000,
+                    last: 12,
                 },
                 xid: 77,
             }],

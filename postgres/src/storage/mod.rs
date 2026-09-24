@@ -694,6 +694,7 @@ unsafe fn write_run_with_map(index: pg_sys::Relation, data: &[u8]) -> (Run, Vec<
         };
         let mut next = NONE;
         let mut blocks = Vec::with_capacity(chunks.len());
+        // Written last page first, so each page links to one already written.
         for chunk in chunks.iter().rev() {
             pgrx::check_for_interrupts!();
             let buffer = Buffer::allocate(index);
@@ -707,12 +708,14 @@ unsafe fn write_run_with_map(index: pg_sys::Relation, data: &[u8]) -> (Run, Vec<
             next = buffer.block();
             blocks.push(next);
         }
+        let last = blocks[0];
         blocks.reverse();
         (
             Run {
                 first: next,
                 blocks: chunks.len() as u32,
                 bytes: data.len() as u32,
+                last,
             },
             blocks,
         )
@@ -1076,6 +1079,7 @@ unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
                 first: run.first,
                 blocks: last.run.blocks + run.blocks,
                 bytes: last.run.bytes.saturating_add(run.bytes),
+                last: last.run.last,
             };
             last.xid = xid;
         }
@@ -1092,39 +1096,39 @@ unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
 unsafe fn prepend_chain(index: pg_sys::Relation, run: Run, next: u32) {
     unsafe {
         let what = format!("released run at page {}", run.first);
-        let mut block = run.first;
-        for i in 1..run.blocks {
-            pgrx::check_for_interrupts!();
-            let buffer = Buffer::read(index, block, false);
-            expect_run_page(&buffer, &what);
-            let (following, _) = buffer.chain();
-            if following == NONE {
-                corrupt(format!(
-                    "Stannum {what}: chain ends after {i} of {} pages",
-                    run.blocks
-                ));
-            }
-            block = following;
-        }
-        let last = Buffer::read(index, block, true);
+        // The run records its last page: one page is written, whatever the
+        // run's length. Walking the chain to find it held the meta lock for
+        // as long as a retired merge input took to read.
+        let last = Buffer::read(index, run.last, true);
         expect_run_page(&last, &what);
-        let (_, data) = last.chain();
+        let (following, data) = last.chain();
+        if following != NONE {
+            corrupt(format!(
+                "Stannum {what}: page {} is not the chain's last page",
+                run.last
+            ));
+        }
         let payload = layout::chain_payload(next, data);
         write_page(index, &last, false, KIND_RUN, &payload);
     }
 }
 
-/// Marks the pages of every pending run that no snapshot can still read as
-/// free and records them in the FSM; the rest stay on the list.
+/// Marks pages of pending runs that no snapshot can still read as free and
+/// records them in the FSM, at most `stannum.reclaim_pages` of them: this
+/// runs under the exclusive meta lock, where freeing every page of a
+/// retired merge input at once stalled the insert and, behind it, every
+/// reader for the duration of the walk. A run freed only in part keeps
+/// its place on the list, from the first page still to free.
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively.
 unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
     unsafe {
+        let mut budget = RECLAIM_PAGES.get().max(1) as u32;
         let mut still_pending = Vec::new();
-        for pending in std::mem::take(&mut meta.pending) {
+        for mut pending in std::mem::take(&mut meta.pending) {
             let xid = pg_sys::TransactionId::from(pending.xid);
-            if !pg_sys::GlobalVisCheckRemovableXid(index, xid) {
+            if budget == 0 || !pg_sys::GlobalVisCheckRemovableXid(index, xid) {
                 still_pending.push(pending);
                 continue;
             }
@@ -1132,7 +1136,8 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
             // below become free and reusable.
             wal::log_reclaim(index, pending.xid);
             let mut block = pending.run.first;
-            for _ in 0..pending.run.blocks {
+            let mut freed = 0;
+            while freed < pending.run.blocks && budget > 0 {
                 pgrx::check_for_interrupts!();
                 if block == NONE {
                     break;
@@ -1143,10 +1148,26 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
                 }
                 let (next, _) = buffer.chain();
                 write_page(index, &buffer, false, KIND_FREE, &pending.xid.to_le_bytes());
-                let freed = buffer.block();
+                let page = buffer.block();
                 drop(buffer);
-                pg_sys::RecordFreeIndexPage(index, freed);
+                pg_sys::RecordFreeIndexPage(index, page);
                 block = next;
+                freed += 1;
+                budget -= 1;
+            }
+            if freed < pending.run.blocks && block != NONE {
+                // The chain from `block` stands on its own; a later drain
+                // or reclamation carries on from there.
+                pending.run = Run {
+                    first: block,
+                    blocks: pending.run.blocks - freed,
+                    bytes: pending
+                        .run
+                        .bytes
+                        .saturating_sub(freed.saturating_mul(CHAIN_CAPACITY as u32)),
+                    last: pending.run.last,
+                };
+                still_pending.push(pending);
             }
         }
         meta.pending = still_pending;
@@ -2172,6 +2193,7 @@ unsafe fn write_run_into(
                 first: blocks[0],
                 blocks: chunks.len() as u32,
                 bytes: data.len() as u32,
+                last: *blocks.last().expect("a run has a page"),
             },
             blocks,
         )
@@ -3089,6 +3111,7 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
                         .run
                         .bytes
                         .saturating_sub(freed.saturating_mul(CHAIN_CAPACITY as u32)),
+                    last: pending.run.last,
                 };
             }
             freeing.push((pending.xid, pages));

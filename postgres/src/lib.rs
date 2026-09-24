@@ -3863,14 +3863,14 @@ mod tests {
              SET LOCAL stannum.merge_tier_factor = 2;
              SET LOCAL stannum.max_merge_docs = 0;
              SET LOCAL stannum.deferred_merge_docs = 0;
-             INSERT INTO merge_full SELECT 'needle' FROM generate_series(1,130);",
+             INSERT INTO merge_full SELECT 'needle' FROM generate_series(1,98);",
         )
         .unwrap();
         assert_eq!(
             value(
                 "SELECT count(*) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
             ),
-            128
+            96
         );
         assert_eq!(
             value(
@@ -3882,7 +3882,7 @@ mod tests {
             value(
                 "SELECT count(DISTINCT generation) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
             ),
-            128
+            96
         );
         // `stannum.max_segments` is a soft bound: with no budget, an insert
         // leaves the directory over it and only the on-disk bound forces the
@@ -3893,7 +3893,7 @@ mod tests {
             value(
                 "SELECT count(*) FROM stannum.segment_info('merge_full_idx') WHERE kind = 'immutable'"
             ),
-            128
+            96
         );
         assert_eq!(
             value("SELECT max(docs) FROM stannum.segment_info('merge_full_idx')"),
@@ -3913,7 +3913,7 @@ mod tests {
         );
         assert_eq!(
             value("SELECT sum(docs)::bigint FROM stannum.segment_info('merge_full_idx')"),
-            132
+            100
         );
         assert_eq!(
             value(
@@ -3924,7 +3924,7 @@ mod tests {
         Spi::run("SET LOCAL enable_seqscan = off").unwrap();
         assert_eq!(
             value("SELECT count(*) FROM merge_full WHERE body ==> 'needle'"),
-            132
+            100
         );
     }
 
@@ -4340,7 +4340,7 @@ mod tests {
         // retires its inputs: the output is discarded and its pages freed,
         // and cleanup retries against the new directory.
         Spi::run(
-            "SET LOCAL stannum.max_merge_docs = 0; SET LOCAL stannum.max_segments = 128;
+            "SET LOCAL stannum.max_merge_docs = 0; SET LOCAL stannum.max_segments = 96;
                   INSERT INTO vac_race SELECT n, 'needle later' FROM generate_series(34, 40) n;",
         )
         .unwrap();

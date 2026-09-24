@@ -42,6 +42,12 @@
   as it keeps.
 - Each dead list carries a stamp, so a reader's cached copy is not served
   once VACUUM replaces the list in the same pages at the same size.
+- Every run records its last page, so retiring a run joins pending chains
+  with one page write instead of a walk of the run under the meta lock,
+  and draining the pending list under that lock frees at most
+  `stannum.reclaim_pages` pages at a time. The published write workload
+  saw an update hold the lock for 20 to 30 s while such a walk read a
+  retired merge input. The directory holds 96 entries (was 128).
 - A view releases the index meta page before it loads segment readers,
   so a slow reload never queues a writer and, behind it, every reader.
   `stannum.reader_cache_mb` defaults to 384 (was 160), enough to keep the

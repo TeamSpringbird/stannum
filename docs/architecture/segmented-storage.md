@@ -141,10 +141,10 @@ set of that size and therefore the cheapest way back under the bound; an
 insert performs that merge only when it fits the remaining budget, preferring
 a due tier merge that fits, and otherwise lets the directory grow for VACUUM
 to shrink. VACUUM merges due tiers and then the smallest entries until the
-directory fits, with no budget. The on-disk directory of 128 entries is the
-hard bound: an insert that would leave 129 entries merges the two smallest
+directory fits, with no budget. The on-disk directory of 96 entries is the
+hard bound: an insert that would leave 97 entries merges the two smallest
 whatever they cost. **That is the only unbudgeted merge.** A fixed document
-ceiling is impossible alongside a fixed 128-entry directory when all 128
+ceiling is impossible alongside a fixed 96-entry directory when all 96
 entries already exceed that ceiling.
 
 Worst case: without VACUUM, folds keep adding entries; once the directory is
