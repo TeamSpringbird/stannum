@@ -936,7 +936,10 @@ type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
 /// hold what every query touches: the page tables of a 150 million row
 /// index are 76 MiB. Sized with `stannum.read_cache_mb` for eight backends
 /// beside 24 GiB of shared buffers in 32 GiB.
-pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(160);
+/// Sized so a directory of a few dozen segments over a hundred million
+/// rows stays resident: at 160 MB eighteen readers' page tables and
+/// dictionary samples overflowed it, so every query reloaded all of them.
+pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(384);
 
 /// `stannum.read_cache_mb`: the budget of [`segment::cache`], the least
 /// recently used ranges cursors sweep, applied whenever a view is captured.
@@ -2411,6 +2414,13 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
             } else {
                 None
             };
+            // The meta page is released before the segment readers load:
+            // segment runs are freed only past every snapshot that could
+            // read them, not under this lock, and loading eighteen readers'
+            // page tables and dead lists from disk under it queued a writer
+            // behind the slowest reader and every later reader behind the
+            // writer, for as long as thirty seconds at 150 million rows.
+            drop(meta_buffer);
             let mut sources: Vec<Source> = Vec::with_capacity(meta.segments.len() + 1);
             let mut labels = Vec::with_capacity(meta.segments.len() + 1);
             let mut dead_sets = Vec::with_capacity(meta.segments.len() + 1);
@@ -2441,7 +2451,6 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
             }
             // Segments are immutable; the buffer index was extended under the
             // shared meta lock, so a fold cannot rewrite pages underneath it.
-            drop(meta_buffer);
             drop(relation);
             return View {
                 sources,

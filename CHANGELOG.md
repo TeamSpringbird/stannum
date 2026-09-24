@@ -42,6 +42,10 @@
   as it keeps.
 - Each dead list carries a stamp, so a reader's cached copy is not served
   once VACUUM replaces the list in the same pages at the same size.
+- A view releases the index meta page before it loads segment readers,
+  so a slow reload never queues a writer and, behind it, every reader.
+  `stannum.reader_cache_mb` defaults to 384 (was 160), enough to keep the
+  readers of a large directory resident across queries.
 - The per-row scorer rewinds a term cursor instead of reopening the term:
   reopening parsed every chunk bound again, and an exhaustive reference
   over a hundred million rows did so for each row.
