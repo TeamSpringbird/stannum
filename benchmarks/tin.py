@@ -8,7 +8,6 @@ import argparse
 import collections
 import csv
 import datetime
-import fcntl
 import gzip
 import json
 import math
@@ -1107,14 +1106,11 @@ def main():
         p.add_argument('--' + variant + '-image', required=True)
         p.add_argument('--' + variant + '-source', type=Path, required=True)
     args = parser.parse_args()
-    if args.command in ('prepare', 'report', 'catalog', 'experiment'):
-        args.func(args)
-    else:
-        # Shared with native pgrx builds/tests across worktrees on this machine.
-        # Do not wrap this command in another acquisition of the same lock.
-        with open('/tmp/stannum-pgrx.lock', 'w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            args.func(args)
+    # No global lock here: a run or an image build works inside Docker and
+    # touches no native pgrx build or install, and a full-scale run holding
+    # the pgrx lock for hours blocked every test and image build meanwhile.
+    # Callers that must serialise with pgrx work wrap the command themselves.
+    args.func(args)
 
 
 if __name__ == '__main__':

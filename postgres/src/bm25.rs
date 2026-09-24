@@ -390,6 +390,31 @@ impl TermScorer {
             .fold(0.0_f32, f32::max)
     }
 
+    /// Per bucket, an upper bound on the score of any document in `block`
+    /// whose bucket is at most that bucket and whose length is at least
+    /// `min_length`: the best score over the buckets up to it, each at its
+    /// own shortest document. A sub-block bound at its largest bucket and
+    /// the chunk's shortest document paired a high term frequency with a
+    /// document that never carried it; this table pairs each bucket with
+    /// the shortest document that does.
+    pub(crate) fn bounds_by_bucket(
+        &self,
+        block: &BlockBound,
+        min_length: u32,
+    ) -> [f32; segment::tf_bucket::BUCKET_COUNT] {
+        let mut table = [0.0_f32; segment::tf_bucket::BUCKET_COUNT];
+        let mut best = 0.0_f32;
+        for (bucket, slot) in table.iter_mut().enumerate() {
+            let len = block.min_len[bucket];
+            if len != u32::MAX {
+                let bucket = TfBucket::new(bucket as u8).expect("bucket within the count");
+                best = best.max(self.score_bucket(bucket, len.max(min_length)));
+            }
+            *slot = best;
+        }
+        table
+    }
+
     /// An upper bound on the score of a document of `length` in `block`:
     /// its bucket is one of the block's, so its score is one of these.
     #[must_use]

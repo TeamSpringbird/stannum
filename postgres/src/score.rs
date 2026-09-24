@@ -1426,6 +1426,7 @@ impl OrdinalWalk<'_, '_> {
         let mut sub_empty = [false; SUBS];
         for term in &self.terms {
             let scorer = &self.scorer.terms[term.slot].1;
+            let by_bucket = scorer.bounds_by_bucket(&term.bound_block(term.pos), min_length);
             for (i, (sub, score)) in term.sub_bounds[term.pos]
                 .iter()
                 .zip(sub_scores.iter_mut())
@@ -1434,8 +1435,7 @@ impl OrdinalWalk<'_, '_> {
                 if *sub == 0 {
                     sub_empty[i] = true;
                 } else {
-                    let bucket = TfBucket::new(*sub - 1).expect("bucket from a chunk bound");
-                    *score += scorer.score_bucket(bucket, min_length);
+                    *score += by_bucket[usize::from(*sub - 1)];
                 }
             }
         }
@@ -1534,16 +1534,12 @@ impl OrdinalWalk<'_, '_> {
                 continue;
             }
             let block = term.bound_block(term.pos);
-            let shortest = floor.unwrap_or_else(|| block.shortest());
             let scorer = &self.scorer.terms[term.slot].1;
             let top = term.sub_bounds[term.pos][sub];
             let upper = if top == 0 {
                 0.0
             } else {
-                let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
-                scorer
-                    .score_bucket(bucket, shortest)
-                    .min(scorer.bound_with_min_length(&block, shortest))
+                scorer.bounds_by_bucket(&block, floor.unwrap_or(0))[usize::from(top - 1)]
             };
             values[n] = upper;
             uppers.push((upper, n));
@@ -1694,11 +1690,10 @@ impl OrdinalWalk<'_, '_> {
         for &t in present {
             let term = &self.terms[t];
             let scorer = &self.scorer.terms[term.slot].1;
-            let shortest = term.bound_block(term.pos).shortest();
+            let by_bucket = scorer.bounds_by_bucket(&term.bound_block(term.pos), 0);
             for (sub, score) in term.sub_bounds[term.pos].iter().zip(sub_scores.iter_mut()) {
                 if *sub > 0 {
-                    let bucket = TfBucket::new(*sub - 1).expect("bucket from a block bound");
-                    *score += scorer.score_bucket(bucket, shortest);
+                    *score += by_bucket[usize::from(*sub - 1)];
                 }
             }
         }
