@@ -390,6 +390,20 @@ impl TermScorer {
             .fold(0.0_f32, f32::max)
     }
 
+    /// An upper bound on the score of a document of `length` in `block`:
+    /// the best score over the buckets that occur, at that length. The walk
+    /// bounds at the sub-block's largest bucket instead, which occurs in
+    /// the chunk and so is this maximum; the test below checks that.
+    #[cfg(test)]
+    pub(crate) fn bound_for_length(&self, block: &BlockBound, length: u32) -> f32 {
+        let mut bound = 0.0_f32;
+        for (bucket, _) in block.buckets() {
+            let bucket = TfBucket::new(bucket).expect("block bounds hold valid buckets");
+            bound = bound.max(self.score_bucket(bucket, length));
+        }
+        bound
+    }
+
     /// Per bucket, an upper bound on the score of any document in `block`
     /// whose bucket is at most that bucket and whose length is at least
     /// `min_length`: the best score over the buckets up to it, each at its
@@ -413,18 +427,6 @@ impl TermScorer {
             *slot = best;
         }
         table
-    }
-
-    /// An upper bound on the score of a document of `length` in `block`:
-    /// its bucket is one of the block's, so its score is one of these.
-    #[must_use]
-    pub(crate) fn bound_for_length(&self, block: &BlockBound, length: u32) -> f32 {
-        let mut bound = 0.0_f32;
-        for (bucket, _) in block.buckets() {
-            let bucket = TfBucket::new(bucket).expect("block bounds hold valid buckets");
-            bound = bound.max(self.score_bucket(bucket, length));
-        }
-        bound
     }
 }
 

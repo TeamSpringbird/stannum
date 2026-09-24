@@ -1021,6 +1021,7 @@ impl IndexScorer {
             pos: 0,
             term_max: scorer.map_or(0.0, |scorer| scorer.bound(&whole)),
             words: Box::new([0; segment::ordinals::WORDS]),
+            counted: (0, 0),
             members: Vec::new(),
             dense: false,
             rank_base: 0,
@@ -1066,6 +1067,9 @@ struct OrdinalTerm<'a> {
     dense: bool,
     /// The rank of the current chunk's first member.
     rank_base: u32,
+    /// Members counted so far in the current chunk: (word index, members
+    /// in the words before it).
+    counted: (usize, u32),
 }
 
 impl OrdinalTerm<'_> {
@@ -1117,6 +1121,7 @@ impl OrdinalTerm<'_> {
         CHUNK_LOADS.set(CHUNK_LOADS.get() + 1);
         let key = self.keys[self.pos];
         self.members.clear();
+        self.counted = (0, 0);
         match &self.list {
             Some(list) => {
                 self.words.fill(0);
@@ -1153,15 +1158,26 @@ impl OrdinalTerm<'_> {
     }
 
     /// Whether the loaded chunk holds `low`, and the member's rank in the stream.
-    fn rank(&self, low: u16) -> Option<u32> {
-        let word = self.words[usize::from(low / 64)];
+    ///
+    /// Candidates are ranked in ascending order within a chunk, so the
+    /// members before `low` are counted from where the last call stopped;
+    /// counting from the chunk's start each time was a thousand words per
+    /// candidate per term.
+    fn rank(&mut self, low: u16) -> Option<u32> {
+        let word_at = usize::from(low / 64);
+        let word = self.words[word_at];
         if word & (1 << (low % 64)) == 0 {
             return None;
         }
-        let before: u32 = self.words[..usize::from(low / 64)]
+        let (mut counted_to, mut before) = self.counted;
+        if counted_to > word_at {
+            (counted_to, before) = (0, 0);
+        }
+        before += self.words[counted_to..word_at]
             .iter()
             .map(|w| w.count_ones())
-            .sum();
+            .sum::<u32>();
+        self.counted = (word_at, before);
         Some(self.rank_base + before + (word & ((1u64 << (low % 64)) - 1)).count_ones())
     }
 }
@@ -1629,13 +1645,14 @@ impl OrdinalWalk<'_, '_> {
                 let term = &terms[present[n]];
                 let scorer = &self.scorer.terms[term.slot].1;
                 let top = term.sub_bounds[term.pos][sub];
+                // The sub-block's largest bucket is a member's, so the score
+                // at that bucket and this length bounds every member: no
+                // sweep of the chunk's buckets tightens it.
                 values[n] = if top == 0 {
                     0.0
                 } else {
                     let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
-                    scorer
-                        .score_bucket(bucket, length)
-                        .min(scorer.bound_for_length(&term.bound_block(term.pos), length))
+                    scorer.score_bucket(bucket, length)
                 };
             }
         };
