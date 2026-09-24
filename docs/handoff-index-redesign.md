@@ -396,6 +396,16 @@ term in every segment, because a chunk's bound over 65,536 documents
 beats a top-ten threshold for any moderately common term. Chunk-level
 cost, per segment, is where the time goes once candidates are cheap.
 
+The mixed workload on the same local database with the harness's byte
+cap lifted (the IOPS cap kept), CPU-bound at 7.4 of 8 cores like the
+host: `f099667` 42.9 QPS, p50 56 ms; `eaa9507` 47.3 QPS, p50 50 ms.
+Per family, `f099667` to `eaa9507`: conjunction p50 21 to 19 ms,
+disjunction p50 95 to 70 ms with p99 674 to 415 ms, phrase p50 125 to
+124 ms with p99 3.8 to 4.0 s. The per-candidate work bought 10% on the
+mixed number because a third of that workload is phrases, which it does
+not touch: phrases are now the largest single cost of the published
+mixed workload, and the disjunction tail the second.
+
 The built database is cached as
 `s3://springbird-dev-stannum-corpus-cache-860510875764/postgres-snapshots/stackexchange-150m-stn3-b961ded.tar`
 (118 GB, manifest beside it), so a full-scale run now restores in minutes.
