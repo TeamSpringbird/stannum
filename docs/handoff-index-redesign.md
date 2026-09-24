@@ -385,6 +385,17 @@ the query is enough to rank hotspots; see the progress notes. A local
 150 million row database (`/tmp/stannum-ordinal-poc/local150m`) was
 building as this was written, to measure these at eighteen segments.
 
+Measured on the local 150 million row database (18 segments, warm,
+same database, 32 GB container with 24 GB of shared buffers) on
+2026-09-24 at 18:00 ET, the build's image `f099667` against `eaa9507`:
+the stopword disjunction 210 to 117 ms (102,000 to 96,000 candidates), a
+five-term conjunction 94 to 70 ms (91,000 to 79,000), a three-term
+disjunction 94 to 48 ms (2,400 to 2,300). The three-term case is the
+next lever: 2,300 candidates but 6,693 chunk loads, every chunk of every
+term in every segment, because a chunk's bound over 65,536 documents
+beats a top-ten threshold for any moderately common term. Chunk-level
+cost, per segment, is where the time goes once candidates are cheap.
+
 The built database is cached as
 `s3://springbird-dev-stannum-corpus-cache-860510875764/postgres-snapshots/stackexchange-150m-stn3-b961ded.tar`
 (118 GB, manifest beside it), so a full-scale run now restores in minutes.
