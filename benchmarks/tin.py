@@ -679,7 +679,9 @@ def run(args):
                 sql('DROP TABLE reference;')
                 if args.workload == 'topk':
                     ranked_queries = validation_queries(queries, getattr(args, 'ranked_validation_queries', 0))
-                    ranked_sql = ranked_check_sql(ranked_queries, engine)
+                    # Like the count check: the references go through the index,
+                    # not a sequential scan that tokenizes every body.
+                    ranked_sql = 'SET enable_seqscan=off;\n' + ranked_check_sql(ranked_queries, engine)
                     (path / 'ranked-correctness.sql').write_text(ranked_sql)
                     # Exhaustive references over the full table are setup work: one
                     # stopword-heavy disjunction over 15 million rows outlasts the
