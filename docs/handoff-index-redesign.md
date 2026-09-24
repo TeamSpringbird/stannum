@@ -451,7 +451,13 @@ retires it; rebuild once the new format settles.
 
 ## Also outstanding
 
-- The published write workload at 150 million rows has not completed: on
+- The published write workload at 150 million rows completed for the
+  first time on 2026-09-24 at 17:40 ET, on the local 150 million row
+  database built by `f099667` and measured with `eaa9507`: 62,361 updates
+  in 300 s at p50 3.5 ms, p95 6.7 ms, worst 1.07 s, zero errors, queries
+  p50 76 ms and worst 2.0 s beside them, count and ranked checks clean
+  before and after the updates. The history below explains what it took.
+  Previously: on
   STN3 one update in about 220,000 reaches the driver's 20 s deadline (the
   old format: 37), and its zero-error threshold fails the run. Updates
   themselves take 1.1 ms at the median. A watcher on the host saw the
