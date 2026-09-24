@@ -891,6 +891,11 @@ impl<'a> OrdinalCursor<'a> {
         }
     }
 
+    /// Back to the first member, without reparsing the stream.
+    pub fn rewind(&mut self) -> Result<()> {
+        self.enter(0)
+    }
+
     /// Moves to the first member at or after `target`.
     pub fn seek(&mut self, target: u32) -> Result<()> {
         if self.current().is_none_or(|current| current >= target) {

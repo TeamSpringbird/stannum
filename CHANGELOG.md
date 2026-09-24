@@ -42,6 +42,9 @@
   as it keeps.
 - Each dead list carries a stamp, so a reader's cached copy is not served
   once VACUUM replaces the list in the same pages at the same size.
+- The per-row scorer rewinds a term cursor instead of reopening the term:
+  reopening parsed every chunk bound again, and an exhaustive reference
+  over a hundred million rows did so for each row.
 - Ranked disjunctions skip dead-listed documents in every chunk form, and
   per-row scores no longer depend on the order the executor hands rows over
   in (a join scores rows in its own order).

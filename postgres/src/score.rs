@@ -83,29 +83,36 @@ struct SourceReader {
 }
 
 struct TermReader {
-    term: segment::segment::Term<'static>,
     /// Rows mostly arrive in heap order, which is ordinal order, so each
-    /// lookup is a forward seek; a request behind the cursor, or behind its
-    /// end (a join hands rows over in its own order, and a lookup past the
-    /// last member exhausts the cursor), reopens it.
+    /// lookup is a forward seek; a request behind the cursor rewinds it (a
+    /// join hands rows over in its own order). Rewinding repositions the
+    /// parsed stream: reopening the term parsed every chunk bound again, and
+    /// an exhaustive reference over a hundred million rows did so per row.
     cursor: segment::ordinals::OrdinalCursor<'static>,
+    /// The lowest ordinal a seek ran off the end at: any request from there
+    /// on is absent without touching the cursor.
+    exhausted_at: Option<u32>,
 }
 
 impl TermReader {
     /// The term-frequency bucket of `ordinal`, if the term lists it.
     fn bucket(&mut self, ordinal: u32, label: &str) -> Option<u8> {
+        if self.exhausted_at.is_some_and(|at| ordinal >= at) {
+            return None;
+        }
         if self
             .cursor
             .current()
             .is_none_or(|current| current > ordinal)
         {
-            self.cursor = segment_error_in(
-                self.term.ordinals().and_then(|stream| stream.cursor()),
-                label,
-            );
+            segment_error_in(self.cursor.rewind(), label);
         }
         segment_error_in(self.cursor.seek(ordinal), label);
-        if self.cursor.current() != Some(ordinal) {
+        let Some(current) = self.cursor.current() else {
+            self.exhausted_at = Some(ordinal.min(self.exhausted_at.unwrap_or(u32::MAX)));
+            return None;
+        };
+        if current != ordinal {
             return None;
         }
         Some(self.cursor.bucket().unwrap_or_else(|| {
@@ -125,8 +132,8 @@ impl SourceReader {
             .iter()
             .map(|(term, _)| {
                 segment_error(segment.term(term)).map(|term| TermReader {
-                    term,
                     cursor: segment_error(term.ordinals().and_then(|stream| stream.cursor())),
+                    exhausted_at: None,
                 })
             })
             .collect();
