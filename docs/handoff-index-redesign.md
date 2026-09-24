@@ -308,6 +308,65 @@ not reproduce any more.
 Re-measure after each step rather than at the end: three hypotheses were
 falsified today by measuring, and each one looked obvious beforehand.
 
+## Measured at 150 million rows, 2026-09-24
+
+The published Stack Exchange workloads on the i7i.8xlarge protocol (8
+clients, 8 CPUs, 32 GB container, 24 GB shared buffers, 600 s), built from
+`b961ded` and measured from the saved database with the two fixes below.
+
+| | LSG5, 2026-09-23 | STN3, 2026-09-24 | TIN, published |
+|---|---|---|---|
+| index relation | 246.5 GB | 47 GB | 50.7 GB |
+| segments after build | 56 | 18 | |
+| build wall time | 3 h 42 min | 5 h 06 min | |
+| mixed QPS | 17.8 | 34.0 | 199 |
+| mixed p50 / p95 / p99 ms | 217 / 1,396 / 3,904 | 76 / 804 / 3,060 | |
+| conjunction-phrase QPS | 17.8 | 31.0 | |
+| conjunction-phrase p50 ms | 201 | 65 | |
+| disk read per query | 26 MB, ~1,500 pages | 3.1 MB, 62 IOs | 1.7 MB |
+| CPU during the mixed run | disk-bound | 7.7 of 8 cores | |
+| correctness | | 0 mismatches, 10 count + 2 ranked checks per run | |
+
+Per family in the mixed run: conjunction p50 27 ms, disjunction p50 122 ms
+(p99 914 ms), phrase p50 158 ms (p99 4.8 s). The disjunction-updates
+workload ran 145,000 updates at p50 1.1 ms before one update reached the
+driver's 20 s deadline, which fails its zero-error threshold; the old
+format failed the same workload with 37 such errors.
+
+The layout did what it was built for: the index is 5.2 times smaller and
+the run no longer waits on the NVMe. Throughput only doubled because the
+run is now CPU-bound at about 226 ms of CPU per query, against TIN's
+implied 40 ms. Where that CPU goes, from EXPLAIN counters on the host
+beside the 15 million row mock:
+
+- Every query re-fetches all 18 page tables (67 MB) and dictionary
+  indexes: the per-backend reader cache budget is exceeded at this segment
+  count, so readers are dropped and rebuilt per statement. The mock, with
+  two segments, pays nothing here.
+- A stopword-heavy disjunction scores 101,000 candidates (4,200 on the
+  mock), and each candidate copies an 8 KiB window of the length and class
+  tables through the cache: 264 MB and 132 MB per query of memcpy.
+- Phrases are scored exhaustively, with no positional pruning: 380 MB of
+  positions and 5 s for "how to get the value"; phrase p99 is 4.8 s.
+- Eighteen segments multiply per-term setup and chunk loads; the 3 GiB
+  cap forced 18 here against 2 on the mock.
+
+Two harness-side problems cost the first attempt: the per-row scorer
+re-parsed a term's stream on every lookup past its end (`20d0db9`), and the
+ranked reference ran as a sequential scan because the statement never
+disabled sequential scans (`7978381`). Both are fixed; the campaign ran with
+`--ranked-validation-queries 2` so three workloads fit before the host's
+expiry, which skips the exhaustive disjunction reference at this scale. The
+build's extra 85 minutes are the single-threaded compaction and pack at the
+end, which read the relation at about 130 MB/s.
+
+The built database is cached as
+`s3://springbird-dev-stannum-corpus-cache-860510875764/postgres-snapshots/stackexchange-150m-stn3-b961ded.tar`
+(118 GB, manifest beside it), so a full-scale run now restores in minutes.
+Next, in order: keep readers resident across queries at this segment count;
+stop copying windows per candidate for lengths and classes; lift the
+segment cap; then phrase pruning.
+
 ## How to measure
 
 Everything below runs on a laptop and needs no AWS. See
@@ -367,8 +426,10 @@ retires it; rebuild once the new format settles.
 
 ## Also outstanding
 
-- The published write workload at 150 million rows has never completed. `af24e4c`
-  fixes the reclamation stall that failed it; the run itself was never retried.
+- The published write workload at 150 million rows has not completed: on
+  STN3 one update in 145,000 reached the driver's 20 s deadline (the old
+  format: 37). The stall's cause is unmeasured; a rerun with a
+  slow-statement watcher was in flight when this was written.
 - The article's four charts carry full-corpus Stannum runs for the mixed and
   conjunction-phrase workloads and prefix runs for the write workload. The count
   chart is from an older build. The importer replaces the series per chart, so
