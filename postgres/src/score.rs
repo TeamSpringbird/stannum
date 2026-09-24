@@ -952,6 +952,9 @@ impl IndexScorer {
             heap,
             scored,
             iterations: 0,
+            seed: seeded_threshold(),
+            values: Vec::new(),
+            uppers: Vec::new(),
         };
         match combine {
             Combine::Any => walk.any(),
@@ -1014,6 +1017,7 @@ impl IndexScorer {
             bounds,
             sub_bounds,
             bound_scores: Vec::new(),
+            by_bucket: Vec::new(),
             pos: 0,
             term_max: scorer.map_or(0.0, |scorer| scorer.bound(&whole)),
             words: Box::new([0; segment::ordinals::WORDS]),
@@ -1047,6 +1051,11 @@ struct OrdinalTerm<'a> {
     sub_bounds: Vec<[u8; SUBS]>,
     /// Per key: the score bound, once asked for.
     bound_scores: Vec<Option<f32>>,
+    /// Per key: the per-bucket bound table at the length floor it was
+    /// computed for, once asked for; a candidate asks per term, so the
+    /// table is computed once per chunk rather than sixteen scores per
+    /// candidate.
+    by_bucket: Vec<Option<(u32, [f32; BUCKET_COUNT])>>,
     /// Index into `keys` of the current chunk.
     pos: usize,
     term_max: f32,
@@ -1068,6 +1077,27 @@ impl OrdinalTerm<'_> {
         BlockBound {
             min_len: self.bounds[pos],
         }
+    }
+
+    /// The per-bucket bound table of chunk `pos` at `min_length`; see
+    /// [`TermScorer::bounds_by_bucket`].
+    fn bounds_by_bucket(
+        &mut self,
+        pos: usize,
+        scorer: &TermScorer,
+        min_length: u32,
+    ) -> [f32; BUCKET_COUNT] {
+        if self.by_bucket.len() < self.keys.len() {
+            self.by_bucket.resize(self.keys.len(), None);
+        }
+        if let Some((at, table)) = self.by_bucket[pos]
+            && at == min_length
+        {
+            return table;
+        }
+        let table = scorer.bounds_by_bucket(&self.bound_block(pos), min_length);
+        self.by_bucket[pos] = Some((min_length, table));
+        table
     }
 
     fn bound_score(&mut self, pos: usize, scorer: &TermScorer) -> f32 {
@@ -1158,6 +1188,14 @@ struct OrdinalWalk<'a, 's> {
     heap: &'s mut BinaryHeap<Ranked>,
     scored: &'s mut usize,
     iterations: u32,
+    /// `stannum.debug_seed_score`, read once: the threshold is consulted
+    /// per sub-block and per candidate, and a setting read is a thread
+    /// check and a lookup each time.
+    seed: Option<(f32, Tid)>,
+    /// Scratch for scoring a candidate: per present term its bound or score,
+    /// and the terms holding the document.
+    values: Vec<f32>,
+    uppers: Vec<(f32, usize)>,
 }
 
 impl OrdinalWalk<'_, '_> {
@@ -1167,7 +1205,7 @@ impl OrdinalWalk<'_, '_> {
         } else {
             None
         };
-        match (real, seeded_threshold()) {
+        match (real, self.seed) {
             (Some(real), Some(seed)) if seed.0 > real.0 => Some(seed),
             (None, seed) => seed,
             (real, _) => real,
@@ -1424,9 +1462,9 @@ impl OrdinalWalk<'_, '_> {
         // some term lacks holds no shared document.
         let mut sub_scores = [0.0_f32; SUBS];
         let mut sub_empty = [false; SUBS];
-        for term in &self.terms {
+        for term in &mut self.terms {
             let scorer = &self.scorer.terms[term.slot].1;
-            let by_bucket = scorer.bounds_by_bucket(&term.bound_block(term.pos), min_length);
+            let by_bucket = term.bounds_by_bucket(term.pos, scorer, min_length);
             for (i, (sub, score)) in term.sub_bounds[term.pos]
                 .iter()
                 .zip(sub_scores.iter_mut())
@@ -1520,32 +1558,66 @@ impl OrdinalWalk<'_, '_> {
         pruning: bool,
         floor: Option<u32>,
     ) -> Option<f32> {
+        // The scratch vectors are the walk's: a candidate is scored a
+        // hundred thousand times a query, and two allocations each showed.
+        let mut values = std::mem::take(&mut self.values);
+        let mut uppers = std::mem::take(&mut self.uppers);
+        values.clear();
+        values.resize(present.len(), 0.0);
+        uppers.clear();
+        let score = self.score_candidate_in(
+            present,
+            low,
+            ordinal,
+            sub,
+            pruning,
+            floor,
+            &mut values,
+            &mut uppers,
+        );
+        self.values = values;
+        self.uppers = uppers;
+        score
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site; the arguments are the candidate and the scratch"
+    )]
+    fn score_candidate_in(
+        &mut self,
+        present: &[usize],
+        low: u16,
+        ordinal: u32,
+        sub: usize,
+        pruning: bool,
+        floor: Option<u32>,
+        values: &mut [f32],
+        uppers: &mut Vec<(f32, usize)>,
+    ) -> Option<f32> {
         // Per term of `present`: its bound, replaced by its exact score once
         // read; and the terms holding the document by descending bound.
-        let mut values: Vec<f32> = vec![0.0; present.len()];
-        let mut uppers: Vec<(f32, usize)> = Vec::with_capacity(present.len());
         // First at the shortest document the bounds allow, which costs no
         // read: the length table is one page per 2,048 documents and
         // candidates are scattered, so reading a length before the bound
         // rejects the candidate was a page per candidate.
         for (n, &t) in present.iter().enumerate() {
-            let term = &self.terms[t];
+            let term = &mut self.terms[t];
             if term.words[usize::from(low / 64)] & (1 << (low % 64)) == 0 {
                 continue;
             }
-            let block = term.bound_block(term.pos);
             let scorer = &self.scorer.terms[term.slot].1;
             let top = term.sub_bounds[term.pos][sub];
             let upper = if top == 0 {
                 0.0
             } else {
-                scorer.bounds_by_bucket(&block, floor.unwrap_or(0))[usize::from(top - 1)]
+                term.bounds_by_bucket(term.pos, scorer, floor.unwrap_or(0))[usize::from(top - 1)]
             };
             values[n] = upper;
             uppers.push((upper, n));
         }
         let fold = |values: &[f32]| values.iter().fold(0.0_f32, |sum, v| sum + v);
-        if pruning && !self.can_beat(fold(&values), ordinal) {
+        if pruning && !self.can_beat(fold(values), ordinal) {
             return None;
         }
         // The document's own length tightens every bound. Its class is a
@@ -1553,7 +1625,7 @@ impl OrdinalWalk<'_, '_> {
         // are tightened at the class first; the exact length, four bytes per
         // document, is read only when the class bound admits the candidate.
         let bound_at = |values: &mut [f32], terms: &[OrdinalTerm<'_>], length: u32| {
-            for &(_, n) in &uppers {
+            for &(_, n) in uppers.iter() {
                 let term = &terms[present[n]];
                 let scorer = &self.scorer.terms[term.slot].1;
                 let top = term.sub_bounds[term.pos][sub];
@@ -1570,25 +1642,25 @@ impl OrdinalWalk<'_, '_> {
         if pruning {
             let class = segment_error(self.index.length_class(ordinal));
             bound_at(
-                &mut values,
+                values,
                 &self.terms,
                 segment::length_class::min_length(class),
             );
-            if !self.can_beat(fold(&values), ordinal) {
+            if !self.can_beat(fold(values), ordinal) {
                 return None;
             }
         }
         let length = segment_error(self.lengths.get(ordinal));
-        bound_at(&mut values, &self.terms, length);
-        if pruning && !self.can_beat(fold(&values), ordinal) {
+        bound_at(values, &self.terms, length);
+        if pruning && !self.can_beat(fold(values), ordinal) {
             return None;
         }
         *self.scored += 1;
-        for entry in &mut uppers {
+        for entry in uppers.iter_mut() {
             entry.0 = values[entry.1];
         }
         uppers.sort_by(|a, b| b.0.total_cmp(&a.0));
-        for &(_, n) in &uppers {
+        for &(_, n) in uppers.iter() {
             let t = present[n];
             let term = &mut self.terms[t];
             let rank = term.rank(low).unwrap_or_else(|| {
@@ -1607,11 +1679,11 @@ impl OrdinalWalk<'_, '_> {
                 ))
             });
             values[n] = self.scorer.terms[term.slot].1.score_bucket(bucket, length);
-            if pruning && !self.can_beat(fold(&values), ordinal) {
+            if pruning && !self.can_beat(fold(values), ordinal) {
                 return None;
             }
         }
-        Some(fold(&values))
+        Some(fold(values))
     }
 
     fn evaluate(&mut self, key: u16, present: &[usize], set: &mut segment::ordinals::Words) {
@@ -1688,9 +1760,9 @@ impl OrdinalWalk<'_, '_> {
         // document; sub-blocks that cannot reach the threshold are skipped.
         let mut sub_scores = [0.0_f32; SUBS];
         for &t in present {
-            let term = &self.terms[t];
+            let term = &mut self.terms[t];
             let scorer = &self.scorer.terms[term.slot].1;
-            let by_bucket = scorer.bounds_by_bucket(&term.bound_block(term.pos), 0);
+            let by_bucket = term.bounds_by_bucket(term.pos, scorer, 0);
             for (sub, score) in term.sub_bounds[term.pos].iter().zip(sub_scores.iter_mut()) {
                 if *sub > 0 {
                     *score += by_bucket[usize::from(*sub - 1)];
