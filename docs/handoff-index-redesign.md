@@ -367,6 +367,24 @@ but still copies 264 MB of lengths and 132 MB of classes for its 101,000
 candidates, 431 ms warm. The per-query cost is candidate work, not
 reader setup.
 
+Per-candidate cost, 2026-09-24 afternoon, on the 15 million row mock
+with candidate counts unchanged throughout: the stopword disjunction
+warm went from 12.0 ms to 6.5 ms and a five-term conjunction from 7.6 to
+4.9 ms, by reading the debug seed setting once per walk instead of per
+threshold check, caching the per-bucket bound table per chunk, reusing
+the scoring scratch vectors, counting a candidate's rank from the
+previous candidate's word instead of the chunk's start, and dropping a
+sweep of every bucket that could never tighten the sub-block bound
+(`b747b84`, `eaa9507`). Tightening the sub-block bound itself, per bucket
+at that bucket's shortest document, removed under 2% of candidates: with
+stopwords some member of every sub-block carries a high bucket, so what
+separates candidates is their own bucket, which is the score. Profiling
+in an OrbStack container: `perf` cannot attach (perf_event_open is
+refused even privileged), but gdb stack sampling of a plpgsql loop over
+the query is enough to rank hotspots; see the progress notes. A local
+150 million row database (`/tmp/stannum-ordinal-poc/local150m`) was
+building as this was written, to measure these at eighteen segments.
+
 The built database is cached as
 `s3://springbird-dev-stannum-corpus-cache-860510875764/postgres-snapshots/stackexchange-150m-stn3-b961ded.tar`
 (118 GB, manifest beside it), so a full-scale run now restores in minutes.
