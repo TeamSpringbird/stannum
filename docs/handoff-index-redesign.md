@@ -360,6 +360,13 @@ expiry, which skips the exhaustive disjunction reference at this scale. The
 build's extra 85 minutes are the single-threaded compaction and pack at the
 end, which read the relation at about 130 MB/s.
 
+Rerun with readers kept resident and the view lock released before
+readers load (`1406e5a`): mixed 33.8 QPS, p50 68 ms (from 76), p99 3.2 s;
+the same disjunction warm in one session fetches no page tables any more
+but still copies 264 MB of lengths and 132 MB of classes for its 101,000
+candidates, 431 ms warm. The per-query cost is candidate work, not
+reader setup.
+
 The built database is cached as
 `s3://springbird-dev-stannum-corpus-cache-860510875764/postgres-snapshots/stackexchange-150m-stn3-b961ded.tar`
 (118 GB, manifest beside it), so a full-scale run now restores in minutes.
