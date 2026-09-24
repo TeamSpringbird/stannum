@@ -42,6 +42,10 @@
   as it keeps.
 - Each dead list carries a stamp, so a reader's cached copy is not served
   once VACUUM replaces the list in the same pages at the same size.
+- Packing a built index marks the pages it reuses as used in the free
+  space map; it left every one of them listed as free, and an insert's
+  page allocation then read stale entries one by one under the meta
+  lock, for seconds at a time in the published write workload.
 - Every run records its last page, so retiring a run joins pending chains
   with one page write instead of a walk of the run under the meta lock,
   and draining the pending list under that lock frees at most

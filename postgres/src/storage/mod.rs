@@ -2167,6 +2167,11 @@ unsafe fn write_run_into(
                     let usable = layout::kind(buffer.page()) == Ok(KIND_FREE);
                     drop(buffer);
                     if usable {
+                        // The free space map still lists the page: an
+                        // allocation that took it from there read it, found
+                        // it in use and tried the next, for every page the
+                        // pack reused, under the exclusive meta lock.
+                        pg_sys::RecordUsedIndexPage(index, block);
                         blocks.push(block);
                     }
                 }

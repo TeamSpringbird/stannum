@@ -114,6 +114,13 @@ mod tests {
             value("SELECT pg_relation_size('packed_idx') / 8192"),
             live + 2
         );
+        // And the free space map lists none of them: a reused page left
+        // there is a page every later allocation reads under the meta lock.
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_freespacemap").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM pg_freespace('packed_idx') WHERE avail > 0"),
+            0
+        );
         Spi::run("SET LOCAL enable_seqscan = off").unwrap();
         assert_eq!(
             value("SELECT count(*) FROM packed WHERE body ==> 'common'"),
