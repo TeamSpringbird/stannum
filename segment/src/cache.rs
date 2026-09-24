@@ -67,11 +67,11 @@ pub const AREAS: usize = 8;
 pub const AREA_NAMES: [&str; AREAS] = [
     "header",
     "dictionary",
-    "postings",
-    "payload",
+    "ordinals",
+    "positions",
     "documents",
     "lengths",
-    "ordinals",
+    "classes",
     "pages",
 ];
 

@@ -2,16 +2,18 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Per-posting term-frequency bucket and token positions.
+//! Per-document token positions of one term.
 //!
-//! Entries are in the same order as the term's postings and are addressed by
-//! posting ordinal, so this stream is only read by queries that need
-//! positions or scores.
+//! Entries are in the same order as the term's ordinal stream and are
+//! addressed by the document's rank in it, so this stream is read only by
+//! queries that need positions: phrases and other positional shapes. The
+//! term-frequency bucket a score needs lives beside the member in the
+//! ordinal stream.
 //!
 //! ```text
 //! stream := count varint, skip u32le * slots, data
 //! slots  := ceil(count / SKIP_INTERVAL) - 1, or 0 for an empty stream
-//! entry  := tf_bucket u8 (low four bits), n varint, position varint * n
+//! entry  := n varint, position varint * n
 //!           positions: first absolute, then (delta - 1)
 //! ```
 //!
@@ -20,20 +22,11 @@
 //! are fixed-width so a seek jumps to its slot in constant time; a ranked
 //! scan seeks once per scored document. A stream of at most `SKIP_INTERVAL`
 //! entries has no table at all.
-//!
-//! Earlier segment formats are still read through [`Payload::parse_format`]:
-//! `LSG2` streams count their slots explicitly and include the zero slot for
-//! entry 0 (`count, skip_count varint, skip u32le * skip_count, data`); `LSG1`
-//! streams hold one skip per 64 entries as varint deltas, so a seek walks
-//! the table from its start.
 
 use crate::reader::Reader;
-use crate::segment::Format;
 use crate::{Error, Result, varint};
 
 pub const SKIP_INTERVAL: u32 = 32;
-const LEGACY_SKIP_INTERVAL: u32 = 64;
-pub const MAX_TF_BUCKET: u8 = crate::tf_bucket::BUCKET_MAX;
 
 #[derive(Default, Debug)]
 pub struct PayloadBuilder {
@@ -44,16 +37,12 @@ pub struct PayloadBuilder {
 
 impl PayloadBuilder {
     /// `positions` must be non-empty and strictly increasing.
-    pub fn push(&mut self, tf_bucket: u8, positions: &[u32]) -> Result<()> {
-        if tf_bucket > MAX_TF_BUCKET {
-            return Err(Error::InvalidTfBucket);
-        }
+    pub fn push(&mut self, positions: &[u32]) -> Result<()> {
         validate_positions(positions)?;
         if self.count.is_multiple_of(SKIP_INTERVAL) {
             self.skips.push(self.data.len());
         }
         self.count += 1;
-        self.data.push(tf_bucket);
         encode_positions(&mut self.data, positions);
         Ok(())
     }
@@ -67,35 +56,10 @@ impl PayloadBuilder {
     }
 
     pub fn finish(self) -> Vec<u8> {
-        self.finish_as(Format::CURRENT)
-    }
-
-    /// Encodes in the layout of an earlier format, for compatibility tests.
-    pub(crate) fn finish_as(self, format: Format) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.data.len() + self.skips.len() * 4 + 8);
         varint::put(&mut out, u64::from(self.count));
-        match format {
-            Format::Lsg1 => {
-                // One varint delta per 64 entries: every other fixed-width slot.
-                let skips: Vec<usize> = self.skips.iter().copied().step_by(2).collect();
-                varint::put(&mut out, skips.len() as u64);
-                let mut previous = 0;
-                for skip in skips {
-                    varint::put(&mut out, (skip - previous) as u64);
-                    previous = skip;
-                }
-            }
-            Format::Lsg2 => {
-                varint::put(&mut out, self.skips.len() as u64);
-                for skip in &self.skips {
-                    out.extend_from_slice(&fixed_skip(*skip).to_le_bytes());
-                }
-            }
-            Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => {
-                for skip in self.skips.iter().skip(1) {
-                    out.extend_from_slice(&fixed_skip(*skip).to_le_bytes());
-                }
-            }
+        for skip in self.skips.iter().skip(1) {
+            out.extend_from_slice(&fixed_skip(*skip).to_le_bytes());
         }
         out.extend_from_slice(&self.data);
         out
@@ -159,7 +123,6 @@ fn visit_positions(reader: &mut Reader<'_>, mut visit: impl FnMut(u32)) -> Resul
 /// A decoded entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    pub tf_bucket: u8,
     pub positions: Vec<u32>,
 }
 
@@ -202,43 +165,29 @@ pub struct Payload<'a> {
     count: u32,
     skips_at: usize,
     data_at: usize,
-    /// Entries per skip; 64 with varint deltas in the `LSG1` layout.
-    interval: u32,
-    format: Format,
 }
 
 impl<'a> Payload<'a> {
-    /// Parses the current layout.
-    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        Self::parse_format(bytes, Format::CURRENT)
-    }
-
-    /// Parses the `LSG1` layout: varint delta skips every 64 entries.
-    pub fn parse_legacy(bytes: &'a [u8]) -> Result<Self> {
-        Self::parse_format(bytes, Format::Lsg1)
-    }
-
     /// Opens a stream of `len` bytes at `base` of a paged source's payload
     /// area, reading only its header and skip table.
     pub(crate) fn open(
         areas: &'a dyn crate::segment::AreaFetch,
         base: u64,
         len: usize,
-        format: Format,
     ) -> Result<Self> {
         // The count decides how long the skip table is.
         let probe = areas.payload_range(base, len.min(8))?;
         let count = Reader::new(probe).varint_u32()?;
-        let head_len = Self::parse_format(probe, format).map_or_else(
+        let head_len = Self::parse(probe).map_or_else(
             |_| {
                 let slots = (count as usize).div_ceil(SKIP_INTERVAL as usize);
-                // Count varint, an explicit slot count for `LSG2`, the table.
+                // Count varint, then the table.
                 (10 + slots * 4).min(len)
             },
             |parsed| parsed.data_at,
         );
         let head = areas.payload_range(base, head_len)?;
-        let parsed = Self::parse_format(head, format)?;
+        let parsed = Self::parse(head)?;
         Ok(Self {
             source: Bytes::Ranged { areas, base, len },
             head: &head[..parsed.data_at],
@@ -247,34 +196,15 @@ impl<'a> Payload<'a> {
         })
     }
 
-    /// Parses the layout written by segments of `format`.
-    pub fn parse_format(bytes: &'a [u8], format: Format) -> Result<Self> {
-        let interval = match format {
-            Format::Lsg1 => LEGACY_SKIP_INTERVAL,
-            Format::Lsg2 | Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => SKIP_INTERVAL,
-        };
+    /// Parses a stream held whole.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         let mut reader = Reader::new(bytes);
         let count = reader.varint_u32()?;
-        let slots = (count as usize).div_ceil(interval as usize);
-        let slots = match format {
-            Format::Lsg1 | Format::Lsg2 => {
-                let skip_count = reader.varint_u32()? as usize;
-                if skip_count != slots {
-                    return Err(Error::Corrupt("payload skip table size"));
-                }
-                skip_count
-            }
-            Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => slots.saturating_sub(1),
-        };
+        let slots = (count as usize)
+            .div_ceil(SKIP_INTERVAL as usize)
+            .saturating_sub(1);
         let skips_at = reader.position();
-        match format {
-            Format::Lsg1 => {
-                for _ in 0..slots {
-                    reader.varint()?;
-                }
-            }
-            Format::Lsg2 | Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => reader.skip(slots * 4)?,
-        }
+        reader.skip(slots * 4)?;
         let data_at = reader.position();
         Ok(Self {
             source: Bytes::Whole(bytes),
@@ -283,8 +213,6 @@ impl<'a> Payload<'a> {
             count,
             skips_at,
             data_at,
-            interval,
-            format,
         })
     }
 
@@ -308,43 +236,29 @@ impl<'a> Payload<'a> {
         if ordinal >= self.count {
             return Err(Error::Corrupt("payload ordinal out of range"));
         }
-        let slot = (ordinal / self.interval) as usize;
-        let fixed = |slot: usize| {
-            let at = self.skips_at + slot * 4;
-            let bytes = &self.head[at..at + 4];
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
-        };
-        let offset = match self.format {
-            Format::Lsg1 => {
-                let mut reader = Reader::at(self.head, self.skips_at);
-                let mut offset = 0usize;
-                for _ in 0..=slot {
-                    offset = offset
-                        .checked_add(reader.varint()? as usize)
-                        .ok_or(Error::Corrupt("payload skip overflow"))?;
-                }
-                offset
+        let slot = (ordinal / SKIP_INTERVAL) as usize;
+        let offset = match slot.checked_sub(1) {
+            Some(slot) => {
+                let at = self.skips_at + slot * 4;
+                let bytes = &self.head[at..at + 4];
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize
             }
-            Format::Lsg2 => fixed(slot),
-            Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => match slot.checked_sub(1) {
-                Some(slot) => fixed(slot),
-                None => 0,
-            },
+            None => 0,
         };
         let at = self
             .data_at
             .checked_add(offset)
             .filter(|at| *at <= self.len)
             .ok_or(Error::Truncated)?;
-        Ok((at, slot as u32 * self.interval))
+        Ok((at, slot as u32 * SKIP_INTERVAL))
     }
 
     /// Where skip slot `slot` starts in the stream; past the last, its end.
     fn slot_at(&self, slot: usize) -> Result<usize> {
-        if slot >= (self.count as usize).div_ceil(self.interval as usize) {
+        if slot >= (self.count as usize).div_ceil(SKIP_INTERVAL as usize) {
             return Ok(self.len);
         }
-        self.skip_to(slot as u32 * self.interval).map(|(at, _)| at)
+        self.skip_to(slot as u32 * SKIP_INTERVAL).map(|(at, _)| at)
     }
 
     pub fn cursor(&self) -> PayloadCursor<'a> {
@@ -400,7 +314,7 @@ impl PayloadCursor<'_> {
         let Bytes::Ranged { areas, base, .. } = self.payload.source else {
             return Ok(());
         };
-        let slot = (self.next_ordinal / self.payload.interval) as usize;
+        let slot = (self.next_ordinal / SKIP_INTERVAL) as usize;
         let (first, count) = self.slots;
         if count != 0 && slot >= first && slot < first + count {
             return Ok(());
@@ -460,7 +374,7 @@ impl PayloadCursor<'_> {
         if ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload ordinal out of range"));
         }
-        let interval = self.payload.interval;
+        let interval = SKIP_INTERVAL;
         let forward_only = ordinal >= self.next_ordinal
             && ordinal - self.next_ordinal < interval
             && ordinal / interval == self.next_ordinal / interval;
@@ -471,74 +385,49 @@ impl PayloadCursor<'_> {
             self.set_position(at - self.span_at)?;
         }
         while self.next_ordinal < ordinal {
-            self.next_bucket()?;
+            self.skip_entry()?;
         }
         Ok(())
     }
 
-    /// Decodes the next entry's term-frequency bucket, skipping its positions.
-    pub fn next_bucket(&mut self) -> Result<u8> {
+    /// Skips the next entry.
+    pub fn skip_entry(&mut self) -> Result<()> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));
         }
         self.load()?;
-        let byte = self.decode(|reader| {
-            let byte = reader.u8()?;
-            if byte > MAX_TF_BUCKET {
-                return Err(Error::Corrupt("payload bucket byte"));
-            }
-            skip_positions(reader)?;
-            Ok(byte)
-        })?;
+        self.decode(skip_positions)?;
         self.next_ordinal += 1;
-        Ok(byte)
+        Ok(())
     }
 
-    /// Decodes the next entry, appending its positions to `positions` and
-    /// returning its term-frequency bucket.
-    pub fn next_into(&mut self, positions: &mut Vec<u32>) -> Result<u8> {
+    /// Decodes the next entry, appending its positions to `positions`.
+    pub fn next_into(&mut self, positions: &mut Vec<u32>) -> Result<()> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));
         }
         self.load()?;
-        let byte = self.decode(|reader| {
-            let byte = reader.u8()?;
-            if byte > MAX_TF_BUCKET {
-                return Err(Error::Corrupt("payload bucket byte"));
-            }
-            decode_positions(reader, positions)?;
-            Ok(byte)
-        })?;
+        self.decode(|reader| decode_positions(reader, positions))?;
         self.next_ordinal += 1;
-        Ok(byte)
+        Ok(())
     }
 
     /// Validate every position and return its count without materializing it.
-    /// Unlike `next_bucket`, this checks cumulative position overflow as well.
-    pub(crate) fn next_count(&mut self) -> Result<(u8, usize)> {
+    /// Unlike `skip_entry`, this checks cumulative position overflow as well.
+    pub(crate) fn next_count(&mut self) -> Result<usize> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));
         }
         self.load()?;
-        let (byte, count) = self.decode(|reader| {
-            let byte = reader.u8()?;
-            if byte > MAX_TF_BUCKET {
-                return Err(Error::Corrupt("payload bucket byte"));
-            }
-            let count = visit_positions(reader, |_| {})?;
-            Ok((byte, count))
-        })?;
+        let count = self.decode(|reader| visit_positions(reader, |_| {}))?;
         self.next_ordinal += 1;
-        Ok((byte, count))
+        Ok(count)
     }
 
     pub fn next_entry(&mut self) -> Result<Entry> {
         let mut positions = Vec::new();
-        let tf_bucket = self.next_into(&mut positions)?;
-        Ok(Entry {
-            tf_bucket,
-            positions,
-        })
+        self.next_into(&mut positions)?;
+        Ok(Entry { positions })
     }
 }
 
@@ -549,7 +438,6 @@ mod tests {
     fn sample(n: u32) -> Vec<Entry> {
         (0..n)
             .map(|i| Entry {
-                tf_bucket: (i % 16) as u8,
                 positions: (0..=(i % 5)).map(|k| i * 7 + k * (k + 1) + 1).collect(),
             })
             .collect()
@@ -558,7 +446,7 @@ mod tests {
     fn build(entries: &[Entry]) -> Vec<u8> {
         let mut builder = PayloadBuilder::default();
         for entry in entries {
-            builder.push(entry.tf_bucket, &entry.positions).unwrap();
+            builder.push(&entry.positions).unwrap();
         }
         builder.finish()
     }
@@ -571,13 +459,19 @@ mod tests {
     }
 
     impl crate::segment::AreaFetch for Area {
-        fn postings_bytes(&self, _: crate::dictionary::Extent) -> Result<&[u8]> {
+        fn ordinals_bytes(&self, _: u64, _: usize) -> Result<&[u8]> {
             unreachable!()
         }
         fn payload_bytes(&self, _: crate::dictionary::Extent) -> Result<&[u8]> {
             unreachable!()
         }
+        fn doc_table(&self) -> Result<crate::docs::DocTable<'_>> {
+            unreachable!()
+        }
         fn length(&self, _: u32) -> Result<u32> {
+            unreachable!()
+        }
+        fn length_class(&self, _: u32) -> Result<u8> {
             unreachable!()
         }
         fn ranged_payloads(&self) -> bool {
@@ -603,7 +497,7 @@ mod tests {
             bytes,
             fetched: std::cell::Cell::new(0),
         };
-        let payload = Payload::open(&area, 13, stream.len(), Format::CURRENT).unwrap();
+        let payload = Payload::open(&area, 13, stream.len()).unwrap();
         assert_eq!(payload.count(), entries.len() as u32);
         assert_eq!(
             payload.data_len(),
@@ -632,7 +526,7 @@ mod tests {
         }
         // One lookup costs the head and one span, not the stream.
         area.fetched.set(0);
-        let payload = Payload::open(&area, 13, stream.len(), Format::CURRENT).unwrap();
+        let payload = Payload::open(&area, 13, stream.len()).unwrap();
         assert_eq!(payload.get(40).unwrap(), entries[40]);
         assert!(
             area.fetched.get() < stream.len() / 3,
@@ -640,7 +534,7 @@ mod tests {
             area.fetched.get()
         );
         // A stream shorter than its table says is an error, not a panic.
-        assert!(Payload::open(&area, 13, 6, Format::CURRENT).is_err());
+        assert!(Payload::open(&area, 13, 6).is_err());
     }
 
     #[test]
@@ -674,63 +568,11 @@ mod tests {
         assert!(payload.get(u32::MAX).is_err());
     }
 
-    /// Encodes entries in the `LSG1` layout, as that format's builder did.
-    fn build_legacy(entries: &[Entry]) -> Vec<u8> {
-        let mut data = Vec::new();
-        let mut skips = Vec::new();
-        for (ordinal, entry) in entries.iter().enumerate() {
-            if (ordinal as u32).is_multiple_of(LEGACY_SKIP_INTERVAL) {
-                skips.push(data.len());
-            }
-            data.push(entry.tf_bucket);
-            encode_positions(&mut data, &entry.positions);
-        }
-        let mut out = Vec::new();
-        varint::put(&mut out, entries.len() as u64);
-        varint::put(&mut out, skips.len() as u64);
-        let mut previous = 0;
-        for skip in skips {
-            varint::put(&mut out, (skip - previous) as u64);
-            previous = skip;
-        }
-        out.extend_from_slice(&data);
-        out
-    }
-
-    /// Encodes entries in the `LSG2` layout, as that format's builder did.
-    fn build_v2(entries: &[Entry]) -> Vec<u8> {
-        let mut data = Vec::new();
-        let mut skips = Vec::new();
-        for (ordinal, entry) in entries.iter().enumerate() {
-            if (ordinal as u32).is_multiple_of(SKIP_INTERVAL) {
-                skips.push(data.len() as u32);
-            }
-            data.push(entry.tf_bucket);
-            encode_positions(&mut data, &entry.positions);
-        }
-        let mut out = Vec::new();
-        varint::put(&mut out, entries.len() as u64);
-        varint::put(&mut out, skips.len() as u64);
-        for skip in skips {
-            out.extend_from_slice(&skip.to_le_bytes());
-        }
-        out.extend_from_slice(&data);
-        out
-    }
-
-    fn build_as(entries: &[Entry], format: Format) -> Vec<u8> {
-        let mut builder = PayloadBuilder::default();
-        for entry in entries {
-            builder.push(entry.tf_bucket, &entry.positions).unwrap();
-        }
-        builder.finish_as(format)
-    }
-
     #[test]
     fn counting_rejects_cumulative_overflow_even_when_each_varint_fits() {
-        // LSG3: one entry, bucket zero, two positions. The second delta is
-        // representable, but adding it and the implicit one overflows u32.
-        let mut bytes = vec![1, 0, 2];
+        // One entry of two positions. The second delta is representable,
+        // but adding it and the implicit one overflows u32.
+        let mut bytes = vec![1, 2];
         varint::put(&mut bytes, u64::from(u32::MAX));
         varint::put(&mut bytes, 0);
         let payload = Payload::parse(&bytes).unwrap();
@@ -740,18 +582,18 @@ mod tests {
             Err(Error::Corrupt("position overflow"))
         );
         assert_eq!(cursor.next_ordinal(), 0);
-        assert_eq!(payload.cursor().next_bucket(), Ok(0));
+        assert_eq!(payload.cursor().skip_entry(), Ok(()));
     }
 
     #[test]
     fn counted_positions_match_materialized_decode_and_failures() {
-        // Exercise all layouts, skip boundaries, seeks, overflow and truncation.
-        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+        // Exercise skip boundaries, seeks, overflow and truncation.
+        {
             let mut entries = sample(70);
             entries[3].positions = vec![0, u32::MAX];
-            let bytes = build_as(&entries, format);
+            let bytes = build(&entries);
             let compare = |bytes: &[u8]| {
-                let Ok(payload) = Payload::parse_format(bytes, format) else {
+                let Ok(payload) = Payload::parse(bytes) else {
                     return;
                 };
                 for start in [None, Some(0), Some(31), Some(32), Some(64), Some(69)] {
@@ -767,9 +609,7 @@ mod tests {
                     }
                     for _ in 0..=entries.len() {
                         let mut positions = Vec::new();
-                        let expected = decode
-                            .next_into(&mut positions)
-                            .map(|bucket| (bucket, positions.len()));
+                        let expected = decode.next_into(&mut positions).map(|()| positions.len());
                         assert_eq!(count.next_count(), expected);
                         assert_eq!(count.next_ordinal(), decode.next_ordinal());
                         if expected.is_err() {
@@ -788,30 +628,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn earlier_layouts_are_still_read() {
-        let entries = sample(3 * LEGACY_SKIP_INTERVAL + 5);
-        for (format, bytes) in [
-            (Format::Lsg1, build_legacy(&entries)),
-            (Format::Lsg2, build_v2(&entries)),
-        ] {
-            // The compatibility writer reproduces the old layout exactly.
-            assert_eq!(build_as(&entries, format), bytes, "{format}");
-            let payload = Payload::parse_format(&bytes, format).unwrap();
-            assert_eq!(payload.count(), entries.len() as u32);
-            for (ordinal, entry) in entries.iter().enumerate() {
-                assert_eq!(&payload.get(ordinal as u32).unwrap(), entry, "{ordinal}");
-            }
-            let mut cursor = payload.cursor();
-            for ordinal in [190u32, 5, 6, 70, 69, 63, 64, 0, 196, 32, 31, 33] {
-                cursor.seek(ordinal).unwrap();
-                assert_eq!(&cursor.next_entry().unwrap(), &entries[ordinal as usize]);
-            }
-            assert!(Payload::parse_format(&build(&entries), format).is_err());
-        }
-        assert_eq!(build_as(&entries, Format::Lsg3), build(&entries));
     }
 
     #[test]
@@ -846,12 +662,11 @@ mod tests {
     #[test]
     fn builder_validates_input() {
         let mut builder = PayloadBuilder::default();
-        assert_eq!(builder.push(16, &[1]), Err(Error::InvalidTfBucket));
-        assert_eq!(builder.push(1, &[]), Err(Error::InvalidPositions));
-        assert_eq!(builder.push(1, &[3, 3]), Err(Error::InvalidPositions));
-        assert_eq!(builder.push(1, &[4, 3]), Err(Error::InvalidPositions));
-        builder.push(0, &[0]).unwrap();
-        builder.push(15, &[1, u32::MAX]).unwrap();
+        assert_eq!(builder.push(&[]), Err(Error::InvalidPositions));
+        assert_eq!(builder.push(&[3, 3]), Err(Error::InvalidPositions));
+        assert_eq!(builder.push(&[4, 3]), Err(Error::InvalidPositions));
+        builder.push(&[0]).unwrap();
+        builder.push(&[1, u32::MAX]).unwrap();
         let bytes = builder.finish();
         let payload = Payload::parse(&bytes).unwrap();
         assert_eq!(payload.get(1).unwrap().positions, vec![1, u32::MAX]);

@@ -4,7 +4,7 @@
 
 //! Boolean counts over segment-local document ordinals.
 //!
-//! An `LSG4` segment stores each term's documents as ordinals into its
+//! A segment stores each term's documents as ordinals into its
 //! TID-ordered document table (see [`segment::ordinals`]). A Boolean count
 //! folds those streams a 65,536-document chunk at a time and counts set bits,
 //! so its work follows the chunks the terms occupy rather than the number of
@@ -14,15 +14,13 @@
 //! (the index checker reports anything else), so per-segment counts add up.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use pgrx::pg_sys;
+use segment::Result;
 use segment::index::Index;
-use segment::ordinals::{self, Node, Words};
-use segment::segment::PAGE_ENTRY;
-use segment::set::Cursor as _;
-use segment::{Result, Tid};
+use segment::ordinals::{self, Node, Ordinals, Words};
 use tinql::runtime::Query;
 
 /// Whether every node is a Boolean combination of plain terms.
@@ -186,98 +184,37 @@ impl Visibility {
     }
 }
 
-/// Dead documents of a segment as ascending ordinals, per dead set.
-type DeadOrdinals = (Rc<BTreeSet<Tid>>, Rc<Vec<u32>>);
+/// Dead documents of a segment as ascending ordinals, per dead list.
+type DeadOrdinals = (Rc<Vec<u8>>, Rc<Vec<u32>>);
 
 thread_local! {
-    /// By index identity and generation. The dead set is held so the pointer
+    /// By index identity and generation. The dead list is held so the pointer
     /// comparison cannot match a later allocation.
     static DEAD: RefCell<HashMap<(u64, u32), DeadOrdinals>> = RefCell::new(HashMap::new());
 }
 
-pub(crate) fn dead_ordinals(
-    key: (u64, u32),
-    source: &dyn Index,
-    dead_set: &Rc<BTreeSet<Tid>>,
-) -> Result<Rc<Vec<u32>>> {
-    if dead_set.is_empty() {
+/// The dead list `dead` of the segment `key` decoded, once per backend and
+/// list.
+pub(crate) fn dead_ordinals(key: (u64, u32), dead: Option<&Rc<Vec<u8>>>) -> Result<Rc<Vec<u32>>> {
+    let Some(dead) = dead else {
         return Ok(Rc::default());
-    }
-    if let Some(found) = DEAD.with_borrow(|dead| {
-        dead.get(&key)
-            .filter(|(set, _)| Rc::ptr_eq(set, dead_set))
+    };
+    if let Some(found) = DEAD.with_borrow(|cache| {
+        cache
+            .get(&key)
+            .filter(|(list, _)| Rc::ptr_eq(list, dead))
             .map(|(_, ordinals)| ordinals.clone())
     }) {
         return Ok(found);
     }
-    let mut documents = source.documents()?;
-    let mut ordinals = Vec::with_capacity(dead_set.len());
-    for tid in dead_set.iter() {
-        documents.seek(*tid)?;
-        // A dead location the segment never held is harmless.
-        if documents.current() == Some(*tid) {
-            ordinals.push(documents.ordinal());
+    let ordinals = Rc::new(Ordinals::parse(dead)?.to_vec()?);
+    DEAD.with_borrow_mut(|cache| {
+        if cache.len() > 4096 {
+            cache.clear();
         }
-    }
-    let ordinals = Rc::new(ordinals);
-    DEAD.with_borrow_mut(|dead| {
-        if dead.len() > 4096 {
-            dead.clear();
-        }
-        dead.insert(key, (dead_set.clone(), ordinals.clone()));
+        cache.insert(key, (dead.clone(), ordinals.clone()));
     });
     Ok(ordinals)
-}
-
-/// A segment's page table: heap blocks ascending with each block's first ordinal.
-struct Pages<'a>(&'a [u8]);
-
-impl Pages<'_> {
-    fn len(&self) -> usize {
-        self.0.len() / PAGE_ENTRY
-    }
-
-    fn block(&self, i: usize) -> u32 {
-        let at = i * PAGE_ENTRY;
-        u32::from_le_bytes(self.0[at..at + 4].try_into().unwrap())
-    }
-
-    /// The first ordinal of entry `i`; past the end, `documents`.
-    fn first(&self, i: usize, documents: u32) -> u32 {
-        if i >= self.len() {
-            return documents;
-        }
-        let at = i * PAGE_ENTRY + 4;
-        u32::from_le_bytes(self.0[at..at + 4].try_into().unwrap())
-    }
-
-    /// The entry of `block`, if the segment has documents on it.
-    fn entry_for(&self, block: u32) -> Option<usize> {
-        let (mut low, mut high) = (0, self.len());
-        while low < high {
-            let middle = (low + high) / 2;
-            if self.block(middle) < block {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        (low < self.len() && self.block(low) == block).then_some(low)
-    }
-
-    /// The entry holding `ordinal`.
-    fn entry_of(&self, ordinal: u32, documents: u32) -> usize {
-        let (mut low, mut high) = (0, self.len());
-        while low < high {
-            let middle = (low + high) / 2;
-            if self.first(middle, documents) <= ordinal {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        low.saturating_sub(1)
-    }
 }
 
 /// A chunk with at most this many matches looks each one's page up; a fuller
@@ -293,43 +230,37 @@ const SPARSE_CHUNK: u32 = 256;
 pub fn count_segment(
     key: (u64, u32),
     source: &dyn Index,
-    dead_set: &Rc<BTreeSet<Tid>>,
+    dead_list: Option<&Rc<Vec<u8>>>,
     query: &Query,
     visibility: &Visibility,
     mut check: impl FnMut(u32, &[u16]),
 ) -> Result<Option<u64>> {
-    let Some(pages) = source.page_table()? else {
-        return Ok(None);
-    };
-    let pages = Pages(pages);
+    let docs = source.doc_table()?;
+    let pages = *docs.pages();
     let documents = source.document_count();
     let mut terms = Vec::new();
     let node = lower(query, &mut terms);
     let mut streams = Vec::with_capacity(terms.len());
     for term in terms {
         streams.push(match source.term(term)? {
-            Some(found) => match found.ordinals()? {
-                Some(stream) => Some(stream),
-                None => return Err(segment::Error::Corrupt("term without an ordinal stream")),
-            },
+            Some(found) => Some(found.ordinals()?),
             None => None,
         });
     }
-    let dead = dead_ordinals(key, source, dead_set)?;
+    let dead = dead_ordinals(key, dead_list)?;
     // The segment's page-table entries among a short list of blocks that are
     // not all-visible; ascending, like the ordinals they cover.
     let listed: Option<Vec<usize>> = visibility.few.as_ref().map(|few| {
-        if pages.len() == 0 {
+        if pages.is_empty() {
             return Vec::new();
         }
         let from = few.partition_point(|block| *block < pages.block(0));
         few[from..]
             .iter()
             .take_while(|block| **block <= pages.block(pages.len() - 1))
-            .filter_map(|block| pages.entry_for(*block))
+            .filter_map(|block| pages.find(*block).ok())
             .collect()
     });
-    let mut tids = None;
     let mut offsets = Vec::new();
     let mut sure = 0u64;
     ordinals::for_each_chunk(&node, &streams, |chunk, words, members| {
@@ -365,24 +296,26 @@ pub fn count_segment(
         // The heap pages to check: those holding a match and not all-visible.
         let mut unchecked: Vec<usize> = Vec::new();
         if let Some(listed) = &listed {
-            let from = listed.partition_point(|entry| pages.first(entry + 1, documents) <= low);
+            let from = listed.partition_point(|entry| pages.end(*entry) <= low);
             unchecked.extend(
                 listed[from..]
                     .iter()
-                    .take_while(|entry| pages.first(**entry, documents) < high),
+                    .take_while(|entry| pages.first(**entry) < high),
             );
         } else if matched <= SPARSE_CHUNK {
             let mut members = Vec::with_capacity(matched as usize);
             ordinals::members(words, low, &mut members);
             for ordinal in members {
-                let entry = pages.entry_of(ordinal, documents);
+                let entry = pages
+                    .entry_of(ordinal)
+                    .ok_or(segment::Error::Corrupt("ordinal beyond the document table"))?;
                 if unchecked.last() != Some(&entry) && !visibility.is_visible(pages.block(entry)) {
                     unchecked.push(entry);
                 }
             }
         } else {
-            let mut entry = pages.entry_of(low, documents);
-            while entry < pages.len() && pages.first(entry, documents) < high {
+            let mut entry = pages.entry_of(low).unwrap_or(pages.len());
+            while entry < pages.len() && pages.first(entry) < high {
                 if !visibility.is_visible(pages.block(entry)) {
                     unchecked.push(entry);
                 }
@@ -391,8 +324,8 @@ pub fn count_segment(
         }
         for entry in unchecked {
             let block = pages.block(entry);
-            let first = pages.first(entry, documents).max(low);
-            let end = pages.first(entry + 1, documents).min(high);
+            let first = pages.first(entry).max(low);
+            let end = pages.end(entry).min(high);
             let any = (first..end).any(|o| {
                 let bit = (o - low) as usize;
                 words[bit / 64] >> (bit % 64) & 1 == 1
@@ -401,24 +334,13 @@ pub fn count_segment(
                 continue;
             }
             // The k-th document of the block has ordinal `first of block + k`.
-            let cursor = match &mut tids {
-                Some(cursor) => cursor,
-                None => tids.insert(source.documents()?),
-            };
-            cursor.seek(Tid { block, offset: 1 })?;
+            let mut resolver = docs.resolver();
             offsets.clear();
-            while let Some(tid) = cursor.current().filter(|tid| tid.block == block) {
-                let ordinal = cursor.ordinal();
-                if ordinal >= end {
-                    break;
+            for ordinal in first..end {
+                let bit = (ordinal - low) as usize;
+                if words[bit / 64] >> (bit % 64) & 1 == 1 {
+                    offsets.push(resolver.tid_at(ordinal)?.offset);
                 }
-                if ordinal >= first {
-                    let bit = (ordinal - low) as usize;
-                    if words[bit / 64] >> (bit % 64) & 1 == 1 {
-                        offsets.push(tid.offset);
-                    }
-                }
-                cursor.advance()?;
             }
             sure -= offsets.len() as u64;
             check(block, &offsets);

@@ -15,9 +15,15 @@ Two things make a Docker Desktop container behave like the instance:
   page cache, uncharged to the container, so the runner drops that cache the
   moment the measurement phase starts.
 
-`mock-build.sh` builds the database once and saves it; `mock-run.sh IMAGE LABEL
+`mock-build.sh` builds the database once and saves it (`STANNUM_IMAGE` picks the
+image, `STANNUM_MOCK` the directory, `STANNUM_SOURCE` the image's `source.json`
+so the working tree may move on while a measurement runs; a saved database is only valid for the
+segment format its image wrote); `mock-run.sh IMAGE LABEL
 STYLE UPDATES [SECONDS]` runs a workload from that copy and reports QPS, latency,
 disk read per query and CPU; `mock-probe.py IMAGE LABEL [N]` reports pages touched,
-candidates scored, disk read and time per query with the cache dropped before each.
+candidates scored, disk read and time per query with the cache dropped before each;
+`mock-container.sh start NAME IMAGE PORT` keeps a server up on the saved database
+for probing by hand (`stop NAME` removes it); `attrib.py IMAGE` reconciles read
+counters per query style (needs `psycopg`).
 Pages touched and candidates scored transfer to the full corpus directly; QPS is
 relative. Paths under `/tmp/stannum-ordinal-poc` are this machine's.

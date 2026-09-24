@@ -10,7 +10,7 @@ ranking statistics in index pages and uses them to find matching row locations.
 | --- | --- |
 | `postgres/src/` | PostgreSQL integration, SQL functions, query planning, and scoring |
 | `postgres/src/storage/` | Index pages, write buffer, segments, WAL, and reclamation |
-| `segment/src/` | Dictionaries, postings, positions, document lengths, and cursors |
+| `segment/src/` | Dictionaries, ordinal streams, the document table, positions, document lengths, and cursors |
 | `tinql/src/` | Query parsing, reference evaluation, and indexed query planning |
 | `tokenizer/src/` | Text normalization and token positions |
 | `boldi-vigna/src/` | Integer encoding used by the storage codecs |
@@ -81,11 +81,11 @@ moving their writes outside it requires a separate reservation protocol.
 ### Merge policy
 
 The [direct-merge architecture decision](../adr/0001-preserve-posting-order-before-changing-encoding.md)
-records the move to preserving sorted postings during merges, with a separate
-evidence gate for any SIMD-friendly on-disk format. Foreground merges now invoke
-the [validated codec API](../benchmarks/hardened-merge.md) under the existing
-metadata lock, retaining LSG3 output, merge selection and WAL publication. It
-validates every source and merges ordered dictionaries/postings directly. Source
+records the move to preserving sorted document order during merges, with a
+separate evidence gate for any SIMD-friendly on-disk format. Foreground merges
+invoke the [validated codec API](../benchmarks/hardened-merge.md) under the
+existing metadata lock, retaining merge selection and WAL publication. It
+validates every source and merges ordered dictionaries and streams directly. Source
 blobs and dead sets are retained through construction, then freed before writing
 the output run. Aggregate encoded inputs or document counts beyond `u32::MAX`
 use the previous reconstruction path, since deletion can still yield a
@@ -104,6 +104,12 @@ inputs retain the previous reconstruction fallback. See the
 [VACUUM measurements](../benchmarks/vacuum-direct-merge.md) and the
 [integration measurements](../benchmarks/direct-merge-integration.md) for validation
 and the limits of the performance evidence.
+
+An index build ends by compacting its directory: the smallest segments that
+fit one run together under the segment byte cap are merged, repeatedly, so
+the build leaves the fewest segments the cap allows rather than the leftovers
+of every tier. Every query pays a dictionary lookup and a stream head per
+term per segment, which is what the compaction buys back.
 
 Each segment belongs to a size tier by document count: tier *t* holds
 segments with `factor^t` to `factor^(t+1) - 1` documents. The lowest full tier
@@ -230,8 +236,15 @@ the unlocked VACUUM and budgeted overflow merges against it.
 ## Reading an index
 
 The query is parsed as TINQL, tokenized using the index's settings, and compiled
-into cursors over each segment and the buffer. Cursors combine postings and
-positions for Boolean, phrase, proximity, and positional queries.
+into cursors over each segment and the buffer. A segment stores each term's
+documents once, as ordinals into the segment's heap-ordered document table (a
+short list for rare terms, otherwise 65,536-document chunks that are sorted
+arrays or bitmaps, each with a score bound), and turns ordinals back into
+tuple locations through that table: a page table from heap block to first
+ordinal plus one two-byte offset per document, so both directions are a
+binary search. Cursors combine those streams and the stored positions for
+Boolean, phrase, proximity, and positional queries. The write buffer keeps
+the same streams in memory, rebuilt per term as records arrive.
 
 Wildcard, regex, range, and fuzzy queries expand terms from the dictionary.
 Expansions beyond 1,024 terms use conservative candidates and recheck the query
@@ -247,22 +260,19 @@ custom scan nodes:
   traversal after enough visible rows pass the remaining SQL filters. For
   supported ranked queries the existing scorer selects the top results.
 - **Count** of a Boolean combination of plain terms folds document ordinals.
-  `LSG4` segments store each term's documents as ordinals into the segment's
-  TID-ordered document table: a short list for rare terms, otherwise
-  65,536-document chunks that are sorted arrays or bitmaps. The count combines
-  the terms' chunks word by word in fixed scratch buffers, visits only chunks
-  some term occupies, clears the segment's dead documents and counts set bits.
+  The count combines the terms' chunks word by word in fixed scratch buffers,
+  visits only chunks some term occupies, clears the segment's dead documents
+  (a dead list is itself an ordinal stream) and counts set bits.
   The visibility map is read once, after the view; if a dead list was published
   in between, the count starts over, because a page VACUUM marked all-visible
   may hold tuples the older view still lists. Matches on pages that are not
   all-visible are mapped back to TIDs through the segment's page table and
-  checked a heap page at a time under one buffer lock. The write buffer and
-  segments older than `LSG4` are counted through their TID postings, always
-  against the heap. Per-source counts are summed: a location is live in one
-  source only.
-- **Ranked disjunctions** over `LSG5` segments walk the same ordinal streams
-  (`stannum.rank_by_ordinal`, on by default): block-max WAND over the terms'
-  chunks with the score bounds each stream stores per chunk and per
+  checked a heap page at a time under one buffer lock. The write buffer is
+  counted the same way, always against the heap. Per-source counts are
+  summed: a location is live in one source only.
+- **Ranked disjunctions and conjunctions** walk the same ordinal streams:
+  block-max WAND over the terms' chunks with the score bounds each stream
+  stores per chunk and per
   1,024-document sub-block, and within an admitted chunk only the members of
   the essential terms are visited, those without which the rest cannot reach
   the threshold; the other terms are tested by bit. A candidate's
@@ -270,33 +280,32 @@ custom scan nodes:
   stream, its length a table lookup by ordinal, and its TID is resolved only
   when it enters the top k. A conjunction is led by its rarest term through
   the chunks every term and elided filter holds, testing the shared members
-  by bit. Phrases and other shapes walk the TID postings with block bounds,
-  as do segments older than `LSG5` and the write buffer. `stannum.count_fold = off` selects the strategies below for
+  by bit. Phrases and other shapes score every candidate of the stream.
+  `stannum.count_fold = off` selects the strategies below for
   these queries too.
-- **Other counts** use page masks when a Boolean term has grouped postings averaging at
-  least four tuples per occupied page; purely sparse or positional plans keep
-  the scalar path. The bulk path streams exact offset masks in heap-page order.
-  Dense grouped postings decode directly into five machine words; Boolean AND/OR/NOT combine
+- **Other counts** use page masks when a Boolean term is dense enough to be
+  stored as bitmap chunks; purely sparse or positional plans keep
+  the scalar path. The bulk path streams exact offset masks in heap-page order,
+  one page-table entry at a time; Boolean AND/OR/NOT combine
   those masks, segment dead lists are subtracted, and a streaming union removes
   cross-segment duplicates. All-visible pages use popcount when the predicate
   is exact and is the query's only restriction. Other pages retain tuple-by-tuple
   visibility checks and, where required, text rechecks. Within bulk plans,
-  sparse postings and positional subexpressions adapt the existing scalar
+  sparse and positional subexpressions adapt the existing scalar
   cursors into page masks. The bulk path does not build or sort a vector of
   every candidate CTID.
 
 Unordered searches own their captured index view until the scan ends, including
 across cursor FETCH calls. Rescans rebuild cursors against that same view, so
 buffer appends and directory changes do not replace the original candidate set.
-The cursor is dropped before its owning view, also on error cleanup. Encoded
-postings bytes can still be fetched up front; streaming bounds decoded candidate
-buffering, not all index memory or I/O. Planner startup cost continues to include
+The cursor is dropped before its owning view, also on error cleanup. Streaming
+bounds decoded candidate buffering, not all index memory or I/O. Planner startup cost continues to include
 estimated index I/O and moves only candidate traversal CPU into run cost.
 
 Reads from a segment are bounded per cursor: a payload cursor holds one span
 of skip slots, an ordinal cursor one chunk, a lengths cursor one window of
-16,384 documents and a postings cursor one 16 KiB window, each replaced by
-the next. Those ranges are shared through a per-backend least-recently-used
+2,048 documents and a document-table cursor one heap block's offsets, each
+replaced by the next. Those ranges are shared through a per-backend least-recently-used
 cache of `stannum.read_cache_mb` (64 MiB), so the hot chunks of frequent
 terms stay resident across queries while a sweep of a long stream displaces
 only itself. Block-bound tables are streamed the same way, and a cursor keeps only the
@@ -451,19 +460,16 @@ and the [original diagnosis](../benchmarks/ranked-prepared-queries.md).
 
 A ranked scan with a known `LIMIT` prunes instead of scoring every candidate
 when the query is a flat `AND` or `OR` of terms (a single term included) whose
-terms are exactly the scoring terms. Each term's postings carry a bound per
-block of 128 postings: the largest term-frequency bucket, the smallest document
-length and the block's last location. The scan walks the sources in tuple
-order with one cursor per term, keeps the k-th best score as a threshold, and
-skips every run of postings whose summed block bounds cannot reach it
-(block-max WAND). Bounds are evaluated at each block's minimum length and over
+terms are exactly the scoring terms. Each term's ordinal stream carries a
+bound per 65,536-document chunk (the shortest document per term-frequency
+bucket) and per 1,024-document sub-block (the largest bucket). The scan walks
+the sources in ordinal order, keeps the k-th best score as a threshold, and
+skips every chunk and sub-block whose summed bounds cannot reach it
+(block-max WAND). Bounds are evaluated at each chunk's minimum length and over
 every bucket up to its maximum, and summed in the scorer's term order, so
 rounding never puts a bound below a score it covers; a run whose bound equals
 the threshold is skipped only when every location in it sorts after the
-current k-th row. Conjunctions additionally use the largest of all current blocks' minimum
-document lengths for every term, combined with each bucket's own minimum. The
-shared bound is cached through the nearest block end and can skip the rarest
-term before another intersection walk. The result is therefore identical to
+current k-th row. The result is therefore identical to
 scoring every candidate:
 same rows, same scores, same tie order. `EXPLAIN ANALYZE` reports `Pruning:
 block-max` and the number of candidates actually scored. Phrase, positional,
@@ -516,25 +522,23 @@ referenced through the pending list until reclaimed, only FREE pages are ever
 allocated, and a crash ends every session. The number reclaimed is written
 to the server log.
 
-The page and segment format signatures are `LDP2` and `LSG5`. Their definitions
-live in `postgres/src/storage/layout.rs` and the `segment` crate. `LSG2` added
-per-block score bounds to term postings and fixed-width payload skip offsets.
-`LSG3` keeps the same bounds in less space: a term whose postings fit one
-block (128 postings, the vast majority of a vocabulary) stores a single term
-bound without the per-block last location and byte offset, the payload skip
-table omits the always-zero slot for entry 0, and dictionary entries store
-each term's extents as gaps from the previous term's (zero, since streams
-are laid out back to back) with `df` and `max_tf_bucket` packed into one
-varint. `LSG4` keeps those streams and adds, per term, the ordinal stream
-Boolean counts fold, and per segment a page table from heap block to first
-ordinal. `LSG5` adds to every ordinal stream a score bound per chunk and per
-sub-block, in the block bound's encoding plus a byte per sub-block, so ranked
-disjunctions prune over the ordinals. `LSG4`, `LSG3`, `LSG2` and `LSG1`
-segments are still read: Boolean counts over `LSG4` fold ordinals and over
-older formats use TID postings; ranked scans over `LSG4` and earlier walk the
-TID postings, pruning over `LSG2` exactly as over `LSG3`, and over `LSG1`
-scoring every candidate.
-Unsupported old formats require rebuilding the index.
+The page and segment format signatures are `LDP2` and `STN3`. Their definitions
+live in `postgres/src/storage/layout.rs` and the `segment` crate. A `STN3`
+segment holds, in order, the dictionary, one ordinal stream per term with
+each member's term-frequency bucket as a nibble beside it and a score bound
+per chunk and per sub-block, one positions stream per term (each document's
+positions, by rank in the ordinal stream, read only by positional queries),
+the document table as two-byte heap offsets, four-byte document lengths, a
+one-byte length class per document (a lower bound a ranked walk bounds at
+before reading the length), and the page table from heap block to first
+ordinal. Dictionary
+entries store each term's two extents as gaps from the previous term's (zero,
+since streams are laid out back to back) with `df` and `max_tf_bucket` packed
+into one varint. A dead list is an ordinal stream without bounds. The
+earlier `LSG` formats, which stored every term's document set a second time
+as tuple-location postings, `STN1`, which kept the bucket beside the
+positions, and `STN2`, which had no length classes, are not read: indexes in
+them must be rebuilt.
 `script/dump-segments.py` writes an index's segment blobs to files and
 `cargo run -p segment --release --example breakdown -- --reencode <blobs>`
 reports where their bytes go, by section and by term document frequency.
@@ -598,7 +602,7 @@ What is checked:
 | `meta page` | Page 0 is unreadable, has the wrong kind or version, its tokenizer spec does not decode, or the buffer counters contradict each other. Every read of the index fails. | `REINDEX` |
 | `directory entry N` | A generation number repeats or is not below the next one. Per-backend caches key on generations, so readers can serve the wrong segment. | `REINDEX` |
 | `segment generation G run` / `page table` / `dead list` | The chain of pages holding that blob is broken: a page has the wrong kind, is marked `FREE`, belongs to something else, holds too few bytes, or the page table disagrees with the chain. | `REINDEX` |
-| `segment generation G, ...` | The blob decoded from those pages is inconsistent inside: header, dictionary, a term (`term "x"`), a document (`document (block,offset)`), the document table or the dead list. Queries touching that term or document fail or return wrong rows. An `LSG1` warning means the segment predates block bounds and ranked scans over it score every candidate. | `REINDEX`; for the `LSG1` warning only if pruning matters |
+| `segment generation G, ...` | The blob decoded from those pages is inconsistent inside: header, dictionary, a term (`term "x"`), a document (`document (block,offset)`), the document table or the dead list. Queries touching that term or document fail or return wrong rows. | `REINDEX` |
 | `write buffer` | The buffer chain or its records are unreadable, or the counters in the meta page disagree with the stream. Inserts and every search fail. | `REINDEX` |
 | `pending entry N` (warning) | A run awaiting reclamation is shorter than recorded; the pages past the break are unreferenced. Harmless to queries. | `VACUUM` reclaims the entry and the orphaned remainder |
 | `page N` (warning) | A page nothing references and not marked `FREE`: typically leaked by a crash between writing a run and publishing it. Harmless to queries. | `VACUUM` reclaims it |

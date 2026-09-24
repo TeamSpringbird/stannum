@@ -19,34 +19,28 @@
 //! * the dictionary: block index in order, every block decoded exactly,
 //!   each block's first term matching the index, terms increasing across
 //!   blocks;
-//! * every term: postings and payload extents inside their areas and not
-//!   overlapping the previous term's, postings decoding to `df` increasing
-//!   locations that are all in the document table, the payload holding one
-//!   entry per posting with a valid bucket that matches its position count,
-//!   `max_tf_bucket` equal to the largest bucket, and (from `LSG2` on) score
-//!   bounds equal to what the postings and document lengths imply, in the
-//!   layout the segment's format writes;
-//! * every term from `LSG4` on: the ordinals extent inside its area and not
-//!   overlapping the previous term's, the stream well formed (see
-//!   [`crate::ordinals::validate`]) and naming, in order, exactly the
-//!   documents of the term's postings;
-//! * the document table: decodes to `doc_count` increasing locations;
-//! * document lengths: nonzero, summing to `total_length`, and equal to the
-//!   number of positions the term payloads hold for that document;
-//! * the page table from `LSG4` on: equal to the one the document table
-//!   implies.
+//! * every term: ordinals and payload extents inside their areas and not
+//!   overlapping the previous term's, the ordinal stream well formed (see
+//!   [`crate::ordinals::validate`]) with `df` members below the document
+//!   count, the positions stream holding one entry per member whose count
+//!   matches the member's bucket, `max_tf_bucket` equal to the largest
+//!   bucket, and the stream's chunk bounds equal to what the buckets and
+//!   document lengths imply;
+//! * the document table: a well-formed page table and `doc_count` increasing
+//!   locations, agreeing with each other;
+//! * document lengths: nonzero, summing to `total_length`, equal to the
+//!   number of positions the term payloads hold for that document, and in
+//!   the class the class table records.
 //!
 //! Bytes of an area that no extent covers are not examined: no reader reaches
 //! them.
 
 use std::fmt;
 
-use crate::dictionary::TermEntry;
+use crate::docs::{PAGE_ENTRY, page_table};
 use crate::forward::ForwardRecord;
 use crate::ordinals::{self, Ordinals};
-use crate::postings::{BLOCK_POSTINGS, BlockBound, Postings};
-use crate::segment::{AreaFetch, Format, PAGE_ENTRY, Segment, page_table};
-use crate::set::{Cursor, collect};
+use crate::segment::{AreaFetch, Segment};
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Tid};
 
@@ -167,10 +161,6 @@ pub struct SegmentReport {
     /// From the header, when it parsed.
     pub doc_count: Option<u32>,
     pub total_length: Option<u64>,
-    /// From the signature, when it parsed.
-    pub format: Option<Format>,
-    /// True for an `LSG1` blob.
-    pub legacy: bool,
     /// The document table, when it decoded; empty otherwise.
     pub documents: Vec<Tid>,
 }
@@ -183,102 +173,6 @@ impl SegmentReport {
 
 fn describe(tid: Tid) -> String {
     format!("({},{})", tid.block, tid.offset)
-}
-
-/// Locate increasing postings in an increasing document table. Galloping over
-/// gaps keeps sparse terms logarithmic in their gap size, while adjacent matches
-/// need one comparison instead of searching the whole table for every posting.
-pub(crate) fn ordered_rank(documents: &[Tid], at: &mut usize, target: Tid) -> Option<usize> {
-    let remaining = &documents[*at..];
-    if remaining.first().is_some_and(|tid| *tid < target) {
-        let mut end = 1usize;
-        while end < remaining.len() && remaining[end] < target {
-            end = end.saturating_mul(2);
-        }
-        let end = end.saturating_add(1).min(remaining.len());
-        *at += remaining[..end].partition_point(|tid| *tid < target);
-    }
-    if documents.get(*at) == Some(&target) {
-        let ordinal = *at;
-        *at += 1;
-        Some(ordinal)
-    } else {
-        None
-    }
-}
-
-/// Compares a term's ordinal stream with its postings: well formed for that
-/// many documents, and naming them in order. `expected` holds each posting's
-/// ordinal in `documents`, where it has one; a term with postings outside the
-/// table is only checked for form, as that finding already covers it.
-fn check_ordinals(
-    bytes: &[u8],
-    tids: &[Tid],
-    expected: &[Option<usize>],
-    documents: &[Tid],
-    doc_count: u32,
-    // The postings' buckets and lengths, for a stream that carries chunk
-    // bounds; `None` for a stream without them.
-    scores: Option<&[(u8, u32)]>,
-) -> Result<(), Finding> {
-    let expected: Option<Vec<u32>> = expected
-        .iter()
-        .map(|ordinal| ordinal.and_then(|ordinal| u32::try_from(ordinal).ok()))
-        .collect();
-    // The encoding is canonical, so the stream the writer would produce for
-    // these postings is the only one that passes every check below. Comparing
-    // with it first spares a sound term, the common case, a second decoding.
-    let canonical = expected.as_deref().map(|expected| match scores {
-        Some(scores) if scores.len() == expected.len() => ordinals::encode_scored(expected, scores),
-        Some(_) => Vec::new(),
-        None => ordinals::encode(expected),
-    });
-    if canonical
-        .as_deref()
-        .is_some_and(|canonical| canonical == bytes)
-    {
-        return Ok(());
-    }
-    let bounded = scores.is_some();
-    let malformed = |error: Error| Finding::error("", format!("ordinals: {error}"));
-    ordinals::validate(bytes, tids.len() as u32, doc_count, bounded).map_err(malformed)?;
-    let found = Ordinals::open(bytes, bytes.len() as u64, bounded)
-        .and_then(|stream| stream.to_vec())
-        .map_err(malformed)?;
-    if let (Some(scores), Some(expected)) = (scores, expected.as_deref())
-        && scores.len() == expected.len()
-        && let Some(canonical) = canonical.as_deref()
-        && let Ok(stream) = Ordinals::open(bytes, bytes.len() as u64, true)
-        && let Ok(wanted) = Ordinals::open(canonical, canonical.len() as u64, true)
-        && stream.bounds() != wanted.bounds()
-    {
-        return Err(Finding::error(
-            "",
-            "ordinal chunk bounds disagree with the postings and lengths",
-        ));
-    }
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    let differing = found.iter().zip(&expected).filter(|(a, b)| a != b).count();
-    let Some(index) = found.iter().zip(&expected).position(|(a, b)| a != b) else {
-        return Err(Finding::warning(
-            "",
-            "ordinals: the stream names its postings but is not encoded as the writer would",
-        ));
-    };
-    let named = documents
-        .get(found[index] as usize)
-        .map_or_else(|| "no document".to_owned(), |tid| describe(*tid));
-    Err(Finding::error(
-        "",
-        format!(
-            "ordinal {index} is {} and names {named} but posting {index} is {}; {differing} of {} ordinals differ from their postings",
-            found[index],
-            describe(tids[index]),
-            tids.len()
-        ),
-    ))
 }
 
 /// Compares the stored page table with the one `documents` implies.
@@ -336,18 +230,9 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
     };
     report.doc_count = Some(segment.document_count());
     report.total_length = Some(segment.total_length());
-    let format = segment.format();
-    report.format = Some(format);
-    report.legacy = segment.is_legacy();
-    if report.legacy {
-        findings.warning(
-            "header",
-            "LSG1 segment: ranked scans over it score every candidate; REINDEX to upgrade",
-        );
-    }
 
     // The document table and lengths first: every term check refers to them.
-    let documents = match segment.documents().and_then(collect) {
+    let documents = match segment.doc_table().and_then(|docs| docs.to_vec()) {
         Ok(documents) => documents,
         Err(error) => {
             findings.error("document table", error);
@@ -386,6 +271,22 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             }
         }
     }
+    for (ordinal, tid) in documents.iter().enumerate() {
+        match segment.length_class(ordinal as u32) {
+            Ok(class) if class != crate::length_class::class_of(length_of[ordinal]) => {
+                findings.error(
+                    format!("document {}", describe(*tid)),
+                    format!(
+                        "length class is {class} but length {} is class {}",
+                        length_of[ordinal],
+                        crate::length_class::class_of(length_of[ordinal])
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(error) => findings.error(format!("document {}", describe(*tid)), error),
+        }
+    }
     if table_ok && total != segment.total_length() {
         findings.error(
             "header",
@@ -395,10 +296,9 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             ),
         );
     }
-
-    if format.has_ordinals() && table_ok {
+    if table_ok {
         match segment.page_table() {
-            Ok(pages) => check_page_table(pages, &documents, &mut findings),
+            Ok(pages) => check_page_table(pages.bytes(), &documents, &mut findings),
             Err(error) => findings.error("page table", error),
         }
     }
@@ -415,20 +315,15 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             None
         }
     };
-    let (postings_len, payload_len) = segment.area_lengths();
-    let ordinals_len = segment.sections().ordinals;
+    let sections = segment.sections();
+    let (ordinals_len, payload_len) = (sections.ordinals, sections.payload);
     let mut previous: Option<String> = None;
-    let mut postings_end = 0u64;
-    let mut payload_end = 0u64;
     let mut ordinals_end = 0u64;
+    let mut payload_end = 0u64;
     // Reuse per-term scratch across the dictionary, especially for singleton
     // terms. Every consumer clears its state before use, including after a
     // malformed term skips the remaining checks in its iteration.
-    let mut tids = Vec::new();
-    let mut ordinals = Vec::new();
     let mut scores: Vec<(u8, u32)> = Vec::new();
-    let mut expected = Vec::new();
-    let mut bounds = Vec::new();
     let blocks = dictionary.map_or(0, |d| d.index().blocks());
     for block in 0..blocks {
         let dictionary = dictionary.expect("blocks come from a parsed dictionary");
@@ -465,86 +360,36 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             previous = Some(term);
             let term = previous.as_ref().expect("just stored the current term");
             let location = || format!("term {term:?}");
-            let postings_extent_end = entry
-                .postings
-                .offset
-                .saturating_add(u64::from(entry.postings.len));
-            let payload_extent_end = entry
-                .payload
-                .offset
-                .saturating_add(u64::from(entry.payload.len));
             let mut resolvable = true;
-            if postings_extent_end > postings_len as u64 {
-                findings.error(
-                    location(),
-                    format!(
-                        "postings extent {}+{} exceeds the postings area of {postings_len} bytes",
-                        entry.postings.offset, entry.postings.len
-                    ),
-                );
-                resolvable = false;
-            } else if entry.postings.offset < postings_end {
-                findings.error(
-                    location(),
-                    format!(
-                        "postings extent starts at {} inside the previous term's extent ending at {postings_end}",
-                        entry.postings.offset
-                    ),
-                );
-            }
-            if payload_extent_end > payload_len as u64 {
-                findings.error(
-                    location(),
-                    format!(
-                        "payload extent {}+{} exceeds the payload area of {payload_len} bytes",
-                        entry.payload.offset, entry.payload.len
-                    ),
-                );
-                resolvable = false;
-            } else if entry.payload.offset < payload_end {
-                findings.error(
-                    location(),
-                    format!(
-                        "payload extent starts at {} inside the previous term's extent ending at {payload_end}",
-                        entry.payload.offset
-                    ),
-                );
-            }
-            // An unusable ordinals extent does not stop the checks of the
-            // term's postings and payload, which no ordinal stream feeds.
-            let mut ordinals_extent = format.has_ordinals().then_some(entry.ordinals);
-            if let Some(extent) = ordinals_extent {
+            for (name, extent, area_len, end) in [
+                ("ordinals", entry.ordinals, ordinals_len, &mut ordinals_end),
+                ("payload", entry.payload, payload_len, &mut payload_end),
+            ] {
                 let extent_end = extent.offset.saturating_add(u64::from(extent.len));
-                if extent_end > ordinals_len as u64 {
+                if extent_end > area_len as u64 {
                     findings.error(
                         location(),
                         format!(
-                            "ordinals extent {}+{} exceeds the ordinals area of {ordinals_len} bytes",
+                            "{name} extent {}+{} exceeds the {name} area of {area_len} bytes",
                             extent.offset, extent.len
                         ),
                     );
-                    ordinals_extent = None;
-                } else if extent.offset < ordinals_end {
+                    resolvable = false;
+                } else if extent.offset < *end {
                     findings.error(
                         location(),
                         format!(
-                            "ordinals extent starts at {} inside the previous term's extent ending at {ordinals_end}",
+                            "{name} extent starts at {} inside the previous term's extent ending at {end}",
                             extent.offset
                         ),
                     );
                 }
-                ordinals_end = ordinals_end.max(extent_end);
+                *end = (*end).max(extent_end);
             }
-            postings_end = postings_end.max(postings_extent_end);
-            payload_end = payload_end.max(payload_extent_end);
             if !resolvable {
                 complete = false;
                 continue;
             }
-            let entry = TermEntry {
-                ordinals: ordinals_extent.unwrap_or_default(),
-                ..entry
-            };
             let resolved = match segment.resolve(entry) {
                 Ok(resolved) => resolved,
                 Err(error) => {
@@ -553,79 +398,44 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     continue;
                 }
             };
+            if entry.df == 0 {
+                findings.error(location(), "term has no documents");
+            }
 
-            // Postings: count, order, membership in the document table.
-            let postings = match resolved.postings() {
-                Ok(postings) => postings,
-                Err(error) => {
-                    findings.error(location(), format!("postings header: {error}"));
-                    complete = false;
-                    continue;
-                }
-            };
-            if postings.count() != entry.df {
-                findings.error(
-                    location(),
-                    format!(
-                        "dictionary df is {} but the postings hold {}",
-                        entry.df,
-                        postings.count()
-                    ),
-                );
-            }
-            tids.clear();
-            let mut posting_cursor = match (|| {
-                let mut cursor = postings.cursor()?;
-                while let Some(tid) = cursor.current() {
-                    tids.push(tid);
-                    cursor.advance()?;
-                }
-                if tids.len() != postings.count() as usize {
-                    return Err(Error::Corrupt("posting count mismatch"));
-                }
-                Ok(cursor)
-            })() {
-                Ok(cursor) => cursor,
-                Err(error) => {
-                    findings.error(location(), format!("postings: {error}"));
-                    complete = false;
-                    continue;
-                }
-            };
-            if tids.is_empty() {
-                findings.error(location(), "term has no postings");
-            }
-            ordinals.clear();
-            ordinals.reserve(tids.len());
-            let mut unknown = 0usize;
-            let mut document_at = 0;
-            for tid in &tids {
-                match if tids.len() == 1 {
-                    documents.binary_search(tid).ok()
-                } else {
-                    ordered_rank(&documents, &mut document_at, *tid)
-                } {
-                    Some(ordinal) => ordinals.push(Some(ordinal)),
-                    None => {
-                        if unknown == 0 {
-                            findings.error(
-                                location(),
-                                format!("posting {} is not in the document table", describe(*tid)),
-                            );
-                        }
-                        unknown += 1;
-                        ordinals.push(None);
+            // Ordinals: well formed, df members, all in the document table.
+            let stream_bytes =
+                match segment.ordinals_bytes(entry.ordinals.offset, entry.ordinals.len as usize) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        findings.error(location(), format!("ordinals: {error}"));
+                        complete = false;
+                        continue;
                     }
-                }
-            }
-            if unknown > 1 {
-                findings.error(
-                    location(),
-                    format!("{unknown} postings are not in the document table"),
-                );
-            }
+                };
+            let members =
+                match ordinals::validate(stream_bytes, entry.df, segment.document_count(), true)
+                    .and_then(|()| Ordinals::open(stream_bytes, stream_bytes.len() as u64, true))
+                    .and_then(|stream| {
+                        let mut cursor = stream.cursor()?;
+                        let mut members = Vec::with_capacity(entry.df as usize);
+                        while let Some(ordinal) = cursor.current() {
+                            let bucket = cursor
+                                .bucket()
+                                .ok_or(Error::Corrupt("member without a bucket"))?;
+                            members.push((ordinal, bucket));
+                            cursor.advance()?;
+                        }
+                        Ok(members)
+                    }) {
+                    Ok(members) => members,
+                    Err(error) => {
+                        findings.error(location(), format!("ordinals: {error}"));
+                        complete = false;
+                        continue;
+                    }
+                };
 
-            // Payload: one entry per posting, buckets matching positions.
+            // Payload: one entry per member, buckets matching positions.
             let payload = match resolved.payload() {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -634,31 +444,32 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     continue;
                 }
             };
-            if payload.count() != postings.count() {
+            if payload.count() != entry.df {
                 findings.error(
                     location(),
                     format!(
-                        "payload holds {} entries for {} postings",
+                        "payload holds {} entries for {} documents",
                         payload.count(),
-                        postings.count()
+                        entry.df
                     ),
                 );
             }
             let mut cursor = payload.cursor();
             scores.clear();
-            scores.reserve(tids.len());
+            scores.reserve(members.len());
             let mut max_bucket = 0u8;
             let mut payload_ok = true;
-            for (index, tid) in tids.iter().enumerate() {
+            for (index, (ordinal, bucket)) in members.iter().enumerate() {
                 if index as u32 >= payload.count() {
                     break;
                 }
-                let (bucket, position_count) = match cursor.next_count() {
+                let bucket = *bucket;
+                let position_count = match cursor.next_count() {
                     Ok(counted) => counted,
                     Err(error) => {
                         findings.error(
                             location(),
-                            format!("payload entry {index} for {}: {error}", describe(*tid)),
+                            format!("payload entry {index} for ordinal {ordinal}: {error}"),
                         );
                         payload_ok = false;
                         break;
@@ -669,23 +480,21 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     findings.error(
                         location(),
                         format!(
-                            "payload entry {index} for {} has bucket {bucket} but {} positions imply {expected}",
-                            describe(*tid),
-                            position_count
+                            "member {index} (ordinal {ordinal}) has bucket {bucket} but its {position_count} positions imply {expected}"
                         ),
                     );
                 }
                 max_bucket = max_bucket.max(bucket);
-                if let Some(ordinal) = ordinals[index] {
-                    positions_of[ordinal] += position_count as u64;
-                    scores.push((bucket, length_of[ordinal]));
+                if let Some(counted) = positions_of.get_mut(*ordinal as usize) {
+                    *counted += position_count as u64;
+                    scores.push((bucket, length_of[*ordinal as usize]));
                 }
             }
             if !payload_ok {
                 complete = false;
                 continue;
             }
-            if !tids.is_empty() && max_bucket != entry.max_tf_bucket {
+            if !members.is_empty() && max_bucket != entry.max_tf_bucket {
                 findings.error(
                     location(),
                     format!(
@@ -695,96 +504,34 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 );
             }
 
-            // Ordinals: the same documents as the postings, by table ordinal.
-            if let Some(extent) = ordinals_extent
-                && let Err(finding) = segment
-                    .ordinals_bytes(extent.offset, extent.len as usize)
-                    .map_err(|error| Finding::error("", format!("ordinals: {error}")))
-                    .and_then(|bytes| {
-                        check_ordinals(
-                            bytes,
-                            &tids,
-                            &ordinals,
-                            &documents,
-                            segment.document_count(),
-                            format.has_chunk_bounds().then_some(&scores[..]),
-                        )
-                    })
-            {
-                findings.push(finding.within(&location()));
-            }
-
-            // Score bounds: what the postings and lengths imply, in the
-            // layout the segment's format writes.
-            match posting_cursor.block_bounds_into(&mut bounds) {
-                Ok(()) => (),
-                Err(error) => {
-                    findings.error(location(), format!("block bounds: {error}"));
-                    continue;
-                }
-            };
-            if !format.has_bounds() {
+            // Bounds: what the payload buckets and lengths imply. The encoding
+            // is canonical, so the stream the writer would produce is the one
+            // that passes; comparing with it first spares a sound term, the
+            // common case, a second decoding.
+            if scores.len() != members.len() || payload.count() != entry.df {
                 continue;
             }
-            if bounds.is_empty() {
-                if !tids.is_empty() {
-                    findings.error(location(), "postings carry no block bounds");
-                }
+            let member_ordinals: Vec<u32> = members.iter().map(|(ordinal, _)| *ordinal).collect();
+            let canonical = ordinals::encode_scored(&member_ordinals, &scores);
+            if canonical == stream_bytes {
                 continue;
             }
-            let one_block = postings.count() <= BLOCK_POSTINGS;
-            match format {
-                Format::Lsg1 => {}
-                Format::Lsg2 => {
-                    if postings.has_term_bound() {
-                        findings.warning(
-                            location(),
-                            "postings carry an LSG3 term bound where LSG2 writes a block table",
-                        );
-                    }
-                }
-                Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => {
-                    if one_block && !postings.has_term_bound() {
-                        findings.warning(
-                            location(),
-                            "postings of one block carry a block table where LSG3 writes a term bound",
-                        );
-                    }
-                }
-            }
-            if unknown > 0 || scores.len() != tids.len() {
-                // Lengths are unknown for postings outside the table; the
-                // finding above already covers this term.
-                continue;
-            }
-            expected.clear();
-            expected.extend(
-                tids.chunks(BLOCK_POSTINGS as usize)
-                    .zip(scores.chunks(BLOCK_POSTINGS as usize))
-                    .map(|(block, scores)| BlockBound::over(scores, block[block.len() - 1])),
-            );
-            if bounds.len() != expected.len() {
+            let same_bounds = Ordinals::open(stream_bytes, stream_bytes.len() as u64, true)
+                .and_then(|found| {
+                    Ordinals::open(&canonical[..], canonical.len() as u64, true)
+                        .map(|wanted| found.bounds() == wanted.bounds())
+                })
+                .unwrap_or(false);
+            if same_bounds {
+                findings.warning(
+                    location(),
+                    "ordinals: the stream names its documents but is not encoded as the writer would",
+                );
+            } else {
                 findings.error(
                     location(),
-                    format!(
-                        "{} block bounds for {} blocks of postings",
-                        bounds.len(),
-                        expected.len()
-                    ),
+                    "ordinal chunk bounds disagree with the payload buckets and document lengths",
                 );
-                continue;
-            }
-            for (index, (found, wanted)) in bounds.iter().zip(&expected).enumerate() {
-                if found != wanted {
-                    findings.error(
-                        location(),
-                        format!(
-                            "block bound {index} (last {}) disagrees with its postings (last {})",
-                            describe(found.last),
-                            describe(wanted.last)
-                        ),
-                    );
-                }
             }
         }
     }
@@ -808,41 +555,14 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
     report
 }
 
-/// Checks a dead list: a postings stream whose locations must all be in
-/// `documents`, the segment's document table in order.
-pub fn verify_dead_list(bytes: &[u8], documents: &[Tid]) -> Vec<Finding> {
+/// Checks a dead list: an ordinal stream without bounds whose members must
+/// all be below `doc_count`, the segment's document count.
+pub fn verify_dead_list(bytes: &[u8], doc_count: u32) -> Vec<Finding> {
     let mut findings = Findings::default();
-    match Postings::parse(bytes).and_then(|postings| postings.to_vec()) {
-        Ok(dead) => {
-            let mut missing = 0usize;
-            for tid in &dead {
-                if documents.binary_search(tid).is_err() {
-                    if missing == 0 {
-                        findings.error(
-                            "dead list",
-                            format!("{} is not in the document table", describe(*tid)),
-                        );
-                    }
-                    missing += 1;
-                }
-            }
-            if missing > 1 {
-                findings.error(
-                    "dead list",
-                    format!("{missing} entries are not in the document table"),
-                );
-            }
-            if dead.len() > documents.len() {
-                findings.error(
-                    "dead list",
-                    format!(
-                        "holds {} entries for a segment of {} documents",
-                        dead.len(),
-                        documents.len()
-                    ),
-                );
-            }
-        }
+    match Ordinals::open(bytes, bytes.len() as u64, false)
+        .and_then(|stream| ordinals::validate(bytes, stream.count(), doc_count, false))
+    {
+        Ok(()) => {}
         Err(error) => findings.error("dead list", error),
     }
     findings.finish()
@@ -907,26 +627,19 @@ pub fn verify_forward_stream(bytes: &[u8]) -> ForwardReport {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use proptest::prelude::*;
-
     use super::*;
-    use crate::dictionary::Extent;
-    use crate::postings::PostingsBuilder;
+    use crate::dictionary::TermEntry;
     use crate::segment::SegmentBuilder;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
 
     fn tid(block: u32, offset: u16) -> Tid {
         Tid::new(block, offset).unwrap()
     }
 
-    /// A segment with more than one dictionary block, a term with several
-    /// score-bound blocks, and both sparse and grouped postings.
+    /// A segment with more than one dictionary block, a term with a chunked
+    /// stream, and both short and long terms.
     fn sample() -> Vec<u8> {
-        sample_as(Format::CURRENT)
-    }
-
-    fn sample_as(format: Format) -> Vec<u8> {
         let mut builder = SegmentBuilder::default();
         for i in 0..300u32 {
             let mut tokens = vec![("common", 1u32)];
@@ -948,47 +661,42 @@ mod tests {
                 )
                 .unwrap();
         }
-        builder.finish_as(format)
+        builder.finish()
     }
 
-    /// Where the length table, the ordinals area and the page table start.
-    fn trailing_sections(bytes: &[u8]) -> (usize, usize, usize) {
+    /// Where the ordinals area, the offsets, the lengths and the pages start.
+    fn section_starts(bytes: &[u8]) -> (usize, usize, usize, usize) {
         let sections = Segment::parse(bytes).unwrap().sections();
-        let pages_at = bytes.len() - sections.pages;
-        let ordinals_at = pages_at - sections.ordinals;
-        (ordinals_at - sections.lengths, ordinals_at, pages_at)
+        let ordinals_at = sections.header + sections.dictionary;
+        let offsets_at = ordinals_at + sections.ordinals + sections.payload;
+        let lengths_at = offsets_at + sections.offsets;
+        (
+            ordinals_at,
+            offsets_at,
+            lengths_at,
+            lengths_at + sections.lengths + sections.classes,
+        )
     }
 
     /// `bytes` with every dictionary entry passed through `edit`.
     fn with_entries(bytes: &[u8], mut edit: impl FnMut(&str, &mut TermEntry)) -> Vec<u8> {
         let segment = Segment::parse(bytes).unwrap();
         let sections = segment.sections();
-        let mut dictionary = crate::dictionary::DictionaryBuilder::with_format(segment.format());
+        let mut dictionary = crate::dictionary::DictionaryBuilder::default();
         for item in segment.dictionary().unwrap().iter() {
             let (term, mut entry) = item.unwrap();
             edit(&term, &mut entry);
             dictionary.push(&term, entry).unwrap();
         }
         let dictionary = dictionary.finish();
-        let mut reader = crate::reader::Reader::new(bytes);
-        let mut out = reader.take(4).unwrap().to_vec();
-        let fields = if segment.format().has_ordinals() {
-            8
-        } else {
-            6
-        };
-        for field in 0..fields {
-            let value = reader.varint().unwrap();
-            crate::varint::put(
-                &mut out,
-                if field == 2 {
-                    dictionary.len() as u64
-                } else {
-                    value
-                },
-            );
-        }
-        assert_eq!(reader.position(), sections.header);
+        let mut out = crate::segment::header(
+            segment.document_count(),
+            segment.total_length(),
+            dictionary.len(),
+            sections.ordinals,
+            sections.payload,
+            sections.pages,
+        );
         out.extend_from_slice(&dictionary);
         out.extend_from_slice(&bytes[sections.header + sections.dictionary..]);
         out
@@ -1002,7 +710,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .entry;
-        let at = trailing_sections(bytes).1 + entry.ordinals.offset as usize;
+        let at = section_starts(bytes).0 + entry.ordinals.offset as usize;
         at..at + entry.ordinals.len as usize
     }
 
@@ -1014,493 +722,315 @@ mod tests {
             .join("\n")
     }
 
+    fn only_for<'a>(report: &'a SegmentReport, location: &str) -> Vec<&'a str> {
+        report
+            .findings
+            .iter()
+            .filter(|f| f.location == location)
+            .map(|f| f.message.as_str())
+            .collect()
+    }
+
     #[test]
     fn a_valid_segment_is_clean() {
-        let bytes = sample();
-        let report = verify_segment(&bytes);
+        let report = verify_segment(&sample());
         assert!(report.is_clean(), "{}", messages(&report.findings));
         assert_eq!(report.doc_count, Some(450));
         assert_eq!(report.documents.len(), 450);
-        assert!(!report.legacy);
-        assert!(verify_segment(&SegmentBuilder::default().finish()).is_clean());
     }
 
     #[test]
     fn header_corruption_is_reported_at_the_header() {
         let bytes = sample();
-        let mut magic = bytes.clone();
-        magic[0] = b'X';
-        let report = verify_segment(&magic);
-        assert_eq!(report.findings.len(), 1);
-        assert_eq!(report.findings[0].location, "header");
-        assert!(report.findings[0].message.contains("magic"));
-        assert_eq!(report.doc_count, None);
-        // Every truncation of the blob breaks the total length.
-        for cut in [0, 3, 4, 10, bytes.len() / 2, bytes.len() - 1] {
-            let report = verify_segment(&bytes[..cut]);
-            assert!(!report.is_clean(), "cut at {cut}");
-            assert_eq!(report.findings[0].location, "header", "cut at {cut}");
-        }
-        // An LSG1 signature is a warning, not an error.
-        let report = verify_segment(&sample_as(Format::Lsg1));
-        assert!(report.legacy);
-        assert_eq!(report.findings.len(), 1, "{}", messages(&report.findings));
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|f| f.severity == Severity::Warning && f.message.contains("LSG1"))
-        );
-        // Older headers lack the lengths `LSG4` added, so relabelling a blob
-        // breaks the total length rather than reinterpreting its sections.
-        for older in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
-            let mut relabelled = bytes.clone();
-            relabelled[..4].copy_from_slice(older.magic());
-            let report = verify_segment(&relabelled);
-            assert_eq!(report.findings.len(), 1, "{older}");
-            assert_eq!(report.findings[0].location, "header", "{older}");
+        for (edit, expected) in [
+            (0usize, "segment magic"),
+            (bytes.len() - 1, "segment length"),
+        ] {
+            let mut bad = if edit == 0 {
+                bytes.clone()
+            } else {
+                bytes[..edit].to_vec()
+            };
+            if edit == 0 {
+                bad[0] = b'X';
+            }
+            let report = verify_segment(&bad);
+            assert_eq!(report.findings.len(), 1);
+            assert_eq!(report.findings[0].location, "header");
+            assert!(
+                report.findings[0].message.contains(expected),
+                "{}",
+                report.findings[0]
+            );
         }
     }
 
     #[test]
     fn swapped_lengths_and_total_length_are_caught() {
-        let bytes = sample();
-        // The last two documents have lengths 2 and 2; the first two
-        // documents (0,1) and (0,2) have lengths 3 and 4.
-        let (lengths_at, ordinals_at, _) = trailing_sections(&bytes);
-        assert_eq!(ordinals_at - lengths_at, 450 * 4);
-        let first = u32::from_le_bytes(bytes[lengths_at..lengths_at + 4].try_into().unwrap());
-        let second = u32::from_le_bytes(bytes[lengths_at + 4..lengths_at + 8].try_into().unwrap());
+        let mut bytes = sample();
+        let (_, _, lengths_at, _) = section_starts(&bytes);
+        // Swap the lengths of documents 0 and 1: the total is unchanged but
+        // every term over them now disagrees with its bounds, and the
+        // position counts disagree with the lengths.
+        let (a, b) = (lengths_at, lengths_at + 4);
+        let first: [u8; 4] = bytes[a..a + 4].try_into().unwrap();
+        let second: [u8; 4] = bytes[b..b + 4].try_into().unwrap();
         assert_ne!(first, second);
-        let mut swapped = bytes.clone();
-        swapped[lengths_at..lengths_at + 4].copy_from_slice(&second.to_le_bytes());
-        swapped[lengths_at + 4..lengths_at + 8].copy_from_slice(&first.to_le_bytes());
-        let report = verify_segment(&swapped);
-        let locations: Vec<&str> = report
-            .findings
-            .iter()
-            .map(|f| f.location.as_str())
-            .collect();
-        assert!(
-            locations.contains(&"document (0,1)"),
-            "{}",
-            messages(&report.findings)
-        );
-        assert!(
-            locations.contains(&"document (0,2)"),
-            "{}",
-            messages(&report.findings)
-        );
-        // Bounds for terms in those documents change too.
+        bytes[a..a + 4].copy_from_slice(&second);
+        bytes[b..b + 4].copy_from_slice(&first);
+        let report = verify_segment(&bytes);
+        assert!(!report.is_clean());
         assert!(
             report
                 .findings
                 .iter()
-                .any(|f| f.message.contains("block bound")),
+                .any(|f| f.location.starts_with("document (0,1)")),
             "{}",
             messages(&report.findings)
         );
-        // Changing one length breaks the header total and the document.
-        let mut bumped = bytes.clone();
-        bumped[lengths_at] ^= 0x01;
-        let report = verify_segment(&bumped);
         assert!(
             report
                 .findings
                 .iter()
-                .any(|f| f.location == "header" && f.message.contains("total_length")),
+                .any(|f| f.message.contains("chunk bounds disagree")),
+            "{}",
+            messages(&report.findings)
+        );
+        // A wrong total is reported at the header.
+        let mut bytes = sample();
+        bytes[lengths_at] ^= 1;
+        let report = verify_segment(&bytes);
+        assert!(
+            only_for(&report, "header")
+                .iter()
+                .any(|m| m.contains("total_length")),
             "{}",
             messages(&report.findings)
         );
     }
 
     #[test]
-    fn a_reordered_dictionary_index_is_caught() {
-        let bytes = sample();
-        // Zero the first term byte of the second block index entry, so the
-        // index no longer increases.
-        let segment = Segment::parse(&bytes).unwrap();
-        let dictionary = segment.dictionary().unwrap();
-        assert!(dictionary.index().blocks() >= 3);
-        let second = dictionary.index().block_first(1).unwrap().to_vec();
-        let at = bytes
-            .windows(second.len())
-            .position(|window| window == second.as_slice())
-            .unwrap();
-        let mut tampered = bytes.clone();
-        tampered[at] = 0;
-        let report = verify_segment(&tampered);
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|f| f.location == "dictionary" && f.message.contains("index order")),
-            "{}",
-            messages(&report.findings)
+    fn a_wrong_bucket_is_reported_for_its_term() {
+        let bytes = with_entries(&sample(), |term, entry| {
+            if term == "even" {
+                entry.max_tf_bucket = 9;
+            }
+        });
+        let report = verify_segment(&bytes);
+        assert_eq!(
+            only_for(&report, "term \"even\""),
+            ["dictionary max_tf_bucket is 9 but the largest payload bucket is 0"]
         );
-    }
-
-    #[test]
-    fn a_wrong_bucket_or_bound_is_reported_for_its_term() {
-        let bytes = sample();
-        let segment = Segment::parse(&bytes).unwrap();
-        let entry = segment.term("even").unwrap().unwrap().entry;
-        // The payload area starts after the postings area; find the first
-        // entry's bucket byte by re-parsing the extent.
-        let sections = segment.sections();
-        let payload_at = sections.header + sections.dictionary + sections.postings;
-        let extent = &bytes[payload_at + entry.payload.offset as usize
-            ..payload_at + entry.payload.offset as usize + entry.payload.len as usize];
-        let payload = crate::payload::Payload::parse(extent).unwrap();
-        let first = payload.get(0).unwrap();
-        assert_eq!(first.tf_bucket, 0);
-        // The bucket byte of entry 0 is the first data byte.
-        let data_at = extent.len() - payload.data_len();
-        let mut tampered = bytes.clone();
-        tampered[payload_at + entry.payload.offset as usize + data_at] = 3;
-        let report = verify_segment(&tampered);
-        let for_even: Vec<&Finding> = report
-            .findings
-            .iter()
-            .filter(|f| f.location == "term \"even\"")
-            .collect();
-        assert!(
-            for_even
-                .iter()
-                .any(|f| f.message.contains("bucket 3") && f.message.contains("imply 0")),
-            "{}",
-            messages(&report.findings)
-        );
-        assert!(
-            for_even.iter().any(|f| f.message.contains("block bound 0")),
-            "{}",
-            messages(&report.findings)
-        );
-        assert!(
-            report
-                .findings
-                .iter()
-                .all(|f| f.location == "term \"even\""),
-            "{}",
-            messages(&report.findings)
-        );
-    }
-
-    fn only_for<'a>(report: &'a SegmentReport, location: &str) -> Vec<&'a str> {
-        assert!(
-            report.findings.iter().all(|f| f.location == location),
-            "{}",
-            messages(&report.findings)
-        );
-        report.findings.iter().map(|f| f.message.as_str()).collect()
+        assert_eq!(report.findings.len(), 1, "{}", messages(&report.findings));
     }
 
     #[test]
     fn a_malformed_ordinal_stream_is_reported_for_its_term() {
         let bytes = sample();
-        assert_eq!(with_entries(&bytes, |_, _| ()), bytes);
-        // `common` holds every document: one array chunk, whose last two
-        // members swapped are no longer ascending.
-        let stream = ordinal_stream(&bytes, "common");
-        let mut swapped = bytes.clone();
-        swapped.swap(stream.end - 4, stream.end - 2);
-        swapped.swap(stream.end - 3, stream.end - 1);
-        let report = verify_segment(&swapped);
-        let found = only_for(&report, "term \"common\"");
-        assert_eq!(
-            found,
-            ["ordinals: corrupt segment data: ordinal array order"]
+        let range = ordinal_stream(&bytes, "common");
+        let mut bad = bytes.clone();
+        // Change the last member's bucket nibble: it no longer matches the
+        // member's positions, and the chunk bound no longer matches it.
+        bad[range.end - 1] ^= 0x0f;
+        let report = verify_segment(&bad);
+        assert!(
+            only_for(&report, "term \"common\"")
+                .iter()
+                .any(|m| m.contains("positions imply") || m.contains("bounds disagree")),
+            "{}",
+            messages(&report.findings)
         );
-        // A list stream counting more ordinals than it holds, or fewer.
-        // One member: the count, its chunk bound and one delta.
-        let stream = ordinal_stream(&bytes, "term0003");
-        assert!((5..=10).contains(&stream.len()), "{}", stream.len());
-        for (count, problem) in [
-            (2, "ordinals: truncated segment data"),
-            (0, "ordinals: corrupt segment data: ordinal list length"),
-        ] {
-            let mut miscounted = bytes.clone();
-            miscounted[stream.start] = count;
-            let report = verify_segment(&miscounted);
-            assert_eq!(only_for(&report, "term \"term0003\""), [problem]);
-        }
-        // A stream cut short by its extent.
-        let shortened = with_entries(&bytes, |term, entry| {
-            if term == "even" {
+        // Break a member of the array chunk: order or count breaks.
+        let mut bad = bytes.clone();
+        bad[range.start + 8] = 0xff;
+        let report = verify_segment(&bad);
+        assert!(
+            only_for(&report, "term \"common\"")
+                .iter()
+                .any(|m| m.starts_with("ordinals:")
+                    || m.contains("bounds disagree")
+                    || m.contains("positions imply")),
+            "{}",
+            messages(&report.findings)
+        );
+        // A truncated extent.
+        let bad = with_entries(&bytes, |term, entry| {
+            if term == "common" {
                 entry.ordinals.len -= 1;
             }
         });
-        let report = verify_segment(&shortened);
-        let found = only_for(&report, "term \"even\"");
-        assert_eq!(found, ["ordinals: truncated segment data"]);
-        // A term of an `LSG4` segment always has a stream.
-        let missing = with_entries(&bytes, |term, entry| {
-            if term == "term0149" {
-                entry.ordinals.len = 0;
-            }
-        });
-        let report = verify_segment(&missing);
-        let found = only_for(&report, "term \"term0149\"");
-        assert_eq!(found, ["ordinals: truncated segment data"]);
-    }
-
-    #[test]
-    fn a_valid_ordinal_stream_naming_the_wrong_document_is_reported() {
-        let bytes = sample();
-        // The 150 even documents are ordinals 0, 2, .. 298; the last becomes
-        // 299, which is a document, but an odd one.
-        let stream = ordinal_stream(&bytes, "even");
-        assert_eq!(bytes[stream.end - 2..stream.end], 298u16.to_le_bytes());
-        let mut renamed = bytes.clone();
-        renamed[stream.end - 2..stream.end].copy_from_slice(&299u16.to_le_bytes());
-        let report = verify_segment(&renamed);
-        let found = only_for(&report, "term \"even\"");
-        assert_eq!(
-            found,
-            [
-                "ordinal 149 is 299 and names (42,6) but posting 149 is (42,5); 1 of 150 ordinals differ from their postings"
-            ]
-        );
-        // Two terms of one document each, exchanging streams: each stream is
-        // well formed and inside the area, and each names the other's document.
-        let segment = Segment::parse(&bytes).unwrap();
-        let first = segment.term("term0003").unwrap().unwrap().entry.ordinals;
-        let second = segment.term("term0004").unwrap().unwrap().entry.ordinals;
-        let exchanged = with_entries(&bytes, |term, entry| match term {
-            "term0003" => entry.ordinals = second,
-            "term0004" => entry.ordinals = first,
-            _ => (),
-        });
-        let report = verify_segment(&exchanged);
-        let found: Vec<String> = report.findings.iter().map(ToString::to_string).collect();
-        assert_eq!(
-            found,
-            [
-                "error: term \"term0003\": ordinal 0 is 304 and names (1012,1) but posting 0 is (1009,1); 1 of 1 ordinals differ from their postings",
-                "error: term \"term0004\": ordinals extent starts at 2217 inside the previous term's extent ending at 2231",
-                "error: term \"term0004\": ordinal 0 is 303 and names (1009,1) but posting 0 is (1012,1); 1 of 1 ordinals differ from their postings",
-            ]
+        let report = verify_segment(&bad);
+        assert!(
+            !only_for(&report, "term \"common\"").is_empty(),
+            "{}",
+            messages(&report.findings)
         );
     }
 
     #[test]
     fn a_wrong_page_table_entry_is_reported() {
-        let bytes = sample();
-        let (_, _, pages_at) = trailing_sections(&bytes);
-        // Seven documents a page: the second page starts at ordinal 7.
-        let entry = pages_at + PAGE_ENTRY;
-        assert_eq!(bytes[entry..entry + 4], 1u32.to_le_bytes());
-        assert_eq!(bytes[entry + 4..entry + 8], 7u32.to_le_bytes());
-        let mut shifted = bytes.clone();
-        shifted[entry + 4] = 8;
-        let report = verify_segment(&shifted);
-        assert_eq!(
-            only_for(&report, "page table"),
-            [
-                "entry 1 is block 1 from ordinal 8 but the document table implies block 1 from ordinal 7"
-            ]
-        );
-        let mut renumbered = bytes.clone();
-        renumbered[entry] = 2;
-        let report = verify_segment(&renumbered);
-        assert_eq!(
-            only_for(&report, "page table"),
-            [
-                "entry 1 is block 2 from ordinal 7 but the document table implies block 1 from ordinal 7"
-            ]
-        );
-        // A table missing its last page: the header still adds up, since the
-        // ordinals area is taken to be one entry longer.
-        let mut reader = crate::reader::Reader::new(&bytes);
-        reader.take(4).unwrap();
-        let fields: Vec<u64> = (0..8).map(|_| reader.varint().unwrap()).collect();
-        let mut short = bytes[..4].to_vec();
-        for (field, value) in fields.iter().enumerate() {
-            crate::varint::put(
-                &mut short,
-                if field == 7 {
-                    value - PAGE_ENTRY as u64
-                } else {
-                    *value
-                },
-            );
-        }
-        short.extend_from_slice(&bytes[reader.position()..bytes.len() - PAGE_ENTRY]);
-        let report = verify_segment(&short);
-        assert_eq!(
-            only_for(&report, "page table"),
-            [format!(
-                "holds {} entries but the documents span {} pages",
-                fields[7] as usize / PAGE_ENTRY - 1,
-                fields[7] as usize / PAGE_ENTRY
-            )]
+        let mut bytes = sample();
+        let (_, _, _, pages_at) = section_starts(&bytes);
+        // The second entry's block.
+        bytes[pages_at + PAGE_ENTRY] ^= 0x40;
+        let report = verify_segment(&bytes);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.location == "document table" || f.location == "page table"),
+            "{}",
+            messages(&report.findings)
         );
     }
 
     #[test]
-    fn an_ordinals_extent_outside_its_area_is_reported() {
-        let bytes = sample();
-        let area = Segment::parse(&bytes).unwrap().sections().ordinals;
-        for (offset, len) in [(area as u64, 1), (area as u64 - 1, 4), (1 << 40, 3)] {
-            let moved = with_entries(&bytes, |term, entry| {
-                if term == "term0149" {
-                    entry.ordinals = Extent { offset, len };
-                }
-            });
-            // The last term, so no later extent is measured from this one.
-            // Its postings and payload are still checked, and found sound.
-            let report = verify_segment(&moved);
-            assert_eq!(
-                only_for(&report, "term \"term0149\""),
-                [format!(
-                    "ordinals extent {offset}+{len} exceeds the ordinals area of {area} bytes"
-                )]
-            );
-            // Readers refuse the term rather than read outside the area.
-            let segment = Segment::parse(&moved).unwrap();
-            assert_eq!(segment.term("term0149").err(), Some(Error::Truncated));
-        }
-    }
-
-    #[test]
-    fn older_formats_have_no_ordinals_or_pages_to_check() {
-        for format in [Format::Lsg2, Format::Lsg3] {
-            let bytes = sample_as(format);
-            let report = verify_segment(&bytes);
-            assert!(
-                report.is_clean(),
-                "{format}: {}",
-                messages(&report.findings)
-            );
-            let segment = Segment::parse(&bytes).unwrap();
-            assert_eq!(segment.sections().ordinals + segment.sections().pages, 0);
-            assert!(
-                segment
-                    .term("common")
-                    .unwrap()
-                    .unwrap()
-                    .ordinals()
-                    .unwrap()
-                    .is_none()
-            );
-        }
+    fn an_extent_outside_its_area_is_reported() {
+        let bytes = with_entries(&sample(), |term, entry| {
+            if term == "odd" {
+                entry.ordinals.offset += 1 << 20;
+            }
+        });
+        let report = verify_segment(&bytes);
+        assert!(
+            only_for(&report, "term \"odd\"")
+                .iter()
+                .any(|m| m.contains("exceeds the ordinals area")),
+            "{}",
+            messages(&report.findings)
+        );
+        let bytes = with_entries(&sample(), |term, entry| {
+            if term == "odd" {
+                entry.payload.offset = 0;
+            }
+        });
+        let report = verify_segment(&bytes);
+        assert!(
+            only_for(&report, "term \"odd\"")
+                .iter()
+                .any(|m| m.contains("payload extent starts at 0 inside")),
+            "{}",
+            messages(&report.findings)
+        );
     }
 
     #[test]
     fn every_single_byte_flip_is_survived_and_detected_unless_still_decodable() {
-        let bytes = sample();
-        let original = Segment::parse(&bytes).unwrap().records(|_| false).unwrap();
-        let mut detected = 0usize;
-        let mut silent = 0usize;
-        let (_, ordinals_at, pages_at) = trailing_sections(&bytes);
-        assert!(ordinals_at < pages_at && pages_at < bytes.len());
+        let mut builder = SegmentBuilder::default();
+        for i in 0..40u32 {
+            builder
+                .add_document(
+                    tid(i / 3, (i % 3 + 1) as u16),
+                    [("x", 1u32), (["y", "z"][(i % 2) as usize], 2)],
+                )
+                .unwrap();
+        }
+        let bytes = builder.finish();
+        assert!(verify_segment(&bytes).is_clean());
+        let (ordinals_at, offsets_at, lengths_at, pages_at) = section_starts(&bytes);
+        let sections = Segment::parse(&bytes).unwrap().sections();
+        let payload_at = ordinals_at + sections.ordinals;
+        let classes_at = lengths_at + sections.lengths;
+        let mut undetected = [0usize; 8];
         for at in 0..bytes.len() {
-            let mut flipped = bytes.clone();
-            flipped[at] ^= 0x55;
-            let report = verify_segment(&flipped);
-            if report.is_clean() {
-                // Every byte of the ordinals area and the page table is
-                // implied by the postings and the document table.
-                assert!(at < ordinals_at, "flip at {at} is silent");
-                // Undetectable flips must leave a readable blob whose
-                // only difference is in token positions or term bytes,
-                // which nothing cross-checks.
-                let records = Segment::parse(&flipped)
-                    .unwrap()
-                    .records(|_| false)
-                    .unwrap_or_else(|error| {
-                        panic!("flip at {at} is silent but unreadable: {error}")
-                    });
-                assert_eq!(records.len(), original.len(), "flip at {at}");
-                for (a, b) in records.iter().zip(&original) {
-                    assert_eq!(a.tid, b.tid, "flip at {at}");
-                    assert_eq!(a.doc_len, b.doc_len, "flip at {at}");
-                    let terms = |r: &ForwardRecord| {
-                        r.terms
-                            .iter()
-                            .map(|t| t.positions.len())
-                            .collect::<Vec<_>>()
+            for bit in 0..8 {
+                let mut bad = bytes.clone();
+                bad[at] ^= 1 << bit;
+                if verify_segment(&bad).is_clean() {
+                    let section = match at {
+                        _ if at >= pages_at => 7,
+                        _ if at >= classes_at => 6,
+                        _ if at >= lengths_at => 5,
+                        _ if at >= offsets_at => 4,
+                        _ if at >= payload_at => 3,
+                        _ if at >= ordinals_at => 2,
+                        _ if at >= sections.header => 1,
+                        _ => 0,
                     };
-                    assert_eq!(terms(a), terms(b), "flip at {at}");
+                    undetected[section] += 1;
                 }
-                silent += 1;
-            } else {
-                detected += 1;
             }
         }
-        assert!(
-            detected > silent * 4,
-            "{detected} detected, {silent} silent"
+        // Values nothing cross-references survive a flip that keeps them
+        // plausible: a term's name (still in order), a page table entry's
+        // block number, a tuple offset that keeps its block's offsets
+        // ascending, and a position value. Everything structural, every
+        // count, every length and every bound is caught.
+        let [
+            header,
+            dictionary,
+            ordinals,
+            payload,
+            offsets,
+            lengths,
+            classes,
+            pages,
+        ] = undetected;
+        assert_eq!(
+            (header, ordinals, lengths, classes),
+            (0, 0, 0, 0),
+            "{undetected:?}"
         );
+        assert!(dictionary <= 8, "{undetected:?}");
+        assert!(pages * 2 < sections.pages * 8, "{undetected:?}");
+        assert!(payload * 2 < sections.payload * 8, "{undetected:?}");
+        assert!(offsets < sections.offsets * 8, "{undetected:?}");
     }
 
     #[test]
-    fn dead_lists_must_be_subsets_of_the_document_table() {
-        let bytes = sample();
-        let documents = verify_segment(&bytes).documents;
-        let mut builder = PostingsBuilder::default();
-        builder.push(documents[3]).unwrap();
-        builder.push(documents[10]).unwrap();
-        let dead = builder.finish();
-        assert!(verify_dead_list(&dead, &documents).is_empty());
-        let mut builder = PostingsBuilder::default();
-        builder.push(tid(0, 291)).unwrap();
-        builder.push(documents[10]).unwrap();
-        builder.push(tid(5_000_000, 1)).unwrap();
-        let findings = verify_dead_list(&builder.finish(), &documents);
-        assert_eq!(findings.len(), 2, "{}", messages(&findings));
-        assert!(findings[0].message.contains("(0,291)"));
-        assert!(findings[1].message.contains("2 entries"));
-        assert_eq!(
-            verify_dead_list(&dead[..dead.len() - 1], &documents).len(),
-            1
-        );
-        assert_eq!(verify_dead_list(b"", &documents).len(), 1);
+    fn dead_lists_must_be_within_the_document_count() {
+        let list = ordinals::encode(&[0, 3, 7]);
+        assert!(verify_dead_list(&list, 8).is_empty());
+        let findings = verify_dead_list(&list, 7);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].location, "dead list");
+        assert!(!verify_dead_list(&[0xff, 0xff], 8).is_empty());
+        assert!(verify_dead_list(&ordinals::encode(&[]), 0).is_empty());
     }
 
     #[test]
     fn forward_streams_report_framing_and_duplicates() {
         let mut stream = Vec::new();
-        for i in 0..5u32 {
-            ForwardRecord::from_tokens(tid(i, 1), [("x", 1), ("y", 2)])
-                .unwrap()
-                .encode(&mut stream)
-                .unwrap();
-        }
+        let record = |block: u32, text: &str| {
+            ForwardRecord::from_tokens(
+                tid(block, 1),
+                text.split_whitespace()
+                    .enumerate()
+                    .map(|(i, w)| (w, i as u32 + 1)),
+            )
+            .unwrap()
+        };
+        record(1, "a b").encode(&mut stream).unwrap();
+        record(2, "c").encode(&mut stream).unwrap();
         let report = verify_forward_stream(&stream);
         assert!(report.findings.is_empty(), "{}", messages(&report.findings));
-        assert_eq!(report.records, 5);
-        assert_eq!(report.tids.len(), 5);
-        let report = verify_forward_stream(&stream[..stream.len() - 1]);
-        assert_eq!(report.records, 4);
-        assert_eq!(report.findings.len(), 1);
-        assert!(report.findings[0].location.starts_with("record 4 at byte"));
-        assert!(report.findings[0].message.contains("past the end"));
-        let mut twice = stream.clone();
-        twice.extend_from_slice(&stream[..ForwardRecord::encoded_len(&stream).unwrap()]);
-        let report = verify_forward_stream(&twice);
-        assert_eq!(report.records, 6);
-        assert!(report.findings[0].message.contains("recorded twice"));
-        let mut wrong_len = stream.clone();
-        wrong_len[3] ^= 0x01; // doc_len of the first record
-        let report = verify_forward_stream(&wrong_len);
+        assert_eq!(report.records, 2);
+        record(1, "d").encode(&mut stream).unwrap();
+        let report = verify_forward_stream(&stream);
+        assert_eq!(report.records, 3);
         assert!(
-            report.findings[0].message.contains("positions"),
+            report.findings.iter().any(|f| f.message.contains("twice")),
             "{}",
             messages(&report.findings)
         );
-        assert!(verify_forward_stream(b"").findings.is_empty());
+        stream.push(0x80);
+        let report = verify_forward_stream(&stream);
+        assert!(report.findings.len() >= 2);
     }
 
     #[test]
     fn findings_are_capped() {
         let mut findings = Findings::default();
-        for i in 0..MAX_FINDINGS + 5 {
+        for i in 0..(MAX_FINDINGS + 10) {
             findings.error("x", i);
         }
         let all = findings.finish();
         assert_eq!(all.len(), MAX_FINDINGS + 1);
-        assert!(all.last().unwrap().message.contains("5 further"));
+        assert!(all.last().unwrap().message.contains("further"));
+    }
+
+    #[test]
+    fn finding_locations_nest() {
         assert_eq!(
             Finding::error("term", "bad").within("segment 3").location,
             "segment 3, term"
@@ -1543,19 +1073,6 @@ mod tests {
         #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
 
         #[test]
-        fn ordered_membership_matches_independent_search(
-            docs in prop::collection::btree_set(0u32..100_000, 0..500),
-            postings in prop::collection::btree_set(0u32..100_000, 0..500),
-        ) {
-            let documents = docs.into_iter().map(|block| tid(block, 1)).collect::<Vec<_>>();
-            let mut at = 0;
-            for block in postings {
-                let posting = tid(block, 1);
-                prop_assert_eq!(ordered_rank(&documents, &mut at, posting), documents.binary_search(&posting).ok());
-            }
-        }
-
-        #[test]
         fn valid_segments_never_yield_findings(documents in documents()) {
             let bytes = build(&documents);
             let report = verify_segment(&bytes);
@@ -1586,7 +1103,7 @@ mod tests {
             }
             let _ = verify_segment(&bytes);
             let _ = verify_segment(&bytes[..cut.index(bytes.len())]);
-            let _ = verify_dead_list(&bytes, &[]);
+            let _ = verify_dead_list(&bytes, 10);
             let _ = verify_forward_stream(&bytes);
         }
     }

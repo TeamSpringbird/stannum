@@ -125,14 +125,6 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
-        c"stannum.rank_by_ordinal",
-        c"Rank pruned disjunctions over the ordinal streams instead of the TID postings",
-        c"A prototype of ADR 0003; chunk bounds are derived from block bounds at query time.",
-        &crate::score::RANK_BY_ORDINAL,
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_bool_guc(
         c"stannum.profile_count_selection",
         c"Collect bounded count-selector features without changing the default strategy",
         c"Estimation timing includes feature collection; counters accumulate over rescans.",
@@ -1332,7 +1324,7 @@ fn candidates_in_view(exec: &mut ScanExec, query: &Query, view: &crate::storage:
         exec.recheck |= !planned.exact;
         if let Some(dead) = dead {
             let dead = crate::storage::codec_in(
-                segment::postings::Postings::parse(dead).and_then(|p| p.cursor()),
+                crate::storage::dead_cursor(&**segment, dead),
                 &format!("{label} dead list"),
             );
             cursor = Box::new(crate::storage::codec_in(
@@ -1818,7 +1810,7 @@ unsafe fn count_fetched(
     }
 }
 
-/// Counts by folding each `LSG4` segment's ordinal streams (see
+/// Counts by folding each segment's ordinal streams (see
 /// [`crate::fold`]). The visibility map is read once, after the view; if a
 /// dead list was published in between, the count starts over, and after
 /// repeated interference it trusts no page. The write buffer and segments
@@ -1855,7 +1847,7 @@ unsafe fn fold_count(
                     crate::fold::count_segment(
                         view.keys[i],
                         source.as_ref(),
-                        &view.dead_sets[i],
+                        view.sources[i].1.as_ref(),
                         query,
                         &visibility,
                         |block, offsets| pending.push((block, offsets.to_vec())),
@@ -2017,7 +2009,7 @@ unsafe extern "C-unwind" fn exec_count(
                         let mut cursor = planned.cursor;
                         if let Some(dead) = dead {
                             let dead = crate::storage::codec_in(
-                                segment::postings::Postings::parse(dead).and_then(|p| p.pages()),
+                                crate::storage::dead_pages(&**source, dead),
                                 &format!("{label} dead list"),
                             );
                             cursor = Box::new(crate::storage::codec_in(
@@ -2297,6 +2289,12 @@ unsafe extern "C-unwind" fn explain(
                 c"Visibility Checks".as_ptr(),
                 std::ptr::null(),
                 crate::score::visibility_checks(),
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
+                c"Visibility Map Hits".as_ptr(),
+                std::ptr::null(),
+                crate::score::vm_hits(),
                 es,
             );
             pg_sys::ExplainPropertyInteger(

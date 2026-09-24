@@ -8,9 +8,17 @@ an AWS campaign. Backwards compatibility is explicitly not a concern: there is n
 production usage, old indexes need not load, and `REINDEX` is an acceptable
 migration.
 
-Branch `perf/ranged-reads`, head `af24e4c`, pushed to remote `stannum`. Working
-tree clean; the full pgrx suite and the install, lifecycle, upgrade and reference
-oracle gates all pass there.
+Branch `perf/ranged-reads`, pushed to remote `stannum`. The redesign below was
+built on 2026-09-23 as a series of `WIP:` commits after `c707013`, meant to be
+squashed into one; each step's measurements are recorded under "Order of
+work". At every commit the full pgrx suite and the install, lifecycle, upgrade
+and reference oracle gates pass; from the last commit the ranked-scan fuzz
+smoke is a gate too. Segment format signatures went `STN1`
+(item 1), `STN2` (items 2 and 3), `STN3` (item 5); only `STN3` is read, and
+the `LSG` readers are gone. The meta page changed last (a stamp per dead
+list), after the measurements below, so the local mocks predate it and any
+further measurement starts with a rebuild. The 150 million row snapshot in
+S3 is `LSG5` and must be rebuilt.
 
 ## The finding
 
@@ -147,10 +155,155 @@ per-query read count comes from.
    for 103,038 of the 105,522 pages and planning for the other 2,484. The
    table above is the corrected breakdown; the previous one understated payload
    and postings by leaving phrase queries out entirely.
-2. Delete the TID postings (item 1). Measure size and reads.
-3. Split positions out and put frequency inline (items 2 and 3). Measure.
-4. Liveness bitmap and compact lengths (items 4 and 5). Measure.
-5. Segment sizing (item 6), which is configuration plus lifting two limits.
+2. **Delete the TID postings (item 1).** Done 2026-09-23, as segment format
+   `STN1` (see `segment/src/segment.rs` and `segment/src/docs.rs`): the
+   ordinal stream is the only document set, the document table is the page
+   table plus a two-byte heap offset per document, dead lists are ordinal
+   streams, and the write buffer carries the same streams. The `LSG` readers
+   are gone. Measured on the mock, same build settings, ten segments:
+
+   | | LSG5 | STN1 |
+   | --- | ---: | ---: |
+   | index relation, fresh build | 21.7 GB | 16.3 GB |
+   | index build | 898 s | 1,105 s |
+   | index pages per query, steady state | 293 | 210 |
+   | phrase / conjunction / disjunction pages | 368 / 307 / 205 | 187 / 239 / 201 |
+   | CPU per query, warm | 18.2 ms | 18.9 ms |
+   | throttled mixed, 8 clients | 55.3 QPS, p50 89 ms | 130.7 QPS, p50 26 ms |
+   | disk read per query, throttled | 5.4 MB | 1.9 MB |
+   | private memory, 8 backends | 2.1 GB | 2.05 GB |
+
+   Phrase queries lost their postings pages and read 11 pages of ordinals in
+   their place; conjunctions lost the 56 postings pages their fallback read;
+   disjunctions were already ordinal-only. The throttled run was measured
+   with other work on the machine and is a lower bound. Three things had to
+   be fixed on the way, each found by measuring: the page table was
+   re-validated on every cursor (now once per reader); rows scored by
+   location ranked the ordinal by a population count over the whole chunk
+   (now a forward cursor per term with incremental counts); and the offsets
+   table was fetched one heap block at a time, which tripled buffer hits,
+   pushed private memory to 3 GB and had the container's OOM killer end a
+   run (now 8 KiB windows). Verification lost its independent witness for
+   term names, page-table block numbers, offsets and positions; the
+   byte-flip test in `segment/src/verify.rs` records exactly what is and is
+   not caught.
+3. **Split positions out and put frequency inline (items 2 and 3).** Done
+   2026-09-23 as `STN2`: each member of an ordinal chunk (or list) carries
+   its term-frequency bucket as a nibble after the members, and the payload
+   holds positions only. Scoring never opens a payload stream.
+4. **Liveness and compact lengths (items 4 and 5).** Done 2026-09-23. The
+   liveness bitmap already existed: a dead list is an ordinal stream, and
+   the walk clears it from every chunk. What remained was the heap fetch per
+   admitted candidate, now answered by the page-level visibility map when the
+   page is all-visible; if a dead list was published after the view was
+   captured the walk is repeated against the heap (the count path's rule).
+   `STN3` adds a one-byte length class per document (`segment/src/length_class.rs`),
+   a lower bound the walk tightens its bounds at before reading the exact
+   length. Measured together on the mock, ten segments, throttled:
+
+   | | LSG5 | STN1 (item 1) | STN3 (items 1-5) |
+   | --- | ---: | ---: | ---: |
+   | index relation, fresh build | 21.7 GB | 16.3 GB | 15.3 GB (4.98 GB packed, see item 6) |
+   | index build | 898 s | 1,105 s | 760 s |
+   | index pages per query | 293 | 210 | 182 |
+   | heap pages per query | 25 | 25 | 4.7 |
+   | conjunction / disjunction / phrase index pages | 307 / 205 / 368 | 239 / 201 / 187 | 200 / 104 / 242 |
+   | CPU per query, warm | 18.2 ms | 18.9 ms | 16.7 ms |
+   | warm unthrottled mixed, 8 clients | 281 QPS | 165 QPS | 385 QPS |
+   | throttled mixed, 8 clients | 55.3 QPS, p50 89 ms | 130.7 QPS, p50 26 ms | 378 QPS, p50 7 ms |
+   | disk read per query, throttled | 5.4 MB | 1.9 MB | 0.6 MB |
+   | CPU busy of 8 cores, throttled | 1.4 | 3.4 | 6.7 |
+   | private memory, 8 backends | 2.1 GB | 2.05 GB | 2.16 GB |
+
+   Disjunctions read no payload at all now (104 pages, all ordinals); the
+   throttled workload is CPU-bound, which is the regime the target named.
+   Phrase queries still read 223 pages of positions per query; they are the
+   remaining disk cost and are untouched by items 2 to 5 by design.
+5. **Segment sizing (item 6).** Partly done 2026-09-23: an index build ends
+   by compacting its directory, merging the smallest segments that fit one
+   run under the segment byte cap until no two do, so a build leaves the
+   fewest segments the cap allows instead of every tier's leftovers. Lifting
+   the 3 GiB cap and the `u32` run length is deferred: a direct merge holds
+   every input blob and its output in memory, so segments larger than the
+   cap need a streaming merge before they can be built inside a 32 GB
+   container next to 24 GB of shared buffers.
+
+   Measured on the mock: 2 segments instead of 10, scorer setup 13.1 to
+   4.5 pages per query, index pages 182 to 166, CPU per query 16.7 to
+   14.7 ms, throttled mixed 378 to 383 QPS (CPU-bound either way). The
+   relation grew from 15.3 GB to 20.2 GB, because the runs the compaction
+   merged stayed on the pending list, to be reclaimed a bounded slice per
+   later insert. Freeing them at once did not help either: freed pages are
+   reusable but never returned, and the tier merges of any build retire
+   about as many pages as they keep. A build now ends by packing its live
+   runs into its lowest pages and truncating the rest. **The built relation
+   is 4.98 GB**, against 21.7 GB for the same rows in `LSG5`: 4.4 times
+   smaller, and 66% of the 7.6 GB table. Two segments, scorer setup 4.5
+   pages per query, 166 index pages and 4.7 heap pages per query, 15.1 ms
+   CPU per query warm, 358 QPS throttled at the mock's 400 MB/s read cap and
+   408 QPS with the byte cap lifted (CPU-bound at 7.8 of 8 cores, the IOPS
+   cap kept). The packed relation reads half the IOs per query of the
+   unpacked one (18.7 against 37.6) but twice the bytes (1.1 against 0.5
+   MB/query): the kernel's readahead fires far more often on a dense file
+   whose neighbours are cached, so the average read grew from 14 to 64 KiB.
+   The mock's byte cap was set from what the AWS NVMe delivered, not from
+   what it can deliver, so on the instance this trades scarce IOPS for
+   plentiful bandwidth; `benchmarks/local/mock-run.sh` keeps both caps, and
+   a run pinned by the byte cap shows it as a read rate near 400 MB/s. The
+   relation now fits the mock's 2 GB of shared buffers plus page cache far
+   better than the 21.7 GB it replaced, and would fit the AWS instance's 24 GB
+   of shared buffers at 150 million rows if size scales with rows (about
+   50 GB, TIN's 50.7 GB).
+
+   Compacting the test index into one segment exposed a pruning gap: the
+   walk decided whether to prune once per chunk, before that chunk's
+   candidates were admitted, so the chunk that fills the top k scored every
+   candidate in it. The threshold is now consulted per sub-block and per
+   candidate.
+
+### Predicted degradations, measured
+
+Two paths do per-document work where grouped postings did per-page work:
+the page-mask count strategy (`stannum.count_fold = off`) and unordered
+scans, both served by the page cursor over an ordinal stream. On the STN3
+mock, warm: a count of `the OR is OR to` (12.4 million matches) takes 0.8 ms
+by the default fold and 299 ms by page masks; `python AND error AND file`
+(8,196 matches) 0.7 ms and 26 ms. An unordered `the AND is LIMIT 100000`
+returns in 151 ms and the full 8,196-row conjunction in 269 ms, most of it
+heap fetches. The page-mask path is slower than it was but is not the
+default for counts, and unordered scans are bounded by the heap, not the
+index. The mutation workload, measured as the published disjunction workload
+with updates on the compacted STN3 mock: 83,039 updates in 300 s at the
+driver's rate, none failed, update p50 2.7 ms, p95 4.9 ms, worst 1.0 s,
+with disjunctions at 383 queries a second beside them and post-update
+checks agreeing. The write-buffer re-encode on out-of-order inserts does
+not show.
+
+### Found by the fuzzer on the way, all fixed
+
+The ranked-scan fuzzer (`postgres/tests/ranked_fuzz.py`) failed on the new
+format in three ways, each with a regression test now, and `--smoke` is a
+gate (`benchmarks/local/gates.sh`):
+
+- The disjunction walk masked a segment's dead ordinals before it rebuilt
+  its candidates from the essential terms, and never masked a list chunk:
+  a deleted document was scored and its location, by then reused by a row
+  that never matched, returned. This was latent in the prototype's ordinal
+  walk and became live when that walk became the only ranked path.
+- A dead list is rewritten whole by every VACUUM that finds more dead rows,
+  and a replacement can land in the freed pages of the list it replaces,
+  at the same byte count; readers keyed their cached dead set by the run
+  alone and served the old list. Each dead list now carries a stamp from
+  the index's generation counter (`SegmentEntry::dead_stamp`; the meta page
+  holds 48 pending runs instead of 64 to make room).
+- The per-row scorer's term cursors, forward-only since this redesign,
+  were reopened for a request behind them but not once exhausted, so a
+  join, which scores rows in its own order, scored every row after the
+  term's last member without that term.
+
+The failure the handoff previously recorded as pre-existing (`fox^0`, join,
+`LIMIT 20 OFFSET 10`) was the third of these at a different seed and does
+not reproduce any more.
 
 Re-measure after each step rather than at the end: three hypotheses were
 falsified today by measuring, and each one looked obvious beforehand.
@@ -169,8 +322,10 @@ through `STANNUM_DOCKER_RUN_ARGS`, which `benchmarks/tin.py` passes to
 VM's page cache, uncharged to the container, so the runner drops that cache when
 the measurement starts.
 
-- Build the database once: `benchmarks/local/mock-build.sh`, about 25 minutes.
-  It is saved and reused by every later run.
+- Build the database once: `benchmarks/local/mock-build.sh`, about 25 minutes
+  (`STANNUM_IMAGE` picks the image, `STANNUM_MOCK` the directory). It is
+  saved and reused by every later run, and is only valid for the segment
+  format its image wrote.
 - A workload: `benchmarks/local/mock-run.sh IMAGE LABEL STYLE UPDATES [SECONDS]`
   reports queries a second, latency, disk read per query and CPU.
 - Per-query detail: `benchmarks/local/mock-probe.py IMAGE LABEL [N]` reports

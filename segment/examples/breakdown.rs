@@ -3,8 +3,9 @@
 // See LICENSE in the repository root for license terms.
 
 //! Where the bytes of a segment go: per section, and per term grouped by
-//! document frequency, split into dictionary entry, postings header, bounds
-//! table, postings body, payload header, payload skip table and payload data.
+//! document frequency, split into dictionary entry, ordinal stream head
+//! (count, directory and bounds), ordinal chunk bodies, payload header,
+//! payload skip table and payload data.
 //!
 //! ```text
 //! script/dump-segments.py --dbname db --index documents_body_idx --out /tmp/blobs
@@ -12,8 +13,8 @@
 //! ```
 //!
 //! With `--reencode`, every blob is also rebuilt through the current writer
-//! and the rebuilt blob is broken down the same way, so an old blob and the
-//! current format can be compared on the same documents.
+//! and the rebuilt blob is broken down the same way, so a blob and the
+//! current writer's output can be compared on the same documents.
 
 use std::collections::BTreeMap;
 
@@ -23,21 +24,19 @@ use segment::segment::{Sections, Segment, SegmentBuilder};
 struct Bytes {
     terms: usize,
     dictionary: usize,
-    postings_header: usize,
-    bounds: usize,
-    postings_body: usize,
+    ordinals_head: usize,
+    ordinals_body: usize,
     payload_header: usize,
     skips: usize,
     payload_data: usize,
-    grouped: usize,
+    bitmap_chunks: usize,
 }
 
 impl Bytes {
     fn total(&self) -> usize {
         self.dictionary
-            + self.postings_header
-            + self.bounds
-            + self.postings_body
+            + self.ordinals_head
+            + self.ordinals_body
             + self.payload_header
             + self.skips
             + self.payload_data
@@ -46,13 +45,12 @@ impl Bytes {
     fn add(&mut self, other: &Bytes) {
         self.terms += other.terms;
         self.dictionary += other.dictionary;
-        self.postings_header += other.postings_header;
-        self.bounds += other.bounds;
-        self.postings_body += other.postings_body;
+        self.ordinals_head += other.ordinals_head;
+        self.ordinals_body += other.ordinals_body;
         self.payload_header += other.payload_header;
         self.skips += other.skips;
         self.payload_data += other.payload_data;
-        self.grouped += other.grouped;
+        self.bitmap_chunks += other.bitmap_chunks;
     }
 }
 
@@ -82,30 +80,27 @@ impl Breakdown {
         self.bytes += bytes.len();
         self.sections.header += sections.header;
         self.sections.dictionary += sections.dictionary;
-        self.sections.postings += sections.postings;
-        self.sections.payload += sections.payload;
-        self.sections.docs += sections.docs;
-        self.sections.lengths += sections.lengths;
         self.sections.ordinals += sections.ordinals;
+        self.sections.payload += sections.payload;
+        self.sections.offsets += sections.offsets;
+        self.sections.lengths += sections.lengths;
         self.sections.pages += sections.pages;
         let dictionary = segment.dictionary()?;
         for block in 0..dictionary.index().blocks() {
             for (_, entry, entry_len) in dictionary.block_sizes(block)? {
                 let term = segment.resolve(entry)?;
-                let postings = term.postings()?;
+                let ordinals = term.ordinals()?;
                 let payload = term.payload()?;
                 let mut bytes = Bytes {
                     terms: 1,
                     dictionary: entry_len,
-                    bounds: postings.bounds_len(),
-                    postings_body: postings.body_len(),
+                    ordinals_head: ordinals.head_len(),
                     skips: payload.skip_table_len(),
                     payload_data: payload.data_len(),
-                    grouped: usize::from(postings.is_grouped()),
+                    bitmap_chunks: ordinals.bitmap_chunks(),
                     ..Bytes::default()
                 };
-                bytes.postings_header =
-                    entry.postings.len as usize - bytes.bounds - bytes.postings_body;
+                bytes.ordinals_body = entry.ordinals.len as usize - bytes.ordinals_head;
                 bytes.payload_header =
                     entry.payload.len as usize - bytes.skips - bytes.payload_data;
                 self.by_df.entry(bucket(entry.df)).or_default().add(&bytes);
@@ -121,24 +116,22 @@ impl Breakdown {
         for (name, n) in [
             ("header", self.sections.header),
             ("dictionary", self.sections.dictionary),
-            ("postings", self.sections.postings),
-            ("payload", self.sections.payload),
-            ("docs", self.sections.docs),
-            ("lengths", self.sections.lengths),
             ("ordinals", self.sections.ordinals),
+            ("payload", self.sections.payload),
+            ("offsets", self.sections.offsets),
+            ("lengths", self.sections.lengths),
             ("pages", self.sections.pages),
         ] {
             println!("  {name:<12} {n:>12} {:>6.1}%", share(n));
         }
         println!(
-            "  {:<9} {:>8} {:>8} {:>11} {:>9} {:>9} {:>10} {:>8} {:>8} {:>10} {:>11}",
+            "  {:<9} {:>8} {:>8} {:>11} {:>10} {:>10} {:>8} {:>8} {:>10} {:>11}",
             "terms",
             "count",
-            "grouped",
+            "bitmaps",
             "dictionary",
-            "post_hdr",
-            "bounds",
-            "post_body",
+            "ord_head",
+            "ord_body",
             "pay_hdr",
             "skips",
             "pay_data",
@@ -156,14 +149,13 @@ impl Breakdown {
 
 fn print_row(name: &str, b: &Bytes) {
     println!(
-        "  {:<9} {:>8} {:>8} {:>11} {:>9} {:>9} {:>10} {:>8} {:>8} {:>10} {:>11}",
+        "  {:<9} {:>8} {:>8} {:>11} {:>10} {:>10} {:>8} {:>8} {:>10} {:>11}",
         name,
         b.terms,
-        b.grouped,
+        b.bitmap_chunks,
         b.dictionary,
-        b.postings_header,
-        b.bounds,
-        b.postings_body,
+        b.ordinals_head,
+        b.ordinals_body,
         b.payload_header,
         b.skips,
         b.payload_data,

@@ -11,8 +11,7 @@ use proptest::prelude::*;
 use crate::dictionary::{DictionaryBuilder, Extent, OwnedDictionary, TermEntry};
 use crate::forward::ForwardRecord;
 use crate::payload::{Payload, PayloadBuilder};
-use crate::postings::{BLOCK_POSTINGS, BlockBound, Postings, PostingsBuilder};
-use crate::segment::Format;
+use crate::segment::{Segment, SegmentBuilder};
 use crate::set::{Cursor, Difference, Intersection, Union, collect};
 use crate::tid::MAX_OFFSET;
 use crate::{Result, Tid};
@@ -42,10 +41,20 @@ fn cases(default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-fn encode(set: &BTreeSet<Tid>) -> Vec<u8> {
-    let mut builder = PostingsBuilder::default();
-    for tid in set {
-        builder.push(*tid).unwrap();
+/// A segment whose documents are the union of the sets, each set a term.
+fn segment_of(sets: &[&BTreeSet<Tid>]) -> Vec<u8> {
+    let mut builder = SegmentBuilder::default();
+    let all: BTreeSet<Tid> = sets.iter().flat_map(|set| set.iter().copied()).collect();
+    for tid in all {
+        let tokens: Vec<(String, u32)> = sets
+            .iter()
+            .enumerate()
+            .filter(|(_, set)| set.contains(&tid))
+            .map(|(i, _)| (format!("t{i}"), i as u32 + 1))
+            .collect();
+        builder
+            .add_document(tid, tokens.iter().map(|(t, p)| (t.as_str(), *p)))
+            .unwrap();
     }
     builder.finish()
 }
@@ -58,111 +67,102 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: cases(256), ..ProptestConfig::default() })]
 
     #[test]
-    fn postings_round_trip_and_seek_match_oracle(
-        set in tid_set(1500),
+    fn term_cursors_round_trip_and_seek_match_oracle(
+        set in tid_set(3000),
         targets in prop::collection::vec((0u32..2100, 1u16..=MAX_OFFSET), 0..40),
     ) {
-        let bytes = encode(&set);
-        let postings = Postings::parse(&bytes).unwrap();
-        prop_assert_eq!(postings.count() as usize, set.len());
-        prop_assert_eq!(postings.to_vec().unwrap(), set.iter().copied().collect::<Vec<_>>());
-        let ordered: Vec<Tid> = set.iter().copied().collect();
-
-        // Fresh cursor per target.
-        for (block, offset) in &targets {
-            let target = Tid::new(*block, *offset).unwrap();
-            let mut cursor = postings.cursor().unwrap();
-            cursor.seek(target).unwrap();
-            let expected = successor(&set, target);
-            prop_assert_eq!(cursor.current(), expected);
-            if let Some(found) = expected {
-                prop_assert_eq!(cursor.ordinal() as usize, ordered.binary_search(&found).unwrap());
-            }
+        let bytes = segment_of(&[&set]);
+        let segment = Segment::parse(&bytes).unwrap();
+        let expected: Vec<Tid> = set.iter().copied().collect();
+        prop_assert_eq!(collect(segment.documents().unwrap()).unwrap(), expected.clone());
+        if set.is_empty() {
+            prop_assert!(segment.term("t0").unwrap().is_none());
+            return Ok(());
         }
-
-        // One cursor, monotone seeks, with ordinals checked throughout.
-        let mut sorted_targets: Vec<Tid> = targets.iter().map(|(b, o)| Tid::new(*b, *o).unwrap()).collect();
-        sorted_targets.sort_unstable();
-        let mut cursor = postings.cursor().unwrap();
-        // After an advance the cursor cannot move backwards, so the oracle
-        // answers for the larger of the target and the advanced-to position.
-        let mut floor: Option<Tid> = None;
-        for target in sorted_targets {
-            cursor.seek(target).unwrap();
-            let effective = floor.map_or(target, |floor| floor.max(target));
-            let expected = successor(&set, effective);
-            prop_assert_eq!(cursor.current(), expected);
-            if let Some(found) = expected {
-                prop_assert_eq!(cursor.ordinal() as usize, ordered.binary_search(&found).unwrap());
-                // Advance once and check again so advance-after-seek is covered.
-                cursor.advance().unwrap();
-                let next = ordered.binary_search(&found).unwrap() + 1;
-                prop_assert_eq!(cursor.current(), ordered.get(next).copied());
-                floor = ordered.get(next).copied().or(Some(Tid { block: u32::MAX, offset: 1 }));
-                if next < ordered.len() {
-                    prop_assert_eq!(cursor.ordinal() as usize, next);
-                }
-            }
+        let term = segment.term("t0").unwrap().unwrap();
+        prop_assert_eq!(term.df() as usize, set.len());
+        prop_assert_eq!(collect(term.cursor().unwrap()).unwrap(), expected.clone());
+        // Pages: every block once, with exactly its members.
+        let mut pages = term.pages().unwrap();
+        let mut paged = Vec::new();
+        while let Some(page) = crate::pages::Cursor::current(&pages) {
+            paged.extend(page.offsets.iter().map(|offset| Tid { block: page.block, offset }));
+            crate::pages::Cursor::advance(&mut pages).unwrap();
         }
-
-        // Rank of every member and of some non-members.
-        let mut cursor = postings.cursor().unwrap();
-        for (index, tid) in ordered.iter().enumerate() {
-            prop_assert_eq!(cursor.rank(*tid).unwrap(), Some(index as u32));
-        }
-        let mut cursor = postings.cursor().unwrap();
-        for (block, offset) in targets.iter().take(10) {
-            let probe = Tid::new(*block, *offset).unwrap();
-            let expected = set.contains(&probe).then(|| ordered.binary_search(&probe).unwrap() as u32);
-            let mut fresh = postings.cursor().unwrap();
-            prop_assert_eq!(fresh.rank(probe).unwrap(), expected);
-            if cursor.current().is_some_and(|current| probe >= current) {
-                prop_assert_eq!(cursor.rank(probe).unwrap(), expected);
+        prop_assert_eq!(paged, expected.clone());
+        // Seeks from a fresh cursor and from a walking one; ranks follow.
+        let mut sorted: Vec<Tid> = targets.iter().map(|(b, o)| Tid::new(*b, *o).unwrap()).collect();
+        sorted.sort_unstable();
+        let mut walking = term.cursor().unwrap();
+        let mut documents = segment.documents().unwrap();
+        for target in sorted {
+            let want = successor(&set, target);
+            let mut fresh = term.cursor().unwrap();
+            fresh.seek(target).unwrap();
+            prop_assert_eq!(fresh.current(), want);
+            walking.seek(target).unwrap();
+            prop_assert_eq!(walking.current(), want);
+            documents.seek(target).unwrap();
+            prop_assert_eq!(documents.current(), want);
+            if let Some(found) = want {
+                let rank = expected.binary_search(&found).unwrap() as u32;
+                prop_assert_eq!(fresh.rank(), rank);
+                prop_assert_eq!(walking.rank(), rank);
+                prop_assert_eq!(documents.ordinal(), rank);
+                prop_assert_eq!(segment.ordinal_of(found).unwrap(), Some(rank));
+                prop_assert_eq!(segment.tid_at(rank).unwrap(), found);
             }
+            prop_assert_eq!(segment.ordinal_of(target).unwrap().is_some(), set.contains(&target));
+        }
+        // A page cursor seeks by block.
+        for (block, _) in targets.iter().take(5) {
+            let mut pages = term.pages().unwrap();
+            crate::pages::Cursor::seek(&mut pages, *block).unwrap();
+            let want = set.iter().find(|tid| tid.block >= *block).map(|tid| tid.block);
+            prop_assert_eq!(crate::pages::Cursor::current(&pages).map(|page| page.block), want);
         }
     }
 
     #[test]
     fn set_operations_match_oracle(
-        a in tid_set(400),
-        b in tid_set(400),
-        c in tid_set(400),
+        a in tid_set(600),
+        b in tid_set(600),
+        c in tid_set(600),
     ) {
-        let (ba, bb, bc) = (encode(&a), encode(&b), encode(&c));
-        let (pa, pb, pc) = (
-            Postings::parse(&ba).unwrap(),
-            Postings::parse(&bb).unwrap(),
-            Postings::parse(&bc).unwrap(),
-        );
-        let and = Intersection::new(vec![pa.cursor().unwrap(), pb.cursor().unwrap(), pc.cursor().unwrap()]).unwrap();
-        let expected: Vec<Tid> = a.iter().filter(|t| b.contains(t) && c.contains(t)).copied().collect();
-        prop_assert_eq!(collect(and).unwrap(), expected);
-
-        let or = Union::new(vec![pa.cursor().unwrap(), pb.cursor().unwrap(), pc.cursor().unwrap()]);
-        let expected: Vec<Tid> = a.union(&b).copied().collect::<BTreeSet<_>>().union(&c).copied().collect();
-        prop_assert_eq!(collect(or).unwrap(), expected);
-
-        let two = crate::set::AtLeast::new(vec![pa.cursor().unwrap(), pb.cursor().unwrap(), pc.cursor().unwrap()], 2).unwrap();
-        let expected: Vec<Tid> = a.iter().chain(&b).chain(&c).copied().collect::<BTreeSet<_>>().into_iter()
-            .filter(|t| [&a, &b, &c].iter().filter(|s| s.contains(t)).count() >= 2).collect();
-        prop_assert_eq!(collect(two).unwrap(), expected);
-
-        let diff = Difference::new(pa.cursor().unwrap(), pb.cursor().unwrap()).unwrap();
-        let expected: Vec<Tid> = a.difference(&b).copied().collect();
-        prop_assert_eq!(collect(diff).unwrap(), expected);
-
-        // (a OR b) AND NOT c, composed through boxed cursors, with a mid-stream seek.
-        let or: Box<dyn Cursor> = Box::new(Union::new(vec![pa.cursor().unwrap(), pb.cursor().unwrap()]));
-        let mut composed = Difference::new(or, pc.cursor().unwrap()).unwrap();
-        let expected: Vec<Tid> = a.union(&b).filter(|t| !c.contains(t)).copied().collect();
-        if let Some(middle) = expected.get(expected.len() / 2) {
-            composed.seek(*middle).unwrap();
+        let bytes = segment_of(&[&a, &b, &c]);
+        let segment = Segment::parse(&bytes).unwrap();
+        let cursor = |name: &str| -> Box<dyn Cursor + '_> {
+            match segment.term(name).unwrap() {
+                Some(term) => Box::new(term.cursor().unwrap()),
+                None => Box::new(crate::set::Empty),
+            }
+        };
+        let union = Union::new(vec![cursor("t0"), cursor("t1"), cursor("t2")]);
+        prop_assert_eq!(collect(union).unwrap(), a.union(&b).cloned().collect::<BTreeSet<_>>().union(&c).cloned().collect::<Vec<_>>());
+        let intersection = Intersection::new(vec![cursor("t0"), cursor("t1")]).unwrap();
+        prop_assert_eq!(collect(intersection).unwrap(), a.intersection(&b).copied().collect::<Vec<_>>());
+        let difference = Difference::new(cursor("t0"), cursor("t2")).unwrap();
+        prop_assert_eq!(collect(difference).unwrap(), a.difference(&c).copied().collect::<Vec<_>>());
+        // NOT against the segment's universe.
+        let not_a = Difference::new(segment.documents().unwrap(), cursor("t0")).unwrap();
+        let all: BTreeSet<Tid> = a.iter().chain(&b).chain(&c).copied().collect();
+        prop_assert_eq!(collect(not_a).unwrap(), all.difference(&a).copied().collect::<Vec<_>>());
+        // Composition with a seek partway through.
+        let composed = Union::new(vec![
+            Box::new(Intersection::new(vec![cursor("t0"), cursor("t1")]).unwrap()) as Box<dyn Cursor>,
+            Box::new(Difference::new(cursor("t2"), cursor("t0")).unwrap()),
+        ]);
+        let ab: BTreeSet<Tid> = a.intersection(&b).copied().collect();
+        let ca: BTreeSet<Tid> = c.difference(&a).copied().collect();
+        let expected: Vec<Tid> = ab.union(&ca).copied().collect();
+        let mut composed = composed;
+        if let Some(mid) = expected.get(expected.len() / 2) {
+            composed.seek(*mid).unwrap();
             prop_assert_eq!(collect(composed).unwrap(), expected[expected.len() / 2..].to_vec());
         } else {
             prop_assert_eq!(collect(composed).unwrap(), expected);
         }
     }
-
     #[test]
     fn payload_round_trips_by_ordinal(
         entries in prop::collection::vec(
@@ -172,21 +172,20 @@ proptest! {
         probes in prop::collection::vec(0usize..300, 0..30),
     ) {
         let mut builder = PayloadBuilder::default();
-        let entries: Vec<(u8, Vec<u32>)> = entries
+        let entries: Vec<Vec<u32>> = entries
             .into_iter()
-            .map(|(bucket, positions)| (bucket, positions.into_iter().collect()))
+            .map(|(_, positions)| positions.into_iter().collect())
             .collect();
-        for (bucket, positions) in &entries {
-            builder.push(*bucket, positions).unwrap();
+        for positions in &entries {
+            builder.push(positions).unwrap();
         }
         let bytes = builder.finish();
         let payload = Payload::parse(&bytes).unwrap();
         prop_assert_eq!(payload.count() as usize, entries.len());
         let mut cursor = payload.cursor();
         let mut scratch = Vec::new();
-        for (bucket, positions) in &entries {
-            let decoded = cursor.next_into(&mut scratch).unwrap();
-            prop_assert_eq!(decoded, *bucket);
+        for positions in &entries {
+            cursor.next_into(&mut scratch).unwrap();
             prop_assert_eq!(&scratch, positions);
             scratch.clear();
         }
@@ -194,10 +193,10 @@ proptest! {
         for probe in probes {
             if probe < entries.len() {
                 let entry = payload.get(probe as u32).unwrap();
-                prop_assert_eq!((entry.tf_bucket, entry.positions), entries[probe].clone());
+                prop_assert_eq!(entry.positions, entries[probe].clone());
                 cursor.seek(probe as u32).unwrap();
                 let entry = cursor.next_entry().unwrap();
-                prop_assert_eq!((entry.tf_bucket, entry.positions), entries[probe].clone());
+                prop_assert_eq!(entry.positions, entries[probe].clone());
             } else {
                 prop_assert!(payload.get(probe as u32).is_err());
             }
@@ -221,22 +220,21 @@ proptest! {
                     TermEntry {
                         df,
                         max_tf_bucket: bucket,
-                        postings: Extent { offset, len },
+                        ordinals: Extent { offset, len },
                         payload: Extent { offset: offset * 2, len: len / 2 },
-                        ordinals: Default::default(),
                     },
                 )
             })
             .collect();
         // Extents here are in no particular order, which the gap-encoded
         // layout must take in its stride as the absolute ones do.
-        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
-        let mut builder = DictionaryBuilder::with_format(format);
+        {
+        let mut builder = DictionaryBuilder::default();
         for (term, entry) in &expected {
             builder.push(term, *entry).unwrap();
         }
         let bytes = builder.finish();
-        let owned = OwnedDictionary::parse_format(&bytes, format).unwrap();
+        let owned = OwnedDictionary::parse(&bytes).unwrap();
         let dictionary = owned.view();
         prop_assert_eq!(dictionary.len(), expected.len());
         let all: Vec<(String, TermEntry)> = dictionary.iter().collect::<Result<_>>().unwrap();
@@ -299,7 +297,6 @@ proptest! {
         ),
         probes in prop::collection::vec("[a-f]{1,3}", 0..10),
     ) {
-        use crate::segment::{Segment, SegmentBuilder};
         use crate::tf_bucket::TfBucket;
         let mut builder = SegmentBuilder::default();
         let mut oracle: BTreeMap<String, BTreeMap<Tid, Vec<u32>>> = BTreeMap::new();
@@ -336,182 +333,63 @@ proptest! {
                     prop_assert_eq!(collect(term.cursor().unwrap()).unwrap(), expected.keys().copied().collect::<Vec<_>>());
                     let payload = term.payload().unwrap();
                     let mut max_bucket = 0;
+                    let ordinals = term.ordinals().unwrap();
+                    let mut bound = crate::bound::BlockBound::EMPTY;
                     let mut cursor = term.cursor().unwrap();
                     for (tid, positions) in expected {
-                        let ordinal = cursor.rank(*tid).unwrap().unwrap();
-                        let entry = payload.get(ordinal).unwrap();
+                        let ordinal = segment.ordinal_of(*tid).unwrap().unwrap();
+                        let rank = ordinals.rank(ordinal).unwrap().unwrap();
+                        let entry = payload.get(rank).unwrap();
                         prop_assert_eq!(&entry.positions, positions);
                         let bucket = TfBucket::from_count(positions.len() as u32).value();
-                        prop_assert_eq!(entry.tf_bucket, bucket);
+                        cursor.seek(*tid).unwrap();
+                        prop_assert_eq!(cursor.current(), Some(*tid));
+                        prop_assert_eq!(cursor.bucket(), Some(bucket));
+                        bound.add(bucket, lengths[tid]);
                         max_bucket = max_bucket.max(bucket);
                     }
                     prop_assert_eq!(term.entry.max_tf_bucket, max_bucket);
-                    // Block bounds are exact over each block of the term's postings.
-                    let expected_bounds: Vec<BlockBound> = expected
-                        .iter()
-                        .collect::<Vec<_>>()
-                        .chunks(BLOCK_POSTINGS as usize)
-                        .map(|block| {
-                            let scores: Vec<(u8, u32)> = block
-                                .iter()
-                                .map(|(tid, positions)| {
-                                    (TfBucket::from_count(positions.len() as u32).value(), lengths[tid])
-                                })
-                                .collect();
-                            BlockBound::over(&scores, *block[block.len() - 1].0)
-                        })
-                        .collect();
-                    prop_assert_eq!(term.cursor().unwrap().block_bounds().unwrap(), expected_bounds);
+                    // The stream's bounds are exact over the term's documents:
+                    // every document of a chunk fits the chunk's bound, and the
+                    // whole term's minima match the oracle's.
+                    let mut merged = crate::bound::BlockBound::EMPTY;
+                    for i in 0..ordinals.bounds().len() {
+                        let chunk = ordinals.chunk_bound(i).unwrap();
+                        merged = merged.merge(&crate::bound::BlockBound { min_len: chunk.min_len });
+                    }
+                    prop_assert_eq!(merged, bound);
                 }
             }
         }
     }
 
-    #[test]
-    fn block_bounds_match_oracle_in_both_layouts(
-        set in tid_set(1500),
-        scores in prop::collection::vec((0u8..=15, 1u32..5000), 1500),
-        targets in prop::collection::vec((0u32..2100, 1u16..=MAX_OFFSET), 0..40),
-    ) {
-        // Scored postings in both layouts: a dense list is grouped, a thinned
-        // copy of the same list is sparse.
-        let ordered: Vec<Tid> = set.iter().copied().collect();
-        let thinned: Vec<Tid> = ordered.iter().copied().step_by(3).collect();
-        for tids in [ordered, thinned] {
-            let scores = &scores[..tids.len()];
-            let mut builder = PostingsBuilder::default();
-            for (tid, (bucket, len)) in tids.iter().zip(scores) {
-                builder.push_scored(*tid, *bucket, *len).unwrap();
-            }
-            let bytes = builder.finish();
-            let postings = Postings::parse(&bytes).unwrap();
-            prop_assert_eq!(postings.has_bounds(), !tids.is_empty());
-            prop_assert_eq!(postings.to_vec().unwrap(), tids.clone());
-            let expected: Vec<BlockBound> = tids
-                .chunks(BLOCK_POSTINGS as usize)
-                .zip(scores.chunks(BLOCK_POSTINGS as usize))
-                .map(|(block, block_scores)| BlockBound::over(block_scores, block[block.len() - 1]))
-                .collect();
-            let decoded = postings.cursor().unwrap().block_bounds().unwrap();
-            prop_assert_eq!(&decoded, &expected);
-            // Every posting is covered by its block's bound: its bucket occurs
-            // with a length no larger than its own, and no reported bucket is
-            // absent from the block.
-            for (block, bound) in scores.chunks(BLOCK_POSTINGS as usize).zip(&decoded) {
-                for (bucket, len) in block {
-                    prop_assert!(bound.min_len[usize::from(*bucket)] <= *len);
-                }
-                for (bucket, len) in bound.buckets() {
-                    prop_assert!(block.contains(&(bucket, len)));
-                }
-            }
-
-            // `bound_at` names the block of the successor of any target the
-            // cursor has not passed; seeks through the table keep ordinals.
-            let mut sorted_targets: Vec<Tid> = targets.iter().map(|(b, o)| Tid::new(*b, *o).unwrap()).collect();
-            sorted_targets.sort_unstable();
-            let mut cursor = postings.cursor().unwrap();
-            let mut fresh = postings.cursor().unwrap();
-            for target in sorted_targets {
-                let successor = tids.iter().position(|t| *t >= target);
-                let expected_bound = successor.map(|i| expected[i / BLOCK_POSTINGS as usize]);
-                prop_assert_eq!(fresh.bound_at(target).unwrap(), expected_bound);
-                prop_assert_eq!(cursor.bound_at(target).unwrap(), expected_bound);
-                cursor.seek(target).unwrap();
-                prop_assert_eq!(cursor.current(), successor.map(|i| tids[i]));
-                if let Some(i) = successor {
-                    prop_assert_eq!(cursor.ordinal() as usize, i);
-                    // The cursor's own block is the bound for anything behind it.
-                    prop_assert_eq!(cursor.bound_at(Tid::new(0, 1).unwrap()).unwrap(), expected_bound);
-                }
-            }
-        }
-    }
 
     #[test]
     fn decoders_never_panic_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
-        let _ = Postings::parse(&bytes).and_then(|p| p.to_vec());
-        let _ = Postings::parse(&bytes).and_then(|p| {
-            let mut pages = p.pages()?;
-            pages.seek(100)?;
-            while pages.current().is_some() { pages.advance()?; }
+        let _ = crate::ordinals::Ordinals::parse(&bytes).and_then(|o| o.to_vec());
+        let _ = crate::ordinals::Ordinals::open(&bytes[..], bytes.len() as u64, true).and_then(|o| {
+            let mut cursor = o.cursor()?;
+            cursor.seek(70_000)?;
+            while cursor.current().is_some() { cursor.advance()?; }
             Ok(())
         });
-        let _ = Postings::parse(&bytes).and_then(|p| p.cursor()?.block_bounds());
-        let _ = Postings::parse(&bytes).and_then(|p| {
-            let mut cursor = p.cursor()?;
-            cursor.seek(Tid::new(100, 1).unwrap())?;
-            cursor.bound_at(Tid::new(200, 1).unwrap())
-        });
-        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
-            let _ = Payload::parse_format(&bytes, format).and_then(|p| p.get(0));
-            let _ = Payload::parse_format(&bytes, format).and_then(|p| p.get(40));
-            // The same bytes under every signature.
-            let mut blob = format.magic().to_vec();
-            blob.extend_from_slice(&bytes);
-            let _ = crate::segment::Segment::parse(&blob).and_then(|s| s.records(|_| false));
-            let _ = crate::verify::verify_segment(&blob);
-        }
+        let _ = crate::ordinals::Ordinals::parse(&bytes).and_then(|o| o.rank(5));
+        let _ = crate::docs::DocTable::parse(&bytes, &bytes, (bytes.len() / 2) as u32).and_then(|d| d.to_vec());
+        let _ = Payload::parse(&bytes).and_then(|p| p.get(0));
+        let _ = Payload::parse(&bytes).and_then(|p| p.get(40));
+        let mut blob = crate::segment::MAGIC.to_vec();
+        blob.extend_from_slice(&bytes);
+        let _ = Segment::parse(&blob).and_then(|s| s.records(|_| false));
+        let _ = crate::verify::verify_segment(&blob);
         let _ = OwnedDictionary::parse(&bytes).map(|d| d.view().iter().count());
         let _ = OwnedDictionary::parse(&bytes).and_then(|d| d.view().get("a"));
         let _ = ForwardRecord::decode(&bytes);
-        let _ = crate::segment::Segment::parse(&bytes).and_then(|s| s.term("a").map(|_| ()));
-    }
-
-    /// Every released format reads to the same documents, and the formats
-    /// with bounds (`LSG2` and `LSG3`) to the same bounds per term, so a
-    /// ranked scan prunes them identically.
-    #[test]
-    fn every_format_reads_the_same_segment(
-        docs in prop::collection::btree_map(
-            (0u32..300, 1u16..=MAX_OFFSET),
-            prop::collection::vec("[a-e]{1,2}", 0..30),
-            0..200,
-        ),
-    ) {
-        use crate::format_tests::{build_as, contents};
-        use crate::verify::{Severity, verify_segment};
-        let documents: Vec<(Tid, Vec<(String, u32)>)> = docs
-            .into_iter()
-            .map(|((block, offset), words)| {
-                let tokens = words.into_iter().enumerate().map(|(i, w)| (w, i as u32 + 1)).collect();
-                (Tid::new(block, offset).unwrap(), tokens)
-            })
-            .collect();
-        let current = build_as(&documents, Format::Lsg3);
-        prop_assert!(verify_segment(&current).is_clean());
-        let (records, bounds) = contents(&current).unwrap();
-        for format in [Format::Lsg1, Format::Lsg2] {
-            let old = build_as(&documents, format);
-            prop_assert_eq!(&old[..4], format.magic());
-            if format == Format::Lsg2 {
-                prop_assert!(old.len() >= current.len(), "{} < {}", old.len(), current.len());
-            }
-            let report = verify_segment(&old);
-            prop_assert!(
-                report.findings.iter().all(|f| f.severity == Severity::Warning && !format.has_bounds()),
-                "{}", report.findings.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
-            );
-            let (old_records, old_bounds) = contents(&old).unwrap();
-            prop_assert_eq!(&old_records, &records);
-            if format.has_bounds() {
-                prop_assert_eq!(&old_bounds, &bounds);
-            } else {
-                prop_assert!(old_bounds.iter().all(|(_, b)| b.is_empty()));
-            }
-        }
+        let _ = Segment::parse(&bytes).and_then(|s| s.term("a").map(|_| ()));
     }
 }
 
 #[test]
 fn claimed_counts_do_not_allocate_before_decoding() {
-    // A valid first sparse posting gets cursor() past initialization; to_vec()
-    // must reach the truncated second posting without reserving 32 GiB first.
-    let mut postings = vec![0];
-    crate::varint::put(&mut postings, u32::MAX as u64);
-    postings.extend_from_slice(&[0, 1]);
-    assert!(Postings::parse(&postings).unwrap().to_vec().is_err());
-
     // A matching huge dictionary count/block count with no index bytes.
     let mut dictionary = Vec::new();
     crate::varint::put(&mut dictionary, u32::MAX as u64);
@@ -522,16 +400,9 @@ fn claimed_counts_do_not_allocate_before_decoding() {
     crate::varint::put(&mut dictionary, 0);
     assert!(OwnedDictionary::parse(&dictionary).is_err());
 
-    // One valid bound and one valid posting, followed by missing bounds.
-    // Sparse bound entry: bucket mask, min length, last block/offset, start.
-    let mut bounded = vec![2];
-    crate::varint::put(&mut bounded, u32::MAX as u64);
-    crate::varint::put(&mut bounded, 5);
-    bounded.extend_from_slice(&[1, 1, 0, 1, 0]);
-    bounded.extend_from_slice(&[0, 1]);
-    assert!(
-        Postings::parse(&bounded)
-            .and_then(|p| p.cursor()?.block_bounds())
-            .is_err()
-    );
+    // A huge ordinal list count over two bytes of body.
+    let mut list = Vec::new();
+    crate::varint::put(&mut list, 60);
+    list.extend_from_slice(&[0, 1]);
+    assert!(crate::ordinals::Ordinals::parse(&list).is_err());
 }

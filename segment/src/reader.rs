@@ -29,12 +29,6 @@ impl<'a> Reader<'a> {
         self.bytes.len() - self.at
     }
 
-    pub fn u8(&mut self) -> Result<u8> {
-        let byte = *self.bytes.get(self.at).ok_or(Error::Truncated)?;
-        self.at += 1;
-        Ok(byte)
-    }
-
     pub fn varint(&mut self) -> Result<u64> {
         varint::get(self.bytes, &mut self.at)
     }

@@ -55,8 +55,9 @@ const FLAGS: usize = PAGE_SIZE - SPECIAL_SIZE + 6;
 
 /// Directory entries the meta page can hold before a merge is forced.
 pub const MAX_SEGMENTS: usize = 128;
-/// Runs the meta page can hold while they wait for readers to drain.
-pub const MAX_PENDING: usize = 64;
+/// Runs the meta page can hold while they wait for readers to drain: what
+/// fits beside a full directory.
+pub const MAX_PENDING: usize = 48;
 
 const LOWER: usize = offset_of!(pg_sys::PageHeaderData, pd_lower);
 const UPPER: usize = offset_of!(pg_sys::PageHeaderData, pd_upper);
@@ -179,12 +180,16 @@ pub struct SegmentEntry {
     /// The run's block numbers in order, so byte offsets map to pages.
     pub map: Run,
     pub dead: Run,
+    /// Names this dead list, from the index's generation counter: a
+    /// replacement can reuse the old list's pages and size, so the run
+    /// alone does not tell a reader's cached copy from the current one.
+    pub dead_stamp: u32,
     pub docs: u32,
     pub total_length: u64,
     pub generation: u32,
 }
 
-const ENTRY_BYTES: usize = 12 + 12 + 12 + 4 + 8 + 4;
+const ENTRY_BYTES: usize = 12 + 12 + 12 + 4 + 4 + 8 + 4;
 
 /// A run waiting until every scan that could still read it has finished.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -263,6 +268,7 @@ impl Meta {
             put_run(&mut out, entry.run);
             put_run(&mut out, entry.map);
             put_run(&mut out, entry.dead);
+            out.extend_from_slice(&entry.dead_stamp.to_le_bytes());
             out.extend_from_slice(&entry.docs.to_le_bytes());
             out.extend_from_slice(&entry.total_length.to_le_bytes());
             out.extend_from_slice(&entry.generation.to_le_bytes());
@@ -311,9 +317,10 @@ impl Meta {
                 run: get_run(bytes, at),
                 map: get_run(bytes, at + 12),
                 dead: get_run(bytes, at + 24),
-                docs: u32_at(bytes, at + 36),
-                total_length: u64_at(bytes, at + 40),
-                generation: u32_at(bytes, at + 48),
+                dead_stamp: u32_at(bytes, at + 36),
+                docs: u32_at(bytes, at + 40),
+                total_length: u64_at(bytes, at + 44),
+                generation: u32_at(bytes, at + 52),
             };
             if entry.run.is_empty() || entry.run.blocks == 0 {
                 return Err("invalid Stannum segment entry");
@@ -371,6 +378,7 @@ mod tests {
                         bytes: 20,
                     },
                     dead: Run::EMPTY,
+                    dead_stamp: 0,
                     docs: 100,
                     total_length: 12_345,
                     generation: 1,
@@ -387,6 +395,7 @@ mod tests {
                         blocks: 1,
                         bytes: 5,
                     },
+                    dead_stamp: 7,
                     docs: 1,
                     total_length: 2,
                     generation: 2,

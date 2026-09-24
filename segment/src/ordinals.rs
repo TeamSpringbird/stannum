@@ -39,15 +39,22 @@
 //! [`for_each_chunk`] evaluates a Boolean tree one 65,536-document chunk at a
 //! time in fixed scratch buffers, visiting only chunks some term occupies.
 //!
-//! From `LSG5` a stream also carries score bounds a ranked walk prunes with:
+//! A term's stream also carries what scoring a member needs beside its
+//! membership: a score bound per chunk a ranked walk prunes with, and the
+//! member's term-frequency bucket as a nibble, so scoring never reads the
+//! positions:
 //!
 //! ```text
-//! stream    := count varint, bound, delta varint * count            count <= LIST_MAX
+//! stream    := count varint, bound, delta varint * count, nibbles     count <= LIST_MAX
 //!            | count varint, chunk_count varint, bounds_len varint,
-//!              entry * chunk_count, bound * chunk_count, chunk*
+//!              entry * chunk_count, bound * chunk_count, (chunk, nibbles)*
+//! nibbles   := u8 * ceil(members / 2): the members' buckets in order, the
+//!              first in the low nibble
 //! bound     := buckets varint, min_len varint per set bucket ascending,
 //!              occupied varint, sub u8 per set bit of occupied ascending
 //! ```
+//!
+//! A dead list is a stream without bounds or nibbles.
 //!
 //! A bound names the term-frequency buckets that occur among the members it
 //! covers with the shortest document per bucket, as a postings block bound
@@ -197,6 +204,9 @@ fn encode_with(ordinals: &[u32], scores: Option<&[(u8, u32)]>) -> Vec<u8> {
             );
             previous = Some(*ordinal);
         }
+        if let Some(scores) = scores {
+            put_nibbles(&mut out, scores.iter().map(|(bucket, _)| *bucket));
+        }
         return out;
     }
     let mut directory = Vec::new();
@@ -232,6 +242,13 @@ fn encode_with(ordinals: &[u32], scores: Option<&[(u8, u32)]>) -> Vec<u8> {
                 body.extend_from_slice(&word.to_le_bytes());
             }
         }
+        if let Some(scores) = scores {
+            let from = scored - members.len();
+            put_nibbles(
+                &mut body,
+                scores[from..scored].iter().map(|(bucket, _)| *bucket),
+            );
+        }
         chunks += 1;
     }
     varint::put(&mut out, chunks);
@@ -242,6 +259,31 @@ fn encode_with(ordinals: &[u32], scores: Option<&[(u8, u32)]>) -> Vec<u8> {
     out.extend_from_slice(&bounds);
     out.extend_from_slice(&body);
     out
+}
+
+/// Packs buckets two to a byte, the first in the low nibble.
+fn put_nibbles(out: &mut Vec<u8>, buckets: impl Iterator<Item = u8>) {
+    let mut pending = None;
+    for bucket in buckets {
+        debug_assert!(bucket < 16);
+        match pending.take() {
+            None => pending = Some(bucket),
+            Some(low) => out.push(low | bucket << 4),
+        }
+    }
+    if let Some(low) = pending {
+        out.push(low);
+    }
+}
+
+/// The bucket of member `within` of `count` packed in `nibbles`.
+fn nibble(nibbles: &[u8], within: usize) -> Option<u8> {
+    let byte = *nibbles.get(within / 2)?;
+    Some(if within.is_multiple_of(2) {
+        byte & 0xf
+    } else {
+        byte >> 4
+    })
 }
 
 /// Byte ranges of one encoded stream, fetched on demand.
@@ -282,20 +324,30 @@ pub struct Ordinals<'a> {
     body: Body<'a>,
     /// One per chunk, or one for a list; empty for a stream without bounds.
     bounds: Vec<ChunkBound>,
+    /// Whether members carry buckets (and chunks bounds): a term's stream,
+    /// as opposed to a dead list.
+    scored: bool,
+    /// A list's buckets, one per member.
+    list_buckets: Vec<u8>,
 }
 
 fn entry_key(entry: &[u8]) -> u16 {
     u16::from_le_bytes([entry[0], entry[1]])
 }
 
-/// A directory entry's cardinality, body offset, body size and whether the
-/// chunk is a bitmap.
+/// A directory entry's cardinality, body offset, body size (members only)
+/// and whether the chunk is a bitmap.
 fn entry_chunk(entry: &[u8]) -> (usize, u64, usize, bool) {
     let cardinality = usize::from(u16::from_le_bytes([entry[2], entry[3]])) + 1;
     let at = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
     let bitmap = at & BITMAP != 0;
     let size = if bitmap { WORDS * 8 } else { cardinality * 2 };
     (cardinality, u64::from(at & !BITMAP), size, bitmap)
+}
+
+/// Bytes of a chunk's nibbles for `cardinality` members, if `scored`.
+fn nibbles_len(cardinality: usize, scored: bool) -> usize {
+    if scored { cardinality.div_ceil(2) } else { 0 }
 }
 
 impl<'a> Ordinals<'a> {
@@ -306,6 +358,7 @@ impl<'a> Ordinals<'a> {
         let mut at = 0;
         let count = varint::get_u32(head, &mut at)?;
         let mut bounds = Vec::new();
+        let mut list_buckets = Vec::new();
         let body = if count as usize <= LIST_MAX {
             let bytes = source.fetch(0, len as usize)?;
             if bounded {
@@ -322,6 +375,15 @@ impl<'a> Ordinals<'a> {
                 .ok_or(Error::Corrupt("ordinal overflow"))?;
                 list.push(ordinal);
                 previous = Some(ordinal);
+            }
+            if bounded {
+                let nibbles = bytes
+                    .get(at..at + (count as usize).div_ceil(2))
+                    .ok_or(Error::Truncated)?;
+                list_buckets = (0..count as usize)
+                    .map(|i| nibble(nibbles, i).expect("within the nibbles"))
+                    .collect();
+                at += nibbles.len();
             }
             if at as u64 != len {
                 return Err(Error::Corrupt("ordinal list length"));
@@ -361,6 +423,8 @@ impl<'a> Ordinals<'a> {
             count,
             body,
             bounds,
+            scored: bounded,
+            list_buckets,
         })
     }
 
@@ -457,12 +521,43 @@ impl<'a> Ordinals<'a> {
         }
     }
 
+    /// Bytes before the chunk bodies of a chunked stream: the count, the
+    /// directory and the bounds. A list is all head.
+    pub fn head_len(&self) -> usize {
+        match &self.body {
+            Body::List(_) => self.len as usize,
+            Body::Chunked { chunks_at, .. } => *chunks_at as usize,
+        }
+    }
+
+    /// Chunks stored as bitmaps.
+    pub fn bitmap_chunks(&self) -> usize {
+        match &self.body {
+            Body::List(_) => 0,
+            Body::Chunked { directory, .. } => directory
+                .chunks_exact(ENTRY)
+                .filter(|entry| entry_chunk(entry).3)
+                .count(),
+        }
+    }
+
     /// The stream as a list, when it is short enough to be stored as one.
     pub fn list(&self) -> Option<&[u32]> {
         match &self.body {
             Body::List(list) => Some(list),
             Body::Chunked { .. } => None,
         }
+    }
+
+    /// A list's members' buckets, parallel to [`Ordinals::list`]; empty for
+    /// a chunked stream or a stream without buckets.
+    pub fn list_buckets(&self) -> &[u8] {
+        &self.list_buckets
+    }
+
+    /// Whether members carry buckets.
+    pub const fn is_scored(&self) -> bool {
+        self.scored
     }
 
     /// Chunks of a chunked stream; zero for a list.
@@ -515,15 +610,18 @@ impl<'a> Ordinals<'a> {
         let entry = &directory[i * ENTRY..(i + 1) * ENTRY];
         let (cardinality, offset, size, bitmap) = entry_chunk(entry);
         let start = chunks_at + offset;
-        if start + size as u64 > self.len {
+        let total = size + nibbles_len(cardinality, self.scored);
+        if start + total as u64 > self.len {
             return Err(Error::Truncated);
         }
         Ok(Chunk {
             key: entry_key(entry),
             cardinality: cardinality as u32,
             before: self.before(i),
-            bytes: self.source.fetch_owned(start, size)?,
+            bytes: self.source.fetch_owned(start, total)?,
             bitmap,
+            body_len: size,
+            buckets_at: self.scored.then_some(size),
         })
     }
 
@@ -583,6 +681,60 @@ impl<'a> Ordinals<'a> {
         Err(Error::Corrupt("ordinal bitmap cardinality"))
     }
 
+    /// The rank of `ordinal` in the stream, if it is a member: the index
+    /// of the term's entry for that document in its payload.
+    pub fn rank(&self, ordinal: u32) -> Result<Option<u32>> {
+        let (directory, ..) = match &self.body {
+            Body::List(list) => return Ok(list.binary_search(&ordinal).ok().map(|i| i as u32)),
+            Body::Chunked {
+                directory,
+                chunks_at,
+                before,
+            } => (directory, chunks_at, before),
+        };
+        let key = (ordinal >> 16) as u16;
+        let chunks = directory.len() / ENTRY;
+        let (mut lo, mut hi) = (0usize, chunks);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match entry_key(&directory[mid * ENTRY..(mid + 1) * ENTRY]).cmp(&key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let chunk = self.chunk(mid)?;
+                    return Ok(chunk
+                        .rank((ordinal & 0xffff) as u16)
+                        .map(|r| chunk.before + r));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether the stream is dense enough that a scan over it should work
+    /// a heap page at a time: any chunk stored as a bitmap.
+    pub fn prefers_pages(&self) -> bool {
+        match &self.body {
+            Body::List(_) => false,
+            Body::Chunked { directory, .. } => directory
+                .chunks_exact(ENTRY)
+                .any(|entry| entry_chunk(entry).3),
+        }
+    }
+
+    /// A cursor over the stream's members in ascending order.
+    pub fn cursor(self) -> Result<OrdinalCursor<'a>> {
+        let mut cursor = OrdinalCursor {
+            stream: self,
+            chunk: None,
+            index: 0,
+            rank: 0,
+            low: 0,
+        };
+        cursor.enter(0)?;
+        Ok(cursor)
+    }
+
     /// Every ordinal, for verification and tests.
     pub fn to_vec(&self) -> Result<Vec<u32>> {
         if let Body::List(list) = &self.body {
@@ -599,6 +751,238 @@ impl<'a> Ordinals<'a> {
             members(&words, u32::from(key) << 16, &mut out);
         }
         Ok(out)
+    }
+}
+
+/// A cursor over a stream's members: the ordinals in ascending order with
+/// each member's rank, which addresses the term's payload.
+pub struct OrdinalCursor<'a> {
+    stream: Ordinals<'a>,
+    /// The chunk being walked, for a chunked stream; `None` once exhausted.
+    chunk: Option<Chunk>,
+    /// Position in the list, or the chunk's index in the directory.
+    index: usize,
+    /// Rank of the current member.
+    rank: u32,
+    /// Low bits of the current member of a chunk; for an array chunk, the
+    /// index into it.
+    low: u32,
+}
+
+impl<'a> OrdinalCursor<'a> {
+    pub fn stream(&self) -> &Ordinals<'a> {
+        &self.stream
+    }
+
+    pub fn count(&self) -> u32 {
+        self.stream.count()
+    }
+
+    /// Positions on the first member of chunk `i`, or exhausts the cursor
+    /// past the last chunk; a list positions on entry `i`.
+    fn enter(&mut self, i: usize) -> Result<()> {
+        match &self.stream.body {
+            Body::List(_) => {
+                self.index = i;
+                self.rank = i as u32;
+            }
+            Body::Chunked { .. } => {
+                if i >= self.stream.chunk_count() {
+                    self.chunk = None;
+                    self.index = i;
+                    self.rank = self.stream.count();
+                    return Ok(());
+                }
+                let chunk = self.stream.chunk(i)?;
+                self.index = i;
+                self.rank = chunk.before;
+                self.low = if chunk.bitmap {
+                    Self::first_set(chunk.body(), 0).ok_or(Error::Corrupt("empty ordinal chunk"))?
+                } else {
+                    0
+                };
+                self.chunk = Some(chunk);
+            }
+        }
+        Ok(())
+    }
+
+    /// The first set bit at or after `from` in a bitmap chunk.
+    fn first_set(bytes: &[u8], from: u32) -> Option<u32> {
+        let mut word = (from / 64) as usize;
+        let mut mask = !0u64 << (from % 64);
+        while word < WORDS {
+            let at = &bytes[word * 8..word * 8 + 8];
+            let value = u64::from_le_bytes(at.try_into().unwrap()) & mask;
+            if value != 0 {
+                return Some(word as u32 * 64 + value.trailing_zeros());
+            }
+            word += 1;
+            mask = !0;
+        }
+        None
+    }
+
+    fn array_low(chunk: &Chunk, at: usize) -> u32 {
+        let bytes = &chunk.body()[at * 2..at * 2 + 2];
+        u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// The current member.
+    pub fn current(&self) -> Option<u32> {
+        match &self.stream.body {
+            Body::List(list) => list.get(self.index).copied(),
+            Body::Chunked { .. } => {
+                let chunk = self.chunk.as_ref()?;
+                let low = if chunk.bitmap {
+                    self.low
+                } else {
+                    Self::array_low(chunk, self.low as usize)
+                };
+                Some(chunk.base() | low)
+            }
+        }
+    }
+
+    /// The rank of the current member; the count once exhausted.
+    pub fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    /// The current member's term-frequency bucket, when the stream stores
+    /// buckets.
+    pub fn bucket(&self) -> Option<u8> {
+        match &self.stream.body {
+            Body::List(_) => self.stream.list_buckets.get(self.index).copied(),
+            Body::Chunked { .. } => {
+                let chunk = self.chunk.as_ref()?;
+                chunk.bucket(self.rank - chunk.before)
+            }
+        }
+    }
+
+    pub fn advance(&mut self) -> Result<()> {
+        match &self.stream.body {
+            Body::List(list) => {
+                if self.index < list.len() {
+                    self.index += 1;
+                    self.rank += 1;
+                }
+                Ok(())
+            }
+            Body::Chunked { .. } => {
+                let Some(chunk) = &self.chunk else {
+                    return Ok(());
+                };
+                let next = if chunk.bitmap {
+                    Self::first_set(chunk.body(), self.low + 1)
+                } else {
+                    (self.low as usize + 1 < chunk.body_len / 2).then_some(self.low + 1)
+                };
+                match next {
+                    Some(low) => {
+                        self.low = low;
+                        self.rank += 1;
+                        Ok(())
+                    }
+                    None => self.enter(self.index + 1),
+                }
+            }
+        }
+    }
+
+    /// Moves to the first member at or after `target`.
+    pub fn seek(&mut self, target: u32) -> Result<()> {
+        if self.current().is_none_or(|current| current >= target) {
+            return Ok(());
+        }
+        match &self.stream.body {
+            Body::List(list) => {
+                let at = self.index + list[self.index..].partition_point(|o| *o < target);
+                self.enter(at)
+            }
+            Body::Chunked { directory, .. } => {
+                let key = (target >> 16) as u16;
+                let chunks = directory.len() / ENTRY;
+                let current_key = self.chunk.as_ref().map(|chunk| chunk.key);
+                if current_key != Some(key) {
+                    // The target's chunk, or the first one after it.
+                    let mut i = self.index;
+                    while i < chunks && entry_key(&directory[i * ENTRY..(i + 1) * ENTRY]) < key {
+                        i += 1;
+                    }
+                    self.enter(i)?;
+                    if self.chunk.as_ref().is_none_or(|chunk| chunk.key != key) {
+                        return Ok(());
+                    }
+                }
+                let chunk = self
+                    .chunk
+                    .as_ref()
+                    .expect("positioned on the target's chunk");
+                let low = target & 0xffff;
+                let next = if chunk.bitmap {
+                    // Count only the members between the current one and the
+                    // target: a forward seek within a chunk costs the bits it
+                    // passes, not the chunk.
+                    let same = current_key == Some(key);
+                    let from = if same { self.low + 1 } else { 0 };
+                    let base = if same {
+                        self.rank - chunk.before + 1
+                    } else {
+                        0
+                    };
+                    Self::first_set(chunk.body(), low.max(from)).map(|found| {
+                        (
+                            found,
+                            base + Self::popcount_between(chunk.body(), from, found),
+                        )
+                    })
+                } else {
+                    let count = chunk.body_len / 2;
+                    let (mut lo, mut hi) = (self.low as usize, count);
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        if Self::array_low(chunk, mid) < low {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    (lo < count).then_some((lo as u32, lo as u32))
+                };
+                match next {
+                    Some((low, within)) => {
+                        self.low = low;
+                        self.rank = chunk.before + within;
+                        Ok(())
+                    }
+                    None => self.enter(self.index + 1),
+                }
+            }
+        }
+    }
+
+    /// Set bits in `from..to` of a bitmap chunk.
+    fn popcount_between(bytes: &[u8], from: u32, to: u32) -> u32 {
+        if from >= to {
+            return 0;
+        }
+        let word = |i: usize| {
+            let at = &bytes[i * 8..i * 8 + 8];
+            u64::from_le_bytes(at.try_into().unwrap())
+        };
+        let (first, last) = ((from / 64) as usize, (to / 64) as usize);
+        let low_mask = !0u64 << (from % 64);
+        let high_mask = (1u64 << (to % 64)) - 1;
+        if first == last {
+            return (word(first) & low_mask & high_mask).count_ones();
+        }
+        let mut count = (word(first) & low_mask).count_ones();
+        for i in first + 1..last {
+            count += word(i).count_ones();
+        }
+        count + (word(last) & high_mask).count_ones()
     }
 }
 
@@ -630,11 +1014,29 @@ pub struct Chunk {
     pub cardinality: u32,
     /// Members of the stream before this chunk: the rank of its first member.
     pub before: u32,
+    /// The members, then their bucket nibbles when the stream stores them.
     bytes: std::rc::Rc<[u8]>,
     bitmap: bool,
+    /// Bytes of the members: the words of a bitmap or the array.
+    body_len: usize,
+    /// Where the members' bucket nibbles start in `bytes`, when stored.
+    buckets_at: Option<usize>,
 }
 
 impl Chunk {
+    /// The members' bytes: `WORDS` words for a bitmap, two bytes per member
+    /// for an array.
+    fn body(&self) -> &[u8] {
+        &self.bytes[..self.body_len]
+    }
+
+    /// The bucket of the member at rank `within` inside the chunk, when the
+    /// stream stores buckets.
+    pub fn bucket(&self, within: u32) -> Option<u8> {
+        let at = self.buckets_at?;
+        nibble(&self.bytes[at..], within as usize)
+    }
+
     /// The first ordinal the chunk can hold.
     pub fn base(&self) -> u32 {
         u32::from(self.key) << 16
@@ -645,23 +1047,23 @@ impl Chunk {
         if self.bitmap {
             let word = usize::from(low / 64);
             let bit = low % 64;
-            let bytes = &self.bytes[word * 8..word * 8 + 8];
+            let bytes = &self.body()[word * 8..word * 8 + 8];
             let value = u64::from_le_bytes(bytes.try_into().unwrap());
             if value & (1 << bit) == 0 {
                 return None;
             }
-            let before: u32 = self.bytes[..word * 8]
+            let before: u32 = self.body()[..word * 8]
                 .chunks_exact(8)
                 .map(|w| u64::from_le_bytes(w.try_into().unwrap()).count_ones())
                 .sum();
             Some(before + (value & ((1u64 << bit) - 1)).count_ones())
         } else {
-            let lows = self.bytes.chunks_exact(2);
+            let lows = self.body().chunks_exact(2);
             let count = lows.len();
             let (mut lo, mut hi) = (0usize, count);
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                let at = &self.bytes[mid * 2..mid * 2 + 2];
+                let at = &self.body()[mid * 2..mid * 2 + 2];
                 let value = u16::from_le_bytes([at[0], at[1]]);
                 match value.cmp(&low) {
                     std::cmp::Ordering::Less => lo = mid + 1,
@@ -683,7 +1085,7 @@ impl Chunk {
     pub fn members(&self, out: &mut Vec<u16>) {
         if !self.bitmap {
             out.extend(
-                self.bytes
+                self.body()
                     .chunks_exact(2)
                     .map(|low| u16::from_le_bytes([low[0], low[1]])),
             );
@@ -693,10 +1095,10 @@ impl Chunk {
     /// Sets `out` to the chunk's members.
     pub fn words(&self, out: &mut Words) {
         if self.bitmap {
-            kernels::assign_bytes(out, &self.bytes);
+            kernels::assign_bytes(out, self.body());
         } else {
             out.fill(0);
-            for low in self.bytes.chunks_exact(2) {
+            for low in self.body().chunks_exact(2) {
                 let low = usize::from(u16::from_le_bytes([low[0], low[1]]));
                 out[low / 64] |= 1 << (low % 64);
             }
@@ -963,10 +1365,12 @@ pub fn validate(bytes: &[u8], count: u32, documents: u32, bounded: bool) -> Resu
                 return Err(Error::Corrupt("ordinal directory order"));
             }
             previous = Some(key);
-            let chunk = bytes.fetch(chunks_at + at, size)?;
+            let total = size + nibbles_len(cardinality, bounded);
+            let chunk = bytes.fetch(chunks_at + at, total)?;
+            let body = &chunk[..size];
             if !bitmap {
                 let mut last = None;
-                for low in chunk.chunks_exact(2) {
+                for low in body.chunks_exact(2) {
                     let low = u16::from_le_bytes([low[0], low[1]]);
                     if last.is_some_and(|last| last >= low) {
                         return Err(Error::Corrupt("ordinal array order"));
@@ -974,7 +1378,7 @@ pub fn validate(bytes: &[u8], count: u32, documents: u32, bounded: bool) -> Resu
                     last = Some(low);
                 }
             } else {
-                let set: usize = chunk
+                let set: usize = body
                     .chunks_exact(8)
                     .map(|w| u64::from_le_bytes(w.try_into().unwrap()).count_ones() as usize)
                     .sum();
@@ -982,7 +1386,7 @@ pub fn validate(bytes: &[u8], count: u32, documents: u32, bounded: bool) -> Resu
                     return Err(Error::Corrupt("ordinal bitmap cardinality"));
                 }
             }
-            expected += size as u64;
+            expected += total as u64;
         }
         if chunks_at + expected != bytes.len() as u64 {
             return Err(Error::Corrupt("ordinal stream length"));
@@ -999,6 +1403,101 @@ pub fn validate(bytes: &[u8], count: u32, documents: u32, bounded: bool) -> Resu
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn cursor_matches(ordinals: &[u32], scored: bool) {
+        let scores: Vec<(u8, u32)> = ordinals.iter().map(|o| ((o % 7) as u8, o + 10)).collect();
+        let bytes = if scored {
+            encode_scored(ordinals, &scores)
+        } else {
+            encode(ordinals)
+        };
+        let stream = Ordinals::open(&bytes[..], bytes.len() as u64, scored).unwrap();
+        for (rank, ordinal) in ordinals.iter().enumerate() {
+            assert_eq!(stream.rank(*ordinal).unwrap(), Some(rank as u32));
+        }
+        assert_eq!(
+            stream
+                .rank(ordinals.last().map_or(0, |last| last + 1))
+                .unwrap(),
+            None
+        );
+        let mut cursor = Ordinals::open(&bytes[..], bytes.len() as u64, scored)
+            .unwrap()
+            .cursor()
+            .unwrap();
+        for (rank, ordinal) in ordinals.iter().enumerate() {
+            assert_eq!(cursor.current(), Some(*ordinal));
+            assert_eq!(cursor.rank(), rank as u32);
+            assert_eq!(
+                cursor.bucket(),
+                scored.then_some(scores[rank].0),
+                "bucket of {ordinal}"
+            );
+            cursor.advance().unwrap();
+        }
+        assert_eq!(stream.is_scored(), scored);
+        if scored && stream.list().is_some() {
+            assert_eq!(
+                stream.list_buckets(),
+                scores.iter().map(|s| s.0).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(cursor.current(), None);
+        assert_eq!(cursor.rank(), ordinals.len() as u32);
+        cursor.advance().unwrap();
+        assert_eq!(cursor.current(), None);
+        // Seeking to every member, every gap and past the end from a fresh
+        // cursor and from the previous position.
+        let targets: Vec<u32> = ordinals
+            .iter()
+            .flat_map(|o| [o.saturating_sub(1), *o, o + 1])
+            .collect();
+        let mut walking = Ordinals::open(&bytes[..], bytes.len() as u64, scored)
+            .unwrap()
+            .cursor()
+            .unwrap();
+        for target in targets {
+            let expected = ordinals.partition_point(|o| *o < target);
+            let mut fresh = Ordinals::open(&bytes[..], bytes.len() as u64, scored)
+                .unwrap()
+                .cursor()
+                .unwrap();
+            fresh.seek(target).unwrap();
+            assert_eq!(
+                fresh.current(),
+                ordinals.get(expected).copied(),
+                "seek {target}"
+            );
+            assert_eq!(fresh.rank(), expected as u32, "rank after seek {target}");
+            if walking.current().is_some_and(|c| c < target) || walking.current().is_none() {
+                walking.seek(target).unwrap();
+                assert_eq!(
+                    walking.current(),
+                    ordinals.get(expected).copied(),
+                    "walk seek {target}"
+                );
+                assert_eq!(walking.rank(), expected as u32);
+                if scored && expected < ordinals.len() {
+                    assert_eq!(walking.bucket(), Some(scores[expected].0));
+                    assert_eq!(fresh.bucket(), Some(scores[expected].0));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_walks_lists_arrays_and_bitmaps() {
+        cursor_matches(&[], false);
+        cursor_matches(&[5], true);
+        cursor_matches(&(0..40).map(|i| i * 3).collect::<Vec<_>>(), true);
+        // Two chunks: a sparse array and a bitmap, with a gap chunk between.
+        let mut dense: Vec<u32> = (0..200).map(|i| i * 300).collect();
+        dense.extend(3 * CHUNK..3 * CHUNK + 5000);
+        dense.extend((3 * CHUNK + 6000..3 * CHUNK + 6100).step_by(7));
+        cursor_matches(&dense, true);
+        cursor_matches(&dense, false);
+        cursor_matches(&sample(200_000, 3, 9), true);
+    }
 
     fn sample(documents: u32, step: u32, seed: u32) -> Vec<u32> {
         let mut state = seed | 1;

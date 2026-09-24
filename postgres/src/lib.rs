@@ -83,6 +83,46 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_build_packs_its_segments_into_its_lowest_pages() {
+        // Small build segments and a low merge cap: the build's tier merges
+        // retire many runs and end with several segments among their holes.
+        Spi::run(
+            "CREATE TABLE packed(id int, body text);
+             INSERT INTO packed SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 1009), ' ')
+             FROM generate_series(1, 40) k) FROM generate_series(1, 20000) n;
+             SET LOCAL stannum.build_segment_docs = 500;
+             CREATE INDEX packed_idx ON packed USING stannum(body)
+             WITH (max_merged_segment_size = 2);",
+        )
+        .unwrap();
+        let index = unsafe {
+            pgrx::PgRelation::with_lock(
+                Spi::get_one::<pg_sys::Oid>("SELECT 'packed_idx'::regclass::oid")
+                    .unwrap()
+                    .unwrap(),
+                pg_sys::AccessShareLock as _,
+            )
+        };
+        let segments = unsafe { crate::storage::testing::segment_pages(index.as_ptr()) };
+        assert!(segments.len() >= 2, "{} segments", segments.len());
+        let live: i64 = segments
+            .iter()
+            .map(|(run, map)| (run.len() + map.len()) as i64)
+            .sum();
+        // Meta page, the write buffer's page, and the runs: nothing else.
+        assert_eq!(
+            value("SELECT pg_relation_size('packed_idx') / 8192"),
+            live + 2
+        );
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM packed WHERE body ==> 'common'"),
+            20000
+        );
+        assert_clean("packed_idx");
+    }
+
+    #[pg_test]
     fn selective_postings_skip_unrelated_heap_pages_and_follow_overflow() {
         Spi::run(
             "CREATE TABLE posting_probe (id int, body text);
@@ -3290,7 +3330,7 @@ mod tests {
         };
         assert_eq!(
             &read_page(root as u32)[DATA_AT as usize..DATA_AT as usize + 4],
-            segment::segment::Format::CURRENT.magic()
+            segment::segment::MAGIC
         );
         drop(index);
         corrupt("release_format_idx", 0, KIND_AT + 1, "ff");
@@ -5167,6 +5207,184 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[pg_test]
+    fn ranked_walks_skip_dead_listed_documents_in_every_chunk_form() {
+        // VACUUM reports rows dead while their heap tuples stay visible, as
+        // a slot reused after VACUUM is: the dead list alone must keep them
+        // out of the ranked walk. Found by the ranked-scan fuzzer: the
+        // disjunction walk masked the dead ordinals before it rebuilt its
+        // candidates from the essential terms, and never masked a list chunk.
+        Spi::run(
+            "CREATE TABLE deadlist(id int primary key, body text);
+             INSERT INTO deadlist SELECT n,
+               CASE WHEN n % 3 = 0 THEN 'needle pad' WHEN n % 3 = 1 THEN 'other pad'
+                    ELSE 'needle other' END || CASE WHEN n % 10 = 0 THEN ' rare' ELSE '' END
+             FROM generate_series(1, 300) n;
+             CREATE INDEX deadlist_idx ON deadlist USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let dead = tids("SELECT ctid::text FROM deadlist WHERE id IN (30, 60, 3, 5)");
+        assert_eq!(dead.len(), 4);
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'deadlist_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        drop(index);
+        // Bitmap chunks (needle, other: 200 documents each), a list chunk
+        // (rare: 30), and their combinations, at a limit past every match.
+        for query in [
+            "needle",
+            "rare",
+            "rare OR needle",
+            "needle OR other",
+            "needle AND other",
+            "rare AND needle",
+        ] {
+            let ids: Vec<i32> = Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id FROM deadlist WHERE body ==> '{query}'
+                             ORDER BY stannum.full_score(ctid) DESC LIMIT 400"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                    .collect()
+            });
+            assert!(
+                ids.iter().all(|id| ![30, 60, 3, 5].contains(id)),
+                "{query}: dead-listed rows returned by the ranked walk"
+            );
+            assert_eq!(
+                ids.len() as i64,
+                value(&format!(
+                    "SELECT count(*) FROM deadlist WHERE body ==> '{query}' AND id NOT IN (30, 60, 3, 5)"
+                )),
+                "{query}"
+            );
+        }
+    }
+
+    #[pg_test]
+    fn a_replaced_dead_list_in_the_same_pages_is_not_served_from_cache() {
+        // A dead list is rewritten whole by every VACUUM that finds more
+        // dead rows, and the old list's pages come back through the free
+        // space map; a replacement of the same size lands in the same pages
+        // with the same byte count, so a reader's cached copy keyed by the
+        // run alone would stand. Found by the ranked-scan fuzzer.
+        Spi::run(
+            "CREATE TABLE stamped(id int primary key, body text);
+             INSERT INTO stamped SELECT n, 'needle pad' FROM generate_series(1, 100) n;
+             CREATE INDEX stamped_idx ON stamped USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'stamped_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        let ranked = || -> Vec<i32> {
+            Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT id FROM stamped WHERE body ==> 'needle'
+                         ORDER BY stannum.full_score(ctid) DESC LIMIT 200",
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                    .collect()
+            })
+        };
+        let unordered = || value("SELECT count(*) FROM stamped WHERE body ==> 'needle'");
+        let swap = |dead: i32| unsafe {
+            crate::storage::testing::set_dead_list(
+                index.as_ptr(),
+                0,
+                &tids(&format!("SELECT ctid::text FROM stamped WHERE id = {dead}")),
+            )
+        };
+        let first = swap(7);
+        let ids = ranked();
+        assert!(!ids.contains(&7) && ids.len() == 99, "{ids:?}");
+        assert_eq!(unordered(), 99);
+        // Each list is written before the one it replaces is freed, so two
+        // swaps bring the third list back to the first list's page, at the
+        // first list's size, with a reader that last saw the first list.
+        let second = swap(8);
+        let third = swap(9);
+        assert_ne!(second, first);
+        assert_eq!(third, first, "{first:?} {second:?} {third:?}");
+        let ids = ranked();
+        assert!(ids.contains(&7) && ids.contains(&8), "{ids:?}");
+        assert!(!ids.contains(&9) && ids.len() == 99, "{ids:?}");
+        assert_eq!(unordered(), 99);
+        drop(index);
+        // The fabricated list names live rows, which the heap check would
+        // rightly report; the structure is what must hold.
+        let rows = findings("stamped_idx", false);
+        assert!(rows.is_empty(), "{}", rows.join("\n"));
+    }
+
+    #[pg_test]
+    fn per_row_scores_do_not_depend_on_the_order_rows_are_scored_in() {
+        // The unpruned path scores rows as the executor hands them over: in
+        // heap order under a bitmap scan, in any order under a join or an
+        // ordered index scan. Found by the ranked-scan fuzzer: a lookup past a
+        // term's last member exhausted its cursor, and every later row, even
+        // one the term listed, then scored without that term.
+        Spi::run(
+            "CREATE TABLE ordered(id int primary key, body text);
+             INSERT INTO ordered SELECT n, CASE WHEN n <= 100 THEN 'needle common' ELSE 'common' END
+             FROM generate_series(1, 200) n;
+             CREATE INDEX ordered_idx ON ordered USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = off;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let scores = |order: &str, bitmap: bool| -> Vec<(i32, u32)> {
+            Spi::run(&format!("SET LOCAL enable_bitmapscan = {bitmap}")).unwrap();
+            Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, stannum.full_score(ctid) AS score FROM ordered
+                             WHERE body ==> 'needle OR common' ORDER BY id {order}"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        };
+        // Heap order, under the bitmap scan, is the reference.
+        let mut ascending = scores("ASC", true);
+        // A backward scan of the primary key hands rows over in descending
+        // heap order, with the text predicate as a filter.
+        let mut descending = scores("DESC", false);
+        assert_eq!(ascending.len(), 200);
+        assert_eq!(descending.len(), 200);
+        assert_ne!(ascending[0].1, ascending[199].1);
+        ascending.sort_unstable();
+        descending.sort_unstable();
+        assert_eq!(ascending, descending);
     }
 
     #[pg_test]

@@ -21,9 +21,9 @@
 
 use boldi_vigna::{SpanQuery, SpanSolver};
 use segment::Tid;
+use segment::docs::{DocCursor, TidCursor};
 use segment::index::{Expanded, Index, Window};
 use segment::payload::PayloadCursor;
-use segment::postings::PostingsCursor;
 use segment::segment::{Lengths, Term};
 use segment::set::{AtLeast, Cursor, Difference, Empty, Intersection, Union};
 
@@ -74,14 +74,15 @@ pub fn plan<'a, I: Index + ?Sized>(
     Planner { segment, limits }.query(query)
 }
 
-/// Prefer bulk execution when a Boolean term has dense grouped postings. Purely
-/// sparse and positional plans retain scalar execution: building a five-word
-/// mask for each isolated tuple costs more than walking its existing cursor.
+/// Prefer bulk execution when a Boolean term is dense enough to be stored as
+/// bitmap chunks. Purely sparse and positional plans retain scalar execution:
+/// building a five-word mask for each isolated tuple costs more than walking
+/// its existing cursor.
 pub fn prefers_pages<I: Index + ?Sized>(query: &Query, segment: &I) -> Result<bool> {
     Ok(match query {
         Query::Term(term) => segment
             .term(term)?
-            .map(|t| t.postings().and_then(|p| p.prefers_pages()))
+            .map(|t| t.prefers_pages())
             .transpose()?
             .unwrap_or(false),
         Query::And(a, b) | Query::Or(a, b) => {
@@ -212,7 +213,7 @@ pub fn page_plan<'a, I: Index + ?Sized>(
     match query {
         Query::Term(term) => match segment.term(term)? {
             Some(term) => Ok(PagePlan {
-                cursor: term.postings()?.pages()?,
+                cursor: Box::new(term.pages()?),
                 exact: true,
             }),
             None => Ok(PagePlan {
@@ -639,7 +640,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
             let mut readers = Vec::with_capacity(terms.len());
             for term in terms {
                 readers.push(SlotTerm {
-                    postings: term.cursor()?,
+                    documents: term.cursor()?,
                     payload: term.payload()?.cursor(),
                 });
             }
@@ -662,12 +663,12 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
 
 /// The segment's documents with at least one token.
 struct NonEmptyDocuments<'a> {
-    documents: PostingsCursor<'a>,
+    documents: DocCursor<'a>,
     lengths: Lengths<'a>,
 }
 
 impl<'a> NonEmptyDocuments<'a> {
-    fn new(documents: PostingsCursor<'a>, lengths: Lengths<'a>) -> segment::Result<Self> {
+    fn new(documents: DocCursor<'a>, lengths: Lengths<'a>) -> segment::Result<Self> {
         let mut this = Self { documents, lengths };
         this.align()?;
         Ok(this)
@@ -697,7 +698,7 @@ impl Cursor for NonEmptyDocuments<'_> {
 }
 
 struct SlotTerm<'a> {
-    postings: PostingsCursor<'a>,
+    documents: TidCursor<'a>,
     payload: PayloadCursor<'a>,
 }
 
@@ -718,7 +719,7 @@ struct SpanFilter<'a> {
     skeleton: DynCursor<'a>,
     slots: Vec<Vec<SlotTerm<'a>>>,
     kind: SpanKind,
-    documents: PostingsCursor<'a>,
+    documents: DocCursor<'a>,
     lengths: Lengths<'a>,
     positions: Vec<Vec<u32>>,
     current: Option<Tid>,
@@ -729,7 +730,7 @@ impl<'a> SpanFilter<'a> {
         skeleton: DynCursor<'a>,
         slots: Vec<Vec<SlotTerm<'a>>>,
         kind: SpanKind,
-        documents: PostingsCursor<'a>,
+        documents: DocCursor<'a>,
         lengths: Lengths<'a>,
     ) -> Result<Self> {
         let positions = vec![Vec::new(); slots.len()];
@@ -766,8 +767,9 @@ impl<'a> SpanFilter<'a> {
             positions.clear();
             let mut sources = 0;
             for term in terms.iter_mut() {
-                if let Some(ordinal) = term.postings.rank(tid)? {
-                    term.payload.seek(ordinal)?;
+                term.documents.seek(tid)?;
+                if term.documents.current() == Some(tid) {
+                    term.payload.seek(term.documents.rank())?;
                     term.payload.next_into(positions)?;
                     sources += 1;
                 }

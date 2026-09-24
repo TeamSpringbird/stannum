@@ -350,15 +350,20 @@ impl Checker {
         if !entry.dead.is_empty()
             && let Some((bytes, _)) = unsafe { self.run(entry.dead, &dead_owner, true) }
         {
-            let decoded = segment::postings::Postings::parse(&bytes).and_then(|p| p.to_vec());
+            let decoded = segment::ordinals::Ordinals::parse(&bytes).and_then(|o| o.to_vec());
             match (&documents, decoded) {
                 (Some(documents), decoded) => {
-                    for finding in verify_dead_list(&bytes, documents) {
+                    for finding in verify_dead_list(&bytes, documents.len() as u32) {
                         self.findings.push(finding.within(&label));
                     }
-                    dead = decoded.unwrap_or_default();
+                    dead = decoded
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|ordinal| documents.get(ordinal as usize).copied())
+                        .collect();
                 }
-                (None, Ok(list)) => dead = list,
+                // Without a document table the ordinals name nothing.
+                (None, Ok(_)) => {}
                 (None, Err(error)) => self.error(dead_owner.clone(), error),
             }
         }

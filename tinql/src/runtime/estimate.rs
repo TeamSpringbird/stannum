@@ -29,9 +29,8 @@
 //! of a live index.
 
 use segment::index::{Expanded, Index, Window};
-use segment::postings::Postings;
+use segment::ordinals::Ordinals;
 use segment::segment::Term;
-use segment::set::Cursor;
 
 use super::eval::FuzzyMatcher;
 use super::{CompiledRegex, Query, RangeBound, SpanTermSlot};
@@ -369,7 +368,8 @@ impl<S: Statistics + ?Sized> Estimator<'_, S> {
 /// Frequencies summed over the sources of an index (its segments and write
 /// buffer), each expanded under the same cap the plan uses.
 pub struct IndexStatistics<'a> {
-    pub sources: Vec<(&'a dyn Index, Option<Postings<'a>>)>,
+    /// Each source with its dead list, an ordinal stream over that source.
+    pub sources: Vec<(&'a dyn Index, Option<Ordinals<'a>>)>,
     pub max_expansion: usize,
 }
 
@@ -384,7 +384,7 @@ impl Statistics for IndexStatistics<'_> {
                 f64::from(
                     source
                         .document_count()
-                        .saturating_sub(dead.as_ref().map_or(0, Postings::count)),
+                        .saturating_sub(dead.as_ref().map_or(0, Ordinals::count)),
                 )
             })
             .sum())
@@ -425,7 +425,7 @@ impl Statistics for IndexStatistics<'_> {
 /// have no dead list and retain their original frequencies.
 fn live_frequency(
     index: &dyn Index,
-    dead: Option<&Postings<'_>>,
+    dead: Option<&Ordinals<'_>>,
     term: &Term<'_>,
 ) -> segment::Result<f64> {
     let Some(dead) = dead.filter(|dead| dead.count() > 0) else {
@@ -436,13 +436,9 @@ fn live_frequency(
         return Ok(0.0);
     }
     if term.df() <= 1024 {
-        let mut postings = term.cursor()?;
-        let mut deleted = dead.cursor()?;
         let mut live = 0u32;
-        while let Some(tid) = postings.current() {
-            deleted.seek(tid)?;
-            live += u32::from(deleted.current() != Some(tid));
-            postings.advance()?;
+        for ordinal in term.ordinals()?.to_vec()? {
+            live += u32::from(dead.rank(ordinal)?.is_none());
         }
         Ok(f64::from(live))
     } else {
@@ -650,12 +646,10 @@ mod tests {
     }
     #[test]
     fn index_statistics_subtract_known_deaths_and_preserve_buffer() {
-        use segment::{
-            Tid, forward::ForwardRecord, index::MutableIndex, postings::PostingsBuilder,
-        };
+        use segment::{Tid, forward::ForwardRecord, index::MutableIndex};
         let index = MutableIndex::default();
         let buffer = MutableIndex::default();
-        let mut dead = PostingsBuilder::default();
+        let mut dead = Vec::new();
         for n in 0..2000 {
             let tid = Tid::new(n, 1).unwrap();
             let mut tokens = vec![("common", 0)];
@@ -666,7 +660,8 @@ mod tests {
                 .add_record(ForwardRecord::from_tokens(tid, tokens).unwrap())
                 .unwrap();
             if n < 10 || (100..590).contains(&n) {
-                dead.push(tid).unwrap();
+                // Records arrive in TID order, so the ordinal is the count.
+                dead.push(n);
             }
         }
         buffer
@@ -674,10 +669,10 @@ mod tests {
                 ForwardRecord::from_tokens(Tid::new(2001, 1).unwrap(), [("rare", 0)]).unwrap(),
             )
             .unwrap();
-        let bytes = dead.finish();
+        let bytes = segment::ordinals::encode(&dead);
         let stats = IndexStatistics {
             sources: vec![
-                (&index, Some(Postings::parse(&bytes).unwrap())),
+                (&index, Some(Ordinals::parse(&bytes).unwrap())),
                 (&buffer, None),
             ],
             max_expansion: 10,
@@ -712,21 +707,17 @@ mod tests {
 
     #[test]
     fn wholly_dead_and_empty_sources_estimate_zero() {
-        use segment::{
-            Tid, forward::ForwardRecord, index::MutableIndex, postings::PostingsBuilder,
-        };
+        use segment::{Tid, forward::ForwardRecord, index::MutableIndex};
         let index = MutableIndex::default();
         let empty = MutableIndex::default();
         let tid = Tid::new(0, 1).unwrap();
         index
             .add_record(ForwardRecord::from_tokens(tid, [("gone", 0)]).unwrap())
             .unwrap();
-        let mut dead = PostingsBuilder::default();
-        dead.push(tid).unwrap();
-        let bytes = dead.finish();
+        let bytes = segment::ordinals::encode(&[0]);
         let stats = IndexStatistics {
             sources: vec![
-                (&index, Some(Postings::parse(&bytes).unwrap())),
+                (&index, Some(Ordinals::parse(&bytes).unwrap())),
                 (&empty, None),
             ],
             max_expansion: 10,

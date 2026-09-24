@@ -1093,6 +1093,8 @@ def main():
     p.add_argument('--setup-timeout-seconds', type=bench.positive, default=1800)
     p.add_argument('--port', type=bench.positive, default=28928)
     p = commands.add_parser('run', parents=[common])
+    p.add_argument('--source-manifest', type=Path, default=None,
+                   help='the source.json build-image wrote for --image, so a run matches the image rather than the working tree')
     p.set_defaults(func=run)
     p.add_argument('--image', required=True)
     p.add_argument('--engines', nargs='+', choices=['stannum', 'postgres'], default=['stannum', 'postgres'])

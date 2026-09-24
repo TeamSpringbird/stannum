@@ -11,13 +11,14 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use rustc_hash::FxHashMap;
 
 use crate::dictionary::{Extent, TermEntry};
+use crate::docs::{self, DocCursor, DocTable, PageTable};
 use crate::forward::ForwardRecord;
 use crate::payload::PayloadBuilder;
-use crate::postings::{PostingsBuilder, PostingsCursor};
 use crate::segment::{AreaFetch, Lengths, Reader, Term};
 use crate::source::Source;
 use crate::tf_bucket::TfBucket;
@@ -50,13 +51,15 @@ pub trait Index {
         limit: usize,
     ) -> Result<Expanded<'_>>;
     /// Every document in the index, in TID order.
-    fn documents(&self) -> Result<PostingsCursor<'_>>;
+    fn documents(&self) -> Result<DocCursor<'_>>;
+    /// The document table: ordinals to locations and back.
+    fn doc_table(&self) -> Result<DocTable<'_>>;
+    /// The heap blocks the documents span.
+    fn page_table(&self) -> Result<PageTable<'_>>;
     fn lengths(&self) -> Lengths<'_>;
-    /// The segment's page table where terms carry ordinal streams; `None`
-    /// for sources counted through their TID postings.
-    fn page_table(&self) -> Result<Option<&[u8]>> {
-        Ok(None)
-    }
+    /// The document's length class (see [`crate::length_class`]), a lower
+    /// bound on its length for bounding scores without reading the length.
+    fn length_class(&self, ordinal: u32) -> Result<u8>;
 }
 
 impl<S: Source> Index for Reader<S> {
@@ -64,12 +67,16 @@ impl<S: Source> Index for Reader<S> {
         Reader::document_count(self)
     }
 
-    fn page_table(&self) -> Result<Option<&[u8]>> {
-        if self.format().has_ordinals() {
-            Reader::page_table(self).map(Some)
-        } else {
-            Ok(None)
-        }
+    fn page_table(&self) -> Result<PageTable<'_>> {
+        Reader::page_table(self)
+    }
+
+    fn doc_table(&self) -> Result<DocTable<'_>> {
+        Reader::doc_table(self)
+    }
+
+    fn length_class(&self, ordinal: u32) -> Result<u8> {
+        Reader::length_class(self, ordinal)
     }
 
     fn total_length(&self) -> u64 {
@@ -106,7 +113,7 @@ impl<S: Source> Index for Reader<S> {
         Ok(Expanded::Terms(found))
     }
 
-    fn documents(&self) -> Result<PostingsCursor<'_>> {
+    fn documents(&self) -> Result<DocCursor<'_>> {
         Reader::documents(self)
     }
 
@@ -133,14 +140,20 @@ impl<I: Index + ?Sized> Index for &I {
     ) -> Result<Expanded<'_>> {
         (**self).expand(window, filter, limit)
     }
-    fn documents(&self) -> Result<PostingsCursor<'_>> {
+    fn documents(&self) -> Result<DocCursor<'_>> {
         (**self).documents()
+    }
+    fn doc_table(&self) -> Result<DocTable<'_>> {
+        (**self).doc_table()
+    }
+    fn page_table(&self) -> Result<PageTable<'_>> {
+        (**self).page_table()
     }
     fn lengths(&self) -> Lengths<'_> {
         (**self).lengths()
     }
-    fn page_table(&self) -> Result<Option<&[u8]>> {
-        (**self).page_table()
+    fn length_class(&self, ordinal: u32) -> Result<u8> {
+        (**self).length_class(ordinal)
     }
 }
 
@@ -162,14 +175,20 @@ impl<I: Index + ?Sized> Index for Box<I> {
     ) -> Result<Expanded<'_>> {
         (**self).expand(window, filter, limit)
     }
-    fn documents(&self) -> Result<PostingsCursor<'_>> {
+    fn documents(&self) -> Result<DocCursor<'_>> {
         (**self).documents()
+    }
+    fn doc_table(&self) -> Result<DocTable<'_>> {
+        (**self).doc_table()
+    }
+    fn page_table(&self) -> Result<PageTable<'_>> {
+        (**self).page_table()
     }
     fn lengths(&self) -> Lengths<'_> {
         (**self).lengths()
     }
-    fn page_table(&self) -> Result<Option<&[u8]>> {
-        (**self).page_table()
+    fn length_class(&self, ordinal: u32) -> Result<u8> {
+        (**self).length_class(ordinal)
     }
 }
 
@@ -191,14 +210,20 @@ impl<I: Index + ?Sized> Index for std::rc::Rc<I> {
     ) -> Result<Expanded<'_>> {
         (**self).expand(window, filter, limit)
     }
-    fn documents(&self) -> Result<PostingsCursor<'_>> {
+    fn documents(&self) -> Result<DocCursor<'_>> {
         (**self).documents()
+    }
+    fn doc_table(&self) -> Result<DocTable<'_>> {
+        (**self).doc_table()
+    }
+    fn page_table(&self) -> Result<PageTable<'_>> {
+        (**self).page_table()
     }
     fn lengths(&self) -> Lengths<'_> {
         (**self).lengths()
     }
-    fn page_table(&self) -> Result<Option<&[u8]>> {
-        (**self).page_table()
+    fn length_class(&self, ordinal: u32) -> Result<u8> {
+        (**self).length_class(ordinal)
     }
 }
 
@@ -236,35 +261,51 @@ impl TermData {
 #[derive(Default)]
 struct Encoded {
     slots: Vec<Box<[u8]>>,
-    /// Slots and entry per term, dropped from the map when the term changes.
+    /// Slots and entry per term, dropped from the map when the term changes
+    /// or when a document is inserted before others, which renumbers them.
     terms: FxHashMap<String, TermEntry>,
-    documents: Option<usize>,
+    /// The documents in TID order, as the document table numbers them.
+    doc_list: Option<Rc<Vec<Tid>>>,
+    /// Slots of the offsets, page table and lengths, in that order.
+    documents: Option<(usize, usize)>,
     lengths: Option<usize>,
+}
+
+/// An extent naming slot `slot` whole; a stream offset within it goes in
+/// the low bits, so a term's stream is fetched by ranges like a segment's.
+fn slot_extent(slot: usize, len: usize) -> Extent {
+    Extent {
+        offset: (slot as u64) << 32,
+        len: len as u32,
+    }
 }
 
 impl Encoded {
     fn push(&mut self, bytes: Vec<u8>) -> Extent {
         self.slots.push(bytes.into_boxed_slice());
         let slot = self.slots.len() - 1;
-        Extent {
-            offset: slot as u64,
-            len: self.slots[slot].len() as u32,
-        }
+        slot_extent(slot, self.slots[slot].len())
     }
 
     /// The lifetime is the caller's: slots are boxed, never removed and never
     /// reallocated in place, so a slice stays valid for as long as the owning
     /// index lives, which is the only lifetime callers ask for.
-    fn slot<'s>(&self, extent: Extent) -> Result<&'s [u8]> {
+    fn slot<'s>(&self, slot: usize) -> Result<&'s [u8]> {
         let bytes = self
             .slots
-            .get(extent.offset as usize)
+            .get(slot)
             .ok_or(Error::Corrupt("mutable index slot"))?;
-        if bytes.len() != extent.len as usize {
-            return Err(Error::Corrupt("mutable index slot length"));
-        }
         // SAFETY: see above; the box's heap allocation outlives every borrow.
         Ok(unsafe { &*std::ptr::from_ref::<[u8]>(bytes) })
+    }
+
+    /// `len` bytes at `at`, an offset in the slot-and-offset form.
+    fn range<'s>(&self, at: u64, len: usize) -> Result<&'s [u8]> {
+        let bytes = self.slot((at >> 32) as usize)?;
+        let within = (at & 0xffff_ffff) as usize;
+        bytes
+            .get(within..within.checked_add(len).ok_or(Error::Truncated)?)
+            .ok_or(Error::Truncated)
     }
 }
 
@@ -303,6 +344,10 @@ impl MutableIndex {
         if documents.contains_key(&header.tid) {
             return Err(Error::Unordered);
         }
+        let appended = documents
+            .keys()
+            .next_back()
+            .is_none_or(|last| *last < header.tid);
         documents.insert(header.tid, header.doc_len);
         *self.total_length.borrow_mut() += u64::from(header.doc_len);
         let mut terms = self.terms.borrow_mut();
@@ -310,6 +355,12 @@ impl MutableIndex {
         let mut encoded = self.encoded.borrow_mut();
         encoded.documents = None;
         encoded.lengths = None;
+        encoded.doc_list = None;
+        if !appended {
+            // Reused heap space before existing documents renumbers every
+            // ordinal after it: every encoded stream is stale.
+            encoded.terms.clear();
+        }
         let tid = header.tid;
         let doc_len = header.doc_len;
         let (_, consumed) = ForwardRecord::decode_with(bytes, |term, positions| {
@@ -359,16 +410,32 @@ impl MutableIndex {
         self.documents.borrow().is_empty()
     }
 
+    /// The documents in TID order, shared until the next insertion.
+    fn doc_list(&self) -> Rc<Vec<Tid>> {
+        if let Some(list) = &self.encoded.borrow().doc_list {
+            return list.clone();
+        }
+        let list = Rc::new(self.documents.borrow().keys().copied().collect::<Vec<_>>());
+        self.encoded.borrow_mut().doc_list = Some(list.clone());
+        list
+    }
+
     fn encode_term(&self, term: &str, data: &TermData) -> TermEntry {
-        let mut postings = PostingsBuilder::default();
+        let documents = self.doc_list();
         let mut payload = PayloadBuilder::default();
         let mut max_tf_bucket = 0;
+        let mut ordinals = Vec::with_capacity(data.tids.len());
+        let mut scores = Vec::with_capacity(data.tids.len());
         for (tid, occurrence) in data.tids.iter().zip(&data.occurrences) {
-            postings
-                .push_scored(*tid, occurrence.bucket, occurrence.doc_len)
-                .expect("tids kept sorted and unique");
+            ordinals.push(
+                documents
+                    .binary_search(tid)
+                    .expect("every occurrence belongs to a recorded document")
+                    as u32,
+            );
+            scores.push((occurrence.bucket, occurrence.doc_len));
             payload
-                .push(occurrence.bucket, data.positions_of(occurrence))
+                .push(data.positions_of(occurrence))
                 .expect("positions validated on insertion");
             max_tf_bucket = max_tf_bucket.max(occurrence.bucket);
         }
@@ -376,10 +443,8 @@ impl MutableIndex {
         let entry = TermEntry {
             df: data.tids.len() as u32,
             max_tf_bucket,
-            postings: encoded.push(postings.finish()),
+            ordinals: encoded.push(crate::ordinals::encode_scored(&ordinals, &scores)),
             payload: encoded.push(payload.finish()),
-            // The write buffer is counted through its TID postings.
-            ordinals: Extent::default(),
         };
         encoded.terms.insert(term.to_owned(), entry);
         entry
@@ -394,40 +459,33 @@ impl MutableIndex {
         Some(self.encode_term(term, data))
     }
 
-    fn documents_extent(&self) -> Extent {
-        if let Some(slot) = self.encoded.borrow().documents {
-            let len = self.encoded.borrow().slots[slot].len() as u32;
-            return Extent {
-                offset: slot as u64,
-                len,
-            };
+    /// Slots of the offsets and page table, encoded on first use.
+    fn document_slots(&self) -> (usize, usize) {
+        if let Some(slots) = self.encoded.borrow().documents {
+            return slots;
         }
-        let mut postings = PostingsBuilder::default();
-        for tid in self.documents.borrow().keys() {
-            postings.push(*tid).expect("map keys are ordered");
-        }
+        let documents = self.doc_list();
+        let offsets = docs::offsets(documents.iter().copied());
+        let pages = docs::page_table(documents.iter().copied());
         let mut encoded = self.encoded.borrow_mut();
-        let extent = encoded.push(postings.finish());
-        encoded.documents = Some(extent.offset as usize);
-        extent
+        let offsets = (encoded.push(offsets).offset >> 32) as usize;
+        let pages = (encoded.push(pages).offset >> 32) as usize;
+        encoded.documents = Some((offsets, pages));
+        (offsets, pages)
     }
 
-    fn lengths_extent(&self) -> Extent {
+    fn lengths_slot(&self) -> usize {
         if let Some(slot) = self.encoded.borrow().lengths {
-            let len = self.encoded.borrow().slots[slot].len() as u32;
-            return Extent {
-                offset: slot as u64,
-                len,
-            };
+            return slot;
         }
         let mut bytes = Vec::with_capacity(self.documents.borrow().len() * 4);
         for len in self.documents.borrow().values() {
             bytes.extend_from_slice(&len.to_le_bytes());
         }
         let mut encoded = self.encoded.borrow_mut();
-        let extent = encoded.push(bytes);
-        encoded.lengths = Some(extent.offset as usize);
-        extent
+        let slot = (encoded.push(bytes).offset >> 32) as usize;
+        encoded.lengths = Some(slot);
+        slot
     }
 
     fn term_view(&self, entry: TermEntry) -> Term<'_> {
@@ -436,22 +494,36 @@ impl MutableIndex {
 }
 
 impl AreaFetch for MutableIndex {
-    fn postings_bytes(&self, extent: Extent) -> Result<&[u8]> {
-        self.encoded.borrow().slot(extent)
+    fn ordinals_bytes(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        self.encoded.borrow().range(offset, len)
     }
 
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]> {
-        self.encoded.borrow().slot(extent)
+        self.encoded
+            .borrow()
+            .range(extent.offset, extent.len as usize)
+    }
+
+    fn doc_table(&self) -> Result<DocTable<'_>> {
+        let (offsets, pages) = self.document_slots();
+        let encoded = self.encoded.borrow();
+        let offsets: &[u8] = encoded.slot(offsets)?;
+        let pages: &[u8] = encoded.slot(pages)?;
+        DocTable::parse(pages, offsets, (offsets.len() / 2) as u32)
     }
 
     fn length(&self, ordinal: u32) -> Result<u32> {
-        let extent = self.lengths_extent();
-        let bytes = self.encoded.borrow().slot(extent)?;
+        let slot = self.lengths_slot();
+        let bytes = self.encoded.borrow().slot(slot)?;
         let at = ordinal as usize * 4;
         let bytes = bytes
             .get(at..at + 4)
             .ok_or(Error::Corrupt("document ordinal out of range"))?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn length_class(&self, ordinal: u32) -> Result<u8> {
+        AreaFetch::length(self, ordinal).map(crate::length_class::class_of)
     }
 }
 
@@ -510,10 +582,22 @@ impl Index for MutableIndex {
         Ok(Expanded::Terms(found))
     }
 
-    fn documents(&self) -> Result<PostingsCursor<'_>> {
-        let extent = self.documents_extent();
-        let bytes = self.encoded.borrow().slot(extent)?;
-        crate::postings::Postings::parse(bytes)?.cursor()
+    fn documents(&self) -> Result<DocCursor<'_>> {
+        AreaFetch::doc_table(self)?.into_cursor()
+    }
+
+    fn doc_table(&self) -> Result<DocTable<'_>> {
+        AreaFetch::doc_table(self)
+    }
+
+    fn page_table(&self) -> Result<PageTable<'_>> {
+        let (_, pages) = self.document_slots();
+        let encoded = self.encoded.borrow();
+        PageTable::parse(encoded.slot(pages)?, self.document_count())
+    }
+
+    fn length_class(&self, ordinal: u32) -> Result<u8> {
+        AreaFetch::length_class(self, ordinal)
     }
 
     fn lengths(&self) -> Lengths<'_> {
@@ -521,11 +605,11 @@ impl Index for MutableIndex {
         // length order too: appending a record in reused heap space may insert
         // before those TIDs. A lazy lookup into the current map would then
         // score retained documents using another document's length.
-        let extent = self.lengths_extent();
+        let slot = self.lengths_slot();
         Lengths::Bytes(
             self.encoded
                 .borrow()
-                .slot(extent)
+                .slot(slot)
                 .expect("length extent was just encoded"),
         )
     }
@@ -568,10 +652,11 @@ mod tests {
             assert_eq!(x.entry.max_tf_bucket, y.entry.max_tf_bucket);
             let tids = collect(x.cursor().unwrap()).unwrap();
             assert_eq!(tids, collect(y.cursor().unwrap()).unwrap());
-            // Both carry the same block bounds, computed from the same documents.
-            let bounds = x.cursor().unwrap().block_bounds().unwrap();
-            assert!(!bounds.is_empty(), "{term}");
-            assert_eq!(bounds, y.cursor().unwrap().block_bounds().unwrap());
+            // Both carry the same chunk bounds, computed from the same documents.
+            let (ox, oy) = (x.ordinals().unwrap(), y.ordinals().unwrap());
+            assert_eq!(ox.to_vec().unwrap(), oy.to_vec().unwrap(), "{term}");
+            assert!(!ox.bounds().is_empty(), "{term}");
+            assert_eq!(ox.bounds(), oy.bounds(), "{term}");
             let (px, py) = (x.payload().unwrap(), y.payload().unwrap());
             for ordinal in 0..tids.len() as u32 {
                 assert_eq!(px.get(ordinal).unwrap(), py.get(ordinal).unwrap());

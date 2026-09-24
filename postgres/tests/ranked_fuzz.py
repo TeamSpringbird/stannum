@@ -639,7 +639,7 @@ class Fuzzer:
             planned = reader.run(['EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) ' + spec['custom']])
             plan = json.loads('\n'.join(planned[0][1]))[0]['Plan']
             self.note_plan(plan)
-            if not has_node(plan, 'block-max', key='Pruning'):
+            if not has_node(plan, 'ordinal', key='Pruning'):
                 return Failure('wide query did not exercise block-max pruning', spec=describe(spec), plan=plan)
             self.wide_coverage[spec['query'].shape] = self.wide_coverage.get(spec['query'].shape, 0) + 1
         expected = oracle[spec['offset']:spec['offset'] + spec['limit']]

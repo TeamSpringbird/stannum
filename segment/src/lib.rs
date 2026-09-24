@@ -12,15 +12,18 @@
 //! Components:
 //!
 //! * [`dictionary`]: sorted, prefix-compressed terms with per-term statistics
-//!   and the extents of that term's postings and payload streams. Supports exact
+//!   and the extents of that term's ordinal and payload streams. Supports exact
 //!   lookup, prefix iteration and lexicographic ranges.
-//! * [`postings`]: a term's tuple locations in heap order, encoded either as a
-//!   sparse delta list or as 256-page groups with page bitmaps and per-page
-//!   offset lists or tuple bitmaps. Cursors support `seek` with group and page
-//!   skipping and report each posting's ordinal.
-//! * [`payload`]: per-posting term-frequency bucket and token positions, in the
-//!   same order as the postings, with a skip table addressed by ordinal so
-//!   Boolean queries never decode it.
+//! * [`ordinals`]: a term's documents as ordinals into the segment's document
+//!   table, as a short list or as 65,536-document chunks of arrays or bitmaps,
+//!   with a score bound per chunk. Cursors support `seek` and report each
+//!   member's rank.
+//! * [`docs`]: the document table, from ordinal to tuple location and back,
+//!   and the cursors that read a term's documents in heap order or a heap
+//!   page at a time.
+//! * [`payload`]: per-document term-frequency bucket and token positions, in
+//!   the same order as the term's ordinals, with a skip table addressed by
+//!   rank so Boolean queries never decode it.
 //! * [`forward`]: one document's tokens as a single record for a mutable write
 //!   buffer, so an insert is one append rather than one per term.
 //! * [`set`]: intersection, union and difference over any cursors.
@@ -38,17 +41,18 @@ mod error;
 mod reader;
 mod varint;
 
+pub mod bound;
 pub mod cache;
 pub mod dictionary;
+pub mod docs;
 pub mod forward;
 pub mod index;
-pub mod maintenance;
+pub mod length_class;
 pub mod merge;
 pub mod merge_strategy;
 pub mod ordinals;
 pub mod pages;
 pub mod payload;
-pub mod postings;
 pub mod segment;
 pub mod set;
 pub mod source;
@@ -61,9 +65,3 @@ pub use tid::Tid;
 
 #[cfg(test)]
 mod random_tests;
-
-#[cfg(test)]
-mod format_tests;
-
-#[cfg(test)]
-mod direct_merge_poc;

@@ -72,7 +72,7 @@ with psycopg.connect(host='127.0.0.1',port=PORT,user='postgres',password='postgr
             st=per_style.setdefault(style, {})
             def sadd(k,v): st[k]=st.get(k,0)+v
             sadd('n',1); sadd('statio index', s1['index']-s0['index']); sadd('statio heap', s1['heap']-s0['heap']); sadd('scan node read', node.get('Shared Read Blocks',0))
-            sadd('exec ms', whole.get('Execution Time',0)); sadd('visibility checks', node.get('Visibility Checks',0))
+            sadd('exec ms', whole.get('Execution Time',0)); sadd('visibility checks', node.get('Visibility Checks',0)); sadd('scan node hit', node.get('Shared Hit Blocks',0))
             for k,v in parse(node.get('Disk Pages By Area')).items(): sadd('area '+k, v)
             for k,v in parse(node.get('Disk Pages By Phase')).items(): sadd('phase '+k, v)
         print(f'== {phase}: {n} queries')

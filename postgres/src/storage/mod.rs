@@ -48,9 +48,10 @@ use pgrx::{
 use rustc_hash::FxHashMap;
 use segment::Tid;
 use segment::dictionary::TermEntry;
+use segment::docs::{DocCursor, DocTable, PageCursor, PageTable, TidCursor};
 use segment::forward::ForwardRecord;
 use segment::index::{Expanded, Index, MutableIndex, Window};
-use segment::postings::{Postings, PostingsBuilder, PostingsCursor};
+use segment::ordinals::Ordinals;
 use segment::segment::{Lengths, Reader, Term};
 use segment::segment::{Segment, SegmentBuilder};
 use segment::set::{Cursor, Difference, Intersection};
@@ -857,7 +858,7 @@ struct CachedSegment {
     /// Dictionary lookups made through this reader. Segments are immutable,
     /// so an answer stays right for as long as the generation exists.
     terms: TermMemo,
-    dead_run: Run,
+    dead_run: (Run, u32),
     dead: Option<Rc<Vec<u8>>>,
     /// `dead` decoded once per dead run, for scorers that test membership.
     dead_set: DeadSet,
@@ -906,15 +907,24 @@ impl Index for MemoizedSegment {
         Index::expand(&*self.reader, window, filter, limit)
     }
 
-    fn documents(&self) -> segment::Result<PostingsCursor<'_>> {
+    fn documents(&self) -> segment::Result<DocCursor<'_>> {
         self.reader.documents()
+    }
+
+    fn doc_table(&self) -> segment::Result<DocTable<'_>> {
+        self.reader.doc_table()
+    }
+
+    fn page_table(&self) -> segment::Result<PageTable<'_>> {
+        self.reader.page_table()
     }
 
     fn lengths(&self) -> Lengths<'_> {
         self.reader.lengths()
     }
-    fn page_table(&self) -> segment::Result<Option<&[u8]>> {
-        Index::page_table(&*self.reader)
+
+    fn length_class(&self, ordinal: u32) -> segment::Result<u8> {
+        self.reader.length_class(ordinal)
     }
 }
 
@@ -958,7 +968,7 @@ unsafe fn cached_segment(
                     reader: cached.reader.clone(),
                     terms: cached.terms.clone(),
                 },
-                (cached.dead_run == entry.dead)
+                (cached.dead_run == (entry.dead, entry.dead_stamp))
                     .then(|| (cached.dead.clone(), cached.dead_set.clone())),
             )
         })
@@ -994,11 +1004,9 @@ unsafe fn cached_segment(
     });
     let dead_set = Rc::new(match &dead {
         Some(bytes) => codec_in(
-            Postings::parse(bytes).and_then(|p| p.to_vec()),
+            dead_tids(&*segment.reader, bytes),
             &format!("{} dead list", generation_label(entry.generation)),
-        )
-        .into_iter()
-        .collect(),
+        ),
         None => BTreeSet::new(),
     });
     SEGMENT_READERS.with_borrow_mut(|readers| {
@@ -1007,7 +1015,7 @@ unsafe fn cached_segment(
             CachedSegment {
                 reader: segment.reader.clone(),
                 terms: segment.terms.clone(),
-                dead_run: entry.dead,
+                dead_run: (entry.dead, entry.dead_stamp),
                 dead: dead.clone(),
                 dead_set: dead_set.clone(),
             },
@@ -1304,8 +1312,40 @@ pub fn cache_probe() -> CacheProbe {
     }
 }
 
-unsafe fn dead_set(index: pg_sys::Relation, entry: &SegmentEntry) -> BTreeSet<Tid> {
-    unsafe { try_dead_set(index, entry) }.unwrap_or_else(|message| corrupt(message))
+/// The dead list of `segment`, an ordinal stream, as the locations it names.
+fn dead_tids(segment: &dyn Index, dead: &[u8]) -> segment::Result<BTreeSet<Tid>> {
+    let docs = segment.doc_table()?;
+    let mut resolver = docs.resolver();
+    let mut out = BTreeSet::new();
+    for ordinal in Ordinals::parse(dead)?.to_vec()? {
+        out.insert(resolver.tid_at(ordinal)?);
+    }
+    Ok(out)
+}
+
+/// A source's dead list as a cursor over its locations, in heap order.
+pub(crate) fn dead_cursor<'a>(
+    source: &'a dyn Index,
+    dead: &'a [u8],
+) -> segment::Result<TidCursor<'a>> {
+    TidCursor::new(Ordinals::parse(dead)?.cursor()?, source.doc_table()?)
+}
+
+/// A source's dead list a heap page at a time.
+pub(crate) fn dead_pages<'a>(
+    source: &'a dyn Index,
+    dead: &'a [u8],
+) -> segment::Result<PageCursor<'a>> {
+    PageCursor::new(Ordinals::parse(dead)?.cursor()?, source.doc_table()?)
+}
+
+/// Documents of the parsed `segment` dead in `entry`'s dead list.
+unsafe fn dead_set(
+    index: pg_sys::Relation,
+    entry: &SegmentEntry,
+    segment: &Segment<'_>,
+) -> BTreeSet<Tid> {
+    unsafe { try_dead_set(index, entry, segment) }.unwrap_or_else(|message| corrupt(message))
 }
 
 /// The dead list of an entry, read like [`try_read_run`]: without the meta
@@ -1313,26 +1353,14 @@ unsafe fn dead_set(index: pg_sys::Relation, entry: &SegmentEntry) -> BTreeSet<Ti
 unsafe fn try_dead_set(
     index: pg_sys::Relation,
     entry: &SegmentEntry,
+    segment: &Segment<'_>,
 ) -> Result<BTreeSet<Tid>, String> {
     if entry.dead.is_empty() {
         return Ok(BTreeSet::new());
     }
     let what = format!("{} dead list", generation_label(entry.generation));
     let bytes = unsafe { try_read_run(index, entry.dead, &what) }?;
-    Postings::parse(&bytes)
-        .and_then(|p| p.to_vec())
-        .map(|dead| dead.into_iter().collect())
-        .map_err(|error| format!("Stannum {what}: {error}"))
-}
-
-fn encode_dead(dead: &BTreeSet<Tid>) -> Vec<u8> {
-    let mut builder = PostingsBuilder::default();
-    for tid in dead {
-        builder
-            .push(*tid)
-            .expect("set iteration is ordered and unique");
-    }
-    builder.finish()
+    dead_tids(segment, &bytes).map_err(|error| format!("Stannum {what}: {error}"))
 }
 
 // --- Write buffer -------------------------------------------------------------
@@ -1463,10 +1491,34 @@ fn new_entry(meta: &mut Meta, run: Run, map: Run, docs: u32, total_length: u64) 
         run,
         map,
         dead: Run::EMPTY,
+        dead_stamp: 0,
         docs,
         total_length,
         generation,
     }
+}
+
+/// Attaches `run` as `entry`'s dead list under a fresh stamp, and queues
+/// the list it replaces.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn replace_dead_list(index: pg_sys::Relation, meta: &mut Meta, i: usize, run: Run) {
+    let old = attach_dead_list(meta, i, run);
+    unsafe { release(index, meta, old) };
+}
+
+/// Makes `run` entry `i`'s dead list under a fresh stamp; returns the list
+/// it replaces, which the caller retires.
+fn attach_dead_list(meta: &mut Meta, i: usize, run: Run) -> Run {
+    let stamp = meta.next_generation;
+    meta.next_generation = meta
+        .next_generation
+        .checked_add(1)
+        .unwrap_or_else(|| pgrx::error!("Stannum segment generations exhausted; REINDEX required"));
+    let entry = &mut meta.segments[i];
+    entry.dead_stamp = stamp;
+    std::mem::replace(&mut entry.dead, run)
 }
 
 /// Queues every run of a retired directory entry for reclamation.
@@ -1709,7 +1761,9 @@ unsafe fn merge_segments_direct(
     for entry in entries {
         pgrx::check_for_interrupts!();
         let label = generation_label(entry.generation);
-        owned.push(unsafe { (read_run(index, entry.run, &label), dead_set(index, entry)) });
+        let bytes = unsafe { read_run(index, entry.run, &label) };
+        let dead = unsafe { dead_set(index, entry, &codec_in(Segment::parse(&bytes), &label)) };
+        owned.push((bytes, dead));
     }
     let inputs = owned
         .iter()
@@ -1752,7 +1806,7 @@ unsafe fn merge_segments_reconstructed(
         let label = generation_label(entry.generation);
         let bytes = unsafe { read_run(index, entry.run, &label) };
         let segment = codec_in(Segment::parse(&bytes), &label);
-        let dead = unsafe { dead_set(index, entry) };
+        let dead = unsafe { dead_set(index, entry, &segment) };
         for record in codec_in(segment.records(|tid| dead.contains(&tid)), &label) {
             pgrx::check_for_interrupts!();
             codec_in(builder.add_record(&record), &label);
@@ -1964,7 +2018,179 @@ impl Builder {
     /// `index` is the relation passed to `new`.
     pub unsafe fn finish(mut self, index: pg_sys::Relation) {
         if self.tokenizer.is_some() {
-            unsafe { self.flush(index) };
+            unsafe {
+                self.flush(index);
+                let (meta_buffer, mut meta) = read_meta(index, true);
+                compact(index, &mut meta);
+                // No reader holds a view of an index being created, so every
+                // run the build's own merges retired is free at once rather
+                // than a bounded slice per later insert; a built relation is
+                // its live segments and nothing else.
+                let pending = std::mem::take(&mut meta.pending);
+                write_meta(index, &meta_buffer, &meta);
+                drop(meta_buffer);
+                for retired in pending {
+                    pgrx::check_for_interrupts!();
+                    wal::log_reclaim(index, retired.xid);
+                    let (pages, _) =
+                        verify::chain_pages(index, retired.run.first, retired.run.blocks, KIND_RUN);
+                    free_pages(index, &pages, retired.xid);
+                }
+                pack(index);
+            }
+        }
+    }
+}
+
+/// Packs the live runs of a freshly built index into its lowest pages and
+/// truncates the rest. The tier merges of a build retire about as many
+/// pages as they keep, and freed pages are reusable but never returned, so
+/// without this a built relation is two to three times its live size.
+///
+/// # Safety
+/// `index` is being built: no reader holds a view of it and no writer
+/// shares it, so its pages may be moved and its extent cut.
+unsafe fn pack(index: pg_sys::Relation) {
+    unsafe {
+        let (meta_buffer, mut meta) = read_meta(index, true);
+        let nblocks = blocks(index);
+        let referenced = match verify::referenced_pages(index, &meta, nblocks, None) {
+            Ok(referenced) => referenced,
+            Err(message) => corrupt(message),
+        };
+        // Free pages below the extent, lowest first; block 0 is the meta page.
+        let mut free: BTreeSet<u32> = (1..nblocks)
+            .filter(|block| !referenced[*block as usize])
+            .collect();
+        let stamp = pg_sys::ReadNextTransactionId().into_inner();
+        let mut entries = meta.segments.clone();
+        // Highest run first: its pages come free for the runs after it.
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(entries[i].run.first));
+        for i in order {
+            pgrx::check_for_interrupts!();
+            let entry = entries[i];
+            let label = generation_label(entry.generation);
+            let lowest_free = free.iter().next().copied().unwrap_or(nblocks);
+            if entry.run.first < lowest_free && entry.map.first < lowest_free {
+                // Already below every free page: nothing to gain by moving.
+                continue;
+            }
+            let bytes = read_run(index, entry.run, &label);
+            let (run, run_blocks) = write_run_into(index, &bytes, &mut free);
+            drop(bytes);
+            let mut table = Vec::with_capacity(run_blocks.len() * 4);
+            for block in run_blocks {
+                table.extend_from_slice(&block.to_le_bytes());
+            }
+            let (map, _) = write_run_into(index, &table, &mut free);
+            for old in [entry.run, entry.map] {
+                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, KIND_RUN);
+                free_pages(index, &pages, stamp);
+                free.extend(pages);
+            }
+            entries[i].run = run;
+            entries[i].map = map;
+        }
+        meta.segments = entries;
+        write_meta(index, &meta_buffer, &meta);
+        drop(meta_buffer);
+        // Everything past the last referenced page is free: cut it off.
+        let nblocks = blocks(index);
+        let referenced = match verify::referenced_pages(index, &meta, nblocks, None) {
+            Ok(referenced) => referenced,
+            Err(message) => corrupt(message),
+        };
+        let keep = referenced
+            .iter()
+            .rposition(|r| *r)
+            .map_or(1, |last| last as u32 + 1);
+        if keep < nblocks {
+            pg_sys::RelationTruncate(index, keep);
+        }
+        pg_sys::IndexFreeSpaceMapVacuum(index);
+    }
+}
+
+/// Writes a run into the lowest blocks of `free`, ascending, extending the
+/// relation once they run out; returns the run and its blocks in order.
+unsafe fn write_run_into(
+    index: pg_sys::Relation,
+    data: &[u8],
+    free: &mut BTreeSet<u32>,
+) -> (Run, Vec<u32>) {
+    if u32::try_from(data.len()).is_err() {
+        pgrx::error!(
+            "Stannum segment of {} bytes exceeds the 4 GiB a run can hold",
+            data.len()
+        );
+    }
+    unsafe {
+        let chunks: Vec<&[u8]> = if data.is_empty() {
+            vec![&[][..]]
+        } else {
+            data.chunks(CHAIN_CAPACITY).collect()
+        };
+        // Choose the blocks first, holding no page: a run is up to half a
+        // million pages, and a backend may hold only a few hundred locks.
+        let mut blocks: Vec<u32> = Vec::with_capacity(chunks.len());
+        while blocks.len() < chunks.len() {
+            pgrx::check_for_interrupts!();
+            match free.pop_first() {
+                Some(block) => {
+                    let buffer = Buffer::read(index, block, false);
+                    // Unreferenced but not free: leave it to the checker.
+                    let usable = layout::kind(buffer.page()) == Ok(KIND_FREE);
+                    drop(buffer);
+                    if usable {
+                        blocks.push(block);
+                    }
+                }
+                None => {
+                    let buffer = Buffer::allocate(index);
+                    blocks.push(buffer.block());
+                }
+            }
+        }
+        for (i, chunk) in chunks.iter().enumerate() {
+            pgrx::check_for_interrupts!();
+            let next = blocks.get(i + 1).copied().unwrap_or(NONE);
+            let buffer = Buffer::read(index, blocks[i], true);
+            write_page(
+                index,
+                &buffer,
+                true,
+                KIND_RUN,
+                &layout::chain_payload(next, chunk),
+            );
+        }
+        (
+            Run {
+                first: blocks[0],
+                blocks: chunks.len() as u32,
+                bytes: data.len() as u32,
+            },
+            blocks,
+        )
+    }
+}
+
+/// Merges the directory down to the fewest segments the segment byte cap
+/// allows: repeatedly the smallest entries that fit one run together. Every
+/// query pays a dictionary lookup and a stream head per term per segment, so
+/// a build ends with as few segments as the cap permits; tier merges alone
+/// leave the leftovers of every tier behind.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn compact(index: pg_sys::Relation, meta: &mut Meta) {
+    let cap = unsafe { segment_bytes_cap(index) };
+    loop {
+        pgrx::check_for_interrupts!();
+        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        match within_run((0..bytes.len()).collect(), &bytes, cap) {
+            Some(positions) => unsafe { merge(index, meta, positions) },
+            None => break,
         }
     }
 }
@@ -2103,7 +2329,7 @@ pub struct View {
     /// Index identity and generation per immutable source.
     pub keys: Vec<(u64, u32)>,
     /// The dead run each immutable source's dead list was read from.
-    dead_runs: Vec<Run>,
+    dead_runs: Vec<(Run, u32)>,
 }
 
 /// Whether the directory still lists exactly `view`'s segments with the dead
@@ -2126,7 +2352,7 @@ pub unsafe fn view_is_current(index_oid: pg_sys::Oid, view: &View) -> bool {
                 .all(|(entry, ((identity, generation), dead))| {
                     *identity == meta.identity
                         && entry.generation == *generation
-                        && entry.dead == *dead
+                        && (entry.dead, entry.dead_stamp) == *dead
                 })
     }
 }
@@ -2193,7 +2419,11 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 .iter()
                 .map(|entry| (meta.identity, entry.generation))
                 .collect();
-            let dead_runs = meta.segments.iter().map(|entry| entry.dead).collect();
+            let dead_runs = meta
+                .segments
+                .iter()
+                .map(|entry| (entry.dead, entry.dead_stamp))
+                .collect();
             trim_reader_cache(meta.identity, &meta);
             for entry in &meta.segments {
                 pgrx::check_for_interrupts!();
@@ -2276,7 +2506,7 @@ pub unsafe fn scan(
             };
             if let Some(dead_bytes) = dead_bytes {
                 let dead = codec_in(
-                    Postings::parse(dead_bytes).and_then(|p| p.cursor()),
+                    dead_cursor(&**segment, dead_bytes),
                     &format!("{label} dead list"),
                 );
                 cursor = Box::new(codec_in(Difference::new(cursor, dead), label));
@@ -2404,8 +2634,8 @@ unsafe fn discard_run(index: pg_sys::Relation, run: Run) {
 }
 
 /// What one pass over a segment found: its dead set, whether the set grew,
-/// and the live and newly dead counts.
-type DeadScan = (BTreeSet<Tid>, bool, u64, u64);
+/// the live and newly dead counts, and the dead list encoded for the entry.
+type DeadScan = (BTreeSet<Tid>, bool, u64, u64, Vec<u8>);
 
 /// Compares every document of `entry` with VACUUM's callback. Unlocked.
 unsafe fn scan_dead(
@@ -2417,17 +2647,20 @@ unsafe fn scan_dead(
     let label = generation_label(entry.generation);
     let bytes = unsafe { try_read_run(index, entry.run, &label) }?;
     let segment = Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
-    let mut dead = unsafe { try_dead_set(index, entry) }?;
+    let mut dead = unsafe { try_dead_set(index, entry, &segment) }?;
     let before = dead.len();
     let (mut live, mut removed) = (0u64, 0u64);
+    let mut ordinals = Vec::with_capacity(dead.len());
     let mut documents = segment
         .documents()
         .map_err(|error| format!("Stannum {label}: {error}"))?;
     while let Some(tid) = documents.current() {
         if dead.contains(&tid) {
             // Already dead: nothing to report.
+            ordinals.push(documents.ordinal());
         } else if is_dead(tid) {
             dead.insert(tid);
+            ordinals.push(documents.ordinal());
             removed += 1;
         } else {
             live += 1;
@@ -2437,7 +2670,13 @@ unsafe fn scan_dead(
             .map_err(|error| format!("Stannum {label}: {error}"))?;
     }
     let grew = dead.len() != before;
-    Ok((dead, grew, live, removed))
+    Ok((
+        dead,
+        grew,
+        live,
+        removed,
+        segment::ordinals::encode(&ordinals),
+    ))
 }
 
 /// Records dead tuples: per segment as a dead list, and by rewriting the write
@@ -2474,10 +2713,10 @@ pub unsafe fn bulk_delete(
             .filter(|entry| !handled.contains(&entry.generation))
         {
             let result = unsafe { scan_dead(index, entry, &mut is_dead) };
-            if let Some((dead, changed, live, removed)) =
+            if let Some((_, changed, live, removed, encoded)) =
                 unsafe { unlocked(index, identity, entry, result) }
             {
-                let run = changed.then(|| unsafe { write_run(index, &encode_dead(&dead)) });
+                let run = changed.then(|| unsafe { write_run(index, &encoded) });
                 scans.push((*entry, run, live, removed));
             }
         }
@@ -2492,8 +2731,7 @@ pub unsafe fn bulk_delete(
             match position {
                 Some(position) => {
                     if let Some(run) = run {
-                        let old = std::mem::replace(&mut meta.segments[position].dead, run);
-                        unsafe { release(index, &mut meta, old) };
+                        unsafe { replace_dead_list(index, &mut meta, position, run) };
                         changed = true;
                     }
                     live += scanned_live;
@@ -2512,13 +2750,12 @@ pub unsafe fn bulk_delete(
             // inserts folded or merged meanwhile.
             for i in remaining {
                 let entry = meta.segments[i];
-                let (dead, grew, scanned_live, scanned_removed) =
+                let (_, grew, scanned_live, scanned_removed, encoded) =
                     unsafe { scan_dead(index, &entry, &mut is_dead) }
                         .unwrap_or_else(|message| corrupt(message));
                 if grew {
-                    let run = unsafe { write_run(index, &encode_dead(&dead)) };
-                    let old = std::mem::replace(&mut meta.segments[i].dead, run);
-                    unsafe { release(index, &mut meta, old) };
+                    let run = unsafe { write_run(index, &encoded) };
+                    unsafe { replace_dead_list(index, &mut meta, i, run) };
                     changed = true;
                 }
                 live += scanned_live;
@@ -2621,8 +2858,8 @@ unsafe fn mostly_dead(
         }
         let what = format!("{} dead list", generation_label(entry.generation));
         let count = unsafe { try_read_run(index, entry.dead, &what) }.and_then(|bytes| {
-            Postings::parse(&bytes)
-                .map(|postings| postings.count())
+            Ordinals::parse(&bytes)
+                .map(|dead| dead.count())
                 .map_err(|error| format!("Stannum {what}: {error}"))
         });
         if let Some(count) = unsafe { unlocked(index, meta.identity, entry, count) }
@@ -2661,8 +2898,12 @@ unsafe fn maintenance_merge_blob(
     for entry in inputs {
         pgrx::check_for_interrupts!();
         let label = generation_label(entry.generation);
-        let read = unsafe { try_read_run(index, entry.run, &label) }
-            .and_then(|bytes| unsafe { try_dead_set(index, entry) }.map(|dead| (bytes, dead)));
+        let read = unsafe { try_read_run(index, entry.run, &label) }.and_then(|bytes| {
+            let segment =
+                Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
+            let dead = unsafe { try_dead_set(index, entry, &segment) }?;
+            Ok((bytes, dead))
+        });
         owned.push(unsafe { unlocked(index, identity, entry, read) }?);
     }
     race_point("maintenance:loaded");
@@ -2713,7 +2954,7 @@ unsafe fn maintenance_reconstruct_blob(
         let result = unsafe { try_read_run(index, entry.run, &label) }.and_then(|bytes| {
             let segment =
                 Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
-            let dead = unsafe { try_dead_set(index, entry) }?;
+            let dead = unsafe { try_dead_set(index, entry, &segment) }?;
             let records = segment
                 .records(|tid| dead.contains(&tid))
                 .map_err(|error| format!("Stannum {label}: {error}"))?;
@@ -2949,6 +3190,57 @@ pub mod testing {
         RACE_HOOK.with_borrow_mut(|slot| *slot = hook);
     }
 
+    /// Replaces segment `i`'s dead list with `dead`, freeing the old list's
+    /// pages at once rather than queueing them: the next list of the same
+    /// size then lands in the same pages, as a reader's cache must notice.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index with no concurrent readers.
+    pub unsafe fn set_dead_list(index: pg_sys::Relation, i: usize, dead: &BTreeSet<Tid>) -> Run {
+        unsafe {
+            let (guard, mut meta) = read_meta(index, true);
+            let entry = meta.segments[i];
+            let label = generation_label(entry.generation);
+            let bytes = read_run(index, entry.run, &label);
+            let segment = codec_in(Segment::parse(&bytes), &label);
+            let docs = codec_in(segment.doc_table(), &label);
+            let ordinals: Vec<u32> = dead
+                .iter()
+                .filter_map(|tid| codec_in(docs.ordinal_of(*tid), &label))
+                .collect();
+            let run = write_run(index, &segment::ordinals::encode(&ordinals));
+            let old = attach_dead_list(&mut meta, i, run);
+            if !old.is_empty() {
+                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, KIND_RUN);
+                let stamp = pg_sys::ReadNextTransactionId().into_inner();
+                free_pages(index, &pages, stamp);
+                // Searches read the map's upper levels, which only a vacuum
+                // of the map refreshes, as VACUUM does after reclaiming.
+                pg_sys::IndexFreeSpaceMapVacuum(index);
+            }
+            write_meta(index, &guard, &meta);
+            run
+        }
+    }
+
+    /// The pages of every segment's run and page map, in chain order.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn segment_pages(index: pg_sys::Relation) -> Vec<(Vec<u32>, Vec<u32>)> {
+        unsafe {
+            let (_, meta) = read_meta(index, false);
+            meta.segments
+                .iter()
+                .map(|entry| {
+                    let chain =
+                        |run: Run| verify::chain_pages(index, run.first, run.blocks, KIND_RUN).0;
+                    (chain(entry.run), chain(entry.map))
+                })
+                .collect()
+        }
+    }
+
     /// Writes a run nothing references, as a crash between writing a run and
     /// publishing it leaves behind. Returns its pages.
     ///
@@ -3059,7 +3351,7 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
             } else {
                 let what = format!("{} dead list", generation_label(entry.generation));
                 let bytes = read_run(index, entry.dead, &what);
-                i64::from(codec_in(Postings::parse(&bytes), &what).count())
+                i64::from(codec_in(Ordinals::parse(&bytes), &what).count())
             };
             rows.push(SegmentRow {
                 ordinal: ordinal as i64,

@@ -101,7 +101,7 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::direct_merge_poc::fixture;
+    use crate::merge::tests::fixture;
     use std::collections::BTreeSet;
 
     fn limits() -> MergeLimits {
@@ -183,16 +183,15 @@ mod tests {
     }
 
     #[test]
-    fn mixed_legacy_inputs_and_dead_tuple_reuse_match() {
-        use crate::segment::Format;
+    fn dead_tuple_reuse_across_inputs_matches() {
         let tid = crate::Tid::new(0, 1).unwrap();
         let mut blobs = Vec::new();
-        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
+        for n in 0..3 {
             let mut builder = SegmentBuilder::default();
             builder
-                .add_document(tid, [("needle", 1), ("common", 2)])
+                .add_document(tid, [("needle", 1), ("common", 2), (["a", "b", "c"][n], 3)])
                 .unwrap();
-            blobs.push(builder.finish_as(format));
+            blobs.push(builder.finish());
         }
         let dead = [
             BTreeSet::from([tid]),

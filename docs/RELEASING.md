@@ -56,14 +56,12 @@ against a database and representative indexes created by the previous tagged
 
 | Extension | Page signature/version read | Segment signatures read | Formats written |
 | --- | --- | --- | --- |
-| 0.1.0 | LDP2, VERSION 2 only | LSG1, LSG2, LSG3, LSG4 and LSG5 | LDP2 VERSION 2; LSG5 |
+| 0.1.0 | LDP2, VERSION 2 only | STN3 | LDP2 VERSION 2; STN3 |
 
 `VERSION` is the special-area byte on every page, including the meta page.
 The write-buffer's `version` counter is a cache invalidation generation, not a
-format version. LSG2 remains readable with pruning: it carries the same score
-bounds as LSG3 in a larger layout. LSG1 remains readable, with pruning
-disabled because it lacks block bounds. REINDEX writes the current page and
-segment formats.
+format version. The `LSG1` to `LSG5`, `STN1` and `STN2` segment formats of
+earlier development builds are not read; REINDEX writes the current page and segment formats.
 
 Readers validate page versions before decoding and reject unknown segment
 signatures. A future writer must bump the page version or segment signature
@@ -74,8 +72,4 @@ segment generation and REINDEX guidance. Do not REINDEX with an older binary
 as a downgrade procedure: restore the supported binary or rebuild from the
 heap in a separately validated migration. Never overwrite a released signature
 with a different encoding. pg_tests exercise future-version rejection and
-REINDEX to the current format; segment tests read an LSG2 fixture captured
-from that format's writer (`segment/tests/fixtures/lsg2.segment`) and keep
-LSG1 and LSG2 writers for property tests over every format. Capture a fixture
-of the current format with `cargo test -p segment write_current_fixture --
---ignored` before changing the writer.
+REINDEX to the current format.

@@ -121,7 +121,7 @@ python3 postgres/tests/ranked_fuzz.py --wide --seed 104 --seconds 30 \
 ```
 
 The existing quiescent oracle capture and subsequent concurrent writer churn
-remain unchanged. An extra EXPLAIN ANALYZE checks block-max pruning while the
+remain unchanged. An extra EXPLAIN ANALYZE checks ordinal pruning while the
 first cursor is open. This also exercises another statement's scorer without
 allowing it to change the retained cursor's scores. Reports count exercised
 widths; missing any of the four widths fails the run rather than silently passing

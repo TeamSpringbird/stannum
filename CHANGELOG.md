@@ -18,16 +18,33 @@
   budget; only the 128-entry on-disk bound forces an unbudgeted merge.
 - VACUUM reclaims pages a crash left unreferenced (`page N` warnings of
   `stannum.verify_index`) instead of requiring REINDEX.
-- Segment format `LSG4`: every term also stores its documents as ordinals
-  into the segment's document table, and `COUNT(*)` over Boolean term queries
-  folds those streams a chunk at a time instead of visiting each match. The
-  302 published Wikipedia count queries sum to 39 ms instead of 3,767 ms in
-  the replay harness. Earlier segments remain readable and are counted the
-  old way; `REINDEX` rewrites. `stannum.count_fold = off` disables the path.
+- Segment format `STN3`: a term's documents are stored once, as ordinals
+  into the segment's document table with each member's term-frequency
+  bucket beside it and a score bound per chunk, so scoring never reads
+  positions; the positions stream holds positions only; and the document
+  table maps ordinals to heap locations and back through the page table and
+  a two-byte offset per document. A one-byte length class per document lets
+  a ranked walk bound a candidate before reading its length, admitted
+  candidates are checked against the visibility map before the heap, and an
+  index build ends by compacting its directory under the segment byte cap. `COUNT(*)` over Boolean term
+  queries folds those streams a chunk at a time instead of visiting each
+  match (the 302 published Wikipedia count queries sum to 39 ms instead of
+  3,767 ms in the replay harness); ranked scans prune over the same streams;
+  dead lists are ordinal streams. Earlier `LSG` segments, which stored the
+  document set a second time as tuple-location postings, are not read;
+  `REINDEX` rewrites. `stannum.count_fold = off` disables the count path.
 - Counts read the visibility map once and start over if VACUUM published a
   dead list meanwhile; earlier builds could count a tuple VACUUM had removed
   from a page it then marked all-visible.
 - Counts check the matches of a heap page under one buffer lock.
+- A built index is packed into its lowest pages and truncated; freed pages
+  were reusable but never returned, and a build retires about as many pages
+  as it keeps.
+- Each dead list carries a stamp, so a reader's cached copy is not served
+  once VACUUM replaces the list in the same pages at the same size.
+- Ranked disjunctions skip dead-listed documents in every chunk form, and
+  per-row scores no longer depend on the order the executor hands rows over
+  in (a join scores rows in its own order).
 - Position payloads are read a span at a time from paged segments: the header
   and skip table, then entry-aligned spans of 64 skip slots as a cursor visits
   them. Whole extents were copied per term and query, which for frequent terms

@@ -15,9 +15,8 @@
 //! stream := count varint, block_count varint, index_len varint, index, blocks
 //! index  := (block_offset varint, first_len varint, first_bytes)* block_count
 //! entry  := shared varint, suffix_len varint, suffix, df_bucket varint,
-//!           postings_gap varint, postings_len varint,
-//!           payload_gap varint, payload_len varint,
-//!           (ordinals_gap varint, ordinals_len varint) from `LSG4` on
+//!           ordinals_gap varint, ordinals_len varint,
+//!           payload_gap varint, payload_len varint
 //! df_bucket := df << 4 | max_tf_bucket
 //! gap    := zigzag(offset - previous_end): the extent's distance from the end
 //!           of the previous entry's extent in the same area, 0 at a block start
@@ -25,12 +24,9 @@
 //!
 //! A segment builder lays each term's streams out back to back in dictionary
 //! order, so a gap is normally zero: one byte in place of an absolute offset
-//! into an area of many megabytes. `LSG1` and `LSG2` dictionaries hold, in
-//! place of `df_bucket` and the gaps, `df varint, max_tf_bucket u8` and the
-//! absolute offsets; [`Dictionary::with_format`] reads them.
+//! into an area of many megabytes.
 
 use crate::reader::Reader;
-use crate::segment::Format;
 use crate::{Error, Result, varint};
 
 pub const BLOCK_TERMS: usize = 64;
@@ -43,7 +39,7 @@ fn unzigzag(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
-/// Location of a byte range in a segment's postings, payload or ordinals area.
+/// Location of a byte range in a segment's ordinals or payload area.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Extent {
     pub offset: u64,
@@ -56,47 +52,24 @@ pub struct TermEntry {
     pub df: u32,
     /// Largest term-frequency bucket over those documents, for score bounds.
     pub max_tf_bucket: u8,
-    pub postings: Extent,
-    pub payload: Extent,
-    /// The term's ordinal stream; empty before [`Format::Lsg4`].
+    /// The term's documents as ordinals, with their score bounds.
     pub ordinals: Extent,
+    /// The term's frequency buckets and positions, by rank in the stream.
+    pub payload: Extent,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct DictionaryBuilder {
-    format: Format,
     count: usize,
     index: Vec<u8>,
     blocks: Vec<u8>,
     last: Vec<u8>,
     /// Where the previous entry's extents ended, for the gaps.
-    postings_end: u64,
     payload_end: u64,
     ordinals_end: u64,
 }
 
-impl Default for DictionaryBuilder {
-    fn default() -> Self {
-        Self::with_format(Format::CURRENT)
-    }
-}
-
 impl DictionaryBuilder {
-    /// A builder writing the entry layout of `format`, for compatibility
-    /// tests; [`Default`] writes the current one.
-    pub fn with_format(format: Format) -> Self {
-        Self {
-            format,
-            count: 0,
-            index: Vec::new(),
-            blocks: Vec::new(),
-            last: Vec::new(),
-            postings_end: 0,
-            payload_end: 0,
-            ordinals_end: 0,
-        }
-    }
-
     /// Terms must arrive in strictly increasing byte order.
     pub fn push(&mut self, term: &str, entry: TermEntry) -> Result<()> {
         if term.is_empty() {
@@ -105,14 +78,13 @@ impl DictionaryBuilder {
         if self.count > 0 && self.last.as_slice() >= term.as_bytes() {
             return Err(Error::Unordered);
         }
-        if entry.max_tf_bucket > crate::payload::MAX_TF_BUCKET {
+        if entry.max_tf_bucket > crate::tf_bucket::BUCKET_MAX {
             return Err(Error::InvalidTfBucket);
         }
         let shared = if self.count.is_multiple_of(BLOCK_TERMS) {
             varint::put(&mut self.index, self.blocks.len() as u64);
             varint::put(&mut self.index, term.len() as u64);
             self.index.extend_from_slice(term.as_bytes());
-            self.postings_end = 0;
             self.payload_end = 0;
             self.ordinals_end = 0;
             0
@@ -123,48 +95,25 @@ impl DictionaryBuilder {
         varint::put(&mut self.blocks, shared as u64);
         varint::put(&mut self.blocks, suffix.len() as u64);
         self.blocks.extend_from_slice(suffix);
-        match self.format {
-            Format::Lsg1 | Format::Lsg2 => {
-                varint::put(&mut self.blocks, u64::from(entry.df));
-                self.blocks.push(entry.max_tf_bucket);
-                varint::put(&mut self.blocks, entry.postings.offset);
-                varint::put(&mut self.blocks, u64::from(entry.postings.len));
-                varint::put(&mut self.blocks, entry.payload.offset);
-                varint::put(&mut self.blocks, u64::from(entry.payload.len));
-            }
-            Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => {
-                varint::put(
-                    &mut self.blocks,
-                    u64::from(entry.df) << 4 | u64::from(entry.max_tf_bucket),
-                );
-                let gap = |offset: u64, end: u64| zigzag(offset.wrapping_sub(end) as i64);
-                varint::put(
-                    &mut self.blocks,
-                    gap(entry.postings.offset, self.postings_end),
-                );
-                varint::put(&mut self.blocks, u64::from(entry.postings.len));
-                varint::put(
-                    &mut self.blocks,
-                    gap(entry.payload.offset, self.payload_end),
-                );
-                varint::put(&mut self.blocks, u64::from(entry.payload.len));
-                if self.format.has_ordinals() {
-                    varint::put(
-                        &mut self.blocks,
-                        gap(entry.ordinals.offset, self.ordinals_end),
-                    );
-                    varint::put(&mut self.blocks, u64::from(entry.ordinals.len));
-                }
-            }
-        }
+        varint::put(
+            &mut self.blocks,
+            u64::from(entry.df) << 4 | u64::from(entry.max_tf_bucket),
+        );
+        let gap = |offset: u64, end: u64| zigzag(offset.wrapping_sub(end) as i64);
+        varint::put(
+            &mut self.blocks,
+            gap(entry.ordinals.offset, self.ordinals_end),
+        );
+        varint::put(&mut self.blocks, u64::from(entry.ordinals.len));
+        varint::put(
+            &mut self.blocks,
+            gap(entry.payload.offset, self.payload_end),
+        );
+        varint::put(&mut self.blocks, u64::from(entry.payload.len));
         self.ordinals_end = entry
             .ordinals
             .offset
             .wrapping_add(u64::from(entry.ordinals.len));
-        self.postings_end = entry
-            .postings
-            .offset
-            .wrapping_add(u64::from(entry.postings.len));
         self.payload_end = entry
             .payload
             .offset
@@ -379,26 +328,11 @@ impl<'a> Blocks<'a> {
 pub struct Dictionary<'a> {
     index: &'a DictionaryIndex<'a>,
     blocks: Blocks<'a>,
-    format: Format,
 }
 
 impl<'a> Dictionary<'a> {
-    /// A view over blocks in the current entry layout.
     pub const fn new(index: &'a DictionaryIndex<'a>, blocks: Blocks<'a>) -> Self {
-        Self::with_format(index, blocks, Format::CURRENT)
-    }
-
-    /// A view over blocks in the entry layout of `format`.
-    pub const fn with_format(
-        index: &'a DictionaryIndex<'a>,
-        blocks: Blocks<'a>,
-        format: Format,
-    ) -> Self {
-        Self {
-            index,
-            blocks,
-            format,
-        }
+        Self { index, blocks }
     }
 
     pub const fn len(&self) -> usize {
@@ -453,7 +387,6 @@ impl<'a> Dictionary<'a> {
             reader: Reader::new(self.blocks.block(range)?),
             remaining_in_block: self.index.block_terms(block),
             term: Vec::new(),
-            postings_end: 0,
             payload_end: 0,
             ordinals_end: 0,
         })
@@ -559,7 +492,6 @@ struct Walker<'a> {
     remaining_in_block: usize,
     term: Vec<u8>,
     /// Where the previous entry's extents ended, for the gaps.
-    postings_end: u64,
     payload_end: u64,
     ordinals_end: u64,
 }
@@ -578,63 +510,34 @@ impl<'a> Walker<'a> {
         if self.term.is_empty() || (!previous.is_empty() && previous >= self.term) {
             return Err(Error::Corrupt("dictionary term order"));
         }
-        let mut ordinals = Extent::default();
-        let (df, max_tf_bucket, postings, payload) = match self.dictionary.format {
-            Format::Lsg1 | Format::Lsg2 => {
-                let df = self.reader.varint_u32()?;
-                let max_tf_bucket = self.reader.u8()?;
-                let postings = Extent {
-                    offset: self.reader.varint()?,
-                    len: self.reader.varint_u32()?,
-                };
-                let payload = Extent {
-                    offset: self.reader.varint()?,
-                    len: self.reader.varint_u32()?,
-                };
-                (df, max_tf_bucket, postings, payload)
-            }
-            Format::Lsg3 | Format::Lsg4 | Format::Lsg5 => {
-                let df_bucket = self.reader.varint()?;
-                let df =
-                    u32::try_from(df_bucket >> 4).map_err(|_| Error::Corrupt("dictionary df"))?;
-                let max_tf_bucket = (df_bucket & 0xf) as u8;
-                let offset = |end: u64, gap: i64| {
-                    end.checked_add_signed(gap)
-                        .ok_or(Error::Corrupt("dictionary extent gap"))
-                };
-                let postings_gap = unzigzag(self.reader.varint()?);
-                let postings = Extent {
-                    offset: offset(self.postings_end, postings_gap)?,
-                    len: self.reader.varint_u32()?,
-                };
-                let payload_gap = unzigzag(self.reader.varint()?);
-                let payload = Extent {
-                    offset: offset(self.payload_end, payload_gap)?,
-                    len: self.reader.varint_u32()?,
-                };
-                if self.dictionary.format.has_ordinals() {
-                    let ordinals_gap = unzigzag(self.reader.varint()?);
-                    ordinals = Extent {
-                        offset: offset(self.ordinals_end, ordinals_gap)?,
-                        len: self.reader.varint_u32()?,
-                    };
-                }
-                (df, max_tf_bucket, postings, payload)
-            }
+        let df_bucket = self.reader.varint()?;
+        let df = u32::try_from(df_bucket >> 4).map_err(|_| Error::Corrupt("dictionary df"))?;
+        let max_tf_bucket = (df_bucket & 0xf) as u8;
+        let offset = |end: u64, gap: i64| {
+            end.checked_add_signed(gap)
+                .ok_or(Error::Corrupt("dictionary extent gap"))
         };
-        if max_tf_bucket > crate::payload::MAX_TF_BUCKET {
+        let ordinals_gap = unzigzag(self.reader.varint()?);
+        let ordinals = Extent {
+            offset: offset(self.ordinals_end, ordinals_gap)?,
+            len: self.reader.varint_u32()?,
+        };
+        let payload_gap = unzigzag(self.reader.varint()?);
+        let payload = Extent {
+            offset: offset(self.payload_end, payload_gap)?,
+            len: self.reader.varint_u32()?,
+        };
+        if max_tf_bucket > crate::tf_bucket::BUCKET_MAX {
             return Err(Error::Corrupt("dictionary bucket"));
         }
-        self.postings_end = postings.offset.wrapping_add(u64::from(postings.len));
         self.payload_end = payload.offset.wrapping_add(u64::from(payload.len));
         self.ordinals_end = ordinals.offset.wrapping_add(u64::from(ordinals.len));
         self.remaining_in_block -= 1;
         Ok(TermEntry {
             df,
             max_tf_bucket,
-            postings,
-            payload,
             ordinals,
+            payload,
         })
     }
 
@@ -694,26 +597,17 @@ impl Iterator for Iter<'_> {
 pub struct OwnedDictionary<'a> {
     index: DictionaryIndex<'a>,
     blocks: Blocks<'a>,
-    format: Format,
 }
 
 impl<'a> OwnedDictionary<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        Self::parse_format(bytes, Format::CURRENT)
-    }
-
-    pub fn parse_format(bytes: &'a [u8], format: Format) -> Result<Self> {
         let index = DictionaryIndex::parse(bytes)?;
         let blocks = Blocks::Slice(&bytes[index.header_len..]);
-        Ok(Self {
-            index,
-            blocks,
-            format,
-        })
+        Ok(Self { index, blocks })
     }
 
     pub fn view(&self) -> Dictionary<'_> {
-        Dictionary::with_format(&self.index, self.blocks, self.format)
+        Dictionary::new(&self.index, self.blocks)
     }
 }
 
@@ -725,17 +619,13 @@ mod tests {
         TermEntry {
             df: i,
             max_tf_bucket: (i % 16) as u8,
-            postings: Extent {
-                offset: u64::from(i) * 100,
-                len: i * 3,
+            ordinals: Extent {
+                offset: u64::from(i) * 10,
+                len: i * 2,
             },
             payload: Extent {
                 offset: u64::from(i) * 1000,
                 len: i * 7,
-            },
-            ordinals: Extent {
-                offset: u64::from(i) * 10,
-                len: i * 2,
             },
         }
     }
@@ -895,50 +785,38 @@ mod tests {
     }
 
     #[test]
-    fn earlier_entry_layouts_are_still_read_and_the_current_one_is_smaller() {
+    fn gaps_round_trip_in_any_order() {
         // Extents laid out back to back, as a segment builder writes them.
         let mut entries = Vec::new();
-        let (mut postings_at, mut payload_at) = (1_000_000u64, 40_000_000u64);
+        let (mut ordinals_at, mut payload_at) = (1_000_000u64, 40_000_000u64);
         for i in 0..300u32 {
             let entry = TermEntry {
                 df: 1 + i % 5,
                 max_tf_bucket: (i % 16) as u8,
-                postings: Extent {
-                    offset: postings_at,
+                ordinals: Extent {
+                    offset: ordinals_at,
                     len: 3 + i,
                 },
                 payload: Extent {
                     offset: payload_at,
                     len: 10 + i,
                 },
-                ordinals: Default::default(),
             };
-            postings_at += u64::from(entry.postings.len);
+            ordinals_at += u64::from(entry.ordinals.len);
             payload_at += u64::from(entry.payload.len);
             entries.push((format!("term{i:04}"), entry));
         }
-        let mut sizes = Vec::new();
-        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
-            let mut builder = DictionaryBuilder::with_format(format);
-            for (term, entry) in &entries {
-                builder.push(term, *entry).unwrap();
-            }
-            let bytes = builder.finish();
-            let owned = OwnedDictionary::parse_format(&bytes, format).unwrap();
-            let all: Vec<(String, TermEntry)> = owned.view().iter().collect::<Result<_>>().unwrap();
-            assert_eq!(all, entries, "{format}");
-            assert_eq!(
-                owned.view().get("term0299").unwrap(),
-                Some(entries[299].1),
-                "{format}"
-            );
-            sizes.push(bytes.len());
+        let mut builder = DictionaryBuilder::default();
+        for (term, entry) in &entries {
+            builder.push(term, *entry).unwrap();
         }
-        // LSG1 and LSG2 share the entry layout. Absolute offsets of three
-        // and four bytes become one-byte gaps (except at block starts) and
-        // df shares a byte with the bucket.
-        assert_eq!(sizes[0], sizes[1]);
-        assert!(sizes[2] + 300 * 5 <= sizes[1], "{sizes:?}");
+        let bytes = builder.finish();
+        let owned = OwnedDictionary::parse(&bytes).unwrap();
+        let all: Vec<(String, TermEntry)> = owned.view().iter().collect::<Result<_>>().unwrap();
+        assert_eq!(all, entries);
+        assert_eq!(owned.view().get("term0299").unwrap(), Some(entries[299].1));
+        // Back-to-back extents cost one byte each for the gap.
+        assert!(bytes.len() < 300 * 20, "{}", bytes.len());
         // Gaps are signed, so extents in any order still round-trip.
         let mut builder = DictionaryBuilder::default();
         let backwards: Vec<(String, TermEntry)> = entries

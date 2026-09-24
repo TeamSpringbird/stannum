@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use rustc_hash::FxHashSet;
-use segment::postings::BlockBound;
+use segment::bound::BlockBound;
 use thiserror::Error;
 
 use crate::tf_bucket::{BUCKET_COUNT, TfBucket};
@@ -631,14 +631,13 @@ mod tests {
             .chain((300..5_000).step_by(37))
             .chain([65_535, 1 << 20, u32::MAX / 2, u32::MAX - 1])
             .collect();
-        let last = segment::Tid::new(1, 1).unwrap();
         for scorer in &scorers {
             // Blocks holding one bucket at one shortest length: every longer
             // document with that bucket scores at most the bound, which the
             // shortest attains.
             for bucket in 0..BUCKET_COUNT as u8 {
                 for &min_len in &lengths {
-                    let block = BlockBound::over(&[(bucket, min_len)], last);
+                    let block = BlockBound::over(&[(bucket, min_len)]);
                     let bound = scorer.bound(&block);
                     let bucket = TfBucket::new(bucket).unwrap();
                     assert!(bound >= 0.0);
@@ -658,7 +657,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, len)| ((i % BUCKET_COUNT) as u8, *len))
                 .collect();
-            let block = BlockBound::over(&postings, last);
+            let block = BlockBound::over(&postings);
             let bound = scorer.bound(&block);
             for (bucket, len) in &postings {
                 let score = scorer.score_bucket(TfBucket::new(*bucket).unwrap(), *len);
