@@ -434,9 +434,21 @@ retires it; rebuild once the new format settles.
 ## Also outstanding
 
 - The published write workload at 150 million rows has not completed: on
-  STN3 one update in 145,000 reached the driver's 20 s deadline (the old
-  format: 37). The stall's cause is unmeasured; a rerun with a
-  slow-statement watcher was in flight when this was written.
+  STN3 one update in about 220,000 reaches the driver's 20 s deadline (the
+  old format: 37), and its zero-error threshold fails the run. Updates
+  themselves take 1.1 ms at the median. A watcher on the host saw the
+  stall: the update sits 20 to 30 s in data-file reads holding the index
+  meta page exclusively, and every reader queues behind it on the buffer
+  lock. Releasing the meta page before readers load (`1406e5a`) did not
+  change it, so the holder is the writer's own work under the lock. Two
+  walks in `storage/mod.rs` are unbounded there: `drain_pending`, which
+  frees every removable retired run once the pending list is full
+  (`MAX_PENDING`, now 48), and `prepend_chain`, which walks a whole
+  retired run to join chains when the list is full. A merge of a large
+  segment retires millions of pages. Bound both to a page budget, like
+  `reclaim_pending`, and rerun the workload from the cached snapshot with
+  an updater inside the container (the probe here issued updates through
+  `docker exec` at 15 a second, too slow to fill the list).
 - The article's four charts carry full-corpus Stannum runs for the mixed and
   conjunction-phrase workloads and prefix runs for the write workload. The count
   chart is from an older build. The importer replaces the series per chart, so
