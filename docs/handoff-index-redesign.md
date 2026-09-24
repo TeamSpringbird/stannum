@@ -445,10 +445,16 @@ retires it; rebuild once the new format settles.
   frees every removable retired run once the pending list is full
   (`MAX_PENDING`, now 48), and `prepend_chain`, which walks a whole
   retired run to join chains when the list is full. A merge of a large
-  segment retires millions of pages. Bound both to a page budget, like
-  `reclaim_pending`, and rerun the workload from the cached snapshot with
-  an updater inside the container (the probe here issued updates through
-  `docker exec` at 15 a second, too slow to fill the list).
+  segment retires millions of pages. Fixed in `36355bc`: a run records
+  its last page, so the join writes one page, and the locked drain frees
+  at most `stannum.reclaim_pages` pages per call. Locally, 180 inserts of
+  2,000 rows with the pending list pinned by a repeatable-read snapshot
+  and then released ran at p50 80 to 110 ms with a worst of 1 to 2 s, all
+  of it the merge in the same statement, and `verify_index` was clean
+  before and after VACUUM. The full-scale proof is a rerun of the write
+  workload from the cached snapshot with an updater inside the container
+  (the probe here issued updates through `docker exec` at 15 a second,
+  too slow to fill the list).
 - The article's four charts carry full-corpus Stannum runs for the mixed and
   conjunction-phrase workloads and prefix runs for the write workload. The count
   chart is from an older build. The importer replaces the series per chart, so
