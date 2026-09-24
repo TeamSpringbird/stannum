@@ -451,10 +451,21 @@ retires it; rebuild once the new format settles.
   2,000 rows with the pending list pinned by a repeatable-read snapshot
   and then released ran at p50 80 to 110 ms with a worst of 1 to 2 s, all
   of it the merge in the same statement, and `verify_index` was clean
-  before and after VACUUM. The full-scale proof is a rerun of the write
-  workload from the cached snapshot with an updater inside the container
-  (the probe here issued updates through `docker exec` at 15 a second,
-  too slow to fill the list).
+  before and after VACUUM. That fix was necessary but not the stall the
+  mock reproduced: with it, the local update workload still stalled once
+  for 9.5 to 11 s, and a backtrace of the lock holder put it in
+  `Buffer::allocate`, walking stale free-space-map entries page by page
+  under the meta lock. The pack at the end of a build reused pages from
+  its own free set without marking them used in the map, so a packed
+  index started with an entry per reused page (millions at 150 million
+  rows). Fixed in `f099667`, with the packing test asserting an empty map
+  after a build. On the 15 million row mock the update workload then ran
+  92,723 updates at p50 2.1 ms with a worst of 967 ms (from 9.5 to 11 s)
+  and a worst query of 306 ms (from 9.6 to 11 s), zero errors, post-update
+  checks clean. The full-scale proof is a rerun of the write workload
+  from a database built by `f099667` or later; the cached snapshot was
+  packed by the old code and carries the stale map, so it needs a rebuild
+  or a `VACUUM` of the index's map first.
 - The article's four charts carry full-corpus Stannum runs for the mixed and
   conjunction-phrase workloads and prefix runs for the write workload. The count
   chart is from an older build. The importer replaces the series per chart, so
