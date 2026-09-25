@@ -1751,6 +1751,7 @@ impl OrdinalWalk<'_, '_> {
     /// reaches here through the conjunction of them.
     fn phrase_matches(&mut self, low: u16, ordinal: u32) -> bool {
         let t0 = segment::payload::diag::ticks();
+        segment::payload::diag::add(12, 1);
         let r = self.phrase_matches_inner(low, ordinal);
         segment::payload::diag::add(11, segment::payload::diag::ticks() - t0);
         r

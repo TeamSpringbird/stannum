@@ -94,6 +94,7 @@ pub(crate) fn skip_positions(reader: &mut Reader<'_>) -> Result<()> {
     for _ in 0..n {
         reader.varint_u32()?;
     }
+    diag::add(5, u64::from(n));
     Ok(())
 }
 
@@ -391,16 +392,12 @@ impl PayloadCursor<'_> {
             self.load()?;
             self.set_position(at - self.span_at)?;
         }
+        let t1 = diag::ticks();
         while self.next_ordinal < ordinal {
-            self.load()?;
-            let n = self.decode(|r| {
-                let mut probe = *r;
-                probe.varint_u32()
-            })?;
             diag::add(4, 1);
-            diag::add(5, u64::from(n));
             self.skip_entry()?;
         }
+        diag::add(13, diag::ticks() - t1);
         diag::add(8, diag::ticks() - t0);
         Ok(())
     }
@@ -453,10 +450,10 @@ impl PayloadCursor<'_> {
 /// Diagnostic counters (throwaway).
 pub mod diag {
     use std::cell::Cell;
-    pub const N: usize = 12;
+    pub const N: usize = 15;
     pub const NAMES: [&str; N] = [
         "seeks", "jumps", "loads", "load_bytes", "skipped_entries", "skipped_positions",
-        "lists", "positions", "seek_ticks", "load_ticks", "decode_ticks", "check_ticks",
+        "lists", "positions", "seek_ticks", "load_ticks", "decode_ticks", "check_ticks", "checks", "skip_ticks", "scratch",
     ];
     thread_local! { pub static C: [Cell<u64>; N] = const { [const { Cell::new(0) }; N] }; }
     #[inline]
@@ -468,7 +465,17 @@ pub mod diag {
     }
     pub fn report() -> String {
         let freq = freq();
-        C.with(|c| {
+        // Overhead of one measurement.
+        let t0 = ticks();
+        for _ in 0..10000 {
+            let t = ticks();
+            add(14, ticks() - t);
+        }
+        let total = ticks() - t0;
+        C.with(|c| c[14].set(0));
+        let o = total as f64 / 10000.0;
+        let head = format!("overhead_ns={:.1} ", o * 1e9 / freq as f64);
+        head + &C.with(|c| {
             NAMES
                 .iter()
                 .zip(c.iter())
