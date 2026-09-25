@@ -1176,11 +1176,14 @@ unsafe fn gather(exec: &mut ScanExec) {
             && k <= crate::score::PRUNE_MAX_K
             && scorer
                 .as_ref()
-                .is_some_and(|scorer| scorer.scores_nothing())
+                .is_some_and(|scorer| scorer.scores_nothing() && !scorer.walks_unscored())
         {
             // Every match scores zero and ties rank in heap order, so the
             // best k are the first k of the heap-ordered stream: a sentence of
-            // stopwords need not collect and sort its million matches.
+            // stopwords need not collect and sort its million matches. A
+            // conjunction or phrase of them is walked by ordinal instead
+            // (`top_rows`): the stream seeks every word's cursor per
+            // candidate, the walk folds whole chunks.
             let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
             let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
             if !stream.recheck {
@@ -1412,7 +1415,7 @@ unsafe fn complete(exec: &mut ScanExec) {
         // before it gives up pruning and scores every match.
         let deeper = exec.pruned_k.saturating_mul(4).max(40);
         if exec.pruned_k > 0 && deeper <= crate::score::PRUNE_MAX_K {
-            let rows = if scorer.scores_nothing() {
+            let rows = if scorer.scores_nothing() && !scorer.walks_unscored() {
                 let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
                 let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
                 (!stream.recheck).then(|| {

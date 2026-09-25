@@ -803,6 +803,17 @@ impl IndexScorer {
         self.terms.is_empty()
     }
 
+    /// True when no term scores and the query is a conjunction (a phrase
+    /// included) of its leaves: every match scores zero and ranks in heap
+    /// order, and the ordinal walk finds the first `k` as a conjunction of
+    /// filters without scoring anything (see [`OrdinalWalk::all_unscored`]).
+    /// A disjunction of elided terms is read from the candidate stream
+    /// instead.
+    pub(crate) fn walks_unscored(&self) -> bool {
+        self.scores_nothing()
+            && prunable_shape(&self.query).is_some_and(|(combine, _, _)| combine == Combine::All)
+    }
+
     /// The `k` best of every candidate `stream` yields, scored as they
     /// arrive: only the heap of `k` rows is held. Scoring every candidate
     /// first held every match, its score and a map of both for the
@@ -864,7 +875,8 @@ impl IndexScorer {
         // its positive scores reach; when they are fewer than k the caller
         // fills the rest from the zero-scoring matches. In a conjunction the elided term adds
         // nothing to a score but still filters, so its cursor joins the walk
-        // without a bound.
+        // without a bound; a conjunction of elided terms alone is walked as
+        // filters only, every match at zero, and stops at the first k.
         if self
             .terms
             .iter()
@@ -1010,7 +1022,10 @@ impl IndexScorer {
                 None => return,
             }
         }
-        if terms.is_empty() {
+        // With no scoring term a conjunction is walked as its filters alone;
+        // a disjunction of none is nothing.
+        let unscored = terms.is_empty();
+        if unscored && (combine != Combine::All || filter_terms.is_empty()) {
             return;
         }
         // A phrase reads each slot's positions from the term's payload; a
@@ -1070,7 +1085,8 @@ impl IndexScorer {
             heap,
             scored,
             iterations: 0,
-            seed: seeded_threshold(),
+            // An unscored walk has no score to seed: every match ties at zero.
+            seed: if unscored { None } else { seeded_threshold() },
             values: Vec::new(),
             uppers: Vec::new(),
             buckets: Vec::new(),
@@ -1080,6 +1096,7 @@ impl IndexScorer {
         };
         match combine {
             Combine::Any => walk.any(),
+            Combine::All if unscored => walk.all_unscored(),
             Combine::All => walk.all(),
         }
         WALK_BLOCKS.set(WALK_BLOCKS.get() + blocks_used() - ready);
@@ -1370,6 +1387,57 @@ struct PhraseCheck<'a> {
     read: Vec<bool>,
 }
 
+/// Narrows the shared members of a chunk (`lows` when `sparse`, else
+/// `set`) to those `term` holds there, loading its chunk: false when none
+/// were left to narrow, so the chunk need not be read.
+fn narrow(
+    term: &mut OrdinalTerm<'_>,
+    sparse: bool,
+    set: &mut segment::ordinals::Words,
+    lows: &mut Vec<u16>,
+) -> bool {
+    if if sparse {
+        lows.is_empty()
+    } else {
+        set.iter().all(|w| *w == 0)
+    } {
+        return false;
+    }
+    term.load();
+    if sparse {
+        lows.retain(|low| term.words[usize::from(low / 64)] & (1 << (low % 64)) != 0);
+    } else {
+        for (out, word) in set.iter_mut().zip(term.words.iter()) {
+            *out &= *word;
+        }
+    }
+    true
+}
+
+/// Removes the dead ordinals of the chunk at `base` from the shared members.
+fn drop_dead(
+    dead: &[u32],
+    base: u32,
+    sparse: bool,
+    set: &mut segment::ordinals::Words,
+    lows: &mut Vec<u16>,
+) {
+    let from = dead.partition_point(|o| *o < base);
+    for dead in &dead[from..] {
+        if *dead >= base + segment::ordinals::CHUNK {
+            break;
+        }
+        let low = (dead - base) as usize;
+        if sparse {
+            if let Ok(at) = lows.binary_search(&(low as u16)) {
+                lows.remove(at);
+            }
+        } else {
+            set[low / 64] &= !(1 << (low % 64));
+        }
+    }
+}
+
 impl OrdinalWalk<'_, '_> {
     /// Reads the candidate `low`'s positions for `slot` into the check's
     /// scratch, unless they are read already.
@@ -1623,6 +1691,119 @@ impl OrdinalWalk<'_, '_> {
         }
     }
 
+    /// A conjunction with no scoring term, a phrase of elided words say:
+    /// every match scores zero and ranks in heap order, and ordinals ascend
+    /// with locations within a source, so the source's share of the top
+    /// `k` is its first `k` visible matches in ordinal order. The rarest
+    /// filter leads through its chunks as in [`Self::all`]; a chunk every
+    /// filter holds is folded to the shared members, and each is checked
+    /// for the phrase and admitted in turn, no bound or score consulted.
+    /// The source is abandoned at the first ordinal whose location cannot
+    /// rank, the heap being full and the location at or past the k-th, as
+    /// every later ordinal lies further on. Across sources the heap keeps
+    /// the `k` earliest of every source's share, which are the `k` earliest
+    /// overall.
+    fn all_unscored(&mut self) {
+        let lead = (0..self.filters.len())
+            .min_by_key(|&f| self.filters[f].keys.len())
+            .expect("an unscored conjunction has filters");
+        let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
+        loop {
+            self.iterations = self.iterations.wrapping_add(1);
+            if self.iterations.is_multiple_of(64) {
+                pgrx::check_for_interrupts!();
+            }
+            let Some(key) = self.filters[lead].key() else {
+                return;
+            };
+            let mut next = key;
+            for f in 0..self.filters.len() {
+                if f == lead {
+                    continue;
+                }
+                let filter = &mut self.filters[f];
+                filter.pos += filter.keys[filter.pos..].partition_point(|k| *k < key);
+                match filter.key() {
+                    None => return,
+                    Some(found) => next = next.max(found),
+                }
+            }
+            if next > key {
+                let filter = &mut self.filters[lead];
+                filter.pos += filter.keys[filter.pos..].partition_point(|k| *k < next);
+                continue;
+            }
+            let base = u32::from(key) << 16;
+            if !self.can_beat(0.0, base) || !self.evaluate_unscored(key, lead, &mut set) {
+                return;
+            }
+            for filter in &mut self.filters {
+                filter.pos += 1;
+            }
+        }
+    }
+
+    /// Admits the documents of chunk `key` that every filter holds and the
+    /// phrase check passes, in ordinal order. False once a document's
+    /// location cannot rank, which ends the source.
+    fn evaluate_unscored(
+        &mut self,
+        key: u16,
+        lead: usize,
+        set: &mut segment::ordinals::Words,
+    ) -> bool {
+        let base = u32::from(key) << 16;
+        self.filters[lead].load();
+        let sparse = !self.filters[lead].dense;
+        let mut lows: Vec<u16> = Vec::new();
+        if sparse {
+            lows.extend_from_slice(&self.filters[lead].members);
+        } else {
+            set.copy_from_slice(&*self.filters[lead].words);
+        }
+        let mut order: Vec<usize> = (0..self.filters.len()).filter(|&f| f != lead).collect();
+        order.sort_by_key(|&f| self.filters[f].keys.len());
+        for f in order {
+            if !narrow(&mut self.filters[f], sparse, set, &mut lows) {
+                return true;
+            }
+        }
+        drop_dead(self.dead, base, sparse, set, &mut lows);
+        if sparse {
+            for low in lows {
+                if !self.admit_unscored(base, low) {
+                    return false;
+                }
+            }
+        } else {
+            for (i, &bits) in set.iter().enumerate() {
+                let mut word = bits;
+                while word != 0 {
+                    let low = (i * 64) as u16 + word.trailing_zeros() as u16;
+                    word &= word - 1;
+                    if !self.admit_unscored(base, low) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Admits the unscored candidate `low` of the loaded chunk if it holds
+    /// the phrase. False when it cannot rank: the heap is full and its
+    /// location is at or past the k-th, as is every later ordinal's.
+    fn admit_unscored(&mut self, base: u32, low: u16) -> bool {
+        let ordinal = base + u32::from(low);
+        if !self.can_beat(0.0, ordinal) {
+            return false;
+        }
+        if self.phrase_matches(low, ordinal) {
+            self.admit(0.0, ordinal);
+        }
+        true
+    }
+
     /// Moves every term and filter past its current chunk.
     fn step_all(&mut self) {
         for term in &mut self.terms {
@@ -1692,54 +1873,16 @@ impl OrdinalWalk<'_, '_> {
         let mut order: Vec<usize> = (0..self.terms.len()).filter(|&t| t != lead).collect();
         order.sort_by_key(|&t| self.terms[t].keys.len());
         for t in order {
-            if if sparse {
-                lows.is_empty()
-            } else {
-                set.iter().all(|w| *w == 0)
-            } {
+            if !narrow(&mut self.terms[t], sparse, set, &mut lows) {
                 return;
-            }
-            let term = &mut self.terms[t];
-            term.load();
-            if sparse {
-                lows.retain(|low| term.words[usize::from(low / 64)] & (1 << (low % 64)) != 0);
-            } else {
-                for (out, word) in set.iter_mut().zip(term.words.iter()) {
-                    *out &= *word;
-                }
             }
         }
         for filter in &mut self.filters {
-            if if sparse {
-                lows.is_empty()
-            } else {
-                set.iter().all(|w| *w == 0)
-            } {
+            if !narrow(filter, sparse, set, &mut lows) {
                 return;
             }
-            filter.load();
-            if sparse {
-                lows.retain(|low| filter.words[usize::from(low / 64)] & (1 << (low % 64)) != 0);
-            } else {
-                for (out, word) in set.iter_mut().zip(filter.words.iter()) {
-                    *out &= *word;
-                }
-            }
         }
-        let from = self.dead.partition_point(|o| *o < base);
-        for dead in &self.dead[from..] {
-            if *dead >= base + segment::ordinals::CHUNK {
-                break;
-            }
-            let low = (dead - base) as usize;
-            if sparse {
-                if let Ok(at) = lows.binary_search(&(low as u16)) {
-                    lows.remove(at);
-                }
-            } else {
-                set[low / 64] &= !(1 << (low % 64));
-            }
-        }
+        drop_dead(self.dead, base, sparse, set, &mut lows);
         let mut sparse_at = 0usize;
         let mut skip_sub = false;
         let all: Vec<usize> = (0..self.terms.len()).collect();

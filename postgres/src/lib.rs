@@ -1589,6 +1589,32 @@ mod tests {
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
         assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        // A phrase or conjunction of elided words alone still walks by
+        // ordinal, as a conjunction of filters: nothing is scored, and the
+        // walk stops at the first k matches in heap order, so the positions
+        // of a handful of the 1,300 documents holding both words are read.
+        // A single elided word is read from the candidate stream.
+        for (query, pruning) in [
+            ("\"alpha beta\"", "ordinal"),
+            ("\"alpha pad tail\"", "ordinal"),
+            ("alpha AND beta", "ordinal"),
+            ("alpha", "block-max"),
+        ] {
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM bmw WHERE body ==> '{query}'
+                 ORDER BY stannum.score(ctid) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            let scan = search_scan(&plan[0]["Plan"]).unwrap();
+            assert_eq!(scan["Pruning"], pruning, "{query}: {scan}");
+            assert_eq!(scan["Scored Candidates"], 0, "{query}: {scan}");
+            assert!(
+                scan["Positions Checked"].as_i64().unwrap() < 100,
+                "{query}: {scan}"
+            );
+        }
         // Rows deleted after the top k was built are invisible, so the parent
         // reads past k and the scan completes the ordering from scratch.
         let top: Vec<i32> = ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3")
@@ -1655,16 +1681,18 @@ mod tests {
                 .flatten()
                 .find_map(search_scan)
         }
-        let explain = |query: &str, filter: &str| {
+        let explain_by = |query: &str, filter: &str, order_by: &str| {
             Spi::get_one::<Json>(&format!(
                 "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM ranked_work
                  WHERE body ==> '{query}' {filter}
-                 ORDER BY stannum.full_score(ctid) DESC LIMIT 10"
+                 ORDER BY {order_by} DESC LIMIT 10"
             ))
             .unwrap()
             .unwrap()
             .0
         };
+        let explain =
+            |query: &str, filter: &str| explain_by(query, filter, "stannum.full_score(ctid)");
         let ordinary = explain("alpha", "");
         let scan = search_scan(&ordinary[0]["Plan"]).unwrap();
         assert_eq!(scan["Pruning"], "ordinal");
@@ -1697,6 +1725,35 @@ mod tests {
         assert!(scan["Pruning"].is_null(), "{scan}");
         assert_eq!(scan["Top-K Completions"], 0);
         assert_eq!(scan["Exhaustive Score Calls"], 1000);
+
+        // `score` elides both words, every document holding them. The phrase
+        // is still walked by ordinal, as a conjunction of filters: nothing
+        // is scored, the first ten matches in heap order are the top ten,
+        // and only their positions are read.
+        let elided = explain_by("\"alpha beta\"", "", "stannum.score(ctid)");
+        let scan = search_scan(&elided[0]["Plan"]).unwrap();
+        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(scan["Scored Candidates"], 0, "{scan}");
+        assert_eq!(scan["Positions Checked"], 10, "{scan}");
+        assert_eq!(scan["Top-K Completions"], 0);
+        assert_eq!(scan["Exhaustive Score Calls"], 0);
+        assert_eq!(elided[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+        // Filtered, the unscored walk deepens through the same completions
+        // as the scored one, and still reads positions for the matches it
+        // admits alone: 10 + 40 + 160 + 640 + 1,000.
+        let elided = explain_by("\"alpha beta\"", "AND id > 990", "stannum.score(ctid)");
+        let scan = search_scan(&elided[0]["Plan"]).unwrap();
+        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(scan["Top-K Completions"], 4, "{scan}");
+        assert_eq!(scan["Exhaustive Score Calls"], 0);
+        assert_eq!(scan["Positions Checked"], 1850, "{scan}");
+        assert_eq!(elided[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+        // A single elided word has no conjunction to walk and is read from
+        // the candidate stream.
+        let single = explain_by("alpha", "", "stannum.score(ctid)");
+        let scan = search_scan(&single[0]["Plan"]).unwrap();
+        assert_eq!(scan["Pruning"], "block-max", "{scan}");
+        assert_eq!(scan["Scored Candidates"], 0, "{scan}");
     }
 
     #[pg_test]
