@@ -1157,6 +1157,9 @@ const SUB: usize = segment::ordinals::SUB as usize;
 /// Sub-blocks per chunk.
 const SUBS: usize = segment::ordinals::SUBS;
 
+/// Words per sub-block.
+const SUB_WORDS: usize = SUB / 64;
+
 /// One scoring term's streams in one source, for the walk over ordinals.
 struct OrdinalTerm<'a> {
     slot: usize,
@@ -1321,6 +1324,29 @@ impl OrdinalTerm<'_> {
         } else {
             for (o, word) in out.iter_mut().zip(self.words.iter()) {
                 *o |= *word;
+            }
+        }
+    }
+
+    /// Keeps of `block`, words `from..` of sub-block `sub`, the loaded
+    /// chunk's members: one pass over the bytes rather than a bounds check
+    /// per word.
+    fn and_sub(&self, sub: usize, from: usize, block: &mut [u64; SUB_WORDS]) {
+        let first = sub * SUB_WORDS + from;
+        let last = (sub + 1) * SUB_WORDS;
+        match &self.bits {
+            Some(bytes) => {
+                for (o, word) in block[from..]
+                    .iter_mut()
+                    .zip(bytes[first * 8..last * 8].chunks_exact(8))
+                {
+                    *o &= u64::from_le_bytes(word.try_into().expect("8"));
+                }
+            }
+            None => {
+                for (o, word) in block[from..].iter_mut().zip(&self.words[first..last]) {
+                    *o &= *word;
+                }
             }
         }
     }
@@ -2182,51 +2208,64 @@ impl OrdinalWalk<'_, '_> {
         // locations in ordinal order, so the judgement cannot be repeated
         // after a candidate of the sub-block has been resolved.
         let mut skip_sub = false;
-        #[expect(
-            clippy::needless_range_loop,
-            reason = "the index addresses the sub-block and the sparse members too"
-        )]
+        // The sub-block's candidate words, with the required terms ANDed in.
+        let mut block = [0u64; SUB_WORDS];
+        // Per present term, whether it is required in the sub-block, and the
+        // threshold that decided it.
+        let mut required = vec![false; present.len()];
+        let mut required_at = None;
         for i in 0..segment::ordinals::WORDS {
-            if i % (SUB / 64) == 0 {
+            let sub = i / SUB_WORDS;
+            let w = i % SUB_WORDS;
+            if w == 0 {
                 // The threshold moves as candidates are admitted, so it is
                 // consulted afresh at every sub-block and candidate: the
                 // chunk that fills the top k also prunes the rest of itself.
-                let sub = i / (SUB / 64);
                 let pruning = self.threshold().is_some();
                 skip_sub = pruning && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32);
-            }
-            let mut word = if sparse {
-                let mut word = 0u64;
-                while sparse_at < lows.len() && usize::from(lows[sparse_at] / 64) == i {
-                    word |= 1 << (lows[sparse_at] % 64);
-                    sparse_at += 1;
+                if sparse {
+                    block.fill(0);
+                    while sparse_at < lows.len() && usize::from(lows[sparse_at]) < (sub + 1) * SUB {
+                        let low = usize::from(lows[sparse_at]) % SUB;
+                        block[low / 64] |= 1 << (low % 64);
+                        sparse_at += 1;
+                    }
+                } else {
+                    block.copy_from_slice(&set[i..i + SUB_WORDS]);
                 }
-                word
-            } else {
-                set[i]
-            };
-            if word == 0 || skip_sub {
+                required.fill(false);
+                required_at = None;
+            }
+            if skip_sub {
                 continue;
             }
             // A term the sub-block's other bounds cannot reach the threshold
-            // without is required: the word keeps only the members it
-            // lists. Sixty-four candidates are settled by one AND per term,
+            // without is required: the words keep only the members it lists.
+            // A sub-block is settled by one AND of sixteen words per term,
             // where bounding each member against every term was most of a
             // walk over common words: once the top k fill, nearly every
             // term of such a query is required, and the survivors are the
-            // few documents holding them all.
-            let sub = i / (SUB / 64);
-            if let Some((threshold, _)) = self.threshold() {
+            // few documents holding them all. The threshold only rises, so
+            // a term once required stays so; when the threshold moves, the
+            // terms it newly requires are ANDed into the words still ahead.
+            if let Some((threshold, holder)) = self.threshold()
+                && required_at != Some((threshold, holder))
+            {
+                required_at = Some((threshold, holder));
                 let all = f64::from(sub_scores[sub]);
                 let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
                 for (n, &t) in present.iter().enumerate() {
-                    if (all - f64::from(self.term_subs[n][sub])) * slack < f64::from(threshold) {
-                        word &= self.terms[t].word(i);
+                    if !required[n]
+                        && (all - f64::from(self.term_subs[n][sub])) * slack < f64::from(threshold)
+                    {
+                        required[n] = true;
+                        self.terms[t].and_sub(sub, w, &mut block);
                     }
                 }
-                if word == 0 {
-                    continue;
-                }
+            }
+            let mut word = block[w];
+            if word == 0 {
+                continue;
             }
             while word != 0 {
                 let low = (i * 64) as u16 + word.trailing_zeros() as u16;
