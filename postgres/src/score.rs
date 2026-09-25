@@ -75,11 +75,19 @@ pub(crate) struct IndexScorer {
 /// One source's readers for scoring rows by location: the document table
 /// finds a row's ordinal, each term's stream its rank, and the payload its
 /// frequency bucket. Every lookup is a few random reads, in any order.
+///
+/// Everything is opened on first use: a ranked scan scores its rows in the
+/// walk and projects them from what it ranked, so most statements never
+/// look a row up here, and opening each term's stream up front parsed every
+/// chunk bound of every term in every source, and loaded each stream's
+/// first chunk, per statement.
 struct SourceReader {
-    docs: DocTable<'static>,
-    lengths: segment::segment::Lengths<'static>,
-    /// One per scoring term: the term's streams in this source, if present.
-    terms: Vec<Option<TermReader>>,
+    segment: &'static dyn Index,
+    docs: Option<DocTable<'static>>,
+    lengths: Option<segment::segment::Lengths<'static>>,
+    /// One per scoring term, once opened: the term's streams in this
+    /// source, if present.
+    terms: Vec<Option<Option<TermReader>>>,
 }
 
 struct TermReader {
@@ -128,20 +136,42 @@ impl SourceReader {
     unsafe fn new(segment: &dyn Index, terms: &[(String, TermScorer)]) -> Self {
         let segment: &'static (dyn Index + 'static) =
             unsafe { std::mem::transmute::<&dyn Index, &'static (dyn Index + 'static)>(segment) };
-        let terms = terms
-            .iter()
-            .map(|(term, _)| {
-                segment_error(segment.term(term)).map(|term| TermReader {
-                    cursor: segment_error(term.ordinals().and_then(|stream| stream.cursor())),
-                    exhausted_at: None,
-                })
-            })
-            .collect();
         Self {
-            docs: segment_error(segment.doc_table()),
-            lengths: segment.lengths(),
-            terms,
+            segment,
+            docs: None,
+            lengths: None,
+            terms: (0..terms.len()).map(|_| None).collect(),
         }
+    }
+
+    /// The source's ordinal for `tid`, if it lists the location.
+    fn ordinal_of(&mut self, tid: Tid, label: &str) -> Option<u32> {
+        let segment = self.segment;
+        let docs = match &mut self.docs {
+            Some(docs) => docs,
+            slot => slot.insert(segment_error_in(segment.doc_table(), label)),
+        };
+        segment_error_in(docs.ordinal_of(tid), label)
+    }
+
+    /// The length of the document at `ordinal`.
+    fn length(&mut self, ordinal: u32, label: &str) -> u32 {
+        let segment = self.segment;
+        let lengths = self.lengths.get_or_insert_with(|| segment.lengths());
+        segment_error_in(lengths.get(ordinal), label)
+    }
+
+    /// The bucket of `ordinal` in scoring term `n`, named `name`, if the
+    /// term lists it here.
+    fn bucket(&mut self, n: usize, name: &str, ordinal: u32, label: &str) -> Option<u8> {
+        let segment = self.segment;
+        let reader = self.terms[n].get_or_insert_with(|| {
+            segment_error_in(segment.term(name), label).map(|term| TermReader {
+                cursor: segment_error_in(term.ordinals().and_then(|stream| stream.cursor()), label),
+                exhausted_at: None,
+            })
+        });
+        reader.as_mut()?.bucket(ordinal, label)
     }
 }
 
@@ -446,20 +476,21 @@ impl IndexScorer {
             }
             let label = self.view.labels[i].as_str();
             let reader = &mut self.sources[i];
-            let Some(ordinal) = segment_error_in(reader.docs.ordinal_of(tid), label) else {
+            let Some(ordinal) = reader.ordinal_of(tid, label) else {
                 continue;
             };
             // Each term's bucket for the document, if the term lists it.
-            let buckets: Vec<Option<u8>> = reader
+            let buckets: Vec<Option<u8>> = self
                 .terms
-                .iter_mut()
-                .map(|slot| slot.as_mut()?.bucket(ordinal, label))
+                .iter()
+                .enumerate()
+                .map(|(n, (name, _))| reader.bucket(n, name, ordinal, label))
                 .collect();
             if buckets.iter().all(Option::is_none) {
                 // The document is in this source but holds no scoring term.
                 continue;
             }
-            let length = segment_error_in(reader.lengths.get(ordinal), label);
+            let length = reader.length(ordinal, label);
             // Left-to-right f32 fold in lexical term order, as production does.
             let mut total = 0.0_f32;
             for ((_, scorer), bucket) in self.terms.iter().zip(&buckets) {
