@@ -392,6 +392,7 @@ impl PayloadCursor<'_> {
             self.set_position(at - self.span_at)?;
         }
         while self.next_ordinal < ordinal {
+            self.load()?;
             let n = self.decode(|r| {
                 let mut probe = *r;
                 probe.varint_u32()
