@@ -9,7 +9,8 @@ Starts a throwaway cluster (install stannum first), builds a small corpus with
 heavy score ties and reused heap space, then drives several writer sessions
 (inserts, deletes, HOT and non-HOT updates, VACUUM, rollbacks, folding and
 merge tunables) while reader sessions run random ranked queries: single terms,
-OR, AND, boosts, phrases, `AND NOT`, `AT LEAST`, `full_score` and `score`,
+OR, AND, boosts, phrases, `AND NOT`, `AT LEAST`, disjunctions with a phrase
+or conjunction child, `full_score` and `score`,
 LIMIT/OFFSET around posting-block boundaries and above the pruning cap,
 cursors fetched partially with writes in between, and joins or filters that
 read past k.
@@ -239,8 +240,8 @@ class Query:
 
         shape = rng.choices(
             ['term', 'or2', 'or3', 'and2', 'and3', 'boosted_or', 'boosted_and', 'phrase',
-             'andnot', 'prefix', 'atleast', 'mixed'],
-            weights=[24, 14, 8, 14, 7, 7, 6, 4, 5, 2, 4, 5])[0]
+             'andnot', 'prefix', 'atleast', 'mixed', 'or_phrase', 'or_and'],
+            weights=[24, 14, 8, 14, 7, 7, 6, 4, 5, 2, 4, 5, 4, 4])[0]
         if shape == 'term':
             w = word()
             return Query(w + boost(), term_regex(w), shape)
@@ -274,8 +275,15 @@ class Query:
             n = rng.choice([1, 2, 2, 3])
             count = ' + '.join(f'({term_regex(w)})::int' for w in ws)
             return Query(f'AT LEAST {n} OF [{" ".join(ws)}]', f'(({count}) >= {n})', shape)
-        # mixed: (a OR b) AND c
         a, b, c = word(), word(), word()
+        if shape == 'or_phrase':
+            return Query(f'{a}{boost()} OR "{b} {c}"',
+                         f"({term_regex(a)} OR body ~ {sql_literal(chr(92) + 'm' + b + ' ' + c + chr(92) + 'M')})",
+                         shape)
+        if shape == 'or_and':
+            return Query(f'({a} AND {b}) OR {c}{boost()}',
+                         f'(({term_regex(a)} AND {term_regex(b)}) OR {term_regex(c)})', shape)
+        # mixed: (a OR b) AND c
         return Query(f'({a} OR {b}) AND {c}',
                      f'(({term_regex(a)} OR {term_regex(b)}) AND {term_regex(c)})', shape)
 

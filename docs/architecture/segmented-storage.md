@@ -280,7 +280,15 @@ custom scan nodes:
   stream, its length a table lookup by ordinal, and its TID is resolved only
   when it enters the top k. A conjunction is led by its rarest term through
   the chunks every term and elided filter holds, testing the shared members
-  by bit. Phrases and other shapes score every candidate of the stream.
+  by bit; a phrase walks its words' conjunction and reads positions only for
+  candidates that would rank. Other combinations of terms and phrases under
+  AND, OR, AT LEAST and AND NOT (`w OR "p q"`, `(a AND b) OR c`,
+  `a AND NOT b`) walk the disjunction of their scoring terms: a document's
+  score is the sum over the scoring terms it holds whatever the shape, so the
+  disjunction's bounds hold, and the shape is tested a word of documents at a
+  time over the terms' bits, a phrase's positions read only for a candidate
+  that would rank. Expansions (prefixes, regexes, fuzzy terms, ranges) and
+  other span shapes score every candidate of the stream.
   `stannum.count_fold = off` selects the strategies below for
   these queries too.
 - **Other counts** use page masks when a Boolean term is dense enough to be
