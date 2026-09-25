@@ -19,7 +19,7 @@
 //! Empty documents match nothing in the reference evaluator, including `*`, so
 //! the universe used here excludes them.
 
-use boldi_vigna::{SpanQuery, SpanSolver};
+use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::docs::{DocCursor, TidCursor};
 use segment::index::{Expanded, Index, Window};
@@ -500,12 +500,20 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
                 };
                 let skeleton = self.span_skeleton(span_query, &slots)?;
                 let solver = SpanSolver::new(span_query)?;
+                // A slot's rarity is the documents its terms hold between them.
+                let plan = PhrasePlan::new(span_query, |slot| {
+                    slots.get(slot).map_or(0, |terms| {
+                        terms.iter().map(|term| u64::from(term.df())).sum()
+                    })
+                })
+                .map(Box::new);
                 self.span_plan(
                     skeleton,
                     slots,
                     SpanKind::Fixed {
                         solver,
                         filter: position_filter.clone(),
+                        plan,
                     },
                 )
             }
@@ -706,6 +714,10 @@ enum SpanKind {
     Fixed {
         solver: SpanSolver,
         filter: Option<SpanPositionFilter>,
+        /// For a phrase shape: the order to read the slots in and the
+        /// distance each adjacent pair must keep, so a candidate is dropped
+        /// at the first pair that cannot match before the rest is read.
+        plan: Option<Box<PhrasePlan>>,
     },
     Dynamic {
         expr: SpanExpr,
@@ -722,6 +734,8 @@ struct SpanFilter<'a> {
     documents: DocCursor<'a>,
     lengths: Lengths<'a>,
     positions: Vec<Vec<u32>>,
+    /// Per slot, whether the current candidate's positions are read.
+    read: Vec<bool>,
     current: Option<Tid>,
 }
 
@@ -734,6 +748,7 @@ impl<'a> SpanFilter<'a> {
         lengths: Lengths<'a>,
     ) -> Result<Self> {
         let positions = vec![Vec::new(); slots.len()];
+        let read = vec![false; slots.len()];
         let mut this = Self {
             skeleton,
             slots,
@@ -741,6 +756,7 @@ impl<'a> SpanFilter<'a> {
             documents,
             lengths,
             positions,
+            read,
             current: None,
         };
         this.align()?;
@@ -761,25 +777,61 @@ impl<'a> SpanFilter<'a> {
         }
     }
 
+    /// Reads every slot's positions for `tid` that is not read already.
     fn load_positions(&mut self, tid: Tid) -> Result<()> {
-        for (slot, terms) in self.slots.iter_mut().enumerate() {
-            let positions = &mut self.positions[slot];
-            positions.clear();
-            let mut sources = 0;
-            for term in terms.iter_mut() {
-                term.documents.seek(tid)?;
-                if term.documents.current() == Some(tid) {
-                    term.payload.seek(term.documents.rank())?;
-                    term.payload.next_into(positions)?;
-                    sources += 1;
-                }
-            }
-            if sources > 1 {
-                positions.sort_unstable();
-                positions.dedup();
-            }
+        for slot in 0..self.slots.len() {
+            self.load_slot(slot, tid)?;
         }
         Ok(())
+    }
+
+    /// Reads `slot`'s positions for `tid`, unless they are read already.
+    fn load_slot(&mut self, slot: usize, tid: Tid) -> Result<()> {
+        if std::mem::replace(&mut self.read[slot], true) {
+            return Ok(());
+        }
+        let positions = &mut self.positions[slot];
+        positions.clear();
+        let mut sources = 0;
+        for term in self.slots[slot].iter_mut() {
+            term.documents.seek(tid)?;
+            if term.documents.current() == Some(tid) {
+                term.payload.seek(term.documents.rank())?;
+                term.payload.next_into(positions)?;
+                sources += 1;
+            }
+        }
+        if sources > 1 {
+            positions.sort_unstable();
+            positions.dedup();
+        }
+        Ok(())
+    }
+
+    /// Reads the slots in the plan's order, rarest first, and says whether
+    /// every adjacent pair of leaves keeps its distance; a candidate that
+    /// fails a pair has the rest of its slots left unread.
+    fn pairs_keep_distance(&mut self, tid: Tid) -> Result<bool> {
+        let SpanKind::Fixed { plan, .. } = &mut self.kind else {
+            return Ok(true);
+        };
+        let Some(plan) = plan.take() else {
+            return Ok(true);
+        };
+        let mut kept = true;
+        for step in plan.steps() {
+            self.load_slot(step.slot, tid)?;
+            if let Some(pair) = step.pair
+                && !plan.pair_keeps(pair, &self.positions)
+            {
+                kept = false;
+                break;
+            }
+        }
+        if let SpanKind::Fixed { plan: slot, .. } = &mut self.kind {
+            *slot = Some(plan);
+        }
+        Ok(kept)
     }
 
     fn document_length(&mut self, tid: Tid) -> Result<u32> {
@@ -799,6 +851,10 @@ impl<'a> SpanFilter<'a> {
     }
 
     fn matches(&mut self, tid: Tid) -> Result<bool> {
+        self.read.fill(false);
+        if !self.pairs_keep_distance(tid)? {
+            return Ok(false);
+        }
         self.load_positions(tid)?;
         let doc_len = if self.needs_doc_length() {
             self.document_length(tid)?
@@ -806,7 +862,7 @@ impl<'a> SpanFilter<'a> {
             0
         };
         match &mut self.kind {
-            SpanKind::Fixed { solver, filter } => {
+            SpanKind::Fixed { solver, filter, .. } => {
                 let mut intervals = solver.intervals(&self.positions);
                 Ok(match filter {
                     None => intervals.next().is_some(),
@@ -963,6 +1019,7 @@ mod tests {
         "",
         "...",
         "wine wine wine",
+        "wine and wine or wine wine",
         "brewhouse jalapeno craft",
         "security threat critical buy",
         "security and a threat but not critical",
@@ -995,6 +1052,23 @@ mod tests {
             "\"big _ wolf\"",
             "\"big bad wolf\"~2",
             "\"[big large] bad wolf\"",
+            // Repeated and pinned-gap words: the slots are read rarest
+            // first and a candidate is dropped at a pair no positions of
+            // which keep the distance, which must agree with the solver.
+            "\"wine wine\"",
+            "\"wine wine wine\"",
+            "\"wine wine wine wine\"",
+            "\"wine _ wine\"",
+            "\"wine __ wine\"",
+            "\"wine _ wine wine\"",
+            "\"wine and wine\"~1",
+            "\"wine _ wine\"~1",
+            "\"and _ or\"",
+            "\"and _ or _ wine\"",
+            "\"wine or wine\"",
+            "\"big _ wolf _ a\"",
+            "\"big bad wolf and\"~1",
+            "\"craft beer craft\"",
             "craft NEAR/5 beer",
             "craft THEN/0 beer",
             "beer THEN/0 craft",
@@ -1088,7 +1162,11 @@ mod tests {
                 1 => Just("beta~1".to_owned()),
                 1 => Just("gamma~0:2".to_owned()),
                 2 => (word(), word()).prop_map(|(a, b)| format!("\"{a} {b}\"")),
+                1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"{a} {b} {c}\"")),
                 1 => (word(), word()).prop_map(|(a, b)| format!("\"{a} _ {b}\"")),
+                1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"{a} _ {b} {c}\"")),
+                1 => (word(), word(), word(), 1u32..3)
+                    .prop_map(|(a, b, c, n)| format!("\"{a} {b} {c}\"~{n}")),
                 1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"[{a} {b}] {c}\"~1")),
                 1 => (word(), word()).prop_map(|(a, b)| format!("\"{a} [MATCHES {b}.*]\"")),
             ]
@@ -1219,6 +1297,6 @@ mod tests {
         plan.cursor.seek(tid(2)).unwrap();
         assert_eq!(plan.cursor.current(), Some(tid(2)));
         plan.cursor.seek(tid(4)).unwrap();
-        assert_eq!(plan.cursor.current(), Some(tid(7)));
+        assert_eq!(plan.cursor.current(), Some(tid(8)));
     }
 }
