@@ -3,7 +3,9 @@
 //! selects in a few word operations rather than one lane at a time.
 
 /// Bits per lane counter: counts reach at most [`LaneSums::MAX_TARGET`].
-const SLICES: usize = 8;
+/// Six rather than eight measured a few percent faster over long
+/// disjunctions, for a coarser unit that let through a few more members.
+const SLICES: usize = 6;
 
 /// Per lane of a word, a running sum of small integer weights, and which
 /// lanes have reached a target.
@@ -47,19 +49,20 @@ impl LaneSums {
         Self { slices, reached: 0 }
     }
 
-    /// Adds `weight`, at most [`Self::MAX_TARGET`], to the lanes of `mask`.
+    /// Adds `weight`, at most [`Self::MAX_TARGET`], to the lanes of `mask`:
+    /// a ripple-carry add over every slice, without branches. Stopping once
+    /// the carry died, or skipping an empty mask, was slower: the branches
+    /// mispredict on real words.
     #[inline]
     pub fn add(&mut self, mask: u64, weight: u32) {
         debug_assert!(weight <= Self::MAX_TARGET);
         let mut carry = 0u64;
-        for j in 0..SLICES {
-            let bits = if weight >> j & 1 != 0 { mask } else { 0 };
-            let slice = self.slices[j];
-            self.slices[j] = slice ^ bits ^ carry;
-            carry = (slice & bits) | (carry & (slice ^ bits));
-            if carry == 0 && weight >> (j + 1) == 0 {
-                return;
-            }
+        for (j, slice) in self.slices.iter_mut().enumerate() {
+            let bits = mask & 0u64.wrapping_sub(u64::from(weight >> j & 1));
+            let sum = *slice ^ bits;
+            let next = (*slice & bits) | (carry & sum);
+            *slice = sum ^ carry;
+            carry = next;
         }
         self.reached |= carry;
     }

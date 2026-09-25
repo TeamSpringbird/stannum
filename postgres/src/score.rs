@@ -1545,7 +1545,7 @@ const SIEVE_TARGET: u32 = segment::lanes::LaneSums::MAX_TARGET;
 /// each term's bound is rounded up to a whole unit of `threshold /
 /// SIEVE_TARGET`, and a lane is kept only when its sum reaches
 /// `SIEVE_TARGET`. A lane cleared sums to at most `SIEVE_TARGET - 1` units,
-/// so its bounds fall short of the threshold by at least a unit, 1/255 of
+/// so its bounds fall short of the threshold by at least a unit, 1/63 of
 /// it: far more than the float error of summing them in any order, so its
 /// first bound is below the threshold and `can_beat` would reject it, tie
 /// or no tie. The threshold only rises, so a sieve planned at an earlier
@@ -1559,8 +1559,7 @@ struct WordSieve {
     by_essential: bool,
     essential: Vec<usize>,
     /// Whether the weighted sum filters; the required terms' weights, which
-    /// every lane holds; and the other terms' as (index, weight), heaviest
-    /// first.
+    /// every lane holds; and the other terms' as (index, weight).
     by_count: bool,
     start: u32,
     adds: Vec<(usize, u32)>,
@@ -1646,7 +1645,6 @@ impl WordSieve {
             if start < SIEVE_TARGET {
                 self.by_count = true;
                 self.start = start;
-                self.adds.sort_by_key(|a| std::cmp::Reverse(a.1));
             }
         }
         self.active = self.by_essential || self.by_count;
@@ -1668,11 +1666,10 @@ impl WordSieve {
         }
         if self.by_count && kept != 0 {
             let mut lanes = segment::lanes::LaneSums::new(self.start, SIEVE_TARGET);
+            // Every term is added: stopping once every kept lane reached the
+            // target measured no faster than the branch it costs per term.
             for &(n, weight) in &self.adds {
                 lanes.add(words[n], weight);
-                if kept & !lanes.reached() == 0 {
-                    break;
-                }
             }
             kept &= lanes.reached();
         }
