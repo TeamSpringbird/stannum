@@ -441,9 +441,35 @@ checks over 244,722 scored candidates; "you want to" 13.7 ms; "see the"
 Count and ranked checks were clean. Time is now 46% disjunctions, 36%
 phrases, 18% conjunctions; the slowest queries are still long phrases of
 common words (worst 3.9 s), whose conjunction admits many candidates
-before the top ten fill. Next, in order: the disjunction tail (candidates
-admitted per chunk under a chunk-level length bound); the remaining
-phrase tail; lift the segment cap.
+before the top ten fill.
+
+### Phrase tail and sub-block bounds, 2026-09-25
+
+Two branches were built and measured in parallel. `perf/subblock-bounds`
+(estimator only, behind `stannum.debug_bound_estimate`) asked whether a
+finer stored bound per sub-block would cut the candidates a stopword
+disjunction scores: on the 15 million row mock an exact per-sub-block
+maximum removes 1% ("the OR a OR you"), 13% (7 stopwords) and 23 to 25%
+(8 and 15 words) of them, a quantized byte slightly less, at +2 to +18%
+index size. A 1,024-ordinal sub-block of three 40 to 70% terms really
+does hold a near-maximal document, so the format change was not built.
+
+`perf/phrase-verify` (merged here as `3c4a3a7`, `e589756`, `d9068b1`)
+reads a phrase candidate's position lists rarest word first and drops
+the candidate at the first adjacent pair that cannot match, in both the
+ordinal walk and tinql's streamed `SpanFilter`; a filled top k also
+checks the rest of a sub-block best score first. Decoding was 98% of a
+check. Warm explain at 150 million rows, `a821f91` to `d9068b1`: "a
+number i would like to have" 1,237 to 356 ms, "it is work for you do"
+1,985 to 633, "or of no use" 1,031 to 464, "with the one which you"
+(every word elided, streamed) 3,327 to 1,963; short phrases unchanged.
+Mixed, byte cap lifted: 141.8 to 153.8 QPS, p50 29 to 30 ms, p95 187 to
+173, p99 336 to 277; phrase mean 61 to 48 ms; count and ranked checks
+clean. Time is 49% disjunctions, 31% phrases, 20% conjunctions.
+
+Next, in order: the segment count (every chunk of every term is loaded
+per segment; 18 here); the disjunction tail; the streamed conjunction
+skeleton behind all-elided phrases.
 
 ## How to measure
 
