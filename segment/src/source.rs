@@ -103,6 +103,9 @@ impl Source for Box<dyn Source> {
     fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         (**self).read(offset, len)
     }
+    fn read_shared(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        (**self).read_shared(offset, len)
+    }
     fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         (**self).slice(offset, len)
     }
