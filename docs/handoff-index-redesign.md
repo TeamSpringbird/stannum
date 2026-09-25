@@ -480,10 +480,14 @@ snapshot predates the meta page layout of `36355bc` and no longer opens):
 | mixed p50 / p95 / p99 ms | 76 / 804 / 3,060 | 35 / 234 / 418 | |
 | conjunction-phrase QPS | 31.0 | 143.4 | |
 | conjunction-phrase p50 / p99 ms | 65 / | 27 / 453 | |
-| count + ranked checks | clean | clean | |
+| disjunction-updates QPS, query p50 ms | failed | 67.3, 74 | |
+| updates in 600 s, p50 / p99 / worst ms, errors | 145,000, 1.1 / / 20,000, 1 | 243,116, 1.2 / 6.1 / 1,457, 0 | |
+| count + ranked checks, before and after updates | clean | clean | |
 
-The same commit measured 141.8 QPS mixed on the local M4, so the host
-runs about 0.8 of the local figure. The `cross_engine_membership_differences`
+The write workload passed for the first time at full scale, on the
+database packed by `f099667` with an empty free-space map: no update
+reached the driver's deadline. The same commit measured 141.8 QPS mixed
+on the local M4, so the host runs about 0.8 of the local figure. The `cross_engine_membership_differences`
 field names four trace disjunctions whose counts differ from the
 published engine's; the local runs report the identical four, so it is
 the trace, not the index.
