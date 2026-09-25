@@ -178,8 +178,7 @@ pub fn get(reader: u64, offset: u64, len: usize) -> Option<Rc<[u8]>> {
 
 /// Caches a range just read, sharing it with the caller. A range larger
 /// than the budget is returned without being kept.
-pub fn insert(reader: u64, offset: u64, bytes: Vec<u8>) -> Rc<[u8]> {
-    let bytes: Rc<[u8]> = Rc::from(bytes);
+pub fn insert(reader: u64, offset: u64, bytes: Rc<[u8]>) -> Rc<[u8]> {
     let Ok(len) = u32::try_from(bytes.len()) else {
         return bytes;
     };
@@ -266,12 +265,12 @@ mod tests {
     fn evicts_least_recently_used_within_budget() {
         clear();
         set_budget(30);
-        let a = insert(1, 0, vec![1; 10]);
-        let _b = insert(1, 10, vec![2; 10]);
-        let _c = insert(1, 20, vec![3; 10]);
+        let a = insert(1, 0, Rc::from(vec![1; 10]));
+        let _b = insert(1, 10, Rc::from(vec![2; 10]));
+        let _c = insert(1, 20, Rc::from(vec![3; 10]));
         assert_eq!(bytes(), 30);
         assert!(get(1, 0, 10).is_some(), "a is touched, so b is the oldest");
-        let _d = insert(1, 30, vec![4; 10]);
+        let _d = insert(1, 30, Rc::from(vec![4; 10]));
         assert_eq!(bytes(), 30);
         assert!(get(1, 10, 10).is_none(), "b evicted");
         assert!(get(1, 0, 10).is_some());
@@ -281,7 +280,7 @@ mod tests {
         // Another reader's identical offsets are distinct entries.
         assert!(get(2, 0, 10).is_none());
         // A range beyond the budget is handed back but not kept.
-        let big = insert(1, 100, vec![9; 40]);
+        let big = insert(1, 100, Rc::from(vec![9; 40]));
         assert_eq!(big.len(), 40);
         assert!(get(1, 100, 40).is_none());
         assert!(bytes() <= 30);

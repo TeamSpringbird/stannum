@@ -24,6 +24,13 @@ pub trait Source {
     /// Copies `len` bytes starting at `offset`.
     fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
 
+    /// The same range shared: a source that copies page by page fills the
+    /// shared allocation directly, where going through a vector copied
+    /// every cached chunk twice.
+    fn read_shared(&self, offset: u64, len: usize) -> Result<std::rc::Rc<[u8]>> {
+        self.read(offset, len).map(std::rc::Rc::from)
+    }
+
     /// A borrowed view of the range, when the source is contiguous in memory.
     fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         let _ = (offset, len);

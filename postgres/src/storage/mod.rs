@@ -796,17 +796,56 @@ impl segment::source::Source for RunSource {
     }
 
     fn read(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
-        crate::score::charging("run source", || self.read_inner(offset, len))
+        crate::score::charging("run source", || {
+            let mut out = Vec::with_capacity(len);
+            self.read_into(offset, len, &mut |data| out.extend_from_slice(data))?;
+            Ok(out)
+        })
+    }
+
+    /// The pages are copied straight into the shared allocation the read
+    /// cache keeps: a chunk a ranked walk misses on was copied into a
+    /// vector and then again into the cache's slice, a second 8 KiB per
+    /// miss.
+    fn read_shared(&self, offset: u64, len: usize) -> segment::Result<Rc<[u8]>> {
+        crate::score::charging("run source", || {
+            let mut out = Rc::<[u8]>::new_uninit_slice(len);
+            let slots = Rc::get_mut(&mut out).expect("just allocated, so unshared");
+            let mut filled = 0usize;
+            self.read_into(offset, len, &mut |data| {
+                let end = filled + data.len();
+                // SAFETY: `read_into` delivers exactly `len` bytes in order
+                // or fails, so `filled..end` lies within `slots`, and the
+                // two allocations are distinct.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        slots[filled..end].as_mut_ptr().cast::<u8>(),
+                        data.len(),
+                    );
+                }
+                filled = end;
+            })?;
+            assert_eq!(filled, len, "a run read delivers every byte or fails");
+            // SAFETY: every byte of the slice was written above.
+            Ok(unsafe { out.assume_init() })
+        })
     }
 }
 
 impl RunSource {
-    fn read_inner(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
+    /// Hands `sink` the range's bytes page by page, in order, exactly `len`
+    /// of them or an error.
+    fn read_into(
+        &self,
+        offset: u64,
+        len: usize,
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> segment::Result<()> {
         let end = offset
             .checked_add(len as u64)
             .filter(|end| *end <= u64::from(self.run.bytes))
             .ok_or(segment::Error::Truncated)?;
-        let mut out = Vec::with_capacity(len);
         // SAFETY: the transaction still holds the lock the planner or scan
         // took on the index; the relcache reference is scoped to this read.
         unsafe {
@@ -833,12 +872,12 @@ impl RunSource {
                     pg_sys::RelationClose(index);
                     return Err(segment::Error::Truncated);
                 }
-                out.extend_from_slice(&data[within..within + take]);
+                sink(&data[within..within + take]);
                 at += take as u64;
             }
             pg_sys::RelationClose(index);
         }
-        Ok(out)
+        Ok(())
     }
 }
 
