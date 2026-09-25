@@ -1071,6 +1071,9 @@ impl IndexScorer {
         let ready = blocks_used();
         SETUP_BLOCKS.set(SETUP_BLOCKS.get() + ready - started);
         let docs = segment_error_in(source.doc_table(), label);
+        // The pages of the length and class tables stay pinned while the
+        // walk reads them per candidate, and are released as it ends.
+        let _held = HeldPages::open(&**source);
         let mut walk = OrdinalWalk {
             scorer: self,
             terms,
@@ -2665,6 +2668,24 @@ impl OrdinalWalk<'_, '_> {
                 }
             }
         }
+    }
+}
+
+/// A span of [`Index::hold`] over one walk: opened before the walk reads a
+/// length or class, closed when the walk ends, by return or by unwind, so
+/// the pages it held pinned never outlive the statement.
+struct HeldPages<'a>(&'a dyn Index);
+
+impl<'a> HeldPages<'a> {
+    fn open(index: &'a dyn Index) -> Self {
+        index.hold(true);
+        Self(index)
+    }
+}
+
+impl Drop for HeldPages<'_> {
+    fn drop(&mut self) {
+        self.0.hold(false);
     }
 }
 

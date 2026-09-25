@@ -32,7 +32,7 @@ pub mod layout;
 pub mod verify;
 pub mod wal;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -788,6 +788,113 @@ pub struct RunSource {
     table: Rc<Vec<u32>>,
     /// The run's name in error messages.
     label: String,
+    /// Open [`Source::hold`](segment::source::Source::hold) spans; pages
+    /// are held only while one is open.
+    holding: Cell<u32>,
+    /// Per slot, the page held pinned for
+    /// [`Source::held_span`](segment::source::Source::held_span).
+    held: [Cell<Option<HeldPage>>; segment::source::HELD_SLOTS],
+}
+
+/// A run page kept pinned, without its content lock, between reads of a
+/// table a walk consults per candidate. Run pages are written once, before
+/// the directory publishes the run, and freed only once no snapshot can
+/// see it, so the bytes of a pinned page cannot change under the reader;
+/// the pin keeps the buffer from being evicted. The page is pinned under
+/// the statement's resource owner and released when the walk's hold span
+/// closes, which a walk does on return and on unwind alike, so no pin
+/// outlives the statement though the reader holding it is cached across
+/// statements.
+#[derive(Clone, Copy)]
+struct HeldPage {
+    /// The page's index in the run.
+    page: usize,
+    buffer: pg_sys::Buffer,
+    /// The page's run data, valid while pinned.
+    data: *const u8,
+    len: usize,
+}
+
+impl RunSource {
+    fn new(index_oid: pg_sys::Oid, run: Run, table: Rc<Vec<u32>>, label: String) -> Self {
+        Self {
+            index_oid,
+            run,
+            table,
+            label,
+            holding: Cell::new(0),
+            held: Default::default(),
+        }
+    }
+
+    /// Releases the pages held in every slot.
+    fn release_held(&self) {
+        for slot in &self.held {
+            if let Some(held) = slot.take() {
+                unpin(held);
+            }
+        }
+    }
+
+    /// Pins page `page` of the run, checked as a run page, and releases
+    /// its content lock.
+    fn pin(&self, page: usize) -> segment::Result<HeldPage> {
+        let block = *self.table.get(page).ok_or(segment::Error::Truncated)?;
+        crate::score::charging("run source", || {
+            // SAFETY: as in `read_into`; the relcache reference is scoped
+            // to this call, and the pin is released by `release_held`.
+            unsafe {
+                let index = pg_sys::RelationIdGetRelation(self.index_oid);
+                if index.is_null() {
+                    pgrx::error!("Stannum index no longer exists");
+                }
+                let buffer = Buffer::read(index, block, false);
+                expect_run_page(&buffer, &self.label);
+                let (_, data) = buffer.chain();
+                let held = HeldPage {
+                    page,
+                    buffer: buffer.0,
+                    data: data.as_ptr(),
+                    len: data.len(),
+                };
+                // Keep the pin, drop the lock: the guard is forgotten so
+                // its drop does not release the pin as well.
+                std::mem::forget(buffer);
+                pg_sys::LockBuffer(held.buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
+                pg_sys::RelationClose(index);
+                HELD_PAGES.set((HELD_PAGES.get().0 + 1, HELD_PAGES.get().1 + 1));
+                Ok(held)
+            }
+        })
+    }
+}
+
+thread_local! {
+    /// Run pages held pinned now, and pinned so in all: a held page must
+    /// never outlive the walk that pinned it.
+    static HELD_PAGES: Cell<(i64, u64)> = const { Cell::new((0, 0)) };
+}
+
+/// Pages held pinned now and in all (see [`HeldPage`]).
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) fn held_pages() -> (i64, u64) {
+    HELD_PAGES.get()
+}
+
+/// Releases a page `RunSource::pin` pinned.
+fn unpin(held: HeldPage) {
+    // SAFETY: the pin was taken by `pin` and is released once: the slot
+    // holding it was emptied before this call.
+    unsafe { pg_sys::ReleaseBuffer(held.buffer) };
+    HELD_PAGES.set((HELD_PAGES.get().0 - 1, HELD_PAGES.get().1));
+}
+
+impl Drop for RunSource {
+    fn drop(&mut self) {
+        // Spans close before a reader can be dropped; this only guards
+        // against a span left open by a bug.
+        self.release_held();
+    }
 }
 
 impl segment::source::Source for RunSource {
@@ -830,6 +937,51 @@ impl segment::source::Source for RunSource {
             // SAFETY: every byte of the slice was written above.
             Ok(unsafe { out.assume_init() })
         })
+    }
+
+    fn hold(&self, open: bool) {
+        if open {
+            self.holding.set(self.holding.get() + 1);
+        } else {
+            let depth = self.holding.get().saturating_sub(1);
+            self.holding.set(depth);
+            if depth == 0 {
+                self.release_held();
+            }
+        }
+    }
+
+    fn held_span(
+        &self,
+        slot: usize,
+        offset: u64,
+    ) -> Option<segment::Result<segment::source::HeldSpan>> {
+        if self.holding.get() == 0 {
+            return None;
+        }
+        let cell = self.held.get(slot)?;
+        let page = (offset / CHAIN_CAPACITY as u64) as usize;
+        let (held, pinned) = match cell.get() {
+            Some(held) if held.page == page => (held, false),
+            previous => {
+                if let Some(previous) = previous {
+                    cell.set(None);
+                    unpin(previous);
+                }
+                let held = match self.pin(page) {
+                    Ok(held) => held,
+                    Err(error) => return Some(Err(error)),
+                };
+                cell.set(Some(held));
+                (held, true)
+            }
+        };
+        Some(Ok(segment::source::HeldSpan {
+            start: page as u64 * CHAIN_CAPACITY as u64,
+            data: held.data,
+            len: held.len,
+            pinned,
+        }))
     }
 }
 
@@ -968,6 +1120,10 @@ impl Index for MemoizedSegment {
     fn length_class(&self, ordinal: u32) -> segment::Result<u8> {
         self.reader.length_class(ordinal)
     }
+
+    fn hold(&self, open: bool) {
+        self.reader.hold(open);
+    }
 }
 
 /// Cached readers by (index identity, segment generation).
@@ -1023,12 +1179,12 @@ unsafe fn cached_segment(
         Some((segment, None)) => (segment, None),
         None => {
             let label = generation_label(entry.generation);
-            let source: Box<dyn segment::source::Source> = Box::new(RunSource {
+            let source: Box<dyn segment::source::Source> = Box::new(RunSource::new(
                 index_oid,
-                run: entry.run,
-                table: unsafe { page_table(index, identity, entry) },
-                label: label.clone(),
-            });
+                entry.run,
+                unsafe { page_table(index, identity, entry) },
+                label.clone(),
+            ));
             let segment = MemoizedSegment {
                 reader: Rc::new(codec_in(Reader::new(source), &label)),
                 terms: Rc::default(),

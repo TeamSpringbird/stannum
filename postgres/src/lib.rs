@@ -1505,6 +1505,58 @@ mod tests {
     }
 
     #[pg_test]
+    fn ranked_walks_release_the_pages_they_hold() {
+        // 20,000 documents in one segment: its class table spans three
+        // pages and its length table ten, so a walk moves its held pages.
+        Spi::run(
+            "CREATE TABLE held(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 100000;
+             INSERT INTO held SELECT n,
+               repeat('alpha ', 1 + n % 3) ||
+               CASE WHEN n % 7 = 0 THEN 'beta ' ELSE '' END ||
+               repeat('pad ', n % 40) || 'tail'
+               FROM generate_series(1, 20000) n;
+             CREATE INDEX held_idx ON held USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;",
+        )
+        .unwrap();
+        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node.clone());
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        let before = crate::storage::held_pages();
+        assert_eq!(before.0, 0, "{before:?}");
+        for query in [
+            "alpha OR beta",
+            "pad OR beta",
+            "alpha AND beta",
+            "\"alpha beta\"",
+        ] {
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM held WHERE body ==> '{query}'
+                 ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
+            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
+            assert_eq!(scan["Actual Rows"].as_f64(), Some(10.0), "{query}: {scan}");
+            let held = crate::storage::held_pages();
+            assert_eq!(held.0, 0, "{query}: {held:?}");
+        }
+        let after = crate::storage::held_pages();
+        assert!(after.1 > before.1 + 4, "the walks held no pages: {after:?}");
+    }
+
+    #[pg_test]
     fn pruned_top_k_matches_full_scoring_bit_for_bit() {
         // Four build segments of 1,000 documents and a write buffer, with a
         // 60-row pattern of term frequencies and lengths so exact score ties

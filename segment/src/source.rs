@@ -13,6 +13,22 @@ use std::rc::Rc;
 
 use crate::{Error, Result};
 
+/// Slots a source may hold a page in, one per table read through
+/// [`Source::held_span`], so two tables read in step do not evict each
+/// other's page.
+pub const HELD_SLOTS: usize = 2;
+
+/// The bytes of a page a source holds pinned: `len` bytes from offset
+/// `start` of the source, at `data`.
+#[derive(Clone, Copy, Debug)]
+pub struct HeldSpan {
+    pub start: u64,
+    pub data: *const u8,
+    pub len: usize,
+    /// Whether the page was pinned by this call rather than held already.
+    pub pinned: bool,
+}
+
 pub trait Source {
     /// Total bytes available.
     fn len(&self) -> u64;
@@ -34,6 +50,27 @@ pub trait Source {
     /// A borrowed view of the range, when the source is contiguous in memory.
     fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         let _ = (offset, len);
+        None
+    }
+
+    /// Opens (`true`) or closes (`false`) a span within which the source
+    /// may keep a page per [`Source::held_span`] slot pinned between reads.
+    /// Spans nest; closing the outermost releases every page held.
+    fn hold(&self, open: bool) {
+        let _ = open;
+    }
+
+    /// The page covering `offset`, held pinned in `slot` in place of the
+    /// page held there: for a table read a few bytes at a time in ascending
+    /// order, where a copied window per read cost a buffer lookup and a
+    /// copy for one value. `None` outside a [`Source::hold`] span and for a
+    /// source that holds nothing.
+    ///
+    /// The span's bytes stay valid until the next call on `slot` or until
+    /// the outermost hold span closes, whichever comes first; the caller
+    /// must not read through `data` after either.
+    fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+        let _ = (slot, offset);
         None
     }
 }
@@ -108,6 +145,12 @@ impl Source for Box<dyn Source> {
     }
     fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         (**self).slice(offset, len)
+    }
+    fn hold(&self, open: bool) {
+        (**self).hold(open);
+    }
+    fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+        (**self).held_span(slot, offset)
     }
 }
 

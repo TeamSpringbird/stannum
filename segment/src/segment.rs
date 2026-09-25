@@ -48,7 +48,7 @@ use crate::docs::{self, DocCursor, DocTable, PageCursor, PageTable, TidCursor};
 use crate::forward::{ForwardRecord, ForwardTerm};
 use crate::ordinals::Ordinals;
 use crate::payload::{Payload, PayloadBuilder};
-use crate::source::Source;
+use crate::source::{HELD_SLOTS, HeldSpan, Source};
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Result, Tid, varint};
 
@@ -427,6 +427,11 @@ pub trait AreaFetch {
     fn length(&self, ordinal: u32) -> Result<u32>;
     /// The document's length class (see [`crate::length_class`]).
     fn length_class(&self, ordinal: u32) -> Result<u8>;
+    /// The length of `ordinal` from a page the source holds pinned, when it
+    /// holds one (see [`Source::held_span`]).
+    fn held_length(&self, _ordinal: u32) -> Option<Result<u32>> {
+        None
+    }
     /// The window of the length table holding `ordinal` as an owned copy,
     /// with the window's first ordinal; `None` for a source whose table is
     /// held whole.
@@ -475,6 +480,9 @@ pub struct Reader<S: Source> {
     /// for classes in ordinal order, and a window fetch was a buffer read
     /// and an 8 KiB copy per candidate.
     last_classes: RefCell<Option<(u32, Rc<[u8]>)>>,
+    /// Per [`Source::held_span`] slot, the span last handed out, valid
+    /// until the next call on the slot or the end of the hold span.
+    held: [Cell<Option<HeldSpan>>; HELD_SLOTS],
 }
 
 /// Byte lengths of a segment's sections, in blob order.
@@ -501,6 +509,10 @@ const LENGTH_CHUNK: u64 = 4096;
 /// uncached from shared buffers and held until a lookup falls outside it;
 /// candidates are sparse, so a wide window was mostly copied for one value.
 pub const CLASS_WINDOW: u32 = 1024;
+
+/// The [`Source::held_span`] slots of the class and length tables.
+const HELD_CLASSES: usize = 0;
+const HELD_LENGTHS: usize = 1;
 
 /// A segment held entirely in memory.
 pub type Segment<'a> = Reader<&'a [u8]>;
@@ -559,6 +571,7 @@ impl<S: Source> Reader<S> {
             pages: OnceCell::new(),
             last_chunk: Cell::new(None),
             last_classes: RefCell::new(None),
+            held: Default::default(),
         })
     }
 
@@ -787,15 +800,19 @@ impl<S: Source> Reader<S> {
         self.lengths().get(ordinal)
     }
 
-    /// Length class by document ordinal. A paged source reads the table in
-    /// windows of [`CLASS_WINDOW`] documents and keeps the window last read:
-    /// the table is a byte per document and a walk consults it per
-    /// candidate, in ordinal order.
+    /// Length class by document ordinal. Within a [`Reader::hold`] span a
+    /// source that holds pages serves it from the page held; otherwise a
+    /// paged source reads the table in windows of [`CLASS_WINDOW`]
+    /// documents and keeps the window last read: the table is a byte per
+    /// document and a walk consults it per candidate, in ordinal order.
     pub fn length_class(&self, ordinal: u32) -> Result<u8> {
         if ordinal >= self.header.doc_count {
             return Err(Error::Corrupt("document ordinal out of range"));
         }
         let at = self.header.classes_at + u64::from(ordinal);
+        if let Some(read) = self.held_read::<1>(HELD_CLASSES, at) {
+            return read.map(|[class]| class);
+        }
         if let Some(bytes) = self.source.slice(at, 1) {
             return Ok(bytes[0]);
         }
@@ -811,6 +828,68 @@ impl<S: Source> Reader<S> {
         }
         let (first, bytes) = held.as_ref().expect("window loaded");
         Ok(bytes[(ordinal - first) as usize])
+    }
+
+    /// Opens or closes a span within which length and class lookups keep
+    /// the source's pages pinned (see [`Source::hold`]). A walk consults
+    /// both per candidate, in ordinal order, so a page serves thousands of
+    /// lookups where a copied window served a dozen.
+    pub fn hold(&self, open: bool) {
+        if !open {
+            // The spans end with the pins the source is about to release.
+            for span in &self.held {
+                span.set(None);
+            }
+        }
+        self.source.hold(open);
+    }
+
+    /// `N` bytes at `offset` through the page the source holds in `slot`;
+    /// `None` where the source holds no page, or the bytes cross one.
+    #[inline]
+    fn held_read<const N: usize>(&self, slot: usize, offset: u64) -> Option<Result<[u8; N]>> {
+        let span = match self.held[slot].get() {
+            Some(span)
+                if span.len >= N && offset.wrapping_sub(span.start) <= (span.len - N) as u64 =>
+            {
+                span
+            }
+            _ => match self.held_move(slot, offset, N)? {
+                Ok(span) => span,
+                Err(error) => return Some(Err(error)),
+            },
+        };
+        // SAFETY: the span came from the source's `held_span` for this slot,
+        // the last call on it, and within the hold span that `hold(false)`
+        // ends by forgetting it, so the source keeps its page pinned; the
+        // check above or in `held_move` put the `N` bytes inside it.
+        let bytes = unsafe {
+            span.data
+                .add((offset - span.start) as usize)
+                .cast::<[u8; N]>()
+                .read_unaligned()
+        };
+        Some(Ok(bytes))
+    }
+
+    /// Moves `slot` to the page holding `len` bytes at `offset`, accounting
+    /// a page newly pinned to its area; `None` where the source holds no
+    /// page, or the bytes cross one.
+    #[inline(never)]
+    fn held_move(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldSpan>> {
+        let before = crate::cache::disk_pages();
+        let span = match self.source.held_span(slot, offset)? {
+            Ok(span) => span,
+            Err(error) => return Some(Err(error)),
+        };
+        self.held[slot].set(Some(span));
+        if span.pinned {
+            let area = self.area_of(offset);
+            crate::cache::note_read(area, span.len);
+            crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        }
+        (offset >= span.start && offset - span.start + len as u64 <= span.len as u64)
+            .then_some(Ok(span))
     }
 
     /// A copyable handle on the length table.
@@ -966,6 +1045,14 @@ impl<S: Source> AreaFetch for Reader<S> {
         Reader::length_class(self, ordinal)
     }
 
+    fn held_length(&self, ordinal: u32) -> Option<Result<u32>> {
+        let at = self.header.lengths_at + u64::from(ordinal) * 4;
+        Some(
+            self.held_read::<4>(HELD_LENGTHS, at)?
+                .map(u32::from_le_bytes),
+        )
+    }
+
     fn length_window_owned(&self, ordinal: u32) -> Result<Option<(Rc<[u8]>, u32)>> {
         if ordinal >= self.header.doc_count {
             return Err(Error::Corrupt("document ordinal out of range"));
@@ -1039,6 +1126,9 @@ impl Lengths<'_> {
             } => {
                 if ordinal >= *count {
                     return Err(Error::Corrupt("document ordinal out of range"));
+                }
+                if let Some(length) = fetch.held_length(ordinal) {
+                    return length;
                 }
                 let mut held = window.borrow_mut();
                 let hit = held.as_ref().is_some_and(|(first, bytes)| {
@@ -1340,6 +1430,113 @@ mod tests {
                 timings
             );
         }
+    }
+
+    /// Pages of 13 bytes, so a length straddles a page now and then, held
+    /// in slots as a buffer pool would pin them; counts the pages pinned.
+    struct Held {
+        bytes: Vec<u8>,
+        holding: Cell<u32>,
+        held: [Cell<Option<u64>>; crate::source::HELD_SLOTS],
+        pins: Cell<u32>,
+    }
+
+    impl Source for Held {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+            let at = offset as usize;
+            self.bytes
+                .get(at..at + len)
+                .map(<[u8]>::to_vec)
+                .ok_or(Error::Truncated)
+        }
+        fn hold(&self, open: bool) {
+            let depth = if open {
+                self.holding.get() + 1
+            } else {
+                self.holding.get() - 1
+            };
+            self.holding.set(depth);
+            if depth == 0 {
+                for slot in &self.held {
+                    slot.set(None);
+                }
+            }
+        }
+        fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+            if self.holding.get() == 0 {
+                return None;
+            }
+            let page = offset / 13;
+            let pinned = self.held[slot].get() != Some(page);
+            if pinned {
+                self.pins.set(self.pins.get() + 1);
+                self.held[slot].set(Some(page));
+            }
+            let start = (page * 13) as usize;
+            let end = (start + 13).min(self.bytes.len());
+            Some(Ok(HeldSpan {
+                start: start as u64,
+                data: self.bytes[start..end].as_ptr(),
+                len: end - start,
+                pinned,
+            }))
+        }
+    }
+
+    #[test]
+    fn held_pages_serve_lengths_and_classes_as_windows_do() {
+        let mut builder = SegmentBuilder::default();
+        let text: Vec<String> = (0..300)
+            .map(|n| vec!["w"; 1 + (n * 37) % 150].join(" "))
+            .collect();
+        for (n, text) in text.iter().enumerate() {
+            builder
+                .add_document(tid(n as u32 / 100, 1 + (n % 100) as u16), tokens(text))
+                .unwrap();
+        }
+        let bytes = builder.finish();
+        let whole = Segment::parse(&bytes).unwrap();
+        let held = Reader::new(Held {
+            bytes: bytes.clone(),
+            holding: Cell::new(0),
+            held: Default::default(),
+            pins: Cell::new(0),
+        })
+        .unwrap();
+        let check = |ordinals: &mut dyn Iterator<Item = u32>| {
+            let lengths = held.lengths();
+            for ordinal in ordinals {
+                assert_eq!(
+                    held.length_class(ordinal).unwrap(),
+                    whole.length_class(ordinal).unwrap(),
+                    "class of {ordinal}"
+                );
+                assert_eq!(
+                    lengths.get(ordinal).unwrap(),
+                    whole.length_at(ordinal).unwrap(),
+                    "length of {ordinal}"
+                );
+            }
+        };
+        // Outside a hold span the windows serve every lookup.
+        check(&mut (0..300));
+        assert_eq!(held.source.pins.get(), 0);
+        held.hold(true);
+        check(&mut (0..300));
+        // Forwards a page at a time per table, the class table's 300 bytes
+        // over 24 pages and the lengths' 1,200 over 93, less the lengths
+        // that straddle two pages and are read through a window instead.
+        let pins = held.source.pins.get();
+        assert!((24 + 80..=24 + 93).contains(&pins), "{pins}");
+        // Backwards and scattered, each slot moving on its own.
+        check(&mut (0..300).rev().step_by(7));
+        held.hold(false);
+        assert!(held.held.iter().all(|span| span.get().is_none()));
+        assert!(held.source.held.iter().all(|page| page.get().is_none()));
+        assert!(held.length_class(300).is_err());
     }
 
     #[test]

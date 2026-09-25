@@ -60,6 +60,11 @@ pub trait Index {
     /// The document's length class (see [`crate::length_class`]), a lower
     /// bound on its length for bounding scores without reading the length.
     fn length_class(&self, ordinal: u32) -> Result<u8>;
+    /// Opens or closes a span within which length and class lookups may
+    /// keep the pages they read pinned (see [`Source::hold`]).
+    fn hold(&self, open: bool) {
+        let _ = open;
+    }
 }
 
 impl<S: Source> Index for Reader<S> {
@@ -77,6 +82,10 @@ impl<S: Source> Index for Reader<S> {
 
     fn length_class(&self, ordinal: u32) -> Result<u8> {
         Reader::length_class(self, ordinal)
+    }
+
+    fn hold(&self, open: bool) {
+        Reader::hold(self, open);
     }
 
     fn total_length(&self) -> u64 {
@@ -155,6 +164,10 @@ impl<I: Index + ?Sized> Index for &I {
     fn length_class(&self, ordinal: u32) -> Result<u8> {
         (**self).length_class(ordinal)
     }
+
+    fn hold(&self, open: bool) {
+        (**self).hold(open);
+    }
 }
 
 impl<I: Index + ?Sized> Index for Box<I> {
@@ -190,6 +203,10 @@ impl<I: Index + ?Sized> Index for Box<I> {
     fn length_class(&self, ordinal: u32) -> Result<u8> {
         (**self).length_class(ordinal)
     }
+
+    fn hold(&self, open: bool) {
+        (**self).hold(open);
+    }
 }
 
 impl<I: Index + ?Sized> Index for std::rc::Rc<I> {
@@ -224,6 +241,10 @@ impl<I: Index + ?Sized> Index for std::rc::Rc<I> {
     }
     fn length_class(&self, ordinal: u32) -> Result<u8> {
         (**self).length_class(ordinal)
+    }
+
+    fn hold(&self, open: bool) {
+        (**self).hold(open);
     }
 }
 
