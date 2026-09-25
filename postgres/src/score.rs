@@ -2139,11 +2139,30 @@ impl OrdinalWalk<'_, '_> {
             if word == 0 || skip_sub {
                 continue;
             }
+            // A term the sub-block's other bounds cannot reach the threshold
+            // without is required: the word keeps only the members it
+            // lists. Sixty-four candidates are settled by one AND per term,
+            // where bounding each member against every term was most of a
+            // walk over common words: once the top k fill, nearly every
+            // term of such a query is required, and the survivors are the
+            // few documents holding them all.
+            let sub = i / (SUB / 64);
+            if let Some((threshold, _)) = self.threshold() {
+                let all = f64::from(sub_scores[sub]);
+                let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
+                for (n, &t) in present.iter().enumerate() {
+                    if (all - f64::from(self.term_subs[n][sub])) * slack < f64::from(threshold) {
+                        word &= self.terms[t].words[i];
+                    }
+                }
+                if word == 0 {
+                    continue;
+                }
+            }
             while word != 0 {
                 let low = (i * 64) as u16 + word.trailing_zeros() as u16;
                 word &= word - 1;
                 let ordinal = base + u32::from(low);
-                let sub = usize::from(low) / SUB;
                 let pruning = self.threshold().is_some();
                 if pruning {
                     let word_at = usize::from(low / 64);
