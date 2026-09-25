@@ -467,9 +467,40 @@ Mixed, byte cap lifted: 141.8 to 153.8 QPS, p50 29 to 30 ms, p95 187 to
 173, p99 336 to 277; phrase mean 61 to 48 ms; count and ranked checks
 clean. Time is 49% disjunctions, 31% phrases, 20% conjunctions.
 
-Next, in order: the segment count (every chunk of every term is loaded
-per segment; 18 here); the disjunction tail; the streamed conjunction
-skeleton behind all-elided phrases.
+### Full scale on the published host, 2026-09-25 (r7)
+
+`64468d5` (the phrase pruning, before the phrase-tail work) on the
+i7i.8xlarge protocol, restored from the local database uploaded as
+`postgres-snapshots/stackexchange-150m-stn3-f099667` (the earlier
+snapshot predates the meta page layout of `36355bc` and no longer opens):
+
+| | STN3 `b961ded`, 2026-09-24 | `64468d5`, 2026-09-25 | TIN, published |
+|---|---|---|---|
+| mixed QPS | 34.0 | 115.2 | 199 |
+| mixed p50 / p95 / p99 ms | 76 / 804 / 3,060 | 35 / 234 / 418 | |
+| conjunction-phrase QPS | 31.0 | 143.4 | |
+| conjunction-phrase p50 / p99 ms | 65 / | 27 / 453 | |
+| count + ranked checks | clean | clean | |
+
+The same commit measured 141.8 QPS mixed on the local M4, so the host
+runs about 0.8 of the local figure. The `cross_engine_membership_differences`
+field names four trace disjunctions whose counts differ from the
+published engine's; the local runs report the identical four, so it is
+the trace, not the index.
+
+### Per-candidate lookups and the walk's inner loop, 2026-09-25
+
+A single-user perf profile of two common-word disjunctions at 150
+million rows put 44% of the time inside the walk itself, 15% in
+`length_class` and 11% in `Lengths::get` (a buffer read per candidate
+each), and 14% in chunk loads. `3280717` keeps the class window last
+read, as the length table already did: mixed 153.8 to 166.9 QPS, p99
+277 to 264 ms, disjunction p50 57 to 51 ms.
+
+Next, in order: the walk's inner loop (the first bound of every member
+of the essential terms' union); the streamed conjunction skeleton behind
+all-elided phrases; the segment count is not a lever (setup pages are
+zero and chunk loads scale with documents, not segments).
 
 ## How to measure
 
