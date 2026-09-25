@@ -1414,6 +1414,124 @@ mod tests {
     }
 
     #[pg_test]
+    fn bound_estimate_leaves_the_walk_unchanged_and_never_exceeds_it() {
+        // `stannum.debug_bound_estimate` counts what finer stored sub-block
+        // bounds would skip; the walk, its rows and its counters are those
+        // of a walk without it, and no alternative skips more than the walk
+        // scored, nor more sub-blocks or chunks than it evaluated.
+        Spi::run(
+            "CREATE TABLE est(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 1000;
+             INSERT INTO est SELECT n,
+               repeat('alpha ', 1 + n % 7) ||
+               CASE WHEN n % 3 = 0 THEN repeat('beta ', 1 + n % 5) ELSE '' END ||
+               CASE WHEN n % 5 = 0 THEN 'gamma ' ELSE '' END ||
+               repeat('pad ', n % 40) || 'tail'
+               FROM generate_series(1, 6000) n;
+             CREATE INDEX est_idx ON est USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;",
+        )
+        .unwrap();
+        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node.clone());
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        let explain = |estimate: bool, query: &str| {
+            Spi::run(&format!(
+                "SET LOCAL stannum.debug_bound_estimate = {}",
+                if estimate { "on" } else { "off" }
+            ))
+            .unwrap();
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM est WHERE body ==> '{query}'
+                 ORDER BY stannum.score(ctid, dense_ratio => 1.0) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{query}: {plan}"))
+        };
+        let rows = |estimate: bool, query: &str| -> Vec<(i32, f32)> {
+            Spi::run(&format!(
+                "SET LOCAL stannum.debug_bound_estimate = {}",
+                if estimate { "on" } else { "off" }
+            ))
+            .unwrap();
+            Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, stannum.score(ctid, dense_ratio => 1.0) FROM est
+                             WHERE body ==> '{query}'
+                             ORDER BY 2 DESC, id LIMIT 10"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+        };
+        for query in [
+            "alpha OR beta OR gamma",
+            "beta OR gamma",
+            "alpha AND beta",
+            "alpha AND beta AND gamma",
+        ] {
+            assert_eq!(rows(true, query), rows(false, query), "{query}");
+            let plain = explain(false, query);
+            let scan = explain(true, query);
+            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
+            assert!(plain["Estimate Chunks"].is_null(), "{query}: {plain}");
+            for counter in ["Scored Candidates", "Chunks Loaded"] {
+                assert_eq!(scan[counter], plain[counter], "{query} {counter}");
+            }
+            let scored = scan["Scored Candidates"].as_i64().unwrap();
+            let subs = scan["Estimate Sub-blocks"].as_i64().unwrap();
+            let chunks = scan["Estimate Chunks"].as_i64().unwrap();
+            assert!(chunks > 0 && scored > 0, "{query}: {scan}");
+            assert_eq!(scan["Estimate Bound Mismatches"], 0, "{query}: {scan}");
+            for name in ["A", "A8", "B", "B+", "C"] {
+                let estimated = scan[format!("Estimate Scored {name}")].as_i64().unwrap();
+                assert!((0..=scored).contains(&estimated), "{query} {name}: {scan}");
+                let skipped = scan[format!("Estimate Sub-blocks Skipped {name}")]
+                    .as_i64()
+                    .unwrap();
+                assert!((0..=subs).contains(&skipped), "{query} {name}: {scan}");
+                let skipped = scan[format!("Estimate Chunks Skipped {name}")]
+                    .as_i64()
+                    .unwrap();
+                assert!((0..=chunks).contains(&skipped), "{query} {name}: {scan}");
+                assert!(scan[format!("Estimate Bytes {name}")].as_i64().unwrap() > 0);
+            }
+            // The exact maximum admits no more than its byte-quantized form,
+            // and the byte form no more than a shortest length alone.
+            let count = |name: &str| scan[format!("Estimate Scored {name}")].as_i64().unwrap();
+            assert!(
+                count("B+") <= count("B") && count("B") <= count("C"),
+                "{query}: {scan}"
+            );
+            assert!(
+                count("B") <= count("A") && count("A") <= count("A8"),
+                "{query}: {scan}"
+            );
+        }
+    }
+
+    #[pg_test]
     fn pruned_top_k_matches_full_scoring_bit_for_bit() {
         // Four build segments of 1,000 documents and a write buffer, with a
         // 60-row pattern of term frequencies and lengths so exact score ties

@@ -5,7 +5,9 @@
 //! Where the bytes of a segment go: per section, and per term grouped by
 //! document frequency, split into dictionary entry, ordinal stream head
 //! (count, directory and bounds), ordinal chunk bodies, payload header,
-//! payload skip table and payload data.
+//! payload skip table and payload data; and per stream its chunks and the
+//! sub-blocks its chunk bounds occupy, the unit a finer per-sub-block bound
+//! would pay per.
 //!
 //! ```text
 //! script/dump-segments.py --dbname db --index documents_body_idx --out /tmp/blobs
@@ -30,6 +32,8 @@ struct Bytes {
     skips: usize,
     payload_data: usize,
     bitmap_chunks: usize,
+    chunks: usize,
+    occupied_subs: usize,
 }
 
 impl Bytes {
@@ -51,6 +55,8 @@ impl Bytes {
         self.skips += other.skips;
         self.payload_data += other.payload_data;
         self.bitmap_chunks += other.bitmap_chunks;
+        self.chunks += other.chunks;
+        self.occupied_subs += other.occupied_subs;
     }
 }
 
@@ -98,6 +104,12 @@ impl Breakdown {
                     skips: payload.skip_table_len(),
                     payload_data: payload.data_len(),
                     bitmap_chunks: ordinals.bitmap_chunks(),
+                    chunks: ordinals.chunk_count(),
+                    occupied_subs: ordinals
+                        .bounds()
+                        .iter()
+                        .map(|bound| bound.subs.iter().filter(|sub| **sub != 0).count())
+                        .sum(),
                     ..Bytes::default()
                 };
                 bytes.ordinals_body = entry.ordinals.len as usize - bytes.ordinals_head;
@@ -125,10 +137,12 @@ impl Breakdown {
             println!("  {name:<12} {n:>12} {:>6.1}%", share(n));
         }
         println!(
-            "  {:<9} {:>8} {:>8} {:>11} {:>10} {:>10} {:>8} {:>8} {:>10} {:>11}",
+            "  {:<9} {:>8} {:>8} {:>8} {:>9} {:>11} {:>10} {:>10} {:>8} {:>8} {:>10} {:>11}",
             "terms",
             "count",
+            "chunks",
             "bitmaps",
+            "occ_subs",
             "dictionary",
             "ord_head",
             "ord_body",
@@ -149,10 +163,12 @@ impl Breakdown {
 
 fn print_row(name: &str, b: &Bytes) {
     println!(
-        "  {:<9} {:>8} {:>8} {:>11} {:>10} {:>10} {:>8} {:>8} {:>10} {:>11}",
+        "  {:<9} {:>8} {:>8} {:>8} {:>9} {:>11} {:>10} {:>10} {:>8} {:>8} {:>10} {:>11}",
         name,
         b.terms,
+        b.chunks,
         b.bitmap_chunks,
+        b.occupied_subs,
         b.dictionary,
         b.ordinals_head,
         b.ordinals_body,
