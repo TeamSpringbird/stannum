@@ -501,10 +501,22 @@ each), and 14% in chunk loads. `3280717` keeps the class window last
 read, as the length table already did: mixed 153.8 to 166.9 QPS, p99
 277 to 264 ms, disjunction p50 57 to 51 ms.
 
-Next, in order: the walk's inner loop (the first bound of every member
-of the essential terms' union); the streamed conjunction skeleton behind
-all-elided phrases; the segment count is not a lever (setup pages are
-zero and chunk loads scale with documents, not segments).
+The walk's inner loop was the first bound of every member of the
+essential terms' union, tested against every present term; the
+disassembly of the profile's hottest addresses resolved there. Gathering
+the terms' words per 64-bit word and stopping early (shelved as
+`/tmp/stannum-ordinal-poc/v22-per-word-first-bound.patch`) changed
+nothing measurable, because the cost is the iteration count. ANDing each
+word with every required term's word first (a term the other bounds
+cannot reach the threshold without) cut the 7 stopword disjunction 89.7
+to 74.2 ms and "python OR java OR sql" 33.0 to 20.7 ms warm; the mixed
+workload stayed within noise at 165.6 QPS.
+
+Next, in order: chunk loads (an 8 KiB copy per loaded chunk, 139 MB for
+a 15 word disjunction, could borrow the cached bytes instead); the
+streamed conjunction skeleton behind all-elided phrases (1.9 s); the
+per-candidate length lookup. The segment count is not a lever: setup
+pages are zero and chunk loads scale with documents, not segments.
 
 ## How to measure
 
