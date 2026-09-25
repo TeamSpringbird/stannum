@@ -125,6 +125,14 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"stannum.debug_bound_estimate",
+        c"Measurement aid: count what finer stored sub-block bounds would let a ranked walk skip",
+        c"The walk is unchanged; EXPLAIN reports the candidates, sub-blocks and chunks each alternative would skip.",
+        &crate::score::DEBUG_BOUND_ESTIMATE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"stannum.profile_count_selection",
         c"Collect bounded count-selector features without changing the default strategy",
         c"Estimation timing includes feature collection; counters accumulate over rescans.",
@@ -2303,6 +2311,34 @@ unsafe extern "C-unwind" fn explain(
                 crate::score::chunk_loads(),
                 es,
             );
+            if crate::score::DEBUG_BOUND_ESTIMATE.get() {
+                let estimate = crate::bound_estimate::counters();
+                let scored = exec.scored.unwrap_or(0) as i64;
+                let put = |name: &str, value: i64| {
+                    let name = std::ffi::CString::new(name).expect("a property name");
+                    pg_sys::ExplainPropertyInteger(name.as_ptr(), std::ptr::null(), value, es);
+                };
+                put("Estimate Chunks", estimate.chunks);
+                put("Estimate Chunk Terms", estimate.chunk_terms);
+                put("Estimate Occupied Sub-blocks", estimate.occupied_subs);
+                put("Estimate Sub-blocks", estimate.subs);
+                put("Estimate Bound Mismatches", estimate.mismatches);
+                for (alt, name) in crate::bound_estimate::ALT_NAMES.iter().enumerate() {
+                    put(
+                        &format!("Estimate Scored {name}"),
+                        scored - estimate.scored_skipped[alt],
+                    );
+                    put(
+                        &format!("Estimate Sub-blocks Skipped {name}"),
+                        estimate.subs_skipped[alt],
+                    );
+                    put(
+                        &format!("Estimate Chunks Skipped {name}"),
+                        estimate.chunks_skipped[alt],
+                    );
+                    put(&format!("Estimate Bytes {name}"), estimate.bytes[alt]);
+                }
+            }
             pg_sys::ExplainPropertyInteger(
                 c"Positions Checked".as_ptr(),
                 std::ptr::null(),

@@ -9,6 +9,7 @@ use pgrx::pg_guard;
 
 mod am;
 mod bm25;
+mod bound_estimate;
 mod customscan;
 mod fold;
 mod highlight;

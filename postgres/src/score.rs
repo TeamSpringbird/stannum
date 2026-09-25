@@ -528,6 +528,13 @@ pub(crate) const PRUNE_MAX_K: usize = 4096;
 /// walk seeded from per-term champion lists would cost.
 pub(crate) static DEBUG_SEED_SCORE: pgrx::GucSetting<f64> = pgrx::GucSetting::<f64>::new(-1.0);
 
+/// `stannum.debug_bound_estimate`: a measurement aid. When on, a pruned
+/// walk also computes what finer stored sub-block bounds would have skipped
+/// (see [`crate::bound_estimate`]) and reports it under EXPLAIN; the walk
+/// itself is unchanged.
+pub(crate) static DEBUG_BOUND_ESTIMATE: pgrx::GucSetting<bool> =
+    pgrx::GucSetting::<bool>::new(false);
+
 thread_local! {
     /// Index pages read while building a walk's per-term state, and while
     /// walking. A pruned walk cannot skip what it reads before it starts, so
@@ -609,6 +616,7 @@ pub(crate) fn reset_walk_blocks() {
     VISIBILITY_CHECKS.set(0);
     VM_HITS.set(0);
     PHASE_DISK.with_borrow_mut(Vec::clear);
+    crate::bound_estimate::reset();
 }
 
 /// Heap visibility checks since the last reset.
@@ -1061,6 +1069,8 @@ impl IndexScorer {
             uppers: Vec::new(),
             term_subs: Vec::new(),
             phrase,
+            estimate: DEBUG_BOUND_ESTIMATE.get().then(Vec::new),
+            estimate_sums: [[0.0; SUBS]; crate::bound_estimate::ALTS],
         };
         match combine {
             Combine::Any => walk.any(),
@@ -1322,6 +1332,11 @@ struct OrdinalWalk<'a, 's> {
     term_subs: Vec<[f32; SUBS]>,
     /// For a phrase: the positions check a candidate must pass to be admitted.
     phrase: Option<PhraseCheck<'a>>,
+    /// `stannum.debug_bound_estimate`: per present term of the evaluated
+    /// chunk, the bounds the alternatives would store, and their sums per
+    /// sub-block.
+    estimate: Option<Vec<crate::bound_estimate::AltTables>>,
+    estimate_sums: [[f32; SUBS]; crate::bound_estimate::ALTS],
 }
 
 /// Which walked stream a phrase slot's term is.
@@ -1382,6 +1397,137 @@ impl OrdinalWalk<'_, '_> {
         };
         self.phrase = Some(phrase);
         matched
+    }
+
+    /// `stannum.debug_bound_estimate`: tables the alternatives' bounds for
+    /// the loaded chunks of the terms `present` (in the order `term_subs`
+    /// uses), and counts the chunk as skipped under each alternative no
+    /// populated sub-block of which can beat the threshold. A sub-block is
+    /// populated when some present term has a member there, or under a
+    /// `conjunction` when every term has.
+    fn estimate_chunk(&mut self, present: &[usize], base: u32, conjunction: Option<u32>) {
+        if self.estimate.is_none() {
+            return;
+        }
+        let mut stats = Vec::with_capacity(present.len());
+        let mut scorers = Vec::with_capacity(present.len());
+        let mut maxima = Vec::with_capacity(present.len());
+        let mut mismatches = 0;
+        for &t in present {
+            let term = &self.terms[t];
+            let lengths = &self.lengths;
+            let gathered = crate::bound_estimate::TermStats::gather(
+                &term.words,
+                term.rank_base,
+                |rank| {
+                    term.bucket(rank).unwrap_or_else(|| {
+                        crate::storage::corrupt("Stannum: a member carries no bucket")
+                    })
+                },
+                |low| segment_error(lengths.get(base + low)),
+            );
+            mismatches += gathered
+                .max_bucket
+                .iter()
+                .zip(&term.sub_bounds[term.pos])
+                .filter(|(mine, stored)| mine != stored)
+                .count() as i64;
+            stats.push(gathered);
+            scorers.push(&self.scorer.terms[term.slot].1);
+            maxima.push(term.term_max);
+        }
+        let tables = crate::bound_estimate::tables(&stats, &scorers, &maxima, conjunction);
+        let mut populated = [conjunction.is_some(); SUBS];
+        for term in &stats {
+            for (sub, populated) in populated.iter_mut().enumerate() {
+                let member = term.max_bucket[sub] != 0;
+                *populated = if conjunction.is_some() {
+                    *populated && member
+                } else {
+                    *populated || member
+                };
+            }
+        }
+        let mut sums = [[0.0_f32; SUBS]; crate::bound_estimate::ALTS];
+        for table in &tables {
+            for (alt, bounds) in table.bounds.iter().enumerate() {
+                for (sum, bound) in sums[alt].iter_mut().zip(bounds) {
+                    *sum += bound;
+                }
+            }
+        }
+        self.estimate = Some(tables);
+        self.estimate_sums = sums;
+        let pruning = self.threshold().is_some();
+        let mut skipped = [false; crate::bound_estimate::ALTS];
+        if pruning {
+            for (alt, skip) in skipped.iter_mut().enumerate() {
+                *skip = !(0..SUBS).any(|sub| {
+                    populated[sub]
+                        && self.can_beat(self.estimate_sums[alt][sub], base + (sub * SUB) as u32)
+                });
+            }
+        }
+        crate::bound_estimate::bump(|c| {
+            c.mismatches += mismatches;
+            for (total, skip) in c.chunks_skipped.iter_mut().zip(skipped) {
+                *total += i64::from(skip);
+            }
+        });
+    }
+
+    /// `stannum.debug_bound_estimate`: the walk is about to evaluate
+    /// sub-block `sub` while pruning; counts it as skipped under each
+    /// alternative whose sum there cannot beat the threshold.
+    fn estimate_sub(&mut self, sub: usize, base: u32) {
+        if self.estimate.is_none() {
+            return;
+        }
+        let mut skipped = [false; crate::bound_estimate::ALTS];
+        for (alt, skip) in skipped.iter_mut().enumerate() {
+            *skip = !self.can_beat(self.estimate_sums[alt][sub], base + (sub * SUB) as u32);
+        }
+        crate::bound_estimate::bump(|c| {
+            c.subs += 1;
+            for (total, skip) in c.subs_skipped.iter_mut().zip(skipped) {
+                *total += i64::from(skip);
+            }
+        });
+    }
+
+    /// `stannum.debug_bound_estimate`: the walk is about to score a
+    /// candidate whose per-term bounds at its own length are `values`
+    /// (zero for terms not holding it, listed in `uppers`); counts it as
+    /// skipped under each alternative whose sub-block bound, tightened by
+    /// the same per-candidate bound, cannot beat the threshold.
+    fn estimate_candidate(
+        &mut self,
+        sub: usize,
+        ordinal: u32,
+        values: &[f32],
+        uppers: &[(f32, usize)],
+    ) {
+        let Some(tables) = self.estimate.take() else {
+            return;
+        };
+        let mut sums = [0.0_f32; crate::bound_estimate::ALTS];
+        for (alt, sum) in sums.iter_mut().enumerate() {
+            let mut folded = vec![0.0_f32; values.len()];
+            for &(_, n) in uppers {
+                folded[n] = values[n].min(tables[n].bounds[alt][sub]);
+            }
+            *sum = folded.iter().fold(0.0_f32, |acc, v| acc + v);
+        }
+        let mut skipped = [false; crate::bound_estimate::ALTS];
+        for (alt, skip) in skipped.iter_mut().enumerate() {
+            *skip = !self.can_beat(sums[alt], ordinal);
+        }
+        self.estimate = Some(tables);
+        crate::bound_estimate::bump(|c| {
+            for (total, skip) in c.scored_skipped.iter_mut().zip(skipped) {
+                *total += i64::from(skip);
+            }
+        });
     }
 
     fn threshold(&self) -> Option<(f32, Tid)> {
@@ -1662,6 +1808,8 @@ impl OrdinalWalk<'_, '_> {
                 }
             }
         }
+        let all_terms: Vec<usize> = (0..self.terms.len()).collect();
+        self.estimate_chunk(&all_terms, base, Some(min_length));
         let from = self.dead.partition_point(|o| *o < base);
         for dead in &self.dead[from..] {
             if *dead >= base + segment::ordinals::CHUNK {
@@ -1691,6 +1839,9 @@ impl OrdinalWalk<'_, '_> {
                 let pruning = self.threshold().is_some();
                 skip_sub = sub_empty[sub]
                     || (pruning && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32));
+                if pruning && !skip_sub {
+                    self.estimate_sub(sub, base);
+                }
             }
             let mut word = if sparse {
                 let mut word = 0u64;
@@ -1850,6 +2001,9 @@ impl OrdinalWalk<'_, '_> {
             return None;
         }
         *self.scored += 1;
+        if pruning && self.estimate.is_some() {
+            self.estimate_candidate(sub, ordinal, values, uppers);
+        }
         for entry in uppers.iter_mut() {
             entry.0 = values[entry.1];
         }
@@ -1929,6 +2083,7 @@ impl OrdinalWalk<'_, '_> {
         for &t in present {
             self.terms[t].load();
         }
+        self.estimate_chunk(present, base, None);
         // The essential terms: sorted by chunk bound, the fewest whose absence
         // leaves the rest unable to reach the threshold. A candidate holds at
         // least one of them, so only their members are visited; the other
@@ -2008,6 +2163,9 @@ impl OrdinalWalk<'_, '_> {
                 let sub = i / (SUB / 64);
                 let pruning = self.threshold().is_some();
                 skip_sub = pruning && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32);
+                if pruning && !skip_sub && sub_scores[sub] > 0.0 {
+                    self.estimate_sub(sub, base);
+                }
             }
             let mut word = if sparse {
                 let mut word = 0u64;
