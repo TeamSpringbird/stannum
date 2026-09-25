@@ -604,6 +604,7 @@ pub(crate) fn area_bytes() -> [u64; segment::cache::AREAS] {
 
 pub(crate) fn reset_walk_blocks() {
     segment::cache::reset_areas();
+    segment::payload::diag::reset();
     SETUP_BLOCKS.set(0);
     WALK_BLOCKS.set(0);
     CHUNK_LOADS.set(0);
@@ -1713,9 +1714,11 @@ impl OrdinalWalk<'_, '_> {
             Member::Term(t) => &mut self.terms[t],
             Member::Filter(f) => &mut self.filters[f],
         };
+        let t0 = segment::payload::diag::ticks();
         let rank = term.rank(low).unwrap_or_else(|| {
             crate::storage::corrupt("Stannum: a phrase candidate is missing a term")
         });
+        segment::payload::diag::add(4, segment::payload::diag::ticks() - t0);
         let positions = &mut phrase.positions[slot];
         positions.clear();
         segment_error(payload.seek(rank));
@@ -1734,9 +1737,10 @@ impl OrdinalWalk<'_, '_> {
         let mut kept = true;
         for step in plan.steps() {
             self.read_slot(phrase, step.slot, low);
-            if let Some(pair) = step.pair
-                && !plan.pair_keeps(pair, &phrase.positions)
-            {
+            let t0 = segment::payload::diag::ticks();
+            let keeps = step.pair.is_none_or(|pair| plan.pair_keeps(pair, &phrase.positions));
+            segment::payload::diag::add(5, segment::payload::diag::ticks() - t0);
+            if !keeps {
                 kept = false;
                 break;
             }
@@ -1749,6 +1753,14 @@ impl OrdinalWalk<'_, '_> {
     /// the phrase. Every slot's term lists the candidate: the walk only
     /// reaches here through the conjunction of them.
     fn phrase_matches(&mut self, low: u16, ordinal: u32) -> bool {
+        let t0 = segment::payload::diag::ticks();
+        segment::payload::diag::add(12, 1);
+        let r = self.phrase_matches_inner(low, ordinal);
+        segment::payload::diag::add(11, segment::payload::diag::ticks() - t0);
+        r
+    }
+
+    fn phrase_matches_inner(&mut self, low: u16, ordinal: u32) -> bool {
         let Some(mut phrase) = self.phrase.take() else {
             return true;
         };
@@ -1761,6 +1773,7 @@ impl OrdinalWalk<'_, '_> {
         for slot in 0..phrase.slots.len() {
             self.read_slot(&mut phrase, slot, low);
         }
+        let t0 = segment::payload::diag::ticks();
         let matched = match &phrase.filter {
             None => phrase.solver.intervals(&phrase.positions).next().is_some(),
             Some(filter) => {
@@ -1775,6 +1788,7 @@ impl OrdinalWalk<'_, '_> {
                     .any(|interval| filter.matches_interval(length, interval))
             }
         };
+        segment::payload::diag::add(13, segment::payload::diag::ticks() - t0);
         self.phrase = Some(phrase);
         matched
     }

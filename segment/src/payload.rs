@@ -385,7 +385,11 @@ impl PayloadCursor<'_> {
         if end < start {
             return Err(Error::Corrupt("payload skip order"));
         }
+        let t0 = diag::ticks();
         self.owned = areas.payload_range_owned(base + start as u64, end - start)?;
+        diag::add(2, 1);
+        diag::add(3, (end - start) as u64);
+        diag::add(9, diag::ticks() - t0);
         self.owned_at = 0;
         self.slots = (slot, count);
         self.span_at = start;
@@ -426,6 +430,14 @@ impl PayloadCursor<'_> {
 
     /// Positions so the next decode returns entry `ordinal`.
     pub fn seek(&mut self, ordinal: u32) -> Result<()> {
+        let t0 = diag::ticks();
+        diag::add(0, 1);
+        let r = self.seek_inner(ordinal);
+        diag::add(8, diag::ticks() - t0);
+        r
+    }
+
+    fn seek_inner(&mut self, ordinal: u32) -> Result<()> {
         if ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload ordinal out of range"));
         }
@@ -434,6 +446,7 @@ impl PayloadCursor<'_> {
             && ordinal - self.next_ordinal < interval
             && ordinal / interval == self.next_ordinal / interval;
         if !forward_only {
+            diag::add(1, 1);
             let (at, start) = self.payload.skip_to(ordinal)?;
             self.next_ordinal = start;
             self.load()?;
@@ -471,9 +484,13 @@ impl PayloadCursor<'_> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));
         }
+        let t0 = diag::ticks();
         self.load()?;
-        self.decode(|reader| decode_positions(reader, positions))?;
+        let n = self.decode(|reader| decode_positions(reader, positions))?;
         self.next_ordinal += 1;
+        diag::add(6, 1);
+        diag::add(7, n as u64);
+        diag::add(10, diag::ticks() - t0);
         Ok(())
     }
 
@@ -493,6 +510,72 @@ impl PayloadCursor<'_> {
         let mut positions = Vec::new();
         self.next_into(&mut positions)?;
         Ok(Entry { positions })
+    }
+}
+
+/// Diagnostic counters (throwaway).
+pub mod diag {
+    use std::cell::Cell;
+    pub const N: usize = 15;
+    pub const NAMES: [&str; N] = [
+        "seeks", "jumps", "loads", "load_bytes", "rank_ticks", "pair_ticks",
+        "lists", "positions", "seek_ticks", "load_ticks", "decode_ticks", "check_ticks", "checks", "solve_ticks", "scratch",
+    ];
+    thread_local! { pub static C: [Cell<u64>; N] = const { [const { Cell::new(0) }; N] }; }
+    #[inline]
+    pub fn add(i: usize, v: u64) {
+        C.with(|c| c[i].set(c[i].get() + v));
+    }
+    pub fn reset() {
+        C.with(|c| c.iter().for_each(|x| x.set(0)));
+    }
+    pub fn report() -> String {
+        let freq = freq();
+        // Overhead of one measurement.
+        let t0 = ticks();
+        for _ in 0..10000 {
+            let t = ticks();
+            add(14, ticks() - t);
+        }
+        let total = ticks() - t0;
+        C.with(|c| c[14].set(0));
+        let o = total as f64 / 10000.0;
+        let head = format!("overhead_ns={:.1} ", o * 1e9 / freq as f64);
+        head + &C.with(|c| {
+            NAMES
+                .iter()
+                .zip(c.iter())
+                .map(|(n, v)| {
+                    if n.ends_with("ticks") {
+                        format!("{n}_us={:.0}", v.get() as f64 * 1e6 / freq as f64)
+                    } else {
+                        format!("{n}={}", v.get())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+    #[inline]
+    pub fn ticks() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let t: u64;
+            unsafe { std::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) t) };
+            t
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        0
+    }
+    fn freq() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let t: u64;
+            unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) t) };
+            t
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        1
     }
 }
 
