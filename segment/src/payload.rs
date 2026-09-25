@@ -97,6 +97,61 @@ pub(crate) fn skip_positions(reader: &mut Reader<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The byte just past `entries` encoded position lists starting at `at`.
+///
+/// A seek within a skip slot passes over the entries before its target,
+/// and for a frequent term those are most of what a phrase check reads.
+/// Each entry's count is decoded, but its positions are only counted: a
+/// varint ends at a byte without the high bit, so eight bytes at a time
+/// are tested at once. The positions are not validated; an entry that is
+/// decoded is, and so is every entry by `verify`.
+fn skip_entries(bytes: &[u8], mut at: usize, entries: u32) -> Result<usize> {
+    for _ in 0..entries {
+        let n = match bytes.get(at) {
+            Some(&byte) if byte < 0x80 => {
+                at += 1;
+                u32::from(byte)
+            }
+            _ => varint::get_u32(bytes, &mut at)?,
+        };
+        if n == 0 {
+            return Err(Error::InvalidPositions);
+        }
+        at = skip_varints(bytes, at, n)?;
+    }
+    Ok(at)
+}
+
+/// The byte just past `n` varints starting at `at`.
+#[inline]
+fn skip_varints(bytes: &[u8], mut at: usize, mut n: u32) -> Result<usize> {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    while n > 0 {
+        if let Some(chunk) = bytes.get(at..at + 8) {
+            let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+            // One bit per byte that ends a varint, at its high bit.
+            let mut ends = !word & HIGH;
+            let found = ends.count_ones();
+            if found < n {
+                n -= found;
+                at += 8;
+                continue;
+            }
+            // The n-th end: clear the n - 1 lowest.
+            for _ in 1..n {
+                ends &= ends - 1;
+            }
+            return Ok(at + (ends.trailing_zeros() / 8) as usize + 1);
+        }
+        let byte = *bytes.get(at).ok_or(Error::Truncated)?;
+        at += 1;
+        if byte < 0x80 {
+            n -= 1;
+        }
+    }
+    Ok(at)
+}
+
 /// Appends decoded positions to `into` and returns how many were read.
 pub(crate) fn decode_positions(reader: &mut Reader<'_>, into: &mut Vec<u32>) -> Result<usize> {
     visit_positions(reader, |position| into.push(position))
@@ -384,8 +439,18 @@ impl PayloadCursor<'_> {
             self.load()?;
             self.set_position(at - self.span_at)?;
         }
-        while self.next_ordinal < ordinal {
-            self.skip_entry()?;
+        if self.next_ordinal < ordinal {
+            // The target shares a skip slot with the next entry, so the
+            // loaded span holds every entry in between.
+            self.load()?;
+            let skip = ordinal - self.next_ordinal;
+            let (bytes, at) = match self.payload.source {
+                Bytes::Whole(bytes) => (bytes, self.reader.position()),
+                Bytes::Ranged { .. } => (&self.owned[..], self.owned_at),
+            };
+            let at = skip_entries(bytes, at, skip)?;
+            self.set_position(at)?;
+            self.next_ordinal = ordinal;
         }
         Ok(())
     }
@@ -627,6 +692,61 @@ mod tests {
                     compare(&corrupted);
                 }
             }
+        }
+    }
+
+    /// Random position lists with deltas of every varint width.
+    fn random_entries(seed: u64, n: usize) -> Vec<Entry> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..n)
+            .map(|_| {
+                let len = 1 + (next() % if next() % 4 == 0 { 40 } else { 4 }) as usize;
+                let mut position = 0u32;
+                let positions = (0..len)
+                    .map(|i| {
+                        let width = [3, 7, 14, 21, 28][(next() % 5) as usize];
+                        let step = (next() % (1 << width)) as u32;
+                        position = if i == 0 { step } else { position + step + 1 };
+                        position
+                    })
+                    .collect();
+                Entry { positions }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn skipping_entries_lands_where_decoding_them_does() {
+        for seed in 1..40 {
+            let entries = random_entries(seed, 50);
+            let mut data = Vec::new();
+            let mut ends = vec![0];
+            for entry in &entries {
+                encode_positions(&mut data, &entry.positions);
+                ends.push(data.len());
+            }
+            for from in 0..entries.len() {
+                for count in 0..=(entries.len() - from).min(33) {
+                    assert_eq!(
+                        skip_entries(&data, ends[from], count as u32),
+                        Ok(ends[from + count]),
+                        "seed {seed} from {from} count {count}"
+                    );
+                    // Cut short, it fails rather than reading past the end.
+                    if count > 0 {
+                        let cut = &data[..ends[from + count] - 1];
+                        assert!(skip_entries(cut, ends[from], count as u32).is_err());
+                    }
+                }
+            }
+            // A zero count is invalid, as when decoding.
+            assert_eq!(skip_entries(&[0], 0, 1), Err(Error::InvalidPositions));
         }
     }
 
