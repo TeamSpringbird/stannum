@@ -1143,6 +1143,7 @@ impl IndexScorer {
             term_max: scorer.map_or(0.0, |scorer| scorer.bound(&whole)),
             words: Box::new([0; segment::ordinals::WORDS]),
             bits: None,
+            loaded: None,
             counted: (0, 0),
             members: Vec::new(),
             dense: false,
@@ -1198,6 +1199,10 @@ struct OrdinalTerm<'a> {
     bits: Option<std::rc::Rc<[u8]>>,
     /// Whether the loaded chunk is a bitmap, held in `chunk` and `bits`.
     dense: bool,
+    /// Index into `keys` of the loaded chunk, if any: a load of the current
+    /// chunk is asked for wherever a bit or bucket of it is first needed,
+    /// and happens once.
+    loaded: Option<usize>,
     /// The rank of the current chunk's first member.
     rank_base: u32,
     /// Members counted so far in the current chunk: (word index, members
@@ -1249,8 +1254,19 @@ impl OrdinalTerm<'_> {
         score
     }
 
-    /// Loads the current chunk's members and the rank of its first member.
+    /// Whether the current chunk is loaded.
+    #[inline]
+    fn is_loaded(&self) -> bool {
+        self.loaded == Some(self.pos)
+    }
+
+    /// Loads the current chunk's members and the rank of its first member,
+    /// unless it is loaded already.
     fn load(&mut self) {
+        if self.is_loaded() {
+            return;
+        }
+        self.loaded = Some(self.pos);
         CHUNK_LOADS.set(CHUNK_LOADS.get() + 1);
         let key = self.keys[self.pos];
         self.members.clear();
@@ -2013,7 +2029,7 @@ impl OrdinalWalk<'_, '_> {
         // candidates are scattered, so reading a length before the bound
         // rejects the candidate was a page per candidate.
         for (n, &t) in present.iter().enumerate() {
-            let term = &mut self.terms[t];
+            let term = &self.terms[t];
             if !term.holds(low) {
                 continue;
             }
@@ -2138,11 +2154,6 @@ impl OrdinalWalk<'_, '_> {
         {
             return;
         }
-        // Every present term's chunk is loaded: a candidate is scored by
-        // testing each term's bits for it.
-        for &t in present {
-            self.terms[t].load();
-        }
         // The essential terms: sorted by chunk bound, the fewest whose absence
         // leaves the rest unable to reach the threshold. A candidate holds at
         // least one of them, so only their members are visited; the other
@@ -2168,6 +2179,15 @@ impl OrdinalWalk<'_, '_> {
                 essential -= 1;
             }
             essential = essential.max(1);
+        }
+        // Only the essential terms' chunks are loaded here: they form the
+        // candidate union. A required term's chunk is loaded when its words
+        // are ANDed in, and any other present term's only when a candidate
+        // survives the bounds without it; over common words the top k fill
+        // early and most chunks are settled by the required terms alone, so
+        // the other terms' chunks are never read.
+        for (_, t) in &by_bound[..essential] {
+            self.terms[*t].load();
         }
         let sparse = by_bound[..essential]
             .iter()
@@ -2214,6 +2234,7 @@ impl OrdinalWalk<'_, '_> {
         // threshold that decided it.
         let mut required = vec![false; present.len()];
         let mut required_at = None;
+        let mut settled = false;
         for i in 0..segment::ordinals::WORDS {
             let sub = i / SUB_WORDS;
             let w = i % SUB_WORDS;
@@ -2248,6 +2269,7 @@ impl OrdinalWalk<'_, '_> {
             // few documents holding them all. The threshold only rises, so
             // a term once required stays so; when the threshold moves, the
             // terms it newly requires are ANDed into the words still ahead.
+            // A required term's chunk is loaded here, at its first AND.
             if let Some((threshold, holder)) = self.threshold()
                 && required_at != Some((threshold, holder))
             {
@@ -2259,13 +2281,25 @@ impl OrdinalWalk<'_, '_> {
                         && (all - f64::from(self.term_subs[n][sub])) * slack < f64::from(threshold)
                     {
                         required[n] = true;
-                        self.terms[t].and_sub(sub, w, &mut block);
+                        let term = &mut self.terms[t];
+                        term.load();
+                        term.and_sub(sub, w, &mut block);
                     }
                 }
             }
             let mut word = block[w];
             if word == 0 {
                 continue;
+            }
+            // A candidate is bounded and scored by every present term's
+            // bits, so the terms not loaded yet are loaded at the chunk's
+            // first surviving word; a chunk the required terms empty never
+            // reads them.
+            if !settled {
+                for &t in present {
+                    self.terms[t].load();
+                }
+                settled = true;
             }
             while word != 0 {
                 let low = (i * 64) as u16 + word.trailing_zeros() as u16;

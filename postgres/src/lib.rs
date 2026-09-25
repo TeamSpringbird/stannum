@@ -1412,6 +1412,87 @@ mod tests {
         assert!(plan.contains("\"Pruning\":\"ordinal\""), "{plan}");
     }
 
+    /// A disjunction's walk loads a term's chunk only where a candidate
+    /// needs its bits. One segment spans two chunks of ordinals and every
+    /// term occupies both; in the first the rare and the middling term
+    /// share documents, which fill the top k, and in the second they never
+    /// do, so the required terms' AND empties every sub-block there and the
+    /// common term's chunk is never read, yet the ranking is the exhaustive
+    /// one bit for bit.
+    #[pg_test]
+    fn disjunction_walk_skips_the_chunks_no_candidate_needs() {
+        Spi::run(
+            "CREATE TABLE lazy(id int primary key, body text);
+             INSERT INTO lazy SELECT n,
+               CASE WHEN n % 2 = 0 THEN 'alpha ' ELSE '' END ||
+               CASE WHEN n <= 65536 AND n % 100 = 0 THEN 'delta delta gamma gamma ' ELSE '' END ||
+               CASE WHEN n <= 65536 AND n % 10 = 0 AND n % 100 <> 0 THEN 'gamma ' ELSE '' END ||
+               CASE WHEN n > 65536 AND n % 10 = 5 THEN 'gamma gamma ' ELSE '' END ||
+               CASE WHEN n > 65536 AND n % 100 = 0 THEN 'delta delta delta ' ELSE '' END ||
+               repeat('pad ', CASE WHEN n % 100 = 0 THEN 0 ELSE n % 7 END) || 'tail'
+               FROM generate_series(1, 70000) n;
+             CREATE INDEX lazy_idx ON lazy USING stannum(body);",
+        )
+        .unwrap();
+        let ranked = |custom: bool| -> Vec<(i32, u32)> {
+            Spi::run(&format!(
+                "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;
+                 SET LOCAL enable_bitmapscan = off;"
+            ))
+            .unwrap();
+            Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, stannum.score(ctid, 1.0) AS score FROM lazy
+                             WHERE body ==> 'delta OR gamma OR alpha'
+                             ORDER BY score DESC{} LIMIT 10",
+                            if custom { "" } else { ", ctid" }
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        };
+        let expected = ranked(false);
+        assert_eq!(ranked(true), expected);
+        assert!(
+            expected.iter().all(|(id, _)| id % 100 == 0 && *id <= 65536),
+            "{expected:?}"
+        );
+        let plan = Spi::get_one::<Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM lazy WHERE body ==> 'delta OR gamma OR alpha'
+             ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10",
+        )
+        .unwrap()
+        .unwrap()
+        .0;
+        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node.clone());
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
+        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        // Three chunks in the first chunk of ordinals; delta and gamma in
+        // the second, whose AND leaves nothing for alpha's chunk to settle.
+        // Loading every present term's chunk up front read six.
+        assert_eq!(scan["Chunks Loaded"], 5, "{scan}");
+    }
+
     #[pg_test]
     fn pruned_top_k_matches_full_scoring_bit_for_bit() {
         // Four build segments of 1,000 documents and a write buffer, with a
