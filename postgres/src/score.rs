@@ -1073,6 +1073,7 @@ impl IndexScorer {
             seed: seeded_threshold(),
             values: Vec::new(),
             uppers: Vec::new(),
+            buckets: Vec::new(),
             term_subs: Vec::new(),
             phrase,
             pending: Vec::new(),
@@ -1332,6 +1333,8 @@ struct OrdinalWalk<'a, 's> {
     /// and the terms holding the document.
     values: Vec<f32>,
     uppers: Vec<(f32, usize)>,
+    /// Scratch: per present term, the candidate's bucket once read.
+    buckets: Vec<TfBucket>,
     /// Scratch for a chunk: per present term its bound per sub-block.
     term_subs: Vec<[f32; SUBS]>,
     /// For a phrase: the positions check a candidate must pass to be admitted.
@@ -1861,11 +1864,12 @@ impl OrdinalWalk<'_, '_> {
     /// The score of the document `low` of the current chunk, or `None` when
     /// it cannot reach the threshold. Of the terms `present` (in slot order)
     /// those holding the document are bounded by their sub-block's largest
-    /// bucket at the document's length, which costs no read; the payloads
-    /// are then read largest bound first and abandoned as soon as the exact
-    /// contributions so far and the bounds of the rest fall short. Every sum
-    /// is folded in slot order, as the exhaustive path folds the total, so
-    /// the bound of a fully read candidate is its exact score, bit for bit.
+    /// bucket at the document's length class, which costs no read; the
+    /// document's buckets, nibbles of the loaded chunk, then tighten the
+    /// bound at the class, and its length is read only when that still
+    /// reaches the threshold. Every sum is folded in slot order, as the
+    /// exhaustive path folds the total, so the bound of a fully read
+    /// candidate is its exact score, bit for bit.
     fn score_candidate(
         &mut self,
         present: &[usize],
@@ -1878,9 +1882,12 @@ impl OrdinalWalk<'_, '_> {
         // hundred thousand times a query, and two allocations each showed.
         let mut values = std::mem::take(&mut self.values);
         let mut uppers = std::mem::take(&mut self.uppers);
+        let mut buckets = std::mem::take(&mut self.buckets);
         values.clear();
         values.resize(present.len(), 0.0);
         uppers.clear();
+        buckets.clear();
+        buckets.resize(present.len(), TfBucket::from_count(0));
         let score = self.score_candidate_in(
             present,
             low,
@@ -1889,9 +1896,11 @@ impl OrdinalWalk<'_, '_> {
             pruning,
             &mut values,
             &mut uppers,
+            &mut buckets,
         );
         self.values = values;
         self.uppers = uppers;
+        self.buckets = buckets;
         score
     }
 
@@ -1908,9 +1917,10 @@ impl OrdinalWalk<'_, '_> {
         pruning: bool,
         values: &mut [f32],
         uppers: &mut Vec<(f32, usize)>,
+        buckets: &mut [TfBucket],
     ) -> Option<f32> {
         // Per term of `present`: its bound, replaced by its exact score once
-        // read; and the terms holding the document by descending bound.
+        // read; and the terms holding the document, in slot order.
         // First at the shortest document the bounds allow, which costs no
         // read: the length table is one page per 2,048 documents and
         // candidates are scattered, so reading a length before the bound
@@ -1932,11 +1942,19 @@ impl OrdinalWalk<'_, '_> {
         }
         // The document's own length tightens every bound. Its class is a
         // byte per document and a lower bound on the length, so the bounds
-        // are tightened at the class first; the exact length, four bytes per
-        // document, is read only when the class bound admits the candidate.
-        let bound_at = |values: &mut [f32], terms: &[OrdinalTerm<'_>], length: u32| {
+        // are tightened at the class first. The exact length, four bytes per
+        // document in a table a walk touches once per scattered candidate,
+        // is read last: the candidate's buckets are nibbles of the chunk
+        // already loaded, so they are read first and bounded at the class
+        // before the length is. Three in four candidates fell to the class
+        // bound and nearly every survivor read its length, only to lose to
+        // the threshold once scored; bounding exact buckets at the class
+        // rejects most of them without the read.
+        let class = if pruning {
+            let class = segment_error(self.index.length_class(ordinal));
+            let floor = segment::length_class::min_length(class);
             for &(_, n) in uppers.iter() {
-                let term = &terms[present[n]];
+                let term = &self.terms[present[n]];
                 let scorer = &self.scorer.terms[term.slot].1;
                 let top = term.sub_bounds[term.pos][sub];
                 // The sub-block's largest bucket is a member's, so the score
@@ -1946,38 +1964,16 @@ impl OrdinalWalk<'_, '_> {
                     0.0
                 } else {
                     let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
-                    scorer.score_bucket(bucket, length)
+                    scorer.score_bucket(bucket, floor)
                 };
             }
-        };
-        if pruning {
-            let class = segment_error(self.index.length_class(ordinal));
-            bound_at(
-                values,
-                &self.terms,
-                segment::length_class::min_length(class),
-            );
             if !self.can_beat(fold(values), ordinal) {
                 return None;
             }
-        }
-        let length = segment_error(self.lengths.get(ordinal));
-        bound_at(values, &self.terms, length);
-        if pruning && !self.can_beat(fold(values), ordinal) {
-            return None;
-        }
-        *self.scored += 1;
-        for entry in uppers.iter_mut() {
-            entry.0 = values[entry.1];
-        }
-        // A handful of terms: an insertion sort, not a sort call per candidate.
-        for i in 1..uppers.len() {
-            let mut j = i;
-            while j > 0 && uppers[j - 1].0 < uppers[j].0 {
-                uppers.swap(j - 1, j);
-                j -= 1;
-            }
-        }
+            Some(class)
+        } else {
+            None
+        };
         for &(_, n) in uppers.iter() {
             let t = present[n];
             let term = &mut self.terms[t];
@@ -1991,16 +1987,31 @@ impl OrdinalWalk<'_, '_> {
                     "Stannum index data: ordinal {ordinal} carries no term-frequency bucket"
                 ))
             });
-            let bucket = TfBucket::new(bucket).unwrap_or_else(|| {
+            buckets[n] = TfBucket::new(bucket).unwrap_or_else(|| {
                 crate::storage::corrupt(format!(
                     "Stannum index data: term-frequency bucket {bucket} out of range"
                 ))
             });
-            values[n] = self.scorer.terms[term.slot].1.score_bucket(bucket, length);
-            if pruning && !self.can_beat(fold(values), ordinal) {
+        }
+        if let Some(class) = class {
+            let floor = segment::length_class::min_length(class);
+            for &(_, n) in uppers.iter() {
+                let slot = self.terms[present[n]].slot;
+                values[n] = self.scorer.terms[slot].1.score_bucket(buckets[n], floor);
+            }
+            if !self.can_beat(fold(values), ordinal) {
                 return None;
             }
         }
+        let length = segment_error(self.lengths.get(ordinal));
+        for &(_, n) in uppers.iter() {
+            let slot = self.terms[present[n]].slot;
+            values[n] = self.scorer.terms[slot].1.score_bucket(buckets[n], length);
+        }
+        if pruning && !self.can_beat(fold(values), ordinal) {
+            return None;
+        }
+        *self.scored += 1;
         Some(fold(values))
     }
 
