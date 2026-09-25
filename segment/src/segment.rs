@@ -391,7 +391,11 @@ impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
 /// else to serve one value. The window is a fraction of a page and is not
 /// cached privately: the table is already in shared buffers, which every
 /// backend shares.
-const LENGTH_WINDOW: u32 = 2048;
+/// Documents per length window handed to a walk: a candidate's length is a
+/// window fetch when the window last read does not hold it, and candidates
+/// are sparse enough that a window served about one of them, so a 2,048
+/// document window was an 8 KiB copy per candidate.
+const LENGTH_WINDOW: u32 = 64;
 
 /// Fetches the streams of the ordinals and payload areas, the document
 /// table and document lengths.

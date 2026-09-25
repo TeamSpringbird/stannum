@@ -831,10 +831,15 @@ impl IndexScorer {
             // hold a tuple the view still lists; the walk is repeated against
             // the heap if a dead list was published meanwhile.
             let mut shortcut = true;
+            // Largest source first: the threshold prunes only once the heap
+            // holds k rows, and the biggest segment is the likeliest to hold
+            // the best of them, so the smaller ones are walked pruned.
+            let mut order: Vec<usize> = (0..self.view.sources.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(self.view.sources[i].0.document_count()));
             loop {
                 let mut visibility =
                     unsafe { Visibility::open(pg_sys::Oid::from(self.key.heap_oid), shortcut) };
-                for i in 0..self.view.sources.len() {
+                for &i in &order {
                     self.walk_by_ordinal(
                         i,
                         combine,
@@ -955,6 +960,7 @@ impl IndexScorer {
             seed: seeded_threshold(),
             values: Vec::new(),
             uppers: Vec::new(),
+            term_subs: Vec::new(),
         };
         match combine {
             Combine::Any => walk.any(),
@@ -1212,6 +1218,8 @@ struct OrdinalWalk<'a, 's> {
     /// and the terms holding the document.
     values: Vec<f32>,
     uppers: Vec<(f32, usize)>,
+    /// Scratch for a chunk: per present term its bound per sub-block.
+    term_subs: Vec<[f32; SUBS]>,
 }
 
 impl OrdinalWalk<'_, '_> {
@@ -1416,9 +1424,11 @@ impl OrdinalWalk<'_, '_> {
         // before any stream is read.
         let mut sub_scores = [0.0_f32; SUBS];
         let mut sub_empty = [false; SUBS];
+        self.term_subs.clear();
         for term in &mut self.terms {
             let scorer = &self.scorer.terms[term.slot].1;
             let by_bucket = term.bounds_by_bucket(term.pos, scorer, min_length);
+            let mut mine = [0.0_f32; SUBS];
             for (i, (sub, score)) in term.sub_bounds[term.pos]
                 .iter()
                 .zip(sub_scores.iter_mut())
@@ -1427,9 +1437,12 @@ impl OrdinalWalk<'_, '_> {
                 if *sub == 0 {
                     sub_empty[i] = true;
                 } else {
-                    *score += by_bucket[usize::from(*sub - 1)];
+                    let bound = by_bucket[usize::from(*sub - 1)];
+                    *score += bound;
+                    mine[i] = bound;
                 }
             }
+            self.term_subs.push(mine);
         }
         if self.threshold().is_some()
             && !(0..SUBS).any(|sub| {
@@ -1631,13 +1644,9 @@ impl OrdinalWalk<'_, '_> {
             if term.words[usize::from(low / 64)] & (1 << (low % 64)) == 0 {
                 continue;
             }
-            let scorer = &self.scorer.terms[term.slot].1;
-            let top = term.sub_bounds[term.pos][sub];
-            let upper = if top == 0 {
-                0.0
-            } else {
-                term.bounds_by_bucket(term.pos, scorer, floor.unwrap_or(0))[usize::from(top - 1)]
-            };
+            // The chunk's per-term bound for this sub-block, computed once
+            // per chunk by the caller; it was a table copy per candidate.
+            let upper = self.term_subs[n][sub];
             values[n] = upper;
             uppers.push((upper, n));
         }
@@ -1685,7 +1694,14 @@ impl OrdinalWalk<'_, '_> {
         for entry in uppers.iter_mut() {
             entry.0 = values[entry.1];
         }
-        uppers.sort_by(|a, b| b.0.total_cmp(&a.0));
+        // A handful of terms: an insertion sort, not a sort call per candidate.
+        for i in 1..uppers.len() {
+            let mut j = i;
+            while j > 0 && uppers[j - 1].0 < uppers[j].0 {
+                uppers.swap(j - 1, j);
+                j -= 1;
+            }
+        }
         for &(_, n) in uppers.iter() {
             let t = present[n];
             let term = &mut self.terms[t];
@@ -1722,15 +1738,27 @@ impl OrdinalWalk<'_, '_> {
         // million rows a three-term disjunction loaded every chunk of every
         // term for 2,300 candidates.
         let mut sub_scores = [0.0_f32; SUBS];
+        // Per present term, its bound per sub-block: a member's first bound
+        // is the sum over the terms holding it, taken inline below before
+        // any call, since most members of a common term's chunk fail it.
+        self.term_subs.clear();
         for &t in present {
             let term = &mut self.terms[t];
             let scorer = &self.scorer.terms[term.slot].1;
             let by_bucket = term.bounds_by_bucket(term.pos, scorer, 0);
-            for (sub, score) in term.sub_bounds[term.pos].iter().zip(sub_scores.iter_mut()) {
+            let mut mine = [0.0_f32; SUBS];
+            for (i, (sub, score)) in term.sub_bounds[term.pos]
+                .iter()
+                .zip(sub_scores.iter_mut())
+                .enumerate()
+            {
                 if *sub > 0 {
-                    *score += by_bucket[usize::from(*sub - 1)];
+                    let bound = by_bucket[usize::from(*sub - 1)];
+                    *score += bound;
+                    mine[i] = bound;
                 }
             }
+            self.term_subs.push(mine);
         }
         if self.threshold().is_some()
             && !(0..SUBS).any(|sub| self.can_beat(sub_scores[sub], base + (sub * SUB) as u32))
@@ -1841,6 +1869,19 @@ impl OrdinalWalk<'_, '_> {
                 let ordinal = base + u32::from(low);
                 let sub = usize::from(low) / SUB;
                 let pruning = self.threshold().is_some();
+                if pruning {
+                    let word_at = usize::from(low / 64);
+                    let bit = 1u64 << (low % 64);
+                    let mut first = 0.0_f32;
+                    for (n, &t) in present.iter().enumerate() {
+                        if self.terms[t].words[word_at] & bit != 0 {
+                            first += self.term_subs[n][sub];
+                        }
+                    }
+                    if !self.can_beat(first, ordinal) {
+                        continue;
+                    }
+                }
                 let Some(total) = self.score_candidate(present, low, ordinal, sub, pruning, None)
                 else {
                     continue;
