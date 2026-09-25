@@ -528,6 +528,52 @@ pub(crate) const PRUNE_MAX_K: usize = 4096;
 /// walk seeded from per-term champion lists would cost.
 pub(crate) static DEBUG_SEED_SCORE: pgrx::GucSetting<f64> = pgrx::GucSetting::<f64>::new(-1.0);
 
+/// Default of `stannum.warmup_chunks`; see [`IndexScorer::warm_up`].
+pub(crate) const DEFAULT_WARMUP_CHUNKS: i32 = 256;
+
+/// `stannum.warmup_chunks`: how many chunks, across every source, a pruned
+/// conjunction evaluates first, those with the highest bounds by the chunk
+/// directory, so its threshold starts near its final value. Zero disables.
+pub(crate) static WARMUP_CHUNKS: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(DEFAULT_WARMUP_CHUNKS);
+
+/// Default of `stannum.warmup_min_matches`.
+pub(crate) const DEFAULT_WARMUP_MIN_MATCHES: f64 = 4.0;
+
+/// `stannum.warmup_min_matches`: a conjunction is warmed up only when its
+/// matches, estimated as if its terms occurred independently, number at
+/// least this many per row asked for. With fewer the top k fills late or
+/// never, so the threshold the warm-up raises prunes little, and its pass
+/// over the directory and its chunks out of order are all it adds. The
+/// estimate falls short for words that keep company, so the bar is low.
+pub(crate) static WARMUP_MIN_MATCHES: pgrx::GucSetting<f64> =
+    pgrx::GucSetting::<f64>::new(DEFAULT_WARMUP_MIN_MATCHES);
+
+thread_local! {
+    /// Chunks walks evaluated in their warm-ups, before walking in order.
+    static WARMUP_EVALUATED: Cell<i64> = const { Cell::new(0) };
+    /// The k-th best score once the last warm-up ended, if the heap was full.
+    static WARMUP_THRESHOLD: Cell<Option<f32>> = const { Cell::new(None) };
+    /// The matches the last conjunction's warm-up was judged by.
+    static WARMUP_ESTIMATE: Cell<Option<f64>> = const { Cell::new(None) };
+}
+
+/// Chunks evaluated in warm-ups since the last reset.
+pub(crate) fn warmup_chunks() -> i64 {
+    WARMUP_EVALUATED.get()
+}
+
+/// The k-th best score after the last warm-up, if it filled the top k.
+pub(crate) fn warmup_threshold() -> Option<f32> {
+    WARMUP_THRESHOLD.get()
+}
+
+/// The matches the last conjunction estimated for its warm-up (see
+/// [`WARMUP_MIN_MATCHES`]), if one was considered.
+pub(crate) fn warmup_estimate() -> Option<f64> {
+    WARMUP_ESTIMATE.get()
+}
+
 thread_local! {
     /// Index pages read while building a walk's per-term state, and while
     /// walking. A pruned walk cannot skip what it reads before it starts, so
@@ -611,6 +657,9 @@ pub(crate) fn reset_walk_blocks() {
     POSITION_READS.set(0);
     VISIBILITY_CHECKS.set(0);
     VM_HITS.set(0);
+    WARMUP_EVALUATED.set(0);
+    WARMUP_THRESHOLD.set(None);
+    WARMUP_ESTIMATE.set(None);
     PHASE_DISK.with_borrow_mut(Vec::clear);
 }
 
@@ -1140,22 +1189,48 @@ impl IndexScorer {
             // the best of them, so the smaller ones are walked pruned.
             let mut order: Vec<usize> = (0..self.view.sources.len()).collect();
             order.sort_by_key(|&i| std::cmp::Reverse(self.view.sources[i].0.document_count()));
+            // Only a conjunction of scoring terms, elided filters beside them
+            // or not, is warmed up (see [`Self::warm_up`]): a phrase's
+            // best-bounded chunks may hold no phrase match, and a
+            // disjunction's threshold forms early without it.
+            let warmup = if combine == Combine::All
+                && check.is_none()
+                && mixed.is_none()
+                && !self.terms.is_empty()
+            {
+                usize::try_from(WARMUP_CHUNKS.get()).unwrap_or(0)
+            } else {
+                0
+            };
             loop {
                 let mut visibility =
                     unsafe { Visibility::open(pg_sys::Oid::from(self.key.heap_oid), shortcut) };
-                for &i in &order {
-                    self.walk_by_ordinal(
-                        i,
-                        combine,
+                if warmup > 0 {
+                    self.warm_up(
+                        &order,
                         &filters,
-                        check.as_ref(),
-                        mixed.as_ref(),
+                        warmup,
                         &mut visibility,
                         k,
                         &mut heap,
                         &mut scored,
                     );
                     ordinal = true;
+                } else {
+                    for &i in &order {
+                        self.walk_by_ordinal(
+                            i,
+                            combine,
+                            &filters,
+                            check.as_ref(),
+                            mixed.as_ref(),
+                            &mut visibility,
+                            k,
+                            &mut heap,
+                            &mut scored,
+                        );
+                        ordinal = true;
+                    }
                 }
                 if !visibility.shortcuts
                     || unsafe {
@@ -1215,6 +1290,21 @@ impl IndexScorer {
         heap: &mut BinaryHeap<Ranked>,
         scored: &mut usize,
     ) {
+        if let Some(mut parts) = self.open_walk(i, combine, filters, check, mixed) {
+            self.run_walk(&mut parts, visibility, k, heap, scored, Pass::Walk(&[]));
+        }
+    }
+
+    /// The streams and checks of source `i`'s walk, or `None` when the
+    /// source holds no match.
+    fn open_walk(
+        &self,
+        i: usize,
+        combine: Combine,
+        filters: &[&str],
+        check: Option<&SpanCheck<'_>>,
+        mixed: Option<&Shape<'_>>,
+    ) -> Option<WalkParts<'_>> {
         let started = blocks_used();
         let (source, dead_list) = &self.view.sources[i];
         let label = &self.view.labels[i];
@@ -1232,7 +1322,7 @@ impl IndexScorer {
             let Some(term) = segment_error_in(source.term(name), label) else {
                 match combine {
                     // A missing term empties the conjunction in this source.
-                    Combine::All => return,
+                    Combine::All => return None,
                     Combine::Any => continue,
                 }
             };
@@ -1263,14 +1353,14 @@ impl IndexScorer {
                     filter_names.push(*name);
                 }
                 None if mixed.is_some() => {}
-                None => return,
+                None => return None,
             }
         }
         // With no scoring term a conjunction is walked as its filters alone;
         // a disjunction of none is nothing.
         let unscored = terms.is_empty();
         if unscored && (combine != Combine::All || filter_terms.is_empty()) {
-            return;
+            return None;
         }
         // A phrase reads each slot's positions from the term's payload; a
         // slot is a scoring term or, when the scorer elided it, a filter.
@@ -1329,41 +1419,84 @@ impl IndexScorer {
             };
             Self::condition(shape, &bits, &**source, label, &mut phrases)
         });
-        let ready = blocks_used();
-        SETUP_BLOCKS.set(SETUP_BLOCKS.get() + ready - started);
         let docs = segment_error_in(source.doc_table(), label);
-        // The pages of the length and class tables stay pinned while the
-        // walk reads them per candidate, and are released as it ends.
-        let _held = HeldPages::open(&**source);
-        let mut walk = OrdinalWalk {
-            scorer: self,
+        SETUP_BLOCKS.set(SETUP_BLOCKS.get() + blocks_used() - started);
+        Some(WalkParts {
+            combine,
+            unscored,
             terms,
             filters: filter_terms,
-            docs: &docs,
-            index: &**source,
-            document_count: source.document_count(),
-            lengths: source.lengths(),
-            dead: &dead,
+            docs,
+            source: &**source,
+            dead,
+            phrase,
+            condition,
+            phrases,
+        })
+    }
+
+    /// Runs `pass` of a source's walk over `parts`, and moves its streams
+    /// back to their first chunks for the next pass.
+    fn run_walk<'a>(
+        &'a self,
+        parts: &mut WalkParts<'a>,
+        visibility: &mut Visibility,
+        k: usize,
+        heap: &mut BinaryHeap<Ranked>,
+        scored: &mut usize,
+        pass: Pass<'_>,
+    ) {
+        let ready = blocks_used();
+        // The pages of the length and class tables stay pinned while the
+        // walk reads them per candidate, and are released as it ends.
+        let _held = HeldPages::open(parts.source);
+        let mut walk = OrdinalWalk {
+            scorer: self,
+            terms: std::mem::take(&mut parts.terms),
+            filters: std::mem::take(&mut parts.filters),
+            docs: &parts.docs,
+            index: parts.source,
+            document_count: parts.source.document_count(),
+            lengths: parts.source.lengths(),
+            dead: &parts.dead,
             visibility,
             k,
             heap,
             scored,
             iterations: 0,
             // An unscored walk has no score to seed: every match ties at zero.
-            seed: if unscored { None } else { seeded_threshold() },
+            seed: if parts.unscored {
+                None
+            } else {
+                seeded_threshold()
+            },
             values: Vec::new(),
             uppers: Vec::new(),
             buckets: Vec::new(),
             term_subs: Vec::new(),
-            phrase,
+            phrase: parts.phrase.take(),
             pending: Vec::new(),
-            condition,
-            phrases,
+            condition: parts.condition.take(),
+            phrases: std::mem::take(&mut parts.phrases),
+            warmed: match pass {
+                Pass::Walk(warmed) => warmed,
+                _ => &[],
+            },
         };
-        match combine {
-            Combine::Any => walk.any(),
-            Combine::All if unscored => walk.all_unscored(),
-            Combine::All => walk.all(),
+        match (pass, parts.combine) {
+            (Pass::Bound(out), _) => walk.chunk_bounds(out),
+            (Pass::Warm(keys), _) => walk.warm(keys),
+            (Pass::Walk(_), Combine::Any) => walk.any(),
+            (Pass::Walk(_), Combine::All) if parts.unscored => walk.all_unscored(),
+            (Pass::Walk(_), Combine::All) => walk.all(),
+        }
+        parts.terms = walk.terms;
+        parts.filters = walk.filters;
+        parts.phrase = walk.phrase;
+        parts.condition = walk.condition;
+        parts.phrases = walk.phrases;
+        for term in parts.terms.iter_mut().chain(parts.filters.iter_mut()) {
+            term.pos = 0;
         }
         WALK_BLOCKS.set(WALK_BLOCKS.get() + blocks_used() - ready);
     }
@@ -1477,6 +1610,233 @@ impl IndexScorer {
             members: Vec::new(),
             dense: false,
             rank_base: 0,
+        }
+    }
+}
+
+/// A source's streams and checks for its walk, kept across the passes of a
+/// warm-up (see [`IndexScorer::open_walk`]).
+struct WalkParts<'a> {
+    combine: Combine,
+    /// A conjunction of elided terms alone: every match scores zero.
+    unscored: bool,
+    terms: Vec<OrdinalTerm<'a>>,
+    filters: Vec<OrdinalTerm<'a>>,
+    docs: DocTable<'a>,
+    source: &'a dyn Index,
+    /// Dead ordinals, ascending.
+    dead: std::rc::Rc<Vec<u32>>,
+    phrase: Option<PhraseCheck<'a>>,
+    condition: Option<Condition>,
+    phrases: Vec<Option<PhraseCheck<'a>>>,
+}
+
+impl WalkParts<'_> {
+    /// The documents of the source holding every term and filter, as if
+    /// each occurred independently of the others.
+    fn estimated_matches(&self) -> f64 {
+        let documents = f64::from(self.source.document_count().max(1));
+        self.terms
+            .iter()
+            .chain(&self.filters)
+            .fold(documents, |matches, term| {
+                matches * f64::from(term.ordinals.count()) / documents
+            })
+    }
+}
+
+/// A conjunction's chunk bounded from the chunk directory alone: the length
+/// every term's bound holds at, the longest of the terms' shortest
+/// documents there, and the chunk's bound at it.
+#[derive(Clone, Copy)]
+struct Bounded {
+    key: u16,
+    min_length: u32,
+    bound: f32,
+}
+
+/// Which part of its work a source's walk runs (see
+/// [`IndexScorer::run_walk`]).
+enum Pass<'p> {
+    /// The walk in chunk order, skipping the chunks the warm-up evaluated,
+    /// whose keys are given ascending.
+    Walk(&'p [u16]),
+    /// A conjunction's warm-up: every chunk each term and filter holds,
+    /// bounded, nothing loaded.
+    Bound(&'p mut Vec<Bounded>),
+    /// A conjunction's warm-up: these chunks evaluated, in this order.
+    Warm(&'p [Bounded]),
+}
+
+impl IndexScorer {
+    /// Walks a conjunction's sources (`order`) after evaluating up to
+    /// `limit` of their chunks, across every source, before any walk runs:
+    /// those whose bound by the chunk directory alone is highest, best
+    /// first, into the shared heap. Each walk then skips the chunks warmed
+    /// in its source, so no document is scored twice.
+    ///
+    /// A walk in chunk order raises its threshold only as it happens to meet
+    /// good documents; for a conjunction of common words that is most of the
+    /// chunks, where seeding the walk with its final threshold loaded a
+    /// ninth of them. Exact whatever the order: each chunk is evaluated once,
+    /// against a threshold that only rises, and a range is judged by the
+    /// location of its first ordinal, which within a source is the earliest
+    /// of every document in the range wherever the range lies.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site; the arguments are the walk's state"
+    )]
+    fn warm_up(
+        &self,
+        order: &[usize],
+        filters: &[&str],
+        limit: usize,
+        visibility: &mut Visibility,
+        k: usize,
+        heap: &mut BinaryHeap<Ranked>,
+        scored: &mut usize,
+    ) {
+        // Each source's streams are opened once, for all three passes.
+        let mut walks: Vec<WalkParts<'_>> = order
+            .iter()
+            .filter_map(|&i| self.open_walk(i, Combine::All, filters, None, None))
+            .collect();
+        let estimate: f64 = walks.iter().map(WalkParts::estimated_matches).sum();
+        WARMUP_ESTIMATE.set(Some(estimate));
+        let limit = if estimate < k as f64 * WARMUP_MIN_MATCHES.get() {
+            0
+        } else {
+            limit
+        };
+        let mut picks: Vec<(usize, Bounded)> = Vec::new();
+        if limit > 0 {
+            let mut bounded = Vec::new();
+            for (n, parts) in walks.iter_mut().enumerate() {
+                bounded.clear();
+                self.run_walk(
+                    parts,
+                    visibility,
+                    k,
+                    heap,
+                    scored,
+                    Pass::Bound(&mut bounded),
+                );
+                picks.extend(bounded.iter().map(|chunk| (n, *chunk)));
+            }
+        }
+        let best = |a: &(usize, Bounded), b: &(usize, Bounded)| {
+            b.1.bound
+                .total_cmp(&a.1.bound)
+                .then(a.0.cmp(&b.0))
+                .then(a.1.key.cmp(&b.1.key))
+        };
+        if picks.len() > limit {
+            picks.select_nth_unstable_by(limit - 1, best);
+            picks.truncate(limit);
+        }
+        picks.sort_unstable_by(best);
+        // Each source's picks are evaluated in one walk, best first, the
+        // largest source first as the walks go.
+        let mut warmed = vec![Vec::new(); walks.len()];
+        for &(n, chunk) in &picks {
+            warmed[n].push(chunk);
+        }
+        let mut skip = Vec::with_capacity(walks.len());
+        for (parts, chunks) in walks.iter_mut().zip(&warmed) {
+            if !chunks.is_empty() {
+                self.run_walk(parts, visibility, k, heap, scored, Pass::Warm(chunks));
+            }
+            let mut keys: Vec<u16> = chunks.iter().map(|chunk| chunk.key).collect();
+            keys.sort_unstable();
+            skip.push(keys);
+        }
+        if !picks.is_empty() {
+            WARMUP_EVALUATED.set(WARMUP_EVALUATED.get() + picks.len() as i64);
+            WARMUP_THRESHOLD.set(if heap.len() == k {
+                heap.peek().map(|worst| worst.0)
+            } else {
+                None
+            });
+        }
+        for (parts, keys) in walks.iter_mut().zip(&skip) {
+            self.run_walk(parts, visibility, k, heap, scored, Pass::Walk(keys));
+        }
+    }
+}
+
+impl OrdinalWalk<'_, '_> {
+    /// Reports every chunk of a conjunction each term and filter holds,
+    /// bounded as [`Self::all`] bounds it, from the chunk directory alone.
+    fn chunk_bounds(&mut self, out: &mut Vec<Bounded>) {
+        let lead = (0..self.terms.len())
+            .min_by_key(|&t| self.terms[t].keys.len())
+            .expect("a conjunction has terms");
+        'keys: for p in 0..self.terms[lead].keys.len() {
+            let key = self.terms[lead].keys[p];
+            self.terms[lead].pos = p;
+            for (t, term) in self.terms.iter_mut().enumerate() {
+                if t == lead {
+                    continue;
+                }
+                term.pos += term.keys[term.pos..].partition_point(|k| *k < key);
+                match term.key() {
+                    None => return,
+                    Some(found) if found != key => continue 'keys,
+                    Some(_) => {}
+                }
+            }
+            for filter in &mut self.filters {
+                filter.pos += filter.keys[filter.pos..].partition_point(|k| *k < key);
+                match filter.key() {
+                    None => return,
+                    Some(found) if found != key => continue 'keys,
+                    Some(_) => {}
+                }
+            }
+            // Conjunction members share one document, so every term's bound
+            // holds at the longest of the chunks' shortest documents.
+            let min_length = self
+                .terms
+                .iter()
+                .map(|term| term.bound_block(term.pos).shortest())
+                .max()
+                .expect("a conjunction has terms");
+            let mut bound = 0.0_f32;
+            for term in &self.terms {
+                let scorer = &self.scorer.terms[term.slot].1;
+                bound += scorer.bound_with_min_length(&term.bound_block(term.pos), min_length);
+            }
+            out.push(Bounded {
+                key,
+                min_length,
+                bound,
+            });
+        }
+    }
+
+    /// Evaluates a conjunction's chunks, in the order given, into the heap;
+    /// [`Self::chunk_bounds`] found and bounded them.
+    fn warm(&mut self, chunks: &[Bounded]) {
+        let lead = (0..self.terms.len())
+            .min_by_key(|&t| self.terms[t].keys.len())
+            .expect("a conjunction has terms");
+        let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
+        for chunk in chunks {
+            self.iterations = self.iterations.wrapping_add(1);
+            if self.iterations.is_multiple_of(64) {
+                pgrx::check_for_interrupts!();
+            }
+            let base = u32::from(chunk.key) << 16;
+            if self.threshold().is_some() && !self.can_beat(chunk.bound, base) {
+                continue;
+            }
+            for term in self.terms.iter_mut().chain(self.filters.iter_mut()) {
+                term.pos = term
+                    .keys
+                    .binary_search(&chunk.key)
+                    .expect("every stream holds a bounded chunk");
+            }
+            self.evaluate_all(chunk.key, lead, chunk.min_length, &mut set);
         }
     }
 }
@@ -1791,6 +2151,9 @@ struct OrdinalWalk<'a, 's> {
     /// candidate must meet, and its phrases' position checks.
     condition: Option<Condition>,
     phrases: Vec<Option<PhraseCheck<'a>>>,
+    /// Keys of the chunks a conjunction's warm-up evaluated, ascending: the
+    /// walk skips them.
+    warmed: &'s [u16],
 }
 
 /// Which walked stream a phrase slot's term is.
@@ -2294,6 +2657,11 @@ impl OrdinalWalk<'_, '_> {
             if next > key {
                 let term = &mut self.terms[lead];
                 term.pos += term.keys[term.pos..].partition_point(|k| *k < next);
+                continue;
+            }
+            if self.warmed.binary_search(&key).is_ok() {
+                // The warm-up evaluated this chunk.
+                self.step_all();
                 continue;
             }
             // Conjunction members share one document, so every term's bound

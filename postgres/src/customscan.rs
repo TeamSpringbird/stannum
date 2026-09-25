@@ -124,6 +124,26 @@ pub fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        c"stannum.warmup_chunks",
+        c"Chunks a pruned ranked conjunction evaluates first, those with the highest bounds, to raise its threshold early",
+        c"Picked across every source by the chunk directory alone; zero walks each source in chunk order from the start.",
+        &crate::score::WARMUP_CHUNKS,
+        0,
+        65536,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_float_guc(
+        c"stannum.warmup_min_matches",
+        c"Estimated matches per row asked for below which a ranked conjunction is not warmed up",
+        c"The estimate takes the terms as independent; zero warms up every conjunction.",
+        &crate::score::WARMUP_MIN_MATCHES,
+        0.0,
+        f64::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
     GucRegistry::define_bool_guc(
         c"stannum.profile_count_selection",
         c"Collect bounded count-selector features without changing the default strategy",
@@ -2299,6 +2319,33 @@ unsafe extern "C-unwind" fn explain(
                         exec.walk_blocks.1,
                         es,
                     );
+                    let warmed = crate::score::warmup_chunks();
+                    if warmed > 0 {
+                        pg_sys::ExplainPropertyInteger(
+                            c"Warm-up Chunks".as_ptr(),
+                            std::ptr::null(),
+                            warmed,
+                            es,
+                        );
+                    }
+                    if let Some(estimate) = crate::score::warmup_estimate() {
+                        pg_sys::ExplainPropertyFloat(
+                            c"Warm-up Estimate".as_ptr(),
+                            std::ptr::null(),
+                            estimate,
+                            0,
+                            es,
+                        );
+                    }
+                    if let Some(threshold) = crate::score::warmup_threshold() {
+                        pg_sys::ExplainPropertyFloat(
+                            c"Warm-up Threshold".as_ptr(),
+                            std::ptr::null(),
+                            f64::from(threshold),
+                            6,
+                            es,
+                        );
+                    }
                 }
             }
             // Read accounting for every scan that ran, pruned or not: a phrase
