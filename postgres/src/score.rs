@@ -27,8 +27,8 @@ use std::collections::{BTreeSet, BinaryHeap};
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::plan::{Limits, plan};
 use tinql::runtime::{
-    CompiledRegex, FuzzyMatcher, Query, RangeBound, SpanTermSlot, evaluate, parse_tinql_to_query,
-    range_matches, tokenize_doc,
+    CompiledRegex, FuzzyMatcher, Query, RangeBound, SpanPositionFilter, SpanTermSlot, evaluate,
+    parse_tinql_to_query, range_matches, tokenize_doc,
 };
 use tokenizer::Tokenizer;
 
@@ -536,6 +536,8 @@ thread_local! {
     static WALK_BLOCKS: Cell<i64> = const { Cell::new(0) };
     /// Chunks of a term's ordinal stream expanded into members.
     static CHUNK_LOADS: Cell<i64> = const { Cell::new(0) };
+    /// Candidates of a phrase walk whose positions were read and checked.
+    static POSITION_CHECKS: Cell<i64> = const { Cell::new(0) };
     /// Heap visibility checks, each a random read of the table.
     static VISIBILITY_CHECKS: Cell<i64> = const { Cell::new(0) };
     /// Visibility checks answered by the visibility map without a heap read.
@@ -603,6 +605,7 @@ pub(crate) fn reset_walk_blocks() {
     SETUP_BLOCKS.set(0);
     WALK_BLOCKS.set(0);
     CHUNK_LOADS.set(0);
+    POSITION_CHECKS.set(0);
     VISIBILITY_CHECKS.set(0);
     VM_HITS.set(0);
     PHASE_DISK.with_borrow_mut(Vec::clear);
@@ -621,6 +624,11 @@ pub(crate) fn vm_hits() -> i64 {
 /// Chunks loaded since the last reset.
 pub(crate) fn chunk_loads() -> i64 {
     CHUNK_LOADS.get()
+}
+
+/// Phrase candidates whose positions were checked since the last reset.
+pub(crate) fn position_checks() -> i64 {
+    POSITION_CHECKS.get()
 }
 
 /// Pages spent on walk setup and on the walk itself since the last reset.
@@ -673,7 +681,42 @@ enum Combine {
 /// A query the scan can prune: a flat conjunction or disjunction of terms
 /// (a single term included), each optionally boosted, with the terms in
 /// lexical order and deduplicated.
-fn prunable_shape(query: &Query) -> Option<(Combine, Vec<&str>)> {
+/// A phrase (or any span query every slot of which must be present) the
+/// walk can prune: its documents are a subset of the conjunction of its
+/// terms, and a document scores the same under either, so the conjunction's
+/// bounds hold and only the candidates that could enter the top k have
+/// their positions read.
+struct SpanCheck<'q> {
+    /// The term of each slot, in slot order.
+    slots: Vec<&'q str>,
+    span: &'q boldi_vigna::SpanQuery,
+    filter: Option<&'q SpanPositionFilter>,
+}
+
+/// Whether every term the span query names must occur for it to match.
+fn span_requires_all(query: &boldi_vigna::SpanQuery) -> bool {
+    use boldi_vigna::SpanQuery::*;
+    match query {
+        Term(_) => true,
+        Ordered(children) | Unordered(children) => children.iter().all(span_requires_all),
+        MaxGaps { inner, .. }
+        | GapsInRange { inner, .. }
+        | MaxWidth { inner, .. }
+        | WithinPositions { inner, .. } => span_requires_all(inner),
+        Empty
+        | Or(_)
+        | NotContaining { .. }
+        | NotContainedBy { .. }
+        | NonOverlapping { .. }
+        | Containing { .. }
+        | ContainedBy { .. }
+        | Overlapping { .. }
+        | Before { .. }
+        | After { .. } => false,
+    }
+}
+
+fn prunable_shape(query: &Query) -> Option<(Combine, Vec<&str>, Option<SpanCheck<'_>>)> {
     fn unboost(query: &Query) -> &Query {
         match query {
             Query::Boost { inner, .. } => unboost(inner),
@@ -689,17 +732,37 @@ fn prunable_shape(query: &Query) -> Option<(Combine, Vec<&str>)> {
             })
             .collect()
     }
+    let mut check = None;
     let (combine, mut terms) = match unboost(query) {
         Query::Term(term) => (Combine::Any, vec![term.as_str()]),
         Query::And(left, right) => (Combine::All, leaves([&**left, &**right])?),
         Query::Conjunction(children) => (Combine::All, leaves(children)?),
         Query::Or(left, right) => (Combine::Any, leaves([&**left, &**right])?),
         Query::Disjunction { min: 1, children } => (Combine::Any, leaves(children)?),
+        Query::Span {
+            term_slots,
+            span_query,
+            position_filter,
+        } if !term_slots.is_empty() && span_requires_all(span_query) => {
+            let slots: Vec<&str> = term_slots
+                .iter()
+                .map(|slot| match slot {
+                    SpanTermSlot::Term(term) => Some(term.as_str()),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            check = Some(SpanCheck {
+                slots: slots.clone(),
+                span: span_query,
+                filter: position_filter.as_ref(),
+            });
+            (Combine::All, slots)
+        }
         _ => return None,
     };
     terms.sort_unstable();
     terms.dedup();
-    Some((combine, terms))
+    Some((combine, terms, check))
 }
 
 /// A heap entry ordered so the worst-ranked row is the greatest.
@@ -783,7 +846,7 @@ impl IndexScorer {
     /// exactly the scoring terms, or a source carries no block bounds; the
     /// caller then scores every candidate.
     pub(crate) fn top_k(&self, k: usize) -> Option<TopK> {
-        let (combine, leaves) = prunable_shape(&self.query)?;
+        let (combine, leaves, check) = prunable_shape(&self.query)?;
         // Every scoring term must be a leaf (no added terms), and a leaf that
         // is not a scoring term must be absent from the index altogether: it
         // then adds nothing to a disjunction and empties a conjunction. A
@@ -844,6 +907,7 @@ impl IndexScorer {
                         i,
                         combine,
                         &filters,
+                        check.as_ref(),
                         &mut visibility,
                         k,
                         &mut heap,
@@ -902,6 +966,7 @@ impl IndexScorer {
         i: usize,
         combine: Combine,
         filters: &[&str],
+        check: Option<&SpanCheck<'_>>,
         visibility: &mut Visibility,
         k: usize,
         heap: &mut BinaryHeap<Ranked>,
@@ -940,6 +1005,40 @@ impl IndexScorer {
         if terms.is_empty() {
             return;
         }
+        // A phrase reads each slot's positions from the term's payload; a
+        // slot is a scoring term or, when the scorer elided it, a filter.
+        let phrase = check.map(|check| {
+            let slots = check
+                .slots
+                .iter()
+                .map(|name| {
+                    let member = terms
+                        .iter()
+                        .position(|t| self.terms[t.slot].0 == *name)
+                        .map(Member::Term)
+                        .or_else(|| filters.iter().position(|f| f == name).map(Member::Filter))
+                        .unwrap_or_else(|| {
+                            crate::storage::corrupt(format!(
+                                "Stannum {label}: phrase slot {name} is not walked"
+                            ))
+                        });
+                    let term = segment_error_in(source.term(name), label).unwrap_or_else(|| {
+                        crate::storage::corrupt(format!(
+                            "Stannum {label}: phrase slot {name} vanished from the source"
+                        ))
+                    });
+                    (member, segment_error_in(term.payload(), label).cursor())
+                })
+                .collect();
+            PhraseCheck {
+                slots,
+                solver: boldi_vigna::SpanSolver::new(check.span).unwrap_or_else(|error| {
+                    crate::storage::corrupt(format!("Stannum {label}: span solver: {error}"))
+                }),
+                filter: check.filter.cloned(),
+                positions: vec![Vec::new(); check.slots.len()],
+            }
+        });
         let ready = blocks_used();
         SETUP_BLOCKS.set(SETUP_BLOCKS.get() + ready - started);
         let docs = segment_error_in(source.doc_table(), label);
@@ -961,6 +1060,7 @@ impl IndexScorer {
             values: Vec::new(),
             uppers: Vec::new(),
             term_subs: Vec::new(),
+            phrase,
         };
         match combine {
             Combine::Any => walk.any(),
@@ -1220,9 +1320,70 @@ struct OrdinalWalk<'a, 's> {
     uppers: Vec<(f32, usize)>,
     /// Scratch for a chunk: per present term its bound per sub-block.
     term_subs: Vec<[f32; SUBS]>,
+    /// For a phrase: the positions check a candidate must pass to be admitted.
+    phrase: Option<PhraseCheck<'a>>,
+}
+
+/// Which walked stream a phrase slot's term is.
+#[derive(Clone, Copy)]
+enum Member {
+    Term(usize),
+    Filter(usize),
+}
+
+/// A phrase's position check over the walk's candidates. Only a candidate
+/// that scores into the top k has its positions read: a phrase of common
+/// words matches a sliver of their conjunction, and reading positions for
+/// every member of the conjunction was seconds per query at scale.
+struct PhraseCheck<'a> {
+    /// Per slot: the walked stream it ranks in, and its positions.
+    slots: Vec<(Member, segment::payload::PayloadCursor<'a>)>,
+    solver: boldi_vigna::SpanSolver,
+    filter: Option<SpanPositionFilter>,
+    /// Scratch: per slot, the candidate's positions.
+    positions: Vec<Vec<u32>>,
 }
 
 impl OrdinalWalk<'_, '_> {
+    /// Whether the candidate `low` of the loaded chunk, at `ordinal`, holds
+    /// the phrase. Every slot's term lists the candidate: the walk only
+    /// reaches here through the conjunction of them.
+    fn phrase_matches(&mut self, low: u16, ordinal: u32) -> bool {
+        let Some(mut phrase) = self.phrase.take() else {
+            return true;
+        };
+        POSITION_CHECKS.set(POSITION_CHECKS.get() + 1);
+        for (slot, (member, payload)) in phrase.slots.iter_mut().enumerate() {
+            let term = match *member {
+                Member::Term(t) => &mut self.terms[t],
+                Member::Filter(f) => &mut self.filters[f],
+            };
+            let rank = term.rank(low).unwrap_or_else(|| {
+                crate::storage::corrupt("Stannum: a phrase candidate is missing a term")
+            });
+            let positions = &mut phrase.positions[slot];
+            positions.clear();
+            segment_error(payload.seek(rank));
+            segment_error(payload.next_into(positions));
+        }
+        let matched = match &phrase.filter {
+            None => phrase.solver.intervals(&phrase.positions).next().is_some(),
+            Some(filter) => {
+                let length = if filter.needs_doc_length() {
+                    segment_error(self.lengths.get(ordinal))
+                } else {
+                    0
+                };
+                phrase
+                    .solver
+                    .intervals(&phrase.positions)
+                    .any(|interval| filter.matches_interval(length, interval))
+            }
+        };
+        self.phrase = Some(phrase);
+        matched
+    }
+
     fn threshold(&self) -> Option<(f32, Tid)> {
         let real = if self.heap.len() == self.k {
             self.heap.peek().map(|w| (w.0, w.1))
@@ -1551,14 +1712,15 @@ impl OrdinalWalk<'_, '_> {
                 let sub = usize::from(low) / SUB;
                 let all: Vec<usize> = (0..self.terms.len()).collect();
                 let pruning = self.threshold().is_some();
-                let Some(total) =
-                    self.score_candidate(&all, low, ordinal, sub, pruning, Some(min_length))
-                else {
+                let Some(total) = self.score_candidate(&all, low, ordinal, sub, pruning) else {
                     continue;
                 };
                 let admit =
                     self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
                 if !admit {
+                    continue;
+                }
+                if self.phrase.is_some() && !self.phrase_matches(low, ordinal) {
                     continue;
                 }
                 let tid = self.resolve(ordinal);
@@ -1594,7 +1756,6 @@ impl OrdinalWalk<'_, '_> {
         ordinal: u32,
         sub: usize,
         pruning: bool,
-        floor: Option<u32>,
     ) -> Option<f32> {
         // The scratch vectors are the walk's: a candidate is scored a
         // hundred thousand times a query, and two allocations each showed.
@@ -1609,7 +1770,6 @@ impl OrdinalWalk<'_, '_> {
             ordinal,
             sub,
             pruning,
-            floor,
             &mut values,
             &mut uppers,
         );
@@ -1629,7 +1789,6 @@ impl OrdinalWalk<'_, '_> {
         ordinal: u32,
         sub: usize,
         pruning: bool,
-        floor: Option<u32>,
         values: &mut [f32],
         uppers: &mut Vec<(f32, usize)>,
     ) -> Option<f32> {
@@ -1882,8 +2041,7 @@ impl OrdinalWalk<'_, '_> {
                         continue;
                     }
                 }
-                let Some(total) = self.score_candidate(present, low, ordinal, sub, pruning, None)
-                else {
+                let Some(total) = self.score_candidate(present, low, ordinal, sub, pruning) else {
                     continue;
                 };
                 let admit =

@@ -7,7 +7,7 @@ export PATH=/opt/homebrew/bin:$PATH
 export STANNUM_DOCKER_RUN_ARGS="${STANNUM_DOCKER_RUN_ARGS:---device-read-iops /dev/vdb:20000 --device-read-bps /dev/vdb:400mb}"
 IMG=$1; LABEL=$2; STYLE=$3; UPDATES=$4; SECONDS_=${5:-180}
 cd /Users/uri/.t3/worktrees/lead/t3code-bf0ed789
-D=/tmp/stannum-ordinal-poc/local-driver
+D=${STANNUM_DRIVER:-/tmp/stannum-ordinal-poc/local-driver}
 DS="$HOME/Library/Application Support/LeadBenchmarks/datasets/planetscale-stackexchange"
 R=${STANNUM_MOCK:-/tmp/stannum-ordinal-poc/local150m}/runs/$LABEL-$STYLE-u$UPDATES; rm -rf $R $R.log; mkdir -p $(dirname $R)
 # Validation warms the VM's global page cache with pages that stay cached, uncharged, after

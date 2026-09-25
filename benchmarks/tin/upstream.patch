@@ -62,10 +62,10 @@ index 8f40f68..bf511ec 100644
      throw new Error("WORKLOAD must be topk or count");
    }
 -  if (![...queryStyles, "mixed"].includes(style)) {
-+  if (![...queryStyles, "mixed", "conjunction-phrase"].includes(style)) {
++  if (![...queryStyles, "mixed", "conjunction-phrase", "conjunction-disjunction"].includes(style)) {
      throw new Error(
 -      "QUERY_STYLE must be conjunction, disjunction, phrase, or mixed",
-+      "QUERY_STYLE must be conjunction, disjunction, phrase, mixed, or conjunction-phrase",
++      "QUERY_STYLE must be conjunction, disjunction, phrase, mixed, conjunction-phrase, or conjunction-disjunction",
      );
    }
    const names = value.split(/[\s,]+/).filter(Boolean);
@@ -74,14 +74,14 @@ index 8f40f68..bf511ec 100644
      throw new Error("The query file must contain a nonempty queries array");
    }
 -  if (![...queryStyles, "mixed"].includes(style)) {
-+  if (![...queryStyles, "mixed", "conjunction-phrase"].includes(style)) {
++  if (![...queryStyles, "mixed", "conjunction-phrase", "conjunction-disjunction"].includes(style)) {
      throw new Error(`Unknown query style: ${style}`);
    }
    if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
      throw new Error("SEED must be an integer between 0 and 4294967295");
    }
 -  const styles = style === "mixed" ? queryStyles : [style];
-+  const styles = style === "mixed" ? queryStyles : style === "conjunction-phrase" ? ["conjunction", "phrase"] : [style];
++  const styles = style === "mixed" ? queryStyles : style === "conjunction-phrase" ? ["conjunction", "phrase"] : style === "conjunction-disjunction" ? ["conjunction", "disjunction"] : [style];
    const entries = contents.queries.flatMap((record) =>
      styles.map((queryStyle) => ({ record, style: queryStyle })),
    );

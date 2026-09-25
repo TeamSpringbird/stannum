@@ -1460,8 +1460,19 @@ mod tests {
             "(alpha AND beta)^0.5",
             "alpha OR alpha",
             "pad OR alpha",
-            // Shapes the pruned path leaves to full scoring.
+            // Phrases: the conjunction's walk, admitting only candidates whose
+            // positions hold the phrase.
             "\"alpha beta\"",
+            "\"alpha alpha\"",
+            "\"beta gamma\"",
+            "\"pad tail\"",
+            "\"alpha pad tail\"",
+            "\"alpha beta\"~1",
+            "\"alpha _ gamma\"",
+            "\"gamma delta\"",
+            "\"alpha missing\"",
+            "\"alpha beta\"^2",
+            // Shapes the pruned path leaves to full scoring.
             "alpha AND NOT beta",
             "al*",
             "AT LEAST 2 OF [alpha beta gamma]",
@@ -1594,11 +1605,18 @@ mod tests {
             ranked(true, "delta", "stannum.full_score(ctid)", "LIMIT 3"),
             ranked(false, "delta", "stannum.full_score(ctid)", "LIMIT 3")
         );
-        // A phrase query is not pruned and reports its candidates as before.
+        // A phrase walks its terms' conjunction and reads positions only for
+        // the candidates that score into the top k: fewer than the 1,300
+        // documents holding both words.
         Spi::run("SET LOCAL stannum.enable_custom_scan = on;").unwrap();
         let scan = explain("\"alpha beta\"");
-        assert!(scan["Pruning"].is_null());
-        assert!(scan["Candidates"].as_i64().unwrap() > 0);
+        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        let checked = scan["Positions Checked"].as_i64().unwrap();
+        assert!(checked > 0 && checked < 1300, "{scan}");
+        // A span shape not every slot of which must occur is left to full
+        // scoring.
+        let scan = explain("\"alpha beta\" NOT ENCLOSES \"gamma\"");
+        assert!(scan["Pruning"].is_null(), "{scan}");
     }
 
     #[pg_test]
@@ -1648,10 +1666,20 @@ mod tests {
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(filtered[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
 
-        // An unprunable phrase scores exhaustively without a completion.
+        // A phrase is pruned like the conjunction of its words, reading
+        // positions only for the candidates that enter its top ten.
         let phrase = explain("\"alpha beta\"", "");
         let scan = search_scan(&phrase[0]["Plan"]).unwrap();
-        assert!(scan["Pruning"].is_null());
+        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(scan["Top-K Completions"], 0);
+        assert_eq!(scan["Exhaustive Score Calls"], 0);
+        assert_eq!(scan["Positions Checked"], 10, "{scan}");
+
+        // A span shape that does not need every word scores exhaustively
+        // without a completion.
+        let span = explain("\"alpha beta\" NOT ENCLOSES \"gamma\"", "");
+        let scan = search_scan(&span[0]["Plan"]).unwrap();
+        assert!(scan["Pruning"].is_null(), "{scan}");
         assert_eq!(scan["Top-K Completions"], 0);
         assert_eq!(scan["Exhaustive Score Calls"], 1000);
     }

@@ -167,7 +167,8 @@ def trace_queries(driver, query_file=None, raw_text=False):
 def selected_style(query_id, style):
     family = query_id.split(':')[1]
     return style == 'mixed' or family == style or (
-        style == 'conjunction-phrase' and family in ('conjunction', 'phrase'))
+        style == 'conjunction-phrase' and family in ('conjunction', 'phrase')) or (
+        style == 'conjunction-disjunction' and family in ('conjunction', 'disjunction'))
 
 
 def validation_queries(queries, limit):
@@ -1077,7 +1078,7 @@ def main():
     p.add_argument('--load-database', type=Path,
                    help='Start from a database saved by --save-database, skipping import and index build')
     p.add_argument('--workload', choices=['count', 'topk'], default='count')
-    p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase', 'conjunction-phrase'], default='mixed')
+    p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase', 'conjunction-phrase', 'conjunction-disjunction'], default='mixed')
     p.add_argument('--clients', type=bench.positive, default=2)
     p.add_argument('--seconds', type=bench.positive, default=60)
     p.add_argument('--warmup', type=bench.positive, default=10)
