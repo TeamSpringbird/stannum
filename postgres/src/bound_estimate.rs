@@ -18,6 +18,9 @@
 //! - `B`: per sub-block per term, the shortest member per bucket, the
 //!   chunk's table at sub-block granularity; this is the sub-block's exact
 //!   maximum contribution;
+//! - `B+`: `B`'s storage, with each candidate bounded at its own length
+//!   over the sub-block's (bucket, shortest length) pairs: the tightest
+//!   bound any per-sub-block stored information can give a candidate;
 //! - `C`: that maximum, quantized upward to one byte on a log scale over
 //!   the term's maximum score.
 //!
@@ -35,12 +38,13 @@ use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use crate::bm25::TermScorer;
 
 /// The alternatives, in report order.
-pub(crate) const ALTS: usize = 4;
-pub(crate) const ALT_NAMES: [&str; ALTS] = ["A", "A8", "B", "C"];
+pub(crate) const ALTS: usize = 5;
+pub(crate) const ALT_NAMES: [&str; ALTS] = ["A", "A8", "B", "B+", "C"];
 const A: usize = 0;
 const A8: usize = 1;
 const B: usize = 2;
-const C: usize = 3;
+pub(crate) const B_PLUS: usize = 3;
+const C: usize = 4;
 
 /// The ratio between adjacent representable values of alternative `C`:
 /// 255 steps of 3.5% span four orders of magnitude below the term maximum.
@@ -163,7 +167,23 @@ impl TermStats {
                 }
             }
         }
+        bytes[B_PLUS] = bytes[B];
         (bytes, occupied)
+    }
+
+    /// `B+`: the best score over the sub-block's buckets, each at the
+    /// longer of its shortest member and `length`, for a candidate of
+    /// `length` in sub-block `sub`.
+    pub(crate) fn bound_at_length(&self, sub: usize, length: u32, scorer: &TermScorer) -> f32 {
+        let mut best = 0.0_f32;
+        for (bucket, len) in self.min_len_by_bucket[sub].iter().enumerate() {
+            if *len == u32::MAX {
+                continue;
+            }
+            let bucket = TfBucket::new(bucket as u8).expect("bucket within the count");
+            best = best.max(scorer.score_bucket(bucket, (*len).max(length)));
+        }
+        best
     }
 }
 
@@ -191,9 +211,11 @@ pub(crate) fn quantize_c(exact: f32, term_max: f32) -> f32 {
     value.min(term_max)
 }
 
-/// The alternatives' bounds for one term over one chunk's sub-blocks.
+/// The alternatives' bounds for one term over one chunk's sub-blocks, and
+/// the statistics they came from.
 pub(crate) struct AltTables {
     pub bounds: [[f32; SUBS]; ALTS],
+    pub stats: TermStats,
 }
 
 /// The alternative bounds per present term. `conjunction` carries the
@@ -203,7 +225,7 @@ pub(crate) struct AltTables {
 /// alternative stores lengths, and `C`, which stores none, keeps today's
 /// bound as a ceiling.
 pub(crate) fn tables(
-    stats: &[TermStats],
+    stats: Vec<TermStats>,
     scorers: &[&TermScorer],
     term_max: &[f32],
     conjunction: Option<u32>,
@@ -212,7 +234,7 @@ pub(crate) fn tables(
     let mut floors_a8 = [0u32; SUBS];
     if conjunction.is_some() {
         for sub in 0..SUBS {
-            for term in stats {
+            for term in &stats {
                 if term.max_bucket[sub] != 0 {
                     floors_a[sub] = floors_a[sub].max(term.min_len[sub]);
                     floors_a8[sub] = floors_a8[sub].max(min_length(class_of(term.min_len[sub])));
@@ -220,8 +242,18 @@ pub(crate) fn tables(
             }
         }
     }
-    let mut out = Vec::with_capacity(stats.len());
-    for ((term, scorer), max) in stats.iter().zip(scorers).zip(term_max) {
+    let mut bytes = [0i64; ALTS];
+    let mut occupied = 0;
+    for term in &stats {
+        let (mine, subs) = term.bytes();
+        for (total, b) in bytes.iter_mut().zip(mine) {
+            *total += b;
+        }
+        occupied += subs;
+    }
+    let count = stats.len();
+    let mut out = Vec::with_capacity(count);
+    for ((term, scorer), max) in stats.into_iter().zip(scorers).zip(term_max) {
         let mut bounds = [[0.0_f32; SUBS]; ALTS];
         for sub in 0..SUBS {
             if term.max_bucket[sub] == 0 {
@@ -243,26 +275,21 @@ pub(crate) fn tables(
                 b = b.max(scorer.score_bucket(bucket, (*len).max(floors_a[sub])));
             }
             bounds[B][sub] = b;
+            bounds[B_PLUS][sub] = b;
             let mut c = quantize_c(exact, *max);
             if let Some(floor) = conjunction {
                 c = c.min(scorer.score_bucket(top, floor));
             }
             bounds[C][sub] = c;
         }
-        out.push(AltTables { bounds });
-    }
-    let mut bytes = [0i64; ALTS];
-    let mut occupied = 0;
-    for term in stats {
-        let (mine, subs) = term.bytes();
-        for (total, b) in bytes.iter_mut().zip(mine) {
-            *total += b;
-        }
-        occupied += subs;
+        out.push(AltTables {
+            bounds,
+            stats: term,
+        });
     }
     bump(|c| {
         c.chunks += 1;
-        c.chunk_terms += stats.len() as i64;
+        c.chunk_terms += count as i64;
         c.occupied_subs += occupied;
         for (total, b) in c.bytes.iter_mut().zip(bytes) {
             *total += b;

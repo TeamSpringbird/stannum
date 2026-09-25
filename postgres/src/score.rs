@@ -1426,21 +1426,25 @@ impl OrdinalWalk<'_, '_> {
                 },
                 |low| segment_error(lengths.get(base + low)),
             );
-            mismatches += gathered
-                .max_bucket
-                .iter()
-                .zip(&term.sub_bounds[term.pos])
-                .filter(|(mine, stored)| mine != stored)
-                .count() as i64;
+            // A list stores one bound for every chunk it touches, its
+            // sub-blocks folded together, so only a chunked stream is checked.
+            if term.list.is_none() {
+                mismatches += gathered
+                    .max_bucket
+                    .iter()
+                    .zip(&term.sub_bounds[term.pos])
+                    .filter(|(mine, stored)| mine != stored)
+                    .count() as i64;
+            }
             stats.push(gathered);
             scorers.push(&self.scorer.terms[term.slot].1);
             maxima.push(term.term_max);
         }
-        let tables = crate::bound_estimate::tables(&stats, &scorers, &maxima, conjunction);
+        let tables = crate::bound_estimate::tables(stats, &scorers, &maxima, conjunction);
         let mut populated = [conjunction.is_some(); SUBS];
-        for term in &stats {
+        for term in &tables {
             for (sub, populated) in populated.iter_mut().enumerate() {
-                let member = term.max_bucket[sub] != 0;
+                let member = term.stats.max_bucket[sub] != 0;
                 *populated = if conjunction.is_some() {
                     *populated && member
                 } else {
@@ -1499,11 +1503,14 @@ impl OrdinalWalk<'_, '_> {
     /// candidate whose per-term bounds at its own length are `values`
     /// (zero for terms not holding it, listed in `uppers`); counts it as
     /// skipped under each alternative whose sub-block bound, tightened by
-    /// the same per-candidate bound, cannot beat the threshold.
+    /// the same per-candidate bound (or for `B+` by the sub-block's
+    /// buckets at the candidate's `length`), cannot beat the threshold.
     fn estimate_candidate(
         &mut self,
+        present: &[usize],
         sub: usize,
         ordinal: u32,
+        length: u32,
         values: &[f32],
         uppers: &[(f32, usize)],
     ) {
@@ -1514,7 +1521,12 @@ impl OrdinalWalk<'_, '_> {
         for (alt, sum) in sums.iter_mut().enumerate() {
             let mut folded = vec![0.0_f32; values.len()];
             for &(_, n) in uppers {
-                folded[n] = values[n].min(tables[n].bounds[alt][sub]);
+                folded[n] = if alt == crate::bound_estimate::B_PLUS {
+                    let scorer = &self.scorer.terms[self.terms[present[n]].slot].1;
+                    tables[n].stats.bound_at_length(sub, length, scorer)
+                } else {
+                    values[n].min(tables[n].bounds[alt][sub])
+                };
             }
             *sum = folded.iter().fold(0.0_f32, |acc, v| acc + v);
         }
@@ -2002,7 +2014,7 @@ impl OrdinalWalk<'_, '_> {
         }
         *self.scored += 1;
         if pruning && self.estimate.is_some() {
-            self.estimate_candidate(sub, ordinal, values, uppers);
+            self.estimate_candidate(present, sub, ordinal, length, values, uppers);
         }
         for entry in uppers.iter_mut() {
             entry.0 = values[entry.1];
