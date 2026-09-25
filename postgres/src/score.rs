@@ -604,6 +604,7 @@ pub(crate) fn area_bytes() -> [u64; segment::cache::AREAS] {
 
 pub(crate) fn reset_walk_blocks() {
     segment::cache::reset_areas();
+    segment::payload::diag::reset();
     SETUP_BLOCKS.set(0);
     WALK_BLOCKS.set(0);
     CHUNK_LOADS.set(0);
@@ -1749,6 +1750,13 @@ impl OrdinalWalk<'_, '_> {
     /// the phrase. Every slot's term lists the candidate: the walk only
     /// reaches here through the conjunction of them.
     fn phrase_matches(&mut self, low: u16, ordinal: u32) -> bool {
+        let t0 = segment::payload::diag::ticks();
+        let r = self.phrase_matches_inner(low, ordinal);
+        segment::payload::diag::add(11, segment::payload::diag::ticks() - t0);
+        r
+    }
+
+    fn phrase_matches_inner(&mut self, low: u16, ordinal: u32) -> bool {
         let Some(mut phrase) = self.phrase.take() else {
             return true;
         };

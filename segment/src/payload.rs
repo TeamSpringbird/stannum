@@ -325,12 +325,16 @@ impl PayloadCursor<'_> {
         } else {
             1
         };
+        let t0 = diag::ticks();
         let start = self.payload.slot_at(slot)?;
         let end = self.payload.slot_at(slot + count)?;
         if end < start {
             return Err(Error::Corrupt("payload skip order"));
         }
         self.owned = areas.payload_range_owned(base + start as u64, end - start)?;
+        diag::add(2, 1);
+        diag::add(3, (end - start) as u64);
+        diag::add(9, diag::ticks() - t0);
         self.owned_at = 0;
         self.slots = (slot, count);
         self.span_at = start;
@@ -374,19 +378,29 @@ impl PayloadCursor<'_> {
         if ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload ordinal out of range"));
         }
+        let t0 = diag::ticks();
+        diag::add(0, 1);
         let interval = SKIP_INTERVAL;
         let forward_only = ordinal >= self.next_ordinal
             && ordinal - self.next_ordinal < interval
             && ordinal / interval == self.next_ordinal / interval;
         if !forward_only {
+            diag::add(1, 1);
             let (at, start) = self.payload.skip_to(ordinal)?;
             self.next_ordinal = start;
             self.load()?;
             self.set_position(at - self.span_at)?;
         }
         while self.next_ordinal < ordinal {
+            let n = self.decode(|r| {
+                let mut probe = *r;
+                probe.varint_u32()
+            })?;
+            diag::add(4, 1);
+            diag::add(5, u64::from(n));
             self.skip_entry()?;
         }
+        diag::add(8, diag::ticks() - t0);
         Ok(())
     }
 
@@ -406,9 +420,13 @@ impl PayloadCursor<'_> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));
         }
+        let t0 = diag::ticks();
         self.load()?;
-        self.decode(|reader| decode_positions(reader, positions))?;
+        let n = self.decode(|reader| decode_positions(reader, positions))?;
         self.next_ordinal += 1;
+        diag::add(6, 1);
+        diag::add(7, n as u64);
+        diag::add(10, diag::ticks() - t0);
         Ok(())
     }
 
@@ -428,6 +446,62 @@ impl PayloadCursor<'_> {
         let mut positions = Vec::new();
         self.next_into(&mut positions)?;
         Ok(Entry { positions })
+    }
+}
+
+/// Diagnostic counters (throwaway).
+pub mod diag {
+    use std::cell::Cell;
+    pub const N: usize = 12;
+    pub const NAMES: [&str; N] = [
+        "seeks", "jumps", "loads", "load_bytes", "skipped_entries", "skipped_positions",
+        "lists", "positions", "seek_ticks", "load_ticks", "decode_ticks", "check_ticks",
+    ];
+    thread_local! { pub static C: [Cell<u64>; N] = const { [const { Cell::new(0) }; N] }; }
+    #[inline]
+    pub fn add(i: usize, v: u64) {
+        C.with(|c| c[i].set(c[i].get() + v));
+    }
+    pub fn reset() {
+        C.with(|c| c.iter().for_each(|x| x.set(0)));
+    }
+    pub fn report() -> String {
+        let freq = freq();
+        C.with(|c| {
+            NAMES
+                .iter()
+                .zip(c.iter())
+                .map(|(n, v)| {
+                    if n.ends_with("ticks") {
+                        format!("{n}_us={:.0}", v.get() as f64 * 1e6 / freq as f64)
+                    } else {
+                        format!("{n}={}", v.get())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+    #[inline]
+    pub fn ticks() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let t: u64;
+            unsafe { std::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) t) };
+            t
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        0
+    }
+    fn freq() -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let t: u64;
+            unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) t) };
+            t
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        1
     }
 }
 

@@ -2330,6 +2330,9 @@ unsafe extern "C-unwind" fn explain(
             if let Ok(text) = CString::new(fetched) {
                 pg_sys::ExplainPropertyText(c"Bytes Fetched".as_ptr(), text.as_ptr(), es);
             }
+            if let Ok(text) = CString::new(segment::payload::diag::report()) {
+                pg_sys::ExplainPropertyText(c"Diag Payload".as_ptr(), text.as_ptr(), es);
+            }
             let from_disk = area_disk
                 .iter()
                 .zip(segment::cache::AREA_NAMES)
