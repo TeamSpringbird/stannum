@@ -471,6 +471,10 @@ pub struct Reader<S: Source> {
     /// The length chunk read last, by offset: scoring reads lengths in
     /// document order, so consecutive reads hit the same chunk.
     last_chunk: Cell<Option<(u64, *const [u8])>>,
+    /// The class window read last, as (first ordinal, bytes): a walk asks
+    /// for classes in ordinal order, and a window fetch was a buffer read
+    /// and an 8 KiB copy per candidate.
+    last_classes: RefCell<Option<(u32, Rc<[u8]>)>>,
 }
 
 /// Byte lengths of a segment's sections, in blob order.
@@ -493,8 +497,10 @@ type Arena = rustc_hash::FxHashMap<(u64, usize), Box<[u8]>>;
 /// Granularity at which document lengths are fetched from a paged source.
 const LENGTH_CHUNK: u64 = 4096;
 
-/// Documents per window of the length-class table: 8 KiB.
-pub const CLASS_WINDOW: u32 = 8192;
+/// Documents per window of the length-class table. A window is read
+/// uncached from shared buffers and held until a lookup falls outside it;
+/// candidates are sparse, so a wide window was mostly copied for one value.
+pub const CLASS_WINDOW: u32 = 1024;
 
 /// A segment held entirely in memory.
 pub type Segment<'a> = Reader<&'a [u8]>;
@@ -552,6 +558,7 @@ impl<S: Source> Reader<S> {
             dictionary: OnceCell::new(),
             pages: OnceCell::new(),
             last_chunk: Cell::new(None),
+            last_classes: RefCell::new(None),
         })
     }
 
@@ -781,8 +788,9 @@ impl<S: Source> Reader<S> {
     }
 
     /// Length class by document ordinal. A paged source reads the table in
-    /// windows of [`CLASS_WINDOW`] documents through the bounded cache: the
-    /// table is a byte per document and a walk consults it per candidate.
+    /// windows of [`CLASS_WINDOW`] documents and keeps the window last read:
+    /// the table is a byte per document and a walk consults it per
+    /// candidate, in ordinal order.
     pub fn length_class(&self, ordinal: u32) -> Result<u8> {
         if ordinal >= self.header.doc_count {
             return Err(Error::Corrupt("document ordinal out of range"));
@@ -791,10 +799,18 @@ impl<S: Source> Reader<S> {
         if let Some(bytes) = self.source.slice(at, 1) {
             return Ok(bytes[0]);
         }
-        let first = ordinal - ordinal % CLASS_WINDOW;
-        let len = (self.header.doc_count - first).min(CLASS_WINDOW) as usize;
-        let window = self.read_owned(self.header.classes_at + u64::from(first), len)?;
-        Ok(window[(ordinal - first) as usize])
+        let mut held = self.last_classes.borrow_mut();
+        let hit = held.as_ref().is_some_and(|(first, bytes)| {
+            ordinal >= *first && ((ordinal - first) as usize) < bytes.len()
+        });
+        if !hit {
+            let first = ordinal - ordinal % CLASS_WINDOW;
+            let len = (self.header.doc_count - first).min(CLASS_WINDOW) as usize;
+            let window = self.read_uncached(self.header.classes_at + u64::from(first), len)?;
+            *held = Some((first, window));
+        }
+        let (first, bytes) = held.as_ref().expect("window loaded");
+        Ok(bytes[(ordinal - first) as usize])
     }
 
     /// A copyable handle on the length table.
