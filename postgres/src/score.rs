@@ -612,6 +612,7 @@ pub(crate) fn reset_walk_blocks() {
     VISIBILITY_CHECKS.set(0);
     VM_HITS.set(0);
     PHASE_DISK.with_borrow_mut(Vec::clear);
+    crate::storage::reset_held_peak();
 }
 
 /// Heap visibility checks since the last reset.
@@ -627,6 +628,35 @@ pub(crate) fn vm_hits() -> i64 {
 /// Chunks loaded since the last reset.
 pub(crate) fn chunk_loads() -> i64 {
     CHUNK_LOADS.get()
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+thread_local! {
+    /// For tests: the chunk load of a scan at which to cancel the query,
+    /// zero for none, and the pages held pinned when it was cancelled.
+    static CANCEL_AT_LOAD: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
+}
+
+/// Cancels the running query at its `load`-th chunk load, as a user's
+/// cancel request arriving mid-walk would; returns the pages held pinned
+/// at the last such cancel.
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) fn cancel_at_chunk_load(load: i64) -> i64 {
+    CANCEL_AT_LOAD.replace((load, 0)).1
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+fn cancel_if_asked() {
+    let (at, _) = CANCEL_AT_LOAD.get();
+    if at != 0 && CHUNK_LOADS.get() >= at {
+        CANCEL_AT_LOAD.set((0, crate::storage::held_pages().0));
+        // SAFETY: the flags a cancel request's signal handler sets.
+        unsafe {
+            pg_sys::QueryCancelPending = 1;
+            pg_sys::InterruptPending = 1;
+        }
+        pgrx::check_for_interrupts!();
+    }
 }
 
 /// Phrase candidates whose positions were checked since the last reset.
@@ -1471,7 +1501,12 @@ impl IndexScorer {
             pos: 0,
             term_max: scorer.map_or(0.0, |scorer| scorer.bound(&whole)),
             words: Box::new([0; segment::ordinals::WORDS]),
-            bits: None,
+            head: std::ptr::null(),
+            head_len: 0,
+            rest: std::ptr::null(),
+            rest_end: 0,
+            held: None,
+            nibbles: Cell::new(None),
             loaded: None,
             counted: (0, 0),
             members: Vec::new(),
@@ -1517,16 +1552,30 @@ struct OrdinalTerm<'a> {
     term_max: f32,
     /// The current chunk's members as words when it is a list or an array
     /// chunk; a bitmap chunk's words are read in place from `chunk`, whose
-    /// bytes are the read cache's, rather than copied here per load.
+    /// bytes are a pinned page's or the read cache's, rather than copied
+    /// here per load.
     words: Box<segment::ordinals::Words>,
     /// The current chunk's members as low bits when it is not a bitmap.
     members: Vec<u16>,
-    /// A loaded bitmap chunk's bytes, shared with the read cache: the words
-    /// are read from here, a null check and a bounds check per word, where
-    /// going through `chunk` was a branch and two dereferences more in the
-    /// loops that test a bit per word per term.
-    bits: Option<std::rc::Rc<[u8]>>,
-    /// Whether the loaded chunk is a bitmap, held in `chunk` and `bits`.
+    /// A loaded bitmap chunk's first `head_len` bytes, contiguous in memory
+    /// (see [`segment::ordinals::Chunk::pieces`]): the words are read from
+    /// here, a bounds check per word, where going through `chunk` for every
+    /// word was a branch and two dereferences more in the loops that test a
+    /// bit per word per term. Valid while `chunk` holds the chunk.
+    head: *const u8,
+    head_len: usize,
+    /// The chunk's bytes `head_len..rest_end`, on its second page when it
+    /// is held in place, at `rest` plus their offset in the chunk; a word
+    /// in neither run is read through `chunk`.
+    rest: *const u8,
+    rest_end: usize,
+    /// The slots the walk's segment holds this term's pages in, once it
+    /// handed them out: its chunk's members, and the page of its bucket
+    /// nibbles past those.
+    held: Option<(usize, usize)>,
+    /// The nibble page held last, in stream offsets.
+    nibbles: Cell<Option<segment::source::HeldSpan>>,
+    /// Whether the loaded chunk is a bitmap, held in `chunk`.
     dense: bool,
     /// Index into `keys` of the loaded chunk, if any: a load of the current
     /// chunk is asked for wherever a bit or bucket of it is first needed,
@@ -1614,12 +1663,20 @@ impl OrdinalTerm<'_> {
                     self.members.push(low as u16);
                 }
                 self.dense = false;
-                self.bits = None;
+                self.head = std::ptr::null();
+                (self.head_len, self.rest_end) = (0, 0);
             }
             None => {
-                let chunk = segment_error(self.ordinals.chunk(self.pos));
-                self.bits = chunk.bitmap_bytes();
-                self.dense = self.bits.is_some();
+                let chunk = self.load_chunk();
+                self.dense = chunk.is_bitmap();
+                let [(head, head_len), (rest, rest_len)] = if self.dense {
+                    chunk.pieces()
+                } else {
+                    [(std::ptr::null(), 0); 2]
+                };
+                (self.head, self.head_len) = (head, head_len);
+                self.rest = rest.wrapping_sub(head_len);
+                self.rest_end = head_len + rest_len;
                 if !self.dense {
                     // An array chunk's members are scattered into words for
                     // the bit tests; a bitmap's words are read in place.
@@ -1629,6 +1686,32 @@ impl OrdinalTerm<'_> {
                 self.rank_base = chunk.before;
                 self.chunk = Some(chunk);
             }
+        }
+        #[cfg(any(test, feature = "pg_test"))]
+        cancel_if_asked();
+    }
+
+    /// The current chunk of a chunked stream: in place from the pages the
+    /// walk's segment holds pinned while the walk runs (a walk's hold span,
+    /// see [`HeldPages`]), else copied through the read cache.
+    fn load_chunk(&mut self) -> segment::ordinals::Chunk {
+        // The chunk in hand borrows the pages the slot is about to move off.
+        self.chunk = None;
+        if self.held.is_none() {
+            self.held = self
+                .ordinals
+                .held_slot()
+                .and_then(|members| Some((members, self.ordinals.held_slot()?)));
+        }
+        match self.held {
+            // SAFETY: the chunk is kept in `self.chunk` until the next load,
+            // which empties it first, as above; the term lives in the walk,
+            // which ends before its hold span (see `walk_by_ordinal`), and
+            // the slot is this term's alone.
+            Some((members, _)) => {
+                segment_error(unsafe { self.ordinals.chunk_held(self.pos, members) })
+            }
+            None => segment_error(self.ordinals.chunk(self.pos)),
         }
     }
 
@@ -1641,9 +1724,26 @@ impl OrdinalTerm<'_> {
     /// Word `i` of the loaded chunk's members.
     #[inline]
     fn word(&self, i: usize) -> u64 {
-        match &self.bits {
-            Some(bytes) => u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("8")),
-            None => self.words[i],
+        if !self.dense {
+            return self.words[i];
+        }
+        match self.run(i * 8, 8) {
+            // SAFETY: `run` found the word's eight bytes in one run.
+            Some(at) => u64::from_le(unsafe { at.cast::<u64>().read_unaligned() }),
+            None => self.bitmap().word(i),
+        }
+    }
+
+    /// Where `len` bytes at `at` of a loaded bitmap chunk lie contiguously
+    /// in `head` or `rest`, if they do; valid while the chunk is loaded.
+    #[inline]
+    fn run(&self, at: usize, len: usize) -> Option<*const u8> {
+        if at + len <= self.head_len {
+            Some(self.head.wrapping_add(at))
+        } else if at >= self.head_len && at + len <= self.rest_end {
+            Some(self.rest.wrapping_add(at))
+        } else {
+            None
         }
     }
 
@@ -1679,19 +1779,19 @@ impl OrdinalTerm<'_> {
     fn and_sub(&self, sub: usize, from: usize, block: &mut [u64; SUB_WORDS]) {
         let first = sub * SUB_WORDS + from;
         let last = (sub + 1) * SUB_WORDS;
-        match &self.bits {
-            Some(bytes) => {
-                for (o, word) in block[from..]
-                    .iter_mut()
-                    .zip(bytes[first * 8..last * 8].chunks_exact(8))
-                {
-                    *o &= u64::from_le_bytes(word.try_into().expect("8"));
-                }
+        if !self.dense {
+            for (o, word) in block[from..].iter_mut().zip(&self.words[first..last]) {
+                *o &= *word;
             }
-            None => {
-                for (o, word) in block[from..].iter_mut().zip(&self.words[first..last]) {
-                    *o &= *word;
-                }
+        } else if let Some(at) = self.run(first * 8, (last - first) * 8) {
+            // SAFETY: `run` found the sub-block's words in one run.
+            let bytes = unsafe { std::slice::from_raw_parts(at, (last - first) * 8) };
+            for (o, word) in block[from..].iter_mut().zip(bytes.chunks_exact(8)) {
+                *o &= u64::from_le_bytes(word.try_into().expect("8"));
+            }
+        } else {
+            for (o, i) in block[from..].iter_mut().zip(first..last) {
+                *o &= self.word(i);
             }
         }
     }
@@ -1712,8 +1812,41 @@ impl OrdinalTerm<'_> {
     fn bucket(&self, rank: u32) -> Option<u8> {
         match &self.list {
             Some(_) => self.ordinals.list_buckets().get(rank as usize).copied(),
-            None => self.chunk.as_ref()?.bucket(rank - self.rank_base),
+            None => {
+                let within = rank - self.rank_base;
+                match self.chunk.as_ref()?.bucket_in_place(within) {
+                    Ok(bucket) => bucket,
+                    Err(offset) => Some(self.far_bucket(offset, within)),
+                }
+            }
         }
+    }
+
+    /// The bucket of member `within` of a chunk held in place whose nibble,
+    /// in the byte at `offset` of the stream, lies past the chunk's pages:
+    /// read from the page the term holds for nibbles, moved there if need
+    /// be. Candidates ask in ordinal order, so the page serves a run of
+    /// them.
+    #[inline(never)]
+    fn far_bucket(&self, offset: u64, within: u32) -> u8 {
+        let span = match self.nibbles.get() {
+            Some(span) if offset.wrapping_sub(span.start) < span.len as u64 => span,
+            _ => {
+                let (_, slot) = self.held.expect("a chunk held in place has its slots");
+                let span = segment_error(
+                    self.ordinals
+                        .held_span(slot, offset)
+                        .expect("pages are held while a chunk held in place is"),
+                );
+                self.nibbles.set(Some(span));
+                span
+            }
+        };
+        // SAFETY: the span's page stays pinned until the next call on the
+        // term's nibble slot or the end of the walk's hold span, and the
+        // byte lies within it.
+        let byte = unsafe { *span.data.add(offset.wrapping_sub(span.start) as usize) };
+        segment::ordinals::nibble_in(byte, within)
     }
 
     /// Whether the loaded chunk holds `low`, and the member's rank in the stream.

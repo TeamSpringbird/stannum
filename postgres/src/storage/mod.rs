@@ -791,10 +791,27 @@ pub struct RunSource {
     /// Open [`Source::hold`](segment::source::Source::hold) spans; pages
     /// are held only while one is open.
     holding: Cell<u32>,
-    /// Per slot, the page held pinned for
-    /// [`Source::held_span`](segment::source::Source::held_span).
-    held: [Cell<Option<HeldPage>>; segment::source::HELD_SLOTS],
+    /// Per slot, the pages held pinned for
+    /// [`Source::held_span`](segment::source::Source::held_span) (one) or
+    /// [`Source::held_range`](segment::source::Source::held_range) (up to
+    /// [`HELD_PIECES`](segment::source::HELD_PIECES)): the tables' slots,
+    /// then one per slot handed out by
+    /// [`Source::held_slot`](segment::source::Source::held_slot) in the
+    /// open span, at most [`HELD_SLOT_LIMIT`] in all.
+    slots: RefCell<Vec<HeldSlot>>,
+    /// The index, opened at the first page a span pins and closed when it
+    /// ends, rather than looked up per page: a walk pins a page per chunk.
+    relation: Cell<pg_sys::Relation>,
 }
+
+/// The pages one slot holds pinned.
+type HeldSlot = [Option<HeldPage>; segment::source::HELD_PIECES];
+
+/// Slots a source hands out within a span, the tables' included: two per
+/// walked term (its chunk's members and its bucket nibbles) and one per
+/// phrase slot's positions, so at most `3 * HELD_PIECES` short of three
+/// times this pages pinned at once. A walk wanting more copies the rest.
+const HELD_SLOT_LIMIT: usize = 64;
 
 /// A run page kept pinned, without its content lock, between reads of a
 /// table a walk consults per candidate. Run pages are written once, before
@@ -823,16 +840,27 @@ impl RunSource {
             table,
             label,
             holding: Cell::new(0),
-            held: Default::default(),
+            slots: RefCell::new(vec![Default::default(); segment::source::HELD_SLOTS]),
+            relation: Cell::new(std::ptr::null_mut()),
         }
     }
 
-    /// Releases the pages held in every slot.
+    /// Releases the pages held in every slot, forgets the slots handed out,
+    /// and closes the index.
     fn release_held(&self) {
-        for slot in &self.held {
-            if let Some(held) = slot.take() {
-                unpin(held);
+        let mut slots = self.slots.borrow_mut();
+        for slot in slots.iter_mut() {
+            for page in slot.iter_mut() {
+                if let Some(held) = page.take() {
+                    unpin(held);
+                }
             }
+        }
+        slots.truncate(segment::source::HELD_SLOTS);
+        let relation = self.relation.replace(std::ptr::null_mut());
+        if !relation.is_null() {
+            // SAFETY: opened by `pin` within the span now ending.
+            unsafe { pg_sys::RelationClose(relation) };
         }
     }
 
@@ -841,28 +869,49 @@ impl RunSource {
     fn pin(&self, page: usize) -> segment::Result<HeldPage> {
         let block = *self.table.get(page).ok_or(segment::Error::Truncated)?;
         crate::score::charging("run source", || {
-            // SAFETY: as in `read_into`; the relcache reference is scoped
-            // to this call, and the pin is released by `release_held`.
+            // SAFETY: as in `read_into`; the relcache reference is held
+            // until the span ends, within the statement, and the pin is
+            // released by `release_held`.
             unsafe {
-                let index = pg_sys::RelationIdGetRelation(self.index_oid);
+                let mut index = self.relation.get();
                 if index.is_null() {
-                    pgrx::error!("Stannum index no longer exists");
+                    index = pg_sys::RelationIdGetRelation(self.index_oid);
+                    if index.is_null() {
+                        pgrx::error!("Stannum index no longer exists");
+                    }
+                    self.relation.set(index);
                 }
-                let buffer = Buffer::read(index, block, false);
-                expect_run_page(&buffer, &self.label);
-                let (_, data) = buffer.chain();
+                // Pinned only: a run page is never written while published
+                // (see `HeldPage`), so its content lock guards nothing, and
+                // a walk pins a page or two per chunk it loads.
+                let buffer =
+                    crate::score::charging("buffer read", || pg_sys::ReadBuffer(index, block));
+                let contents = std::slice::from_raw_parts(
+                    pg_sys::BufferGetPage(buffer).cast::<u8>(),
+                    PAGE_SIZE,
+                );
+                let checked = match layout::kind(contents) {
+                    Ok(KIND_RUN) => layout::chain(contents)
+                        .map(|(_, data)| data)
+                        .map_err(str::to_string),
+                    Ok(kind) => Err(format!("kind {kind} instead of a run page")),
+                    Err(message) => Err(message.to_string()),
+                };
+                let data = match checked {
+                    Ok(data) => data,
+                    Err(message) => {
+                        pg_sys::ReleaseBuffer(buffer);
+                        corrupt(format!("Stannum {}: page {block}: {message}", self.label))
+                    }
+                };
                 let held = HeldPage {
                     page,
-                    buffer: buffer.0,
+                    buffer,
                     data: data.as_ptr(),
                     len: data.len(),
                 };
-                // Keep the pin, drop the lock: the guard is forgotten so
-                // its drop does not release the pin as well.
-                std::mem::forget(buffer);
-                pg_sys::LockBuffer(held.buffer, pg_sys::BUFFER_LOCK_UNLOCK as i32);
-                pg_sys::RelationClose(index);
-                HELD_PAGES.set((HELD_PAGES.get().0 + 1, HELD_PAGES.get().1 + 1));
+                let (now, total, peak) = HELD_PAGES.get();
+                HELD_PAGES.set((now + 1, total + 1, peak.max(now + 1)));
                 Ok(held)
             }
         })
@@ -870,15 +919,28 @@ impl RunSource {
 }
 
 thread_local! {
-    /// Run pages held pinned now, and pinned so in all: a held page must
-    /// never outlive the walk that pinned it.
-    static HELD_PAGES: Cell<(i64, u64)> = const { Cell::new((0, 0)) };
+    /// Run pages held pinned now, pinned so in all, and the most held at
+    /// once since the peak was reset: a held page must never outlive the
+    /// walk that pinned it.
+    static HELD_PAGES: Cell<(i64, u64, i64)> = const { Cell::new((0, 0, 0)) };
 }
 
 /// Pages held pinned now and in all (see [`HeldPage`]).
 #[cfg(any(test, feature = "pg_test"))]
 pub(crate) fn held_pages() -> (i64, u64) {
-    HELD_PAGES.get()
+    let (now, total, _) = HELD_PAGES.get();
+    (now, total)
+}
+
+/// The most pages held pinned at once since the last reset.
+pub(crate) fn held_peak() -> i64 {
+    HELD_PAGES.get().2
+}
+
+/// Restarts [`held_peak`] from the pages held now.
+pub(crate) fn reset_held_peak() {
+    let (now, total, _) = HELD_PAGES.get();
+    HELD_PAGES.set((now, total, now));
 }
 
 /// Releases a page `RunSource::pin` pinned.
@@ -886,7 +948,8 @@ fn unpin(held: HeldPage) {
     // SAFETY: the pin was taken by `pin` and is released once: the slot
     // holding it was emptied before this call.
     unsafe { pg_sys::ReleaseBuffer(held.buffer) };
-    HELD_PAGES.set((HELD_PAGES.get().0 - 1, HELD_PAGES.get().1));
+    let (now, total, peak) = HELD_PAGES.get();
+    HELD_PAGES.set((now - 1, total, peak));
 }
 
 impl Drop for RunSource {
@@ -959,20 +1022,22 @@ impl segment::source::Source for RunSource {
         if self.holding.get() == 0 {
             return None;
         }
-        let cell = self.held.get(slot)?;
+        let mut slots = self.slots.borrow_mut();
+        let pages = slots.get_mut(slot)?;
         let page = (offset / CHAIN_CAPACITY as u64) as usize;
-        let (held, pinned) = match cell.get() {
-            Some(held) if held.page == page => (held, false),
-            previous => {
-                if let Some(previous) = previous {
-                    cell.set(None);
-                    unpin(previous);
+        let (held, pinned) = match pages.iter().flatten().find(|held| held.page == page) {
+            Some(held) => (*held, false),
+            None => {
+                for previous in pages.iter_mut() {
+                    if let Some(previous) = previous.take() {
+                        unpin(previous);
+                    }
                 }
                 let held = match self.pin(page) {
                     Ok(held) => held,
                     Err(error) => return Some(Err(error)),
                 };
-                cell.set(Some(held));
+                pages[0] = Some(held);
                 (held, true)
             }
         };
@@ -982,6 +1047,83 @@ impl segment::source::Source for RunSource {
             len: held.len,
             pinned,
         }))
+    }
+
+    fn held_slot(&self) -> Option<usize> {
+        if self.holding.get() == 0 {
+            return None;
+        }
+        let mut slots = self.slots.borrow_mut();
+        if slots.len() >= HELD_SLOT_LIMIT {
+            return None;
+        }
+        slots.push(Default::default());
+        Some(slots.len() - 1)
+    }
+
+    fn held_range(
+        &self,
+        slot: usize,
+        offset: u64,
+        len: usize,
+    ) -> Option<segment::Result<segment::source::HeldRange>> {
+        if self.holding.get() == 0 || len == 0 {
+            return None;
+        }
+        let Some(end) = offset
+            .checked_add(len as u64)
+            .filter(|end| *end <= u64::from(self.run.bytes))
+        else {
+            return Some(Err(segment::Error::Truncated));
+        };
+        let capacity = CHAIN_CAPACITY as u64;
+        let (first, last) = (
+            (offset / capacity) as usize,
+            ((end - 1) / capacity) as usize,
+        );
+        if last - first >= segment::source::HELD_PIECES {
+            return None;
+        }
+        let mut slots = self.slots.borrow_mut();
+        let pages = slots.get_mut(slot)?;
+        // Pages the slot holds already stay pinned: a term's next chunk
+        // follows its last one in the stream, often on the same page.
+        for page in pages.iter_mut() {
+            if page.is_some_and(|held| held.page < first || held.page > last) {
+                unpin(page.take().expect("checked above"));
+            }
+        }
+        let mut range = segment::source::HeldRange::default();
+        for page in first..=last {
+            let held = match pages.iter().flatten().find(|held| held.page == page) {
+                Some(held) => *held,
+                None => {
+                    let held = match self.pin(page) {
+                        Ok(held) => held,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    // The pages outside the range are released and the
+                    // range spans at most as many pages as the slot holds.
+                    *pages
+                        .iter_mut()
+                        .find(|page| page.is_none())
+                        .expect("a free place in the slot") = Some(held);
+                    range.pinned_bytes += held.len;
+                    held
+                }
+            };
+            let within = if page == first {
+                (offset % capacity) as usize
+            } else {
+                0
+            };
+            if within > held.len {
+                return Some(Err(segment::Error::Truncated));
+            }
+            // SAFETY: within the page's run data.
+            range.push(unsafe { held.data.add(within) }, held.len - within);
+        }
+        Some(Ok(range))
     }
 }
 

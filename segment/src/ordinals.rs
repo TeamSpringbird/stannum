@@ -65,6 +65,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::source::{HeldRange, HeldSpan};
 use crate::tf_bucket::BUCKET_COUNT;
 use crate::{Error, Result, varint};
 
@@ -293,6 +294,23 @@ pub trait Fetch<'a> {
     /// An owned copy that the source need not keep: a chunk a walk visits.
     fn fetch_owned(&self, offset: u64, len: usize) -> Result<std::rc::Rc<[u8]>> {
         self.fetch(offset, len).map(std::rc::Rc::from)
+    }
+    /// A fresh slot to hold ranges in place in (see [`Source::held_slot`]).
+    fn held_slot(&self) -> Option<usize> {
+        None
+    }
+    /// `len` bytes at `offset` of the stream in place from pages held
+    /// pinned in `slot` (see [`Source::held_range`]).
+    fn fetch_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        let _ = (slot, offset, len);
+        None
+    }
+    /// The page holding byte `offset` of the stream, held pinned in `slot`
+    /// (see [`Source::held_span`]), its `start` an offset in the stream,
+    /// wrapped below zero for a page starting before it.
+    fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+        let _ = (slot, offset);
+        None
     }
 }
 
@@ -618,11 +636,78 @@ impl<'a> Ordinals<'a> {
             key: entry_key(entry),
             cardinality: cardinality as u32,
             before: self.before(i),
-            bytes: self.source.fetch_owned(start, total)?,
+            bytes: Stored::Owned(self.source.fetch_owned(start, total)?),
             bitmap,
             body_len: size,
             buckets_at: self.scored.then_some(size),
+            at: start,
         })
+    }
+
+    /// A fresh slot for [`Ordinals::chunk_held`], when the source holds
+    /// pages in place (see [`crate::source::Source::held_slot`]).
+    pub fn held_slot(&self) -> Option<usize> {
+        self.source.held_slot()
+    }
+
+    /// Chunk `i`, its members read in place from the pages the source holds
+    /// pinned in `slot`, in place of what the slot held; copied as
+    /// [`Ordinals::chunk`] does where the source holds nothing or the
+    /// members span too many pages. Of the bucket nibbles, the chunk holds
+    /// what its last page does: [`Chunk::bucket_in_place`] names the byte
+    /// of any other, which [`Ordinals::held_span`] reads.
+    ///
+    /// # Safety
+    ///
+    /// A chunk read in place borrows pinned pages: it must not be used after
+    /// the next call on `slot`, or once the source's outermost
+    /// [`crate::source::Source::hold`] span closes.
+    pub unsafe fn chunk_held(&self, i: usize, slot: usize) -> Result<Chunk> {
+        let Body::Chunked {
+            directory,
+            chunks_at,
+            ..
+        } = &self.body
+        else {
+            return Err(Error::Corrupt("a list has no chunks"));
+        };
+        let entry = &directory[i * ENTRY..(i + 1) * ENTRY];
+        let (cardinality, offset, size, bitmap) = entry_chunk(entry);
+        let start = chunks_at + offset;
+        let total = size + nibbles_len(cardinality, self.scored);
+        if start + total as u64 > self.len {
+            return Err(Error::Truncated);
+        }
+        let Some(range) = self.source.fetch_held(slot, start, size) else {
+            return self.chunk(i);
+        };
+        let mut range = range?;
+        // The members are held; of what follows them on the last page,
+        // only the chunk's own nibbles are the chunk's.
+        let end = range.end().min(total);
+        range.clip(end);
+        Ok(Chunk {
+            key: entry_key(entry),
+            cardinality: cardinality as u32,
+            before: self.before(i),
+            bytes: Stored::Held(range),
+            bitmap,
+            body_len: size,
+            buckets_at: self.scored.then_some(size),
+            at: start,
+        })
+    }
+
+    /// The page holding byte `offset` of the stream, held pinned in `slot`
+    /// in place of what the slot held (see
+    /// [`crate::source::Source::held_span`]): a held chunk's nibbles past
+    /// its pages. The span's `start` is an offset in the stream, wrapped
+    /// below zero for a page that starts before the stream.
+    pub fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+        if offset >= self.len {
+            return Some(Err(Error::Truncated));
+        }
+        self.source.held_span(slot, offset)
     }
 
     /// The ordinal at `index` of the stream: the document of the term's
@@ -1020,26 +1105,165 @@ pub struct Chunk {
     /// Members of the stream before this chunk: the rank of its first member.
     pub before: u32,
     /// The members, then their bucket nibbles when the stream stores them.
-    bytes: std::rc::Rc<[u8]>,
+    bytes: Stored,
     bitmap: bool,
     /// Bytes of the members: the words of a bitmap or the array.
     body_len: usize,
     /// Where the members' bucket nibbles start in `bytes`, when stored.
     buckets_at: Option<usize>,
+    /// Where the chunk starts in the stream.
+    at: u64,
+}
+
+/// Where a chunk's bytes are.
+enum Stored {
+    /// Copied, shared with the read cache.
+    Owned(std::rc::Rc<[u8]>),
+    /// In place on pages the source holds pinned (see
+    /// [`Ordinals::chunk_held`]): the members, and of the nibbles what the
+    /// last page holds.
+    Held(HeldRange),
+}
+
+/// The bucket in nibble `within` of `byte`, the byte holding it.
+#[inline]
+pub fn nibble_in(byte: u8, within: u32) -> u8 {
+    if within.is_multiple_of(2) {
+        byte & 0xf
+    } else {
+        byte >> 4
+    }
 }
 
 impl Chunk {
-    /// The members' bytes: `WORDS` words for a bitmap, two bytes per member
-    /// for an array.
+    /// `N` bytes at `at` of the chunk, which must lie within its members or
+    /// the nibbles it holds.
+    #[inline]
+    fn read<const N: usize>(&self, at: usize) -> [u8; N] {
+        match &self.bytes {
+            Stored::Owned(bytes) => bytes[at..at + N].try_into().expect("N bytes"),
+            Stored::Held(range) => {
+                assert!(at + N <= range.end(), "a read beyond a held chunk");
+                // SAFETY: `chunk_held`'s contract keeps the pages pinned
+                // while the chunk is used; the bytes are within the range.
+                unsafe { range.read::<N>(at) }
+            }
+        }
+    }
+
+    /// Hands `visit` the member bytes `from..to` as contiguous runs.
+    fn runs(&self, from: usize, to: usize, mut visit: impl FnMut(usize, &[u8])) {
+        assert!(to <= self.body_len, "a run beyond the members");
+        match &self.bytes {
+            Stored::Owned(bytes) => visit(from, &bytes[from..to]),
+            // SAFETY: as in `read`.
+            Stored::Held(range) => unsafe { range.runs(from, to, visit) },
+        }
+    }
+
+    /// Folds a bitmap chunk's words into `out` by `op`, a run of whole
+    /// words at a time, a word straddling two pages on its own.
+    fn fold(&self, op: Op, out: &mut Words) {
+        let fold = |out: &mut [u64], bytes: &[u8]| match op {
+            Op::Assign => kernels::assign_bytes(out, bytes),
+            Op::Or => kernels::or_bytes(out, bytes),
+            Op::And => kernels::and_bytes(out, bytes),
+        };
+        match &self.bytes {
+            Stored::Owned(bytes) => fold(out, &bytes[..self.body_len]),
+            Stored::Held(range) => {
+                let mut w = 0;
+                while w < WORDS {
+                    let (data, left) = range.locate(w * 8);
+                    let whole = (left / 8).min(WORDS - w);
+                    if whole == 0 {
+                        let word = self.word(w);
+                        fold(&mut out[w..=w], &word.to_le_bytes());
+                        w += 1;
+                    } else {
+                        // SAFETY: `whole` words of one piece, pinned per
+                        // `chunk_held`'s contract.
+                        let bytes = unsafe { std::slice::from_raw_parts(data, whole * 8) };
+                        fold(&mut out[w..w + whole], bytes);
+                        w += whole;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The members' bytes of a copied chunk: `WORDS` words for a bitmap,
+    /// two bytes per member for an array. Only cursors read these, and
+    /// they read chunks copied.
     fn body(&self) -> &[u8] {
-        &self.bytes[..self.body_len]
+        match &self.bytes {
+            Stored::Owned(bytes) => &bytes[..self.body_len],
+            Stored::Held(_) => unreachable!("a cursor reads chunks copied"),
+        }
+    }
+
+    /// Low bits of array member `i`.
+    #[inline]
+    fn low(&self, i: usize) -> u16 {
+        u16::from_le_bytes(self.read::<2>(i * 2))
+    }
+
+    /// Hands `visit` an array chunk's members' low bits in order, a run of
+    /// bytes at a time, a member split over two pages put back together.
+    #[inline]
+    fn for_each_low(&self, mut visit: impl FnMut(u16)) {
+        let mut carry = None;
+        self.runs(0, self.body_len, |_, mut bytes| {
+            if let Some(low) = carry.take()
+                && let Some((high, rest)) = bytes.split_first()
+            {
+                visit(u16::from_le_bytes([low, *high]));
+                bytes = rest;
+            }
+            let lows = bytes.chunks_exact(2);
+            if let [low] = lows.remainder() {
+                carry = Some(*low);
+            }
+            lows.for_each(|low| visit(u16::from_le_bytes([low[0], low[1]])));
+        });
     }
 
     /// The bucket of the member at rank `within` inside the chunk, when the
     /// stream stores buckets.
+    ///
+    /// # Panics
+    ///
+    /// On a chunk held in place whose nibble lies beyond the pages it
+    /// holds: [`Chunk::bucket_in_place`] says where to read it.
     pub fn bucket(&self, within: u32) -> Option<u8> {
-        let at = self.buckets_at?;
-        nibble(&self.bytes[at..], within as usize)
+        self.bucket_in_place(within)
+            .unwrap_or_else(|_| panic!("the nibble of member {within} is not held"))
+    }
+
+    /// The bucket of the member at rank `within`, as [`Chunk::bucket`];
+    /// for a chunk held in place whose nibble lies past the pages it holds,
+    /// the offset in the stream of the byte holding it instead (see
+    /// [`nibble_in`]).
+    #[inline]
+    pub fn bucket_in_place(&self, within: u32) -> std::result::Result<Option<u8>, u64> {
+        let Some(buckets_at) = self.buckets_at else {
+            return Ok(None);
+        };
+        match &self.bytes {
+            Stored::Owned(bytes) => Ok(nibble(&bytes[buckets_at..], within as usize)),
+            Stored::Held(range) => {
+                if within >= self.cardinality {
+                    return Ok(None);
+                }
+                let at = buckets_at + within as usize / 2;
+                if at < range.end() {
+                    let [byte] = self.read::<1>(at);
+                    Ok(Some(nibble_in(byte, within)))
+                } else {
+                    Err(self.at + at as u64)
+                }
+            }
+        }
     }
 
     /// The first ordinal the chunk can hold.
@@ -1048,9 +1272,9 @@ impl Chunk {
     }
 
     /// Word `i` of a bitmap chunk's members, read in place: the bytes are
-    /// the cache's, so a walk tests bits through the chunk rather than
-    /// copying its 8 KiB into a word buffer per load. The bytes need not be
-    /// word aligned.
+    /// the cache's or a pinned page's, so a walk tests bits through the
+    /// chunk rather than copying its 8 KiB into a word buffer per load.
+    /// The bytes need not be word aligned.
     ///
     /// # Panics
     ///
@@ -1058,29 +1282,71 @@ impl Chunk {
     #[inline]
     pub fn word(&self, i: usize) -> u64 {
         assert!(self.bitmap, "an array chunk has no words");
-        let at = &self.bytes[i * 8..i * 8 + 8];
-        u64::from_le_bytes(at.try_into().expect("eight bytes"))
+        assert!(i < WORDS, "word {i} beyond a bitmap");
+        u64::from_le_bytes(self.read::<8>(i * 8))
+    }
+
+    /// The members' first bytes that lie contiguously in memory, and how
+    /// many: the whole members of a copied chunk, the members on the first
+    /// page of one held in place. A walk reads words from here directly and
+    /// through [`Chunk::word`] past it. The pointer is valid as long as the
+    /// chunk is.
+    pub fn head(&self) -> (*const u8, usize) {
+        self.pieces()[0]
+    }
+
+    /// The members' first two runs of bytes contiguous in memory, and how
+    /// long each is: a copied chunk's members and nothing, or the members
+    /// on the first page of a held chunk and on the second. A bitmap on
+    /// pages of 8,150 bytes spans a third in one chunk of 200, so a walk
+    /// reads most words from the two directly (see [`Chunk::head`]).
+    pub fn pieces(&self) -> [(*const u8, usize); 2] {
+        match &self.bytes {
+            Stored::Owned(bytes) => [(bytes.as_ptr(), self.body_len), (std::ptr::null(), 0)],
+            Stored::Held(range) => {
+                let (data, len) = range.head();
+                let first = len.min(self.body_len);
+                if first == self.body_len || range.end() == len {
+                    return [(data, first), (std::ptr::null(), 0)];
+                }
+                let (second, left) = range.locate(len);
+                [(data, first), (second, left.min(self.body_len - first))]
+            }
+        }
+    }
+
+    /// Whether the chunk is read in place from pinned pages.
+    pub fn is_held(&self) -> bool {
+        matches!(self.bytes, Stored::Held(_))
     }
 
     /// Set bits in words `from..to` of a bitmap chunk.
     pub fn count_words(&self, from: usize, to: usize) -> u32 {
         assert!(self.bitmap, "an array chunk has no words");
-        self.bytes[from * 8..to * 8]
-            .chunks_exact(8)
-            .map(|w| u64::from_le_bytes(w.try_into().expect("eight bytes")).count_ones())
-            .sum()
+        let mut count = 0;
+        // Bits are counted a run of bytes at a time: a word split over two
+        // pages counts the same in two parts.
+        self.runs(from * 8, to * 8, |_, bytes| {
+            let words = bytes.chunks_exact(8);
+            let rest = words.remainder();
+            count += words
+                .map(|w| u64::from_le_bytes(w.try_into().expect("eight bytes")).count_ones())
+                .sum::<u32>();
+            count += rest.iter().map(|b| b.count_ones()).sum::<u32>();
+        });
+        count
     }
 
     /// Ors a bitmap chunk's members into `out`.
     pub fn or_into(&self, out: &mut Words) {
         assert!(self.bitmap, "an array chunk has no words");
-        kernels::or_bytes(out, self.body());
+        self.fold(Op::Or, out);
     }
 
     /// Keeps of `out` the members of a bitmap chunk.
     pub fn and_into(&self, out: &mut Words) {
         assert!(self.bitmap, "an array chunk has no words");
-        kernels::and_bytes(out, self.body());
+        self.fold(Op::And, out);
     }
 
     /// The rank within the chunk of the member with low bits `low`, if any.
@@ -1095,14 +1361,10 @@ impl Chunk {
             let before = self.count_words(0, word);
             Some(before + (value & ((1u64 << bit) - 1)).count_ones())
         } else {
-            let lows = self.body().chunks_exact(2);
-            let count = lows.len();
-            let (mut lo, mut hi) = (0usize, count);
+            let (mut lo, mut hi) = (0usize, self.body_len / 2);
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                let at = &self.body()[mid * 2..mid * 2 + 2];
-                let value = u16::from_le_bytes([at[0], at[1]]);
-                match value.cmp(&low) {
+                match self.low(mid).cmp(&low) {
                     std::cmp::Ordering::Less => lo = mid + 1,
                     std::cmp::Ordering::Greater => hi = mid,
                     std::cmp::Ordering::Equal => return Some(mid as u32),
@@ -1117,35 +1379,25 @@ impl Chunk {
         self.bitmap
     }
 
-    /// A bitmap chunk's bytes, shared with the cache: `WORDS` little-endian
-    /// words, then the bucket nibbles when stored. A walk that tests bits
-    /// per word holds these rather than going through the chunk each time.
-    pub fn bitmap_bytes(&self) -> Option<std::rc::Rc<[u8]>> {
-        self.bitmap.then(|| self.bytes.clone())
-    }
-
     /// Appends the low bits of an array chunk's members, ascending; nothing
     /// for a bitmap.
     pub fn members(&self, out: &mut Vec<u16>) {
         if !self.bitmap {
-            out.extend(
-                self.body()
-                    .chunks_exact(2)
-                    .map(|low| u16::from_le_bytes([low[0], low[1]])),
-            );
+            out.reserve(self.body_len / 2);
+            self.for_each_low(|low| out.push(low));
         }
     }
 
     /// Sets `out` to the chunk's members.
     pub fn words(&self, out: &mut Words) {
         if self.bitmap {
-            kernels::assign_bytes(out, self.body());
+            self.fold(Op::Assign, out);
         } else {
             out.fill(0);
-            for low in self.body().chunks_exact(2) {
-                let low = usize::from(u16::from_le_bytes([low[0], low[1]]));
+            self.for_each_low(|low| {
+                let low = usize::from(low);
                 out[low / 64] |= 1 << (low % 64);
-            }
+            });
         }
     }
 }
@@ -1201,21 +1453,21 @@ mod kernels {
     }
 
     #[inline(always)]
-    fn assign_bytes_body(out: &mut Words, bytes: &[u8]) {
+    fn assign_bytes_body(out: &mut [u64], bytes: &[u8]) {
         out.iter_mut()
             .zip(bytes.chunks_exact(8))
             .for_each(|(o, w)| *o = word(w));
     }
 
     #[inline(always)]
-    fn or_bytes_body(out: &mut Words, bytes: &[u8]) {
+    fn or_bytes_body(out: &mut [u64], bytes: &[u8]) {
         out.iter_mut()
             .zip(bytes.chunks_exact(8))
             .for_each(|(o, w)| *o |= word(w));
     }
 
     #[inline(always)]
-    fn and_bytes_body(out: &mut Words, bytes: &[u8]) {
+    fn and_bytes_body(out: &mut [u64], bytes: &[u8]) {
         out.iter_mut()
             .zip(bytes.chunks_exact(8))
             .for_each(|(o, w)| *o &= word(w));
@@ -1238,10 +1490,10 @@ mod kernels {
 
     kernel!(
         /// Overwrites `out` with a bitmap chunk's little-endian words.
-        assign_bytes, assign_bytes_body, (out: &mut Words, bytes: &[u8])
+        assign_bytes, assign_bytes_body, (out: &mut [u64], bytes: &[u8])
     );
-    kernel!(or_bytes, or_bytes_body, (out: &mut Words, bytes: &[u8]));
-    kernel!(and_bytes, and_bytes_body, (out: &mut Words, bytes: &[u8]));
+    kernel!(or_bytes, or_bytes_body, (out: &mut [u64], bytes: &[u8]));
+    kernel!(and_bytes, and_bytes_body, (out: &mut [u64], bytes: &[u8]));
     kernel!(or_words, or_words_body, (out: &mut Words, other: &Words));
     kernel!(and_words, and_words_body, (out: &mut Words, other: &Words));
     kernel!(count, count_body, (words: &Words) -> u32);

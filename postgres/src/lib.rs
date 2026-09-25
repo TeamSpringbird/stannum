@@ -1557,6 +1557,126 @@ mod tests {
     }
 
     #[pg_test]
+    fn walks_release_the_chunk_and_position_pages_they_read_in_place() {
+        // 140,000 documents in one segment: three chunks of ordinals per
+        // term, bitmaps with their bucket nibbles running over pages past
+        // the members for all but rare, whose chunks are arrays, and
+        // position lists over many pages for the phrases. Beta and gamma
+        // are dense enough to be elided from the default score, delta and
+        // eps not.
+        Spi::run(
+            "CREATE TABLE inplace(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 200000;
+             INSERT INTO inplace SELECT n,
+               repeat('alpha ', 1 + n % 3) ||
+               CASE WHEN n % 7 = 0 THEN 'beta ' ELSE '' END ||
+               CASE WHEN n % 3 = 0 THEN repeat('gamma ', 1 + n % 4) ELSE '' END ||
+               CASE WHEN n % 13 = 0 THEN 'delta ' ELSE '' END ||
+               CASE WHEN n % 29 = 0 THEN repeat('eps ', 1 + n % 2) ELSE '' END ||
+               CASE WHEN n % 97 = 0 THEN 'rare ' ELSE '' END ||
+               repeat('pad ', n % 5) || 'tail'
+               FROM generate_series(1, 140000) n;
+             CREATE INDEX inplace_idx ON inplace USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;",
+        )
+        .unwrap();
+        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node.clone());
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        let before = crate::storage::held_pages();
+        assert_eq!(before.0, 0, "{before:?}");
+        let mut peak = 0;
+        let mut walks = 0;
+        for query in [
+            "alpha OR beta",
+            "delta OR eps OR rare",
+            "alpha AND beta",
+            "delta AND eps",
+            "delta AND gamma AND rare",
+            "delta AND NOT eps",
+            "(delta OR rare) AND gamma",
+            "\"alpha beta\"",
+            "\"delta eps\"",
+            "\"alpha beta\" OR rare",
+            "\"gamma delta\" AND eps",
+        ] {
+            for score in ["stannum.score(ctid)", "stannum.score(ctid, 1.0)"] {
+                let plan = Spi::get_one::<Json>(&format!(
+                    "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM inplace WHERE body ==> '{query}'
+                     ORDER BY {score} DESC LIMIT 10"
+                ))
+                .unwrap()
+                .unwrap()
+                .0;
+                let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
+                assert_eq!(scan["Actual Rows"].as_f64(), Some(10.0), "{query}: {scan}");
+                walks += usize::from(scan["Pruning"] == "ordinal");
+                peak = peak.max(scan["Pages Held Peak"].as_i64().unwrap_or(0));
+                let held = crate::storage::held_pages();
+                assert_eq!(held.0, 0, "{query}, {score}: {held:?}");
+            }
+        }
+        let after = crate::storage::held_pages();
+        assert!(
+            after.1 > before.1 + 20,
+            "the walks held no pages: {after:?}"
+        );
+        assert!(walks >= 16, "{walks} walks");
+        assert!(peak >= 4, "no walk held a chunk's pages: {peak}");
+        // A walk cancelled mid-way, with chunk pages held, releases them as
+        // the cancel unwinds it.
+        for query in [
+            "alpha OR beta OR gamma",
+            "beta AND gamma AND delta",
+            "\"gamma delta\"",
+        ] {
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM inplace WHERE body ==> '{query}'
+                 ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
+            let loads = scan["Chunks Loaded"].as_i64().unwrap_or(0);
+            assert!(
+                loads >= 2 && scan["Pruning"] == "ordinal",
+                "{query}: {scan}"
+            );
+            crate::score::cancel_at_chunk_load(loads / 2 + 1);
+            Spi::run(&format!(
+                "DO $$ BEGIN
+                   PERFORM id FROM inplace WHERE body ==> '{query}'
+                     ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10;
+                   RAISE EXCEPTION 'the walk was not cancelled';
+                 EXCEPTION WHEN query_canceled THEN NULL;
+                 END $$"
+            ))
+            .unwrap();
+            let holding = crate::score::cancel_at_chunk_load(0);
+            assert!(holding > 0, "{query}: cancelled holding no pages");
+            let held = crate::storage::held_pages();
+            assert_eq!(held.0, 0, "{query}: cancelled walk left {held:?}");
+        }
+        // And the next walk reads as before.
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM (SELECT id FROM inplace WHERE body ==> 'alpha AND beta'
+             ORDER BY stannum.score(ctid) DESC LIMIT 10) top",
+        )
+        .unwrap();
+        assert_eq!(count, Some(10));
+        assert_eq!(crate::storage::held_pages().0, 0);
+    }
+
+    #[pg_test]
     fn pruned_top_k_matches_full_scoring_bit_for_bit() {
         // Four build segments of 1,000 documents and a write buffer, with a
         // 60-row pattern of term frequencies and lengths so exact score ties

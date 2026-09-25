@@ -2322,6 +2322,12 @@ unsafe extern "C-unwind" fn explain(
                 es,
             );
             pg_sys::ExplainPropertyInteger(
+                c"Pages Held Peak".as_ptr(),
+                std::ptr::null(),
+                crate::storage::held_peak(),
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
                 c"Positions Checked".as_ptr(),
                 std::ptr::null(),
                 crate::score::position_checks(),

@@ -48,7 +48,7 @@ use crate::docs::{self, DocCursor, DocTable, PageCursor, PageTable, TidCursor};
 use crate::forward::{ForwardRecord, ForwardTerm};
 use crate::ordinals::Ordinals;
 use crate::payload::{Payload, PayloadBuilder};
-use crate::source::{HELD_SLOTS, HeldSpan, Source};
+use crate::source::{HELD_SLOTS, HeldRange, HeldSpan, Source};
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Result, Tid, varint};
 
@@ -383,6 +383,28 @@ impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
         let at = self.base.checked_add(offset).ok_or(Error::Truncated)?;
         self.areas.ordinals_range_owned(at, len)
     }
+    fn held_slot(&self) -> Option<usize> {
+        self.areas.held_slot()
+    }
+    fn fetch_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        let Some(at) = self.base.checked_add(offset) else {
+            return Some(Err(Error::Truncated));
+        };
+        self.areas.ordinals_held(slot, at, len)
+    }
+    fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+        let Some(at) = self.base.checked_add(offset) else {
+            return Some(Err(Error::Truncated));
+        };
+        Some(
+            self.areas
+                .ordinals_held_span(slot, at)?
+                .map(|span| HeldSpan {
+                    start: span.start.wrapping_sub(self.base),
+                    ..span
+                }),
+        )
+    }
 }
 
 /// Document lengths per window of the length table a paged source hands out.
@@ -430,6 +452,26 @@ pub trait AreaFetch {
     /// The length of `ordinal` from a page the source holds pinned, when it
     /// holds one (see [`Source::held_span`]).
     fn held_length(&self, _ordinal: u32) -> Option<Result<u32>> {
+        None
+    }
+    /// A fresh slot to hold ranges in place in (see [`Source::held_slot`]).
+    fn held_slot(&self) -> Option<usize> {
+        None
+    }
+    /// `len` bytes at `offset` of the ordinals area, in place from pages
+    /// held pinned in `slot` (see [`Source::held_range`]).
+    fn ordinals_held(&self, _slot: usize, _offset: u64, _len: usize) -> Option<Result<HeldRange>> {
+        None
+    }
+    /// The page holding byte `offset` of the ordinals area, held pinned in
+    /// `slot` (see [`Source::held_span`]), its `start` an offset in the
+    /// area, wrapped below zero for a page starting before it.
+    fn ordinals_held_span(&self, _slot: usize, _offset: u64) -> Option<Result<HeldSpan>> {
+        None
+    }
+    /// `len` bytes at `offset` of the payload area, as
+    /// [`AreaFetch::ordinals_held`].
+    fn payload_held(&self, _slot: usize, _offset: u64, _len: usize) -> Option<Result<HeldRange>> {
         None
     }
     /// The window of the length table holding `ordinal` as an owned copy,
@@ -892,6 +934,25 @@ impl<S: Source> Reader<S> {
             .then_some(Ok(span))
     }
 
+    /// `len` bytes at `offset` in place from pages the source holds in
+    /// `slot`, accounting pages newly pinned to their area.
+    fn held_range(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        let before = crate::cache::disk_pages();
+        let range = match self.source.held_range(slot, offset, len)? {
+            Ok(range) => range,
+            Err(error) => return Some(Err(error)),
+        };
+        if range.pinned_bytes != 0 {
+            let area = self.area_of(offset);
+            crate::cache::note_read(area, range.pinned_bytes);
+            crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        }
+        if range.end() < len {
+            return Some(Err(Error::Truncated));
+        }
+        Some(Ok(range))
+    }
+
     /// A copyable handle on the length table.
     pub fn lengths(&self) -> Lengths<'_> {
         let len = self.header.doc_count as usize * 4;
@@ -1053,6 +1114,50 @@ impl<S: Source> AreaFetch for Reader<S> {
         )
     }
 
+    fn held_slot(&self) -> Option<usize> {
+        self.source.held_slot()
+    }
+
+    fn ordinals_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.header.ordinals_len as u64)
+        {
+            return Some(Err(Error::Truncated));
+        }
+        self.held_range(slot, self.header.ordinals_at + offset, len)
+    }
+
+    fn ordinals_held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+        if offset >= self.header.ordinals_len as u64 {
+            return Some(Err(Error::Truncated));
+        }
+        let at = self.header.ordinals_at + offset;
+        let before = crate::cache::disk_pages();
+        let span = match self.source.held_span(slot, at)? {
+            Ok(span) => span,
+            Err(error) => return Some(Err(error)),
+        };
+        if span.pinned {
+            crate::cache::note_read(2, span.len);
+            crate::cache::note_disk(2, crate::cache::disk_pages() - before);
+        }
+        Some(Ok(HeldSpan {
+            start: span.start.wrapping_sub(self.header.ordinals_at),
+            ..span
+        }))
+    }
+
+    fn payload_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.header.payload_len as u64)
+        {
+            return Some(Err(Error::Truncated));
+        }
+        self.held_range(slot, self.header.payload_at + offset, len)
+    }
+
     fn length_window_owned(&self, ordinal: u32) -> Result<Option<(Rc<[u8]>, u32)>> {
         if ordinal >= self.header.doc_count {
             return Err(Error::Corrupt("document ordinal out of range"));
@@ -1152,6 +1257,7 @@ impl Lengths<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ordinals::WORDS;
     use crate::set::{Cursor, collect};
 
     fn tid(block: u32, offset: u16) -> Tid {
@@ -1537,6 +1643,259 @@ mod tests {
         assert!(held.held.iter().all(|span| span.get().is_none()));
         assert!(held.source.held.iter().all(|page| page.get().is_none()));
         assert!(held.length_class(300).is_err());
+    }
+
+    /// Pages of `page` bytes, held pinned per slot as a buffer pool would
+    /// for [`Source::held_range`] and [`Source::held_span`]; counts pins.
+    struct Paged {
+        bytes: Vec<u8>,
+        page: usize,
+        holding: Cell<u32>,
+        /// Per slot, the pages held.
+        slots: RefCell<Vec<Vec<usize>>>,
+        pins: Cell<u64>,
+    }
+
+    impl Paged {
+        fn new(bytes: Vec<u8>, page: usize) -> Self {
+            Self {
+                bytes,
+                page,
+                holding: Cell::new(0),
+                slots: RefCell::new(vec![Vec::new(); HELD_SLOTS]),
+                pins: Cell::new(0),
+            }
+        }
+
+        fn held(&self) -> usize {
+            self.slots.borrow().iter().map(Vec::len).sum()
+        }
+
+        /// Holds `pages` in `slot`, counting those newly pinned.
+        fn hold_pages(&self, slot: usize, pages: &[usize]) -> Option<usize> {
+            let mut slots = self.slots.borrow_mut();
+            let held = slots.get_mut(slot)?;
+            let fresh = pages.iter().filter(|p| !held.contains(p)).count();
+            self.pins.set(self.pins.get() + fresh as u64);
+            *held = pages.to_vec();
+            Some(fresh)
+        }
+    }
+
+    impl Source for Paged {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+            let at = offset as usize;
+            self.bytes
+                .get(at..at + len)
+                .map(<[u8]>::to_vec)
+                .ok_or(Error::Truncated)
+        }
+        fn hold(&self, open: bool) {
+            let depth = if open {
+                self.holding.get() + 1
+            } else {
+                self.holding.get() - 1
+            };
+            self.holding.set(depth);
+            if depth == 0 {
+                *self.slots.borrow_mut() = vec![Vec::new(); HELD_SLOTS];
+            }
+        }
+        fn held_slot(&self) -> Option<usize> {
+            if self.holding.get() == 0 {
+                return None;
+            }
+            let mut slots = self.slots.borrow_mut();
+            slots.push(Vec::new());
+            Some(slots.len() - 1)
+        }
+        fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+            if self.holding.get() == 0 {
+                return None;
+            }
+            let page = offset as usize / self.page;
+            let fresh = self.hold_pages(slot, &[page])?;
+            let start = page * self.page;
+            let end = (start + self.page).min(self.bytes.len());
+            Some(Ok(HeldSpan {
+                start: start as u64,
+                data: self.bytes[start..end].as_ptr(),
+                len: end - start,
+                pinned: fresh != 0,
+            }))
+        }
+        fn held_range(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+            if self.holding.get() == 0 || len == 0 {
+                return None;
+            }
+            let (at, end) = (offset as usize, offset as usize + len);
+            let pages: Vec<usize> = (at / self.page..=(end - 1) / self.page).collect();
+            if pages.len() > crate::source::HELD_PIECES {
+                return None;
+            }
+            self.hold_pages(slot, &pages)?;
+            let mut range = HeldRange::default();
+            for page in pages {
+                let from = (page * self.page).max(at);
+                let to = ((page + 1) * self.page).min(self.bytes.len());
+                assert!(range.push(self.bytes[from..].as_ptr(), to - from));
+            }
+            Some(Ok(range))
+        }
+    }
+
+    /// Documents whose terms make array chunks, bitmap chunks of a few and
+    /// of most documents, and a short list, with term frequencies varied so
+    /// the buckets differ from member to member.
+    fn chunky_segment() -> Vec<u8> {
+        let mut builder = SegmentBuilder::default();
+        for n in 0..140_000u32 {
+            let mut text = Vec::new();
+            let mut add = |word: &'static str, times: u32| {
+                text.extend(std::iter::repeat_n(word, times as usize));
+            };
+            if n % 2 == 0 {
+                add("half", 1 + n % 7);
+            }
+            if n % 5 != 0 {
+                add("most", 1 + n % 3);
+            }
+            if n % 23 == 0 {
+                add("some", 1 + n % 11);
+            }
+            if n % 97 == 0 {
+                add("few", 1 + n % 5);
+            }
+            if n == 70_000 || n == 70_001 {
+                add("pair", 2);
+            }
+            builder
+                .add_document(tid(n / 100, 1 + (n % 100) as u16), tokens(&text.join(" ")))
+                .unwrap();
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn chunks_read_in_place_equal_chunks_copied() {
+        let bytes = chunky_segment();
+        let whole = Segment::parse(&bytes).unwrap();
+        let (mut held_chunks, mut far_nibbles) = (0, 0);
+        // Pages on which an 8 KiB bitmap spans two or three pages, from
+        // anywhere on the first, and the nibbles run on over more.
+        for page in [4099, 5003, 8150] {
+            let paged = Reader::new(Paged::new(bytes.clone(), page)).unwrap();
+            for name in ["half", "most", "some", "few", "pair"] {
+                let copied = whole.term(name).unwrap().unwrap().ordinals().unwrap();
+                paged.hold(true);
+                let term = paged.term(name).unwrap().unwrap();
+                let ordinals = term.ordinals().unwrap();
+                let members = ordinals.held_slot().unwrap();
+                let nibbles = ordinals.held_slot().unwrap();
+                let mut nibble_span: Option<HeldSpan> = None;
+                for i in 0..ordinals.chunk_count() {
+                    let expected = copied.chunk(i).unwrap();
+                    // SAFETY: the chunk is dropped before the next call on
+                    // the slot and before the span closes.
+                    let chunk = unsafe { ordinals.chunk_held(i, members) }.unwrap();
+                    assert!(chunk.is_held(), "{name} chunk {i} on {page}-byte pages");
+                    assert!(!expected.is_held());
+                    held_chunks += 1;
+                    assert_eq!(chunk.key, expected.key);
+                    assert_eq!(chunk.cardinality, expected.cardinality);
+                    assert_eq!(chunk.before, expected.before);
+                    assert_eq!(chunk.is_bitmap(), expected.is_bitmap());
+                    let (mut a, mut b) = ([0u64; WORDS], [0u64; WORDS]);
+                    chunk.words(&mut a);
+                    expected.words(&mut b);
+                    assert!(a == b, "{name} chunk {i}: members");
+                    let mut lows = (Vec::new(), Vec::new());
+                    chunk.members(&mut lows.0);
+                    expected.members(&mut lows.1);
+                    assert_eq!(lows.0, lows.1);
+                    if chunk.is_bitmap() {
+                        for w in 0..WORDS {
+                            assert_eq!(chunk.word(w), expected.word(w), "word {w}");
+                        }
+                        for (from, to) in [(0, WORDS), (0, 1), (3, 700), (511, 513), (1000, 1024)] {
+                            assert_eq!(chunk.count_words(from, to), expected.count_words(from, to));
+                        }
+                        let pattern: Vec<u64> = (0..WORDS as u64)
+                            .map(|w| w.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                            .collect();
+                        let (mut a, mut b) = ([0u64; WORDS], [0u64; WORDS]);
+                        a.copy_from_slice(&pattern);
+                        b.copy_from_slice(&pattern);
+                        chunk.and_into(&mut a);
+                        expected.and_into(&mut b);
+                        assert!(a == b, "{name} chunk {i}: and");
+                        a.copy_from_slice(&pattern);
+                        b.copy_from_slice(&pattern);
+                        chunk.or_into(&mut a);
+                        expected.or_into(&mut b);
+                        assert!(a == b, "{name} chunk {i}: or");
+                        let (head, len) = chunk.head();
+                        assert!(len <= WORDS * 8);
+                        // SAFETY: the head is valid while the chunk is.
+                        let head = unsafe { std::slice::from_raw_parts(head, len) };
+                        for (w, word) in head.chunks_exact(8).enumerate() {
+                            assert_eq!(
+                                u64::from_le_bytes(word.try_into().unwrap()),
+                                expected.word(w)
+                            );
+                        }
+                    }
+                    for low in (0..=u16::MAX).step_by(37) {
+                        assert_eq!(chunk.rank(low), expected.rank(low), "rank of {low}");
+                    }
+                    for within in 0..chunk.cardinality {
+                        let bucket = match chunk.bucket_in_place(within) {
+                            Ok(bucket) => bucket,
+                            Err(offset) => {
+                                far_nibbles += 1;
+                                let span = match nibble_span {
+                                    Some(span)
+                                        if offset.wrapping_sub(span.start) < span.len as u64 =>
+                                    {
+                                        span
+                                    }
+                                    _ => ordinals.held_span(nibbles, offset).unwrap().unwrap(),
+                                };
+                                nibble_span = Some(span);
+                                // SAFETY: the page stays held until the next
+                                // call on the nibble slot.
+                                let byte = unsafe {
+                                    *span.data.add(offset.wrapping_sub(span.start) as usize)
+                                };
+                                Some(crate::ordinals::nibble_in(byte, within))
+                            }
+                        };
+                        assert_eq!(bucket, expected.bucket(within), "bucket {within}");
+                    }
+                }
+                // Two slots for chunks and nibbles, a page or three each.
+                assert!(paged.source.held() <= 4, "{}", paged.source.held());
+                paged.hold(false);
+                assert_eq!(paged.source.held(), 0);
+                assert!(
+                    paged
+                        .term(name)
+                        .unwrap()
+                        .unwrap()
+                        .ordinals()
+                        .unwrap()
+                        .held_slot()
+                        .is_none()
+                );
+            }
+        }
+        assert!(
+            held_chunks > 20 && far_nibbles > 10_000,
+            "{held_chunks} {far_nibbles}"
+        );
     }
 
     #[test]
