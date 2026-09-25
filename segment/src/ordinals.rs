@@ -1047,20 +1047,52 @@ impl Chunk {
         u32::from(self.key) << 16
     }
 
+    /// Word `i` of a bitmap chunk's members, read in place: the bytes are
+    /// the cache's, so a walk tests bits through the chunk rather than
+    /// copying its 8 KiB into a word buffer per load. The bytes need not be
+    /// word aligned.
+    ///
+    /// # Panics
+    ///
+    /// On an array chunk, which has no words.
+    #[inline]
+    pub fn word(&self, i: usize) -> u64 {
+        assert!(self.bitmap, "an array chunk has no words");
+        let at = &self.bytes[i * 8..i * 8 + 8];
+        u64::from_le_bytes(at.try_into().expect("eight bytes"))
+    }
+
+    /// Set bits in words `from..to` of a bitmap chunk.
+    pub fn count_words(&self, from: usize, to: usize) -> u32 {
+        assert!(self.bitmap, "an array chunk has no words");
+        self.bytes[from * 8..to * 8]
+            .chunks_exact(8)
+            .map(|w| u64::from_le_bytes(w.try_into().expect("eight bytes")).count_ones())
+            .sum()
+    }
+
+    /// Ors a bitmap chunk's members into `out`.
+    pub fn or_into(&self, out: &mut Words) {
+        assert!(self.bitmap, "an array chunk has no words");
+        kernels::or_bytes(out, self.body());
+    }
+
+    /// Keeps of `out` the members of a bitmap chunk.
+    pub fn and_into(&self, out: &mut Words) {
+        assert!(self.bitmap, "an array chunk has no words");
+        kernels::and_bytes(out, self.body());
+    }
+
     /// The rank within the chunk of the member with low bits `low`, if any.
     pub fn rank(&self, low: u16) -> Option<u32> {
         if self.bitmap {
             let word = usize::from(low / 64);
             let bit = low % 64;
-            let bytes = &self.body()[word * 8..word * 8 + 8];
-            let value = u64::from_le_bytes(bytes.try_into().unwrap());
+            let value = self.word(word);
             if value & (1 << bit) == 0 {
                 return None;
             }
-            let before: u32 = self.body()[..word * 8]
-                .chunks_exact(8)
-                .map(|w| u64::from_le_bytes(w.try_into().unwrap()).count_ones())
-                .sum();
+            let before = self.count_words(0, word);
             Some(before + (value & ((1u64 << bit) - 1)).count_ones())
         } else {
             let lows = self.body().chunks_exact(2);
@@ -1083,6 +1115,13 @@ impl Chunk {
     /// Whether the chunk is a bitmap rather than an array of members.
     pub fn is_bitmap(&self) -> bool {
         self.bitmap
+    }
+
+    /// A bitmap chunk's bytes, shared with the cache: `WORDS` little-endian
+    /// words, then the bucket nibbles when stored. A walk that tests bits
+    /// per word holds these rather than going through the chunk each time.
+    pub fn bitmap_bytes(&self) -> Option<std::rc::Rc<[u8]>> {
+        self.bitmap.then(|| self.bytes.clone())
     }
 
     /// Appends the low bits of an array chunk's members, ascending; nothing
@@ -1677,6 +1716,52 @@ mod tests {
             prop_assert_eq!(evaluate(&node, &lists), expected);
         }
     }
+    #[test]
+    fn bitmap_chunk_words_are_read_in_place() {
+        // A bitmap chunk after an array chunk, so the bitmap's bytes start
+        // at an odd offset in the body and are read unaligned.
+        let mut ordinals: Vec<u32> = (0..7).map(|i| i * 11).collect();
+        ordinals.extend((CHUNK..2 * CHUNK).filter(|o| o % 3 == 0 || o % 1000 == 1));
+        let scores: Vec<(u8, u32)> = ordinals.iter().map(|o| ((o % 5) as u8, 10 + o)).collect();
+        let bytes = encode_scored(&ordinals, &scores);
+        let stream = Ordinals::open(&bytes[..], bytes.len() as u64, true).unwrap();
+        assert_eq!(stream.chunk_count(), 2);
+        let array = stream.chunk(0).unwrap();
+        assert!(!array.is_bitmap());
+        let mut lows = Vec::new();
+        array.members(&mut lows);
+        assert_eq!(lows, (0..7u16).map(|i| i * 11).collect::<Vec<_>>());
+        let chunk = stream.chunk(1).unwrap();
+        assert!(chunk.is_bitmap());
+        let mut copied = Box::new([0u64; WORDS]);
+        chunk.words(&mut copied);
+        for (i, word) in copied.iter().enumerate() {
+            assert_eq!(chunk.word(i), *word, "word {i}");
+        }
+        let expected: u32 = copied[3..700].iter().map(|w| w.count_ones()).sum();
+        assert_eq!(chunk.count_words(3, 700), expected);
+        assert_eq!(chunk.count_words(5, 5), 0);
+        assert_eq!(chunk.count_words(0, WORDS), chunk.cardinality);
+        let mut out = Box::new([0xffu64; WORDS]);
+        chunk.and_into(&mut out);
+        assert_eq!(&out[..], &copied.map(|w| w & 0xff)[..]);
+        chunk.or_into(&mut out);
+        assert_eq!(&out[..], &copied[..]);
+        // Ranks through the words agree with the stream's.
+        for ordinal in &ordinals[7..] {
+            let low = (ordinal & 0xffff) as u16;
+            assert_eq!(
+                chunk.rank(low).map(|r| r + chunk.before),
+                stream.rank(*ordinal).unwrap()
+            );
+        }
+        assert_eq!(
+            chunk.rank(1),
+            None,
+            "65537 is neither a multiple of 3 nor 1 mod 1000"
+        );
+    }
+
     #[test]
     fn bounded_streams_carry_a_bound_per_chunk_and_reject_corrupt_ones() {
         for (name, ordinals) in [

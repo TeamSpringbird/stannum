@@ -1142,6 +1142,7 @@ impl IndexScorer {
             pos: 0,
             term_max: scorer.map_or(0.0, |scorer| scorer.bound(&whole)),
             words: Box::new([0; segment::ordinals::WORDS]),
+            bits: None,
             counted: (0, 0),
             members: Vec::new(),
             dense: false,
@@ -1181,10 +1182,18 @@ struct OrdinalTerm<'a> {
     /// Index into `keys` of the current chunk.
     pos: usize,
     term_max: f32,
-    /// The current chunk's members, once loaded.
+    /// The current chunk's members as words when it is a list or an array
+    /// chunk; a bitmap chunk's words are read in place from `chunk`, whose
+    /// bytes are the read cache's, rather than copied here per load.
     words: Box<segment::ordinals::Words>,
     /// The current chunk's members as low bits when it is not a bitmap.
     members: Vec<u16>,
+    /// A loaded bitmap chunk's bytes, shared with the read cache: the words
+    /// are read from here, a null check and a bounds check per word, where
+    /// going through `chunk` was a branch and two dereferences more in the
+    /// loops that test a bit per word per term.
+    bits: Option<std::rc::Rc<[u8]>>,
+    /// Whether the loaded chunk is a bitmap, held in `chunk` and `bits`.
     dense: bool,
     /// The rank of the current chunk's first member.
     rank_base: u32,
@@ -1257,14 +1266,72 @@ impl OrdinalTerm<'_> {
                     self.members.push(low as u16);
                 }
                 self.dense = false;
+                self.bits = None;
             }
             None => {
                 let chunk = segment_error(self.ordinals.chunk(self.pos));
-                chunk.words(&mut self.words);
-                chunk.members(&mut self.members);
-                self.dense = chunk.is_bitmap();
+                self.bits = chunk.bitmap_bytes();
+                self.dense = self.bits.is_some();
+                if !self.dense {
+                    // An array chunk's members are scattered into words for
+                    // the bit tests; a bitmap's words are read in place.
+                    chunk.words(&mut self.words);
+                    chunk.members(&mut self.members);
+                }
                 self.rank_base = chunk.before;
                 self.chunk = Some(chunk);
+            }
+        }
+    }
+
+    /// The loaded bitmap chunk; `dense` says there is one.
+    #[inline]
+    fn bitmap(&self) -> &segment::ordinals::Chunk {
+        self.chunk.as_ref().expect("a dense term holds its chunk")
+    }
+
+    /// Word `i` of the loaded chunk's members.
+    #[inline]
+    fn word(&self, i: usize) -> u64 {
+        match &self.bits {
+            Some(bytes) => u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("8")),
+            None => self.words[i],
+        }
+    }
+
+    /// Whether the loaded chunk holds `low`.
+    #[inline]
+    fn holds(&self, low: u16) -> bool {
+        self.word(usize::from(low / 64)) & (1 << (low % 64)) != 0
+    }
+
+    /// Sets `out` to the loaded chunk's members.
+    fn assign_into(&self, out: &mut segment::ordinals::Words) {
+        if self.dense {
+            self.bitmap().words(out);
+        } else {
+            out.copy_from_slice(&*self.words);
+        }
+    }
+
+    /// Ors the loaded chunk's members into `out`.
+    fn or_into(&self, out: &mut segment::ordinals::Words) {
+        if self.dense {
+            self.bitmap().or_into(out);
+        } else {
+            for (o, word) in out.iter_mut().zip(self.words.iter()) {
+                *o |= *word;
+            }
+        }
+    }
+
+    /// Keeps of `out` the loaded chunk's members.
+    fn and_into(&self, out: &mut segment::ordinals::Words) {
+        if self.dense {
+            self.bitmap().and_into(out);
+        } else {
+            for (o, word) in out.iter_mut().zip(self.words.iter()) {
+                *o &= *word;
             }
         }
     }
@@ -1285,17 +1352,25 @@ impl OrdinalTerm<'_> {
     /// stopped, forwards or back; counting from the chunk's start each time
     /// was a thousand words per candidate per term.
     fn rank(&mut self, low: u16) -> Option<u32> {
+        if !self.dense {
+            // A list's or an array chunk's members are held ascending: the
+            // rank is the position.
+            return self
+                .members
+                .binary_search(&low)
+                .ok()
+                .map(|at| self.rank_base + at as u32);
+        }
         let word_at = usize::from(low / 64);
-        let word = self.words[word_at];
+        let word = self.bitmap().word(word_at);
         if word & (1 << (low % 64)) == 0 {
             return None;
         }
         let (counted_to, mut before) = self.counted;
-        let count = |words: &[u64]| words.iter().map(|w| w.count_ones()).sum::<u32>();
         if counted_to > word_at {
-            before -= count(&self.words[word_at..counted_to]);
+            before -= self.bitmap().count_words(word_at, counted_to);
         } else {
-            before += count(&self.words[counted_to..word_at]);
+            before += self.bitmap().count_words(counted_to, word_at);
         }
         self.counted = (word_at, before);
         Some(self.rank_base + before + (word & ((1u64 << (low % 64)) - 1)).count_ones())
@@ -1684,7 +1759,7 @@ impl OrdinalWalk<'_, '_> {
         if sparse {
             lows.extend_from_slice(&self.terms[lead].members);
         } else {
-            set.copy_from_slice(&*self.terms[lead].words);
+            self.terms[lead].assign_into(set);
         }
         let mut order: Vec<usize> = (0..self.terms.len()).filter(|&t| t != lead).collect();
         order.sort_by_key(|&t| self.terms[t].keys.len());
@@ -1699,11 +1774,9 @@ impl OrdinalWalk<'_, '_> {
             let term = &mut self.terms[t];
             term.load();
             if sparse {
-                lows.retain(|low| term.words[usize::from(low / 64)] & (1 << (low % 64)) != 0);
+                lows.retain(|low| term.holds(*low));
             } else {
-                for (out, word) in set.iter_mut().zip(term.words.iter()) {
-                    *out &= *word;
-                }
+                term.and_into(set);
             }
         }
         for filter in &mut self.filters {
@@ -1716,11 +1789,9 @@ impl OrdinalWalk<'_, '_> {
             }
             filter.load();
             if sparse {
-                lows.retain(|low| filter.words[usize::from(low / 64)] & (1 << (low % 64)) != 0);
+                lows.retain(|low| filter.holds(*low));
             } else {
-                for (out, word) in set.iter_mut().zip(filter.words.iter()) {
-                    *out &= *word;
-                }
+                filter.and_into(set);
             }
         }
         let from = self.dead.partition_point(|o| *o < base);
@@ -1917,7 +1988,7 @@ impl OrdinalWalk<'_, '_> {
         // rejects the candidate was a page per candidate.
         for (n, &t) in present.iter().enumerate() {
             let term = &mut self.terms[t];
-            if term.words[usize::from(low / 64)] & (1 << (low % 64)) == 0 {
+            if !term.holds(low) {
                 continue;
             }
             // The chunk's per-term bound for this sub-block, computed once
@@ -2085,9 +2156,7 @@ impl OrdinalWalk<'_, '_> {
         } else {
             set.fill(0);
             for (_, t) in &by_bound[..essential] {
-                for (out, word) in set.iter_mut().zip(self.terms[*t].words.iter()) {
-                    *out |= *word;
-                }
+                self.terms[*t].or_into(set);
             }
         }
         // Dead documents leave the candidates, whichever form they take: a
@@ -2152,7 +2221,7 @@ impl OrdinalWalk<'_, '_> {
                 let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
                 for (n, &t) in present.iter().enumerate() {
                     if (all - f64::from(self.term_subs[n][sub])) * slack < f64::from(threshold) {
-                        word &= self.terms[t].words[i];
+                        word &= self.terms[t].word(i);
                     }
                 }
                 if word == 0 {
@@ -2169,7 +2238,7 @@ impl OrdinalWalk<'_, '_> {
                     let bit = 1u64 << (low % 64);
                     let mut first = 0.0_f32;
                     for (n, &t) in present.iter().enumerate() {
-                        if self.terms[t].words[word_at] & bit != 0 {
+                        if self.terms[t].word(word_at) & bit != 0 {
                             first += self.term_subs[n][sub];
                         }
                     }
