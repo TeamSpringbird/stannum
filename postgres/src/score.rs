@@ -1258,6 +1258,9 @@ impl IndexScorer {
             // The write buffer has no dead list.
             std::rc::Rc::default()
         };
+        // An immutable segment's identity, under which its terms' parsed
+        // bounds are kept across statements; the write buffer has none.
+        let key = self.view.keys.get(i).copied();
         let mut terms = Vec::with_capacity(self.terms.len());
         for (slot, (name, scorer)) in self.terms.iter().enumerate() {
             let Some(term) = segment_error_in(source.term(name), label) else {
@@ -1267,7 +1270,13 @@ impl IndexScorer {
                     Combine::Any => continue,
                 }
             };
-            terms.push(Self::ordinal_term(&term, slot, Some(scorer), label));
+            terms.push(Self::ordinal_term(
+                &term,
+                slot,
+                Some(scorer),
+                label,
+                key.map(|k| (k, name.as_str())),
+            ));
         }
         // A mixed shape is tested per candidate unless every document
         // holding a walked term matches it; untested, it walks no filters.
@@ -1290,7 +1299,13 @@ impl IndexScorer {
         for name in filters {
             match segment_error_in(source.term(name), label) {
                 Some(term) => {
-                    filter_terms.push(Self::ordinal_term(&term, usize::MAX, None, label));
+                    filter_terms.push(Self::ordinal_term(
+                        &term,
+                        usize::MAX,
+                        None,
+                        label,
+                        key.map(|k| (k, *name)),
+                    ));
                     filter_names.push(*name);
                 }
                 None if mixed.is_some() => {}
@@ -1447,62 +1462,36 @@ impl IndexScorer {
     }
 
     /// A term's streams in one source for the walk over ordinals. A filter
-    /// has no scorer: it is a member test only.
+    /// has no scorer: it is a member test only. `cached` names the term in
+    /// an immutable segment, whose parsed bounds are kept across statements.
     fn ordinal_term<'a>(
         term: &segment::segment::Term<'a>,
         slot: usize,
         scorer: Option<&TermScorer>,
         label: &str,
+        cached: Option<((u64, u32), &str)>,
     ) -> OrdinalTerm<'a> {
         let ordinals = segment_error_in(term.ordinals(), label);
-        let whole = ordinals
-            .bounds()
-            .iter()
-            .map(|bound| BlockBound {
-                min_len: bound.min_len,
-            })
-            .reduce(|merged, block| merged.merge(&block))
-            .unwrap_or_else(|| {
-                crate::storage::corrupt(format!(
-                    "Stannum {label}: a term's stream carries no bounds"
-                ))
-            });
-        let (keys, list) = match ordinals.list() {
-            Some(list) => {
-                let mut keys: Vec<u16> = list.iter().map(|o| (o >> 16) as u16).collect();
-                keys.dedup();
-                (keys, Some(list.to_vec()))
+        let list = ordinals.list().map(<[u32]>::to_vec);
+        let bounds = match cached {
+            // A list is a few bytes, parsed with the stream.
+            Some((segment, name)) if list.is_none() => {
+                TermBounds::cached(segment, name, || TermBounds::parse(&ordinals, label))
             }
-            None => (
-                (0..ordinals.chunk_count())
-                    .map(|c| ordinals.chunk_key(c))
-                    .collect(),
-                None,
-            ),
+            _ => TermBounds::parse(&ordinals, label),
         };
-        // The stored bound per chunk, or a list's one bound for every chunk
-        // it touches.
-        let mut bounds = Vec::with_capacity(keys.len());
-        let mut sub_bounds = Vec::with_capacity(keys.len());
-        for i in 0..keys.len() {
-            let bound = ordinals.chunk_bound(i).unwrap_or_else(|| {
-                crate::storage::corrupt(format!("Stannum {label}: a chunk carries no bound"))
-            });
-            bounds.push(bound.min_len);
-            sub_bounds.push(bound.subs);
-        }
         OrdinalTerm {
             slot,
             ordinals,
             chunk: None,
-            keys,
+            keys: bounds.keys,
             list,
-            bounds,
-            sub_bounds,
+            bounds: bounds.bounds,
+            sub_bounds: bounds.sub_bounds,
             bound_scores: Vec::new(),
             by_bucket: Vec::new(),
             pos: 0,
-            term_max: scorer.map_or(0.0, |scorer| scorer.bound(&whole)),
+            term_max: scorer.map_or(0.0, |scorer| scorer.bound(&bounds.whole)),
             words: Box::new([0; segment::ordinals::WORDS]),
             bits: None,
             loaded: None,
@@ -1511,6 +1500,98 @@ impl IndexScorer {
             dense: false,
             rank_base: 0,
         }
+    }
+}
+
+/// A term's chunk keys and bounds in one source, as the walk reads them.
+#[derive(Clone)]
+struct TermBounds {
+    /// Keys of the chunks the term occupies, ascending.
+    keys: std::rc::Rc<[u16]>,
+    /// Per key: the shortest document per bucket among the term's postings there.
+    bounds: std::rc::Rc<[[u32; BUCKET_COUNT]]>,
+    /// Per key and sub-block: one past the largest bucket the term has there.
+    sub_bounds: std::rc::Rc<[[u8; SUBS]]>,
+    /// Over the whole stream.
+    whole: BlockBound,
+}
+
+/// Bytes of parsed bounds [`TERM_BOUNDS`] holds before it is emptied.
+const TERM_BOUNDS_BUDGET: usize = 32 << 20;
+
+/// Parsed bounds by segment (index identity and generation) and term, and
+/// the bytes they hold.
+type KeptBounds = (usize, FxHashMap<(u64, u32), FxHashMap<String, TermBounds>>);
+
+thread_local! {
+    /// Segments are immutable, so a term's bounds hold for as long as its
+    /// segment exists; parsing every chunk bound of every query term in
+    /// every segment was a few percent of each statement. Emptied wholesale
+    /// past [`TERM_BOUNDS_BUDGET`].
+    static TERM_BOUNDS: RefCell<KeptBounds> = RefCell::new((0, FxHashMap::default()));
+}
+
+impl TermBounds {
+    fn parse(ordinals: &segment::ordinals::Ordinals<'_>, label: &str) -> Self {
+        let corrupt =
+            |what: &str| -> ! { crate::storage::corrupt(format!("Stannum {label}: {what}")) };
+        let parsed = segment_error_in(ordinals.bounds(), label);
+        let whole = parsed
+            .iter()
+            .map(|bound| BlockBound {
+                min_len: bound.min_len,
+            })
+            .reduce(|merged, block| merged.merge(&block))
+            .unwrap_or_else(|| corrupt("a term's stream carries no bounds"));
+        let keys: Vec<u16> = match ordinals.list() {
+            Some(list) => {
+                let mut keys: Vec<u16> = list.iter().map(|o| (o >> 16) as u16).collect();
+                keys.dedup();
+                keys
+            }
+            None => (0..ordinals.chunk_count())
+                .map(|c| ordinals.chunk_key(c))
+                .collect(),
+        };
+        // The stored bound per chunk, or a list's one bound for every chunk
+        // it touches.
+        let mut bounds = Vec::with_capacity(keys.len());
+        let mut sub_bounds = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let bound = segment_error_in(ordinals.chunk_bound(i), label)
+                .unwrap_or_else(|| corrupt("a chunk carries no bound"));
+            bounds.push(bound.min_len);
+            sub_bounds.push(bound.subs);
+        }
+        Self {
+            keys: keys.into(),
+            bounds: bounds.into(),
+            sub_bounds: sub_bounds.into(),
+            whole,
+        }
+    }
+
+    /// The bounds of `term` in `segment`, parsed by `parse` unless kept.
+    fn cached(segment: (u64, u32), term: &str, parse: impl FnOnce() -> Self) -> Self {
+        let found = TERM_BOUNDS.with_borrow(|(_, kept)| kept.get(&segment)?.get(term).cloned());
+        if let Some(found) = found {
+            return found;
+        }
+        let parsed = parse();
+        let bytes = term.len()
+            + parsed.keys.len()
+                * (size_of::<u16>() + size_of::<[u32; BUCKET_COUNT]>() + size_of::<[u8; SUBS]>());
+        TERM_BOUNDS.with_borrow_mut(|(held, kept)| {
+            if *held + bytes > TERM_BOUNDS_BUDGET {
+                kept.clear();
+                *held = 0;
+            }
+            *held += bytes;
+            kept.entry(segment)
+                .or_default()
+                .insert(term.to_owned(), parsed.clone());
+        });
+        parsed
     }
 }
 
@@ -1530,14 +1611,14 @@ struct OrdinalTerm<'a> {
     /// The chunk last loaded, for its members' buckets.
     chunk: Option<segment::ordinals::Chunk>,
     /// Keys of the chunks the term occupies, ascending.
-    keys: Vec<u16>,
+    keys: std::rc::Rc<[u16]>,
     /// The stream as a list, when it is one.
     list: Option<Vec<u32>>,
     /// Per key: the shortest document per bucket among the term's postings there.
-    bounds: Vec<[u32; BUCKET_COUNT]>,
+    bounds: std::rc::Rc<[[u32; BUCKET_COUNT]]>,
     /// Per key and sub-block: one past the largest bucket the term has there,
     /// zero where it has no posting.
-    sub_bounds: Vec<[u8; SUBS]>,
+    sub_bounds: std::rc::Rc<[[u8; SUBS]]>,
     /// Per key: the score bound, once asked for.
     bound_scores: Vec<Option<f32>>,
     /// Per key: the per-bucket bound table at the length floor it was

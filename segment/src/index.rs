@@ -676,8 +676,8 @@ mod tests {
             // Both carry the same chunk bounds, computed from the same documents.
             let (ox, oy) = (x.ordinals().unwrap(), y.ordinals().unwrap());
             assert_eq!(ox.to_vec().unwrap(), oy.to_vec().unwrap(), "{term}");
-            assert!(!ox.bounds().is_empty(), "{term}");
-            assert_eq!(ox.bounds(), oy.bounds(), "{term}");
+            assert!(!ox.bounds().unwrap().is_empty(), "{term}");
+            assert_eq!(ox.bounds().unwrap(), oy.bounds().unwrap(), "{term}");
             let (px, py) = (x.payload().unwrap(), y.payload().unwrap());
             for ordinal in 0..tids.len() as u32 {
                 assert_eq!(px.get(ordinal).unwrap(), py.get(ordinal).unwrap());

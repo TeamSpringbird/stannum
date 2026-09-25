@@ -323,7 +323,13 @@ pub struct Ordinals<'a> {
     count: u32,
     body: Body<'a>,
     /// One per chunk, or one for a list; empty for a stream without bounds.
-    bounds: Vec<ChunkBound>,
+    /// A chunked stream's are parsed on first use: a reader after the
+    /// members alone never needs them, and a ranked walk that kept them
+    /// from an earlier statement parses them no more.
+    bounds: std::cell::OnceCell<Vec<ChunkBound>>,
+    /// Where a chunked stream's unparsed bounds lie: their offset and
+    /// length in the stream, and the chunk count.
+    bounds_range: Option<(u64, usize, usize)>,
     /// Whether members carry buckets (and chunks bounds): a term's stream,
     /// as opposed to a dead list.
     scored: bool,
@@ -358,6 +364,7 @@ impl<'a> Ordinals<'a> {
         let mut at = 0;
         let count = varint::get_u32(head, &mut at)?;
         let mut bounds = Vec::new();
+        let mut bounds_range = None;
         let mut list_buckets = Vec::new();
         let body = if count as usize <= LIST_MAX {
             let bytes = source.fetch(0, len as usize)?;
@@ -402,14 +409,7 @@ impl<'a> Ordinals<'a> {
                 return Err(Error::Corrupt("ordinal directory"));
             }
             if bounded {
-                let bytes = source.fetch(bounds_at, bounds_len as usize)?;
-                let mut at = 0;
-                for _ in 0..chunks {
-                    bounds.push(ChunkBound::get(bytes, &mut at)?);
-                }
-                if at != bytes.len() {
-                    return Err(Error::Corrupt("chunk bounds length"));
-                }
+                bounds_range = Some((bounds_at, bounds_len as usize, chunks as usize));
             }
             Body::Chunked {
                 directory: source.fetch(at as u64, (chunks as usize) * ENTRY)?,
@@ -417,12 +417,17 @@ impl<'a> Ordinals<'a> {
                 before: std::cell::OnceCell::new(),
             }
         };
+        let parsed = std::cell::OnceCell::new();
+        if bounds_range.is_none() {
+            parsed.set(bounds).expect("a new cell is empty");
+        }
         Ok(Self {
             source: Box::new(source),
             len,
             count,
             body,
-            bounds,
+            bounds: parsed,
+            bounds_range,
             scored: bounded,
             list_buckets,
         })
@@ -434,16 +439,33 @@ impl<'a> Ordinals<'a> {
     }
 
     /// The bounds the stream carries: one per chunk, or one for a list.
-    pub fn bounds(&self) -> &[ChunkBound] {
-        &self.bounds
+    /// A chunked stream's are fetched and parsed on the first call.
+    pub fn bounds(&self) -> Result<&[ChunkBound]> {
+        if let Some(bounds) = self.bounds.get() {
+            return Ok(bounds);
+        }
+        let (at, len, chunks) = self
+            .bounds_range
+            .expect("a stream without parsed bounds names their range");
+        let bytes = self.source.fetch(at, len)?;
+        let mut parsed = Vec::with_capacity(chunks);
+        let mut at = 0;
+        for _ in 0..chunks {
+            parsed.push(ChunkBound::get(bytes, &mut at)?);
+        }
+        if at != bytes.len() {
+            return Err(Error::Corrupt("chunk bounds length"));
+        }
+        Ok(self.bounds.get_or_init(|| parsed))
     }
 
     /// The bound over chunk `i`, or over the whole list, when stored.
-    pub fn chunk_bound(&self, i: usize) -> Option<&ChunkBound> {
-        match &self.body {
-            Body::List(_) => self.bounds.first(),
-            Body::Chunked { .. } => self.bounds.get(i),
-        }
+    pub fn chunk_bound(&self, i: usize) -> Result<Option<&ChunkBound>> {
+        let bounds = self.bounds()?;
+        Ok(match &self.body {
+            Body::List(_) => bounds.first(),
+            Body::Chunked { .. } => bounds.get(i),
+        })
     }
 
     pub fn count(&self) -> u32 {
@@ -1391,6 +1413,8 @@ pub fn for_each_chunk(
 /// below `documents`, in canonical containers, with bounds when `bounded`.
 pub fn validate(bytes: &[u8], count: u32, documents: u32, bounded: bool) -> Result<()> {
     let stream = Ordinals::open(bytes, bytes.len() as u64, bounded)?;
+    // Bounds are parsed on first use; a check parses them now.
+    stream.bounds()?;
     if stream.count() != count {
         return Err(Error::Corrupt("ordinal count differs from the term"));
     }
@@ -1781,16 +1805,16 @@ mod tests {
             } else {
                 stream.chunk_count()
             };
-            assert_eq!(stream.bounds().len(), expected_chunks, "{name}");
+            assert_eq!(stream.bounds().unwrap().len(), expected_chunks, "{name}");
             // Every member's bucket and length are covered by its chunk's bound.
             for (o, (bucket, len)) in ordinals.iter().zip(&scores) {
                 let bound = match stream.list() {
-                    Some(_) => stream.chunk_bound(0).unwrap(),
+                    Some(_) => stream.chunk_bound(0).unwrap().unwrap(),
                     None => {
                         let i = (0..stream.chunk_count())
                             .find(|i| stream.chunk_key(*i) == (o >> 16) as u16)
                             .unwrap();
-                        stream.chunk_bound(i).unwrap()
+                        stream.chunk_bound(i).unwrap().unwrap()
                     }
                 };
                 assert!(bound.min_len[usize::from(*bucket)] <= *len, "{name} {o}");
