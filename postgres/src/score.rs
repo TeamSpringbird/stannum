@@ -538,6 +538,8 @@ thread_local! {
     static CHUNK_LOADS: Cell<i64> = const { Cell::new(0) };
     /// Candidates of a phrase walk whose positions were read and checked.
     static POSITION_CHECKS: Cell<i64> = const { Cell::new(0) };
+    /// Position lists read for those candidates, at most one per slot each.
+    static POSITION_READS: Cell<i64> = const { Cell::new(0) };
     /// Heap visibility checks, each a random read of the table.
     static VISIBILITY_CHECKS: Cell<i64> = const { Cell::new(0) };
     /// Visibility checks answered by the visibility map without a heap read.
@@ -606,6 +608,7 @@ pub(crate) fn reset_walk_blocks() {
     WALK_BLOCKS.set(0);
     CHUNK_LOADS.set(0);
     POSITION_CHECKS.set(0);
+    POSITION_READS.set(0);
     VISIBILITY_CHECKS.set(0);
     VM_HITS.set(0);
     PHASE_DISK.with_borrow_mut(Vec::clear);
@@ -629,6 +632,11 @@ pub(crate) fn chunk_loads() -> i64 {
 /// Phrase candidates whose positions were checked since the last reset.
 pub(crate) fn position_checks() -> i64 {
     POSITION_CHECKS.get()
+}
+
+/// Position lists read for phrase candidates since the last reset.
+pub(crate) fn position_reads() -> i64 {
+    POSITION_READS.get()
 }
 
 /// Pages spent on walk setup and on the walk itself since the last reset.
@@ -1027,16 +1035,23 @@ impl IndexScorer {
                             "Stannum {label}: phrase slot {name} vanished from the source"
                         ))
                     });
-                    (member, segment_error_in(term.payload(), label).cursor())
+                    let payload = segment_error_in(term.payload(), label);
+                    (member, payload.cursor(), payload.count())
                 })
-                .collect();
+                .collect::<Vec<_>>();
             PhraseCheck {
-                slots,
+                rarity: slots.iter().map(|(_, _, count)| *count).collect(),
+                slots: slots
+                    .into_iter()
+                    .map(|(member, cursor, _)| (member, cursor))
+                    .collect(),
                 solver: boldi_vigna::SpanSolver::new(check.span).unwrap_or_else(|error| {
                     crate::storage::corrupt(format!("Stannum {label}: span solver: {error}"))
                 }),
                 filter: check.filter.cloned(),
+                plan: PhrasePlan::of(check.span),
                 positions: vec![Vec::new(); check.slots.len()],
+                read: vec![false; check.slots.len()],
             }
         });
         let ready = blocks_used();
@@ -1338,13 +1353,192 @@ enum Member {
 struct PhraseCheck<'a> {
     /// Per slot: the walked stream it ranks in, and its positions.
     slots: Vec<(Member, segment::payload::PayloadCursor<'a>)>,
+    /// Per slot: documents holding the term in this source, so the slot
+    /// likeliest to fail a candidate is read first.
+    rarity: Vec<u32>,
     solver: boldi_vigna::SpanSolver,
     filter: Option<SpanPositionFilter>,
+    /// The span's leaves in order and the distance each adjacent pair must
+    /// keep, when its shape allows reading the slots one at a time.
+    plan: Option<PhrasePlan>,
     /// Scratch: per slot, the candidate's positions.
     positions: Vec<Vec<u32>>,
+    /// Scratch: per slot, whether the candidate's positions are read.
+    read: Vec<bool>,
+}
+
+/// A span query's leaves in order, with the position distance every
+/// adjacent pair of leaves must keep in a matching interval. A candidate
+/// some pair of which keeps no such distance cannot match, so the slots
+/// are read rarest first and the candidate is dropped at the first pair
+/// that fails, before the rest of its positions are read.
+struct PhrasePlan {
+    /// The slot of each leaf, in the span's order.
+    leaves: Vec<usize>,
+    /// Per adjacent pair of leaves: the least and greatest distance from
+    /// the earlier leaf's position to the later one's.
+    gaps: Vec<(u32, u32)>,
+}
+
+impl PhrasePlan {
+    /// The plan of `query`, or `None` for a shape whose intervals are not
+    /// spanned by their first and last leaf.
+    fn of(query: &boldi_vigna::SpanQuery) -> Option<Self> {
+        let mut plan = Self {
+            leaves: Vec::new(),
+            gaps: Vec::new(),
+        };
+        plan.visit(query, None)?;
+        Some(plan)
+    }
+
+    /// Adds the leaves of `query`; `cap` is the gap budget of the nearest
+    /// enclosing filter, which bounds the junctions of an ordered sequence
+    /// directly under it.
+    fn visit(&mut self, query: &boldi_vigna::SpanQuery, cap: Option<(u32, u32)>) -> Option<()> {
+        use boldi_vigna::SpanQuery::*;
+        match query {
+            Term(slot) => self.leaves.push(*slot),
+            Ordered(children) => {
+                // Children follow one another without overlapping, so a
+                // junction is at least one position; a budget of `max`
+                // uncovered positions over the sequence caps every junction,
+                // and pins the one junction of a pair to an exact budget.
+                let (lo, hi) = match cap {
+                    None => (1, u32::MAX),
+                    Some((min, max)) => {
+                        let hi = max.saturating_add(1);
+                        (
+                            if min == max && children.len() == 2 {
+                                hi
+                            } else {
+                                1
+                            },
+                            hi,
+                        )
+                    }
+                };
+                for child in children {
+                    let first = self.leaves.len();
+                    self.visit(child, None)?;
+                    if first > 0 && first < self.leaves.len() {
+                        self.gaps.push((lo, hi));
+                    }
+                }
+            }
+            MaxGaps { max_gaps, inner } => self.visit(inner, Some((0, *max_gaps)))?,
+            GapsInRange {
+                min_gaps,
+                max_gaps,
+                inner,
+            } => self.visit(inner, Some((*min_gaps, *max_gaps)))?,
+            // These keep an interval or drop it; its gaps are the inner's.
+            MaxWidth { inner, .. } | WithinPositions { inner, .. } => self.visit(inner, cap)?,
+            Empty
+            | Unordered(_)
+            | Or(_)
+            | NotContaining { .. }
+            | NotContainedBy { .. }
+            | NonOverlapping { .. }
+            | Containing { .. }
+            | ContainedBy { .. }
+            | Overlapping { .. }
+            | Before { .. }
+            | After { .. } => return None,
+        }
+        Some(())
+    }
+}
+
+/// Whether some position of `earlier` lies `lo..=hi` before some position
+/// of `later`; both ascend.
+fn keeps_distance(earlier: &[u32], later: &[u32], lo: u32, hi: u32) -> bool {
+    let mut j = 0;
+    for &at in earlier {
+        let Some(least) = at.checked_add(lo) else {
+            return false;
+        };
+        while later.get(j).is_some_and(|&next| next < least) {
+            j += 1;
+        }
+        match later.get(j) {
+            None => return false,
+            Some(&next) if next - at <= hi => return true,
+            Some(_) => {}
+        }
+    }
+    false
 }
 
 impl OrdinalWalk<'_, '_> {
+    /// Reads the candidate `low`'s positions for `slot` into the check's
+    /// scratch, unless they are read already.
+    fn read_slot(&mut self, phrase: &mut PhraseCheck<'_>, slot: usize, low: u16) {
+        if std::mem::replace(&mut phrase.read[slot], true) {
+            return;
+        }
+        let (member, payload) = &mut phrase.slots[slot];
+        let term = match *member {
+            Member::Term(t) => &mut self.terms[t],
+            Member::Filter(f) => &mut self.filters[f],
+        };
+        let rank = term.rank(low).unwrap_or_else(|| {
+            crate::storage::corrupt("Stannum: a phrase candidate is missing a term")
+        });
+        let positions = &mut phrase.positions[slot];
+        positions.clear();
+        segment_error(payload.seek(rank));
+        segment_error(payload.next_into(positions));
+        POSITION_READS.set(POSITION_READS.get() + 1);
+    }
+
+    /// Reads the candidate's slots in the plan's order and says whether
+    /// every adjacent pair keeps its distance: from the rarest leaf
+    /// outwards, taking the rarer neighbour first, so a candidate fails on
+    /// the fewest reads.
+    fn pairs_keep_distance(&mut self, phrase: &mut PhraseCheck<'_>, low: u16) -> bool {
+        let Some(plan) = phrase.plan.take().filter(|plan| !plan.leaves.is_empty()) else {
+            return true;
+        };
+        let cost = |phrase: &PhraseCheck<'_>, leaf: usize| {
+            let slot = plan.leaves[leaf];
+            if phrase.read[slot] {
+                0
+            } else {
+                phrase.rarity[slot]
+            }
+        };
+        let seed = (0..plan.leaves.len())
+            .min_by_key(|&leaf| cost(phrase, leaf))
+            .expect("a plan has a leaf");
+        self.read_slot(phrase, plan.leaves[seed], low);
+        let (mut left, mut right) = (seed, seed);
+        let mut kept = true;
+        while kept && (left > 0 || right + 1 < plan.leaves.len()) {
+            let leftward = left > 0
+                && (right + 1 >= plan.leaves.len()
+                    || cost(phrase, left - 1) <= cost(phrase, right + 1));
+            let pair = if leftward {
+                left -= 1;
+                left
+            } else {
+                right += 1;
+                right - 1
+            };
+            self.read_slot(phrase, plan.leaves[pair], low);
+            self.read_slot(phrase, plan.leaves[pair + 1], low);
+            let (lo, hi) = plan.gaps[pair];
+            kept = keeps_distance(
+                &phrase.positions[plan.leaves[pair]],
+                &phrase.positions[plan.leaves[pair + 1]],
+                lo,
+                hi,
+            );
+        }
+        phrase.plan = Some(plan);
+        kept
+    }
+
     /// Whether the candidate `low` of the loaded chunk, at `ordinal`, holds
     /// the phrase. Every slot's term lists the candidate: the walk only
     /// reaches here through the conjunction of them.
@@ -1353,18 +1547,13 @@ impl OrdinalWalk<'_, '_> {
             return true;
         };
         POSITION_CHECKS.set(POSITION_CHECKS.get() + 1);
-        for (slot, (member, payload)) in phrase.slots.iter_mut().enumerate() {
-            let term = match *member {
-                Member::Term(t) => &mut self.terms[t],
-                Member::Filter(f) => &mut self.filters[f],
-            };
-            let rank = term.rank(low).unwrap_or_else(|| {
-                crate::storage::corrupt("Stannum: a phrase candidate is missing a term")
-            });
-            let positions = &mut phrase.positions[slot];
-            positions.clear();
-            segment_error(payload.seek(rank));
-            segment_error(payload.next_into(positions));
+        phrase.read.fill(false);
+        if !self.pairs_keep_distance(&mut phrase, low) {
+            self.phrase = Some(phrase);
+            return false;
+        }
+        for slot in 0..phrase.slots.len() {
+            self.read_slot(&mut phrase, slot, low);
         }
         let matched = match &phrase.filter {
             None => phrase.solver.intervals(&phrase.positions).next().is_some(),

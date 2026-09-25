@@ -1472,6 +1472,21 @@ mod tests {
             "\"gamma delta\"",
             "\"alpha missing\"",
             "\"alpha beta\"^2",
+            // Shapes the incremental check reads slot by slot: repeated
+            // words, slop over several words, pinned gaps alone and with
+            // slop, and pairs no document keeps at the pinned distance.
+            "\"alpha alpha beta\"",
+            "\"alpha beta alpha\"",
+            "\"pad pad tail\"",
+            "\"alpha alpha pad alpha\"",
+            "\"alpha _ alpha\"",
+            "\"alpha __ pad\"",
+            "\"alpha _ beta\"~1",
+            "\"alpha pad tail\"~2",
+            "\"alpha beta gamma tail\"~3",
+            "\"gamma gamma tail\"",
+            "\"beta _ tail\"",
+            "\"alpha pad _ pad\"",
             // Shapes the pruned path leaves to full scoring.
             "alpha AND NOT beta",
             "al*",

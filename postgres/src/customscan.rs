@@ -2309,6 +2309,12 @@ unsafe extern "C-unwind" fn explain(
                 crate::score::position_checks(),
                 es,
             );
+            pg_sys::ExplainPropertyInteger(
+                c"Position Lists Read".as_ptr(),
+                std::ptr::null(),
+                crate::score::position_reads(),
+                es,
+            );
             let area_bytes = crate::score::area_bytes();
             let area_disk = crate::score::area_disk();
             let fetched = area_bytes
