@@ -611,7 +611,7 @@ impl<S: Source> Reader<S> {
         }
         let area = self.area_of(offset);
         let before = crate::cache::disk_pages();
-        let bytes = self.source.read(offset, len)?;
+        let bytes = self.source.read_shared(offset, len)?;
         crate::cache::note_disk(area, crate::cache::disk_pages() - before);
         if bytes.len() != len {
             return Err(Error::Truncated);
