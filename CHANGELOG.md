@@ -18,6 +18,9 @@
   budget; only the 128-entry on-disk bound forces an unbudgeted merge.
 - VACUUM reclaims pages a crash left unreferenced (`page N` warnings of
   `stannum.verify_index`) instead of requiring REINDEX.
+- A phrase (with slop, gaps or a position filter) is ranked by the
+  block-max walk of its words' conjunction; positions are read only for
+  candidates that score into the top k. EXPLAIN reports `Positions Checked`.
 - Segment format `STN3`: a term's documents are stored once, as ordinals
   into the segment's document table with each member's term-frequency
   bucket beside it and a score bound per chunk, so scoring never reads

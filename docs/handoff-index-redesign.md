@@ -409,9 +409,41 @@ mixed workload, and the disjunction tail the second.
 The built database is cached as
 `s3://springbird-dev-stannum-corpus-cache-860510875764/postgres-snapshots/stackexchange-150m-stn3-b961ded.tar`
 (118 GB, manifest beside it), so a full-scale run now restores in minutes.
-Next, in order: keep readers resident across queries at this segment count;
-stop copying windows per candidate for lengths and classes; lift the
-segment cap; then phrase pruning.
+
+### Phrase pruning, 2026-09-25
+
+Splitting the mixed run's time by query style (the k6 samples carry the
+query id) put phrases at 78% of it: a third of the queries, mean 360 ms
+against 74 ms for disjunctions and 29 ms for conjunctions, with the
+slowest fifteen queries all phrases of common words ("you want to" 8.2 s,
+"see the" 6.2 s). The slowest 5% of queries were 55% of the time. A
+phrase was scored from the candidate stream: every document holding the
+words in order had its positions read, then was scored. The same database
+with phrases left out of the workload ran the conjunction-disjunction
+style at 153 QPS, p50 31 ms.
+
+`a821f91` walks a phrase as the conjunction of its words (their documents
+are a superset, and a document scores the same under either) and reads a
+candidate's positions only once it scores into the top k. Warm explain
+at 150 million rows: "how to get the value" 131 ms with 1,127 position
+checks over 244,722 scored candidates; "you want to" 13.7 ms; "see the"
+9.7 ms. Mixed, byte cap lifted, CPU-bound at 7.2 cores:
+
+| | `90c6215` | `a821f91` |
+|---|---|---|
+| mixed QPS | 51.8 | 141.8 |
+| p50 / p95 / p99 ms | 43 / 539 / 2,446 | 29 / 187 / 336 |
+| phrase p50 / mean ms | 118 / 360 | 25 / 61 |
+| disjunction p50 / mean ms | 54 / 74 | 57 / 77 |
+| conjunction p50 / mean ms | 19 / 29 | 20 / 31 |
+| disk read per query | 6.1 MB | 2.1 MB |
+
+Count and ranked checks were clean. Time is now 46% disjunctions, 36%
+phrases, 18% conjunctions; the slowest queries are still long phrases of
+common words (worst 3.9 s), whose conjunction admits many candidates
+before the top ten fill. Next, in order: the disjunction tail (candidates
+admitted per chunk under a chunk-level length bound); the remaining
+phrase tail; lift the segment cap.
 
 ## How to measure
 
