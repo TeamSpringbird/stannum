@@ -1336,6 +1336,11 @@ fn candidates_in_view(exec: &mut ScanExec, query: &Query, view: &crate::storage:
             ));
         }
         while let Some(tid) = cursor.current() {
+            // An expansion past the planner's cap is a universe of every
+            // document in the source.
+            if tids.len().is_multiple_of(4096) {
+                pgrx::check_for_interrupts!();
+            }
             tids.push(tid);
             crate::storage::codec_in(cursor.advance(), label);
         }
@@ -1352,8 +1357,18 @@ fn finish(exec: &mut ScanExec, mut tids: Vec<Tid>, scorer: Option<crate::score::
     exec.sorted = tids.len();
     if let Some(mut scorer) = scorer {
         let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
-        let mut scored: Vec<(f32, Tid)> =
-            tids.iter().map(|tid| (scorer.score(*tid), *tid)).collect();
+        // A row's score looks up every scoring term, and an expansion can
+        // name thousands: the loop must stay cancellable.
+        let mut scored: Vec<(f32, Tid)> = tids
+            .iter()
+            .enumerate()
+            .map(|(n, tid)| {
+                if n.is_multiple_of(64) {
+                    pgrx::check_for_interrupts!();
+                }
+                (scorer.score(*tid), *tid)
+            })
+            .collect();
         exec.exhaustive_score_calls += scored.len();
         // Only the rows the query will consume are ordered now; the rest
         // are ordered on demand should the executor ask for them.
