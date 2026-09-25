@@ -528,6 +528,15 @@ pub(crate) const PRUNE_MAX_K: usize = 4096;
 /// walk seeded from per-term champion lists would cost.
 pub(crate) static DEBUG_SEED_SCORE: pgrx::GucSetting<f64> = pgrx::GucSetting::<f64>::new(-1.0);
 
+/// Default of `stannum.warmup_chunks`; see [`IndexScorer::warm_up`].
+pub(crate) const DEFAULT_WARMUP_CHUNKS: i32 = 64;
+
+/// `stannum.warmup_chunks`: how many chunks, across every source, a pruned
+/// walk evaluates first, those with the highest bounds by the chunk
+/// directory, so the threshold starts near its final value. Zero disables.
+pub(crate) static WARMUP_CHUNKS: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(DEFAULT_WARMUP_CHUNKS);
+
 thread_local! {
     /// Index pages read while building a walk's per-term state, and while
     /// walking. A pruned walk cannot skip what it reads before it starts, so
@@ -536,6 +545,10 @@ thread_local! {
     static WALK_BLOCKS: Cell<i64> = const { Cell::new(0) };
     /// Chunks of a term's ordinal stream expanded into members.
     static CHUNK_LOADS: Cell<i64> = const { Cell::new(0) };
+    /// Chunks a walk evaluated in its warm-up, before walking in order.
+    static WARMUP_EVALUATED: Cell<i64> = const { Cell::new(0) };
+    /// The k-th best score once the last warm-up ended, if the heap was full.
+    static WARMUP_THRESHOLD: Cell<Option<f32>> = const { Cell::new(None) };
     /// Candidates of a phrase walk whose positions were read and checked.
     static POSITION_CHECKS: Cell<i64> = const { Cell::new(0) };
     /// Position lists read for those candidates, at most one per slot each.
@@ -607,6 +620,8 @@ pub(crate) fn reset_walk_blocks() {
     SETUP_BLOCKS.set(0);
     WALK_BLOCKS.set(0);
     CHUNK_LOADS.set(0);
+    WARMUP_EVALUATED.set(0);
+    WARMUP_THRESHOLD.set(None);
     POSITION_CHECKS.set(0);
     POSITION_READS.set(0);
     VISIBILITY_CHECKS.set(0);
@@ -627,6 +642,16 @@ pub(crate) fn vm_hits() -> i64 {
 /// Chunks loaded since the last reset.
 pub(crate) fn chunk_loads() -> i64 {
     CHUNK_LOADS.get()
+}
+
+/// The k-th best score after the last warm-up, if it filled the top k.
+pub(crate) fn warmup_threshold() -> Option<f32> {
+    WARMUP_THRESHOLD.get()
+}
+
+/// Chunks evaluated in warm-ups since the last reset.
+pub(crate) fn warmup_chunks() -> i64 {
+    WARMUP_EVALUATED.get()
 }
 
 /// Phrase candidates whose positions were checked since the last reset.
@@ -919,22 +944,29 @@ impl IndexScorer {
             // the best of them, so the smaller ones are walked pruned.
             let mut order: Vec<usize> = (0..self.view.sources.len()).collect();
             order.sort_by_key(|&i| std::cmp::Reverse(self.view.sources[i].0.document_count()));
+            let warmup = usize::try_from(WARMUP_CHUNKS.get()).unwrap_or(0);
             loop {
-                let mut visibility =
-                    unsafe { Visibility::open(pg_sys::Oid::from(self.key.heap_oid), shortcut) };
-                for &i in &order {
-                    self.walk_by_ordinal(
-                        i,
-                        combine,
-                        &filters,
-                        check.as_ref(),
-                        &mut visibility,
-                        k,
-                        &mut heap,
-                        &mut scored,
-                    );
-                    ordinal = true;
+                let mut visibility = Some(unsafe {
+                    Visibility::open(pg_sys::Oid::from(self.key.heap_oid), shortcut)
+                });
+                ordinal |= !order.is_empty();
+                // Every source's walk is opened first, so the warm-up can
+                // pick its chunks across all of them; each is then walked
+                // in turn and dropped.
+                let mut walks: Vec<OrdinalWalk<'_, '_>> = order
+                    .iter()
+                    .filter_map(|&i| self.open_walk(i, combine, &filters, check.as_ref(), k))
+                    .collect();
+                let started = blocks_used();
+                Self::warm_up(&mut walks, warmup, &mut heap, &mut visibility);
+                for mut walk in walks.drain(..) {
+                    walk.lend(&mut heap, &mut visibility);
+                    walk.run();
+                    walk.lend(&mut heap, &mut visibility);
+                    scored += walk.scored;
                 }
+                WALK_BLOCKS.set(WALK_BLOCKS.get() + blocks_used() - started);
+                let visibility = visibility.expect("the walks returned the visibility");
                 if !visibility.shortcuts
                     || unsafe {
                         crate::storage::view_is_current(
@@ -974,24 +1006,72 @@ impl IndexScorer {
         })
     }
 
-    /// Walks source `i` over its ordinal streams into the shared heap:
-    /// block-max WAND over the terms' chunks, then a fold of each admitted
-    /// chunk into a candidate set scored in ordinal order.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one call site; the arguments are the walk's state"
-    )]
-    fn walk_by_ordinal(
+    /// Evaluates up to `limit` chunks, across every source, before any walk
+    /// runs: those whose bound by the chunk directory alone is highest (see
+    /// [`OrdinalWalk::chunk_bounds`]), best first, into the shared heap. The
+    /// threshold otherwise rises only as the walks, each in ascending chunk
+    /// order, happen to meet good documents, and prunes nothing until the
+    /// heap holds `k` rows. Each walk then skips the chunks warmed in its
+    /// source, so no document is scored twice.
+    ///
+    /// Exact whatever the order: every chunk is still evaluated once,
+    /// against a threshold that only rises, and a range is judged by the
+    /// location of its first ordinal, which within a source is the earliest
+    /// of every document in the range wherever the range lies.
+    fn warm_up(
+        walks: &mut [OrdinalWalk<'_, '_>],
+        limit: usize,
+        heap: &mut BinaryHeap<Ranked>,
+        visibility: &mut Option<Visibility>,
+    ) {
+        if limit == 0 {
+            return;
+        }
+        let mut picks: Vec<(f32, usize, u16)> = Vec::new();
+        for (w, walk) in walks.iter_mut().enumerate() {
+            walk.chunk_bounds(|bound, key| picks.push((bound, w, key)));
+        }
+        let best = |a: &(f32, usize, u16), b: &(f32, usize, u16)| {
+            b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+        };
+        if picks.len() > limit {
+            picks.select_nth_unstable_by(limit - 1, best);
+            picks.truncate(limit);
+        }
+        picks.sort_unstable_by(best);
+        for &(_, w, key) in &picks {
+            let walk = &mut walks[w];
+            walk.lend(heap, visibility);
+            walk.warm(key);
+            walk.lend(heap, visibility);
+            walk.warmed.push(key);
+        }
+        WARMUP_EVALUATED.set(WARMUP_EVALUATED.get() + picks.len() as i64);
+        let k = walks.first().map_or(0, |walk| walk.k);
+        WARMUP_THRESHOLD.set(if heap.len() == k {
+            heap.peek().map(|worst| worst.0)
+        } else {
+            None
+        });
+        for walk in walks {
+            walk.warmed.sort_unstable();
+            walk.rewind();
+        }
+    }
+
+    /// Opens the walk of source `i` over its ordinal streams, or `None`
+    /// when the source cannot hold a match: block-max WAND over the terms'
+    /// chunks, then a fold of each admitted chunk into a candidate set
+    /// scored in ordinal order. The heap and the visibility are lent to the
+    /// walk while it runs (see [`OrdinalWalk::lend`]).
+    fn open_walk(
         &self,
         i: usize,
         combine: Combine,
         filters: &[&str],
         check: Option<&SpanCheck<'_>>,
-        visibility: &mut Visibility,
         k: usize,
-        heap: &mut BinaryHeap<Ranked>,
-        scored: &mut usize,
-    ) {
+    ) -> Option<OrdinalWalk<'_, '_>> {
         let started = blocks_used();
         let (source, dead_list) = &self.view.sources[i];
         let label = &self.view.labels[i];
@@ -1009,7 +1089,7 @@ impl IndexScorer {
             let Some(term) = segment_error_in(source.term(name), label) else {
                 match combine {
                     // A missing term empties the conjunction in this source.
-                    Combine::All => return,
+                    Combine::All => return None,
                     Combine::Any => continue,
                 }
             };
@@ -1019,14 +1099,14 @@ impl IndexScorer {
         for name in filters {
             match segment_error_in(source.term(name), label) {
                 Some(term) => filter_terms.push(Self::ordinal_term(&term, usize::MAX, None, label)),
-                None => return,
+                None => return None,
             }
         }
         // With no scoring term a conjunction is walked as its filters alone;
         // a disjunction of none is nothing.
         let unscored = terms.is_empty();
         if unscored && (combine != Combine::All || filter_terms.is_empty()) {
-            return;
+            return None;
         }
         // A phrase reads each slot's positions from the term's payload; a
         // slot is a scoring term or, when the scorer elided it, a filter.
@@ -1068,22 +1148,23 @@ impl IndexScorer {
                 read: vec![false; check.slots.len()],
             }
         });
-        let ready = blocks_used();
-        SETUP_BLOCKS.set(SETUP_BLOCKS.get() + ready - started);
         let docs = segment_error_in(source.doc_table(), label);
-        let mut walk = OrdinalWalk {
+        SETUP_BLOCKS.set(SETUP_BLOCKS.get() + blocks_used() - started);
+        Some(OrdinalWalk {
             scorer: self,
+            combine,
+            unscored,
             terms,
             filters: filter_terms,
-            docs: &docs,
+            docs,
             index: &**source,
             document_count: source.document_count(),
             lengths: source.lengths(),
-            dead: &dead,
-            visibility,
+            dead,
+            visibility: None,
             k,
-            heap,
-            scored,
+            heap: BinaryHeap::new(),
+            scored: 0,
             iterations: 0,
             // An unscored walk has no score to seed: every match ties at zero.
             seed: if unscored { None } else { seeded_threshold() },
@@ -1093,13 +1174,8 @@ impl IndexScorer {
             term_subs: Vec::new(),
             phrase,
             pending: Vec::new(),
-        };
-        match combine {
-            Combine::Any => walk.any(),
-            Combine::All if unscored => walk.all_unscored(),
-            Combine::All => walk.all(),
-        }
-        WALK_BLOCKS.set(WALK_BLOCKS.get() + blocks_used() - ready);
+            warmed: Vec::new(),
+        })
     }
 
     /// A term's streams in one source for the walk over ordinals. A filter
@@ -1442,22 +1518,31 @@ impl OrdinalTerm<'_> {
 /// candidate set scored in ordinal order.
 struct OrdinalWalk<'a, 's> {
     scorer: &'s IndexScorer,
+    combine: Combine,
+    /// A conjunction of elided terms alone: every match scores zero.
+    unscored: bool,
     /// In slot order.
     terms: Vec<OrdinalTerm<'a>>,
     /// A conjunction's elided terms: a match must hold them, and they add
     /// nothing to its score.
     filters: Vec<OrdinalTerm<'a>>,
-    docs: &'s DocTable<'a>,
+    docs: DocTable<'a>,
     /// The source, for length classes.
     index: &'a dyn Index,
     document_count: u32,
     lengths: Lengths<'a>,
     /// Dead ordinals, ascending.
-    dead: &'s [u32],
-    visibility: &'s mut Visibility,
+    dead: std::rc::Rc<Vec<u32>>,
+    /// Shared by every source's walk, and lent to each while it runs; see
+    /// [`Self::lend`].
+    visibility: Option<Visibility>,
     k: usize,
-    heap: &'s mut BinaryHeap<Ranked>,
-    scored: &'s mut usize,
+    /// Shared and lent as `visibility` is: the threshold check per
+    /// candidate is the walk's hottest read, so the walk holds the heap
+    /// itself rather than a shared cell.
+    heap: BinaryHeap<Ranked>,
+    /// Candidates this walk scored, in its warm-up and its walk.
+    scored: usize,
     iterations: u32,
     /// `stannum.debug_seed_score`, read once: the threshold is consulted
     /// per sub-block and per candidate, and a setting read is a thread
@@ -1476,6 +1561,8 @@ struct OrdinalWalk<'a, 's> {
     /// Scratch for a sub-block: the phrase candidates that scored into the
     /// top k, as (score, low bits), awaiting their positions check.
     pending: Vec<(f32, u16)>,
+    /// Keys of the chunks the warm-up evaluated, ascending: the walk skips them.
+    warmed: Vec<u16>,
 }
 
 /// Which walked stream a phrase slot's term is.
@@ -1554,6 +1641,163 @@ fn drop_dead(
 }
 
 impl OrdinalWalk<'_, '_> {
+    /// Swaps the shared heap and visibility with the walk's: called before
+    /// the walk runs, lending them, and after, taking them back.
+    fn lend(&mut self, heap: &mut BinaryHeap<Ranked>, visibility: &mut Option<Visibility>) {
+        std::mem::swap(&mut self.heap, heap);
+        std::mem::swap(&mut self.visibility, visibility);
+    }
+
+    fn visible(&mut self, tid: Tid) -> bool {
+        self.visibility
+            .as_mut()
+            .expect("a running walk holds the visibility")
+            .visible(tid)
+    }
+
+    /// Walks the source in ascending chunk order, skipping the chunks the
+    /// warm-up evaluated.
+    fn run(&mut self) {
+        match self.combine {
+            Combine::Any => self.any(),
+            Combine::All if self.unscored => self.all_unscored(),
+            Combine::All => self.all(),
+        }
+    }
+
+    /// Moves every term and filter back to its first chunk.
+    fn rewind(&mut self) {
+        for term in self.terms.iter_mut().chain(self.filters.iter_mut()) {
+            term.pos = 0;
+        }
+    }
+
+    /// The stream a conjunction's walk leads with: the rarest term.
+    fn lead(&self) -> usize {
+        (0..self.terms.len())
+            .min_by_key(|&t| self.terms[t].keys.len())
+            .expect("a conjunction has terms")
+    }
+
+    /// For a conjunction whose terms all sit on one chunk: the length every
+    /// term's bound holds at, the longest of the chunks' shortest documents
+    /// since the members share one document, and the chunk's bound there.
+    fn conjunction_bound(&self) -> (u32, f32) {
+        let min_length = self
+            .terms
+            .iter()
+            .map(|term| term.bound_block(term.pos).shortest())
+            .max()
+            .expect("a conjunction has terms");
+        let mut bound = 0.0_f32;
+        for term in &self.terms {
+            let scorer = &self.scorer.terms[term.slot].1;
+            bound += scorer.bound_with_min_length(&term.bound_block(term.pos), min_length);
+        }
+        (min_length, bound)
+    }
+
+    /// Reports every chunk that could hold a match with its bound from the
+    /// chunk directory alone, loading nothing: for a conjunction the chunks
+    /// every term and filter holds, bounded as [`Self::all`] bounds them;
+    /// for a disjunction every chunk any term holds, bounded by the sum of
+    /// the present terms' chunk bounds, as [`Self::any`] bounds them. Moves
+    /// the terms; the caller rewinds them.
+    fn chunk_bounds(&mut self, mut out: impl FnMut(f32, u16)) {
+        if self.unscored {
+            // Every match ties at zero: nothing to warm.
+            return;
+        }
+        match self.combine {
+            Combine::All => {
+                let lead = self.lead();
+                'keys: for p in 0..self.terms[lead].keys.len() {
+                    let key = self.terms[lead].keys[p];
+                    self.terms[lead].pos = p;
+                    for (t, term) in self.terms.iter_mut().enumerate() {
+                        if t == lead {
+                            continue;
+                        }
+                        term.pos += term.keys[term.pos..].partition_point(|k| *k < key);
+                        match term.key() {
+                            None => return,
+                            Some(found) if found != key => continue 'keys,
+                            Some(_) => {}
+                        }
+                    }
+                    for filter in &mut self.filters {
+                        filter.pos += filter.keys[filter.pos..].partition_point(|k| *k < key);
+                        match filter.key() {
+                            None => return,
+                            Some(found) if found != key => continue 'keys,
+                            Some(_) => {}
+                        }
+                    }
+                    out(self.conjunction_bound().1, key);
+                }
+            }
+            Combine::Any => {
+                let mut entries: Vec<(u16, usize, usize)> = self
+                    .terms
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(t, term)| {
+                        term.keys.iter().enumerate().map(move |(p, k)| (*k, t, p))
+                    })
+                    .collect();
+                entries.sort_unstable();
+                let mut at = 0;
+                while at < entries.len() {
+                    let key = entries[at].0;
+                    let mut bound = 0.0_f32;
+                    while at < entries.len() && entries[at].0 == key {
+                        let (_, t, p) = entries[at];
+                        let scorer = &self.scorer.terms[self.terms[t].slot].1;
+                        bound += self.terms[t].bound_score(p, scorer);
+                        at += 1;
+                    }
+                    out(bound, key);
+                }
+            }
+        }
+    }
+
+    /// Evaluates chunk `key`, out of the walk's order, into the heap: with
+    /// every term holding it for a disjunction, or with every term and
+    /// filter for a conjunction, which [`Self::chunk_bounds`] found all
+    /// hold it. Moves the terms; the caller rewinds them.
+    fn warm(&mut self, key: u16) {
+        let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
+        match self.combine {
+            Combine::Any => {
+                let mut present = Vec::with_capacity(self.terms.len());
+                for (t, term) in self.terms.iter_mut().enumerate() {
+                    if let Ok(p) = term.keys.binary_search(&key) {
+                        term.pos = p;
+                        present.push(t);
+                    }
+                }
+                if !present.is_empty() {
+                    self.evaluate(key, &present, &mut set);
+                }
+            }
+            Combine::All => {
+                for term in self.terms.iter_mut().chain(self.filters.iter_mut()) {
+                    match term.keys.binary_search(&key) {
+                        Ok(p) => term.pos = p,
+                        Err(_) => return,
+                    }
+                }
+                let (min_length, bound) = self.conjunction_bound();
+                if self.threshold().is_some() && !self.can_beat(bound, u32::from(key) << 16) {
+                    return;
+                }
+                let lead = self.lead();
+                self.evaluate_all(key, lead, min_length, &mut set);
+            }
+        }
+    }
+
     /// Reads the candidate `low`'s positions for `slot` into the check's
     /// scratch, unless they are read already.
     fn read_slot(&mut self, phrase: &mut PhraseCheck<'_>, slot: usize, low: u16) {
@@ -1715,6 +1959,13 @@ impl OrdinalWalk<'_, '_> {
                 }
                 continue;
             }
+            if self.warmed.binary_search(&pivot).is_ok() {
+                // The warm-up evaluated this chunk with every term holding it.
+                for &t in &order[..=p] {
+                    self.terms[t].pos += 1;
+                }
+                continue;
+            }
             // Every term of the prefix is on the pivot chunk. Its bounds decide
             // whether anything in it can enter the top k.
             let mut bound = 0.0_f64;
@@ -1746,9 +1997,7 @@ impl OrdinalWalk<'_, '_> {
     /// and the filters are aligned to each, and a chunk every stream holds is
     /// folded to the members they share.
     fn all(&mut self) {
-        let lead = (0..self.terms.len())
-            .min_by_key(|&t| self.terms[t].keys.len())
-            .expect("a conjunction has terms");
+        let lead = self.lead();
         let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
         loop {
             self.iterations = self.iterations.wrapping_add(1);
@@ -1784,18 +2033,12 @@ impl OrdinalWalk<'_, '_> {
                 term.pos += term.keys[term.pos..].partition_point(|k| *k < next);
                 continue;
             }
-            // Conjunction members share one document, so every term's bound
-            // holds at the longest of the chunks' shortest documents.
-            let min_length = (0..self.terms.len())
-                .map(|t| self.terms[t].bound_block(self.terms[t].pos).shortest())
-                .max()
-                .expect("a conjunction has terms");
-            let mut bound = 0.0_f32;
-            for t in 0..self.terms.len() {
-                let term = &self.terms[t];
-                let scorer = &self.scorer.terms[term.slot].1;
-                bound += scorer.bound_with_min_length(&term.bound_block(term.pos), min_length);
+            if self.warmed.binary_search(&key).is_ok() {
+                // The warm-up evaluated this chunk.
+                self.step_all();
+                continue;
             }
+            let (min_length, bound) = self.conjunction_bound();
             let base = u32::from(key) << 16;
             if self.threshold().is_some() && !self.can_beat(bound, base) {
                 self.step_all();
@@ -1883,7 +2126,7 @@ impl OrdinalWalk<'_, '_> {
                 return true;
             }
         }
-        drop_dead(self.dead, base, sparse, set, &mut lows);
+        drop_dead(&self.dead, base, sparse, set, &mut lows);
         if sparse {
             for low in lows {
                 if !self.admit_unscored(base, low) {
@@ -1997,7 +2240,7 @@ impl OrdinalWalk<'_, '_> {
                 return;
             }
         }
-        drop_dead(self.dead, base, sparse, set, &mut lows);
+        drop_dead(&self.dead, base, sparse, set, &mut lows);
         let mut sparse_at = 0usize;
         let mut skip_sub = false;
         let all: Vec<usize> = (0..self.terms.len()).collect();
@@ -2064,10 +2307,10 @@ impl OrdinalWalk<'_, '_> {
         let tid = self.resolve(ordinal);
         let candidate = Ranked(total, tid);
         if self.heap.len() < self.k {
-            if self.visibility.visible(tid) {
+            if self.visible(tid) {
                 self.heap.push(candidate);
             }
-        } else if self.heap.peek().is_some_and(|w| candidate < *w) && self.visibility.visible(tid) {
+        } else if self.heap.peek().is_some_and(|w| candidate < *w) && self.visible(tid) {
             self.heap.pop();
             self.heap.push(candidate);
         }
@@ -2269,7 +2512,7 @@ impl OrdinalWalk<'_, '_> {
         if pruning && !self.can_beat(fold(values), ordinal) {
             return None;
         }
-        *self.scored += 1;
+        self.scored += 1;
         Some(fold(values))
     }
 
@@ -2486,12 +2729,10 @@ impl OrdinalWalk<'_, '_> {
                 let tid = self.resolve(ordinal);
                 let candidate = Ranked(total, tid);
                 if self.heap.len() < self.k {
-                    if self.visibility.visible(tid) {
+                    if self.visible(tid) {
                         self.heap.push(candidate);
                     }
-                } else if self.heap.peek().is_some_and(|w| candidate < *w)
-                    && self.visibility.visible(tid)
-                {
+                } else if self.heap.peek().is_some_and(|w| candidate < *w) && self.visible(tid) {
                     self.heap.pop();
                     self.heap.push(candidate);
                 }

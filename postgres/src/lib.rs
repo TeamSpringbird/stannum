@@ -1468,6 +1468,10 @@ mod tests {
             expected.iter().all(|(id, _)| id % 100 == 0 && *id <= 65536),
             "{expected:?}"
         );
+        // The count below is the in-order walk's. A warm-up evaluates the
+        // second chunk first, its directory bound being the higher, before
+        // any threshold forms, and loads alpha's chunk there too.
+        Spi::run("SET LOCAL stannum.warmup_chunks = 0").unwrap();
         let plan = Spi::get_one::<Json>(
             "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM lazy WHERE body ==> 'delta OR gamma OR alpha'
              ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10",
@@ -1739,6 +1743,170 @@ mod tests {
         // scoring.
         let scan = explain("\"alpha beta\" NOT ENCLOSES \"gamma\"");
         assert!(scan["Pruning"].is_null(), "{scan}");
+    }
+
+    /// The warm-up evaluates the chunks with the highest directory bounds
+    /// first, across every source, and the walks skip them after. Two build
+    /// segments of two chunks each (the second chunk of each holding the
+    /// shortest documents, so the warm-up picks it) and a write buffer of
+    /// tying rows: whether the warm-up covers none, some or all of the
+    /// chunks holding the final top k, the rows are the exhaustive ones bit
+    /// for bit, ties and dead rows included, across the LIMIT and OFFSET
+    /// matrix.
+    #[pg_test]
+    fn warmed_top_k_matches_full_scoring_bit_for_bit() {
+        // The second segment is the write buffer folded at 70,000 documents,
+        // with merges deferred; the rows after it stay in the buffer.
+        let rows = |from: i32, to: i32| {
+            format!(
+                "INSERT INTO warm SELECT n,
+                   repeat('alpha ', n % 4) ||
+                   CASE WHEN n % 3 = 0 THEN 'beta ' ELSE '' END ||
+                   CASE WHEN n % 5 = 0 THEN repeat('gamma ', 1 + n % 2) ELSE '' END ||
+                   CASE WHEN n % 101 = 0 THEN repeat('delta ', 1 + (n / 101) % 3) ELSE '' END ||
+                   repeat('pad ', CASE WHEN n % 70000 > 65536 THEN n % 3 ELSE 3 + n % 6 END) ||
+                   'tail'
+                   FROM generate_series({from}, {to}) n;"
+            )
+        };
+        Spi::run(&format!(
+            "CREATE TABLE warm(id int primary key, body text);
+             {}
+             CREATE INDEX warm_idx ON warm USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 70000;
+             SET LOCAL stannum.write_buffer_bytes = 67108864;
+             SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
+             {}",
+            rows(1, 70000),
+            rows(70001, 140000)
+        ))
+        .unwrap();
+        Spi::run(
+            "INSERT INTO warm SELECT n, 'alpha beta gamma delta tail'
+               FROM generate_series(140001, 140300) n;
+             INSERT INTO warm SELECT n, 'delta delta delta ' || repeat('pad ', n % 4) || 'tail'
+               FROM generate_series(140301, 140400) n;
+             DELETE FROM warm WHERE id % 17 = 0;
+             UPDATE warm SET body = body || ' extra' WHERE id % 23 = 0;",
+        )
+        .unwrap();
+        let ranked = |custom: bool, warmup: i32, query: &str, order_by: &str, limit: &str| {
+            Spi::run(&format!(
+                "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;
+                 SET LOCAL stannum.warmup_chunks = {warmup};"
+            ))
+            .unwrap();
+            Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, {order_by} AS score FROM warm WHERE body ==> '{query}'
+                             ORDER BY score DESC{} {limit}",
+                            if custom { "" } else { ", ctid" }
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let queries = [
+            "delta",
+            "alpha OR delta",
+            "beta OR gamma OR delta",
+            "delta^2 OR gamma^0.5 OR alpha",
+            "alpha AND delta",
+            "beta AND gamma",
+            "alpha AND beta AND gamma",
+            "gamma AND delta AND tail",
+            "\"alpha beta\"",
+            "\"gamma delta\"",
+            "\"delta delta\"",
+        ];
+        let limits = [
+            "LIMIT 1",
+            "LIMIT 10",
+            "LIMIT 10 OFFSET 20",
+            "LIMIT 100",
+            "LIMIT 257",
+        ];
+        for query in queries {
+            for limit in limits {
+                for order_by in [
+                    "stannum.full_score(ctid)",
+                    "stannum.score(ctid)",
+                    "stannum.score(ctid, 1.0)",
+                ] {
+                    let expected = ranked(false, 0, query, order_by, limit);
+                    for warmup in [0, 1, 2, 3, 4096] {
+                        assert_eq!(
+                            ranked(true, warmup, query, order_by, limit),
+                            expected,
+                            "{query} {limit} {order_by} warm-up {warmup}"
+                        );
+                    }
+                }
+            }
+        }
+        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node.clone());
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        Spi::run(
+            "SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;",
+        )
+        .unwrap();
+        let layout = Spi::get_one::<String>(
+            "SELECT string_agg(kind || ' ' || docs, ', ' ORDER BY ordinal)
+             FROM stannum.segment_info('warm_idx')",
+        )
+        .unwrap()
+        .unwrap();
+        // `alpha` is in every chunk of ordinals of every source.
+        let every = Spi::get_one::<i64>(
+            "SELECT sum((docs + 65535) / 65536)::bigint FROM stannum.segment_info('warm_idx')",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(every >= 4, "{layout}");
+        assert_eq!(layout.matches("immutable").count(), 2, "{layout}");
+        assert!(layout.contains(", mutable "), "{layout}");
+        for (query, warmup, chunks) in [
+            ("alpha OR delta", 0, 0),
+            ("alpha OR delta", 2, 2),
+            ("alpha OR delta", 4096, every),
+            ("alpha AND beta AND gamma", 3, 3),
+        ] {
+            Spi::run(&format!("SET LOCAL stannum.warmup_chunks = {warmup}")).unwrap();
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM warm WHERE body ==> '{query}'
+                 ORDER BY stannum.full_score(ctid) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
+            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
+            assert_eq!(
+                scan["Warm-up Chunks"], chunks,
+                "{query} {warmup} over {layout}: {scan}"
+            );
+        }
     }
 
     #[pg_test]

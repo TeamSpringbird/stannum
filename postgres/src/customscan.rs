@@ -124,6 +124,16 @@ pub fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        c"stannum.warmup_chunks",
+        c"Chunks a pruned ranked walk evaluates first, those with the highest bounds, to raise its threshold early",
+        c"Picked across every source by the chunk directory alone; zero walks each source in chunk order from the start.",
+        &crate::score::WARMUP_CHUNKS,
+        0,
+        4096,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
     GucRegistry::define_bool_guc(
         c"stannum.profile_count_selection",
         c"Collect bounded count-selector features without changing the default strategy",
@@ -2284,6 +2294,21 @@ unsafe extern "C-unwind" fn explain(
                         exec.walk_blocks.1,
                         es,
                     );
+                    pg_sys::ExplainPropertyInteger(
+                        c"Warm-up Chunks".as_ptr(),
+                        std::ptr::null(),
+                        crate::score::warmup_chunks(),
+                        es,
+                    );
+                    if let Some(threshold) = crate::score::warmup_threshold() {
+                        pg_sys::ExplainPropertyFloat(
+                            c"Warm-up Threshold".as_ptr(),
+                            std::ptr::null(),
+                            f64::from(threshold),
+                            6,
+                            es,
+                        );
+                    }
                 }
             }
             // Read accounting for every scan that ran, pruned or not: a phrase
