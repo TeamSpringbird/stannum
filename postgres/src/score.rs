@@ -773,6 +773,203 @@ fn prunable_shape(query: &Query) -> Option<(Combine, Vec<&str>, Option<SpanCheck
     Some((combine, terms, check))
 }
 
+/// A query of terms and all-required spans that [`prunable_shape`] does not
+/// accept, combined by AND, OR, AT LEAST and AND NOT: `w OR "p q"`,
+/// `(a AND b) OR c`, `a AND (b OR c)`, `a AND NOT b`, boosts anywhere.
+///
+/// A document's score does not depend on the shape: it is the sum over the
+/// scoring terms it holds, whichever part of the query it matched by, a
+/// phrase's words included when the phrase itself does not match (see
+/// [`IndexScorer::score_listed`]). So the disjunction walk over the scoring
+/// terms bounds such a query's documents exactly as it bounds a flat
+/// disjunction's, and a document holding a scoring term is a candidate only
+/// when the shape holds it too: tested a word of documents at a time over
+/// the terms' bits, a phrase's positions read only for a candidate that
+/// ranks. A match holding no scoring term scores zero; those are filled
+/// from the candidate stream as for a disjunction's elided terms.
+enum Shape<'q> {
+    Term(&'q str),
+    /// A span every slot of which must occur.
+    Phrase(SpanCheck<'q>),
+    All(Vec<Shape<'q>>),
+    /// At least `min` of the children, one or more.
+    Any {
+        min: usize,
+        children: Vec<Shape<'q>>,
+    },
+    /// Only as a child of [`Shape::All`] beside a positive child.
+    Not(Box<Shape<'q>>),
+}
+
+/// The largest `AT LEAST` count a [`Shape`] accepts: the walk counts a
+/// word of documents' children in as many words.
+const MAX_AT_LEAST: usize = 64;
+
+/// Whether a condition holds: certainly, possibly, or certainly not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tri {
+    No,
+    Maybe,
+    Yes,
+}
+
+impl<'q> Shape<'q> {
+    fn of(query: &'q Query) -> Option<Self> {
+        let children = |children: &mut dyn Iterator<Item = &'q Query>| {
+            children.map(Self::of).collect::<Option<Vec<_>>>()
+        };
+        let all = |children: &mut dyn Iterator<Item = &'q Query>| {
+            let children = children
+                .map(|child| match child {
+                    Query::Not(inner) => Self::of(inner).map(|inner| Self::Not(Box::new(inner))),
+                    child => Self::of(child),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            children
+                .iter()
+                .any(|child| !matches!(child, Self::Not(_)))
+                .then_some(Self::All(children))
+        };
+        Some(match query {
+            Query::Boost { inner, .. } => return Self::of(inner),
+            Query::Term(term) => Self::Term(term),
+            Query::Span {
+                term_slots,
+                span_query,
+                position_filter,
+            } if !term_slots.is_empty() && span_requires_all(span_query) => {
+                Self::Phrase(SpanCheck {
+                    slots: term_slots
+                        .iter()
+                        .map(|slot| match slot {
+                            SpanTermSlot::Term(term) => Some(term.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Option<_>>()?,
+                    span: span_query,
+                    filter: position_filter.as_ref(),
+                })
+            }
+            Query::And(left, right) => all(&mut [&**left, &**right].into_iter())?,
+            Query::Conjunction(children) => all(&mut children.iter())?,
+            Query::Or(left, right) => Self::Any {
+                min: 1,
+                children: children(&mut [&**left, &**right].into_iter())?,
+            },
+            Query::Disjunction {
+                min,
+                children: kids,
+            }
+            | Query::AtLeast {
+                min,
+                children: kids,
+            } if *min >= 1 && (*min as usize) <= kids.len().min(MAX_AT_LEAST) => Self::Any {
+                min: *min as usize,
+                children: children(&mut kids.iter())?,
+            },
+            _ => return None,
+        })
+    }
+
+    /// Every term the shape names, sorted and deduplicated.
+    fn leaves(&self) -> Vec<&'q str> {
+        fn walk<'q>(shape: &Shape<'q>, out: &mut Vec<&'q str>) {
+            match shape {
+                Shape::Term(term) => out.push(term),
+                Shape::Phrase(check) => out.extend(check.slots.iter().copied()),
+                Shape::All(children) | Shape::Any { children, .. } => {
+                    children.iter().for_each(|child| walk(child, out));
+                }
+                Shape::Not(inner) => walk(inner, out),
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, &mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Whether the shape can hold a document, given for each term whether
+    /// the document holds it.
+    fn holds(&self, term: &impl Fn(&str) -> Tri) -> Tri {
+        match self {
+            Self::Term(name) => term(name),
+            Self::Phrase(check) => {
+                if check.slots.iter().any(|slot| term(slot) == Tri::No) {
+                    Tri::No
+                } else {
+                    Tri::Maybe
+                }
+            }
+            Self::All(children) => {
+                children
+                    .iter()
+                    .fold(Tri::Yes, |sum, child| match (sum, child.holds(term)) {
+                        (Tri::No, _) | (_, Tri::No) => Tri::No,
+                        (Tri::Yes, Tri::Yes) => Tri::Yes,
+                        _ => Tri::Maybe,
+                    })
+            }
+            Self::Any { min, children } => {
+                let held: Vec<Tri> = children.iter().map(|child| child.holds(term)).collect();
+                let yes = held.iter().filter(|h| **h == Tri::Yes).count();
+                let maybe = held.iter().filter(|h| **h != Tri::No).count();
+                if yes >= *min {
+                    Tri::Yes
+                } else if maybe >= *min {
+                    Tri::Maybe
+                } else {
+                    Tri::No
+                }
+            }
+            Self::Not(inner) => match inner.holds(term) {
+                Tri::Yes => Tri::No,
+                Tri::Maybe => Tri::Maybe,
+                Tri::No => Tri::Yes,
+            },
+        }
+    }
+
+    /// Whether every document holding a term of `walked` matches: the shape
+    /// is a disjunction and each such term one of its children alone, so
+    /// the walk's candidates need no test.
+    fn any_holds(&self, walked: &[&str]) -> bool {
+        match self {
+            Self::Any { min: 1, children } => walked.iter().all(|name| {
+                children
+                    .iter()
+                    .any(|child| matches!(child, Self::Term(term) if term == name))
+            }),
+            _ => false,
+        }
+    }
+}
+
+/// Where the walk finds a term's members in one source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bits {
+    /// A walked scoring term, by index.
+    Term(usize),
+    /// A term that scores nothing, walked as a filter, by index.
+    Filter(usize),
+    /// Absent from the source: no document holds it.
+    Absent,
+}
+
+/// A [`Shape`] resolved against one source's walked streams.
+enum Condition {
+    Leaf(Bits),
+    /// A phrase: its slots' streams, and its check among the walk's.
+    Phrase(Vec<Bits>, usize),
+    All(Vec<Condition>),
+    Any {
+        min: usize,
+        children: Vec<Condition>,
+    },
+    Not(Box<Condition>),
+}
+
 /// A heap entry ordered so the worst-ranked row is the greatest.
 struct Ranked(f32, Tid);
 
@@ -861,11 +1058,21 @@ impl IndexScorer {
     /// are skipped without decoding. Bit-identical to scoring every
     /// candidate and sorting, including tie order.
     ///
-    /// `None` when the query is not a flat conjunction or disjunction of
-    /// exactly the scoring terms, or a source carries no block bounds; the
-    /// caller then scores every candidate.
+    /// A query of terms and all-required spans under AND, OR, AT LEAST and
+    /// AND NOT that is not flat (see [`Shape`]) is walked as the
+    /// disjunction of its scoring terms, each candidate tested against it.
+    ///
+    /// `None` when the query is neither, when a scoring term is not one of
+    /// its terms, or a source carries no block bounds; the caller then
+    /// scores every candidate.
     pub(crate) fn top_k(&self, k: usize) -> Option<TopK> {
-        let (combine, leaves, check) = prunable_shape(&self.query)?;
+        let (combine, leaves, check, mixed) = match prunable_shape(&self.query) {
+            Some((combine, leaves, check)) => (combine, leaves, check, None),
+            None => {
+                let shape = Shape::of(&self.query)?;
+                (Combine::Any, shape.leaves(), None, Some(shape))
+            }
+        };
         // Every scoring term must be a leaf (no added terms), and a leaf that
         // is not a scoring term must be absent from the index altogether: it
         // then adds nothing to a disjunction and empties a conjunction. A
@@ -898,12 +1105,26 @@ impl IndexScorer {
                 .any(|(source, _)| segment_error(source.term(leaf)).is_some())
             {
                 match combine {
+                    // A mixed shape tests its candidates for every term it
+                    // names, a scoring one or not.
+                    Combine::Any if mixed.is_some() => filters.push(leaf),
                     Combine::Any => elided = true,
                     Combine::All => filters.push(leaf),
                 }
                 continue;
             }
             absent = true;
+        }
+        if let Some(shape) = &mixed {
+            // Whether a document holding no scoring term can match: each
+            // term that scores nothing but is present may be held.
+            elided = shape.holds(&|term| {
+                if filters.contains(&term) {
+                    Tri::Maybe
+                } else {
+                    Tri::No
+                }
+            }) != Tri::No;
         }
         let mut heap = BinaryHeap::with_capacity(k + 1);
         let mut scored = 0usize;
@@ -928,6 +1149,7 @@ impl IndexScorer {
                         combine,
                         &filters,
                         check.as_ref(),
+                        mixed.as_ref(),
                         &mut visibility,
                         k,
                         &mut heap,
@@ -987,6 +1209,7 @@ impl IndexScorer {
         combine: Combine,
         filters: &[&str],
         check: Option<&SpanCheck<'_>>,
+        mixed: Option<&Shape<'_>>,
         visibility: &mut Visibility,
         k: usize,
         heap: &mut BinaryHeap<Ranked>,
@@ -1015,10 +1238,31 @@ impl IndexScorer {
             };
             terms.push(Self::ordinal_term(&term, slot, Some(scorer), label));
         }
+        // A mixed shape is tested per candidate unless every document
+        // holding a walked term matches it; untested, it walks no filters.
+        let tested = mixed.filter(|shape| {
+            let walked: Vec<&str> = terms
+                .iter()
+                .map(|t| self.terms[t.slot].0.as_str())
+                .collect();
+            !shape.any_holds(&walked)
+        });
+        let filters = if mixed.is_some() && tested.is_none() {
+            &[]
+        } else {
+            filters
+        };
         let mut filter_terms = Vec::with_capacity(filters.len());
+        // A mixed shape's filters, by name: one absent from this source is
+        // held by no document here.
+        let mut filter_names = Vec::with_capacity(filters.len());
         for name in filters {
             match segment_error_in(source.term(name), label) {
-                Some(term) => filter_terms.push(Self::ordinal_term(&term, usize::MAX, None, label)),
+                Some(term) => {
+                    filter_terms.push(Self::ordinal_term(&term, usize::MAX, None, label));
+                    filter_names.push(*name);
+                }
+                None if mixed.is_some() => {}
                 None => return,
             }
         }
@@ -1068,6 +1312,23 @@ impl IndexScorer {
                 read: vec![false; check.slots.len()],
             }
         });
+        let mut phrases = Vec::new();
+        let condition = tested.map(|shape| {
+            let bits = |name: &str| {
+                terms
+                    .iter()
+                    .position(|t| self.terms[t.slot].0 == name)
+                    .map(Bits::Term)
+                    .or_else(|| {
+                        filter_names
+                            .iter()
+                            .position(|f| *f == name)
+                            .map(Bits::Filter)
+                    })
+                    .unwrap_or(Bits::Absent)
+            };
+            Self::condition(shape, &bits, &**source, label, &mut phrases)
+        });
         let ready = blocks_used();
         SETUP_BLOCKS.set(SETUP_BLOCKS.get() + ready - started);
         let docs = segment_error_in(source.doc_table(), label);
@@ -1096,6 +1357,8 @@ impl IndexScorer {
             term_subs: Vec::new(),
             phrase,
             pending: Vec::new(),
+            condition,
+            phrases,
         };
         match combine {
             Combine::Any => walk.any(),
@@ -1103,6 +1366,51 @@ impl IndexScorer {
             Combine::All => walk.all(),
         }
         WALK_BLOCKS.set(WALK_BLOCKS.get() + blocks_used() - ready);
+    }
+
+    /// Resolves a mixed shape against one source's walked streams, `bits`
+    /// naming each term's, and builds the position check of each phrase
+    /// whose slots the source holds into `phrases`.
+    fn condition<'a>(
+        shape: &Shape<'_>,
+        bits: &impl Fn(&str) -> Bits,
+        source: &'a dyn Index,
+        label: &str,
+        phrases: &mut Vec<Option<PhraseCheck<'a>>>,
+    ) -> Condition {
+        let mut all = |children: &[Shape<'_>]| {
+            children
+                .iter()
+                .map(|child| Self::condition(child, bits, source, label, phrases))
+                .collect()
+        };
+        match shape {
+            Shape::Term(name) => Condition::Leaf(bits(name)),
+            Shape::Phrase(check) => {
+                let slots: Vec<Bits> = check.slots.iter().map(|name| bits(name)).collect();
+                if slots.contains(&Bits::Absent) {
+                    return Condition::Leaf(Bits::Absent);
+                }
+                let members = slots
+                    .iter()
+                    .map(|slot| match *slot {
+                        Bits::Term(t) => Member::Term(t),
+                        Bits::Filter(f) => Member::Filter(f),
+                        Bits::Absent => unreachable!("checked above"),
+                    })
+                    .collect::<Vec<_>>();
+                phrases.push(Some(phrase_check(check, &members, source, label)));
+                Condition::Phrase(slots, phrases.len() - 1)
+            }
+            Shape::All(children) => Condition::All(all(children)),
+            Shape::Any { min, children } => Condition::Any {
+                min: *min,
+                children: all(children),
+            },
+            Shape::Not(inner) => Condition::Not(Box::new(Self::condition(
+                inner, bits, source, label, phrases,
+            ))),
+        }
     }
 
     /// A term's streams in one source for the walk over ordinals. A filter
@@ -1479,6 +1787,10 @@ struct OrdinalWalk<'a, 's> {
     /// Scratch for a sub-block: the phrase candidates that scored into the
     /// top k, as (score, low bits), awaiting their positions check.
     pending: Vec<(f32, u16)>,
+    /// For a disjunction of a mixed shape (see [`Shape`]): the condition a
+    /// candidate must meet, and its phrases' position checks.
+    condition: Option<Condition>,
+    phrases: Vec<Option<PhraseCheck<'a>>>,
 }
 
 /// Which walked stream a phrase slot's term is.
@@ -1505,6 +1817,43 @@ struct PhraseCheck<'a> {
     positions: Vec<Vec<u32>>,
     /// Scratch: per slot, whether the candidate's positions are read.
     read: Vec<bool>,
+}
+
+/// The position check of a mixed shape's phrase, whose slot `n` ranks in
+/// the walked stream `members[n]`; every slot's term is in `source`.
+fn phrase_check<'a>(
+    check: &SpanCheck<'_>,
+    members: &[Member],
+    source: &'a dyn Index,
+    label: &str,
+) -> PhraseCheck<'a> {
+    let slots = check
+        .slots
+        .iter()
+        .zip(members)
+        .map(|(name, member)| {
+            let term = segment_error_in(source.term(name), label).unwrap_or_else(|| {
+                crate::storage::corrupt(format!(
+                    "Stannum {label}: phrase slot {name} vanished from the source"
+                ))
+            });
+            let payload = segment_error_in(term.payload(), label);
+            (*member, payload.cursor(), payload.count())
+        })
+        .collect::<Vec<_>>();
+    PhraseCheck {
+        plan: boldi_vigna::PhrasePlan::new(check.span, |slot| u64::from(slots[slot].2)),
+        slots: slots
+            .into_iter()
+            .map(|(member, cursor, _)| (member, cursor))
+            .collect(),
+        solver: boldi_vigna::SpanSolver::new(check.span).unwrap_or_else(|error| {
+            crate::storage::corrupt(format!("Stannum {label}: span solver: {error}"))
+        }),
+        filter: check.filter.cloned(),
+        positions: vec![Vec::new(); check.slots.len()],
+        read: vec![false; check.slots.len()],
+    }
 }
 
 /// Narrows the shared members of a chunk (`lows` when `sparse`, else
@@ -1881,6 +2230,18 @@ impl OrdinalWalk<'_, '_> {
                     self.terms[t].pos += 1;
                 }
                 continue;
+            }
+            // A mixed shape may need a stream the chunk lacks.
+            if self.condition.is_some() {
+                self.seek_filters(pivot);
+                if let Some(condition) = &self.condition
+                    && !self.chunk_may_hold(condition, pivot)
+                {
+                    for &t in &order[..=p] {
+                        self.terms[t].pos += 1;
+                    }
+                    continue;
+                }
             }
             // Every term of the prefix is on the pivot chunk: fold and score it.
             present.clear();
@@ -2614,6 +2975,13 @@ impl OrdinalWalk<'_, '_> {
                 for &t in present {
                     self.terms[t].load();
                 }
+                if self.condition.is_some() {
+                    for filter in &mut self.filters {
+                        if filter.key() == Some(key) {
+                            filter.load();
+                        }
+                    }
+                }
                 settled = true;
             }
             for (out, &t) in words.iter_mut().zip(present) {
@@ -2628,6 +2996,16 @@ impl OrdinalWalk<'_, '_> {
                 }
                 let kept = sieve.keep(word, &words);
                 word = kept;
+            }
+            // A mixed shape keeps the documents that may meet it; those it
+            // does not settle here are tested once they would rank.
+            let mut certain = !0u64;
+            if word != 0
+                && let Some(condition) = &self.condition
+            {
+                let (sure, may) = self.condition_word(condition, key, i);
+                word &= may;
+                certain = sure;
             }
             while word != 0 {
                 let low = (i * 64) as u16 + word.trailing_zeros() as u16;
@@ -2656,6 +3034,13 @@ impl OrdinalWalk<'_, '_> {
                 }
                 let tid = self.resolve(ordinal);
                 let candidate = Ranked(total, tid);
+                if certain & (1u64 << (low % 64)) == 0
+                    && (self.heap.len() == self.k
+                        && self.heap.peek().is_none_or(|w| candidate >= *w)
+                        || !self.mixed_holds(key, low, ordinal))
+                {
+                    continue;
+                }
                 if self.heap.len() < self.k {
                     if self.visibility.visible(tid) {
                         self.heap.push(candidate);
@@ -2686,6 +3071,141 @@ impl<'a> HeldPages<'a> {
 impl Drop for HeldPages<'_> {
     fn drop(&mut self) {
         self.0.hold(false);
+    }
+}
+
+/// The disjunction walk's test of a mixed shape (see [`Shape`]).
+impl<'a> OrdinalWalk<'a, '_> {
+    /// The stream `bits` names, if it has members in chunk `key`. A walked
+    /// term on the chunk is one of the disjunction's present terms, and a
+    /// filter is on it once [`Self::seek_filters`] moved it there.
+    fn stream(&self, bits: Bits, key: u16) -> Option<&OrdinalTerm<'a>> {
+        let term = match bits {
+            Bits::Term(t) => &self.terms[t],
+            Bits::Filter(f) => &self.filters[f],
+            Bits::Absent => return None,
+        };
+        (term.key() == Some(key)).then_some(term)
+    }
+
+    /// Moves every filter to chunk `key` or past it.
+    fn seek_filters(&mut self, key: u16) {
+        for filter in &mut self.filters {
+            filter.pos += filter.keys[filter.pos..].partition_point(|k| *k < key);
+        }
+    }
+
+    /// Whether some document of chunk `key` may meet `condition`, by which
+    /// streams have members there.
+    fn chunk_may_hold(&self, condition: &Condition, key: u16) -> bool {
+        match condition {
+            Condition::Leaf(bits) => self.stream(*bits, key).is_some(),
+            Condition::Phrase(slots, _) => slots.iter().all(|b| self.stream(*b, key).is_some()),
+            Condition::All(children) => children.iter().all(|c| self.chunk_may_hold(c, key)),
+            Condition::Any { min, children } => {
+                children
+                    .iter()
+                    .filter(|c| self.chunk_may_hold(c, key))
+                    .take(*min)
+                    .count()
+                    == *min
+            }
+            // A term on the chunk need not be in every document of it.
+            Condition::Not(_) => true,
+        }
+    }
+
+    /// Of word `i` of chunk `key`, the documents that certainly meet
+    /// `condition` and those that may: a phrase's are only possible until
+    /// its positions are read. Every stream on the chunk is loaded.
+    fn condition_word(&self, condition: &Condition, key: u16, i: usize) -> (u64, u64) {
+        let word = |bits: Bits| self.stream(bits, key).map_or(0, |term| term.word(i));
+        match condition {
+            Condition::Leaf(bits) => {
+                let word = word(*bits);
+                (word, word)
+            }
+            Condition::Phrase(slots, _) => (0, slots.iter().fold(!0, |all, b| all & word(*b))),
+            Condition::All(children) => children.iter().fold((!0, !0), |(sure, may), child| {
+                let (s, m) = self.condition_word(child, key, i);
+                (sure & s, may & m)
+            }),
+            Condition::Any { min: 1, children } => {
+                children.iter().fold((0, 0), |(sure, may), child| {
+                    let (s, m) = self.condition_word(child, key, i);
+                    (sure | s, may | m)
+                })
+            }
+            Condition::Any { min, children } => {
+                // Per lane, whether at least `j + 1` children hold it, for
+                // each `j` below `min`.
+                let mut sure = [0u64; MAX_AT_LEAST];
+                let mut may = [0u64; MAX_AT_LEAST];
+                for child in children {
+                    let (s, m) = self.condition_word(child, key, i);
+                    for j in (1..*min).rev() {
+                        sure[j] |= sure[j - 1] & s;
+                        may[j] |= may[j - 1] & m;
+                    }
+                    sure[0] |= s;
+                    may[0] |= m;
+                }
+                (sure[min - 1], may[min - 1])
+            }
+            Condition::Not(inner) => {
+                let (sure, may) = self.condition_word(inner, key, i);
+                (!may, !sure)
+            }
+        }
+    }
+
+    /// Whether the document `low` of chunk `key`, at `ordinal`, meets
+    /// `condition`, reading a phrase's positions only where its slots'
+    /// terms all hold the document and the rest does not settle it.
+    fn condition_holds(&mut self, condition: &Condition, key: u16, low: u16, ordinal: u32) -> bool {
+        let holds = |walk: &Self, bits: Bits| walk.stream(bits, key).is_some_and(|t| t.holds(low));
+        match condition {
+            Condition::Leaf(bits) => holds(self, *bits),
+            Condition::Phrase(slots, n) => {
+                if !slots.iter().all(|b| holds(self, *b)) {
+                    return false;
+                }
+                self.phrase = self.phrases[*n].take();
+                let matched = self.phrase_matches(low, ordinal);
+                self.phrases[*n] = self.phrase.take();
+                matched
+            }
+            Condition::All(children) => children
+                .iter()
+                .all(|child| self.condition_holds(child, key, low, ordinal)),
+            Condition::Any { min, children } => {
+                let mut held = 0;
+                for (n, child) in children.iter().enumerate() {
+                    if children.len() - n < min - held {
+                        return false;
+                    }
+                    if self.condition_holds(child, key, low, ordinal) {
+                        held += 1;
+                        if held == *min {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Condition::Not(inner) => !self.condition_holds(inner, key, low, ordinal),
+        }
+    }
+
+    /// Whether the document `low` of chunk `key` meets the walk's mixed
+    /// shape.
+    fn mixed_holds(&mut self, key: u16, low: u16, ordinal: u32) -> bool {
+        let Some(condition) = self.condition.take() else {
+            return true;
+        };
+        let holds = self.condition_holds(&condition, key, low, ordinal);
+        self.condition = Some(condition);
+        holds
     }
 }
 

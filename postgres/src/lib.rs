@@ -1631,10 +1631,40 @@ mod tests {
             "\"gamma gamma tail\"",
             "\"beta _ tail\"",
             "\"alpha pad _ pad\"",
-            // Shapes the pruned path leaves to full scoring.
+            // Mixed shapes: the disjunction's walk over every scoring term,
+            // admitting only candidates the shape holds. A phrase's words
+            // score wherever they occur, the phrase matching or not.
+            "delta OR \"alpha beta\"",
+            "gamma OR \"beta gamma\"",
+            "\"alpha beta\" OR \"beta gamma\"",
+            "\"pad tail\" OR delta",
+            "beta OR \"gamma gamma tail\"",
+            "alpha OR \"alpha beta\"",
+            "delta OR \"alpha beta\"~1 OR \"gamma _ tail\"",
+            "(alpha AND beta) OR gamma",
+            "(delta AND gamma) OR beta",
+            "(alpha AND beta) OR (gamma AND pad)",
+            "alpha AND (beta OR gamma)",
+            "delta AND (beta OR \"alpha alpha\")",
+            "(alpha OR delta) AND (beta OR gamma)",
+            "delta OR (beta AND (gamma OR \"pad tail\"))",
+            "delta OR beta^2 OR \"alpha pad\"^0.5",
+            "(delta^3 AND alpha) OR gamma^0.5",
             "alpha AND NOT beta",
-            "al*",
+            "delta OR (alpha AND NOT gamma)",
+            "(alpha OR beta) AND NOT \"beta gamma\"",
             "AT LEAST 2 OF [alpha beta gamma]",
+            "AT LEAST 2 OF [delta \"alpha beta\" gamma pad]",
+            "AT LEAST 3 OF [alpha beta gamma delta]",
+            "AT LEAST 2 OF [alpha alpha beta]",
+            "delta OR (gamma AND NOT \"alpha beta\")",
+            "missing OR \"alpha beta\"",
+            "\"alpha missing\" OR delta",
+            "(alpha AND missing) OR beta",
+            "(beta AND missing) OR \"missing gamma\"",
+            // Shapes the pruned path leaves to full scoring.
+            "al*",
+            "al* OR beta",
         ];
         let limits = [
             "LIMIT 1",
@@ -1702,6 +1732,37 @@ mod tests {
             assert_eq!(scan["Pruning"], pruning, "{query}");
             assert!(scan["Scored Candidates"].as_i64().unwrap() < 1500, "{scan}");
         }
+        // Mixed shapes walk the disjunction of their scoring terms, and
+        // score nothing exhaustively.
+        for query in [
+            "delta OR \"alpha beta\"",
+            "\"alpha beta\" OR \"beta gamma\"",
+            "(alpha AND beta) OR gamma",
+            "alpha AND (beta OR gamma)",
+            "(alpha OR delta) AND (beta OR gamma)",
+            "delta OR beta^2 OR \"alpha pad\"^0.5",
+            "alpha AND NOT beta",
+            "delta OR (alpha AND NOT gamma)",
+            "AT LEAST 2 OF [alpha beta gamma]",
+        ] {
+            let scan = explain(query);
+            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
+            assert_eq!(scan["Exhaustive Score Calls"], 0, "{query}: {scan}");
+            assert!(
+                scan["Scored Candidates"].as_i64().unwrap() < 1500,
+                "{query}: {scan}"
+            );
+        }
+        // A phrase child's positions are read only for candidates that
+        // would rank and that no other child already admits.
+        let scan = explain("\"alpha beta\" OR \"beta gamma\"");
+        let checked = scan["Positions Checked"].as_i64().unwrap();
+        assert!(checked > 0 && checked < 1300, "{scan}");
+        let scan = explain("gamma OR \"alpha beta\"");
+        assert!(scan["Positions Checked"].as_i64().unwrap() < 1300, "{scan}");
+        // An expansion is left to full scoring.
+        let scan = explain("al* OR beta");
+        assert!(scan["Pruning"].is_null(), "{scan}");
         // `score` elides `alpha`, which most documents hold. The disjunction
         // is still pruned, over `delta` alone, because its top three all
         // score above the zero of a document holding only `alpha`. Asked for
@@ -1840,6 +1901,11 @@ mod tests {
             "w1^2 OR w3 OR w5^0.5 OR w7 OR w9 OR w11 OR w0 OR w2 OR w4 OR w6^3",
             "w2 OR w2 OR w3 OR w4 OR w5 OR w6 OR w7 OR w8 OR w9 OR w10 OR w12",
             "w8 OR w5 OR w3 OR w2 OR w1 OR w0 OR w6 OR w7 OR w9 OR w10",
+            // Mixed shapes over the same sieve and required terms.
+            "(w0 AND w1) OR w8 OR \"w2 w3\" OR (w9 AND NOT w5) OR w12",
+            "\"w0 w1\" OR \"w2 w3\" OR w12 OR w11 OR (w4 AND w6)",
+            "w1 AND (w2 OR w3 OR \"w5 w8\") AND NOT w7",
+            "AT LEAST 3 OF [w1 w2 w3 w4 w5 w6 \"w0 w1\"]",
         ];
         for query in long {
             for limit in ["LIMIT 1", "LIMIT 3", "LIMIT 10", "LIMIT 100", "LIMIT 1000"] {

@@ -21,6 +21,11 @@
 - A phrase (with slop, gaps or a position filter) is ranked by the
   block-max walk of its words' conjunction; positions are read only for
   candidates that score into the top k. EXPLAIN reports `Positions Checked`.
+- Ranked queries mixing terms, phrases and conjunctions under OR, AND,
+  AT LEAST and AND NOT (`w OR "p q"`, `(a AND b) OR c`, `a AND (b OR c)`,
+  `a AND NOT b`) are pruned by the disjunction walk over their scoring terms,
+  each candidate tested against the query's shape; they scored every match
+  (`a OR "i m"` 16.2 s to 1.6 ms on the 15 million row mock).
 - Segment format `STN3`: a term's documents are stored once, as ordinals
   into the segment's document table with each member's term-frequency
   bucket beside it and a score bound per chunk, so scoring never reads

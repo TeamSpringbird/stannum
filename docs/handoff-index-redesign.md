@@ -543,9 +543,12 @@ of the three first-round branches turned up a pre-existing bug the
 property test caught: `DocCursor::seek` resurrected an exhausted
 universe under `NOT` (`7eb033f`).
 
-Found and not yet fixed: a disjunction with a phrase child (`a OR "i m"`,
-which is also how `i''m` parses) is not a prunable shape and scores every
-match, 17 s on the mock. The published trace never mixes the two.
+Found then, fixed on `perf/mixed-disjunction`: a disjunction with a phrase
+child (`a OR "i m"`, which is also how `i''m` parses) was not a prunable
+shape and scored every match, 17 s on the mock. The published trace never
+mixes the two. Such shapes (and `(a AND b) OR c`, `a AND (b OR c)`,
+`a AND NOT b`, `AT LEAST n OF [...]`) now walk the disjunction of their
+scoring terms, testing each candidate against the shape: 1 to 4 ms.
 
 Time now: disjunctions 47%, phrases 32%, conjunctions 21%. Next: the
 per-candidate class and length reads in `score_candidate` (29% of walk
