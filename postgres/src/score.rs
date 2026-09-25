@@ -1325,7 +1325,7 @@ impl IndexScorer {
                         ))
                     });
                     let payload = segment_error_in(term.payload(), label);
-                    (member, payload.cursor(), payload.count())
+                    (member, walk_cursor(&payload), payload.count())
                 })
                 .collect::<Vec<_>>();
             PhraseCheck {
@@ -1952,6 +1952,16 @@ struct PhraseCheck<'a> {
     read: Vec<bool>,
 }
 
+/// A cursor over a phrase slot's positions for a walk, reading its spans in
+/// place from the pages the walk's segment holds pinned.
+fn walk_cursor<'a>(payload: &segment::payload::Payload<'a>) -> segment::payload::PayloadCursor<'a> {
+    let mut cursor = payload.cursor();
+    // SAFETY: the cursor goes into a `PhraseCheck` of the walk, which is
+    // dropped before the walk's hold span closes (see `walk_by_ordinal`).
+    unsafe { cursor.hold_in_place() };
+    cursor
+}
+
 /// The position check of a mixed shape's phrase, whose slot `n` ranks in
 /// the walked stream `members[n]`; every slot's term is in `source`.
 fn phrase_check<'a>(
@@ -1971,7 +1981,7 @@ fn phrase_check<'a>(
                 ))
             });
             let payload = segment_error_in(term.payload(), label);
-            (*member, payload.cursor(), payload.count())
+            (*member, walk_cursor(&payload), payload.count())
         })
         .collect::<Vec<_>>();
     PhraseCheck {

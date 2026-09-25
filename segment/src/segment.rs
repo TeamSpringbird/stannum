@@ -1899,6 +1899,58 @@ mod tests {
     }
 
     #[test]
+    fn position_spans_read_in_place_equal_spans_copied() {
+        let bytes = chunky_segment();
+        let whole = Segment::parse(&bytes).unwrap();
+        let (mut held_spans, mut loads) = (0, 0);
+        for page in [97, 1024, 8150] {
+            let paged = Reader::new(Paged::new(bytes.clone(), page)).unwrap();
+            for name in ["half", "most", "some", "few", "pair"] {
+                let expected_payload = whole.term(name).unwrap().unwrap().payload().unwrap();
+                let count = expected_payload.count();
+                paged.hold(true);
+                let payload = paged.term(name).unwrap().unwrap().payload().unwrap();
+                // Sweeps, which double their spans, then jumps of every
+                // length, forward as a walk reads, and a few back.
+                let targets: Vec<u32> = (0..count.min(300))
+                    .chain((0..count).step_by(7))
+                    .chain((0..count).step_by(131))
+                    .chain((0..count).rev().step_by(977))
+                    .collect();
+                let mut cursor = payload.cursor();
+                // SAFETY: the cursor is dropped before the span closes.
+                unsafe { cursor.hold_in_place() };
+                let mut expected = expected_payload.cursor();
+                let (mut got, mut want) = (Vec::new(), Vec::new());
+                for (n, target) in targets.into_iter().enumerate() {
+                    cursor.seek(target).unwrap();
+                    expected.seek(target).unwrap();
+                    if n % 5 == 4 && target + 1 < count {
+                        cursor.skip_entry().unwrap();
+                        expected.skip_entry().unwrap();
+                    }
+                    got.clear();
+                    want.clear();
+                    cursor.next_into(&mut got).unwrap();
+                    expected.next_into(&mut want).unwrap();
+                    assert_eq!(got, want, "{name} entry {target} on {page}-byte pages");
+                    loads += 1;
+                    held_spans += usize::from(cursor.is_held());
+                }
+                drop(cursor);
+                assert!(paged.source.held() <= 1, "{}", paged.source.held());
+                paged.hold(false);
+                assert_eq!(paged.source.held(), 0);
+            }
+        }
+        // Spans on 97-byte pages mostly overrun them and are copied.
+        assert!(
+            held_spans > loads / 2 && held_spans < loads,
+            "{held_spans} of {loads}"
+        );
+    }
+
+    #[test]
     fn empty_segment_and_corruption() {
         let bytes = SegmentBuilder::default().finish();
         let segment = Segment::parse(&bytes).unwrap();

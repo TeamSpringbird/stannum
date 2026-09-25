@@ -380,10 +380,12 @@ impl<'a> Payload<'a> {
             payload: *self,
             reader,
             owned: std::rc::Rc::from(Vec::new()),
+            held: None,
             owned_at: 0,
             slots: (0, 0),
             span_at: 0,
             next_ordinal: 0,
+            in_place: InPlace::Off,
         }
     }
 
@@ -404,15 +406,123 @@ pub struct PayloadCursor<'a> {
     /// The loaded span of a ranged stream, owned: it is read once and
     /// replaced by the next, so a sweep of a frequent term holds one span.
     owned: std::rc::Rc<[u8]>,
+    /// The loaded span in place instead, as its first byte and length, on
+    /// a page the source holds pinned (see [`PayloadCursor::hold_in_place`]).
+    held: Option<(*const u8, usize)>,
     owned_at: usize,
     /// The loaded span of a ranged stream as (first skip slot, slots), and
     /// where it starts in the stream.
     slots: (usize, usize),
     span_at: usize,
     next_ordinal: u32,
+    /// Whether spans may be read in place, and the slot they are held in.
+    in_place: InPlace,
+}
+
+/// A cursor's reading of spans in place (see [`PayloadCursor::hold_in_place`]).
+#[derive(Clone, Copy, Debug)]
+enum InPlace {
+    Off,
+    /// Allowed, no slot handed out yet.
+    Allowed,
+    /// Held in this slot of the source.
+    Slot(usize),
 }
 
 impl PayloadCursor<'_> {
+    /// Reads the spans a ranged stream loads in place from the page the
+    /// source holds pinned for the cursor, where the source holds pages
+    /// and a span lies on one page; the rest are copied as before. A
+    /// phrase check loads a span per candidate slot it reads, and copying
+    /// it through the read cache was most of the reading.
+    ///
+    /// # Safety
+    ///
+    /// Once a span is loaded within a source's
+    /// [`crate::source::Source::hold`] span, the cursor must not be used
+    /// after that span closes.
+    pub unsafe fn hold_in_place(&mut self) {
+        if matches!(self.payload.source, Bytes::Ranged { .. }) {
+            self.in_place = InPlace::Allowed;
+        }
+    }
+
+    /// Whether the loaded span is read in place.
+    pub fn is_held(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// The loaded span of a ranged stream.
+    #[inline]
+    fn span(&self) -> &[u8] {
+        match self.held {
+            // SAFETY: the page stays pinned until the next load on the
+            // cursor's slot, which replaces `held`, or the end of the hold
+            // span, after which `hold_in_place`'s contract bars any use.
+            Some((data, len)) => unsafe { std::slice::from_raw_parts(data, len) },
+            None => &self.owned,
+        }
+    }
+
+    /// Loads skip slots `slot..slot + count`, bytes `start..` of the
+    /// stream, in place when the source holds a page for the cursor: as
+    /// many of the slots as end on the page `start` is on, at least one.
+    /// `Some(Ok(0))` where the first slot runs over its page's end: the
+    /// caller copies it alone, and the next load is in place again. `None`
+    /// where the source holds no page; the caller copies them all.
+    fn load_held(
+        &mut self,
+        areas: &dyn crate::segment::AreaFetch,
+        base: u64,
+        slot: usize,
+        count: usize,
+        start: usize,
+    ) -> Option<Result<usize>> {
+        let held = match self.in_place {
+            InPlace::Off => return None,
+            InPlace::Slot(held) => held,
+            InPlace::Allowed => {
+                let held = areas.held_slot()?;
+                self.in_place = InPlace::Slot(held);
+                held
+            }
+        };
+        let first = match self.payload.slot_at(slot + 1) {
+            Ok(end) => end,
+            Err(error) => return Some(Err(error)),
+        };
+        if first <= start {
+            return Some(Ok(0));
+        }
+        let range = match areas.payload_held(held, base + start as u64, 1)? {
+            Ok(range) => range,
+            Err(error) => return Some(Err(error)),
+        };
+        let (data, on_page) = range.head();
+        if on_page < first - start {
+            return Some(Ok(0));
+        }
+        // The most slots of the `count` wanted that end on the page: the
+        // first ends there, so search the rest.
+        let (mut take, mut end) = (1, first);
+        let (mut lo, mut hi) = (2, count);
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let at = match self.payload.slot_at(slot + mid) {
+                Ok(at) => at,
+                Err(error) => return Some(Err(error)),
+            };
+            if at - start <= on_page {
+                (take, end) = (mid, at);
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        self.held = Some((data, end - start));
+        Some(Ok(take))
+    }
+
     /// Ordinal the next `next()` call will decode.
     pub const fn next_ordinal(&self) -> u32 {
         self.next_ordinal
@@ -440,7 +550,19 @@ impl PayloadCursor<'_> {
         if end < start {
             return Err(Error::Corrupt("payload skip order"));
         }
-        self.owned = areas.payload_range_owned(base + start as u64, end - start)?;
+        self.held = None;
+        let count = match self.load_held(areas, base, slot, count, start) {
+            Some(Ok(0)) => {
+                let end = self.payload.slot_at(slot + 1)?;
+                self.owned = areas.payload_range_owned(base + start as u64, end - start)?;
+                1
+            }
+            Some(taken) => taken?,
+            None => {
+                self.owned = areas.payload_range_owned(base + start as u64, end - start)?;
+                count
+            }
+        };
         self.owned_at = 0;
         self.slots = (slot, count);
         self.span_at = start;
@@ -453,7 +575,7 @@ impl PayloadCursor<'_> {
 
     fn set_position(&mut self, at: usize) -> Result<()> {
         if self.ranged() {
-            if at > self.owned.len() {
+            if at > self.span().len() {
                 return Err(Error::Truncated);
             }
             self.owned_at = at;
@@ -469,7 +591,7 @@ impl PayloadCursor<'_> {
         let (value, at) = {
             let (bytes, mut at) = match self.payload.source {
                 Bytes::Whole(bytes) => (bytes, self.reader.position()),
-                Bytes::Ranged { .. } => (&self.owned[..], self.owned_at),
+                Bytes::Ranged { .. } => (self.span(), self.owned_at),
             };
             (f(bytes, &mut at)?, at)
         };
