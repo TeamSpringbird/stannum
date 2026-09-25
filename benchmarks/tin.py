@@ -567,7 +567,11 @@ def run(args):
                          '-c', f'max_parallel_workers={args.cpus}', '-c', 'jit=off',
                          '-c', 'track_io_timing=on', '-c', f'plan_cache_mode={args.plan_cache_mode}'] +
                         (['-c', f'stannum.build_segment_docs={args.build_segment_docs}']
-                         if engine == 'stannum' and getattr(args, 'build_segment_docs', None) is not None else []),
+                         if engine == 'stannum' and getattr(args, 'build_segment_docs', None) is not None else []) +
+                        # Local experiments only, recorded in the manifest: extra server
+                        # settings such as STANNUM_POSTGRES_SETTINGS="stannum.read_cache_mb=256".
+                        [a for setting in shlex.split(os.environ.get('STANNUM_POSTGRES_SETTINGS', ''))
+                         for a in ('-c', setting)],
                         stdout=subprocess.DEVNULL)
                 deadline = time.monotonic() + 90
                 while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
