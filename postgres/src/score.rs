@@ -1076,6 +1076,7 @@ impl IndexScorer {
             uppers: Vec::new(),
             term_subs: Vec::new(),
             phrase,
+            pending: Vec::new(),
         };
         match combine {
             Combine::Any => walk.any(),
@@ -1280,24 +1281,23 @@ impl OrdinalTerm<'_> {
 
     /// Whether the loaded chunk holds `low`, and the member's rank in the stream.
     ///
-    /// Candidates are ranked in ascending order within a chunk, so the
-    /// members before `low` are counted from where the last call stopped;
-    /// counting from the chunk's start each time was a thousand words per
-    /// candidate per term.
+    /// Candidates are mostly ranked in ascending order within a chunk, so
+    /// the members before `low` are counted from where the last call
+    /// stopped, forwards or back; counting from the chunk's start each time
+    /// was a thousand words per candidate per term.
     fn rank(&mut self, low: u16) -> Option<u32> {
         let word_at = usize::from(low / 64);
         let word = self.words[word_at];
         if word & (1 << (low % 64)) == 0 {
             return None;
         }
-        let (mut counted_to, mut before) = self.counted;
+        let (counted_to, mut before) = self.counted;
+        let count = |words: &[u64]| words.iter().map(|w| w.count_ones()).sum::<u32>();
         if counted_to > word_at {
-            (counted_to, before) = (0, 0);
+            before -= count(&self.words[word_at..counted_to]);
+        } else {
+            before += count(&self.words[counted_to..word_at]);
         }
-        before += self.words[counted_to..word_at]
-            .iter()
-            .map(|w| w.count_ones())
-            .sum::<u32>();
         self.counted = (word_at, before);
         Some(self.rank_base + before + (word & ((1u64 << (low % 64)) - 1)).count_ones())
     }
@@ -1337,6 +1337,9 @@ struct OrdinalWalk<'a, 's> {
     term_subs: Vec<[f32; SUBS]>,
     /// For a phrase: the positions check a candidate must pass to be admitted.
     phrase: Option<PhraseCheck<'a>>,
+    /// Scratch for a sub-block: the phrase candidates that scored into the
+    /// top k, as (score, low bits), awaiting their positions check.
+    pending: Vec<(f32, u16)>,
 }
 
 /// Which walked stream a phrase slot's term is.
@@ -1867,12 +1870,16 @@ impl OrdinalWalk<'_, '_> {
         }
         let mut sparse_at = 0usize;
         let mut skip_sub = false;
+        let all: Vec<usize> = (0..self.terms.len()).collect();
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.clear();
         #[expect(
             clippy::needless_range_loop,
             reason = "the index addresses the sub-block and the sparse members too"
         )]
         for i in 0..segment::ordinals::WORDS {
             if i % (SUB / 64) == 0 {
+                self.verify_pending(&mut pending, base);
                 // The threshold moves as candidates are admitted, so it is
                 // consulted afresh at every sub-block and candidate: the
                 // chunk that fills the top k also prunes the rest of itself.
@@ -1899,7 +1906,6 @@ impl OrdinalWalk<'_, '_> {
                 word &= word - 1;
                 let ordinal = base + u32::from(low);
                 let sub = usize::from(low) / SUB;
-                let all: Vec<usize> = (0..self.terms.len()).collect();
                 let pruning = self.threshold().is_some();
                 let Some(total) = self.score_candidate(&all, low, ordinal, sub, pruning) else {
                     continue;
@@ -1909,23 +1915,76 @@ impl OrdinalWalk<'_, '_> {
                 if !admit {
                     continue;
                 }
-                if self.phrase.is_some() && !self.phrase_matches(low, ordinal) {
+                if self.phrase.is_some() {
+                    // A phrase candidate is held until the sub-block is
+                    // scored: its positions are read only if it still ranks.
+                    pending.push((total, low));
                     continue;
                 }
-                let tid = self.resolve(ordinal);
-                let candidate = Ranked(total, tid);
-                if self.heap.len() < self.k {
-                    if self.visibility.visible(tid) {
-                        self.heap.push(candidate);
-                    }
-                } else if self.heap.peek().is_some_and(|w| candidate < *w)
-                    && self.visibility.visible(tid)
-                {
-                    self.heap.pop();
-                    self.heap.push(candidate);
-                }
+                self.admit(total, ordinal);
             }
         }
+        self.verify_pending(&mut pending, base);
+        self.pending = pending;
+    }
+
+    /// Admits the document at `ordinal`, scoring `total`, to the heap if it
+    /// ranks in the top k and is visible.
+    fn admit(&mut self, total: f32, ordinal: u32) {
+        let tid = self.resolve(ordinal);
+        let candidate = Ranked(total, tid);
+        if self.heap.len() < self.k {
+            if self.visibility.visible(tid) {
+                self.heap.push(candidate);
+            }
+        } else if self.heap.peek().is_some_and(|w| candidate < *w) && self.visibility.visible(tid) {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    /// Checks a sub-block's phrase candidates, best score first, each
+    /// against the threshold as it then stands. A confirmed match raises
+    /// the threshold, and the candidates it now outranks are dropped
+    /// without reading their positions: checked in ordinal order, a
+    /// sub-block of common words read positions for every candidate
+    /// scoring above a threshold only its rare matches could raise. The
+    /// heap ends the same whichever order admits to it, so the top k is
+    /// bit for bit the exhaustive one.
+    ///
+    /// Until the heap is full nothing is outranked, so the candidates are
+    /// checked in ordinal order, which reads each slot's positions
+    /// forwards; best first, a phrase that never fills its top k read them
+    /// scattered, and a payload cursor moved back re-reads its skip span.
+    fn verify_pending(&mut self, pending: &mut Vec<(f32, u16)>, base: u32) {
+        let by_score = |a: &(f32, u16), b: &(f32, u16)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+        let mut sorted = false;
+        let mut at = 0;
+        while at < pending.len() {
+            if !sorted && self.threshold().is_some() {
+                pending[at..].sort_by(by_score);
+                sorted = true;
+            }
+            let (total, low) = pending[at];
+            at += 1;
+            let ordinal = base + u32::from(low);
+            if self.heap.len() == self.k
+                && let Some(worst) = self.heap.peek().map(|w| (w.0, w.1))
+            {
+                // As `admit` ranks: a better score, or the same from an
+                // earlier location.
+                match total.total_cmp(&worst.0) {
+                    Ordering::Less => continue,
+                    Ordering::Equal if self.resolve(ordinal) >= worst.1 => continue,
+                    _ => {}
+                }
+            }
+            if !self.phrase_matches(low, ordinal) {
+                continue;
+            }
+            self.admit(total, ordinal);
+        }
+        pending.clear();
     }
 
     /// Scores the documents of chunk `key` that the terms `present` (in slot
