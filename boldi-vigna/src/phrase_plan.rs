@@ -107,6 +107,29 @@ impl PhrasePlan {
         )
     }
 
+    /// DIAG: (earlier slot, positions of it a lazy test needs, later slot, positions of it needed).
+    pub fn pair_consumption(&self, pair: usize, positions: &impl TermPositions) -> (usize, usize, usize, usize) {
+        let (lo, hi) = self.gaps[pair];
+        let (a, b) = (self.leaves[pair], self.leaves[pair + 1]);
+        let earlier = positions.positions(a);
+        let later = positions.positions(b);
+        let mut j = 0;
+        for (i, &at) in earlier.iter().enumerate() {
+            let Some(least) = at.checked_add(lo) else {
+                return (a, i + 1, b, j);
+            };
+            while later.get(j).is_some_and(|&next| next < least) {
+                j += 1;
+            }
+            match later.get(j) {
+                None => return (a, i + 1, b, later.len()),
+                Some(&next) if next - at <= hi => return (a, i + 1, b, j + 1),
+                Some(_) => {}
+            }
+        }
+        (a, earlier.len(), b, (j + 1).min(later.len()))
+    }
+
     /// Adds the leaves of `query`; `cap` is the gap budget of the nearest
     /// enclosing filter, which bounds the junctions of an ordered sequence
     /// directly under it.
