@@ -1409,6 +1409,35 @@ impl OrdinalWalk<'_, '_> {
         set: &mut segment::ordinals::Words,
     ) {
         let base = u32::from(key) << 16;
+        // Per sub-block, the best a shared document could score: each term's
+        // largest bucket there at the shared shortest length; a sub-block
+        // some term lacks holds no shared document. From the directory, so a
+        // chunk no sub-block of which can reach the threshold is skipped
+        // before any stream is read.
+        let mut sub_scores = [0.0_f32; SUBS];
+        let mut sub_empty = [false; SUBS];
+        for term in &mut self.terms {
+            let scorer = &self.scorer.terms[term.slot].1;
+            let by_bucket = term.bounds_by_bucket(term.pos, scorer, min_length);
+            for (i, (sub, score)) in term.sub_bounds[term.pos]
+                .iter()
+                .zip(sub_scores.iter_mut())
+                .enumerate()
+            {
+                if *sub == 0 {
+                    sub_empty[i] = true;
+                } else {
+                    *score += by_bucket[usize::from(*sub - 1)];
+                }
+            }
+        }
+        if self.threshold().is_some()
+            && !(0..SUBS).any(|sub| {
+                !sub_empty[sub] && self.can_beat(sub_scores[sub], base + (sub * SUB) as u32)
+            })
+        {
+            return;
+        }
         // The shared members: the lead's array tested against the others'
         // bits, or the words of every stream combined. Streams are loaded
         // rarest first and only while members remain, so a conjunction of
@@ -1471,26 +1500,6 @@ impl OrdinalWalk<'_, '_> {
                 }
             } else {
                 set[low / 64] &= !(1 << (low % 64));
-            }
-        }
-        // Per sub-block, the best a shared document could score: each term's
-        // largest bucket there at the shared shortest length; a sub-block
-        // some term lacks holds no shared document.
-        let mut sub_scores = [0.0_f32; SUBS];
-        let mut sub_empty = [false; SUBS];
-        for term in &mut self.terms {
-            let scorer = &self.scorer.terms[term.slot].1;
-            let by_bucket = term.bounds_by_bucket(term.pos, scorer, min_length);
-            for (i, (sub, score)) in term.sub_bounds[term.pos]
-                .iter()
-                .zip(sub_scores.iter_mut())
-                .enumerate()
-            {
-                if *sub == 0 {
-                    sub_empty[i] = true;
-                } else {
-                    *score += by_bucket[usize::from(*sub - 1)];
-                }
             }
         }
         let mut sparse_at = 0usize;
@@ -1705,6 +1714,29 @@ impl OrdinalWalk<'_, '_> {
 
     fn evaluate(&mut self, key: u16, present: &[usize], set: &mut segment::ordinals::Words) {
         let base = u32::from(key) << 16;
+        // Per sub-block, the best a candidate could score: the sum over the
+        // present terms of their largest bucket there at that bucket's
+        // shortest document. The bounds come from the directory, parsed when
+        // the term opened, so a chunk no sub-block of which can reach the
+        // threshold is skipped before any of its members are read: at 150
+        // million rows a three-term disjunction loaded every chunk of every
+        // term for 2,300 candidates.
+        let mut sub_scores = [0.0_f32; SUBS];
+        for &t in present {
+            let term = &mut self.terms[t];
+            let scorer = &self.scorer.terms[term.slot].1;
+            let by_bucket = term.bounds_by_bucket(term.pos, scorer, 0);
+            for (sub, score) in term.sub_bounds[term.pos].iter().zip(sub_scores.iter_mut()) {
+                if *sub > 0 {
+                    *score += by_bucket[usize::from(*sub - 1)];
+                }
+            }
+        }
+        if self.threshold().is_some()
+            && !(0..SUBS).any(|sub| self.can_beat(sub_scores[sub], base + (sub * SUB) as u32))
+        {
+            return;
+        }
         // Every present term's chunk is loaded: a candidate is scored by
         // testing each term's bits for it.
         for &t in present {
@@ -1770,20 +1802,6 @@ impl OrdinalWalk<'_, '_> {
                 }
             } else {
                 set[low / 64] &= !(1 << (low % 64));
-            }
-        }
-        // Per sub-block, the best a candidate could score: the sum over the
-        // present terms of their largest bucket there at the chunk's shortest
-        // document; sub-blocks that cannot reach the threshold are skipped.
-        let mut sub_scores = [0.0_f32; SUBS];
-        for &t in present {
-            let term = &mut self.terms[t];
-            let scorer = &self.scorer.terms[term.slot].1;
-            let by_bucket = term.bounds_by_bucket(term.pos, scorer, 0);
-            for (sub, score) in term.sub_bounds[term.pos].iter().zip(sub_scores.iter_mut()) {
-                if *sub > 0 {
-                    *score += by_bucket[usize::from(*sub - 1)];
-                }
             }
         }
         let mut sparse_at = 0usize;
