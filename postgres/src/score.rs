@@ -1953,7 +1953,7 @@ impl WordSieve {
                     self.order.push((bound, n));
                 }
             }
-            self.order.sort_by(|a, b| a.0.total_cmp(&b.0));
+            insertion_sort_by(&mut self.order, |a, b| a.0.total_cmp(&b.0).is_lt());
             let mut tail = fixed;
             let mut inessential = 0;
             for &(bound, _) in &self.order {
@@ -2026,6 +2026,22 @@ impl WordSieve {
             kept &= lanes.reached();
         }
         kept
+    }
+}
+
+/// Sorts `v` by `less`, stably, by insertion: the walk sorts a few terms
+/// per chunk, mostly in order already, where the general sort's setup and
+/// partitioning cost more than the comparisons.
+#[inline]
+fn insertion_sort_by<T: Copy>(v: &mut [T], mut less: impl FnMut(&T, &T) -> bool) {
+    for i in 1..v.len() {
+        let x = v[i];
+        let mut j = i;
+        while j > 0 && less(&x, &v[j - 1]) {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
     }
 }
 
@@ -2179,7 +2195,12 @@ impl OrdinalWalk<'_, '_> {
             if order.is_empty() {
                 return;
             }
-            order.sort_unstable_by_key(|&t| self.terms[t].key());
+            // Only the terms stepped last round moved, so the order is
+            // nearly sorted.
+            let terms = &self.terms;
+            insertion_sort_by(&mut order, |&a, &b| {
+                terms[a].keys[terms[a].pos] < terms[b].keys[terms[b].pos]
+            });
             let threshold = self.threshold();
             // The pivot: the first chunk at which the terms up to it could
             // together reach the threshold, by their whole-term maxima.
@@ -2246,7 +2267,7 @@ impl OrdinalWalk<'_, '_> {
             // Every term of the prefix is on the pivot chunk: fold and score it.
             present.clear();
             present.extend(order[..=p].iter().copied());
-            present.sort_unstable();
+            insertion_sort_by(&mut present, |a, b| a < b);
             self.evaluate(pivot, &present, &mut set);
             for &t in &present {
                 self.terms[t].pos += 1;
@@ -2261,6 +2282,10 @@ impl OrdinalWalk<'_, '_> {
         let lead = (0..self.terms.len())
             .min_by_key(|&t| self.terms[t].keys.len())
             .expect("a conjunction has terms");
+        // The other terms, rarest first: the order each chunk narrows in.
+        let mut others: Vec<usize> = (0..self.terms.len()).filter(|&t| t != lead).collect();
+        others.sort_by_key(|&t| self.terms[t].keys.len());
+        let all: Vec<usize> = (0..self.terms.len()).collect();
         let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
         loop {
             self.iterations = self.iterations.wrapping_add(1);
@@ -2313,7 +2338,7 @@ impl OrdinalWalk<'_, '_> {
                 self.step_all();
                 continue;
             }
-            self.evaluate_all(key, lead, min_length, &mut set);
+            self.evaluate_all(key, lead, &others, &all, min_length, &mut set);
             self.step_all();
         }
     }
@@ -2334,6 +2359,8 @@ impl OrdinalWalk<'_, '_> {
         let lead = (0..self.filters.len())
             .min_by_key(|&f| self.filters[f].keys.len())
             .expect("an unscored conjunction has filters");
+        let mut others: Vec<usize> = (0..self.filters.len()).filter(|&f| f != lead).collect();
+        others.sort_by_key(|&f| self.filters[f].keys.len());
         let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
         loop {
             self.iterations = self.iterations.wrapping_add(1);
@@ -2361,7 +2388,7 @@ impl OrdinalWalk<'_, '_> {
                 continue;
             }
             let base = u32::from(key) << 16;
-            if !self.can_beat(0.0, base) || !self.evaluate_unscored(key, lead, &mut set) {
+            if !self.can_beat(0.0, base) || !self.evaluate_unscored(key, lead, &others, &mut set) {
                 return;
             }
             for filter in &mut self.filters {
@@ -2377,6 +2404,7 @@ impl OrdinalWalk<'_, '_> {
         &mut self,
         key: u16,
         lead: usize,
+        others: &[usize],
         set: &mut segment::ordinals::Words,
     ) -> bool {
         let base = u32::from(key) << 16;
@@ -2388,9 +2416,7 @@ impl OrdinalWalk<'_, '_> {
         } else {
             self.filters[lead].assign_into(set);
         }
-        let mut order: Vec<usize> = (0..self.filters.len()).filter(|&f| f != lead).collect();
-        order.sort_by_key(|&f| self.filters[f].keys.len());
-        for f in order {
+        for &f in others {
             if !narrow(&mut self.filters[f], sparse, set, &mut lows) {
                 return true;
             }
@@ -2446,6 +2472,8 @@ impl OrdinalWalk<'_, '_> {
         &mut self,
         key: u16,
         lead: usize,
+        others: &[usize],
+        all: &[usize],
         min_length: u32,
         set: &mut segment::ordinals::Words,
     ) {
@@ -2497,9 +2525,7 @@ impl OrdinalWalk<'_, '_> {
         } else {
             self.terms[lead].assign_into(set);
         }
-        let mut order: Vec<usize> = (0..self.terms.len()).filter(|&t| t != lead).collect();
-        order.sort_by_key(|&t| self.terms[t].keys.len());
-        for t in order {
+        for &t in others {
             if !narrow(&mut self.terms[t], sparse, set, &mut lows) {
                 return;
             }
@@ -2512,7 +2538,6 @@ impl OrdinalWalk<'_, '_> {
         drop_dead(self.dead, base, sparse, set, &mut lows);
         let mut sparse_at = 0usize;
         let mut skip_sub = false;
-        let all: Vec<usize> = (0..self.terms.len()).collect();
         let mut pending = std::mem::take(&mut self.pending);
         pending.clear();
         #[expect(
@@ -2549,7 +2574,7 @@ impl OrdinalWalk<'_, '_> {
                 let ordinal = base + u32::from(low);
                 let sub = usize::from(low) / SUB;
                 let pruning = self.threshold().is_some();
-                let Some(total) = self.score_candidate(&all, low, ordinal, sub, pruning) else {
+                let Some(total) = self.score_candidate(all, low, ordinal, sub, pruning) else {
                     continue;
                 };
                 let admit =
@@ -2834,7 +2859,7 @@ impl OrdinalWalk<'_, '_> {
                 (self.terms[t].bound_score(pos, scorer), t)
             })
             .collect();
-        by_bound.sort_by(|a, b| b.0.total_cmp(&a.0));
+        insertion_sort_by(&mut by_bound, |a, b| b.0.total_cmp(&a.0).is_lt());
         let mut essential = by_bound.len();
         if let Some((threshold, _)) = self.threshold() {
             let mut tail = 0.0_f64;
@@ -2857,16 +2882,13 @@ impl OrdinalWalk<'_, '_> {
         for (_, t) in &by_bound[..essential] {
             self.terms[*t].load();
         }
-        let sparse = by_bound[..essential]
-            .iter()
-            .all(|(_, t)| !self.terms[*t].dense);
+        // One array's members are the candidates as they stand; the union
+        // of several is taken as words, where sorting their members was a
+        // sort of thousands of ordinals per chunk.
+        let sparse = essential == 1 && !self.terms[by_bound[0].1].dense;
         let mut lows: Vec<u16> = Vec::new();
         if sparse {
-            for (_, t) in &by_bound[..essential] {
-                lows.extend_from_slice(&self.terms[*t].members);
-            }
-            lows.sort_unstable();
-            lows.dedup();
+            lows.extend_from_slice(&self.terms[by_bound[0].1].members);
         } else {
             set.fill(0);
             for (_, t) in &by_bound[..essential] {
