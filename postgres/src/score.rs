@@ -1382,6 +1382,7 @@ impl IndexScorer {
             iterations: 0,
             // An unscored walk has no score to seed: every match ties at zero.
             seed: if unscored { None } else { seeded_threshold() },
+            bar: None,
             values: Vec::new(),
             uppers: Vec::new(),
             buckets: Vec::new(),
@@ -1391,6 +1392,7 @@ impl IndexScorer {
             condition,
             phrases,
         };
+        walk.raise();
         match combine {
             Combine::Any => walk.any(),
             Combine::All if unscored => walk.all_unscored(),
@@ -1805,6 +1807,10 @@ struct OrdinalWalk<'a, 's> {
     /// per sub-block and per candidate, and a setting read is a thread
     /// check and a lookup each time.
     seed: Option<(f32, Tid)>,
+    /// The threshold as the heap and the seed set it, kept current by every
+    /// change to the heap: it is consulted per sub-block and per candidate,
+    /// and deriving it each time peeked the heap and matched the seed.
+    bar: Option<(f32, Tid)>,
     /// Scratch for scoring a candidate: per present term its bound or score,
     /// and the terms holding the document.
     values: Vec<f32>,
@@ -2178,17 +2184,32 @@ impl OrdinalWalk<'_, '_> {
         matched
     }
 
+    #[inline]
     fn threshold(&self) -> Option<(f32, Tid)> {
+        self.bar
+    }
+
+    /// Brings the threshold up to date after the heap changed.
+    fn raise(&mut self) {
         let real = if self.heap.len() == self.k {
             self.heap.peek().map(|w| (w.0, w.1))
         } else {
             None
         };
-        match (real, self.seed) {
+        self.bar = match (real, self.seed) {
             (Some(real), Some(seed)) if seed.0 > real.0 => Some(seed),
             (None, seed) => seed,
             (real, _) => real,
+        };
+    }
+
+    /// Adds `candidate` to the heap, dropping the worst row once it holds k.
+    fn push(&mut self, candidate: Ranked) {
+        if self.heap.len() == self.k {
+            self.heap.pop();
         }
+        self.heap.push(candidate);
+        self.raise();
     }
 
     /// Whether a document at or after `ordinal` scoring at most `bound`
@@ -2633,11 +2654,10 @@ impl OrdinalWalk<'_, '_> {
         let candidate = Ranked(total, tid);
         if self.heap.len() < self.k {
             if self.visibility.visible(tid) {
-                self.heap.push(candidate);
+                self.push(candidate);
             }
         } else if self.heap.peek().is_some_and(|w| candidate < *w) && self.visibility.visible(tid) {
-            self.heap.pop();
-            self.heap.push(candidate);
+            self.push(candidate);
         }
     }
 
@@ -3096,13 +3116,12 @@ impl OrdinalWalk<'_, '_> {
                 }
                 if self.heap.len() < self.k {
                     if self.visibility.visible(tid) {
-                        self.heap.push(candidate);
+                        self.push(candidate);
                     }
                 } else if self.heap.peek().is_some_and(|w| candidate < *w)
                     && self.visibility.visible(tid)
                 {
-                    self.heap.pop();
-                    self.heap.push(candidate);
+                    self.push(candidate);
                 }
             }
         }
