@@ -311,7 +311,7 @@ mod tests {
             assert!(q >= exact, "{exact} -> {q}");
             assert!(q <= max);
             assert!(
-                exact < max * 1e-4 || q <= exact / C_STEP as f32 * 1.0001,
+                exact < max * C_STEP.powi(254) as f32 || q <= exact / C_STEP as f32 * 1.0001,
                 "{exact} -> {q}"
             );
             exact *= 0.9;
