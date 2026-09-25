@@ -512,11 +512,46 @@ cannot reach the threshold without) cut the 7 stopword disjunction 89.7
 to 74.2 ms and "python OR java OR sql" 33.0 to 20.7 ms warm; the mixed
 workload stayed within noise at 165.6 QPS.
 
-Next, in order: chunk loads (an 8 KiB copy per loaded chunk, 139 MB for
-a 15 word disjunction, could borrow the cached bytes instead); the
-streamed conjunction skeleton behind all-elided phrases (1.9 s); the
-per-candidate length lookup. The segment count is not a lever: setup
-pages are zero and chunk loads scale with documents, not segments.
+### Two rounds of parallel branches, 2026-09-25
+
+Each branch was built off the branch head, validated on the 15 million
+row mock by its own agent, then measured here on a quiet machine at 150
+million rows (mixed, byte cap lifted, 300 s), one build after another.
+
+| branch | mixed QPS | against | merged |
+|---|---|---|---|
+| `perf/length-lookups` (bucket bound before the length read) | 169.1 | 160.0 | yes |
+| `perf/chunk-loads` (bitmap chunks read in place, lazy loads) | 168.0 | 160.0 | yes |
+| `perf/elided-phrase` (all-elided phrases walked by ordinal) | 163.0 | 160.0 | yes, for the 2 s tail |
+| all three merged (`7eb033f`) | 174.2, 176.7 | | |
+| `perf/threshold-warmup` (best-bounded chunks first) | 172.2 | 176.7 | no |
+| read cache 256 MB instead of 64 (setting only) | 165.0 | 176.7 | no |
+| `perf/word-bounds` (a word's lanes sieved before the per-member bound) | 188.1 | 176.7 | yes |
+
+`perf/word-bounds` also cut p99 from 280 to 194 ms: the long trace
+disjunctions went 332 to 126, 311 to 146 and 431 to 149 ms warm. A profile
+had put 70% of the walk's own time in bounding each member of the
+essential union against every term; the sieve (per-sub-block essential
+terms, then a bit-sliced conservative sum of the terms' sub-block bounds)
+clears 94 to 97% of those members a word at a time.
+
+`perf/threshold-warmup` is kept on its branch: a perfect seed would cut
+the 5 word stopword conjunction from 45 to 3.4 ms and 7,893 to 908 chunk
+loads, but the directory-bound warm-up recovers only 7,893 to 6,464, and
+it regresses phrases whose best-bounded chunks hold no match. The merge
+of the three first-round branches turned up a pre-existing bug the
+property test caught: `DocCursor::seek` resurrected an exhausted
+universe under `NOT` (`7eb033f`).
+
+Found and not yet fixed: a disjunction with a phrase child (`a OR "i m"`,
+which is also how `i''m` parses) is not a prunable shape and scores every
+match, 17 s on the mock. The published trace never mixes the two.
+
+Time now: disjunctions 47%, phrases 32%, conjunctions 21%. Next: the
+per-candidate class and length reads in `score_candidate` (29% of walk
+time after the sieve), long phrases of common words with fewer than k
+matches (every conjunction member is position-checked), and prunable
+disjunctions with phrase children.
 
 ## How to measure
 
