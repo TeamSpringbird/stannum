@@ -1529,6 +1529,157 @@ fn narrow(
     true
 }
 
+/// The sum a lane of a [`WordSieve`] must reach: the threshold in units of
+/// `1 / SIEVE_TARGET` of itself.
+const SIEVE_TARGET: u32 = segment::lanes::LaneSums::MAX_TARGET;
+
+/// A conservative filter over a sub-block's candidate words: it clears the
+/// lanes of a word whose first bound, the sum over the present terms
+/// holding the member of their sub-block bounds, certainly falls below
+/// the threshold, a word at a time rather than a member at a time.
+///
+/// Two tests, each sound alone. A member must hold one of the sub-block's
+/// essential terms, the terms whose absence leaves the required ones and
+/// the rest unable to reach the threshold (MaxScore, with the walk's
+/// float slack). And per lane, the bounds are summed as small integers:
+/// each term's bound is rounded up to a whole unit of `threshold /
+/// SIEVE_TARGET`, and a lane is kept only when its sum reaches
+/// `SIEVE_TARGET`. A lane cleared sums to at most `SIEVE_TARGET - 1` units,
+/// so its bounds fall short of the threshold by at least a unit, 1/255 of
+/// it: far more than the float error of summing them in any order, so its
+/// first bound is below the threshold and `can_beat` would reject it, tie
+/// or no tie. The threshold only rises, so a sieve planned at an earlier
+/// threshold stays sound.
+#[derive(Default)]
+struct WordSieve {
+    /// Whether the sieve filters at all.
+    active: bool,
+    /// Whether the terms `essential` filter, and those terms, as indices
+    /// into the present terms; filtering by none clears every lane.
+    by_essential: bool,
+    essential: Vec<usize>,
+    /// Whether the weighted sum filters; the required terms' weights, which
+    /// every lane holds; and the other terms' as (index, weight), heaviest
+    /// first.
+    by_count: bool,
+    start: u32,
+    adds: Vec<(usize, u32)>,
+    /// Scratch: the other terms' bounds, lightest first.
+    order: Vec<(f32, usize)>,
+}
+
+impl WordSieve {
+    /// Plans the sieve of sub-block `sub` at `threshold`, given per present
+    /// term its bounds per sub-block and whether it is required there.
+    fn plan(&mut self, threshold: f32, subs: &[[f32; SUBS]], sub: usize, required: &[bool]) {
+        self.active = false;
+        self.by_essential = false;
+        self.by_count = false;
+        self.essential.clear();
+        self.adds.clear();
+        let t = f64::from(threshold);
+        // Without a positive threshold every lane could reach it. The float
+        // error argument above holds for sums of bounds none of which is
+        // negative, over any plausible number of terms.
+        if !(t > 0.0 && t.is_finite())
+            || subs.len() > 4096
+            || subs
+                .iter()
+                .any(|bounds| bounds[sub].is_nan() || bounds[sub] < 0.0)
+        {
+            return;
+        }
+        // The essential terms.
+        {
+            let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
+            let mut fixed = 0.0_f64;
+            self.order.clear();
+            for (n, bounds) in subs.iter().enumerate() {
+                let bound = bounds[sub];
+                if required[n] {
+                    fixed += f64::from(bound);
+                } else if bound > 0.0 {
+                    self.order.push((bound, n));
+                }
+            }
+            self.order.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut tail = fixed;
+            let mut inessential = 0;
+            for &(bound, _) in &self.order {
+                let next = tail + f64::from(bound);
+                if next * slack >= t {
+                    break;
+                }
+                tail = next;
+                inessential += 1;
+            }
+            if inessential > 0 {
+                self.by_essential = true;
+                self.essential
+                    .extend(self.order[inessential..].iter().map(|&(_, n)| n));
+            }
+        }
+        // The weights, in units of the threshold.
+        {
+            let unit = t / f64::from(SIEVE_TARGET);
+            let weight = |bound: f32| {
+                let units = f64::from(bound) / unit;
+                if units < f64::from(SIEVE_TARGET) {
+                    // Strictly above the bound: the floor plus one.
+                    units.floor() as u32 + 1
+                } else {
+                    SIEVE_TARGET
+                }
+            };
+            let mut start = 0u32;
+            for (n, bounds) in subs.iter().enumerate() {
+                let bound = bounds[sub];
+                if bound == 0.0 {
+                    continue;
+                }
+                if required[n] {
+                    start = start.saturating_add(weight(bound));
+                } else {
+                    self.adds.push((n, weight(bound)));
+                }
+            }
+            if start < SIEVE_TARGET {
+                self.by_count = true;
+                self.start = start;
+                self.adds.sort_by_key(|a| std::cmp::Reverse(a.1));
+            }
+        }
+        self.active = self.by_essential || self.by_count;
+    }
+
+    /// The lanes of `word` the sieve keeps, given per present term its word.
+    #[inline]
+    fn keep(&self, word: u64, words: &[u64]) -> u64 {
+        if !self.active {
+            return word;
+        }
+        let mut kept = word;
+        if self.by_essential {
+            let mut any = 0;
+            for &n in &self.essential {
+                any |= words[n];
+            }
+            kept &= any;
+        }
+        if self.by_count && kept != 0 {
+            let mut lanes = segment::lanes::LaneSums::new(self.start, SIEVE_TARGET);
+            for &(n, weight) in &self.adds {
+                lanes.add(words[n], weight);
+                if kept & !lanes.reached() == 0 {
+                    break;
+                }
+            }
+            kept &= lanes.reached();
+        }
+        kept
+    }
+}
+
 /// Removes the dead ordinals of the chunk at `base` from the shared members.
 fn drop_dead(
     dead: &[u32],
@@ -2391,6 +2542,12 @@ impl OrdinalWalk<'_, '_> {
         let mut required = vec![false; present.len()];
         let mut required_at = None;
         let mut settled = false;
+        // The sub-block's word sieve, planned at its first surviving word
+        // and again whenever the threshold moves; and per present term its
+        // word at hand.
+        let mut sieve = WordSieve::default();
+        let mut planned = false;
+        let mut words = vec![0u64; present.len()];
         for i in 0..segment::ordinals::WORDS {
             let sub = i / SUB_WORDS;
             let w = i % SUB_WORDS;
@@ -2412,6 +2569,7 @@ impl OrdinalWalk<'_, '_> {
                 }
                 required.fill(false);
                 required_at = None;
+                planned = false;
             }
             if skip_sub {
                 continue;
@@ -2430,6 +2588,7 @@ impl OrdinalWalk<'_, '_> {
                 && required_at != Some((threshold, holder))
             {
                 required_at = Some((threshold, holder));
+                planned = false;
                 let all = f64::from(sub_scores[sub]);
                 let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
                 for (n, &t) in present.iter().enumerate() {
@@ -2457,17 +2616,29 @@ impl OrdinalWalk<'_, '_> {
                 }
                 settled = true;
             }
+            for (out, &t) in words.iter_mut().zip(present) {
+                *out = self.terms[t].word(i);
+            }
+            // Lanes the sieve clears cannot reach the threshold, so the
+            // member-by-member bound below would reject each of them.
+            if let Some((threshold, _)) = required_at {
+                if !planned {
+                    sieve.plan(threshold, &self.term_subs, sub, &required);
+                    planned = true;
+                }
+                let kept = sieve.keep(word, &words);
+                word = kept;
+            }
             while word != 0 {
                 let low = (i * 64) as u16 + word.trailing_zeros() as u16;
                 word &= word - 1;
                 let ordinal = base + u32::from(low);
                 let pruning = self.threshold().is_some();
                 if pruning {
-                    let word_at = usize::from(low / 64);
                     let bit = 1u64 << (low % 64);
                     let mut first = 0.0_f32;
-                    for (n, &t) in present.iter().enumerate() {
-                        if self.terms[t].word(word_at) & bit != 0 {
+                    for (n, held) in words.iter().enumerate() {
+                        if held & bit != 0 {
                             first += self.term_subs[n][sub];
                         }
                     }

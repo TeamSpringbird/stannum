@@ -1238,6 +1238,17 @@ mod tests {
 
     /// Rows of a ranked query as `(id, score bits)` so scores compare exactly.
     fn ranked(custom: bool, query: &str, order_by: &str, limit: &str) -> Vec<(i32, u32)> {
+        ranked_in("bmw", custom, query, order_by, limit)
+    }
+
+    /// As [`ranked`], over `table`.
+    fn ranked_in(
+        table: &str,
+        custom: bool,
+        query: &str,
+        order_by: &str,
+        limit: &str,
+    ) -> Vec<(i32, u32)> {
         Spi::run(&format!(
             "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;"
         ))
@@ -1246,7 +1257,7 @@ mod tests {
             client
                 .select(
                     &format!(
-                        "SELECT id, {order_by} AS score FROM bmw WHERE body ==> '{query}'
+                        "SELECT id, {order_by} AS score FROM {table} WHERE body ==> '{query}'
                          ORDER BY score DESC{} {limit}",
                         if custom { "" } else { ", ctid" }
                     ),
@@ -1739,6 +1750,58 @@ mod tests {
         // scoring.
         let scan = explain("\"alpha beta\" NOT ENCLOSES \"gamma\"");
         assert!(scan["Pruning"].is_null(), "{scan}");
+        // Long disjunctions, whose sub-blocks the walk sieves a word at a
+        // time: fourteen words from one in every document to one in a
+        // thousand, with periodic frequencies and lengths so scores tie
+        // across many documents, over segments of several sub-blocks each,
+        // with deleted rows the index still lists. Two runs of identical
+        // documents, one filling whole sub-blocks of a build segment and one
+        // written later, tie exactly at their sub-blocks' bounds.
+        Spi::run(
+            "CREATE TABLE bmw_long(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 9000;
+             INSERT INTO bmw_long SELECT n, CASE WHEN n BETWEEN 5000 AND 7100 THEN 'w0 w1 w2 w3 w5 w8 end' ELSE
+               repeat('w0 ', 1 + n % 3) ||
+               CASE WHEN n % 2 = 0 THEN 'w1 ' ELSE '' END ||
+               CASE WHEN n % 3 = 0 THEN repeat('w2 ', 1 + n % 4) ELSE '' END ||
+               CASE WHEN n % 5 = 0 THEN 'w3 ' ELSE '' END ||
+               CASE WHEN n % 7 = 0 THEN repeat('w4 ', 1 + n % 2) ELSE '' END ||
+               CASE WHEN n % 11 = 0 THEN 'w5 ' ELSE '' END ||
+               CASE WHEN n % 13 = 0 THEN 'w6 ' ELSE '' END ||
+               CASE WHEN n % 50 = 0 THEN repeat('w7 ', 1 + n % 3) ELSE '' END ||
+               CASE WHEN n % 97 = 0 THEN 'w8 ' ELSE '' END ||
+               CASE WHEN n % 200 = 0 THEN 'w9 w9 ' ELSE '' END ||
+               CASE WHEN n % 500 = 0 THEN 'w10 ' ELSE '' END ||
+               CASE WHEN n BETWEEN 12000 AND 12040 THEN 'w11 ' ELSE '' END ||
+               CASE WHEN n % 1000 = 7 THEN repeat('w12 ', 1 + n % 5) ELSE '' END ||
+               repeat('pad ', n % 8) || 'end' END
+               FROM generate_series(1, 20000) n;
+             CREATE INDEX bmw_long_idx ON bmw_long USING stannum(body);
+             INSERT INTO bmw_long SELECT n, 'w0 w1 w2 w3 w5 w8 end' FROM generate_series(20001, 20200) n;
+             DELETE FROM bmw_long WHERE id % 19 = 0;",
+        )
+        .unwrap();
+        let long = [
+            "w0 OR w1 OR w2 OR w3 OR w4 OR w5 OR w6 OR w7 OR w8 OR w9 OR w10 OR w11 OR w12 OR missing",
+            "w12 OR w11 OR w10 OR w9 OR w8 OR w7 OR w6 OR w5 OR w4 OR w3",
+            "w0 OR w1 OR w2 OR w3 OR w4 OR w5 OR w6 OR w7 OR w8 OR w9 OR w10",
+            "w1^2 OR w3 OR w5^0.5 OR w7 OR w9 OR w11 OR w0 OR w2 OR w4 OR w6^3",
+            "w2 OR w2 OR w3 OR w4 OR w5 OR w6 OR w7 OR w8 OR w9 OR w10 OR w12",
+            "w8 OR w5 OR w3 OR w2 OR w1 OR w0 OR w6 OR w7 OR w9 OR w10",
+        ];
+        for query in long {
+            for limit in ["LIMIT 1", "LIMIT 3", "LIMIT 10", "LIMIT 100", "LIMIT 1000"] {
+                for order_by in [
+                    "stannum.full_score(ctid)",
+                    "stannum.score(ctid)",
+                    "stannum.score(ctid, 1.0)",
+                ] {
+                    let expected = ranked_in("bmw_long", false, query, order_by, limit);
+                    let actual = ranked_in("bmw_long", true, query, order_by, limit);
+                    assert_eq!(actual, expected, "{query} {limit} {order_by}");
+                }
+            }
+        }
     }
 
     #[pg_test]

@@ -47,6 +47,7 @@ pub mod dictionary;
 pub mod docs;
 pub mod forward;
 pub mod index;
+pub mod lanes;
 pub mod length_class;
 pub mod merge;
 pub mod merge_strategy;
