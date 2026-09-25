@@ -446,7 +446,11 @@ impl set::Cursor for DocCursor<'_> {
     }
 
     fn seek(&mut self, target: Tid) -> Result<()> {
-        if self.current().is_some_and(|current| current >= target) {
+        // An exhausted cursor stays exhausted, as every other cursor does:
+        // repositioning it to an earlier target resurrected the universe
+        // under `NOT`, and an intersection probing it after the end then
+        // subtracted documents that were never in the inner set.
+        if self.current().is_none_or(|current| current >= target) {
             return Ok(());
         }
         let ordinal = self.docs.lower_bound(target)?;
@@ -628,6 +632,19 @@ mod tests {
 
     fn tid(block: u32, offset: u16) -> Tid {
         Tid::new(block, offset).unwrap()
+    }
+
+    #[test]
+    fn an_exhausted_document_cursor_stays_exhausted() {
+        let tids = [tid(0, 1), tid(0, 2), tid(3, 1)];
+        let (pages, offsets) = table(&tids);
+        let docs = DocTable::parse(&pages, &offsets, tids.len() as u32).unwrap();
+        let mut cursor = docs.into_cursor().unwrap();
+        cursor.seek(tid(9, 1)).unwrap();
+        assert_eq!(cursor.current(), None);
+        cursor.seek(tid(0, 1)).unwrap();
+        assert_eq!(cursor.current(), None);
+        assert_eq!(cursor.rank(tid(0, 2)).unwrap(), None);
     }
 
     #[test]

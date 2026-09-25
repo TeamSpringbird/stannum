@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c1276d718a31df88447a92bde26820ec9dec22894507fa3b0232377a00078f77 # shrinks to docs = ["delta alpha delta delta", "alpha"], query_text = "(\"delta delta delta\"~1) AND NOT ((alph*) AND NOT (MATCHES .*a))", cap = 1024

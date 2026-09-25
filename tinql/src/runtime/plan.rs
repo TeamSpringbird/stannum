@@ -979,6 +979,21 @@ mod tests {
     }
 
     #[test]
+    fn not_of_an_empty_conjunction_keeps_every_document() {
+        // The universe under `NOT` was probed past its end by the inner
+        // conjunction and then sought back to an earlier document, which
+        // resurrected it: the row plan dropped every match. Found by the
+        // property test below.
+        let docs = ["delta alpha delta delta", "alpha"];
+        for query in [
+            "delta AND NOT (alpha AND NOT alpha)",
+            "(\"delta delta delta\"~1) AND NOT ((alph*) AND NOT (MATCHES .*a))",
+        ] {
+            check(&docs, query, true);
+        }
+    }
+
+    #[test]
     fn dense_page_plans_agree_with_reference_for_nested_boolean_and_positional_queries() {
         let docs: Vec<_> = (0..2000)
             .map(|i| match i % 7 {
