@@ -550,11 +550,26 @@ mixes the two. Such shapes (and `(a AND b) OR c`, `a AND (b OR c)`,
 `a AND NOT b`, `AT LEAST n OF [...]`) now walk the disjunction of their
 scoring terms, testing each candidate against the shape: 1 to 4 ms.
 
-Time now: disjunctions 47%, phrases 32%, conjunctions 21%. Next: the
-per-candidate class and length reads in `score_candidate` (29% of walk
-time after the sieve), long phrases of common words with fewer than k
-matches (every conjunction member is position-checked), and prunable
-disjunctions with phrase children.
+Time now: disjunctions 47%, phrases 32%, conjunctions 21%.
+
+### Round three, 2026-09-25
+
+Against 4eb4f51 at 181.9 QPS, each alone, then merged as `fbf6e52`:
+
+| branch | mixed QPS |
+|---|---|
+| `perf/candidate-reads` (length and class pages held pinned for a walk) | 209.6 |
+| `perf/phrase-decode` (a positions seek passes a slot's entries in one pass; one-byte varints a word at a time) | 187.0 |
+| `perf/mixed-disjunction` (mixed shapes walked over their scoring terms) | 187.4 |
+| all three merged | 205.9, p50 25, p99 178 ms |
+
+The merge is within noise of `perf/candidate-reads` alone; warm
+explains put the mixed-shape code at about 3% on pure shapes, worth a
+fast path. `perf/mixed-disjunction` makes `a OR "i m"` 16.2 s to 1.6 ms
+on the mock and `(how AND to) OR python` 5.6 s to 0.6 ms; prefixes,
+regexes and fuzzy terms in a disjunction still score every match, and
+`al* OR python` (over the expansion cap) now at least answers a cancel.
+Predicted on the published host at the 0.81 ratio of r7: about 167 QPS.
 
 ## How to measure
 
