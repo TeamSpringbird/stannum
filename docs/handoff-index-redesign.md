@@ -611,6 +611,27 @@ Against 382c685 (307.0 QPS), each alone, then merged as `e867445`:
 Count and ranked checks clean. At r7's 0.81 ratio: about 290 QPS on the
 published host, which an AWS run must confirm.
 
+### Full scale on the published host, 2026-09-26 (r8)
+
+`313a696` (rounds one to five) on the i7i.8xlarge protocol, restored from
+`postgres-snapshots/stackexchange-150m-stn3-f099667`:
+
+| | r7, `64468d5` | r8, `313a696` | TIN, published |
+|---|---|---|---|
+| mixed QPS | 115.2 | 269.9 | 199 |
+| mixed p50 / p95 / p99 ms | 35 / 234 / 418 | 15 / 114 / 172 | |
+| conjunction-phrase QPS | 143.4 | 437.9 | |
+| conjunction-phrase p50 / p99 ms | 27 / 453 | 12 / 91 | |
+| disjunction-updates QPS, query p50 ms | 67.3, 74 | 127.6, 40 | |
+| updates in 600 s, p50 / p99 / worst ms, errors | 243,116, 1.2 / 6.1 / 1,457, 0 | 254,224, 1.1 / 5.5 / 1,379, 0 | |
+| count + ranked checks, before and after updates | clean | clean | |
+
+The host ran mixed at 0.75 of the local figure (r7: 0.81). Predictions
+made from the local per-style costs before the last two workloads
+reported: conjunction-phrase about 400 (370 to 430), measured 437.9;
+disjunction-updates about 130 (115 to 145), measured 127.6. No pin or
+buffer warnings in any server log.
+
 ## How to measure
 
 Everything below runs on a laptop and needs no AWS. See
