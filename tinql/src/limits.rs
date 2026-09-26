@@ -63,6 +63,19 @@ pub const MAX_AT_LEAST_COMBINATIONS: usize = 10_000;
 /// operands, does not.
 pub const MAX_SPAN_EXPANSION: usize = 100_000;
 
+/// Bytes the automaton of one regex, or of one wildcard, may take once
+/// compiled: each of its forward and reverse NFAs (the regex engine's
+/// default is 10 MiB). `\w` is every Unicode word character, so the pattern
+/// decides the size: `\w{20}\w*`, a term of at least 20 word characters,
+/// fits; `\w{100}`, about 5.6 MiB in all, does not.
+pub const MAX_REGEX_BYTES: usize = 2 << 20;
+
+/// Bytes the compiled regexes and wildcards of one query may take together,
+/// counted as they are compiled. A query may name [`MAX_TERMS`] of them:
+/// 10,000 prefix wildcards take about 70 MiB, a hundred `\w{10}` about
+/// 56 MiB.
+pub const MAX_QUERY_REGEX_BYTES: usize = 256 << 20;
+
 static STACK_CHECK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// Installs `check`, which every recursive pass over a query calls once per

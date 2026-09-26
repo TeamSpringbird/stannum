@@ -13,9 +13,13 @@
 //! - `MatchAll` is folded out of compound boolean nodes
 //! - single-term phrases collapse to plain `Term` nodes
 
+use std::cell::Cell;
+
 use rustc_hash::FxHashMap;
 
-use crate::limits::{MAX_AT_LEAST_COMBINATIONS, MAX_SPAN_EXPANSION, MAX_SPAN_NESTING};
+use crate::limits::{
+    MAX_AT_LEAST_COMBINATIONS, MAX_QUERY_REGEX_BYTES, MAX_SPAN_EXPANSION, MAX_SPAN_NESTING,
+};
 
 use super::{
     CompiledRegex, PositionFilterBound, Query, RangeBound, SimplificationProfile, SpanExpr,
@@ -45,6 +49,11 @@ pub enum LowerError {
         limit = MAX_SPAN_EXPANSION
     )]
     ExpansionTooLarge,
+    #[error(
+        "the query's regexes compile to more than {limit} MiB",
+        limit = MAX_QUERY_REGEX_BYTES >> 20
+    )]
+    RegexesTooLarge,
 }
 
 impl LowerError {
@@ -53,10 +62,12 @@ impl LowerError {
     #[must_use]
     pub const fn exceeds_limit(&self) -> bool {
         match self {
-            Self::NestingTooDeep | Self::TooManyCombinations { .. } | Self::ExpansionTooLarge => {
-                true
-            }
-            Self::MatchAllInSpanContext | Self::InvalidRegex(_) => false,
+            Self::NestingTooDeep
+            | Self::TooManyCombinations { .. }
+            | Self::ExpansionTooLarge
+            | Self::RegexesTooLarge => true,
+            Self::InvalidRegex(error) => error.exceeds_limit(),
+            Self::MatchAllInSpanContext => false,
         }
     }
 }
@@ -69,7 +80,28 @@ pub fn lower_with_profile(
     expr: &crate::Expr,
     profile: SimplificationProfile,
 ) -> Result<Query, LowerError> {
+    REGEX_BYTES.set(0);
     Ok(simplify(lower_boolean(expr, 1)?, profile))
+}
+
+thread_local! {
+    /// Bytes the regexes and wildcards compiled so far by the lowering
+    /// under way take (see [`compile_regex`]).
+    static REGEX_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Compiles `pattern`, within [`crate::limits::MAX_REGEX_BYTES`] and,
+/// with the regexes the lowering compiled before it, within
+/// [`MAX_QUERY_REGEX_BYTES`]. The total is counted as they are compiled, so
+/// the memory is bounded before the query is refused.
+fn compile_regex(pattern: &str) -> Result<CompiledRegex, LowerError> {
+    let regex = CompiledRegex::new(pattern)?;
+    let total = REGEX_BYTES.get().saturating_add(regex.memory_usage());
+    REGEX_BYTES.set(total);
+    if total > MAX_QUERY_REGEX_BYTES {
+        return Err(LowerError::RegexesTooLarge);
+    }
+    Ok(regex)
 }
 
 /// Lowers `expr`, which sits `depth` levels deep in the lowered query.
@@ -170,10 +202,8 @@ fn lower_leaf(expr: &crate::Expr) -> Result<Query, LowerError> {
             prefix: *prefix,
             distance: *distance,
         }),
-        Expr::Wildcard(parts) => Ok(Query::Regex(CompiledRegex::new(&wildcard_parts_regex(
-            parts,
-        ))?)),
-        Expr::Regex(pat) => Ok(Query::Regex(CompiledRegex::new(pat)?)),
+        Expr::Wildcard(parts) => Ok(Query::Regex(compile_regex(&wildcard_parts_regex(parts))?)),
+        Expr::Regex(pat) => Ok(Query::Regex(compile_regex(pat)?)),
         Expr::Range { lower, upper } => Ok(Query::Range {
             lower: convert_range_bound(lower),
             upper: convert_range_bound(upper),
@@ -316,13 +346,13 @@ impl SpanBuilder {
                 Ok(SpanExpr::Term(idx))
             }
             Expr::Wildcard(parts) => {
-                let idx = self.intern(SpanTermSlot::Regex(CompiledRegex::new(
-                    &wildcard_parts_regex(parts),
-                )?));
+                let idx = self.intern(SpanTermSlot::Regex(compile_regex(&wildcard_parts_regex(
+                    parts,
+                ))?));
                 Ok(SpanExpr::Term(idx))
             }
             Expr::Regex(pat) => {
-                let idx = self.intern(SpanTermSlot::Regex(CompiledRegex::new(pat)?));
+                let idx = self.intern(SpanTermSlot::Regex(compile_regex(pat)?));
                 Ok(SpanExpr::Term(idx))
             }
             Expr::Range { lower, upper } => {
@@ -934,14 +964,14 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" OR ")
         };
-        for query in [regexes(200), format!("({}) NEAR/5 x", regexes(200))] {
+        for query in [regexes(600), format!("({}) NEAR/5 x", regexes(600))] {
             let Err(error) = lowered(&query) else {
                 panic!("{}...: should be refused", &query[..60]);
             };
             let error = error.to_string();
             assert!(error.contains("regexes compile to more than"), "{error}");
         }
-        assert!(lowered(&regexes(50)).is_ok());
+        assert!(lowered(&regexes(100)).is_ok());
         // 10,000 wildcards are a few kilobytes each.
         let wildcards = (0..10_000)
             .map(|i| format!("w{i}*"))

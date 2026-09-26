@@ -71,8 +71,10 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   ends in "stack depth limit exceeded". `AT LEAST n OF [k operands]` inside a
   proximity operator, relation or positional filter, which is matched as the
   disjunction of its C(k, n) combinations, is limited to 10,000 combinations
-  and to 100,000 operands added by the expansion. A query past any of these
-  limits fails with SQLSTATE 54001 (`statement_too_complex`).
+  and to 100,000 operands added by the expansion. A regex or wildcard
+  compiles to at most 2 MiB per automaton, and a query's to 256 MiB in all.
+  A query past any of these limits fails with SQLSTATE 54001
+  (`statement_too_complex`).
 - Term expansions answer a cancel or `statement_timeout`: scanning a
   dictionary checks for interrupts every 1,024 entries. Ranking scores every
   term the wildcards, regexes, ranges and fuzzy terms of a query expand to,

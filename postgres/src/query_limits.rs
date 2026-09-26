@@ -168,6 +168,16 @@ mod tests {
             sqlstate: "",
             backstop: false,
         },
+        // Every Unicode word character a hundred times: an automaton past
+        // the limit on one regex's compiled size.
+        Case {
+            label: "MATCHES with an oversized automaton",
+            sql: "'MATCHES \\w{100}'",
+            count: None,
+            reason: "regex \"\\w{100}\" compiles to more than 2 MiB",
+            sqlstate: "54001",
+            backstop: false,
+        },
         Case {
             label: "MATCHES with 100,000 nested groups",
             sql: "'MATCHES ' || repeat('(', 100000) || 'a' || repeat(')', 100000)",
