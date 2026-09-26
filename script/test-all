@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+# The one entry point for Stannum's tests; docs/testing.md describes each step.
+#
+#   script/test-all [--logs DIR] [--fail-fast] [--list] TIER|STEP...
+#
+# Tiers:
+#   quick   headers fmt clippy rust-unit python-unit     (no PostgreSQL server needed)
+#   full    quick + pgrx install cluster conformance     (installs the extension)
+#   gates   install cluster conformance oracle           (benchmarks/local/gates.sh)
+#
+# Steps that install the extension or use the installed one (pgrx, install,
+# cluster, conformance, oracle) run under script/pgrx-lock.py, in one hold.
+# The pgrx step leaves a pg_test build installed; `full` and `gates` install
+# the release build after it.
+#
+# Environment:
+#   PG_CONFIG       pg_config of the target server (default: pg_config on PATH);
+#                   its bindir is put first on PATH for initdb, pg_ctl and psql
+#   PG_MAJOR        PostgreSQL major version (default: from PG_CONFIG)
+#   STANNUM_PYTHON  Python with psycopg and PyYAML, for the conformance step
+#                   (default: python3)
+#   PGHOST, PGPORT  the server the oracle step uses (default: the pgrx server of
+#                   PG_MAJOR, started if needed); LEAD_REF_DIR a Lead checkout
+#                   (see script/reference-oracle)
+#
+# Every step runs; with --fail-fast the first failure stops the run. A failed
+# install always stops it: later steps would test another build. With --logs
+# each command's output goes to DIR/<command>.log and a failure prints its tail.
+# Exits nonzero if any command failed.
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT" || exit 2
+
+QUICK=(headers fmt clippy rust-unit python-unit)
+LOCKED=(pgrx install cluster conformance oracle)
+ALL_STEPS=("${QUICK[@]}" "${LOCKED[@]}")
+
+usage() {
+    sed -n '/^# The one entry point/,/^set -uo/p' "$0" | sed '$d; s/^# \{0,1\}//'
+    exit "${1:-2}"
+}
+
+logs=''
+fail_fast=0
+list=0
+steps=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --logs) logs=${2:?--logs needs a directory}; shift 2 ;;
+        --fail-fast) fail_fast=1; shift ;;
+        --list) list=1; shift ;;
+        -h|--help) usage 0 ;;
+        quick) steps+=("${QUICK[@]}"); shift ;;
+        full) steps+=("${QUICK[@]}" pgrx install cluster conformance); shift ;;
+        gates) steps+=(install cluster conformance oracle); shift ;;
+        *)
+            case " ${ALL_STEPS[*]} " in
+                *" $1 "*) steps+=("$1"); shift ;;
+                *) echo "test-all: unknown tier or step '$1'" >&2; usage ;;
+            esac ;;
+    esac
+done
+[ ${#steps[@]} -gt 0 ] || usage
+if [ "$list" = 1 ]; then
+    printf '%s\n' "${steps[@]}"
+    exit 0
+fi
+
+# The toolchain rust-toolchain.toml pins, when no rustup proxy is on PATH.
+if ! command -v cargo >/dev/null 2>&1; then
+    channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+    for bin in "${RUSTUP_HOME:-$HOME/.rustup}"/toolchains/"$channel"-*/bin; do
+        [ -x "$bin/cargo" ] && PATH="$bin:$PATH" && break
+    done
+fi
+[ -d "$HOME/.cargo/bin" ] && PATH="$PATH:$HOME/.cargo/bin"
+PG_CONFIG=${PG_CONFIG:-$(command -v pg_config || true)}
+if [ -n "$PG_CONFIG" ]; then
+    PATH="$("$PG_CONFIG" --bindir):$PATH"
+    PG_MAJOR=${PG_MAJOR:-$("$PG_CONFIG" --version | sed -E 's/PostgreSQL ([0-9]+).*/\1/')}
+fi
+export PATH PG_CONFIG PG_MAJOR
+PYTHON=${STANNUM_PYTHON:-python3}
+[ -n "$logs" ] && mkdir -p "$logs"
+
+failures=()
+passed=0
+
+# run LABEL COMMAND...: one command, reported by label.
+run() {
+    local label=$1 status
+    shift
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::group::$label"; fi
+    echo "== $label: $*"
+    if [ -n "$logs" ]; then
+        "$@" >"$logs/$label.log" 2>&1
+        status=$?
+        [ $status -eq 0 ] || tail -n 30 "$logs/$label.log"
+    else
+        "$@"
+        status=$?
+    fi
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::endgroup::"; fi
+    if [ $status -eq 0 ]; then
+        passed=$((passed + 1))
+        echo "== $label: ok"
+    else
+        failures+=("$label")
+        echo "== $label: FAILED (exit $status)"
+        [ "${GITHUB_ACTIONS:-}" = true ] && echo "::error::$label failed (exit $status)"
+        if [ "$fail_fast" = 1 ]; then finish; fi
+    fi
+    return $status
+}
+
+finish() {
+    echo "== test-all: $passed passed, ${#failures[@]} failed${failures:+: ${failures[*]}}"
+    [ ${#failures[@]} -eq 0 ]
+    exit $?
+}
+
+need_pg() {
+    if [ -z "${PG_MAJOR:-}" ]; then
+        echo "test-all: $1 needs PostgreSQL: put pg_config on PATH or set PG_CONFIG" >&2
+        failures+=("$1")
+        return 1
+    fi
+}
+
+features() { echo "pg$PG_MAJOR${1:+ $1}"; }
+
+conformance_check() {
+    local dir port=28951 status
+    "$PYTHON" -c 'import psycopg, yaml' || {
+        echo "conformance: $PYTHON needs psycopg and PyYAML; set STANNUM_PYTHON" >&2
+        return 1
+    }
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/stannum-conformance.XXXXXX")
+    initdb -D "$dir/data" -U postgres -A trust --no-locale --encoding=UTF8 >"$dir/initdb.log" || return 1
+    pg_ctl -D "$dir/data" -l "$dir/server.log" -w \
+        -o "-p $port -c listen_addresses='' -c unix_socket_directories='$dir'" start >/dev/null || {
+        cat "$dir/server.log"
+        return 1
+    }
+    CONFORMANCE_DSN="host=$dir port=$port user=postgres dbname=postgres" \
+        "$PYTHON" conformance/run.py --engine stannum --check conformance/expected/tin-1.0.3
+    status=$?
+    pg_ctl -D "$dir/data" -m fast -w stop >/dev/null
+    if [ $status -eq 0 ]; then rm -rf "$dir"; else echo "conformance: server log kept in $dir"; fi
+    return $status
+}
+
+step() {
+    case "$1" in
+        headers)
+            run source-headers python3 script/source_headers.py
+            run script-unit python3 -m unittest discover -s script -p 'test_*.py' ;;
+        fmt)
+            run fmt cargo fmt --all -- --check ;;
+        clippy)
+            need_pg clippy || return
+            run clippy cargo clippy --locked --workspace --all-targets --no-default-features \
+                --features "$(features pg_test)" -- -D warnings ;;
+        rust-unit)
+            run rust-unit cargo test --locked --workspace --exclude stannum ;;
+        python-unit)
+            run benchmark-harness-unit python3 -m unittest discover -s benchmarks -p 'test_*.py'
+            run cluster-test-unit python3 -m unittest discover -s postgres/tests -p 'test_*.py' ;;
+        pgrx)
+            need_pg pgrx || return
+            # The crash hook exists only in the pg_test build this installs.
+            run pgrx-test cargo pgrx test "pg$PG_MAJOR" --package stannum --no-default-features \
+                --features "$(features pg_test)" &&
+                run crash-before-publication python3 postgres/tests/crash_before_publication.py
+            echo "== note: a pg_test build is installed; 'script/test-all install' restores the release build" ;;
+        install)
+            need_pg install || finish
+            run install cargo pgrx install --release --package stannum --no-default-features \
+                --features "$(features)" --pg-config "$PG_CONFIG" || finish ;;
+        cluster)
+            run extension-upgrade python3 postgres/tests/extension_upgrade.py
+            run postings-lifecycle python3 postgres/tests/postings_lifecycle.py
+            run merge-lifecycle python3 postgres/tests/merge_lifecycle.py
+            run ranked-fuzz-smoke python3 postgres/tests/ranked_fuzz.py --smoke
+            run vacuum-cleanup-pins python3 postgres/tests/vacuum_cleanup_pins.py
+            run mutation-targets python3 benchmarks/mutation_targets.py ;;
+        conformance)
+            run conformance conformance_check ;;
+        oracle)
+            need_pg oracle || return
+            if [ -z "${PGPORT:-}" ]; then
+                # The pgrx server of this major (port 28800 + major).
+                export PGHOST=localhost PGPORT=$((28800 + PG_MAJOR))
+                run pgrx-start cargo pgrx start "pg$PG_MAJOR" || return
+            fi
+            run reference-oracle script/reference-oracle "${STANNUM_ORACLE_OUTPUT:-${logs:-${TMPDIR:-/tmp}}/oracle}" ;;
+    esac
+}
+
+for i in "${!steps[@]}"; do
+    name=${steps[$i]}
+    case " ${LOCKED[*]} " in
+        *" $name "*)
+            if [ "${STANNUM_PGRX_LOCK_HELD:-}" != "${STANNUM_PGRX_LOCK:-/tmp/stannum-pgrx.lock}" ]; then
+                # Hold the lock once for this and every later step.
+                args=()
+                [ -n "$logs" ] && args+=(--logs "$logs")
+                [ "$fail_fast" = 1 ] && args+=(--fail-fast)
+                echo "== waiting for the pgrx lock (script/pgrx-lock.py)"
+                python3 script/pgrx-lock.py -- "$ROOT/script/test-all" ${args[@]+"${args[@]}"} "${steps[@]:$i}"
+                status=$?
+                if [ $passed -gt 0 ] || [ ${#failures[@]} -gt 0 ]; then
+                    echo "== test-all (before the lock): $passed passed, ${#failures[@]} failed${failures:+: ${failures[*]}}"
+                fi
+                [ ${#failures[@]} -eq 0 ] && exit $status
+                exit 1
+            fi ;;
+    esac
+    step "$name"
+done
+finish

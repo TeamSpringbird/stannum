@@ -30,6 +30,8 @@ env:
 
 jobs:
   # Formatting and the pure-Python harness need no PostgreSQL; fail fast here.
+  # Test steps go through script/test-all, so CI, the local gates and
+  # docs/testing.md name the same commands.
   lint:
     name: Format and harness tests
     runs-on: ubuntu-24.04
@@ -40,15 +42,11 @@ jobs:
       - name: Install rustfmt
         run: rustup component add rustfmt
       - name: Source attribution
-        run: |
-          python3 script/source_headers.py
-          python3 -m unittest discover -s script -p 'test_*.py'
+        run: script/test-all headers
       - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Benchmark harness unit tests
-        run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
-      - name: Cluster test unit tests
-        run: python3 -m unittest discover -s postgres/tests -p 'test_*.py'
+        run: script/test-all fmt
+      - name: Benchmark harness and cluster test unit tests
+        run: script/test-all python-unit
       - name: Published benchmark query adapter
         run: |
           python3 benchmarks/tin.py --driver "$RUNNER_TEMP/stannum-benchmark-driver" prepare
@@ -85,7 +83,7 @@ jobs:
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install --yes --no-install-recommends \
             "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}" \
-            libclang-dev pkg-config libssl-dev
+            libclang-dev pkg-config libssl-dev python3-psycopg python3-yaml
           sudo systemctl stop postgresql || true
           # pgrx installs the extension into the server's own directories.
           sudo chown -R "$USER" "/usr/lib/postgresql/${PG_MAJOR}" "/usr/share/postgresql/${PG_MAJOR}"
@@ -119,39 +117,33 @@ jobs:
         run: cargo build --locked --package stannum --no-default-features --features "pg${PG_MAJOR}"
 
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets --no-default-features --features "pg${PG_MAJOR} pg_test" -- -D warnings
+        run: script/test-all clippy
 
       - name: Library crate tests
-        run: cargo test --locked --workspace --exclude stannum
+        run: script/test-all rust-unit
 
-      - name: Extension tests
-        run: cargo pgrx test "pg${PG_MAJOR}" --package stannum --no-default-features --features "pg${PG_MAJOR} pg_test"
+      # pg_tests and the extension's #[test]s, then, on the pg_test build
+      # that leaves installed, crashes injected between page writes and
+      # meta-page publication (postgres/tests/crash_before_publication.py).
+      - name: Extension tests and crash-before-publication checks
+        run: script/test-all pgrx
 
       - name: Install release build
-        run: cargo pgrx install --release --package stannum --no-default-features --features "pg${PG_MAJOR}"
+        run: script/test-all install
 
-      - name: Release schema and upgrade compatibility
-        run: python3 postgres/tests/extension_upgrade.py
+      # Each in a throwaway cluster: release schema and upgrade compatibility;
+      # crash recovery, VACUUM, folds, merges, standby fallback and backend
+      # reuse; deferred-merge crashes; the ranked-scan concurrency fuzz smoke
+      # (fixed seeds plus the regression list, under two minutes); VACUUM
+      # with pinned heap pages; the benchmark writers' target selection.
+      - name: Cluster tests
+        run: script/test-all cluster
 
-      # Crash recovery, VACUUM, folds and merges, standby fallback and
-      # backend reuse, against a real server in a throwaway cluster.
-      - name: Index lifecycle checks
-        run: python3 postgres/tests/postings_lifecycle.py
-
-      # Randomized concurrent writers against ranked readers, each checked in
-      # one snapshot against the unpruned path and a regex scan; fixed seeds
-      # plus the regression list, under two minutes.
-      - name: Ranked-scan concurrency fuzz (smoke)
-        run: python3 postgres/tests/ranked_fuzz.py --smoke
-
-      - name: Deferred-merge lifecycle checks
-        run: python3 postgres/tests/merge_lifecycle.py
-
-      - name: Mutation target and accounting regression
-        run: python3 benchmarks/mutation_targets.py
-
-      - name: VACUUM pinned-page regression
-        run: python3 postgres/tests/vacuum_cleanup_pins.py
+      # Every conformance case against TIN 1.0.3's recorded answers, in a
+      # throwaway cluster. The answers were recorded on PostgreSQL 18.
+      - name: Conformance against TIN 1.0.3
+        if: matrix.postgres == 18
+        run: script/test-all conformance
 
       - name: VACUUM workload harness smoke
         run: |
