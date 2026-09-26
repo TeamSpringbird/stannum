@@ -125,6 +125,16 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
+        c"stannum.max_expansion_terms",
+        c"Terms the wildcards, regexes, ranges and fuzzy terms of a ranked query may expand to",
+        c"Each expanded term is scored, so a query past the limit fails with SQLSTATE 54000 rather than scoring some of them. Matching and counting are not limited.",
+        &crate::score::MAX_EXPANSION_TERMS,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
         c"stannum.warmup_chunks",
         c"Chunks a pruned ranked conjunction evaluates first, those with the highest bounds, to raise its threshold early",
         c"Picked across every source by the chunk directory alone; zero walks each source in chunk order from the start.",
