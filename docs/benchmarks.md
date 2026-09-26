@@ -47,7 +47,7 @@ revision `f487fbaa`. No row is truncated, normalized, remapped or reordered.
 | --- | ---: | --- |
 | Stack Exchange | 150,000,000 (84.5 GB of CSV) | Headline runs, on AWS and locally |
 | Stack Exchange, 15 million row prefix | 15,000,000 | Fast local iteration ("the mock") |
-| Wikipedia | 5,032,104 | Count workloads and earlier campaigns |
+| Wikipedia | 5,032,104 | Count workloads |
 
 The Stack Exchange trace has 1,254 query records. Each expands to a
 conjunction, a disjunction and a phrase form of the same words, 3,762 forms

@@ -2,13 +2,12 @@
 
 ## Temporary and unlogged indexes
 
-New temporary and unlogged Stannum indexes use the same segmented main-fork
+Temporary and unlogged Stannum indexes use the same segmented main-fork
 layout, tokenizer settings, folds, merges, bitmap scans, custom search/count and
-ranking as permanent indexes. Older zero-page indexes retain heap fallback until
-REINDEX. Temporary relations use PostgreSQL local buffers. Temporary and unlogged
-main-fork writes prepare a complete page image, copy it into the pinned buffer
-inside a critical section and mark it dirty; they do not invoke generic WAL.
-Permanent index writes retain generic WAL.
+ranking as permanent indexes. Temporary relations use PostgreSQL local buffers.
+Temporary and unlogged main-fork writes prepare a complete page image, copy it
+into the pinned buffer inside a critical section and mark it dirty; they do not
+invoke generic WAL. Permanent index writes use generic WAL.
 
 `ambuildempty` writes a two-page unlogged init fork: a valid empty meta page and
 its empty write-buffer head. It checksums the pages, logs full-page images and
@@ -180,13 +179,12 @@ instrumentation remain visible; private Stannum counters are explicitly unavaila
 for worker execution, rather than showing the idle leader's misleading zeros.
 This distinguishes planner flags from real worker execution.
 
-No DSM-shared cursor or `amcanparallel` change is included. Parallel bitmap heap
-scans already parallelize heap work after one process builds the bitmap; changing
+Stannum has no DSM-shared cursor and does not set `amcanparallel`. Parallel
+bitmap heap scans already parallelize heap work after one process builds the bitmap; changing
 `amcanparallel` does not make bitmap construction parallel. A partial count needs
 shared candidate ownership, a partial aggregate/finalization contract, rescan and
 error cleanup, and instrumentation aggregation. Marking today's complete count
-path partial would multiply the answer by the number of workers. There is no
-validated implementation or measured 100k-corpus benefit to justify that change.
+path partial would multiply the answer by the number of workers.
 
 ## PostgreSQL references
 

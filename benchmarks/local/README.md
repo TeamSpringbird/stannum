@@ -1,9 +1,10 @@
 # Local rehearsal of the published workloads when the index does not fit in memory
 
-The AWS campaign at 150,000,000 rows runs a 246 GB index against 24 GB of shared
+The AWS runs at 150,000,000 rows read a 47 GB index through 24 GB of shared
 buffers in a 32 GB container on NVMe. These scripts rehearse the same regime on a
-laptop with the 15,000,000-row prefix: a 21 GB index against 2 GB of shared buffers
-in a 5 GB container, ten segments, eight clients on eight CPUs.
+laptop, either at full scale or with the 15,000,000-row prefix, whose index is
+likewise larger than its 2 GB of shared buffers in a 5 GB container, with eight
+clients on eight CPUs.
 
 Two things make a Docker Desktop container behave like the instance:
 
