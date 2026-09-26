@@ -86,8 +86,10 @@ include `stannum.score`, `stannum.full_score`, `stannum.max_score`,
 use the `stannum.` prefix; for example, `SET stannum.enable_custom_scan = off`
 selects the bitmap path.
 
-Scoring and implicitly bound highlighting must appear at the same query level as
-the matching `==>` predicate. Explicit highlighting accepts its own query.
+Scoring must appear at the same query level as the matching `==>` predicate.
+Implicitly bound highlighting also finds the predicate in a subquery or CTE
+the planner flattens into that level, and with no predicate to bind returns the
+text unmarked, as TIN does. Explicit highlighting accepts its own query.
 
 Stannum and TIN need separate databases because both define the `==>` operator in
 `pg_catalog`. There is no in-place migration from TIN or older renamed builds:

@@ -203,3 +203,7 @@
 - A term repeated in a flat AND or OR chain adds its boosts in scoring and
   `score_inspect`, as in TIN 1.0.3: `a a` weighs `a` 2.0 and scores as
   `a^2`, where the repeat was removed before scoring. Matching is unchanged.
+- `highlight()` and `highlight_ansi()` without a query take it from a `==>`
+  clause anywhere in the query's join tree, so a CTE or subquery the planner
+  flattens binds as in TIN 1.0.3; with no clause to bind they return the text
+  unmarked, as TIN does, instead of raising an error.
