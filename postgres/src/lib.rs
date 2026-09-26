@@ -3243,6 +3243,70 @@ mod tests {
         assert_eq!(inspected, Some(vec!["rare".to_owned()]));
     }
 
+    /// `[[id, "score bits"], ...]` of the rows `sql` returns as (id, score).
+    fn score_bits(sql: &str) -> String {
+        Spi::get_one::<String>(&format!(
+            "SELECT coalesce(json_agg(json_build_array(id, encode(float4send(score), 'hex'))
+             ORDER BY id), '[]')::text FROM ({sql}) scored(id, score)"
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    /// A repeated query term adds its boosts, in `score_inspect` and in the
+    /// scores: TIN 1.0.3 weighs `a OR a^2` 3.0, `a a` 2.0 and `(a^2)^3` 6.0
+    /// (conformance/expected/tin-1.0.3/catalog.scoring.json, catalog.S-12),
+    /// so `a a` scores as `a^2` does.
+    #[pg_test]
+    fn tin_1_0_3_repeated_terms_add_their_boosts() {
+        // A segmented index, then a temporary table's heap-scored one.
+        for table_kind in ["", "TEMP"] {
+            Spi::run(&format!(
+                "CREATE {table_kind} TABLE repeats(id int, body text);
+                 INSERT INTO repeats VALUES (1, 'a b');
+                 INSERT INTO repeats SELECT 1000 + n, 'pad' || n FROM generate_series(1, 90) n;
+                 CREATE INDEX repeats_idx ON repeats USING stannum(body)"
+            ))
+            .unwrap();
+            for (query, weight) in [
+                ("a OR a^2", "40400000"),
+                ("a a", "40000000"),
+                ("(a^2)^3", "40c00000"),
+            ] {
+                let inspected = Spi::get_one::<String>(&format!(
+                    "SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), 'hex'))
+                     ORDER BY term), '[]')::text
+                     FROM stannum.score_inspect('repeats_idx'::regclass, '{query}')"
+                ))
+                .unwrap()
+                .unwrap();
+                assert_eq!(inspected, format!("[[\"a\", \"{weight}\"]]"), "{query}");
+            }
+            for custom_scan in ["on", "off"] {
+                Spi::run(&format!(
+                    "SET LOCAL stannum.enable_custom_scan = {custom_scan}"
+                ))
+                .unwrap();
+                for function in ["score", "full_score"] {
+                    let scores = |query: &str, limit: &str| {
+                        score_bits(&format!(
+                            "SELECT id, stannum.{function}(ctid) FROM repeats
+                             WHERE body ==> '{query}'
+                             ORDER BY stannum.{function}(ctid) DESC {limit}"
+                        ))
+                    };
+                    for limit in ["", "LIMIT 1"] {
+                        let doubled = scores("a^2", limit);
+                        assert_ne!(doubled, scores("a", limit));
+                        assert_eq!(scores("a a", limit), doubled, "{function} {limit}");
+                        assert_eq!(scores("a AND a", limit), doubled, "{function} {limit}");
+                    }
+                }
+            }
+            Spi::run("DROP TABLE repeats").unwrap();
+        }
+    }
+
     #[pg_test]
     fn full_score_normalization_matches_tin() {
         // Exercise the custom scan, bitmap scan, and heap-reference scorer.
