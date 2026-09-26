@@ -47,7 +47,7 @@ would change scores midway through a ranked scan.
 | `stannum.max_merge_docs` | 1,024 | Total input documents ordinary insert merges may rewrite per fold |
 | `stannum.deferred_merge_docs` | 262,144 | Input documents of the one merge an insert may run after a fold, outside the metadata lock |
 | `stannum.merge_tier_factor` | 8 | Segments per size tier before they merge |
-| `stannum.max_segments` | 128 | Soft bound on directory entries; 128 is the hard on-disk bound |
+| `stannum.max_segments` | 96 | Soft bound on directory entries; 96 is the hard on-disk bound |
 
 An index may override three of these for itself with the TIN-named storage
 options: `max_mutable_segment_size` (bytes) for `write_buffer_bytes`,
@@ -150,10 +150,10 @@ entries already exceed that ceiling.
 Worst case: without VACUUM, folds keep adding entries; once the directory is
 full, every fold merges the two smallest. While unmerged folds remain those
 are two folds (1,024 documents at the default fold size), so the cost stays
-at the ordinary budget; after about 128 folds every entry has doubled and the
+at the ordinary budget; after about 96 folds every entry has doubled and the
 cost doubles with it, and so on geometrically. Lowering `max_segments` below
-128 makes budget-fitting merges happen earlier, keeps the directory smaller
-and leaves `128 - max_segments` folds of headroom before the hard bound.
+96 makes budget-fitting merges happen earlier, keeps the directory smaller
+and leaves `96 - max_segments` folds of headroom before the hard bound.
 Keep VACUUM timely to avoid emergency work. These settings do not promise a
 maximum wall-clock insert latency; I/O, lock waits, huge documents and other
 VACUUM work still matter.
@@ -344,8 +344,8 @@ coordination:
 - **Segment readers**, by index identity and segment generation. A reader
   keeps the byte ranges it has fetched (dictionary index, dictionary blocks,
   postings, payload, document table) for as long as the generation is in the
-  directory; the readers of one backend hold at most 64 MiB of fetched bytes
-  before they are all dropped. Generations never repeat within an identity,
+  directory; the readers of one backend hold at most `stannum.reader_cache_mb`
+  (384 MiB) of fetched bytes before they are all dropped. Generations never repeat within an identity,
   and REINDEX changes the identity, so a cached reader can never describe a
   different segment.
 - **Dictionary lookups**, per cached segment: a term's entry or its absence,
@@ -650,7 +650,7 @@ inconsistent, the table is the source of truth; `REINDEX` rebuilds from it.
   only to publish (a few page writes per merge, rewrite, dead list or
   reclamation), plus the scan of whatever inserts folded during its last
   unlocked round and the rewrite of the write buffer without dead records.
-- The pending-free list holds 64 entries; runs released together share one.
+- The pending-free list holds 48 entries; runs released together share one.
   A full list first frees runs no snapshot can still read and otherwise
   appends to its newest entry, delaying that entry's reclamation. A crash
   before a new run is published, or between removing a reclaimed pending
@@ -659,7 +659,7 @@ inconsistent, the table is the source of truth; `REINDEX` rebuilds from it.
   cleanup reclaims them.
 - Ordinary insert merges have a document budget, and so do merges that bring
   the directory back under `max_segments`. Only the merge that keeps the
-  directory within its 128-entry on-disk bound is unbudgeted; its cost grows
+  directory within its 96-entry on-disk bound is unbudgeted; its cost grows
   geometrically with the number of folds VACUUM has missed (see Merge
   policy).
 
