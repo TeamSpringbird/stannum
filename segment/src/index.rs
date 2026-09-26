@@ -109,7 +109,10 @@ impl<S: Source> Index for Reader<S> {
             Window::All => Box::new(dictionary.iter()),
         };
         let mut found = Vec::new();
-        for item in items {
+        for (scanned, item) in items.enumerate() {
+            if (scanned + 1).is_multiple_of(crate::INTERRUPT_INTERVAL) {
+                crate::check_interrupts("expand:scan");
+            }
             let (term, entry) = item?;
             if !filter(&term) {
                 continue;
@@ -590,7 +593,16 @@ impl Index for MutableIndex {
                 }
                 Window::All => sorted,
             };
-            keys.iter().filter(|k| filter(k)).cloned().collect()
+            keys.iter()
+                .enumerate()
+                .filter(|(scanned, k)| {
+                    if (scanned + 1).is_multiple_of(crate::INTERRUPT_INTERVAL) {
+                        crate::check_interrupts("expand:scan");
+                    }
+                    filter(k)
+                })
+                .map(|(_, k)| k.clone())
+                .collect()
         };
         if names.len() > limit {
             return Ok(Expanded::Overflow);

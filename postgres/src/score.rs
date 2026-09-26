@@ -4581,6 +4581,9 @@ fn build_index_scorer_inner(
     };
     let mut scorers = Vec::new();
     for term in terms {
+        // A term costs a dictionary lookup per source, and an expansion can
+        // bring thousands of them.
+        pgrx::check_for_interrupts!();
         let mut total_df = 0u64;
         let mut immutable_df = 0u64;
         for (i, segment) in segments.iter().enumerate() {
