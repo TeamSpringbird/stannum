@@ -136,13 +136,13 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6."
     },
-    "benchmarks/local/mock-run.sh": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6."
-    },
     "benchmarks/local/run150m.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6."
+    },
+    "benchmarks/local/workload.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6. Moved from benchmarks/local/mock-run.sh, merged with the duplicate runner in benchmarks/local/run150m.sh (now a wrapper)."
     },
     "benchmarks/merge_costs.py": {
       "owner": "ben",
