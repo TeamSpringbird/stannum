@@ -821,7 +821,8 @@ const HELD_SLOT_LIMIT: usize = 64;
 /// the statement's resource owner and released when the walk's hold span
 /// closes, which a walk does on return and on unwind alike, so no pin
 /// outlives the statement though the reader holding it is cached across
-/// statements.
+/// statements. A backend exiting mid-walk leaves its pins to PostgreSQL
+/// (see [`exiting`]).
 #[derive(Clone, Copy)]
 struct HeldPage {
     /// The page's index in the run.
@@ -846,7 +847,8 @@ impl RunSource {
     }
 
     /// Releases the pages held in every slot, forgets the slots handed out,
-    /// and closes the index.
+    /// and closes the index; in an exiting backend only forgets them (see
+    /// [`exiting`]).
     fn release_held(&self) {
         let mut slots = self.slots.borrow_mut();
         for slot in slots.iter_mut() {
@@ -858,7 +860,7 @@ impl RunSource {
         }
         slots.truncate(segment::source::HELD_SLOTS);
         let relation = self.relation.replace(std::ptr::null_mut());
-        if !relation.is_null() {
+        if !relation.is_null() && !exiting() {
             // SAFETY: opened by `pin` within the span now ending.
             unsafe { pg_sys::RelationClose(relation) };
         }
@@ -1032,18 +1034,40 @@ pub(crate) fn reset_held_peak() {
     SCAN_RECENT.set(0);
 }
 
-/// Releases a page `RunSource::pin` pinned.
+/// Releases a page `RunSource::pin` pinned; in an exiting backend only
+/// forgets it (see [`exiting`]).
 fn unpin(held: HeldPage) {
-    // SAFETY: the pin was taken by `pin` and is released once: the slot
-    // holding it was emptied before this call.
-    unsafe { pg_sys::ReleaseBuffer(held.buffer) };
+    if !exiting() {
+        // SAFETY: the pin was taken by `pin` and is released once: the slot
+        // holding it was emptied before this call.
+        unsafe { pg_sys::ReleaseBuffer(held.buffer) };
+    }
     let (now, total, peak) = HELD_PAGES.get();
     HELD_PAGES.set((now - 1, total, peak));
 }
 
+/// Whether the backend is exiting, from `proc_exit` on: a FATAL error
+/// (`pg_terminate_backend`, a shutdown, postmaster death) exits without
+/// unwinding the walk it interrupts, so a hold span stays open, and
+/// PostgreSQL's exit processing releases the span's pins and relation
+/// reference through the statement's resource owner, then clears
+/// `CurrentResourceOwner`. On Linux `exit` then runs the backend's
+/// thread-local destructors, which drop the cached readers: a reader
+/// released there must leave PostgreSQL's resources alone, as releasing
+/// one again, with no resource owner, crashes the backend and with it the
+/// server. Whatever a reader still holds once exit has begun is the
+/// resource owner's to release, so every release is skipped from then on.
+/// Error and cancel unwind the walk before the transaction aborts, with
+/// the flag clear, and release as usual.
+fn exiting() -> bool {
+    // SAFETY: a plain flag PostgreSQL sets first thing in `proc_exit`.
+    unsafe { pg_sys::proc_exit_inprogress }
+}
+
 impl Drop for RunSource {
     fn drop(&mut self) {
-        // Spans close before a reader can be dropped; this only guards
+        // Spans close before a reader can be dropped, except in a backend
+        // exiting mid-walk (see [`exiting`]); otherwise this only guards
         // against a span left open by a bug.
         self.release_held();
     }
