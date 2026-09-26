@@ -11,10 +11,34 @@ description: >
   answered with TIN's count, and answer the sizes that crashed TIN with an
   ERROR or the correct count, never a crash.
 
-  Stannum 0.1.0 before fix/query-depth overflows its stack on every size
-  above 100 on some servers (the pgrx server crashed on 1000 terms; a
-  server started from a shell with a larger stack limit answered), so all
-  of them are tagged as crashing it.
+  Every size above 100 is tagged as crashing Stannum 0.1.0 until the
+  query-depth fix lands: run this area only on a throwaway server you may
+  restart. Whether a size crashes depends on the build and the server's
+  stack limit; see stannum_observations.
+
+stannum_observations:
+  - date: 2026-09-26
+    server: local Homebrew PostgreSQL 18.6, aarch64-apple-darwin
+    stack_limit: "rlimit 8176kB (max_stack_depth may not exceed 7664kB); max_stack_depth 2MB"
+    build: release stannum.dylib installed 14:44 ET (before the query-depth fix)
+    result: >
+      private initdb server: every size up to 3000 terms and 1000-deep
+      nesting answered 0; 10000 terms, the 10000-term OR chain and 5000-deep
+      nesting crashed the server.
+  - date: 2026-09-26
+    server: shared pgrx server (port 28818), same binary and stack limit
+    stack_limit: "rlimit 8176kB (max_stack_depth may not exceed 7664kB); max_stack_depth 2MB"
+    build: uncertain; another session replaced stannum.dylib in place at 15:01:35 ET
+    result: >
+      15:01:18-15:01:27 ET: 1000 and 3000 terms (both shapes) and 1000-deep
+      nesting crashed the server (SIGSEGV), 100-deep nesting answered.
+      These crashes coincide with the library being overwritten, so they
+      may come from a half-written library rather than the query size.
+  - date: 2026-09-26
+    server: private initdb server
+    stack_limit: "rlimit 8176kB (max_stack_depth may not exceed 7664kB); max_stack_depth 2MB"
+    build: stannum.dylib installed 15:01:35 ET (debug build containing a query-depth limit)
+    result: every size answered 0, except 5000-deep nesting, which raised ERROR XX000.
 
 defaults:
   corpus: spans4
