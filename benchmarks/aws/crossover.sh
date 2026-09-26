@@ -30,7 +30,7 @@ apt-get install -y --no-install-recommends linux-tools-common "linux-tools-$(una
 perf --version > "$OUT/perf-version.txt"
 sysctl -w kernel.perf_event_paranoid=-1
 python3 -m venv --system-site-packages "$BENCH_ROOT/venv"
-"$BENCH_ROOT/venv/bin/pip" install 'psycopg[binary]==3.3.6'
+"$BENCH_ROOT/venv/bin/pip" install -r benchmarks/requirements-aws.txt
 export PATH="$BENCH_ROOT/venv/bin:$PATH"
 python3 - <<'PY'
 import boto3,os
