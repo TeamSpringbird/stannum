@@ -1670,6 +1670,7 @@ impl IndexScorer {
             counted: (0, 0),
             members: Vec::new(),
             dense: false,
+            words_ready: true,
             rank_base: 0,
         }
     }
@@ -2058,6 +2059,10 @@ struct OrdinalTerm<'a> {
     nibbles: Cell<Option<segment::source::HeldSpan>>,
     /// Whether the loaded chunk is a bitmap, held in `chunk`.
     dense: bool,
+    /// Whether `words` holds the loaded chunk's members, when it is not a
+    /// bitmap: an array chunk loaded for its members alone (see
+    /// [`Self::load_members`]) has them scattered on first need.
+    words_ready: bool,
     /// Index into `keys` of the loaded chunk, if any: a load of the current
     /// chunk is asked for wherever a bit or bucket of it is first needed,
     /// and happens once.
@@ -2121,7 +2126,33 @@ impl OrdinalTerm<'_> {
 
     /// Loads the current chunk's members and the rank of its first member,
     /// unless it is loaded already.
+    #[inline]
     fn load(&mut self) {
+        self.load_members();
+        if !self.words_ready {
+            self.scatter_words();
+        }
+    }
+
+    /// Scatters a loaded array chunk's members into `words`, for the bit
+    /// tests.
+    #[inline(never)]
+    fn scatter_words(&mut self) {
+        self.words.fill(0);
+        for &low in &self.members {
+            let low = usize::from(low);
+            self.words[low / 64] |= 1 << (low % 64);
+        }
+        self.words_ready = true;
+    }
+
+    /// Loads the current chunk as [`Self::load`] does, but an array
+    /// chunk's members only as `members`, not scattered into `words`: a
+    /// conjunction intersects sorted members and ranks by them, and
+    /// scattering every array chunk it loaded was a sixteenth of its walk.
+    /// Until `load` scatters them, the chunk has no words: `word`, `holds`
+    /// and the folds into words must not be asked of it.
+    fn load_members(&mut self) {
         if self.is_loaded() {
             return;
         }
@@ -2144,6 +2175,7 @@ impl OrdinalTerm<'_> {
                     self.members.push(low as u16);
                 }
                 self.dense = false;
+                self.words_ready = true;
                 self.head = std::ptr::null();
                 (self.head_len, self.rest_end) = (0, 0);
             }
@@ -2158,10 +2190,11 @@ impl OrdinalTerm<'_> {
                 (self.head, self.head_len) = (head, head_len);
                 self.rest = rest.wrapping_sub(head_len);
                 self.rest_end = head_len + rest_len;
+                // An array chunk's members are scattered into words for the
+                // bit tests when `load` asks; a bitmap's words are read in
+                // place.
+                self.words_ready = self.dense;
                 if !self.dense {
-                    // An array chunk's members are scattered into words for
-                    // the bit tests; a bitmap's words are read in place.
-                    chunk.words(&mut self.words);
                     chunk.members(&mut self.members);
                 }
                 self.rank_base = chunk.before;
@@ -2206,6 +2239,7 @@ impl OrdinalTerm<'_> {
     #[inline]
     fn word(&self, i: usize) -> u64 {
         if !self.dense {
+            debug_assert!(self.words_ready, "an array chunk's words asked before load");
             return self.words[i];
         }
         match self.run(i * 8, 8) {
@@ -2495,26 +2529,41 @@ fn phrase_check<'a>(
 }
 
 /// Narrows the shared members of a chunk (`lows` when `sparse`, else
-/// `set`) to those `term` holds there, loading its chunk: false when none
-/// were left to narrow, so the chunk need not be read.
+/// `set`) to those `term` holds there, loading its chunk's members: false
+/// when none were left to narrow, so the chunk need not be read. A term
+/// whose chunk is not a bitmap holds at most [`segment::ordinals::ARRAY_MAX`]
+/// members there, so the shared members become the sparse `lows` once it
+/// narrows them, and later streams test those rather than fold words.
 fn narrow(
     term: &mut OrdinalTerm<'_>,
-    sparse: bool,
+    sparse: &mut bool,
     set: &mut segment::ordinals::Words,
     lows: &mut Vec<u16>,
 ) -> bool {
-    if if sparse {
+    if if *sparse {
         lows.is_empty()
     } else {
         set.iter().all(|w| *w == 0)
     } {
         return false;
     }
-    term.load();
-    if sparse {
+    term.load_members();
+    if *sparse {
+        // A bit test per member: a merge of the two sorted lists, a search
+        // per member, was slower than scattering an array into words.
+        term.load();
         lows.retain(|low| term.holds(*low));
-    } else {
+    } else if term.dense {
         term.and_into(set);
+    } else {
+        lows.clear();
+        lows.extend(
+            term.members
+                .iter()
+                .copied()
+                .filter(|&low| set[usize::from(low) / 64] & (1 << (low % 64)) != 0),
+        );
+        *sparse = true;
     }
     true
 }
@@ -3065,8 +3114,8 @@ impl OrdinalWalk<'_, '_> {
         set: &mut segment::ordinals::Words,
     ) -> bool {
         let base = u32::from(key) << 16;
-        self.filters[lead].load();
-        let sparse = !self.filters[lead].dense;
+        self.filters[lead].load_members();
+        let mut sparse = !self.filters[lead].dense;
         let mut lows: Vec<u16> = Vec::new();
         if sparse {
             lows.extend_from_slice(&self.filters[lead].members);
@@ -3074,7 +3123,7 @@ impl OrdinalWalk<'_, '_> {
             self.filters[lead].assign_into(set);
         }
         for &f in others {
-            if !narrow(&mut self.filters[f], sparse, set, &mut lows) {
+            if !narrow(&mut self.filters[f], &mut sparse, set, &mut lows) {
                 return true;
             }
         }
@@ -3151,8 +3200,8 @@ impl OrdinalWalk<'_, '_> {
         // rarest first and only while members remain, so a conjunction of
         // common words with a rare one reads the common words' chunks only
         // where the rare one has documents that survive.
-        self.terms[lead].load();
-        let sparse = !self.terms[lead].dense;
+        self.terms[lead].load_members();
+        let mut sparse = !self.terms[lead].dense;
         let mut lows: Vec<u16> = Vec::new();
         if sparse {
             lows.extend_from_slice(&self.terms[lead].members);
@@ -3160,12 +3209,12 @@ impl OrdinalWalk<'_, '_> {
             self.terms[lead].assign_into(set);
         }
         for &t in others {
-            if !narrow(&mut self.terms[t], sparse, set, &mut lows) {
+            if !narrow(&mut self.terms[t], &mut sparse, set, &mut lows) {
                 return;
             }
         }
         for filter in &mut self.filters {
-            if !narrow(filter, sparse, set, &mut lows) {
+            if !narrow(filter, &mut sparse, set, &mut lows) {
                 return;
             }
         }
