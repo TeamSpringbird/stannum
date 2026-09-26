@@ -885,10 +885,7 @@ impl RunSource {
                 // (see `HeldPage`), so its content lock guards nothing, and
                 // a walk pins a page or two per chunk it loads.
                 let buffer = crate::score::charging("buffer read", || pin_block(index, block));
-                let contents = std::slice::from_raw_parts(
-                    pg_sys::BufferGetPage(buffer).cast::<u8>(),
-                    PAGE_SIZE,
-                );
+                let contents = std::slice::from_raw_parts(page_of(buffer), PAGE_SIZE);
                 let checked = match layout::kind(contents) {
                     Ok(KIND_RUN) => layout::chain(contents)
                         .map(|(_, data)| data)
@@ -983,6 +980,29 @@ unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_s
             RECENT_BUFFERS.with_borrow_mut(|recent| recent[at] = RecentBuffer { block, buffer });
         }
         buffer
+    }
+}
+
+/// The page of pinned buffer `buffer`: for a shared buffer computed as
+/// `BufferGetPage` does, which is a static inline function pgrx reaches
+/// through a guarded C shim, a `sigsetjmp` per call.
+///
+/// # Safety
+///
+/// `buffer` is pinned.
+#[inline]
+unsafe fn page_of(buffer: pg_sys::Buffer) -> *const u8 {
+    // SAFETY: a pinned shared buffer's page lies at its index in the
+    // shared buffer pool; local buffers take PostgreSQL's own path.
+    unsafe {
+        if buffer > 0 {
+            pg_sys::BufferBlocks
+                .add((buffer as usize - 1) * pg_sys::BLCKSZ as usize)
+                .cast::<u8>()
+                .cast_const()
+        } else {
+            pg_sys::BufferGetPage(buffer).cast::<u8>().cast_const()
+        }
     }
 }
 
