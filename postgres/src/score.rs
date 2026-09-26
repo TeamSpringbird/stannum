@@ -3193,82 +3193,95 @@ impl OrdinalWalk<'_, '_> {
         }
         drop_dead(self.dead, base, sparse, set, &mut lows);
         let mut sparse_at = 0usize;
-        let mut skip_sub = false;
         let mut pending = std::mem::take(&mut self.pending);
         pending.clear();
-        #[expect(
-            clippy::needless_range_loop,
-            reason = "the index addresses the sub-block and the sparse members too"
-        )]
-        for i in 0..segment::ordinals::WORDS {
-            if i % (SUB / 64) == 0 {
-                self.verify_pending(&mut pending, base);
-                // The threshold moves as candidates are admitted, so it is
-                // consulted afresh at every sub-block and candidate: the
-                // chunk that fills the top k also prunes the rest of itself.
-                let sub = i / (SUB / 64);
-                let pruning = self.threshold().is_some();
-                skip_sub = sub_empty[sub]
-                    || (pruning && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32));
-                self.class_stamp = self.class_stamp.wrapping_add(1);
-                if self.class_stamp == 0 {
-                    self.class_bounds.fill((0, 0.0));
-                    self.class_stamp = 1;
+        let mut block = [0u64; SUB_WORDS];
+        for sub in 0..SUBS {
+            // The sub-block's candidates. Most sub-blocks of a conjunction
+            // of common words hold none, and are passed over whole: taking
+            // the chunk a word at a time, with a sub-block's judgement at
+            // every sixteenth, was a sixth of such a walk.
+            let end = (sub + 1) * SUB;
+            if sparse {
+                if sparse_at == lows.len() {
+                    break;
                 }
-            }
-            let mut word = if sparse {
-                let mut word = 0u64;
-                while sparse_at < lows.len() && usize::from(lows[sparse_at] / 64) == i {
-                    word |= 1 << (lows[sparse_at] % 64);
+                if usize::from(lows[sparse_at]) >= end {
+                    continue;
+                }
+                block.fill(0);
+                while let Some(&low) = lows.get(sparse_at)
+                    && usize::from(low) < end
+                {
+                    let low = usize::from(low) % SUB;
+                    block[low / 64] |= 1 << (low % 64);
                     sparse_at += 1;
                 }
-                word
             } else {
-                set[i]
-            };
-            if word == 0 || skip_sub {
+                block.copy_from_slice(&set[sub * SUB_WORDS..(sub + 1) * SUB_WORDS]);
+                if block.iter().fold(0, |any, word| any | word) == 0 {
+                    continue;
+                }
+            }
+            // The threshold moves as candidates are admitted, so it is
+            // consulted afresh at every sub-block and candidate: the chunk
+            // that fills the top k also prunes the rest of itself.
+            if sub_empty[sub]
+                || (self.threshold().is_some()
+                    && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32))
+            {
                 continue;
             }
-            while word != 0 {
-                let low = (i * 64) as u16 + word.trailing_zeros() as u16;
-                word &= word - 1;
-                let ordinal = base + u32::from(low);
-                let sub = usize::from(low) / SUB;
-                let pruning = self.threshold().is_some();
-                if !pruning && self.phrase.is_some() {
-                    // Until the top k fill every match enters it, so a
-                    // candidate's positions are checked before it is scored:
-                    // a phrase of common words that matches rarely never
-                    // fills its top k, and scoring every member of the
-                    // conjunction first was a sixth of its walk. Admitted in
-                    // ordinal order, as `verify_pending` would admit them.
-                    if self.phrase_matches(low, ordinal) {
-                        let total = self
-                            .score_conjunct(low, ordinal, sub, sub_scores[sub], false)
-                            .expect("a candidate unpruned is scored");
-                        self.admit(total, ordinal);
-                    }
-                    continue;
-                }
-                let Some(total) = self.score_conjunct(low, ordinal, sub, sub_scores[sub], pruning)
-                else {
-                    continue;
-                };
-                let admit =
-                    self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
-                if !admit {
-                    continue;
-                }
-                if self.phrase.is_some() {
-                    // A phrase candidate is held until the sub-block is
-                    // scored: its positions are read only if it still ranks.
-                    pending.push((total, low));
-                    continue;
-                }
-                self.admit(total, ordinal);
+            self.class_stamp = self.class_stamp.wrapping_add(1);
+            if self.class_stamp == 0 {
+                self.class_bounds.fill((0, 0.0));
+                self.class_stamp = 1;
             }
+            for (w, &bits) in block.iter().enumerate() {
+                let mut word = bits;
+                while word != 0 {
+                    let low = ((sub * SUB_WORDS + w) * 64) as u16 + word.trailing_zeros() as u16;
+                    word &= word - 1;
+                    let ordinal = base + u32::from(low);
+                    let pruning = self.threshold().is_some();
+                    if !pruning && self.phrase.is_some() {
+                        // Until the top k fill every match enters it, so a
+                        // candidate's positions are checked before it is
+                        // scored: a phrase of common words that matches
+                        // rarely never fills its top k, and scoring every
+                        // member of the conjunction first was a sixth of its
+                        // walk. Admitted in ordinal order, as
+                        // `verify_pending` would admit them.
+                        if self.phrase_matches(low, ordinal) {
+                            let total = self
+                                .score_conjunct(low, ordinal, sub, sub_scores[sub], false)
+                                .expect("a candidate unpruned is scored");
+                            self.admit(total, ordinal);
+                        }
+                        continue;
+                    }
+                    let Some(total) =
+                        self.score_conjunct(low, ordinal, sub, sub_scores[sub], pruning)
+                    else {
+                        continue;
+                    };
+                    let admit =
+                        self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
+                    if !admit {
+                        continue;
+                    }
+                    if self.phrase.is_some() {
+                        // A phrase candidate is held until the sub-block is
+                        // scored: its positions are read only if it still
+                        // ranks.
+                        pending.push((total, low));
+                        continue;
+                    }
+                    self.admit(total, ordinal);
+                }
+            }
+            self.verify_pending(&mut pending, base);
         }
-        self.verify_pending(&mut pending, base);
         self.pending = pending;
     }
 
