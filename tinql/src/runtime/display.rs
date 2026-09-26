@@ -7,6 +7,7 @@ use std::fmt;
 
 impl fmt::Display for Query {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        crate::limits::check_stack();
         match self {
             Query::Term(s) => write!(f, "{s}"),
             Query::And(l, r) => write!(f, "AND({l}, {r})"),
@@ -146,6 +147,7 @@ fn fmt_span_query_with_sugar(
     span_query: &boldi_vigna::SpanQuery,
 ) -> fmt::Result {
     use boldi_vigna::SpanQuery;
+    crate::limits::check_stack();
 
     if let Some((max_gaps, terms)) = phrase_like_terms(term_slots, span_query) {
         return fmt_phrase_like(f, max_gaps, &terms);
@@ -240,6 +242,7 @@ fn fmt_span_expr_with_sugar(
     term_slots: &[SpanTermSlot],
     span_expr: &SpanExpr,
 ) -> fmt::Result {
+    crate::limits::check_stack();
     match span_expr {
         SpanExpr::Empty => write!(f, "EMPTY"),
         SpanExpr::Term(idx) => match term_slots.get(*idx) {

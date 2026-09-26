@@ -238,6 +238,7 @@ impl<'a> Parser<'a> {
 
     /// Opens the bracket at the current position.
     fn enter(&mut self) -> R<()> {
+        crate::limits::check_stack();
         self.nesting += 1;
         if self.nesting > MAX_NESTING {
             let error = ParseError::NestingTooDeep {

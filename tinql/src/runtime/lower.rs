@@ -49,6 +49,7 @@ pub fn lower_with_profile(
 
 /// Lowers `expr`, which sits `depth` levels deep in the lowered query.
 fn lower_boolean(expr: &crate::Expr, depth: usize) -> Result<Query, LowerError> {
+    crate::limits::check_stack();
     use crate::Expr;
 
     // The parser bounds an expression's height, so this only guards callers
@@ -222,6 +223,7 @@ impl SpanBuilder {
     }
 
     fn lower_span_expr(&mut self, expr: &crate::Expr) -> Result<SpanExpr, LowerError> {
+        crate::limits::check_stack();
         self.depth += 1;
         if self.depth > MAX_SPAN_NESTING {
             return Err(LowerError::NestingTooDeep);

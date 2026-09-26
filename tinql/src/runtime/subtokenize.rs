@@ -106,6 +106,7 @@ fn analyze<T: Tokenizer>(text: &str, tokenizer: &T) -> Vec<AnalyzedToken> {
 }
 
 fn rewrite<T: Tokenizer>(mut expr: Expr, tokenizer: &T) -> Result<Expr, SubTokenizeError> {
+    crate::limits::check_stack();
     match expr {
         Expr::Term(_)
         | Expr::MatchAll

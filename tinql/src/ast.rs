@@ -254,6 +254,7 @@ impl Expr {
 /// Format an expression, wrapping in parens when `expr`'s precedence is
 /// below `min_prec`.
 fn fmt_expr(f: &mut fmt::Formatter<'_>, expr: &Expr, min_prec: u8) -> fmt::Result {
+    crate::limits::check_stack();
     let needs_parens = expr.precedence() < min_prec;
     if needs_parens {
         write!(f, "(")?;

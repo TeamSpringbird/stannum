@@ -352,6 +352,7 @@ impl<S: Statistics + ?Sized> Estimator<'_, S> {
     }
 
     fn query(&self, query: &Query) -> Result<Estimate, S::Error> {
+        crate::limits::check_stack();
         Ok(match query {
             Query::Term(term) => self.term(term)?,
             Query::And(left, right) => Self::and(&[self.query(left)?, self.query(right)?]),

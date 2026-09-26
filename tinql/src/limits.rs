@@ -44,3 +44,25 @@ pub const MAX_TERMS: usize = 10_000;
 /// whose gaps and repeated-term semantics differ from a flat operand list,
 /// and a phrase with pinned gaps nests one level per word; this bounds both.
 pub const MAX_SPAN_NESTING: usize = 2 * MAX_NESTING;
+
+static STACK_CHECK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Installs `check`, which every recursive pass over a query calls once per
+/// level: the parser per bracket, sub-tokenization, lowering,
+/// simplification, estimation, display and evaluation per node. The limits
+/// above keep those passes well inside a backend's stack; `check` is the
+/// backstop for a stack that is smaller or already deeper than expected.
+/// It must not return when the stack is nearly exhausted: the extension
+/// installs PostgreSQL's `check_stack_depth`, whose ERROR reaches Rust as a
+/// panic and unwinds out of the pass. The first installation wins.
+pub fn set_stack_check(check: fn()) {
+    let _ = STACK_CHECK.set(check);
+}
+
+/// Calls the installed stack check, if any.
+#[inline]
+pub(crate) fn check_stack() {
+    if let Some(check) = STACK_CHECK.get() {
+        check();
+    }
+}

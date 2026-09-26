@@ -450,6 +450,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
     }
 
     fn query(&self, query: &Query) -> Result<Plan<'a>> {
+        crate::limits::check_stack();
         match query {
             Query::Term(term) => Self::term_plan(self.segment.term(term)?),
             Query::And(left, right) => self.and(vec![self.query(left)?, self.query(right)?]),
@@ -565,6 +566,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
     /// Boolean skeleton of a span query: a superset of documents that could
     /// contain a match, using only which terms are present.
     fn span_skeleton(&self, query: &SpanQuery, slots: &[Vec<Term<'a>>]) -> Result<Plan<'a>> {
+        crate::limits::check_stack();
         Ok(match query {
             SpanQuery::Empty => Self::empty(),
             SpanQuery::Term(slot) => self.slot_plan(*slot, slots)?,
@@ -598,6 +600,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
     }
 
     fn span_expr_skeleton(&self, expr: &SpanExpr, slots: &[Vec<Term<'a>>]) -> Result<Plan<'a>> {
+        crate::limits::check_stack();
         Ok(match expr {
             SpanExpr::Empty => Self::empty(),
             SpanExpr::Term(slot) => self.slot_plan(*slot, slots)?,
