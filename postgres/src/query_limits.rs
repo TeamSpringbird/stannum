@@ -380,4 +380,80 @@ mod tests {
             }
         }
     }
+
+    /// Ranking scores every term a wildcard, regex, range or fuzzy term
+    /// expands to, as TIN does, so an expansion to millions of terms builds
+    /// millions of scorers. `stannum.max_expansion_terms` bounds the terms
+    /// one query's expansions may score, with SQLSTATE 54000
+    /// (`program_limit_exceeded`), like Lucene's and Elasticsearch's clause
+    /// limits; matching and counting are not limited.
+    #[pg_test]
+    fn scoring_expansions_are_limited_by_max_expansion_terms() {
+        Spi::run(
+            "CREATE TABLE expand_cap(id int, body text);
+             INSERT INTO expand_cap SELECT n, 'w' || n FROM generate_series(1, 1000) n;
+             CREATE INDEX expand_cap_idx ON expand_cap USING stannum(body);
+             ANALYZE expand_cap;
+             SET LOCAL stannum.max_expansion_terms = 100;",
+        )
+        .unwrap();
+        let ranked = "SELECT count(*) FROM (SELECT id FROM expand_cap WHERE body ==> $q
+                      ORDER BY stannum.full_score(ctid) DESC LIMIT 5) ranked";
+        let inspected = "SELECT count(*) FROM stannum.score_inspect('expand_cap_idx', $q)";
+        let outcome = |sql: &str, query: &str| {
+            Spi::get_two::<String, String>(&format!(
+                "SELECT * FROM expand_cap_outcome('{}', '{query}')",
+                sql.replace("$q", "$1").replace('\'', "''")
+            ))
+            .unwrap()
+        };
+        Spi::run(
+            "CREATE FUNCTION expand_cap_outcome(sql text, q text, OUT state text, OUT message text)
+             LANGUAGE plpgsql AS $$
+             DECLARE n bigint;
+             BEGIN
+                 EXECUTE sql INTO n USING q;
+                 state := '00000';
+                 message := n::text;
+             EXCEPTION WHEN OTHERS THEN
+                 state := SQLSTATE;
+                 message := SQLERRM;
+             END $$",
+        )
+        .unwrap();
+        for sql in [ranked, inspected] {
+            // 1,000 terms, past the limit of 100.
+            let (state, message) = outcome(sql, "w*");
+            assert_eq!(state.as_deref(), Some("54000"), "{sql}: {message:?}");
+            assert_eq!(
+                message.as_deref(),
+                Some(
+                    "query expands to more than 100 terms to score \
+                     (stannum.max_expansion_terms)"
+                ),
+                "{sql}"
+            );
+            // Within it: w10, w100..w109 and w1000.
+            let (state, message) = outcome(sql, "w10*");
+            assert_eq!(state.as_deref(), Some("00000"), "{sql}: {message:?}");
+            // The terms of every expansion count: 60 and 30 are within it,
+            // 60, 30 and 12 are not.
+            let within = "MATCHES w[1-6][0-9] OR MATCHES w[7-9][0-9]";
+            let (state, message) = outcome(sql, within);
+            assert_eq!(state.as_deref(), Some("00000"), "{sql}: {message:?}");
+            let (state, message) = outcome(sql, &format!("{within} OR w10*"));
+            assert_eq!(state.as_deref(), Some("54000"), "{sql}: {message:?}");
+        }
+        // Matching and counting expand without the limit.
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM expand_cap WHERE body ==> 'w*'").unwrap(),
+            Some(1000)
+        );
+        Spi::run("SET LOCAL stannum.max_expansion_terms = 1000").unwrap();
+        let (state, message) = outcome(ranked, "w*");
+        assert_eq!(
+            (state.as_deref(), message.as_deref()),
+            (Some("00000"), Some("5"))
+        );
+    }
 }
