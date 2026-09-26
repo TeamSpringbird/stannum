@@ -25,6 +25,10 @@ mod tf_bucket {
 }
 mod udfs;
 
+/// Stannum against TIN's recorded responses (TIN 1.0.3, see the module).
+#[cfg(feature = "pg_test")]
+mod tin_conformance;
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     options::init();

@@ -32,6 +32,30 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "benchmarks/aws/build-image.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
+    },
+    "benchmarks/aws/count-probe.sh": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/aws/crossover.sh": {
+      "owner": "ben",
+      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
+    },
+    "benchmarks/aws/crossover_campaign.py": {
+      "owner": "ben",
+      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
+    },
+    "benchmarks/aws/database_snapshot.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmark snapshot capture, restore, and validation implementation."
+    },
+    "benchmarks/aws/start-postgres.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
+    },
     "benchmarks/baselines.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -44,9 +68,45 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in e0fe96d06f4378ba3c88cf3a0633d3f2739cb6be."
     },
+    "benchmarks/count_crossover.py": {
+      "owner": "ben",
+      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
+    },
+    "benchmarks/count_crossover_report.py": {
+      "owner": "ben",
+      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
+    },
+    "benchmarks/count_fuzz.py": {
+      "owner": "ben",
+      "evidence": "New Stannum seeded Boolean and concurrent-snapshot correctness harness; not copied from Lead."
+    },
+    "benchmarks/count_local.py": {
+      "owner": "ben",
+      "evidence": "New owned local count execution and visibility diagnostic runner; not copied from Lead."
+    },
+    "benchmarks/count_oracle.py": {
+      "owner": "ben",
+      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
+    },
+    "benchmarks/count_probe.py": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/count_visibility.py": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
     "benchmarks/dataset.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "benchmarks/experiment_queue.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
+    },
+    "benchmarks/experiment_report.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
     },
     "benchmarks/fold_reproduction.py": {
       "owner": "ben",
@@ -55,6 +115,10 @@
     "benchmarks/foreground_writes.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 1f79095007a88234389bded090fd7fcab7ce8ee1."
+    },
+    "benchmarks/frontier_snapshot_experiment.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
     },
     "benchmarks/insert_latency.py": {
       "owner": "ben",
@@ -88,6 +152,18 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
     },
+    "benchmarks/published_dataset.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum checksummed downloader for public benchmark data; no upstream code copied."
+    },
+    "benchmarks/query_comparison.py": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/query_shapes.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum deterministic query-shape benchmark integration."
+    },
     "benchmarks/resources.py": {
       "owner": "ben",
       "evidence": "Original Stannum resource measurement summarization and regression coverage."
@@ -99,6 +175,18 @@
     "benchmarks/server_times.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "benchmarks/snapshot_candidate_local.py": {
+      "owner": "ben",
+      "evidence": "Original native PostgreSQL physical snapshot and candidate-binary compatibility rehearsal."
+    },
+    "benchmarks/snapshot_latency_local.py": {
+      "owner": "ben",
+      "evidence": "Original balanced local snapshot latency comparison harness."
+    },
+    "benchmarks/snapshot_load_local.py": {
+      "owner": "ben",
+      "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
     },
     "benchmarks/sustained.py": {
       "owner": "ben",
@@ -112,9 +200,29 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in e0fe96d06f4378ba3c88cf3a0633d3f2739cb6be."
     },
+    "benchmarks/test_count_crossover.py": {
+      "owner": "ben",
+      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
+    },
+    "benchmarks/test_count_fuzz.py": {
+      "owner": "ben",
+      "evidence": "New Stannum seeded Boolean and concurrent-snapshot correctness harness; not copied from Lead."
+    },
+    "benchmarks/test_count_oracle.py": {
+      "owner": "ben",
+      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
+    },
+    "benchmarks/test_database_snapshot.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmark snapshot capture, restore, and validation implementation."
+    },
     "benchmarks/test_dataset.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "benchmarks/test_experiment_report.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
     },
     "benchmarks/test_fold_reproduction.py": {
       "owner": "ben",
@@ -144,6 +252,18 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
     },
+    "benchmarks/test_published_dataset.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum split-stream and integrity regression tests."
+    },
+    "benchmarks/test_query_comparison.py": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
+    "benchmarks/test_query_shapes.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum query-shape coverage and validation regression tests."
+    },
     "benchmarks/test_resources.py": {
       "owner": "ben",
       "evidence": "Original Stannum resource measurement summarization and regression coverage."
@@ -155,6 +275,10 @@
     "benchmarks/test_server_times.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "benchmarks/test_snapshot_load_local.py": {
+      "owner": "ben",
+      "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
     },
     "benchmarks/test_sustained.py": {
       "owner": "ben",
@@ -176,6 +300,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
     },
+    "benchmarks/test_wide_cursor.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum wide-query fuzzer generation regression tests."
+    },
     "benchmarks/tin.py": {
       "owner": "ben",
       "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
@@ -183,6 +311,10 @@
     "benchmarks/tin/position-limit.sql": {
       "owner": "ben",
       "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
+    },
+    "benchmarks/tin_behavior_probe.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-09-26 to record and replay PlanetScale TIN 1.0.3 responses."
     },
     "benchmarks/tin_catalog.py": {
       "owner": "ben",
@@ -312,9 +444,17 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in aa870ad9470babeafa5ac2cf10f38eed5983efbf."
     },
+    "docs/benchmarks/query-shapes-exists-repro.sql": {
+      "owner": "ben",
+      "evidence": "Original Stannum standalone regression reproduction generated from query-shape suite."
+    },
     "docs/benchmarks/render_performance_snapshot.py": {
       "owner": "ben",
       "evidence": "Original Stannum chart renderer added for the recorded GIN/TIN performance snapshot; reads existing benchmark JSON without copied upstream implementation."
+    },
+    "docs/benchmarks/render_query_shapes.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum renderer for synthetic query-shape measurements."
     },
     "docs/query-language/README.md": {
       "owner": "mixed",
@@ -430,6 +570,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "postgres/src/fold.rs": {
+      "owner": "ben",
+      "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
+    },
     "postgres/src/highlight.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/highlight.rs",
@@ -496,6 +640,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 66bc09c8c623cf5026d3030618c2b7e4f16927b2."
     },
+    "postgres/src/tin_conformance.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-09-26 to record and replay PlanetScale TIN 1.0.3 responses."
+    },
     "postgres/src/udfs.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/udfs.rs",
@@ -550,9 +698,17 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
     },
+    "segment/examples/count_paths.rs": {
+      "owner": "ben",
+      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
+    },
     "segment/examples/merge_memory.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
+    },
+    "segment/examples/ordinal_counts.rs": {
+      "owner": "ben",
+      "evidence": "Original replay of the published count queries over TID and ordinal encodings."
     },
     "segment/examples/vacuum_diagnostic.rs": {
       "owner": "ben",
@@ -586,6 +742,22 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "segment/src/maintenance.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum maintenance cursor implementation; no upstream source copied."
+    },
+    "segment/src/maintenance/dictionary.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum bounded maintenance dictionary reader."
+    },
+    "segment/src/maintenance/postings.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum bounded maintenance postings cursor; shares Stannum codec definitions."
+    },
+    "segment/src/maintenance/validate.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum streaming cross-term validation."
+    },
     "segment/src/merge.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 26b9d1ec0f2cad8e84386cf26b63afe3dadcd42c."
@@ -593,6 +765,10 @@
     "segment/src/merge_strategy.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 6f8189c269c66d941502d0da662e142e1f898cc4."
+    },
+    "segment/src/ordinals.rs": {
+      "owner": "ben",
+      "evidence": "Original ordinal stream codec and chunked Boolean evaluator, written for Stannum."
     },
     "segment/src/pages.rs": {
       "owner": "ben",
@@ -865,174 +1041,6 @@
     "tokenizer/tests/compatibility.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 82157ed1e4da3e195b0837dbb868897a8f57ad48."
-    },
-    "benchmarks/aws/build-image.sh": {
-      "owner": "ben",
-      "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
-    },
-    "benchmarks/aws/start-postgres.sh": {
-      "owner": "ben",
-      "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
-    },
-    "benchmarks/query_shapes.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum deterministic query-shape benchmark integration."
-    },
-    "benchmarks/test_query_shapes.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum query-shape coverage and validation regression tests."
-    },
-    "docs/benchmarks/render_query_shapes.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum renderer for synthetic query-shape measurements."
-    },
-    "docs/benchmarks/query-shapes-exists-repro.sql": {
-      "owner": "ben",
-      "evidence": "Original Stannum standalone regression reproduction generated from query-shape suite."
-    },
-    "benchmarks/published_dataset.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum checksummed downloader for public benchmark data; no upstream code copied."
-    },
-    "benchmarks/test_published_dataset.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum split-stream and integrity regression tests."
-    },
-    "benchmarks/test_wide_cursor.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum wide-query fuzzer generation regression tests."
-    },
-    "segment/src/maintenance.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum maintenance cursor implementation; no upstream source copied."
-    },
-    "segment/src/maintenance/postings.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum bounded maintenance postings cursor; shares Stannum codec definitions."
-    },
-    "segment/src/maintenance/dictionary.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum bounded maintenance dictionary reader."
-    },
-    "segment/src/maintenance/validate.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum streaming cross-term validation."
-    },
-    "benchmarks/aws/count-probe.sh": {
-      "owner": "ben",
-      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
-    },
-    "benchmarks/count_probe.py": {
-      "owner": "ben",
-      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
-    },
-    "segment/examples/count_paths.rs": {
-      "owner": "ben",
-      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
-    },
-    "benchmarks/count_visibility.py": {
-      "owner": "ben",
-      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
-    },
-    "benchmarks/query_comparison.py": {
-      "owner": "ben",
-      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
-    },
-    "benchmarks/test_query_comparison.py": {
-      "owner": "ben",
-      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
-    },
-    "benchmarks/count_fuzz.py": {
-      "owner": "ben",
-      "evidence": "New Stannum seeded Boolean and concurrent-snapshot correctness harness; not copied from Lead."
-    },
-    "benchmarks/test_count_fuzz.py": {
-      "owner": "ben",
-      "evidence": "New Stannum seeded Boolean and concurrent-snapshot correctness harness; not copied from Lead."
-    },
-    "benchmarks/count_local.py": {
-      "owner": "ben",
-      "evidence": "New owned local count execution and visibility diagnostic runner; not copied from Lead."
-    },
-    "benchmarks/count_crossover.py": {
-      "owner": "ben",
-      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
-    },
-    "benchmarks/count_crossover_report.py": {
-      "owner": "ben",
-      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
-    },
-    "benchmarks/test_count_crossover.py": {
-      "owner": "ben",
-      "evidence": "New Stannum metadata-based COUNT crossover experiment and held-out policy evaluation; not copied from Lead."
-    },
-    "benchmarks/count_oracle.py": {
-      "owner": "ben",
-      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
-    },
-    "benchmarks/test_count_oracle.py": {
-      "owner": "ben",
-      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
-    },
-    "benchmarks/aws/crossover.sh": {
-      "owner": "ben",
-      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
-    },
-    "benchmarks/aws/crossover_campaign.py": {
-      "owner": "ben",
-      "evidence": "New Stannum bounded index oracle or owned AWS crossover orchestration; not copied from Lead."
-    },
-    "benchmarks/aws/database_snapshot.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum benchmark snapshot capture, restore, and validation implementation."
-    },
-    "benchmarks/test_database_snapshot.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum benchmark snapshot capture, restore, and validation implementation."
-    },
-    "benchmarks/snapshot_candidate_local.py": {
-      "owner": "ben",
-      "evidence": "Original native PostgreSQL physical snapshot and candidate-binary compatibility rehearsal."
-    },
-    "benchmarks/snapshot_latency_local.py": {
-      "owner": "ben",
-      "evidence": "Original balanced local snapshot latency comparison harness."
-    },
-    "benchmarks/experiment_queue.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
-    },
-    "benchmarks/experiment_report.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
-    },
-    "benchmarks/frontier_snapshot_experiment.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
-    },
-    "benchmarks/test_experiment_report.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
-    },
-    "benchmarks/snapshot_load_local.py": {
-      "owner": "ben",
-      "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
-    },
-    "benchmarks/test_snapshot_load_local.py": {
-      "owner": "ben",
-      "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
-    },
-    "postgres/src/fold.rs": {
-      "owner": "ben",
-      "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
-    },
-    "segment/examples/ordinal_counts.rs": {
-      "owner": "ben",
-      "evidence": "Original replay of the published count queries over TID and ordinal encodings."
-    },
-    "segment/src/ordinals.rs": {
-      "owner": "ben",
-      "evidence": "Original ordinal stream codec and chunked Boolean evaluator, written for Stannum."
     }
   }
 }
