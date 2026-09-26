@@ -15,9 +15,11 @@ crash the backend, and the postmaster would restart every backend.
 
 Runs against a server in a Docker container built from the tree under test
 (see benchmarks/local/exit-test.sh), reading the server log with
-`docker logs`:
+`docker logs`. The connection comes from libpq's environment (PGHOST,
+PGPORT, PGUSER, PGPASSWORD, PGDATABASE), never from the command line:
 
-    exit_during_walk.py --port 28963 --container stannum-exit
+    PGHOST=127.0.0.1 PGPORT=28963 PGUSER=postgres PGPASSWORD=... \
+        exit_during_walk.py --container stannum-exit
 
 The container must be dedicated to the test: its log is checked for crashes
 and the last check shuts the server down.
@@ -150,17 +152,14 @@ def assert_walks_hold_pages(control, texts):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--container', required=True)
-    parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--password', default='postgres')
     parser.add_argument('--rounds', type=int, default=40)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--rows', type=int, default=ROWS,
                         help='documents; a table already holding this many is reused')
     parser.add_argument('--no-shutdown', action='store_true', help='skip the final fast shutdown')
     args = parser.parse_args()
-    dsn = f'host={args.host} port={args.port} user=postgres password={args.password} dbname=postgres'
+    dsn = ''  # libpq reads PGHOST, PGPORT, PGUSER, PGPASSWORD and PGDATABASE
     rng = random.Random(args.seed)
 
     control = psycopg.connect(dsn, autocommit=True)
