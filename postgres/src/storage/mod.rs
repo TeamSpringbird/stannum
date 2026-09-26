@@ -23,7 +23,14 @@
 //! WAL: every page change goes through the generic WAL API. New runs and
 //! their directory entries are published in that order, so a crash between
 //! the two leaks unreferenced pages rather than referencing unwritten ones;
-//! the next VACUUM reclaims such orphans. Generic WAL carries no snapshot
+//! the next VACUUM reclaims such orphans. The same holds for an error: page
+//! writes survive the aborted transaction. So before the meta page records a
+//! change, no page it references changes in a way it cannot read: retired
+//! runs are freed and chained into the pending list only after the meta page
+//! no longer lists them where that matters (see `AfterPublication`), and a
+//! replaced write buffer goes to pages the published one does not cover (see
+//! `replace_buffer`). The FSM is not WAL-logged either; VACUUM records FREE
+//! pages it lacks again. Generic WAL carries no snapshot
 //! information, so freeing pages additionally logs a removal horizon
 //! through [`wal`] when the custom resource manager is registered; hot
 //! standbys serve segmented reads only then (see [`index_reads_allowed`]).
@@ -421,9 +428,10 @@ pub unsafe fn present(index: pg_sys::Relation) -> bool {
 unsafe fn read_meta(index: pg_sys::Relation, exclusive: bool) -> (Buffer, Meta) {
     unsafe {
         if exclusive {
-            // A structural change begins: forget releases of an operation
-            // that failed before publishing.
+            // A structural change begins: forget releases, chain joins and
+            // frees of an operation that failed before publishing.
             RELEASED_XIDS.with_borrow_mut(Vec::clear);
+            AFTER_PUBLICATION.with_borrow_mut(|after| *after = AfterPublication::default());
         }
         let buffer = Buffer::read(index, 0, exclusive);
         let kind = buffer.kind();
@@ -438,20 +446,32 @@ unsafe fn read_meta(index: pg_sys::Relation, exclusive: bool) -> (Buffer, Meta) 
     }
 }
 
+/// Publishes `meta`, then does what the structural change in progress could
+/// only do once its meta page is written (see [`AfterPublication`]).
 unsafe fn write_meta(index: pg_sys::Relation, buffer: &Buffer, meta: &Meta) {
     unsafe {
         write_page(index, buffer, false, KIND_META, &checked(meta.encode()));
         let released = RELEASED_XIDS.with_borrow_mut(std::mem::take);
-        if released.is_empty() || wal::registered().is_none() || !is_permanent(index) {
-            return;
+        if !released.is_empty() && wal::registered().is_some() && is_permanent(index) {
+            // Read only after the publication above reached WAL: every
+            // transaction id assigned before it is now below this one, so no
+            // standby snapshot that copied the old directory can have a
+            // larger xmin (see restamp).
+            let horizon = pg_sys::ReadNextTransactionId().into_inner();
+            if let Some(stamped) = restamp(meta, &released, horizon) {
+                write_page(index, buffer, false, KIND_META, &checked(stamped.encode()));
+            }
         }
-        // Read only after the publication above reached WAL: every
-        // transaction id assigned before it is now below this one, so no
-        // standby snapshot that copied the old directory can have a larger
-        // xmin (see restamp).
-        let horizon = pg_sys::ReadNextTransactionId().into_inner();
-        if let Some(stamped) = restamp(meta, &released, horizon) {
-            write_page(index, buffer, false, KIND_META, &checked(stamped.encode()));
+        let after = AFTER_PUBLICATION.with_borrow_mut(std::mem::take);
+        for (last, next) in after.joins {
+            link_chain(index, last, next);
+        }
+        for (xid, pages) in after.frees {
+            // Standbys must resolve the snapshot conflict before the pages
+            // below become free and reusable; the record follows the
+            // publication above in WAL and precedes every page it frees.
+            wal::log_reclaim(index, xid);
+            free_pages(index, &pages, xid);
         }
     }
 }
@@ -460,6 +480,27 @@ thread_local! {
     /// Transaction ids [`release`] stamped on pending entries during the
     /// structural change in progress, consumed by [`write_meta`].
     static RELEASED_XIDS: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// Page writes of the structural change in progress that must wait for
+    /// its meta page, consumed by [`write_meta`].
+    static AFTER_PUBLICATION: RefCell<AfterPublication> = RefCell::new(AfterPublication::default());
+}
+
+/// Page writes a structural change defers until its meta page is written.
+///
+/// Buffer changes survive a failed transaction, and WAL replays any prefix
+/// of what was written. So until the meta page records the change, no page
+/// the on-disk meta page references may change in a way it cannot read:
+/// a pending run's pages stay run pages, and a run still in the directory
+/// keeps its chain as published. Deferred to after publication, the same
+/// writes can only fail into pages nothing references, which VACUUM's
+/// orphan pass reclaims.
+#[derive(Default)]
+struct AfterPublication {
+    /// (last page of a released run, chain it continues into), in order.
+    joins: Vec<(u32, u32)>,
+    /// Pages of drained pending runs, with the transaction id they were
+    /// released at.
+    frees: Vec<(u32, Vec<u32>)>,
 }
 
 /// The meta page with every pending entry released in this operation
@@ -1566,6 +1607,15 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
 /// otherwise the run joins the newest entry, so the list never overflows and
 /// no page is leaked; reclamation of that entry just waits for the newer xid.
 ///
+/// The run stays in the directory on disk until the caller's
+/// [`write_meta`], so its last page is linked only after that (see
+/// [`AfterPublication`]): rewritten earlier, a failure in between left a
+/// published run whose chain continued into the pending list, and every
+/// later attempt to retire it failed as corrupt. The published entry is
+/// ahead of the link for that moment; should the link never be written, the
+/// chain ends early and what follows is unreferenced, for VACUUM's orphan
+/// pass rather than a later drain.
+///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively.
 unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
@@ -1584,7 +1634,8 @@ unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
     let full = meta.pending.len() >= MAX_PENDING;
     match meta.pending.last_mut() {
         Some(last) if full || last.xid == xid => {
-            unsafe { prepend_chain(index, run, last.run.first) };
+            unsafe { expect_chain_end(index, run) };
+            AFTER_PUBLICATION.with_borrow_mut(|after| after.joins.push((run.last, last.run.first)));
             last.run = Run {
                 first: run.first,
                 blocks: last.run.blocks + run.blocks,
@@ -1597,79 +1648,98 @@ unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
     }
 }
 
-/// Points the last page of `run` at `next`, joining two chains of pages that
-/// only the reclamation walk will ever follow across.
+/// Fails unless the page `run` records as its last is a run page ending the
+/// chain, before anything is published that would rely on it. The run
+/// records its last page, so one page is read whatever the run's length:
+/// walking the chain to find it held the meta lock for as long as a retired
+/// merge input took to read.
 ///
 /// # Safety
-/// The caller holds the meta page of `index` exclusively; `run` is a run of
-/// `index` that no directory references any more.
-unsafe fn prepend_chain(index: pg_sys::Relation, run: Run, next: u32) {
-    unsafe {
-        let what = format!("released run at page {}", run.first);
-        // The run records its last page: one page is written, whatever the
-        // run's length. Walking the chain to find it held the meta lock for
-        // as long as a retired merge input took to read.
-        let last = Buffer::read(index, run.last, true);
-        expect_run_page(&last, &what);
-        let (following, data) = last.chain();
-        if following != NONE {
-            corrupt(format!(
-                "Stannum {what}: page {} is not the chain's last page",
-                run.last
-            ));
-        }
-        let payload = layout::chain_payload(next, data);
-        write_page(index, &last, false, KIND_RUN, &payload);
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn expect_chain_end(index: pg_sys::Relation, run: Run) {
+    let what = format!("released run at page {}", run.first);
+    let last = unsafe { Buffer::read(index, run.last, false) };
+    expect_run_page(&last, &what);
+    if last.chain().0 != NONE {
+        corrupt(format!(
+            "Stannum {what}: page {} is not the chain's last page",
+            run.last
+        ));
     }
 }
 
-/// Marks pages of pending runs that no snapshot can still read as free and
-/// records them in the FSM, at most `stannum.reclaim_pages` of them: this
-/// runs under the exclusive meta lock, where freeing every page of a
-/// retired merge input at once stalled the insert and, behind it, every
-/// reader for the duration of the walk. A run freed only in part keeps
-/// its place on the list, from the first page still to free.
+/// Points run page `last` at `next`, joining two chains of pages that only
+/// the reclamation walk will ever follow across.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively and has published
+/// a meta page on which no directory entry references `last`.
+unsafe fn link_chain(index: pg_sys::Relation, last: u32, next: u32) {
+    unsafe {
+        let buffer = Buffer::read(index, last, true);
+        expect_run_page(&buffer, &format!("released run ending at page {last}"));
+        let payload = layout::chain_payload(next, buffer.chain().1);
+        write_page(index, &buffer, false, KIND_RUN, &payload);
+    }
+}
+
+/// Whether no snapshot can still read a run released at `xid`.
+///
+/// # Safety
+/// `index` is a live index relation.
+unsafe fn pending_removable(index: pg_sys::Relation, xid: u32) -> bool {
+    // pg_test builds only: a test's own transaction keeps every entry it
+    // released unremovable, so a test that must drain the pending list
+    // declares its entries removable instead.
+    #[cfg(feature = "pg_test")]
+    if testing::PENDING_REMOVABLE.with(Cell::get) {
+        return true;
+    }
+    unsafe { pg_sys::GlobalVisCheckRemovableXid(index, pg_sys::TransactionId::from(xid)) }
+}
+
+/// Removes from the list what pending runs no snapshot can still read, at
+/// most `stannum.reclaim_pages` pages of them, and leaves their pages to be
+/// freed once the caller's [`write_meta`] has published the shorter list
+/// (see [`AfterPublication`]). Freed before, a failure in between left the
+/// meta page listing FREE pages that a new run could take and a later drain
+/// would then free from under it. A run freed only in part keeps its place
+/// on the list, from the first page still to free.
+///
+/// The walk runs under the exclusive meta lock, where freeing every page of
+/// a retired merge input at once stalled the insert and, behind it, every
+/// reader for the duration of the walk; hence the budget. Entries this
+/// change released or joined are left alone: their chains are not linked
+/// until publication.
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively.
 unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
     unsafe {
         let mut budget = RECLAIM_PAGES.get().max(1) as u32;
+        let released = RELEASED_XIDS.with_borrow(Clone::clone);
         let mut still_pending = Vec::new();
         for mut pending in std::mem::take(&mut meta.pending) {
-            let xid = pg_sys::TransactionId::from(pending.xid);
-            if budget == 0 || !pg_sys::GlobalVisCheckRemovableXid(index, xid) {
+            if budget == 0
+                || released.contains(&pending.xid)
+                || !pending_removable(index, pending.xid)
+            {
                 still_pending.push(pending);
                 continue;
             }
-            // Standbys must resolve the snapshot conflict before the pages
-            // below become free and reusable.
-            wal::log_reclaim(index, pending.xid);
-            let mut block = pending.run.first;
-            let mut freed = 0;
-            while freed < pending.run.blocks && budget > 0 {
-                pgrx::check_for_interrupts!();
-                if block == NONE {
-                    break;
-                }
-                let buffer = Buffer::read(index, block, true);
-                if buffer.kind() != KIND_RUN {
-                    break;
-                }
-                let (next, _) = buffer.chain();
-                write_page(index, &buffer, false, KIND_FREE, &pending.xid.to_le_bytes());
-                let page = buffer.block();
-                drop(buffer);
-                pg_sys::RecordFreeIndexPage(index, page);
-                block = next;
-                freed += 1;
-                budget -= 1;
-            }
-            if freed < pending.run.blocks && block != NONE {
-                // The chain from `block` stands on its own; a later drain
+            let (pages, next) = verify::chain_pages(
+                index,
+                pending.run.first,
+                pending.run.blocks.min(budget),
+                KIND_RUN,
+            );
+            let freed = pages.len() as u32;
+            budget -= freed;
+            if freed < pending.run.blocks && next != NONE {
+                // The chain from `next` stands on its own; a later drain
                 // or reclamation carries on from there.
                 pending.run = Run {
-                    first: block,
+                    first: next,
                     blocks: pending.run.blocks - freed,
                     bytes: pending
                         .run
@@ -1678,6 +1748,9 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
                     last: pending.run.last,
                 };
                 still_pending.push(pending);
+            }
+            if !pages.is_empty() {
+                AFTER_PUBLICATION.with_borrow_mut(|after| after.frees.push((pending.xid, pages)));
             }
         }
         meta.pending = still_pending;
@@ -1709,8 +1782,8 @@ thread_local! {
 /// shared, a page changed by a later record makes the read `None`: replay on
 /// a standby applies a writer's buffer pages before its meta page, without
 /// the meta lock a primary writer would hold across both, so an old meta page
-/// can describe pages already rewritten from the head. Links are exempt: a
-/// page's successor is set once and never changes.
+/// can describe pages a later change reused. Links are checked the same way:
+/// a replaced buffer relinks its pages (see [`replace_buffer`]).
 unsafe fn read_buffer_range(
     index: pg_sys::Relation,
     pages: &mut Vec<u32>,
@@ -1728,6 +1801,9 @@ unsafe fn read_buffer_range(
                 // Follow the chain from the last known page to discover the next.
                 let last = *pages.last().expect("head is always known");
                 let buffer = Buffer::read(index, last, false);
+                if published.is_some_and(|published| buffer.lsn() > published) {
+                    return None;
+                }
                 let (next, _) = buffer.chain();
                 if next == NONE {
                     corrupt(format!(
@@ -1931,6 +2007,9 @@ unsafe fn read_buffer_stream(index: pg_sys::Relation, state: &BufferState) -> Ve
 
 /// Appends bytes to the write buffer, extending the chain as needed. The
 /// caller holds the meta page exclusively and persists `state` afterwards.
+/// Only bytes past the published buffer's last one change, and links past
+/// its tail, so a failure before the meta page is written leaves the
+/// published buffer as it was.
 unsafe fn append_to_buffer(index: pg_sys::Relation, state: &mut BufferState, mut data: &[u8]) {
     unsafe {
         while !data.is_empty() {
@@ -1993,15 +2072,84 @@ fn expect_buffer_page(buffer: &Buffer) {
     }
 }
 
-/// Rewrites the write buffer from its head with new contents.
+/// Replaces the write buffer's contents with `data`, holding `docs`
+/// documents, without changing a byte the published buffer reads.
+///
+/// Until the caller's [`write_meta`], the meta page on disk describes the
+/// old contents, and page writes survive a failed transaction; WAL replays
+/// any prefix of them after a crash or on a promoted standby. Rewritten from
+/// the head in place, the old contents were lost or unreadable whenever the
+/// meta page did not follow. So the new contents go to the pages hanging off
+/// the chain past the old tail, which hold no live byte, and to fresh pages
+/// once those run out; the old live pages follow them in the new chain as
+/// stale pages that later appends reuse, so the chain stays as long as the
+/// largest buffer it held. Only the old tail's link changes beforehand, and
+/// nothing reading the old contents follows it. Should the meta page never
+/// be written, the new pages are unreferenced, for VACUUM's orphan pass.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively, and `state` is the
+/// buffer state that meta page records.
 unsafe fn replace_buffer(index: pg_sys::Relation, state: &mut BufferState, data: &[u8], docs: u32) {
-    state.tail = state.head;
-    state.tail_used = 0;
-    state.bytes = 0;
-    state.docs = docs;
-    state.version = state.version.wrapping_add(1);
-    state.epoch = state.epoch.wrapping_add(1);
-    unsafe { append_to_buffer(index, state, data) };
+    unsafe {
+        let chunks: Vec<&[u8]> = if data.is_empty() {
+            vec![&[][..]]
+        } else {
+            data.chunks(CHAIN_CAPACITY).collect()
+        };
+        let (after_tail, live) = {
+            let tail = Buffer::read(index, state.tail, false);
+            expect_buffer_page(&tail);
+            let (next, data) = tail.chain();
+            (next, data.to_vec())
+        };
+        let (stale, rest) =
+            verify::chain_pages(index, after_tail, chunks.len() as u32, KIND_BUFFER);
+        if stale.len() < chunks.len() && rest != NONE {
+            corrupt(format!(
+                "Stannum write buffer: page {rest} past the tail is not a buffer page"
+            ));
+        }
+        if !stale.is_empty() {
+            // Detach the stale pages taken before they link back to the old
+            // head, or the chain would loop through the old tail.
+            let tail = Buffer::read(index, state.tail, true);
+            write_page(
+                index,
+                &tail,
+                false,
+                KIND_BUFFER,
+                &layout::chain_payload(rest, &live),
+            );
+        }
+        // Last page first, so each links to one already written; the last
+        // links to the old head.
+        let mut next = state.head;
+        let mut pages = Vec::with_capacity(chunks.len());
+        for (i, chunk) in chunks.iter().enumerate().rev() {
+            pgrx::check_for_interrupts!();
+            let buffer = match stale.get(i) {
+                Some(&block) => Buffer::read(index, block, true),
+                None => Buffer::allocate(index),
+            };
+            write_page(
+                index,
+                &buffer,
+                stale.get(i).is_none(),
+                KIND_BUFFER,
+                &layout::chain_payload(next, chunk),
+            );
+            next = buffer.block();
+            pages.push(next);
+        }
+        state.head = next;
+        state.tail = pages[0];
+        state.tail_used = chunks.last().expect("one chunk at least").len() as u32;
+        state.bytes = data.len() as u32;
+        state.docs = docs;
+        state.version = state.version.wrapping_add(1);
+        state.epoch = state.epoch.wrapping_add(1);
+    }
 }
 
 // --- Segments -----------------------------------------------------------------
@@ -2262,6 +2410,9 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
         for entry in old {
             release_entry(index, meta, entry);
         }
+        // Between retiring the inputs and publishing: what reaches the
+        // disk before the caller's write_meta must be safe to abandon.
+        race_point("merge:released");
     }
 }
 
@@ -2349,12 +2500,14 @@ unsafe fn merge_segments_reconstructed(
     finish_builder(builder)
 }
 
-/// Folds the write buffer into a new segment and empties it.
-unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
+/// Folds the write buffer into a new segment and starts it over with the
+/// one encoded document `record` (see [`replace_buffer`]).
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively; `meta` is what it
+/// records, and the buffer holds a document.
+unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta, record: &[u8]) {
     unsafe {
-        if meta.buffer.docs == 0 {
-            return;
-        }
         let stream = read_buffer_stream(index, &meta.buffer);
         let mut builder = SegmentBuilder::default();
         for record in segment::forward::records(&stream) {
@@ -2372,12 +2525,7 @@ unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
             total_length,
             MAX_MERGE_DOCS.get() as u64,
         );
-        meta.buffer.tail = meta.buffer.head;
-        meta.buffer.tail_used = 0;
-        meta.buffer.bytes = 0;
-        meta.buffer.docs = 0;
-        meta.buffer.version = meta.buffer.version.wrapping_add(1);
-        meta.buffer.epoch = meta.buffer.epoch.wrapping_add(1);
+        replace_buffer(index, &mut meta.buffer, record, 1);
     }
 }
 
@@ -2789,10 +2937,12 @@ pub unsafe fn insert(
             && (meta.buffer.bytes as usize + bytes.len() > write_buffer_bytes(index)
                 || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32);
         if folded {
-            fold(index, &mut meta);
+            fold(index, &mut meta, &bytes);
+        } else {
+            append_to_buffer(index, &mut meta.buffer, &bytes);
+            meta.buffer.docs += 1;
         }
-        append_to_buffer(index, &mut meta.buffer, &bytes);
-        meta.buffer.docs += 1;
+        race_point("insert:buffered");
         write_meta(index, &meta_buffer, &meta);
         drop(meta_buffer);
         // Buffer content locks defer PostgreSQL cancel/die interrupts.
@@ -3164,7 +3314,9 @@ unsafe fn unlocked<T>(
 
 /// Marks pages FREE and records them in the FSM. A page that is not readable
 /// as a Stannum page (zeroed by a crash after the relation was extended) is
-/// initialized afresh.
+/// initialized afresh. A page already FREE is recorded again: the FSM is not
+/// WAL-logged, so after a crash or on a promoted standby it can lack pages
+/// freed since it was last written.
 ///
 /// # Safety
 /// No directory entry, buffer chain or pending entry of `index` references
@@ -3174,13 +3326,16 @@ unsafe fn unlocked<T>(
 /// unreferenced forever unless a writer has it written and not yet
 /// published: the caller wrote the pages itself, or holds the maintenance
 /// lock that excludes the only such writer (see [`reclaim_orphans`]). Pages a standby reader could still reference were
-/// preceded by a [`wal::log_reclaim`] record. The caller holds no page lock.
+/// preceded by a [`wal::log_reclaim`] record. The caller holds no page lock
+/// but, at most, the meta page's.
 unsafe fn free_pages(index: pg_sys::Relation, pages: &[u32], stamp: u32) {
     for &block in pages {
         pgrx::check_for_interrupts!();
         let buffer = unsafe { Buffer::read(index, block, true) };
         let kind = layout::kind(buffer.page());
         if kind == Ok(KIND_FREE) {
+            drop(buffer);
+            unsafe { pg_sys::RecordFreeIndexPage(index, block) };
             continue;
         }
         unsafe {
@@ -3356,6 +3511,7 @@ pub unsafe fn bulk_delete(
                 }
                 if dropped {
                     unsafe { replace_buffer(index, &mut meta.buffer, &kept, kept_docs) };
+                    race_point("bulk_delete:buffered");
                     changed = true;
                 }
             }
@@ -3616,8 +3772,7 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
         if left == 0 {
             break;
         }
-        let xid = pg_sys::TransactionId::from(pending.xid);
-        if !unsafe { pg_sys::GlobalVisCheckRemovableXid(index, xid) } {
+        if !unsafe { pending_removable(index, pending.xid) } {
             continue;
         }
         // Only a bounded prefix per call: a run retired by a merge of a large
@@ -3679,7 +3834,8 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
 
 /// Frees pages nothing references that are not FREE: leaked by a crash
 /// between writing a run and publishing it, or between removing a pending
-/// entry and freeing its pages.
+/// entry and freeing its pages. Unreferenced FREE pages are recorded in the
+/// FSM again, which does not survive a crash.
 ///
 /// Two kinds of writer leave pages unreferenced and not FREE while they run.
 /// Inserts write under the exclusive meta lock and publish before releasing
@@ -3738,7 +3894,16 @@ unsafe fn reclaim_orphans_locked(index: pg_sys::Relation) {
         }
         pgrx::check_for_interrupts!();
         let buffer = unsafe { Buffer::read(index, block, false) };
-        if layout::kind(buffer.page()) != Ok(KIND_FREE) {
+        let kind = layout::kind(buffer.page());
+        drop(buffer);
+        if kind == Ok(KIND_FREE) {
+            // The FSM is not WAL-logged: after a crash or on a promoted
+            // standby it lacks the pages freed since it was last written,
+            // and nothing else would ever record them again. Recording a
+            // page an allocation took meanwhile is harmless, because every
+            // allocation checks the page is still FREE under its lock.
+            unsafe { pg_sys::RecordFreeIndexPage(index, block) };
+        } else {
             candidates.push(block);
         }
     }
@@ -3795,6 +3960,36 @@ pub mod testing {
     thread_local! {
         pub static RACE_HOOK: RefCell<Option<RaceHook>> = const { RefCell::new(None) };
         pub static CORRUPT_MAINTENANCE_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Treat every pending entry as removable (see [`pending_removable`]): a
+        /// pg_test's own snapshot otherwise keeps all of them readable.
+        pub static PENDING_REMOVABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The number of runs on the meta page's pending list.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn pending_entries(index: pg_sys::Relation) -> usize {
+        unsafe { read_meta(index, false) }.1.pending.len()
+    }
+
+    /// Forgets `pages` in the free space map, as a crash or a promoted
+    /// standby does for pages freed since the map was last written.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn forget_free_pages(index: pg_sys::Relation, pages: &[u32]) {
+        for &page in pages {
+            unsafe { pg_sys::RecordUsedIndexPage(index, page) };
+        }
+    }
+
+    /// Whether the free space map lists `page` as free.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn recorded_free(index: pg_sys::Relation, page: u32) -> bool {
+        unsafe { pg_sys::GetRecordedFreeSpace(index, page) > 0 }
     }
 
     /// Runs `hook` at every race point until it is cleared.

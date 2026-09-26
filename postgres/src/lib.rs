@@ -5429,6 +5429,343 @@ mod tests {
         }
     }
 
+    /// Raises a query cancellation at the first race point named `at`;
+    /// returns whether it fired.
+    fn fail_at_race_point(at: &'static str) -> std::rc::Rc<std::cell::Cell<bool>> {
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = fired.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == at && !observed.replace(true) {
+                pgrx::ereport!(
+                    pgrx::PgLogLevel::ERROR,
+                    pgrx::PgSqlErrorCode::ERRCODE_QUERY_CANCELED,
+                    "injected failure before publication"
+                );
+            }
+        })));
+        fired
+    }
+
+    /// Asserts that verification finds nothing but pages an interrupted
+    /// operation wrote and never published, which VACUUM reclaims.
+    fn assert_only_orphans(index: &str) {
+        let rows = findings(index, true);
+        assert!(
+            rows.iter().all(|row| row.starts_with("warning: page")
+                && row.ends_with("page referenced by nothing; VACUUM reclaims it")),
+            "{index}:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[pg_test]
+    fn failure_after_a_drain_before_publication_frees_no_listed_page() {
+        Spi::run(
+            "CREATE TABLE drain_race(id int, body text);
+             CREATE INDEX drain_race_idx ON drain_race USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.merge_tier_factor = 2;
+             SET LOCAL stannum.max_merge_docs = 1000000;
+             SET LOCAL stannum.deferred_merge_docs = 0;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        // Each insert commits a subtransaction of its own, so the next takes
+        // a new transaction id and the runs its merges retire open a new
+        // pending entry, until the list is full.
+        Spi::run(
+            "DO $$BEGIN FOR n IN 1..120 LOOP
+                BEGIN INSERT INTO drain_race VALUES (n, 'needle w' || n);
+                EXCEPTION WHEN division_by_zero THEN NULL; END;
+             END LOOP; END$$;",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'drain_race_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        let pending = || unsafe { crate::storage::testing::pending_entries(index.as_ptr()) };
+        assert_eq!(pending(), 48);
+        assert_clean("drain_race_idx");
+        // The next fold's merge finds the list full and drains every entry,
+        // then fails before the meta page is written: the page still lists
+        // every entry, so none of their pages may have been freed.
+        crate::storage::testing::PENDING_REMOVABLE.with(|flag| flag.set(true));
+        let fired = fail_at_race_point("merge:released");
+        Spi::run(
+            "DO $$BEGIN
+                INSERT INTO drain_race VALUES (121, 'needle w121');
+                RAISE EXCEPTION 'failure was not injected';
+             EXCEPTION WHEN query_canceled THEN NULL;
+             END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(fired.get());
+        assert_eq!(pending(), 48);
+        assert_only_orphans("drain_race_idx");
+        // The list drains for real on the next insert, and nothing a later
+        // run allocates is still listed.
+        Spi::run("INSERT INTO drain_race VALUES (121, 'needle w121')").unwrap();
+        assert!(pending() < 48, "{}", pending());
+        assert_only_orphans("drain_race_idx");
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        Spi::run(
+            "INSERT INTO drain_race SELECT n, 'needle w' || n FROM generate_series(122, 140) n",
+        )
+        .unwrap();
+        crate::storage::testing::PENDING_REMOVABLE.with(|flag| flag.set(false));
+        assert_clean("drain_race_idx");
+        assert_eq!(
+            value("SELECT count(*) FROM drain_race WHERE body ==> 'needle'"),
+            140
+        );
+        for n in [1, 60, 120, 121, 140] {
+            assert_eq!(
+                ids(&format!(
+                    "SELECT id FROM drain_race WHERE body ==> 'w{n}' ORDER BY id"
+                )),
+                vec![n],
+            );
+        }
+    }
+
+    #[pg_test]
+    fn failure_after_a_chain_join_before_publication_leaves_published_runs_whole() {
+        direct_merge_fixture();
+        // The third insert folds and merges both singletons; retiring their
+        // runs joins them into one pending chain. The merge then fails
+        // before the meta page is written, so both are still published.
+        let fired = fail_at_race_point("merge:released");
+        Spi::run(
+            "DO $$BEGIN
+                INSERT INTO direct_merge_cancel VALUES (3,'needle third');
+                RAISE EXCEPTION 'failure was not injected';
+             EXCEPTION WHEN query_canceled THEN NULL;
+             END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(fired.get());
+        assert_only_orphans("direct_merge_cancel_idx");
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx')"),
+            2
+        );
+        // The same merge again retires the same published runs.
+        Spi::run("INSERT INTO direct_merge_cancel VALUES (3,'needle third')").unwrap();
+        assert_eq!(
+            value("SELECT sum(id)::bigint FROM direct_merge_cancel WHERE body ==> 'needle'"),
+            6
+        );
+        assert_only_orphans("direct_merge_cancel_idx");
+        let index = unsafe { pgrx::PgRelation::open_with_name("direct_merge_cancel_idx") }.unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("direct_merge_cancel_idx");
+        Spi::run("INSERT INTO direct_merge_cancel VALUES (4,'needle fourth')").unwrap();
+        assert_eq!(
+            value("SELECT sum(id)::bigint FROM direct_merge_cancel WHERE body ==> 'needle'"),
+            10
+        );
+        assert_clean("direct_merge_cancel_idx");
+    }
+
+    #[pg_test]
+    fn failure_after_a_fold_rewrites_the_buffer_leaves_the_published_buffer_whole() {
+        Spi::run(
+            "CREATE TABLE fold_race(id int, body text);
+             CREATE INDEX fold_race_idx ON fold_race USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 2;
+             SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
+             SET LOCAL enable_seqscan = off;
+             INSERT INTO fold_race VALUES (1, 'needle one'), (2, 'needle two');",
+        )
+        .unwrap();
+        // The third insert folds the two buffered documents and starts the
+        // buffer over with its own, then fails before the meta page is
+        // written: the published buffer must still read as those two.
+        let fired = fail_at_race_point("insert:buffered");
+        Spi::run(
+            "DO $$BEGIN
+                INSERT INTO fold_race VALUES (3, 'needle three');
+                RAISE EXCEPTION 'failure was not injected';
+             EXCEPTION WHEN query_canceled THEN NULL;
+             END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(fired.get());
+        assert_only_orphans("fold_race_idx");
+        assert_eq!(
+            ids("SELECT id FROM fold_race WHERE body ==> 'needle' ORDER BY id"),
+            vec![1, 2]
+        );
+        Spi::run("INSERT INTO fold_race VALUES (3, 'needle three'), (4, 'needle four')").unwrap();
+        assert_eq!(
+            ids("SELECT id FROM fold_race WHERE body ==> 'needle' ORDER BY id"),
+            vec![1, 2, 3, 4]
+        );
+        let index = unsafe { pgrx::PgRelation::open_with_name("fold_race_idx") }.unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("fold_race_idx");
+    }
+
+    /// Crashes the server at the first race point named `at` this session
+    /// reaches, after flushing WAL: recovery then replays every page the
+    /// operation wrote before it and not its meta page, which is what a
+    /// crash leaves when those records reached disk and the meta page's did
+    /// not. Driven by postgres/tests/crash_before_publication.py.
+    #[pg_extern]
+    fn crash_at_race_point(at: String) {
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if at == name {
+                unsafe { pg_sys::XLogFlush(pg_sys::GetXLogInsertRecPtr()) };
+                pgrx::ereport!(
+                    pgrx::PgLogLevel::PANIC,
+                    pgrx::PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                    format!("crash injected at race point {name}")
+                );
+            }
+        })));
+    }
+
+    /// The number of runs on the index's pending list.
+    #[pg_extern]
+    fn pending_entries(index_oid: pg_sys::Oid) -> i64 {
+        let index = unsafe { pgrx::PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _) };
+        unsafe { crate::storage::testing::pending_entries(index.as_ptr()) as i64 }
+    }
+
+    #[pg_extern]
+    fn direct_bulk_delete(index_oid: pg_sys::Oid, dead: Vec<String>) -> i64 {
+        let dead = dead
+            .iter()
+            .map(|text| {
+                let (block, offset) = text
+                    .trim_matches(|c| c == '(' || c == ')')
+                    .split_once(',')
+                    .unwrap();
+                segment::Tid::new(block.parse().unwrap(), offset.parse().unwrap()).unwrap()
+            })
+            .collect();
+        let index = unsafe {
+            pgrx::PgRelation::with_lock(index_oid, pg_sys::ShareUpdateExclusiveLock as _)
+        };
+        let (_, removed) =
+            unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        removed as i64
+    }
+
+    #[pg_test]
+    fn failure_after_vacuum_rewrites_the_buffer_leaves_the_published_buffer_whole() {
+        Spi::run(
+            "CREATE TABLE vacuum_buffer(id int, body text);
+             CREATE INDEX vacuum_buffer_idx ON vacuum_buffer USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1000;
+             SET LOCAL enable_seqscan = off;
+             INSERT INTO vacuum_buffer
+                 SELECT n, 'needle w' || n || repeat(' filler', 20) FROM generate_series(1, 400) n;
+             CREATE TEMP TABLE vacuum_buffer_dead(tids text[]);
+             WITH gone AS (DELETE FROM vacuum_buffer WHERE id % 2 = 0 RETURNING ctid)
+                 INSERT INTO vacuum_buffer_dead SELECT array_agg(ctid::text) FROM gone;",
+        )
+        .unwrap();
+        // Four hundred buffered documents span several pages. VACUUM
+        // rewrites the buffer without the dead half, then fails before the
+        // meta page is written: the published buffer must read as before.
+        let fired = fail_at_race_point("bulk_delete:buffered");
+        Spi::run(
+            "DO $$BEGIN
+                PERFORM tests.direct_bulk_delete('vacuum_buffer_idx'::regclass::oid,
+                    (SELECT tids FROM vacuum_buffer_dead));
+                RAISE EXCEPTION 'failure was not injected';
+             EXCEPTION WHEN query_canceled THEN NULL;
+             END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(fired.get());
+        assert_only_orphans("vacuum_buffer_idx");
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx')"),
+            400
+        );
+        assert_eq!(
+            value("SELECT count(*) FROM vacuum_buffer WHERE body ==> 'needle'"),
+            200
+        );
+        assert_eq!(
+            value(
+                "SELECT tests.direct_bulk_delete('vacuum_buffer_idx'::regclass::oid,
+                     (SELECT tids FROM vacuum_buffer_dead))"
+            ),
+            200
+        );
+        assert_eq!(
+            value("SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx')"),
+            200
+        );
+        let index = unsafe { pgrx::PgRelation::open_with_name("vacuum_buffer_idx") }.unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("vacuum_buffer_idx");
+        Spi::run("INSERT INTO vacuum_buffer VALUES (401, 'needle w401')").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM vacuum_buffer WHERE body ==> 'needle'"),
+            201
+        );
+        assert_eq!(
+            ids("SELECT id FROM vacuum_buffer WHERE body ==> 'w399' ORDER BY id"),
+            vec![399]
+        );
+        assert_clean("vacuum_buffer_idx");
+    }
+
+    #[pg_test]
+    fn cleanup_records_free_pages_the_free_space_map_lost() {
+        Spi::run(
+            "CREATE TABLE fsm_lost(body text);
+             CREATE INDEX fsm_lost_idx ON fsm_lost USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
+             INSERT INTO fsm_lost SELECT 'needle' FROM generate_series(1, 4);",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'fsm_lost_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        let leaked =
+            unsafe { crate::storage::testing::leak_run(index.as_ptr(), &vec![7u8; 8 * 8000]) };
+        assert_eq!(leaked.len(), 8);
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("fsm_lost_idx");
+        let recorded = || {
+            leaked
+                .iter()
+                .filter(|&&page| unsafe {
+                    crate::storage::testing::recorded_free(index.as_ptr(), page)
+                })
+                .count()
+        };
+        assert_eq!(recorded(), 8);
+        // A crash, or promotion of a standby, loses what the map learned
+        // since it was last written: the pages stay FREE but unlisted.
+        unsafe { crate::storage::testing::forget_free_pages(index.as_ptr(), &leaked) };
+        assert_eq!(recorded(), 0);
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_eq!(recorded(), 8);
+        // And they are reused: two folds take four of them.
+        let size = || value("SELECT pg_relation_size('fsm_lost_idx')");
+        let before = size();
+        Spi::run("INSERT INTO fsm_lost SELECT 'needle' FROM generate_series(5, 6)").unwrap();
+        assert_eq!(size(), before);
+        assert_clean("fsm_lost_idx");
+    }
+
     #[pg_test]
     fn byte_cap_folds_oversized_documents_one_at_a_time() {
         Spi::run(
