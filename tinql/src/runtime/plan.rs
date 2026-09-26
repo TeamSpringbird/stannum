@@ -1246,9 +1246,66 @@ mod tests {
             ]
         }
 
+        /// An operand of THEN and NEAR over `words`: a word, a phrase
+        /// (exact, with a pinned gap, or sloppy), or a group, itself
+        /// perhaps a span.
+        fn span_operand(words: &'static [&'static str]) -> impl Strategy<Value = String> {
+            let word = move || prop::sample::select(words).prop_map(str::to_owned);
+            prop_oneof![
+                3 => word(),
+                2 => (word(), word()).prop_map(|(a, b)| format!("\"{a} {b}\"")),
+                1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"{a} {b} {c}\"")),
+                1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"{a} _ {b} {c}\"")),
+                1 => (word(), word(), word(), 1u32..3)
+                    .prop_map(|(a, b, c, n)| format!("\"{a} {b} {c}\"~{n}")),
+                1 => (word(), word()).prop_map(|(a, b)| format!("({a} OR {b})")),
+                1 => (word(), word(), 0u32..3).prop_map(|(a, b, n)| format!("({a} THEN/{n} {b})")),
+                1 => (word(), word(), 0u32..3).prop_map(|(a, b, n)| format!("({a} NEAR/{n} {b})")),
+                1 => (word(), word(), 1u32..4)
+                    .prop_map(|(a, b, n)| format!("({a} NEAR/2 \"{b} {a}\") WITHIN {n}")),
+            ]
+        }
+
+        /// Nested ordered and unordered spans over `words`: operands joined
+        /// by THEN and NEAR, one or two joins, perhaps within a width or
+        /// the first words.
+        fn nested_span_of(words: &'static [&'static str]) -> impl Strategy<Value = String> {
+            let operator = (prop::bool::ANY, 0u32..4)
+                .prop_map(|(then, n)| format!("{}/{n}", if then { "THEN" } else { "NEAR" }));
+            let chain = (
+                span_operand(words),
+                prop::collection::vec((operator, span_operand(words)), 1..3),
+            )
+                .prop_map(|(first, rest)| {
+                    rest.into_iter().fold(first, |text, (op, operand)| {
+                        format!("{text} {op} {operand}")
+                    })
+                });
+            (chain, 0u8..4, 1u32..8).prop_map(|(span, wrap, n)| match wrap {
+                0 => format!("({span}) IN FIRST {n} WORDS"),
+                1 => format!("({span}) WITHIN {}", n + 2),
+                _ => span,
+            })
+        }
+
+        fn nested_span() -> impl Strategy<Value = String> {
+            nested_span_of(&WORDS)
+        }
+
+        /// Three words, so that documents often hold a nested span's words
+        /// at the distances it tests.
+        const FEW: [&str; 3] = ["alpha", "beta", "gamma"];
+
+        fn few_document() -> impl Strategy<Value = String> {
+            prop::collection::vec(prop::sample::select(&FEW[..]), 0..10)
+                .prop_map(|words| words.join(" "))
+        }
+
         fn query() -> impl Strategy<Value = String> {
             leaf().prop_recursive(3, 24, 3, |inner| {
                 prop_oneof![
+                    nested_span(),
+                    nested_span(),
                     (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}) AND ({b})")),
                     (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}) OR ({b})")),
                     (inner.clone(), inner.clone())
@@ -1278,6 +1335,34 @@ mod tests {
 
         proptest! {
             #![proptest_config(ProptestConfig { cases: cases(400), ..ProptestConfig::default() })]
+
+            /// The nested spans parse, so the property below tests them
+            /// rather than skipping them as malformed.
+            #[test]
+            fn nested_spans_parse(text in nested_span()) {
+                let parsed = parse_tinql_to_query_default(&text);
+                prop_assert!(parsed.is_ok(), "{}: {:?}", text, parsed.err());
+            }
+
+            /// Nested spans over documents of few words, where the
+            /// distances they test are common: a phrase after the first
+            /// operand of THEN was dropped at ~1 in 1,000 cases of the
+            /// general property, and at once here.
+            #[test]
+            fn nested_spans_agree_with_the_reference_evaluator(
+                docs in prop::collection::vec(few_document(), 1..16),
+                query_text in nested_span_of(&FEW),
+            ) {
+                let docs: Vec<&str> = docs.iter().map(String::as_str).collect();
+                let query = parse_tinql_to_query_default(&query_text).unwrap();
+                let bytes = build(&docs);
+                let segment = Segment::parse(&bytes).unwrap();
+                let limits = Limits::default();
+                let (found, exact) = matches(&query, &segment, &limits).unwrap();
+                prop_assert_eq!(page_matches(&segment, &query, &limits), (found.clone(), exact));
+                prop_assert!(exact, "{}", query_text);
+                prop_assert_eq!(&found, &reference(&docs, &query), "{}", query_text);
+            }
 
             #[test]
             fn plans_agree_with_the_reference_evaluator(

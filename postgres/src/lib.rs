@@ -2301,6 +2301,110 @@ mod tests {
         }
     }
 
+    /// The walk against full scoring, bit for bit, where the default tests
+    /// do not reach: non-default BM25 parameters, documents repeating a
+    /// word hundreds to thousands of times (the highest frequency buckets),
+    /// and one build segment of 140,000 documents, three chunks of 65,536
+    /// ordinals, under mixed shapes.
+    #[pg_test]
+    fn ranked_walks_match_full_scoring_across_parameters_frequencies_and_chunks() {
+        Spi::run(
+            "CREATE TABLE tuned(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 2500;
+             INSERT INTO tuned SELECT n,
+               repeat('alpha ', CASE WHEN n % 97 = 0 THEN 100 + (n * 37) % 3000 ELSE n % 4 END) ||
+               CASE WHEN n % 3 = 0 THEN 'beta ' ELSE '' END ||
+               CASE WHEN n % 5 = 0 THEN repeat('gamma ', CASE WHEN n % 211 = 0 THEN 400 + n % 1700 ELSE 1 + n % 2 END) ELSE '' END ||
+               CASE WHEN n % 13 = 0 THEN 'delta alpha beta ' ELSE '' END ||
+               repeat('pad ', CASE WHEN n % 89 = 0 THEN 2000 ELSE n % 9 END) || 'tail'
+               FROM generate_series(1, 6000) n;
+             CREATE INDEX tuned_idx ON tuned USING stannum(body);
+             INSERT INTO tuned SELECT n, repeat('gamma ', 1 + n % 5) || 'alpha beta tail'
+               FROM generate_series(6001, 6300) n;
+             DELETE FROM tuned WHERE id % 29 = 0;",
+        )
+        .unwrap();
+        let queries = [
+            "alpha",
+            "gamma",
+            "alpha OR gamma",
+            "alpha OR beta OR delta",
+            "alpha AND gamma",
+            "alpha AND beta AND tail",
+            "\"alpha beta\"",
+            "\"delta alpha beta\"~1",
+            "delta OR \"alpha beta\"",
+            "(alpha AND beta) OR gamma",
+            "alpha AND NOT beta",
+            "AT LEAST 2 OF [alpha beta gamma]",
+        ];
+        let mut scorers = vec!["stannum.full_score(ctid)".to_owned()];
+        for k1 in ["0", "0.001", "0.5", "3"] {
+            for b in ["0", "1"] {
+                scorers.push(format!("stannum.full_score(ctid, {k1}, {b})"));
+            }
+        }
+        scorers.push("stannum.score(ctid, k1 => 0, b => 1)".to_owned());
+        for query in queries {
+            for order_by in &scorers {
+                for limit in ["LIMIT 1", "LIMIT 10", "LIMIT 300"] {
+                    let expected = ranked_in("tuned", false, query, order_by, limit);
+                    let actual = ranked_in("tuned", true, query, order_by, limit);
+                    assert_eq!(actual, expected, "{query} {order_by} {limit}");
+                }
+            }
+        }
+        // One segment over three chunks of ordinals.
+        Spi::run(
+            "CREATE TABLE chunked(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 200000;
+             INSERT INTO chunked SELECT n,
+               repeat('alpha ', CASE WHEN n % 4999 = 0 THEN 200 + n % 3000 ELSE n % 3 END) ||
+               CASE WHEN n % 3 = 0 THEN 'beta ' ELSE '' END ||
+               CASE WHEN n % 7 = 0 THEN repeat('gamma ', CASE WHEN n % 7001 = 0 THEN 500 + n % 1500 ELSE 1 + n % 2 END) ELSE '' END ||
+               CASE WHEN n % 101 = 0 THEN 'delta alpha beta ' ELSE '' END ||
+               CASE WHEN n BETWEEN 65000 AND 66100 OR n > 139000 THEN 'edge ' ELSE '' END ||
+               repeat('pad ', n % 9) || 'tail'
+               FROM generate_series(1, 140000) n;
+             CREATE INDEX chunked_idx ON chunked USING stannum(body);
+             DELETE FROM chunked WHERE id % 31 = 0;",
+        )
+        .unwrap();
+        let chunks = Spi::get_one::<i64>(
+            "SELECT sum((docs + 65535) / 65536)::bigint FROM stannum.segment_info('chunked_idx')
+             WHERE kind = 'immutable'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(chunks, 3);
+        for query in [
+            "alpha",
+            "edge",
+            "alpha OR gamma",
+            "edge OR delta",
+            "alpha AND beta",
+            "edge AND gamma",
+            "\"alpha beta\"",
+            "\"delta alpha beta\"",
+            "edge OR \"alpha beta\"",
+            "(alpha AND beta) OR edge",
+            "gamma AND NOT alpha",
+            "AT LEAST 2 OF [alpha beta edge]",
+        ] {
+            for order_by in [
+                "stannum.full_score(ctid)",
+                "stannum.full_score(ctid, 0, 1)",
+                "stannum.full_score(ctid, 3, 0)",
+            ] {
+                for limit in ["LIMIT 1", "LIMIT 10", "LIMIT 1000"] {
+                    let expected = ranked_in("chunked", false, query, order_by, limit);
+                    let actual = ranked_in("chunked", true, query, order_by, limit);
+                    assert_eq!(actual, expected, "{query} {order_by} {limit}");
+                }
+            }
+        }
+    }
+
     /// A phrase that is not the first operand of THEN or NEAR: the pair
     /// tests of the ranked walk's phrase check and of the span filter under
     /// counts and plain filters bounded each pair of words by the wrong

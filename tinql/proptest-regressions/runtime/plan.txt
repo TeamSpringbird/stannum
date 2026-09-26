@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c1276d718a31df88447a92bde26820ec9dec22894507fa3b0232377a00078f77 # shrinks to docs = ["delta alpha delta delta", "alpha"], query_text = "(\"delta delta delta\"~1) AND NOT ((alph*) AND NOT (MATCHES .*a))", cap = 1024
+cc fe5dc0ca89bc4c757d11b2712b1a397973f7c798efe66030edcaaa452eb1f04b # shrinks to docs = ["alpha beta delta gamma gamma"], query_text = "(alpha THEN/2 \"gamma gamma\") IN FIRST 5 WORDS", cap = 1024
