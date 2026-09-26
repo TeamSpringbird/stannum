@@ -380,7 +380,8 @@ fn nibbles_len(cardinality: usize, scored: bool) -> usize {
 
 impl<'a> Ordinals<'a> {
     /// Opens the stream of `len` bytes behind `source`; `bounded` says the
-    /// stream carries chunk bounds (`LSG5`).
+    /// stream carries bounds and buckets, as a term's stream does and a dead
+    /// list does not.
     pub fn open(source: impl Fetch<'a> + 'a, len: u64, bounded: bool) -> Result<Self> {
         let head = source.fetch(0, len.min(HEAD as u64) as usize)?;
         let mut at = 0;

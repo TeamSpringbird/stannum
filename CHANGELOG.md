@@ -26,7 +26,7 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   offset per document, and a one-byte length class per document lets a
   ranked walk bound a candidate before reading its length. Dead lists are
   ordinal streams. On the 150 million row Stack Exchange corpus the index is
-  47 GB, against 246.5 GB for the earlier `LSG5` format.
+  47 GB.
 - Counts of Boolean term queries fold the ordinal streams a chunk at a time
   instead of visiting each match: the 302 published Wikipedia count queries
   sum to 39 ms instead of 3,767 ms in the replay harness.
@@ -48,8 +48,7 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   merge per insert outside the metadata lock (`stannum.deferred_merge_docs`),
   and deferred merges, dead lists and rewrites in VACUUM, which holds the
   metadata lock only to publish. Merges combine the inputs' sorted
-  dictionaries and streams directly through a validated, interruptible API
-  ([ADR 0001](docs/adr/0001-preserve-posting-order-before-changing-encoding.md)).
+  dictionaries and streams directly through a validated, interruptible API.
 - The TIN-named index options `target_segment_count`,
   `max_mutable_segment_size`, `max_merged_segment_size` and
   `dead_percent_threshold` shape maintenance for the index that sets them,
@@ -182,7 +181,6 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Removed
 
-- Readers for the development formats `LSG1` to `LSG5`, `STN1` and `STN2`.
-  Indexes in them must be rebuilt with `REINDEX`.
-- The `stannum.rank_by_ordinal` setting: ranking over the ordinal streams is
-  the only ranked path.
+- Readers for the segment formats of earlier development builds, and the
+  setting that chose between their ranked paths. Indexes built by those
+  builds must be rebuilt with `REINDEX`.

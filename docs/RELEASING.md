@@ -61,8 +61,8 @@ against a database and representative indexes created by the previous tagged
 
 `VERSION` is the special-area byte on every page, including the meta page.
 The write-buffer's `version` counter is a cache invalidation generation, not a
-format version. The `LSG1` to `LSG5`, `STN1` and `STN2` segment formats of
-earlier development builds are not read; REINDEX writes the current page and segment formats.
+format version. Segments with any signature other than those listed are not
+read; REINDEX writes the current page and segment formats.
 
 Readers validate page versions before decoding and reject unknown segment
 signatures. A future writer must bump the page version or segment signature

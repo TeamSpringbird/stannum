@@ -92,12 +92,12 @@ the gates run.
 ## The ranked scan under concurrency
 
 The ranked (top-k) scan keeps state across the life of a scan: the scorer it
-built, the rows it pruned to, and the write-buffer index it retained. Two bugs
-in one day (rows re-emitted after a deletion, fixed in `45d2696`; a retained
-document scored with another document's length after a buffer refresh, fixed
-in `9d3a7a0`) were caught only by the sustained-mutation benchmark, whose
-checks are not an oracle. `postgres/tests/ranked_fuzz.py` is the oracle: a
-randomized concurrency fuzzer for this class of bug.
+built, the rows it pruned to, and the write-buffer index it retained. Bugs in
+that state (rows re-emitted after a deletion, a retained document scored with
+another document's length after a buffer refresh) show up only under
+concurrent writes, and the sustained-mutation benchmark's checks are not an
+oracle. `postgres/tests/ranked_fuzz.py` is the oracle: a randomized
+concurrency fuzzer for this class of bug.
 
 ### What the fuzzer does
 
@@ -138,14 +138,14 @@ another query, its own oracle) checks that two scans do not share state.
 
 Queries are single terms, `OR`, `AND` (two or three terms), boosts, phrases,
 `AND NOT`, prefixes, `AT LEAST`, and `(a OR b) AND c`, scored by `full_score`
-or `score`, with limits around the 128-posting block boundary and above the
-4,096-row pruning cap, offsets, joins that read past k (`enable_hashjoin` and
+or `score`, with limits around 128 and 256 and above the 4,096-row pruning
+cap, offsets, joins that read past k (`enable_hashjoin` and
 `enable_mergejoin` off so the scan's order reaches the top; when a Sort still
 sits above the scan, ties are compared tolerantly), and filters applied above
 the scan.
 
 Every result is checked for unique ids, finite scores, descending scores with
-ties in the posting's heap order, membership in the regex match set, and
+ties in heap order, membership in the regex match set, and
 equality with the oracle's slice (ids, ctids and score text with
 `extra_float_digits = 3`, which round-trips float4 exactly).
 
@@ -166,64 +166,51 @@ python3 postgres/tests/ranked_fuzz.py --smoke     # fixed seeds and REGRESSIONS
 a short configuration that once failed or pins a bug class) in under two
 minutes; CI runs it in the `cluster` step.
 
-### Bug classes it found
+### Bug classes it covers
 
-- **HOT-updated rows scored zero.** The index posts the root of a HOT chain;
-  the executor projects the visible member's `ctid`; `score_bound_indexed`
-  looked that location up in the index, found nothing, and returned zero on
-  both paths. The pruned scan then ordered such a row by its real score while
-  reporting zero. `IndexScorer::score` now resolves a location absent from
-  every source to its chain root (`heap_get_root_tuples` under a share lock).
+- **HOT-updated rows.** The index holds the root of a HOT chain while the
+  executor projects the visible member's `ctid`. `IndexScorer::score`
+  resolves a location absent from every source to its chain root
+  (`heap_get_root_tuples` under a share lock), so both ranked paths score
+  such a row by its real score.
   Test: `hot_updated_rows_keep_their_score_on_both_ranked_paths`.
-- **Scans on one query shared a scorer.** The scan handed its scorer to the
-  score functions through a slot keyed by a backend-wide statement counter,
-  so a later scan (or an unpruned query) on the same query replaced it, and a
-  cursor's remaining rows were projected with statistics that writes in
-  between had changed, out of step with the order it ranked them in. Scans
-  now publish their scorer under their own identity with the score of every
-  row they ranked and record the row they emitted last, with the statement
-  number and an emission stamp; a score call in that statement for exactly
-  that location takes the scan's score, newest emission first (any other
-  location, such as an unpruned scan's row while a cursor is open on the
-  same query, or a row a paused cursor emitted in an earlier statement, is
-  scored by the statement's own scorer), and the entry is dropped when the
-  scan ends, including after an error. The fuzzer's first three attempts at
-  this fix (newest scan wins; most recent emitter wins; exact location
-  without the statement scope) each failed the same seed within three
-  seconds, which is the point of running it.
+- **Several scans on one query.** Each scan publishes its scorer under its
+  own identity with the score of every row it ranked, and records the row it
+  emitted last with the statement number and an emission stamp. A score call
+  in that statement for exactly that location takes the scan's score, newest
+  emission first; any other location (an unpruned scan's row while a cursor
+  is open on the same query, or a row a paused cursor emitted in an earlier
+  statement) is scored by the statement's own scorer. The entry is dropped
+  when the scan ends, including after an error.
   Test: `concurrent_cursors_on_one_query_keep_their_own_scores`.
-
-The earlier two bugs remain covered by
-`a_completed_ranked_scan_does_not_repeat_the_rows_it_emitted` and
-`buffered_scoring_keeps_document_lengths_when_heap_space_is_reused`, and by
-the fuzzer's cursor episodes, which exercise both interleavings continuously.
+- **Completed scans and buffer refreshes.** A scan that reads past its top k
+  does not repeat rows it emitted, and a retained scorer keeps each
+  document's own length after the buffer index is refreshed over reused heap
+  space. Tests: `a_completed_ranked_scan_does_not_repeat_the_rows_it_emitted`
+  and `buffered_scoring_keeps_document_lengths_when_heap_space_is_reused`,
+  plus the fuzzer's cursor episodes, which exercise both interleavings
+  continuously.
 
 ### Wide disjunction cursors
 
-`--wide` uses 31, 32, 33 and 128 distinct alphabetic terms with positive boosts,
-cycling across the grouped-pivot threshold. Documents mix dense 128-term bodies
+`--wide` uses 31, 32, 33 and 128 distinct alphabetic terms with positive
+boosts. Documents mix dense 128-term bodies
 with sparse 32-term bodies. Queries use `full_score` so common-term elision does
 not remove the intended scoring terms. Episodes use cursors or two open cursors,
-with limits around the posting-block boundary, offsets, filters and joins.
+with limits around 128, offsets, filters and joins.
 
 ```sh
 python3 postgres/tests/ranked_fuzz.py --wide --seed 104 --seconds 30 \
   --corpus 400 --writers 2 --readers 2
 ```
 
-The existing quiescent oracle capture and subsequent concurrent writer churn
-remain unchanged. An extra EXPLAIN ANALYZE checks ordinal pruning while the
+The quiescent oracle capture and the concurrent writer churn are those of
+ordinary episodes. An extra EXPLAIN ANALYZE checks ordinal pruning while the
 first cursor is open. This also exercises another statement's scorer without
 allowing it to change the retained cursor's scores. Reports count exercised
 widths; missing any of the four widths fails the run rather than silently passing
 an empty or incomplete campaign. A fixed wide scenario is included in `--smoke`.
 These are correctness stress tests, not performance measurements.
-
-Local validation of the wide mode: seeds 104/105 completed 204 comparisons,
-426 cursor fetches, 1,480 writer operations and 244 VACUUM operations, with all
-four widths exercised and no skipped comparisons. The six-scenario smoke suite
-passed 912 comparisons. These counts are scheduling-dependent observations,
-not fixed expected counts.
 
 ### Backends that exit mid-walk
 
@@ -247,9 +234,8 @@ STANNUM_PYTHON=.venv/bin/python benchmarks/local/exit-test.sh
 The table has 4.6 million documents because a walk checks for interrupts
 only every 64 chunks of 65,536 rows. Below that, every termination lands
 between walks. At this size most of them land with 7 to 17 pages held. The
-real exit could not be made to crash on 36ba97f: the walked readers stay
-referenced by the executor frame that the FATAL abandons, so their
-destructors never run at exit. The ones that do run at exit hold nothing.
+walked readers stay referenced by the executor frame that the FATAL
+abandons, so their destructors never run at exit. The ones that do run at exit hold nothing.
 `a_reader_dropped_at_exit_leaves_its_pins_to_postgres` pins the contract
 directly on any platform: a reader dropped during `proc_exit` with a span
 open leaves its pin and relation to PostgreSQL.

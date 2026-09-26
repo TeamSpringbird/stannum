@@ -13,7 +13,7 @@ ranking statistics in index pages and uses them to find matching row locations.
 | `segment/src/` | Dictionaries, ordinal streams, the document table, positions, document lengths, and cursors |
 | `tinql/src/` | Query parsing, reference evaluation, and indexed query planning |
 | `tokenizer/src/` | Text normalization and token positions |
-| `boldi-vigna/src/` | Integer encoding used by the storage codecs |
+| `boldi-vigna/src/` | Minimal-interval evaluation of phrases, proximity and span operators over token positions |
 | `benchmarks/` | Workload generation, correctness checks, and performance recording |
 
 ## Writing an index
@@ -59,9 +59,9 @@ The next insert folds a nonempty buffer before appending a record that would
 exceed either cap. A single document may exceed the byte cap: it remains one
 record and is folded before the following insert. The two caps bound document
 count and encoded input size, not elapsed time or tokenizer cost. At 2.8 KiB
-per record, the byte limit now folds roughly 365 documents rather than roughly
-1,460. Short documents hit the 512-document limit. Smaller folds also reduce
-the amount a fresh reader must index before its first query.
+per record the byte limit folds roughly 365 documents; short documents hit the
+512-document limit first. Small folds also bound the amount a fresh reader must
+index before its first query.
 
 ### Insert preparation
 
@@ -73,21 +73,21 @@ and uses the latest buffer and directory; unrelated appends, folds, or VACUUM do
 not invalidate the prepared record. An identity/settings change retries
 preparation. Current reloptions are not substituted for the persisted pipeline.
 
-This removes text preparation from the exclusive critical section. Folding,
+Text preparation is therefore outside the exclusive critical section. Folding,
 segment writes, foreground merges, and publication remain locked. In particular,
 orphan reclamation relies on that lock to exclude unpublished foreground runs;
 moving their writes outside it requires a separate reservation protocol.
 
 ### Merge policy
 
-The [direct-merge decision](../adr/0001-preserve-posting-order-before-changing-encoding.md)
-records the move to preserving sorted document order during merges. Foreground
-merges invoke the segment crate's validated direct-merge API under the
-metadata lock, retaining merge selection and WAL publication. It
-validates every source and merges ordered dictionaries and streams directly. Source
-blobs and dead sets are retained through construction, then freed before writing
-the output run. Aggregate encoded inputs or document counts beyond `u32::MAX`
-use the previous reconstruction path, since deletion can still yield a
+A merge walks its inputs' sorted dictionaries and merges each term's ordinal
+streams directly, dropping dead documents and recomputing statistics and score
+bounds, rather than rebuilding documents and sorting them again. Foreground
+merges call the segment crate's validated direct-merge API under the metadata
+lock. It validates every source before reusing any of it. Source blobs and dead
+sets are retained through construction, then freed before writing the output
+run. Aggregate encoded inputs or document counts beyond `u32::MAX` fall back to
+rebuilding documents from the inputs, since deletion can still yield a
 representable output. These format bounds do not impose a peak-memory cap.
 
 PostgreSQL defers interrupts while the metadata buffer lock is held. Merge
@@ -97,9 +97,9 @@ orphan pages, which VACUUM reclaims. VACUUM also uses the validated API for defe
 merges and deletion rewrites, retaining owned source blobs while unlocked. Its
 checkpoints can deliver cancellation during construction. Decoder failures are
 reported as corruption only if the identity and every captured input still match;
-retired inputs cause a retry. Publication still revalidates the complete entries
-and discards stale output. All-dead inputs have no successor. Oversized aggregate
-inputs retain the previous reconstruction fallback.
+retired inputs cause a retry. Publication revalidates the complete entries and
+discards stale output. All-dead inputs have no successor. Oversized aggregate
+inputs fall back to rebuilding documents, as foreground merges do.
 
 A merge takes at most 3 GiB of input (`SEGMENT_BYTES_CAP`, or the index's
 `max_merged_segment_size` when smaller), dropping its largest members until it
@@ -114,8 +114,8 @@ term per segment, which is what the compaction buys back. The build then packs
 its live runs into the lowest pages of the relation, marks the pages it reused
 as used in the free space map, and truncates the rest: tier merges retire
 about as many pages as they keep, and freed pages are reusable but never
-returned to the operating system, so an unpacked build was two to three times
-its live size.
+returned to the operating system, so without packing a built index would keep
+every page its merges retired.
 
 Each segment belongs to a size tier by document count: tier *t* holds
 segments with `factor^t` to `factor^(t+1) - 1` documents. The lowest full tier
@@ -136,10 +136,9 @@ due tier of at most `deferred_merge_docs` input documents the way VACUUM does:
 built from a captured directory without the lock and published only if every
 input is still listed. One backend does this at a time, under a heavyweight
 lock on the metadata page taken conditionally; the others skip it. Only that
-insert waits. Without it, a table autovacuum had not reached yet filled its
-directory in about a minute at 1,000 updates a second, and the full pending
-list was then freed under the metadata lock, stalling every query for half a
-minute. Zero disables it.
+insert waits. Without it, a table that autovacuum has not reached yet fills
+its directory quickly under sustained updates, and the full pending list is
+then freed under the metadata lock, stalling every query. Zero disables it.
 
 `max_segments` is a soft bound. A directory over it merges its smallest
 `entry_count - max_segments + 1` entries (normally two), which is the cheapest
@@ -170,8 +169,8 @@ Large merges run from `amvacuumcleanup`. PostgreSQL already supplies per-table
 maintenance scheduling, relation locking, process lifetime and error cleanup;
 using it avoids a second queue, worker-slot exhaustion, dynamic-worker launch
 races and a new preload requirement. No `shared_preload_libraries` entry is
-needed. The segment directory itself records deferred work; restart does not
-lose a maintenance queue, and the on-disk page format is unchanged.
+needed. The segment directory itself records deferred work, so restart does
+not lose a maintenance queue.
 
 VACUUM holds the meta lock exclusively only to publish. Every phase works
 from a directory captured under a shared lock and then runs with no meta
@@ -198,10 +197,10 @@ scanned in the next; whatever appears during the last round is finished
 under the lock, as is the write buffer, which the fold caps keep small. No
 document the callback knows dead survives in any segment.
 
-The lock order stays meta, buffer/run pages, extension lock. Permanent-index
-page writes still use generic WAL; temporary and unlogged main-fork writes
-skip WAL. Readers with captured directories retain the existing
-snapshot-horizon protection for retired runs. The maintenance builder uses
+The lock order is meta, buffer/run pages, extension lock. Permanent-index
+page writes use generic WAL; temporary and unlogged main-fork writes skip
+WAL. Readers with captured directories are protected by the snapshot horizon
+that delays reuse of retired runs. The maintenance builder uses
 owned bytes while unlocked, so it does not depend on VACUUM having a reader
 snapshot. A cleanup call attempts at most twice the number of directory
 entries it observed on entry, so continuing inserts cannot extend its merge
@@ -237,16 +236,88 @@ index verification, and a crash between a run write and its publication
 followed by orphan reclamation; [testing](../testing.md) lists it with the
 other suites.
 
+## Segment format
+
+Index pages carry the signature `LDP2` (page layout version 2) and segments
+the signature `STN3`. The page layouts are defined in
+`postgres/src/storage/layout.rs` and the segment layout in the `segment`
+crate. Every page is a standard PostgreSQL page whose special area names its
+kind: the meta page (block 0: tokenizer settings, write-buffer state, segment
+directory and runs awaiting reclamation), write-buffer pages, run pages
+holding an immutable blob (a segment, its page table or a dead list), and
+free pages.
+
+A segment is one blob, stored across a chain of run pages:
+
+```text
+blob := "STN3", doc_count, total_length, section lengths,
+        dictionary, ordinals area, positions area,
+        offsets, lengths, classes, pages
+```
+
+Documents are numbered in heap order, and that ordinal addresses everything
+per document:
+
+- **Dictionary.** Terms sorted by their UTF-8 bytes in prefix-compressed
+  blocks of 64, with a block index of first terms for binary search. An
+  entry holds the term's document frequency and largest term-frequency
+  bucket packed into one varint, and the extents of its two streams as gaps
+  from the previous term's (zero, since streams are laid out back to back),
+  so the dictionary alone answers selectivity and score-bound questions.
+- **Ordinal stream**, one per term: the term's documents, which is the only
+  representation of its document set. At most 64 documents are a delta list
+  with one score bound. Longer streams are 65,536-document chunks, each a
+  sorted array of 16-bit offsets or, from 1,024 members, a bitmap, with a
+  directory entry and a score bound per chunk. A bound names the
+  term-frequency buckets that occur with the shortest document per bucket,
+  and per 1,024-document sub-block the largest bucket there. Each member's
+  bucket is stored beside it as a nibble, so scoring never reads positions.
+- **Positions stream**, one per term: each document's token positions,
+  addressed by the document's rank in the term's ordinal stream through a
+  skip table every 32 entries. Only phrases and other positional shapes read
+  it.
+- **Document table**: a two-byte heap offset per document, and a page table
+  of (heap block, first ordinal) pairs. An ordinal becomes a tuple location,
+  and a location an ordinal, by a binary search of the page table and one
+  offset read.
+- **Lengths**: four bytes per document, and a one-byte **length class** per
+  document that names the shortest length it covers, so a ranked walk can
+  bound a candidate before it reads the exact length.
+
+A dead list is an ordinal stream without bounds or buckets. Segments with any
+other signature are not read; `REINDEX` rebuilds them in the current format
+(see [releasing](../RELEASING.md#on-disk-compatibility)).
+
+`script/dump-segments.py` writes an index's segment blobs to files and
+`cargo run -p segment --release --example breakdown -- --reencode <blobs>`
+reports where their bytes go, by section and by term document frequency.
+
+### Why this layout
+
+The layout is sized for an index larger than shared buffers, where the cost
+of a query is the pages it reads. A term's documents are stored once, as
+ordinals, so a Boolean count is a word-wise fold over chunks rather than a
+visit per match ([ADR 0003](../adr/0003-address-postings-by-document-ordinal.md))
+and a ranked walk prunes whole chunks by their bounds
+([ADR 0004](../adr/0004-rank-by-document-ordinal.md)). The bucket beside each
+member keeps scoring out of the positions stream, visibility for all-visible
+pages comes from the visibility map rather than a heap fetch per candidate,
+and the length class bounds a candidate before its exact length is read. On
+the 150 million row Stack Exchange corpus the index is 47 GB, and
+disjunctions read no positions at all.
+
+Fewer segments mean fewer dictionary lookups and stream heads per query, which
+is why a build compacts its directory. Segments are bounded by the 3 GiB merge
+input cap and the 32-bit run length: a direct merge holds every input blob and
+its output in memory, so larger segments would need a streaming merge.
+
 ## Reading an index
 
 The query is parsed as TINQL, tokenized using the index's settings, and compiled
-into cursors over each segment and the buffer. A segment stores each term's
-documents once, as ordinals into the segment's heap-ordered document table (a
-short list for rare terms, otherwise 65,536-document chunks that are sorted
-arrays or bitmaps, each with a score bound), and turns ordinals back into
-tuple locations through that table: a page table from heap block to first
-ordinal plus one two-byte offset per document, so both directions are a
-binary search. Cursors combine those streams and the stored positions for
+into cursors over each segment and the buffer. A segment's cursors read the
+terms' ordinal streams and, for positional shapes, their positions streams
+(see [Segment format](#segment-format)), and turn ordinals into tuple
+locations through the document table. Cursors combine those streams for
 Boolean, phrase, proximity, and positional queries. The write buffer keeps
 the same streams in memory, rebuilt per term as records arrive.
 
@@ -262,7 +333,8 @@ custom scan nodes:
   for dense Boolean terms and scalar cursors otherwise. They do not collect or
   sort all candidate CTIDs before returning the first row. `LIMIT` stops the
   traversal after enough visible rows pass the remaining SQL filters. For
-  supported ranked queries the existing scorer selects the top results.
+  supported ranked queries the scorer selects the top results (see
+  [Ranking](#ranking)).
 - **Count** of a Boolean combination of plain terms folds document ordinals.
   The count combines the terms' chunks word by word in fixed scratch buffers,
   visits only chunks some term occupies, clears the segment's dead documents
@@ -303,22 +375,24 @@ custom scan nodes:
   cross-segment duplicates. All-visible pages use popcount when the predicate
   is exact and is the query's only restriction. Other pages retain tuple-by-tuple
   visibility checks and, where required, text rechecks. Within bulk plans,
-  sparse and positional subexpressions adapt the existing scalar
-  cursors into page masks. The bulk path does not build or sort a vector of
+  sparse and positional subexpressions adapt the scalar cursors into page
+  masks. The bulk path does not build or sort a vector of
   every candidate CTID.
 
 Unordered searches own their captured index view until the scan ends, including
 across cursor FETCH calls. Rescans rebuild cursors against that same view, so
 buffer appends and directory changes do not replace the original candidate set.
 The cursor is dropped before its owning view, also on error cleanup. Streaming
-bounds decoded candidate buffering, not all index memory or I/O. Planner startup cost continues to include
-estimated index I/O and moves only candidate traversal CPU into run cost.
+bounds decoded candidate buffering, not all index memory or I/O. Planner
+startup cost includes estimated index I/O; candidate traversal CPU is run
+cost.
 
 Reads from a segment are bounded per cursor: a payload cursor holds one span
-of skip slots, an ordinal cursor one chunk, a lengths cursor one window of
-2,048 documents and a document-table cursor one heap block's offsets, each
-replaced by the next. Those ranges are shared through a per-backend
-least-recently-used cache of `stannum.read_cache_mb` (64 MiB), so the hot
+of skip slots, an ordinal cursor one chunk, a document-table cursor one window
+of 4,096 offsets and a length lookup one window of 64 documents, each replaced
+by the next. Ordinal chunks, payload spans and offset windows are shared
+through a per-backend least-recently-used cache of `stannum.read_cache_mb`
+(64 MiB), so the hot
 chunks of frequent terms stay resident across queries while a sweep of a long
 stream displaces only itself. Only headers, dictionary blocks and page tables
 stay in the reader's arena, whose total across a backend's cached readers is
@@ -339,11 +413,23 @@ The word operations are portable Rust; there is no architecture-specific SIMD
 dispatch.
 
 `EXPLAIN ANALYZE` shows the chosen path and, for executed custom counts,
-`Count Strategy: page bitmaps` or `scalar`. Unordered searches show
+`Count Strategy: ordinal fold`, `page bitmaps` or `scalar`. Unordered searches show
 `Candidate Strategy: streaming page bitmaps` or `streaming scalar` and
 `Candidates Visited`; that counter records consumed candidates, not an unknown
 full cardinality when LIMIT stops early. `SET stannum.enable_custom_scan = off`
 selects the PostgreSQL bitmap path for comparison.
+
+### Read accounting
+
+`EXPLAIN (ANALYZE, BUFFERS)` on the custom scan reports where reads go:
+`Bytes Fetched` and `Disk Pages By Area` per segment area, `Disk Pages By
+Phase` for reads outside the segment reader, `Walk Setup Blocks` and
+`Walk Body Blocks`, `Chunks Loaded`, `Position Lists Read`, `Visibility
+Checks`, `Visibility Map Hits` and `Heap Fetches`, and the pins a walk held
+(`Pages Pinned`, `Pages Held Peak`). `stannum.debug_seed_score`
+(superuser-only) prunes a walk against a supplied threshold, to measure what
+a perfect threshold would save; it can change results and is not for
+production use.
 
 ### Per-backend caches
 
@@ -467,10 +553,11 @@ for custom plans. Generic ranked plans retain a parameter expression in
 `custom_exprs`, allowing PostgreSQL to track it during plan finalization.
 The executor binds it on first access; NULL returns no rows, and rescans clear
 ranked rows and the scan-owned scorer before rebinding. Plain EXPLAIN does not
-evaluate the parameter. Unknown queries use the existing fallback cost estimate.
+evaluate the parameter. Unknown queries use the default cost estimate.
 
 Arbitrary query expressions, correlated parameters, dynamic scoring settings,
-and parameterized unordered/count custom scans retain their previous paths.
+and parameterized unordered or count scans are not planned as Stannum custom
+scans; PostgreSQL's ordinary paths evaluate them.
 A runtime LIMIT remains correct but cannot supply the planner's constant top-k
 bound. PostgreSQL still chooses between custom and generic plans normally.
 A parameterized `LIMIT` becomes a runtime top-k bound only when no residual
@@ -517,9 +604,9 @@ A ranked scan keeps its scorer for as long as it lives, under its own
 identity, with the score of every row it ranked: a cursor fetched across
 later statements, or two scans on one query open at once, each report the
 scores they ranked by even as writes move the statistics. A HOT-updated row
-is posted at its chain root; the score functions resolve the visible member's
-location to that root. `docs/testing.md` describes the concurrency fuzzer
-that checks this against the unpruned path and the bug classes it found.
+is indexed at its chain root; the score functions resolve the visible member's
+location to that root. [Testing](../testing.md#the-ranked-scan-under-concurrency)
+describes the concurrency fuzzer that checks this against the unpruned path.
 
 ## Durability and maintenance
 
@@ -579,58 +666,6 @@ standby, pages freed since the map was last written are FREE but unlisted;
 the orphan pass records every FREE page it meets in the map again, so they
 are reused rather than leaked until `REINDEX`. Every allocation checks under
 its lock that a page the map offers is still FREE.
-
-The page and segment format signatures are `LDP2` and `STN3`. Their definitions
-live in `postgres/src/storage/layout.rs` and the `segment` crate. A `STN3`
-segment holds, in order, the dictionary, one ordinal stream per term with
-each member's term-frequency bucket as a nibble beside it and a score bound
-per chunk and per sub-block, one positions stream per term (each document's
-positions, by rank in the ordinal stream, read only by positional queries),
-the document table as two-byte heap offsets, four-byte document lengths, a
-one-byte length class per document (a lower bound a ranked walk bounds at
-before reading the length), and the page table from heap block to first
-ordinal. Dictionary
-entries store each term's two extents as gaps from the previous term's (zero,
-since streams are laid out back to back) with `df` and `max_tf_bucket` packed
-into one varint. A dead list is an ordinal stream without bounds. The
-earlier `LSG` formats, which stored every term's document set a second time
-as tuple-location postings, `STN1`, which kept the bucket beside the
-positions, and `STN2`, which had no length classes, are not read: indexes in
-them must be rebuilt.
-`script/dump-segments.py` writes an index's segment blobs to files and
-`cargo run -p segment --release --example breakdown -- --reencode <blobs>`
-reports where their bytes go, by section and by term document frequency.
-
-### Why this layout
-
-The layout is sized for an index larger than shared buffers, where the cost
-of a query is the pages it reads. The earlier `LSG5` format stored every
-term's document set twice, as tuple-location postings and again as ordinal
-streams (about half the index), and interleaved positions with the
-term-frequency bucket, so scoring a candidate read pages that were mostly
-positions. `STN3` keeps one document set per term, puts the bucket beside
-the ordinal members so that scoring never opens the positions stream, answers
-visibility from the visibility map for all-visible pages instead of a heap
-fetch per candidate, and bounds a candidate by its length class before its
-exact length is read. On the 150 million row Stack Exchange corpus the index
-went from 246.5 GB to 47 GB, and disjunctions read no positions at all.
-
-Fewer segments mean fewer dictionary lookups and stream heads per query, which
-is why a build compacts its directory. Segments are bounded by the 3 GiB merge
-input cap and the 32-bit run length: a direct merge holds every input blob and
-its output in memory, so larger segments would need a streaming merge.
-
-### Read accounting
-
-`EXPLAIN (ANALYZE, BUFFERS)` on the custom scan reports where reads go:
-`Bytes Fetched` and `Disk Pages By Area` per segment area, `Disk Pages By
-Phase` for reads outside the segment reader, `Walk Setup Blocks` and
-`Walk Body Blocks`, `Chunks Loaded`, `Position Lists Read`, `Visibility
-Checks`, `Visibility Map Hits` and `Heap Fetches`, and the pins a walk held
-(`Pages Pinned`, `Pages Held Peak`). `stannum.debug_seed_score`
-(superuser-only) prunes a walk against a supplied threshold, to measure what
-a perfect threshold would save; it can change results and is not for
-production use.
 
 ## Checking an index
 
@@ -720,8 +755,7 @@ inconsistent, the table is the source of truth; `REINDEX` rebuilds from it.
   other settings and a `==>` predicate holds the rows the defaults match, is
   never scanned for that clause, and warns when built. See "One tokenizer
   per clause".
-- Legacy zero-page indexes use the slower reference path. Hot standbys use
-  the segmented path only when the extension is preloaded on the primary and
+- Hot standbys use the segmented path only when the extension is preloaded on the primary and
   the standby (removal-horizon WAL records, see
   [recovery](recovery-and-parallel.md#standby-selective-reads)); otherwise
   they use the reference path.
