@@ -45,8 +45,8 @@ that crate, citations name the upstream file, `Lead@bd95c7e:postgres/src/…`.
 | BENCHREPO | [github.com/planetscale/paradedb-benchmarker](https://github.com/planetscale/paradedb-benchmarker), the benchmark driver the blog links (a fork of paradedb/benchmarker; last push 2026-09-17) | 2026-09-17 | 2026-09-26 (metadata only) |
 | X | [PlanetScale on X, launch post](https://x.com/PlanetScale/status/2100258072333865363) (marketing; no contracts) | 2026-09-16 | search result only |
 | M-ARCH | Measured, TIN 1.0.2, 2026-09-17: `git show 33e4ea8^:docs/archive/tin-observed-shape.md` (deleted from the current tree) | — | 2026-09-26 |
-| M-CAT | Measured, TIN 1.0.2, 2026-09-19: [docs/benchmarks/tin-plan-catalog.md](benchmarks/tin-plan-catalog.md) | — | 2026-09-26 |
-| M-BEH | Measured, TIN 1.0.3, 2026-09-26: [docs/tin-behavior.md](tin-behavior.md) | — | 2026-09-26 |
+| M-CAT | Measured, TIN 1.0.2, 2026-09-19: `git show 68ec214:docs/benchmarks/tin-plan-catalog.md` (deleted from the current tree) | — | 2026-09-26 |
+| M-BEH | Measured, TIN 1.0.3, 2026-09-26, by `benchmarks/tin_behavior_probe.py` at `29a520e`. The answers are recorded in [`conformance/expected/tin-1.0.3/`](../conformance/expected/tin-1.0.3/); the write-up is `git show 68ec214:docs/tin-behavior.md` (deleted from the current tree) | — | 2026-09-26 |
 
 The raw `.md` form of each docs page is at `<url>.md`. For example,
 `https://planetscale.com/docs/postgres/search/tinql.md` gives full SQL examples
