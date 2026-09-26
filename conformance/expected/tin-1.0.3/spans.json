@@ -1,0 +1,103 @@
+{
+ "source": {
+  "engine": "tin",
+  "engine_name": "PlanetScale TIN",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, PlanetScale Postgres, us-east-1",
+  "host": "PlanetScale Postgres, us-east-1",
+  "date": "2026-09-26",
+  "suite_commit": null,
+  "runner_version": null,
+  "measured_by": "benchmarks/tin_behavior_probe.py at 29a520e (the depth cases by the equivalent ad-hoc probe the same day)",
+  "imported_from": "postgres/tests/tin_responses/tin-1.0.3.json at d9b9225 (branch test/tin-conformance); answers measured by benchmarks/tin_behavior_probe.py at 29a520e, not by conformance/run.py",
+  "notes": "Responses of TIN, not of Stannum. Record a new TIN release into a new directory conformance/expected/tin-<version>/; never edit these values. The span cases' counts are the number of recorded matches: the probe recorded matches and TIN's count(*) was not taken separately."
+ },
+ "cases": [
+  {
+   "id": "span.then_phrase_operand.1",
+   "captures": {
+    "ids": [
+     1,
+     2
+    ],
+    "count": 2,
+    "ranked": [
+     2,
+     1
+    ]
+   }
+  },
+  {
+   "id": "span.then_phrase_operand.2",
+   "captures": {
+    "ids": [
+     1,
+     2,
+     4
+    ],
+    "count": 3,
+    "ranked": [
+     2,
+     1,
+     4
+    ]
+   }
+  },
+  {
+   "id": "span.then_phrase_operand.3",
+   "captures": {
+    "ids": [
+     1,
+     4
+    ],
+    "count": 2,
+    "ranked": [
+     1,
+     4
+    ]
+   }
+  },
+  {
+   "id": "span.then_phrase_operand.4",
+   "captures": {
+    "ids": [
+     3
+    ],
+    "count": 1,
+    "ranked": [
+     3
+    ]
+   }
+  },
+  {
+   "id": "span.then_terms.1",
+   "captures": {
+    "ids": [
+     1,
+     2
+    ],
+    "count": 2,
+    "ranked": [
+     2,
+     1
+    ]
+   }
+  },
+  {
+   "id": "span.near_phrase_operand.1",
+   "captures": {
+    "ids": [
+     1,
+     2,
+     3
+    ],
+    "count": 3,
+    "ranked": [
+     2,
+     3,
+     1
+    ]
+   }
+  }
+ ]
+}

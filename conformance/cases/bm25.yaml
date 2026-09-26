@@ -1,0 +1,50 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: bm25
+description: >
+  BM25 with a chosen k1 (b = 0.75): every score's float4 bits, and the row
+  the top-k scan returns for ORDER BY score DESC LIMIT 1. Imported from TIN
+  1.0.3's recorded responses (benchmarks/tin_behavior_probe.py at 29a520e,
+  2026-09-26). TIN's pruned LIMIT 1 equals the exhaustive top by (score
+  desc, id asc). At k1 = 0 the rows with the higher term frequency round one
+  ulp lower, so id 2 wins.
+
+defaults:
+  corpus: w10
+  query: w
+  settings:
+    enable_seqscan: "off"
+  capture:
+    - scores
+    - ranked: {k: 1, as: pruned_top_limit_1}
+
+corpora:
+  w10:
+    description: "id 1: 'w w w'; ids 2 to 10: 'w'; one index built after the inserts."
+    rows:
+      - [1, w w w]
+      - [2, w]
+      - [3, w]
+      - [4, w]
+      - [5, w]
+      - [6, w]
+      - [7, w]
+      - [8, w]
+      - [9, w]
+      - [10, w]
+
+cases:
+  - id: bm25.k1.0
+    description: k1 = 0; term frequency no longer counts, only length normalization.
+    score: "{engine}.full_score(ctid, 0.0::real, 0.75::real)"
+  - id: bm25.k1.0_001
+    description: k1 = 0.001.
+    score: "{engine}.full_score(ctid, 0.001::real, 0.75::real)"
+  - id: bm25.k1.0_01
+    description: k1 = 0.01.
+    score: "{engine}.full_score(ctid, 0.01::real, 0.75::real)"
+  - id: bm25.k1.1_2
+    description: k1 = 1.2, the default.
+    score: "{engine}.full_score(ctid, 1.2::real, 0.75::real)"

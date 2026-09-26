@@ -1,0 +1,97 @@
+{
+ "source": {
+  "engine": "tin",
+  "engine_name": "PlanetScale TIN",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, PlanetScale Postgres, us-east-1",
+  "host": "PlanetScale Postgres, us-east-1",
+  "date": "2026-09-26",
+  "suite_commit": null,
+  "runner_version": null,
+  "measured_by": "benchmarks/tin_behavior_probe.py at 29a520e (the depth cases by the equivalent ad-hoc probe the same day)",
+  "imported_from": "postgres/tests/tin_responses/tin-1.0.3.json at d9b9225 (branch test/tin-conformance); answers measured by benchmarks/tin_behavior_probe.py at 29a520e, not by conformance/run.py",
+  "notes": "Responses of TIN, not of Stannum. Record a new TIN release into a new directory conformance/expected/tin-<version>/; never edit these values. The span cases' counts are the number of recorded matches: the probe recorded matches and TIN's count(*) was not taken separately."
+ },
+ "cases": [
+  {
+   "id": "bm25.k1.0",
+   "captures": {
+    "scores": {
+     "1": "3d3e8bc5",
+     "2": "3d3e8bc6",
+     "3": "3d3e8bc6",
+     "4": "3d3e8bc6",
+     "5": "3d3e8bc6",
+     "6": "3d3e8bc6",
+     "7": "3d3e8bc6",
+     "8": "3d3e8bc6",
+     "9": "3d3e8bc6",
+     "10": "3d3e8bc6"
+    },
+    "pruned_top_limit_1": [
+     2
+    ]
+   }
+  },
+  {
+   "id": "bm25.k1.0_001",
+   "captures": {
+    "scores": {
+     "1": "3d3e99fd",
+     "2": "3d3e91de",
+     "3": "3d3e91de",
+     "4": "3d3e91de",
+     "5": "3d3e91de",
+     "6": "3d3e91de",
+     "7": "3d3e91de",
+     "8": "3d3e91de",
+     "9": "3d3e91de",
+     "10": "3d3e91de"
+    },
+    "pruned_top_limit_1": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "bm25.k1.0_01",
+   "captures": {
+    "scores": {
+     "1": "3d3f190b",
+     "2": "3d3ec837",
+     "3": "3d3ec837",
+     "4": "3d3ec837",
+     "5": "3d3ec837",
+     "6": "3d3ec837",
+     "7": "3d3ec837",
+     "8": "3d3ec837",
+     "9": "3d3ec837",
+     "10": "3d3ec837"
+    },
+    "pruned_top_limit_1": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "bm25.k1.1_2",
+   "captures": {
+    "scores": {
+     "1": "3d629860",
+     "2": "3d4c7d07",
+     "3": "3d4c7d07",
+     "4": "3d4c7d07",
+     "5": "3d4c7d07",
+     "6": "3d4c7d07",
+     "7": "3d4c7d07",
+     "8": "3d4c7d07",
+     "9": "3d4c7d07",
+     "10": "3d4c7d07"
+    },
+    "pruned_top_limit_1": [
+     1
+    ]
+   }
+  }
+ ]
+}
