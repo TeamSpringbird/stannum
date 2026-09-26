@@ -1739,19 +1739,19 @@ unsafe extern "C-unwind" fn exec_search(
     unsafe { pg_sys::ExecScan(&mut (*node).ss, Some(search_access), Some(search_recheck)) }
 }
 
-/// Counts one exact candidate page; only all-visible pages can bypass the heap.
+/// Counts one exact candidate page; only pages `visibility` saw all-visible
+/// can bypass the heap (see [`settle_view`]).
 unsafe fn count_page(
     node: *mut pg_sys::CustomScanState,
     exec: &mut ScanExec,
     block: u32,
     offsets: impl Iterator<Item = u16>,
     size: usize,
-    vmbuf: &mut pg_sys::Buffer,
+    visibility: &crate::fold::Visibility,
 ) -> i64 {
     unsafe {
         pgrx::check_for_interrupts!();
-        let status = pg_sys::visibilitymap_get_status(exec.heap, block, vmbuf);
-        if !exec.recheck && status & pg_sys::VISIBILITYMAP_ALL_VISIBLE as u8 != 0 {
+        if !exec.recheck && visibility.is_visible(block) {
             exec.skipped_pages += 1;
             return size as i64;
         }
@@ -1848,32 +1848,51 @@ unsafe fn count_fetched(
     }
 }
 
+/// The visibility map as read after `view` was captured, with the view it
+/// may be trusted for. A page VACUUM marked all-visible after the capture
+/// may hold no tuple where the view still lists one: VACUUM removed it, as
+/// a dead list or a buffer rewrite the view predates records. No index page
+/// pin keeps VACUUM out, as it does for an index-only scan, so the map is
+/// read first and the view confirmed current after; if it is not, the view
+/// is captured and the map read again, and after repeated interference no
+/// page is trusted.
+///
+/// # Safety
+/// `index_oid` names the live LDP2 index `view` was captured from, over
+/// `exec.heap`.
+unsafe fn settle_view(
+    exec: &ScanExec,
+    index_oid: pg_sys::Oid,
+    mut view: crate::storage::View,
+) -> (crate::storage::View, crate::fold::Visibility) {
+    unsafe {
+        let mut attempts = 0;
+        loop {
+            let visibility = crate::fold::Visibility::read(exec.heap);
+            if crate::storage::view_is_current(index_oid, &view) {
+                return (view, visibility);
+            }
+            attempts += 1;
+            if attempts == 3 {
+                return (view, crate::fold::Visibility::none());
+            }
+            view = crate::storage::view(index_oid);
+        }
+    }
+}
+
 /// Counts by folding each segment's ordinal streams (see
-/// [`crate::fold`]). The visibility map is read once, after the view; if a
-/// dead list was published in between, the count starts over, and after
-/// repeated interference it trusts no page. The write buffer and segments
-/// without ordinal streams are counted through their TID postings, against
-/// the heap: the buffer's removals are not covered by the view check.
+/// [`crate::fold`]), trusting the pages `visibility` saw all-visible (see
+/// [`settle_view`]). The write buffer and segments without ordinal streams
+/// are counted through their TID postings, against the heap.
 unsafe fn fold_count(
     node: *mut pg_sys::CustomScanState,
     exec: &mut ScanExec,
     query: &Query,
-    index_oid: pg_sys::Oid,
-    mut view: crate::storage::View,
+    view: crate::storage::View,
+    visibility: crate::fold::Visibility,
 ) -> i64 {
     unsafe {
-        let mut attempts = 0;
-        let visibility = loop {
-            let visibility = crate::fold::Visibility::read(exec.heap);
-            if crate::storage::view_is_current(index_oid, &view) {
-                break visibility;
-            }
-            attempts += 1;
-            if attempts == 3 {
-                break crate::fold::Visibility::none();
-            }
-            view = crate::storage::view(index_oid);
-        };
         let limits = Limits::default();
         let mut count = 0i64;
         let mut candidates = 0usize;
@@ -1925,7 +1944,8 @@ unsafe fn fold_count(
     }
 }
 
-/// Counts visible candidates, skipping heap fetches on all-visible pages.
+/// Counts visible candidates, skipping heap fetches on pages all-visible
+/// since the index view was captured (see [`settle_view`]).
 #[pg_guard]
 unsafe extern "C-unwind" fn exec_count(
     node: *mut pg_sys::CustomScanState,
@@ -1964,13 +1984,14 @@ unsafe extern "C-unwind" fn exec_count(
                     .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
             let view = crate::storage::view(index_oid);
             crate::storage::race_point("count:view");
+            let (view, visibility) = settle_view(exec, index_oid, view);
             // The diagnostic settings ask for the older strategies by name.
             let diagnostic = FORCE_COUNT_PAGES.get()
                 || COUNT_PAGE_THRESHOLD.get() > 0
                 || PROFILE_COUNT_SELECTION.get();
             if COUNT_FOLD.get() && !diagnostic && !exec.recheck && crate::fold::supported(&query) {
                 exec.count_fold = true;
-                count = fold_count(node, exec, &query, index_oid, view);
+                count = fold_count(node, exec, &query, view, visibility);
             } else {
                 // Time the existing policy too, so paired runs expose incremental cost.
                 let selection_start = std::time::Instant::now();
@@ -2013,7 +2034,6 @@ unsafe extern "C-unwind" fn exec_count(
                 exec.selection_calls += 1;
                 exec.selection_time += selection_start.elapsed();
                 exec.page_masks = Some(use_pages);
-                let mut vmbuf = pg_sys::InvalidBuffer as pg_sys::Buffer;
                 let mut candidates = 0usize;
                 if !use_pages {
                     let tids = candidates_in_view(exec, &query, &view);
@@ -2031,7 +2051,7 @@ unsafe extern "C-unwind" fn exec_count(
                             block,
                             tids[i..end].iter().map(|tid| tid.offset),
                             end - i,
-                            &mut vmbuf,
+                            &visibility,
                         );
                         i = end;
                     }
@@ -2071,15 +2091,12 @@ unsafe extern "C-unwind" fn exec_count(
                             page.block,
                             page.offsets.iter(),
                             size,
-                            &mut vmbuf,
+                            &visibility,
                         );
                         crate::storage::codec_in(pages.advance(), "count page stream");
                     }
                 }
                 exec.candidates = Some(candidates);
-                if vmbuf != pg_sys::InvalidBuffer as pg_sys::Buffer {
-                    pg_sys::ReleaseBuffer(vmbuf);
-                }
             }
         }
         exec.next = 1;

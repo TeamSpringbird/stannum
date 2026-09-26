@@ -88,7 +88,7 @@ impl Visibility {
         }
     }
 
-    fn is_visible(&self, block: u32) -> bool {
+    pub fn is_visible(&self, block: u32) -> bool {
         self.visible
             .get(block as usize / 64)
             .is_some_and(|word| word >> (block % 64) & 1 == 1)
@@ -102,7 +102,7 @@ impl Visibility {
     /// snapshot when it is cleared afterwards. A bit VACUUM set after the
     /// caller captured its index view is another matter: the view may still
     /// hold the tuples VACUUM removed. The caller must confirm afterwards that
-    /// no dead list was published since the view (`storage::view_is_current`).
+    /// the view is still current (`storage::view_is_current`).
     ///
     /// # Safety
     /// `heap` is an open heap relation.

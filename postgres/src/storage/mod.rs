@@ -2899,10 +2899,14 @@ pub struct View {
     pub keys: Vec<(u64, u32)>,
     /// The dead run each immutable source's dead list was read from.
     dead_runs: Vec<(Run, u32)>,
+    /// The write buffer's epoch: VACUUM starts a new one when it rewrites
+    /// the buffer without the documents it removed.
+    buffer_epoch: u32,
 }
 
 /// Whether the directory still lists exactly `view`'s segments with the dead
-/// lists the view read. VACUUM publishes a dead list before it may mark a heap
+/// lists the view read, and the write buffer is in the view's epoch. VACUUM
+/// publishes a dead list, or rewrites the buffer, before it may mark a heap
 /// page all-visible, so a count that read the visibility map after capturing
 /// its view and then finds the view current saw no all-visible bit that
 /// postdates a tuple removal the view lacks.
@@ -2913,7 +2917,8 @@ pub unsafe fn view_is_current(index_oid: pg_sys::Oid, view: &View) -> bool {
     unsafe {
         let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
         let (_buffer, meta) = read_meta(relation.as_ptr(), false);
-        meta.segments.len() == view.keys.len()
+        meta.buffer.epoch == view.buffer_epoch
+            && meta.segments.len() == view.keys.len()
             && meta
                 .segments
                 .iter()
@@ -3025,6 +3030,7 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 dead_sets,
                 keys,
                 dead_runs,
+                buffer_epoch: meta.buffer.epoch,
             };
         }
     }
