@@ -28,7 +28,7 @@ use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::plan::{Limits, plan};
 use tinql::runtime::{
     CompiledRegex, FuzzyMatcher, Query, RangeBound, SpanPositionFilter, SpanTermSlot, evaluate,
-    parse_tinql_to_query, range_matches, tokenize_doc,
+    parse_tinql_to_query, parse_tinql_to_scoring_query, range_matches, tokenize_doc,
 };
 use tokenizer::Tokenizer;
 
@@ -176,8 +176,12 @@ impl SourceReader {
 }
 
 thread_local! {
-    static SCORE_CACHE: RefCell<Option<ScoreCorpus>> = const { RefCell::new(None) };
-    static INDEX_SCORE_CACHE: RefCell<Option<IndexScorer>> = const { RefCell::new(None) };
+    /// The statement's scorers, one per scored query and index: a score over
+    /// `==>` clauses on several indexed columns sums one per column, called
+    /// in turn for each row (see [`score_support`]). Oldest first, at most
+    /// [`STATEMENT_SCORERS`].
+    static SCORE_CACHE: RefCell<Vec<ScoreCorpus>> = const { RefCell::new(Vec::new()) };
+    static INDEX_SCORE_CACHE: RefCell<Vec<IndexScorer>> = const { RefCell::new(Vec::new()) };
     /// One scorer per live ranked scan, newest last, holding the score of
     /// every row the scan ranked. Cursors keep scans open across statements
     /// and two scans on one query can be open at once, so a scan's rows are
@@ -189,6 +193,36 @@ thread_local! {
     /// not distinguish consecutive read-only statements, which never assign
     /// a transaction id and each start at command zero.
     static STATEMENT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Scorers a statement keeps at once; see [`SCORE_CACHE`]. A statement
+/// needing more rebuilds the oldest, as one with a new query per row (a
+/// LATERAL search) rebuilds each time anyway.
+const STATEMENT_SCORERS: usize = 8;
+
+/// The cached entry `matches` accepts, else a new one from `build`, which
+/// drops earlier statements' entries and, beyond [`STATEMENT_SCORERS`], the
+/// oldest.
+fn cached_scorer<T>(
+    cache: &mut Vec<T>,
+    matches: impl Fn(&T) -> bool,
+    statement_of: impl Fn(&T) -> u64,
+    statement: u64,
+    build: impl FnOnce() -> T,
+) -> &mut T {
+    let at = match cache.iter().position(matches) {
+        Some(at) => at,
+        None => {
+            let built = build();
+            cache.retain(|entry| statement_of(entry) == statement);
+            if cache.len() >= STATEMENT_SCORERS {
+                cache.remove(0);
+            }
+            cache.push(built);
+            cache.len() - 1
+        }
+    };
+    &mut cache[at]
 }
 
 /// A live ranked scan's scorer; see [`SCAN_SCORERS`].
@@ -308,11 +342,15 @@ fn score_bound(
         add: term_add.clone(),
         replace: term_replace.clone(),
     };
-    SCORE_CACHE.with_borrow_mut(|slot| {
-        if slot.as_ref().is_none_or(|corpus| corpus.key != key) {
-            *slot = Some(build_corpus(key.clone(), k1, b, term_add, term_replace));
-        }
-        let corpus = slot.as_ref().expect("score corpus was just populated");
+    SCORE_CACHE.with_borrow_mut(|cache| {
+        let statement = key.statement;
+        let corpus = cached_scorer(
+            cache,
+            |corpus| corpus.key == key,
+            |corpus| corpus.key.statement,
+            statement,
+            || build_corpus(key.clone(), k1, b, term_add, term_replace),
+        );
         if mode >= 2 {
             corpus.max
         } else {
@@ -386,10 +424,8 @@ fn score_bound_indexed(
             return score;
         }
     }
-    let cached =
-        INDEX_SCORE_CACHE.with_borrow(|slot| slot.as_ref().is_some_and(|s| matches(&s.key)));
-    INDEX_SCORE_CACHE.with_borrow_mut(|slot| {
-        if !cached {
+    INDEX_SCORE_CACHE.with_borrow_mut(|cache| {
+        let build = || {
             let index = unsafe {
                 PgRelation::with_lock(
                     pg_sys::Oid::from(index_oid as u32),
@@ -419,9 +455,15 @@ fn score_bound_indexed(
                 add: term_add.clone(),
                 replace: term_replace.clone(),
             };
-            *slot = Some(build_index_scorer(key, k1, b, term_add, term_replace));
-        }
-        let scorer = slot.as_mut().expect("index scorer was just populated");
+            build_index_scorer(key, k1, b, term_add.clone(), term_replace.clone())
+        };
+        let scorer = cached_scorer(
+            cache,
+            |scorer| matches(&scorer.key),
+            |scorer| scorer.key.statement,
+            statement,
+            build,
+        );
         if mode >= 2 {
             scorer.max_score()
         } else {
@@ -4492,6 +4534,8 @@ fn build_index_scorer_inner(
     }
     let query = parse_tinql_to_query(&key.query, tokenizer.as_ref())
         .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
+    let scoring = parse_tinql_to_scoring_query(&key.query, tokenizer.as_ref())
+        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -4509,7 +4553,7 @@ fn build_index_scorer_inner(
     let view = unsafe { crate::storage::view(index.oid()) };
     let segments: Vec<&dyn Index> = view.sources.iter().map(|(index, _)| &**index).collect();
     let mut collected = Collected::default();
-    collect_score_terms(&query, 1.0, false, &mut collected);
+    collect_score_terms(&scoring, 1.0, false, &mut collected);
     let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
     let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
     let dead = view.dead_sets.clone();
@@ -4635,6 +4679,8 @@ fn build_corpus(
     }
     let query = parse_tinql_to_query(&key.query, &tokenizer)
         .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
+    let scoring = parse_tinql_to_scoring_query(&key.query, &tokenizer)
+        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -4653,7 +4699,7 @@ fn build_corpus(
     let tokenized: Vec<Vec<String>> = positioned.iter().map(|doc| doc.tokens().to_vec()).collect();
     let universe = corpus_universe(&tokenized);
     let mut collected = Collected::default();
-    collect_score_terms(&query, 1.0, false, &mut collected);
+    collect_score_terms(&scoring, 1.0, false, &mut collected);
     let owned = collected.resolve(|expansion| {
         let matcher = expansion.matcher();
         universe
@@ -5018,7 +5064,7 @@ fn score_inspect(
     crate::udfs::require_index_select(&index);
     let heap_oid = unsafe { pg_sys::IndexGetRelation(index.oid(), false) };
     let tokenizer = unsafe { crate::options::tokenizer(index.as_ptr()) };
-    let parsed = parse_tinql_to_query(query, &tokenizer)
+    let parsed = parse_tinql_to_scoring_query(query, &tokenizer)
         .unwrap_or_else(|error| pgrx::error!("stannum.score_inspect() query error: {error}"));
     let edit = TermSetEdit::from_bound_arrays(
         unwrap("term_add", term_add),
@@ -5323,17 +5369,26 @@ fn score_support(request: Internal) -> Internal {
         if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return unhandled();
         }
-        // Score with the index the ==> clause is bound to, so scoring
-        // statistics and matching use the same analyzer.
-        let Some((document, first_query, index_oid)) =
-            binding
-                .matches
+        // Each searched document expression of this relation that an index
+        // covers, in the order of its first clause, with the index that
+        // clause is bound to, so scoring statistics and matching use the
+        // same analyzer. As in TIN, a row's score sums one score per
+        // expression (a row matching one column scores that column's), and
+        // clauses on one expression score as one query (see below).
+        let mut documents: Vec<(*mut pg_sys::Node, *mut pg_sys::Node, pg_sys::Oid)> = Vec::new();
+        for &(document, query, bound) in &binding.matches {
+            if documents
                 .iter()
-                .find_map(|&(document, query, bound)| {
-                    let candidates = matching_stannum_indexes((*rte).relid, ctid.varno, document);
-                    pick_index(&candidates, bound).map(|index_oid| (document, query, index_oid))
-                })
-        else {
+                .any(|&(seen, _, _)| pg_sys::equal(seen.cast(), document.cast()))
+            {
+                continue;
+            }
+            let candidates = matching_stannum_indexes((*rte).relid, ctid.varno, document);
+            if let Some(index_oid) = pick_index(&candidates, bound) {
+                documents.push((document, query, index_oid));
+            }
+        }
+        let Some(&(document, _, index_oid)) = documents.first() else {
             return unhandled();
         };
         let original_nargs = pg_sys::list_length((*request.fcall).args);
@@ -5365,6 +5420,57 @@ fn score_support(request: Internal) -> Internal {
         } else {
             0
         };
+        // max_score reports the first expression's best score: the best sum
+        // over several would need every match scored under each.
+        if mode >= 2 {
+            documents.truncate(1);
+        }
+        let mut replacement: *mut pg_sys::Node = std::ptr::null_mut();
+        for &(document, first_query, index_oid) in &documents {
+            let call = bound_score_call(
+                request,
+                ctid_node,
+                &binding,
+                (*rte).relid,
+                (document, first_query, index_oid),
+                mode,
+                original_nargs,
+            );
+            // Left to right in clause order, in float4 as TIN adds them.
+            replacement = if replacement.is_null() {
+                call
+            } else {
+                let mut sum = PgList::<pg_sys::Node>::new();
+                sum.push(replacement);
+                sum.push(call);
+                pg_sys::makeFuncExpr(
+                    pg_sys::Oid::from(pg_sys::F_FLOAT4PL),
+                    pg_sys::FLOAT4OID,
+                    sum.into_pg(),
+                    pg_sys::InvalidOid,
+                    pg_sys::InvalidOid,
+                    pg_sys::CoercionForm::COERCE_EXPLICIT_CALL,
+                )
+                .cast()
+            };
+        }
+        Internal::from(Some(pg_sys::Datum::from(replacement as usize)))
+    }
+}
+
+/// The bound scorer call of one searched document expression: `document`'s
+/// clauses (the first is `first_query`) scored with `index_oid` under `mode`.
+unsafe fn bound_score_call(
+    request: &pg_sys::SupportRequestSimplify,
+    ctid_node: *mut pg_sys::Node,
+    binding: &QualBinding,
+    heap_oid: pg_sys::Oid,
+    (document, first_query, index_oid): (*mut pg_sys::Node, *mut pg_sys::Node, pg_sys::Oid),
+    mode: i32,
+    original_nargs: i32,
+) -> *mut pg_sys::Node {
+    unsafe {
+        let segmented = crate::storage::is_segmented(index_oid);
         let mut args = PgList::<pg_sys::Node>::new();
         if segmented {
             args.push(pg_sys::copyObjectImpl(ctid_node.cast()).cast());
@@ -5385,7 +5491,7 @@ fn score_support(request: Internal) -> Internal {
         // copy so the score and search clause expose the same constant to
         // ranked-path recognition. Generic plans retain their parameters.
         args.push(pg_sys::eval_const_expressions(request.root, combined_query));
-        args.push(make_int4_const((*rte).relid.to_u32() as i32).cast());
+        args.push(make_int4_const(heap_oid.to_u32() as i32).cast());
         args.push(make_int4_const(index_oid.to_u32() as i32).cast());
         args.push(make_int4_const(mode).cast());
         let null_float = || make_null_const(pg_sys::FLOAT4OID);
@@ -5417,16 +5523,15 @@ fn score_support(request: Internal) -> Internal {
             args.push(null_array().cast());
             args.push(null_array().cast());
         }
-        let oid = lookup_score_bound(segmented);
-        let replacement = pg_sys::makeFuncExpr(
-            oid,
+        pg_sys::makeFuncExpr(
+            lookup_score_bound(segmented),
             pg_sys::FLOAT4OID,
             args.into_pg(),
             pg_sys::InvalidOid,
             pg_sys::InvalidOid,
             pg_sys::CoercionForm::COERCE_EXPLICIT_CALL,
-        );
-        Internal::from(Some(pg_sys::Datum::from(replacement as usize)))
+        )
+        .cast()
     }
 }
 

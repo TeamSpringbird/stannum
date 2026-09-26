@@ -196,3 +196,27 @@
   and crashes at 10,000 terms and 5,000 levels. `MATCHES` patterns scan in
   linear time (pest backtracked exponentially over unclosed groups) and the
   `AT LEAST` estimate is linear for thresholds near either end.
+- `target_segment_count`, `max_mutable_segment_size` and
+  `max_merged_segment_size` take TIN's domains (1..4096, at least 131072
+  bytes, at least 100 MB) and reject other values with SQLSTATE 22023, as
+  TIN 1.0.3 does; unset still leaves the `stannum.*` settings in charge.
+- A term repeated in a flat AND or OR chain adds its boosts in scoring and
+  `score_inspect`, as in TIN 1.0.3: `a a` weighs `a` 2.0 and scores as
+  `a^2`, where the repeat was removed before scoring. Matching is unchanged.
+- `highlight()` and `highlight_ansi()` without a query take it from a `==>`
+  clause anywhere in the query's join tree, so a CTE or subquery the planner
+  flattens binds as in TIN 1.0.3; with no clause to bind they return the text
+  unmarked, as TIN does, instead of raising an error.
+- `score()` and `full_score()` over `==>` clauses on several indexed columns
+  of one table sum one score per column, left to right in clause order, as
+  TIN 1.0.3 does: a row matching two columns scores both, a row matching one
+  that column's, where only the first column scored. Clauses on one column
+  still score as one query. Such a sum is sorted over the matches rather
+  than ranked by the index scan, and `max_score()` still reports the first
+  column's best score.
+- An invalid `==>` query raises its error in TIN 1.0.3's form,
+  `invalid ==> query at byte N in "QUERY": ...` (without the byte when the
+  error names none; a query over 1 KiB is quoted up to 1 KiB), in place of
+  `invalid ==> query: parse error: ...`. The SQLSTATE is unchanged. Syntax
+  errors still name what was expected in the descent parser's words, not
+  TIN's pest grammar rules.

@@ -99,17 +99,19 @@ mod tests {
 
     #[pg_test]
     fn a_build_packs_its_segments_into_its_lowest_pages() {
-        // Small build segments and a low merge cap: the build's tier merges
-        // retire many runs and end with several segments among their holes.
+        // Small build segments and a low merge cap (2 MB, below the smallest
+        // max_merged_segment_size): the build's tier merges retire many runs
+        // and end with several segments among their holes.
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(2 << 20));
         Spi::run(
             "CREATE TABLE packed(id int, body text);
              INSERT INTO packed SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 1009), ' ')
              FROM generate_series(1, 40) k) FROM generate_series(1, 20000) n;
              SET LOCAL stannum.build_segment_docs = 500;
-             CREATE INDEX packed_idx ON packed USING stannum(body)
-             WITH (max_merged_segment_size = 2);",
+             CREATE INDEX packed_idx ON packed USING stannum(body);",
         )
         .unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(None);
         let index = unsafe {
             pgrx::PgRelation::with_lock(
                 Spi::get_one::<pg_sys::Oid>("SELECT 'packed_idx'::regclass::oid")
@@ -3241,6 +3243,137 @@ mod tests {
         assert_eq!(inspected, Some(vec!["rare".to_owned()]));
     }
 
+    /// `[[id, "score bits"], ...]` of the rows `sql` returns as (id, score).
+    fn score_bits(sql: &str) -> String {
+        Spi::get_one::<String>(&format!(
+            "SELECT coalesce(json_agg(json_build_array(id, encode(float4send(score), 'hex'))
+             ORDER BY id), '[]')::text FROM ({sql}) scored(id, score)"
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    /// A repeated query term adds its boosts, in `score_inspect` and in the
+    /// scores: TIN 1.0.3 weighs `a OR a^2` 3.0, `a a` 2.0 and `(a^2)^3` 6.0
+    /// (conformance/expected/tin-1.0.3/catalog.scoring.json, catalog.S-12),
+    /// so `a a` scores as `a^2` does.
+    #[pg_test]
+    fn tin_1_0_3_repeated_terms_add_their_boosts() {
+        // A segmented index, then a temporary table's heap-scored one.
+        for table_kind in ["", "TEMP"] {
+            Spi::run(&format!(
+                "CREATE {table_kind} TABLE repeats(id int, body text);
+                 INSERT INTO repeats VALUES (1, 'a b');
+                 INSERT INTO repeats SELECT 1000 + n, 'pad' || n FROM generate_series(1, 90) n;
+                 CREATE INDEX repeats_idx ON repeats USING stannum(body)"
+            ))
+            .unwrap();
+            for (query, weight) in [
+                ("a OR a^2", "40400000"),
+                ("a a", "40000000"),
+                ("(a^2)^3", "40c00000"),
+            ] {
+                let inspected = Spi::get_one::<String>(&format!(
+                    "SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), 'hex'))
+                     ORDER BY term), '[]')::text
+                     FROM stannum.score_inspect('repeats_idx'::regclass, '{query}')"
+                ))
+                .unwrap()
+                .unwrap();
+                assert_eq!(inspected, format!("[[\"a\", \"{weight}\"]]"), "{query}");
+            }
+            for custom_scan in ["on", "off"] {
+                Spi::run(&format!(
+                    "SET LOCAL stannum.enable_custom_scan = {custom_scan}"
+                ))
+                .unwrap();
+                for function in ["score", "full_score"] {
+                    let scores = |query: &str, limit: &str| {
+                        score_bits(&format!(
+                            "SELECT id, stannum.{function}(ctid) FROM repeats
+                             WHERE body ==> '{query}'
+                             ORDER BY stannum.{function}(ctid) DESC {limit}"
+                        ))
+                    };
+                    for limit in ["", "LIMIT 1"] {
+                        let doubled = scores("a^2", limit);
+                        assert_ne!(doubled, scores("a", limit));
+                        assert_eq!(scores("a a", limit), doubled, "{function} {limit}");
+                        assert_eq!(scores("a AND a", limit), doubled, "{function} {limit}");
+                    }
+                }
+            }
+            Spi::run("DROP TABLE repeats").unwrap();
+        }
+    }
+
+    /// With `==>` clauses on two indexed columns, a row's score is the sum of
+    /// its scores for each column's query: TIN 1.0.3 gives the row matching
+    /// both columns both scores and a row matching one column that column's
+    /// (conformance/expected/tin-1.0.3/catalog.scoring.json, catalog.S-18).
+    #[pg_test]
+    fn tin_1_0_3_scores_sum_across_indexed_columns() {
+        // A segmented index, then a temporary table's heap-scored one.
+        for table_kind in ["", "TEMP"] {
+            Spi::run(&format!(
+                "CREATE {table_kind} TABLE two_columns(id int, name text, notes text);
+                 INSERT INTO two_columns VALUES (1, 'fuji', 'citrus'), (2, 'fuji', 'x'), (3, 'x', 'citrus');
+                 INSERT INTO two_columns SELECT 1000 + n, 'pad' || n, 'pad' || n FROM generate_series(1, 90) n;
+                 CREATE INDEX two_columns_name ON two_columns USING stannum(name);
+                 CREATE INDEX two_columns_notes ON two_columns USING stannum(notes)"
+            ))
+            .unwrap();
+            for custom_scan in ["on", "off"] {
+                Spi::run(&format!(
+                    "SET LOCAL stannum.enable_custom_scan = {custom_scan}"
+                ))
+                .unwrap();
+                // No term is dense here, so full_score scores as score does.
+                for function in ["score", "full_score"] {
+                    let scores = |clause: &str, order: &str| {
+                        score_bits(&format!(
+                            "SELECT id, stannum.{function}(ctid) FROM two_columns
+                             WHERE {clause} {order}"
+                        ))
+                    };
+                    for (clause, recorded, top) in [
+                        (
+                            "name ==> 'fuji' OR notes ==> 'citrus'",
+                            r#"[[1, "40e820d6"], [2, "406820d6"], [3, "406820d6"]]"#,
+                            r#"[[1, "40e820d6"]]"#,
+                        ),
+                        (
+                            "name ==> 'fuji^1.5' OR notes ==> 'citrus'",
+                            r#"[[1, "41111486"], [2, "40ae18a0"], [3, "406820d6"]]"#,
+                            r#"[[1, "41111486"]]"#,
+                        ),
+                    ] {
+                        let context = format!("{table_kind} {custom_scan} {function} {clause}");
+                        assert_eq!(scores(clause, ""), recorded, "{context}");
+                        // Ranked, the row matching both columns comes first.
+                        assert_eq!(
+                            scores(
+                                clause,
+                                &format!("ORDER BY stannum.{function}(ctid) DESC, id LIMIT 1")
+                            ),
+                            top,
+                            "{context}"
+                        );
+                    }
+                    // AND sums too, and a ranked AND, which the index scan
+                    // cannot order by a sum, is sorted over its matches.
+                    for order in ["", "ORDER BY 2 DESC LIMIT 1"] {
+                        assert_eq!(
+                            scores("name ==> 'fuji' AND notes ==> 'citrus'", order),
+                            r#"[[1, "40e820d6"]]"#
+                        );
+                    }
+                }
+            }
+            Spi::run("DROP TABLE two_columns").unwrap();
+        }
+    }
+
     #[pg_test]
     fn full_score_normalization_matches_tin() {
         // Exercise the custom scan, bitmap scan, and heap-reference scorer.
@@ -3566,6 +3699,37 @@ mod tests {
         .unwrap();
         assert!(ansi.contains("\x1b["));
         assert!(ansi.contains("Beer"));
+    }
+
+    /// An implicit highlight finds the `==>` clause through an UPDATE's
+    /// RETURNING, a CTE and a subquery, and without one returns the text
+    /// unmarked, as TIN 1.0.3 answers (conformance/expected/tin-1.0.3/
+    /// catalog.highlight.json, catalog.H-08 and catalog.H-12).
+    #[pg_test]
+    fn tin_1_0_3_implicit_highlight_binding() {
+        let text = |sql: &str| Spi::get_one::<String>(sql).unwrap();
+        assert_eq!(text("SELECT stannum.highlight(NULL, query => 'a')"), None);
+        assert_eq!(text("SELECT stannum.highlight('x')"), Some("x".into()));
+        assert_eq!(
+            text("SELECT stannum.highlight('a b', '<b>', '</b>', 'a AND')"),
+            Some("a b".into())
+        );
+        Spi::run(
+            "CREATE TABLE implicit_binding(id int, body text);
+             INSERT INTO implicit_binding VALUES (1, 'urgent x');
+             CREATE INDEX implicit_binding_idx ON implicit_binding USING stannum(body)",
+        )
+        .unwrap();
+        for sql in [
+            "UPDATE implicit_binding SET body = body WHERE body ==> 'urgent'
+             RETURNING stannum.highlight(body)",
+            "WITH m AS (SELECT body FROM implicit_binding WHERE body ==> 'urgent')
+             SELECT stannum.highlight(body) FROM m",
+            "SELECT stannum.highlight(body)
+             FROM (SELECT body FROM implicit_binding WHERE body ==> 'urgent') s",
+        ] {
+            assert_eq!(text(sql), Some("<b>urgent</b> x".into()), "{sql}");
+        }
     }
 
     /// A corpus with known term frequencies: 4000 rows where `seven` and
@@ -4682,6 +4846,211 @@ mod tests {
         check();
     }
 
+    /// The SQLSTATE and message `sql` fails with, or `None` when it succeeds.
+    /// The statement runs in a subtransaction, so a failure leaves the
+    /// test's transaction usable.
+    fn outcome(sql: &str) -> Option<(String, String)> {
+        Spi::run(
+            "CREATE OR REPLACE FUNCTION pg_temp.outcome(statement text) RETURNS text[]
+             LANGUAGE plpgsql AS $$
+             DECLARE state text; message text;
+             BEGIN
+                 EXECUTE statement;
+                 RETURN NULL;
+             EXCEPTION WHEN OTHERS THEN
+                 GET STACKED DIAGNOSTICS state = RETURNED_SQLSTATE, message = MESSAGE_TEXT;
+                 RETURN ARRAY[state, message];
+             END $$",
+        )
+        .unwrap();
+        Spi::get_one::<Vec<String>>(&format!("SELECT pg_temp.outcome($outcome${sql}$outcome$)"))
+            .unwrap()
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+    }
+
+    /// An invalid `==>` query raises TIN 1.0.3's message on every path: the
+    /// query and the byte the error points at, then the error without the
+    /// stage that raised it (conformance/expected/tin-1.0.3/
+    /// catalog.syntax.json, catalog.expansion.json and catalog.relations.json:
+    /// catalog.Q-14, catalog.E-07, catalog.E-10, catalog.R-06). The syntax
+    /// errors TIN words after its pest grammar ("expected expected base")
+    /// are left out: the descent parser names what it expected in words.
+    #[pg_test]
+    fn tin_1_0_3_invalid_query_messages() {
+        Spi::run(
+            "CREATE TABLE invalid_queries(body text);
+             INSERT INTO invalid_queries VALUES ('craft beer');
+             CREATE INDEX invalid_queries_idx ON invalid_queries USING stannum(body)",
+        )
+        .unwrap();
+        for (query, message) in [
+            (
+                r#""""#,
+                r#"invalid ==> query at byte 0 in "\"\"": empty phrase (at byte 0)"#,
+            ),
+            (
+                "[]",
+                r#"invalid ==> query at byte 0 in "[]": empty alternatives (at byte 0)"#,
+            ),
+            (
+                "* IN FIRST 3 WORDS",
+                r#"invalid ==> query in "* IN FIRST 3 WORDS": MatchAll (*) is not valid inside a span/positional context"#,
+            ),
+            (
+                "a* TO c",
+                r#"invalid ==> query at byte 0 in "a* TO c": range bound "a*" contains a wildcard (at byte 0): bounds must be plain terms"#,
+            ),
+            (
+                "... TO z",
+                r#"invalid ==> query in "... TO z": range bound "..." sub-tokenizes into no tokens"#,
+            ),
+            (
+                r"MATCHES (a)\1",
+                "invalid ==> query in \"MATCHES (a)\\\\1\": invalid regex \"(a)\\1\": regex parse error:\n    \\A(?:(a)\\1)\\z\n            ^^\nerror: backreferences are not supported",
+            ),
+        ] {
+            let quoted = query.replace('\'', "''");
+            for (setting, sql) in [
+                (
+                    "on",
+                    format!("SELECT count(*) FROM invalid_queries WHERE body ==> '{quoted}'"),
+                ),
+                (
+                    "off",
+                    format!("SELECT count(*) FROM invalid_queries WHERE body ==> '{quoted}'"),
+                ),
+                ("on", format!("SELECT 'craft beer' ==> '{quoted}'")),
+            ] {
+                Spi::run(&format!("SET LOCAL stannum.enable_custom_scan = {setting}")).unwrap();
+                assert_eq!(
+                    outcome(&sql),
+                    Some(("XX000".to_owned(), message.to_owned())),
+                    "{sql} (custom scan {setting})"
+                );
+            }
+        }
+    }
+
+    /// Every WITH option at the ends of its domain and one step outside:
+    /// TIN 1.0.3 accepts the ends and rejects the rest with 22023 (answers
+    /// recorded in conformance/expected/tin-1.0.3/catalog.ddl.json,
+    /// catalog.I-02).
+    #[pg_test]
+    fn tin_1_0_3_index_option_domains() {
+        Spi::run("CREATE TABLE option_domains(body text)").unwrap();
+        for (option, rejected) in [
+            ("k1 = 0", None),
+            ("k1 = 10000", None),
+            ("k1 = -1", Some("value -1 out of bounds for option \"k1\"")),
+            (
+                "k1 = 10001",
+                Some("value 10001 out of bounds for option \"k1\""),
+            ),
+            ("b = 0", None),
+            ("b = 1", None),
+            (
+                "b = -0.1",
+                Some("value -0.1 out of bounds for option \"b\""),
+            ),
+            ("b = 1.1", Some("value 1.1 out of bounds for option \"b\"")),
+            ("max_token_bytes = 4", None),
+            ("max_token_bytes = 2692", None),
+            (
+                "max_token_bytes = 3",
+                Some("value 3 out of bounds for option \"max_token_bytes\""),
+            ),
+            (
+                "max_token_bytes = 2693",
+                Some("value 2693 out of bounds for option \"max_token_bytes\""),
+            ),
+            ("initial_segment_count = 1", None),
+            ("initial_segment_count = 4096", None),
+            (
+                "initial_segment_count = 0",
+                Some("value 0 out of bounds for option \"initial_segment_count\""),
+            ),
+            (
+                "initial_segment_count = 4097",
+                Some("value 4097 out of bounds for option \"initial_segment_count\""),
+            ),
+            ("target_segment_count = 1", None),
+            ("target_segment_count = 4096", None),
+            (
+                "target_segment_count = 0",
+                Some("value 0 out of bounds for option \"target_segment_count\""),
+            ),
+            (
+                "target_segment_count = 4097",
+                Some("value 4097 out of bounds for option \"target_segment_count\""),
+            ),
+            ("max_mutable_segment_size = 131072", None),
+            (
+                "max_mutable_segment_size = 131071",
+                Some("value 131071 out of bounds for option \"max_mutable_segment_size\""),
+            ),
+            ("max_merged_segment_size = 100", None),
+            (
+                "max_merged_segment_size = 99",
+                Some("value 99 out of bounds for option \"max_merged_segment_size\""),
+            ),
+            ("dead_percent_threshold = 0", None),
+            ("dead_percent_threshold = 1", None),
+            (
+                "dead_percent_threshold = -0.1",
+                Some("value -0.1 out of bounds for option \"dead_percent_threshold\""),
+            ),
+            (
+                "dead_percent_threshold = 1.1",
+                Some("value 1.1 out of bounds for option \"dead_percent_threshold\""),
+            ),
+            ("tokenizer = 'unicode'", None),
+            ("tokenizer = 'whitespace'", None),
+            (
+                "tokenizer = 'icu'",
+                Some("invalid value for enum option \"tokenizer\": icu"),
+            ),
+            ("case_folding = 'fold'", None),
+            ("case_folding = 'preserve'", None),
+            (
+                "case_folding = 'upper'",
+                Some("invalid value for enum option \"case_folding\": upper"),
+            ),
+            ("accent_folding = 'fold'", None),
+            ("accent_folding = 'preserve'", None),
+            (
+                "accent_folding = 'strip'",
+                Some("invalid value for enum option \"accent_folding\": strip"),
+            ),
+            ("long_tokens = 'split'", None),
+            ("long_tokens = 'truncate'", None),
+            ("long_tokens = 'discard'", None),
+            (
+                "long_tokens = 'wrap'",
+                Some("invalid value for enum option \"long_tokens\": wrap"),
+            ),
+            ("graphemes = 'emoji'", None),
+            ("graphemes = 'retain'", None),
+            ("graphemes = 'discard'", None),
+            (
+                "graphemes = 'all'",
+                Some("invalid value for enum option \"graphemes\": all"),
+            ),
+            ("position_gaps = 'preserve'", None),
+            ("position_gaps = 'collapse'", None),
+            (
+                "position_gaps = 'keep'",
+                Some("invalid value for enum option \"position_gaps\": keep"),
+            ),
+            ("score_stop_words = 'the, a'", None),
+        ] {
+            let got = outcome(&format!(
+                "CREATE INDEX ON option_domains USING stannum(body) WITH ({option})"
+            ));
+            let want = rejected.map(|message| ("22023".to_owned(), message.to_owned()));
+            assert_eq!(got, want, "WITH ({option})");
+        }
+    }
+
     #[pg_test]
     fn tin_maintenance_options_are_accepted_without_changing_search() {
         Spi::run("CREATE TABLE compat_options(id int, body text);
@@ -4710,13 +5079,18 @@ mod tests {
                 "SELECT count(*) FROM stannum.segment_info('{index}') WHERE kind = 'immutable'"
             ))
         };
-        // The write buffer folds at the index's own size.
+        // The write buffer folds at the index's own size: the smallest one
+        // allowed, where the setting's own caps would not fold.
         Spi::run(
             "CREATE TABLE per_index(body text);
              CREATE INDEX per_index_default ON per_index USING stannum(body);
              CREATE INDEX per_index_small ON per_index USING stannum(body)
-                 WITH (max_mutable_segment_size=2000);
-             INSERT INTO per_index SELECT 'needle number ' || n FROM generate_series(1,200) n;",
+                 WITH (max_mutable_segment_size=131072);
+             SET LOCAL stannum.write_buffer_bytes = 67108864;
+             SET LOCAL stannum.write_buffer_docs = 1000000;
+             INSERT INTO per_index SELECT 'needle number ' || n || ' ' ||
+                 (SELECT string_agg('w' || (n * k % 5003), ' ') FROM generate_series(1, 100) k)
+                 FROM generate_series(1,400) n;",
         )
         .unwrap();
         assert_eq!(immutable("per_index_default"), 0);

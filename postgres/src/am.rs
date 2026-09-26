@@ -243,10 +243,9 @@ unsafe extern "C-unwind" fn amrescan(
             unsafe { String::from_datum(key.sk_argument, false) }.expect("non-null search key")
         };
         let query = match &tokenizer {
-            Some(tokenizer) => tinql::runtime::parse_tinql_to_query(&text, tokenizer.as_ref()),
-            None => tinql::runtime::parse_tinql_to_query_default(&text),
-        }
-        .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
+            Some(tokenizer) => crate::operator::parse_or_raise(&text, tokenizer.as_ref()),
+            None => crate::operator::parse_or_raise(&text, tokenizer::presets::default_pipeline()),
+        };
         queries.push(query);
     }
     state.plan = if selective {

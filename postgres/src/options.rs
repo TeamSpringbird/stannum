@@ -112,21 +112,26 @@ pub fn init() {
             4096,
             lock,
         );
-        // Zero, the default, leaves the matching `stannum.*` setting in charge.
-        for (name, description, maximum) in [
+        // TIN's domains. The default, zero, lies outside them: PostgreSQL
+        // checks only values a statement sets, so zero means unset and
+        // leaves the matching `stannum.*` setting in charge.
+        for (name, description, minimum, maximum) in [
             (
                 c"target_segment_count",
-                c"Soft bound on segments; 0 uses stannum.max_segments",
+                c"Soft bound on segments; unset uses stannum.max_segments",
+                1,
                 4096,
             ),
             (
                 c"max_mutable_segment_size",
-                c"Write buffer bytes before a fold; 0 uses stannum.write_buffer_bytes",
+                c"Write buffer bytes before a fold; unset uses stannum.write_buffer_bytes",
+                131_072,
                 i32::MAX,
             ),
             (
                 c"max_merged_segment_size",
-                c"Most input megabytes a merge takes; 0 uses the 3 GiB format ceiling",
+                c"Most input megabytes a merge takes; unset uses the 3 GiB format ceiling",
+                100,
                 i32::MAX,
             ),
         ] {
@@ -135,7 +140,7 @@ pub fn init() {
                 name.as_ptr(),
                 description.as_ptr(),
                 0,
-                0,
+                minimum,
                 maximum,
                 lock,
             );

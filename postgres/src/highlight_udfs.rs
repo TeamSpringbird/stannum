@@ -12,7 +12,8 @@
 //! to, or the one `==>` itself would bind to) into the `indexed_query`
 //! form, which analyzes both with that index's settings, so highlights
 //! agree with matches. A NULL query is taken from the `==>` clauses on the
-//! same expression, as before.
+//! same expression anywhere in the statement's join tree; with none, the
+//! text is returned unmarked, as TIN does.
 
 use crate::highlight::{highlight_text, highlight_text_ansi, positions_from_query, rewrap_text};
 use crate::operator::indexed_query;
@@ -20,10 +21,6 @@ use pgrx::{Internal, IntoDatum, PgList, default, pg_extern, pg_guard, pg_sys};
 use std::borrow::Cow;
 use std::ffi::{CStr, c_void};
 use tokenizer::CompiledTokenizerPipeline;
-
-fn missing_binding(function: &str) -> ! {
-    pgrx::error!("{function} requires an explicit query or a matching stannum index scan")
-}
 
 fn render_highlight(
     pipeline: &CompiledTokenizerPipeline,
@@ -33,7 +30,11 @@ fn render_highlight(
     query: Option<&str>,
 ) -> Option<String> {
     let text = text?;
-    let query = query.unwrap_or_else(|| missing_binding("stannum.highlight()"));
+    // Neither an explicit query nor a `==>` clause to take one from: the
+    // text comes back unmarked, as from TIN.
+    let Some(query) = query else {
+        return Some(text.to_owned());
+    };
     let positions = positions_from_query(pipeline, query, text);
     highlight_text(pipeline, text, begin_tag, end_tag, &positions)
         .map(Some)
@@ -47,11 +48,13 @@ fn render_highlight_ansi(
     query: Option<&str>,
 ) -> Option<String> {
     let text = text?;
-    let query = query.unwrap_or_else(|| missing_binding("stannum.highlight_ansi()"));
     let text = match wrap_to {
         Some(width) if width <= 0 => pgrx::error!("wrap_to must be positive"),
         Some(width) => Cow::Owned(rewrap_text(text, width as usize)),
         None => Cow::Borrowed(text),
+    };
+    let Some(query) = query else {
+        return Some(text.into_owned());
     };
     let positions = positions_from_query(pipeline, query, text.as_ref());
     if positions.is_empty() {
@@ -228,8 +231,11 @@ fn highlight_support(request: Internal) -> Internal {
             queries: Vec::new(),
             bound: None,
         };
+        // The whole join tree: a subquery or CTE the planner pulled up
+        // leaves its WHERE clause in a nested FromExpr, and JOIN ... ON
+        // clauses sit in their JoinExpr.
         collect_queries(
-            (*(*parse).jointree).quals.cast::<pg_sys::Node>(),
+            (*parse).jointree.cast::<pg_sys::Node>(),
             (&mut binding as *mut QueryContext).cast(),
         );
         let implicit = (*supplied_query).type_ == pg_sys::NodeTag::T_Const
