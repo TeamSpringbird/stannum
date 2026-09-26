@@ -8,8 +8,9 @@ against any engine that implements the interface: today PlanetScale TIN
 records one engine's answers and checks another engine's live answers
 against them.
 
-The directory is self-contained (it does not import anything from the rest
-of the repository) so it can be split into its own repository.
+The suite lives in this repository, next to Stannum. The runner imports
+nothing from the rest of the repository, so it can check any engine that
+implements the interface.
 
 ```
 conformance/
@@ -19,6 +20,7 @@ conformance/
   cases/catalog_*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9
   expected/<engine>-<version>/<area>.json
                                recorded answers of one engine version
+  divergences/<engine>.yaml    where an engine knowingly answers differently
 ```
 
 ## Running
@@ -67,9 +69,28 @@ compares against, runs the cases that have a recorded answer (the rest report SK
 | `DIFF` | compatible but not identical: both engines raised an ERROR with the same SQLSTATE but different message text (and the case requires no `message_prefix`). Reported, not a failure |
 | `FAIL` | a capture differs, an ERROR has another SQLSTATE, the engine under test crashed the server, its connection was lost, or it could not build a corpus the recorded engine built |
 | `SKIP` | no answer is recorded for the case (no expectation), or `--skip-crash` skipped it |
+| `IMPROVED` | a documented improvement: the recorded engine refused with an ERROR and the engine under test answered (see Divergences) |
+| `GAP` | a documented gap: the engine under test lacks what the case exercises (see Divergences) |
 
 The run exits 1 if any case FAILs. Answers are compared exactly: id lists in
 order, counts, float4 bit patterns, highlight text.
+
+### Divergences
+
+`divergences/<engine>.yaml` lists the cases where the engine under test
+knowingly answers differently from a recorded engine version (`against`,
+e.g. `tin-1.0.3`), naming the captures that differ:
+
+- `kind: improvement`: the recorded engine raised an ERROR on each listed
+  capture and this engine answers. Reported as `IMPROVED`, with a
+  `question` for the recorded engine's authors (why is this not supported?).
+- `kind: gap`: this engine lacks what the case exercises. Reported as `GAP`.
+
+The entries cannot hide a regression: the case FAILs if a capture that is
+not listed differs, a listed capture matches the recorded answer again, a
+listed case matches entirely, or an improvement raises an ERROR where it
+should answer. Whether a divergence is an improvement is a judgement the
+entry records; the runner only checks its mechanics.
 
 ### Crashes
 

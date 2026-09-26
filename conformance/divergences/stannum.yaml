@@ -1,0 +1,104 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+# Where Stannum knowingly answers differently from a recorded engine.
+#
+# In check mode the runner reads this file for the engine under test and the
+# recorded engine-version named by `against`. A listed case reports
+#   IMPROVED  when kind is improvement: the recorded engine raised an ERROR on
+#             each listed capture and Stannum answered;
+#   GAP       when kind is gap: Stannum lacks what the case exercises.
+# Either way only the listed captures may differ. If another capture differs,
+# a listed capture matches again, or an improvement stops answering, the case
+# FAILs, so this file cannot hide a regression.
+#
+# `question` is what we would ask the recorded engine's authors.
+
+divergences:
+  - id: catalog.S-14
+    against: tin-1.0.3
+    kind: improvement
+    captures: [different_dense_ratio, row_dependent_k1]
+    summary: TIN refuses differing dense_ratio arguments and a row-dependent k1; Stannum scores each call with its own arguments.
+    tin: >
+      XX000 "tin.score() calls on one relation must use identical dense_ratio
+      arguments" and "tin.score() parameters must be statement-constant
+      expressions or external parameters".
+    stannum: Every call is scored with its own dense_ratio and, per row, its own k1.
+    question: >
+      Why are these not supported? k1 may already differ between calls in
+      one statement; is dense_ratio fixed because elision is decided once per
+      scan, and is a row-dependent k1 refused for the same reason?
+
+  - id: catalog.S-15
+    against: tin-1.0.3
+    kind: improvement
+    captures: [value]
+    summary: TIN refuses score() and full_score() on one relation; Stannum returns both.
+    tin: >
+      XX000 "tin.score() and tin.full_score() cannot be combined on one
+      scanned relation; use one scoring function per relation".
+    stannum: Both functions are answered in the same statement, each with its own value.
+    question: >
+      Why is this not supported? Is it because the scan computes one kind of
+      score per relation, and would it be accepted if the scan computed both?
+
+  - id: catalog.S-22
+    against: tin-1.0.3
+    kind: improvement
+    captures: [full_bits, score_bits]
+    summary: TIN refuses to score with its custom scan disabled; Stannum returns the same scores either way.
+    tin: >
+      With the custom scan on, the scores Stannum also returns; with it off,
+      XX000 (scoring requires TIN's custom scan).
+    stannum: Bit-identical scores with stannum.enable_custom_scan on and off.
+    question: >
+      Why is scoring not supported without the custom scan? A plan the
+      planner is free to choose, or a user setting, then decides whether a
+      query succeeds.
+
+  - id: catalog.K-12
+    against: tin-1.0.3
+    kind: improvement
+    captures: [custom_scan_off]
+    summary: TIN refuses a non-default-tokenization index query without its custom scan; Stannum answers it.
+    tin: >
+      With the custom scan off, XX000 "queries targeting a tin index with
+      non-default tokenization require a usable custom scan".
+    stannum: The same matches with the custom scan on and off.
+    question: >
+      Why is this not supported? The docs do not mention that non-default
+      tokenization depends on the custom scan.
+
+  - id: catalog.H-14
+    against: tin-1.0.3
+    kind: improvement
+    captures: [highlight]
+    summary: TIN refuses implicit highlight() on a non-default-tokenization index; Stannum highlights with the index's tokenizer.
+    tin: >
+      XX000 "implicit tin.highlight() is not supported with non-default index
+      tokenization".
+    stannum: Highlights with the index's tokenizer, here case_folding=preserve.
+    question: >
+      Why is this not supported? The explicit form works; is the implicit
+      form missing the index's tokenizer options?
+
+  - id: catalog.I-07
+    against: tin-1.0.3
+    kind: gap
+    captures: [error]
+    summary: Stannum has no maintenance_jobs_per_db setting, so a session SET of it is not refused.
+    tin: 55P02 "parameter "tin.maintenance_jobs_per_db" cannot be changed now".
+    stannum: >
+      Stannum runs no background maintenance workers and defines no such
+      setting. PostgreSQL accepts a SET of any undefined stannum.* name as a
+      placeholder.
+
+  - id: catalog.S-07
+    against: tin-1.0.3
+    kind: gap
+    captures: [script]
+    summary: Stannum has no promote() function, so the case's promote step fails.
+    tin: tin.promote(index) moves the mutable segment into an immutable one and returns its statistics.
+    stannum: No promote(); its write buffer is folded into segments by inserts and VACUUM.

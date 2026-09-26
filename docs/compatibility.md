@@ -57,8 +57,10 @@ outside this table and are not accepted as reloptions.
 Tokenization changes require REINDEX for stored rows, as the public reference
 states. Stannum binds matching and highlighting to the index's persisted
 pipeline, including sequential/bitmap rechecks. This is more permissive than
-the archived TIN 1.0.2 observation that non-default tokenization could reject a
-query lacking a usable custom scan. The unit tests pin all folding, boundary,
+TIN, which on 1.0.3 rejects a non-default-tokenization query lacking a usable
+custom scan and an implicit highlight on such an index; the conformance suite
+records both as improvements (`conformance/divergences/stannum.yaml`,
+`catalog.K-12` and `catalog.H-14`). The unit tests pin all folding, boundary,
 grapheme, long-token and gap modes with concrete edge inputs; pg_tests create
 indexes with each mode and compare plans, matches and highlighting. These
 checks establish Stannum's contract and Lead compatibility, not exhaustive

@@ -631,6 +631,70 @@ def compare_case(case, want, got):
     return "PASS", ""
 
 
+# ---------------------------------------------------------------- divergences
+
+DIVERGENCE_KINDS = {"improvement": "IMPROVED", "gap": "GAP"}
+
+
+def read_divergences(engine, recorded):
+    """The documented divergences of `engine` from the recorded engine-version:
+    {case id: entry}, from divergences/<engine>.yaml."""
+    path = SUITE / "divergences" / f"{engine}.yaml"
+    if not path.exists():
+        return {}
+    chosen = {}
+    for entry in (yaml.safe_load(path.read_text()) or {}).get("divergences") or []:
+        if entry.get("kind") not in DIVERGENCE_KINDS:
+            sys.exit(f"{path}: {entry.get('id')}: kind must be one of {', '.join(DIVERGENCE_KINDS)}")
+        if not entry.get("captures"):
+            sys.exit(f"{path}: {entry.get('id')}: list the captures that diverge")
+        if entry.get("against") == recorded:
+            chosen[entry["id"]] = entry
+    return chosen
+
+
+def is_error(value):
+    return isinstance(value, dict) and ("error" in value or "sqlstate" in value)
+
+
+def recorded_an_error(value):
+    """The recorded engine raised an ERROR here, in every variant or in some."""
+    if is_error(value):
+        return True
+    if isinstance(value, dict) and "variants_disagree" in value:
+        return any(is_error(variant.get("answer")) for variant in value["variants_disagree"])
+    return False
+
+
+def compare_divergent(case, want, got, entry):
+    """Checks a documented divergence: exactly the listed captures differ, and
+    for an improvement each is one the recorded engine refused and this one
+    answered. Anything else fails, so the file cannot hide a regression."""
+    listed = set(entry["captures"])
+    captures = {capture["as"]: capture for capture in case["capture"]}
+    unknown = listed - set(captures)
+    if unknown:
+        return "FAIL", f"divergence lists unknown captures: {', '.join(sorted(unknown))}"
+    differing = set()
+    for name, capture in captures.items():
+        if name not in (want.get("captures") or {}) or name not in (got.get("captures") or {}):
+            continue
+        status, detail = compare_capture(case, capture, want["captures"][name], got["captures"][name])
+        if status == "FAIL":
+            if name not in listed:
+                return "FAIL", detail
+            differing.add(name)
+    if differing != listed:
+        return "FAIL", ("documented divergence no longer holds for "
+                        + ", ".join(sorted(listed - differing)) + "; update divergences/")
+    if entry["kind"] == "improvement":
+        for name in sorted(listed):
+            recorded, answer = want["captures"][name], got["captures"][name]
+            if not recorded_an_error(recorded) or is_error(answer):
+                return "FAIL", f"{name}: an improvement must answer where the recorded engine raised an ERROR"
+    return DIVERGENCE_KINDS[entry["kind"]], entry["summary"]
+
+
 # ---------------------------------------------------------------- expected files
 
 
@@ -702,9 +766,11 @@ def main():
     if not cases:
         sys.exit("no case matches the --area/--case filters")
 
-    expected_source, expected = (None, {})
+    expected_source, expected, divergences = (None, {}, {})
     if args.check:
         expected_source, expected = read_expected(args.check)
+        divergences = read_divergences(
+            args.engine, f"{expected_source.get('engine')}-{expected_source.get('extension_version')}")
         print(f"Comparing against {expected_source.get('engine')} {expected_source.get('extension_version')} "
               f"recorded in {args.check}")
         for key in ("postgres", "server_version", "host", "measured", "date", "measured_by", "imported_from"):
@@ -725,7 +791,7 @@ def main():
 
     def emit(status, case_id, detail=""):
         rows.append((status, case_id, detail))
-        print(f"{status:<5} {case_id:<{width}}  {detail}".rstrip(), flush=True)
+        print(f"{status:<8} {case_id:<{width}}  {detail}".rstrip(), flush=True)
 
     print()
     try:
@@ -757,6 +823,11 @@ def main():
             results[case["id"]] = record
             if args.check:
                 status, detail = compare_case(case, expected[case["id"]], record)
+                entry = divergences.get(case["id"])
+                if entry and status != "PASS":
+                    status, detail = compare_divergent(case, expected[case["id"]], record, entry)
+                elif entry:
+                    status, detail = "FAIL", "matches the recorded engine; remove the documented divergence"
                 emit(status, case["id"], detail)
             else:
                 if "corpus_error" in record:
@@ -789,6 +860,8 @@ def main():
         unknown = sorted(set(expected) - {case["id"] for case in all_cases})
         if unknown:
             print(f"Recorded answers without a case in the suite: {', '.join(unknown)}")
+        if divergences:
+            print(f"IMPROVED and GAP are divergences documented in divergences/{args.engine}.yaml")
         print(f"Compared {args.engine} {version} against {expected_source.get('engine')} "
               f"{expected_source.get('extension_version')} ({args.check})")
         return 1 if counts.get("FAIL") else 0
