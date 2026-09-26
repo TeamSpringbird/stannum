@@ -884,8 +884,7 @@ impl RunSource {
                 // Pinned only: a run page is never written while published
                 // (see `HeldPage`), so its content lock guards nothing, and
                 // a walk pins a page or two per chunk it loads.
-                let buffer =
-                    crate::score::charging("buffer read", || pg_sys::ReadBuffer(index, block));
+                let buffer = crate::score::charging("buffer read", || pin_block(index, block));
                 let contents = std::slice::from_raw_parts(
                     pg_sys::BufferGetPage(buffer).cast::<u8>(),
                     PAGE_SIZE,
@@ -912,6 +911,7 @@ impl RunSource {
                 };
                 let (now, total, peak) = HELD_PAGES.get();
                 HELD_PAGES.set((now + 1, total + 1, peak.max(now + 1)));
+                SCAN_PINS.set(SCAN_PINS.get() + 1);
                 Ok(held)
             }
         })
@@ -923,6 +923,77 @@ thread_local! {
     /// once since the peak was reset: a held page must never outlive the
     /// walk that pinned it.
     static HELD_PAGES: Cell<(i64, u64, i64)> = const { Cell::new((0, 0, 0)) };
+    /// Run pages pinned to be held since the peak was reset, and of those
+    /// the ones [`pin_block`] pinned through their recent buffer.
+    static SCAN_PINS: Cell<i64> = const { Cell::new(0) };
+    static SCAN_RECENT: Cell<i64> = const { Cell::new(0) };
+    /// Per backend, the buffer a block was last pinned in (see
+    /// [`pin_block`]), direct-mapped by block and relation.
+    static RECENT_BUFFERS: RefCell<Box<[RecentBuffer]>> =
+        RefCell::new(vec![RecentBuffer::default(); RECENT_BUFFERS_LEN].into_boxed_slice());
+}
+
+/// Entries of [`RECENT_BUFFERS`], 384 KiB per backend.
+const RECENT_BUFFERS_LEN: usize = 1 << 15;
+
+/// A block of a relation and the shared buffer it was last pinned in.
+#[derive(Clone, Copy, Default)]
+struct RecentBuffer {
+    relation: pg_sys::RelFileNumber,
+    block: pg_sys::BlockNumber,
+    buffer: pg_sys::Buffer,
+}
+
+/// Pins block `block` of `index`: through the buffer it was last pinned
+/// in while that buffer still holds it, which skips the buffer mapping
+/// table's partition lock and hash lookup, else through `ReadBuffer`. A
+/// walk pins a page per chunk it loads, most of them pinned by an earlier
+/// query of the backend.
+///
+/// # Safety
+///
+/// `index` is a live index relation held open by the caller.
+unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_sys::Buffer {
+    // SAFETY: per the contract. `ReadRecentBuffer` checks the buffer's tag
+    // under its header lock before pinning it, so a remembered buffer since
+    // given to another page is refused rather than pinned.
+    unsafe {
+        let locator = (*index).rd_locator;
+        let at = (block as usize ^ (locator.relNumber.to_u32() as usize).wrapping_mul(0x9e37_79b9))
+            & (RECENT_BUFFERS_LEN - 1);
+        let recent = RECENT_BUFFERS.with_borrow(|recent| recent[at]);
+        if recent.buffer > 0
+            && recent.block == block
+            && recent.relation == locator.relNumber
+            && pg_sys::ReadRecentBuffer(
+                locator,
+                pg_sys::ForkNumber::MAIN_FORKNUM,
+                block,
+                recent.buffer,
+            )
+        {
+            SCAN_RECENT.set(SCAN_RECENT.get() + 1);
+            return recent.buffer;
+        }
+        let buffer = pg_sys::ReadBuffer(index, block);
+        // Local buffers (a temporary index) are left to `ReadBuffer`.
+        if buffer > 0 {
+            RECENT_BUFFERS.with_borrow_mut(|recent| {
+                recent[at] = RecentBuffer {
+                    relation: locator.relNumber,
+                    block,
+                    buffer,
+                }
+            });
+        }
+        buffer
+    }
+}
+
+/// Run pages pinned to be held since the last reset, and of those the
+/// ones pinned through their recent buffer.
+pub(crate) fn scan_pins() -> (i64, i64) {
+    (SCAN_PINS.get(), SCAN_RECENT.get())
 }
 
 /// Pages held pinned now and in all (see [`HeldPage`]).
@@ -941,6 +1012,8 @@ pub(crate) fn held_peak() -> i64 {
 pub(crate) fn reset_held_peak() {
     let (now, total, _) = HELD_PAGES.get();
     HELD_PAGES.set((now, total, now));
+    SCAN_PINS.set(0);
+    SCAN_RECENT.set(0);
 }
 
 /// Releases a page `RunSource::pin` pinned.

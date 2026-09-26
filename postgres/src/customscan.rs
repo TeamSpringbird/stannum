@@ -2374,6 +2374,14 @@ unsafe extern "C-unwind" fn explain(
                 crate::storage::held_peak(),
                 es,
             );
+            let (pins, recent) = crate::storage::scan_pins();
+            pg_sys::ExplainPropertyInteger(c"Pages Pinned".as_ptr(), std::ptr::null(), pins, es);
+            pg_sys::ExplainPropertyInteger(
+                c"Pages Pinned Recent".as_ptr(),
+                std::ptr::null(),
+                recent,
+                es,
+            );
             pg_sys::ExplainPropertyInteger(
                 c"Positions Checked".as_ptr(),
                 std::ptr::null(),
