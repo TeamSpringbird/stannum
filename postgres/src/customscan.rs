@@ -1963,6 +1963,7 @@ unsafe extern "C-unwind" fn exec_count(
                 tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
                     .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
             let view = crate::storage::view(index_oid);
+            crate::storage::race_point("count:view");
             // The diagnostic settings ask for the older strategies by name.
             let diagnostic = FORCE_COUNT_PAGES.get()
                 || COUNT_PAGE_THRESHOLD.get() > 0

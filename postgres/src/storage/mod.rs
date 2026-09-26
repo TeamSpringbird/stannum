@@ -3122,7 +3122,7 @@ pub unsafe fn scan(
 const DEAD_LIST_ROUNDS: usize = 3;
 
 /// A point where a test may interleave operations with unlocked preparation.
-fn race_point(name: &'static str) {
+pub(crate) fn race_point(name: &'static str) {
     #[cfg(feature = "pg_test")]
     if let Some(mut hook) = testing::RACE_HOOK.with_borrow_mut(Option::take) {
         hook(name);
