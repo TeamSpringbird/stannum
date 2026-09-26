@@ -1,0 +1,247 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-26T19:18:38Z",
+  "suite_commit": "64b7f8e52b9f40be77c6a1a34a5ea695d4866cf8",
+  "runner_version": "1"
+ },
+ "cases": [
+  {
+   "id": "catalog.I-01",
+   "captures": {
+    "two_columns": {
+     "sqlstate": "0A000",
+     "message": "access method \"tin\" does not support multicolumn indexes"
+    },
+    "int_column": {
+     "sqlstate": "42704",
+     "message": "data type integer has no default operator class for access method \"tin\""
+    }
+   }
+  },
+  {
+   "id": "catalog.I-02",
+   "captures": {
+    "k1=0": {
+     "no_error": []
+    },
+    "k1=10000": {
+     "no_error": []
+    },
+    "k1=-1": {
+     "sqlstate": "22023",
+     "message": "value -1 out of bounds for option \"k1\""
+    },
+    "k1=10001": {
+     "sqlstate": "22023",
+     "message": "value 10001 out of bounds for option \"k1\""
+    },
+    "b=0": {
+     "no_error": []
+    },
+    "b=1": {
+     "no_error": []
+    },
+    "b=-0.1": {
+     "sqlstate": "22023",
+     "message": "value -0.1 out of bounds for option \"b\""
+    },
+    "b=1.1": {
+     "sqlstate": "22023",
+     "message": "value 1.1 out of bounds for option \"b\""
+    },
+    "max_token_bytes=4": {
+     "no_error": []
+    },
+    "max_token_bytes=2692": {
+     "no_error": []
+    },
+    "max_token_bytes=3": {
+     "sqlstate": "22023",
+     "message": "value 3 out of bounds for option \"max_token_bytes\""
+    },
+    "max_token_bytes=2693": {
+     "sqlstate": "22023",
+     "message": "value 2693 out of bounds for option \"max_token_bytes\""
+    },
+    "initial_segment_count=1": {
+     "no_error": []
+    },
+    "initial_segment_count=4096": {
+     "no_error": []
+    },
+    "initial_segment_count=0": {
+     "sqlstate": "22023",
+     "message": "value 0 out of bounds for option \"initial_segment_count\""
+    },
+    "initial_segment_count=4097": {
+     "sqlstate": "22023",
+     "message": "value 4097 out of bounds for option \"initial_segment_count\""
+    },
+    "target_segment_count=1": {
+     "no_error": []
+    },
+    "target_segment_count=4096": {
+     "no_error": []
+    },
+    "target_segment_count=0": {
+     "sqlstate": "22023",
+     "message": "value 0 out of bounds for option \"target_segment_count\""
+    },
+    "target_segment_count=4097": {
+     "sqlstate": "22023",
+     "message": "value 4097 out of bounds for option \"target_segment_count\""
+    },
+    "max_mutable_segment_size=131072": {
+     "no_error": []
+    },
+    "max_mutable_segment_size=131071": {
+     "sqlstate": "22023",
+     "message": "value 131071 out of bounds for option \"max_mutable_segment_size\""
+    },
+    "max_merged_segment_size=100": {
+     "no_error": []
+    },
+    "max_merged_segment_size=99": {
+     "sqlstate": "22023",
+     "message": "value 99 out of bounds for option \"max_merged_segment_size\""
+    },
+    "dead_percent_threshold=0": {
+     "no_error": []
+    },
+    "dead_percent_threshold=1": {
+     "no_error": []
+    },
+    "dead_percent_threshold=-0.1": {
+     "sqlstate": "22023",
+     "message": "value -0.1 out of bounds for option \"dead_percent_threshold\""
+    },
+    "dead_percent_threshold=1.1": {
+     "sqlstate": "22023",
+     "message": "value 1.1 out of bounds for option \"dead_percent_threshold\""
+    },
+    "tokenizer=unicode": {
+     "no_error": []
+    },
+    "tokenizer=whitespace": {
+     "no_error": []
+    },
+    "tokenizer=icu": {
+     "sqlstate": "22023",
+     "message": "invalid value for enum option \"tokenizer\": icu"
+    },
+    "case_folding=fold": {
+     "no_error": []
+    },
+    "case_folding=preserve": {
+     "no_error": []
+    },
+    "case_folding=upper": {
+     "sqlstate": "22023",
+     "message": "invalid value for enum option \"case_folding\": upper"
+    },
+    "accent_folding=fold": {
+     "no_error": []
+    },
+    "accent_folding=preserve": {
+     "no_error": []
+    },
+    "accent_folding=strip": {
+     "sqlstate": "22023",
+     "message": "invalid value for enum option \"accent_folding\": strip"
+    },
+    "long_tokens=split": {
+     "no_error": []
+    },
+    "long_tokens=truncate": {
+     "no_error": []
+    },
+    "long_tokens=discard": {
+     "no_error": []
+    },
+    "long_tokens=wrap": {
+     "sqlstate": "22023",
+     "message": "invalid value for enum option \"long_tokens\": wrap"
+    },
+    "graphemes=emoji": {
+     "no_error": []
+    },
+    "graphemes=retain": {
+     "no_error": []
+    },
+    "graphemes=discard": {
+     "no_error": []
+    },
+    "graphemes=all": {
+     "sqlstate": "22023",
+     "message": "invalid value for enum option \"graphemes\": all"
+    },
+    "position_gaps=preserve": {
+     "no_error": []
+    },
+    "position_gaps=collapse": {
+     "no_error": []
+    },
+    "position_gaps=keep": {
+     "sqlstate": "22023",
+     "message": "invalid value for enum option \"position_gaps\": keep"
+    },
+    "score_stop_words=the, a": {
+     "no_error": []
+    }
+   }
+  },
+  {
+   "id": "catalog.I-03",
+   "captures": {
+    "expression": [
+     1
+    ],
+    "column": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.I-04",
+   "captures": {
+    "implied": [
+     1
+    ],
+    "not_implied": [
+     1,
+     2
+    ]
+   }
+  },
+  {
+   "id": "catalog.I-05",
+   "captures": {
+    "ids": [
+     1,
+     2
+    ]
+   }
+  },
+  {
+   "id": "catalog.I-06",
+   "captures": {
+    "ids": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.I-07",
+   "captures": {
+    "error": {
+     "sqlstate": "55P02",
+     "message": "parameter \"tin.maintenance_jobs_per_db\" cannot be changed now"
+    }
+   }
+  }
+ ]
+}

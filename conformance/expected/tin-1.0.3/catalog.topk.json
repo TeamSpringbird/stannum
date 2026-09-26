@@ -1,0 +1,120 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-26T19:18:38Z",
+  "suite_commit": "64b7f8e52b9f40be77c6a1a34a5ea695d4866cf8",
+  "runner_version": "1"
+ },
+ "cases": [
+  {
+   "id": "catalog.T-01",
+   "captures": {
+    "limit_5": [
+     20,
+     10,
+     5,
+     11,
+     12
+    ],
+    "all": [
+     20,
+     10,
+     5,
+     11,
+     12,
+     3,
+     6,
+     13,
+     2,
+     14,
+     7,
+     15,
+     4,
+     16,
+     8,
+     17,
+     18,
+     1,
+     9,
+     19
+    ]
+   }
+  },
+  {
+   "id": "catalog.T-02",
+   "captures": {
+    "ranked": [
+     1,
+     2,
+     3
+    ]
+   }
+  },
+  {
+   "id": "catalog.T-03",
+   "captures": {
+    "value": [
+     11,
+     12,
+     3
+    ]
+   }
+  },
+  {
+   "id": "catalog.T-04",
+   "captures": {
+    "value": [
+     3,
+     6,
+     13
+    ]
+   }
+  },
+  {
+   "id": "catalog.T-05",
+   "captures": {
+    "limit_1": [
+     2
+    ],
+    "bits": {
+     "1": "3d3e8bc5",
+     "2": "3d3e8bc6",
+     "3": "3d3e8bc6",
+     "4": "3d3e8bc6",
+     "5": "3d3e8bc6",
+     "6": "3d3e8bc6",
+     "7": "3d3e8bc6",
+     "8": "3d3e8bc6",
+     "9": "3d3e8bc6",
+     "10": "3d3e8bc6"
+    }
+   }
+  },
+  {
+   "id": "catalog.T-06",
+   "captures": {
+    "value": [
+     [
+      1,
+      1
+     ],
+     [
+      1,
+      2
+     ],
+     [
+      2,
+      4
+     ],
+     [
+      2,
+      5
+     ]
+    ]
+   }
+  }
+ ]
+}

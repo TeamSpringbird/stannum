@@ -1,0 +1,141 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-26T19:18:38Z",
+  "suite_commit": "64b7f8e52b9f40be77c6a1a34a5ea695d4866cf8",
+  "runner_version": "1"
+ },
+ "cases": [
+  {
+   "id": "catalog.E-01",
+   "captures": {
+    "trailing_star": [
+     1,
+     2,
+     3
+    ],
+    "trailing_question": [
+     1,
+     2
+    ],
+    "leading_star": [
+     1,
+     4
+    ],
+    "inner_star": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.E-02",
+   "captures": {
+    "ids": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.E-03",
+   "captures": {
+    "aple_1": [
+     1,
+     2
+    ],
+    "pple_1": [],
+    "pple_0_1": [
+     1
+    ],
+    "apple_0": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.E-04",
+   "captures": {
+    "teh_1": [],
+    "teh_2": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.E-05",
+   "captures": {
+    "ids": [
+     1,
+     2
+    ]
+   }
+  },
+  {
+   "id": "catalog.E-06",
+   "captures": {
+    "upper": [],
+    "lower": [
+     1,
+     2
+    ],
+    "unanchored": []
+   }
+  },
+  {
+   "id": "catalog.E-07",
+   "captures": {
+    "unbalanced": {
+     "sqlstate": "XX000",
+     "message": "invalid ==> query in \"MATCHES (\": invalid regex \"(\": regex parse error:\n    \\A(?:()\\z\n      ^\nerror: unclosed group"
+    },
+    "backreference": {
+     "sqlstate": "XX000",
+     "message": "invalid ==> query in \"MATCHES (a)\\\\1\": invalid regex \"(a)\\1\": regex parse error:\n    \\A(?:(a)\\1)\\z\n            ^^\nerror: backreferences are not supported"
+    }
+   }
+  },
+  {
+   "id": "catalog.E-08",
+   "captures": {
+    "closed": [
+     2,
+     3
+    ],
+    "open_low": [
+     1,
+     2
+    ],
+    "open_high": [
+     3,
+     4
+    ],
+    "reversed": []
+   }
+  },
+  {
+   "id": "catalog.E-09",
+   "captures": {
+    "ids": [
+     1,
+     2,
+     4
+    ]
+   }
+  },
+  {
+   "id": "catalog.E-10",
+   "captures": {
+    "wildcard_bound": {
+     "sqlstate": "XX000",
+     "message": "invalid ==> query at byte 0 in \"a* TO c\": range bound \"a*\" contains a wildcard (at byte 0): bounds must be plain terms"
+    },
+    "empty_bound": {
+     "sqlstate": "XX000",
+     "message": "invalid ==> query in \"... TO z\": range bound \"...\" sub-tokenizes into no tokens"
+    }
+   }
+  }
+ ]
+}

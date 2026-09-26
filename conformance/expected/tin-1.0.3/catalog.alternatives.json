@@ -10,55 +10,92 @@
  },
  "cases": [
   {
-   "id": "span.minimal_interval.1",
-   "captures": {
-    "ids": [
-     2
-    ]
-   }
-  },
-  {
-   "id": "span.minimal_interval.2",
-   "captures": {
-    "ids": [
-     2
-    ]
-   }
-  },
-  {
-   "id": "span.minimal_interval.3",
+   "id": "catalog.A-01",
    "captures": {
     "ids": [
      1,
+     2,
      3
     ]
    }
   },
   {
-   "id": "span.minimal_interval.4",
+   "id": "catalog.A-02",
    "captures": {
-    "ids": []
+    "comma": [
+     1,
+     2,
+     3
+    ],
+    "comma_space": [
+     1,
+     2,
+     3
+    ]
    }
   },
   {
-   "id": "span.minimal_interval.5",
-   "captures": {
-    "ids": []
-   }
-  },
-  {
-   "id": "span.minimal_interval.6",
-   "captures": {
-    "ids": []
-   }
-  },
-  {
-   "id": "span.minimal_interval.7",
+   "id": "catalog.A-03",
    "captures": {
     "ids": [
-     4,
-     5,
-     6
+     1,
+     2
+    ]
+   }
+  },
+  {
+   "id": "catalog.A-04",
+   "captures": {
+    "ids": [
+     2,
+     3,
+     4
+    ]
+   }
+  },
+  {
+   "id": "catalog.A-05",
+   "captures": {
+    "pct_50": [
+     2,
+     3
+    ],
+    "pct_34": [
+     2,
+     3
+    ],
+    "pct_33": [
+     1,
+     2,
+     3
+    ]
+   }
+  },
+  {
+   "id": "catalog.A-06",
+   "captures": {
+    "ids": [
+     3
+    ]
+   }
+  },
+  {
+   "id": "catalog.A-07",
+   "captures": {
+    "more_than_elements": [],
+    "zero": [
+     1,
+     2,
+     3
+    ]
+   }
+  },
+  {
+   "id": "catalog.A-08",
+   "captures": {
+    "ids": [
+     1,
+     2
     ]
    }
   }

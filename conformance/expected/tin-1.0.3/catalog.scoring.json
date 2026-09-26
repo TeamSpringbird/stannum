@@ -1,0 +1,950 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-26T19:18:38Z",
+  "suite_commit": "64b7f8e52b9f40be77c6a1a34a5ea695d4866cf8",
+  "runner_version": "1"
+ },
+ "cases": [
+  {
+   "id": "catalog.S-01",
+   "captures": {
+    "full_bits": {
+     "1": "40692497",
+     "2": "40a5c296",
+     "3": "40692497"
+    },
+    "score_bits": {
+     "1": "40692497",
+     "2": "40a5c296",
+     "3": "40692497"
+    },
+    "full_ranked": [
+     2,
+     1,
+     3
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-02",
+   "captures": {
+    "scores": {
+     "1": "404d5022",
+     "2": "404d5022"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-03",
+   "captures": {
+    "scores": {
+     "1": "404d5022",
+     "2": "4086d86c"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-04",
+   "captures": {
+    "scores": {
+     "1": "3f8711c4",
+     "2": "3eadfbe4",
+     "3": "3eadfbe4",
+     "4": "3f4b534b",
+     "5": "3e85a079"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-05",
+   "captures": {
+    "nine": {
+     "1": "3fedffaa",
+     "2": "3fedffaa",
+     "3": "3fdf1339",
+     "4": "4009617a",
+     "5": "3fff0ff1",
+     "6": "3fedffaa",
+     "7": "3fdf1339",
+     "8": "4009617a",
+     "9": "3fff0ff1"
+    },
+    "ten": {
+     "1": "3fe3ec04",
+     "2": "3fe3ec04",
+     "3": "3fd5a154",
+     "4": "4003906b",
+     "5": "3ff44358",
+     "6": "3fe3ec04",
+     "7": "3fd5a154",
+     "8": "4003906b",
+     "9": "3ff44358",
+     "10": "3ff44358"
+    },
+    "eleven": {
+     "1": "00000000",
+     "2": "00000000",
+     "3": "00000000",
+     "4": "00000000",
+     "5": "00000000",
+     "6": "00000000",
+     "7": "00000000",
+     "8": "00000000",
+     "9": "00000000",
+     "10": "00000000",
+     "11": "00000000"
+    },
+    "nine_pinned": {
+     "1": "3fedffaa",
+     "2": "3fedffaa",
+     "3": "3fdf1339",
+     "4": "4009617a",
+     "5": "3fff0ff1",
+     "6": "3fedffaa",
+     "7": "3fdf1339",
+     "8": "4009617a",
+     "9": "3fff0ff1"
+    },
+    "ten_pinned": {
+     "1": "3fe3ec04",
+     "2": "3fe3ec04",
+     "3": "3fd5a154",
+     "4": "4003906b",
+     "5": "3ff44358",
+     "6": "3fe3ec04",
+     "7": "3fd5a154",
+     "8": "4003906b",
+     "9": "3ff44358",
+     "10": "3ff44358"
+    },
+    "eleven_pinned": {
+     "1": "3fdac339",
+     "2": "3fdac339",
+     "3": "3fcd0b91",
+     "4": "3ffc8ddb",
+     "5": "3fea7270",
+     "6": "3fdac339",
+     "7": "3fcd0b91",
+     "8": "3ffc8ddb",
+     "9": "3fea7270",
+     "10": "3fea7270",
+     "11": "3fea7270"
+    },
+    "eleven_ratio_1_1": {
+     "1": "3fdac339",
+     "2": "3fdac339",
+     "3": "3fcd0b91",
+     "4": "3ffc8ddb",
+     "5": "3fea7270",
+     "6": "3fdac339",
+     "7": "3fcd0b91",
+     "8": "3ffc8ddb",
+     "9": "3fea7270",
+     "10": "3fea7270",
+     "11": "3fea7270"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-06",
+   "captures": {
+    "default_ratio": [
+     [
+      "nine",
+      "3f800000"
+     ],
+     [
+      "ten",
+      "3f800000"
+     ]
+    ],
+    "ratio_0_25": [
+     [
+      "eleven",
+      "3f800000"
+     ],
+     [
+      "nine",
+      "3f800000"
+     ],
+     [
+      "ten",
+      "3f800000"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-07",
+   "captures": {
+    "script": [
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ],
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ],
+     true,
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ],
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-08",
+   "captures": {
+    "score": {
+     "1": "4056a9ee"
+    },
+    "full_score": {
+     "1": "40957424"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-09",
+   "captures": {
+    "wildcard": {
+     "1": "4084117c",
+     "2": "4084117c"
+    },
+    "wildcard_boost_2": {
+     "1": "4104117c",
+     "2": "4104117c"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-10",
+   "captures": {
+    "regex": {
+     "1": "4084117c"
+    },
+    "range": {
+     "1": "4084117c",
+     "2": "4084117c"
+    },
+    "fuzzy": {
+     "1": "4084117c"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-11",
+   "captures": {
+    "and_not": [
+     [
+      "a",
+      "3f800000"
+     ]
+    ],
+    "not_overlapping": [
+     [
+      "a",
+      "3f800000"
+     ],
+     [
+      "b",
+      "3f800000"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-12",
+   "captures": {
+    "or_boosted": [
+     [
+      "a",
+      "40400000"
+     ]
+    ],
+    "duplicate": [
+     [
+      "a",
+      "40000000"
+     ]
+    ],
+    "nested": [
+     [
+      "a",
+      "40c00000"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-13",
+   "captures": {
+    "term_add": {
+     "1": "40bc25f3"
+    },
+    "term_replace": {
+     "1": "403c25f3"
+    },
+    "both": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "tin.score() term_add and term_replace cannot both be non-NULL"
+     }
+    }
+   }
+  },
+  {
+   "id": "catalog.S-14",
+   "captures": {
+    "different_dense_ratio": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "tin.score() calls on one relation must use identical dense_ratio arguments"
+     }
+    },
+    "different_k1": [
+     [
+      1,
+      "403c25f3",
+      "4030e96b"
+     ]
+    ],
+    "row_dependent_k1": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "tin.score() parameters must be statement-constant expressions or external parameters"
+     }
+    }
+   }
+  },
+  {
+   "id": "catalog.S-15",
+   "captures": {
+    "value": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "tin.score() and tin.full_score() cannot be combined on one scanned relation; use one scoring function per relation (tin.max_score() adapts to either)"
+     }
+    }
+   }
+  },
+  {
+   "id": "catalog.S-16",
+   "captures": {
+    "no_scan": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "synthetic-column queries require a usable tin custom scan path"
+     }
+    },
+    "update_returning": [
+     [
+      1,
+      "403c25f3"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-17",
+   "captures": {
+    "score_over_max": [
+     [
+      1,
+      "3f800000"
+     ],
+     [
+      2,
+      "3f61ea2d"
+     ]
+    ],
+    "max_alone": [
+     [
+      1,
+      "406979d8"
+     ],
+     [
+      2,
+      "406979d8"
+     ]
+    ],
+    "max_full_score": "406979d8"
+   }
+  },
+  {
+   "id": "catalog.S-18",
+   "captures": {
+    "or": [
+     [
+      1,
+      "40e820d6"
+     ],
+     [
+      2,
+      "406820d6"
+     ],
+     [
+      3,
+      "406820d6"
+     ]
+    ],
+    "or_boosted": [
+     [
+      1,
+      "41111486"
+     ],
+     [
+      2,
+      "40ae18a0"
+     ],
+     [
+      3,
+      "406820d6"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-19",
+   "captures": {
+    "two_predicates": [
+     [
+      1,
+      "40bc25f3"
+     ]
+    ],
+    "one_query": [
+     [
+      1,
+      "40bc25f3"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-20",
+   "captures": {
+    "script": [
+     [
+      [
+       1,
+       "3f8711c4"
+      ],
+      [
+       2,
+       "3eadfbe4"
+      ],
+      [
+       3,
+       "3eadfbe4"
+      ],
+      [
+       4,
+       "3f4b534b"
+      ],
+      [
+       5,
+       "3e85a079"
+      ]
+     ],
+     [
+      [
+       1,
+       "3f8711c4"
+      ],
+      [
+       4,
+       "3f4b534b"
+      ],
+      [
+       5,
+       "3e85a079"
+      ]
+     ],
+     [
+      [
+       1,
+       "3f8711c4"
+      ],
+      [
+       4,
+       "3f4b534b"
+      ],
+      [
+       5,
+       "3e85a079"
+      ]
+     ],
+     [
+      [
+       1,
+       "3f70a451"
+      ],
+      [
+       4,
+       "3ef0a451"
+      ],
+      [
+       5,
+       "3ef0a451"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-21",
+   "captures": {
+    "scores": {
+     "1": "3f8711c4",
+     "2": "3eadfbe4",
+     "3": "3eadfbe4",
+     "4": "3f4b534b",
+     "5": "3e85a079"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-22",
+   "captures": {
+    "full_bits": {
+     "variants_disagree": [
+      {
+       "settings": {
+        "enable_seqscan": "off",
+        "tin.enable_custom_scan": "on"
+       },
+       "answer": {
+        "1": "40692497",
+        "2": "40a5c296",
+        "3": "40692497"
+       }
+      },
+      {
+       "settings": {
+        "enable_seqscan": "off",
+        "tin.enable_custom_scan": "off"
+       },
+       "answer": {
+        "error": {
+         "sqlstate": "XX000",
+         "message": "synthetic-column queries require a usable tin custom scan path"
+        }
+       }
+      }
+     ]
+    },
+    "score_bits": {
+     "variants_disagree": [
+      {
+       "settings": {
+        "enable_seqscan": "off",
+        "tin.enable_custom_scan": "on"
+       },
+       "answer": {
+        "1": "40692497",
+        "2": "40a5c296",
+        "3": "40692497"
+       }
+      },
+      {
+       "settings": {
+        "enable_seqscan": "off",
+        "tin.enable_custom_scan": "off"
+       },
+       "answer": {
+        "error": {
+         "sqlstate": "XX000",
+         "message": "synthetic-column queries require a usable tin custom scan path"
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "catalog.S-23",
+   "captures": {
+    "k1_b": [
+     [
+      [
+       1,
+       "40c2cea9"
+      ],
+      [
+       2,
+       "40691c19"
+      ],
+      [
+       3,
+       "4042cea9"
+      ]
+     ],
+     [
+      [
+       1,
+       "40c8ac65"
+      ],
+      [
+       2,
+       "4068ee42"
+      ],
+      [
+       3,
+       "4048ac65"
+      ]
+     ]
+    ],
+    "stop_words_upper": {
+     "1": "40a6c65e",
+     "2": "406a2513",
+     "3": "4026c65e"
+    },
+    "stop_words_lower": {
+     "1": "4026c65e",
+     "2": "00000000",
+     "3": "4026c65e"
+    }
+   }
+  },
+  {
+   "id": "catalog.S-24",
+   "captures": {
+    "ddl_b_1_5": {
+     "sqlstate": "22023",
+     "message": "value 1.5 out of bounds for option \"b\""
+    },
+    "runtime_k1_neg": {
+     "sqlstate": "XX000",
+     "message": "failed to plan search cursor: BM25 k1 must be in [0, 10000] and b must be in [0, 1]"
+    },
+    "runtime_dense_ratio_neg": {
+     "sqlstate": "XX000",
+     "message": "tin.score() dense_ratio must be finite and >= 0"
+    }
+   }
+  }
+ ]
+}
