@@ -332,10 +332,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
     },
-    "benchmarks/test_wide_cursor.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum wide-query fuzzer generation regression tests."
-    },
     "benchmarks/tin.py": {
       "owner": "ben",
       "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
@@ -359,10 +355,6 @@
     "benchmarks/vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in a70ba90f4658fdc1f3b91cfb313a55429a76810c."
-    },
-    "benchmarks/vacuum_cleanup_pins.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum regression reproducing reader-pinned heap cleanup and validating benchmark accounting."
     },
     "boldi-vigna/Cargo.toml": {
       "owner": "planetscale",
@@ -556,21 +548,9 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
     },
-    "docs/benchmarks/merge_lifecycle.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in aa870ad9470babeafa5ac2cf10f38eed5983efbf."
-    },
     "docs/benchmarks/query-shapes-exists-repro.sql": {
       "owner": "ben",
       "evidence": "Original Stannum standalone regression reproduction generated from query-shape suite."
-    },
-    "docs/benchmarks/render_performance_snapshot.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum chart renderer added for the recorded GIN/TIN performance snapshot; reads existing benchmark JSON without copied upstream implementation."
-    },
-    "docs/benchmarks/render_query_shapes.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum renderer for synthetic query-shape measurements."
     },
     "docs/query-language/README.md": {
       "owner": "mixed",
@@ -788,6 +768,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9997c06219d0b106a91e788a959bc2036a7de179."
     },
+    "postgres/tests/merge_lifecycle.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in aa870ad9470babeafa5ac2cf10f38eed5983efbf. Moved from docs/benchmarks/merge_lifecycle.py."
+    },
     "postgres/tests/postings_lifecycle.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -795,6 +779,14 @@
     "postgres/tests/ranked_fuzz.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in c66fd1b570fc111d9cbe3d399065736d8013a447."
+    },
+    "postgres/tests/test_wide_cursor.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum wide-query fuzzer generation regression tests. Moved from benchmarks/test_wide_cursor.py."
+    },
+    "postgres/tests/vacuum_cleanup_pins.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum regression reproducing reader-pinned heap cleanup and validating benchmark accounting. Moved from benchmarks/vacuum_cleanup_pins.py."
     },
     "rust-toolchain.toml": {
       "owner": "planetscale",

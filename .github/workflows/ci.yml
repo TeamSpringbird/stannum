@@ -47,6 +47,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Benchmark harness unit tests
         run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+      - name: Cluster test unit tests
+        run: python3 -m unittest discover -s postgres/tests -p 'test_*.py'
       - name: Published benchmark query adapter
         run: |
           python3 benchmarks/tin.py --driver "$RUNNER_TEMP/stannum-benchmark-driver" prepare
@@ -142,11 +144,14 @@ jobs:
       - name: Ranked-scan concurrency fuzz (smoke)
         run: python3 postgres/tests/ranked_fuzz.py --smoke
 
+      - name: Deferred-merge lifecycle checks
+        run: python3 postgres/tests/merge_lifecycle.py
+
       - name: Mutation target and accounting regression
         run: python3 benchmarks/mutation_targets.py
 
       - name: VACUUM pinned-page regression
-        run: python3 benchmarks/vacuum_cleanup_pins.py
+        run: python3 postgres/tests/vacuum_cleanup_pins.py
 
       - name: VACUUM workload harness smoke
         run: |

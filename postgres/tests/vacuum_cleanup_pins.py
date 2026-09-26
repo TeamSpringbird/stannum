@@ -10,10 +10,13 @@ from pathlib import Path
 import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
-from vacuum_cleanup import validate_cleanup
+# The drain contract under test is the VACUUM benchmark's own validator.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'benchmarks'))
+from vacuum_cleanup import validate_cleanup  # noqa: E402
 
 
 def main():
