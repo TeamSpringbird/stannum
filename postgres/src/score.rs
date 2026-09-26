@@ -2148,8 +2148,9 @@ impl OrdinalTerm<'_> {
 
     /// Loads the current chunk as [`Self::load`] does, but an array
     /// chunk's members only as `members`, not scattered into `words`: a
-    /// conjunction intersects sorted members and ranks by them, and
-    /// scattering every array chunk it loaded was a sixteenth of its walk.
+    /// conjunction narrowing a chunk's words by an array filters its
+    /// members by them and ranks by its members, and scattering every
+    /// array chunk it loaded was a sixteenth of its walk.
     /// Until `load` scatters them, the chunk has no words: `word`, `holds`
     /// and the folds into words must not be asked of it.
     fn load_members(&mut self) {
