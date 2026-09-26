@@ -1,4 +1,8 @@
 #!/bin/bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 # Backends killed mid-walk on Linux (postgres/tests/exit_during_walk.py): builds an image of the working tree,
 # serves it as container stannum-exit on 127.0.0.1:28963, runs the test, removes the container.
 #   exit-test.sh [test args...]      STANNUM_EXIT_IMAGE reuses a built image; PYTHON needs psycopg (default /tmp/stannum-venv)

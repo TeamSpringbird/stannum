@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Attribute every page a ranked query reads from storage.
 
 Per query, three independent views of the same reads: pg_statio deltas by

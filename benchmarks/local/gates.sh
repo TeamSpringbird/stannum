@@ -1,4 +1,8 @@
 #!/bin/zsh
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 # Correctness gates on the release build: install, lifecycle, upgrade check,
 # Lead reference oracle, ranked-scan fuzz smoke. Logs go under $STANNUM_GATES (default /tmp/stannum-gates).
 # Serialise with other pgrx work: python3 /tmp/stannum-pgrx-lock.py -- zsh benchmarks/local/gates.sh

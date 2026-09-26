@@ -124,6 +124,38 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 727399bf5516b6ede4f97aad2250d4a57399e35d."
     },
+    "benchmarks/local/attrib.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c707013d43d68a147968076494794631560d17e0."
+    },
+    "benchmarks/local/exit-test.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 6af89821cd53beafdd501d234c91f66bba107d6c."
+    },
+    "benchmarks/local/gates.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in b961ded6db3c05c4ab918f680c01ef309ffba9cb."
+    },
+    "benchmarks/local/mock-build.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6."
+    },
+    "benchmarks/local/mock-container.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in b961ded6db3c05c4ab918f680c01ef309ffba9cb."
+    },
+    "benchmarks/local/mock-probe.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6."
+    },
+    "benchmarks/local/mock-run.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6."
+    },
+    "benchmarks/local/run150m.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6."
+    },
     "benchmarks/merge_costs.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 849853598b1c007451ebe049d58e6e4c2a46acd3."
@@ -314,7 +346,7 @@
     },
     "benchmarks/tin_behavior_probe.py": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation, written 2026-09-26 to record and replay PlanetScale TIN 1.0.3 responses."
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 29a520e482ac9f1c1a32329ca9a88050f22f469b."
     },
     "benchmarks/tin_catalog.py": {
       "owner": "ben",
@@ -367,6 +399,10 @@
       "upstream_path": "boldi-vigna/src/lib.rs",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Byte-identical to the upstream source before notice insertion."
+    },
+    "boldi-vigna/src/phrase_plan.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in d9068b1ee21e988ea72c8b1f195b4b9c58e91572."
     },
     "boldi-vigna/src/positions.rs": {
       "owner": "planetscale",
@@ -511,6 +547,10 @@
     "conformance/cases/spans.yaml": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
+    },
+    "conformance/divergences/stannum.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in b70feda7cb36cca0ccde1216515d347a79176a9b."
     },
     "conformance/run.py": {
       "owner": "ben",
@@ -736,6 +776,14 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Derived from Lead postgres/tin.control; extension name, description and version handling changed."
     },
+    "postgres/tests/crash_before_publication.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 1c7a95736839c1c36a4ef1a97756d5d7c372d016."
+    },
+    "postgres/tests/exit_during_walk.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 6af89821cd53beafdd501d234c91f66bba107d6c."
+    },
     "postgres/tests/extension_upgrade.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9997c06219d0b106a91e788a959bc2036a7de179."
@@ -778,37 +826,33 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
     },
-    "segment/examples/count_paths.rs": {
-      "owner": "ben",
-      "evidence": "New Stannum diagnostic or test code; not copied from Lead."
-    },
     "segment/examples/merge_memory.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
-    },
-    "segment/examples/ordinal_counts.rs": {
-      "owner": "ben",
-      "evidence": "Original replay of the published count queries over TID and ordinal encodings."
     },
     "segment/examples/vacuum_diagnostic.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in a70ba90f4658fdc1f3b91cfb313a55429a76810c."
     },
+    "segment/src/bound.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in b961ded6db3c05c4ab918f680c01ef309ffba9cb."
+    },
+    "segment/src/cache.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 7372fc6fb8f0bbf469f1b6b3340dbe8af787bcdf."
+    },
     "segment/src/dictionary.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
-    "segment/src/direct_merge_poc.rs": {
+    "segment/src/docs.rs": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in cc3e29c59725656c8ffcf6a63042fc06aa0670a0."
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in b961ded6db3c05c4ab918f680c01ef309ffba9cb."
     },
     "segment/src/error.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
-    },
-    "segment/src/format_tests.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
     },
     "segment/src/forward.rs": {
       "owner": "ben",
@@ -818,25 +862,17 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "segment/src/lanes.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in abf20157d9c675a86b92c1399b729ff197f78f3c."
+    },
+    "segment/src/length_class.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in b961ded6db3c05c4ab918f680c01ef309ffba9cb."
+    },
     "segment/src/lib.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
-    },
-    "segment/src/maintenance.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum maintenance cursor implementation; no upstream source copied."
-    },
-    "segment/src/maintenance/dictionary.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum bounded maintenance dictionary reader."
-    },
-    "segment/src/maintenance/postings.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum bounded maintenance postings cursor; shares Stannum codec definitions."
-    },
-    "segment/src/maintenance/validate.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum streaming cross-term validation."
     },
     "segment/src/merge.rs": {
       "owner": "ben",
@@ -855,10 +891,6 @@
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 6bbb74b787fb206f26ea0cc107cfe74d1cf924a7."
     },
     "segment/src/payload.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
-    },
-    "segment/src/postings.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
@@ -901,10 +933,6 @@
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 15f5764703950b4715fb64dba9eda7b3993bb8bf."
     },
     "segment/tests/buffer_cost.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
-    },
-    "segment/tests/scoring_cost.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },

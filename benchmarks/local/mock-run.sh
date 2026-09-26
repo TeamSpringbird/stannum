@@ -1,4 +1,8 @@
 #!/bin/bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 # A workload on the local mock from the saved database: mock15m-run.sh IMAGE_TAG LABEL STYLE UPDATES [SECONDS]
 set -u
 export PATH=/opt/homebrew/bin:$PATH

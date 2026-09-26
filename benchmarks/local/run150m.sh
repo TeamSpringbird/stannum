@@ -1,4 +1,8 @@
 #!/bin/bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 # A published workload on the local 150M database: run150m.sh IMAGE_TAG LABEL STYLE UPDATES [SECONDS]; caps as mock-run.sh
 set -u
 export PATH=/opt/homebrew/bin:$PATH
