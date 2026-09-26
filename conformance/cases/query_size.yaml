@@ -11,10 +11,11 @@ description: >
   answered with TIN's count, and answer the sizes that crashed TIN with an
   ERROR or the correct count, never a crash.
 
-  Every size above 100 is tagged as crashing Stannum 0.1.0 until the
-  query-depth fix lands: run this area only on a throwaway server you may
-  restart. Whether a size crashes depends on the build and the server's
-  stack limit; see stannum_observations.
+  Stannum 0.1.0 crashed on sizes above 100 until the query-depth fix
+  (merged 2026-09-26 as 12ac031), which answers every size TIN answered and
+  refuses the larger ones with an ERROR; see stannum_observations. The sizes
+  TIN crashed on are still tagged: recording them against TIN restarts its
+  server.
 
 stannum_observations:
   - date: 2026-09-26
@@ -39,6 +40,11 @@ stannum_observations:
     stack_limit: "rlimit 8176kB (max_stack_depth may not exceed 7664kB); max_stack_depth 2MB"
     build: stannum.dylib installed 15:01:35 ET (debug build containing a query-depth limit)
     result: every size answered 0, except 5000-deep nesting, which raised ERROR XX000.
+  - date: 2026-09-26
+    server: shared pgrx server (port 28818)
+    stack_limit: "rlimit 8176kB (max_stack_depth may not exceed 7664kB); max_stack_depth 2MB"
+    build: release build of a5cd99f (query-depth fix, merged as 12ac031)
+    result: every size checked against TIN 1.0.3's recorded answers with no crash; see the conformance run in the merge.
 
 defaults:
   corpus: spans4
@@ -49,28 +55,24 @@ cases:
   - id: query_size.words.1000
     description: 1000 space-separated terms (implicit AND).
     query_sql: "repeat('a ', 1000)"
-    crashes: [stannum-0.1.0]
   - id: query_size.words.3000
     description: 3000 space-separated terms.
     query_sql: "repeat('a ', 3000)"
-    crashes: [stannum-0.1.0]
   - id: query_size.words.10000
     description: 10000 space-separated terms; crashed TIN 1.0.3's server.
     query_sql: "repeat('a ', 10000)"
-    crashes: [tin-1.0.3, stannum-0.1.0]
+    crashes: [tin-1.0.3]
     expect_if_answered: {count: 0}
   - id: query_size.or_chain.1000
     description: "'a OR a OR ...' with 1000 terms."
     query_sql: "array_to_string(array_fill('a'::text, ARRAY[1000]), ' OR ')"
-    crashes: [stannum-0.1.0]
   - id: query_size.or_chain.3000
     description: "'a OR a OR ...' with 3000 terms."
     query_sql: "array_to_string(array_fill('a'::text, ARRAY[3000]), ' OR ')"
-    crashes: [stannum-0.1.0]
   - id: query_size.or_chain.10000
     description: "'a OR a OR ...' with 10000 terms; crashed TIN 1.0.3's server."
     query_sql: "array_to_string(array_fill('a'::text, ARRAY[10000]), ' OR ')"
-    crashes: [tin-1.0.3, stannum-0.1.0]
+    crashes: [tin-1.0.3]
     expect_if_answered: {count: 0}
   - id: query_size.nested.100
     description: "'a' inside 100 levels of parentheses."
@@ -78,9 +80,8 @@ cases:
   - id: query_size.nested.1000
     description: "'a' inside 1000 levels of parentheses."
     query_sql: "repeat('(', 1000) || 'a' || repeat(')', 1000)"
-    crashes: [stannum-0.1.0]
   - id: query_size.nested.5000
     description: "'a' inside 5000 levels of parentheses; crashed TIN 1.0.3's server."
     query_sql: "repeat('(', 5000) || 'a' || repeat(')', 5000)"
-    crashes: [tin-1.0.3, stannum-0.1.0]
+    crashes: [tin-1.0.3]
     expect_if_answered: {count: 0}
