@@ -286,7 +286,7 @@ jobs:
   # mutation states on Stannum and on the original Lead, checked out directly
   # from PlanetScale's repository and built under its own name `tin`. Match
   # sets and rank order must agree; Lead's score bits are not compared (see
-  # docs/benchmarks/README.md for the two known deviations).
+  # docs/compatibility.md#reference-oracle-against-lead for the two known deviations).
   reference-oracle:
     name: Reference oracle against upstream Lead
     runs-on: ubuntu-24.04

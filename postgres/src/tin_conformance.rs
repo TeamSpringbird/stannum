@@ -21,7 +21,8 @@
 //! runs the whole suite against an installed build; these tests run a part
 //! of it in every `cargo pgrx test`.
 //!
-//! See `docs/tin-behavior.md` for the decisions taken from TIN's answers. To
+//! See `docs/tin-behavior-catalog.md` for the behavior the catalog cases
+//! pin and `conformance/README.md` for how answers are recorded. To
 //! follow a new TIN release, record it into a new
 //! `conformance/expected/tin-<version>/` and point the constants below at
 //! it; never edit the recorded values of an existing directory.
