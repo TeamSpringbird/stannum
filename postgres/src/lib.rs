@@ -4868,6 +4868,69 @@ mod tests {
             .map(|pair| (pair[0].clone(), pair[1].clone()))
     }
 
+    /// An invalid `==>` query raises TIN 1.0.3's message on every path: the
+    /// query and the byte the error points at, then the error without the
+    /// stage that raised it (conformance/expected/tin-1.0.3/
+    /// catalog.syntax.json, catalog.expansion.json and catalog.relations.json:
+    /// catalog.Q-14, catalog.E-07, catalog.E-10, catalog.R-06). The syntax
+    /// errors TIN words after its pest grammar ("expected expected base")
+    /// are left out: the descent parser names what it expected in words.
+    #[pg_test]
+    fn tin_1_0_3_invalid_query_messages() {
+        Spi::run(
+            "CREATE TABLE invalid_queries(body text);
+             INSERT INTO invalid_queries VALUES ('craft beer');
+             CREATE INDEX invalid_queries_idx ON invalid_queries USING stannum(body)",
+        )
+        .unwrap();
+        for (query, message) in [
+            (
+                r#""""#,
+                r#"invalid ==> query at byte 0 in "\"\"": empty phrase (at byte 0)"#,
+            ),
+            (
+                "[]",
+                r#"invalid ==> query at byte 0 in "[]": empty alternatives (at byte 0)"#,
+            ),
+            (
+                "* IN FIRST 3 WORDS",
+                r#"invalid ==> query in "* IN FIRST 3 WORDS": MatchAll (*) is not valid inside a span/positional context"#,
+            ),
+            (
+                "a* TO c",
+                r#"invalid ==> query at byte 0 in "a* TO c": range bound "a*" contains a wildcard (at byte 0): bounds must be plain terms"#,
+            ),
+            (
+                "... TO z",
+                r#"invalid ==> query in "... TO z": range bound "..." sub-tokenizes into no tokens"#,
+            ),
+            (
+                r"MATCHES (a)\1",
+                "invalid ==> query in \"MATCHES (a)\\\\1\": invalid regex \"(a)\\1\": regex parse error:\n    \\A(?:(a)\\1)\\z\n            ^^\nerror: backreferences are not supported",
+            ),
+        ] {
+            let quoted = query.replace('\'', "''");
+            for (setting, sql) in [
+                (
+                    "on",
+                    format!("SELECT count(*) FROM invalid_queries WHERE body ==> '{quoted}'"),
+                ),
+                (
+                    "off",
+                    format!("SELECT count(*) FROM invalid_queries WHERE body ==> '{quoted}'"),
+                ),
+                ("on", format!("SELECT 'craft beer' ==> '{quoted}'")),
+            ] {
+                Spi::run(&format!("SET LOCAL stannum.enable_custom_scan = {setting}")).unwrap();
+                assert_eq!(
+                    outcome(&sql),
+                    Some(("XX000".to_owned(), message.to_owned())),
+                    "{sql} (custom scan {setting})"
+                );
+            }
+        }
+    }
+
     /// Every WITH option at the ends of its domain and one step outside:
     /// TIN 1.0.3 accepts the ends and rejects the rest with 22023 (answers
     /// recorded in conformance/expected/tin-1.0.3/catalog.ddl.json,
