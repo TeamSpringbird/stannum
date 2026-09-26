@@ -2192,6 +2192,193 @@ mod tests {
         }
     }
 
+    /// With k1 at or near zero a term's score barely depends on its
+    /// frequency, and `f32` rounding leaves a higher frequency bucket up to
+    /// an ulp below a lower one. A bound at a sub-block's largest bucket
+    /// then sits below a member with a smaller bucket, and the walk drops a
+    /// row the exhaustive order keeps: at k1 = 0, row 1 ('w w w') scores an
+    /// ulp below rows 2..10 ('w'), yet the walk returned row 1 for LIMIT 1.
+    #[pg_test]
+    fn ranked_walks_bound_scores_that_fall_as_the_frequency_rises() {
+        Spi::run(
+            "CREATE TABLE flat(id int primary key, body text);
+             INSERT INTO flat VALUES (1, 'w w w');
+             INSERT INTO flat SELECT n, 'w' FROM generate_series(2, 10) n;
+             CREATE INDEX flat_idx ON flat USING stannum(body);
+             CREATE TABLE flat_k0(id int primary key, body text);
+             INSERT INTO flat_k0 SELECT * FROM flat;
+             CREATE INDEX flat_k0_idx ON flat_k0 USING stannum(body) WITH (k1 = 0);",
+        )
+        .unwrap();
+        // TIN 1.0.3 on the same table: at k1 = 0 row 1 scores 0.046520013
+        // and row 2 0.046520017, and its pruned top 1 is row 2; at k1 =
+        // 0.001, 0.01 and 1.2 row 1 is the top.
+        for (table, order_by, top) in [
+            ("flat", "stannum.full_score(ctid, 0, 0.75)", 2),
+            ("flat_k0", "stannum.full_score(ctid)", 2),
+            ("flat", "stannum.full_score(ctid, 0.001, 0.75)", 1),
+            ("flat", "stannum.full_score(ctid, 0.01, 0.75)", 1),
+            ("flat", "stannum.full_score(ctid, 1.2, 0.75)", 1),
+        ] {
+            for limit in ["LIMIT 1", "LIMIT 2", "LIMIT 10"] {
+                let expected = ranked_in(table, false, "w", order_by, limit);
+                let actual = ranked_in(table, true, "w", order_by, limit);
+                assert_eq!(actual, expected, "{table} {order_by} {limit}");
+                assert_eq!(actual[0].0, top, "{table} {order_by} {limit}");
+            }
+        }
+        let flat = |id: i32| {
+            Spi::get_one::<f32>(&format!(
+                "SELECT stannum.full_score(ctid, 0, 0.75) FROM flat WHERE id = {id} AND body ==> 'w'"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        // 0.046520013 and 0.046520017, one ulp apart.
+        assert_eq!(
+            (flat(1).to_bits(), flat(2).to_bits()),
+            (1_027_509_189, 1_027_509_190)
+        );
+        // At k1 = 0.001 and b = 0 a document holding the word 14,938 times
+        // (bucket 14) scores above one holding it 31,288 times (bucket 15)
+        // when nine documents of ten hold it; the longer comes first.
+        Spi::run(
+            "CREATE TABLE flat_high(id int primary key, body text);
+             INSERT INTO flat_high VALUES (1, repeat('w ', 31288) || 'v'), (2, repeat('w ', 14938) || 'v');
+             INSERT INTO flat_high SELECT n, 'w' || CASE WHEN n % 2 = 0 THEN ' v' ELSE '' END
+               FROM generate_series(3, 9) n;
+             INSERT INTO flat_high VALUES (10, 'x');
+             CREATE INDEX flat_high_idx ON flat_high USING stannum(body);",
+        )
+        .unwrap();
+        for k1 in ["0", "0.001", "0.01"] {
+            for b in ["0", "0.75", "1"] {
+                let order_by = format!("stannum.full_score(ctid, {k1}, {b})");
+                for query in ["w", "w OR v", "w AND v", "w OR x"] {
+                    for limit in ["LIMIT 1", "LIMIT 2", "LIMIT 10"] {
+                        let expected = ranked_in("flat_high", false, query, &order_by, limit);
+                        let actual = ranked_in("flat_high", true, query, &order_by, limit);
+                        assert_eq!(actual, expected, "{query} {order_by} {limit}");
+                    }
+                }
+            }
+        }
+        // Frequencies over every bucket and lengths over several classes,
+        // for single terms, disjunctions and conjunctions.
+        Spi::run(
+            "CREATE TABLE flat_mix(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 1500;
+             INSERT INTO flat_mix SELECT n,
+               repeat('w ', 1 + (n * 7) % 23 + CASE WHEN n % 97 = 0 THEN 300 ELSE 0 END) ||
+               CASE WHEN n % 3 = 0 THEN repeat('v ', 1 + n % 5) ELSE '' END ||
+               CASE WHEN n % 11 = 0 THEN repeat('u ', 1 + n % 40) ELSE '' END ||
+               repeat('pad ', n % 7) || 'end'
+               FROM generate_series(1, 3000) n;
+             INSERT INTO flat_mix SELECT n, 'w v u end' FROM generate_series(3001, 3100) n;
+             CREATE INDEX flat_mix_idx ON flat_mix USING stannum(body);
+             INSERT INTO flat_mix SELECT n, 'w ' || repeat('v ', n % 4) || 'end'
+               FROM generate_series(3101, 3200) n;",
+        )
+        .unwrap();
+        for k1 in ["0", "0.001", "0.01"] {
+            for b in ["0.75", "0", "1"] {
+                let order_by = format!("stannum.full_score(ctid, {k1}, {b})");
+                for query in [
+                    "w",
+                    "u",
+                    "w OR v",
+                    "u OR v OR w",
+                    "w AND v",
+                    "u AND w AND v",
+                ] {
+                    for limit in ["LIMIT 1", "LIMIT 7", "LIMIT 100"] {
+                        let expected = ranked_in("flat_mix", false, query, &order_by, limit);
+                        let actual = ranked_in("flat_mix", true, query, &order_by, limit);
+                        assert_eq!(actual, expected, "{query} {order_by} {limit}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A phrase that is not the first operand of THEN or NEAR: the pair
+    /// tests of the ranked walk's phrase check and of the span filter under
+    /// counts and plain filters bounded each pair of words by the wrong
+    /// junction, and dropped rows that match. The rows, counts and ranked
+    /// orders are TIN 1.0.3's on the same table.
+    #[pg_test]
+    fn then_and_near_over_phrase_operands_match_tin() {
+        Spi::run(
+            "CREATE TABLE spans(id int primary key, body text);
+             INSERT INTO spans VALUES (1, 'alpha x beta gamma'), (2, 'alpha beta gamma'),
+               (3, 'beta gamma alpha'), (4, 'alpha x y beta gamma');
+             CREATE INDEX spans_idx ON spans USING stannum(body);",
+        )
+        .unwrap();
+        for (query, ids, ranked_ids) in [
+            ("alpha THEN/1 \"beta gamma\"", &[1, 2][..], &[2, 1][..]),
+            ("alpha THEN/2 \"beta gamma\"", &[1, 2, 4], &[2, 1, 4]),
+            ("\"alpha x\" THEN/2 \"beta gamma\"", &[1, 4], &[1, 4]),
+            ("alpha THEN/1 beta", &[1, 2], &[2, 1]),
+            ("\"beta gamma\" THEN/1 alpha", &[3], &[3]),
+            ("alpha NEAR/1 \"beta gamma\"", &[1, 2, 3], &[2, 3, 1]),
+        ] {
+            for custom in [false, true] {
+                Spi::run(&format!(
+                    "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;"
+                ))
+                .unwrap();
+                let found: Vec<i32> = Spi::connect(|client| {
+                    client
+                        .select(
+                            &format!("SELECT id FROM spans WHERE body ==> '{query}' ORDER BY id"),
+                            None,
+                            &[],
+                        )
+                        .unwrap()
+                        .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                        .collect()
+                });
+                assert_eq!(found, ids, "{query} custom {custom}");
+                let count = Spi::get_one::<i64>(&format!(
+                    "SELECT count(*) FROM spans WHERE body ==> '{query}'"
+                ))
+                .unwrap()
+                .unwrap();
+                assert_eq!(count, ids.len() as i64, "{query} custom {custom}");
+                let ranked: Vec<i32> = ranked_in(
+                    "spans",
+                    custom,
+                    query,
+                    "stannum.full_score(ctid)",
+                    "LIMIT 10",
+                )
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+                assert_eq!(ranked, ranked_ids, "{query} custom {custom}");
+            }
+        }
+    }
+
+    /// `stannum.debug_seed_score` prunes every ranked walk against a
+    /// threshold of the caller's choosing: set above every score, a query
+    /// returns no rows. Only a superuser may set it.
+    #[pg_test]
+    fn only_a_superuser_seeds_the_ranked_threshold() {
+        Spi::run(
+            "CREATE ROLE seed_setter;
+             DO $$ BEGIN
+               BEGIN SET LOCAL ROLE seed_setter; SET stannum.debug_seed_score = 1e9;
+                 RAISE EXCEPTION 'a user seeded the ranked threshold';
+               EXCEPTION WHEN insufficient_privilege THEN NULL; END;
+             END $$;
+             RESET ROLE;
+             SET LOCAL stannum.debug_seed_score = -1;",
+        )
+        .unwrap();
+    }
+
     /// A conjunction's warm-up evaluates the chunks with the highest
     /// directory bounds first, across every source, and the walks skip them
     /// after. Two build segments of two chunks each (the second chunk of

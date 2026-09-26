@@ -340,6 +340,114 @@ mod tests {
         assert!(dropped > 0 && matched > 0);
     }
 
+    /// `a THEN/1 "b c"`: the outer junction between `a` and the phrase
+    /// takes up to one gap, the phrase's own junction none.
+    #[test]
+    fn a_phrase_after_the_first_operand_keeps_its_own_junction() {
+        let query = SpanQuery::MaxGaps {
+            max_gaps: 1,
+            inner: Box::new(SpanQuery::Ordered(vec![
+                SpanQuery::Term(0),
+                phrase(&[1, 2], 0),
+            ])),
+        };
+        let plan = PhrasePlan::new(&query, |s| [1, 2, 3][s]).unwrap();
+        assert_eq!(plan.gaps, [(1, 2), (1, 1)]);
+        // "a x b c": a at 0, b at 2, c at 3.
+        let positions = vec![vec![0], vec![2], vec![3]];
+        assert!(solver_says(&query, &positions));
+        assert_eq!(plan_says(&query, &[1, 2, 3], &positions), Some(true));
+        // `"a x" THEN/2 "b c"`: the outer junction sits between leaves 1
+        // and 2.
+        let query = SpanQuery::MaxGaps {
+            max_gaps: 2,
+            inner: Box::new(SpanQuery::Ordered(vec![
+                phrase(&[0, 1], 0),
+                phrase(&[2, 3], 0),
+            ])),
+        };
+        let plan = PhrasePlan::new(&query, |_| 1).unwrap();
+        assert_eq!(plan.gaps, [(1, 1), (1, 3), (1, 1)]);
+    }
+
+    mod random {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn cases(default: u32) -> u32 {
+            std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+
+        const SLOTS: usize = 4;
+
+        /// Nested ordered spans as the query languages build them:
+        /// phrases with slop and pinned gaps, THEN/NEAR budgets over
+        /// phrase and group operands, width and position windows.
+        fn span() -> impl Strategy<Value = SpanQuery> {
+            let leaf = (0..SLOTS).prop_map(SpanQuery::Term);
+            leaf.prop_recursive(4, 24, 3, |inner| {
+                let ordered =
+                    prop::collection::vec(inner.clone(), 2..4).prop_map(SpanQuery::Ordered);
+                prop_oneof![
+                    2 => ordered.clone(),
+                    3 => (ordered.clone(), 0u32..4).prop_map(|(inner, max_gaps)| {
+                        SpanQuery::MaxGaps { max_gaps, inner: Box::new(inner) }
+                    }),
+                    2 => (inner.clone(), inner.clone(), 0u32..3).prop_map(|(left, right, gap)| {
+                        SpanQuery::GapsInRange {
+                            min_gaps: gap,
+                            max_gaps: gap,
+                            inner: Box::new(SpanQuery::Ordered(vec![left, right])),
+                        }
+                    }),
+                    1 => (ordered.clone(), 0u32..3, 0u32..3).prop_map(|(inner, min, extra)| {
+                        SpanQuery::GapsInRange {
+                            min_gaps: min,
+                            max_gaps: min + extra,
+                            inner: Box::new(inner),
+                        }
+                    }),
+                    1 => (inner.clone(), 1u32..8).prop_map(|(inner, max_width)| {
+                        SpanQuery::MaxWidth { max_width, inner: Box::new(inner) }
+                    }),
+                    1 => (inner, 1u32..10).prop_map(|(inner, n)| SpanQuery::first_n(inner, n)),
+                ]
+            })
+        }
+
+        fn positions() -> impl Strategy<Value = Vec<Vec<u32>>> {
+            prop::collection::vec(
+                prop::collection::btree_set(0u32..14, 0..6)
+                    .prop_map(|set| set.into_iter().collect::<Vec<_>>()),
+                SLOTS,
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: cases(2000), ..ProptestConfig::default() })]
+
+            #[test]
+            fn pair_tests_never_reject_what_the_solver_accepts_in_nested_spans(
+                query in span(),
+                documents in prop::collection::vec(positions(), 1..8),
+                rarity in prop::collection::vec(1u64..5, SLOTS),
+            ) {
+                // A lone term has no pairs to test.
+                if PhrasePlan::new(&query, |slot| rarity[slot]).is_none() {
+                    return Ok(());
+                }
+                for positions in &documents {
+                    let solver = solver_says(&query, positions);
+                    let plan = plan_says(&query, &rarity, positions).unwrap();
+                    prop_assert!(plan || !solver, "{:?} {:?} {:?}", query, positions, rarity);
+                }
+            }
+        }
+    }
+
     #[test]
     fn distance_is_tested_from_the_earlier_leaf() {
         assert!(keeps_distance(&[3], &[4], 1, 1));

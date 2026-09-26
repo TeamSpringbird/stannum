@@ -1107,6 +1107,65 @@ mod tests {
     }
 
     #[test]
+    fn nested_ordered_spans_keep_each_junction_s_distance() {
+        // A phrase that is not the first operand of THEN/NEAR: the span
+        // filter's pair tests must bound each pair of adjacent words by the
+        // junction between them, the outer operator's gap between the
+        // operands and the phrase's inside it.
+        let docs = [
+            "alpha x beta gamma",
+            "alpha beta gamma",
+            "beta gamma alpha",
+            "alpha x y beta gamma",
+            "alpha x beta y gamma",
+            "delta alpha x gamma delta beta gamma",
+        ];
+        for query in [
+            "alpha THEN/1 \"beta gamma\"",
+            "alpha THEN/2 \"beta gamma\"",
+            "\"alpha x\" THEN/2 \"beta gamma\"",
+            "\"alpha x\" THEN/0 \"beta gamma\"",
+            "alpha NEAR/2 \"beta gamma\"",
+            "\"beta gamma\" NEAR/2 alpha",
+            "alpha THEN/2 \"beta _ gamma\"",
+            "alpha THEN/2 \"x beta gamma\"~1",
+            "delta THEN/1 (alpha THEN/1 gamma)",
+            "(alpha THEN/1 \"beta gamma\") IN FIRST 4 WORDS",
+            "(alpha THEN/3 \"beta gamma\") WITHIN 5",
+        ] {
+            check(&docs, query, true);
+        }
+    }
+
+    /// The rows TIN 1.0.3 returns for these queries, ids from one.
+    #[test]
+    fn then_and_near_over_phrases_match_tin() {
+        let docs = [
+            "alpha x beta gamma",
+            "alpha beta gamma",
+            "beta gamma alpha",
+            "alpha x y beta gamma",
+        ];
+        let bytes = build(&docs);
+        let segment = Segment::parse(&bytes).unwrap();
+        for (query, ids) in [
+            ("alpha THEN/1 \"beta gamma\"", &[1, 2][..]),
+            ("alpha THEN/2 \"beta gamma\"", &[1, 2, 4]),
+            ("\"alpha x\" THEN/2 \"beta gamma\"", &[1, 4]),
+            ("alpha THEN/1 beta", &[1, 2]),
+            ("\"beta gamma\" THEN/1 alpha", &[3]),
+            ("alpha NEAR/1 \"beta gamma\"", &[1, 2, 3]),
+        ] {
+            let parsed = parse_tinql_to_query_default(query).unwrap();
+            let (found, exact) = matches(&parsed, &segment, &Limits::default()).unwrap();
+            let expected: Vec<Tid> = ids.iter().map(|id| tid(id - 1)).collect();
+            assert!(exact, "{query}");
+            assert_eq!(found, expected, "{query}");
+            assert_eq!(reference(&docs, &parsed), expected, "{query}");
+        }
+    }
+
+    #[test]
     fn expansions_are_exact_within_the_cap_and_degrade_beyond_it() {
         for query in [
             "brew*",
