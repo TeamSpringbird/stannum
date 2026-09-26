@@ -342,6 +342,22 @@ where
     Ok(lower::lower(&expr)?)
 }
 
+/// The query as scoring reads it: [`parse_tinql_to_query`] without removing
+/// repeated terms from flat AND and OR chains, so each occurrence of a term
+/// adds its boost (`a a` weighs `a` 2.0, as TIN does). Matching reads the
+/// deduplicated query, which accepts the same documents.
+pub fn parse_tinql_to_scoring_query<T>(query_str: &str, tokenizer: &T) -> Result<Query, QueryError>
+where
+    T: tokenizer::Tokenizer,
+{
+    let expr = crate::parse(query_str, crate::ImplicitOp::And)?;
+    let expr = subtokenize::sub_tokenize(expr, tokenizer)?;
+    Ok(lower::lower_with_profile(
+        &expr,
+        SimplificationProfile::StructuralScoring,
+    )?)
+}
+
 pub fn parse_tinql_to_query_default(query_str: &str) -> Result<Query, QueryError> {
     parse_tinql_to_query(query_str, default_pipeline())
 }

@@ -28,7 +28,7 @@ use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::plan::{Limits, plan};
 use tinql::runtime::{
     CompiledRegex, FuzzyMatcher, Query, RangeBound, SpanPositionFilter, SpanTermSlot, evaluate,
-    parse_tinql_to_query, range_matches, tokenize_doc,
+    parse_tinql_to_query, parse_tinql_to_scoring_query, range_matches, tokenize_doc,
 };
 use tokenizer::Tokenizer;
 
@@ -4492,6 +4492,8 @@ fn build_index_scorer_inner(
     }
     let query = parse_tinql_to_query(&key.query, tokenizer.as_ref())
         .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
+    let scoring = parse_tinql_to_scoring_query(&key.query, tokenizer.as_ref())
+        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -4509,7 +4511,7 @@ fn build_index_scorer_inner(
     let view = unsafe { crate::storage::view(index.oid()) };
     let segments: Vec<&dyn Index> = view.sources.iter().map(|(index, _)| &**index).collect();
     let mut collected = Collected::default();
-    collect_score_terms(&query, 1.0, false, &mut collected);
+    collect_score_terms(&scoring, 1.0, false, &mut collected);
     let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
     let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
     let dead = view.dead_sets.clone();
@@ -4635,6 +4637,8 @@ fn build_corpus(
     }
     let query = parse_tinql_to_query(&key.query, &tokenizer)
         .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
+    let scoring = parse_tinql_to_scoring_query(&key.query, &tokenizer)
+        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -4653,7 +4657,7 @@ fn build_corpus(
     let tokenized: Vec<Vec<String>> = positioned.iter().map(|doc| doc.tokens().to_vec()).collect();
     let universe = corpus_universe(&tokenized);
     let mut collected = Collected::default();
-    collect_score_terms(&query, 1.0, false, &mut collected);
+    collect_score_terms(&scoring, 1.0, false, &mut collected);
     let owned = collected.resolve(|expansion| {
         let matcher = expansion.matcher();
         universe
@@ -5018,7 +5022,7 @@ fn score_inspect(
     crate::udfs::require_index_select(&index);
     let heap_oid = unsafe { pg_sys::IndexGetRelation(index.oid(), false) };
     let tokenizer = unsafe { crate::options::tokenizer(index.as_ptr()) };
-    let parsed = parse_tinql_to_query(query, &tokenizer)
+    let parsed = parse_tinql_to_scoring_query(query, &tokenizer)
         .unwrap_or_else(|error| pgrx::error!("stannum.score_inspect() query error: {error}"));
     let edit = TermSetEdit::from_bound_arrays(
         unwrap("term_add", term_add),

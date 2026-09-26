@@ -200,3 +200,6 @@
   `max_merged_segment_size` take TIN's domains (1..4096, at least 131072
   bytes, at least 100 MB) and reject other values with SQLSTATE 22023, as
   TIN 1.0.3 does; unset still leaves the `stannum.*` settings in charge.
+- A term repeated in a flat AND or OR chain adds its boosts in scoring and
+  `score_inspect`, as in TIN 1.0.3: `a a` weighs `a` 2.0 and scores as
+  `a^2`, where the repeat was removed before scoring. Matching is unchanged.

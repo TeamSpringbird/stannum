@@ -50,6 +50,9 @@ use rustc_hash::FxHashSet;
 pub enum SimplificationProfile {
     Structural,
     StructuralPreserveTermMultiplicity,
+    /// [`Self::Structural`] without removing repeated flat terms: the query
+    /// scoring reads, where each occurrence of a term adds its boost.
+    StructuralScoring,
     LogicalUnscored,
 }
 
@@ -57,7 +60,8 @@ pub fn simplify(query: Query, profile: SimplificationProfile) -> Query {
     let query = normalize_boolean_query(query, profile);
     match profile {
         SimplificationProfile::Structural
-        | SimplificationProfile::StructuralPreserveTermMultiplicity => query,
+        | SimplificationProfile::StructuralPreserveTermMultiplicity
+        | SimplificationProfile::StructuralScoring => query,
         SimplificationProfile::LogicalUnscored => reduce_unscored_redundancy(query),
     }
 }
@@ -66,7 +70,7 @@ impl SimplificationProfile {
     const fn dedup_flat_terms(self) -> bool {
         match self {
             Self::Structural | Self::LogicalUnscored => true,
-            Self::StructuralPreserveTermMultiplicity => false,
+            Self::StructuralPreserveTermMultiplicity | Self::StructuralScoring => false,
         }
     }
 }
@@ -727,6 +731,26 @@ mod tests {
                 Query::Term("be".into()),
                 Query::Term("to".into()),
             ]),
+        );
+    }
+
+    #[test]
+    fn scoring_simplify_keeps_repeated_terms_and_folds_match_all() {
+        let repeated = Query::And(
+            Box::new(Query::Term("a".into())),
+            Box::new(Query::Term("a".into())),
+        );
+        assert_eq!(
+            simplify(repeated, SimplificationProfile::StructuralScoring),
+            Query::Conjunction(vec![Query::Term("a".into()), Query::Term("a".into())]),
+        );
+        let with_match_all = Query::Disjunction {
+            min: 1,
+            children: vec![Query::MatchAll, Query::Term("beer".into())],
+        };
+        assert_eq!(
+            simplify(with_match_all, SimplificationProfile::StructuralScoring),
+            Query::MatchAll,
         );
     }
 
