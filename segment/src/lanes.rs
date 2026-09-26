@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Ben Weis <ben@springbird.app>
+//
+// See LICENSE in the repository root for license terms.
+
 //! Weighted sums over the 64 lanes of a word, bit-sliced: each lane is a
 //! member of a bitmap word, and a weight is added to every lane a mask
 //! selects in a few word operations rather than one lane at a time.

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Per-query pages and disk reads on the local mock: mock15m-probe.py IMAGE_TAG LABEL [N_PUBLISHED]
 
 Starts a container on the saved mock database with the AWS proportions (5g memory, 2GB shared

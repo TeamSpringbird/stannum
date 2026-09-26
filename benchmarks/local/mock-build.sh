@@ -1,4 +1,8 @@
 #!/bin/bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 # Build the 15M mock database once under AWS-like proportions, saving it for load-database runs.
 set -u
 export PATH=/opt/homebrew/bin:$PATH

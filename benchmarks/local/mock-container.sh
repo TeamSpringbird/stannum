@@ -1,4 +1,8 @@
 #!/bin/bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 # A persistent server on the saved mock database, for probing by hand:
 #   mock-container.sh start NAME IMAGE PORT [extra postgres -c args...]
 #   mock-container.sh stop NAME
