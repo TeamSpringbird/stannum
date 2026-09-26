@@ -3,16 +3,22 @@
 // See LICENSE in the repository root for license terms.
 
 //! Reading a candidate's positions one slot at a time, dropping it at the
-//! first adjacent pair of leaves that cannot match.
+//! first pair of leaves that cannot match.
 //!
 //! In a matching interval of an ordered span every leaf sits a bounded
 //! distance after the leaf before it: one position in a phrase, up to the
 //! slop plus one under a gap budget, exactly the pinned gap for `"a _ b"`.
-//! A candidate no positions of which keep some pair's distance cannot
-//! match, so a plan reads the rarest slot first, then the rarer neighbour
-//! of the leaves read so far, and tests each pair as its second slot
-//! arrives. Only a candidate every pair of which passes has the rest of
-//! its slots read and the solver run; the solver's answer is the result.
+//! Any two leaves then lie within the sum of the bounds between them. A
+//! candidate no positions of which keep some pair's distance cannot match,
+//! so a plan reads the slots rarest first and tests each leaf, as its slot
+//! arrives, against the nearest leaf read before it. Only a candidate every
+//! pair of which passes has the rest of its slots read and the solver run;
+//! the solver's answer is the result.
+//!
+//! Rarest first rather than outwards from the rarest leaf: a phrase's rare
+//! words are mostly flanked by the commonest ones (`"a number i would"`),
+//! whose position lists are the longest to reach and to read, and the two
+//! rarest words at their distance are no less rare a pair.
 
 use crate::positions::TermPositions;
 use crate::query::SpanQuery;
@@ -22,9 +28,9 @@ use crate::query::SpanQuery;
 pub struct Step {
     /// The slot to read, unless it was read by an earlier step.
     pub slot: usize,
-    /// The adjacent pair (by its earlier leaf's index) to test once the
-    /// slot is read; `None` for the first step.
-    pub pair: Option<usize>,
+    /// The pair of leaves, earlier first, to test once the slot is read;
+    /// `None` for the first step.
+    pub pair: Option<(usize, usize)>,
 }
 
 /// A span query's leaves in order, the distance every adjacent pair must
@@ -59,30 +65,28 @@ impl PhrasePlan {
             let slot = plan.leaves[leaf];
             if read[slot] { 0 } else { rarity(slot) }
         };
-        let seed = (0..plan.leaves.len())
-            .min_by_key(|&leaf| cost(&read, leaf))
-            .expect("a leaf");
-        read[plan.leaves[seed]] = true;
-        plan.steps.push(Step {
-            slot: plan.leaves[seed],
-            pair: None,
-        });
-        let (mut left, mut right) = (seed, seed);
-        while left > 0 || right + 1 < plan.leaves.len() {
-            let leftward = left > 0
-                && (right + 1 >= plan.leaves.len()
-                    || cost(&read, left - 1) <= cost(&read, right + 1));
-            let (leaf, pair) = if leftward {
-                left -= 1;
-                (left, left)
-            } else {
-                right += 1;
-                (right, right - 1)
+        // Each step places the cheapest leaf left, a leaf whose slot is read
+        // costing nothing, and tests it against the nearest leaf placed,
+        // the earlier on a tie.
+        let mut placed = vec![false; plan.leaves.len()];
+        for _ in 0..plan.leaves.len() {
+            let leaf = (0..plan.leaves.len())
+                .filter(|&leaf| !placed[leaf])
+                .min_by_key(|&leaf| cost(&read, leaf))
+                .expect("a leaf left");
+            let before = (0..leaf).rev().find(|&other| placed[other]);
+            let after = (leaf + 1..plan.leaves.len()).find(|&other| placed[other]);
+            let pair = match (before, after) {
+                (Some(before), Some(after)) if after - leaf < leaf - before => Some((leaf, after)),
+                (Some(before), _) => Some((before, leaf)),
+                (None, Some(after)) => Some((leaf, after)),
+                (None, None) => None,
             };
+            placed[leaf] = true;
             read[plan.leaves[leaf]] = true;
             plan.steps.push(Step {
                 slot: plan.leaves[leaf],
-                pair: Some(pair),
+                pair,
             });
         }
         Some(plan)
@@ -95,13 +99,18 @@ impl PhrasePlan {
     }
 
     /// Whether the candidate keeps `pair`'s distance: some position of the
-    /// earlier leaf lies the pair's distance before some position of the
-    /// later one. Both leaves' slots must be read.
-    pub fn pair_keeps(&self, pair: usize, positions: &impl TermPositions) -> bool {
-        let (lo, hi) = self.gaps[pair];
+    /// earlier leaf lies the sum of the distances between the two before
+    /// some position of the later one. Both leaves' slots must be read.
+    pub fn pair_keeps(&self, pair: (usize, usize), positions: &impl TermPositions) -> bool {
+        let (earlier, later) = pair;
+        let (lo, hi) = self.gaps[earlier..later]
+            .iter()
+            .fold((0u32, 0u32), |(lo, hi), gap| {
+                (lo.saturating_add(gap.0), hi.saturating_add(gap.1))
+            });
         keeps_distance(
-            positions.positions(self.leaves[pair]),
-            positions.positions(self.leaves[pair + 1]),
+            positions.positions(self.leaves[earlier]),
+            positions.positions(self.leaves[later]),
             lo,
             hi,
         )
@@ -233,22 +242,36 @@ mod tests {
     }
 
     #[test]
-    fn reads_rarest_first_then_rarer_neighbour() {
+    fn reads_rarest_first_testing_the_nearest_leaf_read() {
         let plan = PhrasePlan::new(&phrase(&[0, 1, 2, 3], 0), |s| [50, 5, 40, 1][s]).unwrap();
         let slots: Vec<_> = plan.steps().iter().map(|s| (s.slot, s.pair)).collect();
-        assert_eq!(slots, [(3, None), (2, Some(2)), (1, Some(1)), (0, Some(0))]);
-        // A repeated word is read once and still tested at every pair.
+        assert_eq!(
+            slots,
+            [
+                (3, None),
+                (1, Some((1, 3))),
+                (2, Some((1, 2))),
+                (0, Some((0, 1)))
+            ]
+        );
+        // A pair two leaves apart keeps the sum of their distances.
+        let positions = vec![vec![], vec![4], vec![], vec![6]];
+        assert!(plan.pair_keeps((1, 3), &positions));
+        let positions = vec![vec![], vec![4], vec![], vec![5]];
+        assert!(!plan.pair_keeps((1, 3), &positions));
+        // A repeated word is read once, and its other leaves are placed
+        // before any slot more is read.
         let plan = PhrasePlan::new(&phrase(&[0, 1, 0, 0, 1, 0], 0), |s| [9, 3][s]).unwrap();
         let slots: Vec<_> = plan.steps().iter().map(|s| (s.slot, s.pair)).collect();
         assert_eq!(
             slots,
             [
                 (1, None),
-                (0, Some(0)),
-                (0, Some(1)),
-                (0, Some(2)),
-                (1, Some(3)),
-                (0, Some(4))
+                (1, Some((1, 4))),
+                (0, Some((0, 1))),
+                (0, Some((1, 2))),
+                (0, Some((2, 3))),
+                (0, Some((4, 5)))
             ]
         );
     }

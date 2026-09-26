@@ -2730,9 +2730,9 @@ impl OrdinalWalk<'_, '_> {
     }
 
     /// Reads the candidate's slots in the plan's order and says whether
-    /// every adjacent pair keeps its distance: from the rarest leaf
-    /// outwards, taking the rarer neighbour first, so a candidate fails on
-    /// the fewest reads.
+    /// every pair the plan tests keeps its distance: rarest slot first,
+    /// each leaf tested against the nearest leaf read before it, so a
+    /// candidate fails on the fewest and shortest reads.
     fn pairs_keep_distance(&mut self, phrase: &mut PhraseCheck<'_>, low: u16) -> bool {
         let Some(plan) = phrase.plan.take() else {
             return true;
