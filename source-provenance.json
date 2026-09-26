@@ -560,10 +560,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in aa870ad9470babeafa5ac2cf10f38eed5983efbf."
     },
-    "docs/benchmarks/query-shapes-exists-repro.sql": {
-      "owner": "ben",
-      "evidence": "Original Stannum standalone regression reproduction generated from query-shape suite."
-    },
     "docs/benchmarks/render_performance_snapshot.py": {
       "owner": "ben",
       "evidence": "Original Stannum chart renderer added for the recorded GIN/TIN performance snapshot; reads existing benchmark JSON without copied upstream implementation."
