@@ -304,10 +304,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
     },
-    "benchmarks/test_wide_cursor.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum wide-query fuzzer generation regression tests."
-    },
     "benchmarks/tin.py": {
       "owner": "ben",
       "evidence": "Original Stannum integration and validation for the pinned PlanetScale/ParadeDB benchmark driver. Upstream patch context retains its separate MIT license."
@@ -331,10 +327,6 @@
     "benchmarks/vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in a70ba90f4658fdc1f3b91cfb313a55429a76810c."
-    },
-    "benchmarks/vacuum_cleanup_pins.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum regression reproducing reader-pinned heap cleanup and validating benchmark accounting."
     },
     "boldi-vigna/Cargo.toml": {
       "owner": "planetscale",
@@ -452,57 +444,57 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
     },
-    "conformance/cases/catalog_alternatives.yaml": {
+    "conformance/cases/catalog.alternatives.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_alternatives.yaml."
     },
-    "conformance/cases/catalog_count.yaml": {
+    "conformance/cases/catalog.count.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_count.yaml."
     },
-    "conformance/cases/catalog_ddl.yaml": {
+    "conformance/cases/catalog.ddl.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_ddl.yaml."
     },
-    "conformance/cases/catalog_expansion.yaml": {
+    "conformance/cases/catalog.expansion.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_expansion.yaml."
     },
-    "conformance/cases/catalog_highlight.yaml": {
+    "conformance/cases/catalog.highlight.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_highlight.yaml."
     },
-    "conformance/cases/catalog_phrase.yaml": {
+    "conformance/cases/catalog.phrase.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_phrase.yaml."
     },
-    "conformance/cases/catalog_positions.yaml": {
+    "conformance/cases/catalog.positions.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_positions.yaml."
     },
-    "conformance/cases/catalog_proximity.yaml": {
+    "conformance/cases/catalog.proximity.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_proximity.yaml."
     },
-    "conformance/cases/catalog_relations.yaml": {
+    "conformance/cases/catalog.relations.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_relations.yaml."
     },
-    "conformance/cases/catalog_scoring.yaml": {
+    "conformance/cases/catalog.scoring.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_scoring.yaml."
     },
-    "conformance/cases/catalog_syntax.yaml": {
+    "conformance/cases/catalog.syntax.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_syntax.yaml."
     },
-    "conformance/cases/catalog_tokenize.yaml": {
+    "conformance/cases/catalog.tokenize.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_tokenize.yaml."
     },
-    "conformance/cases/catalog_topk.yaml": {
+    "conformance/cases/catalog.topk.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_topk.yaml."
     },
     "conformance/cases/query_size.yaml": {
       "owner": "ben",
@@ -512,9 +504,9 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
     },
-    "conformance/cases/span_minimal_interval.yaml": {
+    "conformance/cases/span.minimal_interval.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26. Moved from conformance/cases/span_minimal_interval.yaml."
     },
     "conformance/cases/spans.yaml": {
       "owner": "ben",
@@ -527,18 +519,6 @@
     "conformance/run.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
-    },
-    "docs/benchmarks/merge_lifecycle.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in aa870ad9470babeafa5ac2cf10f38eed5983efbf."
-    },
-    "docs/benchmarks/render_performance_snapshot.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum chart renderer added for the recorded GIN/TIN performance snapshot; reads existing benchmark JSON without copied upstream implementation."
-    },
-    "docs/benchmarks/render_query_shapes.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum renderer for synthetic query-shape measurements."
     },
     "docs/query-language/README.md": {
       "owner": "mixed",
@@ -756,6 +736,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9997c06219d0b106a91e788a959bc2036a7de179."
     },
+    "postgres/tests/merge_lifecycle.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in aa870ad9470babeafa5ac2cf10f38eed5983efbf. Moved from docs/benchmarks/merge_lifecycle.py."
+    },
     "postgres/tests/postings_lifecycle.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -763,6 +747,14 @@
     "postgres/tests/ranked_fuzz.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in c66fd1b570fc111d9cbe3d399065736d8013a447."
+    },
+    "postgres/tests/test_wide_cursor.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum wide-query fuzzer generation regression tests. Moved from benchmarks/test_wide_cursor.py."
+    },
+    "postgres/tests/vacuum_cleanup_pins.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum regression reproducing reader-pinned heap cleanup and validating benchmark accounting. Moved from benchmarks/vacuum_cleanup_pins.py."
     },
     "rust-toolchain.toml": {
       "owner": "planetscale",
@@ -774,6 +766,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
     },
+    "script/pgrx-lock.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in d3f5c9833304d4d8a2fa05edf7931f64aaf0d764."
+    },
     "script/reference-oracle": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 44ae79a7b960bdace26fbeccf5b34f9d3c6487fe."
@@ -781,6 +777,14 @@
     "script/source_headers.py": {
       "owner": "ben",
       "evidence": "Added for the Stannum attribution migration; original header-check tooling."
+    },
+    "script/test-all": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in bba2ea6dd197e3ca6ed553ef3f412964adc7be6e."
+    },
+    "script/test_pgrx_lock.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in d3f5c9833304d4d8a2fa05edf7931f64aaf0d764."
     },
     "script/test_source_headers.py": {
       "owner": "ben",

@@ -5,7 +5,7 @@
 
 """Deferred-merge checks in a private PG18 cluster; install a release build first.
 
-Run under /tmp/stannum-pgrx-lock.py on a shared development machine.
+Run under script/pgrx-lock.py on a shared development machine.
 No preload library or extra Python dependencies are needed.
 """
 import os
@@ -18,7 +18,7 @@ import time
 def main():
     root = Path(tempfile.mkdtemp(prefix="stannum-merge-"))
     data = root / "data"
-    env = dict(os.environ, PGHOST=str(root), PGPORT="28929", PGUSER="postgres",
+    env = dict(os.environ, PGHOST=str(root), PGPORT="28931", PGUSER="postgres",
                PGDATABASE="postgres", PGOPTIONS="-c statement_timeout=60000")
     for name in ("PGSERVICE", "PGSERVICEFILE", "PGPASSWORD"):
         env.pop(name, None)
@@ -46,7 +46,7 @@ def main():
         command(["initdb", "-D", str(data), "-U", "postgres", "-A", "trust",
                  "--no-locale", "--encoding=UTF8", "--data-checksums"])
         with (data / "postgresql.conf").open("a") as handle:
-            handle.write(f"\nlisten_addresses=''\nport=28929\nunix_socket_directories='{root}'\n"
+            handle.write(f"\nlisten_addresses=''\nport=28931\nunix_socket_directories='{root}'\n"
                          "shared_buffers='64MB'\nautovacuum_naptime='1s'\n"
                          "log_autovacuum_min_duration=0\nshared_preload_libraries=''\n")
         start()

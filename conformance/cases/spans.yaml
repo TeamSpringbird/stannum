@@ -5,8 +5,10 @@
 area: spans
 description: >
   Span operators (THEN/N, NEAR/N) whose operands are phrases, and the plain
-  spans beside them. Imported from TIN 1.0.3's recorded responses
-  (benchmarks/tin_behavior_probe.py at 29a520e, 2026-09-26).
+  spans beside them. First measured on TIN 1.0.3 by
+  benchmarks/tin_behavior_probe.py at 29a520e (2026-09-26), then recorded
+  by conformance/run.py. postgres/src/tin_conformance.rs replays these
+  cases by id in every `cargo pgrx test`.
 
 defaults:
   corpus: spans4

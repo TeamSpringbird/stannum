@@ -267,7 +267,7 @@ fn index_reads_allowed(index: pgrx::PgRelation) -> bool {
     unsafe { super::index_reads_allowed(index.as_ptr()) }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
+#[cfg(feature = "pg_test")]
 #[pgrx::pg_schema]
 mod tests {
     use super::*;

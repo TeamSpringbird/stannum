@@ -7,7 +7,7 @@ from pathlib import Path
 import random
 import unittest
 
-spec = importlib.util.spec_from_file_location('ranked_fuzz', Path(__file__).resolve().parents[1] / 'postgres/tests/ranked_fuzz.py')
+spec = importlib.util.spec_from_file_location('ranked_fuzz', Path(__file__).resolve().parent / 'ranked_fuzz.py')
 fuzz = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fuzz)
 

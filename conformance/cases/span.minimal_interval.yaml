@@ -6,10 +6,10 @@ area: span.minimal_interval
 description: >
   Phrases with gaps and spans whose operand is a phrase that shares a term
   with the other operand. A span must be matched on minimal intervals
-  without letting one token play two roles. TIN 1.0.3's answers were
-  measured on 2026-09-26 by the lead session (ad-hoc probe, PostgreSQL 18.6
-  on PlanetScale, us-east-1); matches were identical with the custom scan on
-  and off.
+  without letting one token play two roles. TIN 1.0.3's answers were first
+  measured on 2026-09-26 by a one-off psql probe (PostgreSQL 18.6 on
+  PlanetScale, us-east-1), with matches identical with the custom scan on
+  and off, and recorded again the same day by conformance/run.py.
 
 defaults:
   corpus: minimal6
