@@ -756,7 +756,7 @@ pub(crate) fn chunk_loads() -> i64 {
 #[cfg(any(test, feature = "pg_test"))]
 thread_local! {
     /// For tests: the chunk load of a scan at which to cancel the query,
-    /// zero for none, and the pages held pinned when it was cancelled.
+    /// zero for none, and the pages held pinned when it was canceled.
     static CANCEL_AT_LOAD: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
 }
 
@@ -3381,7 +3381,7 @@ impl OrdinalWalk<'_, '_> {
         for sub in 0..SUBS {
             // The sub-block's candidates. Most sub-blocks of a conjunction
             // of common words hold none, and are passed over whole: taking
-            // the chunk a word at a time, with a sub-block's judgement at
+            // the chunk a word at a time, with a sub-block's judgment at
             // every sixteenth, was a sixth of such a walk.
             let end = (sub + 1) * SUB;
             if sparse {
@@ -3918,7 +3918,7 @@ impl OrdinalWalk<'_, '_> {
         }
         let mut sparse_at = 0usize;
         // A sub-block is judged once, at its first word: the walk resolves
-        // locations in ordinal order, so the judgement cannot be repeated
+        // locations in ordinal order, so the judgment cannot be repeated
         // after a candidate of the sub-block has been resolved.
         let mut skip_sub = false;
         // The sub-block's candidate words, with the required terms ANDed in.

@@ -4,7 +4,7 @@
 
 area: smoke
 description: >
-  Basic behaviour every engine of the interface should share: terms,
+  Basic behavior every engine of the interface should share: terms,
   implicit AND, OR, NOT, phrases, prefix wildcards, boosts, count, top-k
   order and highlighting. No TIN answers are recorded yet.
 

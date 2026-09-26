@@ -1114,7 +1114,7 @@ def main():
     # No global lock here: a run or an image build works inside Docker and
     # touches no native pgrx build or install, and a full-scale run holding
     # the pgrx lock for hours blocked every test and image build meanwhile.
-    # Callers that must serialise with pgrx work wrap the command themselves.
+    # Callers that must serialize with pgrx work wrap the command themselves.
     args.func(args)
 
 

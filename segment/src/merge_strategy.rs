@@ -175,8 +175,8 @@ mod tests {
                     Err(MergeError::Limit("output bytes"))
                 ));
                 assert!(matches!(
-                    execute(strategy, &inputs, limits(), || Err(MergeError::Cancelled)),
-                    Err(MergeError::Cancelled)
+                    execute(strategy, &inputs, limits(), || Err(MergeError::Canceled)),
+                    Err(MergeError::Canceled)
                 ));
             }
         }
@@ -234,12 +234,12 @@ mod tests {
                 execute(strategy, &inputs, limits(), || {
                     calls += 1;
                     if calls == 9 {
-                        Err(MergeError::Cancelled)
+                        Err(MergeError::Canceled)
                     } else {
                         Ok(())
                     }
                 }),
-                Err(MergeError::Cancelled)
+                Err(MergeError::Canceled)
             ));
         }
     }

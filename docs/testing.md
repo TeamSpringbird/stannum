@@ -150,7 +150,7 @@ equality with the oracle's slice (ids, ctids and score text with
 
 On a failure the fuzzer writes `failure.json` and `repro.sql` into its
 artifact directory: the seed and arguments, the failing comparison, and every
-statement issued, in order, labelled by session. Re-running with the same
+statement issued, in order, labeled by session. Re-running with the same
 `--seed`, `--seconds`, `--writers`, `--readers` and `--corpus` repeats the
 scenario and random seed, but concurrent scheduling and the timed cutoff can
 change the exact execution. Retain the failing trace for diagnosis;

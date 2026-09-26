@@ -26,9 +26,9 @@ const NONE: usize = usize::MAX;
 struct Entry {
     key: Key,
     bytes: Rc<[u8]>,
-    /// More recently used neighbour.
+    /// More recently used neighbor.
     prev: usize,
-    /// Less recently used neighbour.
+    /// Less recently used neighbor.
     next: usize,
 }
 

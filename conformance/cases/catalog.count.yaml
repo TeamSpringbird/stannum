@@ -4,7 +4,7 @@
 
 area: catalog.count
 description: count(*), ==> with ANY and NULL, visibility and prepared statements. Encoded from docs/tin-behavior-catalog.md
-  section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine's answers
+  section 9 (compiled 2026-09-26); each case cites its catalog row and the behavior it tests. No engine's answers
   are recorded yet.
 defaults:
   settings: {enable_seqscan: 'off'}
@@ -34,7 +34,7 @@ corpora:
 cases:
 - id: catalog.N-01
   description: count(*) stays exact after DELETE and after VACUUM.
-  source: docs/tin-behavior-catalog.md §9 N-01; behaviour §6 C4
+  source: docs/tin-behavior-catalog.md §9 N-01; behavior §6 C4
   corpus: cat_n01
   capture:
   - script:
@@ -46,7 +46,7 @@ cases:
       - {sql: 'SELECT count(*) FROM {table} WHERE body ==> ''x'''}
 - id: catalog.N-02
   description: count(*) with and without the count pushdown.
-  source: docs/tin-behavior-catalog.md §9 N-02; behaviour §6 C4
+  source: docs/tin-behavior-catalog.md §9 N-02; behavior §6 C4
   corpus: cat_n02
   capture:
   - count: {query: x, as: pushdown}
@@ -56,14 +56,14 @@ cases:
       settings: {'{engine}.debug_disable_count_pushdown': 'on'}
 - id: catalog.N-03
   description: OR with a btree predicate returns the union without duplicates.
-  source: docs/tin-behavior-catalog.md §9 N-03; behaviour §6 C3
+  source: docs/tin-behavior-catalog.md §9 N-03; behavior §6 C3
   corpus: cat_n03
   capture:
   - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE body ==> ''a'' OR id = 1', as: same_row}
   - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE body ==> ''a'' OR id = 2', as: other_row}
 - id: catalog.N-04
   description: ==> ANY(array), with a NULL element and with an empty array.
-  source: docs/tin-behavior-catalog.md §9 N-04; behaviour §6 C2
+  source: docs/tin-behavior-catalog.md §9 N-04; behavior §6 C2
   corpus: cat_n04
   capture:
   - value: {sql: 'SELECT coalesce(json_agg(id ORDER BY id), ''[]'') FROM {table} WHERE body ==> ANY(ARRAY[''apple'',
@@ -74,7 +74,7 @@ cases:
       as: any_empty}
 - id: catalog.N-05
   description: NULL on either side of ==>.
-  source: docs/tin-behavior-catalog.md §9 N-05; behaviour §6 C9, §6 C10
+  source: docs/tin-behavior-catalog.md §9 N-05; behavior §6 C9, §6 C10
   priority: edge
   corpus: cat_n04
   capture:
@@ -83,7 +83,7 @@ cases:
   - value: {sql: 'SELECT coalesce(json_agg(id ORDER BY id), ''[]'') FROM {table} WHERE body ==> NULL', as: where_null}
 - id: catalog.N-06
   description: An uncommitted insert is invisible to another session and visible to its own.
-  source: docs/tin-behavior-catalog.md §9 N-06; behaviour §6 C11
+  source: docs/tin-behavior-catalog.md §9 N-06; behavior §6 C11
   corpus: cat_n06
   capture:
   - script:
@@ -96,7 +96,7 @@ cases:
       - {session: b, sql: 'SELECT count(*) FROM {table} WHERE body ==> ''zz'''}
 - id: catalog.N-07
   description: A prepared statement gives the same ids under generic and custom plans.
-  source: docs/tin-behavior-catalog.md §9 N-07; behaviour §6 C1
+  source: docs/tin-behavior-catalog.md §9 N-07; behavior §6 C1
   corpus: cat_n07
   capture:
   - script:

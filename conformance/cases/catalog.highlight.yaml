@@ -4,7 +4,7 @@
 
 area: catalog.highlight
 description: highlight() and highlight_ansi(). Encoded from docs/tin-behavior-catalog.md section 9 (compiled 2026-09-26);
-  each case cites its catalog row and the behaviour it tests. No engine's answers are recorded yet.
+  each case cites its catalog row and the behavior it tests. No engine's answers are recorded yet.
 defaults:
   settings: {enable_seqscan: 'off'}
 corpora:
@@ -46,57 +46,57 @@ corpora:
 cases:
 - id: catalog.H-01
   description: highlight(body) with the row's own predicate.
-  source: docs/tin-behavior-catalog.md §9 H-01; behaviour §4 H1
+  source: docs/tin-behavior-catalog.md §9 H-01; behavior §4 H1
   corpus: cat_h01
   capture:
   - highlight: {query: apple}
 - id: catalog.H-02
   description: 'BEFORE highlighting: does the leading b stay unmarked?'
-  source: docs/tin-behavior-catalog.md §9 H-02; behaviour §4 H3; §8 conflict 5
+  source: docs/tin-behavior-catalog.md §9 H-02; behavior §4 H3; §8 conflict 5
   priority: conflict
   capture:
   - value: {sql: 'SELECT {engine}.highlight(''b a b'', query => ''a BEFORE b'')'}
 - id: catalog.H-03
   description: A phrase is wrapped once, punctuation inside included.
-  source: docs/tin-behavior-catalog.md §9 H-03; behaviour §4 H4
+  source: docs/tin-behavior-catalog.md §9 H-03; behavior §4 H4
   corpus: cat_h03
   capture:
   - highlight: {query: '"fuji apple"'}
 - id: catalog.H-04
   description: Separate terms get separate tags; overlapping matches merge.
-  source: docs/tin-behavior-catalog.md §9 H-04; behaviour §4 H5
+  source: docs/tin-behavior-catalog.md §9 H-04; behavior §4 H5
   corpus: cat_h04
   capture:
   - highlight: {query: fuji OR apple, as: terms}
   - highlight: {query: '"fuji apple" OR apple', as: overlap}
 - id: catalog.H-05
   description: $QUERY_PART is the matching query part (the pattern for a wildcard).
-  source: docs/tin-behavior-catalog.md §9 H-05; behaviour §4 H6
+  source: docs/tin-behavior-catalog.md §9 H-05; behavior §4 H6
   capture:
   - value: {sql: 'SELECT {engine}.highlight(''send email now'', ''<b title="$QUERY_PART">'', ''</b>'', ''email*'')'}
 - id: catalog.H-06
   description: '$QUERY_LABEL: a CSS-safe label per query part.'
-  source: docs/tin-behavior-catalog.md §9 H-06; behaviour §4 H7
+  source: docs/tin-behavior-catalog.md §9 H-06; behavior §4 H7
   corpus: cat_h06
   capture:
   - highlight: {query: Apple OR 3d OR café OR "fuji apple", sql: 'SELECT id, {engine}.highlight(body, ''<i class="$QUERY_LABEL"
         title="$QUERY_PART">'', ''</i>'') FROM {table} WHERE body ==> {query} ORDER BY id'}
 - id: catalog.H-07
   description: Document text is not HTML-escaped.
-  source: docs/tin-behavior-catalog.md §9 H-07; behaviour §4 H8
+  source: docs/tin-behavior-catalog.md §9 H-07; behavior §4 H8
   corpus: cat_h07
   capture:
   - highlight: {query: apple}
 - id: catalog.H-08
   description: NULL text, no query to bind, and an invalid explicit query.
-  source: docs/tin-behavior-catalog.md §9 H-08; behaviour §4 H9, §4 H10, §4 H11
+  source: docs/tin-behavior-catalog.md §9 H-08; behavior §4 H9, §4 H10, §4 H11
   capture:
   - value: {sql: 'SELECT {engine}.highlight(NULL, query => ''a'')', as: null_text}
   - value: {sql: 'SELECT {engine}.highlight(''x'')', as: no_binding}
   - value: {sql: 'SELECT {engine}.highlight(''a b'', ''<b>'', ''</b>'', ''a AND'')', as: invalid_query}
 - id: catalog.H-09
   description: ANSI highlighting, byte for byte (hex).
-  source: docs/tin-behavior-catalog.md §9 H-09; behaviour §4 H13
+  source: docs/tin-behavior-catalog.md §9 H-09; behavior §4 H13
   corpus: cat_h09
   capture:
   - highlight: {query: red, as: red, sql: 'SELECT id, encode(convert_to({engine}.highlight_ansi(body), ''UTF8''),
@@ -107,7 +107,7 @@ cases:
         ''UTF8''), ''hex'') FROM {table} WHERE body ==> {query} ORDER BY id'}
 - id: catalog.H-10
   description: wrap_to reflows before highlighting; 0 and negative values.
-  source: docs/tin-behavior-catalog.md §9 H-10; behaviour §4 H14
+  source: docs/tin-behavior-catalog.md §9 H-10; behavior §4 H14
   corpus: cat_h10
   capture:
   - highlight: {query: apple, as: wrap_10, sql: 'SELECT id, encode(convert_to({engine}.highlight_ansi(body, 10),
@@ -118,13 +118,13 @@ cases:
         ''UTF8''), ''hex'') FROM {table} WHERE body ==> {query} ORDER BY id'}
 - id: catalog.H-11
   description: Byte offsets in multi-byte text.
-  source: docs/tin-behavior-catalog.md §9 H-11; behaviour §4 H16
+  source: docs/tin-behavior-catalog.md §9 H-11; behavior §4 H16
   corpus: cat_h11
   capture:
   - highlight: {query: naive}
 - id: catalog.H-12
   description: The implicit query binds through UPDATE ... RETURNING, a CTE and a subquery.
-  source: docs/tin-behavior-catalog.md §9 H-12; behaviour §4 H1
+  source: docs/tin-behavior-catalog.md §9 H-12; behavior §4 H1
   corpus: cat_h12
   capture:
   - value: {sql: 'UPDATE {table} SET body = body WHERE body ==> ''urgent'' RETURNING {engine}.highlight(body)',
@@ -135,14 +135,14 @@ cases:
       as: subquery}
 - id: catalog.H-13
   description: Only the text that produced the match is marked.
-  source: docs/tin-behavior-catalog.md §9 H-13; behaviour §4 H2, §4 H17
+  source: docs/tin-behavior-catalog.md §9 H-13; behavior §4 H2, §4 H17
   corpus: cat_h13
   capture:
   - highlight: {query: a AND NOT z, as: and_not}
   - highlight: {query: (a NEAR/3 c) ENCLOSES b, as: encloses}
 - id: catalog.H-14
   description: Highlighting follows the index's tokenizer (case_folding=preserve).
-  source: docs/tin-behavior-catalog.md §9 H-14; behaviour §4 H15; §8 conflict 11
+  source: docs/tin-behavior-catalog.md §9 H-14; behavior §4 H15; §8 conflict 11
   priority: conflict
   corpus: cat_h14
   capture:

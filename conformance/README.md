@@ -95,7 +95,7 @@ e.g. `tin-1.0.3`), naming the captures that differ:
 The entries cannot hide a regression: the case FAILs if a capture that is
 not listed differs, a listed capture matches the recorded answer again, a
 listed case matches entirely, or an improvement raises an ERROR where it
-should answer. Whether a divergence is an improvement is a judgement the
+should answer. Whether a divergence is an improvement is a judgment the
 entry records; the runner only checks its mechanics.
 
 ### Crashes
@@ -251,8 +251,8 @@ Case fields:
   (e.g. `catalog.F-02`); stable forever.
 - `description`: required. `corpus`: the case's corpus; a case that only
   calls functions (`value`, `error`) may omit it.
-- `source`: where the expected behaviour is documented (the catalog cases
-  cite `docs/tin-behavior-catalog.md` §9 and the behaviour row);
+- `source`: where the expected behavior is documented (the catalog cases
+  cite `docs/tin-behavior-catalog.md` §9 and the behavior row);
   `priority`: `conflict` for the §8 documentation conflicts, `edge` for
   error and edge cases. Both are documentation; the runner does not use
   them.

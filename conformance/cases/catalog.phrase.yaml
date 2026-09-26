@@ -4,7 +4,7 @@
 
 area: catalog.phrase
 description: Phrases, gaps, slop and alternatives inside phrases. Encoded from docs/tin-behavior-catalog.md section
-  9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine's answers are recorded
+  9 (compiled 2026-09-26); each case cites its catalog row and the behavior it tests. No engine's answers are recorded
   yet.
 defaults:
   settings: {enable_seqscan: 'off'}
@@ -63,51 +63,51 @@ corpora:
 cases:
 - id: catalog.P-01
   description: A phrase matches adjacent words in order.
-  source: docs/tin-behavior-catalog.md §9 P-01; behaviour §1.3 P1
+  source: docs/tin-behavior-catalog.md §9 P-01; behavior §1.3 P1
   corpus: cat_p01
   capture:
   - ids: {query: '"fuji apple"'}
 - id: catalog.P-02
   description: _ in a phrase is one wildcard position, __ two.
-  source: docs/tin-behavior-catalog.md §9 P-02; behaviour §1.3 P2
+  source: docs/tin-behavior-catalog.md §9 P-02; behavior §1.3 P2
   corpus: cat_p02
   capture:
   - ids: {query: '"big _ wolf"', as: one_gap}
   - ids: {query: '"big __ wolf"', as: two_gaps}
 - id: catalog.P-03
   description: Gaps are pinned per slot.
-  source: docs/tin-behavior-catalog.md §9 P-03; behaviour §1.3 P3
+  source: docs/tin-behavior-catalog.md §9 P-03; behavior §1.3 P3
   corpus: cat_p03
   capture:
   - ids: {query: '"a _ b __ c"'}
 - id: catalog.P-04
   description: Phrase slop ~N allows N extra words in total, in order.
-  source: docs/tin-behavior-catalog.md §9 P-04; behaviour §1.3 P5
+  source: docs/tin-behavior-catalog.md §9 P-04; behavior §1.3 P5
   corpus: cat_p04
   capture:
   - ids: {query: '"fuji apple"~2', as: slop_2}
   - ids: {query: '"fuji apple"~3', as: slop_3}
 - id: catalog.P-05
   description: 'Slop on top of pinned gaps: the gaps are the minimum.'
-  source: docs/tin-behavior-catalog.md §9 P-05; behaviour §1.3 P6
+  source: docs/tin-behavior-catalog.md §9 P-05; behavior §1.3 P6
   corpus: cat_p05
   capture:
   - ids: {query: '"a _ c"~1'}
 - id: catalog.P-06
   description: Alternatives for one phrase position.
-  source: docs/tin-behavior-catalog.md §9 P-06; behaviour §1.3 P7
+  source: docs/tin-behavior-catalog.md §9 P-06; behavior §1.3 P7
   corpus: cat_p06
   capture:
   - ids: {query: '"big [bad large] wolf"'}
 - id: catalog.P-07
   description: An expression inside phrase alternatives.
-  source: docs/tin-behavior-catalog.md §9 P-07; behaviour §1.3 P8
+  source: docs/tin-behavior-catalog.md §9 P-07; behavior §1.3 P8
   corpus: cat_p07
   capture:
   - ids: {query: '"alpha [MATCHES b.*]"'}
 - id: catalog.P-08
   description: Underscores inside phrase words, escaped and not, and outside a phrase.
-  source: docs/tin-behavior-catalog.md §9 P-08; behaviour §1.3 P9, §1.3 P10
+  source: docs/tin-behavior-catalog.md §9 P-08; behavior §1.3 P9, §1.3 P10
   corpus: cat_p08
   capture:
   - ids: {query: '"foo_bar"', as: phrase}
@@ -116,13 +116,13 @@ cases:
   - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''foo_bar'') t', as: tokenize}
 - id: catalog.P-09
   description: Punctuation and newlines between words do not break adjacency.
-  source: docs/tin-behavior-catalog.md §9 P-09; behaviour §1.3 P13
+  source: docs/tin-behavior-catalog.md §9 P-09; behavior §1.3 P13
   corpus: cat_p09
   capture:
   - ids: {query: '"alpha beta"'}
 - id: catalog.P-10
   description: 'A single-word phrase is the term: same matches and score bits.'
-  source: docs/tin-behavior-catalog.md §9 P-10; behaviour §1.3 P12
+  source: docs/tin-behavior-catalog.md §9 P-10; behavior §1.3 P12
   corpus: cat_p10
   capture:
   - ids: {query: '"apple"', as: phrase_ids}
@@ -131,7 +131,7 @@ cases:
   - scores: {query: apple, score: '{engine}.full_score(ctid)', as: term_bits}
 - id: catalog.P-11
   description: A phrase whose words all analyze away matches nothing, without an error.
-  source: docs/tin-behavior-catalog.md §9 P-11; behaviour §1.3 P11
+  source: docs/tin-behavior-catalog.md §9 P-11; behavior §1.3 P11
   corpus: cat_q13
   capture:
   - count: {query: '"..."'}

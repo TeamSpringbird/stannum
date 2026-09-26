@@ -1648,7 +1648,7 @@ mod tests {
         );
         assert!(walks >= 16, "{walks} walks");
         assert!(peak >= 4, "no walk held a chunk's pages: {peak}");
-        // A walk cancelled mid-way, with chunk pages held, releases them as
+        // A walk canceled mid-way, with chunk pages held, releases them as
         // the cancel unwinds it.
         for query in [
             "alpha OR beta OR gamma",
@@ -1673,15 +1673,15 @@ mod tests {
                 "DO $$ BEGIN
                    PERFORM id FROM inplace WHERE body ==> '{query}'
                      ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10;
-                   RAISE EXCEPTION 'the walk was not cancelled';
+                   RAISE EXCEPTION 'the walk was not canceled';
                  EXCEPTION WHEN query_canceled THEN NULL;
                  END $$"
             ))
             .unwrap();
             let holding = crate::score::cancel_at_chunk_load(0);
-            assert!(holding > 0, "{query}: cancelled holding no pages");
+            assert!(holding > 0, "{query}: canceled holding no pages");
             let held = crate::storage::held_pages();
-            assert_eq!(held.0, 0, "{query}: cancelled walk left {held:?}");
+            assert_eq!(held.0, 0, "{query}: canceled walk left {held:?}");
         }
         // And the next walk reads as before.
         let count = Spi::get_one::<i64>(

@@ -4,7 +4,7 @@
 
 area: catalog.scoring
 description: BM25 scoring, dense-term elision, score options and statistics. Encoded from docs/tin-behavior-catalog.md
-  section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine's answers
+  section 9 (compiled 2026-09-26); each case cites its catalog row and the behavior it tests. No engine's answers
   are recorded yet.
 defaults:
   settings: {enable_seqscan: 'off'}
@@ -121,7 +121,7 @@ corpora:
 cases:
 - id: catalog.S-01
   description: BM25 bits and ranking under full_score and score.
-  source: docs/tin-behavior-catalog.md §9 S-01; behaviour §3 S3, §3 S4
+  source: docs/tin-behavior-catalog.md §9 S-01; behavior §3 S3, §3 S4
   corpus: cat_s01
   capture:
   - scores: {query: a OR b, score: '{engine}.full_score(ctid)', as: full_bits}
@@ -129,26 +129,26 @@ cases:
   - ranked: {query: a OR b, score: '{engine}.full_score(ctid)', k: 100, as: full_ranked}
 - id: catalog.S-02
   description: 'Term frequencies 3 and 4 share a quantization bucket: equal scores.'
-  source: docs/tin-behavior-catalog.md §9 S-02; behaviour §3 S5
+  source: docs/tin-behavior-catalog.md §9 S-02; behavior §3 S5
   corpus: cat_s02
   capture:
   - scores: {query: w, score: '{engine}.full_score(ctid)'}
 - id: catalog.S-03
   description: 'Term frequencies 4 and 5 fall in different buckets: different scores.'
-  source: docs/tin-behavior-catalog.md §9 S-03; behaviour §3 S5
+  source: docs/tin-behavior-catalog.md §9 S-03; behavior §3 S5
   corpus: cat_s03
   capture:
   - scores: {query: w, score: '{engine}.full_score(ctid)'}
 - id: catalog.S-04
   description: idf and length normalization on a five-document corpus.
-  source: docs/tin-behavior-catalog.md §9 S-04; behaviour §3 S3
+  source: docs/tin-behavior-catalog.md §9 S-04; behavior §3 S3
   corpus: cat_s04
   capture:
   - scores: {query: rare OR common, score: '{engine}.full_score(ctid)'}
 - id: catalog.S-05
   description: Dense-term elision at 9, 10 and 11 of 100 documents; a boost pins a term; dense_ratio above 1 disables
     elision.
-  source: docs/tin-behavior-catalog.md §9 S-05; behaviour §3 S8, §3 S9; §8 conflict 6
+  source: docs/tin-behavior-catalog.md §9 S-05; behavior §3 S8, §3 S9; §8 conflict 6
   priority: conflict
   corpus: cat_s05
   capture:
@@ -161,7 +161,7 @@ cases:
   - scores: {query: eleven, score: '{engine}.score(ctid, dense_ratio => 1.1)', as: eleven_ratio_1_1}
 - id: catalog.S-06
   description: score_inspect after elision, at the default ratio and at 0.25.
-  source: docs/tin-behavior-catalog.md §9 S-06; behaviour §3 S28
+  source: docs/tin-behavior-catalog.md §9 S-06; behavior §3 S28
   corpus: cat_s05
   capture:
   - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
@@ -171,7 +171,7 @@ cases:
         => 0.25)', as: ratio_0_25}
 - id: catalog.S-07
   description: Elision statistics with every row in the mutable segment, before and after promote.
-  source: docs/tin-behavior-catalog.md §9 S-07; behaviour §3 S10
+  source: docs/tin-behavior-catalog.md §9 S-07; behavior §3 S10
   corpus: cat_s07
   capture:
   - script:
@@ -187,14 +187,14 @@ cases:
           ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
 - id: catalog.S-08
   description: 'full_score ignores elision: ''the'' is dense (20 of 110 documents).'
-  source: docs/tin-behavior-catalog.md §9 S-08; behaviour §3 S11
+  source: docs/tin-behavior-catalog.md §9 S-08; behavior §3 S11
   corpus: cat_s08
   capture:
   - scores: {query: the AND midnight, score: '{engine}.score(ctid)', as: score}
   - scores: {query: the AND midnight, score: '{engine}.full_score(ctid)', as: full_score}
 - id: catalog.S-09
   description: A wildcard scores the dictionary terms it reaches, at its boost.
-  source: docs/tin-behavior-catalog.md §9 S-09; behaviour §3 S13; §8 conflict 7
+  source: docs/tin-behavior-catalog.md §9 S-09; behavior §3 S13; §8 conflict 7
   priority: conflict
   corpus: cat_s09
   capture:
@@ -202,7 +202,7 @@ cases:
   - scores: {query: appl*^2, score: '{engine}.full_score(ctid)', as: wildcard_boost_2}
 - id: catalog.S-10
   description: 'Regex, range and fuzzy expansions: do they score?'
-  source: docs/tin-behavior-catalog.md §9 S-10; behaviour §3 S13; §8 conflict 7
+  source: docs/tin-behavior-catalog.md §9 S-10; behavior §3 S13; §8 conflict 7
   priority: conflict
   corpus: cat_s10
   capture:
@@ -211,7 +211,7 @@ cases:
   - scores: {query: ant~1, score: '{engine}.full_score(ctid)', as: fuzzy}
 - id: catalog.S-11
   description: A boolean NOT drops its subtree from scoring; a negative span relation does not.
-  source: docs/tin-behavior-catalog.md §9 S-11; behaviour §3 S14; §8 conflict 7
+  source: docs/tin-behavior-catalog.md §9 S-11; behavior §3 S14; §8 conflict 7
   priority: conflict
   corpus: cat_s11
   capture:
@@ -221,7 +221,7 @@ cases:
         term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''a NOT OVERLAPPING b'')', as: not_overlapping}
 - id: catalog.S-12
   description: Repeated occurrences add their boosts; duplicates are removed; nested boosts multiply.
-  source: docs/tin-behavior-catalog.md §9 S-12; behaviour §3 S12, §1.9 W6
+  source: docs/tin-behavior-catalog.md §9 S-12; behavior §3 S12, §1.9 W6
   corpus: cat_s12
   capture:
   - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
@@ -232,7 +232,7 @@ cases:
         term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''(a^2)^3'')', as: nested}
 - id: catalog.S-13
   description: term_add and term_replace; both at once is an error.
-  source: docs/tin-behavior-catalog.md §9 S-13; behaviour §3 S15
+  source: docs/tin-behavior-catalog.md §9 S-13; behavior §3 S15
   corpus: cat_s13
   capture:
   - scores: {query: alpha, score: '{engine}.score(ctid, term_add => ARRAY[''Gamma''])', as: term_add}
@@ -241,7 +241,7 @@ cases:
       as: both}
 - id: catalog.S-14
   description: Calls in one statement must agree on dense_ratio; k1 may differ; arguments must be constant.
-  source: docs/tin-behavior-catalog.md §9 S-14; behaviour §3 S16
+  source: docs/tin-behavior-catalog.md §9 S-14; behavior §3 S16
   corpus: cat_s13
   capture:
   - value: {sql: 'SELECT json_agg(json_build_array(id, encode(float4send({engine}.score(ctid, dense_ratio => 0.1)),
@@ -254,7 +254,7 @@ cases:
         ''hex'')) ORDER BY id) FROM {table} WHERE body ==> ''alpha''', as: row_dependent_k1}
 - id: catalog.S-15
   description: score and full_score on the same relation is an error.
-  source: docs/tin-behavior-catalog.md §9 S-15; behaviour §3 S17; §8 conflict 14
+  source: docs/tin-behavior-catalog.md §9 S-15; behavior §3 S17; §8 conflict 14
   priority: conflict
   corpus: cat_s13
   capture:
@@ -262,7 +262,7 @@ cases:
         WHERE body ==> ''alpha'''}
 - id: catalog.S-16
   description: Scoring without a scan is an error; UPDATE ... RETURNING with a search predicate.
-  source: docs/tin-behavior-catalog.md §9 S-16; behaviour §3 S18
+  source: docs/tin-behavior-catalog.md §9 S-16; behavior §3 S18
   corpus: cat_s13
   capture:
   - value: {sql: 'SELECT {engine}.score(ctid) FROM {table} ORDER BY id LIMIT 1', as: no_scan}
@@ -270,7 +270,7 @@ cases:
         ''hex'')', as: update_returning}
 - id: catalog.S-17
   description: max_score is the best actual score; alone it follows full_score.
-  source: docs/tin-behavior-catalog.md §9 S-17; behaviour §3 S19
+  source: docs/tin-behavior-catalog.md §9 S-17; behavior §3 S19
   corpus: cat_s17
   capture:
   - value: {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid) / {engine}.max_score(ctid)),
@@ -281,7 +281,7 @@ cases:
         WHERE body ==> ''a'') f', as: max_full_score}
 - id: catalog.S-18
   description: Scores sum across predicates on two indexed columns (product docs) or use one (Lead).
-  source: docs/tin-behavior-catalog.md §9 S-18; behaviour §3 S20; §8 conflict 4
+  source: docs/tin-behavior-catalog.md §9 S-18; behavior §3 S20; §8 conflict 4
   priority: conflict
   corpus: cat_s18
   capture:
@@ -291,7 +291,7 @@ cases:
         ORDER BY id), ''[]'') FROM {table} WHERE name ==> ''fuji^1.5'' OR notes ==> ''citrus''', as: or_boosted}
 - id: catalog.S-19
   description: Two predicates on the same column versus one combined query.
-  source: docs/tin-behavior-catalog.md §9 S-19; behaviour §3 S21
+  source: docs/tin-behavior-catalog.md §9 S-19; behavior §3 S21
   corpus: cat_s19
   capture:
   - value: {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
@@ -300,7 +300,7 @@ cases:
         ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''a b''', as: one_query}
 - id: catalog.S-20
   description: 'Statistics count deleted rows until a rewrite: bits after DELETE, VACUUM and REINDEX.'
-  source: docs/tin-behavior-catalog.md §9 S-20; behaviour §3 S23; §8 conflict 8
+  source: docs/tin-behavior-catalog.md §9 S-20; behavior §3 S23; §8 conflict 8
   priority: conflict
   corpus: cat_s20
   capture:
@@ -319,7 +319,7 @@ cases:
           ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''rare OR common'''}
 - id: catalog.S-21
   description: Token-less documents are left out of N and avgdl (compare with S-04).
-  source: docs/tin-behavior-catalog.md §9 S-21; behaviour §3 S7; §8 conflict 8
+  source: docs/tin-behavior-catalog.md §9 S-21; behavior §3 S7; §8 conflict 8
   priority: conflict
   corpus: cat_s21
   capture:
@@ -327,7 +327,7 @@ cases:
 - id: catalog.S-22
   description: 'Scores do not depend on the plan: custom scan on and off. (Add each debug_force_* value once TIN''s
     names and values are recorded.)'
-  source: docs/tin-behavior-catalog.md §9 S-22; behaviour §3 S25
+  source: docs/tin-behavior-catalog.md §9 S-22; behavior §3 S25
   corpus: cat_s01
   variants:
     settings:
@@ -339,7 +339,7 @@ cases:
   - scores: {query: a OR b, score: '{engine}.score(ctid)', as: score_bits}
 - id: catalog.S-23
   description: Per-index k1 and b, ALTER INDEX SET without a rebuild, and score_stop_words matched exactly.
-  source: docs/tin-behavior-catalog.md §9 S-23; behaviour §3 S1, §3 S29
+  source: docs/tin-behavior-catalog.md §9 S-23; behavior §3 S1, §3 S29
   corpus: cat_s23
   capture:
   - script:
@@ -354,7 +354,7 @@ cases:
   - scores: {query: the OR x, score: '{engine}.score(ctid)', as: stop_words_lower, corpus: cat_s23_lower}
 - id: catalog.S-24
   description: k1, b and dense_ratio outside their domains are errors, at DDL and at run time.
-  source: docs/tin-behavior-catalog.md §9 S-24; behaviour §3 S2
+  source: docs/tin-behavior-catalog.md §9 S-24; behavior §3 S2
   corpus: cat_s13
   capture:
   - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (b = 1.5)', as: ddl_b_1_5}

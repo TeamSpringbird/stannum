@@ -46,8 +46,8 @@ pub enum MergeError {
     InvalidInput { index: usize, detail: String },
     #[error("merge limit exceeded: {0}")]
     Limit(&'static str),
-    #[error("merge cancelled")]
-    Cancelled,
+    #[error("merge canceled")]
+    Canceled,
     #[error("cannot allocate merge output")]
     Allocation,
 }
@@ -594,12 +594,12 @@ pub(crate) mod tests {
                     merge(&input, limits(), || {
                         at += 1;
                         if at == stop {
-                            Err(MergeError::Cancelled)
+                            Err(MergeError::Canceled)
                         } else {
                             Ok(())
                         }
                     }),
-                    Err(MergeError::Cancelled)
+                    Err(MergeError::Canceled)
                 ));
             }
             assert_eq!(blobs, original);

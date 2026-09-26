@@ -130,7 +130,7 @@ def setup(control, rows):
     control.execute('CREATE EXTENSION IF NOT EXISTS stannum')
     control.execute('CREATE TABLE exit_docs(id int PRIMARY KEY, body text)')
     control.execute('SELECT setseed(0.42)')
-    # Zipf-like: a cube of a uniform draw favours the first words, so a few
+    # Zipf-like: a cube of a uniform draw favors the first words, so a few
     # are in most documents and most are rare.
     control.execute("""INSERT INTO exit_docs
         SELECT n, (SELECT string_agg((%s::text[])[1 + floor(power(random(), 3) * %s)::int], ' ')

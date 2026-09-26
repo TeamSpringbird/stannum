@@ -4,7 +4,7 @@
 
 area: catalog.ddl
 description: Index creation, options and settings. Encoded from docs/tin-behavior-catalog.md section 9 (compiled
-  2026-09-26); each case cites its catalog row and the behaviour it tests. No engine's answers are recorded yet.
+  2026-09-26); each case cites its catalog row and the behavior it tests. No engine's answers are recorded yet.
 defaults:
   settings: {enable_seqscan: 'off'}
 corpora:
@@ -36,14 +36,14 @@ corpora:
 cases:
 - id: catalog.I-01
   description: 'Only one text column: two columns, or an int column, are errors.'
-  source: docs/tin-behavior-catalog.md §9 I-01; behaviour §5 I1
+  source: docs/tin-behavior-catalog.md §9 I-01; behavior §5 I1
   corpus: cat_i01
   capture:
   - error: {sql: 'CREATE INDEX ON {table} USING {engine}(id, body)', as: two_columns}
   - error: {sql: 'CREATE INDEX ON {table} USING {engine}(id)', as: int_column}
 - id: catalog.I-02
   description: 'Every WITH option at its endpoints and one step outside: accepted or an error.'
-  source: docs/tin-behavior-catalog.md §9 I-02; behaviour §5 I4
+  source: docs/tin-behavior-catalog.md §9 I-02; behavior §5 I4
   corpus: cat_i01
   capture:
   - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (k1 = 0)', as: k1=0}
@@ -98,27 +98,27 @@ cases:
         a'}
 - id: catalog.I-03
   description: An expression index answers the repeated expression; the plain column is a filter.
-  source: docs/tin-behavior-catalog.md §9 I-03; behaviour §5 I2
+  source: docs/tin-behavior-catalog.md §9 I-03; behavior §5 I2
   corpus: cat_i03
   capture:
   - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE (data->>''title'') ==> ''x''', as: expression}
   - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE body ==> ''x''', as: column}
 - id: catalog.I-04
   description: A partial index, with its predicate implied and not.
-  source: docs/tin-behavior-catalog.md §9 I-04; behaviour §5 I2
+  source: docs/tin-behavior-catalog.md §9 I-04; behavior §5 I2
   corpus: cat_i04
   capture:
   - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE active AND body ==> ''x''', as: implied}
   - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE body ==> ''x''', as: not_implied}
 - id: catalog.I-05
   description: An index on a citext column.
-  source: docs/tin-behavior-catalog.md §9 I-05; behaviour §5 I1
+  source: docs/tin-behavior-catalog.md §9 I-05; behavior §5 I1
   corpus: cat_i05
   capture:
   - ids: {query: APPLE}
 - id: catalog.I-06
   description: Without an index, ==> is an ordinary filter with the default tokenizer.
-  source: docs/tin-behavior-catalog.md §9 I-06; behaviour §5 I6
+  source: docs/tin-behavior-catalog.md §9 I-06; behavior §5 I6
   corpus: cat_i06
   capture:
   - ids:
@@ -126,6 +126,6 @@ cases:
       settings: {enable_seqscan: 'on'}
 - id: catalog.I-07
   description: A session SET of maintenance_jobs_per_db is rejected.
-  source: docs/tin-behavior-catalog.md §9 I-07; behaviour §5 I9
+  source: docs/tin-behavior-catalog.md §9 I-07; behavior §5 I9
   capture:
   - error: {sql: 'SET {engine}.maintenance_jobs_per_db = 1'}

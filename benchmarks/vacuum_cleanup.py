@@ -300,7 +300,7 @@ ANALYZE docs;"""
         sql(setup)
         if args.vacuum_strategy:
             # Unknown custom-GUC placeholders also pass current_setting();
-            # require a real registered setting before labelling the strategy.
+            # require a real registered setting before labeling the strategy.
             verify_strategy(sql, args.vacuum_strategy)
         before = json.loads(sql("SELECT json_agg(row_to_json(s)) FROM stannum.segment_info('docs_idx') s"))
         assert len(before) == segments and all(row['kind'] == 'immutable' for row in before), before
