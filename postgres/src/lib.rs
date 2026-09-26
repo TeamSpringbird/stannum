@@ -4682,6 +4682,148 @@ mod tests {
         check();
     }
 
+    /// The SQLSTATE and message `sql` fails with, or `None` when it succeeds.
+    /// The statement runs in a subtransaction, so a failure leaves the
+    /// test's transaction usable.
+    fn outcome(sql: &str) -> Option<(String, String)> {
+        Spi::run(
+            "CREATE OR REPLACE FUNCTION pg_temp.outcome(statement text) RETURNS text[]
+             LANGUAGE plpgsql AS $$
+             DECLARE state text; message text;
+             BEGIN
+                 EXECUTE statement;
+                 RETURN NULL;
+             EXCEPTION WHEN OTHERS THEN
+                 GET STACKED DIAGNOSTICS state = RETURNED_SQLSTATE, message = MESSAGE_TEXT;
+                 RETURN ARRAY[state, message];
+             END $$",
+        )
+        .unwrap();
+        Spi::get_one::<Vec<String>>(&format!("SELECT pg_temp.outcome($outcome${sql}$outcome$)"))
+            .unwrap()
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+    }
+
+    /// Every WITH option at the ends of its domain and one step outside:
+    /// TIN 1.0.3 accepts the ends and rejects the rest with 22023 (answers
+    /// recorded in conformance/expected/tin-1.0.3/catalog.ddl.json,
+    /// catalog.I-02).
+    #[pg_test]
+    fn tin_1_0_3_index_option_domains() {
+        Spi::run("CREATE TABLE option_domains(body text)").unwrap();
+        for (option, rejected) in [
+            ("k1 = 0", None),
+            ("k1 = 10000", None),
+            ("k1 = -1", Some("value -1 out of bounds for option \"k1\"")),
+            (
+                "k1 = 10001",
+                Some("value 10001 out of bounds for option \"k1\""),
+            ),
+            ("b = 0", None),
+            ("b = 1", None),
+            (
+                "b = -0.1",
+                Some("value -0.1 out of bounds for option \"b\""),
+            ),
+            ("b = 1.1", Some("value 1.1 out of bounds for option \"b\"")),
+            ("max_token_bytes = 4", None),
+            ("max_token_bytes = 2692", None),
+            (
+                "max_token_bytes = 3",
+                Some("value 3 out of bounds for option \"max_token_bytes\""),
+            ),
+            (
+                "max_token_bytes = 2693",
+                Some("value 2693 out of bounds for option \"max_token_bytes\""),
+            ),
+            ("initial_segment_count = 1", None),
+            ("initial_segment_count = 4096", None),
+            (
+                "initial_segment_count = 0",
+                Some("value 0 out of bounds for option \"initial_segment_count\""),
+            ),
+            (
+                "initial_segment_count = 4097",
+                Some("value 4097 out of bounds for option \"initial_segment_count\""),
+            ),
+            ("target_segment_count = 1", None),
+            ("target_segment_count = 4096", None),
+            (
+                "target_segment_count = 0",
+                Some("value 0 out of bounds for option \"target_segment_count\""),
+            ),
+            (
+                "target_segment_count = 4097",
+                Some("value 4097 out of bounds for option \"target_segment_count\""),
+            ),
+            ("max_mutable_segment_size = 131072", None),
+            (
+                "max_mutable_segment_size = 131071",
+                Some("value 131071 out of bounds for option \"max_mutable_segment_size\""),
+            ),
+            ("max_merged_segment_size = 100", None),
+            (
+                "max_merged_segment_size = 99",
+                Some("value 99 out of bounds for option \"max_merged_segment_size\""),
+            ),
+            ("dead_percent_threshold = 0", None),
+            ("dead_percent_threshold = 1", None),
+            (
+                "dead_percent_threshold = -0.1",
+                Some("value -0.1 out of bounds for option \"dead_percent_threshold\""),
+            ),
+            (
+                "dead_percent_threshold = 1.1",
+                Some("value 1.1 out of bounds for option \"dead_percent_threshold\""),
+            ),
+            ("tokenizer = 'unicode'", None),
+            ("tokenizer = 'whitespace'", None),
+            (
+                "tokenizer = 'icu'",
+                Some("invalid value for enum option \"tokenizer\": icu"),
+            ),
+            ("case_folding = 'fold'", None),
+            ("case_folding = 'preserve'", None),
+            (
+                "case_folding = 'upper'",
+                Some("invalid value for enum option \"case_folding\": upper"),
+            ),
+            ("accent_folding = 'fold'", None),
+            ("accent_folding = 'preserve'", None),
+            (
+                "accent_folding = 'strip'",
+                Some("invalid value for enum option \"accent_folding\": strip"),
+            ),
+            ("long_tokens = 'split'", None),
+            ("long_tokens = 'truncate'", None),
+            ("long_tokens = 'discard'", None),
+            (
+                "long_tokens = 'wrap'",
+                Some("invalid value for enum option \"long_tokens\": wrap"),
+            ),
+            ("graphemes = 'emoji'", None),
+            ("graphemes = 'retain'", None),
+            ("graphemes = 'discard'", None),
+            (
+                "graphemes = 'all'",
+                Some("invalid value for enum option \"graphemes\": all"),
+            ),
+            ("position_gaps = 'preserve'", None),
+            ("position_gaps = 'collapse'", None),
+            (
+                "position_gaps = 'keep'",
+                Some("invalid value for enum option \"position_gaps\": keep"),
+            ),
+            ("score_stop_words = 'the, a'", None),
+        ] {
+            let got = outcome(&format!(
+                "CREATE INDEX ON option_domains USING stannum(body) WITH ({option})"
+            ));
+            let want = rejected.map(|message| ("22023".to_owned(), message.to_owned()));
+            assert_eq!(got, want, "WITH ({option})");
+        }
+    }
+
     #[pg_test]
     fn tin_maintenance_options_are_accepted_without_changing_search() {
         Spi::run("CREATE TABLE compat_options(id int, body text);
