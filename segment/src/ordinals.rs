@@ -299,6 +299,10 @@ pub trait Fetch<'a> {
     fn held_slot(&self) -> Option<usize> {
         None
     }
+    /// The hold span open or last opened (see [`Source::hold_generation`]).
+    fn hold_generation(&self) -> u64 {
+        0
+    }
     /// `len` bytes at `offset` of the stream in place from pages held
     /// pinned in `slot` (see [`Source::held_range`]).
     fn fetch_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
@@ -670,6 +674,13 @@ impl<'a> Ordinals<'a> {
     /// pages in place (see [`crate::source::Source::held_slot`]).
     pub fn held_slot(&self) -> Option<usize> {
         self.source.held_slot()
+    }
+
+    /// The source's hold span open or last opened (see
+    /// [`crate::source::Source::hold_generation`]): slots and the chunks
+    /// read through them are valid only in the span that handed them out.
+    pub fn hold_generation(&self) -> u64 {
+        self.source.hold_generation()
     }
 
     /// Chunk `i`, its members read in place from the pages the source holds

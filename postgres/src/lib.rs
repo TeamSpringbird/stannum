@@ -2340,6 +2340,116 @@ mod tests {
     }
 
     #[pg_test]
+    fn warm_up_passes_read_in_place_only_through_their_own_hold_span() {
+        // One segment of three chunks of ordinals. `zeta` and `eta` are in
+        // the first two, `theta` in every document. In the first chunk
+        // every document is short, so it bounds highest and is the one
+        // warmed; there `zeta` and `eta` never meet, so the warm pass loads
+        // their chunks in place and never `theta`'s. The walk then loads
+        // `zeta` and `eta` again in the second chunk, and `theta` for the
+        // first time: a term may read in place only through slots of the
+        // hold span it runs in, and `theta`'s fresh slots are the numbers
+        // the warm pass handed the others.
+        Spi::run(
+            "CREATE TABLE warm_span(id int primary key, body text);
+             INSERT INTO warm_span SELECT n,
+               CASE WHEN n <= 65536 THEN
+                 CASE n % 500 WHEN 0 THEN 'zeta theta' WHEN 250 THEN 'eta theta'
+                   ELSE 'theta' END
+               ELSE
+                 'theta pad pad pad pad pad pad pad pad' ||
+                 CASE WHEN n > 131072 THEN ''
+                   WHEN n % 500 = 0 THEN ' zeta eta'
+                   WHEN n % 500 = 250 THEN ' eta' ELSE '' END
+               END
+               FROM generate_series(1, 150000) n;
+             SET LOCAL stannum.build_segment_docs = 200000;
+             CREATE INDEX warm_span_idx ON warm_span USING stannum(body);",
+        )
+        .unwrap();
+        let layout = Spi::get_one::<String>(
+            "SELECT string_agg(kind || ' ' || docs, ', ' ORDER BY ordinal)
+             FROM stannum.segment_info('warm_span_idx')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(layout, "immutable 150000", "{layout}");
+        let query = "zeta AND eta AND theta";
+        let ranked = |custom: bool, warmup: i32, order_by: &str| {
+            Spi::run(&format!(
+                "SET LOCAL stannum.enable_custom_scan = {custom}; SET LOCAL enable_seqscan = off;
+                 SET LOCAL enable_bitmapscan = {};
+                 SET LOCAL stannum.warmup_chunks = {warmup};
+                 SET LOCAL stannum.warmup_min_matches = 0;",
+                !custom
+            ))
+            .unwrap();
+            Spi::connect(|client| {
+                client
+                    .select(
+                        &format!(
+                            "SELECT id, {order_by} AS score FROM warm_span
+                             WHERE body ==> '{query}'
+                             ORDER BY score DESC{} LIMIT 10",
+                            if custom { "" } else { ", ctid" }
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        for order_by in [
+            "stannum.full_score(ctid)",
+            "stannum.score(ctid)",
+            "stannum.score(ctid, 1.0)",
+        ] {
+            let expected = ranked(false, 0, order_by);
+            assert_eq!(expected.len(), 10, "{order_by}");
+            for warmup in [0, 1, 2] {
+                assert_eq!(
+                    ranked(true, warmup, order_by),
+                    expected,
+                    "{order_by} warm-up {warmup}"
+                );
+            }
+        }
+        // The first chunk alone was warmed, so the walk had the second.
+        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node.clone());
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        Spi::run(
+            "SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_bitmapscan = off;
+             SET LOCAL stannum.warmup_chunks = 1;",
+        )
+        .unwrap();
+        let plan = Spi::get_one::<Json>(&format!(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM warm_span WHERE body ==> '{query}'
+             ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10"
+        ))
+        .unwrap()
+        .unwrap()
+        .0;
+        let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
+        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(scan["Warm-up Chunks"].as_i64(), Some(1), "{scan}");
+    }
+
+    #[pg_test]
     fn ranked_work_counters_distinguish_filtered_completion() {
         Spi::run(
             "CREATE TABLE ranked_work(id int, body text);

@@ -193,6 +193,15 @@ pub trait Source {
         let _ = open;
     }
 
+    /// The outermost [`Source::hold`] span open or last opened, as a number
+    /// no other outermost span of any source in the process shares: slots
+    /// from [`Source::held_slot`] and the pages read through them belong
+    /// to the span that handed them out, and a reader may check it still
+    /// is the one open. Zero for a source that holds nothing.
+    fn hold_generation(&self) -> u64 {
+        0
+    }
+
     /// The page covering `offset`, held pinned in `slot` in place of the
     /// page held there: for a table read a few bytes at a time in ascending
     /// order, where a copied window per read cost a buffer lookup and a
@@ -301,6 +310,9 @@ impl Source for Box<dyn Source> {
     }
     fn hold(&self, open: bool) {
         (**self).hold(open);
+    }
+    fn hold_generation(&self) -> u64 {
+        (**self).hold_generation()
     }
     fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
         (**self).held_span(slot, offset)

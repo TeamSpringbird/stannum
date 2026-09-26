@@ -791,6 +791,10 @@ pub struct RunSource {
     /// Open [`Source::hold`](segment::source::Source::hold) spans; pages
     /// are held only while one is open.
     holding: Cell<u32>,
+    /// The outermost span open or last opened (see
+    /// [`Source::hold_generation`](segment::source::Source::hold_generation)),
+    /// from [`HOLD_SPANS`].
+    generation: Cell<u64>,
     /// Per slot, the pages held pinned for
     /// [`Source::held_span`](segment::source::Source::held_span) (one) or
     /// [`Source::held_range`](segment::source::Source::held_range) (up to
@@ -802,6 +806,12 @@ pub struct RunSource {
     /// The index, opened at the first page a span pins and closed when it
     /// ends, rather than looked up per page: a walk pins a page per chunk.
     relation: Cell<pg_sys::Relation>,
+}
+
+thread_local! {
+    /// Outermost hold spans opened by the backend's run sources, numbering
+    /// each span uniquely across sources.
+    static HOLD_SPANS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The pages one slot holds pinned.
@@ -840,6 +850,7 @@ impl RunSource {
             table,
             label,
             holding: Cell::new(0),
+            generation: Cell::new(0),
             slots: RefCell::new(vec![Default::default(); segment::source::HELD_SLOTS]),
             relation: Cell::new(std::ptr::null_mut()),
         }
@@ -1093,6 +1104,11 @@ impl segment::source::Source for RunSource {
 
     fn hold(&self, open: bool) {
         if open {
+            if self.holding.get() == 0 {
+                let generation = HOLD_SPANS.get() + 1;
+                HOLD_SPANS.set(generation);
+                self.generation.set(generation);
+            }
             self.holding.set(self.holding.get() + 1);
         } else {
             let depth = self.holding.get().saturating_sub(1);
@@ -1136,6 +1152,10 @@ impl segment::source::Source for RunSource {
             len: held.len,
             pinned,
         }))
+    }
+
+    fn hold_generation(&self) -> u64 {
+        self.generation.get()
     }
 
     fn held_slot(&self) -> Option<usize> {

@@ -386,6 +386,9 @@ impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
     fn held_slot(&self) -> Option<usize> {
         self.areas.held_slot()
     }
+    fn hold_generation(&self) -> u64 {
+        self.areas.hold_generation()
+    }
     fn fetch_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
         let Some(at) = self.base.checked_add(offset) else {
             return Some(Err(Error::Truncated));
@@ -457,6 +460,10 @@ pub trait AreaFetch {
     /// A fresh slot to hold ranges in place in (see [`Source::held_slot`]).
     fn held_slot(&self) -> Option<usize> {
         None
+    }
+    /// The hold span open or last opened (see [`Source::hold_generation`]).
+    fn hold_generation(&self) -> u64 {
+        0
     }
     /// `len` bytes at `offset` of the ordinals area, in place from pages
     /// held pinned in `slot` (see [`Source::held_range`]).
@@ -1116,6 +1123,10 @@ impl<S: Source> AreaFetch for Reader<S> {
 
     fn held_slot(&self) -> Option<usize> {
         self.source.held_slot()
+    }
+
+    fn hold_generation(&self) -> u64 {
+        self.source.hold_generation()
     }
 
     fn ordinals_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
