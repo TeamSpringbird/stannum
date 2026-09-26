@@ -3307,6 +3307,70 @@ mod tests {
         }
     }
 
+    /// With `==>` clauses on two indexed columns, a row's score is the sum of
+    /// its scores for each column's query: TIN 1.0.3 gives the row matching
+    /// both columns both scores and a row matching one column that column's
+    /// (conformance/expected/tin-1.0.3/catalog.scoring.json, catalog.S-18).
+    #[pg_test]
+    fn tin_1_0_3_scores_sum_across_indexed_columns() {
+        // A segmented index, then a temporary table's heap-scored one.
+        for table_kind in ["", "TEMP"] {
+            Spi::run(&format!(
+                "CREATE {table_kind} TABLE two_columns(id int, name text, notes text);
+                 INSERT INTO two_columns VALUES (1, 'fuji', 'citrus'), (2, 'fuji', 'x'), (3, 'x', 'citrus');
+                 INSERT INTO two_columns SELECT 1000 + n, 'pad' || n, 'pad' || n FROM generate_series(1, 90) n;
+                 CREATE INDEX two_columns_name ON two_columns USING stannum(name);
+                 CREATE INDEX two_columns_notes ON two_columns USING stannum(notes)"
+            ))
+            .unwrap();
+            for custom_scan in ["on", "off"] {
+                Spi::run(&format!(
+                    "SET LOCAL stannum.enable_custom_scan = {custom_scan}"
+                ))
+                .unwrap();
+                // No term is dense here, so full_score scores as score does.
+                for function in ["score", "full_score"] {
+                    let scores = |clause: &str, order: &str| {
+                        score_bits(&format!(
+                            "SELECT id, stannum.{function}(ctid) FROM two_columns
+                             WHERE {clause} {order}"
+                        ))
+                    };
+                    for (clause, recorded, top) in [
+                        (
+                            "name ==> 'fuji' OR notes ==> 'citrus'",
+                            r#"[[1, "40e820d6"], [2, "406820d6"], [3, "406820d6"]]"#,
+                            r#"[[1, "40e820d6"]]"#,
+                        ),
+                        (
+                            "name ==> 'fuji^1.5' OR notes ==> 'citrus'",
+                            r#"[[1, "41111486"], [2, "40ae18a0"], [3, "406820d6"]]"#,
+                            r#"[[1, "41111486"]]"#,
+                        ),
+                    ] {
+                        let context = format!("{table_kind} {custom_scan} {function} {clause}");
+                        assert_eq!(scores(clause, ""), recorded, "{context}");
+                        // Ranked, the row matching both columns comes first.
+                        assert_eq!(
+                            scores(
+                                clause,
+                                &format!("ORDER BY stannum.{function}(ctid) DESC, id LIMIT 1")
+                            ),
+                            top,
+                            "{context}"
+                        );
+                    }
+                    // AND sums too.
+                    assert_eq!(
+                        scores("name ==> 'fuji' AND notes ==> 'citrus'", ""),
+                        r#"[[1, "40e820d6"]]"#
+                    );
+                }
+            }
+            Spi::run("DROP TABLE two_columns").unwrap();
+        }
+    }
+
     #[pg_test]
     fn full_score_normalization_matches_tin() {
         // Exercise the custom scan, bitmap scan, and heap-reference scorer.
