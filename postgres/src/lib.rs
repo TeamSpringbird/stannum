@@ -3360,11 +3360,14 @@ mod tests {
                             "{context}"
                         );
                     }
-                    // AND sums too.
-                    assert_eq!(
-                        scores("name ==> 'fuji' AND notes ==> 'citrus'", ""),
-                        r#"[[1, "40e820d6"]]"#
-                    );
+                    // AND sums too, and a ranked AND, which the index scan
+                    // cannot order by a sum, is sorted over its matches.
+                    for order in ["", "ORDER BY 2 DESC LIMIT 1"] {
+                        assert_eq!(
+                            scores("name ==> 'fuji' AND notes ==> 'citrus'", order),
+                            r#"[[1, "40e820d6"]]"#
+                        );
+                    }
                 }
             }
             Spi::run("DROP TABLE two_columns").unwrap();

@@ -207,3 +207,10 @@
   clause anywhere in the query's join tree, so a CTE or subquery the planner
   flattens binds as in TIN 1.0.3; with no clause to bind they return the text
   unmarked, as TIN does, instead of raising an error.
+- `score()` and `full_score()` over `==>` clauses on several indexed columns
+  of one table sum one score per column, left to right in clause order, as
+  TIN 1.0.3 does: a row matching two columns scores both, a row matching one
+  that column's, where only the first column scored. Clauses on one column
+  still score as one query. Such a sum is sorted over the matches rather
+  than ranked by the index scan, and `max_score()` still reports the first
+  column's best score.
