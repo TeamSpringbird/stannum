@@ -1512,7 +1512,8 @@ impl IndexScorer {
     }
 
     /// Runs `pass` of a source's walk over `parts`, and moves its streams
-    /// back to their first chunks for the next pass.
+    /// back to their first chunks for the next pass. Each pass is its own
+    /// hold span, whose slots and pages the streams give up as it ends.
     fn run_walk<'a>(
         &'a self,
         parts: &mut WalkParts<'a>,
@@ -1579,6 +1580,7 @@ impl IndexScorer {
         parts.phrases = walk.phrases;
         for term in parts.terms.iter_mut().chain(parts.filters.iter_mut()) {
             term.pos = 0;
+            term.leave_span();
         }
         WALK_BLOCKS.set(WALK_BLOCKS.get() + blocks_used() - ready);
     }
@@ -2236,9 +2238,9 @@ impl OrdinalTerm<'_> {
         }
         match self.held {
             // SAFETY: the chunk is kept in `self.chunk` until the next load,
-            // which empties it first, as above; the term lives in the walk,
-            // which ends before its hold span (see `walk_by_ordinal`), and
-            // the slot is this term's alone.
+            // which empties it first, as above, or until the walk's hold
+            // span ends, where `leave_span` empties it with the slots, which
+            // were handed out in that span and are this term's alone.
             Some((members, _)) => {
                 self.check_held(self.span, members);
                 segment_error(unsafe { self.ordinals.chunk_held(self.pos, members) })
@@ -2277,6 +2279,21 @@ impl OrdinalTerm<'_> {
         {
             self.check_held(self.span, members);
         }
+    }
+
+    /// Gives up the slots the term holds pages in, and the chunk and
+    /// nibble page read through them, as the walk's hold span closes: a
+    /// warm-up runs its passes over the same terms, each pass its own
+    /// span, and a slot's number is handed out afresh in the next one, to
+    /// this term or another. The next load takes new slots and rereads.
+    fn leave_span(&mut self) {
+        self.chunk = None;
+        self.loaded = None;
+        self.held = None;
+        self.nibbles.set(None);
+        self.head = std::ptr::null();
+        self.rest = std::ptr::null();
+        (self.head_len, self.rest_end) = (0, 0);
     }
 
     /// The loaded bitmap chunk; `dense` says there is one.
