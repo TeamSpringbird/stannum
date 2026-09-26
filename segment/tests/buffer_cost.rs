@@ -3,8 +3,9 @@
 // See LICENSE in the repository root for license terms.
 
 //! Cost of turning the write buffer's forward stream into a queryable index.
-//! Run with LEAD_DOCS=/path/to/documents.csv cargo test --release -p segment
-//! --test buffer_cost -- --ignored --nocapture
+//! Run with STANNUM_DOCS=/path/to/documents.csv cargo test --release -p segment
+//! --test buffer_cost -- --ignored --nocapture (STANNUM_COUNT: lines to read,
+//! default 593).
 
 use std::time::Instant;
 
@@ -13,10 +14,10 @@ use segment::index::MutableIndex;
 use segment::tid::Tid;
 
 #[test]
-#[ignore]
+#[ignore = "manual release-mode timing probe; needs STANNUM_DOCS"]
 fn buffer_index_cost() {
-    let path = std::env::var("LEAD_DOCS").expect("LEAD_DOCS");
-    let count: usize = std::env::var("LEAD_COUNT")
+    let path = std::env::var("STANNUM_DOCS").expect("STANNUM_DOCS: a CSV of id,body lines");
+    let count: usize = std::env::var("STANNUM_COUNT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(593);

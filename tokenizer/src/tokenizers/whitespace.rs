@@ -51,7 +51,7 @@ mod tests {
     use crate::{Classification, Token, Tokenizer};
 
     #[test]
-    fn test_whitespace() {
+    fn whitespace_splits_on_spaces_and_keeps_punctuation() {
         let whitespace = Whitespace;
         let mut tokenizer = whitespace.tokenize("Hello, world!");
         assert_eq!(
