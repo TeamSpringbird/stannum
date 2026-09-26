@@ -36,7 +36,7 @@ path. Reload their data into a fresh database and rebuild their indexes.
    previous public release. The next snapshot automatically activates real
    ALTER EXTENSION upgrade checks. Keep old C wrapper symbols callable until
    their old SQL objects have been replaced by the migration.
-5. Run formatting, clippy, Rust and PostgreSQL tests, lifecycle checks and the
+5. Run `script/test-all full` (every tier is listed in `docs/testing.md`) and the
    reference oracle. CI checks PostgreSQL 17/18 on x86-64 and AArch64, including
    release schema/upgrade checks. Never ship a binary built with `pg_test`.
 6. Review `docs/SECURITY.md`, changelog, SQL changes and the compatibility table.

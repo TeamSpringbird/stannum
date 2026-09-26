@@ -25,7 +25,9 @@ conformance/
 
 ## Running
 
-Requirements: Python 3.9+, `pip install pyyaml psycopg`, and a PostgreSQL
+Requirements: Python 3.11+ with the packages in `benchmarks/requirements.txt`
+(`python3 -m venv .venv && .venv/bin/pip install -r benchmarks/requirements.txt`),
+and a PostgreSQL
 database where the engine's extension is installed (or may be created by the
 connecting role).
 

@@ -18,3 +18,4 @@
 # Python caches and local artifacts.
 **/__pycache__/
 /artifacts/
+.venv/

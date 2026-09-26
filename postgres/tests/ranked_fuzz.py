@@ -45,7 +45,7 @@ import tempfile
 import threading
 import time
 
-PORT = '28938'
+PORT = '28939'
 STATEMENT_TIMEOUT_MS = 120_000
 
 VOCABULARY = ['alpha', 'beta', 'gamma', 'delta', 'echo', 'fox', 'golf', 'hotel', 'india', 'juliet']

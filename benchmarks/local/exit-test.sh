@@ -15,7 +15,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 PYTHON=${STANNUM_PYTHON:-python3}
 if ! "$PYTHON" -c 'import psycopg' 2>/dev/null; then
     echo "exit-test.sh: $PYTHON cannot import psycopg; set STANNUM_PYTHON to an interpreter that can" >&2
-    echo "  (for example: python3 -m venv /tmp/stannum-venv && /tmp/stannum-venv/bin/pip install 'psycopg[binary]')" >&2
+    echo "  (for example: python3 -m venv .venv && .venv/bin/pip install -r benchmarks/requirements.txt)" >&2
     exit 2
 fi
 IMG=${STANNUM_EXIT_IMAGE:-}

@@ -32,7 +32,7 @@ try:
     import psycopg
     import yaml
 except ImportError as error:  # pragma: no cover - environment guidance
-    sys.exit(f"{error}; install the dependencies with: pip install pyyaml psycopg")
+    sys.exit(f"{error}; install the dependencies with: pip install -r benchmarks/requirements.txt")
 
 RUNNER_VERSION = "1"
 SUITE = Path(__file__).resolve().parent

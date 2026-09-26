@@ -34,8 +34,8 @@ a nonzero exit if any failed; `--fail-fast` stops at the first failure and
   `PATH`, so `initdb`, `pg_ctl` and `psql` match it.
 - For the conformance suite, the count fuzzer and the exit test: a Python
   with `psycopg` 3 and PyYAML, named by `STANNUM_PYTHON` (default `python3`),
-  for example `python3 -m venv /tmp/stannum-venv && /tmp/stannum-venv/bin/pip
-  install 'psycopg[binary]' pyyaml`.
+  for example `python3 -m venv .venv && .venv/bin/pip install -r
+  benchmarks/requirements.txt`.
 - Everything else in Python needs only the standard library and `psql`.
 
 ### The pgrx lock
@@ -239,7 +239,7 @@ server log. It needs a Linux server, so it runs in Docker (a few minutes,
 most of it the image build):
 
 ```sh
-STANNUM_PYTHON=/tmp/stannum-venv/bin/python benchmarks/local/exit-test.sh
+STANNUM_PYTHON=.venv/bin/python benchmarks/local/exit-test.sh
 # STANNUM_EXIT_IMAGE=... reuses an image built earlier
 ```
 
