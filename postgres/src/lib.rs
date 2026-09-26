@@ -7152,4 +7152,278 @@ mod tests {
         assert_eq!(from_b, after[..12]);
         Spi::run("CLOSE a; CLOSE b;").unwrap();
     }
+
+    /// The advisory lock a count waits on at its `count:view` race point.
+    const COUNT_RACE_LOCK: i64 = 0x5354_4e43;
+
+    /// Makes this session's counts wait at the `count:view` race point, after
+    /// they captured their index view, until [`COUNT_RACE_LOCK`] is free.
+    #[pg_extern]
+    fn count_race_pause() {
+        crate::storage::testing::set_race_hook(Some(Box::new(|name| {
+            if name == "count:view" {
+                Spi::run(&format!(
+                    "SELECT pg_advisory_lock_shared({COUNT_RACE_LOCK});
+                     SELECT pg_advisory_unlock_shared({COUNT_RACE_LOCK});"
+                ))
+                .unwrap();
+            }
+        })));
+    }
+
+    /// Whether the visibility map marks `block` of `heap` all-visible.
+    #[pg_extern]
+    fn count_race_all_visible(heap: pg_sys::Oid, block: i64) -> bool {
+        unsafe {
+            let relation = pg_sys::table_open(heap, pg_sys::AccessShareLock as _);
+            let mut vmbuf = pg_sys::InvalidBuffer as pg_sys::Buffer;
+            let status = pg_sys::visibilitymap_get_status(relation, block as u32, &mut vmbuf);
+            if vmbuf != pg_sys::InvalidBuffer as pg_sys::Buffer {
+                pg_sys::ReleaseBuffer(vmbuf);
+            }
+            pg_sys::table_close(relation, pg_sys::AccessShareLock as _);
+            status & pg_sys::VISIBILITYMAP_ALL_VISIBLE as u8 != 0
+        }
+    }
+
+    /// Lets [`count_misses_rows_vacuum_removes_after_its_view`] start the
+    /// test server.
+    #[pg_extern]
+    fn count_race_ready() {}
+
+    /// A count captures its view listing a deleted row; VACUUM then publishes
+    /// the row's removal (a segment's dead list, or a rewritten write buffer),
+    /// frees its line pointer and marks the page all-visible, as the deleter
+    /// being older than the count's snapshot allows. The count must not take
+    /// the page's all-visible bit to cover a row its view still lists. This
+    /// needs separate connections: VACUUM cannot run inside the test
+    /// transaction, and the row must be removable under the count's snapshot.
+    #[test]
+    fn count_misses_rows_vacuum_removes_after_its_view() {
+        pgrx_tests::run_test(
+            "count_race_ready",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+        // A database of its own: VACUUM's horizon for its tables ignores the
+        // snapshots of tests running in parallel in the test database.
+        let (mut server, _) = pgrx_tests::client().unwrap();
+        let setting = |server: &mut postgres::Client, name: &str| -> String {
+            server
+                .query_one(&format!("SELECT current_setting('{name}')"), &[])
+                .unwrap()
+                .get(0)
+        };
+        let socket = setting(&mut server, "unix_socket_directories");
+        let socket = socket.split(',').next().unwrap().trim().to_owned();
+        let port: u16 = setting(&mut server, "port").parse().unwrap();
+        let user: String = server
+            .query_one("SELECT current_user::text", &[])
+            .unwrap()
+            .get(0);
+        server
+            .batch_execute("DROP DATABASE IF EXISTS count_race WITH (FORCE)")
+            .unwrap();
+        server.batch_execute("CREATE DATABASE count_race").unwrap();
+        let connect = || {
+            postgres::Config::new()
+                .host(&socket)
+                .port(port)
+                .user(&user)
+                .dbname("count_race")
+                .connect(postgres::NoTls)
+                .unwrap()
+        };
+        let mut admin = connect();
+        // Rows 1-400 are in a segment, 1001-1060 in the write buffer.
+        admin
+            .batch_execute(
+                "CREATE EXTENSION stannum;
+                 CREATE TABLE count_race(id int PRIMARY KEY, body text)
+                     WITH (autovacuum_enabled = off);
+                 INSERT INTO count_race SELECT n,
+                     CASE WHEN n % 2 = 0 THEN 'alpha beta' ELSE 'alpha gamma' END
+                     FROM generate_series(1, 400) n;
+                 CREATE INDEX count_race_idx ON count_race USING stannum(body);
+                 INSERT INTO count_race SELECT n,
+                     CASE WHEN n % 2 = 0 THEN 'alpha beta' ELSE 'alpha gamma' END
+                     FROM generate_series(1001, 1060) n;",
+            )
+            .unwrap();
+        admin.batch_execute("VACUUM count_race").unwrap();
+        let buffered: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM stannum.segment_info('count_race_idx')
+                 WHERE kind = 'mutable' AND docs = 60",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(buffered, 1, "rows 1001-1060 are in the write buffer");
+        // (deleted row, ==> query, equivalent SQL predicate, setting); every
+        // deleted row matches its query.
+        let cases = [
+            (2, "alpha", "true", "stannum.count_fold = off"),
+            (4, "\"alpha beta\"", "body = 'alpha beta'", ""),
+            (
+                6,
+                "\"alpha beta\"",
+                "body = 'alpha beta'",
+                "stannum.force_count_pages = on",
+            ),
+            (8, "alpha AND NOT gamma", "body = 'alpha beta'", ""),
+            (10, "alph*", "true", ""),
+            (1002, "\"alpha beta\"", "body = 'alpha beta'", ""),
+            (1004, "alpha", "true", "stannum.count_fold = off"),
+            (
+                1006,
+                "alpha AND NOT gamma",
+                "body = 'alpha beta'",
+                "stannum.force_count_pages = on",
+            ),
+            // The fold already checks its view after reading the map.
+            (12, "alpha", "true", "stannum.count_fold = on"),
+        ];
+        let mut wrong = Vec::new();
+        for (id, query, predicate, setting) in cases {
+            let block: i64 = admin
+                .query_one(
+                    "SELECT (ctid::text::point)[0]::bigint FROM count_race WHERE id = $1",
+                    &[&id],
+                )
+                .unwrap()
+                .get(0);
+            let mut delete = admin.transaction().unwrap();
+            delete
+                .execute("DELETE FROM count_race WHERE id = $1", &[&id])
+                .unwrap();
+            let deleter: i64 = delete
+                .query_one("SELECT txid_current()", &[])
+                .unwrap()
+                .get(0);
+            delete.commit().unwrap();
+            // A snapshot's xmin counts transactions in every database: wait
+            // until none that could still see the row is running, so the
+            // count's snapshot lets VACUUM remove it.
+            let mut polls = 0;
+            loop {
+                let past: bool = admin
+                    .query_one(
+                        "SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint > $1",
+                        &[&deleter],
+                    )
+                    .unwrap()
+                    .get(0);
+                if past {
+                    break;
+                }
+                polls += 1;
+                assert!(
+                    polls < 6000,
+                    "transactions older than the delete kept running"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let mut locker = connect();
+            locker
+                .batch_execute(&format!("SELECT pg_advisory_lock({COUNT_RACE_LOCK})"))
+                .unwrap();
+            let mut counter = connect();
+            let pid: i32 = counter
+                .query_one("SELECT pg_backend_pid()", &[])
+                .unwrap()
+                .get(0);
+            let settings = if setting.is_empty() {
+                String::new()
+            } else {
+                format!("SET {setting};")
+            };
+            counter
+                .batch_execute(&format!(
+                    "SELECT tests.count_race_pause(); SET enable_seqscan = off; {settings}"
+                ))
+                .unwrap();
+            let count = format!("SELECT count(*) FROM count_race WHERE body ==> '{query}'");
+            let plan: Vec<String> = counter
+                .query(&format!("EXPLAIN {count}"), &[])
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            assert!(
+                plan.iter().any(|line| line.contains("Stannum Count")),
+                "{query}: {plan:?}"
+            );
+            let truth = format!("SELECT count(*) FROM count_race WHERE {predicate}");
+            let counting = std::thread::spawn(move || {
+                counter
+                    .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+                    .unwrap();
+                // The first statement fixes the snapshot, after the delete.
+                let expected: i64 = counter.query_one(&truth, &[]).unwrap().get(0);
+                let counted: i64 = counter.query_one(&count, &[]).unwrap().get(0);
+                counter.batch_execute("COMMIT").unwrap();
+                (expected, counted)
+            });
+            let mut polls = 0;
+            loop {
+                let waiting: bool = admin
+                    .query_one(
+                        "SELECT count(*) > 0 FROM pg_locks
+                         WHERE pid = $1 AND locktype = 'advisory' AND NOT granted",
+                        &[&pid],
+                    )
+                    .unwrap()
+                    .get(0);
+                if waiting {
+                    break;
+                }
+                polls += 1;
+                assert!(
+                    polls < 3000 && !counting.is_finished(),
+                    "the count did not reach count:view"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // VACUUM skips a page it cannot lock for cleanup; retry until the
+            // row's page is all-visible.
+            let mut vacuums = 0;
+            loop {
+                admin
+                    .batch_execute("VACUUM (INDEX_CLEANUP ON) count_race")
+                    .unwrap();
+                let visible: bool = admin
+                    .query_one(
+                        "SELECT tests.count_race_all_visible('count_race'::regclass, $1)",
+                        &[&block],
+                    )
+                    .unwrap()
+                    .get(0);
+                if visible {
+                    break;
+                }
+                vacuums += 1;
+                assert!(
+                    vacuums < 300,
+                    "VACUUM never marked block {block} all-visible"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            locker
+                .batch_execute(&format!("SELECT pg_advisory_unlock({COUNT_RACE_LOCK})"))
+                .unwrap();
+            let (expected, counted) = counting.join().unwrap();
+            if expected != counted {
+                wrong.push(format!(
+                    "row {id}, {query} ({setting}): counted {counted}, expected {expected}"
+                ));
+            }
+        }
+        drop(admin);
+        server
+            .batch_execute("DROP DATABASE count_race WITH (FORCE)")
+            .unwrap();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
 }

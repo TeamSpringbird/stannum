@@ -13,13 +13,16 @@ OR, AND, boosts, phrases, `AND NOT`, `AT LEAST`, disjunctions with a phrase
 or conjunction child, `full_score` and `score`,
 LIMIT/OFFSET around posting-block boundaries and above the pruning cap,
 cursors fetched partially with writes in between, and joins or filters that
-read past k.
+read past k. Count episodes run `count(*)` through the custom count node
+(phrases, `AND NOT`, prefixes and other shapes the fold rejects, and terms
+with the fold off or page bitmaps forced) while writers delete and vacuum.
 
 Each reader compares, inside one snapshot, the custom-scan output (ids and
 float4 score bits) with the same query forced through the unpruned path
 (`stannum.enable_custom_scan = off`, `ORDER BY score DESC, ctid`) and with a
 regex sequential-scan membership check, and also checks uniqueness, descending
-order, finite scores and the tie order the scan promises. On any mismatch it
+order, finite scores and the tie order the scan promises. A count is compared
+with the regex count in its snapshot. On any mismatch it
 writes a reproduction script (seed, schema, statements in order) and stops.
 
     python3 postgres/tests/ranked_fuzz.py --seconds 600 --seed 7
@@ -222,7 +225,7 @@ class Query:
         self.shape = shape
 
     @staticmethod
-    def generate(rng, width=None):
+    def generate(rng, width=None, shape=None):
         def word():
             pool = VOCABULARY + RARE + ['missing']
             return rng.choice(pool) if rng.random() < 0.15 else rng.choice(VOCABULARY)
@@ -238,7 +241,7 @@ class Query:
             tinql = ' OR '.join(w + rng.choice(['', '^0.25', '^2']) for w in ws)
             return Query(tinql, '(' + ' OR '.join(term_regex(w) for w in ws) + ')', f'wide_or_{width}')
 
-        shape = rng.choices(
+        shape = shape or rng.choices(
             ['term', 'or2', 'or3', 'and2', 'and3', 'boosted_or', 'boosted_and', 'phrase',
              'andnot', 'prefix', 'atleast', 'mixed', 'or_phrase', 'or_and'],
             weights=[24, 14, 8, 14, 7, 7, 6, 4, 5, 2, 4, 5, 4, 4])[0]
@@ -341,7 +344,7 @@ class Fuzzer:
         self.readers = []
         self.stats = dict(episodes=0, comparisons=0, rows_compared=0, cursor_fetches=0, writer_ops=0,
                           pruned_plans=0, custom_plans=0, unstable_skipped=0, benign_errors=0,
-                          vacuums=0, reindexes=0, folds_observed=0)
+                          vacuums=0, reindexes=0, folds_observed=0, counts=0, count_plans=0)
         self.schema = []
         self.wide_queries = 0
         self.wide_coverage = {}
@@ -409,7 +412,7 @@ class Fuzzer:
         return (f'SET stannum.write_buffer_docs = {docs}; '
                 f'SET stannum.write_buffer_bytes = {rng.choice([1024, 4096, 65536, 1048576])}; '
                 f'SET stannum.merge_tier_factor = {rng.choice([2, 2, 3, 4, 8])}; '
-                f'SET stannum.max_segments = {rng.choice([2, 3, 4, 6, 8, 16, 128])}; '
+                f'SET stannum.max_segments = {rng.choice([2, 3, 4, 6, 8, 16, 96])}; '
                 f'SET stannum.max_merge_docs = {rng.choice([0, 0, 10, 100, 1000, 100000])}; '
                 f'SET stannum.build_segment_docs = {rng.choice([10, 50, 200, 1000, 32768])}')
 
@@ -554,13 +557,22 @@ class Fuzzer:
         if not join and rng.random() < 0.15:
             extra = rng.choice([f'd.grp = {rng.randint(0, 3)}', 'd.id % 7 = 3', 'd.revision = 0', 'd.id % 2 = 1'])
         weights = dict(plain=50, cursor=getattr(self.args, 'cursor_weight', 40),
-                       twin=getattr(self.args, 'twin_weight', 6))
+                       twin=getattr(self.args, 'twin_weight', 6), count=getattr(self.args, 'count_weight', 12))
         mode = rng.choices(list(weights), weights=list(weights.values()))[0]
         if self.args.wide:
             scorer = 'stannum.full_score(d.ctid)'
             mode = rng.choice(['cursor', 'cursor', 'twin'])
             limit = rng.choice([10, 31, 127, 128, 129])
         isolation = rng.choice(['REPEATABLE READ', 'REPEATABLE READ', 'REPEATABLE READ', 'READ COMMITTED'])
+        count_settings = None
+        if mode == 'count':
+            # Mostly shapes the fold rejects; the count and its regex
+            # reference must share one snapshot.
+            query = Query.generate(rng, shape=rng.choice(
+                ['phrase', 'phrase', 'andnot', 'andnot', 'prefix', 'prefix', 'or_phrase', 'term', 'and2']))
+            join, extra, isolation = False, None, 'REPEATABLE READ'
+            count_settings = [f"SET LOCAL stannum.count_fold = {rng.choice(['on', 'off'])}",
+                              f"SET LOCAL stannum.force_count_pages = {rng.choice(['on', 'off', 'off'])}"]
         from_clause = 'docs d JOIN keep k USING (id)' if join else 'docs d'
         where = f"d.body ==> {sql_literal(query.tinql)}"
         regex_where = query.predicate.replace('body ~', 'd.body ~')
@@ -574,6 +586,7 @@ class Fuzzer:
             oracle=f'{select} ORDER BY score DESC, d.ctid',
             custom=f'{select} ORDER BY score DESC LIMIT {limit} OFFSET {offset}',
             regex=f'SELECT d.id, d.ctid FROM {from_clause} WHERE {regex_where}',
+            count=f'SELECT count(*) FROM {from_clause} WHERE {where}', count_settings=count_settings,
         )
 
     @staticmethod
@@ -625,6 +638,8 @@ class Fuzzer:
         # deleted, updated, vacuumed and replaced by documents it cannot see.
         self.churn(rng.randint(0, 6))
         self.quiesce_writers()
+        if spec['mode'] == 'count':
+            return self.count_episode(reader, spec, rng)
         settings_oracle = ['SET LOCAL stannum.enable_custom_scan = off', 'SET LOCAL enable_seqscan = off',
                            'SET LOCAL enable_bitmapscan = on']
         settings_custom = ['SET LOCAL stannum.enable_custom_scan = on', 'SET LOCAL enable_seqscan = off',
@@ -704,6 +719,37 @@ class Fuzzer:
             # Only a prefix was read; it must be a prefix of the expected rows.
             expected = expected[:len(actual)]
         return self.after_failure(reader, spec, self.compare('cursor', actual, expected, oracle, visible, roots, strict, spec))
+
+    def count_episode(self, reader, spec, rng):
+        """Counts through the custom count node, repeatedly, while writers
+        delete and vacuum: VACUUM may remove rows deleted before the snapshot
+        and mark their pages all-visible after a count captured its index
+        view. Each count must equal the regex count in the same snapshot."""
+        truth = f"SELECT count(*) FROM ({spec['regex']}) r"
+        results = reader.run(['SET LOCAL stannum.enable_custom_scan = off', 'SET LOCAL enable_bitmapscan = on',
+                              truth, 'SET LOCAL stannum.enable_custom_scan = on',
+                              'SET LOCAL enable_bitmapscan = off'] + spec['count_settings']
+                             + ['EXPLAIN (FORMAT JSON) ' + spec['count']])
+        expected = int(results[2][1][0])
+        plan = json.loads('\n'.join(results[-1][1]))[0]['Plan']
+        if has_node(plan, 'Stannum Count', key='Custom Plan Provider'):
+            self.stats['count_plans'] += 1
+        for _ in range(rng.randint(1, 3)):
+            reader.send([spec['count']])
+            self.churn(rng.randint(0, 4))
+            self.quiesce_writers()
+            out = reader.wait()
+            statement, lines, error = out[0]
+            if error:
+                return Failure(f'count failed: {statement}', output=lines, spec=describe(spec))
+            self.stats['comparisons'] += 1
+            self.stats['counts'] += 1
+            actual = int(lines[0])
+            if actual != expected:
+                return self.after_failure(reader, spec, Failure(
+                    'count differs from the regex count in its snapshot', spec=describe(spec),
+                    actual=actual, expected=expected))
+        return None
 
     def oracle_of(self, spec, by_statement):
         """The unpruned path's rows in the scan's promised order, the regex
@@ -1033,7 +1079,8 @@ def ranked_correctness_query(rng, corpus):
 
 
 def describe(spec):
-    return {k: v for k, v in spec.items() if k in ('scorer', 'limit', 'offset', 'join', 'extra', 'mode', 'isolation', 'oracle', 'custom', 'regex', 'chunks')} | {'tinql': spec['query'].tinql, 'shape': spec['query'].shape}
+    return {k: v for k, v in spec.items() if k in ('scorer', 'limit', 'offset', 'join', 'extra', 'mode', 'isolation', 'oracle', 'custom', 'regex', 'chunks', 'count',
+                                                'count_settings')} | {'tinql': spec['query'].tinql, 'shape': spec['query'].shape}
 
 
 def first_difference(actual, expected):

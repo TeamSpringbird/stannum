@@ -1244,7 +1244,8 @@ impl IndexScorer {
             // Admission trusts the visibility map for all-visible pages. A
             // page VACUUM marked all-visible after the view was captured may
             // hold a tuple the view still lists; the walk is repeated against
-            // the heap if a dead list was published meanwhile.
+            // the heap if the view is no longer current (a dead list was
+            // published or the write buffer rewritten meanwhile).
             let mut shortcut = true;
             // Largest source first: the threshold prunes only once the heap
             // holds k rows, and the biggest segment is the likeliest to hold
