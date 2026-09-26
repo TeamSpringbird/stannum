@@ -933,13 +933,16 @@ thread_local! {
         RefCell::new(vec![RecentBuffer::default(); RECENT_BUFFERS_LEN].into_boxed_slice());
 }
 
-/// Entries of [`RECENT_BUFFERS`], 384 KiB per backend.
-const RECENT_BUFFERS_LEN: usize = 1 << 15;
+/// Entries of [`RECENT_BUFFERS`], 2 MiB per backend. A pass over the 60
+/// queries of the published trace sample pins some 50,000 distinct pages
+/// of the 15 million row index; at 2^15 entries collisions cost two pins
+/// in five their recent buffer.
+const RECENT_BUFFERS_LEN: usize = 1 << 18;
 
-/// A block of a relation and the shared buffer it was last pinned in.
+/// A block and the shared buffer it was last pinned in. The relation is
+/// left to the buffer's tag, which `ReadRecentBuffer` checks.
 #[derive(Clone, Copy, Default)]
 struct RecentBuffer {
-    relation: pg_sys::RelFileNumber,
     block: pg_sys::BlockNumber,
     buffer: pg_sys::Buffer,
 }
@@ -964,7 +967,6 @@ unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_s
         let recent = RECENT_BUFFERS.with_borrow(|recent| recent[at]);
         if recent.buffer > 0
             && recent.block == block
-            && recent.relation == locator.relNumber
             && pg_sys::ReadRecentBuffer(
                 locator,
                 pg_sys::ForkNumber::MAIN_FORKNUM,
@@ -978,13 +980,7 @@ unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_s
         let buffer = pg_sys::ReadBuffer(index, block);
         // Local buffers (a temporary index) are left to `ReadBuffer`.
         if buffer > 0 {
-            RECENT_BUFFERS.with_borrow_mut(|recent| {
-                recent[at] = RecentBuffer {
-                    relation: locator.relNumber,
-                    block,
-                    buffer,
-                }
-            });
+            RECENT_BUFFERS.with_borrow_mut(|recent| recent[at] = RecentBuffer { block, buffer });
         }
         buffer
     }
