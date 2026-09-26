@@ -819,4 +819,62 @@ mod tests {
                 )
         ));
     }
+
+    /// `AT LEAST n OF [k operands]` inside a proximity operator is matched
+    /// as the disjunction of every n-operand combination, built again for
+    /// each candidate document. A query whose combinations cannot be built
+    /// in bounded time and memory is refused when it is lowered, before any
+    /// document is read; below the bound it lowers as before.
+    #[test]
+    fn at_least_expansions_inside_spans_are_bounded() {
+        let words = |prefix: &str, count: usize| {
+            (0..count)
+                .map(|i| format!("{prefix}{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let lowered = |input: &str| {
+            let expr = super::super::subtokenize::sub_tokenize(parse(input), default_pipeline())
+                .expect("query should sub-tokenize");
+            lower(&expr)
+        };
+        let refused = [
+            // C(30, 15), about 155 million combinations.
+            format!("(AT LEAST 15 OF [{}]) NEAR/5 x", words("t", 30)),
+            // C(1000, 999) is only 1,000 combinations, but of 999 operands
+            // each: about a million copied operands.
+            format!("(AT LEAST 999 OF [{}]) NEAR/5 x", words("t", 1000)),
+            // Two operands of four at every level, twelve levels deep: six
+            // combinations each, but each level copies the one below it
+            // three times, 3^12 copies of the innermost.
+            {
+                let mut query = "a".to_owned();
+                for level in 0..12 {
+                    query = format!("AT LEAST 2 OF [({query}) b{level} c{level} d{level}]");
+                }
+                format!("({query}) NEAR/5 x")
+            },
+        ];
+        for query in &refused {
+            let error = lowered(query).expect_err("query should be refused").to_string();
+            assert!(
+                error.contains("AT LEAST") && error.contains("more than"),
+                "{}: {error}",
+                &query[..query.len().min(60)]
+            );
+        }
+
+        for query in [
+            format!("(AT LEAST 2 OF [{}]) NEAR/5 x", words("t", 100)),
+            format!("(AT LEAST 6 OF [{}]) NEAR/5 x", words("t", 16)),
+            format!("(AT LEAST 1 OF [{}]) NEAR/5 x", words("t", 5000)),
+            format!("(AT LEAST 5000 OF [{}]) NEAR/5 x", words("t", 5000)),
+        ] {
+            assert!(
+                matches!(lowered(&query), Ok(Query::SpanExpr { .. })),
+                "{}",
+                &query[..60]
+            );
+        }
+    }
 }
