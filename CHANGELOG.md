@@ -48,8 +48,7 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   merge per insert outside the metadata lock (`stannum.deferred_merge_docs`),
   and deferred merges, dead lists and rewrites in VACUUM, which holds the
   metadata lock only to publish. Merges combine the inputs' sorted
-  dictionaries and streams directly through a validated, interruptible API
-  ([ADR 0001](docs/adr/0001-preserve-posting-order-before-changing-encoding.md)).
+  dictionaries and streams directly through a validated, interruptible API.
 - The TIN-named index options `target_segment_count`,
   `max_mutable_segment_size`, `max_merged_segment_size` and
   `dead_percent_threshold` shape maintenance for the index that sets them,

@@ -80,14 +80,14 @@ moving their writes outside it requires a separate reservation protocol.
 
 ### Merge policy
 
-The [direct-merge decision](../adr/0001-preserve-posting-order-before-changing-encoding.md)
-records the move to preserving sorted document order during merges. Foreground
-merges invoke the segment crate's validated direct-merge API under the
-metadata lock, retaining merge selection and WAL publication. It
-validates every source and merges ordered dictionaries and streams directly. Source
-blobs and dead sets are retained through construction, then freed before writing
-the output run. Aggregate encoded inputs or document counts beyond `u32::MAX`
-use the previous reconstruction path, since deletion can still yield a
+A merge walks its inputs' sorted dictionaries and merges each term's ordinal
+streams directly, dropping dead documents and recomputing statistics and score
+bounds, rather than rebuilding documents and sorting them again. Foreground
+merges call the segment crate's validated direct-merge API under the metadata
+lock. It validates every source before reusing any of it. Source blobs and dead
+sets are retained through construction, then freed before writing the output
+run. Aggregate encoded inputs or document counts beyond `u32::MAX` fall back to
+rebuilding documents from the inputs, since deletion can still yield a
 representable output. These format bounds do not impose a peak-memory cap.
 
 PostgreSQL defers interrupts while the metadata buffer lock is held. Merge

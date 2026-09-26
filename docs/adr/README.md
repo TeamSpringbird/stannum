@@ -1,18 +1,16 @@
 # Architecture decision records
 
-Each record states a decision, the evidence behind it and its consequences at
-the time it was made. A record is not rewritten when the code moves on; its
-front matter says whether it is still in force. The
-[storage guide](../architecture/segmented-storage.md) describes the current
-system.
+Each record states a decision that is in force, why it was made and what
+follows from it. The [storage guide](../architecture/segmented-storage.md)
+describes the system as a whole. A record whose decision no longer holds is
+deleted rather than kept.
 
 | ADR | Decision | Status |
 | --- | --- | --- |
-| [0001](0001-preserve-posting-order-before-changing-encoding.md) | Merge segments by preserving sorted posting order, before changing the encoding | Accepted; its encoding decision superseded by 0003 |
-| [0002](0002-batched-posting-execution-before-format-migration.md) | Batch Boolean execution over physical heap-page bitmaps before migrating the format | Superseded by 0003 |
 | [0003](0003-address-postings-by-document-ordinal.md) | Address a term's documents by ordinal into the segment's document table | Accepted |
-| [0004](0004-rank-by-document-ordinal.md) | Rank over the ordinal streams with per-chunk score bounds | Accepted; extends 0003 |
+| [0004](0004-rank-by-document-ordinal.md) | Rank over the ordinal streams with per-chunk and per-sub-block score bounds | Accepted; extends 0003 |
 
-New records take the next number and a front-matter `status` (`proposed`,
-`accepted` or `superseded`), with `supersedes`, `superseded-by` or `extends`
-naming other records by number.
+ADR numbers are identifiers and are never reused; 0001 and 0002 were removed
+when their decisions stopped holding. New records take the next number, 0005,
+and a front-matter `status` (`proposed` or `accepted`), with `extends` naming
+another record by number.

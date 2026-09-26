@@ -36,12 +36,8 @@ search. Run commands from the repository root.
 - [How Stannum works](architecture/segmented-storage.md): the segment format,
   query execution, ranking and durability rules.
 - [Architecture decision records](adr/README.md):
-  [0001](adr/0001-preserve-posting-order-before-changing-encoding.md) merge by
-  sorted order,
-  [0002](adr/0002-batched-posting-execution-before-format-migration.md) batched
-  page bitmaps (superseded),
   [0003](adr/0003-address-postings-by-document-ordinal.md) documents as
-  ordinals, and [0004](adr/0004-rank-by-document-ordinal.md) ranking over
+  ordinals and [0004](adr/0004-rank-by-document-ordinal.md) ranking over
   ordinals.
 
 ## Compatibility and conformance
