@@ -5211,6 +5211,85 @@ mod tests {
     }
 
     #[pg_test]
+    fn cleanup_leaves_a_deferred_merges_unpublished_run_alone() {
+        // Four one-document segments of the lowest tier and one document in
+        // the buffer; no merge has run.
+        Spi::run(
+            "CREATE TABLE merge_orphans(id int, body text);
+             CREATE INDEX merge_orphans_idx ON merge_orphans USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.merge_tier_factor = 4;
+             SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
+             INSERT INTO merge_orphans SELECT n, 'needle w' || n FROM generate_series(1, 5) n;",
+        )
+        .unwrap();
+        let segments = || {
+            Spi::get_one::<String>(
+                "SELECT array_agg(docs ORDER BY docs)::text
+                 FROM stannum.segment_info('merge_orphans_idx') WHERE kind = 'immutable'",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(segments(), "{1,1,1,1}");
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'merge_orphans_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        // The next insert folds and then merges the due tier of four outside
+        // the meta lock. Between writing the merged run and publishing it,
+        // VACUUM's cleanup runs, with no merge of its own to do.
+        let mut fired = false;
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "maintenance:built" && !fired {
+                fired = true;
+                Spi::run("SET LOCAL stannum.merge_tier_factor = 64").unwrap();
+                let index = unsafe {
+                    pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _)
+                };
+                unsafe { crate::storage::cleanup(index.as_ptr()) };
+                Spi::run("SET LOCAL stannum.merge_tier_factor = 4").unwrap();
+            }
+        })));
+        Spi::run(
+            "SET LOCAL stannum.deferred_merge_docs = 8;
+             INSERT INTO merge_orphans VALUES (6, 'needle w6');",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        // The merge published: four documents in one segment, one more
+        // folded beside it and the newest in the buffer.
+        assert_eq!(segments(), "{1,4}");
+        assert_clean("merge_orphans_idx");
+        // Later folds allocate whatever pages cleanup freed; none may be the
+        // merged segment's.
+        Spi::run(
+            "SET LOCAL stannum.deferred_merge_docs = 0;
+             SET LOCAL stannum.merge_tier_factor = 64;
+             INSERT INTO merge_orphans SELECT n, 'needle w' || n FROM generate_series(7, 10) n;",
+        )
+        .unwrap();
+        assert_clean("merge_orphans_idx");
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("merge_orphans_idx");
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM merge_orphans WHERE body ==> 'needle'"),
+            10
+        );
+        for n in 1..=10 {
+            assert_eq!(
+                ids(&format!(
+                    "SELECT id FROM merge_orphans WHERE body ==> 'w{n}' ORDER BY id"
+                )),
+                vec![n],
+            );
+        }
+    }
+
+    #[pg_test]
     fn byte_cap_folds_oversized_documents_one_at_a_time() {
         Spi::run(
             "CREATE TABLE merge_bytes(body text);
