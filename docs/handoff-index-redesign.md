@@ -598,6 +598,19 @@ Predicted on the published host at r7's 0.81 ratio: about 248 QPS, above
 TIN's 199. The ratio came from a build bottlenecked elsewhere, so an AWS
 run is the real check.
 
+### Round five, 2026-09-25
+
+Against 382c685 (307.0 QPS), each alone, then merged as `e867445`:
+
+| branch | mixed QPS |
+|---|---|
+| `perf/cheaper-pins` (pin through the buffer a block was last seen in, `ReadRecentBuffer`) | 322.4 |
+| `perf/conj-walk` (phrase positions checked before scoring until the top k fills; a conjunction scorer bounding per class per sub-block; phrase slots read rarest first against the nearest read leaf) | 340.7 |
+| both merged | 359.6, p50 12, p95 77, p99 117 ms |
+
+Count and ranked checks clean. At r7's 0.81 ratio: about 290 QPS on the
+published host, which an AWS run must confirm.
+
 ## How to measure
 
 Everything below runs on a laptop and needs no AWS. See
