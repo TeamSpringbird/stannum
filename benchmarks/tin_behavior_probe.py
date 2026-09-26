@@ -1,14 +1,18 @@
+#!/usr/bin/env python3
 # Copyright (C) 2026 Ben Weis <ben@springbird.app>
 #
 # See LICENSE in the repository root for license terms.
 
-"""Probe a TIN (or Stannum) server for the behaviours recorded in
+"""Probe a TIN (or Stannum) server for the behaviors recorded in
 docs/tin-behavior.md, so the comparison can be repeated.
 
-    TIN_DSN='postgresql://...' python3 benchmarks/tin_behavior_probe.py [--engine tin] [--crash-probe]
+    PGHOST=... PGDATABASE=... benchmarks/tin_behavior_probe.py [--engine tin] [--crash-probe]
 
-The connection string is read from the environment only; never pass it on
-the command line or commit it. Objects are created in a scratch schema,
+The connection comes from the environment only, like the other benchmark
+tools: the libpq variables (PGHOST, PGPORT, PGUSER, PGDATABASE, PGPASSWORD or
+~/.pgpass, PGSERVICE), or a full connection string in TIN_DSN, which takes
+precedence. Never pass it on the command line or commit it. Objects are
+created in a scratch schema,
 `stannum_probe`, which is dropped at the end. `--crash-probe` sends queries
 that crashed the whole TIN server (every backend restarted) on 2026-09-26;
 it stops at the first dropped connection and reports whether an idle
@@ -34,11 +38,12 @@ def connect(dsn):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--engine', default='tin', choices=['tin', 'stannum'])
     parser.add_argument('--crash-probe', action='store_true')
     args = parser.parse_args()
-    dsn = os.environ['TIN_DSN']
+    # An empty connection string leaves every setting to the libpq environment.
+    dsn = os.environ.get('TIN_DSN', '')
     engine = args.engine
     out = {}
     connection = connect(dsn)
