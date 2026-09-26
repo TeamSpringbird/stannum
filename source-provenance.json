@@ -100,14 +100,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
-    "benchmarks/experiment_queue.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
-    },
-    "benchmarks/experiment_report.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
-    },
     "benchmarks/fold_reproduction.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
@@ -115,10 +107,6 @@
     "benchmarks/foreground_writes.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 1f79095007a88234389bded090fd7fcab7ce8ee1."
-    },
-    "benchmarks/frontier_snapshot_experiment.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
     },
     "benchmarks/insert_latency.py": {
       "owner": "ben",
@@ -168,10 +156,6 @@
       "owner": "ben",
       "evidence": "Original Stannum native PostgreSQL workload generator regression."
     },
-    "benchmarks/notify.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
-    },
     "benchmarks/oracle.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -208,18 +192,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
-    "benchmarks/snapshot_candidate_local.py": {
-      "owner": "ben",
-      "evidence": "Original native PostgreSQL physical snapshot and candidate-binary compatibility rehearsal."
-    },
-    "benchmarks/snapshot_latency_local.py": {
-      "owner": "ben",
-      "evidence": "Original balanced local snapshot latency comparison harness."
-    },
-    "benchmarks/snapshot_load_local.py": {
-      "owner": "ben",
-      "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
-    },
     "benchmarks/sustained.py": {
       "owner": "ben",
       "evidence": "Original Stannum benchmark work, built on the existing Ben-authored benchmark modules; no Lead source copied. Private-cluster rate/concurrency campaign using the existing Stannum mutation runner."
@@ -252,10 +224,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
-    "benchmarks/test_experiment_report.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum reproducible local experiment queue, ranking workload and reporting code."
-    },
     "benchmarks/test_fold_reproduction.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
@@ -267,10 +235,6 @@
     "benchmarks/test_merge_costs.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 849853598b1c007451ebe049d58e6e4c2a46acd3."
-    },
-    "benchmarks/test_notify.py": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
     "benchmarks/test_oracle.py": {
       "owner": "ben",
@@ -307,10 +271,6 @@
     "benchmarks/test_server_times.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
-    },
-    "benchmarks/test_snapshot_load_local.py": {
-      "owner": "ben",
-      "evidence": "Original closed-loop concurrent snapshot experiment and timing-window regression checks."
     },
     "benchmarks/test_sustained.py": {
       "owner": "ben",
