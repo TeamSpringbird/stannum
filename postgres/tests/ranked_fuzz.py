@@ -345,6 +345,9 @@ class Fuzzer:
         self.schema = []
         self.wide_queries = 0
         self.wide_coverage = {}
+        # Its own stream, so the main sequence (and every pinned seed's
+        # scenario) is the same with or without the positional shapes.
+        self.positional_rng = random.Random(args.seed * 7919 + 17)
 
     # -- cluster --------------------------------------------------------------------
     def command(self, args, **kw):
@@ -542,6 +545,8 @@ class Fuzzer:
             self.wide_queries += 1
         query = Query.generate(rng, width=width)
         scorer = rng.choice(['stannum.full_score(d.ctid)', 'stannum.full_score(d.ctid)', 'stannum.score(d.ctid)'])
+        if width is None:
+            query, scorer = ranked_correctness_shapes(self.positional_rng, self.corpus, query, scorer)
         limit = rng.choice(LIMITS)
         offset = rng.choice(OFFSETS)
         join = rng.random() < 0.15
@@ -904,6 +909,127 @@ class Fuzzer:
             (self.root / 'failure.json').write_text(json.dumps(summary, indent=2, default=str) + '\n')
         summary['artifacts'] = str(self.root)
         return summary
+
+
+# --- fix/ranked-correctness: positional shapes and BM25 parameters ---------------------
+# Phrases of three or more words with slop and pinned gaps, THEN and NEAR
+# with phrase operands, and random k1 and b. Each shape comes with an exact
+# regex over `body`, whose words are single-space separated.
+
+POSITIONAL_WORD = '[a-z0-9]+'
+
+
+def ranked_correctness_shapes(rng, corpus, query, scorer):
+    """Replaces some episodes' query with a positional shape and some
+    scorers with explicit BM25 parameters; `rng` is the fuzzer's positional
+    stream, not the main one."""
+    if rng.random() < 0.3:
+        query = ranked_correctness_query(rng, corpus)
+    if rng.random() < 0.3:
+        k1 = rng.choice(['0', '0.001', '0.01', '0.5', '1.2', '3'])
+        b = rng.choice(['0', '0.25', '0.75', '1'])
+        scorer = rng.choice([f'stannum.full_score(d.ctid, {k1}, {b})',
+                             f'stannum.score(d.ctid, k1 => {k1}, b => {b})'])
+    return query, scorer
+
+
+def ranked_correctness_query(rng, corpus):
+    """A positional query over runs of the corpus's templates, so that it
+    matches some documents, and its regex."""
+    def gap(count):
+        return f'( {POSITIONAL_WORD}){{{count}}}' if count else ''
+
+    def run(n):
+        words, pad = rng.choice(corpus.templates)
+        words = list(words) + [FILLER] * min(pad, 3)
+        if len(words) < n or rng.random() < 0.15:
+            return [rng.choice(VOCABULARY) for _ in range(n)]
+        start = rng.randrange(len(words) - n + 1)
+        return words[start:start + n]
+
+    backslash = chr(92)
+
+    def distinct(n, avoid=()):
+        """`n` distinct words, none in `avoid`: a run of a template when it
+        has them, else drawn from the vocabulary."""
+        words = run(n)
+        if len(set(words)) == n and not set(words) & set(avoid):
+            return words
+        return rng.sample([w for w in VOCABULARY if w not in avoid], n)
+
+    def exact(n, gaps=True, avoid=()):
+        """A phrase of `n` words, perhaps with one pinned gap of one or two
+        words in the middle: its text and regex.
+
+        Spans match by minimal intervals: `"a b _ c d"` is the phrase
+        `"a b"`, then `c` with exactly one word between, then `d`, and the
+        interval of the middle part must hold no shorter one. So the gap may
+        not hold `c`, nor the whole prefix before it; with distinct words
+        that is `c` or, for a one-word prefix, that word; for a two-word
+        prefix and a two-word gap, the prefix itself. The regex excludes
+        exactly those."""
+        if gaps and n >= 3 and rng.random() < 0.4:
+            words = distinct(n, avoid)
+            at = rng.randrange(1, n - 1)
+            width = rng.choice([1, 1, 2])
+            prefix, after = words[:at], words[at + 1]
+            excluded = [after] + (prefix if len(prefix) == 1 else [])
+            one = f'(?!(?:{"|".join(excluded)}){backslash}M){POSITIONAL_WORD}'
+            gap_regex = ' '.join([one] * width)
+            if len(prefix) == 2 and width == 2:
+                gap_regex = f'(?!{prefix[0]} {prefix[1]}{backslash}M){gap_regex}'
+            texts = words[:at] + ['_' * width] + words[at + 1:]
+            regex = ' '.join(words[:at] + [gap_regex] + words[at + 1:])
+            return f'"{" ".join(texts)}"', regex
+        words = distinct(n, avoid) if avoid else run(n)
+        text = ' '.join(words)
+        return (text if n == 1 else f'"{text}"'), text
+
+    def sloppy(n, slop):
+        """A phrase of `n` words whose junctions take at most `slop` words
+        between them: every spread of the slop over the junctions."""
+        words = run(n)
+        alternatives = []
+
+        def spread(i, left, parts):
+            if i == n - 1:
+                alternatives.append(''.join(parts) + words[-1])
+                return
+            for g in range(left + 1):
+                spread(i + 1, left - g, parts + [words[i] + gap(g) + ' '])
+
+        spread(0, slop, [])
+        return f'"{" ".join(words)}"~{slop}', '(' + '|'.join(alternatives) + ')'
+
+    shape = rng.choice(['sloppy', 'pinned', 'then', 'then', 'near'])
+    n = rng.choice([0, 1, 2, 3])
+    between = f'( {POSITIONAL_WORD}){{0,{n}}} '
+    if shape == 'sloppy':
+        tinql, regex = sloppy(rng.choice([3, 3, 4]), rng.choice([1, 2]))
+    elif shape == 'pinned':
+        tinql, regex = exact(rng.choice([3, 4]))
+        while '_' not in tinql:
+            tinql, regex = exact(rng.choice([3, 4]))
+    elif shape == 'then':
+        # THEN only caps its gap, so the tightest match inside any match
+        # passes too: any operands are exact.
+        left = exact(rng.choice([1, 2, 2, 3]))
+        right = exact(rng.choice([1, 2, 2, 3]))
+        tinql = f'{left[0]} THEN/{n} {right[0]}'
+        regex = f'{left[1]}{between}{right[1]}'
+    else:
+        # NEAR's operands may overlap, and an overlapping pair is a minimal
+        # interval no other pair around it can replace: operands of disjoint
+        # words, without gaps, never overlap.
+        left_words = distinct(rng.choice([1, 2, 2, 3]))
+        left = (left_words[0] if len(left_words) == 1 else f'"{" ".join(left_words)}"', ' '.join(left_words))
+        right = exact(rng.choice([1, 2, 2]), gaps=False, avoid=left_words)
+        tinql = f'{left[0]} NEAR/{n} {right[0]}'
+        regex = f'{left[1]}{between}{right[1]}|{right[1]}{between}{left[1]}'
+    predicate = f"body ~ {sql_literal(backslash + 'm(' + regex + ')' + backslash + 'M')}"
+    return Query(tinql, predicate, f'positional_{shape}')
+
+# --- end fix/ranked-correctness ---------------------------------------------------------
 
 
 def describe(spec):

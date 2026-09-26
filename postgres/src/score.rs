@@ -557,6 +557,7 @@ pub(crate) const PRUNE_MAX_K: usize = 4096;
 /// walk prunes against this score from its first candidate, as if the top k
 /// were already known: the pages and candidates it then costs are what a
 /// walk seeded from per-term champion lists would cost.
+/// It changes which rows a query returns, so only a superuser may set it.
 pub(crate) static DEBUG_SEED_SCORE: pgrx::GucSetting<f64> = pgrx::GucSetting::<f64>::new(-1.0);
 
 /// Default of `stannum.warmup_chunks`; see [`IndexScorer::warm_up`].
@@ -1476,6 +1477,7 @@ impl IndexScorer {
                 filter: check.filter.cloned(),
                 positions: vec![Vec::new(); check.slots.len()],
                 read: vec![false; check.slots.len()],
+                span: None,
             }
         });
         let mut phrases = Vec::new();
@@ -2553,6 +2555,29 @@ struct PhraseCheck<'a> {
     positions: Vec<Vec<u32>>,
     /// Scratch: per slot, whether the candidate's positions are read.
     read: Vec<bool>,
+    /// The hold span the cursors first read in, whose slot each keeps for
+    /// the rest of its life; see [`walk_cursor`].
+    span: Option<u64>,
+}
+
+impl PhraseCheck<'_> {
+    /// Checks, in test builds, that the cursors read in the hold span
+    /// `open`, the one they first read in: a cursor keeps the slot, and
+    /// the page read in place through it, of the span that handed the slot
+    /// out, so a check carried into a later span (a warm-up pass) would
+    /// read a page no longer pinned, or pinned for another reader.
+    #[inline]
+    #[track_caller]
+    fn check_span(&mut self, open: u64) {
+        let first = *self.span.get_or_insert(open);
+        #[cfg(any(test, feature = "pg_test"))]
+        assert!(
+            first == open,
+            "a phrase check read positions in hold span {open}, its cursors held in span {first}"
+        );
+        #[cfg(not(any(test, feature = "pg_test")))]
+        debug_assert_eq!(first, open, "a phrase check outlived its hold span");
+    }
 }
 
 /// A cursor over a phrase slot's positions for a walk, reading its spans in
@@ -2561,6 +2586,12 @@ fn walk_cursor<'a>(payload: &segment::payload::Payload<'a>) -> segment::payload:
     let mut cursor = payload.cursor();
     // SAFETY: the cursor goes into a `PhraseCheck` of the walk, which is
     // dropped before the walk's hold span closes (see `walk_by_ordinal`).
+    // Its checks run in one pass, one span: the warm-up's passes, each its
+    // own span over the same streams, open their walks without a phrase.
+    // The cursor keeps its slot across spans (the terms give theirs up in
+    // `leave_span`, a cursor cannot), so a check warmed across passes would
+    // read unpinned pages; `PhraseCheck::check_span` catches that in test
+    // builds.
     unsafe { cursor.hold_in_place() };
     cursor
 }
@@ -2599,6 +2630,7 @@ fn phrase_check<'a>(
         filter: check.filter.cloned(),
         positions: vec![Vec::new(); check.slots.len()],
         read: vec![false; check.slots.len()],
+        span: None,
     }
 }
 
@@ -2837,14 +2869,16 @@ impl OrdinalWalk<'_, '_> {
         if std::mem::replace(&mut phrase.read[slot], true) {
             return;
         }
-        let (member, payload) = &mut phrase.slots[slot];
-        let term = match *member {
+        let member = phrase.slots[slot].0;
+        let term = match member {
             Member::Term(t) => &mut self.terms[t],
             Member::Filter(f) => &mut self.filters[f],
         };
         let rank = term.rank(low).unwrap_or_else(|| {
             crate::storage::corrupt("Stannum: a phrase candidate is missing a term")
         });
+        phrase.check_span(term.ordinals.hold_generation());
+        let (_, payload) = &mut phrase.slots[slot];
         let positions = &mut phrase.positions[slot];
         positions.clear();
         segment_error(payload.seek(rank));
@@ -3482,8 +3516,9 @@ impl OrdinalWalk<'_, '_> {
     /// first two bounds taken whole. Every term holds the document, so its
     /// first bound is the sub-block's, `first`, the sum of every term's
     /// sub-block bound in slot order; and its bound at its length class is
-    /// the sum of every term's largest sub-block bucket at the class's
-    /// shortest length, which within the sub-block depends on the class
+    /// the sum of every term's best score over the buckets up to its
+    /// largest in the sub-block ([`TermScorer::bound_through`]), at the
+    /// class's shortest length, which within the sub-block depends on the class
     /// alone, so it is computed once per class a sub-block meets rather
     /// than per candidate. Four in five candidates of a conjunction fell to
     /// the class bound, each after testing every term's bit and scoring
@@ -3515,7 +3550,7 @@ impl OrdinalWalk<'_, '_> {
                         0.0
                     } else {
                         let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
-                        self.scorer.terms[term.slot].1.score_bucket(bucket, floor)
+                        self.scorer.terms[term.slot].1.bound_through(bucket, floor)
                     };
                 }
                 self.class_bounds[usize::from(class)] = (self.class_stamp, bound);
@@ -3669,14 +3704,18 @@ impl OrdinalWalk<'_, '_> {
                 let term = &self.terms[present[n]];
                 let scorer = &self.scorer.terms[term.slot].1;
                 let top = term.sub_bounds[term.pos][sub];
-                // The sub-block's largest bucket is a member's, so the score
-                // at that bucket and this length bounds every member: no
-                // sweep of the chunk's buckets tightens it.
+                // Every member's bucket is at most the sub-block's largest,
+                // so the best score over the buckets up to it, at this
+                // length, bounds every member. That is the score at the
+                // largest bucket itself unless rounding lets the score fall
+                // as the bucket rises (k1 near zero): taken there alone, a
+                // member with a smaller bucket outscored the bound and was
+                // dropped.
                 values[n] = if top == 0 {
                     0.0
                 } else {
                     let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
-                    scorer.score_bucket(bucket, floor)
+                    scorer.bound_through(bucket, floor)
                 };
             }
             if !self.can_beat(fold(values), ordinal) {

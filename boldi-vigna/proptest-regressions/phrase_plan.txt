@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ef4a819c697033a6fea9c3294ebdf0e6de0aeb95d48a05bebf45f322b482cf13 # shrinks to query = Ordered([MaxGaps { max_gaps: 0, inner: Ordered([Term(0), MaxGaps { max_gaps: 0, inner: Ordered([Term(2), Term(3)]) }]) }, Term(0)]), documents = [[[1, 5], [], [2], [3]]], rarity = [1, 1, 1, 1]

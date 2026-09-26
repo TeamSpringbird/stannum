@@ -691,3 +691,240 @@ mod tests {
         assert!(PageTable::parse(&[0, 0, 0, 0, 1, 0, 0, 0], 2).is_err());
     }
 }
+
+/// Every cursor over documents treats exhaustion as final and never moves
+/// backwards: a seek to a target at or before its position, or any seek or
+/// advance once it is exhausted, leaves it where it is. A document cursor
+/// sought back to an earlier target after its end came back to life
+/// (7eb033f) and the universe under `NOT` subtracted documents the inner
+/// set never held. Each cursor is driven by random advances and seeks,
+/// backwards, past the end and after it, against a model over its members;
+/// tables span several 65,536-ordinal chunks.
+#[cfg(test)]
+mod exhaustion {
+    use super::*;
+    use crate::ordinals::{Ordinals, encode};
+    use crate::pages::Cursor as _;
+    use crate::set::{AtLeast, Cursor, Difference, Intersection, Slice, Union};
+    use proptest::prelude::*;
+
+    /// Draws from a seed, so that tables of a hundred thousand documents
+    /// cost one value each to generate and shrink.
+    struct Draw(u64);
+
+    impl Draw {
+        fn next(&mut self) -> u64 {
+            // SplitMix64.
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// `count` document locations in heap order, a few to a block.
+    fn locations(draw: &mut Draw, count: u32) -> Vec<Tid> {
+        let mut tids = Vec::with_capacity(count as usize);
+        let (mut block, mut offset) = (draw.below(3) as u32, 0u16);
+        for _ in 0..count {
+            if offset >= MAX_OFFSET - 1 || draw.below(4) == 0 {
+                block += 1 + draw.below(3) as u32;
+                offset = 0;
+            }
+            offset += 1 + draw.below(2) as u16;
+            tids.push(Tid::new(block, offset).unwrap());
+        }
+        tids
+    }
+
+    /// A subset of `0..count` of density about one in `every`.
+    fn members(draw: &mut Draw, count: u32, every: u64) -> Vec<u32> {
+        (0..count).filter(|_| draw.below(every) == 0).collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Advance,
+        /// Seek to a location drawn from 0..=1 past the last block, so
+        /// backwards, onto members, between them and after the end.
+        Seek(u64),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![2 => Just(Op::Advance), 3 => any::<u64>().prop_map(Op::Seek)],
+            1..60,
+        )
+    }
+
+    /// The target of `seed` among `tids`' blocks, past the last one too.
+    fn target(tids: &[Tid], seed: u64) -> Tid {
+        let last = tids.last().map_or(0, |tid| tid.block);
+        let block = (seed % u64::from(last + 3)) as u32;
+        let offset = ((seed >> 32) % u64::from(MAX_OFFSET)) as u16 + 1;
+        Tid::new(block, offset).unwrap()
+    }
+
+    /// The model: the position among `expected`, which only moves forward.
+    fn replay<T: Copy + Ord + std::fmt::Debug>(
+        expected: &[T],
+        ops: &[Op],
+        at: impl Fn(u64) -> T,
+        mut step: impl FnMut(Option<T>) -> Option<T>,
+        label: &str,
+    ) {
+        let mut index = 0usize;
+        let mut exhausted_at = None;
+        for (n, op) in ops.iter().enumerate() {
+            let (target, actual) = match *op {
+                Op::Advance => {
+                    index = (index + 1).min(expected.len());
+                    (None, step(None))
+                }
+                Op::Seek(seed) => {
+                    let target = at(seed);
+                    if expected.get(index).is_some_and(|current| *current < target) {
+                        index += expected[index..].partition_point(|member| *member < target);
+                    }
+                    (Some(target), step(Some(target)))
+                }
+            };
+            let want = expected.get(index).copied();
+            assert_eq!(
+                actual, want,
+                "{label}: op {n} {op:?} (target {target:?}) after exhaustion at {exhausted_at:?}"
+            );
+            if want.is_none() && exhausted_at.is_none() {
+                exhausted_at = Some(n);
+            }
+        }
+    }
+
+    /// Drives a set cursor by `ops` against `expected`.
+    fn check(mut cursor: impl Cursor, expected: &[Tid], tids: &[Tid], ops: &[Op], label: &str) {
+        assert_eq!(
+            cursor.current(),
+            expected.first().copied(),
+            "{label}: first"
+        );
+        replay(
+            expected,
+            ops,
+            |seed| target(tids, seed),
+            |op| {
+                match op {
+                    None => cursor.advance().unwrap(),
+                    Some(target) => cursor.seek(target).unwrap(),
+                }
+                cursor.current()
+            },
+            label,
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 96, ..ProptestConfig::default() })]
+
+        #[test]
+        fn exhausted_cursors_stay_exhausted(
+            seed in any::<u64>(),
+            size in prop_oneof![
+                6 => 0u32..400,
+                1 => 65_530u32..65_545,
+                1 => 131_060u32..140_000,
+            ],
+            density in (1u64..40, 1u64..40),
+            ops in ops(),
+        ) {
+            let mut draw = Draw(seed);
+            let tids = locations(&mut draw, size);
+            let pages = page_table(tids.iter().copied());
+            let offsets = offsets(tids.iter().copied());
+            let docs = || DocTable::parse(&pages, &offsets, size).unwrap();
+            check(docs().into_cursor().unwrap(), &tids, &tids, &ops, "documents");
+
+            let a = members(&mut draw, size, density.0);
+            let b = members(&mut draw, size, density.1);
+            let (a_bytes, b_bytes) = (encode(&a), encode(&b));
+            let stream = |bytes| Ordinals::parse(bytes).unwrap().cursor().unwrap();
+            let at = |ordinals: &[u32]| -> Vec<Tid> {
+                ordinals.iter().map(|o| tids[*o as usize]).collect()
+            };
+            let (a_tids, b_tids) = (at(&a), at(&b));
+
+            // The ordinal stream itself, sought by ordinal.
+            let mut ordinals = stream(&a_bytes);
+            replay(
+                &a,
+                &ops,
+                |seed| (seed % u64::from(size + 2)) as u32,
+                |op| {
+                    match op {
+                        None => ordinals.advance().unwrap(),
+                        Some(target) => ordinals.seek(target).unwrap(),
+                    }
+                    ordinals.current()
+                },
+                "ordinals",
+            );
+
+            let tid_cursor = |bytes| TidCursor::new(stream(bytes), docs()).unwrap();
+            check(tid_cursor(&a_bytes), &a_tids, &tids, &ops, "term");
+
+            let both: Vec<Tid> = a_tids.iter().copied().filter(|t| b_tids.binary_search(t).is_ok()).collect();
+            let either: Vec<Tid> = {
+                let mut all: Vec<Tid> = a_tids.iter().chain(&b_tids).copied().collect();
+                all.sort_unstable();
+                all.dedup();
+                all
+            };
+            let only_a: Vec<Tid> = a_tids.iter().copied().filter(|t| b_tids.binary_search(t).is_err()).collect();
+            check(
+                Intersection::new(vec![tid_cursor(&a_bytes), tid_cursor(&b_bytes)]).unwrap(),
+                &both, &tids, &ops, "intersection",
+            );
+            check(Union::new(vec![tid_cursor(&a_bytes), tid_cursor(&b_bytes)]), &either, &tids, &ops, "union");
+            check(
+                AtLeast::new(vec![tid_cursor(&a_bytes), tid_cursor(&b_bytes)], 2).unwrap(),
+                &both, &tids, &ops, "at least two",
+            );
+            check(
+                Difference::new(tid_cursor(&a_bytes), tid_cursor(&b_bytes)).unwrap(),
+                &only_a, &tids, &ops, "difference",
+            );
+            // The universe less a term, as `NOT` plans it, and a slice.
+            let universe_less_b: Vec<Tid> =
+                tids.iter().copied().filter(|t| b_tids.binary_search(t).is_err()).collect();
+            check(
+                Difference::new(docs().into_cursor().unwrap(), tid_cursor(&b_bytes)).unwrap(),
+                &universe_less_b, &tids, &ops, "universe less a term",
+            );
+            check(Slice::new(&a_tids), &a_tids, &tids, &ops, "slice");
+
+            // A term a heap page at a time, sought by block.
+            let mut blocks: Vec<u32> = a_tids.iter().map(|t| t.block).collect();
+            blocks.dedup();
+            let mut page_cursor = PageCursor::new(stream(&a_bytes), docs()).unwrap();
+            prop_assert_eq!(page_cursor.current().map(|p| p.block), blocks.first().copied());
+            let last = tids.last().map_or(0, |tid| tid.block);
+            replay(
+                &blocks,
+                &ops,
+                |seed| (seed % u64::from(last + 3)) as u32,
+                |op| {
+                    match op {
+                        None => page_cursor.advance().unwrap(),
+                        Some(block) => page_cursor.seek(block).unwrap(),
+                    }
+                    page_cursor.current().map(|page| page.block)
+                },
+                "pages",
+            );
+        }
+    }
+}
