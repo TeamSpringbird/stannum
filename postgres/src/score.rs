@@ -3134,39 +3134,17 @@ impl OrdinalWalk<'_, '_> {
         set: &mut segment::ordinals::Words,
     ) {
         let base = u32::from(key) << 16;
-        // Per sub-block, the best a shared document could score: each term's
-        // largest bucket there at the shared shortest length; a sub-block
-        // some term lacks holds no shared document. From the directory, so a
-        // chunk no sub-block of which can reach the threshold is skipped
-        // before any stream is read.
-        let mut sub_scores = [0.0_f32; SUBS];
-        let mut sub_empty = [false; SUBS];
-        self.term_subs.clear();
-        for term in &mut self.terms {
-            let scorer = &self.scorer.terms[term.slot].1;
-            let by_bucket = term.bounds_by_bucket(term.pos, scorer, min_length);
-            let mut mine = [0.0_f32; SUBS];
-            for (i, (sub, score)) in term.sub_bounds[term.pos]
-                .iter()
-                .zip(sub_scores.iter_mut())
-                .enumerate()
-            {
-                if *sub == 0 {
-                    sub_empty[i] = true;
-                } else {
-                    let bound = by_bucket[usize::from(*sub - 1)];
-                    *score += bound;
-                    mine[i] = bound;
-                }
-            }
-            self.term_subs.push(mine);
-        }
-        if self.threshold().is_some()
-            && !(0..SUBS).any(|sub| {
+        // The chunk's bounds per sub-block (see `sub_bounds_all`), taken
+        // once there is a threshold to hold them to: a conjunction of common
+        // words that matches rarely walks most of its chunks without one.
+        let mut subs = None;
+        if self.threshold().is_some() {
+            let (sub_scores, sub_empty) = *subs.insert(self.sub_bounds_all(min_length));
+            if !(0..SUBS).any(|sub| {
                 !sub_empty[sub] && self.can_beat(sub_scores[sub], base + (sub * SUB) as u32)
-            })
-        {
-            return;
+            }) {
+                return;
+            }
         }
         // The shared members: the lead's array tested against the others'
         // bits, or the words of every stream combined. Streams are loaded
@@ -3226,11 +3204,12 @@ impl OrdinalWalk<'_, '_> {
             // The threshold moves as candidates are admitted, so it is
             // consulted afresh at every sub-block and candidate: the chunk
             // that fills the top k also prunes the rest of itself.
-            if sub_empty[sub]
-                || (self.threshold().is_some()
-                    && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32))
-            {
-                continue;
+            if self.threshold().is_some() {
+                let (sub_scores, sub_empty) =
+                    *subs.get_or_insert_with(|| self.sub_bounds_all(min_length));
+                if sub_empty[sub] || !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32) {
+                    continue;
+                }
             }
             self.class_stamp = self.class_stamp.wrapping_add(1);
             if self.class_stamp == 0 {
@@ -3254,15 +3233,19 @@ impl OrdinalWalk<'_, '_> {
                         // `verify_pending` would admit them.
                         if self.phrase_matches(low, ordinal) {
                             let total = self
-                                .score_conjunct(low, ordinal, sub, sub_scores[sub], false)
+                                .score_conjunct(low, ordinal, sub, 0.0, false)
                                 .expect("a candidate unpruned is scored");
                             self.admit(total, ordinal);
                         }
                         continue;
                     }
-                    let Some(total) =
-                        self.score_conjunct(low, ordinal, sub, sub_scores[sub], pruning)
-                    else {
+                    let first = if pruning {
+                        subs.get_or_insert_with(|| self.sub_bounds_all(min_length))
+                            .0[sub]
+                    } else {
+                        0.0
+                    };
+                    let Some(total) = self.score_conjunct(low, ordinal, sub, first, pruning) else {
                         continue;
                     };
                     let admit =
@@ -3341,6 +3324,33 @@ impl OrdinalWalk<'_, '_> {
             self.admit(total, ordinal);
         }
         pending.clear();
+    }
+
+    /// Per sub-block of a conjunction's current chunk, the best a shared
+    /// document could score, each term's largest bucket there at the shared
+    /// shortest length `min_length` summed in slot order; and whether some
+    /// term lacks the sub-block, which then holds no shared document. From
+    /// the directory, so a chunk no sub-block of which can reach the
+    /// threshold is skipped before any stream is read.
+    fn sub_bounds_all(&mut self, min_length: u32) -> ([f32; SUBS], [bool; SUBS]) {
+        let mut sub_scores = [0.0_f32; SUBS];
+        let mut sub_empty = [false; SUBS];
+        for term in &mut self.terms {
+            let scorer = &self.scorer.terms[term.slot].1;
+            let by_bucket = term.bounds_by_bucket(term.pos, scorer, min_length);
+            for ((sub, score), empty) in term.sub_bounds[term.pos]
+                .iter()
+                .zip(sub_scores.iter_mut())
+                .zip(sub_empty.iter_mut())
+            {
+                if *sub == 0 {
+                    *empty = true;
+                } else {
+                    *score += by_bucket[usize::from(*sub - 1)];
+                }
+            }
+        }
+        (sub_scores, sub_empty)
     }
 
     /// The score of the document `low` of a conjunction's current chunk,
