@@ -287,6 +287,23 @@ impl QueryError {
         }
     }
 
+    /// Whether the query is refused for exceeding a limit of
+    /// [`crate::limits`] (its size, nesting or expansion) rather than for
+    /// being invalid.
+    #[must_use]
+    pub const fn exceeds_limit(&self) -> bool {
+        match self {
+            Self::Parse(error) => matches!(
+                error,
+                crate::ParseError::NestingTooDeep { .. } | crate::ParseError::TooManyTerms { .. }
+            ),
+            Self::SubTokenize(error) => {
+                matches!(error, subtokenize::SubTokenizeError::TooManyTerms)
+            }
+            Self::Lower(error) => error.exceeds_limit(),
+        }
+    }
+
     /// The error without the stage that raised it.
     #[must_use]
     pub fn detail(&self) -> String {

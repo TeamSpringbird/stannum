@@ -340,6 +340,101 @@ impl SpanExpr {
     }
 }
 
+impl SpanExpr {
+    /// Nodes this expression has, and nodes [`Self::resolve`] builds from
+    /// it at most, saturating: an `AT LEAST` that expands contributes its
+    /// disjunction, a conjunction per combination, and a copy of each
+    /// operand per combination that includes it. Resolving drops operands
+    /// that resolve to nothing, which only shrinks the expansion.
+    pub(crate) fn expansion_size(&self) -> (usize, usize) {
+        crate::limits::check_stack();
+        let sum = |children: &[Self]| {
+            children
+                .iter()
+                .map(Self::expansion_size)
+                .fold((1usize, 1usize), |(plain, resolved), (p, r)| {
+                    (plain.saturating_add(p), resolved.saturating_add(r))
+                })
+        };
+        match self {
+            Self::Empty | Self::Term(_) => (1, 1),
+            Self::Ordered(children) | Self::Unordered(children) | Self::Or(children) => {
+                sum(children)
+            }
+            Self::AtLeast { min, children } => {
+                let (plain, resolved) = sum(children);
+                let combinations = at_least_combinations(*min, children.len());
+                if combinations == 0 {
+                    return (plain, resolved);
+                }
+                // Each operand is in C(k - 1, n - 1) of the combinations.
+                let copies = binomial(children.len() - 1, *min as usize - 1);
+                let operands = resolved - 1;
+                (
+                    plain,
+                    operands
+                        .saturating_mul(copies)
+                        .saturating_add(combinations)
+                        .saturating_add(1),
+                )
+            }
+            Self::MaxGaps { inner, .. }
+            | Self::GapsInRange { inner, .. }
+            | Self::MaxWidth { inner, .. }
+            | Self::WithinPositions { inner, .. }
+            | Self::PositionFilter { inner, .. } => {
+                let (plain, resolved) = inner.expansion_size();
+                (plain.saturating_add(1), resolved.saturating_add(1))
+            }
+            Self::Containing { big: a, little: b }
+            | Self::ContainedBy { little: a, big: b }
+            | Self::NotContaining { big: a, little: b }
+            | Self::NotContainedBy { little: a, big: b }
+            | Self::Overlapping { a, b }
+            | Self::NonOverlapping { a, b }
+            | Self::Before { a, b }
+            | Self::After { a, b } => {
+                let (pa, ra) = a.expansion_size();
+                let (pb, rb) = b.expansion_size();
+                (
+                    pa.saturating_add(pb).saturating_add(1),
+                    ra.saturating_add(rb).saturating_add(1),
+                )
+            }
+        }
+    }
+}
+
+/// The combinations `AT LEAST min OF` `operands` operands expands to inside
+/// a span context, saturating past [`crate::limits::MAX_AT_LEAST_COMBINATIONS`]:
+/// C(operands, min), or zero when it is matched without expanding (a
+/// threshold of at most one, or of every operand, or none can meet).
+pub(crate) fn at_least_combinations(min: u32, operands: usize) -> usize {
+    let min = min as usize;
+    if min <= 1 || min >= operands {
+        return 0;
+    }
+    binomial(operands, min)
+}
+
+/// C(`n`, `k`) for `k <= n`, or `usize::MAX` once it passes
+/// [`crate::limits::MAX_AT_LEAST_COMBINATIONS`].
+fn binomial(n: usize, k: usize) -> usize {
+    // C(n, i) grows with i up to n / 2, so the product can stop as soon as
+    // it passes the limit, and stays small enough not to overflow.
+    let cap = crate::limits::MAX_AT_LEAST_COMBINATIONS as u128;
+    let take = k.min(n - k) as u128;
+    let n = n as u128;
+    let mut combinations: u128 = 1;
+    for i in 0..take {
+        combinations = combinations * (n - i) / (i + 1);
+        if combinations > cap {
+            return usize::MAX;
+        }
+    }
+    combinations as usize
+}
+
 fn nonempty_children(
     children: impl IntoIterator<Item = boldi_vigna::SpanQuery>,
 ) -> Vec<boldi_vigna::SpanQuery> {
@@ -391,8 +486,12 @@ fn collect_combinations(
     current: &mut Vec<boldi_vigna::SpanQuery>,
     out: &mut Vec<boldi_vigna::SpanQuery>,
 ) {
+    crate::limits::check_stack();
     if current.len() == choose {
         out.push(boldi_vigna::SpanQuery::Unordered(current.clone()));
+        if out.len().is_multiple_of(segment::INTERRUPT_INTERVAL) {
+            segment::check_interrupts("at_least:combine");
+        }
         return;
     }
 
@@ -459,6 +558,47 @@ mod tests {
                 ]),
             ])
         );
+    }
+
+    /// The size lowering bounds is the size resolving builds.
+    #[test]
+    fn expansion_size_counts_the_resolved_nodes() {
+        fn nodes(query: &boldi_vigna::SpanQuery) -> usize {
+            match query {
+                boldi_vigna::SpanQuery::Or(children)
+                | boldi_vigna::SpanQuery::Unordered(children) => {
+                    1 + children.iter().map(nodes).sum::<usize>()
+                }
+                boldi_vigna::SpanQuery::MaxGaps { inner, .. } => 1 + nodes(inner),
+                _ => 1,
+            }
+        }
+        let at_least = |min, children: Vec<SpanExpr>| SpanExpr::AtLeast { min, children };
+        let terms = |count: usize| (0..count).map(SpanExpr::Term).collect::<Vec<_>>();
+        for operands in 1..9 {
+            for min in 0..=operands as u32 + 1 {
+                let flat = at_least(min, terms(operands));
+                let nested = SpanExpr::MaxGaps {
+                    max_gaps: 3,
+                    inner: Box::new(at_least(
+                        2,
+                        vec![flat.clone(), SpanExpr::Term(20), SpanExpr::Term(21)],
+                    )),
+                };
+                // Exact when the threshold expands; otherwise resolving may
+                // collapse a node or two.
+                let exact = at_least_combinations(min, operands) > 0;
+                for expr in [flat, nested] {
+                    let (bound, built) = (expr.expansion_size().1, nodes(&expr.resolve(10)));
+                    assert!(bound >= built && (!exact || bound == built), "{expr:?}");
+                }
+            }
+        }
+        assert_eq!(at_least_combinations(15, 30), usize::MAX);
+        assert_eq!(at_least_combinations(6, 16), 8008);
+        assert_eq!(at_least_combinations(999, 1000), 1000);
+        assert_eq!(at_least_combinations(1, 1000), 0);
+        assert_eq!(at_least_combinations(1000, 1000), 0);
     }
 
     #[test]

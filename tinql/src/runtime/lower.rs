@@ -15,7 +15,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::limits::MAX_SPAN_NESTING;
+use crate::limits::{MAX_AT_LEAST_COMBINATIONS, MAX_SPAN_EXPANSION, MAX_SPAN_NESTING};
 
 use super::{
     CompiledRegex, PositionFilterBound, Query, RangeBound, SimplificationProfile, SpanExpr,
@@ -34,6 +34,31 @@ pub enum LowerError {
         limit = MAX_SPAN_NESTING
     )]
     NestingTooDeep,
+    #[error(
+        "AT LEAST {min} OF {operands} operands inside a proximity operator expands to more than \
+         {limit} combinations",
+        limit = MAX_AT_LEAST_COMBINATIONS
+    )]
+    TooManyCombinations { min: u32, operands: usize },
+    #[error(
+        "AT LEAST inside a proximity operator expands the query by more than {limit} operands",
+        limit = MAX_SPAN_EXPANSION
+    )]
+    ExpansionTooLarge,
+}
+
+impl LowerError {
+    /// Whether the query is refused for exceeding a limit of
+    /// [`crate::limits`] rather than for being invalid.
+    #[must_use]
+    pub const fn exceeds_limit(&self) -> bool {
+        match self {
+            Self::NestingTooDeep | Self::TooManyCombinations { .. } | Self::ExpansionTooLarge => {
+                true
+            }
+            Self::MatchAllInSpanContext | Self::InvalidRegex(_) => false,
+        }
+    }
 }
 
 pub fn lower(expr: &crate::Expr) -> Result<Query, LowerError> {
@@ -161,6 +186,10 @@ fn lower_leaf(expr: &crate::Expr) -> Result<Query, LowerError> {
 fn lower_as_span(expr: &crate::Expr, depth: usize) -> Result<Query, LowerError> {
     let mut builder = SpanBuilder::new(depth);
     let span_expr = builder.lower_span_expr(expr)?;
+    let (plain, resolved) = span_expr.expansion_size();
+    if resolved.saturating_sub(plain) > MAX_SPAN_EXPANSION {
+        return Err(LowerError::ExpansionTooLarge);
+    }
     if let Some((span_query, position_filter)) = span_expr.to_fast_path_root() {
         Ok(Query::Span {
             term_slots: builder.term_slots,
@@ -330,6 +359,14 @@ impl SpanBuilder {
             }
             Expr::AtLeast { threshold, exprs } => {
                 let min = resolve_threshold(threshold, exprs.len());
+                if super::span_expr::at_least_combinations(min, exprs.len())
+                    > MAX_AT_LEAST_COMBINATIONS
+                {
+                    return Err(LowerError::TooManyCombinations {
+                        min,
+                        operands: exprs.len(),
+                    });
+                }
                 let children = exprs
                     .iter()
                     .map(|expr| self.lower_span_expr(expr))
@@ -856,7 +893,9 @@ mod tests {
             },
         ];
         for query in &refused {
-            let error = lowered(query).expect_err("query should be refused").to_string();
+            let error = lowered(query)
+                .expect_err("query should be refused")
+                .to_string();
             assert!(
                 error.contains("AT LEAST") && error.contains("more than"),
                 "{}: {error}",

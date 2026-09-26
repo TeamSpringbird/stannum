@@ -45,6 +45,24 @@ pub const MAX_TERMS: usize = 10_000;
 /// and a phrase with pinned gaps nests one level per word; this bounds both.
 pub const MAX_SPAN_NESTING: usize = 2 * MAX_NESTING;
 
+/// Combinations one `AT LEAST n OF [k operands]` inside a proximity
+/// operator, relation or positional filter may expand to. There it is
+/// matched as the disjunction of every `n`-operand combination, C(k, n) of
+/// them, built again for each candidate document: C(30, 15) is 155 million.
+/// Outside a span context `AT LEAST` is counted, not expanded, and has no
+/// such limit.
+pub const MAX_AT_LEAST_COMBINATIONS: usize = 10_000;
+
+/// Operands the expansion of `AT LEAST` inside a span context may add to
+/// the query's span expression: each operand is copied into every
+/// combination that includes it, and an expanded `AT LEAST` among the
+/// operands of another is copied whole, so the copies multiply. A single
+/// expansion of terms within [`MAX_AT_LEAST_COMBINATIONS`] that takes at
+/// most nine at a time (or has at most 16 operands) stays within it;
+/// `AT LEAST 999 OF` a thousand terms, a thousand combinations of 999
+/// operands, does not.
+pub const MAX_SPAN_EXPANSION: usize = 100_000;
+
 static STACK_CHECK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// Installs `check`, which every recursive pass over a query calls once per

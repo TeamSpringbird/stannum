@@ -64,5 +64,31 @@ pub mod verify;
 pub use error::{Error, Result};
 pub use tid::Tid;
 
+/// Units of work between two interrupt checks in a loop whose length the
+/// query decides: dictionary entries a term expansion scans, combinations
+/// an `AT LEAST` expands to.
+pub const INTERRUPT_INTERVAL: usize = 1024;
+
+static INTERRUPT_CHECK: std::sync::OnceLock<fn(&'static str)> = std::sync::OnceLock::new();
+
+/// Installs `check`, which such loops call every [`INTERRUPT_INTERVAL`]
+/// units with the name of the loop. The extension installs PostgreSQL's
+/// `CHECK_FOR_INTERRUPTS`, whose ERROR on a cancel or `statement_timeout`
+/// reaches Rust as a panic and unwinds out of the loop, so `check` is
+/// called only where unwinding leaves nothing behind (no buffer content
+/// lock held, which would hold the interrupt off anyway). The first
+/// installation wins.
+pub fn set_interrupt_check(check: fn(&'static str)) {
+    let _ = INTERRUPT_CHECK.set(check);
+}
+
+/// Calls the installed interrupt check, if any, for the loop `site`.
+#[inline]
+pub fn check_interrupts(site: &'static str) {
+    if let Some(check) = INTERRUPT_CHECK.get() {
+        check(site);
+    }
+}
+
 #[cfg(test)]
 mod random_tests;

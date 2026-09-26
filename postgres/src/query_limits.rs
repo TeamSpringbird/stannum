@@ -7,9 +7,11 @@
 //! A query past `tinql::limits` must end in a clean ERROR, and one within
 //! them in its answer, wherever the server parses it: planning (the custom
 //! scan's selectivity estimate), EXPLAIN, execution through the index or the
-//! custom scan, the `==>` operator on an unindexed table, and ranking. Before
-//! the limits, 300,000 words or 100,000 nested parentheses overflowed the
-//! backend's stack, and the abort restarted every session.
+//! custom scan, the `==>` operator on an unindexed table, and ranking, with
+//! SQLSTATE 54001 (`statement_too_complex`). Before the limits, 300,000
+//! words or 100,000 nested parentheses overflowed the backend's stack, and
+//! `AT LEAST 15 OF` 30 terms inside `NEAR` exhausted its memory; either
+//! abort restarted every session.
 
 #[cfg(feature = "pg_test")]
 #[pgrx::pg_schema]
@@ -17,12 +19,14 @@ mod tests {
     use pgrx::prelude::*;
 
     /// Query text, as SQL, with its expected count of the 100 matching rows
-    /// (`None`: rejected with an error containing `reason`).
+    /// (`None`: rejected with an error containing `reason`, with SQLSTATE
+    /// `sqlstate`).
     struct Case {
         label: &'static str,
         sql: &'static str,
         count: Option<i64>,
         reason: &'static str,
+        sqlstate: &'static str,
         /// A tree a thousand operators high: a release build answers it in
         /// about 1.1 MiB of stack, but the unoptimized build these tests run
         /// needs about 6 MiB, past the default `max_stack_depth` of 2 MiB,
@@ -40,6 +44,7 @@ mod tests {
             sql: "repeat('a ', 3000)",
             count: Some(100),
             reason: "",
+            sqlstate: "",
             backstop: false,
         },
         Case {
@@ -47,6 +52,7 @@ mod tests {
             sql: "repeat('a ', 10000)",
             count: Some(100),
             reason: "",
+            sqlstate: "",
             backstop: false,
         },
         Case {
@@ -54,6 +60,7 @@ mod tests {
             sql: "'a' || repeat(' OR a', 9999)",
             count: Some(100),
             reason: "",
+            sqlstate: "",
             backstop: false,
         },
         Case {
@@ -61,6 +68,7 @@ mod tests {
             sql: "repeat('(', 1000) || 'a' || repeat(')', 1000)",
             count: Some(100),
             reason: "",
+            sqlstate: "",
             backstop: false,
         },
         Case {
@@ -68,6 +76,7 @@ mod tests {
             sql: "repeat('(zz OR ', 999) || 'a' || repeat(')', 999)",
             count: Some(100),
             reason: "",
+            sqlstate: "",
             backstop: true,
         },
         Case {
@@ -75,6 +84,7 @@ mod tests {
             sql: "repeat('[', 1000) || 'a' || repeat(']', 1000)",
             count: Some(100),
             reason: "",
+            sqlstate: "",
             backstop: true,
         },
         // Past them.
@@ -83,6 +93,7 @@ mod tests {
             sql: "repeat('a ', 300000)",
             count: None,
             reason: "more than 10000 terms",
+            sqlstate: "54001",
             backstop: false,
         },
         Case {
@@ -90,6 +101,7 @@ mod tests {
             sql: "'a' || repeat(' OR a', 299999)",
             count: None,
             reason: "more than 10000 terms",
+            sqlstate: "54001",
             backstop: false,
         },
         Case {
@@ -97,6 +109,7 @@ mod tests {
             sql: "repeat('(', 100000) || 'a' || repeat(')', 100000)",
             count: None,
             reason: "nesting exceeds 1000 levels",
+            sqlstate: "54001",
             backstop: false,
         },
         Case {
@@ -104,6 +117,7 @@ mod tests {
             sql: "repeat('(', 5000) || 'a' || repeat(')', 5000)",
             count: None,
             reason: "nesting exceeds 1000 levels",
+            sqlstate: "54001",
             backstop: false,
         },
         Case {
@@ -111,6 +125,7 @@ mod tests {
             sql: "repeat('[', 100000) || 'a' || repeat(']', 100000)",
             count: None,
             reason: "nesting exceeds 1000 levels",
+            sqlstate: "54001",
             backstop: false,
         },
         Case {
@@ -118,6 +133,39 @@ mod tests {
             sql: "'a' || repeat(' AND NOT zz', 299999)",
             count: None,
             reason: "nesting exceeds 1000 levels",
+            sqlstate: "54001",
+            backstop: false,
+        },
+        // AT LEAST inside a proximity operator is matched as the
+        // disjunction of its combinations; C(30, 15) is 155 million, which
+        // exhausted the backend's memory without answering a cancel.
+        Case {
+            label: "AT LEAST 15 OF 30 inside NEAR",
+            sql: "'(AT LEAST 15 OF [' || (SELECT string_agg('t' || n, ' ')
+                  FROM generate_series(1, 30) n) || ']) NEAR/5 a'",
+            count: None,
+            reason: "AT LEAST 15 OF 30 operands inside a proximity operator expands to more than \
+                     10000 combinations",
+            sqlstate: "54001",
+            backstop: false,
+        },
+        Case {
+            label: "AT LEAST 999 OF 1000 inside NEAR",
+            sql: "'(AT LEAST 999 OF [' || (SELECT string_agg('t' || n, ' ')
+                  FROM generate_series(1, 1000) n) || ']) NEAR/5 a'",
+            count: None,
+            reason: "AT LEAST inside a proximity operator expands the query by more than 100000 \
+                     operands",
+            sqlstate: "54001",
+            backstop: false,
+        },
+        Case {
+            label: "AT LEAST 2 OF 100 inside WITHIN",
+            sql: "'(AT LEAST 2 OF [a b ' || (SELECT string_agg('t' || n, ' ')
+                  FROM generate_series(1, 98) n) || ']) WITHIN 3'",
+            count: Some(100),
+            reason: "",
+            sqlstate: "",
             backstop: false,
         },
         Case {
@@ -125,6 +173,7 @@ mod tests {
             sql: "'MATCHES ' || repeat('(', 100000) || 'a' || repeat(')', 100000)",
             count: None,
             reason: "invalid regex",
+            sqlstate: "XX000",
             backstop: false,
         },
     ];
@@ -165,7 +214,7 @@ mod tests {
              CREATE TABLE query_limits_heap AS SELECT * FROM query_limits;
              ANALYZE query_limits;
              CREATE TEMP TABLE query_limits_outcome(
-                 label text, statement text, n bigint, message text);",
+                 label text, statement text, n bigint, message text, sqlstate text);",
         )
         .unwrap();
 
@@ -187,10 +236,11 @@ mod tests {
                 Spi::run(&format!(
                     "DO $$ DECLARE q text := {query}; n bigint; line text; BEGIN
                          {run}
-                         INSERT INTO query_limits_outcome VALUES ('{label}', '{statement}', n, NULL);
+                         INSERT INTO query_limits_outcome
+                             VALUES ('{label}', '{statement}', n, NULL, NULL);
                      EXCEPTION WHEN OTHERS THEN
                          INSERT INTO query_limits_outcome
-                             VALUES ('{label}', '{statement}', NULL, SQLERRM);
+                             VALUES ('{label}', '{statement}', NULL, SQLERRM, SQLSTATE);
                      END $$",
                     query = case.sql,
                     label = case.label,
@@ -201,8 +251,8 @@ mod tests {
 
         for case in CASES {
             for (statement, _) in STATEMENTS {
-                let (n, message) = Spi::get_two::<i64, String>(&format!(
-                    "SELECT n, message FROM query_limits_outcome
+                let (n, message, sqlstate) = Spi::get_three::<i64, String, String>(&format!(
+                    "SELECT n, message, sqlstate FROM query_limits_outcome
                      WHERE label = '{}' AND statement = '{statement}'",
                     case.label
                 ))
@@ -225,8 +275,10 @@ mod tests {
                     // default estimate for a query it cannot parse; every
                     // statement that runs the query must fail cleanly.
                     None if *statement == "explain" => assert!(
-                        message.is_none() || message.as_deref().unwrap().contains(case.reason),
-                        "{} / {statement}: {message:?}",
+                        message.is_none()
+                            || message.as_deref().unwrap().contains(case.reason)
+                                && sqlstate.as_deref() == Some(case.sqlstate),
+                        "{} / {statement}: {sqlstate:?} {message:?}",
                         case.label
                     ),
                     None => {
@@ -237,6 +289,12 @@ mod tests {
                              (n = {n:?})",
                             case.label,
                             case.reason
+                        );
+                        assert_eq!(
+                            sqlstate.as_deref(),
+                            Some(case.sqlstate),
+                            "{} / {statement}: {message}",
+                            case.label
                         );
                     }
                 }

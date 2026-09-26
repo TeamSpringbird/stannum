@@ -4532,10 +4532,16 @@ fn build_index_scorer_inner(
     if !key.full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let query = parse_tinql_to_query(&key.query, tokenizer.as_ref())
-        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
-    let scoring = parse_tinql_to_scoring_query(&key.query, tokenizer.as_ref())
-        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
+    let query = parse_tinql_to_query(&key.query, tokenizer.as_ref()).unwrap_or_else(|error| {
+        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
+    });
+    let scoring =
+        parse_tinql_to_scoring_query(&key.query, tokenizer.as_ref()).unwrap_or_else(|error| {
+            crate::operator::raise_query_error(
+                &error,
+                format!("Stannum score query error: {error}"),
+            )
+        });
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -4677,10 +4683,12 @@ fn build_corpus(
     if !key.full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let query = parse_tinql_to_query(&key.query, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
-    let scoring = parse_tinql_to_scoring_query(&key.query, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
+    let query = parse_tinql_to_query(&key.query, &tokenizer).unwrap_or_else(|error| {
+        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
+    });
+    let scoring = parse_tinql_to_scoring_query(&key.query, &tokenizer).unwrap_or_else(|error| {
+        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
+    });
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -5064,8 +5072,12 @@ fn score_inspect(
     crate::udfs::require_index_select(&index);
     let heap_oid = unsafe { pg_sys::IndexGetRelation(index.oid(), false) };
     let tokenizer = unsafe { crate::options::tokenizer(index.as_ptr()) };
-    let parsed = parse_tinql_to_scoring_query(query, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("stannum.score_inspect() query error: {error}"));
+    let parsed = parse_tinql_to_scoring_query(query, &tokenizer).unwrap_or_else(|error| {
+        crate::operator::raise_query_error(
+            &error,
+            format!("stannum.score_inspect() query error: {error}"),
+        )
+    });
     let edit = TermSetEdit::from_bound_arrays(
         unwrap("term_add", term_add),
         unwrap("term_replace", term_replace),

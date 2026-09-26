@@ -55,7 +55,8 @@ declaration cannot hide a regression.
 - **Index options.** All fifteen documented options are accepted with TIN's
   domains; see [index options](#index-options).
 - **Errors.** An invalid query raises `invalid ==> query at byte N in
-  "QUERY": ...` with TIN's SQLSTATE. `target_segment_count`,
+  "QUERY": ...` with TIN's SQLSTATE, except a query past a size limit
+  (below). `target_segment_count`,
   `max_mutable_segment_size` and `max_merged_segment_size` values outside
   TIN's domains are rejected with SQLSTATE 22023.
 - **Query size.** Stannum answers every query size TIN answers (3,000 words,
@@ -63,6 +64,9 @@ declaration cannot hide a regression.
   terms). Where TIN 1.0.3 crashes the server (10,000 terms, 5,000 nesting
   levels), Stannum raises an ERROR: a query is limited to 1,000 nesting levels
   and 10,000 terms, and every recursive pass checks PostgreSQL's stack depth.
+  `AT LEAST` inside a proximity operator is limited to 10,000 combinations.
+  These errors carry SQLSTATE 54001 (`statement_too_complex`), not TIN's
+  XX000.
 
 ## Documented improvements
 

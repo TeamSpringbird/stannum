@@ -64,7 +64,9 @@ impl From<LowerError> for LoweringIssue {
         match value {
             LowerError::MatchAllInSpanContext => Self::MatchAllInSpanContext,
             LowerError::InvalidRegex(_) => Self::InvalidRegex,
-            LowerError::NestingTooDeep => Self::TooLarge,
+            LowerError::NestingTooDeep
+            | LowerError::TooManyCombinations { .. }
+            | LowerError::ExpansionTooLarge => Self::TooLarge,
         }
     }
 }

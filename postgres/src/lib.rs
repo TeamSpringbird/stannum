@@ -39,9 +39,20 @@ fn check_stack_depth() {
     unsafe { pgrx::pg_sys::check_stack_depth() }
 }
 
+/// The interrupt check of loops whose length a query decides, such as
+/// scanning a dictionary for a term expansion
+/// (`segment::set_interrupt_check`): the loop's race point, for tests, then
+/// PostgreSQL's `CHECK_FOR_INTERRUPTS`, whose ERROR on a cancel or a
+/// `statement_timeout` unwinds out of the loop as the stack check's does.
+fn check_for_interrupts(site: &'static str) {
+    storage::race_point(site);
+    pgrx::check_for_interrupts!();
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     tinql::limits::set_stack_check(check_stack_depth);
+    segment::set_interrupt_check(check_for_interrupts);
     options::init();
     storage::init();
     storage::wal::init();
