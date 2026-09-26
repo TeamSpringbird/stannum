@@ -59,7 +59,7 @@ is 60 s.
 
 `--check EXPECTED_DIR` reads every `*.json` in the directory (all must come
 from the same engine version), prints the engine version and source it
-compares against, runs the cases and prints one line per case:
+compares against, runs the cases that have a recorded answer (the rest report SKIP without running) and prints one line per case:
 
 | status | meaning |
 |--------|---------|

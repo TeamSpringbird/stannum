@@ -729,16 +729,25 @@ def main():
 
     print()
     try:
+        def skip_reason(case):
+            if crash_tagged(case, args.engine, version) and args.skip_crash:
+                return f"tagged crashes: {args.engine}-{version}"
+            if args.check and case["id"] not in expected:
+                return "no expectation recorded"
+            return None
+
         corpus_errors = {}
-        for name in dict.fromkeys(name for case in cases for name in case_corpora(case)):
+        runnable = [case for case in cases if skip_reason(case) is None]
+        for name in dict.fromkeys(name for case in runnable for name in case_corpora(case)):
             try:
                 build_corpus(session, args.engine, corpora[name])
             except psycopg.Error as error:
                 corpus_errors[name] = dict(error_of(error), corpus=name)
         for case in cases:
             tagged = crash_tagged(case, args.engine, version)
-            if tagged and args.skip_crash:
-                emit("SKIP", case["id"], f"tagged crashes: {args.engine}-{version}")
+            reason = skip_reason(case)
+            if reason:
+                emit("SKIP", case["id"], reason)
                 continue
             failed = [corpus_errors[name] for name in case_corpora(case) if name in corpus_errors]
             if failed:
@@ -747,12 +756,8 @@ def main():
                 record = execute_case(session, args.engine, case, risky=bool(case.get("risky") or tagged))
             results[case["id"]] = record
             if args.check:
-                want = expected.get(case["id"])
-                if want is None:
-                    emit("SKIP", case["id"], "no expectation recorded")
-                else:
-                    status, detail = compare_case(case, want, record)
-                    emit(status, case["id"], detail)
+                status, detail = compare_case(case, expected[case["id"]], record)
+                emit(status, case["id"], detail)
             else:
                 if "corpus_error" in record:
                     error = record["corpus_error"]
