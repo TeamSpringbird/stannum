@@ -1049,6 +1049,46 @@ impl Drop for RunSource {
     }
 }
 
+/// Holds page 0 of the first segment of `index_oid` pinned in a hold span
+/// of a source of its own, then drops the source, open span and all, as a
+/// reader dropped at exit is, with `proc_exit_inprogress` set to
+/// `exiting`. Returns the buffer and relation reference the span held; the
+/// caller releases them if the drop did not.
+///
+/// # Safety
+///
+/// `index_oid` names a live Stannum index with a segment.
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) unsafe fn drop_holding_source(
+    index_oid: pg_sys::Oid,
+    exiting: bool,
+) -> (pg_sys::Buffer, pg_sys::Relation) {
+    use segment::source::Source as _;
+    // SAFETY: per the contract; the flag is set only while the source
+    // drops.
+    unsafe {
+        let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
+        let index = relation.as_ptr();
+        let (meta_buffer, meta) = read_meta(index, false);
+        drop(meta_buffer);
+        let entry = meta.segments.first().expect("a segment");
+        let table = page_table(index, meta.identity, entry);
+        let source = RunSource::new(index_oid, entry.run, table, "exit test".to_owned());
+        source.hold(true);
+        source
+            .held_span(0, 0)
+            .expect("a held span")
+            .expect("a pinned page");
+        let buffer = source.slots.borrow()[0][0].expect("the pinned page").buffer;
+        let held = source.relation.get();
+        assert!(!held.is_null());
+        pg_sys::proc_exit_inprogress = exiting;
+        drop(source);
+        pg_sys::proc_exit_inprogress = false;
+        (buffer, held)
+    }
+}
+
 impl segment::source::Source for RunSource {
     fn len(&self) -> u64 {
         u64::from(self.run.bytes)
