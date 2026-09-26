@@ -7327,8 +7327,11 @@ mod tests {
             delete.commit().unwrap();
             // A snapshot's xmin counts transactions in every database: wait
             // until none that could still see the row is running, so the
-            // count's snapshot lets VACUUM remove it.
-            let mut polls = 0;
+            // count's snapshot lets VACUUM remove it. Tests running in
+            // parallel hold their transactions for as long as they run, so
+            // the wait is bounded by the slowest of them, not by this test:
+            // on CI runners some take well over a minute.
+            let started = std::time::Instant::now();
             loop {
                 let past: bool = admin
                     .query_one(
@@ -7340,11 +7343,22 @@ mod tests {
                 if past {
                     break;
                 }
-                polls += 1;
-                assert!(
-                    polls < 6000,
-                    "transactions older than the delete kept running"
-                );
+                if started.elapsed() > std::time::Duration::from_secs(600) {
+                    let holders: String = admin
+                        .query_one(
+                            "SELECT coalesce(string_agg(format('pid %s in %s: %s', pid, datname,
+                                        left(query, 80)), '; '), 'none')
+                             FROM pg_stat_activity
+                             WHERE backend_xid IS NOT NULL
+                               AND backend_xid::text::bigint <= $1 % 4294967296",
+                            &[&deleter],
+                        )
+                        .unwrap()
+                        .get(0);
+                    panic!(
+                        "transactions older than the delete kept running for 10 minutes: {holders}"
+                    );
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             let mut locker = connect();
