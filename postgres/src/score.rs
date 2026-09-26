@@ -3224,6 +3224,21 @@ impl OrdinalWalk<'_, '_> {
                 let ordinal = base + u32::from(low);
                 let sub = usize::from(low) / SUB;
                 let pruning = self.threshold().is_some();
+                if !pruning && self.phrase.is_some() {
+                    // Until the top k fill every match enters it, so a
+                    // candidate's positions are checked before it is scored:
+                    // a phrase of common words that matches rarely never
+                    // fills its top k, and scoring every member of the
+                    // conjunction first was a sixth of its walk. Admitted in
+                    // ordinal order, as `verify_pending` would admit them.
+                    if self.phrase_matches(low, ordinal) {
+                        let total = self
+                            .score_candidate(all, low, ordinal, sub, false)
+                            .expect("a candidate unpruned is scored");
+                        self.admit(total, ordinal);
+                    }
+                    continue;
+                }
                 let Some(total) = self.score_candidate(all, low, ordinal, sub, pruning) else {
                     continue;
                 };
