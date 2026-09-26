@@ -13,7 +13,8 @@ the developer, which is the intended use. The blobs feed the `segment` crate's
     script/dump-segments.py --dbname mydb --index documents_body_idx --out /tmp/blobs
     cargo run -p segment --release --example breakdown -- /tmp/blobs/*.segment
 
-Connection settings come from the usual PG* environment variables.
+Connection settings come from the usual PG* environment variables; --dbname
+defaults to PGDATABASE.
 """
 import argparse
 import struct
@@ -33,11 +34,14 @@ FILE_BLOCKS = (1 << 30) // PAGE_SIZE
 ENTRY_BYTES = 12 + 12 + 12 + 4 + 8 + 4
 
 
-def psql(dbname, sql):
-    result = subprocess.run(
-        ["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1", "-d", dbname, "-c", sql],
-        check=True, text=True, capture_output=True,
-    )
+def psql(dbname, sql, **variables):
+    """Run one statement; psql quotes the :'name' variables it references."""
+    command = ["psql", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"]
+    if dbname:
+        command += ["-d", dbname]
+    for name, value in variables.items():
+        command += ["-v", f"{name}={value}"]
+    result = subprocess.run(command, input=sql, check=True, text=True, capture_output=True)
     return result.stdout.strip()
 
 
@@ -77,15 +81,15 @@ class Relation:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--dbname", required=True)
-    parser.add_argument("--index", required=True)
+    parser.add_argument("--dbname", help="database name (default: PGDATABASE)")
+    parser.add_argument("--index", required=True, help="index name, schema-qualified if not on search_path")
     parser.add_argument("--out", required=True, help="directory for gen<N>.segment files")
     parser.add_argument("--data-directory", help="the server's data directory as this host sees it, "
                         "for a server in a container whose directory is bind-mounted")
     args = parser.parse_args()
     psql(args.dbname, "CHECKPOINT")
     data_directory = args.data_directory or psql(args.dbname, "SHOW data_directory")
-    relative = psql(args.dbname, f"SELECT pg_relation_filepath('{args.index}')")
+    relative = psql(args.dbname, "SELECT pg_relation_filepath(:'index'::regclass)", index=args.index)
     relation = Relation(Path(data_directory) / relative)
     kind, meta = relation.page(0)
     if kind != KIND_META:
