@@ -17,7 +17,7 @@ conformance/
   README.md
   run.py                       the runner
   cases/<area>.yaml            declarative cases, grouped by area
-  cases/catalog_*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9
+  cases/catalog.*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9
   expected/<engine>-<version>/<area>.json
                                recorded answers of one engine version
   divergences/<engine>.yaml    where an engine knowingly answers differently
@@ -170,21 +170,24 @@ may restart.
   is the finding.
 - `expected/tin-*` hold answers of PlanetScale TIN only, never answers
   produced by Stannum or derived from Stannum's code.
-- `expected/tin-1.0.3/` holds answers imported from earlier measurements,
-  each file naming its origin:
-  - `spans.json`, `bm25.json`, `query_size.json`: from
-    `postgres/tests/tin_responses/tin-1.0.3.json` (commit `d9b9225`),
-    measured on 2026-09-26 by `benchmarks/tin_behavior_probe.py` at `29a520e`
-    against PostgreSQL 18.6 on PlanetScale. The span counts are the number of
-    recorded matches (the probe did not run `count(*)` separately).
-  - `span.minimal_interval.json`: measured on 2026-09-26 by the lead
-    session's ad-hoc probe on the same server; matches identical with the
-    custom scan on and off.
-  The smoke and catalog cases have no TIN answers yet.
+- `expected/tin-1.0.3/` holds TIN 1.0.3's answers for every area, recorded
+  live by `run.py` at `64b7f8e` on 2026-09-26 against PostgreSQL 18.6 on
+  PlanetScale (us-east-1): 186 of the 189 cases answered. The spans, BM25,
+  query-size and minimal-interval answers were first measured the same day
+  by `benchmarks/tin_behavior_probe.py` and a one-off psql probe; the live
+  run reproduced them identically. `query_size.json` keeps its imported
+  header (`imported_from`, `measured_by`): the live run skipped the three
+  sizes that crash TIN's server, and their `server_crashed` records come
+  from that first probe.
 - A case without recorded answers for an engine is not a failure; it is
   reported as SKIP until someone records that engine.
 
 ## Case format
+
+A case file is named after its area, `cases/<area>.yaml` (for example
+`catalog.count.yaml`), the name of the recorded
+`expected/<engine>-<version>/<area>.json`; the runner rejects a file whose
+`area` differs from its name.
 
 A case file has an `area`, an optional `description`, optional `defaults`
 merged into every case (`settings` are merged key by key), named `corpora`,

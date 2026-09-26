@@ -58,6 +58,9 @@ def load_cases(directory):
         area = document.get("area")
         if not area:
             raise CaseError(f"{path.name}: missing top-level 'area'")
+        # cases/<area>.yaml pairs with expected/<engine>-<version>/<area>.json.
+        if path.stem != area:
+            raise CaseError(f"{path.name}: area {area!r} must be the file name ({area}.yaml)")
         for name, corpus in (document.get("corpora") or {}).items():
             if name in corpora:
                 raise CaseError(f"{path.name}: corpus {name!r} is defined twice")

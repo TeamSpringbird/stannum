@@ -5,9 +5,10 @@
 area: bm25
 description: >
   BM25 with a chosen k1 (b = 0.75): every score's float4 bits, and the row
-  the top-k scan returns for ORDER BY score DESC LIMIT 1. Imported from TIN
-  1.0.3's recorded responses (benchmarks/tin_behavior_probe.py at 29a520e,
-  2026-09-26). TIN's pruned LIMIT 1 equals the exhaustive top by (score
+  the top-k scan returns for ORDER BY score DESC LIMIT 1. First measured on
+  TIN 1.0.3 by benchmarks/tin_behavior_probe.py at 29a520e (2026-09-26),
+  then recorded by conformance/run.py; postgres/src/tin_conformance.rs
+  replays these cases by id. TIN's pruned LIMIT 1 equals the exhaustive top by (score
   desc, id asc). At k1 = 0 the rows with the higher term frequency round one
   ulp lower, so id 2 wins.
 

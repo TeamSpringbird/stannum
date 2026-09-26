@@ -211,7 +211,6 @@ cases:
   source: docs/tin-behavior-catalog.md §9 Q-20; behaviour §1.2 B12
   corpus: cat_q20
   risky: true
-  crashes: [stannum-0.1.0]
   capture:
   - ids: {query_sql: '(SELECT string_agg(''w'' || n, '' '') FROM generate_series(1, 3000) n)', as: and_3000}
   - ids: {query_sql: '(SELECT string_agg(''w'' || n, '' OR '') FROM generate_series(1, 3000) n)', as: or_3000}

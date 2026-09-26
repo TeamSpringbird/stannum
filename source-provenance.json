@@ -472,57 +472,57 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
     },
-    "conformance/cases/catalog_alternatives.yaml": {
+    "conformance/cases/catalog.alternatives.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_alternatives.yaml."
     },
-    "conformance/cases/catalog_count.yaml": {
+    "conformance/cases/catalog.count.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_count.yaml."
     },
-    "conformance/cases/catalog_ddl.yaml": {
+    "conformance/cases/catalog.ddl.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_ddl.yaml."
     },
-    "conformance/cases/catalog_expansion.yaml": {
+    "conformance/cases/catalog.expansion.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_expansion.yaml."
     },
-    "conformance/cases/catalog_highlight.yaml": {
+    "conformance/cases/catalog.highlight.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_highlight.yaml."
     },
-    "conformance/cases/catalog_phrase.yaml": {
+    "conformance/cases/catalog.phrase.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_phrase.yaml."
     },
-    "conformance/cases/catalog_positions.yaml": {
+    "conformance/cases/catalog.positions.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_positions.yaml."
     },
-    "conformance/cases/catalog_proximity.yaml": {
+    "conformance/cases/catalog.proximity.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_proximity.yaml."
     },
-    "conformance/cases/catalog_relations.yaml": {
+    "conformance/cases/catalog.relations.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_relations.yaml."
     },
-    "conformance/cases/catalog_scoring.yaml": {
+    "conformance/cases/catalog.scoring.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_scoring.yaml."
     },
-    "conformance/cases/catalog_syntax.yaml": {
+    "conformance/cases/catalog.syntax.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_syntax.yaml."
     },
-    "conformance/cases/catalog_tokenize.yaml": {
+    "conformance/cases/catalog.tokenize.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_tokenize.yaml."
     },
-    "conformance/cases/catalog_topk.yaml": {
+    "conformance/cases/catalog.topk.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_topk.yaml."
     },
     "conformance/cases/query_size.yaml": {
       "owner": "ben",
@@ -532,9 +532,9 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
     },
-    "conformance/cases/span_minimal_interval.yaml": {
+    "conformance/cases/span.minimal_interval.yaml": {
       "owner": "ben",
-      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26. Moved from conformance/cases/span_minimal_interval.yaml."
     },
     "conformance/cases/spans.yaml": {
       "owner": "ben",
