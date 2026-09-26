@@ -18,10 +18,70 @@ pub enum SubTokenizeError {
     SplitFuzzyTerm { term: String },
     #[error("range bound \"{bound}\" is split by the long-token policy")]
     SplitRangeBound { bound: String },
+    #[error(
+        "query has more than {limit} terms after analysis",
+        limit = crate::limits::MAX_TERMS
+    )]
+    TooManyTerms,
 }
 
 pub fn sub_tokenize<T: Tokenizer>(expr: Expr, tokenizer: &T) -> Result<Expr, SubTokenizeError> {
-    rewrite(expr, tokenizer)
+    let expr = rewrite(expr, tokenizer)?;
+    // Analysis splits a written term into its tokens (a phrase of them), so
+    // the parser's term limit applies again to what is searched for.
+    if count_terms(&expr) > crate::limits::MAX_TERMS {
+        return Err(SubTokenizeError::TooManyTerms);
+    }
+    Ok(expr)
+}
+
+/// The search terms `expr` names: its leaves and each word of its phrases.
+fn count_terms(expr: &Expr) -> usize {
+    match expr {
+        Expr::Term(_)
+        | Expr::MatchAll
+        | Expr::Fuzzy { .. }
+        | Expr::Wildcard(_)
+        | Expr::Regex(_)
+        | Expr::Range { .. } => 1,
+        Expr::MatchNone => 0,
+        Expr::Phrase { elements, .. } => elements
+            .iter()
+            .map(|element| match element {
+                PhraseElement::Term(_) => 1,
+                PhraseElement::Gap(_) => 0,
+                PhraseElement::Alternatives(exprs) => exprs.iter().map(count_terms).sum(),
+            })
+            .sum(),
+        Expr::Alternatives(exprs)
+        | Expr::AtLeast { exprs, .. }
+        | Expr::And(exprs)
+        | Expr::Or(exprs) => exprs.iter().map(count_terms).sum(),
+        Expr::AndNot {
+            positive: a,
+            negative: b,
+        }
+        | Expr::Then {
+            left: a, right: b, ..
+        }
+        | Expr::Near {
+            left: a, right: b, ..
+        }
+        | Expr::Encloses { big: a, little: b }
+        | Expr::NotEncloses { big: a, little: b }
+        | Expr::EnclosedBy { little: a, big: b }
+        | Expr::NotEnclosedBy { little: a, big: b }
+        | Expr::Overlapping { a, b }
+        | Expr::NotOverlapping { a, b }
+        | Expr::Before { a, b }
+        | Expr::After { a, b } => count_terms(a) + count_terms(b),
+        Expr::First { inner, .. }
+        | Expr::Last { inner, .. }
+        | Expr::Middle { inner, .. }
+        | Expr::Between { inner, .. }
+        | Expr::Within { inner, .. }
+        | Expr::Boost { inner, .. } => count_terms(inner),
+    }
 }
 
 struct AnalyzedToken {
@@ -45,7 +105,26 @@ fn analyze<T: Tokenizer>(text: &str, tokenizer: &T) -> Vec<AnalyzedToken> {
         .collect()
 }
 
-fn rewrite<T: Tokenizer>(expr: Expr, tokenizer: &T) -> Result<Expr, SubTokenizeError> {
+fn rewrite<T: Tokenizer>(mut expr: Expr, tokenizer: &T) -> Result<Expr, SubTokenizeError> {
+    match expr {
+        Expr::Term(_)
+        | Expr::MatchAll
+        | Expr::MatchNone
+        | Expr::Fuzzy { .. }
+        | Expr::Wildcard(_)
+        | Expr::Regex(_)
+        | Expr::Range { .. }
+        | Expr::Phrase { .. } => rewrite_leaf(expr, tokenizer),
+        _ => {
+            rewrite_operands(&mut expr, tokenizer)?;
+            Ok(expr)
+        }
+    }
+}
+
+/// Rewrites a leaf or a phrase.
+#[inline(never)]
+fn rewrite_leaf<T: Tokenizer>(expr: Expr, tokenizer: &T) -> Result<Expr, SubTokenizeError> {
     match expr {
         Expr::Term(s) => Ok(rewrite_term(&s, tokenizer)),
         Expr::Fuzzy {
@@ -94,90 +173,65 @@ fn rewrite<T: Tokenizer>(expr: Expr, tokenizer: &T) -> Result<Expr, SubTokenizeE
             Ok(Expr::Phrase { elements, slop })
         }
         Expr::MatchAll | Expr::MatchNone => Ok(expr),
-        Expr::Alternatives(xs) => Ok(Expr::Alternatives(rewrite_vec(xs, tokenizer)?)),
-        Expr::AtLeast { threshold, exprs } => Ok(Expr::AtLeast {
-            threshold,
-            exprs: rewrite_vec(exprs, tokenizer)?,
-        }),
-        Expr::And(l, r) => Ok(Expr::And(
-            Box::new(rewrite(*l, tokenizer)?),
-            Box::new(rewrite(*r, tokenizer)?),
-        )),
-        Expr::Or(l, r) => Ok(Expr::Or(
-            Box::new(rewrite(*l, tokenizer)?),
-            Box::new(rewrite(*r, tokenizer)?),
-        )),
-        Expr::AndNot { positive, negative } => Ok(Expr::AndNot {
-            positive: Box::new(rewrite(*positive, tokenizer)?),
-            negative: Box::new(rewrite(*negative, tokenizer)?),
-        }),
-        Expr::Then { left, right, gap } => Ok(Expr::Then {
-            left: Box::new(rewrite(*left, tokenizer)?),
-            right: Box::new(rewrite(*right, tokenizer)?),
-            gap,
-        }),
-        Expr::Near { left, right, gap } => Ok(Expr::Near {
-            left: Box::new(rewrite(*left, tokenizer)?),
-            right: Box::new(rewrite(*right, tokenizer)?),
-            gap,
-        }),
-        Expr::Encloses { big, little } => Ok(Expr::Encloses {
-            big: Box::new(rewrite(*big, tokenizer)?),
-            little: Box::new(rewrite(*little, tokenizer)?),
-        }),
-        Expr::NotEncloses { big, little } => Ok(Expr::NotEncloses {
-            big: Box::new(rewrite(*big, tokenizer)?),
-            little: Box::new(rewrite(*little, tokenizer)?),
-        }),
-        Expr::EnclosedBy { little, big } => Ok(Expr::EnclosedBy {
-            little: Box::new(rewrite(*little, tokenizer)?),
-            big: Box::new(rewrite(*big, tokenizer)?),
-        }),
-        Expr::NotEnclosedBy { little, big } => Ok(Expr::NotEnclosedBy {
-            little: Box::new(rewrite(*little, tokenizer)?),
-            big: Box::new(rewrite(*big, tokenizer)?),
-        }),
-        Expr::Overlapping { a, b } => Ok(Expr::Overlapping {
-            a: Box::new(rewrite(*a, tokenizer)?),
-            b: Box::new(rewrite(*b, tokenizer)?),
-        }),
-        Expr::NotOverlapping { a, b } => Ok(Expr::NotOverlapping {
-            a: Box::new(rewrite(*a, tokenizer)?),
-            b: Box::new(rewrite(*b, tokenizer)?),
-        }),
-        Expr::Before { a, b } => Ok(Expr::Before {
-            a: Box::new(rewrite(*a, tokenizer)?),
-            b: Box::new(rewrite(*b, tokenizer)?),
-        }),
-        Expr::After { a, b } => Ok(Expr::After {
-            a: Box::new(rewrite(*a, tokenizer)?),
-            b: Box::new(rewrite(*b, tokenizer)?),
-        }),
-        Expr::First { bound, inner } => Ok(Expr::First {
-            bound,
-            inner: Box::new(rewrite(*inner, tokenizer)?),
-        }),
-        Expr::Last { bound, inner } => Ok(Expr::Last {
-            bound,
-            inner: Box::new(rewrite(*inner, tokenizer)?),
-        }),
-        Expr::Middle { percent, inner } => Ok(Expr::Middle {
-            percent,
-            inner: Box::new(rewrite(*inner, tokenizer)?),
-        }),
-        Expr::Between { lo, hi, inner } => Ok(Expr::Between {
-            lo,
-            hi,
-            inner: Box::new(rewrite(*inner, tokenizer)?),
-        }),
-        Expr::Within { width, inner } => Ok(Expr::Within {
-            width,
-            inner: Box::new(rewrite(*inner, tokenizer)?),
-        }),
-        Expr::Boost { factor, inner } => Ok(Expr::Boost {
-            factor,
-            inner: Box::new(rewrite(*inner, tokenizer)?),
-        }),
+        // An operator: rewritten in place by `rewrite`.
+        _ => unreachable!("rewrite_leaf takes leaves and phrases"),
+    }
+}
+
+/// Rewrites every operand of the operator `expr` in place.
+///
+/// This and [`rewrite`] are the recursion, one level per operator: they
+/// hold only references and one operand at a time, so a deep query costs
+/// little stack per level (the per-variant rebuilding they replace cost
+/// about 3 KiB per level in a release build).
+fn rewrite_operands<T: Tokenizer>(expr: &mut Expr, tokenizer: &T) -> Result<(), SubTokenizeError> {
+    let each = |slot: &mut Expr| -> Result<(), SubTokenizeError> {
+        let operand = std::mem::replace(slot, Expr::MatchNone);
+        *slot = rewrite(operand, tokenizer)?;
+        Ok(())
+    };
+    match expr {
+        Expr::Alternatives(operands)
+        | Expr::AtLeast {
+            exprs: operands, ..
+        }
+        | Expr::And(operands)
+        | Expr::Or(operands) => operands.iter_mut().try_for_each(each),
+        Expr::AndNot {
+            positive: a,
+            negative: b,
+        }
+        | Expr::Then {
+            left: a, right: b, ..
+        }
+        | Expr::Near {
+            left: a, right: b, ..
+        }
+        | Expr::Encloses { big: a, little: b }
+        | Expr::NotEncloses { big: a, little: b }
+        | Expr::EnclosedBy { little: a, big: b }
+        | Expr::NotEnclosedBy { little: a, big: b }
+        | Expr::Overlapping { a, b }
+        | Expr::NotOverlapping { a, b }
+        | Expr::Before { a, b }
+        | Expr::After { a, b } => {
+            each(a)?;
+            each(b)
+        }
+        Expr::First { inner, .. }
+        | Expr::Last { inner, .. }
+        | Expr::Middle { inner, .. }
+        | Expr::Between { inner, .. }
+        | Expr::Within { inner, .. }
+        | Expr::Boost { inner, .. } => each(inner),
+        Expr::Term(_)
+        | Expr::MatchAll
+        | Expr::MatchNone
+        | Expr::Fuzzy { .. }
+        | Expr::Wildcard(_)
+        | Expr::Regex(_)
+        | Expr::Range { .. }
+        | Expr::Phrase { .. } => Ok(()),
     }
 }
 

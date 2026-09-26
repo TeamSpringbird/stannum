@@ -183,3 +183,15 @@
   every block it passed (500 MB for one phrase at 150 million rows). Ranked queries the
   scorer cannot prune, such as phrases, score candidates as the stream
   yields them and keep only the top `k` rows instead of every match.
+- An oversized or deeply nested TINQL query is a clean ERROR instead of a
+  backend crash: 30,000 words, a 30,000-term OR chain or 5,000 nested
+  parentheses overflowed the backend's stack and restarted every session.
+  Word and OR chains parse into one flat node however long; a recursive
+  descent parser replaces the pest one, bounded to 1,000 nesting levels
+  (1,000 nested parentheses take about 0.95 MiB of stack, where pest took
+  4.5 MiB) and 10,000 terms; lowering bounds a span's nesting to 2,000
+  levels, and the extension's own query walks call `check_stack_depth`.
+  PlanetScale TIN 1.0.3 answers 3,000 words or OR terms and 1,000 levels
+  and crashes at 10,000 terms and 5,000 levels. `MATCHES` patterns scan in
+  linear time (pest backtracked exponentially over unclosed groups) and the
+  `AT LEAST` estimate is linear for thresholds near either end.

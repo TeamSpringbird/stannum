@@ -16,6 +16,7 @@ mod highlight_udfs;
 mod match_positions;
 mod operator;
 pub(crate) mod options;
+mod query_limits;
 mod score;
 mod selectivity;
 mod storage;

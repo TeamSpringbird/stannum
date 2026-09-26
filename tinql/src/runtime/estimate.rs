@@ -147,23 +147,37 @@ pub fn at_least(fractions: impl IntoIterator<Item = f64>, min: usize) -> f64 {
         return 1.0;
     }
     let fractions: Vec<f64> = fractions.into_iter().map(clamp).collect();
-    if min > fractions.len() {
+    let n = fractions.len();
+    if min > n {
         return 0.0;
     }
-    // exactly[j]: probability that exactly j of the events seen so far occur.
-    let mut exactly = vec![0.0; fractions.len() + 1];
-    exactly[0] = 1.0;
-    for (seen, fraction) in fractions.iter().enumerate() {
-        for j in (0..=seen + 1).rev() {
-            let with = if j > 0 {
-                exactly[j - 1] * fraction
-            } else {
-                0.0
-            };
-            exactly[j] = exactly[j] * (1.0 - fraction) + with;
-        }
+    // At least `min` of the events occurring is at most `n - min` of them
+    // failing; count whichever threshold is smaller, so the work is
+    // O(n * min(min, n - min + 1)) rather than O(n^2).
+    let failures = n - min + 1;
+    if failures < min {
+        let complements = fractions.iter().map(|fraction| 1.0 - fraction);
+        return (1.0 - at_least_tail(complements, failures)).clamp(0.0, 1.0);
     }
-    exactly[min..].iter().sum::<f64>().min(1.0)
+    at_least_tail(fractions.into_iter(), min).min(1.0)
+}
+
+/// The probability that at least `min >= 1` of independent events with
+/// probabilities `fractions` occur.
+fn at_least_tail(fractions: impl Iterator<Item = f64>, min: usize) -> f64 {
+    // below[j]: probability that exactly j < min of the events seen so far
+    // occur; tail: probability that min or more do.
+    let mut below = vec![0.0; min];
+    below[0] = 1.0;
+    let mut tail = 0.0;
+    for fraction in fractions {
+        tail += below[min - 1] * fraction;
+        for j in (1..min).rev() {
+            below[j] = below[j] * (1.0 - fraction) + below[j - 1] * fraction;
+        }
+        below[0] *= 1.0 - fraction;
+    }
+    tail
 }
 
 /// Phrase or proximity: bounded by the rarest slot, discounted once per
@@ -560,6 +574,51 @@ mod tests {
         close(at_least([0.1, 0.5, 0.3], 4), 0.0);
         close(at_least([0.1], 0), 1.0);
         close(at_least([], 1), 0.0);
+    }
+
+    /// The truncated recurrence agrees with the full Poisson binomial
+    /// distribution at every threshold, from either side.
+    #[test]
+    fn at_least_matches_the_full_distribution() {
+        fn full(fractions: &[f64], min: usize) -> f64 {
+            let mut exactly = vec![0.0; fractions.len() + 1];
+            exactly[0] = 1.0;
+            for (seen, fraction) in fractions.iter().enumerate() {
+                for j in (0..=seen + 1).rev() {
+                    let with = if j > 0 {
+                        exactly[j - 1] * fraction
+                    } else {
+                        0.0
+                    };
+                    exactly[j] = exactly[j] * (1.0 - fraction) + with;
+                }
+            }
+            exactly[min..].iter().sum::<f64>().min(1.0)
+        }
+        let fractions: Vec<f64> = (0..23).map(|i| ((i * 37 % 101) as f64) / 100.0).collect();
+        for n in 0..=fractions.len() {
+            for min in 1..=n + 1 {
+                let actual = at_least(fractions[..n].iter().copied(), min);
+                let expected = if min > n {
+                    0.0
+                } else {
+                    full(&fractions[..n], min)
+                };
+                assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "n {n} min {min}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    /// Large lists estimate in time linear in the list for thresholds near
+    /// either end (the full distribution was quadratic).
+    #[test]
+    fn at_least_is_fast_at_either_end() {
+        let fractions = vec![0.3; 200_000];
+        close(at_least(fractions.iter().copied(), 2), 1.0);
+        close(at_least(fractions.iter().copied(), fractions.len()), 0.0);
     }
 
     #[test]

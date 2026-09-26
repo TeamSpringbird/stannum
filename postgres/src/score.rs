@@ -925,6 +925,10 @@ enum Tri {
 
 impl<'q> Shape<'q> {
     fn of(query: &'q Query) -> Option<Self> {
+        // As in collect_score_terms: a clean ERROR if the walk nears the
+        // stack limit.
+        // SAFETY: called only in a backend.
+        unsafe { pg_sys::check_stack_depth() };
         let children = |children: &mut dyn Iterator<Item = &'q Query>| {
             children.map(Self::of).collect::<Option<Vec<_>>>()
         };
@@ -4851,6 +4855,11 @@ fn collect_score_terms<'a>(
     explicitly_boosted: bool,
     out: &mut Collected<'a>,
 ) {
+    // tinql bounds a query's nesting (tinql::limits); this turns a walk that
+    // still runs out of stack into PostgreSQL's ERROR rather than an abort.
+    // SAFETY: called only in a backend, where check_stack_depth reports
+    // through ereport, which pgrx turns into a Rust panic at this boundary.
+    unsafe { pg_sys::check_stack_depth() };
     let mut push = |text: &'a str| {
         out.terms.push(ScoringTermInput {
             text,

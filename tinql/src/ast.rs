@@ -60,11 +60,13 @@ pub enum Expr {
     },
 
     // -- Boolean operators (document-level) --
-    /// `A AND B`
-    And(Box<Expr>, Box<Expr>),
+    /// `A AND B AND C`: a left-associative chain, flat so that its depth does
+    /// not grow with its length. Always two or more operands, the first never
+    /// itself an `And` (see [`Expr::and`]).
+    And(Vec<Expr>),
 
-    /// `A OR B`
-    Or(Box<Expr>, Box<Expr>),
+    /// `A OR B OR C`: a left-associative chain, flat like [`Expr::And`].
+    Or(Vec<Expr>),
 
     /// `A AND NOT B`
     AndNot {
@@ -141,6 +143,33 @@ pub enum Expr {
         factor: BoostFactor,
         inner: Box<Expr>,
     },
+}
+
+impl Expr {
+    /// `left AND right`, left-associative: extends `left` when it is already
+    /// an AND chain, so `a AND b AND c` is one three-operand node. This is the
+    /// only way the parser builds `And`, which keeps the representation
+    /// canonical: an `And` never has an `And` as its first operand.
+    pub fn and(left: Expr, right: Expr) -> Expr {
+        match left {
+            Expr::And(mut operands) => {
+                operands.push(right);
+                Expr::And(operands)
+            }
+            left => Expr::And(vec![left, right]),
+        }
+    }
+
+    /// `left OR right`, left-associative, flat like [`Expr::and`].
+    pub fn or(left: Expr, right: Expr) -> Expr {
+        match left {
+            Expr::Or(mut operands) => {
+                operands.push(right);
+                Expr::Or(operands)
+            }
+            left => Expr::Or(vec![left, right]),
+        }
+    }
 }
 
 /// A boost factor for relevance scoring.
@@ -315,15 +344,23 @@ fn fmt_expr(f: &mut fmt::Formatter<'_>, expr: &Expr, min_prec: u8) -> fmt::Resul
         }
 
         // -- Boolean --
-        Expr::Or(l, r) => {
-            fmt_expr(f, l, prec::OR)?;
-            write!(f, " OR ")?;
-            fmt_expr(f, r, prec::OR + 1)?;
+        // A chain prints as its left-deep binary form would: the first
+        // operand at the operator's own precedence, the rest one tighter.
+        Expr::Or(operands) => {
+            for (i, operand) in operands.iter().enumerate() {
+                if i > 0 {
+                    write!(f, " OR ")?;
+                }
+                fmt_expr(f, operand, if i == 0 { prec::OR } else { prec::OR + 1 })?;
+            }
         }
-        Expr::And(l, r) => {
-            fmt_expr(f, l, prec::AND)?;
-            write!(f, " AND ")?;
-            fmt_expr(f, r, prec::AND + 1)?;
+        Expr::And(operands) => {
+            for (i, operand) in operands.iter().enumerate() {
+                if i > 0 {
+                    write!(f, " AND ")?;
+                }
+                fmt_expr(f, operand, if i == 0 { prec::AND } else { prec::AND + 1 })?;
+            }
         }
         Expr::AndNot { positive, negative } => {
             fmt_expr(f, positive, prec::AND_NOT)?;

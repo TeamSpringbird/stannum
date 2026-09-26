@@ -107,9 +107,9 @@ fn exercise(query: &str) -> String {
 }
 
 /// Runs `build`'s query through [`exercise`] in a child process on a
-/// backend-sized stack. `name` must be the calling test's name, which the
-/// child uses to select it.
-fn assert_front_end_survives(name: &str, build: fn() -> String) {
+/// backend-sized stack and returns how it ended. `name` must be the calling
+/// test's name, which the child uses to select it.
+fn assert_front_end_survives(name: &str, build: fn() -> String) -> String {
     if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
         let query = build();
         let outcome = std::thread::Builder::new()
@@ -119,7 +119,10 @@ fn assert_front_end_survives(name: &str, build: fn() -> String) {
             .join()
             .expect("the front end panicked");
         println!("{DONE_MARKER} {outcome}");
-        return;
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        // The parent checks the outcome; the rest of the test is its.
+        std::process::exit(0);
     }
 
     let log = |stream: &str| -> PathBuf {
@@ -175,11 +178,101 @@ fn assert_front_end_survives(name: &str, build: fn() -> String) {
         tail(&stderr),
         tail(&stdout),
     );
-    eprintln!("{name}: {} in {elapsed:?}", finished.unwrap());
+    let finished = finished.unwrap_or_default();
+    eprintln!("{name}: {finished} in {elapsed:?}");
+    finished.to_string()
 }
 
 const WORDS: usize = 300_000;
 const NESTING: usize = 100_000;
+
+/// Every size PlanetScale TIN 1.0.3 answered (3,000 words, a 3,000-term OR
+/// chain, 1,000 levels of parentheses; it crashed its server at 10,000
+/// words, 10,000 OR terms and 5,000 levels) parses and lowers, and so do the
+/// limits themselves; one past a limit is a clean error naming it.
+fn assert_lowers(name: &str, build: fn() -> String) {
+    let outcome = assert_front_end_survives(name, build);
+    assert!(
+        outcome.contains("default pipeline ok") && !outcome.contains("error"),
+        "{name}: {outcome}"
+    );
+}
+
+fn assert_rejected(name: &str, build: fn() -> String, reason: &str) {
+    let outcome = assert_front_end_survives(name, build);
+    assert!(
+        outcome.contains("default pipeline error") && outcome.contains(reason),
+        "{name}: {outcome}"
+    );
+}
+
+#[test]
+fn words_at_the_term_limit() {
+    assert_lowers("words_at_the_term_limit", || "a ".repeat(10_000));
+}
+
+#[test]
+fn words_past_the_term_limit() {
+    assert_rejected(
+        "words_past_the_term_limit",
+        || "a ".repeat(10_001),
+        "more than 10000 terms",
+    );
+}
+
+#[test]
+fn distinct_or_terms_at_the_term_limit() {
+    assert_lowers("distinct_or_terms_at_the_term_limit", || {
+        let terms: Vec<String> = (0..10_000).map(|i| format!("t{i}")).collect();
+        terms.join(" OR ")
+    });
+}
+
+#[test]
+fn parentheses_at_the_nesting_limit() {
+    assert_lowers("parentheses_at_the_nesting_limit", || {
+        format!("{}a{}", "(".repeat(1_000), ")".repeat(1_000))
+    });
+}
+
+#[test]
+fn parentheses_past_the_nesting_limit() {
+    assert_rejected(
+        "parentheses_past_the_nesting_limit",
+        || format!("{}a{}", "(".repeat(1_001), ")".repeat(1_001)),
+        "nesting exceeds 1000 levels",
+    );
+}
+
+#[test]
+fn nested_groups_with_terms_at_the_nesting_limit() {
+    assert_lowers("nested_groups_with_terms_at_the_nesting_limit", || {
+        format!("{}a{}", "(a OR ".repeat(999), ")".repeat(999))
+    });
+}
+
+#[test]
+fn nested_alternatives_at_the_nesting_limit() {
+    assert_lowers("nested_alternatives_at_the_nesting_limit", || {
+        format!("{}a{}", "[".repeat(1_000), "]".repeat(1_000))
+    });
+}
+
+#[test]
+fn and_not_chain_at_the_nesting_limit() {
+    assert_lowers("and_not_chain_at_the_nesting_limit", || {
+        vec!["a"; 1_001].join(" AND NOT ")
+    });
+}
+
+#[test]
+fn and_not_chain_past_the_nesting_limit() {
+    assert_rejected(
+        "and_not_chain_past_the_nesting_limit",
+        || vec!["a"; 1_002].join(" AND NOT "),
+        "nesting exceeds 1000 levels",
+    );
+}
 
 #[test]
 fn plain_words_300_000() {
