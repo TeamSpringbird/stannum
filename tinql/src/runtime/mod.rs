@@ -277,6 +277,27 @@ pub enum QueryError {
     Lower(#[from] lower::LowerError),
 }
 
+impl QueryError {
+    /// The byte of the query the error points at, when it names one.
+    #[must_use]
+    pub const fn position(&self) -> Option<usize> {
+        match self {
+            Self::Parse(error) => Some(error.position()),
+            Self::SubTokenize(_) | Self::Lower(_) => None,
+        }
+    }
+
+    /// The error without the stage that raised it.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Parse(error) => error.to_string(),
+            Self::SubTokenize(error) => error.to_string(),
+            Self::Lower(error) => error.to_string(),
+        }
+    }
+}
+
 /// Conjunction (AND) estimate using exponential backoff on selectivities.
 ///
 /// Sorts child selectivities from most to least selective, then applies

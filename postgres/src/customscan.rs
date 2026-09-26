@@ -1306,10 +1306,7 @@ unsafe fn scan_query(exec: &ScanExec) -> Query {
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
         let tokenizer = crate::storage::index_tokenizer(index);
         pg_sys::index_close(index, pg_sys::AccessShareLock as _);
-        let query: Query =
-            tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
-                .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
-        query
+        crate::operator::parse_or_raise(&exec.private.query, tokenizer.as_ref())
     }
 }
 
@@ -1979,9 +1976,7 @@ unsafe extern "C-unwind" fn exec_count(
             let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
             let tokenizer = crate::storage::index_tokenizer(index);
             pg_sys::index_close(index, pg_sys::AccessShareLock as _);
-            let query =
-                tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
-                    .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
+            let query = crate::operator::parse_or_raise(&exec.private.query, tokenizer.as_ref());
             let view = crate::storage::view(index_oid);
             crate::storage::race_point("count:view");
             let (view, visibility) = settle_view(exec, index_oid, view);

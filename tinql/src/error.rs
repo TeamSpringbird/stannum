@@ -48,3 +48,20 @@ pub enum ParseError {
     )]
     TooManyTerms { pos: usize },
 }
+
+impl ParseError {
+    /// The byte of the query the error points at.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        match self {
+            Self::Expected { pos, .. }
+            | Self::EmptyAlternatives { pos }
+            | Self::EmptyPhrase { pos }
+            | Self::NumberOutOfRange { pos, .. }
+            | Self::WildcardInRangeBound { pos, .. }
+            | Self::BoostOutOfRange { pos, .. }
+            | Self::NestingTooDeep { pos }
+            | Self::TooManyTerms { pos } => *pos,
+        }
+    }
+}

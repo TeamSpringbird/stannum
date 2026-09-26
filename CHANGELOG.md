@@ -214,3 +214,9 @@
   still score as one query. Such a sum is sorted over the matches rather
   than ranked by the index scan, and `max_score()` still reports the first
   column's best score.
+- An invalid `==>` query raises its error in TIN 1.0.3's form,
+  `invalid ==> query at byte N in "QUERY": ...` (without the byte when the
+  error names none; a query over 1 KiB is quoted up to 1 KiB), in place of
+  `invalid ==> query: parse error: ...`. The SQLSTATE is unchanged. Syntax
+  errors still name what was expected in the descent parser's words, not
+  TIN's pest grammar rules.
