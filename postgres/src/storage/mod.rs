@@ -1623,6 +1623,21 @@ unsafe fn prepend_chain(index: pg_sys::Relation, run: Run, next: u32) {
     }
 }
 
+/// Whether no snapshot can still read a run released at `xid`.
+///
+/// # Safety
+/// `index` is a live index relation.
+unsafe fn pending_removable(index: pg_sys::Relation, xid: u32) -> bool {
+    // pg_test builds only: a test's own transaction keeps every entry it
+    // released unremovable, so a test that must drain the pending list
+    // declares its entries removable instead.
+    #[cfg(feature = "pg_test")]
+    if testing::PENDING_REMOVABLE.with(Cell::get) {
+        return true;
+    }
+    unsafe { pg_sys::GlobalVisCheckRemovableXid(index, pg_sys::TransactionId::from(xid)) }
+}
+
 /// Marks pages of pending runs that no snapshot can still read as free and
 /// records them in the FSM, at most `stannum.reclaim_pages` of them: this
 /// runs under the exclusive meta lock, where freeing every page of a
@@ -1637,8 +1652,7 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
         let mut budget = RECLAIM_PAGES.get().max(1) as u32;
         let mut still_pending = Vec::new();
         for mut pending in std::mem::take(&mut meta.pending) {
-            let xid = pg_sys::TransactionId::from(pending.xid);
-            if budget == 0 || !pg_sys::GlobalVisCheckRemovableXid(index, xid) {
+            if budget == 0 || !pending_removable(index, pending.xid) {
                 still_pending.push(pending);
                 continue;
             }
@@ -2262,6 +2276,9 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
         for entry in old {
             release_entry(index, meta, entry);
         }
+        // Between retiring the inputs and publishing: what reaches the
+        // disk before the caller's write_meta must be safe to abandon.
+        race_point("merge:released");
     }
 }
 
@@ -2793,6 +2810,7 @@ pub unsafe fn insert(
         }
         append_to_buffer(index, &mut meta.buffer, &bytes);
         meta.buffer.docs += 1;
+        race_point("insert:buffered");
         write_meta(index, &meta_buffer, &meta);
         drop(meta_buffer);
         // Buffer content locks defer PostgreSQL cancel/die interrupts.
@@ -3356,6 +3374,7 @@ pub unsafe fn bulk_delete(
                 }
                 if dropped {
                     unsafe { replace_buffer(index, &mut meta.buffer, &kept, kept_docs) };
+                    race_point("bulk_delete:buffered");
                     changed = true;
                 }
             }
@@ -3616,8 +3635,7 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
         if left == 0 {
             break;
         }
-        let xid = pg_sys::TransactionId::from(pending.xid);
-        if !unsafe { pg_sys::GlobalVisCheckRemovableXid(index, xid) } {
+        if !unsafe { pending_removable(index, pending.xid) } {
             continue;
         }
         // Only a bounded prefix per call: a run retired by a merge of a large
@@ -3795,6 +3813,36 @@ pub mod testing {
     thread_local! {
         pub static RACE_HOOK: RefCell<Option<RaceHook>> = const { RefCell::new(None) };
         pub static CORRUPT_MAINTENANCE_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Treat every pending entry as removable (see [`pending_removable`]): a
+        /// pg_test's own snapshot otherwise keeps all of them readable.
+        pub static PENDING_REMOVABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The number of runs on the meta page's pending list.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn pending_entries(index: pg_sys::Relation) -> usize {
+        unsafe { read_meta(index, false) }.1.pending.len()
+    }
+
+    /// Forgets `pages` in the free space map, as a crash or a promoted
+    /// standby does for pages freed since the map was last written.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn forget_free_pages(index: pg_sys::Relation, pages: &[u32]) {
+        for &page in pages {
+            unsafe { pg_sys::RecordUsedIndexPage(index, page) };
+        }
+    }
+
+    /// Whether the free space map lists `page` as free.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn recorded_free(index: pg_sys::Relation, page: u32) -> bool {
+        unsafe { pg_sys::GetRecordedFreeSpace(index, page) > 0 }
     }
 
     /// Runs `hook` at every race point until it is cleared.
