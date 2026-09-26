@@ -1,222 +1,188 @@
 # Changelog
 
-## 0.1.0-dev
+All notable changes to Stannum are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries describe
+the state of the code; where a later change replaced an earlier one, only the
+result is listed.
 
-- First Stannum release baseline, independently versioned from Lead.
-- PostgreSQL 17/18; TINQL matching, BM25 ranking, highlighting, segmented indexes,
-  index verification and exact-count paths. Development software; see the
-  architecture and benchmark guides for limitations.
-- Versioned schema snapshot and automatic fresh-install/upgrade comparison.
-- Explicit page/segment compatibility policy and release procedure.
-- Heap permission and row-security checks for physical index diagnostics;
-  catalog-dependent SQL functions use STABLE rather than IMMUTABLE.
-- Malformed indexed-query and future page-version regression checks.
-- VACUUM holds the index meta lock only to publish: dead lists, deferred
-  merges, rewrites and reclamation work from a captured directory and are
-  revalidated entry by entry before publication.
-- `stannum.max_segments` is a soft bound enforced within the insert merge
-  budget; only the 128-entry on-disk bound forces an unbudgeted merge.
-- VACUUM reclaims pages a crash left unreferenced (`page N` warnings of
-  `stannum.verify_index`) instead of requiring REINDEX.
-- A phrase (with slop, gaps or a position filter) is ranked by the
-  block-max walk of its words' conjunction; positions are read only for
-  candidates that score into the top k. EXPLAIN reports `Positions Checked`.
-- Ranked queries mixing terms, phrases and conjunctions under OR, AND,
-  AT LEAST and AND NOT (`w OR "p q"`, `(a AND b) OR c`, `a AND (b OR c)`,
-  `a AND NOT b`) are pruned by the disjunction walk over their scoring terms,
-  each candidate tested against the query's shape; they scored every match
-  (`a OR "i m"` 16.2 s to 1.6 ms on the 15 million row mock).
-- Segment format `STN3`: a term's documents are stored once, as ordinals
-  into the segment's document table with each member's term-frequency
-  bucket beside it and a score bound per chunk, so scoring never reads
-  positions; the positions stream holds positions only; and the document
-  table maps ordinals to heap locations and back through the page table and
-  a two-byte offset per document. A one-byte length class per document lets
-  a ranked walk bound a candidate before reading its length, admitted
-  candidates are checked against the visibility map before the heap, and an
-  index build ends by compacting its directory under the segment byte cap. `COUNT(*)` over Boolean term
-  queries folds those streams a chunk at a time instead of visiting each
-  match (the 302 published Wikipedia count queries sum to 39 ms instead of
-  3,767 ms in the replay harness); ranked scans prune over the same streams;
-  dead lists are ordinal streams. Earlier `LSG` segments, which stored the
-  document set a second time as tuple-location postings, are not read;
-  `REINDEX` rewrites. `stannum.count_fold = off` disables the count path.
-- Counts read the visibility map once and start over if VACUUM published a
-  dead list meanwhile; earlier builds could count a tuple VACUUM had removed
-  from a page it then marked all-visible.
-- Counts check the matches of a heap page under one buffer lock.
-- A built index is packed into its lowest pages and truncated; freed pages
-  were reusable but never returned, and a build retires about as many pages
-  as it keeps.
-- Each dead list carries a stamp, so a reader's cached copy is not served
-  once VACUUM replaces the list in the same pages at the same size.
-- Packing a built index marks the pages it reuses as used in the free
-  space map; it left every one of them listed as free, and an insert's
-  page allocation then read stale entries one by one under the meta
-  lock, for seconds at a time in the published write workload.
-- Every run records its last page, so retiring a run joins pending chains
-  with one page write instead of a walk of the run under the meta lock,
-  and draining the pending list under that lock frees at most
-  `stannum.reclaim_pages` pages at a time. The published write workload
-  saw an update hold the lock for 20 to 30 s while such a walk read a
-  retired merge input. The directory holds 96 entries (was 128).
-- A view releases the index meta page before it loads segment readers,
-  so a slow reload never queues a writer and, behind it, every reader.
-  `stannum.reader_cache_mb` defaults to 384 (was 160), enough to keep the
-  readers of a large directory resident across queries.
-- The per-row scorer rewinds a term cursor instead of reopening the term:
-  reopening parsed every chunk bound again, and an exhaustive reference
-  over a hundred million rows did so for each row.
-- Ranked disjunctions skip dead-listed documents in every chunk form, and
-  per-row scores no longer depend on the order the executor hands rows over
-  in (a join scores rows in its own order).
-- Position payloads are read a span at a time from paged segments: the header
-  and skip table, then entry-aligned spans of 64 skip slots as a cursor visits
-  them. Whole extents were copied per term and query, which for frequent terms
-  ran to megabytes and emptied the reader cache; the median phrase query over
-  15 million Stack Exchange rows falls from 11 to 3 ms.
-- A merge takes at most 3 GiB of input, dropping its largest members until it
-  fits, and writing a segment longer than a run's 32-bit length is an error.
-  Selection counted documents only, so at 50 million rows a tier merged into a
-  segment over 4 GiB whose length wrapped: the build succeeded and every query
-  then reported a corrupt segment.
-- A pruned ranked scan that must read past its top k deepens the pruned search
-  to 4k, 16k and so on before it scores every match. An update leaves its old
-  version in the index beside the new one with the same score, so under
-  steady updates a growing share of top tens held a row the snapshot could not
-  see, and each such query scored millions of documents: eight clients ranking
-  disjunctions over 15 million rows beside 1,000 updates a second fell to 2
-  queries a second with a p99 of 20 s. They now sustain 125 with a p99 of
-  208 ms.
-- Ranked conjunctions with elided dense terms are pruned: an elided term's
-  cursor joins the walk as a filter without a score bound. Over 15 million
-  Stack Exchange rows the p99 of published AND queries falls from 165 to 38 ms.
-- A ranked query whose terms are all elided or absent takes its top k from
-  the heap-ordered candidate stream: every match scores zero and ties rank in
-  heap order, so nothing is collected or sorted.
-- Ranked disjunctions ordered by `stannum.score` are pruned when dense terms
-  are elided: the walk covers the scoring terms and is exact whenever the top k
-  score above zero. They were scored exhaustively before, 6.4 s at the median
-  over 15 million Stack Exchange comments against 21 ms now.
-- Ranked scans name a scored document through its term's ordinal stream
-  instead of ranking its TID in the segment's document table, which has no
-  skip structure and was decoded from the start by every ranked query: about
-  15 ms per query at five million documents, growing with the corpus. Median
-  top-10 latency over the published Wikipedia queries falls from 17 to 2.5 ms
-  (OR), 16 to 1.1 ms (AND) and 17 to 1.7 ms (phrase).
-- Segment format `LSG3`: one term bound for postings that fit a block, no
-  payload skip slot for entry 0, and dictionary entries with gap-encoded
-  extents; the 100k Wikipedia index shrinks by about a tenth with the same
-  pruning. `LSG1` and `LSG2` segments remain readable; `REINDEX` rewrites.
-- Foreground segment merges preserve dictionary/posting order through the
-  validated direct-merge API, retaining existing encoding and publication locks.
-  Oversized aggregate inputs retain reconstruction fallback; pending insert
-  cancellation is checked after metadata unlock.
-- VACUUM deferred merges and deletion rewrites use validated direct posting
-  merges, with interruptible construction and unchanged stale-input publication
-  checks. All-dead inputs leave no empty successor.
-- After a fold, an insert frees reclaimable runs and merges one due tier of
-  up to `stannum.deferred_merge_docs` documents outside the metadata lock.
-  At 1,000 updates a second against 15 million Stack Exchange rows for ten
-  minutes, ranked disjunctions went from 120 to 156 queries a second, the
-  directory from 129 segments to 34 and the longest query from 34 s to 11 s.
-- `target_segment_count`, `max_mutable_segment_size`, `max_merged_segment_size`
-  and `dead_percent_threshold` now shape maintenance for the index that sets
-  them instead of being ignored; unset, the `stannum.*` settings apply.
-- A pruned disjunction whose scoring terms match fewer than k documents fills
-  the rest of its top k from the matches of its elided terms, which tie at
-  zero in heap order, instead of scoring every match. In the same write
-  workload the longest query went from 10 s to 0.55 s and throughput from 156
-  to 180 queries a second.
-- The pruned ranked walk checks a row's snapshot visibility as it enters the
-  top k, so the dead version an update leaves beside its successor never
-  takes a place and the scan no longer deepens for it. With 300,000 of 15
-  million Stack Exchange rows updated, one ranked disjunction in six had
-  needed that second walk; none does now, and their total time fell 12%.
-- The pruned disjunction walk sums its terms' maxima once per step instead
-  of folding every prefix, and a sparse stream seeks through its bounds
-  table without decoding the first posting of each block it skips. Mixed
-  ranked queries at eight clients on 15 million rows: 313 to 340 a second.
-- Benchmark harness: `--save-database` copies a built, vacuumed and checked
-  database out of its container and `--load-database` starts a later run
-  from that copy, so one build serves every workload of a campaign;
+## [Unreleased]
+
+The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
+`0.1.0`), versioned independently of Lead.
+
+### Added
+
+- A PostgreSQL 17 and 18 index access method, `stannum`, with TINQL matching
+  through `==>`, BM25 ranking (`stannum.score`, `full_score`, `max_score`,
+  `score_inspect`), highlighting (`stannum.highlight`, `highlight_ansi`),
+  segmented indexes and exact counts under concurrent writes.
+- Segment format `STN3`. A term's documents are stored once, as ordinals into
+  the segment's document table, with each member's term-frequency bucket
+  beside it and a score bound per 65,536-document chunk and per
+  1,024-document sub-block, so scoring never reads positions. Positions have
+  their own stream, read only by positional queries. The document table maps
+  ordinals to heap locations and back through a page table and a two-byte
+  offset per document, and a one-byte length class per document lets a
+  ranked walk bound a candidate before reading its length. Dead lists are
+  ordinal streams. On the 150 million row Stack Exchange corpus the index is
+  47 GB, against 246.5 GB for the earlier `LSG5` format.
+- Counts of Boolean term queries fold the ordinal streams a chunk at a time
+  instead of visiting each match: the 302 published Wikipedia count queries
+  sum to 39 ms instead of 3,767 ms in the replay harness.
+  `stannum.count_fold = off` selects the page-mask and scalar strategies.
+- Pruned ranked retrieval over the ordinal streams (block-max WAND with
+  per-chunk and per-sub-block bounds), with the same rows, scores and tie
+  order as exhaustive scoring. It covers flat conjunctions and disjunctions,
+  phrases (walked as the conjunction of their words, with positions read only
+  for candidates that would enter the top k), and combinations of terms and
+  phrases under `AND`, `OR`, `AT LEAST` and `AND NOT`. Dense terms that
+  `stannum.score` elides join the walk as filters, and a query whose terms are
+  all elided takes its top k in heap order. A ranked conjunction first
+  evaluates its best-bounded chunks (`stannum.warmup_chunks`,
+  `stannum.warmup_min_matches`).
+- `stannum.verify_index(index, heap_check)`, which walks a whole index and
+  lists every inconsistency with a severity and location, and
+  `stannum.segment_info` for inspecting the segment layout.
+- Tiered segment merges with per-fold budgets (`stannum.max_merge_docs`), one
+  merge per insert outside the metadata lock (`stannum.deferred_merge_docs`),
+  and deferred merges, dead lists and rewrites in VACUUM, which holds the
+  metadata lock only to publish. Merges combine the inputs' sorted
+  dictionaries and streams directly through a validated, interruptible API
+  ([ADR 0001](docs/adr/0001-preserve-posting-order-before-changing-encoding.md)).
+- The TIN-named index options `target_segment_count`,
+  `max_mutable_segment_size`, `max_merged_segment_size` and
+  `dead_percent_threshold` shape maintenance for the index that sets them,
+  within TIN's domains (1..4096, at least 131,072 bytes, at least 100 MB);
+  other values fail with SQLSTATE 22023. Unset, the `stannum.*` settings
+  apply. `initial_segment_count` is accepted and ignored with a warning.
+- Hot-standby index reads when the extension is preloaded on the primary and
+  standby, through removal-horizon WAL records from a custom resource manager.
+- The [TIN conformance suite](conformance/README.md): engine-agnostic,
+  declarative cases (the 140 cases of the TIN behavior catalog among them),
+  PlanetScale TIN 1.0.3's recorded answers, and a runner that records one
+  engine and checks another. Documented divergences report as `IMPROVED`
+  (TIN refuses, Stannum answers) or `GAP` (Stannum lacks the feature), and a
+  declared divergence cannot hide a regression. Against TIN 1.0.3: 170 PASS,
+  12 DIFF (error wording), 5 IMPROVED, 2 GAP, 0 FAIL.
+- Limits on query size: 1,000 nesting levels, 10,000 terms and 2,000 levels
+  of span nesting, each an ERROR naming the byte offset. Every recursive pass
+  over a query also calls PostgreSQL's `check_stack_depth`, so a smaller stack
+  ends in "stack depth limit exceeded".
+- A versioned schema snapshot with an automatic fresh-install and upgrade
+  comparison, an explicit page and segment compatibility policy, and a
+  release procedure.
+- Benchmark harness: `--save-database` and `--load-database` let one built,
+  vacuumed and checked database serve every workload of a campaign;
   `--ranked-validation-queries` samples the exhaustive ranked check;
-  `build-image --base` builds a native image for rehearsals; a benchmark
-  stack may live up to 24 hours.
-- Prototype of ranking over the ordinal streams (ADR 0003), behind
-  `stannum.rank_by_ordinal` (off): block-max WAND over the terms' chunks
-  with only the essential terms' members visited within a chunk. Chunk
-  bounds are derived from block bounds at query time until the format
-  stores them. Same rows and scores as the postings walk on the published
-  disjunctions over 15 million rows, at 10.7 ms median instead of 18.1 and
-  65 ms at the 99th percentile instead of 154; the mixed workload at eight
-  clients went from 345 to 417 queries a second.
-- Segment format `LSG5`: every ordinal stream stores a score bound per chunk
-  and per occupied 1,024-document sub-block, and ranked disjunctions walk the
-  ordinal streams by default (`stannum.rank_by_ordinal`), see ADR 0003. On
-  15 million Stack Exchange rows the published disjunctions take 8.9 ms at
-  the median instead of 17.3 and 58 ms at the 99th percentile instead of
-  154, with the same rows and scores; the mixed workload at eight clients
-  runs at 436 queries a second instead of 347. The index grows 5% and builds
-  2% slower. `LSG4` and earlier segments remain readable and rank through
-  their TID postings; `REINDEX` rewrites.
-- Ranked conjunctions walk the ordinal streams too: the rarest term leads
-  through its chunks, the others and any elided terms are aligned to each,
-  and the shared members are tested by bit. On 15 million rows the
-  published conjunctions take 1.25 ms at the median instead of 3.0 with the
-  same rows and scores; at eight clients the conjunction-phrase workload
-  runs at 500 queries a second instead of 437 and the mixed workload at
-  479 instead of 343.
-- A backend's private memory no longer grows with what a query reads:
-  payload spans, ordinal chunks, document lengths and postings windows are
-  read into buffers the cursor owns and replaces, where earlier every
-  fetched range stayed in the reader's arena until the query ended (a
-  phrase of common words held 480 MB per backend at 15 million rows, and
-  the 150 million row run was killed for memory). The ranges are shared
-  through a least-recently-used cache of `stannum.read_cache_mb` (64 MiB)
-  per backend, so frequent terms' chunks stay warm; `stannum.reader_cache_mb`
-  defaults to 160 MiB, and a segment's dictionary index is held at every
-  sixteenth block rather than whole, so eight backends fit beside 24 GiB of
-  shared buffers in a 32 GiB container at 150 million rows. A cursor over a term's
-  TID postings streams its block-bound table the same way and keeps only
-  the bounds between its block and its lookahead, where it decoded and kept
-  every block it passed (500 MB for one phrase at 150 million rows). Ranked queries the
-  scorer cannot prune, such as phrases, score candidates as the stream
-  yields them and keep only the top `k` rows instead of every match.
-- An oversized or deeply nested TINQL query is a clean ERROR instead of a
-  backend crash: 30,000 words, a 30,000-term OR chain or 5,000 nested
-  parentheses overflowed the backend's stack and restarted every session.
-  Word and OR chains parse into one flat node however long; a recursive
-  descent parser replaces the pest one, bounded to 1,000 nesting levels
-  (1,000 nested parentheses take about 0.95 MiB of stack, where pest took
-  4.5 MiB) and 10,000 terms; lowering bounds a span's nesting to 2,000
-  levels, and every recursive pass over a query calls `check_stack_depth`,
-  so a smaller stack ends in "stack depth limit exceeded" instead.
-  PlanetScale TIN 1.0.3 answers 3,000 words or OR terms and 1,000 levels
-  and crashes at 10,000 terms and 5,000 levels. `MATCHES` patterns scan in
-  linear time (pest backtracked exponentially over unclosed groups) and the
-  `AT LEAST` estimate is linear for thresholds near either end.
-- `target_segment_count`, `max_mutable_segment_size` and
-  `max_merged_segment_size` take TIN's domains (1..4096, at least 131072
-  bytes, at least 100 MB) and reject other values with SQLSTATE 22023, as
-  TIN 1.0.3 does; unset still leaves the `stannum.*` settings in charge.
-- A term repeated in a flat AND or OR chain adds its boosts in scoring and
-  `score_inspect`, as in TIN 1.0.3: `a a` weighs `a` 2.0 and scores as
-  `a^2`, where the repeat was removed before scoring. Matching is unchanged.
-- `highlight()` and `highlight_ansi()` without a query take it from a `==>`
-  clause anywhere in the query's join tree, so a CTE or subquery the planner
-  flattens binds as in TIN 1.0.3; with no clause to bind they return the text
-  unmarked, as TIN does, instead of raising an error.
-- `score()` and `full_score()` over `==>` clauses on several indexed columns
-  of one table sum one score per column, left to right in clause order, as
-  TIN 1.0.3 does: a row matching two columns scores both, a row matching one
-  that column's, where only the first column scored. Clauses on one column
-  still score as one query. Such a sum is sorted over the matches rather
-  than ranked by the index scan, and `max_score()` still reports the first
-  column's best score.
+  `build-image --base` builds a native image for local runs.
+
+### Changed
+
+- TINQL query expressions are parsed by a recursive-descent parser; the pest
+  expression grammar remains only as a test-only differential oracle, and
+  phrase contents are still parsed with pest. AND and OR chains parse into
+  one flat node however long, a bracket level takes about 0.95 KiB of stack
+  instead of 4.5 KiB, and `MATCHES` patterns scan in linear time where the
+  pest grammar backtracked exponentially over unclosed groups. The `AT LEAST`
+  estimate is linear for thresholds near either end.
 - An invalid `==>` query raises its error in TIN 1.0.3's form,
   `invalid ==> query at byte N in "QUERY": ...` (without the byte when the
-  error names none; a query over 1 KiB is quoted up to 1 KiB), in place of
-  `invalid ==> query: parse error: ...`. The SQLSTATE is unchanged. Syntax
-  errors still name what was expected in the descent parser's words, not
-  TIN's pest grammar rules.
+  error names none; a query over 1 KiB is quoted up to 1 KiB). The SQLSTATE is
+  unchanged. Syntax errors name what was expected in the descent parser's
+  words, not TIN's grammar rules.
+- A term repeated in a flat AND or OR chain adds its boosts in scoring and
+  `score_inspect`, as in TIN 1.0.3: `a a` scores as `a^2`. Matching is
+  unchanged.
+- `score()` and `full_score()` over `==>` clauses on several indexed columns
+  of one table sum one score per column in clause order, as TIN 1.0.3 does.
+  Such a sum is sorted over the matches rather than ranked by the index scan,
+  and `max_score()` reports the first column's best score.
+- `highlight()` and `highlight_ansi()` without a query take it from a `==>`
+  clause anywhere in the query's join tree, so a CTE or subquery the planner
+  flattens binds, and with no clause to bind they return the text unmarked,
+  as TIN 1.0.3 does.
+- A pruned ranked scan that must read past its top k deepens the pruned
+  search (to four times the depth, up to 4,096 rows) before it scores every
+  match, and checks each row's snapshot visibility as it enters the top k.
+  With eight clients ranking disjunctions over 15 million rows beside 1,000
+  updates a second, throughput went from 2 to 125 queries a second.
+- A ranked walk reads ordinal chunks, position spans and its candidates'
+  length and class pages in place from pinned shared-buffer pages instead of
+  copying them per backend.
+- A backend's private memory no longer grows with what a query reads: cursors
+  own bounded buffers, shared through a least-recently-used cache of
+  `stannum.read_cache_mb` (64 MiB) per backend; the segment readers' headers,
+  dictionary samples and page tables are bounded by `stannum.reader_cache_mb`
+  (384 MiB). A view releases the meta page before it loads segment readers.
+- The on-disk directory holds 96 entries and the pending-free list 48.
+  `stannum.max_segments` is a soft bound enforced within the insert merge
+  budget; only the 96-entry bound forces an unbudgeted merge.
+- An index build compacts its directory to the fewest segments the 3 GiB
+  merge cap allows, then packs its live runs into the lowest pages and
+  truncates the relation.
+- A merge takes at most 3 GiB of input, dropping its largest members until it
+  fits; writing a segment longer than a run's 32-bit length is an error.
+- Inserts free at most `stannum.reclaim_pages` pages of retired runs at a
+  time, and each run records its last page, so retiring a run no longer walks
+  it under the meta lock.
+- Physical index diagnostics check heap permissions and row security;
+  catalog-dependent SQL functions are STABLE rather than IMMUTABLE.
+- `stannum.debug_seed_score` is superuser-only: a plain role could set it and
+  make a ranked query return wrong or no rows.
+
+### Fixed
+
+- Draining the pending list, and joining a retired run to the pending chain,
+  wait until the meta page is written. An error or crash in between left the
+  meta page listing runs whose pages were already free, and a later drain
+  could free a live segment's page (`62cd0fc`).
+- VACUUM records FREE pages the free space map lost. The map is not
+  WAL-logged, so after a crash or on a promoted standby such pages were never
+  reused and the index grew until `REINDEX` (`5abb6e6`).
+- A fold or VACUUM that replaces the write buffer writes the new contents to
+  pages the published buffer does not cover. A failure before the meta page
+  was written could pair the old meta page with rewritten pages, losing
+  buffered rows (`05f6f4c`).
+- VACUUM's orphan pass holds the index's maintenance lock, so it no longer
+  frees the pages of a deferred merge that is about to be published
+  (`0626d91`).
+- Counts that do not fold (phrases, `NOT`, prefixes and other expansions)
+  read the visibility map after capturing their view and confirm the view is
+  still current, so a row VACUUM removed meanwhile is not counted
+  (`0f785be`).
+- An ordered span with a phrase operand after its first position (for
+  example `a THEN/1 "b c"`) tested the wrong word pair and missed rows
+  (`290f633`).
+- Pruned ranking at `k1` near zero no longer drops the true top row when
+  rounding leaves a higher frequency bucket an ulp below a lower one
+  (`290f633`).
+- A conjunction's warm-up passes give up their pinned pages as each pass
+  ends; a later pass could read a chunk from a page no longer pinned
+  (`a147da3`).
+- A backend that exits during a ranked walk leaves the walk's pins to
+  PostgreSQL instead of releasing them a second time, which crashed the
+  backend and restarted the server (`e2e3e58`).
+- An oversized or deeply nested query (30,000 words, a 30,000-term OR chain,
+  5,000 nested parentheses) is an ERROR instead of a stack overflow that
+  restarted every session (`23afe78`, `1b580f9`).
+- A deleted document is no longer scored by the disjunction walk; its reused
+  location could be returned for a row that never matched.
+- A dead list replaced by VACUUM in the same pages at the same size is no
+  longer served from a reader's cache: each dead list carries a stamp.
+- Counts check a heap page's matches under one buffer lock, and restart if
+  VACUUM publishes a dead list after their view.
+- Per-row scores no longer depend on the order the executor hands rows over
+  in (a join scores rows in its own order).
+- Packing a built index marks the pages it reuses as used in the free space
+  map; stale entries made inserts walk the map under the meta lock for
+  seconds at a time.
+- VACUUM reclaims pages a crash left unreferenced (`page N` warnings of
+  `stannum.verify_index`) instead of requiring `REINDEX`.
+
+### Removed
+
+- Readers for the development formats `LSG1` to `LSG5`, `STN1` and `STN2`.
+  Indexes in them must be rebuilt with `REINDEX`.
+- The `stannum.rank_by_ordinal` setting: ranking over the ordinal streams is
+  the only ranked path.
