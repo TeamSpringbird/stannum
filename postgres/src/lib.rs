@@ -3634,6 +3634,37 @@ mod tests {
         assert!(ansi.contains("Beer"));
     }
 
+    /// An implicit highlight finds the `==>` clause through an UPDATE's
+    /// RETURNING, a CTE and a subquery, and without one returns the text
+    /// unmarked, as TIN 1.0.3 answers (conformance/expected/tin-1.0.3/
+    /// catalog.highlight.json, catalog.H-08 and catalog.H-12).
+    #[pg_test]
+    fn tin_1_0_3_implicit_highlight_binding() {
+        let text = |sql: &str| Spi::get_one::<String>(sql).unwrap();
+        assert_eq!(text("SELECT stannum.highlight(NULL, query => 'a')"), None);
+        assert_eq!(text("SELECT stannum.highlight('x')"), Some("x".into()));
+        assert_eq!(
+            text("SELECT stannum.highlight('a b', '<b>', '</b>', 'a AND')"),
+            Some("a b".into())
+        );
+        Spi::run(
+            "CREATE TABLE implicit_binding(id int, body text);
+             INSERT INTO implicit_binding VALUES (1, 'urgent x');
+             CREATE INDEX implicit_binding_idx ON implicit_binding USING stannum(body)",
+        )
+        .unwrap();
+        for sql in [
+            "UPDATE implicit_binding SET body = body WHERE body ==> 'urgent'
+             RETURNING stannum.highlight(body)",
+            "WITH m AS (SELECT body FROM implicit_binding WHERE body ==> 'urgent')
+             SELECT stannum.highlight(body) FROM m",
+            "SELECT stannum.highlight(body)
+             FROM (SELECT body FROM implicit_binding WHERE body ==> 'urgent') s",
+        ] {
+            assert_eq!(text(sql), Some("<b>urgent</b> x".into()), "{sql}");
+        }
+    }
+
     /// A corpus with known term frequencies: 4000 rows where `seven` and
     /// `five` are independent (every 7th and 5th row), `needle` is rare,
     /// `alpha beta` is a phrase on every 100th row and `beta` alone on
