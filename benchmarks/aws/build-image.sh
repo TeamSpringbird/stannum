@@ -3,12 +3,26 @@
 #
 # See LICENSE in the repository root for license terms.
 
-set -eu
+# Build the benchmark image on the stack's instance from a pinned commit:
+#
+#   build-image.sh COMMIT        (or STANNUM_COMMIT=COMMIT build-image.sh)
+#
+# COMMIT must be a full 40-character SHA so the recorded provenance names
+# exactly one tree. The first AWS comparison pinned
+# ab1e6db87e7c5bafbfc5c121ac66d879d48bbd3b. STANNUM_REPOSITORY overrides the
+# clone URL.
+set -euo pipefail
+COMMIT=${1:-${STANNUM_COMMIT:-}}
+if ! [[ $COMMIT =~ ^[0-9a-f]{40}$ ]]; then
+  echo "usage: $0 COMMIT (a full 40-character commit SHA, or set STANNUM_COMMIT)" >&2
+  exit 2
+fi
+REPOSITORY=${STANNUM_REPOSITORY:-https://github.com/TeamSpringbird/stannum.git}
 until test -f /opt/stannum-benchmark/bootstrap-ready; do sleep 5; done
 cd /opt/stannum-benchmark
-git clone https://github.com/TeamSpringbird/stannum.git source
+git clone "$REPOSITORY" source
 cd source
-git checkout --detach ab1e6db87e7c5bafbfc5c121ac66d879d48bbd3b
+git checkout --detach "$COMMIT"
 mkdir -p /opt/stannum-benchmark/build
 python3 - <<'BUILD'
 import json, sys, subprocess

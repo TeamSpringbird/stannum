@@ -3,7 +3,7 @@
 #
 # See LICENSE in the repository root for license terms.
 
-set -eu
+set -euo pipefail
 while systemctl is-active --quiet stannum-image-build; do sleep 10; done
 test -f /opt/stannum-benchmark/build/image.json
 docker run -d --name stannum-benchmark --shm-size=3g -p 127.0.0.1:5432:5432 -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=stannum_bench_aws -v stannum-benchmark-data:/var/lib/postgresql stannum-bench:aws postgres -c shared_buffers=2GB -c work_mem=2MB -c jit=off
