@@ -1665,7 +1665,9 @@ impl IndexScorer {
             rest: std::ptr::null(),
             rest_end: 0,
             held: None,
+            span: 0,
             nibbles: Cell::new(None),
+            id: held_owner::next_id(),
             loaded: None,
             counted: (0, 0),
             members: Vec::new(),
@@ -2053,10 +2055,19 @@ struct OrdinalTerm<'a> {
     rest_end: usize,
     /// The slots the walk's segment holds this term's pages in, once it
     /// handed them out: its chunk's members, and the page of its bucket
-    /// nibbles past those.
+    /// nibbles past those. They and what was read through them belong to
+    /// the hold span that handed them out, numbered `span`.
     held: Option<(usize, usize)>,
-    /// The nibble page held last, in stream offsets.
-    nibbles: Cell<Option<segment::source::HeldSpan>>,
+    /// The [`segment::ordinals::Ordinals::hold_generation`] `held` was
+    /// handed out in.
+    span: u64,
+    /// The nibble page held last, in stream offsets, and the hold span it
+    /// was read in.
+    nibbles: Cell<Option<(segment::source::HeldSpan, u64)>>,
+    /// The term's identity as the owner of its slots, for the check of
+    /// test builds that a slot read in place is this term's (see
+    /// [`held_owner`]).
+    id: u64,
     /// Whether the loaded chunk is a bitmap, held in `chunk`.
     dense: bool,
     /// Whether `words` holds the loaded chunk's members, when it is not a
@@ -2217,6 +2228,11 @@ impl OrdinalTerm<'_> {
                 .ordinals
                 .held_slot()
                 .and_then(|members| Some((members, self.ordinals.held_slot()?)));
+            if let Some((members, nibbles)) = self.held {
+                self.span = self.ordinals.hold_generation();
+                held_owner::claim(self.span, members, self.id);
+                held_owner::claim(self.span, nibbles, self.id);
+            }
         }
         match self.held {
             // SAFETY: the chunk is kept in `self.chunk` until the next load,
@@ -2224,15 +2240,49 @@ impl OrdinalTerm<'_> {
             // which ends before its hold span (see `walk_by_ordinal`), and
             // the slot is this term's alone.
             Some((members, _)) => {
+                self.check_held(self.span, members);
                 segment_error(unsafe { self.ordinals.chunk_held(self.pos, members) })
             }
             None => segment_error(self.ordinals.chunk(self.pos)),
         }
     }
 
+    /// Checks, in test builds, that pages read in place through `slot`,
+    /// handed out in hold span `span`, are still this term's: the span is
+    /// the one open, and the slot was handed to this term in it.
+    #[inline]
+    #[track_caller]
+    fn check_held(&self, span: u64, slot: usize) {
+        #[cfg(any(test, feature = "pg_test"))]
+        {
+            let open = self.ordinals.hold_generation();
+            assert!(
+                span == open,
+                "a term read slot {slot} in place from hold span {span} in span {open}"
+            );
+            held_owner::check(span, slot, self.id);
+        }
+        #[cfg(not(any(test, feature = "pg_test")))]
+        let _ = (span, slot);
+    }
+
+    /// Checks, in test builds, that the loaded chunk, if read in place, was
+    /// read in the hold span open (see [`Self::check_held`]).
+    #[inline]
+    #[track_caller]
+    fn check_chunk(&self) {
+        #[cfg(any(test, feature = "pg_test"))]
+        if let (Some(chunk), Some((members, _))) = (&self.chunk, self.held)
+            && chunk.is_held()
+        {
+            self.check_held(self.span, members);
+        }
+    }
+
     /// The loaded bitmap chunk; `dense` says there is one.
     #[inline]
     fn bitmap(&self) -> &segment::ordinals::Chunk {
+        self.check_chunk();
         self.chunk.as_ref().expect("a dense term holds its chunk")
     }
 
@@ -2254,6 +2304,7 @@ impl OrdinalTerm<'_> {
     /// in `head` or `rest`, if they do; valid while the chunk is loaded.
     #[inline]
     fn run(&self, at: usize, len: usize) -> Option<*const u8> {
+        self.check_chunk();
         if at + len <= self.head_len {
             Some(self.head.wrapping_add(at))
         } else if at >= self.head_len && at + len <= self.rest_end {
@@ -2330,6 +2381,7 @@ impl OrdinalTerm<'_> {
             Some(_) => self.ordinals.list_buckets().get(rank as usize).copied(),
             None => {
                 let within = rank - self.rank_base;
+                self.check_chunk();
                 match self.chunk.as_ref()?.bucket_in_place(within) {
                     Ok(bucket) => bucket,
                     Err(offset) => Some(self.far_bucket(offset, within)),
@@ -2345,16 +2397,20 @@ impl OrdinalTerm<'_> {
     /// them.
     #[inline(never)]
     fn far_bucket(&self, offset: u64, within: u32) -> u8 {
+        let (_, slot) = self.held.expect("a chunk held in place has its slots");
         let span = match self.nibbles.get() {
-            Some(span) if offset.wrapping_sub(span.start) < span.len as u64 => span,
+            Some((span, generation)) if offset.wrapping_sub(span.start) < span.len as u64 => {
+                self.check_held(generation, slot);
+                span
+            }
             _ => {
-                let (_, slot) = self.held.expect("a chunk held in place has its slots");
+                self.check_held(self.span, slot);
                 let span = segment_error(
                     self.ordinals
                         .held_span(slot, offset)
                         .expect("pages are held while a chunk held in place is"),
                 );
-                self.nibbles.set(Some(span));
+                self.nibbles.set(Some((span, self.span)));
                 span
             }
         };
@@ -3918,6 +3974,60 @@ impl OrdinalWalk<'_, '_> {
                 }
             }
         }
+    }
+}
+
+/// Which walked term each slot handed out in a hold span belongs to, kept
+/// in test builds to check that a term reads in place only through its own
+/// slots (see [`OrdinalTerm::check_held`]).
+mod held_owner {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NEXT_ID: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[cfg(any(test, feature = "pg_test"))]
+    thread_local! {
+        /// Owners by (hold span, slot).
+        static OWNERS: std::cell::RefCell<rustc_hash::FxHashMap<(u64, usize), u64>> =
+            std::cell::RefCell::new(Default::default());
+    }
+
+    /// A fresh term identity.
+    pub(super) fn next_id() -> u64 {
+        let id = NEXT_ID.get() + 1;
+        NEXT_ID.set(id);
+        id
+    }
+
+    /// Records `slot`, handed out in hold span `span`, as term `id`'s; a
+    /// slot is handed out once per span.
+    #[inline]
+    pub(super) fn claim(span: u64, slot: usize, id: u64) {
+        #[cfg(any(test, feature = "pg_test"))]
+        OWNERS.with_borrow_mut(|owners| {
+            // Only the spans open matter, and one is open at a time.
+            if owners.len() > 4096 {
+                owners.retain(|(at, _), _| *at == span);
+            }
+            if let Some(owner) = owners.insert((span, slot), id) {
+                panic!("slot {slot} of hold span {span} handed to term {id} and term {owner}");
+            }
+        });
+        #[cfg(not(any(test, feature = "pg_test")))]
+        let _ = (span, slot, id);
+    }
+
+    /// Asserts that `slot` of hold span `span` is term `id`'s.
+    #[cfg(any(test, feature = "pg_test"))]
+    #[track_caller]
+    pub(super) fn check(span: u64, slot: usize, id: u64) {
+        let owner = OWNERS.with_borrow(|owners| owners.get(&(span, slot)).copied());
+        assert!(
+            owner == Some(id),
+            "term {id} read slot {slot} of hold span {span} in place, owned by {owner:?}"
+        );
     }
 }
 
