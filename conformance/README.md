@@ -50,6 +50,10 @@ python3 conformance/run.py --engine stannum --check conformance/expected/tin-1.0
 With neither `--record` nor `--check` the runner only runs the cases and
 reports which ones raised an ERROR.
 
+For Stannum, `script/test-all conformance` runs the check against the
+installed build in a throwaway cluster of its own; CI runs it on
+PostgreSQL 18 after installing the release build (see `docs/testing.md`).
+
 Every run creates a scratch schema `conformance_<random>`, builds each corpus
 the selected cases use once (a table and an index in that schema), runs the
 cases and drops the schema at the end, also when the run fails. Each capture

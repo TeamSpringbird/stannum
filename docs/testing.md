@@ -1,4 +1,94 @@
-# Testing the ranked scan under concurrency
+# Testing Stannum
+
+`script/test-all` is the one entry point for the tests. CI and the local
+gates (`benchmarks/local/gates.sh`) call it, so the three run the same
+commands; this page is the index of every kind of test, what it needs and
+where it runs.
+
+```sh
+script/test-all quick     # formatting, lint and unit tests; no PostgreSQL server
+script/test-all full      # quick, then pg_tests, the cluster tests and conformance
+script/test-all cluster   # one step; --list shows what a tier runs
+```
+
+| tier | steps |
+|------|-------|
+| `quick` | `headers` `fmt` `clippy` `rust-unit` `python-unit` |
+| `full` | `quick`, then `pgrx` `install` `cluster` `conformance` |
+| `gates` | `install` `cluster` `conformance` `oracle` (what `benchmarks/local/gates.sh` runs) |
+
+Every command in the selected steps runs, and the run ends with a summary and
+a nonzero exit if any failed; `--fail-fast` stops at the first failure and
+`--logs DIR` writes each command's output to `DIR/<command>.log`. A failed
+`install` always stops the run, since later steps would test another build.
+
+## Prerequisites
+
+- The Rust toolchain `rust-toolchain.toml` pins, with rustfmt and Clippy.
+  Without a rustup proxy on `PATH`, `script/test-all` finds the pinned
+  toolchain under `~/.rustup/toolchains`.
+- For everything past `quick` except `fmt`, `rust-unit` and `python-unit`:
+  PostgreSQL 17 or 18 with its server headers, `cargo-pgrx` 0.19.1 and
+  `cargo pgrx init` pointed at that server. `script/test-all` uses the
+  `pg_config` on `PATH` (or `PG_CONFIG`) and puts its `bindir` first on
+  `PATH`, so `initdb`, `pg_ctl` and `psql` match it.
+- For the conformance suite, the count fuzzer and the exit test: a Python
+  with `psycopg` 3 and PyYAML, named by `STANNUM_PYTHON` (default `python3`),
+  for example `python3 -m venv /tmp/stannum-venv && /tmp/stannum-venv/bin/pip
+  install 'psycopg[binary]' pyyaml`.
+- Everything else in Python needs only the standard library and `psql`.
+
+### The pgrx lock
+
+`cargo pgrx test` and `cargo pgrx install` replace the extension in the
+server's directories, and `cargo pgrx test` uses one server per machine (port
+28800 + the major version). On a machine where several checkouts share that,
+wrap every command that installs the extension or uses the installed one:
+
+```sh
+script/pgrx-lock.py -- cargo pgrx test pg18 -p stannum
+```
+
+`script/test-all` takes the lock itself, once, for its `pgrx`, `install`,
+`cluster`, `conformance` and `oracle` steps. The lock is reentrant, so it can
+run inside an outer hold. `$STANNUM_PGRX_LOCK` names the lock file (default
+`/tmp/stannum-pgrx.lock`). `cargo pgrx test` leaves a debug build with test
+hooks installed; `script/test-all install` restores the release build.
+
+## Every kind of test
+
+"CI" is `.github/workflows/ci.yml`: the `lint` job, the `build-and-test`
+matrix (x86-64 and arm64, PostgreSQL 17 and 18) and the `reference-oracle`
+job. "Step" is the `script/test-all` step that runs it.
+
+| kind | where | command | needs | runs in |
+|------|-------|---------|-------|---------|
+| Rust unit tests and proptests | `#[test]` and `proptest!` in `segment`, `tinql`, `tokenizer`, `boldi-vigna` | `cargo test --workspace --exclude stannum` | Rust | CI build-and-test; step `rust-unit` |
+| Crate integration tests | `tinql/tests/`, `tokenizer/tests/` | the same command | Rust | the same |
+| Parser differential test | `tinql/src/parser/differential.rs`: the descent parser against the retired pest grammar | the same command | Rust | the same |
+| Heavier proptests | the property tests that read `PROPTEST_CASES` (`segment/src/random_tests.rs`, `tinql/src/runtime/plan.rs`, `boldi-vigna/src/phrase_plan.rs`) | `PROPTEST_CASES=5000 cargo test --release -p segment` | Rust | manual |
+| pg_tests | `#[pg_test]` in `postgres/src`, including `tin_conformance.rs` (TIN 1.0.3's recorded answers) | `cargo pgrx test pg18 -p stannum` | pgrx; installs a pg_test build | CI build-and-test; step `pgrx` |
+| Extension-crate `#[test]`s | plain `#[test]` in `postgres/src` (options, BM25, UDF helpers); they link against PostgreSQL, so only `cargo pgrx test` runs them, not `cargo test` | the same command | the same | the same |
+| Crashes before publication | `postgres/tests/crash_before_publication.py`: crash hooks that exist only in the pg_test build | right after `cargo pgrx test`, under the same lock hold | the pg_test build installed | CI build-and-test; step `pgrx` |
+| Cluster tests | `postgres/tests/`: `extension_upgrade.py`, `postings_lifecycle.py`, `merge_lifecycle.py`, `ranked_fuzz.py --smoke`, `vacuum_cleanup_pins.py`; and `benchmarks/mutation_targets.py` (the benchmark writers' target selection) | `python3 postgres/tests/<test>.py` | the release build installed; each starts its own throwaway cluster | CI build-and-test; step `cluster` |
+| Conformance against TIN 1.0.3 | `conformance/`: 189 cases checked against `conformance/expected/tin-1.0.3` ([README](../conformance/README.md)) | `conformance/run.py --engine stannum --check conformance/expected/tin-1.0.3` | `STANNUM_PYTHON`; the release build installed | CI build-and-test (PostgreSQL 18); step `conformance`, in a throwaway cluster |
+| Reference oracle | `script/reference-oracle`: 47 query shapes in five mutation states against PlanetScale's Lead, built as `tin` | `PGHOST=... PGPORT=... script/reference-oracle OUT` | a running server; a Lead checkout (`LEAD_REF_DIR`) | CI reference-oracle; step `oracle` |
+| Cluster-test unit tests | `postgres/tests/test_*.py` (the fuzzer's query generation) | `python3 -m unittest discover -s postgres/tests -p 'test_*.py'` | Python | CI lint; step `python-unit` |
+| Benchmark harness unit tests | `benchmarks/test_*.py` | `python3 -m unittest discover -s benchmarks -p 'test_*.py'` | Python | CI lint; step `python-unit` |
+| Script unit tests and source headers | `script/test_*.py`; `script/source_headers.py` checks every license header against `source-provenance.json` | `python3 -m unittest discover -s script -p 'test_*.py'` | Python | CI lint; step `headers` |
+| Formatting and lint | the workspace | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features "pg18 pg_test" -- -D warnings` | Rust; pgrx for Clippy | CI lint and build-and-test; steps `fmt`, `clippy` |
+| Benchmark adapter tests | `benchmarks/tin/adapter.test.mjs` and the published driver's query tests | see the `lint` job in `ci.yml` | Node.js; network | CI lint |
+| Benchmark harness smokes | the VACUUM workload and sustained mixed-write harnesses on tiny inputs | see `ci.yml` | the release build installed | CI build-and-test |
+| Ranked-scan fuzzer, long runs | `postgres/tests/ranked_fuzz.py` (below) | `python3 postgres/tests/ranked_fuzz.py --seed 7 --seconds 600` | the release build installed | manual |
+| Count fuzzer | `benchmarks/count_fuzz.py`: seeded AND/OR count queries under writes, against a Python evaluation of the same token sets, with forced page counting | `$STANNUM_PYTHON benchmarks/count_fuzz.py --output DIR` (`--replay DIR/<seed>-fixture.json` repeats one) | `STANNUM_PYTHON`; libpq variables naming a database where the role may create schemas and `stannum` is installed | manual |
+| Backends that exit mid-walk | `postgres/tests/exit_during_walk.py` (below) | `benchmarks/local/exit-test.sh` | Docker; `STANNUM_PYTHON` | manual |
+| Timing microprobes | `#[ignore]`d: `segment/tests/buffer_cost.rs` (`STANNUM_DOCS`, `STANNUM_COUNT`) and `grouped_record_ingestion_microprobe` in `segment/src/segment.rs`; they print timings and assert nothing | `cargo test --release -p segment -- --ignored --nocapture` | Rust | manual |
+
+To add a test, put it where its kind lives above; a new Python cluster test
+also goes into the `cluster` step of `script/test-all`, which is what CI and
+the gates run.
+
+## The ranked scan under concurrency
 
 The ranked (top-k) scan keeps state across the life of a scan: the scorer it
 built, the rows it pruned to, and the write-buffer index it retained. Two bugs
@@ -8,7 +98,7 @@ in `9d3a7a0`) were caught only by the sustained-mutation benchmark, whose
 checks are not an oracle. `postgres/tests/ranked_fuzz.py` is the oracle: a
 randomized concurrency fuzzer for this class of bug.
 
-## What the fuzzer does
+### What the fuzzer does
 
 It starts a throwaway cluster (install stannum first; standard library plus
 `psql`, autovacuum off so every VACUUM is a scheduled step) and builds a small
@@ -73,9 +163,9 @@ python3 postgres/tests/ranked_fuzz.py --smoke     # fixed seeds and REGRESSIONS
 
 `--smoke` runs one fixed seed and the `REGRESSIONS` list in the script (each
 a short configuration that once failed or pins a bug class) in under two
-minutes; CI runs it after the lifecycle checks.
+minutes; CI runs it in the `cluster` step.
 
-## Bug classes it found
+### Bug classes it found
 
 - **HOT-updated rows scored zero.** The index posts the root of a HOT chain;
   the executor projects the visible member's `ctid`; `score_bound_indexed`
@@ -107,7 +197,7 @@ The earlier two bugs remain covered by
 `buffered_scoring_keeps_document_lengths_when_heap_space_is_reused`, and by
 the fuzzer's cursor episodes, which exercise both interleavings continuously.
 
-## Wide disjunction cursors
+### Wide disjunction cursors
 
 `--wide` uses 31, 32, 33 and 128 distinct alphabetic terms with positive boosts,
 cycling across the grouped-pivot threshold. Documents mix dense 128-term bodies
@@ -132,9 +222,9 @@ Local validation of the wide mode: seeds 104/105 completed 204 comparisons,
 426 cursor fetches, 1,480 writer operations and 244 VACUUM operations, with all
 four widths exercised and no skipped comparisons. The six-scenario smoke suite
 passed 912 comparisons. These counts are scheduling-dependent observations,
-not fixed expected counts. [Recorded results](benchmarks/wide-cursor-results.json).
+not fixed expected counts.
 
-## Backends that exit mid-walk
+### Backends that exit mid-walk
 
 A FATAL error (`pg_terminate_backend`, a fast shutdown, postmaster death)
 exits a backend through `proc_exit` without unwinding the ranked walk it
@@ -149,7 +239,8 @@ server log. It needs a Linux server, so it runs in Docker (a few minutes,
 most of it the image build):
 
 ```sh
-benchmarks/local/exit-test.sh            # STANNUM_EXIT_IMAGE=... reuses an image
+STANNUM_PYTHON=/tmp/stannum-venv/bin/python benchmarks/local/exit-test.sh
+# STANNUM_EXIT_IMAGE=... reuses an image built earlier
 ```
 
 The table has 4.6 million documents because a walk checks for interrupts
