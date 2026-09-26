@@ -15,7 +15,7 @@ Every behavior carries one of these provenance tags:
   The TIN version is given.
 - **OPEN**: undocumented or contradictory. Measure it on TIN and record the answer.
 
-Lead code citations use this worktree's paths. The `tinql/`, `tokenizer/` and
+Lead code citations use this repository's paths. The `tinql/`, `tokenizer/` and
 `boldi-vigna/` crates here match Lead `bd95c7e` (2026-09-19) except for license
 headers and `tin`→`stannum` renames. Line numbers can shift by a few lines
 against upstream. This repository's `postgres/` crate is Stannum's rewrite. For
