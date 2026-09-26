@@ -724,6 +724,10 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Derived from Lead postgres/tin.control; extension name, description and version handling changed."
     },
+    "postgres/tests/count_under_vacuum.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Ported from the pg_test count_misses_rows_vacuum_removes_after_its_view (introduced in d96b2aa) to a private cluster on 2026-09-26."
+    },
     "postgres/tests/crash_before_publication.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 1c7a95736839c1c36a4ef1a97756d5d7c372d016."

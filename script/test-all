@@ -173,10 +173,13 @@ step() {
             run cluster-test-unit python3 -m unittest discover -s postgres/tests -p 'test_*.py' ;;
         pgrx)
             need_pg pgrx || return
-            # The crash hook exists only in the pg_test build this installs.
-            run pgrx-test cargo pgrx test "pg$PG_MAJOR" --package stannum --no-default-features \
-                --features "$(features pg_test)" &&
+            # The crash and pause hooks exist only in the pg_test build this
+            # installs; each of these tests runs in a private cluster.
+            if run pgrx-test cargo pgrx test "pg$PG_MAJOR" --package stannum --no-default-features \
+                --features "$(features pg_test)"; then
                 run crash-before-publication python3 postgres/tests/crash_before_publication.py
+                run count-under-vacuum python3 postgres/tests/count_under_vacuum.py
+            fi
             echo "== note: a pg_test build is installed; 'script/test-all install' restores the release build" ;;
         install)
             need_pg install || finish

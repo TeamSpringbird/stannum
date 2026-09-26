@@ -123,9 +123,11 @@ jobs:
         run: script/test-all rust-unit
 
       # pg_tests and the extension's #[test]s, then, on the pg_test build
-      # that leaves installed, crashes injected between page writes and
-      # meta-page publication (postgres/tests/crash_before_publication.py).
-      - name: Extension tests and crash-before-publication checks
+      # that leaves installed and each in a private cluster: crashes injected
+      # between page writes and meta-page publication
+      # (postgres/tests/crash_before_publication.py) and a count racing VACUUM
+      # (postgres/tests/count_under_vacuum.py).
+      - name: Extension tests and race-point checks
         run: script/test-all pgrx
 
       - name: Install release build
