@@ -2720,6 +2720,35 @@ pub unsafe fn insert(
     }
 }
 
+/// The block whose heavyweight page lock is the maintenance lock: held by an
+/// insert's deferred merge for as long as it has pages written and not yet
+/// published or freed, and by VACUUM's orphan reclamation, which must not
+/// see those pages. It is independent of the meta page's buffer lock, which
+/// neither holder waits for it beneath.
+const MAINTENANCE_LOCK: u32 = 0;
+const MAINTENANCE_LOCK_MODE: pg_sys::LOCKMODE = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
+
+/// Whether this backend's transaction holds the maintenance lock of `index`.
+unsafe fn holds_maintenance_lock(index: pg_sys::Relation) -> bool {
+    unsafe {
+        // SET_LOCKTAG_PAGE, as LockPage builds it.
+        let database = if (*(*index).rd_rel).relisshared {
+            pg_sys::InvalidOid
+        } else {
+            pg_sys::MyDatabaseId
+        };
+        let tag = pg_sys::LOCKTAG {
+            locktag_field1: database.to_u32(),
+            locktag_field2: (*index).rd_id.to_u32(),
+            locktag_field3: MAINTENANCE_LOCK,
+            locktag_field4: 0,
+            locktag_type: pg_sys::LockTagType::LOCKTAG_PAGE as u8,
+            locktag_lockmethodid: pg_sys::DEFAULT_LOCKMETHOD as u8,
+        };
+        pg_sys::LockHeldByMe(&tag, MAINTENANCE_LOCK_MODE, false)
+    }
+}
+
 /// After a fold, merges one due tier that the inline budget left behind,
 /// without the meta lock: the segment is built from the inputs as VACUUM builds
 /// its merges and published only if the directory still lists them. Readers and
@@ -2729,16 +2758,16 @@ pub unsafe fn insert(
 /// but a due tier costs `merge_tier_factor` folds, which exceeds it, so under
 /// sustained writes nothing merged until VACUUM ran and the directory filled:
 /// at 1,000 updates a second, in about a minute. One backend merges at a time,
-/// serialized by a heavyweight lock on the meta page that the transaction
-/// releases if the merge fails.
+/// serialized by the maintenance lock ([`MAINTENANCE_LOCK`]), which the
+/// transaction releases if the merge fails; VACUUM's orphan reclamation takes
+/// it too, so the merged run it writes before publishing is never reclaimed.
 ///
 /// # Safety
 /// `index` is an open LDP2 index the caller may write; no buffer is locked.
 unsafe fn merge_deferred(index: pg_sys::Relation) {
     unsafe {
         let ceiling = DEFERRED_MERGE_DOCS.get().max(0) as u64;
-        let lock = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
-        if !pg_sys::ConditionalLockPage(index, 0, lock) {
+        if !pg_sys::ConditionalLockPage(index, MAINTENANCE_LOCK, MAINTENANCE_LOCK_MODE) {
             return;
         }
         // Retired runs are otherwise freed only by VACUUM, or under the meta
@@ -2757,7 +2786,7 @@ unsafe fn merge_deferred(index: pg_sys::Relation) {
             let inputs: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
             replace_entries(index, meta.identity, &inputs);
         }
-        pg_sys::UnlockPage(index, 0, lock);
+        pg_sys::UnlockPage(index, MAINTENANCE_LOCK, MAINTENANCE_LOCK_MODE);
     }
 }
 
@@ -3058,7 +3087,9 @@ unsafe fn unlocked<T>(
 /// `pages`, and no reader's captured directory can: every page enters a
 /// directory through publication under the exclusive meta lock, and only
 /// FREE pages are ever allocated, so a page unreferenced under that lock is
-/// unreferenced forever. Pages a standby reader could still reference were
+/// unreferenced forever unless a writer has it written and not yet
+/// published: the caller wrote the pages itself, or holds the maintenance
+/// lock that excludes the only such writer (see [`reclaim_orphans`]). Pages a standby reader could still reference were
 /// preceded by a [`wal::log_reclaim`] record. The caller holds no page lock.
 unsafe fn free_pages(index: pg_sys::Relation, pages: &[u32], stamp: u32) {
     for &block in pages {
@@ -3564,15 +3595,49 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
 
 /// Frees pages nothing references that are not FREE: leaked by a crash
 /// between writing a run and publishing it, or between removing a pending
-/// entry and freeing its pages. The reachability walk runs unlocked from a
-/// captured directory over the pages that existed at capture. Under a
-/// shared meta lock, which no writer can hold a half-written run beneath,
-/// the candidates still unreferenced by the current directory are confirmed
-/// by walking only what changed since the capture; they are freed after the
-/// lock is released. No snapshot can reference such a page: a reader's
-/// directory holds only published entries, retired entries stay referenced
-/// through the pending list until reclaimed, and a crash ends every session.
+/// entry and freeing its pages.
+///
+/// Two kinds of writer leave pages unreferenced and not FREE while they run.
+/// Inserts write under the exclusive meta lock and publish before releasing
+/// it, so under the shared meta lock their pages are referenced or still
+/// FREE. An insert's deferred merge holds only the maintenance lock
+/// ([`MAINTENANCE_LOCK`]): it writes its merged run before taking the meta
+/// lock to publish it, discards the run if its inputs changed, and frees the
+/// pending runs it removed from the list after releasing the meta lock.
+/// VACUUM's own merges, dead lists and discards run in this backend before
+/// this pass, and builds exclude VACUUM. So this pass holds the maintenance
+/// lock from before the capture until its pages are freed: no page it
+/// reclaims can belong to a run being written, and no page it frees can be
+/// freed and reallocated by another backend in between.
+///
+/// The reachability walk runs unlocked from a captured directory over the
+/// pages that existed at capture. Under a shared meta lock the candidates
+/// still unreferenced by the current directory are confirmed by walking only
+/// what changed since the capture; they are freed after the meta lock is
+/// released. No snapshot can reference such a page: a reader's directory
+/// holds only published entries, retired entries stay referenced through the
+/// pending list until reclaimed, and a crash ends every session.
+///
+/// The lock does not exclude this backend's own transaction, so if this
+/// backend already holds it, its own unpublished run may be beneath and the
+/// pass is skipped.
 unsafe fn reclaim_orphans(index: pg_sys::Relation) {
+    unsafe {
+        if holds_maintenance_lock(index) {
+            return;
+        }
+        // Waits for at most one deferred merge; inserts that try the lock
+        // meanwhile skip their merge rather than wait. Holding no buffer lock
+        // here and taking no other heavyweight lock beneath it (relation
+        // extension aside), this cannot deadlock against the meta lock.
+        pg_sys::LockPage(index, MAINTENANCE_LOCK, MAINTENANCE_LOCK_MODE);
+        reclaim_orphans_locked(index);
+        pg_sys::UnlockPage(index, MAINTENANCE_LOCK, MAINTENANCE_LOCK_MODE);
+    }
+}
+
+/// [`reclaim_orphans`] under the maintenance lock.
+unsafe fn reclaim_orphans_locked(index: pg_sys::Relation) {
     let nblocks = unsafe { blocks(index) };
     let captured = unsafe { read_meta(index, false) }.1;
     let Ok(referenced) = (unsafe { verify::referenced_pages(index, &captured, nblocks, None) })
