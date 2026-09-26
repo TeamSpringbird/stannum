@@ -1489,8 +1489,9 @@ impl Index for MemoizedSegment {
 /// Cached readers by (index identity, segment generation).
 type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
 
-/// `stannum.reader_cache_mb`: fetched bytes across a backend's cached readers
-/// before the cache is emptied. Emptying is wholesale, so the budget should
+/// `stannum.reader_cache_mb`: fetched bytes across a backend's cached
+/// readers, with their dead lists and page tables, before the cache is
+/// emptied. Emptying is wholesale, so the budget should
 /// hold what every query touches: the page tables of a 150 million row
 /// index are 76 MiB. Sized with `stannum.read_cache_mb` for eight backends
 /// beside 24 GiB of shared buffers in 32 GiB.
@@ -1594,18 +1595,41 @@ fn reader_cache_budget() -> usize {
     READER_CACHE_MB.get() as usize * 1024 * 1024
 }
 
-/// Drops cached readers for segments no longer in the directory, and every
-/// reader once the fetched bytes exceed the budget. Live views keep their
-/// own references, so dropping here only releases what nothing else holds.
+/// Memory a cached segment holds besides its reader's arena: the raw dead
+/// list and its decoded locations. Ascending inserts leave a `BTreeSet`'s
+/// nodes about half full, so a location costs about twice its size.
+fn dead_bytes(cached: &CachedSegment) -> usize {
+    cached.dead.as_ref().map_or(0, |dead| dead.len())
+        + cached.dead_set.len() * 2 * std::mem::size_of::<Tid>()
+}
+
+/// Drops what the backend caches for segments no longer in the directory:
+/// readers with their dictionary memos and dead sets, page tables and
+/// decoded dead lists. Then empties all three caches once together they
+/// exceed `stannum.reader_cache_mb`. Live views keep their own references,
+/// so dropping here only releases what nothing else holds.
+///
+/// Runs once per captured view, over at most a few thousand cache entries.
 fn trim_reader_cache(identity: u64, meta: &Meta) {
     segment::cache::set_budget(READ_CACHE_MB.get() as usize * 1024 * 1024);
+    let live = |(id, generation): (u64, u32)| {
+        id != identity || meta.segments.iter().any(|e| e.generation == generation)
+    };
+    let mut bytes = crate::fold::retain_dead_ordinals(live);
+    bytes += PAGE_TABLES.with_borrow_mut(|tables| {
+        tables.retain(|key, _| live(*key));
+        tables.values().map(|table| table.len() * 4).sum::<usize>()
+    });
     SEGMENT_READERS.with_borrow_mut(|readers| {
-        readers.retain(|(id, generation), _| {
-            *id != identity || meta.segments.iter().any(|e| e.generation == *generation)
-        });
-        let bytes: usize = readers.values().map(|c| c.reader.cached_bytes()).sum();
+        readers.retain(|key, _| live(*key));
+        bytes += readers
+            .values()
+            .map(|c| c.reader.cached_bytes() + dead_bytes(c))
+            .sum::<usize>();
         if bytes > reader_cache_budget() {
             readers.clear();
+            PAGE_TABLES.with_borrow_mut(HashMap::clear);
+            crate::fold::retain_dead_ordinals(|_| false);
             #[cfg(feature = "pg_test")]
             testing::READER_CACHE_CLEARS.set(testing::READER_CACHE_CLEARS.get() + 1);
         }

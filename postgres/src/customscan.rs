@@ -176,8 +176,8 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"stannum.reader_cache_mb",
-        c"Per-backend memory for bytes fetched from immutable segments",
-        c"The cache is emptied when its readers hold more; dense terms' ordinal chunks make a larger cache worthwhile.",
+        c"Per-backend memory for bytes fetched from immutable segments, their dead lists and page tables",
+        c"The cache is emptied when it holds more; dense terms' ordinal chunks make a larger cache worthwhile.",
         &crate::storage::READER_CACHE_MB, 1, 1024 * 1024, GucContext::Userset, GucFlags::default(),
     );
     GucRegistry::define_int_guc(

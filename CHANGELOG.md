@@ -113,8 +113,9 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 - A backend's private memory no longer grows with what a query reads: cursors
   own bounded buffers, shared through a least-recently-used cache of
   `stannum.read_cache_mb` (64 MiB) per backend; the segment readers' headers,
-  dictionary samples and page tables are bounded by `stannum.reader_cache_mb`
-  (384 MiB). A view releases the meta page before it loads segment readers.
+  dictionary samples, page tables and decoded dead lists are bounded by
+  `stannum.reader_cache_mb` (384 MiB), and each captured view drops those of
+  segment generations a merge retired. A view releases the meta page before it loads segment readers.
 - The on-disk directory holds 96 entries and the pending-free list 48.
   `stannum.max_segments` is a soft bound enforced within the insert merge
   budget; only the 96-entry bound forces an unbudgeted merge.
