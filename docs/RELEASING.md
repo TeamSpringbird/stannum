@@ -1,7 +1,7 @@
 # Releasing Stannum
 
-Stannum starts at **0.1.0**. Before its first tag this is 0.1.0-dev in the
-changelog; the build and SQL version are 0.1.0. The workspace version is the
+Stannum starts at **0.1.0**. Before its first tag, changes accumulate under
+`[Unreleased]` in the changelog; the build and SQL version are 0.1.0. The workspace version is the
 single source of truth: pgrx substitutes it into `stannum.control`'s
 `@CARGO_VERSION@`, and `stannum.version()` reports the compiled value. Earlier
 0.0.0 development builds are not public releases and have no supported upgrade
@@ -9,7 +9,8 @@ path. Reload their data into a fresh database and rebuild their indexes.
 
 ## Release checklist
 
-1. Update the workspace version and Cargo.lock, and add a dated changelog entry.
+1. Update the workspace version and Cargo.lock, and rename the changelog's
+   `[Unreleased]` section to the version and date, leaving an empty one above.
    Before 1.0, minor releases can change APIs; patch releases preserve them.
    SQL and on-disk format versions are independent.
 2. Generate the release schema without the `pg_test` feature:
