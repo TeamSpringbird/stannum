@@ -798,6 +798,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
     },
+    "script/pgrx-lock.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in d3f5c9833304d4d8a2fa05edf7931f64aaf0d764."
+    },
     "script/reference-oracle": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 44ae79a7b960bdace26fbeccf5b34f9d3c6487fe."
@@ -805,6 +809,14 @@
     "script/source_headers.py": {
       "owner": "ben",
       "evidence": "Added for the Stannum attribution migration; original header-check tooling."
+    },
+    "script/test-all": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in bba2ea6dd197e3ca6ed553ef3f412964adc7be6e."
+    },
+    "script/test_pgrx_lock.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in d3f5c9833304d4d8a2fa05edf7931f64aaf0d764."
     },
     "script/test_source_headers.py": {
       "owner": "ben",
