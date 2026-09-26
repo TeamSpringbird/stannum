@@ -1677,6 +1677,126 @@ mod tests {
     }
 
     #[pg_test]
+    fn held_pages_are_pinned_through_the_buffers_they_were_last_in() {
+        // A walk pins a held page through the buffer the backend last
+        // pinned its block in. The buffer is only a hint: after eviction,
+        // other relations' pages, or a rebuild that reuses the block
+        // numbers under a new relfilenode, the walk must read the pages it
+        // asks for, and still release every pin.
+        Spi::run(
+            "CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+             CREATE TABLE recent(id int primary key, body text);
+             SET LOCAL stannum.build_segment_docs = 200000;
+             INSERT INTO recent SELECT n,
+               repeat('alpha ', 1 + n % 3) ||
+               CASE WHEN n % 7 = 0 THEN 'beta ' ELSE '' END ||
+               CASE WHEN n % 13 = 0 THEN 'delta ' ELSE '' END ||
+               CASE WHEN n % 29 = 0 THEN repeat('eps ', 1 + n % 2) ELSE '' END ||
+               repeat('pad ', n % 5) || 'tail'
+               FROM generate_series(1, 90000) n;
+             CREATE INDEX recent_idx ON recent USING stannum(body);
+             CREATE TABLE other(id int, body text);
+             INSERT INTO other SELECT n, repeat('beta alpha ', 1 + n % 4) || 'tail'
+               FROM generate_series(1, 90000) n;
+             CREATE INDEX other_idx ON other USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;",
+        )
+        .unwrap();
+        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
+            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+                return Some(node.clone());
+            }
+            node["Plans"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(search_scan)
+        }
+        let queries = [
+            "alpha OR beta",
+            "delta OR eps",
+            "beta AND delta",
+            "\"alpha beta\"",
+            "\"delta eps\"",
+        ];
+        let top = |table: &str, query: &str| {
+            Spi::get_one::<String>(&format!(
+                "SELECT coalesce(string_agg(id || ':' || score, ',' ORDER BY score DESC, id), '') FROM
+                   (SELECT id, stannum.score(ctid) AS score FROM {table}
+                    WHERE body ==> '{query}' ORDER BY score DESC LIMIT 10) top"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        // (pages pinned, of those through their recent buffer)
+        let pins = |table: &str, query: &str| {
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM {table} WHERE body ==> '{query}'
+                 ORDER BY stannum.score(ctid) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0;
+            let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
+            let held = crate::storage::held_pages();
+            assert_eq!(held.0, 0, "{table}, {query}: {held:?}");
+            (
+                scan["Pages Pinned"].as_i64().unwrap(),
+                scan["Pages Pinned Recent"].as_i64().unwrap(),
+            )
+        };
+        let expected: Vec<String> = queries.iter().map(|query| top("recent", query)).collect();
+        let others: Vec<String> = queries.iter().map(|query| top("other", query)).collect();
+        // Repeated, a walk pins its pages through the buffers it saw them in.
+        let mut walked = 0;
+        for query in queries {
+            pins("recent", query);
+            let (pinned, recent) = pins("recent", query);
+            walked += usize::from(pinned > 0);
+            assert_eq!(recent, pinned, "{query}: repeated but pinned afresh");
+        }
+        assert!(walked >= 3, "{walked} walks held pages");
+        let evict = |relation: &str| {
+            Spi::run(&format!(
+                "SELECT count(pg_buffercache_evict(bufferid)) FROM pg_buffercache
+                 WHERE relfilenode = pg_relation_filenode('{relation}')"
+            ))
+            .unwrap();
+            let left = Spi::get_one::<i64>(&format!(
+                "SELECT count(*) FROM pg_buffercache
+                 WHERE relfilenode = pg_relation_filenode('{relation}')"
+            ))
+            .unwrap();
+            assert_eq!(left, Some(0), "{relation} kept buffers");
+        };
+        let check = |round: &str| {
+            for (query, expected) in queries.iter().zip(&expected) {
+                assert_eq!(&top("recent", query), expected, "{round}: {query}");
+                pins("recent", query);
+            }
+            for (query, expected) in queries.iter().zip(&others) {
+                assert_eq!(&top("other", query), expected, "{round}: other, {query}");
+            }
+        };
+        // Evicted, the remembered buffers go to other pages, the other
+        // index's among them; the walks read their own.
+        evict("recent_idx");
+        evict("other_idx");
+        check("evicted");
+        evict("recent_idx");
+        check("evicted again");
+        // Rebuilt, the index has the same block numbers in a new file.
+        Spi::run("REINDEX INDEX recent_idx").unwrap();
+        check("reindexed");
+        for query in queries {
+            let (pinned, recent) = pins("recent", query);
+            assert_eq!(recent, pinned, "reindexed, repeated: {query}");
+        }
+        assert_eq!(crate::storage::held_pages().0, 0);
+    }
+
+    #[pg_test]
     fn pruned_top_k_matches_full_scoring_bit_for_bit() {
         // Four build segments of 1,000 documents and a write buffer, with a
         // 60-row pattern of term frequencies and lengths so exact score ties
