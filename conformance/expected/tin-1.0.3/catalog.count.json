@@ -1,0 +1,116 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-26T19:18:38Z",
+  "suite_commit": "64b7f8e52b9f40be77c6a1a34a5ea695d4866cf8",
+  "runner_version": "1"
+ },
+ "cases": [
+  {
+   "id": "catalog.N-01",
+   "captures": {
+    "script": [
+     50,
+     40,
+     40
+    ]
+   }
+  },
+  {
+   "id": "catalog.N-02",
+   "captures": {
+    "pushdown": 50,
+    "no_pushdown": 50
+   }
+  },
+  {
+   "id": "catalog.N-03",
+   "captures": {
+    "same_row": [
+     1
+    ],
+    "other_row": [
+     1,
+     2
+    ]
+   }
+  },
+  {
+   "id": "catalog.N-04",
+   "captures": {
+    "any": [
+     1,
+     2
+    ],
+    "any_null_element": [
+     1
+    ],
+    "any_empty": []
+   }
+  },
+  {
+   "id": "catalog.N-05",
+   "captures": {
+    "null_document": null,
+    "null_query": null,
+    "where_null": []
+   }
+  },
+  {
+   "id": "catalog.N-06",
+   "captures": {
+    "script": [
+     0,
+     1,
+     0
+    ]
+   }
+  },
+  {
+   "id": "catalog.N-07",
+   "captures": {
+    "script": [
+     [
+      1
+     ],
+     [
+      2
+     ],
+     [
+      1
+     ],
+     [
+      2
+     ],
+     [
+      1
+     ],
+     [
+      2
+     ],
+     [
+      1
+     ],
+     [
+      2
+     ],
+     [
+      1
+     ],
+     [
+      2
+     ],
+     [
+      1
+     ],
+     [
+      2
+     ]
+    ]
+   }
+  }
+ ]
+}

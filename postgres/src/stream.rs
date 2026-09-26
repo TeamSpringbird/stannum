@@ -73,10 +73,7 @@ impl CandidateStream {
                 self.recheck |= !planned.exact;
                 let mut cursor = planned.cursor;
                 if let Some(dead) = dead {
-                    let dead = codec_in(
-                        segment::postings::Postings::parse(dead).and_then(|p| p.pages()),
-                        label,
-                    );
+                    let dead = codec_in(crate::storage::dead_pages(&**source, dead), label);
                     cursor = Box::new(codec_in(pages::Difference::new(cursor, dead), label));
                 }
                 inputs.push(cursor);
@@ -91,10 +88,7 @@ impl CandidateStream {
                 self.recheck |= !planned.exact;
                 let mut cursor = planned.cursor;
                 if let Some(dead) = dead {
-                    let dead = codec_in(
-                        segment::postings::Postings::parse(dead).and_then(|p| p.cursor()),
-                        label,
-                    );
+                    let dead = codec_in(crate::storage::dead_cursor(&**source, dead), label);
                     cursor = Box::new(codec_in(set::Difference::new(cursor, dead), label));
                 }
                 inputs.push(cursor);

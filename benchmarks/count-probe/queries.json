@@ -1,0 +1,38 @@
+[
+  {
+    "id": "302:disjunction",
+    "text": "a search engine is an information retrieval software system designed to help find information stored on one or more computer systems",
+    "tinql": "a OR search OR engine OR is OR an OR information OR retrieval OR software OR system OR designed OR to OR help OR find OR information OR stored OR on OR one OR or OR more OR computer OR systems",
+    "baseline_mean_ms": 743.7971769230769
+  },
+  {
+    "id": "88:disjunction",
+    "text": "american academy of child and adolescent psychiatry",
+    "tinql": "american OR academy OR of OR child OR and OR adolescent OR psychiatry",
+    "baseline_mean_ms": 254.51496153846153
+  },
+  {
+    "id": "301:disjunction",
+    "text": "to be or not to be",
+    "tinql": "to OR be OR or OR not OR to OR be",
+    "baseline_mean_ms": 178.21694615384615
+  },
+  {
+    "id": "222:disjunction",
+    "text": "ambassador of italy",
+    "tinql": "ambassador OR of OR italy",
+    "baseline_mean_ms": 122.55255384615384
+  },
+  {
+    "id": "197:disjunction",
+    "text": "ford parts",
+    "tinql": "ford OR parts",
+    "baseline_mean_ms": 7.343076335877862
+  },
+  {
+    "id": "251:disjunction",
+    "text": "foam mattress",
+    "tinql": "foam OR mattress",
+    "baseline_mean_ms": 0.8764000000000001
+  }
+]

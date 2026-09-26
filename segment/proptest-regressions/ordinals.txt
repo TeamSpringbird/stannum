@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 37e2f82f5f97f5c89d61f0241607d374fbad70fd9fa6c3ff35931446917880d3 # shrinks to node = Or([And([Term(2), Term(0)]), Term(2)]), densities = [2, 2, 2, 2], seed = 1

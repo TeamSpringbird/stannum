@@ -1,0 +1,87 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-26T19:18:38Z",
+  "suite_commit": "64b7f8e52b9f40be77c6a1a34a5ea695d4866cf8",
+  "runner_version": "1"
+ },
+ "cases": [
+  {
+   "id": "catalog.R-01",
+   "captures": {
+    "ids": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.R-02",
+   "captures": {
+    "enclosed_by": [
+     [
+      1,
+      "<b>a b c</b>"
+     ]
+    ],
+    "encloses": [
+     [
+      1,
+      "<b>a b c</b>"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.R-03",
+   "captures": {
+    "ids": [
+     2
+    ]
+   }
+  },
+  {
+   "id": "catalog.R-04",
+   "captures": {
+    "overlapping": [
+     1
+    ],
+    "not_overlapping": [
+     2
+    ]
+   }
+  },
+  {
+   "id": "catalog.R-05",
+   "captures": {
+    "before": [
+     1,
+     3
+    ],
+    "after": [
+     2,
+     3
+    ]
+   }
+  },
+  {
+   "id": "catalog.R-06",
+   "captures": {
+    "not_encloses": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "invalid ==> query in \"* NOT ENCLOSES spam\": MatchAll (*) is not valid inside a span/positional context"
+     }
+    },
+    "in_first": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "invalid ==> query in \"* IN FIRST 3 WORDS\": MatchAll (*) is not valid inside a span/positional context"
+     }
+    }
+   }
+  }
+ ]
+}

@@ -4,7 +4,8 @@
 
 """Bounded remote TIN experiments; connection secrets come only from libpq env.
 
-Requires psycopg[binary]==3.3.6 for persistent sessions and streaming COPY.
+Requires psycopg (benchmarks/requirements.txt) for persistent sessions and
+streaming COPY. Run through `tin.py experiment`.
 Uses only uniquely owned schemas; all recorded SQL is generated fixture SQL.
 """
 import concurrent.futures

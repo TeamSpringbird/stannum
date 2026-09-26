@@ -274,13 +274,26 @@ def main():
     segments = 1 if args.scenario == 'rewrite' else 8
     predicate = 'id % 4 <> 0' if args.delete_percent == 75 else f'id % 100 < {args.delete_percent}'
     delete = '' if args.scenario == 'merge' else f'DELETE FROM docs WHERE {predicate};'
+    # A build packs its output into as few segments as the size cap allows,
+    # so the segments are made by inserts instead: each fold of a write
+    # buffer of docs/segments rows becomes one segment, and a merge tier
+    # factor above the segment count keeps them apart. One more row folds
+    # the last full buffer; deleting it and a VACUUM leave the buffer empty
+    # (INDEX_CLEANUP ON: one dead row is too few for VACUUM to visit indexes).
+    per_segment = args.docs // segments
     setup = f"""CREATE EXTENSION stannum;
 CREATE TABLE docs(id int PRIMARY KEY, body text) WITH (autovacuum_enabled=false);
+CREATE INDEX docs_idx ON docs USING stannum(body);
+SET stannum.merge_tier_factor=64;
+SET stannum.write_buffer_docs={per_segment};
+SET stannum.write_buffer_bytes={64 * 1024 * 1024};
 INSERT INTO docs SELECT n, 'w' || {term_expression(args.vocabulary, args.distribution)} || ' ' || repeat('common filler ', {args.repeat}) || md5(n::text)
  FROM generate_series(1,{args.docs}) n;
-SET stannum.build_segment_docs={args.docs // segments};
-SET stannum.merge_tier_factor=64;
-CREATE INDEX docs_idx ON docs USING stannum(body);
+INSERT INTO docs VALUES ({args.docs + 1}, 'fold');
+DELETE FROM docs WHERE id = {args.docs + 1};
+VACUUM (INDEX_CLEANUP ON) docs;
+RESET stannum.write_buffer_docs;
+RESET stannum.write_buffer_bytes;
 {delete}
 ANALYZE docs;"""
     (output / 'setup.sql').write_text(setup)
@@ -300,7 +313,7 @@ ANALYZE docs;"""
         sql(setup)
         if args.vacuum_strategy:
             # Unknown custom-GUC placeholders also pass current_setting();
-            # require a real registered setting before labelling the strategy.
+            # require a real registered setting before labeling the strategy.
             verify_strategy(sql, args.vacuum_strategy)
         before = json.loads(sql("SELECT json_agg(row_to_json(s)) FROM stannum.segment_info('docs_idx') s"))
         assert len(before) == segments and all(row['kind'] == 'immutable' for row in before), before

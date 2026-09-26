@@ -1,7 +1,7 @@
 # Releasing Stannum
 
-Stannum starts at **0.1.0**. Before its first tag this is 0.1.0-dev in the
-changelog; the build and SQL version are 0.1.0. The workspace version is the
+Stannum starts at **0.1.0**. Before its first tag, changes accumulate under
+`[Unreleased]` in the changelog; the build and SQL version are 0.1.0. The workspace version is the
 single source of truth: pgrx substitutes it into `stannum.control`'s
 `@CARGO_VERSION@`, and `stannum.version()` reports the compiled value. Earlier
 0.0.0 development builds are not public releases and have no supported upgrade
@@ -9,7 +9,8 @@ path. Reload their data into a fresh database and rebuild their indexes.
 
 ## Release checklist
 
-1. Update the workspace version and Cargo.lock, and add a dated changelog entry.
+1. Update the workspace version and Cargo.lock, and rename the changelog's
+   `[Unreleased]` section to the version and date, leaving an empty one above.
    Before 1.0, minor releases can change APIs; patch releases preserve them.
    SQL and on-disk format versions are independent.
 2. Generate the release schema without the `pg_test` feature:
@@ -35,7 +36,7 @@ path. Reload their data into a fresh database and rebuild their indexes.
    previous public release. The next snapshot automatically activates real
    ALTER EXTENSION upgrade checks. Keep old C wrapper symbols callable until
    their old SQL objects have been replaced by the migration.
-5. Run formatting, clippy, Rust and PostgreSQL tests, lifecycle checks and the
+5. Run `script/test-all full` (every tier is listed in `docs/testing.md`) and the
    reference oracle. CI checks PostgreSQL 17/18 on x86-64 and AArch64, including
    release schema/upgrade checks. Never ship a binary built with `pg_test`.
 6. Review `docs/SECURITY.md`, changelog, SQL changes and the compatibility table.
@@ -56,14 +57,12 @@ against a database and representative indexes created by the previous tagged
 
 | Extension | Page signature/version read | Segment signatures read | Formats written |
 | --- | --- | --- | --- |
-| 0.1.0 | LDP2, VERSION 2 only | LSG1, LSG2 and LSG3 | LDP2 VERSION 2; LSG3 |
+| 0.1.0 | LDP2, VERSION 2 only | STN3 | LDP2 VERSION 2; STN3 |
 
 `VERSION` is the special-area byte on every page, including the meta page.
 The write-buffer's `version` counter is a cache invalidation generation, not a
-format version. LSG2 remains readable with pruning: it carries the same score
-bounds as LSG3 in a larger layout. LSG1 remains readable, with pruning
-disabled because it lacks block bounds. REINDEX writes the current page and
-segment formats.
+format version. The `LSG1` to `LSG5`, `STN1` and `STN2` segment formats of
+earlier development builds are not read; REINDEX writes the current page and segment formats.
 
 Readers validate page versions before decoding and reject unknown segment
 signatures. A future writer must bump the page version or segment signature
@@ -74,8 +73,4 @@ segment generation and REINDEX guidance. Do not REINDEX with an older binary
 as a downgrade procedure: restore the supported binary or rebuild from the
 heap in a separately validated migration. Never overwrite a released signature
 with a different encoding. pg_tests exercise future-version rejection and
-REINDEX to the current format; segment tests read an LSG2 fixture captured
-from that format's writer (`segment/tests/fixtures/lsg2.segment`) and keep
-LSG1 and LSG2 writers for property tests over every format. Capture a fixture
-of the current format with `cargo test -p segment write_current_fixture --
---ignored` before changing the writer.
+REINDEX to the current format.

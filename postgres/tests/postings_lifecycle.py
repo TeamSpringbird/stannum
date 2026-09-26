@@ -109,12 +109,12 @@ def main():
         sql('DROP TABLE cursor_docs;')
         # Cancel after scan initialization in a single reusable backend, then
         # prove that transaction/error cleanup leaves subsequent scans usable.
-        cancelled = command(['psql','-X','-qAt'], input="""SET statement_timeout='50ms';
+        canceled = command(['psql','-X','-qAt'], input="""SET statement_timeout='50ms';
             SELECT pg_sleep(1) FROM docs WHERE body ==> 'needle' LIMIT 1;
             SET statement_timeout='60000ms';
             SELECT count(*) FROM docs WHERE body ==> 'needle';""", env=env)
-        assert 'canceling statement due to statement timeout' in cancelled, cancelled
-        assert cancelled.strip().endswith('50'), cancelled
+        assert 'canceling statement due to statement timeout' in canceled, canceled
+        assert canceled.strip().endswith('50'), canceled
         # Scorer state lives for one statement: a document inserted between
         # two statements in one backend is scored by the second.
         ranked = command(['psql','-X','-qAt','-v','ON_ERROR_STOP=1'], input="""SET enable_seqscan=off;
@@ -299,7 +299,7 @@ def main():
         # and both an infinite and a finite max_standby_streaming_delay run.
         totals = {'answers': 0, 'wrong': 0, 'conflicts': 0, 'runs': []}
         # Recovery may terminate an idle-in-transaction session instead of
-        # cancelling a running statement. Both are valid only in the finite
+        # canceling a running statement. Both are valid only in the finite
         # delay/no-feedback case; other failures must still fail this test.
         cancel_messages = ('canceling statement due to conflict with recovery',
                            'terminating connection due to conflict with recovery')
@@ -363,17 +363,17 @@ def main():
                     totals['wrong'] += 1
             # The snapshot is fixed, so the reference answer never changes.
             assert len(refs) <= 1, (feedback, delay, refs)
-            cancelled = any(message in err for message in cancel_messages)
+            canceled = any(message in err for message in cancel_messages)
             totals['answers'] += matched
-            if cancelled:
+            if canceled:
                 totals['conflicts'] += 1
             totals['runs'].append({'feedback': feedback, 'delay': delay,
-                                   'answers': matched, 'cancelled': cancelled})
+                                   'answers': matched, 'canceled': canceled})
             # Correctness is absolute; availability is not guaranteed with a
             # finite delay and no feedback.
-            assert reader.returncode == 0 or cancelled, (feedback, delay, err)
+            assert reader.returncode == 0 or canceled, (feedback, delay, err)
             if delay == '-1' or feedback == 'on':
-                assert matched == 160 and not cancelled, (feedback, delay, matched, cancelled, err)
+                assert matched == 160 and not canceled, (feedback, delay, matched, canceled, err)
             # Reader cancellation/completion does not mean replay caught up.
             # Inspecting between run allocation and directory publication can
             # report transient orphan pages. Wait for all primary cleanup WAL
@@ -384,7 +384,7 @@ def main():
                 assert time.monotonic() < deadline, 'standby cleanup failed to replay'
                 time.sleep(.02)
             verify('standby_churn_idx', env=standby_env)
-            return matched, cancelled
+            return matched, canceled
 
         run_reader('off', '-1', 10000)          # replay waits for the reader
         run_reader('off', '250ms', 20000)       # finite delay: cancellation allowed

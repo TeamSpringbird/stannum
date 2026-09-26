@@ -9,16 +9,6 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-    inputs:
-      direct_merge_performance:
-        description: Compare direct merges with the pre-integration baseline
-        type: boolean
-        default: false
-
-      vacuum_performance:
-        description: Compare direct VACUUM merges with main before integration
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -30,6 +20,8 @@ env:
 
 jobs:
   # Formatting and the pure-Python harness need no PostgreSQL; fail fast here.
+  # Test steps go through script/test-all, so CI, the local gates and
+  # docs/testing.md name the same commands.
   lint:
     name: Format and harness tests
     runs-on: ubuntu-24.04
@@ -40,13 +32,11 @@ jobs:
       - name: Install rustfmt
         run: rustup component add rustfmt
       - name: Source attribution
-        run: |
-          python3 script/source_headers.py
-          python3 -m unittest discover -s script -p 'test_*.py'
+        run: script/test-all headers
       - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Benchmark harness unit tests
-        run: python3 -m unittest discover -s benchmarks -p 'test_*.py'
+        run: script/test-all fmt
+      - name: Benchmark harness and cluster test unit tests
+        run: script/test-all python-unit
       - name: Published benchmark query adapter
         run: |
           python3 benchmarks/tin.py --driver "$RUNNER_TEMP/stannum-benchmark-driver" prepare
@@ -83,7 +73,7 @@ jobs:
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install --yes --no-install-recommends \
             "postgresql-${PG_MAJOR}" "postgresql-server-dev-${PG_MAJOR}" \
-            libclang-dev pkg-config libssl-dev
+            libclang-dev pkg-config libssl-dev python3-psycopg python3-yaml
           sudo systemctl stop postgresql || true
           # pgrx installs the extension into the server's own directories.
           sudo chown -R "$USER" "/usr/lib/postgresql/${PG_MAJOR}" "/usr/share/postgresql/${PG_MAJOR}"
@@ -117,36 +107,35 @@ jobs:
         run: cargo build --locked --package stannum --no-default-features --features "pg${PG_MAJOR}"
 
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets --no-default-features --features "pg${PG_MAJOR} pg_test" -- -D warnings
+        run: script/test-all clippy
 
       - name: Library crate tests
-        run: cargo test --locked --workspace --exclude stannum
+        run: script/test-all rust-unit
 
-      - name: Extension tests
-        run: cargo pgrx test "pg${PG_MAJOR}" --package stannum --no-default-features --features "pg${PG_MAJOR} pg_test"
+      # pg_tests and the extension's #[test]s, then, on the pg_test build
+      # that leaves installed and each in a private cluster: crashes injected
+      # between page writes and meta-page publication
+      # (postgres/tests/crash_before_publication.py) and a count racing VACUUM
+      # (postgres/tests/count_under_vacuum.py).
+      - name: Extension tests and race-point checks
+        run: script/test-all pgrx
 
       - name: Install release build
-        run: cargo pgrx install --release --package stannum --no-default-features --features "pg${PG_MAJOR}"
+        run: script/test-all install
 
-      - name: Release schema and upgrade compatibility
-        run: python3 postgres/tests/extension_upgrade.py
+      # Each in a throwaway cluster: release schema and upgrade compatibility;
+      # crash recovery, VACUUM, folds, merges, standby fallback and backend
+      # reuse; deferred-merge crashes; the ranked-scan concurrency fuzz smoke
+      # (fixed seeds plus the regression list, under two minutes); VACUUM
+      # with pinned heap pages; the benchmark writers' target selection.
+      - name: Cluster tests
+        run: script/test-all cluster
 
-      # Crash recovery, VACUUM, folds and merges, standby fallback and
-      # backend reuse, against a real server in a throwaway cluster.
-      - name: Index lifecycle checks
-        run: python3 postgres/tests/postings_lifecycle.py
-
-      # Randomized concurrent writers against ranked readers, each checked in
-      # one snapshot against the unpruned path and a regex scan; fixed seeds
-      # plus the regression list, under two minutes.
-      - name: Ranked-scan concurrency fuzz (smoke)
-        run: python3 postgres/tests/ranked_fuzz.py --smoke
-
-      - name: Mutation target and accounting regression
-        run: python3 benchmarks/mutation_targets.py
-
-      - name: VACUUM pinned-page regression
-        run: python3 benchmarks/vacuum_cleanup_pins.py
+      # Every conformance case against TIN 1.0.3's recorded answers, in a
+      # throwaway cluster. The answers were recorded on PostgreSQL 18.
+      - name: Conformance against TIN 1.0.3
+        if: matrix.postgres == 18
+        run: script/test-all conformance
 
       - name: VACUUM workload harness smoke
         run: |
@@ -190,106 +179,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      # Opt-in promotion gate: both binaries run on the same runner. No timing
-      # threshold is asserted on shared CI hardware; retain pairs for review.
-      # The paired driver restores libraries only after confirmed shutdown;
-      # an unconditional shell EXIT restore would defeat that safety check.
-      - name: Compare direct-merge contention
-        if: github.event_name == 'workflow_dispatch' && inputs.direct_merge_performance
-        run: |
-          comparison_dir="$RUNNER_TEMP/direct-merge-comparison"
-          mkdir -p "$comparison_dir"
-          installed_library="$(pg_config --pkglibdir)/stannum.so"
-          cp "$installed_library" "$comparison_dir/integrated.so"
-          # This baseline has the same extension SQL and on-disk format.
-          baseline_commit=26b9d1ec0f2cad8e84386cf26b63afe3dadcd42c
-          git fetch --no-tags origin "$baseline_commit"
-          git worktree add --detach "$comparison_dir/baseline-source" "$baseline_commit"
-          (
-            cd "$comparison_dir/baseline-source"
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo pgrx install --release \
-              --package stannum --no-default-features --features "pg${PG_MAJOR}"
-          )
-          cp "$installed_library" "$comparison_dir/baseline.so"
-          cp "$comparison_dir/integrated.so" "$installed_library"
-          for repetition in 200 20; do
-            python3 benchmarks/paired_libraries.py \
-              --baseline "$comparison_dir/baseline.so" \
-              --integrated "$comparison_dir/integrated.so" \
-              --installed-library "$installed_library" \
-              --checkpoint-control --seconds 20 --rounds 3 --repeat "$repetition" \
-              --output "$comparison_dir/results/repeat$repetition"
-          done
-
-      - name: Retain direct-merge comparisons
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.direct_merge_performance
-        uses: actions/upload-artifact@v4
-        with:
-          name: direct-merge-${{ matrix.arch.name }}-pg${{ matrix.postgres }}
-          path: ${{ runner.temp }}/direct-merge-comparison/results
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Compare direct VACUUM merges
-        if: github.event_name == 'workflow_dispatch' && inputs.vacuum_performance
-        run: |
-          comparison_dir="$RUNNER_TEMP/vacuum-merge-comparison"
-          mkdir -p "$comparison_dir"
-          installed_library="$(pg_config --pkglibdir)/stannum.so"
-          cp "$installed_library" "$comparison_dir/integrated.so"
-          baseline_commit=80e5f85e05b178c58e24a73d30a794a9004c4a18
-          git fetch --no-tags origin "$baseline_commit"
-          git worktree add --detach "$comparison_dir/baseline-source" "$baseline_commit"
-          (
-            cd "$comparison_dir/baseline-source"
-            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo pgrx install --release \
-              --package stannum --no-default-features --features "pg${PG_MAJOR}"
-          )
-          cp "$installed_library" "$comparison_dir/baseline.so"
-          cp "$comparison_dir/integrated.so" "$installed_library"
-          for repetition in 200 20; do
-            for scenario in merge rewrite mixed; do
-              python3 benchmarks/paired_libraries.py \
-                --baseline "$comparison_dir/baseline.so" \
-                --integrated "$comparison_dir/integrated.so" \
-                --installed-library "$installed_library" \
-                --checkpoint-control --workload vacuum --scenario "$scenario" --rounds 3 \
-                --repeat "$repetition" --output "$comparison_dir/results/repeat$repetition/$scenario"
-            done
-          done
-          python3 benchmarks/paired_libraries.py \
-            --baseline "$comparison_dir/baseline.so" \
-            --integrated "$comparison_dir/integrated.so" \
-            --installed-library "$installed_library" \
-            --checkpoint-control --workload vacuum --scenario mixed --rounds 3 \
-            --docs 131072 --repeat 20 --delete-percent 50 --vocabulary 997 --distribution hot \
-            --query-shapes mixed --reader-rate 200 --reader-seconds 12 \
-            --output "$comparison_dir/results/larger-fixed-arrival"
-          # Same release binary, different registered strategies: compare full
-          # validation on both paths rather than the historical reconstruction.
-          python3 benchmarks/paired_libraries.py \
-            --baseline "$comparison_dir/integrated.so" \
-            --integrated "$comparison_dir/integrated.so" \
-            --installed-library "$installed_library" \
-            --baseline-vacuum-strategy direct --integrated-vacuum-strategy reconstruct \
-            --checkpoint-control --workload vacuum --scenario mixed --repeat 20 --rounds 3 \
-            --query-shapes mixed --reader-rate 200 --reader-seconds 12 \
-            --output "$comparison_dir/results/forced-strategies"
-
-      - name: Retain VACUUM comparisons
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.vacuum_performance
-        uses: actions/upload-artifact@v4
-        with:
-          name: vacuum-merge-${{ matrix.arch.name }}-pg${{ matrix.postgres }}
-          path: ${{ runner.temp }}/vacuum-merge-comparison/results
-          if-no-files-found: warn
-          retention-days: 7
-
   # Behavioral regression suite: the same fixture, 47 query shapes and five
   # mutation states on Stannum and on the original Lead, checked out directly
   # from PlanetScale's repository and built under its own name `tin`. Match
   # sets and rank order must agree; Lead's score bits are not compared (see
-  # docs/benchmarks/README.md for the two known deviations).
+  # docs/compatibility.md#reference-oracle-against-lead for the two known deviations).
   reference-oracle:
     name: Reference oracle against upstream Lead
     runs-on: ubuntu-24.04

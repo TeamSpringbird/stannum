@@ -19,11 +19,11 @@
 //! Empty documents match nothing in the reference evaluator, including `*`, so
 //! the universe used here excludes them.
 
-use boldi_vigna::{SpanQuery, SpanSolver};
+use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
+use segment::docs::{DocCursor, TidCursor};
 use segment::index::{Expanded, Index, Window};
 use segment::payload::PayloadCursor;
-use segment::postings::PostingsCursor;
 use segment::segment::{Lengths, Term};
 use segment::set::{AtLeast, Cursor, Difference, Empty, Intersection, Union};
 
@@ -74,14 +74,15 @@ pub fn plan<'a, I: Index + ?Sized>(
     Planner { segment, limits }.query(query)
 }
 
-/// Prefer bulk execution when a Boolean term has dense grouped postings. Purely
-/// sparse and positional plans retain scalar execution: building a five-word
-/// mask for each isolated tuple costs more than walking its existing cursor.
+/// Prefer bulk execution when a Boolean term is dense enough to be stored as
+/// bitmap chunks. Purely sparse and positional plans retain scalar execution:
+/// building a five-word mask for each isolated tuple costs more than walking
+/// its existing cursor.
 pub fn prefers_pages<I: Index + ?Sized>(query: &Query, segment: &I) -> Result<bool> {
     Ok(match query {
         Query::Term(term) => segment
             .term(term)?
-            .map(|t| t.postings().and_then(|p| p.prefers_pages()))
+            .map(|t| t.prefers_pages())
             .transpose()?
             .unwrap_or(false),
         Query::And(a, b) | Query::Or(a, b) => {
@@ -102,6 +103,76 @@ pub fn prefers_pages<I: Index + ?Sized>(query: &Query, segment: &I) -> Result<bo
         Query::Boost { inner, .. } => prefers_pages(inner, segment)?,
         _ => false,
     })
+}
+
+/// Bounded, metadata-only features for experimental count selection. Counts
+/// include duplicates and dead entries: they estimate input work, not results.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CountEstimate {
+    pub leaves: usize,
+    pub sources: usize,
+    pub lookups: usize,
+    pub postings: u64,
+    pub min_postings: Option<u32>,
+    pub supported: bool,
+}
+
+impl CountEstimate {
+    /// Zero disables the experimental rule. This is a calibration parameter,
+    /// not a validated universal crossover. Never overrides an existing page choice.
+    pub fn choose_pages(&self, default_pages: bool, threshold: u64) -> bool {
+        default_pages || (self.supported && threshold > 0 && self.postings >= threshold)
+    }
+}
+
+/// Only plain term ORs are eligible. Bound tree traversal and dictionary reads;
+/// no expansion, posting decode, visibility reads, or sampling is performed.
+pub fn estimate_count_disjunction<I: Index + ?Sized>(
+    query: &Query,
+    sources: &[&I],
+) -> Result<CountEstimate> {
+    let mut estimate = CountEstimate {
+        sources: sources.len(),
+        ..Default::default()
+    };
+    let mut pending = vec![query];
+    let mut terms = Vec::new();
+    let mut visited = 0;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > 256 {
+            return Ok(estimate);
+        }
+        match node {
+            Query::Term(term) => terms.push(term),
+            Query::Or(a, b) => {
+                pending.push(a);
+                pending.push(b);
+            }
+            Query::Disjunction { min: 1, children } | Query::AtLeast { min: 1, children } => {
+                if children.len() + pending.len() > 256 {
+                    return Ok(estimate);
+                }
+                pending.extend(children);
+            }
+            Query::Boost { inner, .. } => pending.push(inner),
+            _ => return Ok(estimate),
+        }
+    }
+    estimate.leaves = terms.len();
+    if terms.len() < 2 || terms.len().saturating_mul(sources.len()) > 1024 {
+        return Ok(estimate);
+    }
+    for source in sources {
+        for term in &terms {
+            let df = source.term(term)?.map_or(0, |term| term.df());
+            estimate.lookups += 1;
+            estimate.postings += u64::from(df);
+            estimate.min_postings = Some(estimate.min_postings.map_or(df, |min| min.min(df)));
+        }
+    }
+    estimate.supported = true;
+    Ok(estimate)
 }
 
 /// A page-oriented plan. Exactness has the same meaning as [`Plan`].
@@ -142,7 +213,7 @@ pub fn page_plan<'a, I: Index + ?Sized>(
     match query {
         Query::Term(term) => match segment.term(term)? {
             Some(term) => Ok(PagePlan {
-                cursor: term.postings()?.pages()?,
+                cursor: Box::new(term.pages()?),
                 exact: true,
             }),
             None => Ok(PagePlan {
@@ -379,6 +450,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
     }
 
     fn query(&self, query: &Query) -> Result<Plan<'a>> {
+        crate::limits::check_stack();
         match query {
             Query::Term(term) => Self::term_plan(self.segment.term(term)?),
             Query::And(left, right) => self.and(vec![self.query(left)?, self.query(right)?]),
@@ -429,12 +501,20 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
                 };
                 let skeleton = self.span_skeleton(span_query, &slots)?;
                 let solver = SpanSolver::new(span_query)?;
+                // A slot's rarity is the documents its terms hold between them.
+                let plan = PhrasePlan::new(span_query, |slot| {
+                    slots.get(slot).map_or(0, |terms| {
+                        terms.iter().map(|term| u64::from(term.df())).sum()
+                    })
+                })
+                .map(Box::new);
                 self.span_plan(
                     skeleton,
                     slots,
                     SpanKind::Fixed {
                         solver,
                         filter: position_filter.clone(),
+                        plan,
                     },
                 )
             }
@@ -486,6 +566,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
     /// Boolean skeleton of a span query: a superset of documents that could
     /// contain a match, using only which terms are present.
     fn span_skeleton(&self, query: &SpanQuery, slots: &[Vec<Term<'a>>]) -> Result<Plan<'a>> {
+        crate::limits::check_stack();
         Ok(match query {
             SpanQuery::Empty => Self::empty(),
             SpanQuery::Term(slot) => self.slot_plan(*slot, slots)?,
@@ -519,6 +600,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
     }
 
     fn span_expr_skeleton(&self, expr: &SpanExpr, slots: &[Vec<Term<'a>>]) -> Result<Plan<'a>> {
+        crate::limits::check_stack();
         Ok(match expr {
             SpanExpr::Empty => Self::empty(),
             SpanExpr::Term(slot) => self.slot_plan(*slot, slots)?,
@@ -569,7 +651,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
             let mut readers = Vec::with_capacity(terms.len());
             for term in terms {
                 readers.push(SlotTerm {
-                    postings: term.cursor()?,
+                    documents: term.cursor()?,
                     payload: term.payload()?.cursor(),
                 });
             }
@@ -592,12 +674,12 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
 
 /// The segment's documents with at least one token.
 struct NonEmptyDocuments<'a> {
-    documents: PostingsCursor<'a>,
+    documents: DocCursor<'a>,
     lengths: Lengths<'a>,
 }
 
 impl<'a> NonEmptyDocuments<'a> {
-    fn new(documents: PostingsCursor<'a>, lengths: Lengths<'a>) -> segment::Result<Self> {
+    fn new(documents: DocCursor<'a>, lengths: Lengths<'a>) -> segment::Result<Self> {
         let mut this = Self { documents, lengths };
         this.align()?;
         Ok(this)
@@ -627,7 +709,7 @@ impl Cursor for NonEmptyDocuments<'_> {
 }
 
 struct SlotTerm<'a> {
-    postings: PostingsCursor<'a>,
+    documents: TidCursor<'a>,
     payload: PayloadCursor<'a>,
 }
 
@@ -635,6 +717,10 @@ enum SpanKind {
     Fixed {
         solver: SpanSolver,
         filter: Option<SpanPositionFilter>,
+        /// For a phrase shape: the order to read the slots in and the
+        /// distance each adjacent pair must keep, so a candidate is dropped
+        /// at the first pair that cannot match before the rest is read.
+        plan: Option<Box<PhrasePlan>>,
     },
     Dynamic {
         expr: SpanExpr,
@@ -648,9 +734,11 @@ struct SpanFilter<'a> {
     skeleton: DynCursor<'a>,
     slots: Vec<Vec<SlotTerm<'a>>>,
     kind: SpanKind,
-    documents: PostingsCursor<'a>,
+    documents: DocCursor<'a>,
     lengths: Lengths<'a>,
     positions: Vec<Vec<u32>>,
+    /// Per slot, whether the current candidate's positions are read.
+    read: Vec<bool>,
     current: Option<Tid>,
 }
 
@@ -659,10 +747,11 @@ impl<'a> SpanFilter<'a> {
         skeleton: DynCursor<'a>,
         slots: Vec<Vec<SlotTerm<'a>>>,
         kind: SpanKind,
-        documents: PostingsCursor<'a>,
+        documents: DocCursor<'a>,
         lengths: Lengths<'a>,
     ) -> Result<Self> {
         let positions = vec![Vec::new(); slots.len()];
+        let read = vec![false; slots.len()];
         let mut this = Self {
             skeleton,
             slots,
@@ -670,6 +759,7 @@ impl<'a> SpanFilter<'a> {
             documents,
             lengths,
             positions,
+            read,
             current: None,
         };
         this.align()?;
@@ -690,24 +780,61 @@ impl<'a> SpanFilter<'a> {
         }
     }
 
+    /// Reads every slot's positions for `tid` that is not read already.
     fn load_positions(&mut self, tid: Tid) -> Result<()> {
-        for (slot, terms) in self.slots.iter_mut().enumerate() {
-            let positions = &mut self.positions[slot];
-            positions.clear();
-            let mut sources = 0;
-            for term in terms.iter_mut() {
-                if let Some(ordinal) = term.postings.rank(tid)? {
-                    term.payload.seek(ordinal)?;
-                    term.payload.next_into(positions)?;
-                    sources += 1;
-                }
-            }
-            if sources > 1 {
-                positions.sort_unstable();
-                positions.dedup();
-            }
+        for slot in 0..self.slots.len() {
+            self.load_slot(slot, tid)?;
         }
         Ok(())
+    }
+
+    /// Reads `slot`'s positions for `tid`, unless they are read already.
+    fn load_slot(&mut self, slot: usize, tid: Tid) -> Result<()> {
+        if std::mem::replace(&mut self.read[slot], true) {
+            return Ok(());
+        }
+        let positions = &mut self.positions[slot];
+        positions.clear();
+        let mut sources = 0;
+        for term in self.slots[slot].iter_mut() {
+            term.documents.seek(tid)?;
+            if term.documents.current() == Some(tid) {
+                term.payload.seek(term.documents.rank())?;
+                term.payload.next_into(positions)?;
+                sources += 1;
+            }
+        }
+        if sources > 1 {
+            positions.sort_unstable();
+            positions.dedup();
+        }
+        Ok(())
+    }
+
+    /// Reads the slots in the plan's order, rarest first, and says whether
+    /// every adjacent pair of leaves keeps its distance; a candidate that
+    /// fails a pair has the rest of its slots left unread.
+    fn pairs_keep_distance(&mut self, tid: Tid) -> Result<bool> {
+        let SpanKind::Fixed { plan, .. } = &mut self.kind else {
+            return Ok(true);
+        };
+        let Some(plan) = plan.take() else {
+            return Ok(true);
+        };
+        let mut kept = true;
+        for step in plan.steps() {
+            self.load_slot(step.slot, tid)?;
+            if let Some(pair) = step.pair
+                && !plan.pair_keeps(pair, &self.positions)
+            {
+                kept = false;
+                break;
+            }
+        }
+        if let SpanKind::Fixed { plan: slot, .. } = &mut self.kind {
+            *slot = Some(plan);
+        }
+        Ok(kept)
     }
 
     fn document_length(&mut self, tid: Tid) -> Result<u32> {
@@ -727,6 +854,10 @@ impl<'a> SpanFilter<'a> {
     }
 
     fn matches(&mut self, tid: Tid) -> Result<bool> {
+        self.read.fill(false);
+        if !self.pairs_keep_distance(tid)? {
+            return Ok(false);
+        }
         self.load_positions(tid)?;
         let doc_len = if self.needs_doc_length() {
             self.document_length(tid)?
@@ -734,7 +865,7 @@ impl<'a> SpanFilter<'a> {
             0
         };
         match &mut self.kind {
-            SpanKind::Fixed { solver, filter } => {
+            SpanKind::Fixed { solver, filter, .. } => {
                 let mut intervals = solver.intervals(&self.positions);
                 Ok(match filter {
                     None => intervals.next().is_some(),
@@ -851,6 +982,21 @@ mod tests {
     }
 
     #[test]
+    fn not_of_an_empty_conjunction_keeps_every_document() {
+        // The universe under `NOT` was probed past its end by the inner
+        // conjunction and then sought back to an earlier document, which
+        // resurrected it: the row plan dropped every match. Found by the
+        // property test below.
+        let docs = ["delta alpha delta delta", "alpha"];
+        for query in [
+            "delta AND NOT (alpha AND NOT alpha)",
+            "(\"delta delta delta\"~1) AND NOT ((alph*) AND NOT (MATCHES .*a))",
+        ] {
+            check(&docs, query, true);
+        }
+    }
+
+    #[test]
     fn dense_page_plans_agree_with_reference_for_nested_boolean_and_positional_queries() {
         let docs: Vec<_> = (0..2000)
             .map(|i| match i % 7 {
@@ -891,6 +1037,7 @@ mod tests {
         "",
         "...",
         "wine wine wine",
+        "wine and wine or wine wine",
         "brewhouse jalapeno craft",
         "security threat critical buy",
         "security and a threat but not critical",
@@ -923,6 +1070,23 @@ mod tests {
             "\"big _ wolf\"",
             "\"big bad wolf\"~2",
             "\"[big large] bad wolf\"",
+            // Repeated and pinned-gap words: the slots are read rarest
+            // first and a candidate is dropped at a pair no positions of
+            // which keep the distance, which must agree with the solver.
+            "\"wine wine\"",
+            "\"wine wine wine\"",
+            "\"wine wine wine wine\"",
+            "\"wine _ wine\"",
+            "\"wine __ wine\"",
+            "\"wine _ wine wine\"",
+            "\"wine and wine\"~1",
+            "\"wine _ wine\"~1",
+            "\"and _ or\"",
+            "\"and _ or _ wine\"",
+            "\"wine or wine\"",
+            "\"big _ wolf _ a\"",
+            "\"big bad wolf and\"~1",
+            "\"craft beer craft\"",
             "craft NEAR/5 beer",
             "craft THEN/0 beer",
             "beer THEN/0 craft",
@@ -942,6 +1106,65 @@ mod tests {
             "(craft THEN/5 beer) IN FIRST 200 WORDS",
         ] {
             check(DOCS, query, true);
+        }
+    }
+
+    #[test]
+    fn nested_ordered_spans_keep_each_junction_s_distance() {
+        // A phrase that is not the first operand of THEN/NEAR: the span
+        // filter's pair tests must bound each pair of adjacent words by the
+        // junction between them, the outer operator's gap between the
+        // operands and the phrase's inside it.
+        let docs = [
+            "alpha x beta gamma",
+            "alpha beta gamma",
+            "beta gamma alpha",
+            "alpha x y beta gamma",
+            "alpha x beta y gamma",
+            "delta alpha x gamma delta beta gamma",
+        ];
+        for query in [
+            "alpha THEN/1 \"beta gamma\"",
+            "alpha THEN/2 \"beta gamma\"",
+            "\"alpha x\" THEN/2 \"beta gamma\"",
+            "\"alpha x\" THEN/0 \"beta gamma\"",
+            "alpha NEAR/2 \"beta gamma\"",
+            "\"beta gamma\" NEAR/2 alpha",
+            "alpha THEN/2 \"beta _ gamma\"",
+            "alpha THEN/2 \"x beta gamma\"~1",
+            "delta THEN/1 (alpha THEN/1 gamma)",
+            "(alpha THEN/1 \"beta gamma\") IN FIRST 4 WORDS",
+            "(alpha THEN/3 \"beta gamma\") WITHIN 5",
+        ] {
+            check(&docs, query, true);
+        }
+    }
+
+    /// The rows TIN 1.0.3 returns for these queries, ids from one.
+    #[test]
+    fn then_and_near_over_phrases_match_tin() {
+        let docs = [
+            "alpha x beta gamma",
+            "alpha beta gamma",
+            "beta gamma alpha",
+            "alpha x y beta gamma",
+        ];
+        let bytes = build(&docs);
+        let segment = Segment::parse(&bytes).unwrap();
+        for (query, ids) in [
+            ("alpha THEN/1 \"beta gamma\"", &[1, 2][..]),
+            ("alpha THEN/2 \"beta gamma\"", &[1, 2, 4]),
+            ("\"alpha x\" THEN/2 \"beta gamma\"", &[1, 4]),
+            ("alpha THEN/1 beta", &[1, 2]),
+            ("\"beta gamma\" THEN/1 alpha", &[3]),
+            ("alpha NEAR/1 \"beta gamma\"", &[1, 2, 3]),
+        ] {
+            let parsed = parse_tinql_to_query_default(query).unwrap();
+            let (found, exact) = matches(&parsed, &segment, &Limits::default()).unwrap();
+            let expected: Vec<Tid> = ids.iter().map(|id| tid(id - 1)).collect();
+            assert!(exact, "{query}");
+            assert_eq!(found, expected, "{query}");
+            assert_eq!(reference(&docs, &parsed), expected, "{query}");
         }
     }
 
@@ -1016,15 +1239,76 @@ mod tests {
                 1 => Just("beta~1".to_owned()),
                 1 => Just("gamma~0:2".to_owned()),
                 2 => (word(), word()).prop_map(|(a, b)| format!("\"{a} {b}\"")),
+                1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"{a} {b} {c}\"")),
                 1 => (word(), word()).prop_map(|(a, b)| format!("\"{a} _ {b}\"")),
+                1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"{a} _ {b} {c}\"")),
+                1 => (word(), word(), word(), 1u32..3)
+                    .prop_map(|(a, b, c, n)| format!("\"{a} {b} {c}\"~{n}")),
                 1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"[{a} {b}] {c}\"~1")),
                 1 => (word(), word()).prop_map(|(a, b)| format!("\"{a} [MATCHES {b}.*]\"")),
             ]
         }
 
+        /// An operand of THEN and NEAR over `words`: a word, a phrase
+        /// (exact, with a pinned gap, or sloppy), or a group, itself
+        /// perhaps a span.
+        fn span_operand(words: &'static [&'static str]) -> impl Strategy<Value = String> {
+            let word = move || prop::sample::select(words).prop_map(str::to_owned);
+            prop_oneof![
+                3 => word(),
+                2 => (word(), word()).prop_map(|(a, b)| format!("\"{a} {b}\"")),
+                1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"{a} {b} {c}\"")),
+                1 => (word(), word(), word()).prop_map(|(a, b, c)| format!("\"{a} _ {b} {c}\"")),
+                1 => (word(), word(), word(), 1u32..3)
+                    .prop_map(|(a, b, c, n)| format!("\"{a} {b} {c}\"~{n}")),
+                1 => (word(), word()).prop_map(|(a, b)| format!("({a} OR {b})")),
+                1 => (word(), word(), 0u32..3).prop_map(|(a, b, n)| format!("({a} THEN/{n} {b})")),
+                1 => (word(), word(), 0u32..3).prop_map(|(a, b, n)| format!("({a} NEAR/{n} {b})")),
+                1 => (word(), word(), 1u32..4)
+                    .prop_map(|(a, b, n)| format!("({a} NEAR/2 \"{b} {a}\") WITHIN {n}")),
+            ]
+        }
+
+        /// Nested ordered and unordered spans over `words`: operands joined
+        /// by THEN and NEAR, one or two joins, perhaps within a width or
+        /// the first words.
+        fn nested_span_of(words: &'static [&'static str]) -> impl Strategy<Value = String> {
+            let operator = (prop::bool::ANY, 0u32..4)
+                .prop_map(|(then, n)| format!("{}/{n}", if then { "THEN" } else { "NEAR" }));
+            let chain = (
+                span_operand(words),
+                prop::collection::vec((operator, span_operand(words)), 1..3),
+            )
+                .prop_map(|(first, rest)| {
+                    rest.into_iter().fold(first, |text, (op, operand)| {
+                        format!("{text} {op} {operand}")
+                    })
+                });
+            (chain, 0u8..4, 1u32..8).prop_map(|(span, wrap, n)| match wrap {
+                0 => format!("({span}) IN FIRST {n} WORDS"),
+                1 => format!("({span}) WITHIN {}", n + 2),
+                _ => span,
+            })
+        }
+
+        fn nested_span() -> impl Strategy<Value = String> {
+            nested_span_of(&WORDS)
+        }
+
+        /// Three words, so that documents often hold a nested span's words
+        /// at the distances it tests.
+        const FEW: [&str; 3] = ["alpha", "beta", "gamma"];
+
+        fn few_document() -> impl Strategy<Value = String> {
+            prop::collection::vec(prop::sample::select(&FEW[..]), 0..10)
+                .prop_map(|words| words.join(" "))
+        }
+
         fn query() -> impl Strategy<Value = String> {
             leaf().prop_recursive(3, 24, 3, |inner| {
                 prop_oneof![
+                    nested_span(),
+                    nested_span(),
                     (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}) AND ({b})")),
                     (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}) OR ({b})")),
                     (inner.clone(), inner.clone())
@@ -1054,6 +1338,34 @@ mod tests {
 
         proptest! {
             #![proptest_config(ProptestConfig { cases: cases(400), ..ProptestConfig::default() })]
+
+            /// The nested spans parse, so the property below tests them
+            /// rather than skipping them as malformed.
+            #[test]
+            fn nested_spans_parse(text in nested_span()) {
+                let parsed = parse_tinql_to_query_default(&text);
+                prop_assert!(parsed.is_ok(), "{}: {:?}", text, parsed.err());
+            }
+
+            /// Nested spans over documents of few words, where the
+            /// distances they test are common: a phrase after the first
+            /// operand of THEN was dropped at ~1 in 1,000 cases of the
+            /// general property, and at once here.
+            #[test]
+            fn nested_spans_agree_with_the_reference_evaluator(
+                docs in prop::collection::vec(few_document(), 1..16),
+                query_text in nested_span_of(&FEW),
+            ) {
+                let docs: Vec<&str> = docs.iter().map(String::as_str).collect();
+                let query = parse_tinql_to_query_default(&query_text).unwrap();
+                let bytes = build(&docs);
+                let segment = Segment::parse(&bytes).unwrap();
+                let limits = Limits::default();
+                let (found, exact) = matches(&query, &segment, &limits).unwrap();
+                prop_assert_eq!(page_matches(&segment, &query, &limits), (found.clone(), exact));
+                prop_assert!(exact, "{}", query_text);
+                prop_assert_eq!(&found, &reference(&docs, &query), "{}", query_text);
+            }
 
             #[test]
             fn plans_agree_with_the_reference_evaluator(
@@ -1092,6 +1404,51 @@ mod tests {
     }
 
     #[test]
+    fn count_estimation_is_bounded_and_falls_back() {
+        let bytes = build(&["alpha beta", "alpha", "gamma"]);
+        let segment = Segment::parse(&bytes).unwrap();
+        let query = Query::Or(
+            Box::new(Query::Term("alpha".into())),
+            Box::new(Query::Term("beta".into())),
+        );
+        let estimate = estimate_count_disjunction(&query, &[&segment]).unwrap();
+        assert!(estimate.supported);
+        assert_eq!(estimate.postings, 3);
+        assert_eq!(estimate.min_postings, Some(1));
+        assert_eq!(estimate.lookups, 2);
+        assert!(!estimate.choose_pages(false, 0));
+        assert!(!estimate.choose_pages(false, 4));
+        assert!(estimate.choose_pages(false, 3));
+        assert!(estimate.choose_pages(true, 0));
+        let unsupported = Query::Not(Box::new(query.clone()));
+        let estimate = estimate_count_disjunction(&unsupported, &[&segment]).unwrap();
+        assert!(!estimate.supported);
+        assert_eq!(estimate.lookups, 0);
+        assert!(!estimate.choose_pages(false, 1));
+        let wide = Query::Disjunction {
+            min: 1,
+            children: vec![query.clone(); 257],
+        };
+        assert!(
+            !estimate_count_disjunction(&wide, &[&segment])
+                .unwrap()
+                .supported
+        );
+        let sources = vec![&segment; 513];
+        let estimate = estimate_count_disjunction(&query, &sources).unwrap();
+        assert!(!estimate.supported);
+        assert_eq!(estimate.lookups, 0);
+        let absent = Query::Or(
+            Box::new(Query::Term("missing".into())),
+            Box::new(Query::Term("absent".into())),
+        );
+        let estimate = estimate_count_disjunction(&absent, &[&segment]).unwrap();
+        assert!(estimate.supported);
+        assert_eq!(estimate.postings, 0);
+        assert!(!estimate.choose_pages(false, 1));
+    }
+
+    #[test]
     fn empty_documents_never_match_and_seek_composes() {
         check(&["", "...", "x"], "*", true);
         check(&["", "...", "x"], "* AND NOT y", true);
@@ -1102,6 +1459,6 @@ mod tests {
         plan.cursor.seek(tid(2)).unwrap();
         assert_eq!(plan.cursor.current(), Some(tid(2)));
         plan.cursor.seek(tid(4)).unwrap();
-        assert_eq!(plan.cursor.current(), Some(tid(7)));
+        assert_eq!(plan.cursor.current(), Some(tid(8)));
     }
 }

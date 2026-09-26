@@ -4,6 +4,7 @@
 
 pub mod ast;
 pub mod error;
+pub mod limits;
 mod parser;
 mod quote;
 pub mod runtime;
@@ -41,5 +42,5 @@ pub fn parse(input: &str, implicit_op: ImplicitOp) -> Result<Expr, ParseError> {
         // An empty query matches nothing; it is not a syntax error.
         return Ok(Expr::MatchNone);
     }
-    parser::pest_parser::parse(input, implicit_op)
+    parser::descent::parse(input, implicit_op)
 }

@@ -2,9 +2,18 @@
 #
 # See LICENSE in the repository root for license terms.
 
-# Native ARM64 image: every engine uses exactly this PostgreSQL/runtime build.
-ARG BASE=paradedb/paradedb@sha256:c17153b8b7307734c3aede0393dfe8fa447f4a528ec028b1c3937186ab3ee242
-FROM ${BASE} AS builder
+# Native x86-64 published-reference baseline; every engine shares this runtime.
+ARG BASE=paradedb/paradedb@sha256:9b7e2540dcb9e6e67825b9a2fa665125af1f0c4e488d50f1afa15ae7dd274359
+FROM ${BASE} AS runtime
+USER root
+# Pin both compilation and measurement to the published PostgreSQL minor version.
+ARG PG_PACKAGE_VERSION=18.6-1.pgdg13+2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-18="${PG_PACKAGE_VERSION}" postgresql-client-18="${PG_PACKAGE_VERSION}" \
+    && rm -rf /var/lib/apt/lists/* \
+    && /usr/lib/postgresql/18/bin/postgres --version | grep -F 'PostgreSQL) 18.6'
+
+FROM runtime AS builder
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential clang libclang-dev pkg-config libssl-dev curl ca-certificates git \
@@ -29,9 +38,10 @@ COPY tinql tinql
 COPY tokenizer tokenizer
 COPY boldi-vigna boldi-vigna
 COPY segment segment
-RUN cargo pgrx install --package stannum --no-default-features --features pg18 --release
+# Keep optimized code and line tables for the owned perf diagnostics.
+RUN CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none cargo pgrx install --package stannum --no-default-features --features pg18 --release
 
-FROM ${BASE}
+FROM runtime
 USER root
 ARG STANNUM_SOURCE_SHA256=unknown
 ARG STANNUM_COMMIT=unknown
@@ -43,5 +53,7 @@ COPY --from=builder /usr/lib/postgresql/18/lib/pg_textsearch.so /usr/lib/postgre
 COPY --from=builder /usr/share/postgresql/18/extension/pg_textsearch* /usr/share/postgresql/18/extension/
 # The campaign owns settings/extension creation; omit the distribution's auto-tuner
 # and unrelated extension bootstrap (which otherwise requires pg_cron).
-RUN rm /docker-entrypoint-initdb.d/10_bootstrap_paradedb.sh \
+# The script exists only in the ParadeDB base; another BASE, such as a
+# multi-arch postgres image for native ARM rehearsals, has nothing to remove.
+RUN rm -f /docker-entrypoint-initdb.d/10_bootstrap_paradedb.sh \
     && mkdir /benchmark && dpkg-query -W > /benchmark/packages.txt

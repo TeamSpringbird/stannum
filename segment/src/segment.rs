@@ -2,94 +2,58 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! One immutable segment: dictionary, postings area, payload area and a
-//! document table, assembled from documents and read back by term or TID.
+//! One immutable segment: dictionary, ordinal streams, payload, document
+//! table and lengths, assembled from documents and read back by term or by
+//! tuple location.
 //!
 //! ```text
-//! blob   := magic "LSG3", doc_count varint, total_length varint,
-//!           dictionary_len varint, postings_len varint, payload_len varint,
-//!           docs_len varint,
-//!           dictionary, postings_area, payload_area, docs, lengths
-//! docs   := a `postings` stream of every document TID in the segment
-//! lengths:= u32le per document, in TID order (addressed by docs ordinal)
+//! blob     := magic "STN3", doc_count varint, total_length varint,
+//!             dictionary_len varint, ordinals_len varint, payload_len varint,
+//!             pages_len varint,
+//!             dictionary, ordinals_area, payload_area, offsets, lengths,
+//!             classes, pages
+//! offsets  := u16le per document, in heap order (see [`crate::docs`])
+//! lengths  := u32le per document, in heap order
+//! classes  := u8 per document, in heap order (see [`crate::length_class`])
+//! pages    := (block u32le, first u32le)* per heap block holding a document
 //! ```
 //!
-//! The postings and payload areas are concatenations of per-term streams;
-//! each dictionary entry's extents locate them. Document frequency is the
-//! postings count and `max_tf_bucket` is computed while building, so the
-//! dictionary alone answers selectivity and score-bound questions. Each
-//! term's postings carry score bounds (see [`crate::postings`]).
+//! Documents are numbered in heap order; that ordinal addresses the offsets,
+//! lengths and pages tables. The ordinals area concatenates one
+//! [`crate::ordinals`] stream per term: the term's documents as ordinals with
+//! a score bound per chunk, which is the only representation of a term's
+//! document set. The payload area concatenates one [`crate::payload`] stream
+//! per term, addressed by a document's rank within the term's stream. Each
+//! dictionary entry's extents locate the two streams; document frequency and
+//! the largest frequency bucket are in the entry, so the dictionary alone
+//! answers selectivity and score-bound questions.
 //!
-//! Every released signature is still read; see [`Format`]. `LSG2` added
-//! block bounds to term postings and fixed-width payload skip offsets;
-//! `LSG3` stores a single term bound for postings of one block, drops the
-//! payload skip slot for entry 0 and gap-encodes dictionary extents. Ranked
-//! scans over `LSG1` segments score every candidate instead of pruning.
+//! Only this signature is read. Earlier formats (`LSG1` to `LSG5`, `STN1`)
+//! stored the document set twice or the bucket beside the positions;
+//! indexes in them are rebuilt with `REINDEX`.
 //!
 //! The builder holds the segment in memory. That matches the intended use,
 //! folding a bounded write buffer, and an index build that partitions the heap
-//! into bounded ranges. A sort-based external builder can share the same byte
-//! layout later.
+//! into bounded ranges.
 
 use std::collections::BTreeMap;
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::dictionary::{
     BlockFetch, Blocks, Dictionary, DictionaryBuilder, DictionaryIndex, Extent, TermEntry,
 };
+use crate::docs::{self, DocCursor, DocTable, PageCursor, PageTable, TidCursor};
 use crate::forward::{ForwardRecord, ForwardTerm};
+use crate::ordinals::Ordinals;
 use crate::payload::{Payload, PayloadBuilder};
-use crate::postings::{Postings, PostingsBuilder, PostingsCursor};
-use crate::set::Cursor as _;
-use crate::source::Source;
+use crate::source::{HELD_SLOTS, HeldRange, HeldSpan, Source};
 use crate::tf_bucket::TfBucket;
 use crate::{Error, Result, Tid, varint};
 
-/// A segment format, named by the signature that opens its blob. Every
-/// format listed is read; only [`Format::CURRENT`] is written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Format {
-    /// No score bounds; payload skips as varint deltas every 64 entries.
-    Lsg1,
-    /// Block bounds on every term; fixed-width payload skips every 32
-    /// entries, counted explicitly and including entry 0.
-    Lsg2,
-    /// A single term bound for postings of one block; no payload skip slot
-    /// for entry 0; dictionary entries pack `df` with the bucket and store
-    /// extents as gaps from the previous entry's.
-    Lsg3,
-}
-
-impl Format {
-    pub const CURRENT: Self = Self::Lsg3;
-
-    pub const fn magic(self) -> &'static [u8; 4] {
-        match self {
-            Self::Lsg1 => b"LSG1",
-            Self::Lsg2 => b"LSG2",
-            Self::Lsg3 => b"LSG3",
-        }
-    }
-
-    pub fn from_magic(magic: &[u8]) -> Option<Self> {
-        [Self::Lsg1, Self::Lsg2, Self::Lsg3]
-            .into_iter()
-            .find(|format| format.magic() == magic)
-    }
-
-    /// True when term postings carry score bounds a ranked scan can prune with.
-    pub const fn has_bounds(self) -> bool {
-        !matches!(self, Self::Lsg1)
-    }
-}
-
-impl std::fmt::Display for Format {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(std::str::from_utf8(self.magic()).expect("ASCII"))
-    }
-}
+/// The signature that opens a segment blob.
+pub const MAGIC: &[u8; 4] = b"STN3";
 
 struct Occurrence {
     tid: Tid,
@@ -220,98 +184,141 @@ impl SegmentBuilder {
     }
 
     pub fn finish(self) -> Vec<u8> {
-        self.finish_as(Format::CURRENT)
-    }
-
-    /// Encodes in the layout of an earlier format, for compatibility tests.
-    pub(crate) fn finish_as(self, format: Format) -> Vec<u8> {
-        self.finish_mixed(format, format, format)
-    }
-
-    /// A builder over `documents`, for tests.
-    #[cfg(test)]
-    pub(crate) fn from_documents(documents: &[(Tid, Vec<(String, u32)>)]) -> Self {
-        let mut builder = Self::default();
-        for (tid, tokens) in documents {
-            builder
-                .add_document(*tid, tokens.iter().map(|(t, p)| (t.as_str(), *p)))
-                .unwrap();
-        }
-        builder
-    }
-
-    /// Encodes with the signature of one format and the stream layouts of
-    /// others, so the verifier's layout checks can be exercised.
-    pub(crate) fn finish_mixed(self, magic: Format, postings: Format, payload: Format) -> Vec<u8> {
-        let (postings_format, payload_format) = (postings, payload);
-        let mut dictionary = DictionaryBuilder::with_format(magic);
-        let mut postings_area = Vec::new();
+        let mut dictionary = DictionaryBuilder::default();
+        let mut ordinals_area = Vec::new();
         let mut payload_area = Vec::new();
+        let documents: Vec<Tid> = self.lengths.keys().copied().collect();
+        let mut ordinals = Vec::new();
+        let mut scores = Vec::new();
         for (term, mut occurrences) in self.terms {
             occurrences.sort_unstable_by_key(|occurrence| occurrence.tid);
-            let mut postings = PostingsBuilder::default();
             let mut payload = PayloadBuilder::default();
             let mut max_tf_bucket = 0;
+            ordinals.clear();
+            scores.clear();
             for occurrence in &occurrences {
                 let bucket = TfBucket::from_count(occurrence.positions.len() as u32).value();
                 max_tf_bucket = max_tf_bucket.max(bucket);
-                postings
-                    .push_scored(occurrence.tid, bucket, occurrence.doc_len)
-                    .expect("occurrences are unique per document and sorted");
+                scores.push((bucket, occurrence.doc_len));
+                ordinals.push(
+                    documents
+                        .binary_search(&occurrence.tid)
+                        .expect("every occurrence belongs to a recorded document")
+                        as u32,
+                );
                 payload
-                    .push(bucket, &occurrence.positions)
+                    .push(&occurrence.positions)
                     .expect("positions validated on insertion");
             }
-            let postings_bytes = postings.finish_as(postings_format);
-            let payload_bytes = payload.finish_as(payload_format);
+            let ordinals_bytes = crate::ordinals::encode_scored(&ordinals, &scores);
+            let payload_bytes = payload.finish();
             let entry = TermEntry {
                 df: occurrences.len() as u32,
                 max_tf_bucket,
-                postings: Extent {
-                    offset: postings_area.len() as u64,
-                    len: postings_bytes.len() as u32,
+                ordinals: Extent {
+                    offset: ordinals_area.len() as u64,
+                    len: ordinals_bytes.len() as u32,
                 },
                 payload: Extent {
                     offset: payload_area.len() as u64,
                     len: payload_bytes.len() as u32,
                 },
             };
-            postings_area.extend_from_slice(&postings_bytes);
+            ordinals_area.extend_from_slice(&ordinals_bytes);
             payload_area.extend_from_slice(&payload_bytes);
             dictionary
                 .push(&term, entry)
                 .expect("terms come from an ordered map");
         }
         let dictionary_bytes = dictionary.finish();
-        let mut docs = PostingsBuilder::default();
         let mut lengths = Vec::with_capacity(self.lengths.len() * 4);
+        let mut classes = Vec::with_capacity(self.lengths.len());
         let mut total_length = 0u64;
-        for (tid, doc_len) in &self.lengths {
-            docs.push(*tid).expect("map keys are ordered and unique");
+        for doc_len in self.lengths.values() {
             lengths.extend_from_slice(&doc_len.to_le_bytes());
+            classes.push(crate::length_class::class_of(*doc_len));
             total_length += u64::from(*doc_len);
         }
-        let docs_bytes = docs.finish();
-
-        let mut out = Vec::new();
-        out.extend_from_slice(magic.magic());
-        varint::put(&mut out, self.lengths.len() as u64);
-        varint::put(&mut out, total_length);
-        varint::put(&mut out, dictionary_bytes.len() as u64);
-        varint::put(&mut out, postings_area.len() as u64);
-        varint::put(&mut out, payload_area.len() as u64);
-        varint::put(&mut out, docs_bytes.len() as u64);
-        out.extend_from_slice(&dictionary_bytes);
-        out.extend_from_slice(&postings_area);
-        out.extend_from_slice(&payload_area);
-        out.extend_from_slice(&docs_bytes);
-        out.extend_from_slice(&lengths);
-        out
+        let offsets = docs::offsets(documents.iter().copied());
+        let pages = docs::page_table(documents.iter().copied());
+        assemble(
+            self.lengths.len() as u32,
+            total_length,
+            &dictionary_bytes,
+            &ordinals_area,
+            &payload_area,
+            &offsets,
+            &lengths,
+            &classes,
+            &pages,
+        )
     }
 }
 
-/// A term resolved against a segment. Postings and payload bytes are fetched
-/// only when a cursor asks for them, so Boolean queries never read positions.
+/// Lays the sections out as a blob with its header.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble(
+    doc_count: u32,
+    total_length: u64,
+    dictionary: &[u8],
+    ordinals: &[u8],
+    payload: &[u8],
+    offsets: &[u8],
+    lengths: &[u8],
+    classes: &[u8],
+    pages: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        32 + dictionary.len()
+            + ordinals.len()
+            + payload.len()
+            + offsets.len()
+            + lengths.len()
+            + classes.len()
+            + pages.len(),
+    );
+    out.extend_from_slice(&header(
+        doc_count,
+        total_length,
+        dictionary.len(),
+        ordinals.len(),
+        payload.len(),
+        pages.len(),
+    ));
+    for section in [
+        dictionary, ordinals, payload, offsets, lengths, classes, pages,
+    ] {
+        out.extend_from_slice(section);
+    }
+    out
+}
+
+/// The header of a blob whose sections have the given lengths.
+pub(crate) fn header(
+    doc_count: u32,
+    total_length: u64,
+    dictionary_len: usize,
+    ordinals_len: usize,
+    payload_len: usize,
+    pages_len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    out.extend_from_slice(MAGIC);
+    for n in [
+        u64::from(doc_count),
+        total_length,
+        dictionary_len as u64,
+        ordinals_len as u64,
+        payload_len as u64,
+        pages_len as u64,
+    ] {
+        varint::put(&mut out, n);
+    }
+    out
+}
+
+/// A term resolved against a segment. Stream bytes are fetched only when a
+/// cursor asks for them, so Boolean queries never read positions.
 #[derive(Clone, Copy)]
 pub struct Term<'a> {
     pub entry: TermEntry,
@@ -328,45 +335,175 @@ impl<'a> Term<'a> {
         self.entry.df
     }
 
-    pub fn postings(&self) -> Result<Postings<'a>> {
-        Postings::parse(self.areas.postings_bytes(self.entry.postings)?)
+    /// The term's documents as ordinals, with a bound per chunk.
+    pub fn ordinals(&self) -> Result<Ordinals<'a>> {
+        let fetch = OrdinalsFetch {
+            areas: self.areas,
+            base: self.entry.ordinals.offset,
+        };
+        Ordinals::open(fetch, u64::from(self.entry.ordinals.len), true)
     }
 
-    pub fn cursor(&self) -> Result<PostingsCursor<'a>> {
-        self.postings()?.cursor()
+    /// The term's documents as tuple locations, in heap order.
+    pub fn cursor(&self) -> Result<TidCursor<'a>> {
+        TidCursor::new(self.ordinals()?.cursor()?, self.areas.doc_table()?)
+    }
+
+    /// The term's documents a heap page at a time.
+    pub fn pages(&self) -> Result<PageCursor<'a>> {
+        PageCursor::new(self.ordinals()?.cursor()?, self.areas.doc_table()?)
+    }
+
+    /// Whether a scan over the term should work a heap page at a time.
+    pub fn prefers_pages(&self) -> Result<bool> {
+        Ok(self.ordinals()?.prefers_pages())
     }
 
     pub fn payload(&self) -> Result<Payload<'a>> {
-        let bytes = self.areas.payload_bytes(self.entry.payload)?;
-        Payload::parse_format(bytes, self.areas.format())
+        if self.areas.ranged_payloads() {
+            let extent = self.entry.payload;
+            return Payload::open(self.areas, extent.offset, extent.len as usize);
+        }
+        Payload::parse(self.areas.payload_bytes(self.entry.payload)?)
     }
 }
 
-/// Fetches extents of the postings and payload areas and document lengths.
+/// One term's stream within the ordinals area, fetched a range at a time.
+struct OrdinalsFetch<'a> {
+    areas: &'a dyn AreaFetch,
+    base: u64,
+}
+
+impl<'a> crate::ordinals::Fetch<'a> for OrdinalsFetch<'a> {
+    fn fetch(&self, offset: u64, len: usize) -> Result<&'a [u8]> {
+        let at = self.base.checked_add(offset).ok_or(Error::Truncated)?;
+        self.areas.ordinals_bytes(at, len)
+    }
+    fn fetch_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        let at = self.base.checked_add(offset).ok_or(Error::Truncated)?;
+        self.areas.ordinals_range_owned(at, len)
+    }
+    fn held_slot(&self) -> Option<usize> {
+        self.areas.held_slot()
+    }
+    fn hold_generation(&self) -> u64 {
+        self.areas.hold_generation()
+    }
+    fn fetch_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        let Some(at) = self.base.checked_add(offset) else {
+            return Some(Err(Error::Truncated));
+        };
+        self.areas.ordinals_held(slot, at, len)
+    }
+    fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+        let Some(at) = self.base.checked_add(offset) else {
+            return Some(Err(Error::Truncated));
+        };
+        Some(
+            self.areas
+                .ordinals_held_span(slot, at)?
+                .map(|span| HeldSpan {
+                    start: span.start.wrapping_sub(self.base),
+                    ..span
+                }),
+        )
+    }
+}
+
+/// Document lengths per window of the length table a paged source hands out.
+/// One lookup needs four bytes, and the table of a large segment is far
+/// bigger than a backend's read cache, so a wide window evicted everything
+/// else to serve one value. The window is a fraction of a page and is not
+/// cached privately: the table is already in shared buffers, which every
+/// backend shares.
+/// Documents per length window handed to a walk: a candidate's length is a
+/// window fetch when the window last read does not hold it, and candidates
+/// are sparse enough that a window served about one of them, so a 2,048
+/// document window was an 8 KiB copy per candidate.
+const LENGTH_WINDOW: u32 = 64;
+
+/// Fetches the streams of the ordinals and payload areas, the document
+/// table and document lengths.
 pub trait AreaFetch {
-    fn postings_bytes(&self, extent: Extent) -> Result<&[u8]>;
+    /// Bytes of the ordinals area.
+    fn ordinals_bytes(&self, offset: u64, len: usize) -> Result<&[u8]>;
+    /// Ranges a cursor reads and moves on from, shared through the bounded
+    /// [`crate::cache`] rather than kept with the reader, so a query that
+    /// sweeps a frequent term's streams holds one span of each at a time.
+    fn ordinals_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        self.ordinals_bytes(offset, len).map(Rc::from)
+    }
+    /// A term's whole payload stream.
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]>;
+    /// Whether payload streams are read a range at a time through
+    /// [`AreaFetch::payload_range`] rather than as whole extents.
+    fn ranged_payloads(&self) -> bool {
+        false
+    }
+    /// Bytes of the payload area.
+    fn payload_range(&self, _offset: u64, _len: usize) -> Result<&[u8]> {
+        Err(Error::Corrupt("source has no ranged payloads"))
+    }
+    fn payload_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        self.payload_range(offset, len).map(Rc::from)
+    }
+    /// The document table.
+    fn doc_table(&self) -> Result<DocTable<'_>>;
     fn length(&self, ordinal: u32) -> Result<u32>;
-    /// The format the streams were written in.
-    fn format(&self) -> Format {
-        Format::CURRENT
+    /// The document's length class (see [`crate::length_class`]).
+    fn length_class(&self, ordinal: u32) -> Result<u8>;
+    /// The length of `ordinal` from a page the source holds pinned, when it
+    /// holds one (see [`Source::held_span`]).
+    fn held_length(&self, _ordinal: u32) -> Option<Result<u32>> {
+        None
+    }
+    /// A fresh slot to hold ranges in place in (see [`Source::held_slot`]).
+    fn held_slot(&self) -> Option<usize> {
+        None
+    }
+    /// The hold span open or last opened (see [`Source::hold_generation`]).
+    fn hold_generation(&self) -> u64 {
+        0
+    }
+    /// `len` bytes at `offset` of the ordinals area, in place from pages
+    /// held pinned in `slot` (see [`Source::held_range`]).
+    fn ordinals_held(&self, _slot: usize, _offset: u64, _len: usize) -> Option<Result<HeldRange>> {
+        None
+    }
+    /// The page holding byte `offset` of the ordinals area, held pinned in
+    /// `slot` (see [`Source::held_span`]), its `start` an offset in the
+    /// area, wrapped below zero for a page starting before it.
+    fn ordinals_held_span(&self, _slot: usize, _offset: u64) -> Option<Result<HeldSpan>> {
+        None
+    }
+    /// `len` bytes at `offset` of the payload area, as
+    /// [`AreaFetch::ordinals_held`].
+    fn payload_held(&self, _slot: usize, _offset: u64, _len: usize) -> Option<Result<HeldRange>> {
+        None
+    }
+    /// The window of the length table holding `ordinal` as an owned copy,
+    /// with the window's first ordinal; `None` for a source whose table is
+    /// held whole.
+    fn length_window_owned(&self, _ordinal: u32) -> Result<Option<(Rc<[u8]>, u32)>> {
+        Ok(None)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Header {
-    format: Format,
     doc_count: u32,
     total_length: u64,
     dictionary_at: u64,
     dictionary_len: usize,
-    postings_at: u64,
-    postings_len: usize,
+    ordinals_at: u64,
+    ordinals_len: usize,
     payload_at: u64,
     payload_len: usize,
-    docs_at: u64,
-    docs_len: usize,
+    offsets_at: u64,
     lengths_at: u64,
+    classes_at: u64,
+    pages_at: u64,
+    pages_len: usize,
 }
 
 /// Reads a segment from any [`Source`], fetching only the extents a query
@@ -376,12 +513,25 @@ struct Header {
 pub struct Reader<S: Source> {
     source: S,
     header: Header,
+    /// Identity in the [`crate::cache`].
+    id: u64,
     arena: RefCell<Arena>,
     arena_bytes: Cell<usize>,
     dictionary: OnceCell<DictionaryIndex<'static>>,
+    /// The page table, checked once: every cursor over the segment starts
+    /// from it, and a large segment's table has hundreds of thousands of
+    /// entries.
+    pages: OnceCell<PageTable<'static>>,
     /// The length chunk read last, by offset: scoring reads lengths in
     /// document order, so consecutive reads hit the same chunk.
     last_chunk: Cell<Option<(u64, *const [u8])>>,
+    /// The class window read last, as (first ordinal, bytes): a walk asks
+    /// for classes in ordinal order, and a window fetch was a buffer read
+    /// and an 8 KiB copy per candidate.
+    last_classes: RefCell<Option<(u32, Rc<[u8]>)>>,
+    /// Per [`Source::held_span`] slot, the span last handed out, valid
+    /// until the next call on the slot or the end of the hold span.
+    held: [Cell<Option<HeldSpan>>; HELD_SLOTS],
 }
 
 /// Byte lengths of a segment's sections, in blob order.
@@ -389,17 +539,29 @@ pub struct Reader<S: Source> {
 pub struct Sections {
     pub header: usize,
     pub dictionary: usize,
-    pub postings: usize,
+    pub ordinals: usize,
     pub payload: usize,
-    pub docs: usize,
+    pub offsets: usize,
     pub lengths: usize,
+    pub classes: usize,
+    pub pages: usize,
 }
 
-/// Fetched extents by (offset, len).
-type Arena = HashMap<(u64, usize), Box<[u8]>>;
+/// Fetched byte ranges by (offset, len). A ranged cursor fetches thousands
+/// of windows per query, so the hash is the cheap one.
+type Arena = rustc_hash::FxHashMap<(u64, usize), Box<[u8]>>;
 
 /// Granularity at which document lengths are fetched from a paged source.
 const LENGTH_CHUNK: u64 = 4096;
+
+/// Documents per window of the length-class table. A window is read
+/// uncached from shared buffers and held until a lookup falls outside it;
+/// candidates are sparse, so a wide window was mostly copied for one value.
+pub const CLASS_WINDOW: u32 = 1024;
+
+/// The [`Source::held_span`] slots of the class and length tables.
+const HELD_CLASSES: usize = 0;
+const HELD_LENGTHS: usize = 1;
 
 /// A segment held entirely in memory.
 pub type Segment<'a> = Reader<&'a [u8]>;
@@ -415,42 +577,50 @@ impl<S: Source> Reader<S> {
         let total = source.len();
         let head = source.read(0, (total.min(64)) as usize)?;
         let mut reader = crate::reader::Reader::new(&head);
-        let magic = reader.take(4)?;
-        let format = Format::from_magic(magic).ok_or(Error::Corrupt("segment magic"))?;
+        if reader.take(4)? != MAGIC {
+            return Err(Error::Corrupt("segment magic"));
+        }
         let doc_count = reader.varint_u32()?;
         let total_length = reader.varint()?;
         let dictionary_len = reader.varint_u32()? as usize;
-        let postings_len = reader.varint_u32()? as usize;
+        let ordinals_len = reader.varint_u32()? as usize;
         let payload_len = reader.varint_u32()? as usize;
-        let docs_len = reader.varint_u32()? as usize;
+        let pages_len = reader.varint_u32()? as usize;
         let dictionary_at = reader.position() as u64;
-        let postings_at = dictionary_at + dictionary_len as u64;
-        let payload_at = postings_at + postings_len as u64;
-        let docs_at = payload_at + payload_len as u64;
-        let lengths_at = docs_at + docs_len as u64;
-        if lengths_at + u64::from(doc_count) * 4 != total {
+        let ordinals_at = dictionary_at + dictionary_len as u64;
+        let payload_at = ordinals_at + ordinals_len as u64;
+        let offsets_at = payload_at + payload_len as u64;
+        let lengths_at = offsets_at + u64::from(doc_count) * 2;
+        let classes_at = lengths_at + u64::from(doc_count) * 4;
+        let pages_at = classes_at + u64::from(doc_count);
+        if pages_at + pages_len as u64 != total || !pages_len.is_multiple_of(docs::PAGE_ENTRY) {
             return Err(Error::Corrupt("segment length"));
         }
         Ok(Self {
             source,
             header: Header {
-                format,
                 doc_count,
                 total_length,
                 dictionary_at,
                 dictionary_len,
-                postings_at,
-                postings_len,
+                ordinals_at,
+                ordinals_len,
                 payload_at,
                 payload_len,
-                docs_at,
-                docs_len,
+                offsets_at,
                 lengths_at,
+                classes_at,
+                pages_at,
+                pages_len,
             },
-            arena: RefCell::new(HashMap::new()),
+            id: crate::cache::reader_id(),
+            arena: RefCell::new(Arena::default()),
             arena_bytes: Cell::new(0),
             dictionary: OnceCell::new(),
+            pages: OnceCell::new(),
             last_chunk: Cell::new(None),
+            last_classes: RefCell::new(None),
+            held: Default::default(),
         })
     }
 
@@ -459,8 +629,59 @@ impl<S: Source> Reader<S> {
         self.arena_bytes.get()
     }
 
-    /// Bytes `[offset, offset + len)` of the source, borrowed for as long as
-    /// this reader lives.
+    /// Which area of the blob `offset` lies in, for read accounting.
+    fn area_of(&self, offset: u64) -> usize {
+        let header = &self.header;
+        match offset {
+            _ if offset >= header.pages_at => 7,
+            _ if offset >= header.classes_at => 6,
+            _ if offset >= header.lengths_at => 5,
+            _ if offset >= header.offsets_at => 4,
+            _ if offset >= header.payload_at => 3,
+            _ if offset >= header.ordinals_at => 2,
+            _ if offset >= header.dictionary_at => 1,
+            _ => 0,
+        }
+    }
+
+    /// A range read straight from the source, kept by the caller alone: for
+    /// a table that shared buffers already cache, where a private copy would
+    /// only evict what nothing else holds.
+    fn read_uncached(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        if let Some(slice) = self.source.slice(offset, len) {
+            return Ok(Rc::from(slice));
+        }
+        let area = self.area_of(offset);
+        crate::cache::note_read(area, len);
+        let before = crate::cache::disk_pages();
+        let bytes = self.source.read(offset, len)?;
+        crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        if bytes.len() != len {
+            return Err(Error::Truncated);
+        }
+        Ok(Rc::from(bytes))
+    }
+
+    /// A range a cursor sweeps, through the bounded cache rather than the
+    /// arena.
+    fn read_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        if let Some(slice) = self.source.slice(offset, len) {
+            return Ok(Rc::from(slice));
+        }
+        if let Some(bytes) = crate::cache::get(self.id, offset, len) {
+            return Ok(bytes);
+        }
+        let area = self.area_of(offset);
+        let before = crate::cache::disk_pages();
+        let bytes = self.source.read_shared(offset, len)?;
+        crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        if bytes.len() != len {
+            return Err(Error::Truncated);
+        }
+        crate::cache::note_read(area, len);
+        Ok(crate::cache::insert(self.id, offset, bytes))
+    }
+
     fn load(&self, offset: u64, len: usize) -> Result<&[u8]> {
         if let Some(slice) = self.source.slice(offset, len) {
             return Ok(slice);
@@ -470,7 +691,11 @@ impl<S: Source> Reader<S> {
             // SAFETY: as below; the box stays in the arena for `self`'s life.
             return Ok(unsafe { &*pointer });
         }
+        let area = self.area_of(offset);
+        crate::cache::note_read(area, len);
+        let before = crate::cache::disk_pages();
         let bytes = self.source.read(offset, len)?.into_boxed_slice();
+        crate::cache::note_disk(area, crate::cache::disk_pages() - before);
         let pointer: *const [u8] = &*bytes;
         self.arena_bytes.set(self.arena_bytes.get() + bytes.len());
         self.arena.borrow_mut().insert((offset, len), bytes);
@@ -488,31 +713,42 @@ impl<S: Source> Reader<S> {
         self.header.total_length
     }
 
-    /// The blob's format, from its signature.
-    pub const fn format(&self) -> Format {
-        self.header.format
-    }
-
-    /// True for an `LSG1` blob, whose term postings carry no block bounds.
-    pub const fn is_legacy(&self) -> bool {
-        matches!(self.header.format, Format::Lsg1)
-    }
-
-    /// Byte lengths of the postings and payload areas.
-    pub const fn area_lengths(&self) -> (usize, usize) {
-        (self.header.postings_len, self.header.payload_len)
-    }
-
     /// Byte lengths of every section of the blob, for size accounting.
     pub const fn sections(&self) -> Sections {
         Sections {
             header: self.header.dictionary_at as usize,
             dictionary: self.header.dictionary_len,
-            postings: self.header.postings_len,
+            ordinals: self.header.ordinals_len,
             payload: self.header.payload_len,
-            docs: self.header.docs_len,
+            offsets: self.header.doc_count as usize * 2,
             lengths: self.header.doc_count as usize * 4,
+            classes: self.header.doc_count as usize,
+            pages: self.header.pages_len,
         }
+    }
+
+    /// The page table: the heap blocks the documents span.
+    pub fn page_table(&self) -> Result<PageTable<'_>> {
+        if let Some(pages) = self.pages.get() {
+            return Ok(*pages);
+        }
+        let pages = PageTable::parse(
+            self.load(self.header.pages_at, self.header.pages_len)?,
+            self.header.doc_count,
+        )?;
+        // SAFETY: the bytes live in the arena for the reader's lifetime; the
+        // table is only ever handed out shortened to a borrow of `self`.
+        let pages: PageTable<'static> = unsafe { std::mem::transmute(pages) };
+        Ok(*self.pages.get_or_init(|| pages))
+    }
+
+    /// The document table, with offsets fetched a heap block at a time.
+    pub fn doc_table(&self) -> Result<DocTable<'_>> {
+        DocTable::new(
+            self.page_table()?,
+            OffsetsFetch { reader: self },
+            u64::from(self.header.doc_count) * 2,
+        )
     }
 
     fn dictionary_index(&self) -> Result<&DictionaryIndex<'_>> {
@@ -549,7 +785,7 @@ impl<S: Source> Reader<S> {
                 fetch: self,
             }
         };
-        Ok(Dictionary::with_format(index, blocks, self.header.format))
+        Ok(Dictionary::new(index, blocks))
     }
 
     /// Resolves a dictionary entry obtained earlier from this segment.
@@ -560,7 +796,7 @@ impl<S: Source> Reader<S> {
                 .checked_add(u64::from(extent.len))
                 .is_some_and(|end| end <= area_len as u64)
         };
-        if !within(entry.postings, self.header.postings_len)
+        if !within(entry.ordinals, self.header.ordinals_len)
             || !within(entry.payload, self.header.payload_len)
         {
             return Err(Error::Truncated);
@@ -587,22 +823,141 @@ impl<S: Source> Reader<S> {
     }
 
     /// Cursor over every document in the segment, the universe for NOT.
-    pub fn documents(&self) -> Result<PostingsCursor<'_>> {
-        Postings::parse(self.load(self.header.docs_at, self.header.docs_len)?)?.cursor()
+    pub fn documents(&self) -> Result<DocCursor<'_>> {
+        self.doc_table()?.into_cursor()
+    }
+
+    /// The location of document `ordinal`.
+    pub fn tid_at(&self, ordinal: u32) -> Result<Tid> {
+        self.doc_table()?.tid_at(ordinal)
+    }
+
+    /// The ordinal of the document at `tid`, if it is in this segment.
+    pub fn ordinal_of(&self, tid: Tid) -> Result<Option<u32>> {
+        self.doc_table()?.ordinal_of(tid)
     }
 
     /// Length of the document at `tid`, if it is in this segment.
     pub fn document_length(&self, tid: Tid) -> Result<Option<u32>> {
-        let mut cursor = self.documents()?;
-        cursor
-            .rank(tid)?
+        self.ordinal_of(tid)?
             .map(|ordinal| self.length_at(ordinal))
             .transpose()
     }
 
-    /// Length by document ordinal, as reported by [`Reader::documents`].
+    /// Length by document ordinal.
     pub fn length_at(&self, ordinal: u32) -> Result<u32> {
         self.lengths().get(ordinal)
+    }
+
+    /// Length class by document ordinal. Within a [`Reader::hold`] span a
+    /// source that holds pages serves it from the page held; otherwise a
+    /// paged source reads the table in windows of [`CLASS_WINDOW`]
+    /// documents and keeps the window last read: the table is a byte per
+    /// document and a walk consults it per candidate, in ordinal order.
+    pub fn length_class(&self, ordinal: u32) -> Result<u8> {
+        if ordinal >= self.header.doc_count {
+            return Err(Error::Corrupt("document ordinal out of range"));
+        }
+        let at = self.header.classes_at + u64::from(ordinal);
+        if let Some(read) = self.held_read::<1>(HELD_CLASSES, at) {
+            return read.map(|[class]| class);
+        }
+        if let Some(bytes) = self.source.slice(at, 1) {
+            return Ok(bytes[0]);
+        }
+        let mut held = self.last_classes.borrow_mut();
+        let hit = held.as_ref().is_some_and(|(first, bytes)| {
+            ordinal >= *first && ((ordinal - first) as usize) < bytes.len()
+        });
+        if !hit {
+            let first = ordinal - ordinal % CLASS_WINDOW;
+            let len = (self.header.doc_count - first).min(CLASS_WINDOW) as usize;
+            let window = self.read_uncached(self.header.classes_at + u64::from(first), len)?;
+            *held = Some((first, window));
+        }
+        let (first, bytes) = held.as_ref().expect("window loaded");
+        Ok(bytes[(ordinal - first) as usize])
+    }
+
+    /// Opens or closes a span within which length and class lookups keep
+    /// the source's pages pinned (see [`Source::hold`]). A walk consults
+    /// both per candidate, in ordinal order, so a page serves thousands of
+    /// lookups where a copied window served a dozen.
+    pub fn hold(&self, open: bool) {
+        if !open {
+            // The spans end with the pins the source is about to release.
+            for span in &self.held {
+                span.set(None);
+            }
+        }
+        self.source.hold(open);
+    }
+
+    /// `N` bytes at `offset` through the page the source holds in `slot`;
+    /// `None` where the source holds no page, or the bytes cross one.
+    #[inline]
+    fn held_read<const N: usize>(&self, slot: usize, offset: u64) -> Option<Result<[u8; N]>> {
+        let span = match self.held[slot].get() {
+            Some(span)
+                if span.len >= N && offset.wrapping_sub(span.start) <= (span.len - N) as u64 =>
+            {
+                span
+            }
+            _ => match self.held_move(slot, offset, N)? {
+                Ok(span) => span,
+                Err(error) => return Some(Err(error)),
+            },
+        };
+        // SAFETY: the span came from the source's `held_span` for this slot,
+        // the last call on it, and within the hold span that `hold(false)`
+        // ends by forgetting it, so the source keeps its page pinned; the
+        // check above or in `held_move` put the `N` bytes inside it.
+        let bytes = unsafe {
+            span.data
+                .add((offset - span.start) as usize)
+                .cast::<[u8; N]>()
+                .read_unaligned()
+        };
+        Some(Ok(bytes))
+    }
+
+    /// Moves `slot` to the page holding `len` bytes at `offset`, accounting
+    /// a page newly pinned to its area; `None` where the source holds no
+    /// page, or the bytes cross one.
+    #[inline(never)]
+    fn held_move(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldSpan>> {
+        let before = crate::cache::disk_pages();
+        let span = match self.source.held_span(slot, offset)? {
+            Ok(span) => span,
+            Err(error) => return Some(Err(error)),
+        };
+        self.held[slot].set(Some(span));
+        if span.pinned {
+            let area = self.area_of(offset);
+            crate::cache::note_read(area, span.len);
+            crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        }
+        (offset >= span.start && offset - span.start + len as u64 <= span.len as u64)
+            .then_some(Ok(span))
+    }
+
+    /// `len` bytes at `offset` in place from pages the source holds in
+    /// `slot`, accounting pages newly pinned to their area.
+    fn held_range(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        let before = crate::cache::disk_pages();
+        let range = match self.source.held_range(slot, offset, len)? {
+            Ok(range) => range,
+            Err(error) => return Some(Err(error)),
+        };
+        if range.pinned_bytes != 0 {
+            let area = self.area_of(offset);
+            crate::cache::note_read(area, range.pinned_bytes);
+            crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        }
+        if range.end() < len {
+            return Some(Err(Error::Truncated));
+        }
+        Some(Ok(range))
     }
 
     /// A copyable handle on the length table.
@@ -610,9 +965,14 @@ impl<S: Source> Reader<S> {
         let len = self.header.doc_count as usize * 4;
         match self.source.slice(self.header.lengths_at, len) {
             Some(bytes) => Lengths::Bytes(bytes),
+            // A paged source hands the table out in windows, cached with the
+            // reader: a walk looks lengths up per candidate, one fetch per
+            // lookup cost more than the scoring, and the whole table of a
+            // large segment is megabytes a query rarely needs.
             None => Lengths::Lazy {
                 fetch: self,
                 count: self.header.doc_count,
+                window: std::cell::RefCell::new(None),
             },
         }
     }
@@ -621,44 +981,72 @@ impl<S: Source> Reader<S> {
     /// `skip` returns true. This is how folds and merges carry documents
     /// between segments without re-reading the heap.
     pub fn records(&self, mut skip: impl FnMut(Tid) -> bool) -> Result<Vec<ForwardRecord>> {
+        let docs = self.doc_table()?;
+        let documents = docs.to_vec()?;
         let mut by_document: BTreeMap<Tid, Vec<ForwardTerm>> = BTreeMap::new();
-        let mut documents = self.documents()?;
-        while let Some(tid) = documents.current() {
-            if !skip(tid) {
-                by_document.insert(tid, Vec::new());
+        for tid in &documents {
+            if !skip(*tid) {
+                by_document.insert(*tid, Vec::new());
             }
-            documents.advance()?;
         }
         for item in self.dictionary()?.iter() {
             let (term, entry) = item?;
             let resolved = self.resolve(entry)?;
-            let mut postings = resolved.cursor()?;
+            let mut ordinals = resolved.ordinals()?.cursor()?;
             let mut payload = resolved.payload()?.cursor();
-            while let Some(tid) = postings.current() {
+            while let Some(ordinal) = ordinals.current() {
                 let mut positions = Vec::new();
                 payload.next_into(&mut positions)?;
+                let tid = *documents
+                    .get(ordinal as usize)
+                    .ok_or(Error::Corrupt("ordinal beyond the document table"))?;
                 if let Some(terms) = by_document.get_mut(&tid) {
                     terms.push(ForwardTerm {
                         term: term.clone(),
                         positions,
                     });
                 }
-                postings.advance()?;
+                ordinals.advance()?;
             }
         }
-        let mut lengths = self.documents()?;
         let mut out = Vec::with_capacity(by_document.len());
         for (tid, terms) in by_document {
-            let ordinal = lengths
-                .rank(tid)?
-                .ok_or(Error::Corrupt("document missing from table"))?;
+            let ordinal = documents
+                .binary_search(&tid)
+                .map_err(|_| Error::Corrupt("document missing from table"))?;
             out.push(ForwardRecord {
                 tid,
-                doc_len: self.length_at(ordinal)?,
+                doc_len: self.length_at(ordinal as u32)?,
                 terms,
             });
         }
         Ok(out)
+    }
+}
+
+/// The offsets table of a reader, fetched a heap block at a time.
+struct OffsetsFetch<'a, S: Source> {
+    reader: &'a Reader<S>,
+}
+
+impl<'a, S: Source> crate::ordinals::Fetch<'a> for OffsetsFetch<'a, S> {
+    fn fetch(&self, offset: u64, len: usize) -> Result<&'a [u8]> {
+        let header = &self.reader.header;
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= u64::from(header.doc_count) * 2 => {
+                self.reader.load(header.offsets_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
+    }
+    fn fetch_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        let header = &self.reader.header;
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= u64::from(header.doc_count) * 2 => {
+                self.reader.read_owned(header.offsets_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
     }
 }
 
@@ -671,16 +1059,124 @@ impl<S: Source> BlockFetch for Reader<S> {
 }
 
 impl<S: Source> AreaFetch for Reader<S> {
-    fn postings_bytes(&self, extent: Extent) -> Result<&[u8]> {
-        self.load(self.header.postings_at + extent.offset, extent.len as usize)
+    fn ordinals_bytes(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.header.ordinals_len as u64)
+        {
+            return Err(Error::Truncated);
+        }
+        self.load(self.header.ordinals_at + offset, len)
+    }
+
+    fn ordinals_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.header.ordinals_len as u64)
+        {
+            return Err(Error::Truncated);
+        }
+        self.read_owned(self.header.ordinals_at + offset, len)
     }
 
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]> {
         self.load(self.header.payload_at + extent.offset, extent.len as usize)
     }
 
-    fn format(&self) -> Format {
-        self.header.format
+    fn ranged_payloads(&self) -> bool {
+        true
+    }
+
+    fn payload_range(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.payload_len as u64 => {
+                self.load(self.header.payload_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
+    }
+
+    fn payload_range_owned(&self, offset: u64, len: usize) -> Result<Rc<[u8]>> {
+        match offset.checked_add(len as u64) {
+            Some(end) if end <= self.header.payload_len as u64 => {
+                self.read_owned(self.header.payload_at + offset, len)
+            }
+            _ => Err(Error::Truncated),
+        }
+    }
+
+    fn doc_table(&self) -> Result<DocTable<'_>> {
+        Reader::doc_table(self)
+    }
+
+    fn length_class(&self, ordinal: u32) -> Result<u8> {
+        Reader::length_class(self, ordinal)
+    }
+
+    fn held_length(&self, ordinal: u32) -> Option<Result<u32>> {
+        let at = self.header.lengths_at + u64::from(ordinal) * 4;
+        Some(
+            self.held_read::<4>(HELD_LENGTHS, at)?
+                .map(u32::from_le_bytes),
+        )
+    }
+
+    fn held_slot(&self) -> Option<usize> {
+        self.source.held_slot()
+    }
+
+    fn hold_generation(&self) -> u64 {
+        self.source.hold_generation()
+    }
+
+    fn ordinals_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.header.ordinals_len as u64)
+        {
+            return Some(Err(Error::Truncated));
+        }
+        self.held_range(slot, self.header.ordinals_at + offset, len)
+    }
+
+    fn ordinals_held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+        if offset >= self.header.ordinals_len as u64 {
+            return Some(Err(Error::Truncated));
+        }
+        let at = self.header.ordinals_at + offset;
+        let before = crate::cache::disk_pages();
+        let span = match self.source.held_span(slot, at)? {
+            Ok(span) => span,
+            Err(error) => return Some(Err(error)),
+        };
+        if span.pinned {
+            crate::cache::note_read(2, span.len);
+            crate::cache::note_disk(2, crate::cache::disk_pages() - before);
+        }
+        Some(Ok(HeldSpan {
+            start: span.start.wrapping_sub(self.header.ordinals_at),
+            ..span
+        }))
+    }
+
+    fn payload_held(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.header.payload_len as u64)
+        {
+            return Some(Err(Error::Truncated));
+        }
+        self.held_range(slot, self.header.payload_at + offset, len)
+    }
+
+    fn length_window_owned(&self, ordinal: u32) -> Result<Option<(Rc<[u8]>, u32)>> {
+        if ordinal >= self.header.doc_count {
+            return Err(Error::Corrupt("document ordinal out of range"));
+        }
+        let first = ordinal - ordinal % LENGTH_WINDOW;
+        let len = ((self.header.doc_count - first).min(LENGTH_WINDOW) as usize) * 4;
+        let bytes = self.read_uncached(self.header.lengths_at + u64::from(first) * 4, len)?;
+        Ok(Some((bytes, first)))
     }
 
     fn length(&self, ordinal: u32) -> Result<u32> {
@@ -718,12 +1214,14 @@ impl<S: Source> AreaFetch for Reader<S> {
 }
 
 /// Document lengths addressed by document ordinal.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Lengths<'a> {
     Bytes(&'a [u8]),
     Lazy {
         fetch: &'a dyn AreaFetch,
         count: u32,
+        /// The window last read, as (first ordinal, bytes).
+        window: std::cell::RefCell<Option<(u32, Rc<[u8]>)>>,
     },
 }
 
@@ -737,11 +1235,31 @@ impl Lengths<'_> {
                     .ok_or(Error::Corrupt("document ordinal out of range"))?;
                 Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             }
-            Self::Lazy { fetch, count } => {
+            Self::Lazy {
+                fetch,
+                count,
+                window,
+            } => {
                 if ordinal >= *count {
                     return Err(Error::Corrupt("document ordinal out of range"));
                 }
-                fetch.length(ordinal)
+                if let Some(length) = fetch.held_length(ordinal) {
+                    return length;
+                }
+                let mut held = window.borrow_mut();
+                let hit = held.as_ref().is_some_and(|(first, bytes)| {
+                    ordinal >= *first && ((ordinal - first) as usize) * 4 + 4 <= bytes.len()
+                });
+                if !hit {
+                    match fetch.length_window_owned(ordinal)? {
+                        Some((bytes, first)) => *held = Some((first, bytes)),
+                        None => return fetch.length(ordinal),
+                    }
+                }
+                let (first, bytes) = held.as_ref().expect("window loaded");
+                let at = (ordinal - first) as usize * 4;
+                let bytes = bytes.get(at..at + 4).ok_or(Error::Truncated)?;
+                Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             }
         }
     }
@@ -750,6 +1268,7 @@ impl Lengths<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ordinals::WORDS;
     use crate::set::{Cursor, collect};
 
     fn tid(block: u32, offset: u16) -> Tid {
@@ -789,6 +1308,8 @@ mod tests {
         assert_eq!(segment.document_length(tid(2, 1)).unwrap(), Some(3));
         assert_eq!(segment.document_length(tid(1, 3)).unwrap(), None);
         assert_eq!(segment.document_length(tid(1, 4)).unwrap(), None);
+        assert_eq!(segment.tid_at(1).unwrap(), tid(2, 1));
+        assert_eq!(segment.ordinal_of(tid(0, 5)).unwrap(), Some(0));
 
         let beer = segment.term("beer").unwrap().unwrap();
         assert_eq!(beer.df(), 2);
@@ -797,25 +1318,31 @@ mod tests {
             collect(beer.cursor().unwrap()).unwrap(),
             [tid(0, 5), tid(2, 1)]
         );
-        // Term postings carry block bounds over the term's documents.
-        let mut cursor = beer.cursor().unwrap();
-        assert!(cursor.has_bounds());
-        assert_eq!(
-            cursor.block_bounds().unwrap(),
-            [crate::postings::BlockBound::over(
-                &[
-                    (TfBucket::from_count(1).value(), 2),
-                    (TfBucket::from_count(2).value(), 3)
-                ],
-                tid(2, 1),
-            )]
-        );
-        assert!(!segment.documents().unwrap().has_bounds());
+        // The term's stream carries a bound over its documents.
+        let ordinals = beer.ordinals().unwrap();
+        assert_eq!(ordinals.to_vec().unwrap(), [0, 1]);
+        let bound = ordinals.chunk_bound(0).unwrap().unwrap();
+        assert_eq!(bound.min_len[TfBucket::from_count(1).value() as usize], 2);
+        assert_eq!(bound.min_len[TfBucket::from_count(2).value() as usize], 3);
         let payload = beer.payload().unwrap();
-        let mut cursor = beer.cursor().unwrap();
-        let ordinal = cursor.rank(tid(2, 1)).unwrap().unwrap();
-        assert_eq!(payload.get(ordinal).unwrap().positions, [1, 2]);
+        let rank = ordinals.rank(1).unwrap().unwrap();
+        assert_eq!(payload.get(rank).unwrap().positions, [1, 2]);
         assert_eq!(payload.get(0).unwrap().positions, [2]);
+        let mut cursor = beer.cursor().unwrap();
+        cursor.seek(tid(1, 1)).unwrap();
+        assert_eq!(cursor.current(), Some(tid(2, 1)));
+        assert_eq!(cursor.rank(), 1);
+        assert!(!beer.prefers_pages().unwrap());
+        let pages: Vec<(u32, Vec<u16>)> = {
+            let mut out = Vec::new();
+            let mut pages = beer.pages().unwrap();
+            while let Some(page) = crate::pages::Cursor::current(&pages) {
+                out.push((page.block, page.offsets.iter().collect()));
+                crate::pages::Cursor::advance(&mut pages).unwrap();
+            }
+            out
+        };
+        assert_eq!(pages, [(0, vec![5]), (2, vec![1])]);
 
         assert!(segment.term("ale").unwrap().is_none());
         let terms: Vec<String> = segment
@@ -868,38 +1395,36 @@ mod tests {
     }
 
     #[test]
-    fn grouped_records_match_token_rebuild_in_every_format() {
-        for format in [Format::Lsg1, Format::Lsg2, Format::Lsg3] {
-            let mut grouped = SegmentBuilder::default();
-            let mut tokens_builder = SegmentBuilder::default();
-            for n in (0..140).rev() {
-                let mut record = ForwardRecord::from_tokens(
-                    tid(n / 50, (n % 50 + 1) as u16),
-                    (0..(n % 30 + 1)).map(|p| (["alpha", "beer", "wine"][(p % 3) as usize], p * 2)),
-                )
+    fn grouped_records_match_token_rebuild() {
+        let mut grouped = SegmentBuilder::default();
+        let mut tokens_builder = SegmentBuilder::default();
+        for n in (0..140).rev() {
+            let mut record = ForwardRecord::from_tokens(
+                tid(n / 50, (n % 50 + 1) as u16),
+                (0..(n % 30 + 1)).map(|p| (["alpha", "beer", "wine"][(p % 3) as usize], p * 2)),
+            )
+            .unwrap();
+            // The caller's header is not trusted for scoring lengths.
+            record.doc_len = 999;
+            grouped.add_record(&record).unwrap();
+            tokens_builder
+                .add_document(record.tid, record.tokens())
                 .unwrap();
-                // The caller's header is not trusted for scoring lengths.
-                record.doc_len = 999;
-                grouped.add_record(&record).unwrap();
-                tokens_builder
-                    .add_document(record.tid, record.tokens())
-                    .unwrap();
-            }
-            let expected = tokens_builder.finish_as(format);
-            let actual = grouped.finish_as(format);
-            // Exact bytes cover positions, document lengths, per-term and
-            // block score bounds, and dictionary/postings ordering together.
-            assert_eq!(actual, expected, "{format}");
-            let report = crate::verify::verify_segment(&actual);
-            assert!(
-                report
-                    .findings
-                    .iter()
-                    .all(|finding| finding.severity != crate::verify::Severity::Error),
-                "{format}: {:?}",
-                report.findings
-            );
         }
+        let expected = tokens_builder.finish();
+        let actual = grouped.finish();
+        // Exact bytes cover positions, document lengths, chunk bounds and
+        // dictionary ordering together.
+        assert_eq!(actual, expected);
+        let report = crate::verify::verify_segment(&actual);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.severity != crate::verify::Severity::Error),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -1024,6 +1549,418 @@ mod tests {
         }
     }
 
+    /// Pages of 13 bytes, so a length straddles a page now and then, held
+    /// in slots as a buffer pool would pin them; counts the pages pinned.
+    struct Held {
+        bytes: Vec<u8>,
+        holding: Cell<u32>,
+        held: [Cell<Option<u64>>; crate::source::HELD_SLOTS],
+        pins: Cell<u32>,
+    }
+
+    impl Source for Held {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+            let at = offset as usize;
+            self.bytes
+                .get(at..at + len)
+                .map(<[u8]>::to_vec)
+                .ok_or(Error::Truncated)
+        }
+        fn hold(&self, open: bool) {
+            let depth = if open {
+                self.holding.get() + 1
+            } else {
+                self.holding.get() - 1
+            };
+            self.holding.set(depth);
+            if depth == 0 {
+                for slot in &self.held {
+                    slot.set(None);
+                }
+            }
+        }
+        fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+            if self.holding.get() == 0 {
+                return None;
+            }
+            let page = offset / 13;
+            let pinned = self.held[slot].get() != Some(page);
+            if pinned {
+                self.pins.set(self.pins.get() + 1);
+                self.held[slot].set(Some(page));
+            }
+            let start = (page * 13) as usize;
+            let end = (start + 13).min(self.bytes.len());
+            Some(Ok(HeldSpan {
+                start: start as u64,
+                data: self.bytes[start..end].as_ptr(),
+                len: end - start,
+                pinned,
+            }))
+        }
+    }
+
+    #[test]
+    fn held_pages_serve_lengths_and_classes_as_windows_do() {
+        let mut builder = SegmentBuilder::default();
+        let text: Vec<String> = (0..300)
+            .map(|n| vec!["w"; 1 + (n * 37) % 150].join(" "))
+            .collect();
+        for (n, text) in text.iter().enumerate() {
+            builder
+                .add_document(tid(n as u32 / 100, 1 + (n % 100) as u16), tokens(text))
+                .unwrap();
+        }
+        let bytes = builder.finish();
+        let whole = Segment::parse(&bytes).unwrap();
+        let held = Reader::new(Held {
+            bytes: bytes.clone(),
+            holding: Cell::new(0),
+            held: Default::default(),
+            pins: Cell::new(0),
+        })
+        .unwrap();
+        let check = |ordinals: &mut dyn Iterator<Item = u32>| {
+            let lengths = held.lengths();
+            for ordinal in ordinals {
+                assert_eq!(
+                    held.length_class(ordinal).unwrap(),
+                    whole.length_class(ordinal).unwrap(),
+                    "class of {ordinal}"
+                );
+                assert_eq!(
+                    lengths.get(ordinal).unwrap(),
+                    whole.length_at(ordinal).unwrap(),
+                    "length of {ordinal}"
+                );
+            }
+        };
+        // Outside a hold span the windows serve every lookup.
+        check(&mut (0..300));
+        assert_eq!(held.source.pins.get(), 0);
+        held.hold(true);
+        check(&mut (0..300));
+        // Forwards a page at a time per table, the class table's 300 bytes
+        // over 24 pages and the lengths' 1,200 over 93, less the lengths
+        // that straddle two pages and are read through a window instead.
+        let pins = held.source.pins.get();
+        assert!((24 + 80..=24 + 93).contains(&pins), "{pins}");
+        // Backwards and scattered, each slot moving on its own.
+        check(&mut (0..300).rev().step_by(7));
+        held.hold(false);
+        assert!(held.held.iter().all(|span| span.get().is_none()));
+        assert!(held.source.held.iter().all(|page| page.get().is_none()));
+        assert!(held.length_class(300).is_err());
+    }
+
+    /// Pages of `page` bytes, held pinned per slot as a buffer pool would
+    /// for [`Source::held_range`] and [`Source::held_span`]; counts pins.
+    struct Paged {
+        bytes: Vec<u8>,
+        page: usize,
+        holding: Cell<u32>,
+        /// Per slot, the pages held.
+        slots: RefCell<Vec<Vec<usize>>>,
+        pins: Cell<u64>,
+    }
+
+    impl Paged {
+        fn new(bytes: Vec<u8>, page: usize) -> Self {
+            Self {
+                bytes,
+                page,
+                holding: Cell::new(0),
+                slots: RefCell::new(vec![Vec::new(); HELD_SLOTS]),
+                pins: Cell::new(0),
+            }
+        }
+
+        fn held(&self) -> usize {
+            self.slots.borrow().iter().map(Vec::len).sum()
+        }
+
+        /// Holds `pages` in `slot`, counting those newly pinned.
+        fn hold_pages(&self, slot: usize, pages: &[usize]) -> Option<usize> {
+            let mut slots = self.slots.borrow_mut();
+            let held = slots.get_mut(slot)?;
+            let fresh = pages.iter().filter(|p| !held.contains(p)).count();
+            self.pins.set(self.pins.get() + fresh as u64);
+            *held = pages.to_vec();
+            Some(fresh)
+        }
+    }
+
+    impl Source for Paged {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+        fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+            let at = offset as usize;
+            self.bytes
+                .get(at..at + len)
+                .map(<[u8]>::to_vec)
+                .ok_or(Error::Truncated)
+        }
+        fn hold(&self, open: bool) {
+            let depth = if open {
+                self.holding.get() + 1
+            } else {
+                self.holding.get() - 1
+            };
+            self.holding.set(depth);
+            if depth == 0 {
+                *self.slots.borrow_mut() = vec![Vec::new(); HELD_SLOTS];
+            }
+        }
+        fn held_slot(&self) -> Option<usize> {
+            if self.holding.get() == 0 {
+                return None;
+            }
+            let mut slots = self.slots.borrow_mut();
+            slots.push(Vec::new());
+            Some(slots.len() - 1)
+        }
+        fn held_span(&self, slot: usize, offset: u64) -> Option<Result<HeldSpan>> {
+            if self.holding.get() == 0 {
+                return None;
+            }
+            let page = offset as usize / self.page;
+            let fresh = self.hold_pages(slot, &[page])?;
+            let start = page * self.page;
+            let end = (start + self.page).min(self.bytes.len());
+            Some(Ok(HeldSpan {
+                start: start as u64,
+                data: self.bytes[start..end].as_ptr(),
+                len: end - start,
+                pinned: fresh != 0,
+            }))
+        }
+        fn held_range(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
+            if self.holding.get() == 0 || len == 0 {
+                return None;
+            }
+            let (at, end) = (offset as usize, offset as usize + len);
+            let pages: Vec<usize> = (at / self.page..=(end - 1) / self.page).collect();
+            if pages.len() > crate::source::HELD_PIECES {
+                return None;
+            }
+            self.hold_pages(slot, &pages)?;
+            let mut range = HeldRange::default();
+            for page in pages {
+                let from = (page * self.page).max(at);
+                let to = ((page + 1) * self.page).min(self.bytes.len());
+                assert!(range.push(self.bytes[from..].as_ptr(), to - from));
+            }
+            Some(Ok(range))
+        }
+    }
+
+    /// Documents whose terms make array chunks, bitmap chunks of a few and
+    /// of most documents, and a short list, with term frequencies varied so
+    /// the buckets differ from member to member.
+    fn chunky_segment() -> Vec<u8> {
+        let mut builder = SegmentBuilder::default();
+        for n in 0..140_000u32 {
+            let mut text = Vec::new();
+            let mut add = |word: &'static str, times: u32| {
+                text.extend(std::iter::repeat_n(word, times as usize));
+            };
+            if n % 2 == 0 {
+                add("half", 1 + n % 7);
+            }
+            if n % 5 != 0 {
+                add("most", 1 + n % 3);
+            }
+            if n % 23 == 0 {
+                add("some", 1 + n % 11);
+            }
+            if n % 97 == 0 {
+                add("few", 1 + n % 5);
+            }
+            if n == 70_000 || n == 70_001 {
+                add("pair", 2);
+            }
+            builder
+                .add_document(tid(n / 100, 1 + (n % 100) as u16), tokens(&text.join(" ")))
+                .unwrap();
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn chunks_read_in_place_equal_chunks_copied() {
+        let bytes = chunky_segment();
+        let whole = Segment::parse(&bytes).unwrap();
+        let (mut held_chunks, mut far_nibbles) = (0, 0);
+        // Pages on which an 8 KiB bitmap spans two or three pages, from
+        // anywhere on the first, and the nibbles run on over more.
+        for page in [4099, 5003, 8150] {
+            let paged = Reader::new(Paged::new(bytes.clone(), page)).unwrap();
+            for name in ["half", "most", "some", "few", "pair"] {
+                let copied = whole.term(name).unwrap().unwrap().ordinals().unwrap();
+                paged.hold(true);
+                let term = paged.term(name).unwrap().unwrap();
+                let ordinals = term.ordinals().unwrap();
+                let members = ordinals.held_slot().unwrap();
+                let nibbles = ordinals.held_slot().unwrap();
+                let mut nibble_span: Option<HeldSpan> = None;
+                for i in 0..ordinals.chunk_count() {
+                    let expected = copied.chunk(i).unwrap();
+                    // SAFETY: the chunk is dropped before the next call on
+                    // the slot and before the span closes.
+                    let chunk = unsafe { ordinals.chunk_held(i, members) }.unwrap();
+                    assert!(chunk.is_held(), "{name} chunk {i} on {page}-byte pages");
+                    assert!(!expected.is_held());
+                    held_chunks += 1;
+                    assert_eq!(chunk.key, expected.key);
+                    assert_eq!(chunk.cardinality, expected.cardinality);
+                    assert_eq!(chunk.before, expected.before);
+                    assert_eq!(chunk.is_bitmap(), expected.is_bitmap());
+                    let (mut a, mut b) = ([0u64; WORDS], [0u64; WORDS]);
+                    chunk.words(&mut a);
+                    expected.words(&mut b);
+                    assert!(a == b, "{name} chunk {i}: members");
+                    let mut lows = (Vec::new(), Vec::new());
+                    chunk.members(&mut lows.0);
+                    expected.members(&mut lows.1);
+                    assert_eq!(lows.0, lows.1);
+                    if chunk.is_bitmap() {
+                        for w in 0..WORDS {
+                            assert_eq!(chunk.word(w), expected.word(w), "word {w}");
+                        }
+                        for (from, to) in [(0, WORDS), (0, 1), (3, 700), (511, 513), (1000, 1024)] {
+                            assert_eq!(chunk.count_words(from, to), expected.count_words(from, to));
+                        }
+                        let pattern: Vec<u64> = (0..WORDS as u64)
+                            .map(|w| w.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                            .collect();
+                        let (mut a, mut b) = ([0u64; WORDS], [0u64; WORDS]);
+                        a.copy_from_slice(&pattern);
+                        b.copy_from_slice(&pattern);
+                        chunk.and_into(&mut a);
+                        expected.and_into(&mut b);
+                        assert!(a == b, "{name} chunk {i}: and");
+                        a.copy_from_slice(&pattern);
+                        b.copy_from_slice(&pattern);
+                        chunk.or_into(&mut a);
+                        expected.or_into(&mut b);
+                        assert!(a == b, "{name} chunk {i}: or");
+                        let (head, len) = chunk.head();
+                        assert!(len <= WORDS * 8);
+                        // SAFETY: the head is valid while the chunk is.
+                        let head = unsafe { std::slice::from_raw_parts(head, len) };
+                        for (w, word) in head.chunks_exact(8).enumerate() {
+                            assert_eq!(
+                                u64::from_le_bytes(word.try_into().unwrap()),
+                                expected.word(w)
+                            );
+                        }
+                    }
+                    for low in (0..=u16::MAX).step_by(37) {
+                        assert_eq!(chunk.rank(low), expected.rank(low), "rank of {low}");
+                    }
+                    for within in 0..chunk.cardinality {
+                        let bucket = match chunk.bucket_in_place(within) {
+                            Ok(bucket) => bucket,
+                            Err(offset) => {
+                                far_nibbles += 1;
+                                let span = match nibble_span {
+                                    Some(span)
+                                        if offset.wrapping_sub(span.start) < span.len as u64 =>
+                                    {
+                                        span
+                                    }
+                                    _ => ordinals.held_span(nibbles, offset).unwrap().unwrap(),
+                                };
+                                nibble_span = Some(span);
+                                // SAFETY: the page stays held until the next
+                                // call on the nibble slot.
+                                let byte = unsafe {
+                                    *span.data.add(offset.wrapping_sub(span.start) as usize)
+                                };
+                                Some(crate::ordinals::nibble_in(byte, within))
+                            }
+                        };
+                        assert_eq!(bucket, expected.bucket(within), "bucket {within}");
+                    }
+                }
+                // Two slots for chunks and nibbles, a page or three each.
+                assert!(paged.source.held() <= 4, "{}", paged.source.held());
+                paged.hold(false);
+                assert_eq!(paged.source.held(), 0);
+                assert!(
+                    paged
+                        .term(name)
+                        .unwrap()
+                        .unwrap()
+                        .ordinals()
+                        .unwrap()
+                        .held_slot()
+                        .is_none()
+                );
+            }
+        }
+        assert!(
+            held_chunks > 20 && far_nibbles > 10_000,
+            "{held_chunks} {far_nibbles}"
+        );
+    }
+
+    #[test]
+    fn position_spans_read_in_place_equal_spans_copied() {
+        let bytes = chunky_segment();
+        let whole = Segment::parse(&bytes).unwrap();
+        let (mut held_spans, mut loads) = (0, 0);
+        for page in [97, 1024, 8150] {
+            let paged = Reader::new(Paged::new(bytes.clone(), page)).unwrap();
+            for name in ["half", "most", "some", "few", "pair"] {
+                let expected_payload = whole.term(name).unwrap().unwrap().payload().unwrap();
+                let count = expected_payload.count();
+                paged.hold(true);
+                let payload = paged.term(name).unwrap().unwrap().payload().unwrap();
+                // Sweeps, which double their spans, then jumps of every
+                // length, forward as a walk reads, and a few back.
+                let targets: Vec<u32> = (0..count.min(300))
+                    .chain((0..count).step_by(7))
+                    .chain((0..count).step_by(131))
+                    .chain((0..count).rev().step_by(977))
+                    .collect();
+                let mut cursor = payload.cursor();
+                // SAFETY: the cursor is dropped before the span closes.
+                unsafe { cursor.hold_in_place() };
+                let mut expected = expected_payload.cursor();
+                let (mut got, mut want) = (Vec::new(), Vec::new());
+                for (n, target) in targets.into_iter().enumerate() {
+                    cursor.seek(target).unwrap();
+                    expected.seek(target).unwrap();
+                    if n % 5 == 4 && target + 1 < count {
+                        cursor.skip_entry().unwrap();
+                        expected.skip_entry().unwrap();
+                    }
+                    got.clear();
+                    want.clear();
+                    cursor.next_into(&mut got).unwrap();
+                    expected.next_into(&mut want).unwrap();
+                    assert_eq!(got, want, "{name} entry {target} on {page}-byte pages");
+                    loads += 1;
+                    held_spans += usize::from(cursor.is_held());
+                }
+                drop(cursor);
+                assert!(paged.source.held() <= 1, "{}", paged.source.held());
+                paged.hold(false);
+                assert_eq!(paged.source.held(), 0);
+            }
+        }
+        // Spans on 97-byte pages mostly overrun them and are copied.
+        assert!(
+            held_spans > loads / 2 && held_spans < loads,
+            "{held_spans} of {loads}"
+        );
+    }
+
     #[test]
     fn empty_segment_and_corruption() {
         let bytes = SegmentBuilder::default().finish();
@@ -1032,29 +1969,28 @@ mod tests {
         assert!(segment.term("x").unwrap().is_none());
         assert_eq!(segment.documents().unwrap().current(), None);
         assert!(Segment::parse(&bytes[..bytes.len() - 1]).is_err());
-        assert!(Segment::parse(b"LSG3").is_err());
-        assert!(Segment::parse(b"LSG1").is_err());
-        assert_eq!(&bytes[..4], Format::CURRENT.magic());
-        // An unknown signature is rejected outright.
-        let mut future = bytes.clone();
-        future[..4].copy_from_slice(b"LSG4");
-        assert_eq!(
-            Segment::parse(&future).err(),
-            Some(Error::Corrupt("segment magic"))
-        );
-        // Earlier signatures are still readable.
-        for format in [Format::Lsg1, Format::Lsg2] {
-            let mut old = bytes.clone();
-            old[..4].copy_from_slice(format.magic());
-            let segment = Segment::parse(&old).unwrap();
-            assert_eq!(segment.document_count(), 0);
-            assert_eq!(segment.format(), format);
-            assert_eq!(segment.is_legacy(), format == Format::Lsg1);
+        assert_eq!(&bytes[..4], MAGIC);
+        // Earlier and unknown signatures are rejected outright.
+        for magic in [b"LSG1", b"LSG5", b"STN2", b"STN4"] {
+            let mut other = bytes.clone();
+            other[..4].copy_from_slice(magic);
+            assert_eq!(
+                Segment::parse(&other).err(),
+                Some(Error::Corrupt("segment magic"))
+            );
         }
         let mut builder = SegmentBuilder::default();
         builder.add_document(tid(1, 1), tokens("a b c")).unwrap();
         let mut bytes = builder.finish();
-        let last = bytes.len() - 1;
+        let sections = Segment::parse(&bytes).unwrap().sections();
+        assert_eq!(sections.pages, docs::PAGE_ENTRY);
+        assert_eq!(sections.offsets, 2);
+        assert_eq!(sections.classes, 1);
+        assert_eq!(
+            Segment::parse(&bytes).unwrap().length_class(0).unwrap(),
+            crate::length_class::class_of(3)
+        );
+        let last = bytes.len() - sections.pages - sections.classes - 1;
         bytes[last] ^= 0x80; // Corrupt the length table.
         let segment = Segment::parse(&bytes).unwrap();
         assert_eq!(
@@ -1063,5 +1999,15 @@ mod tests {
         );
         bytes.push(0);
         assert!(Segment::parse(&bytes).is_err());
+        // A page table is whole entries.
+        bytes.pop();
+        let pages_len_at = sections.header - 1;
+        assert_eq!(bytes[pages_len_at] as usize, docs::PAGE_ENTRY);
+        bytes[pages_len_at] -= 1;
+        bytes.pop();
+        assert_eq!(
+            Segment::parse(&bytes).err(),
+            Some(Error::Corrupt("segment length"))
+        );
     }
 }

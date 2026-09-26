@@ -23,7 +23,7 @@
 //! replays them (see `storage::index_reads_allowed`). The bitmap index scan
 //! path remains available; `stannum.enable_custom_scan` disables these nodes.
 
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, CString, c_void};
 
 use pgrx::{
     FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgList, PgMemoryContexts, pg_guard,
@@ -38,6 +38,11 @@ use tinql::runtime::plan::{Limits, plan};
 use crate::score::rank;
 
 static ENABLE: GucSetting<bool> = GucSetting::<bool>::new(true);
+// Experimental diagnostic control: preserve production selection unless requested.
+static PROFILE_COUNT_SELECTION: GucSetting<bool> = GucSetting::<bool>::new(false);
+static COUNT_PAGE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
+static FORCE_COUNT_PAGES: GucSetting<bool> = GucSetting::<bool>::new(false);
+static COUNT_FOLD: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Method tables hold C string pointers; they are immutable and never
 /// touched off the backend's main thread.
@@ -104,6 +109,89 @@ static COUNT_EXEC_METHODS: Methods<pg_sys::CustomExecMethods> =
     });
 
 pub fn init() {
+    // Attribute pages read from storage to the segment area that asked for them.
+    segment::cache::set_disk_probe(|| unsafe {
+        let usage = &raw const pg_sys::pgBufferUsage;
+        (*usage).shared_blks_read as u64
+    });
+    GucRegistry::define_float_guc(
+        c"stannum.debug_seed_score",
+        c"Measurement aid: prune a ranked walk against this score from the start; negative disables",
+        c"What a walk seeded with the final top-k threshold would cost in pages and candidates. It changes results, so only a superuser may set it.",
+        &crate::score::DEBUG_SEED_SCORE,
+        -1.0,
+        f64::MAX,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.warmup_chunks",
+        c"Chunks a pruned ranked conjunction evaluates first, those with the highest bounds, to raise its threshold early",
+        c"Picked across every source by the chunk directory alone; zero walks each source in chunk order from the start.",
+        &crate::score::WARMUP_CHUNKS,
+        0,
+        65536,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_float_guc(
+        c"stannum.warmup_min_matches",
+        c"Estimated matches per row asked for below which a ranked conjunction is not warmed up",
+        c"The estimate takes the terms as independent; zero warms up every conjunction.",
+        &crate::score::WARMUP_MIN_MATCHES,
+        0.0,
+        f64::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"stannum.profile_count_selection",
+        c"Collect bounded count-selector features without changing the default strategy",
+        c"Estimation timing includes feature collection; counters accumulate over rescans.",
+        &PROFILE_COUNT_SELECTION,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.count_page_threshold",
+        c"Experimental OR input-posting threshold for page counts; zero disables",
+        c"Uncalibrated diagnostic rule. Unsupported shapes retain automatic selection; force_count_pages takes precedence.",
+        &COUNT_PAGE_THRESHOLD, 0, i32::MAX, GucContext::Userset, GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"stannum.force_count_pages",
+        c"Force the page-bitmap count strategy for diagnostic comparisons",
+        c"Off retains automatic selection; visibility checks and rechecks remain enabled.",
+        &FORCE_COUNT_PAGES,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"stannum.count_fold",
+        c"Count Boolean term queries by folding document-ordinal streams",
+        c"Off keeps the scalar and page-bitmap strategies; other query shapes always use those.",
+        &COUNT_FOLD,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.reader_cache_mb",
+        c"Per-backend memory for bytes fetched from immutable segments",
+        c"The cache is emptied when its readers hold more; dense terms' ordinal chunks make a larger cache worthwhile.",
+        &crate::storage::READER_CACHE_MB, 1, 1024 * 1024, GucContext::Userset, GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.reclaim_pages",
+        c"Pages of retired runs an insert frees after a fold",
+        c"The rest wait for the next fold or VACUUM; freeing a large merge's pages at once stalls the insert.",
+        &crate::storage::RECLAIM_PAGES, 1, 1024 * 1024, GucContext::Userset, GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"stannum.read_cache_mb",
+        c"Per-backend memory for the ranges cursors sweep: postings windows, ordinal chunks, payload spans",
+        c"Least recently used ranges are evicted beyond this; the reader cache holds headers and tables separately.",
+        &crate::storage::READ_CACHE_MB, 1, 1024 * 1024, GucContext::Userset, GucFlags::default(),
+    );
     GucRegistry::define_bool_guc(
         c"stannum.enable_custom_scan",
         c"Enable Stannum's custom scan nodes for ==> queries",
@@ -890,6 +978,14 @@ struct ScanExec {
     fallback: *mut pg_sys::TableScanDescData,
     /// `tids` holds only the pruned top k; the rest are produced on demand.
     pruned: bool,
+    /// The k the pruned rows were found for, which a completion deepens.
+    pruned_k: usize,
+    /// The pruned walk ran over the ordinal streams.
+    ordinal_walk: bool,
+    /// Index pages the ordinal walk spent before it started, and walking.
+    walk_blocks: (i64, i64),
+    /// Every location emitted before a completion, across completions.
+    emitted: FxHashSet<Tid>,
     /// Explain counters. Candidates are unknown while pruned; `scored`
     /// counts the candidates a pruned scan scored.
     candidates: Option<usize>,
@@ -901,6 +997,13 @@ struct ScanExec {
     fetched: usize,
     skipped_pages: usize,
     page_masks: Option<bool>,
+    count_fold: bool,
+    selection_calls: usize,
+    selection_time: std::time::Duration,
+    estimation_time: std::time::Duration,
+    estimation_calls: usize,
+    selection_threshold: i32,
+    count_estimate: Option<tinql::runtime::plan::CountEstimate>,
     ordered: bool,
     /// Identity under which the scan publishes its scorer.
     scan_id: u64,
@@ -1035,6 +1138,10 @@ unsafe extern "C-unwind" fn begin_scan(
             started: false,
             fallback: std::ptr::null_mut(),
             pruned: false,
+            pruned_k: 0,
+            ordinal_walk: false,
+            walk_blocks: (0, 0),
+            emitted: FxHashSet::default(),
             candidates: None,
             scored: None,
             exhaustive_score_calls: 0,
@@ -1042,6 +1149,13 @@ unsafe extern "C-unwind" fn begin_scan(
             fetched: 0,
             skipped_pages: 0,
             page_masks: None,
+            count_fold: false,
+            selection_calls: 0,
+            selection_time: std::time::Duration::ZERO,
+            estimation_time: std::time::Duration::ZERO,
+            estimation_calls: 0,
+            selection_threshold: 0,
+            count_estimate: None,
             ordered,
             scan_id: crate::score::scan_id(),
         };
@@ -1059,6 +1173,7 @@ unsafe extern "C-unwind" fn begin_scan(
 /// bound enumerate and score every candidate; unordered scans use a stream.
 unsafe fn gather(exec: &mut ScanExec) {
     unsafe {
+        crate::score::reset_walk_blocks();
         exec.scores.clear();
         exec.pruned = false;
         exec.scored = None;
@@ -1079,14 +1194,60 @@ unsafe fn gather(exec: &mut ScanExec) {
         let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
         if let Some(k) = top_k
             && k <= crate::score::PRUNE_MAX_K
-            && let Some(top) = scorer.as_ref().and_then(|scorer| scorer.top_k(k))
+            && scorer
+                .as_ref()
+                .is_some_and(|scorer| scorer.scores_nothing() && !scorer.walks_unscored())
+        {
+            // Every match scores zero and ties rank in heap order, so the
+            // best k are the first k of the heap-ordered stream: a sentence of
+            // stopwords need not collect and sort its million matches. A
+            // conjunction or phrase of them is walked by ordinal instead
+            // (`top_rows`): the stream seeks every word's cursor per
+            // candidate, the walk folds whole chunks.
+            let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
+            let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+            if !stream.recheck {
+                let mut rows = Vec::with_capacity(k);
+                while rows.len() < k {
+                    pgrx::check_for_interrupts!();
+                    match stream.next() {
+                        Some(tid) => rows.push((0.0_f32, tid)),
+                        None => break,
+                    }
+                }
+                let complete = rows.len() < k;
+                exec.candidates = complete.then_some(rows.len());
+                exec.scored = Some(0);
+                exec.scores = vec![0.0; rows.len()];
+                exec.tids = rows.iter().map(|(_, tid)| *tid).collect();
+                exec.sorted = exec.tids.len();
+                exec.pruned = !complete;
+                exec.pruned_k = k;
+                let scorer = scorer.take().expect("checked above");
+                crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);
+                exec.next = 0;
+                exec.started = true;
+                return;
+            }
+        }
+        if let Some(k) = top_k
+            && k <= crate::score::PRUNE_MAX_K
+            && let Some(top) = scorer.as_mut().and_then(|scorer| top_rows(exec, scorer, k))
         {
             exec.candidates = top.complete.then_some(top.rows.len());
-            exec.scored = Some(top.scored);
+            if top.streamed {
+                exec.candidates = Some(top.scored);
+                exec.exhaustive_score_calls += top.scored;
+            } else {
+                exec.scored = Some(top.scored);
+            }
             exec.scores = top.rows.iter().map(|(score, _)| *score).collect();
             exec.tids = top.rows.iter().map(|(_, tid)| *tid).collect();
             exec.sorted = exec.tids.len();
             exec.pruned = !top.complete;
+            exec.pruned_k = k;
+            exec.ordinal_walk = top.ordinal;
+            exec.walk_blocks = crate::score::walk_blocks();
             let scorer = scorer.take().expect("a top k needs a scorer");
             crate::score::publish_scan_scorer(exec.scan_id, scorer, &top.rows);
             exec.next = 0;
@@ -1100,21 +1261,58 @@ unsafe fn gather(exec: &mut ScanExec) {
     }
 }
 
+/// The scorer's pruned top `k`. When a disjunction's positive scores are
+/// fewer than `k`, the rest are matches of its elided terms alone: they tie at
+/// zero and rank in heap order, which is the order the candidate stream
+/// yields, so they are read from it instead of scoring every match. A query
+/// of common words and one rare word otherwise scored millions of rows as
+/// soon as an updated row's dead version took a place in the first top k.
+///
+/// A query the scorer cannot prune, such as a phrase, is scored from the
+/// candidate stream instead, holding only the top `k`.
+unsafe fn top_rows(
+    exec: &ScanExec,
+    scorer: &mut crate::score::IndexScorer,
+    k: usize,
+) -> Option<crate::score::TopK> {
+    let Some(mut top) = scorer.top_k(k) else {
+        let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
+        let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
+        return scorer.top_k_streamed(&mut stream, k);
+    };
+    if top.zero_fill {
+        let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
+        let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
+        if stream.recheck {
+            return None;
+        }
+        let positive: FxHashSet<Tid> = top.rows.iter().map(|(_, tid)| *tid).collect();
+        while top.rows.len() < k {
+            pgrx::check_for_interrupts!();
+            match stream.next() {
+                Some(tid) if positive.contains(&tid) => {}
+                Some(tid) => top.rows.push((0.0, tid)),
+                None => break,
+            }
+        }
+        top.complete = top.rows.len() < k;
+    }
+    Some(top)
+}
+
 unsafe fn scan_query(exec: &ScanExec) -> Query {
     unsafe {
         let index_oid = pg_sys::Oid::from(exec.private.index_oid);
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
         let tokenizer = crate::storage::index_tokenizer(index);
         pg_sys::index_close(index, pg_sys::AccessShareLock as _);
-        let query: Query =
-            tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
-                .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
-        query
+        crate::operator::parse_or_raise(&exec.private.query, tokenizer.as_ref())
     }
 }
 
 unsafe fn start_stream(exec: &mut ScanExec) {
     unsafe {
+        crate::score::reset_walk_blocks();
         let query = scan_query(exec);
         let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
         let stream = crate::stream::CandidateStream::new(view, query);
@@ -1146,7 +1344,7 @@ fn candidates_in_view(exec: &mut ScanExec, query: &Query, view: &crate::storage:
         exec.recheck |= !planned.exact;
         if let Some(dead) = dead {
             let dead = crate::storage::codec_in(
-                segment::postings::Postings::parse(dead).and_then(|p| p.cursor()),
+                crate::storage::dead_cursor(&**segment, dead),
                 &format!("{label} dead list"),
             );
             cursor = Box::new(crate::storage::codec_in(
@@ -1155,6 +1353,11 @@ fn candidates_in_view(exec: &mut ScanExec, query: &Query, view: &crate::storage:
             ));
         }
         while let Some(tid) = cursor.current() {
+            // An expansion past the planner's cap is a universe of every
+            // document in the source.
+            if tids.len().is_multiple_of(4096) {
+                pgrx::check_for_interrupts!();
+            }
             tids.push(tid);
             crate::storage::codec_in(cursor.advance(), label);
         }
@@ -1171,8 +1374,18 @@ fn finish(exec: &mut ScanExec, mut tids: Vec<Tid>, scorer: Option<crate::score::
     exec.sorted = tids.len();
     if let Some(mut scorer) = scorer {
         let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
-        let mut scored: Vec<(f32, Tid)> =
-            tids.iter().map(|tid| (scorer.score(*tid), *tid)).collect();
+        // A row's score looks up every scoring term, and an expansion can
+        // name thousands: the loop must stay cancellable.
+        let mut scored: Vec<(f32, Tid)> = tids
+            .iter()
+            .enumerate()
+            .map(|(n, tid)| {
+                if n.is_multiple_of(64) {
+                    pgrx::check_for_interrupts!();
+                }
+                (scorer.score(*tid), *tid)
+            })
+            .collect();
         exec.exhaustive_score_calls += scored.len();
         // Only the rows the query will consume are ordered now; the rest
         // are ordered on demand should the executor ask for them.
@@ -1211,7 +1424,7 @@ unsafe fn complete(exec: &mut ScanExec) {
             .ordering
             .as_ref()
             .expect("pruned scans are ordered");
-        let scorer = crate::score::scorer_for_scan(
+        let mut scorer = crate::score::scorer_for_scan(
             exec.scan_id,
             exec.private.heap_oid,
             exec.private.index_oid,
@@ -1223,7 +1436,51 @@ unsafe fn complete(exec: &mut ScanExec) {
             ordering.term_add.clone(),
             ordering.term_replace.clone(),
         );
-        let consumed: FxHashSet<Tid> = exec.tids[..exec.next].iter().copied().collect();
+        // A scan can complete more than once, so the consumed locations accumulate.
+        let emitted: Vec<Tid> = exec.tids[..exec.next].to_vec();
+        exec.emitted.extend(emitted);
+        let consumed = exec.emitted.clone();
+        // Rows of the top k that the snapshot cannot see, such as the dead
+        // version an update leaves in the index beside its successor with the
+        // same score, send the parent past k. The same scorer's top 4k, 16k
+        // and so on extend the rows already emitted, so the search deepens
+        // before it gives up pruning and scores every match.
+        let deeper = exec.pruned_k.saturating_mul(4).max(40);
+        if exec.pruned_k > 0 && deeper <= crate::score::PRUNE_MAX_K {
+            let rows = if scorer.scores_nothing() && !scorer.walks_unscored() {
+                let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
+                let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+                (!stream.recheck).then(|| {
+                    let mut rows = Vec::with_capacity(deeper);
+                    while rows.len() < deeper {
+                        match stream.next() {
+                            Some(tid) => rows.push((0.0_f32, tid)),
+                            None => break,
+                        }
+                    }
+                    let complete = rows.len() < deeper;
+                    (rows, complete)
+                })
+            } else {
+                top_rows(exec, &mut scorer, deeper).map(|top| {
+                    if top.streamed {
+                        exec.exhaustive_score_calls += top.scored;
+                    }
+                    (top.rows, top.complete)
+                })
+            };
+            if let Some((mut rows, complete)) = rows {
+                crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);
+                rows.retain(|(_, tid)| !consumed.contains(tid));
+                exec.scores = rows.iter().map(|(score, _)| *score).collect();
+                exec.tids = rows.iter().map(|(_, tid)| *tid).collect();
+                exec.sorted = exec.tids.len();
+                exec.next = 0;
+                exec.pruned = !complete;
+                exec.pruned_k = deeper;
+                return;
+            }
+        }
         let tids = candidates(exec);
         finish(exec, tids, Some(scorer));
         let mut kept = 0;
@@ -1479,19 +1736,19 @@ unsafe extern "C-unwind" fn exec_search(
     unsafe { pg_sys::ExecScan(&mut (*node).ss, Some(search_access), Some(search_recheck)) }
 }
 
-/// Counts one exact candidate page; only all-visible pages can bypass the heap.
+/// Counts one exact candidate page; only pages `visibility` saw all-visible
+/// can bypass the heap (see [`settle_view`]).
 unsafe fn count_page(
     node: *mut pg_sys::CustomScanState,
     exec: &mut ScanExec,
     block: u32,
     offsets: impl Iterator<Item = u16>,
     size: usize,
-    vmbuf: &mut pg_sys::Buffer,
+    visibility: &crate::fold::Visibility,
 ) -> i64 {
     unsafe {
         pgrx::check_for_interrupts!();
-        let status = pg_sys::visibilitymap_get_status(exec.heap, block, vmbuf);
-        if !exec.recheck && status & pg_sys::VISIBILITYMAP_ALL_VISIBLE as u8 != 0 {
+        if !exec.recheck && visibility.is_visible(block) {
             exec.skipped_pages += 1;
             return size as i64;
         }
@@ -1525,7 +1782,167 @@ unsafe fn count_page(
     }
 }
 
-/// Counts visible candidates, skipping heap fetches on all-visible pages.
+/// Counts every offset of `block` that is visible and passes the recheck,
+/// always through the heap.
+unsafe fn count_fetched(
+    node: *mut pg_sys::CustomScanState,
+    exec: &mut ScanExec,
+    block: u32,
+    offsets: impl Iterator<Item = u16>,
+) -> i64 {
+    unsafe {
+        let snapshot = (*(*node).ss.ps.state).es_snapshot;
+        let mut count = 0;
+        if !exec.recheck && (*exec.heap).rd_tableam == pg_sys::GetHeapamTableAmRoutine() {
+            // No tuple is needed, only whether each chain has a visible
+            // member: one buffer read and one lock serve the whole page.
+            let buffer = pg_sys::ReadBuffer(exec.heap, block);
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+            let mut tuple = std::mem::zeroed::<pg_sys::HeapTupleData>();
+            for offset in offsets {
+                let mut pointer = pointer_of(Tid { block, offset });
+                if pg_sys::heap_hot_search_buffer(
+                    &mut pointer,
+                    exec.heap,
+                    buffer,
+                    snapshot,
+                    &mut tuple,
+                    std::ptr::null_mut(),
+                    true,
+                ) {
+                    count += 1;
+                }
+                exec.fetched += 1;
+            }
+            pg_sys::UnlockReleaseBuffer(buffer);
+            return count;
+        }
+        for offset in offsets {
+            let mut pointer = pointer_of(Tid { block, offset });
+            let mut call_again = false;
+            let mut all_dead = false;
+            loop {
+                if pg_sys::table_index_fetch_tuple(
+                    exec.fetch,
+                    &mut pointer,
+                    snapshot,
+                    exec.fetch_slot,
+                    &mut call_again,
+                    &mut all_dead,
+                ) {
+                    exec.fetched += 1;
+                    if !exec.recheck || passes_clause(node, exec, exec.fetch_slot) {
+                        count += 1;
+                    }
+                    break;
+                }
+                if !call_again {
+                    break;
+                }
+            }
+        }
+        count
+    }
+}
+
+/// The visibility map as read after `view` was captured, with the view it
+/// may be trusted for. A page VACUUM marked all-visible after the capture
+/// may hold no tuple where the view still lists one: VACUUM removed it, as
+/// a dead list or a buffer rewrite the view predates records. No index page
+/// pin keeps VACUUM out, as it does for an index-only scan, so the map is
+/// read first and the view confirmed current after; if it is not, the view
+/// is captured and the map read again, and after repeated interference no
+/// page is trusted.
+///
+/// # Safety
+/// `index_oid` names the live LDP2 index `view` was captured from, over
+/// `exec.heap`.
+unsafe fn settle_view(
+    exec: &ScanExec,
+    index_oid: pg_sys::Oid,
+    mut view: crate::storage::View,
+) -> (crate::storage::View, crate::fold::Visibility) {
+    unsafe {
+        let mut attempts = 0;
+        loop {
+            let visibility = crate::fold::Visibility::read(exec.heap);
+            if crate::storage::view_is_current(index_oid, &view) {
+                return (view, visibility);
+            }
+            attempts += 1;
+            if attempts == 3 {
+                return (view, crate::fold::Visibility::none());
+            }
+            view = crate::storage::view(index_oid);
+        }
+    }
+}
+
+/// Counts by folding each segment's ordinal streams (see
+/// [`crate::fold`]), trusting the pages `visibility` saw all-visible (see
+/// [`settle_view`]). The write buffer and segments without ordinal streams
+/// are counted through their TID postings, against the heap.
+unsafe fn fold_count(
+    node: *mut pg_sys::CustomScanState,
+    exec: &mut ScanExec,
+    query: &Query,
+    view: crate::storage::View,
+    visibility: crate::fold::Visibility,
+) -> i64 {
+    unsafe {
+        let limits = Limits::default();
+        let mut count = 0i64;
+        let mut candidates = 0usize;
+        for (i, ((source, _), label)) in view.sources.iter().zip(&view.labels).enumerate() {
+            pgrx::check_for_interrupts!();
+            if i < view.immutable_sources {
+                let mut pending: Vec<(u32, Vec<u16>)> = Vec::new();
+                let sure = crate::storage::codec_in(
+                    crate::fold::count_segment(
+                        view.keys[i],
+                        source.as_ref(),
+                        view.sources[i].1.as_ref(),
+                        query,
+                        &visibility,
+                        |block, offsets| pending.push((block, offsets.to_vec())),
+                    ),
+                    label,
+                );
+                if let Some(sure) = sure {
+                    exec.skipped_pages += usize::from(sure > 0);
+                    candidates += sure as usize;
+                    count += sure as i64;
+                    for (block, offsets) in pending {
+                        candidates += offsets.len();
+                        count += count_fetched(node, exec, block, offsets.into_iter());
+                    }
+                    continue;
+                }
+            }
+            let planned = plan(query, source, &limits)
+                .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
+            let dead = &view.dead_sets[i];
+            let mut cursor = planned.cursor;
+            let mut tids = Vec::new();
+            while let Some(tid) = cursor.current() {
+                if !dead.contains(&tid) {
+                    tids.push(tid);
+                }
+                crate::storage::codec_in(cursor.advance(), label);
+            }
+            candidates += tids.len();
+            for page in tids.chunk_by(|a, b| a.block == b.block) {
+                count +=
+                    count_fetched(node, exec, page[0].block, page.iter().map(|tid| tid.offset));
+            }
+        }
+        exec.candidates = Some(candidates);
+        count
+    }
+}
+
+/// Counts visible candidates, skipping heap fetches on pages all-visible
+/// since the index view was captured (see [`settle_view`]).
 #[pg_guard]
 unsafe extern "C-unwind" fn exec_count(
     node: *mut pg_sys::CustomScanState,
@@ -1539,6 +1956,7 @@ unsafe extern "C-unwind" fn exec_count(
         }
         let mut count = 0i64;
         let fetch_slot = exec.fetch_slot;
+        crate::score::reset_walk_blocks();
         if heap_fallback(exec) {
             // Count through a heap scan with the original clause.
             let scan = pg_sys::table_beginscan(exec.heap, snapshot, 0, std::ptr::null_mut());
@@ -1558,83 +1976,122 @@ unsafe extern "C-unwind" fn exec_count(
             let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
             let tokenizer = crate::storage::index_tokenizer(index);
             pg_sys::index_close(index, pg_sys::AccessShareLock as _);
-            let query =
-                tinql::runtime::parse_tinql_to_query(&exec.private.query, tokenizer.as_ref())
-                    .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"));
+            let query = crate::operator::parse_or_raise(&exec.private.query, tokenizer.as_ref());
             let view = crate::storage::view(index_oid);
-            let mut use_pages = false;
-            for (source, _) in &view.sources {
-                use_pages |= tinql::runtime::plan::prefers_pages(&query, source)
-                    .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
-                if use_pages {
-                    break;
-                }
-            }
-            exec.page_masks = Some(use_pages);
-            let mut vmbuf = pg_sys::InvalidBuffer as pg_sys::Buffer;
-            let mut candidates = 0usize;
-            if !use_pages {
-                let tids = candidates_in_view(exec, &query, &view);
-                candidates = tids.len();
-                let mut i = 0;
-                while i < tids.len() {
-                    let block = tids[i].block;
-                    let mut end = i + 1;
-                    while end < tids.len() && tids[end].block == block {
-                        end += 1;
-                    }
-                    count += count_page(
-                        node,
-                        exec,
-                        block,
-                        tids[i..end].iter().map(|tid| tid.offset),
-                        end - i,
-                        &mut vmbuf,
-                    );
-                    i = end;
-                }
+            crate::storage::race_point("count:view");
+            let (view, visibility) = settle_view(exec, index_oid, view);
+            // The diagnostic settings ask for the older strategies by name.
+            let diagnostic = FORCE_COUNT_PAGES.get()
+                || COUNT_PAGE_THRESHOLD.get() > 0
+                || PROFILE_COUNT_SELECTION.get();
+            if COUNT_FOLD.get() && !diagnostic && !exec.recheck && crate::fold::supported(&query) {
+                exec.count_fold = true;
+                count = fold_count(node, exec, &query, view, visibility);
             } else {
-                let mut sources: Vec<Box<dyn segment::pages::Cursor>> = Vec::new();
-                for ((source, dead), label) in view.sources.iter().zip(&view.labels) {
-                    pgrx::check_for_interrupts!();
-                    let planned =
-                        tinql::runtime::plan::page_plan(&query, source, &Limits::default())
-                            .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
-                    exec.recheck |= !planned.exact;
-                    let mut cursor = planned.cursor;
-                    if let Some(dead) = dead {
-                        let dead = crate::storage::codec_in(
-                            segment::postings::Postings::parse(dead).and_then(|p| p.pages()),
-                            &format!("{label} dead list"),
-                        );
-                        cursor = Box::new(crate::storage::codec_in(
-                            segment::pages::Difference::new(cursor, dead),
-                            label,
-                        ));
+                // Time the existing policy too, so paired runs expose incremental cost.
+                let selection_start = std::time::Instant::now();
+                let mut use_pages = FORCE_COUNT_PAGES.get();
+                for (source, _) in &view.sources {
+                    if use_pages {
+                        break;
                     }
-                    sources.push(cursor);
+                    use_pages |= tinql::runtime::plan::prefers_pages(&query, source)
+                        .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
+                    if use_pages {
+                        break;
+                    }
                 }
-                use segment::pages::Cursor as _;
-                // Union deduplicates across segments before visibility checks, with
-                // one offset mask per source rather than a sorted vector of TIDs.
-                let mut pages = segment::pages::Union::new(sources);
-                while let Some(page) = pages.current() {
-                    let size = page.offsets.count() as usize;
-                    candidates += size;
-                    count += count_page(
-                        node,
-                        exec,
-                        page.block,
-                        page.offsets.iter(),
-                        size,
-                        &mut vmbuf,
-                    );
-                    crate::storage::codec_in(pages.advance(), "count page stream");
+                exec.count_estimate = None;
+                exec.selection_threshold = COUNT_PAGE_THRESHOLD.get();
+                if !FORCE_COUNT_PAGES.get()
+                    && (PROFILE_COUNT_SELECTION.get() || COUNT_PAGE_THRESHOLD.get() > 0)
+                {
+                    // Start before allocating the source list or reading any metadata.
+                    let estimation_start = std::time::Instant::now();
+                    let estimate = if view.sources.len() > 512 {
+                        tinql::runtime::plan::CountEstimate {
+                            sources: view.sources.len(),
+                            ..Default::default()
+                        }
+                    } else {
+                        let sources: Vec<_> =
+                            view.sources.iter().map(|(source, _)| source).collect();
+                        tinql::runtime::plan::estimate_count_disjunction(&query, &sources)
+                            .unwrap_or_else(|error| {
+                                pgrx::error!("Stannum count estimation: {error}")
+                            })
+                    };
+                    use_pages = estimate.choose_pages(use_pages, exec.selection_threshold as u64);
+                    exec.count_estimate = Some(estimate);
+                    exec.estimation_calls += 1;
+                    exec.estimation_time += estimation_start.elapsed();
                 }
-            }
-            exec.candidates = Some(candidates);
-            if vmbuf != pg_sys::InvalidBuffer as pg_sys::Buffer {
-                pg_sys::ReleaseBuffer(vmbuf);
+                exec.selection_calls += 1;
+                exec.selection_time += selection_start.elapsed();
+                exec.page_masks = Some(use_pages);
+                let mut candidates = 0usize;
+                if !use_pages {
+                    let tids = candidates_in_view(exec, &query, &view);
+                    candidates = tids.len();
+                    let mut i = 0;
+                    while i < tids.len() {
+                        let block = tids[i].block;
+                        let mut end = i + 1;
+                        while end < tids.len() && tids[end].block == block {
+                            end += 1;
+                        }
+                        count += count_page(
+                            node,
+                            exec,
+                            block,
+                            tids[i..end].iter().map(|tid| tid.offset),
+                            end - i,
+                            &visibility,
+                        );
+                        i = end;
+                    }
+                } else {
+                    let mut sources: Vec<Box<dyn segment::pages::Cursor>> = Vec::new();
+                    for ((source, dead), label) in view.sources.iter().zip(&view.labels) {
+                        pgrx::check_for_interrupts!();
+                        let planned =
+                            tinql::runtime::plan::page_plan(&query, source, &Limits::default())
+                                .unwrap_or_else(|error| {
+                                    pgrx::error!("Stannum query plan: {error}")
+                                });
+                        exec.recheck |= !planned.exact;
+                        let mut cursor = planned.cursor;
+                        if let Some(dead) = dead {
+                            let dead = crate::storage::codec_in(
+                                crate::storage::dead_pages(&**source, dead),
+                                &format!("{label} dead list"),
+                            );
+                            cursor = Box::new(crate::storage::codec_in(
+                                segment::pages::Difference::new(cursor, dead),
+                                label,
+                            ));
+                        }
+                        sources.push(cursor);
+                    }
+                    use segment::pages::Cursor as _;
+                    // Union deduplicates across segments before visibility checks, with
+                    // one offset mask per source rather than a sorted vector of TIDs.
+                    let mut pages = segment::pages::Union::new(sources);
+                    while let Some(page) = pages.current() {
+                        let size = page.offsets.count() as usize;
+                        candidates += size;
+                        count += count_page(
+                            node,
+                            exec,
+                            page.block,
+                            page.offsets.iter(),
+                            size,
+                            &visibility,
+                        );
+                        crate::storage::codec_in(pages.advance(), "count page stream");
+                    }
+                }
+                exec.candidates = Some(candidates);
             }
         }
         exec.next = 1;
@@ -1693,6 +2150,8 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
             exec.scores.clear();
             exec.sorted = 0;
             exec.pruned = false;
+            exec.pruned_k = 0;
+            exec.emitted.clear();
             exec.recheck = false;
             exec.candidates = None;
             exec.scored = None;
@@ -1762,7 +2221,70 @@ unsafe extern "C-unwind" fn explain(
                     es,
                 );
             }
-            if let Some(pages) = exec.page_masks {
+            if exec.selection_calls > 0 {
+                pg_sys::ExplainPropertyInteger(
+                    c"Count Estimation Calls".as_ptr(),
+                    std::ptr::null(),
+                    exec.estimation_calls as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Count Page Threshold (Last)".as_ptr(),
+                    std::ptr::null(),
+                    exec.selection_threshold as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Count Selection Calls".as_ptr(),
+                    std::ptr::null(),
+                    exec.selection_calls as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyFloat(
+                    c"Count Selection Time".as_ptr(),
+                    c"ms".as_ptr(),
+                    exec.selection_time.as_secs_f64() * 1000.0,
+                    6,
+                    es,
+                );
+                pg_sys::ExplainPropertyFloat(
+                    c"Count Estimation Time".as_ptr(),
+                    c"ms".as_ptr(),
+                    exec.estimation_time.as_secs_f64() * 1000.0,
+                    6,
+                    es,
+                );
+            }
+            if let Some(estimate) = exec.count_estimate {
+                pg_sys::ExplainPropertyBool(
+                    c"Count Estimate Supported (Last)".as_ptr(),
+                    estimate.supported,
+                    es,
+                );
+                if let Some(minimum) = estimate.min_postings {
+                    pg_sys::ExplainPropertyInteger(
+                        c"Count Estimate Minimum DF (Last)".as_ptr(),
+                        std::ptr::null(),
+                        i64::from(minimum),
+                        es,
+                    );
+                }
+                for (label, value) in [
+                    (c"Count Estimate Leaves (Last)", estimate.leaves as i64),
+                    (c"Count Estimate Sources (Last)", estimate.sources as i64),
+                    (c"Count Estimate Lookups (Last)", estimate.lookups as i64),
+                    (c"Count Estimate Postings (Last)", estimate.postings as i64),
+                ] {
+                    pg_sys::ExplainPropertyInteger(label.as_ptr(), std::ptr::null(), value, es);
+                }
+            }
+            if exec.count_fold {
+                pg_sys::ExplainPropertyText(
+                    c"Count Strategy".as_ptr(),
+                    c"ordinal fold".as_ptr(),
+                    es,
+                );
+            } else if let Some(pages) = exec.page_masks {
                 pg_sys::ExplainPropertyText(
                     c"Count Strategy".as_ptr(),
                     if pages {
@@ -1782,13 +2304,138 @@ unsafe extern "C-unwind" fn explain(
                 );
             }
             if let Some(scored) = exec.scored {
-                pg_sys::ExplainPropertyText(c"Pruning".as_ptr(), c"block-max".as_ptr(), es);
+                pg_sys::ExplainPropertyText(
+                    c"Pruning".as_ptr(),
+                    if exec.ordinal_walk {
+                        c"ordinal".as_ptr()
+                    } else {
+                        c"block-max".as_ptr()
+                    },
+                    es,
+                );
                 pg_sys::ExplainPropertyInteger(
                     c"Scored Candidates".as_ptr(),
                     std::ptr::null(),
                     scored as i64,
                     es,
                 );
+                if exec.ordinal_walk {
+                    pg_sys::ExplainPropertyInteger(
+                        c"Walk Setup Blocks".as_ptr(),
+                        std::ptr::null(),
+                        exec.walk_blocks.0,
+                        es,
+                    );
+                    pg_sys::ExplainPropertyInteger(
+                        c"Walk Body Blocks".as_ptr(),
+                        std::ptr::null(),
+                        exec.walk_blocks.1,
+                        es,
+                    );
+                    let warmed = crate::score::warmup_chunks();
+                    if warmed > 0 {
+                        pg_sys::ExplainPropertyInteger(
+                            c"Warm-up Chunks".as_ptr(),
+                            std::ptr::null(),
+                            warmed,
+                            es,
+                        );
+                    }
+                    if let Some(estimate) = crate::score::warmup_estimate() {
+                        pg_sys::ExplainPropertyFloat(
+                            c"Warm-up Estimate".as_ptr(),
+                            std::ptr::null(),
+                            estimate,
+                            0,
+                            es,
+                        );
+                    }
+                    if let Some(threshold) = crate::score::warmup_threshold() {
+                        pg_sys::ExplainPropertyFloat(
+                            c"Warm-up Threshold".as_ptr(),
+                            std::ptr::null(),
+                            f64::from(threshold),
+                            6,
+                            es,
+                        );
+                    }
+                }
+            }
+            // Read accounting for every scan that ran, pruned or not: a phrase
+            // scored from the candidate stream reads as much as any walk.
+            pg_sys::ExplainPropertyInteger(
+                c"Visibility Checks".as_ptr(),
+                std::ptr::null(),
+                crate::score::visibility_checks(),
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
+                c"Visibility Map Hits".as_ptr(),
+                std::ptr::null(),
+                crate::score::vm_hits(),
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
+                c"Chunks Loaded".as_ptr(),
+                std::ptr::null(),
+                crate::score::chunk_loads(),
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
+                c"Pages Held Peak".as_ptr(),
+                std::ptr::null(),
+                crate::storage::held_peak(),
+                es,
+            );
+            let (pins, recent) = crate::storage::scan_pins();
+            pg_sys::ExplainPropertyInteger(c"Pages Pinned".as_ptr(), std::ptr::null(), pins, es);
+            pg_sys::ExplainPropertyInteger(
+                c"Pages Pinned Recent".as_ptr(),
+                std::ptr::null(),
+                recent,
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
+                c"Positions Checked".as_ptr(),
+                std::ptr::null(),
+                crate::score::position_checks(),
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
+                c"Position Lists Read".as_ptr(),
+                std::ptr::null(),
+                crate::score::position_reads(),
+                es,
+            );
+            let area_bytes = crate::score::area_bytes();
+            let area_disk = crate::score::area_disk();
+            let fetched = area_bytes
+                .iter()
+                .zip(segment::cache::AREA_NAMES)
+                .filter(|(bytes, _)| **bytes != 0)
+                .map(|(bytes, name)| format!("{name} {bytes}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(fetched) {
+                pg_sys::ExplainPropertyText(c"Bytes Fetched".as_ptr(), text.as_ptr(), es);
+            }
+            let from_disk = area_disk
+                .iter()
+                .zip(segment::cache::AREA_NAMES)
+                .filter(|(pages, _)| **pages != 0)
+                .map(|(pages, name)| format!("{name} {pages}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(from_disk) {
+                pg_sys::ExplainPropertyText(c"Disk Pages By Area".as_ptr(), text.as_ptr(), es);
+            }
+            let phases = crate::score::phase_disk()
+                .iter()
+                .map(|(name, pages)| format!("{name} {pages}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(phases) {
+                pg_sys::ExplainPropertyText(c"Disk Pages By Phase".as_ptr(), text.as_ptr(), es);
             }
             if exec.ordered {
                 pg_sys::ExplainPropertyInteger(

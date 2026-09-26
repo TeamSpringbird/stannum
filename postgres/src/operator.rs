@@ -52,7 +52,7 @@ use pgrx::{
     pg_sys,
 };
 use serde::{Deserialize, Serialize};
-use tinql::runtime::{Query, evaluate, parse_tinql_to_query, tokenize_doc};
+use tinql::runtime::{Query, QueryError, evaluate, parse_tinql_to_query, tokenize_doc};
 use tokenizer::{CompiledTokenizerPipeline, TokenizerPipelineSpec};
 
 /// A query bound to the index whose tokenizer settings evaluate it.
@@ -93,6 +93,37 @@ thread_local! {
 
 const QUERY_MEMO_LIMIT: usize = 256;
 
+/// Bytes of an invalid query its error message quotes; a longer query (the
+/// size limits reject queries of hundreds of kilobytes) is cut, and `...`
+/// follows the quotes.
+const QUOTED_QUERY_BYTES: usize = 1024;
+
+/// The message of an invalid `==>` query, in TIN's form:
+/// `invalid ==> query at byte N in "QUERY": ...`, without the byte when the
+/// error names none.
+pub(crate) fn invalid_query(text: &str, error: &QueryError) -> String {
+    let at = error
+        .position()
+        .map_or_else(String::new, |byte| format!(" at byte {byte}"));
+    let mut end = text.len().min(QUOTED_QUERY_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = if end < text.len() { "..." } else { "" };
+    format!(
+        "invalid ==> query{at} in {:?}{cut}: {}",
+        &text[..end],
+        error.detail()
+    )
+}
+
+/// Parses `text` with `tokenizer`, or raises the error of an invalid query.
+pub(crate) fn parse_or_raise<T: tokenizer::Tokenizer>(text: &str, tokenizer: &T) -> Query {
+    parse_tinql_to_query(text, tokenizer)
+        .unwrap_or_else(|error| pgrx::error!("{}", invalid_query(text, &error)))
+}
+
+/// Errors carry their whole message.
 fn parsed_query(
     spec: [u8; SPEC_BYTES],
     tokenizer: &CompiledTokenizerPipeline,
@@ -105,7 +136,9 @@ fn parsed_query(
     if let Some(query) = memoized {
         return Ok(query);
     }
-    let query = Rc::new(parse_tinql_to_query(text, tokenizer).map_err(|e| e.to_string())?);
+    let query = Rc::new(
+        parse_tinql_to_query(text, tokenizer).map_err(|error| invalid_query(text, &error))?,
+    );
     QUERIES.with_borrow_mut(|memo| {
         let queries = memo.entry(spec).or_default();
         if queries.len() >= QUERY_MEMO_LIMIT {
@@ -126,7 +159,7 @@ fn evaluate_with(
     let document = tokenize_doc(document, tokenizer);
     evaluate(&query, &document)
         .map(|result| result.matched)
-        .map_err(|e| e.to_string())
+        .map_err(|error| format!("invalid ==> query: {error}"))
 }
 
 fn default_spec() -> [u8; SPEC_BYTES] {
@@ -145,8 +178,7 @@ fn evaluate_text(document: &str, query_text: &str) -> Result<bool, String> {
 /// `text ==> text`: the default tokenizer settings.
 #[pg_extern(immutable, parallel_safe)]
 pub fn stannum_text_cmpfunc(document: &str, query: &str) -> bool {
-    evaluate_text(document, query)
-        .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"))
+    evaluate_text(document, query).unwrap_or_else(|error| pgrx::error!("{error}"))
 }
 
 /// `text ==> indexed_query`: the bound index's tokenizer settings.
@@ -159,7 +191,7 @@ pub fn stannum_text_cmpfunc_indexed(document: &str, query: indexed_query) -> boo
     let spec = unsafe { crate::storage::spec_by_oid(pg_sys::Oid::from(query.index)) };
     let tokenizer = crate::storage::tokenizer_for(&spec);
     evaluate_with(document, &query.query, spec, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("invalid ==> query: {error}"))
+        .unwrap_or_else(|error| pgrx::error!("{error}"))
 }
 
 /// Binds a non-constant query expression to an index at plan time.
@@ -895,5 +927,26 @@ mod tests {
     #[test]
     fn invalid_queries_are_reported() {
         assert!(evaluate_text("beer", "beer OR").is_err());
+    }
+
+    #[test]
+    fn invalid_query_messages_quote_the_query_as_tin_does() {
+        let message = |query: &str| {
+            let error = tinql::runtime::parse_tinql_to_query_default(query).unwrap_err();
+            super::invalid_query(query, &error)
+        };
+        assert_eq!(
+            message("x []"),
+            "invalid ==> query at byte 2 in \"x []\": empty alternatives (at byte 2)"
+        );
+        assert_eq!(
+            message("... TO z"),
+            "invalid ==> query in \"... TO z\": range bound \"...\" sub-tokenizes into no tokens"
+        );
+        // A long query is quoted up to a bound.
+        let long = message(&("a ".repeat(1000) + "[]"));
+        assert!(long.starts_with("invalid ==> query at byte 2000 in \"a a "));
+        assert!(long.ends_with(" a \"...: empty alternatives (at byte 2000)"));
+        assert!(long.len() < 1200, "{}", long.len());
     }
 }

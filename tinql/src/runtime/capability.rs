@@ -21,6 +21,8 @@ pub enum LoweringIssue {
     SplitLongToken,
     MatchAllInSpanContext,
     InvalidRegex,
+    /// Past a size or nesting limit (see [`crate::limits`]).
+    TooLarge,
 }
 
 pub fn classify_expr<T>(expr: &Expr, tokenizer: &T) -> CapabilityClass
@@ -52,6 +54,7 @@ impl From<SubTokenizeError> for LoweringIssue {
             SubTokenizeError::SplitWildcardLiteral { .. }
             | SubTokenizeError::SplitFuzzyTerm { .. }
             | SubTokenizeError::SplitRangeBound { .. } => Self::SplitLongToken,
+            SubTokenizeError::TooManyTerms => Self::TooLarge,
         }
     }
 }
@@ -61,6 +64,7 @@ impl From<LowerError> for LoweringIssue {
         match value {
             LowerError::MatchAllInSpanContext => Self::MatchAllInSpanContext,
             LowerError::InvalidRegex(_) => Self::InvalidRegex,
+            LowerError::NestingTooDeep => Self::TooLarge,
         }
     }
 }

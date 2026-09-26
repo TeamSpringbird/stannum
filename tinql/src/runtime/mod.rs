@@ -138,6 +138,7 @@ impl Query {
     }
 
     fn estimate_selectivity(&self, n: f64, lookup: &dyn Fn(&str) -> u64, total_tuples: u64) -> f64 {
+        crate::limits::check_stack();
         if n <= 0.0 {
             return 0.0;
         }
@@ -238,6 +239,7 @@ impl Query {
     }
 
     fn collect_terms<'a>(&'a self, out: &mut Vec<&'a str>) {
+        crate::limits::check_stack();
         match self {
             Query::Term(s) => out.push(s),
             Query::Span { term_slots, .. } | Query::SpanExpr { term_slots, .. } => {
@@ -273,6 +275,27 @@ pub enum QueryError {
     SubTokenize(#[from] subtokenize::SubTokenizeError),
     #[error("lowering error: {0}")]
     Lower(#[from] lower::LowerError),
+}
+
+impl QueryError {
+    /// The byte of the query the error points at, when it names one.
+    #[must_use]
+    pub const fn position(&self) -> Option<usize> {
+        match self {
+            Self::Parse(error) => Some(error.position()),
+            Self::SubTokenize(_) | Self::Lower(_) => None,
+        }
+    }
+
+    /// The error without the stage that raised it.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Parse(error) => error.to_string(),
+            Self::SubTokenize(error) => error.to_string(),
+            Self::Lower(error) => error.to_string(),
+        }
+    }
 }
 
 /// Conjunction (AND) estimate using exponential backoff on selectivities.
@@ -338,6 +361,22 @@ where
     let expr = crate::parse(query_str, crate::ImplicitOp::And)?;
     let expr = subtokenize::sub_tokenize(expr, tokenizer)?;
     Ok(lower::lower(&expr)?)
+}
+
+/// The query as scoring reads it: [`parse_tinql_to_query`] without removing
+/// repeated terms from flat AND and OR chains, so each occurrence of a term
+/// adds its boost (`a a` weighs `a` 2.0, as TIN does). Matching reads the
+/// deduplicated query, which accepts the same documents.
+pub fn parse_tinql_to_scoring_query<T>(query_str: &str, tokenizer: &T) -> Result<Query, QueryError>
+where
+    T: tokenizer::Tokenizer,
+{
+    let expr = crate::parse(query_str, crate::ImplicitOp::And)?;
+    let expr = subtokenize::sub_tokenize(expr, tokenizer)?;
+    Ok(lower::lower_with_profile(
+        &expr,
+        SimplificationProfile::StructuralScoring,
+    )?)
 }
 
 pub fn parse_tinql_to_query_default(query_str: &str) -> Result<Query, QueryError> {

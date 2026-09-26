@@ -28,10 +28,13 @@ and numeric OIDs; user query strings and options are not SQL-interpolated.
 
 Storage GUCs are USERSET with bounds: write-buffer docs 1..1,000,000, build docs
 1..10,000,000, write-buffer bytes 1,024..67,108,864, merge documents
-0..2,147,483,647, maximum segments 1..128, tier factor 2..64. Custom-scan selection is
+0..2,147,483,647, maximum segments 1..96, tier factor 2..64. Custom-scan selection is
 a USERSET boolean. These tune the caller's work without escalating privileges;
 large build settings can consume substantial memory, as other PostgreSQL user
-query settings can. No GUC accepts a filesystem path.
+query settings can. A user setting may change the plan, never the result:
+`stannum.debug_seed_score`, a measurement aid that prunes a ranked walk against
+a supplied threshold and can therefore drop rows, is superuser-only (SUSET).
+No GUC accepts a filesystem path.
 
 The storage Buffer guard unlocks/releases buffers on Rust unwind; PostgreSQL
 resource owners handle error cleanup for server-managed resources. Corruption

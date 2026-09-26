@@ -46,7 +46,10 @@ def acquire(corpus, root):
         if verify(target, part):
             continue
         pending = root / (part['file'] + '.partial')
-        subprocess.run(['curl', '--fail', '--location', '--retry', '5', '--continue-at', '-',
+        # A reset connection is not among the failures curl retries by
+        # default; resume the partial file rather than fail a whole campaign.
+        subprocess.run(['curl', '--fail', '--location', '--retry', '20', '--retry-all-errors',
+                        '--retry-delay', '5', '--continue-at', '-',
                         '--output', str(pending), f'{MEDIA}/datasets/{corpus}/{part["file"]}'], check=True)
         if not verify(pending, part):
             raise ValueError(f'Checksum/size mismatch: {pending}; remove it before retrying')

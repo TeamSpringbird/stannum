@@ -5,6 +5,7 @@
 mod display;
 mod error;
 mod interval;
+mod phrase_plan;
 mod positions;
 mod query;
 mod solver;
@@ -12,6 +13,7 @@ pub(crate) mod state;
 
 pub use error::SpanError;
 pub use interval::Interval;
+pub use phrase_plan::{PhrasePlan, Step};
 pub use positions::TermPositions;
 pub use query::SpanQuery;
 pub use solver::{Intervals, SpanSolver};

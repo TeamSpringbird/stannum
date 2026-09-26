@@ -35,4 +35,33 @@ pub enum ParseError {
         max = crate::ast::BoostFactor::MAX
     )]
     BoostOutOfRange { text: String, pos: usize },
+
+    #[error(
+        "query nesting exceeds {limit} levels (at byte {pos})",
+        limit = crate::limits::MAX_NESTING
+    )]
+    NestingTooDeep { pos: usize },
+
+    #[error(
+        "query has more than {limit} terms (at byte {pos})",
+        limit = crate::limits::MAX_TERMS
+    )]
+    TooManyTerms { pos: usize },
+}
+
+impl ParseError {
+    /// The byte of the query the error points at.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        match self {
+            Self::Expected { pos, .. }
+            | Self::EmptyAlternatives { pos }
+            | Self::EmptyPhrase { pos }
+            | Self::NumberOutOfRange { pos, .. }
+            | Self::WildcardInRangeBound { pos, .. }
+            | Self::BoostOutOfRange { pos, .. }
+            | Self::NestingTooDeep { pos }
+            | Self::TooManyTerms { pos } => *pos,
+        }
+    }
 }

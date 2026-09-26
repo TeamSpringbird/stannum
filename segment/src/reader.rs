@@ -29,12 +29,6 @@ impl<'a> Reader<'a> {
         self.bytes.len() - self.at
     }
 
-    pub fn u8(&mut self) -> Result<u8> {
-        let byte = *self.bytes.get(self.at).ok_or(Error::Truncated)?;
-        self.at += 1;
-        Ok(byte)
-    }
-
     pub fn varint(&mut self) -> Result<u64> {
         varint::get(self.bytes, &mut self.at)
     }
@@ -52,11 +46,6 @@ impl<'a> Reader<'a> {
 
     pub fn skip(&mut self, len: usize) -> Result<()> {
         self.take(len).map(|_| ())
-    }
-
-    pub fn u16_le(&mut self) -> Result<u16> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     /// Moves to an absolute position that must not exceed the end of input.

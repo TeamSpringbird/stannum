@@ -12,7 +12,7 @@
 //! record names the index and the latest transaction id whose snapshots could
 //! still read the pages about to be freed. Replay resolves the conflict with
 //! `ResolveRecoveryConflictWithSnapshot` *before* the generic records that mark
-//! the pages free and reuse them, so conflicting standby queries are cancelled
+//! the pages free and reuse them, so conflicting standby queries are canceled
 //! or waited for exactly as for heap pruning and btree page reuse
 //! (`max_standby_streaming_delay`, `hot_standby_feedback` apply unchanged).
 //!
@@ -267,7 +267,7 @@ fn index_reads_allowed(index: pgrx::PgRelation) -> bool {
     unsafe { super::index_reads_allowed(index.as_ptr()) }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
+#[cfg(feature = "pg_test")]
 #[pgrx::pg_schema]
 mod tests {
     use super::*;

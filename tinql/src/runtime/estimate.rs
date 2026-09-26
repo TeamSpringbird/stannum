@@ -29,9 +29,8 @@
 //! of a live index.
 
 use segment::index::{Expanded, Index, Window};
-use segment::postings::Postings;
+use segment::ordinals::Ordinals;
 use segment::segment::Term;
-use segment::set::Cursor;
 
 use super::eval::FuzzyMatcher;
 use super::{CompiledRegex, Query, RangeBound, SpanTermSlot};
@@ -148,23 +147,37 @@ pub fn at_least(fractions: impl IntoIterator<Item = f64>, min: usize) -> f64 {
         return 1.0;
     }
     let fractions: Vec<f64> = fractions.into_iter().map(clamp).collect();
-    if min > fractions.len() {
+    let n = fractions.len();
+    if min > n {
         return 0.0;
     }
-    // exactly[j]: probability that exactly j of the events seen so far occur.
-    let mut exactly = vec![0.0; fractions.len() + 1];
-    exactly[0] = 1.0;
-    for (seen, fraction) in fractions.iter().enumerate() {
-        for j in (0..=seen + 1).rev() {
-            let with = if j > 0 {
-                exactly[j - 1] * fraction
-            } else {
-                0.0
-            };
-            exactly[j] = exactly[j] * (1.0 - fraction) + with;
-        }
+    // At least `min` of the events occurring is at most `n - min` of them
+    // failing; count whichever threshold is smaller, so the work is
+    // O(n * min(min, n - min + 1)) rather than O(n^2).
+    let failures = n - min + 1;
+    if failures < min {
+        let complements = fractions.iter().map(|fraction| 1.0 - fraction);
+        return (1.0 - at_least_tail(complements, failures)).clamp(0.0, 1.0);
     }
-    exactly[min..].iter().sum::<f64>().min(1.0)
+    at_least_tail(fractions.into_iter(), min).min(1.0)
+}
+
+/// The probability that at least `min >= 1` of independent events with
+/// probabilities `fractions` occur.
+fn at_least_tail(fractions: impl Iterator<Item = f64>, min: usize) -> f64 {
+    // below[j]: probability that exactly j < min of the events seen so far
+    // occur; tail: probability that min or more do.
+    let mut below = vec![0.0; min];
+    below[0] = 1.0;
+    let mut tail = 0.0;
+    for fraction in fractions {
+        tail += below[min - 1] * fraction;
+        for j in (1..min).rev() {
+            below[j] = below[j] * (1.0 - fraction) + below[j - 1] * fraction;
+        }
+        below[0] *= 1.0 - fraction;
+    }
+    tail
 }
 
 /// Phrase or proximity: bounded by the rarest slot, discounted once per
@@ -339,6 +352,7 @@ impl<S: Statistics + ?Sized> Estimator<'_, S> {
     }
 
     fn query(&self, query: &Query) -> Result<Estimate, S::Error> {
+        crate::limits::check_stack();
         Ok(match query {
             Query::Term(term) => self.term(term)?,
             Query::And(left, right) => Self::and(&[self.query(left)?, self.query(right)?]),
@@ -369,7 +383,8 @@ impl<S: Statistics + ?Sized> Estimator<'_, S> {
 /// Frequencies summed over the sources of an index (its segments and write
 /// buffer), each expanded under the same cap the plan uses.
 pub struct IndexStatistics<'a> {
-    pub sources: Vec<(&'a dyn Index, Option<Postings<'a>>)>,
+    /// Each source with its dead list, an ordinal stream over that source.
+    pub sources: Vec<(&'a dyn Index, Option<Ordinals<'a>>)>,
     pub max_expansion: usize,
 }
 
@@ -384,7 +399,7 @@ impl Statistics for IndexStatistics<'_> {
                 f64::from(
                     source
                         .document_count()
-                        .saturating_sub(dead.as_ref().map_or(0, Postings::count)),
+                        .saturating_sub(dead.as_ref().map_or(0, Ordinals::count)),
                 )
             })
             .sum())
@@ -425,7 +440,7 @@ impl Statistics for IndexStatistics<'_> {
 /// have no dead list and retain their original frequencies.
 fn live_frequency(
     index: &dyn Index,
-    dead: Option<&Postings<'_>>,
+    dead: Option<&Ordinals<'_>>,
     term: &Term<'_>,
 ) -> segment::Result<f64> {
     let Some(dead) = dead.filter(|dead| dead.count() > 0) else {
@@ -436,13 +451,9 @@ fn live_frequency(
         return Ok(0.0);
     }
     if term.df() <= 1024 {
-        let mut postings = term.cursor()?;
-        let mut deleted = dead.cursor()?;
         let mut live = 0u32;
-        while let Some(tid) = postings.current() {
-            deleted.seek(tid)?;
-            live += u32::from(deleted.current() != Some(tid));
-            postings.advance()?;
+        for ordinal in term.ordinals()?.to_vec()? {
+            live += u32::from(dead.rank(ordinal)?.is_none());
         }
         Ok(f64::from(live))
     } else {
@@ -566,6 +577,51 @@ mod tests {
         close(at_least([], 1), 0.0);
     }
 
+    /// The truncated recurrence agrees with the full Poisson binomial
+    /// distribution at every threshold, from either side.
+    #[test]
+    fn at_least_matches_the_full_distribution() {
+        fn full(fractions: &[f64], min: usize) -> f64 {
+            let mut exactly = vec![0.0; fractions.len() + 1];
+            exactly[0] = 1.0;
+            for (seen, fraction) in fractions.iter().enumerate() {
+                for j in (0..=seen + 1).rev() {
+                    let with = if j > 0 {
+                        exactly[j - 1] * fraction
+                    } else {
+                        0.0
+                    };
+                    exactly[j] = exactly[j] * (1.0 - fraction) + with;
+                }
+            }
+            exactly[min..].iter().sum::<f64>().min(1.0)
+        }
+        let fractions: Vec<f64> = (0..23).map(|i| ((i * 37 % 101) as f64) / 100.0).collect();
+        for n in 0..=fractions.len() {
+            for min in 1..=n + 1 {
+                let actual = at_least(fractions[..n].iter().copied(), min);
+                let expected = if min > n {
+                    0.0
+                } else {
+                    full(&fractions[..n], min)
+                };
+                assert!(
+                    (actual - expected).abs() < 1e-12,
+                    "n {n} min {min}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    /// Large lists estimate in time linear in the list for thresholds near
+    /// either end (the full distribution was quadratic).
+    #[test]
+    fn at_least_is_fast_at_either_end() {
+        let fractions = vec![0.3; 200_000];
+        close(at_least(fractions.iter().copied(), 2), 1.0);
+        close(at_least(fractions.iter().copied(), fractions.len()), 0.0);
+    }
+
     #[test]
     fn phrase_is_the_discounted_rarest_slot() {
         close(phrase([0.5, 0.01]), 0.005);
@@ -650,12 +706,10 @@ mod tests {
     }
     #[test]
     fn index_statistics_subtract_known_deaths_and_preserve_buffer() {
-        use segment::{
-            Tid, forward::ForwardRecord, index::MutableIndex, postings::PostingsBuilder,
-        };
+        use segment::{Tid, forward::ForwardRecord, index::MutableIndex};
         let index = MutableIndex::default();
         let buffer = MutableIndex::default();
-        let mut dead = PostingsBuilder::default();
+        let mut dead = Vec::new();
         for n in 0..2000 {
             let tid = Tid::new(n, 1).unwrap();
             let mut tokens = vec![("common", 0)];
@@ -666,7 +720,8 @@ mod tests {
                 .add_record(ForwardRecord::from_tokens(tid, tokens).unwrap())
                 .unwrap();
             if n < 10 || (100..590).contains(&n) {
-                dead.push(tid).unwrap();
+                // Records arrive in TID order, so the ordinal is the count.
+                dead.push(n);
             }
         }
         buffer
@@ -674,10 +729,10 @@ mod tests {
                 ForwardRecord::from_tokens(Tid::new(2001, 1).unwrap(), [("rare", 0)]).unwrap(),
             )
             .unwrap();
-        let bytes = dead.finish();
+        let bytes = segment::ordinals::encode(&dead);
         let stats = IndexStatistics {
             sources: vec![
-                (&index, Some(Postings::parse(&bytes).unwrap())),
+                (&index, Some(Ordinals::parse(&bytes).unwrap())),
                 (&buffer, None),
             ],
             max_expansion: 10,
@@ -712,21 +767,17 @@ mod tests {
 
     #[test]
     fn wholly_dead_and_empty_sources_estimate_zero() {
-        use segment::{
-            Tid, forward::ForwardRecord, index::MutableIndex, postings::PostingsBuilder,
-        };
+        use segment::{Tid, forward::ForwardRecord, index::MutableIndex};
         let index = MutableIndex::default();
         let empty = MutableIndex::default();
         let tid = Tid::new(0, 1).unwrap();
         index
             .add_record(ForwardRecord::from_tokens(tid, [("gone", 0)]).unwrap())
             .unwrap();
-        let mut dead = PostingsBuilder::default();
-        dead.push(tid).unwrap();
-        let bytes = dead.finish();
+        let bytes = segment::ordinals::encode(&[0]);
         let stats = IndexStatistics {
             sources: vec![
-                (&index, Some(Postings::parse(&bytes).unwrap())),
+                (&index, Some(Ordinals::parse(&bytes).unwrap())),
                 (&empty, None),
             ],
             max_expansion: 10,

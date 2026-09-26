@@ -4,9 +4,9 @@
 
 //! Streaming set operations over exact, nonempty heap-page bitmaps.
 //!
-//! Only the current page of each input is retained. Sparse or positional
-//! cursors can participate through [`Rows`]; grouped postings decode their
-//! stored bitmaps directly. Padding bits are never part of a set.
+//! Only the current page of each input is retained. Row cursors participate
+//! through [`Rows`]; a term's ordinal stream produces pages directly through
+//! [`crate::docs::PageCursor`]. Padding bits are never part of a set.
 
 use crate::{Result, Tid, set, tid::MAX_OFFSET};
 
@@ -330,16 +330,32 @@ impl<L: Cursor, R: Cursor> Cursor for Difference<L, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::postings::{Postings, PostingsBuilder};
+    use crate::segment::{Segment, SegmentBuilder};
     use proptest::prelude::*;
     use std::collections::BTreeSet;
 
-    fn encode(tids: &BTreeSet<Tid>) -> Vec<u8> {
-        let mut builder = PostingsBuilder::default();
-        for tid in tids {
-            builder.push(*tid).unwrap();
+    /// A segment whose documents are the union of the sets, each set a term.
+    fn segment_of(sets: &[&BTreeSet<Tid>]) -> Vec<u8> {
+        let mut builder = SegmentBuilder::default();
+        let all: BTreeSet<Tid> = sets.iter().flat_map(|set| set.iter().copied()).collect();
+        for tid in all {
+            let tokens: Vec<(String, u32)> = sets
+                .iter()
+                .enumerate()
+                .filter(|(_, set)| set.contains(&tid))
+                .map(|(i, _)| (format!("t{i}"), i as u32 + 1))
+                .collect();
+            builder
+                .add_document(tid, tokens.iter().map(|(t, p)| (t.as_str(), *p)))
+                .unwrap();
         }
         builder.finish()
+    }
+    fn pages<'a>(segment: &'a Segment<'a>, term: &str) -> Box<dyn Cursor + 'a> {
+        match segment.term(term).unwrap() {
+            Some(term) => Box::new(term.pages().unwrap()),
+            None => Box::new(Rows::new(set::Empty).unwrap()),
+        }
     }
     fn collect(mut pages: impl Cursor) -> Vec<Tid> {
         let mut out = Vec::new();
@@ -368,52 +384,60 @@ mod tests {
     proptest! {
         #[test]
         fn page_algebra_matches_independent_sets(a in locations(), b in locations(), target in 0u32..1000) {
-            let ab = encode(&a); let bb = encode(&b);
-            let ap = Postings::parse(&ab).unwrap(); let bp = Postings::parse(&bb).unwrap();
-            let mut cursor = ap.pages().unwrap();
+            let bytes = segment_of(&[&a, &b]);
+            let segment = Segment::parse(&bytes).unwrap();
+            let mut cursor = pages(&segment, "t0");
             cursor.seek(target).unwrap();
             prop_assert_eq!(collect(cursor), a.iter().filter(|t| t.block >= target).copied().collect::<Vec<_>>());
-            let mut union = Union::new(vec![ap.pages().unwrap(), bp.pages().unwrap()]);
+            let mut union = Union::new(vec![pages(&segment, "t0"), pages(&segment, "t1")]);
             union.seek(target).unwrap();
             prop_assert_eq!(collect(union), a.union(&b).filter(|t| t.block >= target).copied().collect::<Vec<_>>());
-            let mut intersection = Intersection::new(vec![ap.pages().unwrap(), bp.pages().unwrap()]).unwrap();
+            let mut intersection = Intersection::new(vec![pages(&segment, "t0"), pages(&segment, "t1")]).unwrap();
             intersection.seek(target).unwrap();
             prop_assert_eq!(collect(intersection), a.intersection(&b).filter(|t| t.block >= target).copied().collect::<Vec<_>>());
-            let mut difference = Difference::new(ap.pages().unwrap(), bp.pages().unwrap()).unwrap();
+            let mut difference = Difference::new(pages(&segment, "t0"), pages(&segment, "t1")).unwrap();
             difference.seek(target).unwrap();
             prop_assert_eq!(collect(difference), a.difference(&b).filter(|t| t.block >= target).copied().collect::<Vec<_>>());
+            // Rows over a TID cursor agree with the term's own pages.
+            if let Some(term) = segment.term("t0").unwrap() {
+                let rows = Rows::new(term.cursor().unwrap()).unwrap();
+                prop_assert_eq!(collect(rows), a.iter().copied().collect::<Vec<_>>());
+            }
         }
     }
 
     #[test]
-    fn dense_pages_seek_across_groups_and_preserve_boundary_offsets() {
-        let tids: BTreeSet<_> = [0, 1, 255, 256, 257, 511, 768]
-            .into_iter()
+    fn dense_pages_seek_across_chunks_and_preserve_boundary_offsets() {
+        // Full blocks either side of a 65,536-document chunk boundary.
+        let tids: BTreeSet<_> = (0..226)
+            .chain([300, 500])
             .flat_map(|block| (1..=MAX_OFFSET).map(move |offset| Tid { block, offset }))
             .collect();
-        let bytes = encode(&tids);
-        let postings = Postings::parse(&bytes).unwrap();
-        assert!(postings.is_grouped());
+        assert!(tids.len() > crate::ordinals::CHUNK as usize);
+        let bytes = segment_of(&[&tids]);
+        let segment = Segment::parse(&bytes).unwrap();
+        let term = segment.term("t0").unwrap().unwrap();
+        assert!(term.prefers_pages().unwrap());
         assert_eq!(
-            collect(postings.pages().unwrap()),
+            collect(term.pages().unwrap()),
             tids.iter().copied().collect::<Vec<_>>()
         );
         for target in [
             0,
             1,
             2,
-            255,
-            256,
-            257,
-            258,
-            511,
-            512,
-            767,
-            768,
-            769,
+            224,
+            225,
+            226,
+            227,
+            300,
+            301,
+            499,
+            500,
+            501,
             u32::MAX,
         ] {
-            let mut cursor = postings.pages().unwrap();
+            let mut cursor = term.pages().unwrap();
             cursor.seek(target).unwrap();
             assert_eq!(
                 collect(cursor),
@@ -423,8 +447,8 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-        let mut cursor = postings.pages().unwrap();
-        for target in [0, 1, 255, 256, 256, 511, 768, 769] {
+        let mut cursor = term.pages().unwrap();
+        for target in [0, 1, 224, 225, 225, 300, 500, 501] {
             cursor.seek(target).unwrap();
             assert_eq!(
                 cursor.current().map(|p| p.block),

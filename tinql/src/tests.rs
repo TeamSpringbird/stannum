@@ -13,11 +13,13 @@ mod cases {
     fn term(s: &str) -> Expr {
         Expr::Term(s.into())
     }
+    // Left-associative, as the parser builds chains: `and(and(a, b), c)` is
+    // the flat `a AND b AND c`.
     fn and(a: Expr, b: Expr) -> Expr {
-        Expr::And(Box::new(a), Box::new(b))
+        Expr::and(a, b)
     }
     fn or(a: Expr, b: Expr) -> Expr {
-        Expr::Or(Box::new(a), Box::new(b))
+        Expr::or(a, b)
     }
     fn and_not(pos: Expr, neg: Expr) -> Expr {
         Expr::AndNot {

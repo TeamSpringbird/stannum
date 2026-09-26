@@ -125,6 +125,7 @@ pub fn evaluate(query: &Query, doc: &TokenizedDoc) -> Result<MatchResult, EvalEr
 }
 
 fn evaluate_searchable(query: &Query, doc: &TokenizedDoc) -> Result<MatchResult, EvalError> {
+    crate::limits::check_stack();
     match query {
         Query::Term(term) => {
             let intervals = doc
@@ -335,6 +336,7 @@ pub fn evaluate_for_highlight(query: &Query, doc: &TokenizedDoc) -> Vec<Highligh
 }
 
 fn collect_highlight_matches(query: &Query, doc: &TokenizedDoc, out: &mut Vec<HighlightMatch>) {
+    crate::limits::check_stack();
     match query {
         Query::Term(term) => {
             for &pos in doc.positions(term) {

@@ -259,6 +259,16 @@ impl Checker {
                 format!("last page links on to page {block}, which no reader follows"),
             );
         }
+        if complete && visited.last().is_some_and(|last| *last != run.last) {
+            self.error(
+                owner.to_owned(),
+                format!(
+                    "the run records page {} as its last; the chain ends at page {}",
+                    run.last,
+                    visited.last().expect("a complete chain has a page")
+                ),
+            );
+        }
         if out.len() != run.bytes as usize {
             if complete {
                 self.error(
@@ -350,15 +360,20 @@ impl Checker {
         if !entry.dead.is_empty()
             && let Some((bytes, _)) = unsafe { self.run(entry.dead, &dead_owner, true) }
         {
-            let decoded = segment::postings::Postings::parse(&bytes).and_then(|p| p.to_vec());
+            let decoded = segment::ordinals::Ordinals::parse(&bytes).and_then(|o| o.to_vec());
             match (&documents, decoded) {
                 (Some(documents), decoded) => {
-                    for finding in verify_dead_list(&bytes, documents) {
+                    for finding in verify_dead_list(&bytes, documents.len() as u32) {
                         self.findings.push(finding.within(&label));
                     }
-                    dead = decoded.unwrap_or_default();
+                    dead = decoded
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|ordinal| documents.get(ordinal as usize).copied())
+                        .collect();
                 }
-                (None, Ok(list)) => dead = list,
+                // Without a document table the ordinals name nothing.
+                (None, Ok(_)) => {}
                 (None, Err(error)) => self.error(dead_owner.clone(), error),
             }
         }

@@ -1,0 +1,16 @@
+# Third-party Python packages for the benchmark, oracle and conformance tooling.
+# Requires Python 3.11 or later (hashlib.file_digest, tomllib).
+#
+#   python3 -m venv .venv && .venv/bin/pip install -r benchmarks/requirements.txt
+#
+# The AWS scripts also need benchmarks/requirements-aws.txt. Everything else in
+# benchmarks/ and script/ uses only the standard library and PostgreSQL's
+# command-line tools (psql, pg_ctl, initdb, pg_config) on PATH.
+
+# Direct connections: tin.py sessions and streaming COPY, the local probes,
+# count probes, tin_behavior_probe.py and conformance/run.py.
+psycopg[binary]==3.3.6
+# dataset.py: converting the published Parquet corpora to CSV.
+pyarrow==23.0.1
+# conformance/run.py: the YAML case files.
+PyYAML==6.0.3

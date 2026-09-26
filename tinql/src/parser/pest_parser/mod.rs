@@ -2,7 +2,11 @@
 //
 // See LICENSE in the repository root for license terms.
 
-mod phrase_grammar;
+//! The pest parser the query grammar was first written for, kept (test
+//! builds only) as the oracle the recursive-descent parser in
+//! [`super::descent`] is checked against: both must accept the same inputs
+//! and build the same trees. It has no nesting or size limits, so it is only
+//! fed small inputs.
 
 use pest::Parser;
 use pest_derive::Parser;
@@ -12,7 +16,8 @@ use crate::ast::*;
 use crate::error::ParseError;
 use crate::util::{classify_term, unescape_phrase_term};
 
-use phrase_grammar::{PhraseContentParser, PhraseRule};
+use super::descent::split_comma_separated_alternatives;
+use super::phrase_grammar::{PhraseContentParser, PhraseRule};
 
 #[derive(Parser)]
 #[grammar = "parser/pest_parser/grammar.pest"]
@@ -86,7 +91,7 @@ fn build_or_expr(pair: Pair<'_>, implicit_op: ImplicitOp) -> Result<Expr, ParseE
     let mut iter = or_items.into_iter();
     let mut left = iter.next().unwrap();
     for right in iter {
-        left = Expr::Or(Box::new(left), Box::new(right));
+        left = Expr::or(left, right);
     }
     Ok(left)
 }
@@ -100,7 +105,7 @@ fn build_alt_or_expr(pair: Pair<'_>, implicit_op: ImplicitOp) -> Result<Expr, Pa
     let mut left = build_alt_and_expr(first, implicit_op)?;
     for child in children {
         let right = build_alt_and_expr(child, implicit_op)?;
-        left = Expr::Or(Box::new(left), Box::new(right));
+        left = Expr::or(left, right);
     }
     Ok(left)
 }
@@ -142,7 +147,7 @@ fn build_and_expr_items(pair: Pair<'_>, implicit_op: ImplicitOp) -> Result<Vec<E
             let mut iter = items.into_iter();
             let mut left = iter.next().unwrap().1;
             for (_, right) in iter {
-                left = Expr::And(Box::new(left), Box::new(right));
+                left = Expr::and(left, right);
             }
             Ok(vec![left])
         }
@@ -180,7 +185,7 @@ fn fold_left_and(items: Vec<Expr>) -> Expr {
     let mut iter = items.into_iter();
     let mut left = iter.next().unwrap();
     for right in iter {
-        left = Expr::And(Box::new(left), Box::new(right));
+        left = Expr::and(left, right);
     }
     left
 }
@@ -209,7 +214,7 @@ fn build_alt_and_expr(pair: Pair<'_>, implicit_op: ImplicitOp) -> Result<Expr, P
     let mut left = build_alt_andnot_expr(first, implicit_op)?;
     for child in children {
         let right = build_alt_andnot_expr(child, implicit_op)?;
-        left = Expr::And(Box::new(left), Box::new(right));
+        left = Expr::and(left, right);
     }
     Ok(left)
 }
@@ -589,63 +594,6 @@ fn build_alternatives_vec(
         return Err(ParseError::EmptyAlternatives { pos: open_pos });
     }
     Ok(split_comma_separated_alternatives(items))
-}
-
-/// Alternatives lists document commas as element separators
-/// (`[beer, ale, lager]` means `or(beer, ale, lager)`), but the word rule
-/// deliberately admits `,` as a term character so free text keeps parsing.
-/// Re-split bare-word elements on separator commas here so `[beer,wine]` and
-/// `[beer, wine]` both mean the documented OR instead of a phrase. A comma
-/// between two digits is a numeric separator, not a list separator — the same
-/// distinction word segmentation makes — so `[47,000 48,000]` keeps its two
-/// numeric terms.
-fn split_comma_separated_alternatives(items: Vec<Expr>) -> Vec<Expr> {
-    items
-        .into_iter()
-        .flat_map(|item| match item {
-            Expr::Term(word) if word.contains(',') => {
-                let pieces: Vec<Expr> = split_separator_commas(&word)
-                    .into_iter()
-                    .map(|piece| classify_term(&piece))
-                    .collect();
-                if pieces.is_empty() {
-                    // Pure separator residue like a bare "," element:
-                    // analysis-empty, matches nothing.
-                    vec![Expr::MatchNone]
-                } else {
-                    pieces
-                }
-            }
-            other => vec![other],
-        })
-        .collect()
-}
-
-/// Splits `word` at every comma that is not flanked by digits on both sides,
-/// dropping empty pieces.
-fn split_separator_commas(word: &str) -> Vec<String> {
-    let bytes = word.as_bytes();
-    let mut pieces = Vec::new();
-    let mut start = 0;
-    for (idx, byte) in bytes.iter().enumerate() {
-        if *byte != b',' {
-            continue;
-        }
-        let numeric_separator = idx > 0
-            && bytes[idx - 1].is_ascii_digit()
-            && bytes.get(idx + 1).is_some_and(u8::is_ascii_digit);
-        if numeric_separator {
-            continue;
-        }
-        if start < idx {
-            pieces.push(word[start..idx].to_string());
-        }
-        start = idx + 1;
-    }
-    if start < word.len() {
-        pieces.push(word[start..].to_string());
-    }
-    pieces
 }
 
 // ── Phrase ──────────────────────────────────────────────────────────

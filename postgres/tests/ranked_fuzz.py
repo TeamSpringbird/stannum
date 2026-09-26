@@ -9,16 +9,20 @@ Starts a throwaway cluster (install stannum first), builds a small corpus with
 heavy score ties and reused heap space, then drives several writer sessions
 (inserts, deletes, HOT and non-HOT updates, VACUUM, rollbacks, folding and
 merge tunables) while reader sessions run random ranked queries: single terms,
-OR, AND, boosts, phrases, `AND NOT`, `AT LEAST`, `full_score` and `score`,
+OR, AND, boosts, phrases, `AND NOT`, `AT LEAST`, disjunctions with a phrase
+or conjunction child, `full_score` and `score`,
 LIMIT/OFFSET around posting-block boundaries and above the pruning cap,
 cursors fetched partially with writes in between, and joins or filters that
-read past k.
+read past k. Count episodes run `count(*)` through the custom count node
+(phrases, `AND NOT`, prefixes and other shapes the fold rejects, and terms
+with the fold off or page bitmaps forced) while writers delete and vacuum.
 
 Each reader compares, inside one snapshot, the custom-scan output (ids and
 float4 score bits) with the same query forced through the unpruned path
 (`stannum.enable_custom_scan = off`, `ORDER BY score DESC, ctid`) and with a
 regex sequential-scan membership check, and also checks uniqueness, descending
-order, finite scores and the tie order the scan promises. On any mismatch it
+order, finite scores and the tie order the scan promises. A count is compared
+with the regex count in its snapshot. On any mismatch it
 writes a reproduction script (seed, schema, statements in order) and stops.
 
     python3 postgres/tests/ranked_fuzz.py --seconds 600 --seed 7
@@ -41,7 +45,7 @@ import tempfile
 import threading
 import time
 
-PORT = '28938'
+PORT = '28939'
 STATEMENT_TIMEOUT_MS = 120_000
 
 VOCABULARY = ['alpha', 'beta', 'gamma', 'delta', 'echo', 'fox', 'golf', 'hotel', 'india', 'juliet']
@@ -221,7 +225,7 @@ class Query:
         self.shape = shape
 
     @staticmethod
-    def generate(rng, width=None):
+    def generate(rng, width=None, shape=None):
         def word():
             pool = VOCABULARY + RARE + ['missing']
             return rng.choice(pool) if rng.random() < 0.15 else rng.choice(VOCABULARY)
@@ -237,10 +241,10 @@ class Query:
             tinql = ' OR '.join(w + rng.choice(['', '^0.25', '^2']) for w in ws)
             return Query(tinql, '(' + ' OR '.join(term_regex(w) for w in ws) + ')', f'wide_or_{width}')
 
-        shape = rng.choices(
+        shape = shape or rng.choices(
             ['term', 'or2', 'or3', 'and2', 'and3', 'boosted_or', 'boosted_and', 'phrase',
-             'andnot', 'prefix', 'atleast', 'mixed'],
-            weights=[24, 14, 8, 14, 7, 7, 6, 4, 5, 2, 4, 5])[0]
+             'andnot', 'prefix', 'atleast', 'mixed', 'or_phrase', 'or_and'],
+            weights=[24, 14, 8, 14, 7, 7, 6, 4, 5, 2, 4, 5, 4, 4])[0]
         if shape == 'term':
             w = word()
             return Query(w + boost(), term_regex(w), shape)
@@ -274,8 +278,15 @@ class Query:
             n = rng.choice([1, 2, 2, 3])
             count = ' + '.join(f'({term_regex(w)})::int' for w in ws)
             return Query(f'AT LEAST {n} OF [{" ".join(ws)}]', f'(({count}) >= {n})', shape)
-        # mixed: (a OR b) AND c
         a, b, c = word(), word(), word()
+        if shape == 'or_phrase':
+            return Query(f'{a}{boost()} OR "{b} {c}"',
+                         f"({term_regex(a)} OR body ~ {sql_literal(chr(92) + 'm' + b + ' ' + c + chr(92) + 'M')})",
+                         shape)
+        if shape == 'or_and':
+            return Query(f'({a} AND {b}) OR {c}{boost()}',
+                         f'(({term_regex(a)} AND {term_regex(b)}) OR {term_regex(c)})', shape)
+        # mixed: (a OR b) AND c
         return Query(f'({a} OR {b}) AND {c}',
                      f'(({term_regex(a)} OR {term_regex(b)}) AND {term_regex(c)})', shape)
 
@@ -333,10 +344,13 @@ class Fuzzer:
         self.readers = []
         self.stats = dict(episodes=0, comparisons=0, rows_compared=0, cursor_fetches=0, writer_ops=0,
                           pruned_plans=0, custom_plans=0, unstable_skipped=0, benign_errors=0,
-                          vacuums=0, reindexes=0, folds_observed=0)
+                          vacuums=0, reindexes=0, folds_observed=0, counts=0, count_plans=0)
         self.schema = []
         self.wide_queries = 0
         self.wide_coverage = {}
+        # Its own stream, so the main sequence (and every pinned seed's
+        # scenario) is the same with or without the positional shapes.
+        self.positional_rng = random.Random(args.seed * 7919 + 17)
 
     # -- cluster --------------------------------------------------------------------
     def command(self, args, **kw):
@@ -398,7 +412,7 @@ class Fuzzer:
         return (f'SET stannum.write_buffer_docs = {docs}; '
                 f'SET stannum.write_buffer_bytes = {rng.choice([1024, 4096, 65536, 1048576])}; '
                 f'SET stannum.merge_tier_factor = {rng.choice([2, 2, 3, 4, 8])}; '
-                f'SET stannum.max_segments = {rng.choice([2, 3, 4, 6, 8, 16, 128])}; '
+                f'SET stannum.max_segments = {rng.choice([2, 3, 4, 6, 8, 16, 96])}; '
                 f'SET stannum.max_merge_docs = {rng.choice([0, 0, 10, 100, 1000, 100000])}; '
                 f'SET stannum.build_segment_docs = {rng.choice([10, 50, 200, 1000, 32768])}')
 
@@ -534,6 +548,8 @@ class Fuzzer:
             self.wide_queries += 1
         query = Query.generate(rng, width=width)
         scorer = rng.choice(['stannum.full_score(d.ctid)', 'stannum.full_score(d.ctid)', 'stannum.score(d.ctid)'])
+        if width is None:
+            query, scorer = ranked_correctness_shapes(self.positional_rng, self.corpus, query, scorer)
         limit = rng.choice(LIMITS)
         offset = rng.choice(OFFSETS)
         join = rng.random() < 0.15
@@ -541,13 +557,22 @@ class Fuzzer:
         if not join and rng.random() < 0.15:
             extra = rng.choice([f'd.grp = {rng.randint(0, 3)}', 'd.id % 7 = 3', 'd.revision = 0', 'd.id % 2 = 1'])
         weights = dict(plain=50, cursor=getattr(self.args, 'cursor_weight', 40),
-                       twin=getattr(self.args, 'twin_weight', 6))
+                       twin=getattr(self.args, 'twin_weight', 6), count=getattr(self.args, 'count_weight', 12))
         mode = rng.choices(list(weights), weights=list(weights.values()))[0]
         if self.args.wide:
             scorer = 'stannum.full_score(d.ctid)'
             mode = rng.choice(['cursor', 'cursor', 'twin'])
             limit = rng.choice([10, 31, 127, 128, 129])
         isolation = rng.choice(['REPEATABLE READ', 'REPEATABLE READ', 'REPEATABLE READ', 'READ COMMITTED'])
+        count_settings = None
+        if mode == 'count':
+            # Mostly shapes the fold rejects; the count and its regex
+            # reference must share one snapshot.
+            query = Query.generate(rng, shape=rng.choice(
+                ['phrase', 'phrase', 'andnot', 'andnot', 'prefix', 'prefix', 'or_phrase', 'term', 'and2']))
+            join, extra, isolation = False, None, 'REPEATABLE READ'
+            count_settings = [f"SET LOCAL stannum.count_fold = {rng.choice(['on', 'off'])}",
+                              f"SET LOCAL stannum.force_count_pages = {rng.choice(['on', 'off', 'off'])}"]
         from_clause = 'docs d JOIN keep k USING (id)' if join else 'docs d'
         where = f"d.body ==> {sql_literal(query.tinql)}"
         regex_where = query.predicate.replace('body ~', 'd.body ~')
@@ -561,6 +586,7 @@ class Fuzzer:
             oracle=f'{select} ORDER BY score DESC, d.ctid',
             custom=f'{select} ORDER BY score DESC LIMIT {limit} OFFSET {offset}',
             regex=f'SELECT d.id, d.ctid FROM {from_clause} WHERE {regex_where}',
+            count=f'SELECT count(*) FROM {from_clause} WHERE {where}', count_settings=count_settings,
         )
 
     @staticmethod
@@ -612,6 +638,8 @@ class Fuzzer:
         # deleted, updated, vacuumed and replaced by documents it cannot see.
         self.churn(rng.randint(0, 6))
         self.quiesce_writers()
+        if spec['mode'] == 'count':
+            return self.count_episode(reader, spec, rng)
         settings_oracle = ['SET LOCAL stannum.enable_custom_scan = off', 'SET LOCAL enable_seqscan = off',
                            'SET LOCAL enable_bitmapscan = on']
         settings_custom = ['SET LOCAL stannum.enable_custom_scan = on', 'SET LOCAL enable_seqscan = off',
@@ -639,7 +667,7 @@ class Fuzzer:
             planned = reader.run(['EXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) ' + spec['custom']])
             plan = json.loads('\n'.join(planned[0][1]))[0]['Plan']
             self.note_plan(plan)
-            if not has_node(plan, 'block-max', key='Pruning'):
+            if not has_node(plan, 'ordinal', key='Pruning'):
                 return Failure('wide query did not exercise block-max pruning', spec=describe(spec), plan=plan)
             self.wide_coverage[spec['query'].shape] = self.wide_coverage.get(spec['query'].shape, 0) + 1
         expected = oracle[spec['offset']:spec['offset'] + spec['limit']]
@@ -691,6 +719,37 @@ class Fuzzer:
             # Only a prefix was read; it must be a prefix of the expected rows.
             expected = expected[:len(actual)]
         return self.after_failure(reader, spec, self.compare('cursor', actual, expected, oracle, visible, roots, strict, spec))
+
+    def count_episode(self, reader, spec, rng):
+        """Counts through the custom count node, repeatedly, while writers
+        delete and vacuum: VACUUM may remove rows deleted before the snapshot
+        and mark their pages all-visible after a count captured its index
+        view. Each count must equal the regex count in the same snapshot."""
+        truth = f"SELECT count(*) FROM ({spec['regex']}) r"
+        results = reader.run(['SET LOCAL stannum.enable_custom_scan = off', 'SET LOCAL enable_bitmapscan = on',
+                              truth, 'SET LOCAL stannum.enable_custom_scan = on',
+                              'SET LOCAL enable_bitmapscan = off'] + spec['count_settings']
+                             + ['EXPLAIN (FORMAT JSON) ' + spec['count']])
+        expected = int(results[2][1][0])
+        plan = json.loads('\n'.join(results[-1][1]))[0]['Plan']
+        if has_node(plan, 'Stannum Count', key='Custom Plan Provider'):
+            self.stats['count_plans'] += 1
+        for _ in range(rng.randint(1, 3)):
+            reader.send([spec['count']])
+            self.churn(rng.randint(0, 4))
+            self.quiesce_writers()
+            out = reader.wait()
+            statement, lines, error = out[0]
+            if error:
+                return Failure(f'count failed: {statement}', output=lines, spec=describe(spec))
+            self.stats['comparisons'] += 1
+            self.stats['counts'] += 1
+            actual = int(lines[0])
+            if actual != expected:
+                return self.after_failure(reader, spec, Failure(
+                    'count differs from the regex count in its snapshot', spec=describe(spec),
+                    actual=actual, expected=expected))
+        return None
 
     def oracle_of(self, spec, by_statement):
         """The unpruned path's rows in the scan's promised order, the regex
@@ -898,8 +957,130 @@ class Fuzzer:
         return summary
 
 
+# --- fix/ranked-correctness: positional shapes and BM25 parameters ---------------------
+# Phrases of three or more words with slop and pinned gaps, THEN and NEAR
+# with phrase operands, and random k1 and b. Each shape comes with an exact
+# regex over `body`, whose words are single-space separated.
+
+POSITIONAL_WORD = '[a-z0-9]+'
+
+
+def ranked_correctness_shapes(rng, corpus, query, scorer):
+    """Replaces some episodes' query with a positional shape and some
+    scorers with explicit BM25 parameters; `rng` is the fuzzer's positional
+    stream, not the main one."""
+    if rng.random() < 0.3:
+        query = ranked_correctness_query(rng, corpus)
+    if rng.random() < 0.3:
+        k1 = rng.choice(['0', '0.001', '0.01', '0.5', '1.2', '3'])
+        b = rng.choice(['0', '0.25', '0.75', '1'])
+        scorer = rng.choice([f'stannum.full_score(d.ctid, {k1}, {b})',
+                             f'stannum.score(d.ctid, k1 => {k1}, b => {b})'])
+    return query, scorer
+
+
+def ranked_correctness_query(rng, corpus):
+    """A positional query over runs of the corpus's templates, so that it
+    matches some documents, and its regex."""
+    def gap(count):
+        return f'( {POSITIONAL_WORD}){{{count}}}' if count else ''
+
+    def run(n):
+        words, pad = rng.choice(corpus.templates)
+        words = list(words) + [FILLER] * min(pad, 3)
+        if len(words) < n or rng.random() < 0.15:
+            return [rng.choice(VOCABULARY) for _ in range(n)]
+        start = rng.randrange(len(words) - n + 1)
+        return words[start:start + n]
+
+    backslash = chr(92)
+
+    def distinct(n, avoid=()):
+        """`n` distinct words, none in `avoid`: a run of a template when it
+        has them, else drawn from the vocabulary."""
+        words = run(n)
+        if len(set(words)) == n and not set(words) & set(avoid):
+            return words
+        return rng.sample([w for w in VOCABULARY if w not in avoid], n)
+
+    def exact(n, gaps=True, avoid=()):
+        """A phrase of `n` words, perhaps with one pinned gap of one or two
+        words in the middle: its text and regex.
+
+        Spans match by minimal intervals: `"a b _ c d"` is the phrase
+        `"a b"`, then `c` with exactly one word between, then `d`, and the
+        interval of the middle part must hold no shorter one. So the gap may
+        not hold `c`, nor the whole prefix before it; with distinct words
+        that is `c` or, for a one-word prefix, that word; for a two-word
+        prefix and a two-word gap, the prefix itself. The regex excludes
+        exactly those."""
+        if gaps and n >= 3 and rng.random() < 0.4:
+            words = distinct(n, avoid)
+            at = rng.randrange(1, n - 1)
+            width = rng.choice([1, 1, 2])
+            prefix, after = words[:at], words[at + 1]
+            excluded = [after] + (prefix if len(prefix) == 1 else [])
+            one = f'(?!(?:{"|".join(excluded)}){backslash}M){POSITIONAL_WORD}'
+            gap_regex = ' '.join([one] * width)
+            if len(prefix) == 2 and width == 2:
+                gap_regex = f'(?!{prefix[0]} {prefix[1]}{backslash}M){gap_regex}'
+            texts = words[:at] + ['_' * width] + words[at + 1:]
+            regex = ' '.join(words[:at] + [gap_regex] + words[at + 1:])
+            return f'"{" ".join(texts)}"', regex
+        words = distinct(n, avoid) if avoid else run(n)
+        text = ' '.join(words)
+        return (text if n == 1 else f'"{text}"'), text
+
+    def sloppy(n, slop):
+        """A phrase of `n` words whose junctions take at most `slop` words
+        between them: every spread of the slop over the junctions."""
+        words = run(n)
+        alternatives = []
+
+        def spread(i, left, parts):
+            if i == n - 1:
+                alternatives.append(''.join(parts) + words[-1])
+                return
+            for g in range(left + 1):
+                spread(i + 1, left - g, parts + [words[i] + gap(g) + ' '])
+
+        spread(0, slop, [])
+        return f'"{" ".join(words)}"~{slop}', '(' + '|'.join(alternatives) + ')'
+
+    shape = rng.choice(['sloppy', 'pinned', 'then', 'then', 'near'])
+    n = rng.choice([0, 1, 2, 3])
+    between = f'( {POSITIONAL_WORD}){{0,{n}}} '
+    if shape == 'sloppy':
+        tinql, regex = sloppy(rng.choice([3, 3, 4]), rng.choice([1, 2]))
+    elif shape == 'pinned':
+        tinql, regex = exact(rng.choice([3, 4]))
+        while '_' not in tinql:
+            tinql, regex = exact(rng.choice([3, 4]))
+    elif shape == 'then':
+        # THEN only caps its gap, so the tightest match inside any match
+        # passes too: any operands are exact.
+        left = exact(rng.choice([1, 2, 2, 3]))
+        right = exact(rng.choice([1, 2, 2, 3]))
+        tinql = f'{left[0]} THEN/{n} {right[0]}'
+        regex = f'{left[1]}{between}{right[1]}'
+    else:
+        # NEAR's operands may overlap, and an overlapping pair is a minimal
+        # interval no other pair around it can replace: operands of disjoint
+        # words, without gaps, never overlap.
+        left_words = distinct(rng.choice([1, 2, 2, 3]))
+        left = (left_words[0] if len(left_words) == 1 else f'"{" ".join(left_words)}"', ' '.join(left_words))
+        right = exact(rng.choice([1, 2, 2]), gaps=False, avoid=left_words)
+        tinql = f'{left[0]} NEAR/{n} {right[0]}'
+        regex = f'{left[1]}{between}{right[1]}|{right[1]}{between}{left[1]}'
+    predicate = f"body ~ {sql_literal(backslash + 'm(' + regex + ')' + backslash + 'M')}"
+    return Query(tinql, predicate, f'positional_{shape}')
+
+# --- end fix/ranked-correctness ---------------------------------------------------------
+
+
 def describe(spec):
-    return {k: v for k, v in spec.items() if k in ('scorer', 'limit', 'offset', 'join', 'extra', 'mode', 'isolation', 'oracle', 'custom', 'regex', 'chunks')} | {'tinql': spec['query'].tinql, 'shape': spec['query'].shape}
+    return {k: v for k, v in spec.items() if k in ('scorer', 'limit', 'offset', 'join', 'extra', 'mode', 'isolation', 'oracle', 'custom', 'regex', 'chunks', 'count',
+                                                'count_settings')} | {'tinql': spec['query'].tinql, 'shape': spec['query'].shape}
 
 
 def first_difference(actual, expected):

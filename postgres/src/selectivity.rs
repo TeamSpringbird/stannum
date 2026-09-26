@@ -76,7 +76,7 @@ pub unsafe fn estimate_query(index_oid: pg_sys::Oid, query: &str) -> Option<Esti
                 .map(|(index, dead)| {
                     let dead = dead
                         .as_ref()
-                        .map(|bytes| segment::postings::Postings::parse(bytes))
+                        .map(|bytes| segment::ordinals::Ordinals::parse(bytes))
                         .transpose();
                     dead.map(|dead| (&**index, dead))
                 })
