@@ -1,8 +1,12 @@
 ---
 status: accepted
-extends: 0002
+extends: 0003
 ---
 # Rank by document ordinal
+
+Implemented as `LSG5` and carried into `STN3`, where ranking by ordinal is the
+only ranked path and the TID postings and the `LSG4` readers mentioned below
+are gone.
 
 The pruned ranked walk still runs over TID-keyed postings. Profiled under the
 published mixed workload at eight clients on 15 million rows, more than half

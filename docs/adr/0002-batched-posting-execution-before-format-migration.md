@@ -1,7 +1,15 @@
 ---
-status: accepted
+status: superseded
+superseded-by: 0003
+extends: 0001
 ---
 # Batch posting execution before migrating the stored format
+
+Superseded by [ADR 0003](0003-address-postings-by-document-ordinal.md):
+instead of batching physical heap-page bitmaps, a term's documents became
+ordinals into the segment's document table, counted by folding ordinal
+chunks. This record is kept for its reasoning; the modules it names
+(`segment/src/postings.rs`, grouped TID postings) no longer exist.
 
 ## Decision
 
@@ -16,9 +24,9 @@ writer remain experimental until measured. TIN's published use of vectorization
 motivates this work but does not establish how much of its performance comes
 from SIMD or reveal its complete representation.
 
-## What exists today
+## What existed at the time
 
-`segment/src/postings.rs` chooses between sparse delta lists and grouped postings.
+`segment/src/postings.rs` (since removed) chose between sparse delta lists and grouped postings.
 A group covers 256 heap pages, with a 32-byte page-presence bitmap. A populated
 page uses either a list of offsets or a 37-byte tuple bitmap. The tuple bitmap
 has 291 usable bits, indexed by the one-based heap offset; padding is invalid.

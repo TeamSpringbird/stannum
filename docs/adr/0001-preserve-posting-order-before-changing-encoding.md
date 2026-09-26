@@ -1,7 +1,12 @@
 ---
 status: accepted
+superseded-in-part-by: 0003
 ---
 # Preserve posting order before changing encoding
+
+The merge algorithm decided here is current. The encoding decision to retain
+physical CTIDs was superseded by [ADR 0003](0003-address-postings-by-document-ordinal.md),
+which addresses postings by document ordinal.
 
 Segment merges will move toward a term-ordered merge of existing sorted postings,
 retaining physical PostgreSQL CTIDs and separate positional payloads. Prove this

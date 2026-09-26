@@ -1,8 +1,13 @@
 ---
 status: accepted
-supersedes: the "retain physical CTIDs" encoding decision of 0001
+supersedes: 0002, and the "retain physical CTIDs" encoding decision of 0001
 ---
 # Address postings by document ordinal
+
+Later formats carried this further: `STN3` stores a term's documents only as
+ordinals, and the TID postings this record keeps for ranked, positional and
+streaming scans are gone. See the
+[storage guide](../architecture/segmented-storage.md#why-this-layout).
 
 Boolean counts cost 35 to 60 ns per matching document on the full Wikipedia
 corpus, and 195 of the 302 published count queries match more than 100,000
@@ -28,7 +33,7 @@ prototype reached 26,407 QPS against 473 for main.
 ## Consequences
 
 - Segments grow by the ordinal area, until a later format drops TID postings
-  in favour of ordinals plus the document table. Earlier formats remain
+  in favor of ordinals plus the document table. Earlier formats remain
   readable and are counted the old way; REINDEX upgrades them.
 - Per-segment counts are summed, which relies on a location being live in one
   source only. The index checker already reports violations.
