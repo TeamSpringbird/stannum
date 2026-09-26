@@ -916,4 +916,37 @@ mod tests {
             );
         }
     }
+
+    /// Each regex is bounded on its own, and a query's regexes and
+    /// wildcards together: 10,000 of them, each within the bound, would
+    /// still take gigabytes.
+    #[test]
+    fn the_regexes_of_a_query_are_bounded_together() {
+        let lowered = |input: &str| {
+            let expr = super::super::subtokenize::sub_tokenize(parse(input), default_pipeline())
+                .expect("query should sub-tokenize");
+            lower(&expr)
+        };
+        // About 0.56 MB each.
+        let regexes = |count: usize| {
+            (0..count)
+                .map(|i| format!("MATCHES \\w{{10}}{i}"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        };
+        for query in [regexes(200), format!("({}) NEAR/5 x", regexes(200))] {
+            let Err(error) = lowered(&query) else {
+                panic!("{}...: should be refused", &query[..60]);
+            };
+            let error = error.to_string();
+            assert!(error.contains("regexes compile to more than"), "{error}");
+        }
+        assert!(lowered(&regexes(50)).is_ok());
+        // 10,000 wildcards are a few kilobytes each.
+        let wildcards = (0..10_000)
+            .map(|i| format!("w{i}*"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert!(lowered(&wildcards).is_ok());
+    }
 }

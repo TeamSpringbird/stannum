@@ -135,4 +135,36 @@ mod tests {
         assert_eq!(prefix(".*"), None); // empty prefix
         assert_eq!(prefix("fo?o.*"), None);
     }
+
+    /// A regex compiles to an automaton whose size its pattern decides:
+    /// `\w` is every Unicode word character, so `\w{100}` is some 5.6 MB,
+    /// and a query may name 10,000 regexes. One whose automaton is too
+    /// large is refused with an error naming the limit; the patterns
+    /// queries use stay far below it.
+    #[test]
+    fn oversized_regexes_are_refused() {
+        for pattern in [
+            r"\w{100}",
+            r"(?:\w{1,100}){1,10}",
+            r"[\p{L}]{200}",
+            ".{500}",
+        ] {
+            let error = CompiledRegex::new(pattern).expect_err(pattern).to_string();
+            assert!(
+                error.contains("compiles to more than"),
+                "{pattern}: {error}"
+            );
+        }
+        for pattern in [
+            "alp[a-z]*",
+            ".*a.*b.*c.*",
+            r"\w+",
+            r"\w{10}",
+            r"\w{20}\w*",
+            "(?:[a-z]{1,20}){1,20}",
+            ".{50}",
+        ] {
+            CompiledRegex::new(pattern).expect(pattern);
+        }
+    }
 }
