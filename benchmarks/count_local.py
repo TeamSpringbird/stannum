@@ -7,7 +7,9 @@
 
 Input is an existing headerless two-column Wikipedia CSV. Requires installed
 experimental Stannum and PostgreSQL tools in PATH. Serializes installation use
-with the shared local pgrx lock. This is a local diagnostic, not a capacity run.
+with the shared local pgrx lock (STANNUM_PGRX_LOCK, default
+/tmp/stannum-pgrx.lock, the same file script/pgrx-lock.py holds). This is a
+local diagnostic, not a capacity run.
 """
 import argparse
 import fcntl
@@ -21,6 +23,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+PGRX_LOCK = os.environ.get('STANNUM_PGRX_LOCK', '/tmp/stannum-pgrx.lock')
 
 
 def main():
@@ -50,7 +54,7 @@ def main():
     def sql(statement):
         return subprocess.check_output(['psql','-XqAt','-v','ON_ERROR_STOP=1','-c',statement],env=env,text=True).strip()
     save()
-    with open('/tmp/stannum-pgrx.lock','a') as lock, tempfile.TemporaryDirectory(prefix='stannum-local-count-') as temp:
+    with open(PGRX_LOCK,'a') as lock, tempfile.TemporaryDirectory(prefix='stannum-local-count-') as temp:
         fcntl.flock(lock,fcntl.LOCK_EX)
         data = Path(temp)/'data'
         try:
