@@ -190,7 +190,8 @@
   descent parser replaces the pest one, bounded to 1,000 nesting levels
   (1,000 nested parentheses take about 0.95 MiB of stack, where pest took
   4.5 MiB) and 10,000 terms; lowering bounds a span's nesting to 2,000
-  levels, and the extension's own query walks call `check_stack_depth`.
+  levels, and every recursive pass over a query calls `check_stack_depth`,
+  so a smaller stack ends in "stack depth limit exceeded" instead.
   PlanetScale TIN 1.0.3 answers 3,000 words or OR terms and 1,000 levels
   and crashes at 10,000 terms and 5,000 levels. `MATCHES` patterns scan in
   linear time (pest backtracked exponentially over unclosed groups) and the
