@@ -15,6 +15,8 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::limits::MAX_SPAN_NESTING;
+
 use super::{
     CompiledRegex, PositionFilterBound, Query, RangeBound, SimplificationProfile, SpanExpr,
     SpanPositionFilter, SpanTermSlot, simplify,
@@ -26,6 +28,12 @@ pub enum LowerError {
     MatchAllInSpanContext,
     #[error("{0}")]
     InvalidRegex(#[from] super::RegexError),
+    #[error(
+        "query nesting exceeds {limit} levels once lowered (a proximity operator or phrase \
+         nests one level per operand)",
+        limit = MAX_SPAN_NESTING
+    )]
+    NestingTooDeep,
 }
 
 pub fn lower(expr: &crate::Expr) -> Result<Query, LowerError> {
@@ -36,65 +44,57 @@ pub fn lower_with_profile(
     expr: &crate::Expr,
     profile: SimplificationProfile,
 ) -> Result<Query, LowerError> {
-    Ok(simplify(lower_boolean(expr)?, profile))
+    Ok(simplify(lower_boolean(expr, 1)?, profile))
 }
 
-fn lower_boolean(expr: &crate::Expr) -> Result<Query, LowerError> {
+/// Lowers `expr`, which sits `depth` levels deep in the lowered query.
+fn lower_boolean(expr: &crate::Expr, depth: usize) -> Result<Query, LowerError> {
+    crate::limits::check_stack();
     use crate::Expr;
 
+    // The parser bounds an expression's height, so this only guards callers
+    // that lower a tree built some other way.
+    if depth > MAX_SPAN_NESTING {
+        return Err(LowerError::NestingTooDeep);
+    }
+    let lower_all = |exprs: &[Expr]| {
+        exprs
+            .iter()
+            .map(|expr| lower_boolean(expr, depth + 1))
+            .collect::<Result<Vec<_>, _>>()
+    };
     match expr {
-        Expr::Term(s) => Ok(Query::Term(s.clone())),
-        Expr::MatchAll => Ok(Query::MatchAll),
-        // The canonical match-nothing query; simplify folds it out of
-        // enclosing boolean nodes without disturbing AT LEAST thresholds.
-        Expr::MatchNone => Ok(Query::Not(Box::new(Query::MatchAll))),
-        Expr::Fuzzy {
-            term,
-            prefix,
-            distance,
-        } => Ok(Query::Fuzzy {
-            term: term.clone(),
-            prefix: *prefix,
-            distance: *distance,
-        }),
-        Expr::Wildcard(parts) => Ok(Query::Regex(CompiledRegex::new(&wildcard_parts_regex(
-            parts,
-        ))?)),
-        Expr::Regex(pat) => Ok(Query::Regex(CompiledRegex::new(pat)?)),
-        Expr::Range { lower, upper } => Ok(Query::Range {
-            lower: convert_range_bound(lower),
-            upper: convert_range_bound(upper),
-        }),
-        Expr::And(l, r) => Ok(Query::Conjunction(vec![
-            lower_boolean(l)?,
-            lower_boolean(r)?,
-        ])),
-        Expr::Or(l, r) => Ok(Query::Disjunction {
+        Expr::Term(_)
+        | Expr::MatchAll
+        | Expr::MatchNone
+        | Expr::Fuzzy { .. }
+        | Expr::Wildcard(_)
+        | Expr::Regex(_)
+        | Expr::Range { .. } => lower_leaf(expr),
+        // A chain lowers to one flat node. The left-deep binary nodes the
+        // parser once built lowered to nested ones, which simplification
+        // flattened into exactly this.
+        Expr::And(operands) => Ok(Query::Conjunction(lower_all(operands)?)),
+        Expr::Or(operands) => Ok(Query::Disjunction {
             min: 1,
-            children: vec![lower_boolean(l)?, lower_boolean(r)?],
+            children: lower_all(operands)?,
         }),
         Expr::AndNot { positive, negative } => Ok(Query::Conjunction(vec![
-            lower_boolean(positive)?,
-            Query::Not(Box::new(lower_boolean(negative)?)),
+            lower_boolean(positive, depth + 1)?,
+            Query::Not(Box::new(lower_boolean(negative, depth + 2)?)),
         ])),
         Expr::Alternatives(xs) => Ok(Query::Disjunction {
             min: 1,
-            children: xs
-                .iter()
-                .map(lower_boolean)
-                .collect::<Result<Vec<_>, _>>()?,
+            children: lower_all(xs)?,
         }),
         Expr::AtLeast { threshold, exprs } => {
             let min = resolve_threshold(threshold, exprs.len());
-            let children = exprs
-                .iter()
-                .map(lower_boolean)
-                .collect::<Result<Vec<_>, _>>()?;
+            let children = lower_all(exprs)?;
             Ok(Query::Disjunction { min, children })
         }
         Expr::Boost { factor, inner } => Ok(Query::Boost {
             factor: factor.0,
-            inner: Box::new(lower_boolean(inner)?),
+            inner: Box::new(lower_boolean(inner, depth + 1)?),
         }),
         // A single-term phrase is just a term — no span machinery needed.
         Expr::Phrase { elements, .. }
@@ -120,12 +120,46 @@ fn lower_boolean(expr: &crate::Expr) -> Result<Query, LowerError> {
         | Expr::Last { .. }
         | Expr::Middle { .. }
         | Expr::Between { .. }
-        | Expr::Within { .. } => lower_as_span(expr),
+        | Expr::Within { .. } => lower_as_span(expr, depth),
     }
 }
 
-fn lower_as_span(expr: &crate::Expr) -> Result<Query, LowerError> {
-    let mut builder = SpanBuilder::new();
+/// Lowers a leaf. Out of line, so that compiling a regex does not weigh on
+/// every level of the recursion.
+#[inline(never)]
+fn lower_leaf(expr: &crate::Expr) -> Result<Query, LowerError> {
+    use crate::Expr;
+
+    match expr {
+        Expr::Term(s) => Ok(Query::Term(s.clone())),
+        Expr::MatchAll => Ok(Query::MatchAll),
+        // The canonical match-nothing query; simplify folds it out of
+        // enclosing boolean nodes without disturbing AT LEAST thresholds.
+        Expr::MatchNone => Ok(Query::Not(Box::new(Query::MatchAll))),
+        Expr::Fuzzy {
+            term,
+            prefix,
+            distance,
+        } => Ok(Query::Fuzzy {
+            term: term.clone(),
+            prefix: *prefix,
+            distance: *distance,
+        }),
+        Expr::Wildcard(parts) => Ok(Query::Regex(CompiledRegex::new(&wildcard_parts_regex(
+            parts,
+        ))?)),
+        Expr::Regex(pat) => Ok(Query::Regex(CompiledRegex::new(pat)?)),
+        Expr::Range { lower, upper } => Ok(Query::Range {
+            lower: convert_range_bound(lower),
+            upper: convert_range_bound(upper),
+        }),
+        _ => unreachable!("lower_leaf takes leaves"),
+    }
+}
+
+#[inline(never)]
+fn lower_as_span(expr: &crate::Expr, depth: usize) -> Result<Query, LowerError> {
+    let mut builder = SpanBuilder::new(depth);
     let span_expr = builder.lower_span_expr(expr)?;
     if let Some((span_query, position_filter)) = span_expr.to_fast_path_root() {
         Ok(Query::Span {
@@ -144,14 +178,59 @@ fn lower_as_span(expr: &crate::Expr) -> Result<Query, LowerError> {
 struct SpanBuilder {
     term_slots: Vec<SpanTermSlot>,
     intern_map: FxHashMap<SpanTermSlot, usize>,
+    /// Levels above the node being lowered, the query's included.
+    depth: usize,
 }
 
 impl SpanBuilder {
-    fn new() -> Self {
+    fn new(depth: usize) -> Self {
         Self {
             term_slots: Vec::new(),
             intern_map: FxHashMap::default(),
+            depth: depth.saturating_sub(1),
         }
+    }
+
+    /// Lowers `exprs` as operands nested `extra` levels below the node being
+    /// lowered (a left-deep chain puts its first operand deepest).
+    fn lower_nested(
+        &mut self,
+        exprs: &[crate::Expr],
+        extra: usize,
+    ) -> Result<Vec<SpanExpr>, LowerError> {
+        self.depth += extra;
+        let lowered = exprs
+            .iter()
+            .map(|expr| self.lower_span_expr(expr))
+            .collect();
+        self.depth -= extra;
+        lowered
+    }
+
+    /// The left-deep binary chain `node(node(a, b), c)` over `operands`,
+    /// the shape an AND or OR chain has always had inside a span: an
+    /// unordered conjunction's gaps and repeated-operand rules differ
+    /// between `(a b) c` and `a b c`, so it is not flattened.
+    fn lower_chain(
+        &mut self,
+        operands: &[crate::Expr],
+        node: fn(Vec<SpanExpr>) -> SpanExpr,
+    ) -> Result<SpanExpr, LowerError> {
+        let lowered = self.lower_nested(operands, operands.len().saturating_sub(2))?;
+        let mut lowered = lowered.into_iter();
+        let first = lowered.next().expect("a chain has operands");
+        Ok(lowered.fold(first, |acc, next| node(vec![acc, next])))
+    }
+
+    fn lower_span_expr(&mut self, expr: &crate::Expr) -> Result<SpanExpr, LowerError> {
+        crate::limits::check_stack();
+        self.depth += 1;
+        if self.depth > MAX_SPAN_NESTING {
+            return Err(LowerError::NestingTooDeep);
+        }
+        let lowered = self.lower_span_node(expr);
+        self.depth -= 1;
+        lowered
     }
 
     fn intern(&mut self, slot: SpanTermSlot) -> usize {
@@ -164,7 +243,28 @@ impl SpanBuilder {
         idx
     }
 
-    fn lower_span_expr(&mut self, expr: &crate::Expr) -> Result<SpanExpr, LowerError> {
+    fn lower_span_node(&mut self, expr: &crate::Expr) -> Result<SpanExpr, LowerError> {
+        use crate::Expr;
+
+        match expr {
+            Expr::Term(_)
+            | Expr::MatchAll
+            | Expr::MatchNone
+            | Expr::Fuzzy { .. }
+            | Expr::Wildcard(_)
+            | Expr::Regex(_)
+            | Expr::Range { .. }
+            | Expr::Phrase { .. } => self.lower_span_leaf(expr),
+            Expr::And(operands) => self.lower_chain(operands, SpanExpr::Unordered),
+            Expr::Or(operands) => self.lower_chain(operands, SpanExpr::Or),
+            _ => self.lower_span_operator(expr),
+        }
+    }
+
+    /// Lowers a leaf or a phrase. Out of line, so that compiling a regex
+    /// does not weigh on every level of the recursion.
+    #[inline(never)]
+    fn lower_span_leaf(&mut self, expr: &crate::Expr) -> Result<SpanExpr, LowerError> {
         use crate::Expr;
 
         match expr {
@@ -204,16 +304,15 @@ impl SpanBuilder {
                 Ok(SpanExpr::Term(idx))
             }
             Expr::Phrase { elements, slop } => self.lower_phrase(elements, *slop),
-            Expr::And(l, r) => {
-                let left = self.lower_span_expr(l)?;
-                let right = self.lower_span_expr(r)?;
-                Ok(SpanExpr::Unordered(vec![left, right]))
-            }
-            Expr::Or(l, r) => {
-                let left = self.lower_span_expr(l)?;
-                let right = self.lower_span_expr(r)?;
-                Ok(SpanExpr::Or(vec![left, right]))
-            }
+            _ => unreachable!("lower_span_leaf takes leaves and phrases"),
+        }
+    }
+
+    /// Lowers an operator other than an AND or OR chain.
+    fn lower_span_operator(&mut self, expr: &crate::Expr) -> Result<SpanExpr, LowerError> {
+        use crate::Expr;
+
+        match expr {
             Expr::AndNot { positive, negative } => {
                 let big = self.lower_span_expr(positive)?;
                 let little = self.lower_span_expr(negative)?;
@@ -341,6 +440,7 @@ impl SpanBuilder {
                 })
             }
             Expr::Boost { inner, .. } => self.lower_span_expr(inner),
+            _ => unreachable!("lower_span_node dispatches leaves and chains elsewhere"),
         }
     }
 
@@ -355,6 +455,31 @@ impl SpanBuilder {
         let mut children: Vec<(u32, SpanExpr)> = Vec::new();
         let mut pending_gap: u32 = 0;
 
+        // Levels the phrase's shape puts between it and its first word: two
+        // for a flat budgeted sequence, two per word when every gap is
+        // pinned in its own nested pair (see below).
+        let words = elements
+            .iter()
+            .filter(|elem| !matches!(elem, crate::PhraseElement::Gap(_)))
+            .count();
+        let interior_gap = elements
+            .iter()
+            .skip_while(|elem| matches!(elem, crate::PhraseElement::Gap(_)))
+            .scan(false, |gap_seen, elem| {
+                let pinned = *gap_seen && !matches!(elem, crate::PhraseElement::Gap(_));
+                *gap_seen |= matches!(elem, crate::PhraseElement::Gap(n) if *n > 0);
+                Some(pinned)
+            })
+            .any(|pinned| pinned);
+        let extra = match words {
+            0 | 1 => 0,
+            _ if interior_gap && slop.is_none() => 2 * (words - 1),
+            _ => 2,
+        };
+        if self.depth + extra + 1 > MAX_SPAN_NESTING {
+            return Err(LowerError::NestingTooDeep);
+        }
+
         for elem in elements {
             match elem {
                 crate::PhraseElement::Term(s) => {
@@ -366,10 +491,8 @@ impl SpanBuilder {
                     pending_gap = pending_gap.saturating_add(*n);
                 }
                 crate::PhraseElement::Alternatives(exprs) => {
-                    let alts = exprs
-                        .iter()
-                        .map(|e| self.lower_span_expr(e))
-                        .collect::<Result<Vec<_>, _>>()?;
+                    // One more level for the alternatives' OR.
+                    let alts = self.lower_nested(exprs, extra + 1)?;
                     children.push((pending_gap, SpanExpr::Or(alts)));
                     pending_gap = 0;
                 }

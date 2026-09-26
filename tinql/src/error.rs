@@ -35,4 +35,16 @@ pub enum ParseError {
         max = crate::ast::BoostFactor::MAX
     )]
     BoostOutOfRange { text: String, pos: usize },
+
+    #[error(
+        "query nesting exceeds {limit} levels (at byte {pos})",
+        limit = crate::limits::MAX_NESTING
+    )]
+    NestingTooDeep { pos: usize },
+
+    #[error(
+        "query has more than {limit} terms (at byte {pos})",
+        limit = crate::limits::MAX_TERMS
+    )]
+    TooManyTerms { pos: usize },
 }

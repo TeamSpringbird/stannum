@@ -138,6 +138,7 @@ impl Query {
     }
 
     fn estimate_selectivity(&self, n: f64, lookup: &dyn Fn(&str) -> u64, total_tuples: u64) -> f64 {
+        crate::limits::check_stack();
         if n <= 0.0 {
             return 0.0;
         }
@@ -238,6 +239,7 @@ impl Query {
     }
 
     fn collect_terms<'a>(&'a self, out: &mut Vec<&'a str>) {
+        crate::limits::check_stack();
         match self {
             Query::Term(s) => out.push(s),
             Query::Span { term_slots, .. } | Query::SpanExpr { term_slots, .. } => {

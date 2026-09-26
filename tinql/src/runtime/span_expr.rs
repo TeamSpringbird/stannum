@@ -150,6 +150,7 @@ impl SpanExpr {
     }
 
     fn to_fast_path_body(&self) -> Option<boldi_vigna::SpanQuery> {
+        crate::limits::check_stack();
         match self {
             Self::Empty => Some(boldi_vigna::SpanQuery::Empty),
             Self::Term(idx) => Some(boldi_vigna::SpanQuery::Term(*idx)),
@@ -243,6 +244,7 @@ impl SpanExpr {
     }
 
     pub fn resolve(&self, search_doc_len: u32) -> boldi_vigna::SpanQuery {
+        crate::limits::check_stack();
         match self {
             Self::Empty => boldi_vigna::SpanQuery::Empty,
             Self::Term(idx) => boldi_vigna::SpanQuery::Term(*idx),

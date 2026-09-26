@@ -137,6 +137,11 @@ are ordinary terms.
 
 An opening delimiter requires a matching closing delimiter.
 
+A query nests at most 1,000 levels deep (brackets inside brackets, or an
+operator applied to another operator's result; a chain such as `a b c` or
+`a OR b OR c` is one level however long it is) and names at most 10,000
+terms. A larger query is an error, not a partial search.
+
 ### Operators and modifiers
 
 | Character | Meaning | Context |

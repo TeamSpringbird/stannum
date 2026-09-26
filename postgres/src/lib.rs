@@ -16,6 +16,7 @@ mod highlight_udfs;
 mod match_positions;
 mod operator;
 pub(crate) mod options;
+mod query_limits;
 mod score;
 mod selectivity;
 mod storage;
@@ -25,8 +26,18 @@ mod tf_bucket {
 }
 mod udfs;
 
+/// The query front end's stack backstop (`tinql::limits::set_stack_check`):
+/// PostgreSQL's `check_stack_depth`, whose ERROR pgrx turns into a panic that
+/// unwinds out of the query pass and is raised again at the extension's
+/// boundary.
+fn check_stack_depth() {
+    // SAFETY: tinql runs only on the backend's own thread.
+    unsafe { pgrx::pg_sys::check_stack_depth() }
+}
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    tinql::limits::set_stack_check(check_stack_depth);
     options::init();
     storage::init();
     storage::wal::init();

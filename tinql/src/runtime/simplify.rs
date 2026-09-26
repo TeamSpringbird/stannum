@@ -106,6 +106,7 @@ pub fn all_terms_required_span_expr(span_expr: &SpanExpr) -> bool {
 }
 
 fn reduce_unscored_redundancy(query: Query) -> Query {
+    crate::limits::check_stack();
     match query {
         Query::And(left, right) => reduce_conjunction(vec![
             reduce_unscored_redundancy(*left),
@@ -262,6 +263,7 @@ fn positive_root(query: &Query) -> Option<&Query> {
 }
 
 fn implies(lhs: &Query, rhs: &Query) -> bool {
+    crate::limits::check_stack();
     if lhs == rhs {
         return true;
     }
@@ -551,6 +553,7 @@ fn simplify_boost(factor: f32, inner: Query) -> Query {
 }
 
 fn normalize_boolean_query(query: Query, profile: SimplificationProfile) -> Query {
+    crate::limits::check_stack();
     match query {
         Query::And(left, right) => normalize_conjunction(vec![*left, *right], profile),
         Query::Conjunction(children) => normalize_conjunction(children, profile),
