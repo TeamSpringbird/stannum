@@ -1,0 +1,187 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-26T19:18:38Z",
+  "suite_commit": "64b7f8e52b9f40be77c6a1a34a5ea695d4866cf8",
+  "runner_version": "1"
+ },
+ "cases": [
+  {
+   "id": "catalog.K-01",
+   "captures": {
+    "value": [
+     "3.14",
+     "can't",
+     "wi",
+     "fi",
+     "example.com",
+     "e",
+     "mail",
+     "u.s.a",
+     "1,000",
+     "foo_bar",
+     "user",
+     "tag"
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-02",
+   "captures": {
+    "value": [
+     "stra\u00dfe",
+     "strasse",
+     "istanbul",
+     "\u03c3\u03b9\u03c3\u03c5\u03c6\u03bf\u03c3"
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-03",
+   "captures": {
+    "value": [
+     "jalapeno",
+     "\ufb01ne",
+     "\uff46\uff55\uff4c\uff4c",
+     "\u2460",
+     "x",
+     "\u00b2"
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-04",
+   "captures": {
+    "nfd": [
+     1
+    ],
+    "unaccented": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-05",
+   "captures": {
+    "grinning": [
+     1
+    ],
+    "zwj_sequence": [
+     1
+    ],
+    "graphemes_emoji": [
+     "i",
+     "\u2764",
+     "\ud83d\ude00",
+     "\ud83d\udc69\u200d\ud83d\udcbb",
+     "\ud83c\uddfa\ud83c\uddf8"
+    ],
+    "graphemes_retain": [
+     "i",
+     "\u2764",
+     "\ud83d\ude00",
+     "\ud83d\udc69\u200d\ud83d\udcbb",
+     "\ud83c\uddfa\ud83c\uddf8"
+    ],
+    "graphemes_discard": [
+     "i"
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-06",
+   "captures": {
+    "value": [
+     "\u6771",
+     "\u4eac",
+     "\u30bf\u30ef\u30fc",
+     "\u3072",
+     "\u3089",
+     "\u304b",
+     "\u306a",
+     "\ud55c\uad6d\uc5b4"
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-07",
+   "captures": {
+    "phrase": [
+     1
+    ],
+    "ideograph": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-08",
+   "captures": {
+    "value": [
+     "hello,",
+     "world!",
+     "wi-fi"
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-09",
+   "captures": {
+    "ids": []
+   }
+  },
+  {
+   "id": "catalog.K-10",
+   "captures": {
+    "split": [
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "truncate": [
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "discard": null,
+    "max_token_bytes_3": {
+     "sqlstate": "XX000",
+     "message": "max_token_bytes must be between 4 and 2692"
+    }
+   }
+  },
+  {
+   "id": "catalog.K-11",
+   "captures": {
+    "preserve": [],
+    "collapse": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "catalog.K-12",
+   "captures": {
+    "custom_scan_on": [
+     2
+    ],
+    "custom_scan_off": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "queries targeting a tin index with non-default tokenization require a usable tin custom scan path"
+     }
+    }
+   }
+  },
+  {
+   "id": "catalog.K-13",
+   "captures": {
+    "icu": {
+     "sqlstate": "XX000",
+     "message": "invalid tokenizer value \"icu\"; expected unicode or whitespace"
+    },
+    "null_rows": 0
+   }
+  }
+ ]
+}

@@ -1,0 +1,123 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.count
+description: count(*), ==> with ANY and NULL, visibility and prepared statements. Encoded from docs/tin-behavior-catalog.md
+  section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine's answers
+  are recorded yet.
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_n01:
+    setup_sql: ['INSERT INTO {table} SELECT n, CASE WHEN n % 2 = 0 THEN ''x y'' || n ELSE ''y'' || n END FROM generate_series(1,
+        100) n']
+  cat_n02:
+    setup_sql: ['INSERT INTO {table} SELECT n, CASE WHEN n % 2 = 0 THEN ''x y'' || n ELSE ''y'' || n END FROM generate_series(1,
+        100) n']
+  cat_n03:
+    rows:
+    - [1, a]
+    - [2, b]
+  cat_n04:
+    rows:
+    - [1, apple]
+    - [2, grape]
+    - [3, null]
+  cat_n06:
+    rows:
+    - [1, a]
+  cat_n07:
+    rows:
+    - [1, a]
+    - [2, b]
+cases:
+- id: catalog.N-01
+  description: count(*) stays exact after DELETE and after VACUUM.
+  source: docs/tin-behavior-catalog.md §9 N-01; behaviour §6 C4
+  corpus: cat_n01
+  capture:
+  - script:
+      steps:
+      - {sql: 'SELECT count(*) FROM {table} WHERE body ==> ''x'''}
+      - {sql: 'DELETE FROM {table} WHERE id <= 20 AND id % 2 = 0', capture: false}
+      - {sql: 'SELECT count(*) FROM {table} WHERE body ==> ''x'''}
+      - {sql: 'VACUUM {table}', capture: false}
+      - {sql: 'SELECT count(*) FROM {table} WHERE body ==> ''x'''}
+- id: catalog.N-02
+  description: count(*) with and without the count pushdown.
+  source: docs/tin-behavior-catalog.md §9 N-02; behaviour §6 C4
+  corpus: cat_n02
+  capture:
+  - count: {query: x, as: pushdown}
+  - count:
+      query: x
+      as: no_pushdown
+      settings: {'{engine}.debug_disable_count_pushdown': 'on'}
+- id: catalog.N-03
+  description: OR with a btree predicate returns the union without duplicates.
+  source: docs/tin-behavior-catalog.md §9 N-03; behaviour §6 C3
+  corpus: cat_n03
+  capture:
+  - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE body ==> ''a'' OR id = 1', as: same_row}
+  - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE body ==> ''a'' OR id = 2', as: other_row}
+- id: catalog.N-04
+  description: ==> ANY(array), with a NULL element and with an empty array.
+  source: docs/tin-behavior-catalog.md §9 N-04; behaviour §6 C2
+  corpus: cat_n04
+  capture:
+  - value: {sql: 'SELECT coalesce(json_agg(id ORDER BY id), ''[]'') FROM {table} WHERE body ==> ANY(ARRAY[''apple'',
+        ''grape''])', as: any}
+  - value: {sql: 'SELECT coalesce(json_agg(id ORDER BY id), ''[]'') FROM {table} WHERE body ==> ANY(ARRAY[''apple'',
+        NULL])', as: any_null_element}
+  - value: {sql: 'SELECT coalesce(json_agg(id ORDER BY id), ''[]'') FROM {table} WHERE body ==> ANY(''{}''::text[])',
+      as: any_empty}
+- id: catalog.N-05
+  description: NULL on either side of ==>.
+  source: docs/tin-behavior-catalog.md §9 N-05; behaviour §6 C9, §6 C10
+  priority: edge
+  corpus: cat_n04
+  capture:
+  - value: {sql: 'SELECT NULL::text ==> ''a''', as: null_document}
+  - value: {sql: 'SELECT ''a'' ==> NULL::text', as: null_query}
+  - value: {sql: 'SELECT coalesce(json_agg(id ORDER BY id), ''[]'') FROM {table} WHERE body ==> NULL', as: where_null}
+- id: catalog.N-06
+  description: An uncommitted insert is invisible to another session and visible to its own.
+  source: docs/tin-behavior-catalog.md §9 N-06; behaviour §6 C11
+  corpus: cat_n06
+  capture:
+  - script:
+      steps:
+      - {session: a, sql: BEGIN, capture: false}
+      - {session: a, sql: 'INSERT INTO {table} VALUES (2, ''zz'')', capture: false}
+      - {session: b, sql: 'SELECT count(*) FROM {table} WHERE body ==> ''zz'''}
+      - {session: a, sql: 'SELECT count(*) FROM {table} WHERE body ==> ''zz'''}
+      - {session: a, sql: ROLLBACK, capture: false}
+      - {session: b, sql: 'SELECT count(*) FROM {table} WHERE body ==> ''zz'''}
+- id: catalog.N-07
+  description: A prepared statement gives the same ids under generic and custom plans.
+  source: docs/tin-behavior-catalog.md §9 N-07; behaviour §6 C1
+  corpus: cat_n07
+  capture:
+  - script:
+      steps:
+      - {sql: SET plan_cache_mode = force_generic_plan, capture: false}
+      - {sql: 'PREPARE p(text) AS SELECT coalesce(json_agg(id ORDER BY id), ''[]'') FROM {table} WHERE body ==>
+          $1', capture: false}
+      - {sql: EXECUTE p('a')}
+      - {sql: EXECUTE p('b')}
+      - {sql: EXECUTE p('a')}
+      - {sql: EXECUTE p('b')}
+      - {sql: EXECUTE p('a')}
+      - {sql: EXECUTE p('b')}
+      - {sql: DEALLOCATE p, capture: false}
+      - {sql: SET plan_cache_mode = force_custom_plan, capture: false}
+      - {sql: 'PREPARE p(text) AS SELECT coalesce(json_agg(id ORDER BY id), ''[]'') FROM {table} WHERE body ==>
+          $1', capture: false}
+      - {sql: EXECUTE p('a')}
+      - {sql: EXECUTE p('b')}
+      - {sql: EXECUTE p('a')}
+      - {sql: EXECUTE p('b')}
+      - {sql: EXECUTE p('a')}
+      - {sql: EXECUTE p('b')}
+      - {sql: DEALLOCATE p, capture: false}

@@ -1,0 +1,89 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.alternatives
+description: '[...] alternatives, AT LEAST and ALL OF. Encoded from docs/tin-behavior-catalog.md section 9 (compiled
+  2026-09-26); each case cites its catalog row and the behaviour it tests. No engine''s answers are recorded yet.'
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_a01:
+    rows:
+    - [1, beer]
+    - [2, wine]
+    - [3, beer wine]
+    - [4, water]
+  cat_a03:
+    rows:
+    - [1, '47,000']
+    - [2, '48,000']
+  cat_a04:
+    rows:
+    - [1, a]
+    - [2, a b]
+    - [3, a b c]
+    - [4, a b c d]
+  cat_a05:
+    rows:
+    - [1, a]
+    - [2, a b]
+    - [3, a b c]
+  cat_a08:
+    rows:
+    - [1, a b]
+    - [2, c]
+cases:
+- id: catalog.A-01
+  description: '[a b] is an OR of its elements.'
+  source: docs/tin-behavior-catalog.md §9 A-01; behaviour §1.4 A1
+  corpus: cat_a01
+  capture:
+  - ids: {query: '[beer wine]'}
+- id: catalog.A-02
+  description: 'Commas inside [...]: separators (Lead) or not (product docs)?'
+  source: docs/tin-behavior-catalog.md §9 A-02; behaviour §1.4 A2; §8 conflict 2
+  priority: conflict
+  corpus: cat_a01
+  capture:
+  - ids: {query: '[beer,wine]', as: comma}
+  - ids: {query: '[beer, wine]', as: comma_space}
+- id: catalog.A-03
+  description: A comma between digits inside [...].
+  source: docs/tin-behavior-catalog.md §9 A-03; behaviour §1.4 A2
+  corpus: cat_a03
+  capture:
+  - ids: {query: '[47,000 48,000]'}
+- id: catalog.A-04
+  description: AT LEAST N OF needs N elements.
+  source: docs/tin-behavior-catalog.md §9 A-04; behaviour §1.4 A5
+  corpus: cat_a04
+  capture:
+  - ids: {query: 'AT LEAST 2 OF [a b c d]'}
+- id: catalog.A-05
+  description: AT LEAST N% OF rounds the needed count up.
+  source: docs/tin-behavior-catalog.md §9 A-05; behaviour §1.4 A6
+  corpus: cat_a05
+  capture:
+  - ids: {query: 'AT LEAST 50% OF [a b c]', as: pct_50}
+  - ids: {query: 'AT LEAST 34% OF [a b c]', as: pct_34}
+  - ids: {query: 'AT LEAST 33% OF [a b c]', as: pct_33}
+- id: catalog.A-06
+  description: ALL OF needs every element.
+  source: docs/tin-behavior-catalog.md §9 A-06; behaviour §1.4 A7
+  corpus: cat_a05
+  capture:
+  - ids: {query: 'ALL OF [a b c]'}
+- id: catalog.A-07
+  description: 'AT LEAST more than the elements, and AT LEAST 0: rows or error.'
+  source: docs/tin-behavior-catalog.md §9 A-07; behaviour §1.4 A8
+  corpus: cat_a05
+  capture:
+  - ids: {query: 'AT LEAST 5 OF [a b]', as: more_than_elements}
+  - ids: {query: 'AT LEAST 0 OF [a b]', as: zero}
+- id: catalog.A-08
+  description: Explicit AND inside brackets; no implicit AND there.
+  source: docs/tin-behavior-catalog.md §9 A-08; behaviour §1.4 A4
+  corpus: cat_a08
+  capture:
+  - ids: {query: '[a AND b c]'}

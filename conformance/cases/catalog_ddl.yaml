@@ -1,0 +1,131 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.ddl
+description: Index creation, options and settings. Encoded from docs/tin-behavior-catalog.md section 9 (compiled
+  2026-09-26); each case cites its catalog row and the behaviour it tests. No engine's answers are recorded yet.
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_i01:
+    rows:
+    - [1, apple]
+  cat_i03:
+    columns: id int PRIMARY KEY, body text, data jsonb
+    setup_sql: ['INSERT INTO {table} VALUES (1, ''x y'', ''{"title": "x y"}''), (2, ''z'', ''{"title": "z"}'')']
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}((data->>''title''))']
+  cat_i04:
+    columns: id int PRIMARY KEY, body text, active bool NOT NULL DEFAULT true
+    rows:
+    - [1, x]
+    - [2, x]
+    - [3, y]
+    setup_sql: ['UPDATE {table} SET active = false WHERE id = 2']
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}(body) WHERE active']
+  cat_i05:
+    rows:
+    - [1, apple]
+    - [2, Apple]
+    setup_sql: [CREATE EXTENSION IF NOT EXISTS citext, 'ALTER TABLE {table} ALTER COLUMN body TYPE citext']
+  cat_i06:
+    rows:
+    - [1, Apple]
+    - [2, grape]
+    index_sql: []
+cases:
+- id: catalog.I-01
+  description: 'Only one text column: two columns, or an int column, are errors.'
+  source: docs/tin-behavior-catalog.md §9 I-01; behaviour §5 I1
+  corpus: cat_i01
+  capture:
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(id, body)', as: two_columns}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(id)', as: int_column}
+- id: catalog.I-02
+  description: 'Every WITH option at its endpoints and one step outside: accepted or an error.'
+  source: docs/tin-behavior-catalog.md §9 I-02; behaviour §5 I4
+  corpus: cat_i01
+  capture:
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (k1 = 0)', as: k1=0}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (k1 = 10000)', as: k1=10000}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (k1 = -1)', as: k1=-1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (k1 = 10001)', as: k1=10001}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (b = 0)', as: b=0}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (b = 1)', as: b=1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (b = -0.1)', as: b=-0.1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (b = 1.1)', as: b=1.1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (max_token_bytes = 4)', as: max_token_bytes=4}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (max_token_bytes = 2692)', as: max_token_bytes=2692}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (max_token_bytes = 3)', as: max_token_bytes=3}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (max_token_bytes = 2693)', as: max_token_bytes=2693}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (initial_segment_count = 1)', as: initial_segment_count=1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (initial_segment_count = 4096)', as: initial_segment_count=4096}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (initial_segment_count = 0)', as: initial_segment_count=0}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (initial_segment_count = 4097)', as: initial_segment_count=4097}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (target_segment_count = 1)', as: target_segment_count=1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (target_segment_count = 4096)', as: target_segment_count=4096}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (target_segment_count = 0)', as: target_segment_count=0}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (target_segment_count = 4097)', as: target_segment_count=4097}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (max_mutable_segment_size = 131072)', as: max_mutable_segment_size=131072}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (max_mutable_segment_size = 131071)', as: max_mutable_segment_size=131071}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (max_merged_segment_size = 100)', as: max_merged_segment_size=100}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (max_merged_segment_size = 99)', as: max_merged_segment_size=99}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (dead_percent_threshold = 0)', as: dead_percent_threshold=0}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (dead_percent_threshold = 1)', as: dead_percent_threshold=1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (dead_percent_threshold = -0.1)', as: dead_percent_threshold=-0.1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (dead_percent_threshold = 1.1)', as: dead_percent_threshold=1.1}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (tokenizer = ''unicode'')', as: tokenizer=unicode}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (tokenizer = ''whitespace'')', as: tokenizer=whitespace}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (tokenizer = ''icu'')', as: tokenizer=icu}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (case_folding = ''fold'')', as: case_folding=fold}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (case_folding = ''preserve'')', as: case_folding=preserve}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (case_folding = ''upper'')', as: case_folding=upper}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (accent_folding = ''fold'')', as: accent_folding=fold}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (accent_folding = ''preserve'')', as: accent_folding=preserve}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (accent_folding = ''strip'')', as: accent_folding=strip}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (long_tokens = ''split'')', as: long_tokens=split}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (long_tokens = ''truncate'')', as: long_tokens=truncate}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (long_tokens = ''discard'')', as: long_tokens=discard}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (long_tokens = ''wrap'')', as: long_tokens=wrap}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (graphemes = ''emoji'')', as: graphemes=emoji}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (graphemes = ''retain'')', as: graphemes=retain}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (graphemes = ''discard'')', as: graphemes=discard}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (graphemes = ''all'')', as: graphemes=all}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (position_gaps = ''preserve'')', as: position_gaps=preserve}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (position_gaps = ''collapse'')', as: position_gaps=collapse}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (position_gaps = ''keep'')', as: position_gaps=keep}
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (score_stop_words = ''the, a'')', as: 'score_stop_words=the,
+        a'}
+- id: catalog.I-03
+  description: An expression index answers the repeated expression; the plain column is a filter.
+  source: docs/tin-behavior-catalog.md §9 I-03; behaviour §5 I2
+  corpus: cat_i03
+  capture:
+  - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE (data->>''title'') ==> ''x''', as: expression}
+  - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE body ==> ''x''', as: column}
+- id: catalog.I-04
+  description: A partial index, with its predicate implied and not.
+  source: docs/tin-behavior-catalog.md §9 I-04; behaviour §5 I2
+  corpus: cat_i04
+  capture:
+  - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE active AND body ==> ''x''', as: implied}
+  - value: {sql: 'SELECT json_agg(id ORDER BY id) FROM {table} WHERE body ==> ''x''', as: not_implied}
+- id: catalog.I-05
+  description: An index on a citext column.
+  source: docs/tin-behavior-catalog.md §9 I-05; behaviour §5 I1
+  corpus: cat_i05
+  capture:
+  - ids: {query: APPLE}
+- id: catalog.I-06
+  description: Without an index, ==> is an ordinary filter with the default tokenizer.
+  source: docs/tin-behavior-catalog.md §9 I-06; behaviour §5 I6
+  corpus: cat_i06
+  capture:
+  - ids:
+      query: apple
+      settings: {enable_seqscan: 'on'}
+- id: catalog.I-07
+  description: A session SET of maintenance_jobs_per_db is rejected.
+  source: docs/tin-behavior-catalog.md §9 I-07; behaviour §5 I9
+  capture:
+  - error: {sql: 'SET {engine}.maintenance_jobs_per_db = 1'}

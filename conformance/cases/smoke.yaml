@@ -1,0 +1,113 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: smoke
+description: >
+  Basic behaviour every engine of the interface should share: terms,
+  implicit AND, OR, NOT, phrases, prefix wildcards, boosts, count, top-k
+  order and highlighting. No TIN answers are recorded yet.
+
+defaults:
+  corpus: drinks
+  settings:
+    enable_seqscan: "off"
+  capture: [ids, count]
+
+corpora:
+  drinks:
+    description: Eight short documents about drinks.
+    rows:
+      - [1, craft beer and wine]
+      - [2, wine only]
+      - [3, beer bud light]
+      - [4, stout beer from the brewery]
+      - [5, "brewing notes: hops and malt"]
+      - [6, the craft of wine making]
+      - [7, beer beer beer]
+      - [8, Cider]
+
+cases:
+  - id: smoke.term.single
+    description: One term matches every document containing it.
+    query: beer
+  - id: smoke.term.case_folding
+    description: The default tokenizer folds case, in the query and in the documents.
+    query: CIDER
+  - id: smoke.term.no_match
+    description: A term in no document matches nothing.
+    query: mead
+  - id: smoke.and.implicit
+    description: Adjacent terms are combined with AND.
+    query: craft beer
+  - id: smoke.and.explicit
+    description: Explicit AND.
+    query: craft AND wine
+  - id: smoke.or.terms
+    description: OR of two terms.
+    query: cider OR stout
+  - id: smoke.or.precedence
+    description: AND binds tighter than OR, and implicit AND follows the same rule.
+    query: craft beer OR cider
+  - id: smoke.not.and_not
+    description: AND NOT excludes documents with the term.
+    query: beer AND NOT bud
+  - id: smoke.group.parentheses
+    description: Parentheses group an OR under an AND.
+    query: (cider OR stout) AND beer
+  - id: smoke.phrase.adjacent
+    description: A phrase matches its terms adjacent and in order.
+    query: '"craft beer"'
+  - id: smoke.phrase.reversed
+    description: A phrase does not match its terms in the other order.
+    query: '"beer craft"'
+  - id: smoke.prefix.trailing
+    description: A trailing wildcard matches every term with the prefix.
+    query: brew*
+  - id: smoke.near.either_order
+    description: NEAR/N matches within N positions in either order.
+    query: wine NEAR/3 craft
+  - id: smoke.boost.zero_still_matches
+    description: A zero boost removes the score contribution but keeps the match.
+    query: beer^0
+    capture: [ids]
+  - id: smoke.boost.reorders
+    description: Boosting one side of an OR ranks its documents first.
+    query: wine OR stout^5
+    capture:
+      - ranked: {k: 10}
+  - id: smoke.count.or_all
+    description: count(*) over a query matching most documents.
+    query: beer OR wine OR cider
+    capture: [count]
+  - id: smoke.ranked.term_frequency
+    description: The document repeating the term ranks first; ties are listed by id.
+    query: beer
+    capture:
+      - ranked: {k: 10}
+  - id: smoke.ranked.limit
+    description: Top two by score through the ranked scan.
+    query: beer
+    capture:
+      - ranked: {k: 2}
+  - id: smoke.scores.bits
+    description: BM25 scores, bit for bit, with the default parameters.
+    query: beer
+    capture: [scores]
+  - id: smoke.highlight.default
+    description: highlight() wraps the matched terms of the row's own query in <b></b>.
+    query: beer
+    capture: [highlight]
+  - id: smoke.highlight.markers
+    description: highlight() with explicit markers and query, outside any scan.
+    capture:
+      - value:
+          sql: "SELECT {engine}.highlight('Beer and wine', '[', ']', query => 'beer')"
+  - id: smoke.error.unterminated_phrase
+    description: An unterminated phrase is a query syntax error.
+    query: '"craft beer'
+    capture: [error]
+  - id: smoke.error.missing_operand
+    description: A dangling OR is a query syntax error.
+    query: beer OR
+    capture: [error]

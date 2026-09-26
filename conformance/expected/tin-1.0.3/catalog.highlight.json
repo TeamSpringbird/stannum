@@ -1,0 +1,191 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-26T19:18:38Z",
+  "suite_commit": "64b7f8e52b9f40be77c6a1a34a5ea695d4866cf8",
+  "runner_version": "1"
+ },
+ "cases": [
+  {
+   "id": "catalog.H-01",
+   "captures": {
+    "highlight": [
+     [
+      1,
+      "I like <b>apple</b> pie"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.H-02",
+   "captures": {
+    "value": "b <b>a</b> <b>b</b>"
+   }
+  },
+  {
+   "id": "catalog.H-03",
+   "captures": {
+    "highlight": [
+     [
+      1,
+      "<b>Fuji, apple</b>!"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.H-04",
+   "captures": {
+    "terms": [
+     [
+      1,
+      "<b>fuji</b> <b>apple</b>"
+     ]
+    ],
+    "overlap": [
+     [
+      1,
+      "<b>fuji apple</b>"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.H-05",
+   "captures": {
+    "value": "send <b title=\"MATCHES email.*\">email</b> now"
+   }
+  },
+  {
+   "id": "catalog.H-06",
+   "captures": {
+    "highlight": [
+     [
+      1,
+      "<i class=\"apple\" title=\"apple\">Apple</i> <i class=\"qpart-3d\" title=\"3d\">3d</i> <i class=\"cafe\" title=\"cafe\">caf\u00e9</i> <i class=\"apple phrase-fuji-apple\" title=\"PHRASE(&quot;fuji apple&quot;); apple\">fuji apple</i>"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.H-07",
+   "captures": {
+    "highlight": [
+     [
+      1,
+      "<script><b>apple</b></script> & \"x\""
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.H-08",
+   "captures": {
+    "null_text": null,
+    "no_binding": "x",
+    "invalid_query": "a b"
+   }
+  },
+  {
+   "id": "catalog.H-09",
+   "captures": {
+    "red": [
+     [
+      1,
+      "1b5b313b33316d7265641b5b306d206170706c65"
+     ]
+    ],
+    "apple": [
+     [
+      1,
+      "726564201b5b313b33346d6170706c651b5b306d"
+     ],
+     [
+      2,
+      "66756a69201b5b313b33346d6170706c651b5b306d"
+     ]
+    ],
+    "phrase": [
+     [
+      2,
+      "1b5b39373b3130346d66756a69206170706c651b5b306d"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.H-10",
+   "captures": {
+    "wrap_10": [
+     [
+      1,
+      "6f6e652074776f0a746872656520666f75720a66697665201b5b313b33346d6170706c651b5b306d"
+     ]
+    ],
+    "wrap_0": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "wrap_to must be positive"
+     }
+    },
+    "wrap_neg_1": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "wrap_to must be positive"
+     }
+    }
+   }
+  },
+  {
+   "id": "catalog.H-11",
+   "captures": {
+    "highlight": [
+     [
+      1,
+      "caf\u00e9 \ud83d\ude00 <b>na\u00efve</b>"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.H-12",
+   "captures": {
+    "returning": "<b>urgent</b> x",
+    "cte": "<b>urgent</b> x",
+    "subquery": "<b>urgent</b> x"
+   }
+  },
+  {
+   "id": "catalog.H-13",
+   "captures": {
+    "and_not": [
+     [
+      1,
+      "<b>a</b> b c"
+     ]
+    ],
+    "encloses": [
+     [
+      1,
+      "<b>a b c</b>"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.H-14",
+   "captures": {
+    "highlight": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "implicit tin.highlight() is not supported with non-default index tokenization; pass the query explicitly or omit highlighting"
+     }
+    }
+   }
+  }
+ ]
+}

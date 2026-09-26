@@ -1,0 +1,77 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.topk
+description: ORDER BY score LIMIT k, ties, paging, filters and LATERAL. Encoded from docs/tin-behavior-catalog.md
+  section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine's answers
+  are recorded yet.
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_t01:
+    pad: 90
+    setup_sql: ['INSERT INTO {table} SELECT n, rtrim(repeat(''w '', n)) FROM generate_series(1, 20) n']
+  cat_t02:
+    pad: 90
+    setup_sql: ['INSERT INTO {table} SELECT n, ''w'' FROM generate_series(1, 10) n']
+  cat_t04:
+    columns: id int PRIMARY KEY, body text, ups int NOT NULL DEFAULT 1
+    pad: 90
+    setup_sql: ['INSERT INTO {table} (id, body) SELECT n, rtrim(repeat(''w '', n)) FROM generate_series(1, 20) n',
+      'UPDATE {table} SET ups = 0 WHERE id IN (20, 10, 5, 11, 12)']
+  cat_t06:
+    pad: 90
+    rows:
+    - [1, rust rust rust]
+    - [2, rust rust x]
+    - [3, rust x y]
+    - [4, python python x]
+    - [5, python x y]
+    - [6, python y z]
+    setup_sql: ['CREATE TABLE {table}_authors (id int PRIMARY KEY, topic text)', 'INSERT INTO {table}_authors VALUES
+        (1, ''rust''), (2, ''python'')']
+cases:
+- id: catalog.T-01
+  description: Top-k with LIMIT equals the head of the full ordering.
+  source: docs/tin-behavior-catalog.md §9 T-01; behaviour §6 C5
+  corpus: cat_t01
+  capture:
+  - ranked: {query: w, score: '{engine}.full_score(ctid)', k: 5, as: limit_5}
+  - ranked: {query: w, score: '{engine}.full_score(ctid)', k: 100, as: all}
+- id: catalog.T-02
+  description: 'Ten equal scores under LIMIT 3: which rows come back?'
+  source: docs/tin-behavior-catalog.md §9 T-02; behaviour §3 S27
+  corpus: cat_t02
+  capture:
+  - ranked: {query: w, score: '{engine}.full_score(ctid)', k: 3}
+- id: catalog.T-03
+  description: LIMIT/OFFSET paging with an id tiebreak equals a slice of the full ordering.
+  source: docs/tin-behavior-catalog.md §9 T-03; behaviour §6 C6
+  corpus: cat_t01
+  capture:
+  - value: {sql: 'SELECT json_agg(id) FROM (SELECT id FROM {table} WHERE body ==> ''w'' ORDER BY {engine}.full_score(ctid)
+        DESC, id LIMIT 3 OFFSET 3) page'}
+- id: catalog.T-04
+  description: 'A filter on an unindexed column must not stop top-k from filling k: ups = 0 on ids 20, 10, 5, 11
+    and 12, the top five of T-01''s full_score order (TF buckets make it non-monotonic).'
+  source: docs/tin-behavior-catalog.md §9 T-04; behaviour §6 C7
+  corpus: cat_t04
+  capture:
+  - value: {sql: 'SELECT json_agg(id) FROM (SELECT id FROM {table} WHERE body ==> ''w'' AND ups > 0 ORDER BY {engine}.full_score(ctid)
+        DESC LIMIT 3) top'}
+- id: catalog.T-05
+  description: The pruned LIMIT 1 at k1 = 0 returns the exhaustive top (the M-BEH corpus).
+  source: docs/tin-behavior-catalog.md §9 T-05; behaviour §3 S27, §6 C5
+  corpus: w10
+  capture:
+  - ranked: {query: w, score: '{engine}.full_score(ctid, 0::real, 0.75::real)', k: 1, as: limit_1}
+  - scores: {query: w, score: '{engine}.full_score(ctid, 0::real, 0.75::real)', as: bits}
+- id: catalog.T-06
+  description: A correlated LATERAL top-2 per outer row.
+  source: docs/tin-behavior-catalog.md §9 T-06; behaviour §6 C8
+  corpus: cat_t06
+  capture:
+  - value: {sql: 'SELECT json_agg(json_build_array(a.id, p.id) ORDER BY a.id, p.id) FROM {table}_authors a CROSS
+        JOIN LATERAL (SELECT id FROM {table} WHERE body ==> a.topic ORDER BY {engine}.score(ctid) DESC LIMIT 2)
+        p'}

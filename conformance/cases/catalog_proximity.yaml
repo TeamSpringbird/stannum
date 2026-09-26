@@ -1,0 +1,69 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.proximity
+description: THEN/N, NEAR/N and WITHIN. Encoded from docs/tin-behavior-catalog.md section 9 (compiled 2026-09-26);
+  each case cites its catalog row and the behaviour it tests. No engine's answers are recorded yet.
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_x01:
+    rows:
+    - [1, a b]
+    - [2, a x b]
+    - [3, b a]
+    - [4, a x y b]
+  cat_x05:
+    rows:
+    - [1, a b]
+    - [2, a x b]
+  cat_x06:
+    rows:
+    - [1, a]
+    - [2, a x a]
+cases:
+- id: catalog.X-01
+  description: THEN/N is ordered; N counts the words allowed between.
+  source: docs/tin-behavior-catalog.md §9 X-01; behaviour §1.5 X2
+  corpus: cat_x01
+  capture:
+  - ids: {query: a THEN/0 b, as: then_0}
+  - ids: {query: a THEN/1 b, as: then_1}
+- id: catalog.X-02
+  description: NEAR/N matches either order.
+  source: docs/tin-behavior-catalog.md §9 X-02; behaviour §1.5 X3
+  corpus: cat_x01
+  capture:
+  - ids: {query: a NEAR/0 b, as: near_0}
+  - ids: {query: a NEAR/1 b, as: near_1}
+- id: catalog.X-03
+  description: THEN without /N is a parse error.
+  source: docs/tin-behavior-catalog.md §9 X-03; behaviour §1.5 X1
+  corpus: cat_x01
+  capture:
+  - error: {query: a THEN b}
+- id: catalog.X-04
+  description: Span operands that are phrases (the M-BEH corpus), matches and ranking.
+  source: docs/tin-behavior-catalog.md §9 X-04; behaviour §1.5 X4
+  corpus: spans4
+  capture:
+  - ids: {query: alpha THEN/1 "beta gamma", as: then_ids}
+  - ranked: {query: alpha THEN/1 "beta gamma", score: '{engine}.full_score(ctid)', k: 10, as: then_ranked}
+  - ids: {query: '"beta gamma" THEN/1 alpha', as: reversed_ids}
+  - ranked: {query: '"beta gamma" THEN/1 alpha', score: '{engine}.full_score(ctid)', k: 10, as: reversed_ranked}
+  - ids: {query: alpha NEAR/1 "beta gamma", as: near_ids}
+  - ranked: {query: alpha NEAR/1 "beta gamma", score: '{engine}.full_score(ctid)', k: 10, as: near_ranked}
+- id: catalog.X-05
+  description: WITHIN keeps spans of width at most N, and binds to a primary.
+  source: docs/tin-behavior-catalog.md §9 X-05; behaviour §1.5 X5, §1.5 X6
+  corpus: cat_x05
+  capture:
+  - ids: {query: (a NEAR/5 b) WITHIN 2, as: parenthesized}
+  - ids: {query: a NEAR/5 b WITHIN 2, as: bare}
+- id: catalog.X-06
+  description: 'Self-proximity: does one occurrence satisfy a NEAR/2 a?'
+  source: docs/tin-behavior-catalog.md §9 X-06; behaviour §1.5 X7
+  corpus: cat_x06
+  capture:
+  - ids: {query: a NEAR/2 a}

@@ -1,0 +1,123 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.expansion
+description: 'Term expansions: wildcards, fuzzy, MATCHES and ranges. Encoded from docs/tin-behavior-catalog.md section
+  9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine''s answers are
+  recorded yet.'
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_e01:
+    rows:
+    - [1, apple]
+    - [2, apply]
+    - [3, appl]
+    - [4, pineapple]
+  cat_e02:
+    rows:
+    - [1, Jalapeño]
+  cat_e03:
+    rows:
+    - [1, apple]
+    - [2, ample]
+  cat_e04:
+    rows:
+    - [1, the]
+  cat_e05:
+    rows:
+    - [1, wi fx]
+    - [2, wi fi]
+  cat_e06:
+    rows:
+    - [1, apple]
+    - [2, Apple]
+  cat_e08:
+    rows:
+    - [1, ant]
+    - [2, bee]
+    - [3, cat]
+    - [4, dog]
+  cat_e09:
+    rows:
+    - [1, ä]
+    - [2, b]
+    - [3, '9']
+    - [4, aé]
+cases:
+- id: catalog.E-01
+  description: Wildcards * and ? anywhere in a term.
+  source: docs/tin-behavior-catalog.md §9 E-01; behaviour §1.8 E1
+  corpus: cat_e01
+  capture:
+  - ids: {query: appl*, as: trailing_star}
+  - ids: {query: 'appl?', as: trailing_question}
+  - ids: {query: '*apple', as: leading_star}
+  - ids: {query: a*e, as: inner_star}
+- id: catalog.E-02
+  description: Wildcard literals are folded.
+  source: docs/tin-behavior-catalog.md §9 E-02; behaviour §1.8 E3
+  corpus: cat_e02
+  capture:
+  - ids: {query: JALAP*}
+- id: catalog.E-03
+  description: Fuzzy terms and their prefix length.
+  source: docs/tin-behavior-catalog.md §9 E-03; behaviour §1.8 E6, §1.8 E7
+  corpus: cat_e03
+  capture:
+  - ids: {query: aple~1, as: aple_1}
+  - ids: {query: pple~1, as: pple_1}
+  - ids: {query: 'pple~0:1', as: pple_0_1}
+  - ids: {query: apple~0, as: apple_0}
+- id: catalog.E-04
+  description: Is a transposition one edit (Damerau) or two (Levenshtein)?
+  source: docs/tin-behavior-catalog.md §9 E-04; behaviour §1.8 E8
+  corpus: cat_e04
+  capture:
+  - ids: {query: teh~1, as: teh_1}
+  - ids: {query: teh~2, as: teh_2}
+- id: catalog.E-05
+  description: 'Fuzzy on a hyphenated term: an error (product docs) or a phrase (Lead)?'
+  source: docs/tin-behavior-catalog.md §9 E-05; behaviour §1.8 E10; §8 conflict 3
+  priority: conflict
+  corpus: cat_e05
+  capture:
+  - ids: {query: wi-fi~1}
+- id: catalog.E-06
+  description: MATCHES is anchored and runs against folded dictionary terms.
+  source: docs/tin-behavior-catalog.md §9 E-06; behaviour §1.8 E12
+  corpus: cat_e06
+  capture:
+  - ids: {query: MATCHES Apple.*, as: upper}
+  - ids: {query: MATCHES apple.*, as: lower}
+  - ids: {query: MATCHES ppl, as: unanchored}
+- id: catalog.E-07
+  description: Invalid and unsupported regular expressions.
+  source: docs/tin-behavior-catalog.md §9 E-07; behaviour §1.8 E14, §1.8 E15
+  corpus: cat_q13
+  capture:
+  - error: {query: MATCHES (, as: unbalanced}
+  - error: {query: MATCHES (a)\1, as: backreference}
+- id: catalog.E-08
+  description: Term ranges, open and reversed.
+  source: docs/tin-behavior-catalog.md §9 E-08; behaviour §1.8 E16
+  corpus: cat_e08
+  capture:
+  - ids: {query: bee TO cat, as: closed}
+  - ids: {query: '* TO bee', as: open_low}
+  - ids: {query: cat TO *, as: open_high}
+  - ids: {query: cat TO bee, as: reversed}
+- id: catalog.E-09
+  description: Range order is byte order of folded terms.
+  source: docs/tin-behavior-catalog.md §9 E-09; behaviour §1.8 E17
+  corpus: cat_e09
+  capture:
+  - ids: {query: a TO b}
+- id: catalog.E-10
+  description: A wildcard range bound, and a bound that analyzes to nothing, are errors.
+  source: docs/tin-behavior-catalog.md §9 E-10; behaviour §1.8 E18, §1.8 E19
+  corpus: cat_q13
+  capture:
+  - error: {query: a* TO c, as: wildcard_bound}
+  - error: {query: '... TO z', as: empty_bound}

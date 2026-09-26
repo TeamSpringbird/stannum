@@ -1,0 +1,51 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: spans
+description: >
+  Span operators (THEN/N, NEAR/N) whose operands are phrases, and the plain
+  spans beside them. Imported from TIN 1.0.3's recorded responses
+  (benchmarks/tin_behavior_probe.py at 29a520e, 2026-09-26).
+
+defaults:
+  corpus: spans4
+  settings:
+    enable_seqscan: "off"
+  # Matches and counts must not depend on the custom scan; the ranked order
+  # is taken with the engine's default plan, as TIN's was.
+  variants:
+    settings:
+      - {"{engine}.enable_custom_scan": "on"}
+      - {"{engine}.enable_custom_scan": "off"}
+    captures: [ids, count]
+  capture: [ids, count, ranked]
+
+corpora:
+  spans4:
+    description: Four short documents that place alpha before, after and apart from "beta gamma".
+    rows:
+      - [1, alpha x beta gamma]
+      - [2, alpha beta gamma]
+      - [3, beta gamma alpha]
+      - [4, alpha x y beta gamma]
+
+cases:
+  - id: span.then_phrase_operand.1
+    description: A term then a phrase at most one position apart.
+    query: 'alpha THEN/1 "beta gamma"'
+  - id: span.then_phrase_operand.2
+    description: A term then a phrase at most two positions apart.
+    query: 'alpha THEN/2 "beta gamma"'
+  - id: span.then_phrase_operand.3
+    description: A phrase then a phrase at most two positions apart.
+    query: '"alpha x" THEN/2 "beta gamma"'
+  - id: span.then_phrase_operand.4
+    description: A phrase then a term; only the reversed document matches.
+    query: '"beta gamma" THEN/1 alpha'
+  - id: span.then_terms.1
+    description: Two plain terms at most one position apart, beside the phrase cases.
+    query: 'alpha THEN/1 beta'
+  - id: span.near_phrase_operand.1
+    description: A term near a phrase, either order.
+    query: 'alpha NEAR/1 "beta gamma"'
