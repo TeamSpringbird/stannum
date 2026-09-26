@@ -22,11 +22,11 @@ The crash hook exists only in pg_test builds, which `cargo pgrx test`
 installs; run this right after one, in the same hold of the pgrx lock, in a
 disposable private cluster:
 
-    python3 /tmp/stannum-pgrx-lock.py -- zsh -c \\
+    script/pgrx-lock.py -- sh -c \\
         'cargo pgrx test pg18 -p stannum && python3 postgres/tests/crash_before_publication.py'
 
-Name cases to run only those (default: all). Reinstall the release build
-afterwards (benchmarks/local/gates.sh does).
+`script/test-all pgrx` runs both. Name cases to run only those (default:
+all). Reinstall the release build afterwards (`script/test-all install`).
 """
 import json
 import os
