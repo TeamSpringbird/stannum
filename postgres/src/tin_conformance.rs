@@ -217,10 +217,13 @@ mod tests {
                 other => panic!("unknown recorded shape {other}"),
             }
         };
+        // The expression is parenthesized: `||` and `==>` share PostgreSQL's
+        // precedence for other operators, left to right, so without it
+        // `body ==> repeat('(', n) || 'a'` applies `==>` to the first term.
         let run = |label: &str, expression: &str| {
             Spi::run(&format!(
                 "DO $probe$ DECLARE n bigint; BEGIN
-                   SELECT count(*) INTO n FROM tin_size WHERE body ==> {expression};
+                   SELECT count(*) INTO n FROM tin_size WHERE body ==> ({expression});
                    INSERT INTO tin_size_outcome VALUES ('{label}', true, n, NULL);
                  EXCEPTION WHEN OTHERS THEN
                    INSERT INTO tin_size_outcome VALUES ('{label}', false, NULL, SQLSTATE);
