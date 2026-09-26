@@ -636,9 +636,19 @@ impl<'a> Parser<'a> {
 
     // ── Positional filter tier ──────────────────────────────────────
 
+    /// `pos_expr` and the `rel_expr` it starts with, one frame: a relation
+    /// (`a BEFORE b`) and an optional positional filter.
     fn pos_expr(&mut self) -> R {
-        if !self.rel_expr()? {
+        if !self.span_expr()? {
             return Ok(false);
+        }
+        let mark = self.mark();
+        if let Some(op) = self.rel_op()
+            && self.span_expr()?
+        {
+            self.join_rel(op)?;
+        } else {
+            self.reset(mark);
         }
         self.pos_suffix()?;
         Ok(true)
@@ -748,21 +758,6 @@ impl<'a> Parser<'a> {
 
     // ── Relation tier ───────────────────────────────────────────────
 
-    fn rel_expr(&mut self) -> R {
-        if !self.span_expr()? {
-            return Ok(false);
-        }
-        let mark = self.mark();
-        if let Some(op) = self.rel_op()
-            && self.span_expr()?
-        {
-            self.join_rel(op)?;
-            return Ok(true);
-        }
-        self.reset(mark);
-        Ok(true)
-    }
-
     #[inline(never)]
     fn join_rel(&mut self, op: RelOp) -> R<()> {
         self.binary(|l, r| match op {
@@ -864,10 +859,13 @@ impl<'a> Parser<'a> {
 
     // ── Atom tier ───────────────────────────────────────────────────
 
+    /// `atom_expr` and the `primary` it starts with, one frame: a base, an
+    /// optional boost, an optional `WITHIN`.
     fn atom_expr(&mut self) -> R {
-        if !self.primary()? {
+        if !self.base()? {
             return Ok(false);
         }
+        self.boost_suffix()?;
         self.within_suffix()?;
         Ok(true)
     }
@@ -887,14 +885,6 @@ impl<'a> Parser<'a> {
         }
         self.reset(mark);
         Ok(())
-    }
-
-    fn primary(&mut self) -> R {
-        if !self.base()? {
-            return Ok(false);
-        }
-        self.boost_suffix()?;
-        Ok(true)
     }
 
     /// An optional `^factor` on the top node.
@@ -960,12 +950,33 @@ impl<'a> Parser<'a> {
 
     // ── Primary ─────────────────────────────────────────────────────
 
+    /// The ordered choice of primaries, dispatched on the first character
+    /// where that decides the alternative. A parenthesized group and an
+    /// alternatives list are parsed here rather than in rules of their own,
+    /// to spend one frame fewer per bracket level.
     fn base(&mut self) -> R {
-        // The ordered choice, dispatched on the first character where that
-        // decides the alternative.
         match self.byte(self.pos) {
-            Some(b'(') => self.grouped(),
-            Some(b'[') => self.alternatives_expr(),
+            Some(b'(') => {
+                let mark = self.mark();
+                self.enter()?;
+                self.skip_ws();
+                let matched = self.or_expr()? && {
+                    self.skip_ws();
+                    self.eat(b')')
+                };
+                self.nesting -= 1;
+                if !matched {
+                    self.reset(mark);
+                }
+                Ok(matched)
+            }
+            Some(b'[') => {
+                let Some((open, count)) = self.alternatives()? else {
+                    return Ok(false);
+                };
+                self.finish_list(open, count, None)?;
+                Ok(true)
+            }
             Some(b'"') => self.phrase(),
             _ => Ok(self.all_of()?
                 || self.at_least()?
@@ -973,21 +984,6 @@ impl<'a> Parser<'a> {
                 || self.contains_expr()?
                 || self.word_primary()?),
         }
-    }
-
-    fn grouped(&mut self) -> R {
-        let mark = self.mark();
-        self.enter()?;
-        self.skip_ws();
-        let matched = self.or_expr()? && {
-            self.skip_ws();
-            self.eat(b')')
-        };
-        self.nesting -= 1;
-        if !matched {
-            self.reset(mark);
-        }
-        Ok(matched)
     }
 
     /// `[` elements `]`: pushes the elements; returns where the bracket
@@ -1024,14 +1020,6 @@ impl<'a> Parser<'a> {
         Ok(Some((open, count)))
     }
 
-    fn alternatives_expr(&mut self) -> R {
-        let Some((open, count)) = self.alternatives()? else {
-            return Ok(false);
-        };
-        self.finish_list(open, count, None)?;
-        Ok(true)
-    }
-
     /// Replaces the top `count` elements of the list opened at `open` with
     /// the list: alternatives, or `AT LEAST`/`ALL OF` at `threshold`. The
     /// builder rejects an empty list and splits bare words on commas.
@@ -1062,6 +1050,7 @@ impl<'a> Parser<'a> {
         self.push(expr, depth)
     }
 
+    #[inline(never)]
     fn all_of(&mut self) -> R {
         let mark = self.mark();
         if !self.eat_keyword("ALL") || !self.separator("OF") {
@@ -1076,6 +1065,7 @@ impl<'a> Parser<'a> {
         Ok(true)
     }
 
+    #[inline(never)]
     fn at_least(&mut self) -> R {
         let mark = self.mark();
         let Some(threshold) = self.at_least_head() else {

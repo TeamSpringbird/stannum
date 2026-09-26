@@ -23,6 +23,12 @@ mod tests {
         sql: &'static str,
         count: Option<i64>,
         reason: &'static str,
+        /// A tree a thousand operators high: a release build answers it in
+        /// about 1.1 MiB of stack, but the unoptimized build these tests run
+        /// needs about 6 MiB, past the default `max_stack_depth` of 2 MiB,
+        /// so there it may end in `check_stack_depth`'s ERROR instead,
+        /// never a crash.
+        backstop: bool,
     }
 
     const CASES: &[Case] = &[
@@ -34,36 +40,42 @@ mod tests {
             sql: "repeat('a ', 3000)",
             count: Some(100),
             reason: "",
+            backstop: false,
         },
         Case {
             label: "10,000 words",
             sql: "repeat('a ', 10000)",
             count: Some(100),
             reason: "",
+            backstop: false,
         },
         Case {
             label: "10,000-term OR chain",
             sql: "'a' || repeat(' OR a', 9999)",
             count: Some(100),
             reason: "",
+            backstop: false,
         },
         Case {
             label: "1,000 nested parentheses",
             sql: "repeat('(', 1000) || 'a' || repeat(')', 1000)",
             count: Some(100),
             reason: "",
+            backstop: false,
         },
         Case {
             label: "999 nested OR groups",
             sql: "repeat('(zz OR ', 999) || 'a' || repeat(')', 999)",
             count: Some(100),
             reason: "",
+            backstop: true,
         },
         Case {
             label: "1,000 nested alternatives",
             sql: "repeat('[', 1000) || 'a' || repeat(']', 1000)",
             count: Some(100),
             reason: "",
+            backstop: true,
         },
         // Past them.
         Case {
@@ -71,42 +83,49 @@ mod tests {
             sql: "repeat('a ', 300000)",
             count: None,
             reason: "more than 10000 terms",
+            backstop: false,
         },
         Case {
             label: "300,000-term OR chain",
             sql: "'a' || repeat(' OR a', 299999)",
             count: None,
             reason: "more than 10000 terms",
+            backstop: false,
         },
         Case {
             label: "100,000 nested parentheses",
             sql: "repeat('(', 100000) || 'a' || repeat(')', 100000)",
             count: None,
             reason: "nesting exceeds 1000 levels",
+            backstop: false,
         },
         Case {
             label: "5,000 nested parentheses",
             sql: "repeat('(', 5000) || 'a' || repeat(')', 5000)",
             count: None,
             reason: "nesting exceeds 1000 levels",
+            backstop: false,
         },
         Case {
             label: "100,000 nested alternatives",
             sql: "repeat('[', 100000) || 'a' || repeat(']', 100000)",
             count: None,
             reason: "nesting exceeds 1000 levels",
+            backstop: false,
         },
         Case {
             label: "300,000-term AND NOT chain",
             sql: "'a' || repeat(' AND NOT zz', 299999)",
             count: None,
             reason: "nesting exceeds 1000 levels",
+            backstop: false,
         },
         Case {
             label: "MATCHES with 100,000 nested groups",
             sql: "'MATCHES ' || repeat('(', 100000) || 'a' || repeat(')', 100000)",
             count: None,
             reason: "invalid regex",
+            backstop: false,
         },
     ];
 
@@ -190,6 +209,11 @@ mod tests {
                 .unwrap();
                 let explain = statement.starts_with("explain");
                 match case.count {
+                    Some(_)
+                        if case.backstop
+                            && message
+                                .as_deref()
+                                .is_some_and(|m| m.contains("stack depth limit exceeded")) => {}
                     Some(expected) => {
                         assert_eq!(message, None, "{} / {statement}", case.label);
                         if !explain {

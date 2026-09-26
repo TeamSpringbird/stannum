@@ -466,6 +466,10 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },
+    "postgres/src/query_limits.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: pg_tests of oversized and deeply nested queries."
+    },
     "postgres/src/score.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/score.rs",
@@ -676,6 +680,20 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
+    "tinql/src/limits.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: query size and nesting limits."
+    },
+    "tinql/src/parser/descent.rs": {
+      "owner": "mixed",
+      "upstream_path": "tinql/src/parser/pest_parser/mod.rs",
+      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "evidence": "Recursive-descent transliteration of the upstream pest grammar (tinql/src/parser/pest_parser/grammar.pest) and builder, keeping the upstream builder helpers, with Stannum's nesting and size limits; retain PlanetScale credit."
+    },
+    "tinql/src/parser/differential.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: differential tests of the descent parser against the pest oracle."
+    },
     "tinql/src/parser/mod.rs": {
       "owner": "planetscale",
       "upstream_path": "tinql/src/parser/mod.rs",
@@ -694,17 +712,17 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
-    "tinql/src/parser/pest_parser/phrase.pest": {
+    "tinql/src/parser/phrase.pest": {
       "owner": "planetscale",
       "upstream_path": "tinql/src/parser/pest_parser/phrase.pest",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Byte-identical to the upstream source before notice insertion."
+      "evidence": "Moved from tinql/src/parser/pest_parser/phrase.pest; otherwise byte-identical to the upstream source before notice insertion."
     },
-    "tinql/src/parser/pest_parser/phrase_grammar.rs": {
+    "tinql/src/parser/phrase_grammar.rs": {
       "owner": "planetscale",
       "upstream_path": "tinql/src/parser/pest_parser/phrase_grammar.rs",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Byte-identical to the upstream source before notice insertion."
+      "evidence": "Moved from tinql/src/parser/pest_parser/phrase_grammar.rs, with its grammar path and visibility adjusted."
     },
     "tinql/src/quote.rs": {
       "owner": "planetscale",
@@ -795,6 +813,10 @@
       "upstream_path": "tinql/src/util.rs",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Byte-identical to the upstream source before notice insertion."
+    },
+    "tinql/tests/deep_queries.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: oversized and deeply nested query tests."
     },
     "tokenizer/Cargo.toml": {
       "owner": "planetscale",
