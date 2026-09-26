@@ -301,4 +301,83 @@ mod tests {
             }
         }
     }
+
+    /// Runs `sql` with a cancel requested at the first interrupt check of a
+    /// dictionary scan (the `expand:scan` race point), and returns how many
+    /// such checks ran. `sql` must end in `query_canceled`: a scan that
+    /// never checks runs to the end, and the query answers.
+    fn cancel_at_first_dictionary_check(sql: &str) -> usize {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let checks = Rc::new(Cell::new(0));
+        let counted = checks.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "expand:scan" {
+                counted.set(counted.get() + 1);
+                if counted.get() == 1 {
+                    unsafe {
+                        pg_sys::QueryCancelPending = 1;
+                        pg_sys::InterruptPending = 1;
+                    }
+                }
+            }
+        })));
+        let outcome = Spi::run(&format!(
+            "DO $$BEGIN
+                 PERFORM count(*) FROM ({sql}) q;
+                 RAISE EXCEPTION 'the dictionary scan was not canceled';
+             EXCEPTION WHEN query_canceled THEN NULL;
+             END$$"
+        ));
+        crate::storage::testing::set_race_hook(None);
+        outcome.unwrap_or_else(|error| panic!("{sql}: {error}"));
+        checks.get()
+    }
+
+    /// A wildcard, regex or fuzzy term with no fixed prefix scans the whole
+    /// dictionary of every segment and of the write buffer, when planning
+    /// estimates it and when ranking expands it. Each scan checks for
+    /// interrupts every 1,024 entries, so a cancel or `statement_timeout`
+    /// ends it within that many entries instead of at its end.
+    #[pg_test]
+    fn dictionary_scans_answer_a_cancel() {
+        Spi::run(
+            "CREATE TABLE expand_segment(id int, body text);
+             INSERT INTO expand_segment SELECT n, 'w' || n FROM generate_series(1, 5000) n;
+             INSERT INTO expand_segment VALUES (0, 'xzzx');
+             CREATE INDEX expand_segment_idx ON expand_segment USING stannum(body);
+             ANALYZE expand_segment;
+             SET LOCAL stannum.write_buffer_docs = 100000;
+             CREATE TABLE expand_buffer(id int, body text);
+             CREATE INDEX expand_buffer_idx ON expand_buffer USING stannum(body);
+             INSERT INTO expand_buffer SELECT n, 'w' || n FROM generate_series(1, 5000) n;
+             INSERT INTO expand_buffer VALUES (0, 'xzzx');
+             ANALYZE expand_buffer;",
+        )
+        .unwrap();
+        for table in ["expand_segment", "expand_buffer"] {
+            // Both ends of the scan are covered: the whole dictionary is
+            // read, and one term matches.
+            for query in ["MATCHES .*zz.*", "xzzy~0:1"] {
+                assert_eq!(
+                    Spi::get_one::<i64>(&format!(
+                        "SELECT count(*) FROM {table} WHERE body ==> '{query}'"
+                    ))
+                    .unwrap(),
+                    Some(1),
+                    "{table} {query}"
+                );
+                for sql in [
+                    format!("SELECT id FROM {table} WHERE body ==> '{query}'"),
+                    format!(
+                        "SELECT id FROM {table} WHERE body ==> '{query}'
+                         ORDER BY stannum.full_score(ctid) DESC LIMIT 5"
+                    ),
+                    format!("SELECT * FROM stannum.score_inspect('{table}_idx', '{query}')"),
+                ] {
+                    assert_eq!(cancel_at_first_dictionary_check(&sql), 1, "{sql}");
+                }
+            }
+        }
+    }
 }
