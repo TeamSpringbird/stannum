@@ -31,6 +31,11 @@
       "Type": "AWS::EC2::AvailabilityZone::Name",
       "Default": "us-east-1a",
       "Description": "i7i.8xlarge is not offered in every zone, such as us-east-1e."
+    },
+    "CorpusBucket": {
+      "Type": "String",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]",
+      "Description": "Existing S3 bucket, owned by the account running the stack, that holds the pinned corpus cache under <published revision>/ and reusable database snapshots under postgres-snapshots/."
     }
   },
   "Resources": {
@@ -182,7 +187,9 @@
                   "Action": [
                     "s3:GetObject"
                   ],
-                  "Resource": "arn:aws:s3:::springbird-dev-stannum-corpus-cache-860510875764/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/wikipedia/*"
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${CorpusBucket}/f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/wikipedia/*"
+                  }
                 }
               ]
             }
@@ -199,14 +206,18 @@
                     "s3:PutObject",
                     "s3:AbortMultipartUpload"
                   ],
-                  "Resource": "arn:aws:s3:::springbird-dev-stannum-corpus-cache-860510875764/postgres-snapshots/*"
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${CorpusBucket}/postgres-snapshots/*"
+                  }
                 },
                 {
                   "Effect": "Allow",
                   "Action": [
                     "s3:ListBucket"
                   ],
-                  "Resource": "arn:aws:s3:::springbird-dev-stannum-corpus-cache-860510875764",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${CorpusBucket}"
+                  },
                   "Condition": {
                     "StringLike": {
                       "s3:prefix": [

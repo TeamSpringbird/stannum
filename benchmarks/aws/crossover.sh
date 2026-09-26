@@ -3,11 +3,23 @@
 #
 # See LICENSE in the repository root for license terms.
 
+# Full-Wikipedia COUNT crossover campaign on the stack's instance, run from the
+# repository checkout at /opt/stannum-benchmark/repo:
+#
+#   STANNUM_CORPUS_BUCKET=<bucket> BENCH_BUCKET=<artifact bucket> bash benchmarks/aws/crossover.sh
+#
+# STANNUM_CORPUS_BUCKET is the stack's CorpusBucket parameter: it holds the
+# pinned corpus under <published revision>/wikipedia/ and database snapshots
+# under postgres-snapshots/. BENCH_BUCKET is the stack's ArtifactBucket output.
+# SNAPSHOT_CAPTURE_PREFIX or SNAPSHOT_RESTORE_PREFIX (not both) saves or reuses
+# the built database.
 set -euo pipefail
+: "${STANNUM_CORPUS_BUCKET:?set STANNUM_CORPUS_BUCKET to the stack's CorpusBucket parameter}"
+: "${BENCH_BUCKET:?set BENCH_BUCKET to the stack's ArtifactBucket output}"
 BENCH_ROOT=/opt/stannum-benchmark
 OUT="$BENCH_ROOT/repo/benchmarks/results/aws-crossover"
 export OUT
-SNAPSHOT_BUCKET=springbird-dev-stannum-corpus-cache-860510875764
+SNAPSHOT_BUCKET=$STANNUM_CORPUS_BUCKET
 SNAPSHOT_DIR="$BENCH_ROOT/database-snapshot"
 CORPUS_SHA=7e4cba73338f9aba3a344de9f7d63007fa51f0f4ee85d70d7bd34fe95ff6e9a8
 IMAGE=stannum-bench:crossover
@@ -22,7 +34,7 @@ fi
 mkdir -p "$OUT/protocol"
 cp benchmarks/count{_probe,_crossover,_crossover_report,_oracle}.py "$OUT/protocol/"
 cp benchmarks/aws/crossover.sh benchmarks/aws/crossover_campaign.py benchmarks/aws/database_snapshot.py "$OUT/protocol/"
-cp docs/benchmarks/count-crossover/100k-selection.json "$OUT/protocol/frozen-rule.json"
+cp benchmarks/count-crossover/100k-selection.json "$OUT/protocol/frozen-rule.json"
 git rev-parse HEAD > "$OUT/protocol/commit.txt"
 git diff > "$OUT/protocol/source.patch"
 apt-get update
@@ -32,14 +44,17 @@ sysctl -w kernel.perf_event_paranoid=-1
 python3 -m venv --system-site-packages "$BENCH_ROOT/venv"
 "$BENCH_ROOT/venv/bin/pip" install -r benchmarks/requirements-aws.txt
 export PATH="$BENCH_ROOT/venv/bin:$PATH"
-python3 - <<'PY'
-import boto3,os
+python3 - "$STANNUM_CORPUS_BUCKET" <<'PY'
+import sys
 from pathlib import Path
+import boto3
+sys.path.insert(0, 'benchmarks')
+import published_dataset
 root=Path('/opt/stannum-benchmark/datasets/wikipedia');root.mkdir(parents=True,exist_ok=True)
-prefix='f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86/wikipedia/'
+prefix=published_dataset.REVISION+'/wikipedia/'
 s3=boto3.client('s3')
 for name in ('data.csv','data-manifest.json','queries.json','source.json','verification.json'):
-    s3.download_file('springbird-dev-stannum-corpus-cache-860510875764',prefix+name,str(root/name))
+    s3.download_file(sys.argv[1],prefix+name,str(root/name))
 PY
 python3 benchmarks/published_dataset.py --corpus wikipedia --output "$BENCH_ROOT/datasets/wikipedia"
 if [ -z "${SNAPSHOT_RESTORE_PREFIX:-}" ]; then
