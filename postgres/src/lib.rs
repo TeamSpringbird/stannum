@@ -5612,6 +5612,32 @@ mod tests {
         assert_clean("fold_race_idx");
     }
 
+    /// Crashes the server at the first race point named `at` this session
+    /// reaches, after flushing WAL: recovery then replays every page the
+    /// operation wrote before it and not its meta page, which is what a
+    /// crash leaves when those records reached disk and the meta page's did
+    /// not. Driven by postgres/tests/crash_before_publication.py.
+    #[pg_extern]
+    fn crash_at_race_point(at: String) {
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if at == name {
+                unsafe { pg_sys::XLogFlush(pg_sys::GetXLogInsertRecPtr()) };
+                pgrx::ereport!(
+                    pgrx::PgLogLevel::PANIC,
+                    pgrx::PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                    format!("crash injected at race point {name}")
+                );
+            }
+        })));
+    }
+
+    /// The number of runs on the index's pending list.
+    #[pg_extern]
+    fn pending_entries(index_oid: pg_sys::Oid) -> i64 {
+        let index = unsafe { pgrx::PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _) };
+        unsafe { crate::storage::testing::pending_entries(index.as_ptr()) as i64 }
+    }
+
     #[pg_extern]
     fn direct_bulk_delete(index_oid: pg_sys::Oid, dead: Vec<String>) -> i64 {
         let dead = dead
