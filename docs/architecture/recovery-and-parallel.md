@@ -84,7 +84,7 @@ snapshots could still reference the pages about to be freed.
 * **Replay.** On redo the resource manager calls
   `ResolveRecoveryConflictWithSnapshot(horizon, isCatalogRel, locator)` before
   the following generic records free the pages, so a conflicting standby query
-  is cancelled or waited for exactly as for a heap prune or a btree page reuse.
+  is canceled or waited for exactly as for a heap prune or a btree page reuse.
   `max_standby_streaming_delay` governs the wait and `hot_standby_feedback`
   governs whether a conflict arises at all — both unchanged. A crash-recovering
   primary is never in hot standby, so its redo resolves nothing and needs no

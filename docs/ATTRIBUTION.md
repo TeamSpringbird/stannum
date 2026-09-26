@@ -68,10 +68,18 @@ and source-header references remain intact.
 
 The check covers tracked Rust, Python, shell, SQL, Pest grammars, Cargo and
 other TOML configuration, YAML workflows, extension control files, Dockerfiles,
-and files with interpreter shebangs. The inventory also explicitly covers the
-copied documentation. Original prose, lockfiles, ignore patterns, JSON
-metadata, regression seeds, and binary fixtures are outside text-header
-coverage. Add support when introducing another source format; a file being
+and files with interpreter shebangs. Lockfiles, ignore patterns, JSON metadata,
+regression seeds, and binary fixtures are outside text-header coverage.
+
+Markdown is checked only when it has a manifest entry. Inherited
+documentation carries an entry and an HTML-comment notice: the root
+`README.md`, `boldi-vigna/README.md`, and the query-language guide in
+`docs/query-language/`, copied from Lead's `tinql/docs/src/`. Documentation
+written for Stannum has no entry and no notice; it is covered by the
+repository LICENSE. Give a Markdown file an entry, and let
+`script/source_headers.py --write` add its notice, when it copies or adapts
+upstream text. When deleting a file that has an entry, delete the entry too:
+the check fails on an entry without a tracked file. Add support when introducing another source format; a file being
 outside the check does not remove its attribution obligations.
 
 The check catches missing entries and incorrect headers. It cannot determine

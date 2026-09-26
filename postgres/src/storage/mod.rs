@@ -123,7 +123,7 @@ pub fn init() {
     GucRegistry::define_int_guc(
         c"stannum.max_merge_docs",
         c"Document budget for ordinary merges performed by one inserting backend per fold",
-        c"Larger merges wait for VACUUM, including those that bring the directory back under max_segments; only the 128-entry on-disk bound forces the two smallest entries to merge above this budget. Zero defers every budgeted merge.",
+        c"Larger merges wait for VACUUM, including those that bring the directory back under max_segments; only the 96-entry on-disk bound forces the two smallest entries to merge above this budget. Zero defers every budgeted merge.",
         &MAX_MERGE_DOCS,
         0,
         i32::MAX,
@@ -163,7 +163,7 @@ pub fn init() {
     GucRegistry::define_int_guc(
         c"stannum.max_segments",
         c"Segments an index directory may hold before its smallest entries merge",
-        c"A soft bound: inserts merge the smallest entries within their budget, VACUUM without one. Tiered merges keep the count far lower. The on-disk directory holds at most 128 entries, a hard bound inserts enforce whatever the cost.",
+        c"A soft bound: inserts merge the smallest entries within their budget, VACUUM without one. Tiered merges keep the count far lower. The on-disk directory holds at most 96 entries, a hard bound inserts enforce whatever the cost.",
         &MAX_SEGMENTS_GUC,
         1,
         MAX_SEGMENTS as i32,

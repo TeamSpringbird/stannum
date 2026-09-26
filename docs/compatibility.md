@@ -1,109 +1,175 @@
-# TIN index options and highlighting compatibility
+# Compatibility with TIN
 
-Audited 2026-09-18 against Stannum `45d2696` plus this change. The live
-[PlanetScale index reference](https://planetscale.com/docs/postgres/search/reference/indexes)
-was retrieved on that date; the supplied `/docs/postgres/tin` URL is not the
-current reference. Historical observations dated 2026-09-17 were recovered from
-`33e4ea8^:docs/archive/tin-configuration-research.md`,
-`33e4ea8^:docs/archive/tin-observed-shape.md`, and
-`33e4ea8^:docs/archive/tin-research.md` (deleted from the current tree).
-The historical live observations used TIN 1.0.2 on PostgreSQL 18.6. Current web
-pages do not identify a TIN release, so this is an audit of the documented
-surface, not a claim to enumerate undocumented options.
+Stannum implements the SQL interface of PlanetScale TIN: the `==>` operator,
+the TINQL query language, the index access method with TIN's index options,
+and the scoring and highlighting functions. The reference is PlanetScale TIN
+1.0.3 on PostgreSQL 18.6, whose answers are recorded by the
+[conformance suite](../conformance/README.md), and PlanetScale's open-source
+Lead, which CI runs beside Stannum on every push.
 
-## Complete documented index-option surface
+This page lists what matches, where Stannum knowingly differs, and how that is
+checked. The [TIN behavior catalog](tin-behavior-catalog.md) lists every
+documented and measured TIN behavior with its source.
 
-All 15 options on the public index reference are listed below. Stannum's
-registration is in [`options.rs`](../postgres/src/options.rs); tokenization
-is represented by [`TokenizerPipelineSpec`](../tokenizer/src/spec.rs).
-An equal option surface does not establish identical behavior on every Unicode
-version or script; the exact Stannum behavior and remaining uncertainty follow.
+## Names and installation
 
-| Option | TIN accepted values; default | Meaning | Stannum values; default | Status / decision |
-| --- | --- | --- | --- | --- |
-| `tokenizer` | `unicode`, `whitespace`; `unicode` | Word boundaries or whitespace fields | Same | Matches documented modes; test punctuation, URLs, numerics, apostrophes, mixed scripts |
-| `case_folding` | `fold`, `preserve`; `fold` | Case-insensitive or original-case terms | Same | Surface matches; Stannum lowercases Unicode scalars, not full Unicode case folding (`ß` stays `ß`); TIN docs do not specify an algorithm |
-| `accent_folding` | `fold`, `preserve`; `fold` | Remove or retain accents | Same | Surface matches; Stannum uses canonical decomposition, removes combining marks, recomposes; TIN algorithm unspecified |
-| `long_tokens` | `split`, `truncate`, `discard`; `split` | Handle terms beyond byte ceiling after folding | Same | Matches documented modes; chunks prefer grapheme boundaries, oversized clusters fall back to bounded scalar chunks |
-| `max_token_bytes` | integer `4..2692`; `256` | UTF-8 analyzed-term byte ceiling | Same | Matches; tested with accented source text that shrinks after folding |
-| `graphemes` | `emoji`, `retain`, `discard`; `emoji` | Standalone emoji/symbol clusters | Same | Matches documented modes; tests ZWJ emoji, flags, symbols |
-| `position_gaps` | `preserve`, `collapse`; `preserve` | Positions consumed by removed analyzed tokens | Same | Matches documented modes; discarded long tokens leave gaps only in preserve mode; base-tokenizer discarded punctuation/graphemes do not consume positions |
-| `k1` | real `0..10000`; `1.2` | BM25 saturation | Same | Matches; query-time setting, no rebuild |
-| `b` | real `0..1`; `0.75` | BM25 length normalization | Same | Matches; query-time setting, no rebuild |
-| `score_stop_words` | comma-separated text; unset | Exact analyzed terms omitted from default scoring | Same | Matches; entries are not tokenized; does not remove indexed tokens or change matching; full scoring ignores this list |
-| `initial_segment_count` | integer `1..4096`; available parallelism | Build partitions; default target count | `1..4096`; stored default `1` | Accepted **and ignored, with warning**; expanded previous `1..1024` domain |
-| `target_segment_count` | integer `1..4096`; initial count | Background maintenance target | `1..4096`; unset | Applied per index as the soft directory bound in place of `stannum.max_segments`; unset uses the setting. Enforced by inserts within their merge budgets and by VACUUM; no background worker |
-| `max_mutable_segment_size` | integer `>=131072`; `4194304` bytes | Promotion trigger; also 16,384 docs | `131072..2147483647`; unset | Applied per index as the write buffer's fold size in place of `stannum.write_buffer_bytes`; unset uses the setting. `stannum.write_buffer_docs` still applies |
-| `max_merged_segment_size` | integer `>=100`; `2000` MB | Segment merge-size ceiling | `100..2147483647`; unset | Applied per index as the most input megabytes one merge takes, within the 3 GiB a run can record; unset uses that ceiling |
-| `dead_percent_threshold` | real `0..1`; `0.5` | Dead-entry rewrite threshold | Same | Applied per index: VACUUM rewrites a segment once this fraction of its documents is dead |
+Stannum's extension, library, access method and SQL schema are `stannum`,
+where TIN's and Lead's are `tin`: `tin.score` is `stannum.score`, and TIN's
+settings are `stannum.*` settings. The operator is `==>` in both. Because both
+extensions define `==>` in `pg_catalog`, Stannum and TIN (or Lead) need
+separate databases. There is no in-place migration: create a fresh database,
+load the data, and build indexes with `USING stannum`.
 
-`initial_segment_count` is accepted for portable DDL and ignored, with a
-warning. The other four storage options shape maintenance for the index that
-sets them, because the right write buffer and merge ceiling depend on the
-documents; an index that leaves them unset follows the
-[storage and maintenance settings](architecture/segmented-storage.md). They are
-PostgreSQL reloptions only, read when maintenance runs, so `ALTER INDEX ... SET`
-takes effect without a rebuild. None of them enforces a memory limit or creates
-workers.
+## Conformance summary
 
-No documented tokenizer behavior is missing from the pipeline. The reference
-lists neither a stemming option nor a language selector nor indexing-time stop
-words. This change adds none: inventing a Snowball or other stemmer would change
-matching without a TIN contract. `score_stop_words` remains scoring-only. The
-[settings reference](https://planetscale.com/docs/postgres/search/reference/settings)
-contains server/session GUCs, not additional `WITH` index options; they are
-outside this table and are not accepted as reloptions.
+Checked against TIN 1.0.3's recorded answers:
 
-Tokenization changes require REINDEX for stored rows, as the public reference
-states. Stannum binds matching and highlighting to the index's persisted
-pipeline, including sequential/bitmap rechecks. This is more permissive than
-TIN, which on 1.0.3 rejects a non-default-tokenization query lacking a usable
-custom scan and an implicit highlight on such an index; the conformance suite
-records both as improvements (`conformance/divergences/stannum.yaml`,
-`catalog.K-12` and `catalog.H-14`). The unit tests pin all folding, boundary,
-grapheme, long-token and gap modes with concrete edge inputs; pg_tests create
-indexes with each mode and compare plans, matches and highlighting. These
-checks establish Stannum's contract and Lead compatibility, not exhaustive
-binary equivalence to hosted TIN.
+| Status | Cases | Meaning |
+| --- | ---: | --- |
+| PASS | 170 | Every capture equals TIN's answer |
+| DIFF | 12 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
+| IMPROVED | 5 | TIN refuses the query with an ERROR; Stannum answers it |
+| GAP | 2 | Stannum lacks what the case exercises |
+| FAIL | 0 | |
 
-## Reference highlighting oracle
+Improvements and gaps are declared in
+[`conformance/divergences/stannum.yaml`](../conformance/divergences/stannum.yaml).
+A declared case fails if anything other than the listed captures differs, so a
+declaration cannot hide a regression.
 
-`script/reference-oracle` records the actual Lead revision and `\df
-tin.*highlight*` output alongside its report. Lead exposes
-`tin.highlight(text, begin_tag text DEFAULT '<b>', end_tag text DEFAULT '</b>',
-query text DEFAULT NULL)` and `tin.highlight_ansi(text, wrap_to integer DEFAULT
-NULL, query text DEFAULT NULL)`; Stannum has the equivalent schema-qualified
-functions plus its internal bound-query overloads.
+## What matches TIN 1.0.3
 
-Each query observes the one-argument HTML and ANSI functions for every matching
-document, ordered by ID, exercising implicit query binding. Rendered strings,
-including escape codes, are compared exactly in both score-bit and rank-order
-modes. Highlight errors are retained independently of matching/scoring evidence.
-Score exclusions for Lead expansions do not exclude their highlights. A
-separate `REFERENCE_UNHIGHLIGHTED` reason map controls only proven reference
-highlight defects in order mode; raw observations and exclusions are always
-recorded in `oracle.json`.
+- **Query language.** Terms, Boolean operators, phrases with slop and gaps,
+  alternatives, `AT LEAST` and `ALL OF`, proximity, span relations, positional
+  filters, expansions (wildcards, regular expressions, ranges, fuzzy terms)
+  and boosts, as described in the [query language guide](query-language/introduction.md).
+- **Scoring.** BM25 scores are bit-identical to TIN's, including at `k1 = 0`,
+  and the pruned top k is the exhaustive top k. A term repeated in a flat `AND` or `OR` chain adds its
+  boosts (`a a` scores as `a^2`). `score()` and `full_score()` over `==>`
+  clauses on several indexed columns of one table sum one score per column,
+  in clause order.
+- **Highlighting.** `highlight()` and `highlight_ansi()` without a query take
+  it from a `==>` clause anywhere in the query's join tree, including a CTE or
+  subquery the planner flattens; with no clause to bind they return the text
+  unmarked.
+- **Index options.** All fifteen documented options are accepted with TIN's
+  domains; see [index options](#index-options).
+- **Errors.** An invalid query raises `invalid ==> query at byte N in
+  "QUERY": ...` with TIN's SQLSTATE. `target_segment_count`,
+  `max_mutable_segment_size` and `max_merged_segment_size` values outside
+  TIN's domains are rejected with SQLSTATE 22023.
+- **Query size.** Stannum answers every query size TIN answers (3,000 words,
+  a 3,000-term `OR` chain, 1,000 nested parentheses) and more (up to 10,000
+  terms). Where TIN 1.0.3 crashes the server (10,000 terms, 5,000 nesting
+  levels), Stannum raises an ERROR: a query is limited to 1,000 nesting levels
+  and 10,000 terms, and every recursive pass checks PostgreSQL's stack depth.
 
-The fixture now contains numeric decimals, apostrophes, hyphens, URL hosts,
-accented text, and ZWJ emoji. Six new ordered shapes bring the suite to 47
-queries across five mutation states (235 query/state pairs).
+## Documented improvements
 
-Local result: **235/235 agree, zero differences**, against Lead revision
-`0e29dbe5177bb64d027d6afeaa20eb0b46536be6` (extension `tin` 1.0.3),
-PostgreSQL 18, 5,000 generated fixture rows plus the edge rows and later inserts.
-HTML and ANSI observations contain no errors. **Highlight exclusion list:
-empty.** No Stannum renderer bug was found, and no renderer change was needed.
-The six pre-existing score-order exclusions remain restricted to scoring.
+TIN 1.0.3 refuses these with an ERROR; Stannum answers them.
 
-The initial harness attempted an aggregate over a flattenable subquery. Both
-engines lost implicit query binding in that shape. The final harness uses a
-direct ordered projection, `SELECT json_build_array(id, engine.highlight(body))
-FROM oracle_docs WHERE body ==> query ORDER BY id`, and parses each JSON row.
-This exercises the supported implicit-binding form without suppressing any
-query shape or using explicit-query arguments to bypass binding.
+| Case | TIN 1.0.3 | Stannum |
+| --- | --- | --- |
+| `catalog.S-14` | Refuses differing `dense_ratio` arguments and a row-dependent `k1` | Scores each call with its own arguments |
+| `catalog.S-15` | Refuses `score()` and `full_score()` on one relation | Returns both |
+| `catalog.S-22` | Refuses to score with its custom scan disabled | Returns the same scores with `stannum.enable_custom_scan` on or off |
+| `catalog.K-12` | Refuses a query on a non-default-tokenization index without its custom scan | Answers with the index's tokenizer either way |
+| `catalog.H-14` | Refuses an implicit highlight on a non-default-tokenization index | Highlights with the index's tokenizer |
 
-Validation: PG18 suite 76 tests passed; all non-extension workspace tests
-passed, including four new tokenizer audit tests; PG18 and PG17 clippy with
-pg_test and warnings denied passed; 44 Python benchmark tests passed. Full
-reference report and catalog evidence were saved locally under
-`/tmp/stannum-ab7-oracle-final/`; the large raw report is not checked in.
+Stannum binds matching and highlighting to the index's persisted tokenizer
+settings, including sequential-scan and bitmap rechecks, which is what makes
+the last two possible.
+
+## Documented gaps
+
+| Case | Difference |
+| --- | --- |
+| `catalog.I-07` | Stannum runs no background maintenance workers and has no `maintenance_jobs_per_db` setting, so a session `SET` of it is not refused. |
+| `catalog.S-07` | Stannum has no `promote()` function. Inserts fold the write buffer into segments and VACUUM merges them. |
+
+## Other known differences
+
+- **Error wording.** Syntax errors name what was expected in the words of
+  Stannum's recursive-descent parser, not TIN's grammar rules; the SQLSTATE
+  matches. These are the DIFF cases.
+- **`max_score()`** over several indexed columns reports the first column's
+  best score, while `score()` sums the columns.
+- **Case folding** lowercases Unicode scalar values rather than applying full
+  Unicode case folding (`ß` stays `ß`). TIN's documentation does not specify
+  its algorithm; accent folding and word boundaries are likewise unspecified
+  there.
+- **Maintenance** runs in inserting backends and VACUUM rather than
+  background workers, so `initial_segment_count` is accepted and ignored with
+  a warning.
+- **Unbound `==>`.** Where no query is planned around the operator (a
+  partial-index predicate, a CHECK constraint, a generated column) or the
+  document is not an indexed column, `==>` uses the default tokenizer
+  settings. See the storage guide's
+  [current limits](architecture/segmented-storage.md#current-limits).
+
+## Index options
+
+All options on PlanetScale's
+[index reference](https://planetscale.com/docs/postgres/search/reference/indexes)
+are accepted. Stannum's registration is in
+[`options.rs`](../postgres/src/options.rs); tokenization is represented by
+[`TokenizerPipelineSpec`](../tokenizer/src/spec.rs).
+
+| Option | TIN values; default | Meaning | Stannum |
+| --- | --- | --- | --- |
+| `tokenizer` | `unicode`, `whitespace`; `unicode` | Word boundaries or whitespace fields | Same |
+| `case_folding` | `fold`, `preserve`; `fold` | Case-insensitive or original-case terms | Same; lowercases Unicode scalars |
+| `accent_folding` | `fold`, `preserve`; `fold` | Remove or retain accents | Same; canonical decomposition, combining marks removed, recomposed |
+| `long_tokens` | `split`, `truncate`, `discard`; `split` | Terms beyond the byte ceiling after folding | Same; chunks prefer grapheme boundaries |
+| `max_token_bytes` | integer `4..2692`; `256` | UTF-8 analyzed-term byte ceiling | Same |
+| `graphemes` | `emoji`, `retain`, `discard`; `emoji` | Standalone emoji and symbol clusters | Same |
+| `position_gaps` | `preserve`, `collapse`; `preserve` | Positions consumed by removed tokens | Same; discarded long tokens leave gaps only in preserve mode |
+| `k1` | real `0..10000`; `1.2` | BM25 saturation | Same; query-time, no rebuild |
+| `b` | real `0..1`; `0.75` | BM25 length normalization | Same; query-time, no rebuild |
+| `score_stop_words` | comma-separated text; unset | Analyzed terms omitted from default scoring | Same; matching unchanged, full scoring ignores the list |
+| `initial_segment_count` | integer `1..4096` | Build partitions | Accepted and ignored, with a warning |
+| `target_segment_count` | integer `1..4096` | Maintenance target | Soft directory bound in place of `stannum.max_segments` |
+| `max_mutable_segment_size` | integer `>= 131072` bytes; `4194304` | Write buffer size before promotion | Fold size in place of `stannum.write_buffer_bytes`; `stannum.write_buffer_docs` still applies |
+| `max_merged_segment_size` | integer `>= 100` MB; `2000` | Merge size ceiling | Most input megabytes one merge takes, within the 3 GiB a run can record |
+| `dead_percent_threshold` | real `0..1`; `0.5` | Dead fraction that triggers a rewrite | VACUUM rewrites a segment at this dead fraction |
+
+The storage options are reloptions read when maintenance runs, so
+`ALTER INDEX ... SET` takes effect without a rebuild; unset, the
+[storage settings](architecture/segmented-storage.md#writing-an-index) apply.
+None of them enforces a memory limit or starts workers. Tokenizer options
+change stored terms and need `REINDEX`, as TIN's reference states. TIN
+documents no stemming, language selection or indexing-time stop words, and
+Stannum adds none. TIN's server and session
+[settings](https://planetscale.com/docs/postgres/search/reference/settings) are
+not index options and are not accepted as reloptions.
+
+## Reference oracle against Lead
+
+`script/reference-oracle`, run in CI as "Reference oracle against upstream
+Lead", checks out PlanetScale's Lead (`main` unless `LEAD_REF` pins a
+revision), builds it under its own extension name `tin` into the same server
+as Stannum, and runs `benchmarks/oracle.py` on both. The oracle covers 47
+TINQL shapes (terms, Boolean forms, phrases, gaps, slop, proximity, span
+relations, positional filters, expansions, `AT LEAST`, boosts, and
+tokenizer-sensitive accents, numerics, apostrophes, hyphens, URL hosts and
+emoji) across five mutation states: after the build, after deletes, after
+VACUUM, after inserts into the write buffer, and after `REINDEX`.
+
+Match sets, the rank order of full and dense scores, and the exact HTML and
+ANSI highlighted strings must agree, highlights through the one-argument
+functions so implicit binding is exercised. Two known deviations of Lead are
+allowed for:
+
+- Score bits are not compared. Lead counts a document with no tokens at index
+  build time in its corpus size, which shifts every IDF in the last bits; TIN
+  and Stannum do not.
+- Expansion shapes (wildcards, regular expressions, ranges) compare match
+  sets and highlights only, because Lead scores their matches as zero where
+  TIN scores the expanded terms.
+
+A highlight difference can be excused only with an explicit reason in
+`REFERENCE_UNHIGHLIGHTED`, and score exclusions never suppress highlight
+checks. The same oracle runs against PlanetScale TIN by hand
+(`benchmarks/oracle.py --right-engine tin`, with the connection in a libpq
+environment file outside the repository); there score bits, including
+`max_score`, are compared exactly.
