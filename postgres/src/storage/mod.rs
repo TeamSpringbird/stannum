@@ -1775,8 +1775,8 @@ thread_local! {
 /// shared, a page changed by a later record makes the read `None`: replay on
 /// a standby applies a writer's buffer pages before its meta page, without
 /// the meta lock a primary writer would hold across both, so an old meta page
-/// can describe pages already rewritten from the head. Links are exempt: a
-/// page's successor is set once and never changes.
+/// can describe pages a later change reused. Links are checked the same way:
+/// a replaced buffer relinks its pages (see [`replace_buffer`]).
 unsafe fn read_buffer_range(
     index: pg_sys::Relation,
     pages: &mut Vec<u32>,
@@ -1794,6 +1794,9 @@ unsafe fn read_buffer_range(
                 // Follow the chain from the last known page to discover the next.
                 let last = *pages.last().expect("head is always known");
                 let buffer = Buffer::read(index, last, false);
+                if published.is_some_and(|published| buffer.lsn() > published) {
+                    return None;
+                }
                 let (next, _) = buffer.chain();
                 if next == NONE {
                     corrupt(format!(
@@ -1997,6 +2000,9 @@ unsafe fn read_buffer_stream(index: pg_sys::Relation, state: &BufferState) -> Ve
 
 /// Appends bytes to the write buffer, extending the chain as needed. The
 /// caller holds the meta page exclusively and persists `state` afterwards.
+/// Only bytes past the published buffer's last one change, and links past
+/// its tail, so a failure before the meta page is written leaves the
+/// published buffer as it was.
 unsafe fn append_to_buffer(index: pg_sys::Relation, state: &mut BufferState, mut data: &[u8]) {
     unsafe {
         while !data.is_empty() {
@@ -2059,15 +2065,84 @@ fn expect_buffer_page(buffer: &Buffer) {
     }
 }
 
-/// Rewrites the write buffer from its head with new contents.
+/// Replaces the write buffer's contents with `data`, holding `docs`
+/// documents, without changing a byte the published buffer reads.
+///
+/// Until the caller's [`write_meta`], the meta page on disk describes the
+/// old contents, and page writes survive a failed transaction; WAL replays
+/// any prefix of them after a crash or on a promoted standby. Rewritten from
+/// the head in place, the old contents were lost or unreadable whenever the
+/// meta page did not follow. So the new contents go to the pages hanging off
+/// the chain past the old tail, which hold no live byte, and to fresh pages
+/// once those run out; the old live pages follow them in the new chain as
+/// stale pages that later appends reuse, so the chain stays as long as the
+/// largest buffer it held. Only the old tail's link changes beforehand, and
+/// nothing reading the old contents follows it. Should the meta page never
+/// be written, the new pages are unreferenced, for VACUUM's orphan pass.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively, and `state` is the
+/// buffer state that meta page records.
 unsafe fn replace_buffer(index: pg_sys::Relation, state: &mut BufferState, data: &[u8], docs: u32) {
-    state.tail = state.head;
-    state.tail_used = 0;
-    state.bytes = 0;
-    state.docs = docs;
-    state.version = state.version.wrapping_add(1);
-    state.epoch = state.epoch.wrapping_add(1);
-    unsafe { append_to_buffer(index, state, data) };
+    unsafe {
+        let chunks: Vec<&[u8]> = if data.is_empty() {
+            vec![&[][..]]
+        } else {
+            data.chunks(CHAIN_CAPACITY).collect()
+        };
+        let (after_tail, live) = {
+            let tail = Buffer::read(index, state.tail, false);
+            expect_buffer_page(&tail);
+            let (next, data) = tail.chain();
+            (next, data.to_vec())
+        };
+        let (stale, rest) =
+            verify::chain_pages(index, after_tail, chunks.len() as u32, KIND_BUFFER);
+        if stale.len() < chunks.len() && rest != NONE {
+            corrupt(format!(
+                "Stannum write buffer: page {rest} past the tail is not a buffer page"
+            ));
+        }
+        if !stale.is_empty() {
+            // Detach the stale pages taken before they link back to the old
+            // head, or the chain would loop through the old tail.
+            let tail = Buffer::read(index, state.tail, true);
+            write_page(
+                index,
+                &tail,
+                false,
+                KIND_BUFFER,
+                &layout::chain_payload(rest, &live),
+            );
+        }
+        // Last page first, so each links to one already written; the last
+        // links to the old head.
+        let mut next = state.head;
+        let mut pages = Vec::with_capacity(chunks.len());
+        for (i, chunk) in chunks.iter().enumerate().rev() {
+            pgrx::check_for_interrupts!();
+            let buffer = match stale.get(i) {
+                Some(&block) => Buffer::read(index, block, true),
+                None => Buffer::allocate(index),
+            };
+            write_page(
+                index,
+                &buffer,
+                stale.get(i).is_none(),
+                KIND_BUFFER,
+                &layout::chain_payload(next, chunk),
+            );
+            next = buffer.block();
+            pages.push(next);
+        }
+        state.head = next;
+        state.tail = pages[0];
+        state.tail_used = chunks.last().expect("one chunk at least").len() as u32;
+        state.bytes = data.len() as u32;
+        state.docs = docs;
+        state.version = state.version.wrapping_add(1);
+        state.epoch = state.epoch.wrapping_add(1);
+    }
 }
 
 // --- Segments -----------------------------------------------------------------
@@ -2418,12 +2493,14 @@ unsafe fn merge_segments_reconstructed(
     finish_builder(builder)
 }
 
-/// Folds the write buffer into a new segment and empties it.
-unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
+/// Folds the write buffer into a new segment and starts it over with the
+/// one encoded document `record` (see [`replace_buffer`]).
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively; `meta` is what it
+/// records, and the buffer holds a document.
+unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta, record: &[u8]) {
     unsafe {
-        if meta.buffer.docs == 0 {
-            return;
-        }
         let stream = read_buffer_stream(index, &meta.buffer);
         let mut builder = SegmentBuilder::default();
         for record in segment::forward::records(&stream) {
@@ -2441,12 +2518,7 @@ unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta) {
             total_length,
             MAX_MERGE_DOCS.get() as u64,
         );
-        meta.buffer.tail = meta.buffer.head;
-        meta.buffer.tail_used = 0;
-        meta.buffer.bytes = 0;
-        meta.buffer.docs = 0;
-        meta.buffer.version = meta.buffer.version.wrapping_add(1);
-        meta.buffer.epoch = meta.buffer.epoch.wrapping_add(1);
+        replace_buffer(index, &mut meta.buffer, record, 1);
     }
 }
 
@@ -2858,10 +2930,11 @@ pub unsafe fn insert(
             && (meta.buffer.bytes as usize + bytes.len() > write_buffer_bytes(index)
                 || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32);
         if folded {
-            fold(index, &mut meta);
+            fold(index, &mut meta, &bytes);
+        } else {
+            append_to_buffer(index, &mut meta.buffer, &bytes);
+            meta.buffer.docs += 1;
         }
-        append_to_buffer(index, &mut meta.buffer, &bytes);
-        meta.buffer.docs += 1;
         race_point("insert:buffered");
         write_meta(index, &meta_buffer, &meta);
         drop(meta_buffer);
