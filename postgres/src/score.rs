@@ -1551,6 +1551,8 @@ impl IndexScorer {
             uppers: Vec::new(),
             buckets: Vec::new(),
             term_subs: Vec::new(),
+            class_bounds: Box::new([(0, 0.0); 256]),
+            class_stamp: 0,
             phrase: parts.phrase.take(),
             pending: Vec::new(),
             condition: parts.condition.take(),
@@ -1971,10 +1973,9 @@ impl OrdinalWalk<'_, '_> {
         let lead = (0..self.terms.len())
             .min_by_key(|&t| self.terms[t].keys.len())
             .expect("a conjunction has terms");
-        // As `all` orders them: the other terms rarest first, and every term.
+        // As `all` orders them: the other terms rarest first.
         let mut others: Vec<usize> = (0..self.terms.len()).filter(|&t| t != lead).collect();
         others.sort_by_key(|&t| self.terms[t].keys.len());
-        let all: Vec<usize> = (0..self.terms.len()).collect();
         let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
         for chunk in chunks {
             self.iterations = self.iterations.wrapping_add(1);
@@ -1991,7 +1992,7 @@ impl OrdinalWalk<'_, '_> {
                     .binary_search(&chunk.key)
                     .expect("every stream holds a bounded chunk");
             }
-            self.evaluate_all(chunk.key, lead, &others, &all, chunk.min_length, &mut set);
+            self.evaluate_all(chunk.key, lead, &others, chunk.min_length, &mut set);
         }
     }
 }
@@ -2399,6 +2400,13 @@ struct OrdinalWalk<'a, 's> {
     buckets: Vec<TfBucket>,
     /// Scratch for a chunk: per present term its bound per sub-block.
     term_subs: Vec<[f32; SUBS]>,
+    /// A conjunction's bound per length class in the sub-block being
+    /// scored, each with the stamp of the sub-block it was computed for:
+    /// within a sub-block it depends on the class alone (see
+    /// [`Self::score_conjunct`]).
+    class_bounds: Box<[(u32, f32); 256]>,
+    /// The stamp of the sub-block being scored; never zero once one is.
+    class_stamp: u32,
     /// For a phrase: the positions check a candidate must pass to be admitted.
     phrase: Option<PhraseCheck<'a>>,
     /// Scratch for a sub-block: the phrase candidates that scored into the
@@ -2930,7 +2938,6 @@ impl OrdinalWalk<'_, '_> {
         // The other terms, rarest first: the order each chunk narrows in.
         let mut others: Vec<usize> = (0..self.terms.len()).filter(|&t| t != lead).collect();
         others.sort_by_key(|&t| self.terms[t].keys.len());
-        let all: Vec<usize> = (0..self.terms.len()).collect();
         let mut set: Box<segment::ordinals::Words> = Box::new([0; segment::ordinals::WORDS]);
         loop {
             self.iterations = self.iterations.wrapping_add(1);
@@ -2988,7 +2995,7 @@ impl OrdinalWalk<'_, '_> {
                 self.step_all();
                 continue;
             }
-            self.evaluate_all(key, lead, &others, &all, min_length, &mut set);
+            self.evaluate_all(key, lead, &others, min_length, &mut set);
             self.step_all();
         }
     }
@@ -3123,7 +3130,6 @@ impl OrdinalWalk<'_, '_> {
         key: u16,
         lead: usize,
         others: &[usize],
-        all: &[usize],
         min_length: u32,
         set: &mut segment::ordinals::Words,
     ) {
@@ -3204,6 +3210,11 @@ impl OrdinalWalk<'_, '_> {
                 let pruning = self.threshold().is_some();
                 skip_sub = sub_empty[sub]
                     || (pruning && !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32));
+                self.class_stamp = self.class_stamp.wrapping_add(1);
+                if self.class_stamp == 0 {
+                    self.class_bounds.fill((0, 0.0));
+                    self.class_stamp = 1;
+                }
             }
             let mut word = if sparse {
                 let mut word = 0u64;
@@ -3233,13 +3244,14 @@ impl OrdinalWalk<'_, '_> {
                     // ordinal order, as `verify_pending` would admit them.
                     if self.phrase_matches(low, ordinal) {
                         let total = self
-                            .score_candidate(all, low, ordinal, sub, false)
+                            .score_conjunct(low, ordinal, sub, sub_scores[sub], false)
                             .expect("a candidate unpruned is scored");
                         self.admit(total, ordinal);
                     }
                     continue;
                 }
-                let Some(total) = self.score_candidate(all, low, ordinal, sub, pruning) else {
+                let Some(total) = self.score_conjunct(low, ordinal, sub, sub_scores[sub], pruning)
+                else {
                     continue;
                 };
                 let admit =
@@ -3318,8 +3330,103 @@ impl OrdinalWalk<'_, '_> {
         pending.clear();
     }
 
-    /// Scores the documents of chunk `key` that the terms `present` (in slot
-    /// order) hold, against the bounds of those terms' chunks.
+    /// The score of the document `low` of a conjunction's current chunk,
+    /// which every term holds, or `None` when it cannot reach the threshold:
+    /// [`Self::score_candidate`] over every term, bit for bit, with its
+    /// first two bounds taken whole. Every term holds the document, so its
+    /// first bound is the sub-block's, `first`, the sum of every term's
+    /// sub-block bound in slot order; and its bound at its length class is
+    /// the sum of every term's largest sub-block bucket at the class's
+    /// shortest length, which within the sub-block depends on the class
+    /// alone, so it is computed once per class a sub-block meets rather
+    /// than per candidate. Four in five candidates of a conjunction fell to
+    /// the class bound, each after testing every term's bit and scoring
+    /// every term's largest bucket at its class.
+    fn score_conjunct(
+        &mut self,
+        low: u16,
+        ordinal: u32,
+        sub: usize,
+        first: f32,
+        pruning: bool,
+    ) -> Option<f32> {
+        let class = if pruning {
+            if !self.can_beat(first, ordinal) {
+                return None;
+            }
+            let class = segment_error(self.index.length_class(ordinal));
+            let (stamp, bound) = self.class_bounds[usize::from(class)];
+            let bound = if stamp == self.class_stamp {
+                bound
+            } else {
+                let floor = segment::length_class::min_length(class);
+                // Folded as `score_candidate` folds its values: from zero,
+                // in slot order.
+                let mut bound = 0.0_f32;
+                for term in &self.terms {
+                    let top = term.sub_bounds[term.pos][sub];
+                    bound += if top == 0 {
+                        0.0
+                    } else {
+                        let bucket = TfBucket::new(top - 1).expect("bucket from a chunk bound");
+                        self.scorer.terms[term.slot].1.score_bucket(bucket, floor)
+                    };
+                }
+                self.class_bounds[usize::from(class)] = (self.class_stamp, bound);
+                bound
+            };
+            if !self.can_beat(bound, ordinal) {
+                return None;
+            }
+            Some(class)
+        } else {
+            None
+        };
+        let mut buckets = std::mem::take(&mut self.buckets);
+        buckets.clear();
+        for term in &mut self.terms {
+            let rank = term.rank(low).unwrap_or_else(|| {
+                crate::storage::corrupt(format!(
+                    "Stannum index data: ordinal {ordinal} is missing from a term's chunk"
+                ))
+            });
+            let bucket = term.bucket(rank).unwrap_or_else(|| {
+                crate::storage::corrupt(format!(
+                    "Stannum index data: ordinal {ordinal} carries no term-frequency bucket"
+                ))
+            });
+            buckets.push(TfBucket::new(bucket).unwrap_or_else(|| {
+                crate::storage::corrupt(format!(
+                    "Stannum index data: term-frequency bucket {bucket} out of range"
+                ))
+            }));
+        }
+        let at = |walk: &Self, buckets: &[TfBucket], length: u32| {
+            let mut total = 0.0_f32;
+            for (term, bucket) in walk.terms.iter().zip(buckets) {
+                total += walk.scorer.terms[term.slot].1.score_bucket(*bucket, length);
+            }
+            total
+        };
+        if let Some(class) = class
+            && !self.can_beat(
+                at(self, &buckets, segment::length_class::min_length(class)),
+                ordinal,
+            )
+        {
+            self.buckets = buckets;
+            return None;
+        }
+        let length = segment_error(self.lengths.get(ordinal));
+        let total = at(self, &buckets, length);
+        self.buckets = buckets;
+        if pruning && !self.can_beat(total, ordinal) {
+            return None;
+        }
+        *self.scored += 1;
+        Some(total)
+    }
+
     /// The score of the document `low` of the current chunk, or `None` when
     /// it cannot reach the threshold. Of the terms `present` (in slot order)
     /// those holding the document are bounded by their sub-block's largest
