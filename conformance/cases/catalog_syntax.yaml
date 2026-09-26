@@ -1,0 +1,218 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.syntax
+description: 'TINQL syntax: terms, keywords, boolean operators, grouping, malformed and large queries. Encoded from
+  docs/tin-behavior-catalog.md section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour
+  it tests. No engine''s answers are recorded yet.'
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_q01:
+    rows:
+    - [1, Apple pie]
+    - [2, grape]
+  cat_q02:
+    rows:
+    - [1, cats and dogs]
+    - [2, cats dogs]
+  cat_q03:
+    rows:
+    - [1, apple grape]
+    - [2, apple]
+  cat_q05:
+    rows:
+    - [1, apple peel]
+    - [2, apple]
+  cat_q08:
+    rows:
+    - [1, a]
+    - [2, b]
+    - [3, c]
+    - [4, b c]
+    - [5, a d]
+  cat_q09:
+    rows:
+    - [1, a b c]
+    - [2, a b]
+    - [3, a c]
+  cat_q10:
+    rows:
+    - [1, and or not]
+  cat_q11:
+    rows:
+    - [1, in at all first of by]
+  cat_q12:
+    rows:
+    - [1, apple]
+    - [2, '']
+    - [3, '...']
+    - [4, null]
+  cat_q13:
+    rows:
+    - [1, apple]
+  cat_q16:
+    rows:
+    - [1, wi-fi]
+    - [2, wi fi]
+    - [3, fi wi]
+    - [4, wifi]
+  cat_q17:
+    rows:
+    - [1, visit example.com today]
+    - [2, example]
+  cat_q19:
+    rows:
+    - [1, a b c]
+  cat_q20:
+    setup_sql: ['INSERT INTO {table} VALUES (1, (SELECT string_agg(''w'' || n, '' '') FROM generate_series(1, 3000)
+        n))']
+cases:
+- id: catalog.Q-01
+  description: 'A bare word is folded for case: APPLE matches ''Apple pie''.'
+  source: docs/tin-behavior-catalog.md §9 Q-01; behaviour §1.1 Q1
+  corpus: cat_q01
+  capture:
+  - ids: {query: APPLE}
+- id: catalog.Q-02
+  description: Lower-case and is a search term; upper-case AND is the operator.
+  source: docs/tin-behavior-catalog.md §9 Q-02; behaviour §1.1 Q2
+  corpus: cat_q02
+  capture:
+  - ids: {query: cats and dogs, as: lower_and}
+  - ids: {query: cats AND dogs, as: upper_and}
+- id: catalog.Q-03
+  description: Juxtaposition means AND.
+  source: docs/tin-behavior-catalog.md §9 Q-03; behaviour §1.2 B1
+  corpus: cat_q03
+  capture:
+  - ids: {query: apple grape}
+- id: catalog.Q-04
+  description: Explicit OR.
+  source: docs/tin-behavior-catalog.md §9 Q-04; behaviour §1.2 B2
+  corpus: cat_q03
+  capture:
+  - ids: {query: apple OR grape}
+- id: catalog.Q-05
+  description: AND NOT excludes.
+  source: docs/tin-behavior-catalog.md §9 Q-05; behaviour §1.2 B3
+  corpus: cat_q05
+  capture:
+  - ids: {query: apple AND NOT peel}
+- id: catalog.Q-06
+  description: 'NOT never stands alone: a leading NOT is a parse error.'
+  source: docs/tin-behavior-catalog.md §9 Q-06; behaviour §1.2 B3
+  priority: edge
+  corpus: cat_q05
+  capture:
+  - error: {query: NOT peel}
+- id: catalog.Q-07
+  description: '''-'' is not negation: -peel is the term peel (or an error). Record which.'
+  source: docs/tin-behavior-catalog.md §9 Q-07; behaviour §1.1 Q9
+  corpus: cat_q05
+  capture:
+  - ids: {query: apple -peel}
+- id: catalog.Q-08
+  description: 'Precedence: a OR b THEN/5 c AND d parses as a OR ((b THEN/5 c) AND d).'
+  source: docs/tin-behavior-catalog.md §9 Q-08; behaviour §1.2 B5
+  corpus: cat_q08
+  capture:
+  - ids: {query: a OR b THEN/5 c AND d, as: operators}
+  - ids: {query: a OR ((b THEN/5 c) AND d), as: explicit}
+- id: catalog.Q-09
+  description: 'AND NOT binds tighter than implicit AND: a b AND NOT c is a AND (b AND NOT c).'
+  source: docs/tin-behavior-catalog.md §9 Q-09; behaviour §1.2 B7
+  corpus: cat_q09
+  capture:
+  - ids: {query: a b AND NOT c}
+- id: catalog.Q-10
+  description: A quoted keyword is a term; maybe_quote adds quotes where needed.
+  source: docs/tin-behavior-catalog.md §9 Q-10; behaviour §1.1 Q3
+  corpus: cat_q10
+  capture:
+  - ids: {query: '"AND"'}
+  - value: {sql: 'SELECT json_build_array({engine}.maybe_quote(''AND''), {engine}.maybe_quote(''beer''), {engine}.maybe_quote(''foo*bar''),
+        {engine}.maybe_quote(''a b''))', as: maybe_quote}
+- id: catalog.Q-11
+  description: 'Which context keywords are reserved outside their context: ids or parse error per word.'
+  source: docs/tin-behavior-catalog.md §9 Q-11; behaviour §1.1 Q5, §1.1 Q4; §8 conflict 10
+  priority: conflict
+  corpus: cat_q11
+  capture:
+  - ids: {query: IN, as: in}
+  - ids: {query: AT, as: at}
+  - ids: {query: ALL, as: all}
+  - ids: {query: FIRST, as: first}
+  - ids: {query: OF, as: of}
+  - ids: {query: BY, as: by}
+- id: catalog.Q-12
+  description: Standalone * matches all documents; do empty, token-less and NULL documents match?
+  source: docs/tin-behavior-catalog.md §9 Q-12; behaviour §1.1 Q7, §6 C10
+  corpus: cat_q12
+  capture:
+  - ids: {query: '*'}
+  - count: {query: '*'}
+- id: catalog.Q-13
+  description: Queries that analyze to nothing match nothing, without an error.
+  source: docs/tin-behavior-catalog.md §9 Q-13; behaviour §2 K19
+  priority: edge
+  corpus: cat_q13
+  capture:
+  - count: {query: '', as: empty}
+  - count: {query: '   ', as: spaces}
+  - count: {query: '!!!', as: punctuation}
+- id: catalog.Q-14
+  description: Empty phrase, empty alternatives and a whitespace phrase are parse errors.
+  source: docs/tin-behavior-catalog.md §9 Q-14; behaviour §1.3 P11, §1.4 A3
+  priority: edge
+  corpus: cat_q13
+  capture:
+  - error: {query: '""', as: empty_phrase}
+  - error: {query: '[]', as: empty_alternatives}
+  - error: {query: '"   "', as: blank_phrase}
+- id: catalog.Q-15
+  description: 'Malformed queries are errors: dangling AND, unbalanced parentheses, a detached boost.'
+  source: docs/tin-behavior-catalog.md §9 Q-15; behaviour §1.2 B3, §1.9 W2
+  priority: edge
+  corpus: cat_q13
+  capture:
+  - error: {query: apple AND, as: dangling_and}
+  - error: {query: (apple, as: open_paren}
+  - error: {query: apple), as: close_paren}
+  - error: {query: apple ^2, as: detached_boost}
+- id: catalog.Q-16
+  description: 'A hyphenated term is a phrase: wi-fi means "wi fi".'
+  source: docs/tin-behavior-catalog.md §9 Q-16; behaviour §1.1 Q10
+  corpus: cat_q16
+  capture:
+  - ids: {query: wi-fi}
+- id: catalog.Q-17
+  description: A term with punctuation is split by the analyzer.
+  source: docs/tin-behavior-catalog.md §9 Q-17; behaviour §1.1 Q8
+  corpus: cat_q17
+  capture:
+  - ids: {query: example.com}
+- id: catalog.Q-18
+  description: CONTAINS term means term.
+  source: docs/tin-behavior-catalog.md §9 Q-18; behaviour §1.1 Q6
+  corpus: cat_q13
+  capture:
+  - ids: {query: CONTAINS apple}
+- id: catalog.Q-19
+  description: 'Chained relations: a BEFORE b BEFORE c matches or is a parse error.'
+  source: docs/tin-behavior-catalog.md §9 Q-19; behaviour §1.2 B8
+  corpus: cat_q19
+  capture:
+  - ids: {query: a BEFORE b BEFORE c}
+- id: catalog.Q-20
+  description: 'Large queries TIN 1.0.3 accepted must be answered: 3,000 ANDed words, a 3,000-term OR, 1,000 levels
+    of parentheses.'
+  source: docs/tin-behavior-catalog.md §9 Q-20; behaviour §1.2 B12
+  corpus: cat_q20
+  risky: true
+  crashes: [stannum-0.1.0]
+  capture:
+  - ids: {query_sql: '(SELECT string_agg(''w'' || n, '' '') FROM generate_series(1, 3000) n)', as: and_3000}
+  - ids: {query_sql: '(SELECT string_agg(''w'' || n, '' OR '') FROM generate_series(1, 3000) n)', as: or_3000}
+  - ids: {query_sql: 'repeat(''('', 1000) || ''w1'' || repeat('')'', 1000)', as: nested_1000}

@@ -1,0 +1,90 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.positions
+description: 'Positional filters: IN FIRST/LAST/MIDDLE and IN WORDS X TO Y. Encoded from docs/tin-behavior-catalog.md
+  section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine''s answers
+  are recorded yet.'
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_f01:
+    rows:
+    - [1, a b c d e]
+  cat_f04:
+    rows:
+    - [1, x0 x1 t x3 x4 x5 x6 x7 x8 x9]
+  cat_f05:
+    rows:
+    - [1, x0 x1 x2 m x4 x5 x6 x7 x8 x9]
+    - [2, x0 x1 m x3 x4 x5 x6 x7 x8 x9]
+  cat_f06:
+    rows:
+    - [1, a b c d]
+  cat_f07:
+    rows:
+    - [1, a b]
+  cat_f08:
+    rows:
+    - [1, beer x wine]
+    - [2, x x beer wine]
+cases:
+- id: catalog.F-01
+  description: IN FIRST N WORDS covers positions 0 to N-1.
+  source: docs/tin-behavior-catalog.md §9 F-01; behaviour §1.7 F1
+  corpus: cat_f01
+  capture:
+  - ids: {query: c IN FIRST 2 WORDS, as: first_2}
+  - ids: {query: c IN FIRST 3 WORDS, as: first_3}
+- id: catalog.F-02
+  description: 'IN WORDS X TO Y: 0-based (product docs) or 1-based (Lead)?'
+  source: docs/tin-behavior-catalog.md §9 F-02; behaviour §1.7 F2; §8 conflict 1
+  priority: conflict
+  corpus: cat_f01
+  capture:
+  - ids: {query: a IN WORDS 0 TO 0, as: a_0_0}
+  - ids: {query: c IN WORDS 2 TO 2, as: c_2_2}
+  - ids: {query: a IN WORDS 1 TO 1, as: a_1_1}
+- id: catalog.F-03
+  description: IN LAST N WORDS.
+  source: docs/tin-behavior-catalog.md §9 F-03; behaviour §1.7 F3
+  corpus: cat_f01
+  capture:
+  - ids: {query: e IN LAST 1 WORDS, as: e_last_1}
+  - ids: {query: d IN LAST 1 WORDS, as: d_last_1}
+- id: catalog.F-04
+  description: IN FIRST N% rounds the window up (t at position 2 of 10).
+  source: docs/tin-behavior-catalog.md §9 F-04; behaviour §1.7 F4
+  corpus: cat_f04
+  capture:
+  - ids: {query: t IN FIRST 25%, as: pct_25}
+  - ids: {query: t IN FIRST 20%, as: pct_20}
+- id: catalog.F-05
+  description: IN MIDDLE N% excludes (100-N)/2 % at each end (m at position 3, then 2).
+  source: docs/tin-behavior-catalog.md §9 F-05; behaviour §1.7 F5
+  corpus: cat_f05
+  capture:
+  - ids: {query: m IN MIDDLE 50%}
+- id: catalog.F-06
+  description: The whole span must fit inside the window.
+  source: docs/tin-behavior-catalog.md §9 F-06; behaviour §1.7 F6
+  corpus: cat_f06
+  capture:
+  - ids: {query: '"c d" IN FIRST 3 WORDS', as: first_3}
+  - ids: {query: '"c d" IN FIRST 4 WORDS', as: first_4}
+- id: catalog.F-07
+  description: 'Zero and reversed windows, and the nonexistent IN MIDDLE N WORDS: rows or error.'
+  source: docs/tin-behavior-catalog.md §9 F-07; behaviour §1.7 F8, §1.7 F5
+  corpus: cat_f07
+  capture:
+  - ids: {query: a IN FIRST 0 WORDS, as: first_0}
+  - ids: {query: a IN WORDS 5 TO 2, as: reversed}
+  - ids: {query: a IN MIDDLE 5 WORDS, as: middle_words}
+- id: catalog.F-08
+  description: A positional filter applies to the expression immediately to its left.
+  source: docs/tin-behavior-catalog.md §9 F-08; behaviour §1.2 B9
+  corpus: cat_f08
+  capture:
+  - ids: {query: beer IN FIRST 2 WORDS AND wine, as: left_operand}
+  - ids: {query: (beer AND wine) IN FIRST 2 WORDS, as: grouped}

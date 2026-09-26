@@ -1,0 +1,57 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: span.minimal_interval
+description: >
+  Phrases with gaps and spans whose operand is a phrase that shares a term
+  with the other operand. A span must be matched on minimal intervals
+  without letting one token play two roles. TIN 1.0.3's answers were
+  measured on 2026-09-26 by the lead session (ad-hoc probe, PostgreSQL 18.6
+  on PlanetScale, us-east-1); matches were identical with the custom scan on
+  and off.
+
+defaults:
+  corpus: minimal6
+  settings:
+    enable_seqscan: "off"
+  variants:
+    settings:
+      - {"{engine}.enable_custom_scan": "on"}
+      - {"{engine}.enable_custom_scan": "off"}
+    captures: [ids]
+  capture: [ids]
+
+corpora:
+  minimal6:
+    description: Repeated terms, so the shortest witness and the first witness differ.
+    rows:
+      - [1, x hotel hotel hotel zed y]
+      - [2, hotel x hotel zed]
+      - [3, hotel hotel zed]
+      - [4, a b b c d]
+      - [5, a b c b d]
+      - [6, a b x x b]
+
+cases:
+  - id: span.minimal_interval.1
+    description: A one-position gap inside a three-word phrase.
+    query: '"hotel _ hotel zed"'
+  - id: span.minimal_interval.2
+    description: A one-position gap between two occurrences of the same term.
+    query: '"hotel _ hotel"'
+  - id: span.minimal_interval.3
+    description: A phrase whose first two words are the same term.
+    query: '"hotel hotel zed"'
+  - id: span.minimal_interval.4
+    description: A phrase NEAR/2 one of its own terms; the phrase's b cannot also be the other operand.
+    query: '"a b" NEAR/2 b'
+  - id: span.minimal_interval.5
+    description: A phrase NEAR/1 one of its own terms.
+    query: '"a b" NEAR/1 b'
+  - id: span.minimal_interval.6
+    description: A term NEAR/2 a phrase containing it, operands reversed.
+    query: 'b NEAR/2 "a b"'
+  - id: span.minimal_interval.7
+    description: A phrase THEN/2 one of its own terms, which must be a later occurrence.
+    query: '"a b" THEN/2 b'

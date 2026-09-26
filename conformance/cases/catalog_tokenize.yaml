@@ -1,0 +1,133 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.tokenize
+description: 'Tokenization: tokenize() and the index''s tokenizer options. Encoded from docs/tin-behavior-catalog.md
+  section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine''s answers
+  are recorded yet.'
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_k04:
+    setup_sql: ['INSERT INTO {table} VALUES (1, normalize(''café'', NFC))']
+  cat_k05:
+    setup_sql: ['INSERT INTO {table} VALUES (1, ''I '' || chr(10084) || chr(65039) || '' '' || chr(128512) || ''
+        '' || chr(128105) || chr(8205) || chr(128187) || '' '' || chr(127482) || chr(127480))']
+  cat_k07:
+    rows:
+    - [1, 東京タワー]
+  cat_k09:
+    rows:
+    - [1, running]
+  cat_k11_preserve:
+    rows:
+    - [1, x aaaaaaaaaaaa y]
+    index_options: {long_tokens: discard, max_token_bytes: 8, position_gaps: preserve}
+  cat_k11_collapse:
+    rows:
+    - [1, x aaaaaaaaaaaa y]
+    index_options: {long_tokens: discard, max_token_bytes: 8, position_gaps: collapse}
+  cat_k12:
+    rows:
+    - [1, apple]
+    - [2, Apple]
+    index_options: {case_folding: preserve}
+cases:
+- id: catalog.K-01
+  description: 'UAX #29 word boundaries on numbers, apostrophes, hyphens, URLs and symbols.'
+  source: docs/tin-behavior-catalog.md §9 K-01; behaviour §2 K2
+  capture:
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''3.14 can''''t wi-fi example.com e-mail U.S.A. 1,000
+        foo_bar @user #tag'') t'}
+- id: catalog.K-02
+  description: Case folding of ß, dotted İ and final sigma.
+  source: docs/tin-behavior-catalog.md §9 K-02; behaviour §2 K3
+  capture:
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''Straße STRASSE İstanbul ΣΊΣΥΦΟΣ'') t'}
+- id: catalog.K-03
+  description: Accent folding; no compatibility normalization of ligatures, fullwidth, circled, superscript.
+  source: docs/tin-behavior-catalog.md §9 K-03; behaviour §2 K4
+  capture:
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''Jalapeño ﬁne Ｆｕｌｌ ① x²'') t'}
+- id: catalog.K-04
+  description: NFC and NFD spellings are the same term; the accent folds away.
+  source: docs/tin-behavior-catalog.md §9 K-04; behaviour §2 K5
+  corpus: cat_k04
+  capture:
+  - ids: {query_sql: 'normalize(''café'', NFD)', as: nfd}
+  - ids: {query: cafe, as: unaccented}
+- id: catalog.K-05
+  description: Emoji are searchable; grapheme modes emoji, retain and discard.
+  source: docs/tin-behavior-catalog.md §9 K-05; behaviour §2 K6, §2 K7
+  corpus: cat_k05
+  capture:
+  - ids: {query_sql: chr(128512), as: grinning}
+  - ids: {query_sql: chr(128105) || chr(8205) || chr(128187), as: zwj_sequence}
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''I '' || chr(10084) || chr(65039) || '' '' || chr(128512)
+        || '' '' || chr(128105) || chr(8205) || chr(128187) || '' '' || chr(127482) || chr(127480), graphemes =>
+        ''emoji'') t', as: graphemes_emoji}
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''I '' || chr(10084) || chr(65039) || '' '' || chr(128512)
+        || '' '' || chr(128105) || chr(8205) || chr(128187) || '' '' || chr(127482) || chr(127480), graphemes =>
+        ''retain'') t', as: graphemes_retain}
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''I '' || chr(10084) || chr(65039) || '' '' || chr(128512)
+        || '' '' || chr(128105) || chr(8205) || chr(128187) || '' '' || chr(127482) || chr(127480), graphemes =>
+        ''discard'') t', as: graphemes_discard}
+- id: catalog.K-06
+  description: CJK and Hangul segmentation.
+  source: docs/tin-behavior-catalog.md §9 K-06; behaviour §2 K9
+  capture:
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''東京タワー ひらがな 한국어'') t'}
+- id: catalog.K-07
+  description: A Han phrase and a single ideograph against a CJK document.
+  source: docs/tin-behavior-catalog.md §9 K-07; behaviour §2 K9
+  corpus: cat_k07
+  capture:
+  - ids: {query: '"東京"', as: phrase}
+  - ids: {query: 東, as: ideograph}
+- id: catalog.K-08
+  description: The whitespace tokenizer keeps punctuation and still folds case.
+  source: docs/tin-behavior-catalog.md §9 K-08; behaviour §2 K8
+  capture:
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''Hello, World! wi-fi'', tokenizer => ''whitespace'')
+        t'}
+- id: catalog.K-09
+  description: No stemming.
+  source: docs/tin-behavior-catalog.md §9 K-09; behaviour §2 K12
+  corpus: cat_k09
+  capture:
+  - ids: {query: run}
+- id: catalog.K-10
+  description: 'Long tokens: split, truncate, discard, and a max_token_bytes below the minimum.'
+  source: docs/tin-behavior-catalog.md §9 K-10; behaviour §2 K14
+  capture:
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(repeat(''a'', 300), long_tokens => ''split'') t', as: split}
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(repeat(''a'', 300), long_tokens => ''truncate'') t',
+      as: truncate}
+  - value: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(repeat(''a'', 300), long_tokens => ''discard'') t',
+      as: discard}
+  - error: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''abcdef'', max_token_bytes => 3) t', as: max_token_bytes_3}
+- id: catalog.K-11
+  description: A discarded token keeps its position under preserve, not under collapse.
+  source: docs/tin-behavior-catalog.md §9 K-11; behaviour §2 K15
+  corpus: cat_k11_preserve
+  capture:
+  - ids: {query: '"x y"', as: preserve, corpus: cat_k11_preserve}
+  - ids: {query: '"x y"', as: collapse, corpus: cat_k11_collapse}
+- id: catalog.K-12
+  description: An index with case_folding=preserve, with and without the custom scan.
+  source: docs/tin-behavior-catalog.md §9 K-12; behaviour §5 I7, §4 H15; §8 conflict 11
+  priority: conflict
+  corpus: cat_k12
+  capture:
+  - ids: {query: Apple, as: custom_scan_on}
+  - ids:
+      query: Apple
+      as: custom_scan_off
+      settings: {'{engine}.enable_custom_scan': 'off'}
+- id: catalog.K-13
+  description: An unknown tokenizer is an error; tokenize(NULL) returns no rows.
+  source: docs/tin-behavior-catalog.md §9 K-13; behaviour §2 K17, §2 K18
+  capture:
+  - error: {sql: 'SELECT array_agg(t) FROM {engine}.tokenize(''x'', tokenizer => ''icu'') t', as: icu}
+  - value: {sql: 'SELECT count(*) FROM {engine}.tokenize(NULL) t', as: null_rows}

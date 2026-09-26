@@ -1,0 +1,77 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.relations
+description: 'Span relations: ENCLOSES, ENCLOSED BY, OVERLAPPING, BEFORE, AFTER. Encoded from docs/tin-behavior-catalog.md
+  section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine''s answers
+  are recorded yet.'
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_r01:
+    rows:
+    - [1, a b c]
+    - [2, a c b]
+  cat_r02:
+    rows:
+    - [1, a b c]
+  cat_r03:
+    rows:
+    - [1, a b c]
+    - [2, a c]
+  cat_r04:
+    rows:
+    - [1, a b c]
+    - [2, a b x x c]
+  cat_r05:
+    rows:
+    - [1, a b]
+    - [2, b a]
+    - [3, b a b]
+  cat_r06:
+    rows:
+    - [1, spam eggs]
+    - [2, eggs]
+cases:
+- id: catalog.R-01
+  description: ENCLOSES keeps spans that contain the other.
+  source: docs/tin-behavior-catalog.md §9 R-01; behaviour §1.6 R1
+  corpus: cat_r01
+  capture:
+  - ids: {query: (a NEAR/3 c) ENCLOSES b}
+- id: catalog.R-02
+  description: 'ENCLOSED BY returns the inner span, ENCLOSES the outer: compare highlights.'
+  source: docs/tin-behavior-catalog.md §9 R-02; behaviour §1.6 R2, §4 H17
+  corpus: cat_r02
+  capture:
+  - highlight: {query: b ENCLOSED BY (a NEAR/3 c), as: enclosed_by}
+  - highlight: {query: (a NEAR/3 c) ENCLOSES b, as: encloses}
+- id: catalog.R-03
+  description: NOT ENCLOSES.
+  source: docs/tin-behavior-catalog.md §9 R-03; behaviour §1.6 R3
+  corpus: cat_r03
+  capture:
+  - ids: {query: (a NEAR/3 c) NOT ENCLOSES b}
+- id: catalog.R-04
+  description: OVERLAPPING and NOT OVERLAPPING.
+  source: docs/tin-behavior-catalog.md §9 R-04; behaviour §1.6 R4
+  corpus: cat_r04
+  capture:
+  - ids: {query: (a NEAR/1 b) OVERLAPPING (b NEAR/1 c), as: overlapping}
+  - ids: {query: (a NEAR/1 b) NOT OVERLAPPING (b NEAR/1 c), as: not_overlapping}
+- id: catalog.R-05
+  description: BEFORE and AFTER compare span starts.
+  source: docs/tin-behavior-catalog.md §9 R-05; behaviour §1.6 R5, §1.6 R6
+  corpus: cat_r05
+  capture:
+  - ids: {query: a BEFORE b, as: before}
+  - ids: {query: a AFTER b, as: after}
+- id: catalog.R-06
+  description: '* inside a span or positional context: rows (product docs example) or an error (Lead).'
+  source: docs/tin-behavior-catalog.md §9 R-06; behaviour §1.6 R8; §8 conflict 9
+  priority: conflict
+  corpus: cat_r06
+  capture:
+  - ids: {query: '* NOT ENCLOSES spam', as: not_encloses}
+  - ids: {query: '* IN FIRST 3 WORDS', as: in_first}

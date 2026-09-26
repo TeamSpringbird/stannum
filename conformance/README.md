@@ -16,6 +16,7 @@ conformance/
   README.md
   run.py                       the runner
   cases/<area>.yaml            declarative cases, grouped by area
+  cases/catalog_*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9
   expected/<engine>-<version>/<area>.json
                                recorded answers of one engine version
 ```
@@ -64,7 +65,7 @@ compares against, runs the cases and prints one line per case:
 |--------|---------|
 | `PASS` | every recorded capture equals the live answer |
 | `DIFF` | compatible but not identical: both engines raised an ERROR with the same SQLSTATE but different message text (and the case requires no `message_prefix`). Reported, not a failure |
-| `FAIL` | a capture differs, an ERROR has another SQLSTATE, the engine under test crashed the server, or its connection was lost |
+| `FAIL` | a capture differs, an ERROR has another SQLSTATE, the engine under test crashed the server, its connection was lost, or it could not build a corpus the recorded engine built |
 | `SKIP` | no answer is recorded for the case (no expectation), or `--skip-crash` skipped it |
 
 The run exits 1 if any case FAILs. Answers are compared exactly: id lists in
@@ -127,7 +128,9 @@ Each file starts with a `source` header, then the answers:
 ```
 
 A capture that raised an ERROR is recorded as
-`{"error": {"sqlstate": ..., "message": ...}}`. With `--area` or `--case`,
+`{"error": {"sqlstate": ..., "message": ...}}`; a case whose corpus could not
+be built (for example an index option the engine rejects) is recorded as
+`{"corpus_error": {...}}`. With `--area` or `--case`,
 the recorded cases are merged into existing files instead of replacing them.
 Record with `--skip-crash` only if the recorded engine's crashes should stay
 unrecorded; to record that an engine crashes, run without it on a server you
@@ -146,11 +149,17 @@ may restart.
   is the finding.
 - `expected/tin-*` hold answers of PlanetScale TIN only, never answers
   produced by Stannum or derived from Stannum's code.
-- `expected/tin-1.0.3/` was imported from
-  `postgres/tests/tin_responses/tin-1.0.3.json` (commit `d9b9225`), measured
-  on 2026-09-26 by `benchmarks/tin_behavior_probe.py` at `29a520e` against
-  PostgreSQL 18.6 on PlanetScale. The span counts are the number of recorded
-  matches (the probe did not run `count(*)` separately).
+- `expected/tin-1.0.3/` holds answers imported from earlier measurements,
+  each file naming its origin:
+  - `spans.json`, `bm25.json`, `query_size.json`: from
+    `postgres/tests/tin_responses/tin-1.0.3.json` (commit `d9b9225`),
+    measured on 2026-09-26 by `benchmarks/tin_behavior_probe.py` at `29a520e`
+    against PostgreSQL 18.6 on PlanetScale. The span counts are the number of
+    recorded matches (the probe did not run `count(*)` separately).
+  - `span.minimal_interval.json`: measured on 2026-09-26 by the lead
+    session's ad-hoc probe on the same server; matches identical with the
+    custom scan on and off.
+  The smoke and catalog cases have no TIN answers yet.
 - A case without recorded answers for an engine is not a failure; it is
   reported as SKIP until someone records that engine.
 
@@ -159,7 +168,8 @@ may restart.
 A case file has an `area`, an optional `description`, optional `defaults`
 merged into every case (`settings` are merged key by key), named `corpora`,
 and `cases`. Corpus names are global across files, so one area may use a
-corpus another defines.
+corpus another defines. Keys the runner does not know (for example the
+`stannum_observations` of `query_size.yaml`) are kept as documentation.
 
 ```yaml
 area: spans
@@ -188,16 +198,42 @@ cases:
     query: 'alpha THEN/1 "beta gamma"'
 ```
 
+Corpus fields, all optional:
+
+- `rows`: `[id, body]` pairs (a body may be `null`).
+- `pad: N`: adds N rows `(1000 + n, 'pad' || n)`, each with a unique term, so
+  a small corpus has enough documents that its terms are not dense.
+- `columns`: the table's columns (default `id int PRIMARY KEY, body text`).
+- `setup_sql`: statements run after the rows are inserted, before the index.
+- `index_options`: `WITH (...)` options of the default index
+  `CREATE INDEX {index} ON {table} USING {engine}(body)`.
+- `index_sql`: statements that replace the default index (an empty list
+  builds no index).
+- `after_index_sql`: statements run after the index is built (rows inserted
+  here live in the index's write buffer).
+
+If a corpus cannot be built, every case using it records a `corpus_error`
+and the run continues.
+
 Case fields:
 
-- `id`: dotted lower-case words, `<area>.<topic>.<n>`; stable forever.
-- `description`, `corpus`: required.
+- `id`: dotted words, `<area>.<topic>.<n>` or `catalog.<catalog id>`
+  (e.g. `catalog.F-02`); stable forever.
+- `description`: required. `corpus`: the case's corpus; a case that only
+  calls functions (`value`, `error`) may omit it.
+- `source`: where the expected behaviour is documented (the catalog cases
+  cite `docs/tin-behavior-catalog.md` §9 and the behaviour row);
+  `priority`: `conflict` for the §8 documentation conflicts, `edge` for
+  error and edge cases. Both are documentation; the runner does not use
+  them.
 - `query`: a TINQL string, bound as a SQL literal to `{query}`; or
   `query_sql`: a SQL expression that computes the query (e.g.
   `repeat('a ', 1000)`).
 - `capture`: a list of captures, each a name or a one-key mapping from the
   name to parameters (`as` renames the result, so one case can hold two
-  captures of the same kind). Any capture may give its own `sql`.
+  captures of the same kind). Any capture may give its own `sql`, its own
+  `query` or `query_sql`, its own `settings` (merged over the case's), and
+  its own `corpus` (so one case can compare two index configurations).
   - `ids`: ids of `body ==> query`, ordered by id.
   - `count`: `count(*)` of the matches.
   - `ranked`: the top `k` (default 10) ids by `score` (default
@@ -210,6 +246,13 @@ Case fields:
   - `error`: runs `sql` (default: the `ids` query) and records the ERROR's
     SQLSTATE and message; with `message_prefix`, check mode also requires the
     live message to start with it.
+  - `script`: ordered `steps`, each `{sql, session: a, capture: true}`, run
+    in autocommit mode on fresh connections named by `session` (so a step may
+    `BEGIN` in one session while another session reads), with the case's
+    settings as session settings. The result lists the captured steps'
+    rows or ERRORs. Use it for mutations (DELETE, VACUUM, REINDEX, ALTER
+    INDEX) and for multi-session visibility; give such a case its own corpus,
+    since the changes are not rolled back.
 - `score`, `k`: defaults for the ranked and scores captures.
 - `settings`: GUCs set with `SET LOCAL` for every capture; names may use
   `{engine}`.
@@ -221,9 +264,14 @@ Case fields:
 
 SQL placeholders: `{engine}` (the engine's name, which is both its function
 schema and its access method: `{engine}.full_score(ctid)`,
-`USING {engine}(body)`), `{table}` (the corpus table), `{query}`, `{score}`,
-`{k}` and `{schema}`. Other braces, such as `'{}'` array literals, are left
+`USING {engine}(body)`), `{table}` (the corpus table), `{index}` (its
+default index, `{table}_idx`), `{query}`, `{score}`, `{k}` and `{schema}`. Other braces, such as `'{}'` array literals, are left
 alone.
+
+Compare scores bit for bit only when both engines see identical corpus
+statistics. Beware dense-term elision in `score()`: a term in at least 10%
+of the documents scores 0, which turns a ranking into an id tiebreak; use
+`full_score()` or `pad` when a case is about order.
 
 ### Adding a case
 

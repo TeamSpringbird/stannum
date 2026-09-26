@@ -1,0 +1,362 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.scoring
+description: BM25 scoring, dense-term elision, score options and statistics. Encoded from docs/tin-behavior-catalog.md
+  section 9 (compiled 2026-09-26); each case cites its catalog row and the behaviour it tests. No engine's answers
+  are recorded yet.
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  cat_s01:
+    rows:
+    - [1, a]
+    - [2, a b]
+    - [3, b]
+    pad: 90
+  cat_s02:
+    rows:
+    - [1, w w w x y]
+    - [2, w w w w x]
+    pad: 90
+  cat_s03:
+    rows:
+    - [1, w w w w x]
+    - [2, w w w w w]
+    pad: 90
+  cat_s04:
+    rows:
+    - [1, rare common]
+    - [2, common]
+    - [3, common]
+    - [4, rare x]
+    - [5, common y]
+  cat_s05:
+    setup_sql: ['INSERT INTO {table} SELECT n, ''padding '' || repeat(''extra '', n % 4) || CASE WHEN n <= 9 THEN
+        ''nine '' ELSE '''' END || CASE WHEN n <= 10 THEN ''ten '' ELSE '''' END || CASE WHEN n <= 11 THEN ''eleven
+        '' ELSE '''' END || CASE WHEN n = 1 THEN ''alpha beta gamma'' ELSE ''beta alpha'' END FROM generate_series(1,
+        100) n']
+    description: benchmarks/oracle.py BOUNDARY_FIXTURE
+  cat_s07:
+    after_index_sql: ['INSERT INTO {table} SELECT n, ''w k'' || n FROM generate_series(1, 20) n']
+  cat_s08:
+    rows:
+    - [1, the midnight]
+    pad: 90
+    setup_sql: ['INSERT INTO {table} SELECT n, ''the filler'' || n FROM generate_series(2, 20) n']
+  cat_s09:
+    rows:
+    - [1, apple]
+    - [2, apply]
+    pad: 90
+  cat_s10:
+    rows:
+    - [1, ant]
+    - [2, bee]
+    pad: 90
+  cat_s11:
+    rows:
+    - [1, a]
+    - [2, a b]
+    pad: 90
+  cat_s12:
+    rows:
+    - [1, a b]
+    pad: 90
+  cat_s13:
+    rows:
+    - [1, alpha gamma]
+    pad: 90
+  cat_s17:
+    rows:
+    - [1, a]
+    - [2, a a b]
+    pad: 90
+  cat_s18:
+    columns: id int PRIMARY KEY, body text, name text, notes text
+    setup_sql: ['INSERT INTO {table} (id, name, notes) VALUES (1, ''fuji'', ''citrus''), (2, ''fuji'', ''x''), (3,
+        ''x'', ''citrus'')', 'INSERT INTO {table} (id, name, notes) SELECT 1000 + n, ''pad'' || n, ''pad'' || n
+        FROM generate_series(1, 90) n']
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}(name)', 'CREATE INDEX {table}_notes_idx ON {table}
+        USING {engine}(notes)']
+  cat_s19:
+    rows:
+    - [1, a b]
+    pad: 90
+  cat_s20:
+    rows:
+    - [1, rare common]
+    - [2, common]
+    - [3, common]
+    - [4, rare x]
+    - [5, common y]
+  cat_s21:
+    rows:
+    - [1, rare common]
+    - [2, common]
+    - [3, common]
+    - [4, rare x]
+    - [5, common y]
+    - [11, '']
+    - [12, '']
+    - [13, '']
+    - [14, '']
+    - [15, '']
+  cat_s23:
+    rows: &id001
+    - [1, the x]
+    - [2, the]
+    - [3, x y]
+    pad: 90
+    index_options: {k1: 2, b: 0.3}
+  cat_s23_upper:
+    rows: *id001
+    pad: 90
+    index_options: {score_stop_words: '''The'''}
+  cat_s23_lower:
+    rows: *id001
+    pad: 90
+    index_options: {score_stop_words: '''the'''}
+cases:
+- id: catalog.S-01
+  description: BM25 bits and ranking under full_score and score.
+  source: docs/tin-behavior-catalog.md §9 S-01; behaviour §3 S3, §3 S4
+  corpus: cat_s01
+  capture:
+  - scores: {query: a OR b, score: '{engine}.full_score(ctid)', as: full_bits}
+  - scores: {query: a OR b, score: '{engine}.score(ctid)', as: score_bits}
+  - ranked: {query: a OR b, score: '{engine}.full_score(ctid)', k: 100, as: full_ranked}
+- id: catalog.S-02
+  description: 'Term frequencies 3 and 4 share a quantization bucket: equal scores.'
+  source: docs/tin-behavior-catalog.md §9 S-02; behaviour §3 S5
+  corpus: cat_s02
+  capture:
+  - scores: {query: w, score: '{engine}.full_score(ctid)'}
+- id: catalog.S-03
+  description: 'Term frequencies 4 and 5 fall in different buckets: different scores.'
+  source: docs/tin-behavior-catalog.md §9 S-03; behaviour §3 S5
+  corpus: cat_s03
+  capture:
+  - scores: {query: w, score: '{engine}.full_score(ctid)'}
+- id: catalog.S-04
+  description: idf and length normalization on a five-document corpus.
+  source: docs/tin-behavior-catalog.md §9 S-04; behaviour §3 S3
+  corpus: cat_s04
+  capture:
+  - scores: {query: rare OR common, score: '{engine}.full_score(ctid)'}
+- id: catalog.S-05
+  description: Dense-term elision at 9, 10 and 11 of 100 documents; a boost pins a term; dense_ratio above 1 disables
+    elision.
+  source: docs/tin-behavior-catalog.md §9 S-05; behaviour §3 S8, §3 S9; §8 conflict 6
+  priority: conflict
+  corpus: cat_s05
+  capture:
+  - scores: {query: nine, score: '{engine}.score(ctid)', as: nine}
+  - scores: {query: ten, score: '{engine}.score(ctid)', as: ten}
+  - scores: {query: eleven, score: '{engine}.score(ctid)', as: eleven}
+  - scores: {query: nine^1, score: '{engine}.score(ctid)', as: nine_pinned}
+  - scores: {query: ten^1, score: '{engine}.score(ctid)', as: ten_pinned}
+  - scores: {query: eleven^1, score: '{engine}.score(ctid)', as: eleven_pinned}
+  - scores: {query: eleven, score: '{engine}.score(ctid, dense_ratio => 1.1)', as: eleven_ratio_1_1}
+- id: catalog.S-06
+  description: score_inspect after elision, at the default ratio and at 0.25.
+  source: docs/tin-behavior-catalog.md §9 S-06; behaviour §3 S28
+  corpus: cat_s05
+  capture:
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
+        term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''nine OR ten OR eleven'')', as: default_ratio}
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
+        term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''nine OR ten OR eleven'', dense_ratio
+        => 0.25)', as: ratio_0_25}
+- id: catalog.S-07
+  description: Elision statistics with every row in the mutable segment, before and after promote.
+  source: docs/tin-behavior-catalog.md §9 S-07; behaviour §3 S10
+  corpus: cat_s07
+  capture:
+  - script:
+      steps:
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.full_score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
+      - {sql: 'SELECT {engine}.promote(''{index}''::regclass) IS NOT NULL'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.full_score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
+- id: catalog.S-08
+  description: 'full_score ignores elision: ''the'' is dense (20 of 110 documents).'
+  source: docs/tin-behavior-catalog.md §9 S-08; behaviour §3 S11
+  corpus: cat_s08
+  capture:
+  - scores: {query: the AND midnight, score: '{engine}.score(ctid)', as: score}
+  - scores: {query: the AND midnight, score: '{engine}.full_score(ctid)', as: full_score}
+- id: catalog.S-09
+  description: A wildcard scores the dictionary terms it reaches, at its boost.
+  source: docs/tin-behavior-catalog.md §9 S-09; behaviour §3 S13; §8 conflict 7
+  priority: conflict
+  corpus: cat_s09
+  capture:
+  - scores: {query: appl*, score: '{engine}.full_score(ctid)', as: wildcard}
+  - scores: {query: appl*^2, score: '{engine}.full_score(ctid)', as: wildcard_boost_2}
+- id: catalog.S-10
+  description: 'Regex, range and fuzzy expansions: do they score?'
+  source: docs/tin-behavior-catalog.md §9 S-10; behaviour §3 S13; §8 conflict 7
+  priority: conflict
+  corpus: cat_s10
+  capture:
+  - scores: {query: MATCHES a.*, score: '{engine}.full_score(ctid)', as: regex}
+  - scores: {query: ant TO bee, score: '{engine}.full_score(ctid)', as: range}
+  - scores: {query: ant~1, score: '{engine}.full_score(ctid)', as: fuzzy}
+- id: catalog.S-11
+  description: A boolean NOT drops its subtree from scoring; a negative span relation does not.
+  source: docs/tin-behavior-catalog.md §9 S-11; behaviour §3 S14; §8 conflict 7
+  priority: conflict
+  corpus: cat_s11
+  capture:
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
+        term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''a AND NOT b'')', as: and_not}
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
+        term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''a NOT OVERLAPPING b'')', as: not_overlapping}
+- id: catalog.S-12
+  description: Repeated occurrences add their boosts; duplicates are removed; nested boosts multiply.
+  source: docs/tin-behavior-catalog.md §9 S-12; behaviour §3 S12, §1.9 W6
+  corpus: cat_s12
+  capture:
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
+        term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''a OR a^2'')', as: or_boosted}
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
+        term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''a a'')', as: duplicate}
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY
+        term), ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''(a^2)^3'')', as: nested}
+- id: catalog.S-13
+  description: term_add and term_replace; both at once is an error.
+  source: docs/tin-behavior-catalog.md §9 S-13; behaviour §3 S15
+  corpus: cat_s13
+  capture:
+  - scores: {query: alpha, score: '{engine}.score(ctid, term_add => ARRAY[''Gamma''])', as: term_add}
+  - scores: {query: alpha, score: '{engine}.score(ctid, term_replace => ARRAY[''gamma''])', as: term_replace}
+  - scores: {query: alpha, score: '{engine}.score(ctid, term_add => ARRAY[''gamma''], term_replace => ARRAY[''gamma''])',
+      as: both}
+- id: catalog.S-14
+  description: Calls in one statement must agree on dense_ratio; k1 may differ; arguments must be constant.
+  source: docs/tin-behavior-catalog.md §9 S-14; behaviour §3 S16
+  corpus: cat_s13
+  capture:
+  - value: {sql: 'SELECT json_agg(json_build_array(id, encode(float4send({engine}.score(ctid, dense_ratio => 0.1)),
+        ''hex''), encode(float4send({engine}.score(ctid, dense_ratio => 0.2)), ''hex'')) ORDER BY id) FROM {table}
+        WHERE body ==> ''alpha''', as: different_dense_ratio}
+  - value: {sql: 'SELECT json_agg(json_build_array(id, encode(float4send({engine}.score(ctid, k1 => 1.2)), ''hex''),
+        encode(float4send({engine}.score(ctid, k1 => 2.0)), ''hex'')) ORDER BY id) FROM {table} WHERE body ==> ''alpha''',
+      as: different_k1}
+  - value: {sql: 'SELECT json_agg(json_build_array(id, encode(float4send({engine}.score(ctid, k1 => id::real)),
+        ''hex'')) ORDER BY id) FROM {table} WHERE body ==> ''alpha''', as: row_dependent_k1}
+- id: catalog.S-15
+  description: score and full_score on the same relation is an error.
+  source: docs/tin-behavior-catalog.md §9 S-15; behaviour §3 S17; §8 conflict 14
+  priority: conflict
+  corpus: cat_s13
+  capture:
+  - value: {sql: 'SELECT json_agg(json_build_array(id, {engine}.score(ctid), {engine}.full_score(ctid))) FROM {table}
+        WHERE body ==> ''alpha'''}
+- id: catalog.S-16
+  description: Scoring without a scan is an error; UPDATE ... RETURNING with a search predicate.
+  source: docs/tin-behavior-catalog.md §9 S-16; behaviour §3 S18
+  corpus: cat_s13
+  capture:
+  - value: {sql: 'SELECT {engine}.score(ctid) FROM {table} ORDER BY id LIMIT 1', as: no_scan}
+  - value: {sql: 'UPDATE {table} SET body = body WHERE body ==> ''alpha'' RETURNING id, encode(float4send({engine}.score(ctid)),
+        ''hex'')', as: update_returning}
+- id: catalog.S-17
+  description: max_score is the best actual score; alone it follows full_score.
+  source: docs/tin-behavior-catalog.md §9 S-17; behaviour §3 S19
+  corpus: cat_s17
+  capture:
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid) / {engine}.max_score(ctid)),
+        ''hex'')) ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''a''', as: score_over_max}
+  - value: {sql: 'SELECT json_agg(json_build_array(id, encode(float4send({engine}.max_score(ctid)), ''hex'')) ORDER
+        BY id) FROM {table} WHERE body ==> ''a''', as: max_alone}
+  - value: {sql: 'SELECT encode(float4send(max(s)), ''hex'') FROM (SELECT {engine}.full_score(ctid) s FROM {table}
+        WHERE body ==> ''a'') f', as: max_full_score}
+- id: catalog.S-18
+  description: Scores sum across predicates on two indexed columns (product docs) or use one (Lead).
+  source: docs/tin-behavior-catalog.md §9 S-18; behaviour §3 S20; §8 conflict 4
+  priority: conflict
+  corpus: cat_s18
+  capture:
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+        ORDER BY id), ''[]'') FROM {table} WHERE name ==> ''fuji'' OR notes ==> ''citrus''', as: or}
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+        ORDER BY id), ''[]'') FROM {table} WHERE name ==> ''fuji^1.5'' OR notes ==> ''citrus''', as: or_boosted}
+- id: catalog.S-19
+  description: Two predicates on the same column versus one combined query.
+  source: docs/tin-behavior-catalog.md §9 S-19; behaviour §3 S21
+  corpus: cat_s19
+  capture:
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+        ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''a'' AND body ==> ''b''', as: two_predicates}
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+        ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''a b''', as: one_query}
+- id: catalog.S-20
+  description: 'Statistics count deleted rows until a rewrite: bits after DELETE, VACUUM and REINDEX.'
+  source: docs/tin-behavior-catalog.md §9 S-20; behaviour §3 S23; §8 conflict 8
+  priority: conflict
+  corpus: cat_s20
+  capture:
+  - script:
+      steps:
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.full_score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''rare OR common'''}
+      - {sql: 'DELETE FROM {table} WHERE id IN (2, 3)', capture: false}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.full_score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''rare OR common'''}
+      - {sql: 'VACUUM {table}', capture: false}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.full_score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''rare OR common'''}
+      - {sql: 'REINDEX INDEX {index}', capture: false}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.full_score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''rare OR common'''}
+- id: catalog.S-21
+  description: Token-less documents are left out of N and avgdl (compare with S-04).
+  source: docs/tin-behavior-catalog.md §9 S-21; behaviour §3 S7; §8 conflict 8
+  priority: conflict
+  corpus: cat_s21
+  capture:
+  - scores: {query: rare OR common, score: '{engine}.full_score(ctid)'}
+- id: catalog.S-22
+  description: 'Scores do not depend on the plan: custom scan on and off. (Add each debug_force_* value once TIN''s
+    names and values are recorded.)'
+  source: docs/tin-behavior-catalog.md §9 S-22; behaviour §3 S25
+  corpus: cat_s01
+  variants:
+    settings:
+    - {'{engine}.enable_custom_scan': 'on'}
+    - {'{engine}.enable_custom_scan': 'off'}
+    captures: [full_bits, score_bits]
+  capture:
+  - scores: {query: a OR b, score: '{engine}.full_score(ctid)', as: full_bits}
+  - scores: {query: a OR b, score: '{engine}.score(ctid)', as: score_bits}
+- id: catalog.S-23
+  description: Per-index k1 and b, ALTER INDEX SET without a rebuild, and score_stop_words matched exactly.
+  source: docs/tin-behavior-catalog.md §9 S-23; behaviour §3 S1, §3 S29
+  corpus: cat_s23
+  capture:
+  - script:
+      steps:
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''the OR x'''}
+      - {sql: 'ALTER INDEX {index} SET (k1 = 1.2)', capture: false}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''the OR x'''}
+      as: k1_b
+  - scores: {query: the OR x, score: '{engine}.score(ctid)', as: stop_words_upper, corpus: cat_s23_upper}
+  - scores: {query: the OR x, score: '{engine}.score(ctid)', as: stop_words_lower, corpus: cat_s23_lower}
+- id: catalog.S-24
+  description: k1, b and dense_ratio outside their domains are errors, at DDL and at run time.
+  source: docs/tin-behavior-catalog.md §9 S-24; behaviour §3 S2
+  corpus: cat_s13
+  capture:
+  - error: {sql: 'CREATE INDEX ON {table} USING {engine}(body) WITH (b = 1.5)', as: ddl_b_1_5}
+  - error: {sql: 'SELECT {engine}.score(ctid, k1 => -1) FROM {table} WHERE body ==> ''alpha''', as: runtime_k1_neg}
+  - error: {sql: 'SELECT {engine}.score(ctid, dense_ratio => -0.1) FROM {table} WHERE body ==> ''alpha''', as: runtime_dense_ratio_neg}

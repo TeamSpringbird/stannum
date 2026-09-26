@@ -36,7 +36,8 @@ except ImportError as error:  # pragma: no cover - environment guidance
 
 RUNNER_VERSION = "1"
 SUITE = Path(__file__).resolve().parent
-CAPTURES = ("ids", "count", "ranked", "scores", "highlight", "value", "error")
+CAPTURES = ("ids", "count", "ranked", "scores", "highlight", "value", "error", "script")
+PAD_ROWS_START = 1000
 DEFAULT_SCORE = "{engine}.full_score(ctid)"
 DEFAULT_TIMEOUT = "60s"
 RECONNECT_SECONDS = 120
@@ -72,9 +73,17 @@ def load_cases(directory):
             seen.add(case["id"])
             cases.append(case)
     for case in cases:
-        if case["corpus"] not in corpora:
-            raise CaseError(f"{case['id']}: unknown corpus {case['corpus']!r}")
+        for name in case_corpora(case):
+            if name not in corpora:
+                raise CaseError(f"{case['id']}: unknown corpus {name!r}")
     return corpora, cases
+
+
+def case_corpora(case):
+    """The corpora a case uses: its own and any a capture names."""
+    names = [case["corpus"]] if case.get("corpus") else []
+    names += [capture["corpus"] for capture in case["capture"] if capture.get("corpus")]
+    return list(dict.fromkeys(names))
 
 
 def merge_defaults(defaults, case):
@@ -87,11 +96,11 @@ def merge_defaults(defaults, case):
 
 def validate_case(case, seen):
     case_id = case.get("id")
-    if not case_id or not re.fullmatch(r"[a-z0-9_]+(\.[a-z0-9_]+)+", case_id):
-        raise CaseError(f"{case_id!r}: ids are dotted lower-case words, e.g. span.then_phrase_operand.1")
+    if not case_id or not re.fullmatch(r"[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+", case_id):
+        raise CaseError(f"{case_id!r}: ids are dotted words, e.g. span.then_phrase_operand.1 or catalog.F-02")
     if case_id in seen:
         raise CaseError(f"{case_id}: duplicate case id")
-    for field in ("description", "corpus", "capture"):
+    for field in ("description", "capture"):
         if not case.get(field):
             raise CaseError(f"{case_id}: missing {field!r}")
     if "query" in case and "query_sql" in case:
@@ -100,12 +109,20 @@ def validate_case(case, seen):
     names = [capture["as"] for capture in case["capture"]]
     if len(set(names)) != len(names):
         raise CaseError(f"{case_id}: two captures share a name; use 'as' to rename one")
+    has_query = any(key in case for key in ("query", "query_sql"))
     for capture in case["capture"]:
+        if "query" in capture and "query_sql" in capture:
+            raise CaseError(f"{case_id}: capture {capture['as']}: give 'query' or 'query_sql', not both")
+        own_query = any(key in capture for key in ("query", "query_sql"))
         needs_query = capture["kind"] in ("ids", "count", "ranked", "scores") and "sql" not in capture
-        if needs_query and "query" not in case and "query_sql" not in case:
-            raise CaseError(f"{case_id}: capture {capture['kind']} needs 'query' or 'query_sql'")
+        if needs_query and not (has_query or own_query):
+            raise CaseError(f"{case_id}: capture {capture['as']} needs 'query' or 'query_sql'")
         if capture["kind"] == "value" and "sql" not in capture and "sql" not in case:
             raise CaseError(f"{case_id}: capture value needs 'sql'")
+        if capture["kind"] == "script":
+            steps = capture.get("steps")
+            if not steps or not all(isinstance(step, dict) and "sql" in step for step in steps):
+                raise CaseError(f"{case_id}: capture script needs 'steps', each with 'sql'")
 
 
 def normalize_capture(case_id, item):
@@ -167,6 +184,8 @@ def jsonable(value):
         return str(value)
     if isinstance(value, (list, tuple)):
         return [jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): jsonable(item) for key, item in value.items()}
     if isinstance(value, (bytes, memoryview)):
         return bytes(value).hex()
     return str(value)
@@ -294,25 +313,53 @@ def corpus_table(name):
     return f"corpus_{name}"
 
 
+def corpus_values(engine, name, schema=None):
+    values = {"engine": engine}
+    if name:
+        table = corpus_table(name)
+        values.update(table=table, index=f"{table}_idx")
+    if schema:
+        values["schema"] = schema
+    return values
+
+
 def build_corpus(session, engine, corpus):
-    table = corpus_table(corpus["name"])
+    """Create the corpus table, fill it, and build its index.
+
+    Defaults: columns `id int PRIMARY KEY, body text`, rows [id, body] (body
+    may be null), `pad: N` adds rows (1000 + n, 'pad' || n) for n in 1..N, and
+    one index `USING {engine}(body)` with `index_options`, built after the
+    inserts. `index_sql` replaces that index statement (a list; empty for no
+    index); `setup_sql` runs before the index, `after_index_sql` after it.
+    """
+    values = corpus_values(engine, corpus["name"], session.schema)
+    table = values["table"]
     connection = session.connection
-    connection.execute(f"CREATE TABLE {table} (id int PRIMARY KEY, body text)")
+    columns = corpus.get("columns") or "id int PRIMARY KEY, body text"
+    connection.execute(f"CREATE TABLE {table} ({substitute(columns, values)})")
     rows = []
     for row in corpus.get("rows") or []:
         if isinstance(row, dict):
-            rows.append((int(row["id"]), row["body"]))
+            rows.append((int(row["id"]), row.get("body")))
         else:
             rows.append((int(row[0]), row[1]))
+    rows += [(PAD_ROWS_START + n, f"pad{n}") for n in range(1, int(corpus.get("pad", 0)) + 1)]
     with connection.cursor() as cursor:
         cursor.executemany(f"INSERT INTO {table} (id, body) VALUES (%s, %s)", rows)
     for statement in corpus.get("setup_sql") or []:
-        connection.execute(substitute(statement, {"engine": engine, "table": table}))
-    options = corpus.get("index_options") or {}
-    with_clause = ""
-    if options:
-        with_clause = " WITH (" + ", ".join(f"{key} = {value}" for key, value in options.items()) + ")"
-    connection.execute(f"CREATE INDEX {table}_idx ON {table} USING {engine}(body){with_clause}")
+        connection.execute(substitute(statement, values))
+    if "index_sql" in corpus:
+        statements = corpus["index_sql"] or []
+    else:
+        options = corpus.get("index_options") or {}
+        with_clause = ""
+        if options:
+            with_clause = " WITH (" + ", ".join(f"{key} = {value}" for key, value in options.items()) + ")"
+        statements = [f"CREATE INDEX {{index}} ON {{table}} USING {{engine}}(body){with_clause}"]
+    for statement in statements:
+        connection.execute(substitute(statement, values))
+    for statement in corpus.get("after_index_sql") or []:
+        connection.execute(substitute(statement, values))
     connection.execute(f"ANALYZE {table}")
 
 
@@ -354,18 +401,81 @@ def shape(kind, rows):
     return [jsonable(list(row)) for row in rows]
 
 
+def query_value(owner, values):
+    """The SQL for {query}: a literal of 'query', or the expression 'query_sql'."""
+    if "query" in owner:
+        return literal(owner["query"])
+    if "query_sql" in owner:
+        return "(" + substitute(owner["query_sql"], values) + ")"
+    return None
+
+
+def error_of(error):
+    return {"sqlstate": error.sqlstate, "message": error.diag.message_primary or str(error)}
+
+
+def run_script(session, capture, values, settings):
+    """Ordered steps over named sessions (fresh autocommit connections, closed at
+    the end, which rolls back anything left open). Returns one entry per step
+    with capture: true: its rows (shaped like value) or its ERROR."""
+    connections, results = {}, []
+    try:
+        for step in capture["steps"]:
+            name = str(step.get("session", "a"))
+            if name not in connections:
+                connection = session.open()
+                connection.autocommit = True
+                connection.execute(f"SET search_path = {session.schema}, public")
+                connection.execute("SELECT set_config('statement_timeout', %s, false)",
+                                   (settings.get("statement_timeout", DEFAULT_TIMEOUT),))
+                for key, value in settings.items():
+                    if key != "statement_timeout":
+                        connection.execute("SELECT set_config(%s, %s, false)", (key, str(value)))
+                connections[name] = connection
+            sql = substitute(step["sql"], values)
+            try:
+                with connections[name].cursor() as cursor:
+                    cursor.execute(sql)
+                    rows = cursor.fetchall() if cursor.description else []
+                outcome = shape("value", rows) if rows else None
+            except psycopg.OperationalError as error:
+                if connections[name].closed or connections[name].broken:
+                    raise ConnectionLost(str(error)) from error
+                outcome = {"error": error_of(error)}
+            except psycopg.Error as error:
+                outcome = {"error": error_of(error)}
+            if step.get("capture", True):
+                results.append(outcome)
+    finally:
+        for connection in connections.values():
+            try:
+                connection.close()
+            except Exception:
+                pass
+    return results
+
+
 def run_capture(session, case, capture, values, settings):
     """Returns the capture's JSON result; an ERROR becomes {"error": {...}}."""
     local = dict(values)
+    if capture.get("corpus"):
+        local.update(corpus_values(values["engine"], capture["corpus"], values.get("schema")))
+    own_query = query_value(capture, local)
+    if own_query is not None:
+        local["query"] = own_query
     local["score"] = capture.get("score", case.get("score", DEFAULT_SCORE))
     local["k"] = str(int(capture.get("k", case.get("k", 10))))
+    settings = {**settings, **{substitute(name, values): value
+                               for name, value in (capture.get("settings") or {}).items()}}
+    if capture["kind"] == "script":
+        return run_script(session, capture, local, settings)
     sql = substitute(capture_sql(case, capture, local), local)
     try:
         rows = session.run(sql, settings)
     except ConnectionLost:
         raise
     except psycopg.Error as error:
-        failure = {"sqlstate": error.sqlstate, "message": error.diag.message_primary or str(error)}
+        failure = error_of(error)
         return failure if capture["kind"] == "error" else {"error": failure}
     if capture["kind"] == "error":
         return {"no_error": shape("value", rows)}
@@ -374,11 +484,10 @@ def run_capture(session, case, capture, values, settings):
 
 def run_case(session, engine, case):
     """Returns the case record: {"captures": {...}} or {"server_crashed": true, ...}."""
-    values = {"engine": engine, "table": corpus_table(case["corpus"]), "schema": session.schema}
-    if "query" in case:
-        values["query"] = literal(case["query"])
-    elif "query_sql" in case:
-        values["query"] = "(" + substitute(case["query_sql"], values) + ")"
+    values = corpus_values(engine, case.get("corpus"), session.schema)
+    query = query_value(case, values)
+    if query is not None:
+        values["query"] = query
     base = {substitute(name, values): value for name, value in (case.get("settings") or {}).items()}
     variants = case.get("variants") or {}
     variant_settings = [
@@ -442,7 +551,20 @@ def compare_capture(case, capture, want, got):
         return compare_errors(capture.get("message_prefix"), want["error"], got["error"])
     if want == got:
         return "PASS", ""
+    if without_messages(want) == without_messages(got):
+        return "DIFF", f"{capture['as']}: same answers and SQLSTATEs, different ERROR messages"
     return "FAIL", f"{capture['as']}: got {brief(got)}, recorded {brief(want)}"
+
+
+def without_messages(value):
+    """The value with every ERROR's message removed, keeping its SQLSTATE."""
+    if isinstance(value, dict):
+        if "error" in value and isinstance(value["error"], dict):
+            return {"error": {"sqlstate": value["error"].get("sqlstate")}}
+        return {key: without_messages(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [without_messages(item) for item in value]
+    return value
 
 
 def compare_errors(prefix, want, got):
@@ -467,6 +589,12 @@ def only_errors(record):
 
 
 def compare_case(case, want, got):
+    if "corpus_error" in got or "corpus_error" in want:
+        if "corpus_error" not in got:
+            return "FAIL", f"recorded engine could not build the corpus: {brief(want['corpus_error'])}"
+        if "corpus_error" not in want:
+            return "FAIL", f"could not build the corpus: {brief(got['corpus_error'])}"
+        return compare_errors(None, want["corpus_error"], got["corpus_error"])
     if got.get("server_crashed"):
         return "FAIL", "the server crashed" + (" (as the recorded engine did)" if want.get("server_crashed") else "")
     if "connection_lost" in (got.get("captures") or {}):
@@ -601,14 +729,22 @@ def main():
 
     print()
     try:
-        for name in dict.fromkeys(case["corpus"] for case in cases):
-            build_corpus(session, args.engine, corpora[name])
+        corpus_errors = {}
+        for name in dict.fromkeys(name for case in cases for name in case_corpora(case)):
+            try:
+                build_corpus(session, args.engine, corpora[name])
+            except psycopg.Error as error:
+                corpus_errors[name] = dict(error_of(error), corpus=name)
         for case in cases:
             tagged = crash_tagged(case, args.engine, version)
             if tagged and args.skip_crash:
                 emit("SKIP", case["id"], f"tagged crashes: {args.engine}-{version}")
                 continue
-            record = execute_case(session, args.engine, case, risky=bool(case.get("risky") or tagged))
+            failed = [corpus_errors[name] for name in case_corpora(case) if name in corpus_errors]
+            if failed:
+                record = {"corpus_error": failed[0]}
+            else:
+                record = execute_case(session, args.engine, case, risky=bool(case.get("risky") or tagged))
             results[case["id"]] = record
             if args.check:
                 want = expected.get(case["id"])
@@ -618,7 +754,10 @@ def main():
                     status, detail = compare_case(case, want, record)
                     emit(status, case["id"], detail)
             else:
-                if record.get("server_crashed"):
+                if "corpus_error" in record:
+                    error = record["corpus_error"]
+                    emit("ERROR", case["id"], f"corpus {error['corpus']}: {error['sqlstate']} {error['message']}")
+                elif record.get("server_crashed"):
                     emit("CRASH", case["id"], record.get("detail", ""))
                 elif "connection_lost" in record["captures"]:
                     emit("LOST", case["id"], record["captures"]["connection_lost"])
