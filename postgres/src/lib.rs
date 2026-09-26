@@ -6991,6 +6991,129 @@ mod tests {
         assert!(rows.is_empty(), "{}", rows.join("\n"));
     }
 
+    /// Ids of the top `limit` rows of `table` for `needle`, ranked.
+    fn ranked_ids(table: &str, limit: i64) -> Vec<i32> {
+        Spi::connect(|client| {
+            client
+                .select(
+                    &format!(
+                        "SELECT id FROM {table} WHERE body ==> 'needle'
+                         ORDER BY stannum.full_score(ctid) DESC, id LIMIT {limit}"
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                .collect()
+        })
+    }
+
+    #[pg_test]
+    fn per_segment_caches_forget_retired_generations() {
+        // A backend behind a connection pooler outlives thousands of folds
+        // and merges. Its caches keyed by segment generation must let go of
+        // the generations a merge retires when the next view is captured,
+        // rather than hold them until a count limit empties the cache.
+        Spi::run(
+            "CREATE TABLE churn(id int primary key, body text);
+             CREATE INDEX churn_idx ON churn USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 2;
+             SET LOCAL stannum.merge_tier_factor = 2;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'churn_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let mut generations = std::collections::BTreeSet::new();
+        for cycle in 0..20i64 {
+            let from = cycle * 6 + 1;
+            Spi::run(&format!(
+                "INSERT INTO churn SELECT n, 'needle pad ' || n
+                 FROM generate_series({from}, {}) n",
+                from + 5
+            ))
+            .unwrap();
+            // One folded row per cycle dies, so segments carry dead lists
+            // that the ranked walk decodes.
+            let dead = tids(&format!("SELECT ctid::text FROM churn WHERE id = {from}"));
+            let index =
+                unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+            unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+            drop(index);
+            Spi::run(&format!("DELETE FROM churn WHERE id = {from}")).unwrap();
+            assert_eq!(ranked_ids("churn", 1000).len() as i64, 5 * (cycle + 1));
+            assert_eq!(
+                value("SELECT count(*) FROM churn WHERE body ==> 'needle'"),
+                5 * (cycle + 1)
+            );
+            generations.extend(Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT generation FROM stannum.segment_info('churn_idx')
+                             WHERE kind = 'immutable'",
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| row.get::<i64>(1).unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let index = unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::AccessShareLock as _) };
+        let entries = unsafe { crate::storage::testing::cached_entries(index.as_ptr()) };
+        drop(index);
+        assert!(
+            generations.len() > 2 * entries.live_segments,
+            "merges retired too few generations: {} seen, {entries:?}",
+            generations.len()
+        );
+        assert!(entries.readers <= entries.live_segments, "{entries:?}");
+        assert!(entries.page_tables <= entries.live_segments, "{entries:?}");
+        assert!(entries.dead_lists <= entries.live_segments, "{entries:?}");
+    }
+
+    #[pg_test]
+    fn dead_sets_count_against_the_reader_cache_budget() {
+        // A segment's decoded dead list lives beside its reader for as long
+        // as the reader is cached; at 10 million documents half dead it is
+        // tens of megabytes per backend, so `stannum.reader_cache_mb` must
+        // count it, not the reader's fetched bytes alone.
+        use crate::storage::testing::{READER_CACHE_BYTES, READER_CACHE_CLEARS};
+        Spi::run(
+            "CREATE TABLE deadweight(id int primary key, body text);
+             INSERT INTO deadweight SELECT n, 'needle pad' FROM generate_series(1, 3000) n;
+             CREATE INDEX deadweight_idx ON deadweight USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'deadweight_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let dead = tids("SELECT ctid::text FROM deadweight WHERE id > 1000");
+        assert_eq!(dead.len(), 2000);
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        drop(index);
+        Spi::run("DELETE FROM deadweight WHERE id > 1000").unwrap();
+        assert_eq!(ranked_ids("deadweight", 10), (1..=10).collect::<Vec<_>>());
+        // The next view is captured with the fetched bytes as they are now,
+        // under a budget above them but below them plus the dead locations.
+        let arena = crate::storage::testing::reader_arena_bytes();
+        let budget = arena + dead.len() * std::mem::size_of::<segment::Tid>() - 1;
+        let clears = READER_CACHE_CLEARS.get();
+        READER_CACHE_BYTES.set(Some(budget));
+        let ids = ranked_ids("deadweight", 10);
+        READER_CACHE_BYTES.set(None);
+        assert_eq!(ids, (1..=10).collect::<Vec<_>>());
+        assert!(
+            READER_CACHE_CLEARS.get() > clears,
+            "a {arena} byte arena and 2,000 dead locations fit in {budget} bytes"
+        );
+    }
+
     #[pg_test]
     fn per_row_scores_do_not_depend_on_the_order_rows_are_scored_in() {
         // The unpruned path scores rows as the executor hands them over: in

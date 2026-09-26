@@ -1585,6 +1585,15 @@ unsafe fn cached_segment(
     (segment, dead, dead_set)
 }
 
+/// `stannum.reader_cache_mb` in bytes.
+fn reader_cache_budget() -> usize {
+    #[cfg(feature = "pg_test")]
+    if let Some(bytes) = testing::READER_CACHE_BYTES.get() {
+        return bytes;
+    }
+    READER_CACHE_MB.get() as usize * 1024 * 1024
+}
+
 /// Drops cached readers for segments no longer in the directory, and every
 /// reader once the fetched bytes exceed the budget. Live views keep their
 /// own references, so dropping here only releases what nothing else holds.
@@ -1595,8 +1604,10 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
             *id != identity || meta.segments.iter().any(|e| e.generation == *generation)
         });
         let bytes: usize = readers.values().map(|c| c.reader.cached_bytes()).sum();
-        if bytes > READER_CACHE_MB.get() as usize * 1024 * 1024 {
+        if bytes > reader_cache_budget() {
             readers.clear();
+            #[cfg(feature = "pg_test")]
+            testing::READER_CACHE_CLEARS.set(testing::READER_CACHE_CLEARS.get() + 1);
         }
     });
 }
@@ -3976,6 +3987,47 @@ pub mod testing {
         /// A merge input ceiling in bytes below the smallest
         /// `max_merged_segment_size` (100 MB), for builds of test size.
         pub static SEGMENT_BYTES_CAP_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+        /// `stannum.reader_cache_mb` in bytes, for budgets finer than the
+        /// GUC's megabytes.
+        pub static READER_CACHE_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        /// Times the reader cache was emptied for exceeding its budget.
+        pub static READER_CACHE_CLEARS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// What a backend's per-segment caches hold for one index.
+    #[derive(Debug)]
+    pub struct CachedEntries {
+        /// Immutable segments in the index's directory.
+        pub live_segments: usize,
+        /// Cached segment readers.
+        pub readers: usize,
+        /// Cached run page tables.
+        pub page_tables: usize,
+        /// Decoded dead lists.
+        pub dead_lists: usize,
+    }
+
+    /// The entries this backend's caches hold under `index`'s identity.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn cached_entries(index: pg_sys::Relation) -> CachedEntries {
+        let (_, meta) = unsafe { read_meta(index, false) };
+        let identity = meta.identity;
+        CachedEntries {
+            live_segments: meta.segments.len(),
+            readers: SEGMENT_READERS
+                .with_borrow(|readers| readers.keys().filter(|(id, _)| *id == identity).count()),
+            page_tables: PAGE_TABLES
+                .with_borrow(|tables| tables.keys().filter(|(id, _)| *id == identity).count()),
+            dead_lists: crate::fold::cached_dead_lists(identity),
+        }
+    }
+
+    /// Bytes the cached readers' arenas hold, across every index.
+    pub fn reader_arena_bytes() -> usize {
+        SEGMENT_READERS
+            .with_borrow(|readers| readers.values().map(|c| c.reader.cached_bytes()).sum())
     }
 
     /// The number of runs on the meta page's pending list.
