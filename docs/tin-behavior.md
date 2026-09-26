@@ -63,3 +63,30 @@ VACUUM freeing a merge's unpublished pages, the pending list freed before
 the meta page is written, and counts racing VACUUM are properties of
 Stannum's storage and are fixed and tested locally with race points
 (`docs/testing.md`).
+
+## Conformance tests
+
+TIN's responses are recorded, not re-derived, in
+`postgres/tests/tin_responses/tin-<version>.json`. Each file opens with a
+`source` block naming the TIN extension version, the PostgreSQL version and
+host, the date, and the probe that measured it. The pg_tests in
+`postgres/src/tin_conformance.rs` replay every recorded case against
+Stannum; the module header and each test's comment name the TIN version
+their expectations came from, and the tests check that the file they read
+is that version.
+
+| Test | Checks against TIN 1.0.3 |
+|---|---|
+| `tin_1_0_3_spans_with_phrase_operands` | matches (custom scan on and off), counts, and ranked top ten for the six span queries |
+| `tin_1_0_3_bm25_k1_scores_and_pruned_top` | every score bit-identical to TIN's at k1 = 0, 0.001, 0.01 and 1.2, and the pruned `LIMIT 1` row |
+| `tin_1_0_3_query_size_and_nesting` | every size TIN answered is answered with TIN's count; the sizes that crashed TIN end in an ERROR or a correct count |
+
+On `29a520e`, before the fixes, the first two fail: the span counts and
+rankings drop rows, and the pruned `LIMIT 1` at k1 = 0 returns row 1 where
+TIN returns row 2. All 40 scores already match TIN's bits. The third is
+run only on builds with the query-depth fix, because on earlier builds it
+crashes the test server.
+
+To follow a new TIN release: run `benchmarks/tin_behavior_probe.py` against
+it, record the responses in a new `tin-<version>.json`, and add tests named
+for that version. Never edit a recorded file's values.

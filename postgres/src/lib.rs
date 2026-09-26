@@ -26,6 +26,10 @@ mod tf_bucket {
 }
 mod udfs;
 
+/// Stannum against TIN's recorded responses (TIN 1.0.3, see the module).
+#[cfg(feature = "pg_test")]
+mod tin_conformance;
+
 /// The query front end's stack backstop (`tinql::limits::set_stack_check`):
 /// PostgreSQL's `check_stack_depth`, whose ERROR pgrx turns into a panic that
 /// unwinds out of the query pass and is raised again at the extension's
