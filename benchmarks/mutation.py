@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
 # Copyright (C) 2026 Ben Weis <ben@springbird.app>
 #
 # See LICENSE in the repository root for license terms.
 
-"""The sustained-mutation profile of run.py. See docs/benchmarks/harness.md.
+"""The sustained-mutation profile of run.py (`run.py run --profile mutation`).
 
 Rate-scheduled writers insert copies of dataset documents under fresh ids,
 delete existing rows, and rewrite the reserved suffix of existing rows with
