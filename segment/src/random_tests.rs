@@ -353,8 +353,8 @@ proptest! {
                     // every document of a chunk fits the chunk's bound, and the
                     // whole term's minima match the oracle's.
                     let mut merged = crate::bound::BlockBound::EMPTY;
-                    for i in 0..ordinals.bounds().len() {
-                        let chunk = ordinals.chunk_bound(i).unwrap();
+                    for i in 0..ordinals.bounds().unwrap().len() {
+                        let chunk = ordinals.chunk_bound(i).unwrap().unwrap();
                         merged = merged.merge(&crate::bound::BlockBound { min_len: chunk.min_len });
                     }
                     prop_assert_eq!(merged, bound);
@@ -368,6 +368,7 @@ proptest! {
     fn decoders_never_panic_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
         let _ = crate::ordinals::Ordinals::parse(&bytes).and_then(|o| o.to_vec());
         let _ = crate::ordinals::Ordinals::open(&bytes[..], bytes.len() as u64, true).and_then(|o| {
+            o.bounds()?;
             let mut cursor = o.cursor()?;
             cursor.seek(70_000)?;
             while cursor.current().is_some() { cursor.advance()?; }

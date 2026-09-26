@@ -1310,7 +1310,7 @@ mod tests {
         // The term's stream carries a bound over its documents.
         let ordinals = beer.ordinals().unwrap();
         assert_eq!(ordinals.to_vec().unwrap(), [0, 1]);
-        let bound = ordinals.chunk_bound(0).unwrap();
+        let bound = ordinals.chunk_bound(0).unwrap().unwrap();
         assert_eq!(bound.min_len[TfBucket::from_count(1).value() as usize], 2);
         assert_eq!(bound.min_len[TfBucket::from_count(2).value() as usize], 3);
         let payload = beer.payload().unwrap();

@@ -519,7 +519,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let same_bounds = Ordinals::open(stream_bytes, stream_bytes.len() as u64, true)
                 .and_then(|found| {
                     Ordinals::open(&canonical[..], canonical.len() as u64, true)
-                        .map(|wanted| found.bounds() == wanted.bounds())
+                        .and_then(|wanted| Ok(found.bounds()? == wanted.bounds()?))
                 })
                 .unwrap_or(false);
             if same_bounds {
