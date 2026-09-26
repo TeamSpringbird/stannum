@@ -292,6 +292,40 @@ pub(crate) struct TermScorer {
     numerator: [f32; BUCKET_COUNT],
     denominator_constant: [f32; BUCKET_COUNT],
     document_length_factor: f32,
+    /// Whether the score is proven never to fall as the bucket rises, at
+    /// every document length; see [`rises_with_the_bucket`].
+    rises: bool,
+}
+
+/// Whether `numerator[i] / (denominator[i] + x)`, each sum and the quotient
+/// rounded to `f32`, never falls from one bucket to the next for any
+/// length term `x >= 0` (itself an `f32`, shared by both buckets).
+///
+/// For buckets `i < j` with numerators `n`, `n'` and denominators `d`,
+/// `d'`, rounding is monotonic, so the scores keep their order when the
+/// unrounded quotients `n' / fl(d' + x)` and `n / fl(d + x)` do. Each
+/// rounded sum lies within a factor `1 ± u` of the exact one, `u = 2^-24`,
+/// so it suffices that `n' (d + x)(1 - u) >= n (d' + x)(1 + u)`: linear in
+/// `x`, it holds for every `x >= 0` when it holds at `x = 0` and its slope
+/// is not negative, that is when `n' d (1 - u) >= n d' (1 + u)` and
+/// `n' (1 - u) >= n (1 + u)`. Products of two `f32` are exact in `f64`; the
+/// margin of four `u` absorbs the `f64` rounding of the differences. A
+/// numerator that is not finite fails the test, and the caller falls back
+/// to the running best.
+fn rises_with_the_bucket(
+    numerator: &[f32; BUCKET_COUNT],
+    denominator: &[f32; BUCKET_COUNT],
+) -> bool {
+    let u = f64::from(f32::EPSILON) / 2.0;
+    let keeps = |higher: f64, lower: f64| higher - lower >= 4.0 * u * (higher + lower);
+    numerator
+        .windows(2)
+        .zip(denominator.windows(2))
+        .all(|(n, d)| {
+            let (lower_n, higher_n) = (f64::from(n[0]), f64::from(n[1]));
+            let (lower_d, higher_d) = (f64::from(d[0]), f64::from(d[1]));
+            keeps(higher_n * lower_d, lower_n * higher_d) && keeps(higher_n, lower_n)
+        })
 }
 
 impl TermScorer {
@@ -337,10 +371,12 @@ impl TermScorer {
             numerator[bucket] = multiplier * tf * k1_plus_one;
             denominator_constant[bucket] = tf + k1_one_minus_b;
         }
+        let rises = rises_with_the_bucket(&numerator, &denominator_constant);
         Ok(Self {
             numerator,
             denominator_constant,
             document_length_factor,
+            rises,
         })
     }
 
@@ -350,6 +386,33 @@ impl TermScorer {
         let denominator =
             self.denominator_constant[index] + self.document_length_factor * document_length as f32;
         self.numerator[index] / denominator
+    }
+
+    /// An upper bound on the score of a document of at least
+    /// `document_length` whose bucket is at most `bucket`: the best of
+    /// [`Self::score_bucket`] over the buckets up to it, at that length.
+    ///
+    /// The score never rises with the length, every operation being
+    /// correctly rounded and monotonic, but it may fall as the bucket
+    /// rises: with k1 at or near zero, or with `b = 1` and a length term
+    /// far below the frequency, the exact score barely grows from one
+    /// bucket to the next and rounding leaves the higher bucket an ulp
+    /// below the lower one. Where the scorer is proven to rise with the
+    /// bucket at every length this is the score at `bucket`; otherwise it
+    /// is the running best over the buckets up to it.
+    #[must_use]
+    pub(crate) fn bound_through(&self, bucket: TfBucket, document_length: u32) -> f32 {
+        if self.rises {
+            return self.score_bucket(bucket, document_length);
+        }
+        (0..=bucket.value())
+            .map(|lower| {
+                self.score_bucket(
+                    TfBucket::new(lower).expect("a bucket below a valid one"),
+                    document_length,
+                )
+            })
+            .fold(0.0_f32, f32::max)
     }
 
     #[must_use]
@@ -392,8 +455,8 @@ impl TermScorer {
 
     /// An upper bound on the score of a document of `length` in `block`:
     /// the best score over the buckets that occur, at that length. The walk
-    /// bounds at the sub-block's largest bucket instead, which occurs in
-    /// the chunk and so is this maximum; the test below checks that.
+    /// bounds a sub-block at [`Self::bound_through`] its largest bucket
+    /// instead, which is at least this maximum; the tests below check that.
     #[cfg(test)]
     pub(crate) fn bound_for_length(&self, block: &BlockBound, length: u32) -> f32 {
         let mut bound = 0.0_f32;
@@ -706,6 +769,79 @@ mod tests {
                     .any(|(b, l)| scorer.score_bucket(TfBucket::new(*b).unwrap(), *l) == bound)
             );
         }
+    }
+
+    /// With k1 = 0 the score is `fl(fl(m tf) 1) / tf`, which rounding
+    /// leaves an ulp lower for three occurrences than for one: the
+    /// ten-document table of 'w w w' and nine 'w'. A bound at the higher
+    /// bucket alone fell below the lower bucket's score.
+    #[test]
+    fn bounds_through_a_bucket_cover_every_bucket_below_it() {
+        let flat =
+            TermScorer::from_statistics(10, 10, 1.0, Bm25Params { k1: 0.0, b: 0.75 }, 1.2).unwrap();
+        let (one, three) = (TfBucket::from_count(1), TfBucket::from_count(3));
+        assert!(flat.score_bucket(three, 3) < flat.score_bucket(one, 3));
+        assert!(!flat.rises);
+        assert_eq!(flat.bound_through(three, 3), flat.score_bucket(one, 3));
+        // The default parameters rise with the bucket, so the walk's bound
+        // stays one division.
+        for (docs, df, avg) in [
+            (10, 10, 1.2),
+            (1_000_000, 3, 250.0),
+            (1 << 30, 1 << 29, 1.0),
+        ] {
+            for boost in [0.25, 1.0, 3.0] {
+                let scorer =
+                    TermScorer::from_statistics(docs, df, boost, Bm25Params::default(), avg)
+                        .unwrap();
+                assert!(scorer.rises, "{docs} {df} {avg} {boost}");
+            }
+        }
+        let lengths: Vec<u32> = (0..70)
+            .chain([
+                100,
+                777,
+                1_626,
+                3_405,
+                7_132,
+                14_938,
+                31_288,
+                100_000,
+                1 << 24,
+            ])
+            .collect();
+        let mut inverted = 0;
+        let mut checked = 0;
+        for k1 in [0.0, 0.001, 0.01, 0.1, 0.5, 1.2, 3.0, 1e4] {
+            for b in [0.0, 0.25, 0.75, 1.0] {
+                for (docs, df) in [(10, 10), (10, 1), (100, 7), (100_000, 999), (1 << 31, 3)] {
+                    for avg in [0.5, 1.0, 3.7, 100.0, 5_000.0] {
+                        let scorer =
+                            TermScorer::from_statistics(docs, df, 1.0, Bm25Params { k1, b }, avg)
+                                .unwrap();
+                        for &length in &lengths {
+                            let mut best = 0.0_f32;
+                            for bucket in 0..BUCKET_COUNT as u8 {
+                                let bucket = TfBucket::new(bucket).unwrap();
+                                let score = scorer.score_bucket(bucket, length);
+                                inverted += usize::from(score < best);
+                                best = best.max(score);
+                                let bound = scorer.bound_through(bucket, length);
+                                assert!(
+                                    bound >= best,
+                                    "k1 {k1} b {b} N {docs} df {df} avg {avg} len {length} {bucket:?}"
+                                );
+                                if scorer.rises {
+                                    assert_eq!(bound, score, "k1 {k1} b {b} {bucket:?}");
+                                }
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(inverted > 0 && checked > inverted);
     }
 
     #[test]

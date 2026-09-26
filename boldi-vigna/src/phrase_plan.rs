@@ -59,6 +59,7 @@ impl PhrasePlan {
         if plan.leaves.is_empty() {
             return None;
         }
+        debug_assert_eq!(plan.gaps.len() + 1, plan.leaves.len(), "a gap per junction");
         let slots = plan.leaves.iter().max().map_or(0, |slot| slot + 1);
         let mut read = vec![false; slots];
         let cost = |read: &[bool], leaf: usize| {
@@ -116,46 +117,64 @@ impl PhrasePlan {
         )
     }
 
-    /// Adds the leaves of `query`; `cap` is the gap budget of the nearest
-    /// enclosing filter, which bounds the junctions of an ordered sequence
-    /// directly under it.
+    /// Adds the leaves of `query` and the gaps between them; `cap` is the
+    /// range of gaps the filters directly over `query` allow its interval,
+    /// which bounds the junctions of an ordered sequence directly under
+    /// them.
+    ///
+    /// Each junction of an ordered sequence lies between the last leaf of
+    /// one child and the first leaf of the next, whatever the nesting
+    /// inside either, so its gap is pushed between the two children's
+    /// leaves: `gaps[i]` stays the distance from leaf `i` to leaf `i + 1`.
+    /// Pushed after the child instead, and whenever any leaf came before,
+    /// an ordered child not first in the whole span pushed a gap before its
+    /// own first leaf and its parent's junction landed after the child's
+    /// inner gaps: `a THEN/1 "b c"` tested (a, b) at the phrase's distance
+    /// and dropped "a x b c".
     fn visit(&mut self, query: &SpanQuery, cap: Option<(u32, u32)>) -> Option<()> {
         use SpanQuery::*;
         match query {
             Term(slot) => self.leaves.push(*slot),
             Ordered(children) => {
                 // Children follow one another without overlapping, so a
-                // junction is at least one position; a budget of `max`
-                // uncovered positions over the sequence caps every junction,
-                // and pins the one junction of a pair to an exact budget.
+                // junction is at least one position. The interval's gaps
+                // are the uncovered positions between its children, the
+                // sum over its junctions of each distance less one: a
+                // budget of `max` caps every junction, and of a pair's one
+                // junction the budget's least is a floor too. A child's own
+                // gaps are its own, bounded only by filters over it.
                 let (lo, hi) = match cap {
                     None => (1, u32::MAX),
-                    Some((min, max)) => {
-                        let hi = max.saturating_add(1);
-                        (
-                            if min == max && children.len() == 2 {
-                                hi
-                            } else {
-                                1
-                            },
-                            hi,
-                        )
-                    }
+                    Some((min, max)) => (
+                        if children.len() == 2 {
+                            min.saturating_add(1)
+                        } else {
+                            1
+                        },
+                        max.saturating_add(1),
+                    ),
                 };
-                for child in children {
+                for (index, child) in children.iter().enumerate() {
+                    if index > 0 {
+                        self.gaps.push((lo, hi));
+                    }
                     let first = self.leaves.len();
                     self.visit(child, None)?;
-                    if first > 0 && first < self.leaves.len() {
-                        self.gaps.push((lo, hi));
+                    // A child without a leaf would leave its junction's gap
+                    // between the wrong leaves.
+                    if self.leaves.len() == first {
+                        return None;
                     }
                 }
             }
-            MaxGaps { max_gaps, inner } => self.visit(inner, Some((0, *max_gaps)))?,
+            // Filters over filters keep the interval only when every one
+            // does: their ranges intersect.
+            MaxGaps { max_gaps, inner } => self.visit(inner, Some(within(cap, 0, *max_gaps)))?,
             GapsInRange {
                 min_gaps,
                 max_gaps,
                 inner,
-            } => self.visit(inner, Some((*min_gaps, *max_gaps)))?,
+            } => self.visit(inner, Some(within(cap, *min_gaps, *max_gaps)))?,
             // These keep an interval or drop it; its gaps are the inner's.
             MaxWidth { inner, .. } | WithinPositions { inner, .. } => self.visit(inner, cap)?,
             Empty
@@ -171,6 +190,14 @@ impl PhrasePlan {
             | After { .. } => return None,
         }
         Some(())
+    }
+}
+
+/// The gap range `min..=max` of a filter under the filters' `cap`.
+fn within(cap: Option<(u32, u32)>, min: u32, max: u32) -> (u32, u32) {
+    match cap {
+        None => (min, max),
+        Some((outer_min, outer_max)) => (outer_min.max(min), outer_max.min(max)),
     }
 }
 
@@ -223,10 +250,10 @@ mod tests {
         let mut read = vec![false; positions.len()];
         for step in plan.steps() {
             read[step.slot] = true;
-            if let Some(pair) = step.pair {
-                if !plan.pair_keeps(pair, &positions.to_vec()) {
-                    return Some(false);
-                }
+            if let Some(pair) = step.pair
+                && !plan.pair_keeps(pair, &positions.to_vec())
+            {
+                return Some(false);
             }
         }
         assert!(

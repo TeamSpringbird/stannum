@@ -117,11 +117,11 @@ pub fn init() {
     GucRegistry::define_float_guc(
         c"stannum.debug_seed_score",
         c"Measurement aid: prune a ranked walk against this score from the start; negative disables",
-        c"What a walk seeded with the final top-k threshold would cost in pages and candidates.",
+        c"What a walk seeded with the final top-k threshold would cost in pages and candidates. It changes results, so only a superuser may set it.",
         &crate::score::DEBUG_SEED_SCORE,
         -1.0,
         f64::MAX,
-        GucContext::Userset,
+        GucContext::Suset,
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
