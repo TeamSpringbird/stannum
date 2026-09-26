@@ -133,3 +133,31 @@ Local validation of the wide mode: seeds 104/105 completed 204 comparisons,
 four widths exercised and no skipped comparisons. The six-scenario smoke suite
 passed 912 comparisons. These counts are scheduling-dependent observations,
 not fixed expected counts. [Recorded results](benchmarks/wide-cursor-results.json).
+
+## Backends that exit mid-walk
+
+A FATAL error (`pg_terminate_backend`, a fast shutdown, postmaster death)
+exits a backend through `proc_exit` without unwinding the ranked walk it
+interrupts. PostgreSQL releases the walk's pins and relation reference
+itself; on Linux `exit` then runs the backend's thread-local destructors,
+which drop the cached segment readers after `CurrentResourceOwner` is gone.
+`postgres/tests/exit_during_walk.py` terminates 40 sessions, each busy with
+ranked disjunctions, conjunctions and phrases, and then fast-stops the server
+under four more. It fails on a changed postmaster start time, a lost control
+connection, or any crash, restart, WARNING, ERROR or unexpected FATAL in the
+server log. It needs a Linux server, so it runs in Docker (a few minutes,
+most of it the image build):
+
+```sh
+benchmarks/local/exit-test.sh            # STANNUM_EXIT_IMAGE=... reuses an image
+```
+
+The table has 4.6 million documents because a walk checks for interrupts
+only every 64 chunks of 65,536 rows. Below that, every termination lands
+between walks. At this size most of them land with 7 to 17 pages held. The
+real exit could not be made to crash on 36ba97f: the walked readers stay
+referenced by the executor frame that the FATAL abandons, so their
+destructors never run at exit. The ones that do run at exit hold nothing.
+`a_reader_dropped_at_exit_leaves_its_pins_to_postgres` pins the contract
+directly on any platform: a reader dropped during `proc_exit` with a span
+open leaves its pin and relation to PostgreSQL.

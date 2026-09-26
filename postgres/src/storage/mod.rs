@@ -831,7 +831,8 @@ const HELD_SLOT_LIMIT: usize = 64;
 /// the statement's resource owner and released when the walk's hold span
 /// closes, which a walk does on return and on unwind alike, so no pin
 /// outlives the statement though the reader holding it is cached across
-/// statements.
+/// statements. A backend exiting mid-walk leaves its pins to PostgreSQL
+/// (see [`exiting`]).
 #[derive(Clone, Copy)]
 struct HeldPage {
     /// The page's index in the run.
@@ -857,7 +858,8 @@ impl RunSource {
     }
 
     /// Releases the pages held in every slot, forgets the slots handed out,
-    /// and closes the index.
+    /// and closes the index; in an exiting backend only forgets them (see
+    /// [`exiting`]).
     fn release_held(&self) {
         let mut slots = self.slots.borrow_mut();
         for slot in slots.iter_mut() {
@@ -869,7 +871,7 @@ impl RunSource {
         }
         slots.truncate(segment::source::HELD_SLOTS);
         let relation = self.relation.replace(std::ptr::null_mut());
-        if !relation.is_null() {
+        if !relation.is_null() && !exiting() {
             // SAFETY: opened by `pin` within the span now ending.
             unsafe { pg_sys::RelationClose(relation) };
         }
@@ -1043,20 +1045,82 @@ pub(crate) fn reset_held_peak() {
     SCAN_RECENT.set(0);
 }
 
-/// Releases a page `RunSource::pin` pinned.
+/// Releases a page `RunSource::pin` pinned; in an exiting backend only
+/// forgets it (see [`exiting`]).
 fn unpin(held: HeldPage) {
-    // SAFETY: the pin was taken by `pin` and is released once: the slot
-    // holding it was emptied before this call.
-    unsafe { pg_sys::ReleaseBuffer(held.buffer) };
+    if !exiting() {
+        // SAFETY: the pin was taken by `pin` and is released once: the slot
+        // holding it was emptied before this call.
+        unsafe { pg_sys::ReleaseBuffer(held.buffer) };
+    }
     let (now, total, peak) = HELD_PAGES.get();
     HELD_PAGES.set((now - 1, total, peak));
 }
 
+/// Whether the backend is exiting, from `proc_exit` on: a FATAL error
+/// (`pg_terminate_backend`, a shutdown, postmaster death) exits without
+/// unwinding the walk it interrupts, so a hold span stays open, and
+/// PostgreSQL's exit processing releases the span's pins and relation
+/// reference through the statement's resource owner, then clears
+/// `CurrentResourceOwner`. On Linux `exit` then runs the backend's
+/// thread-local destructors, which drop the cached readers: a reader
+/// released there must leave PostgreSQL's resources alone, as releasing
+/// one again, with no resource owner, crashes the backend and with it the
+/// server. Whatever a reader still holds once exit has begun is the
+/// resource owner's to release, so every release is skipped from then on.
+/// Error and cancel unwind the walk before the transaction aborts, with
+/// the flag clear, and release as usual.
+fn exiting() -> bool {
+    // SAFETY: a plain flag PostgreSQL sets first thing in `proc_exit`.
+    unsafe { pg_sys::proc_exit_inprogress }
+}
+
 impl Drop for RunSource {
     fn drop(&mut self) {
-        // Spans close before a reader can be dropped; this only guards
+        // Spans close before a reader can be dropped, except in a backend
+        // exiting mid-walk (see [`exiting`]); otherwise this only guards
         // against a span left open by a bug.
         self.release_held();
+    }
+}
+
+/// Holds page 0 of the first segment of `index_oid` pinned in a hold span
+/// of a source of its own, then drops the source, open span and all, as a
+/// reader dropped at exit is, with `proc_exit_inprogress` set to
+/// `exiting`. Returns the buffer and relation reference the span held; the
+/// caller releases them if the drop did not.
+///
+/// # Safety
+///
+/// `index_oid` names a live Stannum index with a segment.
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) unsafe fn drop_holding_source(
+    index_oid: pg_sys::Oid,
+    exiting: bool,
+) -> (pg_sys::Buffer, pg_sys::Relation) {
+    use segment::source::Source as _;
+    // SAFETY: per the contract; the flag is set only while the source
+    // drops.
+    unsafe {
+        let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
+        let index = relation.as_ptr();
+        let (meta_buffer, meta) = read_meta(index, false);
+        drop(meta_buffer);
+        let entry = meta.segments.first().expect("a segment");
+        let table = page_table(index, meta.identity, entry);
+        let source = RunSource::new(index_oid, entry.run, table, "exit test".to_owned());
+        source.hold(true);
+        source
+            .held_span(0, 0)
+            .expect("a held span")
+            .expect("a pinned page");
+        let buffer = source.slots.borrow()[0][0].expect("the pinned page").buffer;
+        let held = source.relation.get();
+        assert!(!held.is_null());
+        pg_sys::proc_exit_inprogress = exiting;
+        drop(source);
+        pg_sys::proc_exit_inprogress = false;
+        (buffer, held)
     }
 }
 

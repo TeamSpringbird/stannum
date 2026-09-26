@@ -1676,6 +1676,36 @@ mod tests {
         assert_eq!(crate::storage::held_pages().0, 0);
     }
 
+    /// A backend exiting on FATAL drops its cached readers with a walk's
+    /// hold span still open, after PostgreSQL released the span's pin and
+    /// relation reference itself; the reader must not release them again.
+    /// postgres/tests/exit_during_walk.py drives the real exit on Linux.
+    #[pg_test]
+    fn a_reader_dropped_at_exit_leaves_its_pins_to_postgres() {
+        Spi::run(
+            "CREATE TABLE exiting(id int, body text);
+             INSERT INTO exiting SELECT n, 'alpha beta ' || n FROM generate_series(1, 5000) n;
+             CREATE INDEX exiting_idx ON exiting USING stannum(body);",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'exiting_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let before = crate::storage::held_pages().0;
+        // Otherwise the drop releases the span's page and relation.
+        unsafe { crate::storage::drop_holding_source(oid, false) };
+        assert_eq!(crate::storage::held_pages().0, before);
+        // At exit it leaves both to the resource owner, so releasing them
+        // here, as exit processing would, releases each once: a second
+        // release raises "not owned by resource owner".
+        let (buffer, relation) = unsafe { crate::storage::drop_holding_source(oid, true) };
+        assert_eq!(crate::storage::held_pages().0, before);
+        unsafe {
+            pg_sys::ReleaseBuffer(buffer);
+            pg_sys::RelationClose(relation);
+        }
+    }
+
     #[pg_test]
     fn held_pages_are_pinned_through_the_buffers_they_were_last_in() {
         // A walk pins a held page through the buffer the backend last
