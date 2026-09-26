@@ -9,7 +9,7 @@ BENCH_ROOT=/opt/stannum-benchmark
 OUT="$BENCH_ROOT/repo/benchmarks/results/aws-count-probe"
 NAME=stannum-count-profile
 VOLUME=stannum-count-profile-data
-export PGHOST=127.0.0.1 PGPORT=28929 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=benchmark
+export PGHOST=127.0.0.1 PGPORT=28930 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=benchmark
 export PGOPTIONS='-c statement_timeout=3600000 -c jit=off'
 unset PGSERVICE PGSERVICEFILE || true
 mkdir -p "$OUT/protocol"
@@ -45,7 +45,7 @@ fi
 trap cleanup EXIT
 docker volume create "$VOLUME" >/dev/null
 docker run -d --name "$NAME" --pid=host --cpus 8 --memory 64g --memory-swap 64g --shm-size 1g \
-  -p 127.0.0.1:28929:5432 -v "$VOLUME:/var/lib/postgresql" \
+  -p 127.0.0.1:28930:5432 -v "$VOLUME:/var/lib/postgresql" \
   -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=benchmark stannum-bench:count-probe \
   postgres -c shared_buffers=24GB -c maintenance_work_mem=24GB -c work_mem=16MB \
   -c max_parallel_workers=8 -c jit=off -c track_io_timing=on >/dev/null

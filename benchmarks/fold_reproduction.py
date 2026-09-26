@@ -57,7 +57,7 @@ def main():
         os.replace(temporary, library)
 
     cluster = Path(tempfile.mkdtemp(prefix='stannum-fold-repro-'))
-    env = dict(os.environ, PGHOST=str(cluster), PGPORT='28995',
+    env = dict(os.environ, PGHOST=str(cluster), PGPORT='28997',
                PGDATABASE='postgres', PGUSER='fold_bench')
     for key in ('PGOPTIONS', 'PGSERVICE', 'PGSERVICEFILE', 'PGPASSWORD'):
         env.pop(key, None)
@@ -72,7 +72,7 @@ def main():
     try:
         run(['initdb', '-D', str(cluster / 'data'), '-U', 'fold_bench', '-A', 'trust',
              '--no-locale', '--encoding=UTF8'], 'initdb')
-        settings = ("\nlisten_addresses=''\nport=28995\n"
+        settings = ("\nlisten_addresses=''\nport=28997\n"
                     f"unix_socket_directories='{cluster}'\nshared_buffers='512MB'\n")
         if args.checkpoint_control:
             settings += "checkpoint_timeout='30min'\nmax_wal_size='16GB'\n"
