@@ -23,7 +23,14 @@
 //! WAL: every page change goes through the generic WAL API. New runs and
 //! their directory entries are published in that order, so a crash between
 //! the two leaks unreferenced pages rather than referencing unwritten ones;
-//! the next VACUUM reclaims such orphans. Generic WAL carries no snapshot
+//! the next VACUUM reclaims such orphans. The same holds for an error: page
+//! writes survive the aborted transaction. So before the meta page records a
+//! change, no page it references changes in a way it cannot read: retired
+//! runs are freed and chained into the pending list only after the meta page
+//! no longer lists them where that matters (see `AfterPublication`), and a
+//! replaced write buffer goes to pages the published one does not cover (see
+//! `replace_buffer`). The FSM is not WAL-logged either; VACUUM records FREE
+//! pages it lacks again. Generic WAL carries no snapshot
 //! information, so freeing pages additionally logs a removal horizon
 //! through [`wal`] when the custom resource manager is registered; hot
 //! standbys serve segmented reads only then (see [`index_reads_allowed`]).
@@ -3307,7 +3314,9 @@ unsafe fn unlocked<T>(
 
 /// Marks pages FREE and records them in the FSM. A page that is not readable
 /// as a Stannum page (zeroed by a crash after the relation was extended) is
-/// initialized afresh.
+/// initialized afresh. A page already FREE is recorded again: the FSM is not
+/// WAL-logged, so after a crash or on a promoted standby it can lack pages
+/// freed since it was last written.
 ///
 /// # Safety
 /// No directory entry, buffer chain or pending entry of `index` references
@@ -3317,13 +3326,16 @@ unsafe fn unlocked<T>(
 /// unreferenced forever unless a writer has it written and not yet
 /// published: the caller wrote the pages itself, or holds the maintenance
 /// lock that excludes the only such writer (see [`reclaim_orphans`]). Pages a standby reader could still reference were
-/// preceded by a [`wal::log_reclaim`] record. The caller holds no page lock.
+/// preceded by a [`wal::log_reclaim`] record. The caller holds no page lock
+/// but, at most, the meta page's.
 unsafe fn free_pages(index: pg_sys::Relation, pages: &[u32], stamp: u32) {
     for &block in pages {
         pgrx::check_for_interrupts!();
         let buffer = unsafe { Buffer::read(index, block, true) };
         let kind = layout::kind(buffer.page());
         if kind == Ok(KIND_FREE) {
+            drop(buffer);
+            unsafe { pg_sys::RecordFreeIndexPage(index, block) };
             continue;
         }
         unsafe {
@@ -3822,7 +3834,8 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
 
 /// Frees pages nothing references that are not FREE: leaked by a crash
 /// between writing a run and publishing it, or between removing a pending
-/// entry and freeing its pages.
+/// entry and freeing its pages. Unreferenced FREE pages are recorded in the
+/// FSM again, which does not survive a crash.
 ///
 /// Two kinds of writer leave pages unreferenced and not FREE while they run.
 /// Inserts write under the exclusive meta lock and publish before releasing
@@ -3881,7 +3894,16 @@ unsafe fn reclaim_orphans_locked(index: pg_sys::Relation) {
         }
         pgrx::check_for_interrupts!();
         let buffer = unsafe { Buffer::read(index, block, false) };
-        if layout::kind(buffer.page()) != Ok(KIND_FREE) {
+        let kind = layout::kind(buffer.page());
+        drop(buffer);
+        if kind == Ok(KIND_FREE) {
+            // The FSM is not WAL-logged: after a crash or on a promoted
+            // standby it lacks the pages freed since it was last written,
+            // and nothing else would ever record them again. Recording a
+            // page an allocation took meanwhile is harmless, because every
+            // allocation checks the page is still FREE under its lock.
+            unsafe { pg_sys::RecordFreeIndexPage(index, block) };
+        } else {
             candidates.push(block);
         }
     }
