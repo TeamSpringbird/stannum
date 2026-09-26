@@ -3,6 +3,7 @@
 # See LICENSE in the repository root for license terms.
 
 """The sustained-mutation profile of run.py (`run.py run --profile mutation`).
+See docs/benchmarks.md.
 
 Rate-scheduled writers insert copies of dataset documents under fresh ids,
 delete existing rows, and rewrite the reserved suffix of existing rows with

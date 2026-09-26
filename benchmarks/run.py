@@ -3,7 +3,7 @@
 #
 # See LICENSE in the repository root for license terms.
 
-"""Small, dependency-free PostgreSQL benchmark recorder."""
+"""Small, dependency-free PostgreSQL benchmark recorder. See docs/benchmarks.md."""
 import argparse
 import collections
 import csv

@@ -7,7 +7,7 @@
 
 Hold the installation/timing lock around the whole campaign. No binary swaps or
 builds occur here. Each window gets a fresh database; failures retain the stopped
-cluster for diagnosis.
+cluster for diagnosis. See docs/benchmarks.md.
 """
 import argparse
 import hashlib

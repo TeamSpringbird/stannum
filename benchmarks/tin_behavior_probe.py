@@ -4,7 +4,8 @@
 # See LICENSE in the repository root for license terms.
 
 """Probe a TIN (or Stannum) server for the behaviors recorded in
-docs/tin-behavior.md, so the comparison can be repeated.
+docs/tin-behavior-catalog.md and the conformance suite (conformance/README.md),
+so the comparison can be repeated.
 
     PGHOST=... PGDATABASE=... benchmarks/tin_behavior_probe.py [--engine tin] [--crash-probe]
 
