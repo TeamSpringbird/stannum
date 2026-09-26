@@ -193,6 +193,10 @@ unsafe fn max_segments(index: pg_sys::Relation) -> usize {
 /// The most input bytes a merge of this index takes: its
 /// `max_merged_segment_size` when it sets one, within what a run can record.
 unsafe fn segment_bytes_cap(index: pg_sys::Relation) -> u64 {
+    #[cfg(feature = "pg_test")]
+    if let Some(cap) = testing::SEGMENT_BYTES_CAP_OVERRIDE.get() {
+        return cap;
+    }
     unsafe { crate::options::merged_segment_bytes(index) }
         .unwrap_or(SEGMENT_BYTES_CAP)
         .min(SEGMENT_BYTES_CAP)
@@ -3969,6 +3973,9 @@ pub mod testing {
         /// Treat every pending entry as removable (see [`pending_removable`]): a
         /// pg_test's own snapshot otherwise keeps all of them readable.
         pub static PENDING_REMOVABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// A merge input ceiling in bytes below the smallest
+        /// `max_merged_segment_size` (100 MB), for builds of test size.
+        pub static SEGMENT_BYTES_CAP_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
 
     /// The number of runs on the meta page's pending list.

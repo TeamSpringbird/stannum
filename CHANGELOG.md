@@ -196,3 +196,7 @@
   and crashes at 10,000 terms and 5,000 levels. `MATCHES` patterns scan in
   linear time (pest backtracked exponentially over unclosed groups) and the
   `AT LEAST` estimate is linear for thresholds near either end.
+- `target_segment_count`, `max_mutable_segment_size` and
+  `max_merged_segment_size` take TIN's domains (1..4096, at least 131072
+  bytes, at least 100 MB) and reject other values with SQLSTATE 22023, as
+  TIN 1.0.3 does; unset still leaves the `stannum.*` settings in charge.

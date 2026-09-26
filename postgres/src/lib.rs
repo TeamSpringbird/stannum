@@ -99,17 +99,19 @@ mod tests {
 
     #[pg_test]
     fn a_build_packs_its_segments_into_its_lowest_pages() {
-        // Small build segments and a low merge cap: the build's tier merges
-        // retire many runs and end with several segments among their holes.
+        // Small build segments and a low merge cap (2 MB, below the smallest
+        // max_merged_segment_size): the build's tier merges retire many runs
+        // and end with several segments among their holes.
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(2 << 20));
         Spi::run(
             "CREATE TABLE packed(id int, body text);
              INSERT INTO packed SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 1009), ' ')
              FROM generate_series(1, 40) k) FROM generate_series(1, 20000) n;
              SET LOCAL stannum.build_segment_docs = 500;
-             CREATE INDEX packed_idx ON packed USING stannum(body)
-             WITH (max_merged_segment_size = 2);",
+             CREATE INDEX packed_idx ON packed USING stannum(body);",
         )
         .unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(None);
         let index = unsafe {
             pgrx::PgRelation::with_lock(
                 Spi::get_one::<pg_sys::Oid>("SELECT 'packed_idx'::regclass::oid")
@@ -4852,13 +4854,18 @@ mod tests {
                 "SELECT count(*) FROM stannum.segment_info('{index}') WHERE kind = 'immutable'"
             ))
         };
-        // The write buffer folds at the index's own size.
+        // The write buffer folds at the index's own size: the smallest one
+        // allowed, where the setting's own caps would not fold.
         Spi::run(
             "CREATE TABLE per_index(body text);
              CREATE INDEX per_index_default ON per_index USING stannum(body);
              CREATE INDEX per_index_small ON per_index USING stannum(body)
-                 WITH (max_mutable_segment_size=2000);
-             INSERT INTO per_index SELECT 'needle number ' || n FROM generate_series(1,200) n;",
+                 WITH (max_mutable_segment_size=131072);
+             SET LOCAL stannum.write_buffer_bytes = 67108864;
+             SET LOCAL stannum.write_buffer_docs = 1000000;
+             INSERT INTO per_index SELECT 'needle number ' || n || ' ' ||
+                 (SELECT string_agg('w' || (n * k % 5003), ' ') FROM generate_series(1, 100) k)
+                 FROM generate_series(1,400) n;",
         )
         .unwrap();
         assert_eq!(immutable("per_index_default"), 0);
