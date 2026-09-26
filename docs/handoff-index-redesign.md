@@ -571,6 +571,33 @@ regexes and fuzzy terms in a disjunction still score every match, and
 `al* OR python` (over the expansion cap) now at least answers a cancel.
 Predicted on the published host at the 0.81 ratio of r7: about 167 QPS.
 
+### Round four, 2026-09-25
+
+Chosen from a warm profile over a stratified 60-query sample of the trace
+(chunk loads 30%, the walk's loops 20%, phrase checks 17%, candidate
+scoring 12%). Each against b1899a0 (209.0 QPS; rerun 210.7), then merged
+as `74c678f`:
+
+| branch | mixed QPS |
+|---|---|
+| `perf/in-place-reads` (ordinal chunks and position spans read from pinned shared-buffer pages during a walk, not copied into the per-backend cache) | 301.0, rerun 301.3 |
+| `perf/walk-overheads` (sorts, lazy row readers, parsed chunk bounds kept across statements, cached threshold) | 222.6 |
+| `perf/conj-warmup` (a conjunction's 256 best-bounded chunks first, guarded by an estimate of its matches) | 206.9 |
+| all three merged | 306.1, p50 16, p95 86, p99 128 ms |
+
+In-place reads gained far more under eight clients than single queries
+showed (the copies were per backend, into a 64 MB cache each). A walk
+now holds at most a few dozen pages pinned; a test cancels walks
+mid-chunk and checks no pin survives. Short disjunctions are 10 to 25%
+slower than before it ("python OR java OR sql" 13.5 to 15.6 ms warm):
+past eight pins PostgreSQL's pin bookkeeping moves to a hash table.
+The conjunction warm-up is flat on the trace but takes the stopword
+conjunction from 30.5 to 4.5 ms.
+
+Predicted on the published host at r7's 0.81 ratio: about 248 QPS, above
+TIN's 199. The ratio came from a build bottlenecked elsewhere, so an AWS
+run is the real check.
+
 ## How to measure
 
 Everything below runs on a laptop and needs no AWS. See
