@@ -77,7 +77,7 @@ def main():
                             except Exception as error:state['profile_failures'].append(dict(phase=phase,id=q['source_id'],mode=mode,error=repr(error)))
                     checkpoint()
             state['status']='complete';checkpoint()
-            subprocess.run([sys.executable,str(REPO/'benchmarks/count_crossover_report.py'),str(OUT),'--fixed-rule',str(REPO/'docs/benchmarks/count-crossover/100k-selection.json'),'--output',str(OUT/'selection')],check=True)
+            subprocess.run([sys.executable,str(REPO/'benchmarks/count_crossover_report.py'),str(OUT),'--fixed-rule',str(REPO/'benchmarks/count-crossover/100k-selection.json'),'--output',str(OUT/'selection')],check=True)
             checkpoint()
             if state['profile_failures']:raise RuntimeError('Measurements complete but profiling failures retained')
         except BaseException as error:

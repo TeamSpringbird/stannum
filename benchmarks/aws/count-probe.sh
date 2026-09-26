@@ -9,7 +9,7 @@ BENCH_ROOT=/opt/stannum-benchmark
 OUT="$BENCH_ROOT/repo/benchmarks/results/aws-count-probe"
 NAME=stannum-count-profile
 VOLUME=stannum-count-profile-data
-export PGHOST=127.0.0.1 PGPORT=28929 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=benchmark
+export PGHOST=127.0.0.1 PGPORT=28930 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=benchmark
 export PGOPTIONS='-c statement_timeout=3600000 -c jit=off'
 unset PGSERVICE PGSERVICEFILE || true
 mkdir -p "$OUT/protocol"
@@ -26,6 +26,9 @@ apt-get update
 apt-get install -y --no-install-recommends linux-tools-common "linux-tools-$(uname -r)"
 perf --version > "$OUT/perf-version.txt"
 sysctl -w kernel.perf_event_paranoid=-1
+python3 -m venv --system-site-packages "$BENCH_ROOT/venv"
+"$BENCH_ROOT/venv/bin/pip" install -r benchmarks/requirements.txt
+export PATH="$BENCH_ROOT/venv/bin:$PATH"
 python3 benchmarks/tin.py build-image --image stannum-bench:count-probe --output "$OUT/image"
 python3 benchmarks/published_dataset.py --corpus wikipedia --output "$BENCH_ROOT/datasets/wikipedia"
 cleanup() {
@@ -42,7 +45,7 @@ fi
 trap cleanup EXIT
 docker volume create "$VOLUME" >/dev/null
 docker run -d --name "$NAME" --pid=host --cpus 8 --memory 64g --memory-swap 64g --shm-size 1g \
-  -p 127.0.0.1:28929:5432 -v "$VOLUME:/var/lib/postgresql" \
+  -p 127.0.0.1:28930:5432 -v "$VOLUME:/var/lib/postgresql" \
   -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=benchmark stannum-bench:count-probe \
   postgres -c shared_buffers=24GB -c maintenance_work_mem=24GB -c work_mem=16MB \
   -c max_parallel_workers=8 -c jit=off -c track_io_timing=on >/dev/null

@@ -1,0 +1,5 @@
+# Additional packages for benchmarks/aws (database_snapshot.py, crossover_campaign.py).
+# The instance image installs Ubuntu's python3-boto3, so the lower bound matches
+# Ubuntu 24.04's package.
+-r requirements.txt
+boto3>=1.34,<2
