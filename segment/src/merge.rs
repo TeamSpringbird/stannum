@@ -7,9 +7,9 @@
 //! Inputs are borrowed complete blobs with per-input dead sets. All inputs,
 //! including dead documents, are verified before metadata is reused. No index
 //! page is written.
-//! Foreground PostgreSQL merges retain the metadata lock; VACUUM merges owned
-//! snapshots unlocked and revalidates before publication. Page allocation, WAL
-//! and publication remain the caller’s responsibility.
+//! A fold's budgeted PostgreSQL merges retain the metadata lock; every other
+//! merge runs on owned snapshots unlocked and revalidates before publication.
+//! Page allocation, WAL and publication remain the caller’s responsibility.
 use crate::dictionary::{DictionaryBuilder, Extent, TermEntry};
 use crate::docs::TidCursor;
 use crate::payload::PayloadBuilder;
