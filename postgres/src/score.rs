@@ -4720,10 +4720,7 @@ fn build_corpus(
     };
     let documents = load_documents(heap_oid, index.oid());
     let positioned = tokenize_documents(&documents, |document| tokenize_doc(document, &tokenizer));
-    let tokenized: Vec<Vec<String>> = positioned
-        .iter()
-        .map(|doc| doc.tokens().map(str::to_owned).collect())
-        .collect();
+    let tokenized: Vec<Vec<String>> = positioned.iter().map(|doc| doc.tokens().to_vec()).collect();
     let universe = corpus_universe(&tokenized);
     let mut collected = Collected::default();
     collect_score_terms(&scoring, 1.0, false, &mut collected);
