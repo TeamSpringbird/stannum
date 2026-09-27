@@ -311,7 +311,8 @@ def suite_commit():
     try:
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SUITE, text=True,
                                        stderr=subprocess.DEVNULL).strip()
-        dirty = subprocess.check_output(["git", "status", "--porcelain", "--", "."], cwd=SUITE,
+        # Uncommitted recorded answers (expected/) do not change what was run.
+        dirty = subprocess.check_output(["git", "status", "--porcelain", "--", ".", ":!expected"], cwd=SUITE,
                                         text=True, stderr=subprocess.DEVNULL).strip()
         return head + ("-dirty" if dirty else "")
     except (OSError, subprocess.CalledProcessError):
@@ -648,20 +649,22 @@ def compare_case(case, want, got):
         return "FAIL", "the server crashed" + (" (as the recorded engine did)" if want.get("server_crashed") else "")
     if "connection_lost" in (got.get("captures") or {}):
         return "FAIL", f"connection lost: {got['captures']['connection_lost']}"
-    if want.get("server_crashed"):
-        # The recorded engine crashed: an ERROR or a correct answer passes; a crash fails.
+    if want.get("server_crashed") or "connection_lost" in (want.get("captures") or {}):
+        # The recorded engine crashed the server or lost its backend: an ERROR
+        # or a correct answer passes; a crash fails.
+        what = "crashed" if want.get("server_crashed") else "lost its connection"
         if only_errors(got):
             states = sorted({(v.get("error") or v)["sqlstate"] for v in got["captures"].values()})
-            return "PASS", f"recorded engine crashed; answered ERROR {', '.join(states)}"
+            return "PASS", f"recorded engine {what}; answered ERROR {', '.join(states)}"
         expect = case.get("expect_if_answered")
         if expect is None:
-            return "PASS", "recorded engine crashed; answered (no reference answer to check)"
+            return "PASS", f"recorded engine {what}; answered (no reference answer to check)"
         wrong = [name for name, value in expect.items()
                  if name in got["captures"] and got["captures"][name] != value]
         if wrong:
-            return "FAIL", "recorded engine crashed; answered wrongly: " + ", ".join(
+            return "FAIL", f"recorded engine {what}; answered wrongly: " + ", ".join(
                 f"{name} {brief(got['captures'][name])}, correct {brief(expect[name])}" for name in wrong)
-        return "PASS", "recorded engine crashed; answered correctly"
+        return "PASS", f"recorded engine {what}; answered correctly"
     statuses, details, compared = [], [], 0
     for capture in case["capture"]:
         name = capture["as"]

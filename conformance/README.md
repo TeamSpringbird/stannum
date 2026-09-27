@@ -129,8 +129,12 @@ the sentinel; if it died, the case's result is `server_crashed`, and the
 runner waits for crash recovery, reconnects and continues. A dropped working
 connection with a live sentinel is reported as a lost connection instead.
 
+A managed server may also end only the offending backend (PlanetScale's
+reads "terminating connection due to administrator command"), which records
+`{"captures": {"connection_lost": ...}}`; tag such a case too.
+
 If the recorded result of a case is `server_crashed` (the recorded engine
-crashed on it), the engine under test must not crash: an ERROR passes, and an
+crashed on it) or a lost connection, the engine under test must not crash: an ERROR passes, and an
 answer passes if it equals the case's `expect_if_answered` (when the case
 gives none, the answer is reported as unchecked and passes).
 
@@ -196,6 +200,12 @@ may restart.
   header (`imported_from`, `measured_by`): the live run skipped the three
   sizes that crash TIN's server, and their `server_crashed` records come
   from that first probe.
+- `expected/tin-1.0.3/catalog.promote.json` and `limits.json` were recorded
+  live by `run.py` (runner version 2) at `8592c98` on 2026-09-27 UTC
+  (2026-09-26 US Eastern) on the same server, the risky limits cases one at a
+  time and last. `limits.json`'s header reads `8592c98…-dirty` only because
+  the answer files being recorded were not yet committed (the runner now
+  ignores `expected/` in that check); the cases and runner were at `8592c98`.
 - A case without recorded answers for an engine is not a failure; it is
   reported as SKIP until someone records that engine.
 
