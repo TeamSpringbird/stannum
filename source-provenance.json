@@ -1082,6 +1082,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: oversized and deeply nested query tests."
     },
+    "tinql/tests/tokenized_doc_cost.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a timing probe of tokenizing short documents for exact evaluation."
+    },
     "tokenizer/Cargo.toml": {
       "owner": "planetscale",
       "upstream_path": "tokenizer/Cargo.toml",
