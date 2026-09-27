@@ -5354,6 +5354,94 @@ mod tests {
         assert_clean("insert_race_idx");
     }
 
+    /// Runs `sql` with a cancel requested at the first interrupt check of
+    /// tokenization (the `tokenize` race point), and returns the SQLSTATE it
+    /// ended with (`None`: it completed) and how many such checks ran.
+    fn cancel_at_first_tokenize_check(sql: &str) -> (Option<String>, usize) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let checks = Rc::new(Cell::new(0));
+        let counted = checks.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "tokenize" {
+                counted.set(counted.get() + 1);
+                if counted.get() == 1 {
+                    unsafe {
+                        pg_sys::QueryCancelPending = 1;
+                        pg_sys::InterruptPending = 1;
+                    }
+                }
+            }
+        })));
+        let outcome = Spi::get_one::<String>(&format!(
+            "DO $$DECLARE state text;
+             BEGIN
+                 {sql};
+                 CREATE TEMP TABLE IF NOT EXISTS tokenize_cancel_outcome(state text);
+                 TRUNCATE tokenize_cancel_outcome;
+                 INSERT INTO tokenize_cancel_outcome VALUES (NULL);
+             EXCEPTION WHEN query_canceled OR others THEN
+                 GET STACKED DIAGNOSTICS state = RETURNED_SQLSTATE;
+                 CREATE TEMP TABLE IF NOT EXISTS tokenize_cancel_outcome(state text);
+                 TRUNCATE tokenize_cancel_outcome;
+                 INSERT INTO tokenize_cancel_outcome VALUES (state);
+             END$$;
+             SELECT state FROM tokenize_cancel_outcome"
+        ));
+        crate::storage::testing::set_race_hook(None);
+        let state = outcome.unwrap_or_else(|error| panic!("{sql}: {error}"));
+        (state, checks.get())
+    }
+
+    /// Tokenizing a value for an insert or an index build checks for
+    /// interrupts every 65,536 tokens, so a cancel or `statement_timeout`
+    /// ends it within that many tokens instead of after the whole value.
+    /// An insert tokenizes before it takes any index lock, and a build
+    /// between heap tuples, so the ERROR unwinds with nothing held.
+    #[pg_test]
+    fn tokenizing_a_large_value_answers_a_cancel() {
+        // 200,000 tokens: three checks, the first of which cancels.
+        let large = "repeat('word ', 200000)";
+        Spi::run(
+            "CREATE TABLE tokenize_insert(id int, body text);
+             CREATE INDEX tokenize_insert_idx ON tokenize_insert USING stannum(body);
+             CREATE TABLE tokenize_build(id int, body text);",
+        )
+        .unwrap();
+        Spi::run(&format!("INSERT INTO tokenize_build VALUES (1, {large})")).unwrap();
+        for sql in [
+            format!("INSERT INTO tokenize_insert VALUES (1, {large})"),
+            "CREATE INDEX tokenize_build_idx ON tokenize_build USING stannum(body)".to_owned(),
+        ] {
+            assert_eq!(
+                cancel_at_first_tokenize_check(&sql),
+                (Some("57014".to_owned()), 1),
+                "{sql}"
+            );
+        }
+        assert_eq!(value("SELECT count(*) FROM tokenize_insert"), 0);
+        assert_eq!(
+            value("SELECT count(*) FROM pg_class WHERE relname = 'tokenize_build_idx'"),
+            0
+        );
+        // Uncanceled, both complete and index the value.
+        for sql in [
+            format!("INSERT INTO tokenize_insert VALUES (1, {large})"),
+            "CREATE INDEX tokenize_build_idx ON tokenize_build USING stannum(body)".to_owned(),
+        ] {
+            Spi::run(&sql).unwrap();
+        }
+        for table in ["tokenize_insert", "tokenize_build"] {
+            assert_eq!(
+                value(&format!(
+                    "SELECT count(*) FROM {table} WHERE body ==> 'word'"
+                )),
+                1,
+                "{table}"
+            );
+        }
+    }
+
     #[pg_extern]
     fn direct_vacuum_cleanup(index_oid: pg_sys::Oid) {
         let index = unsafe {

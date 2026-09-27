@@ -912,6 +912,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "segment/tests/record_memory.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the peak-memory test of grouping a document's tokens by term."
+    },
     "tinql/Cargo.toml": {
       "owner": "mixed",
       "upstream_path": "tinql/Cargo.toml",
