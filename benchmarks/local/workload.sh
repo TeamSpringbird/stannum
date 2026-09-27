@@ -13,7 +13,8 @@
 #   STANNUM_MOCK     directory holding the saved database in db/; runs go to runs/
 #   STANNUM_DRIVER   prepared benchmark driver (tin.py --driver)
 #   STANNUM_DATASET  the published StackExchange dataset directory
-# Optional: STANNUM_SOURCE (a source.json to pin the image's provenance) and
+# Optional: STANNUM_EXTRA_ARGS (more tin.py run arguments, split on spaces, e.g.
+#   "--before-measure-sql delete.sql"), STANNUM_SOURCE (a source.json to pin the image's provenance) and
 # STANNUM_DOCKER_RUN_ARGS (defaults to the NVMe read caps below).
 set -euo pipefail
 usage() {
@@ -64,6 +65,7 @@ python3 benchmarks/tin.py --driver "$STANNUM_DRIVER" run ${STANNUM_SOURCE:+--sou
   --published-corpus stackexchange --dataset "$STANNUM_DATASET" --rows "$ROWS" \
   --validation-rows 1000 "${CHECKS[@]}" --engines stannum --workload topk --style "$STYLE" --updates "$UPDATES" \
   --warmup 10 --seconds "$SECONDS_" --clients 8 --cpus 8 "${SIZES[@]}" \
-  --setup-timeout-seconds 14400 --load-database "$STANNUM_MOCK/db" --image "$IMG" --output "$R" >> "$R.log" 2>&1 || status=$?
+  --setup-timeout-seconds 14400 --load-database "$STANNUM_MOCK/db" --image "$IMG" --output "$R" \
+  ${STANNUM_EXTRA_ARGS:-} >> "$R.log" 2>&1 || status=$?
 python3 benchmarks/local/report.py workload "$R" "$LABEL" "$STYLE" "$UPDATES" "$SECONDS_"
 exit $status

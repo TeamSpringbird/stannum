@@ -664,6 +664,16 @@ def run(args):
                     sampler.phase = 'query-memory-transition'
                     command(['docker', 'update', '--memory', args.memory, '--memory-swap', args.memory, name],
                             stdout=subprocess.DEVNULL)
+                if getattr(args, 'before_measure_sql', None):
+                    # A deliberate change to the loaded or built database before
+                    # validation and measurement, such as deleting a fraction of
+                    # the rows: recorded with its text and duration.
+                    sampler.phase = 'before-measure'
+                    statement = args.before_measure_sql.read_text()
+                    started = time.monotonic()
+                    sql(statement, setup=True)
+                    job['before_measure'] = dict(sql=statement, seconds=round(time.monotonic() - started, 3))
+                    bench.save(root / 'manifest.json', manifest)
                 sampler.phase = 'validation'
                 if loaded is None:
                     sql('VACUUM ANALYZE documents;', setup=True)
@@ -1089,6 +1099,8 @@ def main():
                    help='After the build and its checks, copy the data volume here for later runs to start from')
     p.add_argument('--load-database', type=Path,
                    help='Start from a database saved by --save-database, skipping import and index build')
+    p.add_argument('--before-measure-sql', type=Path,
+                   help='SQL run on the database after load or build and before validation and measurement')
     p.add_argument('--workload', choices=['count', 'topk'], default='count')
     p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase', 'conjunction-phrase', 'conjunction-disjunction'], default='mixed')
     p.add_argument('--clients', type=bench.positive, default=2)
