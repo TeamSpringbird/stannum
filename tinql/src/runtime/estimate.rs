@@ -424,7 +424,10 @@ impl Statistics for IndexStatistics<'_> {
         for (source, dead) in &self.sources {
             match source.expand(window, filter, self.max_expansion)? {
                 Expanded::Terms(terms) => {
+                    // Each term may read a posting list of up to 1,024
+                    // documents.
                     for (_, term) in terms {
+                        segment::check_interrupts("expand:estimate");
                         sum += live_frequency(*source, dead.as_ref(), &term)?;
                     }
                 }

@@ -63,8 +63,12 @@ impl From<LowerError> for LoweringIssue {
     fn from(value: LowerError) -> Self {
         match value {
             LowerError::MatchAllInSpanContext => Self::MatchAllInSpanContext,
+            LowerError::InvalidRegex(error) if error.exceeds_limit() => Self::TooLarge,
             LowerError::InvalidRegex(_) => Self::InvalidRegex,
-            LowerError::NestingTooDeep => Self::TooLarge,
+            LowerError::NestingTooDeep
+            | LowerError::TooManyCombinations { .. }
+            | LowerError::ExpansionTooLarge
+            | LowerError::RegexesTooLarge => Self::TooLarge,
         }
     }
 }

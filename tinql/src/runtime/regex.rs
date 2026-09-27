@@ -16,10 +16,14 @@ pub struct CompiledRegex {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid regex \"{pattern}\": {message}")]
-pub struct RegexError {
-    pattern: String,
-    message: String,
+pub enum RegexError {
+    #[error("invalid regex \"{pattern}\": {message}")]
+    Invalid { pattern: String, message: String },
+    #[error(
+        "regex \"{pattern}\" compiles to more than {limit} MiB",
+        limit = crate::limits::MAX_REGEX_BYTES >> 20
+    )]
+    TooLarge { pattern: String },
 }
 
 impl CompiledRegex {
@@ -27,8 +31,14 @@ impl CompiledRegex {
         let hir = regex_syntax::parse(&full_term_regex_pattern(pattern))
             .map_err(|err| RegexError::new(pattern, err.to_string()))?;
         let matcher = MetaRegex::builder()
+            .configure(MetaRegex::config().nfa_size_limit(Some(crate::limits::MAX_REGEX_BYTES)))
             .build_from_hir(&hir)
-            .map_err(|err| RegexError::new(pattern, err.to_string()))?;
+            .map_err(|err| match err.size_limit() {
+                Some(_) => RegexError::TooLarge {
+                    pattern: pattern.to_owned(),
+                },
+                None => RegexError::new(pattern, err.to_string()),
+            })?;
         Ok(Self {
             source: Arc::from(pattern),
             hir: Arc::new(hir),
@@ -42,6 +52,12 @@ impl CompiledRegex {
 
     pub fn hir(&self) -> &Hir {
         self.hir.as_ref()
+    }
+
+    /// Heap bytes the compiled automata take, before any match fills
+    /// their caches.
+    pub fn memory_usage(&self) -> usize {
+        self.matcher.memory_usage()
     }
 
     pub fn is_match(&self, haystack: &str) -> bool {
@@ -73,10 +89,17 @@ impl CompiledRegex {
 
 impl RegexError {
     fn new(pattern: &str, message: String) -> Self {
-        Self {
+        Self::Invalid {
             pattern: pattern.to_owned(),
             message,
         }
+    }
+
+    /// Whether the regex is refused for its compiled size rather than for
+    /// being invalid.
+    #[must_use]
+    pub const fn exceeds_limit(&self) -> bool {
+        matches!(self, Self::TooLarge { .. })
     }
 }
 
@@ -134,5 +157,32 @@ mod tests {
         assert_eq!(prefix(".*foo"), None);
         assert_eq!(prefix(".*"), None); // empty prefix
         assert_eq!(prefix("fo?o.*"), None);
+    }
+
+    /// A regex compiles to an automaton whose size its pattern decides:
+    /// `\w` is every Unicode word character, so `\w{100}` is some 5.6 MB,
+    /// and a query may name 10,000 regexes. One whose automaton is too
+    /// large is refused with an error naming the limit; the patterns
+    /// queries use stay far below it.
+    #[test]
+    fn oversized_regexes_are_refused() {
+        for pattern in [r"\w{100}", r"(?:\w{1,100}){1,10}", r"[\p{L}]{200}"] {
+            let error = CompiledRegex::new(pattern).expect_err(pattern).to_string();
+            assert!(
+                error.contains("compiles to more than"),
+                "{pattern}: {error}"
+            );
+        }
+        for pattern in [
+            "alp[a-z]*",
+            ".*a.*b.*c.*",
+            r"\w+",
+            r"\w{10}",
+            r"\w{20}\w*",
+            "(?:[a-z]{1,20}){1,20}",
+            ".{50}",
+        ] {
+            CompiledRegex::new(pattern).expect(pattern);
+        }
     }
 }

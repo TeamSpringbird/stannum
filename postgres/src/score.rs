@@ -608,6 +608,19 @@ pub(crate) const DEFAULT_WARMUP_CHUNKS: i32 = 256;
 /// `stannum.warmup_chunks`: how many chunks, across every source, a pruned
 /// conjunction evaluates first, those with the highest bounds by the chunk
 /// directory, so its threshold starts near its final value. Zero disables.
+/// Default of `stannum.max_expansion_terms`.
+pub(crate) const DEFAULT_MAX_EXPANSION_TERMS: i32 = 65_536;
+
+/// `stannum.max_expansion_terms`: the dictionary terms the wildcards,
+/// regexes, ranges and fuzzy terms of one ranked query may expand to in
+/// all. Each is scored with a scorer of its own, as TIN scores them, so a
+/// query past the limit fails (SQLSTATE 54000) instead of scoring a subset,
+/// as Lucene's `maxClauseCount` and Elasticsearch's
+/// `indices.query.bool.max_clause_count` do. Matching and counting expand
+/// without it.
+pub(crate) static MAX_EXPANSION_TERMS: pgrx::GucSetting<i32> =
+    pgrx::GucSetting::<i32>::new(DEFAULT_MAX_EXPANSION_TERMS);
+
 pub(crate) static WARMUP_CHUNKS: pgrx::GucSetting<i32> =
     pgrx::GucSetting::<i32>::new(DEFAULT_WARMUP_CHUNKS);
 
@@ -4532,10 +4545,16 @@ fn build_index_scorer_inner(
     if !key.full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let query = parse_tinql_to_query(&key.query, tokenizer.as_ref())
-        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
-    let scoring = parse_tinql_to_scoring_query(&key.query, tokenizer.as_ref())
-        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
+    let query = parse_tinql_to_query(&key.query, tokenizer.as_ref()).unwrap_or_else(|error| {
+        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
+    });
+    let scoring =
+        parse_tinql_to_scoring_query(&key.query, tokenizer.as_ref()).unwrap_or_else(|error| {
+            crate::operator::raise_query_error(
+                &error,
+                format!("Stannum score query error: {error}"),
+            )
+        });
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -4554,7 +4573,7 @@ fn build_index_scorer_inner(
     let segments: Vec<&dyn Index> = view.sources.iter().map(|(index, _)| &**index).collect();
     let mut collected = Collected::default();
     collect_score_terms(&scoring, 1.0, false, &mut collected);
-    let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
+    let owned = collected.resolve(|expansion, limit| expansion.expand_in(&segments, limit));
     let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
     let dead = view.dead_sets.clone();
     // Statistics include dead documents until their segment is rewritten,
@@ -4575,6 +4594,9 @@ fn build_index_scorer_inner(
     };
     let mut scorers = Vec::new();
     for term in terms {
+        // A term costs a dictionary lookup per source, and an expansion can
+        // bring thousands of them.
+        pgrx::check_for_interrupts!();
         let mut total_df = 0u64;
         let mut immutable_df = 0u64;
         for (i, segment) in segments.iter().enumerate() {
@@ -4677,10 +4699,12 @@ fn build_corpus(
     if !key.full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let query = parse_tinql_to_query(&key.query, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
-    let scoring = parse_tinql_to_scoring_query(&key.query, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("Stannum score query error: {error}"));
+    let query = parse_tinql_to_query(&key.query, &tokenizer).unwrap_or_else(|error| {
+        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
+    });
+    let scoring = parse_tinql_to_scoring_query(&key.query, &tokenizer).unwrap_or_else(|error| {
+        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
+    });
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -4700,14 +4724,7 @@ fn build_corpus(
     let universe = corpus_universe(&tokenized);
     let mut collected = Collected::default();
     collect_score_terms(&scoring, 1.0, false, &mut collected);
-    let owned = collected.resolve(|expansion| {
-        let matcher = expansion.matcher();
-        universe
-            .iter()
-            .filter(|term| matcher(term))
-            .map(|term| (*term).to_owned())
-            .collect()
-    });
+    let owned = collected.resolve(|expansion, limit| expansion.expand_over(&universe, limit));
     let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
     // Token-less documents are not documents for scoring, as in TIN.
     let total_docs = tokenized.iter().filter(|tokens| !tokens.is_empty()).count() as u64;
@@ -4859,15 +4876,16 @@ impl Expansion<'_> {
         }
     }
 
-    /// Every matching term across the given indexes.
-    fn expand_in(&self, segments: &[&dyn Index]) -> Vec<String> {
+    /// Every matching term across the given indexes, or `None` when there
+    /// are more than `limit`.
+    fn expand_in(&self, segments: &[&dyn Index], limit: usize) -> Option<Vec<String>> {
         let mut found = BTreeSet::new();
         let matcher = self.matcher();
         for segment in segments {
             let expanded = match self {
                 Self::Regex(regex) => match regex.pure_prefix() {
-                    Some(prefix) => segment.expand(Window::Prefix(&prefix), &|_| true, usize::MAX),
-                    None => segment.expand(Window::All, &*matcher, usize::MAX),
+                    Some(prefix) => segment.expand(Window::Prefix(&prefix), &|_| true, limit),
+                    None => segment.expand(Window::All, &*matcher, limit),
                 },
                 Self::Range(lower, upper) => {
                     fn bound(bound: &RangeBound) -> Option<&str> {
@@ -4876,22 +4894,35 @@ impl Expansion<'_> {
                             RangeBound::Term(term) => Some(term.as_str()),
                         }
                     }
-                    segment.expand(
-                        Window::Range(bound(lower), bound(upper)),
-                        &|_| true,
-                        usize::MAX,
-                    )
+                    segment.expand(Window::Range(bound(lower), bound(upper)), &|_| true, limit)
                 }
                 Self::Fuzzy { term, prefix, .. } => {
                     let fixed: String = term.chars().take(*prefix as usize).collect();
-                    segment.expand(Window::Prefix(&fixed), &*matcher, usize::MAX)
+                    segment.expand(Window::Prefix(&fixed), &*matcher, limit)
                 }
             };
-            if let Expanded::Terms(terms) = segment_error(expanded) {
-                found.extend(terms.into_iter().map(|(t, _)| t));
+            match segment_error(expanded) {
+                Expanded::Terms(terms) => found.extend(terms.into_iter().map(|(t, _)| t)),
+                Expanded::Overflow => return None,
+            }
+            if found.len() > limit {
+                return None;
             }
         }
-        found.into_iter().collect()
+        Some(found.into_iter().collect())
+    }
+
+    /// Every term of `universe` that matches, or `None` when there are more
+    /// than `limit`.
+    fn expand_over(&self, universe: &BTreeSet<&str>, limit: usize) -> Option<Vec<String>> {
+        let matcher = self.matcher();
+        let found: Vec<String> = universe
+            .iter()
+            .filter(|term| matcher(term))
+            .take(limit.saturating_add(1))
+            .map(|term| (*term).to_owned())
+            .collect();
+        (found.len() <= limit).then_some(found)
     }
 }
 
@@ -4904,17 +4935,34 @@ struct Collected<'a> {
 
 impl<'a> Collected<'a> {
     /// Resolves expansions through `expand` and returns owned inputs.
+    /// `expand` is given the terms the expansions may still bring and
+    /// returns `None` past them: every term an expansion brings is scored,
+    /// so their number is bounded by `stannum.max_expansion_terms`, past
+    /// which the query fails rather than scoring some of them.
     fn resolve(
         self,
-        mut expand: impl FnMut(&Expansion<'a>) -> Vec<String>,
+        mut expand: impl FnMut(&Expansion<'a>, usize) -> Option<Vec<String>>,
     ) -> Vec<(String, f32, bool)> {
+        let limit = usize::try_from(MAX_EXPANSION_TERMS.get()).unwrap_or(0);
         let mut out: Vec<(String, f32, bool)> = self
             .terms
             .iter()
             .map(|input| (input.text.to_owned(), input.boost, input.explicitly_boosted))
             .collect();
+        let mut expanded = 0usize;
         for (expansion, boost, explicit) in &self.expansions {
-            for term in expand(expansion) {
+            let Some(terms) = expand(expansion, limit - expanded) else {
+                pgrx::ereport!(
+                    ERROR,
+                    pgrx::PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+                    format!(
+                        "query expands to more than {limit} terms to score \
+                         (stannum.max_expansion_terms)"
+                    )
+                );
+            };
+            expanded += terms.len();
+            for term in terms {
                 out.push((term, *boost, *explicit));
             }
         }
@@ -5064,8 +5112,12 @@ fn score_inspect(
     crate::udfs::require_index_select(&index);
     let heap_oid = unsafe { pg_sys::IndexGetRelation(index.oid(), false) };
     let tokenizer = unsafe { crate::options::tokenizer(index.as_ptr()) };
-    let parsed = parse_tinql_to_scoring_query(query, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("stannum.score_inspect() query error: {error}"));
+    let parsed = parse_tinql_to_scoring_query(query, &tokenizer).unwrap_or_else(|error| {
+        crate::operator::raise_query_error(
+            &error,
+            format!("stannum.score_inspect() query error: {error}"),
+        )
+    });
     let edit = TermSetEdit::from_bound_arrays(
         unwrap("term_add", term_add),
         unwrap("term_replace", term_replace),
@@ -5088,7 +5140,7 @@ fn score_inspect(
     let rows = if unsafe { crate::storage::present(index.as_ptr()) } {
         let view = unsafe { crate::storage::view(index.oid()) };
         let segments: Vec<&dyn Index> = view.sources.iter().map(|(index, _)| &**index).collect();
-        let owned = collected.resolve(|expansion| expansion.expand_in(&segments));
+        let owned = collected.resolve(|expansion, limit| expansion.expand_in(&segments, limit));
         let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
         let is_immutable = |i: usize| i < view.immutable_sources;
         let immutable_docs: u64 = segments
@@ -5122,14 +5174,7 @@ fn score_inspect(
                 .collect::<Vec<_>>()
         });
         let universe = corpus_universe(&tokenized);
-        let owned = collected.resolve(|expansion| {
-            let matcher = expansion.matcher();
-            universe
-                .iter()
-                .filter(|term| matcher(term))
-                .map(|term| (*term).to_owned())
-                .collect()
-        });
+        let owned = collected.resolve(|expansion, limit| expansion.expand_over(&universe, limit));
         let terms = compile_scoring_terms(inputs_of(&owned), &edit, stop.as_ref());
         let n = tokenized.iter().filter(|tokens| !tokens.is_empty()).count() as u64;
         terms

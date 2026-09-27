@@ -48,8 +48,8 @@ use crate::options::SPEC_BYTES;
 #[allow(unused_imports)]
 use crate::selectivity::stannum_text_restrict;
 use pgrx::{
-    FromDatum, Internal, IntoDatum, PgList, PostgresType, extension_sql, pg_extern, pg_guard,
-    pg_sys,
+    FromDatum, Internal, IntoDatum, PgList, PgSqlErrorCode, PostgresType, extension_sql, pg_extern,
+    pg_guard, pg_sys,
 };
 use serde::{Deserialize, Serialize};
 use tinql::runtime::{Query, QueryError, evaluate, parse_tinql_to_query, tokenize_doc};
@@ -117,18 +117,43 @@ pub(crate) fn invalid_query(text: &str, error: &QueryError) -> String {
     )
 }
 
+/// The SQLSTATE of a query that does not parse: `statement_too_complex`
+/// (54001) for one refused by a limit of `tinql::limits` (its terms, its
+/// nesting, the expansion of `AT LEAST` inside a proximity operator, the
+/// compiled size of its regexes), as PostgreSQL reports its own stack depth
+/// limit; otherwise TIN's `internal_error` (XX000).
+pub(crate) fn query_error_code(error: &QueryError) -> PgSqlErrorCode {
+    if error.exceeds_limit() {
+        PgSqlErrorCode::ERRCODE_STATEMENT_TOO_COMPLEX
+    } else {
+        PgSqlErrorCode::ERRCODE_INTERNAL_ERROR
+    }
+}
+
+/// Raises `message`, which reports `error`, with the error's SQLSTATE.
+pub(crate) fn raise_query_error(error: &QueryError, message: String) -> ! {
+    pgrx::ereport!(ERROR, query_error_code(error), message);
+}
+
 /// Parses `text` with `tokenizer`, or raises the error of an invalid query.
 pub(crate) fn parse_or_raise<T: tokenizer::Tokenizer>(text: &str, tokenizer: &T) -> Query {
     parse_tinql_to_query(text, tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("{}", invalid_query(text, &error)))
+        .unwrap_or_else(|error| raise_query_error(&error, invalid_query(text, &error)))
 }
 
-/// Errors carry their whole message.
+/// An error of `==>`: its SQLSTATE and whole message.
+type Failure = (PgSqlErrorCode, String);
+
+/// Raises `failure`.
+fn raise(failure: Failure) -> ! {
+    pgrx::ereport!(ERROR, failure.0, failure.1);
+}
+
 fn parsed_query(
     spec: [u8; SPEC_BYTES],
     tokenizer: &CompiledTokenizerPipeline,
     text: &str,
-) -> Result<Rc<Query>, String> {
+) -> Result<Rc<Query>, Failure> {
     let memoized = QUERIES.with_borrow(|memo| {
         memo.get(&spec)
             .and_then(|queries| queries.get(text).cloned())
@@ -137,7 +162,8 @@ fn parsed_query(
         return Ok(query);
     }
     let query = Rc::new(
-        parse_tinql_to_query(text, tokenizer).map_err(|error| invalid_query(text, &error))?,
+        parse_tinql_to_query(text, tokenizer)
+            .map_err(|error| (query_error_code(&error), invalid_query(text, &error)))?,
     );
     QUERIES.with_borrow_mut(|memo| {
         let queries = memo.entry(spec).or_default();
@@ -154,19 +180,24 @@ fn evaluate_with(
     query: &str,
     spec: [u8; SPEC_BYTES],
     tokenizer: &CompiledTokenizerPipeline,
-) -> Result<bool, String> {
+) -> Result<bool, Failure> {
     let query = parsed_query(spec, tokenizer, query)?;
     let document = tokenize_doc(document, tokenizer);
     evaluate(&query, &document)
         .map(|result| result.matched)
-        .map_err(|error| format!("invalid ==> query: {error}"))
+        .map_err(|error| {
+            (
+                PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+                format!("invalid ==> query: {error}"),
+            )
+        })
 }
 
 fn default_spec() -> [u8; SPEC_BYTES] {
     crate::options::encode_spec(&TokenizerPipelineSpec::stannum_default())
 }
 
-fn evaluate_text(document: &str, query_text: &str) -> Result<bool, String> {
+fn evaluate_text(document: &str, query_text: &str) -> Result<bool, Failure> {
     evaluate_with(
         document,
         query_text,
@@ -178,7 +209,7 @@ fn evaluate_text(document: &str, query_text: &str) -> Result<bool, String> {
 /// `text ==> text`: the default tokenizer settings.
 #[pg_extern(immutable, parallel_safe)]
 pub fn stannum_text_cmpfunc(document: &str, query: &str) -> bool {
-    evaluate_text(document, query).unwrap_or_else(|error| pgrx::error!("{error}"))
+    evaluate_text(document, query).unwrap_or_else(|failure| raise(failure))
 }
 
 /// `text ==> indexed_query`: the bound index's tokenizer settings.
@@ -190,8 +221,7 @@ pub fn stannum_text_cmpfunc_indexed(document: &str, query: indexed_query) -> boo
     crate::udfs::validate_stannum_index(&index, "indexed_query");
     let spec = unsafe { crate::storage::spec_by_oid(pg_sys::Oid::from(query.index)) };
     let tokenizer = crate::storage::tokenizer_for(&spec);
-    evaluate_with(document, &query.query, spec, &tokenizer)
-        .unwrap_or_else(|error| pgrx::error!("{error}"))
+    evaluate_with(document, &query.query, spec, &tokenizer).unwrap_or_else(|failure| raise(failure))
 }
 
 /// Binds a non-constant query expression to an index at plan time.

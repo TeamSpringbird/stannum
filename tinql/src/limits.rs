@@ -45,6 +45,37 @@ pub const MAX_TERMS: usize = 10_000;
 /// and a phrase with pinned gaps nests one level per word; this bounds both.
 pub const MAX_SPAN_NESTING: usize = 2 * MAX_NESTING;
 
+/// Combinations one `AT LEAST n OF [k operands]` inside a proximity
+/// operator, relation or positional filter may expand to. There it is
+/// matched as the disjunction of every `n`-operand combination, C(k, n) of
+/// them, built again for each candidate document: C(30, 15) is 155 million.
+/// Outside a span context `AT LEAST` is counted, not expanded, and has no
+/// such limit.
+pub const MAX_AT_LEAST_COMBINATIONS: usize = 10_000;
+
+/// Operands the expansion of `AT LEAST` inside a span context may add to
+/// the query's span expression: each operand is copied into every
+/// combination that includes it, and an expanded `AT LEAST` among the
+/// operands of another is copied whole, so the copies multiply. A single
+/// expansion of terms within [`MAX_AT_LEAST_COMBINATIONS`] that takes at
+/// most nine at a time (or has at most 16 operands) stays within it;
+/// `AT LEAST 999 OF` a thousand terms, a thousand combinations of 999
+/// operands, does not.
+pub const MAX_SPAN_EXPANSION: usize = 100_000;
+
+/// Bytes the automaton of one regex, or of one wildcard, may take once
+/// compiled: each of its forward and reverse NFAs (the regex engine's
+/// default is 10 MiB). `\w` is every Unicode word character, so the pattern
+/// decides the size: `\w{20}\w*`, a term of at least 20 word characters,
+/// fits; `\w{100}`, about 5.6 MiB in all, does not.
+pub const MAX_REGEX_BYTES: usize = 2 << 20;
+
+/// Bytes the compiled regexes and wildcards of one query may take together,
+/// counted as they are compiled. A query may name [`MAX_TERMS`] of them:
+/// 10,000 prefix wildcards take about 70 MiB, a hundred `\w{10}` about
+/// 56 MiB.
+pub const MAX_QUERY_REGEX_BYTES: usize = 256 << 20;
+
 static STACK_CHECK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// Installs `check`, which every recursive pass over a query calls once per

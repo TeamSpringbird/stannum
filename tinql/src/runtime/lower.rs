@@ -13,9 +13,13 @@
 //! - `MatchAll` is folded out of compound boolean nodes
 //! - single-term phrases collapse to plain `Term` nodes
 
+use std::cell::Cell;
+
 use rustc_hash::FxHashMap;
 
-use crate::limits::MAX_SPAN_NESTING;
+use crate::limits::{
+    MAX_AT_LEAST_COMBINATIONS, MAX_QUERY_REGEX_BYTES, MAX_SPAN_EXPANSION, MAX_SPAN_NESTING,
+};
 
 use super::{
     CompiledRegex, PositionFilterBound, Query, RangeBound, SimplificationProfile, SpanExpr,
@@ -34,6 +38,38 @@ pub enum LowerError {
         limit = MAX_SPAN_NESTING
     )]
     NestingTooDeep,
+    #[error(
+        "AT LEAST {min} OF {operands} operands inside a proximity operator expands to more than \
+         {limit} combinations",
+        limit = MAX_AT_LEAST_COMBINATIONS
+    )]
+    TooManyCombinations { min: u32, operands: usize },
+    #[error(
+        "AT LEAST inside a proximity operator expands the query by more than {limit} operands",
+        limit = MAX_SPAN_EXPANSION
+    )]
+    ExpansionTooLarge,
+    #[error(
+        "the query's regexes compile to more than {limit} MiB",
+        limit = MAX_QUERY_REGEX_BYTES >> 20
+    )]
+    RegexesTooLarge,
+}
+
+impl LowerError {
+    /// Whether the query is refused for exceeding a limit of
+    /// [`crate::limits`] rather than for being invalid.
+    #[must_use]
+    pub const fn exceeds_limit(&self) -> bool {
+        match self {
+            Self::NestingTooDeep
+            | Self::TooManyCombinations { .. }
+            | Self::ExpansionTooLarge
+            | Self::RegexesTooLarge => true,
+            Self::InvalidRegex(error) => error.exceeds_limit(),
+            Self::MatchAllInSpanContext => false,
+        }
+    }
 }
 
 pub fn lower(expr: &crate::Expr) -> Result<Query, LowerError> {
@@ -44,7 +80,28 @@ pub fn lower_with_profile(
     expr: &crate::Expr,
     profile: SimplificationProfile,
 ) -> Result<Query, LowerError> {
+    REGEX_BYTES.set(0);
     Ok(simplify(lower_boolean(expr, 1)?, profile))
+}
+
+thread_local! {
+    /// Bytes the regexes and wildcards compiled so far by the lowering
+    /// under way take (see [`compile_regex`]).
+    static REGEX_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Compiles `pattern`, within [`crate::limits::MAX_REGEX_BYTES`] and,
+/// with the regexes the lowering compiled before it, within
+/// [`MAX_QUERY_REGEX_BYTES`]. The total is counted as they are compiled, so
+/// the memory is bounded before the query is refused.
+fn compile_regex(pattern: &str) -> Result<CompiledRegex, LowerError> {
+    let regex = CompiledRegex::new(pattern)?;
+    let total = REGEX_BYTES.get().saturating_add(regex.memory_usage());
+    REGEX_BYTES.set(total);
+    if total > MAX_QUERY_REGEX_BYTES {
+        return Err(LowerError::RegexesTooLarge);
+    }
+    Ok(regex)
 }
 
 /// Lowers `expr`, which sits `depth` levels deep in the lowered query.
@@ -145,10 +202,8 @@ fn lower_leaf(expr: &crate::Expr) -> Result<Query, LowerError> {
             prefix: *prefix,
             distance: *distance,
         }),
-        Expr::Wildcard(parts) => Ok(Query::Regex(CompiledRegex::new(&wildcard_parts_regex(
-            parts,
-        ))?)),
-        Expr::Regex(pat) => Ok(Query::Regex(CompiledRegex::new(pat)?)),
+        Expr::Wildcard(parts) => Ok(Query::Regex(compile_regex(&wildcard_parts_regex(parts))?)),
+        Expr::Regex(pat) => Ok(Query::Regex(compile_regex(pat)?)),
         Expr::Range { lower, upper } => Ok(Query::Range {
             lower: convert_range_bound(lower),
             upper: convert_range_bound(upper),
@@ -161,6 +216,10 @@ fn lower_leaf(expr: &crate::Expr) -> Result<Query, LowerError> {
 fn lower_as_span(expr: &crate::Expr, depth: usize) -> Result<Query, LowerError> {
     let mut builder = SpanBuilder::new(depth);
     let span_expr = builder.lower_span_expr(expr)?;
+    let (plain, resolved) = span_expr.expansion_size();
+    if resolved.saturating_sub(plain) > MAX_SPAN_EXPANSION {
+        return Err(LowerError::ExpansionTooLarge);
+    }
     if let Some((span_query, position_filter)) = span_expr.to_fast_path_root() {
         Ok(Query::Span {
             term_slots: builder.term_slots,
@@ -287,13 +346,13 @@ impl SpanBuilder {
                 Ok(SpanExpr::Term(idx))
             }
             Expr::Wildcard(parts) => {
-                let idx = self.intern(SpanTermSlot::Regex(CompiledRegex::new(
-                    &wildcard_parts_regex(parts),
-                )?));
+                let idx = self.intern(SpanTermSlot::Regex(compile_regex(&wildcard_parts_regex(
+                    parts,
+                ))?));
                 Ok(SpanExpr::Term(idx))
             }
             Expr::Regex(pat) => {
-                let idx = self.intern(SpanTermSlot::Regex(CompiledRegex::new(pat)?));
+                let idx = self.intern(SpanTermSlot::Regex(compile_regex(pat)?));
                 Ok(SpanExpr::Term(idx))
             }
             Expr::Range { lower, upper } => {
@@ -330,6 +389,14 @@ impl SpanBuilder {
             }
             Expr::AtLeast { threshold, exprs } => {
                 let min = resolve_threshold(threshold, exprs.len());
+                if super::span_expr::at_least_combinations(min, exprs.len())
+                    > MAX_AT_LEAST_COMBINATIONS
+                {
+                    return Err(LowerError::TooManyCombinations {
+                        min,
+                        operands: exprs.len(),
+                    });
+                }
                 let children = exprs
                     .iter()
                     .map(|expr| self.lower_span_expr(expr))
@@ -818,5 +885,98 @@ mod tests {
                     SpanExpr::AtLeast { min: 2, children } if children.len() == 3
                 )
         ));
+    }
+
+    /// `AT LEAST n OF [k operands]` inside a proximity operator is matched
+    /// as the disjunction of every n-operand combination, built again for
+    /// each candidate document. A query whose combinations cannot be built
+    /// in bounded time and memory is refused when it is lowered, before any
+    /// document is read; below the bound it lowers as before.
+    #[test]
+    fn at_least_expansions_inside_spans_are_bounded() {
+        let words = |prefix: &str, count: usize| {
+            (0..count)
+                .map(|i| format!("{prefix}{i}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let lowered = |input: &str| {
+            let expr = super::super::subtokenize::sub_tokenize(parse(input), default_pipeline())
+                .expect("query should sub-tokenize");
+            lower(&expr)
+        };
+        let refused = [
+            // C(30, 15), about 155 million combinations.
+            format!("(AT LEAST 15 OF [{}]) NEAR/5 x", words("t", 30)),
+            // C(1000, 999) is only 1,000 combinations, but of 999 operands
+            // each: about a million copied operands.
+            format!("(AT LEAST 999 OF [{}]) NEAR/5 x", words("t", 1000)),
+            // Two operands of four at every level, twelve levels deep: six
+            // combinations each, but each level copies the one below it
+            // three times, 3^12 copies of the innermost.
+            {
+                let mut query = "a".to_owned();
+                for level in 0..12 {
+                    query = format!("AT LEAST 2 OF [({query}) b{level} c{level} d{level}]");
+                }
+                format!("({query}) NEAR/5 x")
+            },
+        ];
+        for query in &refused {
+            let error = lowered(query)
+                .expect_err("query should be refused")
+                .to_string();
+            assert!(
+                error.contains("AT LEAST") && error.contains("more than"),
+                "{}: {error}",
+                &query[..query.len().min(60)]
+            );
+        }
+
+        for query in [
+            format!("(AT LEAST 2 OF [{}]) NEAR/5 x", words("t", 100)),
+            format!("(AT LEAST 6 OF [{}]) NEAR/5 x", words("t", 16)),
+            format!("(AT LEAST 1 OF [{}]) NEAR/5 x", words("t", 5000)),
+            format!("(AT LEAST 5000 OF [{}]) NEAR/5 x", words("t", 5000)),
+        ] {
+            assert!(
+                matches!(lowered(&query), Ok(Query::SpanExpr { .. })),
+                "{}",
+                &query[..60]
+            );
+        }
+    }
+
+    /// Each regex is bounded on its own, and a query's regexes and
+    /// wildcards together: 10,000 of them, each within the bound, would
+    /// still take gigabytes.
+    #[test]
+    fn the_regexes_of_a_query_are_bounded_together() {
+        let lowered = |input: &str| {
+            let expr = super::super::subtokenize::sub_tokenize(parse(input), default_pipeline())
+                .expect("query should sub-tokenize");
+            lower(&expr)
+        };
+        // About 0.56 MB each.
+        let regexes = |count: usize| {
+            (0..count)
+                .map(|i| format!("MATCHES \\w{{10}}{i}"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        };
+        for query in [regexes(600), format!("({}) NEAR/5 x", regexes(600))] {
+            let Err(error) = lowered(&query) else {
+                panic!("{}...: should be refused", &query[..60]);
+            };
+            let error = error.to_string();
+            assert!(error.contains("regexes compile to more than"), "{error}");
+        }
+        assert!(lowered(&regexes(100)).is_ok());
+        // 10,000 wildcards are a few kilobytes each.
+        let wildcards = (0..10_000)
+            .map(|i| format!("w{i}*"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert!(lowered(&wildcards).is_ok());
     }
 }

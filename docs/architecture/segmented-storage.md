@@ -584,7 +584,10 @@ terms). A conjunction whose estimated matches warrant it
 (`stannum.warmup_min_matches`) first evaluates its best-bounded chunks
 (`stannum.warmup_chunks`) to raise its threshold early. Expansions (prefixes,
 regexes, fuzzy terms, ranges), span shapes that do not require every word, and
-limits above 4,096 rows score every candidate. `EXPLAIN ANALYZE` reports
+limits above 4,096 rows score every candidate. Every term an expansion brings
+gets a scorer of its own; `stannum.max_expansion_terms` (default 65,536)
+bounds their number per query, past which ranking fails with SQLSTATE 54000
+rather than scoring some of them. `EXPLAIN ANALYZE` reports
 `Pruning: ordinal`, `Scored Candidates`, `Positions Checked`,
 `Top-K Completions` and `Exhaustive Score Calls`; the last two are cumulative
 across rescans.
