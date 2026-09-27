@@ -64,7 +64,7 @@ job. "Step" is the `script/test-all` step that runs it.
 | kind | where | command | needs | runs in |
 |------|-------|---------|-------|---------|
 | Rust unit tests and proptests | `#[test]` and `proptest!` in `segment`, `tinql`, `tokenizer`, `boldi-vigna` | `cargo test --workspace --exclude stannum` | Rust | CI build-and-test; step `rust-unit` |
-| Crate integration tests | `tinql/tests/`, `tokenizer/tests/` | the same command | Rust | the same |
+| Crate integration tests | `tinql/tests/`, `tokenizer/tests/`, `segment/tests/record_memory.rs` (peak memory of grouping a 16 MiB document, under a counting allocator) | the same command | Rust | the same |
 | Parser differential test | `tinql/src/parser/differential.rs`: the descent parser against the retired pest grammar | the same command | Rust | the same |
 | Heavier proptests | the property tests that read `PROPTEST_CASES` (`segment/src/random_tests.rs`, `tinql/src/runtime/plan.rs`, `boldi-vigna/src/phrase_plan.rs`) | `PROPTEST_CASES=5000 cargo test --release -p segment` | Rust | manual |
 | pg_tests | `#[pg_test]` in `postgres/src`, including `tin_conformance.rs` (TIN 1.0.3's recorded answers) | `cargo pgrx test pg18 -p stannum` | pgrx; installs a pg_test build | CI build-and-test; step `pgrx` |
@@ -83,7 +83,7 @@ job. "Step" is the `script/test-all` step that runs it.
 | Ranked-scan fuzzer, long runs | `postgres/tests/ranked_fuzz.py` (below) | `python3 postgres/tests/ranked_fuzz.py --seed 7 --seconds 600` | the release build installed | manual |
 | Count fuzzer | `benchmarks/count_fuzz.py`: seeded AND/OR count queries under writes, against a Python evaluation of the same token sets, with forced page counting | `$STANNUM_PYTHON benchmarks/count_fuzz.py --output DIR` (`--replay DIR/<seed>-fixture.json` repeats one) | `STANNUM_PYTHON`; libpq variables naming a database where the role may create schemas and `stannum` is installed | manual |
 | Backends that exit mid-walk | `postgres/tests/exit_during_walk.py` (below) | `benchmarks/local/exit-test.sh` | Docker; `STANNUM_PYTHON` | manual |
-| Timing microprobes | `#[ignore]`d: `segment/tests/buffer_cost.rs` (`STANNUM_DOCS`, `STANNUM_COUNT`) and `grouped_record_ingestion_microprobe` in `segment/src/segment.rs`; they print timings and assert nothing | `cargo test --release -p segment -- --ignored --nocapture` | Rust | manual |
+| Timing microprobes | `#[ignore]`d: `segment/tests/buffer_cost.rs` (`STANNUM_DOCS`, `STANNUM_COUNT`), `segment/tests/record_throughput.rs` (tokenizing and grouping a synthetic corpus as inserts and builds do; `STANNUM_RUNS`) and `grouped_record_ingestion_microprobe` in `segment/src/segment.rs`; they print timings and assert nothing | `cargo test --release -p segment -- --ignored --nocapture` | Rust | manual |
 
 To add a test, put it where its kind lives above; a new Python cluster test
 also goes into the `cluster` step of `script/test-all`, which is what CI and

@@ -916,6 +916,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the peak-memory test of grouping a document's tokens by term."
     },
+    "segment/tests/record_throughput.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a timing probe of grouping tokenized documents by term."
+    },
     "tinql/Cargo.toml": {
       "owner": "mixed",
       "upstream_path": "tinql/Cargo.toml",
