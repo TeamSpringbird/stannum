@@ -217,6 +217,25 @@ pub(crate) fn dead_ordinals(key: (u64, u32), dead: Option<&Rc<Vec<u8>>>) -> Resu
     Ok(ordinals)
 }
 
+/// Decoded dead lists cached under index identity `identity`.
+#[cfg(feature = "pg_test")]
+pub(crate) fn cached_dead_lists(identity: u64) -> usize {
+    DEAD.with_borrow(|cache| cache.keys().filter(|(id, _)| *id == identity).count())
+}
+
+/// Keeps the decoded dead lists of the segments `keep` names; returns the
+/// bytes of those kept. The raw lists are shared with the segment readers,
+/// which account for them.
+pub(crate) fn retain_dead_ordinals(keep: impl Fn((u64, u32)) -> bool) -> usize {
+    DEAD.with_borrow_mut(|cache| {
+        cache.retain(|key, _| keep(*key));
+        cache
+            .values()
+            .map(|(_, ordinals)| ordinals.len() * std::mem::size_of::<u32>())
+            .sum()
+    })
+}
+
 /// A chunk with at most this many matches looks each one's page up; a fuller
 /// chunk walks the page table across it instead.
 const SPARSE_CHUNK: u32 = 256;
