@@ -667,11 +667,15 @@ def run(args):
                 if getattr(args, 'before_measure_sql', None):
                     # A deliberate change to the loaded or built database before
                     # validation and measurement, such as deleting a fraction of
-                    # the rows: recorded with its text and duration.
+                    # the rows: recorded with its text and duration. Paragraphs
+                    # (separated by blank lines) run as separate statements, so
+                    # one can be a VACUUM.
                     sampler.phase = 'before-measure'
                     statement = args.before_measure_sql.read_text()
                     started = time.monotonic()
-                    sql(statement, setup=True)
+                    for paragraph in statement.split('\n\n'):
+                        if paragraph.strip():
+                            sql(paragraph, setup=True)
                     job['before_measure'] = dict(sql=statement, seconds=round(time.monotonic() - started, 3))
                     bench.save(root / 'manifest.json', manifest)
                 sampler.phase = 'validation'
