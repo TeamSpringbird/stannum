@@ -50,8 +50,8 @@ impl SegmentBuilder {
             return Err(DuplicateDocument(id));
         }
         // One posting per document/term, independent of term frequency.
-        for term in document.tokens().iter().collect::<BTreeSet<_>>() {
-            self.terms.entry(term.clone()).or_default().push(id);
+        for (term, _) in document.terms() {
+            self.terms.entry(term.to_owned()).or_default().push(id);
         }
         Ok(())
     }

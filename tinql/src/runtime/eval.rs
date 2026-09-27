@@ -3,66 +3,104 @@
 //
 // See LICENSE in the repository root for license terms.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 use boldi_vigna::{Interval, SpanSolver, TermPositions};
 use rustc_hash::FxHashMap;
+use segment::forward::TOKENIZE_INTERRUPT_INTERVAL;
 
 use super::{Query, RangeBound, SpanTermSlot};
 
+/// A document's tokens for exact evaluation: each distinct term once, with
+/// its positions, and the document's token sequence as term numbers, so
+/// memory grows with the positions and the distinct terms rather than with a
+/// string per token.
 pub struct TokenizedDoc {
-    tokens: Vec<String>,
+    /// Distinct terms in order of first occurrence, with their positions.
+    terms: Vec<(String, Vec<u32>)>,
+    /// Index into `terms` by term text.
+    ids: FxHashMap<String, u32>,
+    /// Per token, in document order: its term's index into `terms`.
+    token_terms: Vec<u32>,
     token_positions: Vec<u32>,
-    positions: FxHashMap<String, Vec<u32>>,
 }
 
 impl TokenizedDoc {
-    pub fn new(positioned_tokens: Vec<(String, u32)>) -> Self {
-        let mut tokens = Vec::with_capacity(positioned_tokens.len());
-        let mut token_positions = Vec::with_capacity(positioned_tokens.len());
-        let mut positions = FxHashMap::default();
+    /// From `(term, position)` in document order with strictly increasing
+    /// positions. Checks for interrupts every
+    /// [`segment::forward::TOKENIZE_INTERRUPT_INTERVAL`] tokens.
+    pub fn from_tokens<'t, T: Into<Cow<'t, str>>>(
+        positioned_tokens: impl IntoIterator<Item = (T, u32)>,
+    ) -> Self {
+        let mut doc = Self {
+            terms: Vec::new(),
+            ids: FxHashMap::default(),
+            token_terms: Vec::new(),
+            token_positions: Vec::new(),
+        };
         for (token, pos) in positioned_tokens {
-            positions
-                .entry(token.clone())
-                .or_insert_with(Vec::new)
-                .push(pos);
-            tokens.push(token);
-            token_positions.push(pos);
+            let token = token.into();
+            let id = match doc.ids.get(&*token) {
+                Some(id) => *id,
+                None => {
+                    let id = doc.terms.len() as u32;
+                    let token = token.into_owned();
+                    doc.ids.insert(token.clone(), id);
+                    doc.terms.push((token, Vec::new()));
+                    id
+                }
+            };
+            doc.terms[id as usize].1.push(pos);
+            doc.token_terms.push(id);
+            doc.token_positions.push(pos);
+            if doc
+                .token_positions
+                .len()
+                .is_multiple_of(TOKENIZE_INTERRUPT_INTERVAL as usize)
+            {
+                segment::check_interrupts("tokenize");
+            }
         }
-        debug_assert!(token_positions.windows(2).all(|pair| pair[0] < pair[1]));
-        Self {
-            tokens,
-            token_positions,
-            positions,
-        }
+        debug_assert!(doc.token_positions.windows(2).all(|pair| pair[0] < pair[1]));
+        doc
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
+        self.token_positions.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.tokens.len()
+        self.token_positions.len()
     }
 
-    pub fn tokens(&self) -> &[String] {
-        &self.tokens
+    /// Every token's text, in document order.
+    pub fn tokens(&self) -> impl Iterator<Item = &str> {
+        self.token_terms
+            .iter()
+            .map(|id| self.terms[*id as usize].0.as_str())
+    }
+
+    /// Every distinct term with its positions, in order of first occurrence.
+    pub fn terms(&self) -> impl Iterator<Item = (&str, &[u32])> {
+        self.terms
+            .iter()
+            .map(|(term, positions)| (term.as_str(), positions.as_slice()))
     }
 
     pub fn positions(&self, term: &str) -> &[u32] {
-        self.positions.get(term).map(Vec::as_slice).unwrap_or(&[])
+        self.ids
+            .get(term)
+            .map_or(&[], |id| self.terms[*id as usize].1.as_slice())
     }
 
     /// Every token with its position, in document order.
     pub fn positioned_tokens(&self) -> impl Iterator<Item = (&str, u32)> {
-        self.tokens
-            .iter()
-            .map(String::as_str)
-            .zip(self.token_positions.iter().copied())
+        self.tokens().zip(self.token_positions.iter().copied())
     }
 
     pub fn snippet(&self, interval: Interval, context: usize) -> String {
-        if self.tokens.is_empty() {
+        if self.is_empty() {
             return String::new();
         }
 
@@ -75,7 +113,11 @@ impl TokenizedDoc {
         let hi = self
             .token_positions
             .partition_point(|position| *position <= hi_position);
-        self.tokens[lo..hi].join(" ")
+        self.tokens()
+            .skip(lo)
+            .take(hi - lo)
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -110,11 +152,11 @@ pub fn tokenize_doc<T>(text: &str, tokenizer: &T) -> TokenizedDoc
 where
     T: tokenizer::Tokenizer,
 {
-    let tokens = tokenizer
-        .tokenize(text)
-        .map(|token| (token.text.into_owned(), token.pos))
-        .collect();
-    TokenizedDoc::new(tokens)
+    TokenizedDoc::from_tokens(
+        tokenizer
+            .tokenize(text)
+            .map(|token| (token.text, token.pos)),
+    )
 }
 
 pub fn evaluate(query: &Query, doc: &TokenizedDoc) -> Result<MatchResult, EvalError> {
@@ -447,7 +489,7 @@ fn collect_expanded_matches<F>(
 ) where
     F: FnMut(&str) -> bool,
 {
-    for (term, positions) in &doc.positions {
+    for (term, positions) in doc.terms() {
         if !predicate(term) {
             continue;
         }
@@ -481,7 +523,7 @@ where
     F: FnMut(&str) -> bool,
 {
     let mut positions = Vec::new();
-    for (term, term_positions) in &doc.positions {
+    for (term, term_positions) in doc.terms() {
         if predicate(term) {
             positions.extend(term_positions.iter().copied());
         }

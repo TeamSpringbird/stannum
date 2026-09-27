@@ -46,7 +46,7 @@ use crate::dictionary::{
     BlockFetch, Blocks, Dictionary, DictionaryBuilder, DictionaryIndex, Extent, TermEntry,
 };
 use crate::docs::{self, DocCursor, DocTable, PageCursor, PageTable, TidCursor};
-use crate::forward::{ForwardRecord, ForwardTerm};
+use crate::forward::{ForwardRecord, ForwardTerm, group_by_term};
 use crate::ordinals::Ordinals;
 use crate::payload::{Payload, PayloadBuilder};
 use crate::source::{HELD_SLOTS, HeldRange, HeldSpan, Source};
@@ -79,54 +79,53 @@ impl SegmentBuilder {
         tid: Tid,
         tokens: impl IntoIterator<Item = (&'t str, u32)>,
     ) -> Result<()> {
-        Tid::new(tid.block, tid.offset)?;
-        if self.lengths.contains_key(&tid) {
-            return Err(Error::Unordered);
-        }
-        let mut by_term = BTreeMap::<&str, Vec<u32>>::new();
-        let mut doc_len = 0u32;
-        let mut last = None;
-        for (term, position) in tokens {
-            if term.is_empty() {
-                return Err(Error::EmptyTerm);
-            }
-            if last.is_some_and(|last| last >= position) {
-                return Err(Error::InvalidPositions);
-            }
-            last = Some(position);
-            doc_len += 1;
-            by_term.entry(term).or_default().push(position);
-        }
-        if doc_len == 0 {
-            return Ok(());
-        }
-        self.lengths.insert(tid, doc_len);
-        for (term, positions) in by_term {
-            self.terms
-                .entry(term.to_owned())
-                .or_default()
-                .push(Occurrence {
-                    tid,
-                    doc_len,
-                    positions,
-                });
-        }
-        Ok(())
+        self.add_groups(tid, tokens, false)
     }
 
     /// Adds one document from a tokenizer's output, as an index build does:
     /// [`add_document`](Self::add_document) with each token's text borrowed
-    /// from the document or owned when folding changed it.
+    /// from the document or owned when folding changed it. Checks for
+    /// interrupts every [`crate::forward::TOKENIZE_INTERRUPT_INTERVAL`] tokens, so the
+    /// caller must hold no buffer lock; the builder is unchanged until every
+    /// token is read.
     pub fn add_token_stream<'t>(
         &mut self,
         tid: Tid,
         tokens: impl IntoIterator<Item = (Cow<'t, str>, u32)>,
     ) -> Result<()> {
-        let tokens: Vec<(String, u32)> = tokens
-            .into_iter()
-            .map(|(term, position)| (term.into_owned(), position))
-            .collect();
-        self.add_document(tid, tokens.iter().map(|(term, p)| (term.as_str(), *p)))
+        self.add_groups(tid, tokens, true)
+    }
+
+    fn add_groups<'t, T: Into<Cow<'t, str>>>(
+        &mut self,
+        tid: Tid,
+        tokens: impl IntoIterator<Item = (T, u32)>,
+        interruptible: bool,
+    ) -> Result<()> {
+        Tid::new(tid.block, tid.offset)?;
+        if self.lengths.contains_key(&tid) {
+            return Err(Error::Unordered);
+        }
+        let (doc_len, by_term) = group_by_term(tokens, interruptible)?;
+        if doc_len == 0 {
+            return Ok(());
+        }
+        self.lengths.insert(tid, doc_len);
+        for (term, positions) in by_term {
+            let occurrence = Occurrence {
+                tid,
+                doc_len,
+                positions,
+            };
+            // A term the builder holds already needs no new key.
+            match self.terms.get_mut(&*term) {
+                Some(occurrences) => occurrences.push(occurrence),
+                None => {
+                    self.terms.insert(term.into_owned(), vec![occurrence]);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Adds a document from a forward record, as a buffer fold does.

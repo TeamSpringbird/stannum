@@ -5393,11 +5393,12 @@ mod tests {
         (state, checks.get())
     }
 
-    /// Tokenizing a value for an insert or an index build checks for
-    /// interrupts every 65,536 tokens, so a cancel or `statement_timeout`
-    /// ends it within that many tokens instead of after the whole value.
-    /// An insert tokenizes before it takes any index lock, and a build
-    /// between heap tuples, so the ERROR unwinds with nothing held.
+    /// Tokenizing a value for an insert, an index build or exact evaluation
+    /// checks for interrupts every 65,536 tokens, so a cancel or
+    /// `statement_timeout` ends it within that many tokens instead of after
+    /// the whole value. An insert tokenizes before it takes any index lock,
+    /// a build between heap tuples, and evaluation holds no buffer lock, so
+    /// the ERROR unwinds with nothing held.
     #[pg_test]
     fn tokenizing_a_large_value_answers_a_cancel() {
         // 200,000 tokens: three checks, the first of which cancels.
@@ -5412,6 +5413,7 @@ mod tests {
         for sql in [
             format!("INSERT INTO tokenize_insert VALUES (1, {large})"),
             "CREATE INDEX tokenize_build_idx ON tokenize_build USING stannum(body)".to_owned(),
+            format!("PERFORM {large} ==> 'absent'"),
         ] {
             assert_eq!(
                 cancel_at_first_tokenize_check(&sql),
