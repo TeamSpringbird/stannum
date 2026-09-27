@@ -912,6 +912,14 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "segment/tests/record_memory.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the peak-memory test of grouping a document's tokens by term."
+    },
+    "segment/tests/record_throughput.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a timing probe of grouping tokenized documents by term."
+    },
     "tinql/Cargo.toml": {
       "owner": "mixed",
       "upstream_path": "tinql/Cargo.toml",
@@ -1073,6 +1081,10 @@
     "tinql/tests/deep_queries.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: oversized and deeply nested query tests."
+    },
+    "tinql/tests/tokenized_doc_cost.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a timing probe of tokenizing short documents for exact evaluation."
     },
     "tokenizer/Cargo.toml": {
       "owner": "planetscale",

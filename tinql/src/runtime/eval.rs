@@ -10,6 +10,9 @@ use rustc_hash::FxHashMap;
 
 use super::{Query, RangeBound, SpanTermSlot};
 
+/// Tokens between two interrupt checks in [`tokenize_doc`].
+const TOKENIZE_INTERRUPT_INTERVAL: usize = segment::forward::TOKENIZE_INTERRUPT_INTERVAL as usize;
+
 pub struct TokenizedDoc {
     tokens: Vec<String>,
     token_positions: Vec<u32>,
@@ -110,10 +113,15 @@ pub fn tokenize_doc<T>(text: &str, tokenizer: &T) -> TokenizedDoc
 where
     T: tokenizer::Tokenizer,
 {
-    let tokens = tokenizer
-        .tokenize(text)
-        .map(|token| (token.text.into_owned(), token.pos))
-        .collect();
+    let mut tokens = Vec::new();
+    for token in tokenizer.tokenize(text) {
+        tokens.push((token.text.into_owned(), token.pos));
+        // A large value's tokenization answers a cancel or statement_timeout;
+        // short documents never reach the first check.
+        if tokens.len().is_multiple_of(TOKENIZE_INTERRUPT_INTERVAL) {
+            segment::check_interrupts("tokenize");
+        }
+    }
     TokenizedDoc::new(tokens)
 }
 
