@@ -17,7 +17,11 @@ conformance/
   README.md
   run.py                       the runner
   cases/<area>.yaml            declarative cases, grouped by area
-  cases/catalog.*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9
+  cases/catalog.*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9,
+                               and catalog.promote.yaml, which asks catalog.S-07's
+                               question again
+  cases/limits.yaml            resource limits: expansion, regex size, large
+                               documents, cancellation
   expected/<engine>-<version>/<area>.json
                                recorded answers of one engine version
   divergences/<engine>.yaml    where an engine knowingly answers differently
@@ -77,6 +81,7 @@ compares against, runs the cases that have a recorded answer (the rest report SK
 | `SKIP` | no answer is recorded for the case (no expectation), or `--skip-crash` skipped it |
 | `IMPROVED` | a documented improvement: the recorded engine refused with an ERROR and the engine under test answered (see Divergences) |
 | `GAP` | a documented gap: the engine under test lacks what the case exercises (see Divergences) |
+| `LIMITED` | a documented limit: the recorded engine answered and the engine under test refused with a limit ERROR, 54000 or 54001 (see Divergences) |
 
 The run exits 1 if any case FAILs. Answers are compared exactly: id lists in
 order, counts, float4 bit patterns, highlight text.
@@ -91,11 +96,17 @@ e.g. `tin-1.0.3`), naming the captures that differ:
   capture and this engine answers. Reported as `IMPROVED`, with a
   `question` for the recorded engine's authors (why is this not supported?).
 - `kind: gap`: this engine lacks what the case exercises. Reported as `GAP`.
+- `kind: limit`: the recorded engine answered each listed capture (or, in a
+  `script`, the step), and this engine refuses it with SQLSTATE 54000
+  (program_limit_exceeded) or 54001 (statement_too_complex) by design.
+  Reported as `LIMITED`, with the recorded engine's behavior, this engine's
+  limit and a `question`. (Where the recorded engine crashed the server, no
+  entry is needed: any ERROR passes, see Crashes.)
 
 The entries cannot hide a regression: the case FAILs if a capture that is
 not listed differs, a listed capture matches the recorded answer again, a
-listed case matches entirely, or an improvement raises an ERROR where it
-should answer. Whether a divergence is an improvement is a judgment the
+listed case matches entirely, an improvement raises an ERROR where it
+should answer, or a limit answers or raises another ERROR. Whether a divergence is an improvement is a judgment the
 entry records; the runner only checks its mechanics.
 
 ### Crashes
@@ -283,6 +294,15 @@ Case fields:
     rows or ERRORs. Use it for mutations (DELETE, VACUUM, REINDEX, ALTER
     INDEX) and for multi-session visibility; give such a case its own corpus,
     since the changes are not rolled back.
+  - `cancel`: runs `sql` under `statement_timeout = timeout_ms` and records
+    whether it was canceled, not how long it took:
+    `{"canceled": true, "sqlstate": "57014", "prompt": true}`, where `prompt`
+    says the cancel came within `within_ms` (default 250) of the timeout;
+    `{"canceled": false, "answer": ...}` if the statement finished first; or
+    the ERROR. Choose the timeout well below the statement's uninterrupted
+    time and `within_ms` well below the difference, so the record does not
+    depend on the machine. `--timings` prints every capture's elapsed time
+    (never recorded).
 - `score`, `k`: defaults for the ranked and scores captures.
 - `settings`: GUCs set with `SET LOCAL` for every capture; names may use
   `{engine}`.
