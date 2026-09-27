@@ -39,6 +39,7 @@ pub mod layout;
 pub mod verify;
 pub mod wal;
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -616,11 +617,15 @@ pub unsafe fn tokenizer_by_oid(index_oid: pg_sys::Oid) -> Rc<CompiledTokenizerPi
     tokenizer_for(&unsafe { spec_by_oid(index_oid) })
 }
 
-fn tokens_of(tokenizer: &CompiledTokenizerPipeline, text: &str) -> Vec<(String, u32)> {
+/// The `(text, position)` stream the index records for `text`: each token's
+/// text borrowed from `text`, or owned when folding changed it.
+fn tokens_of<'t>(
+    tokenizer: &CompiledTokenizerPipeline,
+    text: &'t str,
+) -> impl Iterator<Item = (Cow<'t, str>, u32)> {
     tokenizer
         .tokenize(text)
-        .map(|token| (token.text.into_owned(), token.pos))
-        .collect()
+        .map(|token| (token.text, token.pos))
 }
 
 fn tid_of(pointer: pg_sys::ItemPointerData) -> Tid {
@@ -2711,11 +2716,10 @@ impl Builder {
                 return;
             }
             let text = String::from_datum(*values, false).expect("non-null indexed text");
-            let tokens = tokens_of(&tokenizer, &text);
-            codec(self.segment.add_document(
-                tid_of(*tid),
-                tokens.iter().map(|(term, pos)| (term.as_str(), *pos)),
-            ));
+            codec(
+                self.segment
+                    .add_token_stream(tid_of(*tid), tokens_of(&tokenizer, &text)),
+            );
             if self.segment.document_count() >= BUILD_SEGMENT_DOCS.get().max(1) as usize {
                 self.flush(index);
             }
@@ -2951,10 +2955,9 @@ pub unsafe fn insert(
             // tokenization and forward-record encoding run.
             let bytes = {
                 let tokenizer = tokenizer_for(&spec);
-                let tokens = tokens_of(&tokenizer, &text);
-                let record = codec(ForwardRecord::from_tokens(
+                let record = codec(ForwardRecord::from_token_stream(
                     tid_of(*tid),
-                    tokens.iter().map(|(term, pos)| (term.as_str(), *pos)),
+                    tokens_of(&tokenizer, &text),
                 ));
                 let mut bytes = Vec::new();
                 codec(record.encode(&mut bytes));

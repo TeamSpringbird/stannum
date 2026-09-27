@@ -17,6 +17,8 @@
 //!           positions: first absolute, then (delta - 1); terms sorted, unique
 //! ```
 
+use std::borrow::Cow;
+
 use crate::payload::{decode_positions, encode_positions, validate_positions};
 use crate::reader::Reader;
 use crate::{Error, Result, Tid, varint};
@@ -76,6 +78,21 @@ impl ForwardRecord {
                 })
                 .collect(),
         })
+    }
+
+    /// Groups a tokenizer's output by term: `(text, position)` in document
+    /// order, as [`from_tokens`](Self::from_tokens) takes them, with each
+    /// token's text borrowed from the document or owned when folding
+    /// changed it.
+    pub fn from_token_stream<'t>(
+        tid: Tid,
+        tokens: impl IntoIterator<Item = (Cow<'t, str>, u32)>,
+    ) -> Result<Self> {
+        let tokens: Vec<(String, u32)> = tokens
+            .into_iter()
+            .map(|(term, position)| (term.into_owned(), position))
+            .collect();
+        Self::from_tokens(tid, tokens.iter().map(|(term, p)| (term.as_str(), *p)))
     }
 
     fn validate(&self) -> Result<()> {

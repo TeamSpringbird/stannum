@@ -36,6 +36,7 @@
 //! folding a bounded write buffer, and an index build that partitions the heap
 //! into bounded ranges.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -111,6 +112,21 @@ impl SegmentBuilder {
                 });
         }
         Ok(())
+    }
+
+    /// Adds one document from a tokenizer's output, as an index build does:
+    /// [`add_document`](Self::add_document) with each token's text borrowed
+    /// from the document or owned when folding changed it.
+    pub fn add_token_stream<'t>(
+        &mut self,
+        tid: Tid,
+        tokens: impl IntoIterator<Item = (Cow<'t, str>, u32)>,
+    ) -> Result<()> {
+        let tokens: Vec<(String, u32)> = tokens
+            .into_iter()
+            .map(|(term, position)| (term.into_owned(), position))
+            .collect();
+        self.add_document(tid, tokens.iter().map(|(term, p)| (term.as_str(), *p)))
     }
 
     /// Adds a document from a forward record, as a buffer fold does.
