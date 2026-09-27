@@ -5040,6 +5040,175 @@ mod tests {
         assert_clean("direct_merge_cancel_idx");
     }
 
+    type Counter<T> = std::rc::Rc<std::cell::Cell<T>>;
+
+    /// Queues a cancel at the first merge checkpoint a statement reaches.
+    /// Returns whether it was queued, the interrupt holdoff there, and how
+    /// many merge checkpoints ran after it.
+    fn cancel_at_first_merge_checkpoint() -> (Counter<bool>, Counter<u32>, Counter<u32>) {
+        use std::{cell::Cell, rc::Rc};
+        let queued = Rc::new(Cell::new(false));
+        let holdoff = Rc::new(Cell::new(0));
+        let after = Rc::new(Cell::new(0));
+        let (q, h, a) = (queued.clone(), holdoff.clone(), after.clone());
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name != "merge:checkpoint" && name != "maintenance:checkpoint" {
+                return;
+            }
+            if q.replace(true) {
+                a.set(a.get() + 1);
+            } else {
+                unsafe {
+                    h.set(pg_sys::InterruptHoldoffCount);
+                    pg_sys::QueryCancelPending = 1;
+                    pg_sys::InterruptPending = 1;
+                }
+            }
+        })));
+        (queued, holdoff, after)
+    }
+
+    #[pg_test]
+    fn a_canceled_build_stops_compacting_at_the_next_merge_checkpoint() {
+        // Twenty build segments and a tier factor too high for any tier to
+        // fill: the build's only merge is the compaction at its end.
+        Spi::run(
+            "CREATE TABLE build_cancel(id int, body text);
+             INSERT INTO build_cancel SELECT n, (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 20) k) FROM generate_series(1, 400) n;
+             SET LOCAL stannum.build_segment_docs = 20;
+             SET LOCAL stannum.merge_tier_factor = 64;",
+        )
+        .unwrap();
+        let (queued, holdoff, after) = cancel_at_first_merge_checkpoint();
+        Spi::run(
+            "DO $$BEGIN
+            CREATE INDEX build_cancel_idx ON build_cancel USING stannum(body);
+            RAISE EXCEPTION 'the build was not canceled';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(queued.get(), "the build reached no merge checkpoint");
+        assert_eq!(
+            (holdoff.get(), after.get()),
+            (0, 0),
+            "a build merges with interrupts deliverable and stops at the checkpoint that sees the cancel"
+        );
+        assert!(
+            Spi::get_one::<bool>("SELECT to_regclass('build_cancel_idx') IS NULL")
+                .unwrap()
+                .unwrap()
+        );
+        Spi::run("CREATE INDEX build_cancel_idx ON build_cancel USING stannum(body)").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM stannum.segment_info('build_cancel_idx')"),
+            1
+        );
+        assert_clean("build_cancel_idx");
+    }
+
+    #[pg_test]
+    fn a_canceled_insert_stops_the_directory_bound_merge_at_the_next_checkpoint() {
+        // One segment per insert and no budgeted merges: 97 inserts leave the
+        // on-disk directory full (96 entries) and one document buffered, so
+        // the next fold must first merge the two smallest entries.
+        Spi::run(
+            "CREATE TABLE bound_cancel(id int, body text);
+             CREATE INDEX bound_cancel_idx ON bound_cancel USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
+             INSERT INTO bound_cancel SELECT n, 'needle ' || (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 20) k) FROM generate_series(1, 97) n;",
+        )
+        .unwrap();
+        let entries = "SELECT count(*) FROM stannum.segment_info('bound_cancel_idx') WHERE kind = 'immutable'";
+        assert_eq!(value(entries), 96);
+        let (queued, holdoff, after) = cancel_at_first_merge_checkpoint();
+        Spi::run(
+            "DO $$BEGIN
+            INSERT INTO bound_cancel VALUES (98, 'needle w98');
+            RAISE EXCEPTION 'the insert was not canceled';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(queued.get(), "the insert reached no merge checkpoint");
+        assert_eq!(
+            (holdoff.get(), after.get()),
+            (0, 0),
+            "the directory-bound merge runs with interrupts deliverable and stops at the checkpoint that sees the cancel"
+        );
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(value(entries), 96);
+        assert_eq!(
+            value("SELECT count(*) FROM bound_cancel WHERE body ==> 'needle'"),
+            97
+        );
+        Spi::run("INSERT INTO bound_cancel VALUES (98, 'needle w98')").unwrap();
+        assert_eq!(value(entries), 96);
+        assert_eq!(
+            value("SELECT count(*) FROM bound_cancel WHERE body ==> 'needle'"),
+            98
+        );
+        let index = unsafe { pgrx::PgRelation::open_with_name("bound_cancel_idx") }.unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("bound_cancel_idx");
+    }
+
+    /// Every segment of `index` as it lies on disk (its placement, counts,
+    /// generation and the digest of its bytes), and the relation's size.
+    fn build_digest(index: &str) -> String {
+        Spi::get_one::<String>(&format!(
+            "SELECT string_agg(concat_ws(',', root_block, docs, sum_doc_lengths, total_pages,
+                    generation, md5(tests.segment_blob('{index}'::regclass::oid, ordinal))),
+                    ';' ORDER BY ordinal)
+                    || ' size ' || pg_relation_size('{index}')
+             FROM stannum.segment_info('{index}')"
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    #[pg_test]
+    fn index_builds_are_byte_for_byte_reproducible() {
+        // Tier merges while the build writes its segments, trimmed to a small
+        // merge cap, then the compaction and packing that end a build: the
+        // segments, their bytes and their pages are those recorded here from
+        // the build that merged under the meta lock. The uncapped build
+        // compacts to one segment.
+        Spi::run(
+            "CREATE TABLE reproducible(id int, body text);
+             INSERT INTO reproducible SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 1009), ' ')
+             FROM generate_series(1, 30) k) FROM generate_series(1, 6000) n;
+             SET LOCAL stannum.build_segment_docs = 150;",
+        )
+        .unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(200 << 10));
+        Spi::run("CREATE INDEX reproducible_capped ON reproducible USING stannum(body)").unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(None);
+        Spi::run("CREATE INDEX reproducible_whole ON reproducible USING stannum(body)").unwrap();
+        assert_eq!(
+            build_digest("reproducible_capped"),
+            "56,900,27900,15,9,ae0c93790dc792b76cefcb5ac997350b;\
+             102,900,27900,15,16,dd5b8d00ea07c3c5e74a4efedb3d3436;\
+             78,900,27900,15,23,89ce88852f2b101249dde1f7636bafc0;\
+             62,900,27900,15,30,5a8e51148ea4c6c288d60f736cb7ee52;\
+             30,900,27900,15,37,13a5b66972e1f6b71bc78fed2aa12f9e;\
+             14,900,27900,15,44,6a7c5b6ce2cecc129f0ef094f9f531e6;\
+             2,600,18600,11,47,ce729ed109fa944b0e16c29f9a604554 size 901120"
+        );
+        assert_eq!(
+            build_digest("reproducible_whole"),
+            "2,6000,186000,115,46,d6398d2a106f33c3f02a604d8a8bba58 size 966656"
+        );
+        assert_clean("reproducible_capped");
+        assert_clean("reproducible_whole");
+    }
+
     #[pg_test]
     fn insert_defers_large_merges_and_cleanup_finishes_them() {
         Spi::run(
@@ -5953,6 +6122,37 @@ mod tests {
                 );
             }
         })));
+    }
+
+    /// Queues this session's termination, as `pg_terminate_backend` does, at
+    /// the first race point named in `at` it reaches, and logs every such
+    /// race point it passes afterwards: a backend that delivers the
+    /// termination at once logs none. Driven by
+    /// postgres/tests/crash_before_publication.py.
+    #[pg_extern]
+    fn terminate_at_race_point(at: Vec<String>) {
+        let mut queued = false;
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if !at.iter().any(|at| at == name) {
+                return;
+            }
+            if queued {
+                pgrx::log!("race point {name} passed after termination");
+            } else {
+                queued = true;
+                unsafe {
+                    pg_sys::ProcDiePending = 1;
+                    pg_sys::InterruptPending = 1;
+                }
+            }
+        })));
+    }
+
+    /// The bytes of directory entry `ordinal` of the index.
+    #[pg_extern]
+    fn segment_blob(index_oid: pg_sys::Oid, ordinal: i64) -> Vec<u8> {
+        let index = unsafe { pgrx::PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _) };
+        unsafe { crate::storage::testing::segment_blob(index.as_ptr(), ordinal as usize) }
     }
 
     /// The number of runs on the index's pending list.

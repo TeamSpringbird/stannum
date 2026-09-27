@@ -16,7 +16,16 @@ a race point, after flushing WAL, and checks the recovered index:
 - fold: an insert that folded the write buffer and started it over with
   its own document (insert:buffered);
 - vacuum: VACUUM rewriting the write buffer without its dead documents
-  (bulk_delete:buffered).
+  (bulk_delete:buffered);
+- bound: an insert into a full directory (96 entries) merging its two
+  smallest entries without the meta lock before it folds
+  (maintenance:built).
+
+One case terminates instead of crashing:
+
+- terminate: a CREATE INDEX terminated (as by pg_terminate_backend) at its
+  first merge checkpoint must exit there, with no merge checkpoint after it,
+  and leave no index behind.
 
 The crash hook exists only in pg_test builds, which `cargo pgrx test`
 installs; run this right after one, in the same hold of the pgrx lock, in a
@@ -159,7 +168,59 @@ def main():
         assert sql("SELECT count(*) FROM vacuumed WHERE body ==> 'needle';") == '200'
         return orphans
 
-    cases = {'drain': drain, 'fold': fold, 'vacuum': vacuum}
+    def bound():
+        """An insert into a full directory merges its two smallest entries
+        without the meta lock and crashes before publishing the merge."""
+        tuned = 'SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0; SET stannum.deferred_merge_docs=0;'
+        entries = "SELECT count(*) FROM stannum.segment_info('bounded_idx') WHERE kind = 'immutable';"
+        sql('CREATE TABLE bounded(id int, body text); CREATE INDEX bounded_idx ON bounded USING stannum(body);')
+        # One segment per insert: 96 entries, the on-disk bound, and one
+        # document buffered, so the next fold must make room first.
+        sql(tuned + "INSERT INTO bounded SELECT n, 'needle w' || n FROM generate_series(1, 97) n;")
+        assert sql(entries) == '96'
+        crash(tuned, "INSERT INTO bounded VALUES (98, 'needle w98');", 'maintenance:built')
+        orphans = assert_only_orphans('bounded_idx')
+        assert orphans > 0, 'the merged run was not written before the crash'
+        assert sql(entries) == '96'
+        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '97'
+        sql(tuned + "INSERT INTO bounded VALUES (98, 'needle w98');")
+        assert sql(entries) == '96'
+        sql('VACUUM (INDEX_CLEANUP ON) bounded;')
+        assert_clean('bounded_idx')
+        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '98'
+        for n in (1, 2, 97, 98):
+            assert sql(f"SELECT string_agg(id::text, ',') FROM bounded WHERE body ==> 'w{n}';") == str(n), n
+        return orphans
+
+    def terminate():
+        """A CREATE INDEX terminated at its first merge checkpoint exits
+        there instead of finishing the merges of its build."""
+        sql("CREATE TABLE terminated(id int, body text);"
+            "INSERT INTO terminated SELECT n, (SELECT string_agg('w' || (n * k % 997), ' ') "
+            "FROM generate_series(1, 20) k) FROM generate_series(1, 400) n;")
+        marker = 'passed after termination'
+        restarts = 'all server processes terminated'
+        before = log.read_text()
+        # Twenty build segments, no tier that fills: the only merge is the
+        # compaction that ends the build.
+        result = subprocess.run(
+            ['psql', '-X', '-qAt'], env=env, text=True, capture_output=True,
+            input="SET stannum.build_segment_docs=20; SET stannum.merge_tier_factor=64;\n"
+                  "SELECT tests.terminate_at_race_point(ARRAY['merge:checkpoint', 'maintenance:checkpoint']);\n"
+                  "CREATE INDEX terminated_idx ON terminated USING stannum(body);\n")
+        assert result.returncode != 0, ('the build was not terminated', result.stdout)
+        assert 'terminating connection due to administrator command' in result.stderr, result.stderr
+        after = log.read_text()
+        assert after.count(marker) == before.count(marker), 'merge checkpoints ran after the termination'
+        assert after.count(restarts) == before.count(restarts), 'the server restarted'
+        assert sql("SELECT to_regclass('terminated_idx') IS NULL;") == 't'
+        sql('SET stannum.build_segment_docs=20; SET stannum.merge_tier_factor=64;'
+            'CREATE INDEX terminated_idx ON terminated USING stannum(body);')
+        assert_clean('terminated_idx')
+        assert sql("SELECT count(*) FROM stannum.segment_info('terminated_idx');") == '1'
+        return 0
+
+    cases = {'drain': drain, 'fold': fold, 'vacuum': vacuum, 'bound': bound, 'terminate': terminate}
     selected = sys.argv[1:] or list(cases)
     try:
         command(['initdb', '-D', str(data), '-U', 'postgres', '-A', 'trust', '--no-locale',

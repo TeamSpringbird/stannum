@@ -4137,6 +4137,18 @@ pub mod testing {
         }
     }
 
+    /// The blob of directory entry `i`.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn segment_blob(index: pg_sys::Relation, i: usize) -> Vec<u8> {
+        unsafe {
+            let (_, meta) = read_meta(index, false);
+            let entry = meta.segments[i];
+            read_run(index, entry.run, &generation_label(entry.generation))
+        }
+    }
+
     /// Writes a run nothing references, as a crash between writing a run and
     /// publishing it leaves behind. Returns its pages.
     ///
