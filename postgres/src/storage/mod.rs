@@ -4192,6 +4192,14 @@ pub mod testing {
         }
     }
 
+    /// Empties this backend's segment readers, page tables and decoded dead
+    /// lists, as exceeding `stannum.reader_cache_mb` does.
+    pub fn clear_reader_caches() {
+        SEGMENT_READERS.with_borrow_mut(HashMap::clear);
+        PAGE_TABLES.with_borrow_mut(HashMap::clear);
+        crate::fold::retain_dead_ordinals(|_| false);
+    }
+
     /// Bytes the cached readers' arenas hold, across every index.
     pub fn reader_arena_bytes() -> usize {
         SEGMENT_READERS

@@ -11,6 +11,8 @@ mod am;
 mod bm25;
 mod customscan;
 mod fold;
+#[cfg(feature = "pg_test")]
+mod heap_probe;
 mod highlight;
 mod highlight_udfs;
 mod match_positions;
@@ -7412,6 +7414,79 @@ mod tests {
         assert!(
             READER_CACHE_CLEARS.get() > clears,
             "a {arena} byte arena and 2,000 dead locations fit in {budget} bytes"
+        );
+    }
+
+    #[pg_test]
+    fn a_backend_holds_dead_documents_in_about_a_bit_per_document() {
+        // VACUUM publishes a dead list per segment, and every backend that
+        // queries the segment decodes it. Held as a set of locations plus a
+        // vector of ordinals it cost over 20 bytes per dead row per backend:
+        // at 150 million rows with 45 million dead, eight query backends
+        // held about a gigabyte each and the server was killed for memory.
+        // A segment's dead documents must cost about a bit per document,
+        // whatever fraction of them is dead, in what a ranked query and a
+        // count hold at their peak and in what the backend keeps after.
+        const DOCS: usize = 100_000;
+        Spi::run(&format!(
+            "CREATE TABLE dead_memory(id int primary key, body text);
+             INSERT INTO dead_memory SELECT n, 'needle pad' FROM generate_series(1, {DOCS}) n;
+             CREATE INDEX dead_memory_idx ON dead_memory USING stannum(body);
+             SET LOCAL enable_seqscan = off;"
+        ))
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'dead_memory_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        // A query from empty caches: its peak and what it leaves cached.
+        let measure = || {
+            crate::storage::testing::clear_reader_caches();
+            let (ids, peak, kept) = crate::heap_probe::measure(|| {
+                let ids = ranked_ids("dead_memory", 10);
+                let count =
+                    Spi::get_one::<i64>("SELECT count(*) FROM dead_memory WHERE body ==> 'needle'")
+                        .unwrap()
+                        .unwrap();
+                (ids, count)
+            });
+            (ids, peak, kept.max(0) as usize)
+        };
+        let (_, clean_peak, clean_kept) = measure();
+        let mut report = Vec::new();
+        let mut within = true;
+        for tenths in [1, 3, 5] {
+            // Each round adds to the rows the earlier rounds deleted.
+            let dead = tids(&format!(
+                "SELECT ctid::text FROM dead_memory WHERE id % 10 < {tenths}"
+            ));
+            let index =
+                unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+            unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+            drop(index);
+            Spi::run(&format!("DELETE FROM dead_memory WHERE id % 10 < {tenths}")).unwrap();
+            let ((ids, count), peak, kept) = measure();
+            let dead = DOCS * tenths as usize / 10;
+            assert_eq!(count, (DOCS - dead) as i64);
+            assert_eq!(ids.len(), 10);
+            assert!(ids.iter().all(|id| id % 10 >= tenths), "{ids:?}");
+            let extra_peak = peak.saturating_sub(clean_peak);
+            let extra_kept = kept.saturating_sub(clean_kept);
+            // Two bits per document: the dead list as stored plus decoded.
+            let bound = DOCS / 4 + 16 * 1024;
+            within &= extra_peak <= bound && extra_kept <= bound;
+            report.push(format!(
+                "{} dead: {extra_peak} bytes more at peak ({:.1} per dead row), \
+                 {extra_kept} more kept ({:.1} per dead row), bound {bound}",
+                dead,
+                extra_peak as f64 / dead as f64,
+                extra_kept as f64 / dead as f64,
+            ));
+        }
+        assert!(
+            within,
+            "dead documents cost more than a bit each (clean: {clean_peak} peak, \
+             {clean_kept} kept):\n{}",
+            report.join("\n")
         );
     }
 
