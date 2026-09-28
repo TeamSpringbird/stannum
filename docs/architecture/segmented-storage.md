@@ -356,7 +356,9 @@ custom scan nodes:
 - **Count** of a Boolean combination of plain terms folds document ordinals.
   The count combines the terms' chunks word by word in fixed scratch buffers,
   visits only chunks some term occupies, clears the segment's dead documents
-  (a dead list is itself an ordinal stream) and counts set bits.
+  a word at a time from the backend's bitmap of them, so a count after a
+  large delete and VACUUM costs close to what it costs on a fresh index, and
+  counts set bits.
   The visibility map is read once, after the view; if a dead list was published
   in between, the count starts over, because a page VACUUM marked all-visible
   may hold tuples the older view still lists. Matches on pages that are not

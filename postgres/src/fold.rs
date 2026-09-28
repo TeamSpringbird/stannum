@@ -181,6 +181,19 @@ impl Visibility {
     }
 }
 
+#[cfg(feature = "pg_test")]
+thread_local! {
+    /// Steps folds have spent clearing dead documents from their chunks:
+    /// a word per step, a chunk's words at a time.
+    static CLEAR_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Steps this backend's folds have spent clearing dead documents.
+#[cfg(feature = "pg_test")]
+pub(crate) fn dead_clear_steps() -> u64 {
+    CLEAR_STEPS.get()
+}
+
 /// A chunk with at most this many matches looks each one's page up; a fuller
 /// chunk walks the page table across it instead.
 const SPARSE_CHUNK: u32 = 256;
@@ -234,6 +247,8 @@ pub fn count_segment(
         let words = if has_dead {
             let mut cleared = Box::new(*words);
             dead.clear(low, &mut cleared);
+            #[cfg(feature = "pg_test")]
+            CLEAR_STEPS.set(CLEAR_STEPS.get() + ordinals::WORDS as u64);
             live = cleared;
             &live
         } else {

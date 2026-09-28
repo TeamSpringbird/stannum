@@ -7493,6 +7493,71 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_fold_clears_dense_dead_lists_a_word_at_a_time() {
+        // After a delete and VACUUM a segment's dead list is as dense as the
+        // deletes were. A count that cleared each dead document from each
+        // chunk it folded worked in proportion to the segment's dead
+        // documents on every count: at 5 million Wikipedia rows with 30 %
+        // deleted and vacuumed, counts ran 4.8 times slower than on the fresh
+        // index although the visibility map was all-visible again. Clearing
+        // a chunk's dead documents costs at most its `WORDS` words, whatever
+        // their number.
+        Spi::run(
+            "CREATE TABLE dense_dead(id int primary key, body text);
+             INSERT INTO dense_dead SELECT n,
+               CASE WHEN n % 5 = 0 THEN 'needle pad' ELSE 'pad' END
+               FROM generate_series(1, 6000) n;
+             CREATE INDEX dense_dead_idx ON dense_dead USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.enable_custom_scan = on;",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'dense_dead_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let dead = tids("SELECT ctid::text FROM dense_dead WHERE id % 10 < 3");
+        assert_eq!(dead.len(), 1800);
+        Spi::run("DELETE FROM dense_dead WHERE id % 10 < 3").unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        drop(index);
+        assert_eq!(
+            value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('dense_dead_idx')"),
+            1800,
+            "the dead list is published, not rewritten away"
+        );
+        for (query, like) in [
+            ("needle", "%needle%"),
+            ("pad", "%pad%"),
+            ("needle OR pad", "%pad%"),
+            ("needle AND pad", "%needle%"),
+        ] {
+            let sql = format!("SELECT count(*) FROM dense_dead WHERE body ==> '{query}'");
+            let before = crate::fold::dead_clear_steps();
+            let counted = value(&sql);
+            let steps = crate::fold::dead_clear_steps() - before;
+            assert_eq!(
+                counted,
+                value(&format!(
+                    "SELECT count(*) FROM dense_dead WHERE body LIKE '{like}'"
+                )),
+                "{query}"
+            );
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0;
+            assert_eq!(plan[0]["Plan"]["Count Strategy"], "ordinal fold", "{query}");
+            // Every document is in chunk 0, which holds all 1,800 dead.
+            assert!(
+                steps <= segment::ordinals::WORDS as u64,
+                "{query}: {steps} steps to clear 1,800 dead documents from one chunk"
+            );
+        }
+    }
+
+    #[pg_test]
     fn per_row_scores_do_not_depend_on_the_order_rows_are_scored_in() {
         // The unpruned path scores rows as the executor hands them over: in
         // heap order under a bitmap scan, in any order under a join or an
