@@ -11,6 +11,8 @@ mod am;
 mod bm25;
 mod customscan;
 mod fold;
+#[cfg(feature = "pg_test")]
+mod heap_probe;
 mod highlight;
 mod highlight_udfs;
 mod match_positions;
@@ -7377,9 +7379,9 @@ mod tests {
 
     #[pg_test]
     fn dead_sets_count_against_the_reader_cache_budget() {
-        // A segment's decoded dead list lives beside its reader for as long
-        // as the reader is cached; at 10 million documents half dead it is
-        // tens of megabytes per backend, so `stannum.reader_cache_mb` must
+        // A segment's dead list, stored and decoded, lives beside its reader
+        // for as long as the reader is cached. It grows with deletes rather
+        // than with what queries read, so `stannum.reader_cache_mb` must
         // count it, not the reader's fetched bytes alone.
         use crate::storage::testing::{READER_CACHE_BYTES, READER_CACHE_CLEARS};
         Spi::run(
@@ -7401,9 +7403,11 @@ mod tests {
         Spi::run("DELETE FROM deadweight WHERE id > 1000").unwrap();
         assert_eq!(ranked_ids("deadweight", 10), (1..=10).collect::<Vec<_>>());
         // The next view is captured with the fetched bytes as they are now,
-        // under a budget above them but below them plus the dead locations.
+        // under a budget above them but below them plus the dead list.
         let arena = crate::storage::testing::reader_arena_bytes();
-        let budget = arena + dead.len() * std::mem::size_of::<segment::Tid>() - 1;
+        let dead_bytes = crate::storage::testing::dead_list_bytes();
+        assert!(dead_bytes >= 3000 / 8, "{dead_bytes} bytes of dead lists");
+        let budget = arena + dead_bytes - 1;
         let clears = READER_CACHE_CLEARS.get();
         READER_CACHE_BYTES.set(Some(budget));
         let ids = ranked_ids("deadweight", 10);
@@ -7411,8 +7415,146 @@ mod tests {
         assert_eq!(ids, (1..=10).collect::<Vec<_>>());
         assert!(
             READER_CACHE_CLEARS.get() > clears,
-            "a {arena} byte arena and 2,000 dead locations fit in {budget} bytes"
+            "a {arena} byte arena and {dead_bytes} bytes of dead lists fit in {budget} bytes"
         );
+    }
+
+    #[pg_test]
+    fn a_backend_holds_dead_documents_in_about_a_bit_per_document() {
+        // VACUUM publishes a dead list per segment, and every backend that
+        // queries the segment decodes it. Held as a set of locations plus a
+        // vector of ordinals it cost over 20 bytes per dead row per backend:
+        // at 150 million rows with 45 million dead, eight query backends
+        // held about a gigabyte each and the server was killed for memory.
+        // A segment's dead documents must cost about a bit per document,
+        // whatever fraction of them is dead, in what a ranked query and a
+        // count hold at their peak and in what the backend keeps after.
+        const DOCS: usize = 100_000;
+        Spi::run(&format!(
+            "CREATE TABLE dead_memory(id int primary key, body text);
+             INSERT INTO dead_memory SELECT n, 'needle pad' FROM generate_series(1, {DOCS}) n;
+             CREATE INDEX dead_memory_idx ON dead_memory USING stannum(body);
+             SET LOCAL enable_seqscan = off;"
+        ))
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'dead_memory_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        // A query from empty caches: its peak and what it leaves cached.
+        let measure = || {
+            crate::storage::testing::clear_reader_caches();
+            let (ids, peak, kept) = crate::heap_probe::measure(|| {
+                let ids = ranked_ids("dead_memory", 10);
+                let count =
+                    Spi::get_one::<i64>("SELECT count(*) FROM dead_memory WHERE body ==> 'needle'")
+                        .unwrap()
+                        .unwrap();
+                (ids, count)
+            });
+            (ids, peak, kept.max(0) as usize)
+        };
+        let (_, clean_peak, clean_kept) = measure();
+        let mut report = Vec::new();
+        let mut within = true;
+        for tenths in [1, 3, 5] {
+            // Each round adds to the rows the earlier rounds deleted.
+            let dead = tids(&format!(
+                "SELECT ctid::text FROM dead_memory WHERE id % 10 < {tenths}"
+            ));
+            let index =
+                unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+            unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+            drop(index);
+            Spi::run(&format!("DELETE FROM dead_memory WHERE id % 10 < {tenths}")).unwrap();
+            let ((ids, count), peak, kept) = measure();
+            let dead = DOCS * tenths as usize / 10;
+            assert_eq!(count, (DOCS - dead) as i64);
+            assert_eq!(ids.len(), 10);
+            assert!(ids.iter().all(|id| id % 10 >= tenths), "{ids:?}");
+            let extra_peak = peak.saturating_sub(clean_peak);
+            let extra_kept = kept.saturating_sub(clean_kept);
+            // Two bits per document: the dead list as stored plus decoded.
+            let bound = DOCS / 4 + 16 * 1024;
+            within &= extra_peak <= bound && extra_kept <= bound;
+            report.push(format!(
+                "{} dead: {extra_peak} bytes more at peak ({:.1} per dead row), \
+                 {extra_kept} more kept ({:.1} per dead row), bound {bound}",
+                dead,
+                extra_peak as f64 / dead as f64,
+                extra_kept as f64 / dead as f64,
+            ));
+        }
+        assert!(
+            within,
+            "dead documents cost more than a bit each (clean: {clean_peak} peak, \
+             {clean_kept} kept):\n{}",
+            report.join("\n")
+        );
+    }
+
+    #[pg_test]
+    fn a_fold_clears_dense_dead_lists_a_word_at_a_time() {
+        // After a delete and VACUUM a segment's dead list is as dense as the
+        // deletes were. A count that cleared each dead document from each
+        // chunk it folded worked in proportion to the segment's dead
+        // documents on every count: at 5 million Wikipedia rows with 30 %
+        // deleted and vacuumed, counts ran 4.8 times slower than on the fresh
+        // index although the visibility map was all-visible again. Clearing
+        // a chunk's dead documents costs at most its `WORDS` words, whatever
+        // their number.
+        Spi::run(
+            "CREATE TABLE dense_dead(id int primary key, body text);
+             INSERT INTO dense_dead SELECT n,
+               CASE WHEN n % 5 = 0 THEN 'needle pad' ELSE 'pad' END
+               FROM generate_series(1, 6000) n;
+             CREATE INDEX dense_dead_idx ON dense_dead USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.enable_custom_scan = on;",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'dense_dead_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let dead = tids("SELECT ctid::text FROM dense_dead WHERE id % 10 < 3");
+        assert_eq!(dead.len(), 1800);
+        Spi::run("DELETE FROM dense_dead WHERE id % 10 < 3").unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        drop(index);
+        assert_eq!(
+            value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('dense_dead_idx')"),
+            1800,
+            "the dead list is published, not rewritten away"
+        );
+        for (query, like) in [
+            ("needle", "%needle%"),
+            ("pad", "%pad%"),
+            ("needle OR pad", "%pad%"),
+            ("needle AND pad", "%needle%"),
+        ] {
+            let sql = format!("SELECT count(*) FROM dense_dead WHERE body ==> '{query}'");
+            let before = crate::fold::dead_clear_steps();
+            let counted = value(&sql);
+            let steps = crate::fold::dead_clear_steps() - before;
+            assert_eq!(
+                counted,
+                value(&format!(
+                    "SELECT count(*) FROM dense_dead WHERE body LIKE '{like}'"
+                )),
+                "{query}"
+            );
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0;
+            assert_eq!(plan[0]["Plan"]["Count Strategy"], "ordinal fold", "{query}");
+            // Every document is in chunk 0, which holds all 1,800 dead.
+            assert!(
+                steps <= segment::ordinals::WORDS as u64,
+                "{query}: {steps} steps to clear 1,800 dead documents from one chunk"
+            );
+        }
     }
 
     #[pg_test]

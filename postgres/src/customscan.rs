@@ -1903,15 +1903,14 @@ unsafe fn fold_count(
         let limits = Limits::default();
         let mut count = 0i64;
         let mut candidates = 0usize;
-        for (i, ((source, _), label)) in view.sources.iter().zip(&view.labels).enumerate() {
+        for (i, ((source, dead_list), label)) in view.sources.iter().zip(&view.labels).enumerate() {
             pgrx::check_for_interrupts!();
             if i < view.immutable_sources {
                 let mut pending: Vec<(u32, Vec<u16>)> = Vec::new();
                 let sure = crate::storage::codec_in(
                     crate::fold::count_segment(
-                        view.keys[i],
                         source.as_ref(),
-                        view.sources[i].1.as_ref(),
+                        &view.dead_sets[i],
                         query,
                         &visibility,
                         |block, offsets| pending.push((block, offsets.to_vec())),
@@ -1931,13 +1930,20 @@ unsafe fn fold_count(
             }
             let planned = plan(query, source, &limits)
                 .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
-            let dead = &view.dead_sets[i];
             let mut cursor = planned.cursor;
+            if let Some(dead) = dead_list {
+                let dead = crate::storage::codec_in(
+                    crate::storage::dead_cursor(&**source, dead),
+                    &format!("{label} dead list"),
+                );
+                cursor = Box::new(crate::storage::codec_in(
+                    segment::set::Difference::new(cursor, dead),
+                    label,
+                ));
+            }
             let mut tids = Vec::new();
             while let Some(tid) = cursor.current() {
-                if !dead.contains(&tid) {
-                    tids.push(tid);
-                }
+                tids.push(tid);
                 crate::storage::codec_in(cursor.advance(), label);
             }
             candidates += tids.len();

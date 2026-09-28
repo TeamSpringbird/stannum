@@ -13,14 +13,11 @@
 //! caller for the per-tuple check. A location is live in one source only
 //! (the index checker reports anything else), so per-segment counts add up.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use pgrx::pg_sys;
 use segment::Result;
+use segment::dead::DeadDocs;
 use segment::index::Index;
-use segment::ordinals::{self, Node, Ordinals, Words};
+use segment::ordinals::{self, Node, Words};
 use tinql::runtime::Query;
 
 /// Whether every node is a Boolean combination of plain terms.
@@ -184,56 +181,17 @@ impl Visibility {
     }
 }
 
-/// Dead documents of a segment as ascending ordinals, per dead list.
-type DeadOrdinals = (Rc<Vec<u8>>, Rc<Vec<u32>>);
-
-thread_local! {
-    /// By index identity and generation. The dead list is held so the pointer
-    /// comparison cannot match a later allocation.
-    static DEAD: RefCell<HashMap<(u64, u32), DeadOrdinals>> = RefCell::new(HashMap::new());
-}
-
-/// The dead list `dead` of the segment `key` decoded, once per backend and
-/// list.
-pub(crate) fn dead_ordinals(key: (u64, u32), dead: Option<&Rc<Vec<u8>>>) -> Result<Rc<Vec<u32>>> {
-    let Some(dead) = dead else {
-        return Ok(Rc::default());
-    };
-    if let Some(found) = DEAD.with_borrow(|cache| {
-        cache
-            .get(&key)
-            .filter(|(list, _)| Rc::ptr_eq(list, dead))
-            .map(|(_, ordinals)| ordinals.clone())
-    }) {
-        return Ok(found);
-    }
-    let ordinals = Rc::new(Ordinals::parse(dead)?.to_vec()?);
-    DEAD.with_borrow_mut(|cache| {
-        if cache.len() > 4096 {
-            cache.clear();
-        }
-        cache.insert(key, (dead.clone(), ordinals.clone()));
-    });
-    Ok(ordinals)
-}
-
-/// Decoded dead lists cached under index identity `identity`.
 #[cfg(feature = "pg_test")]
-pub(crate) fn cached_dead_lists(identity: u64) -> usize {
-    DEAD.with_borrow(|cache| cache.keys().filter(|(id, _)| *id == identity).count())
+thread_local! {
+    /// Steps folds have spent clearing dead documents from their chunks:
+    /// a word per step, a chunk's words at a time.
+    static CLEAR_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Keeps the decoded dead lists of the segments `keep` names; returns the
-/// bytes of those kept. The raw lists are shared with the segment readers,
-/// which account for them.
-pub(crate) fn retain_dead_ordinals(keep: impl Fn((u64, u32)) -> bool) -> usize {
-    DEAD.with_borrow_mut(|cache| {
-        cache.retain(|key, _| keep(*key));
-        cache
-            .values()
-            .map(|(_, ordinals)| ordinals.len() * std::mem::size_of::<u32>())
-            .sum()
-    })
+/// Steps this backend's folds have spent clearing dead documents.
+#[cfg(feature = "pg_test")]
+pub(crate) fn dead_clear_steps() -> u64 {
+    CLEAR_STEPS.get()
 }
 
 /// A chunk with at most this many matches looks each one's page up; a fuller
@@ -245,11 +203,11 @@ const SPARSE_CHUNK: u32 = 256;
 /// Returns the number of matches on all-visible pages. Matches elsewhere are
 /// passed to `check` a heap page at a time, as the block and the matching
 /// offsets, and are not included. `None` when the segment predates ordinal
-/// streams, in which case nothing was counted or checked.
+/// streams, in which case nothing was counted or checked. `dead` is the
+/// segment's decoded dead list, as the view holds it.
 pub fn count_segment(
-    key: (u64, u32),
     source: &dyn Index,
-    dead_list: Option<&Rc<Vec<u8>>>,
+    dead: &DeadDocs,
     query: &Query,
     visibility: &Visibility,
     mut check: impl FnMut(u32, &[u16]),
@@ -266,7 +224,6 @@ pub fn count_segment(
             None => None,
         });
     }
-    let dead = dead_ordinals(key, dead_list)?;
     // The segment's page-table entries among a short list of blocks that are
     // not all-visible; ascending, like the ordinals they cover.
     let listed: Option<Vec<usize>> = visibility.few.as_ref().map(|few| {
@@ -285,25 +242,23 @@ pub fn count_segment(
     ordinals::for_each_chunk(&node, &streams, |chunk, words, members| {
         let low = u32::from(chunk) << 16;
         let high = low.saturating_add(ordinals::CHUNK).min(documents);
-        let from = dead.partition_point(|ordinal| *ordinal < low);
-        let to = from + dead[from..].partition_point(|ordinal| *ordinal < high);
         let live: Box<Words>;
-        let words = if from == to {
-            words
-        } else {
+        let has_dead = dead.chunk(low).is_some();
+        let words = if has_dead {
             let mut cleared = Box::new(*words);
-            for ordinal in &dead[from..to] {
-                let bit = (ordinal - low) as usize;
-                cleared[bit / 64] &= !(1 << (bit % 64));
-            }
+            dead.clear(low, &mut cleared);
+            #[cfg(feature = "pg_test")]
+            CLEAR_STEPS.set(CLEAR_STEPS.get() + ordinals::WORDS as u64);
             live = cleared;
             &live
+        } else {
+            words
         };
         // Only a chunk with dead documents was changed since it was counted.
-        let matched = if from == to {
-            members
-        } else {
+        let matched = if has_dead {
             ordinals::count(words)
+        } else {
+            members
         };
         if matched == 0 {
             return Ok(());

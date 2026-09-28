@@ -642,6 +642,10 @@
       "owner": "ben",
       "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
     },
+    "postgres/src/heap_probe.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a counting allocator for pg_test builds, written for Stannum."
+    },
     "postgres/src/highlight.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/highlight.rs",
@@ -821,6 +825,10 @@
     "segment/src/cache.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 7372fc6fb8f0bbf469f1b6b3340dbe8af787bcdf."
+    },
+    "segment/src/dead.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: dead lists decoded as a bitmap over segment ordinals, written for Stannum."
     },
     "segment/src/dictionary.rs": {
       "owner": "ben",

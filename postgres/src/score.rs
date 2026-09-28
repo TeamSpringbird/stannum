@@ -15,6 +15,7 @@ use pgrx::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use segment::Tid;
 use segment::bound::BlockBound;
+use segment::dead::DeadDocs;
 use segment::docs::DocTable;
 use segment::index::{Expanded, Index, Window};
 use segment::segment::Lengths;
@@ -62,7 +63,7 @@ pub(crate) struct IndexScorer {
     /// Per-source cursors, declared before `view` so they drop first.
     sources: Vec<SourceReader>,
     view: View,
-    dead: Vec<std::rc::Rc<BTreeSet<Tid>>>,
+    dead: Vec<crate::storage::DeadSet>,
     terms: Vec<(String, TermScorer)>,
     query: Query,
     /// Computed on first request: the maximum over matching documents.
@@ -513,14 +514,14 @@ impl IndexScorer {
     /// Score of the document at `tid` in the first source listing it live.
     fn score_listed(&mut self, tid: Tid) -> Option<f32> {
         for i in 0..self.view.sources.len() {
-            if self.dead[i].contains(&tid) {
-                continue;
-            }
             let label = self.view.labels[i].as_str();
             let reader = &mut self.sources[i];
             let Some(ordinal) = reader.ordinal_of(tid, label) else {
                 continue;
             };
+            if self.dead[i].contains(ordinal) {
+                continue;
+            }
             // Each term's bucket for the document, if the term lists it.
             let buckets: Vec<Option<u8>> = self
                 .terms
@@ -1428,17 +1429,10 @@ impl IndexScorer {
         mixed: Option<&Shape<'_>>,
     ) -> Option<WalkParts<'_>> {
         let started = blocks_used();
-        let (source, dead_list) = &self.view.sources[i];
+        let (source, _) = &self.view.sources[i];
         let label = &self.view.labels[i];
-        let dead = if i < self.view.keys.len() {
-            segment_error_in(
-                crate::fold::dead_ordinals(self.view.keys[i], dead_list.as_ref()),
-                label,
-            )
-        } else {
-            // The write buffer has no dead list.
-            std::rc::Rc::default()
-        };
+        // Empty for the write buffer, which has no dead list.
+        let dead = self.view.dead_sets[i].clone();
         // An immutable segment's identity, under which its terms' parsed
         // bounds are kept across statements; the write buffer has none.
         let key = self.view.keys.get(i).copied();
@@ -1844,8 +1838,8 @@ struct WalkParts<'a> {
     filters: Vec<OrdinalTerm<'a>>,
     docs: DocTable<'a>,
     source: &'a dyn Index,
-    /// Dead ordinals, ascending.
-    dead: std::rc::Rc<Vec<u32>>,
+    /// Dead documents, by ordinal.
+    dead: crate::storage::DeadSet,
     phrase: Option<PhraseCheck<'a>>,
     condition: Option<Condition>,
     phrases: Vec<Option<PhraseCheck<'a>>>,
@@ -2547,8 +2541,8 @@ struct OrdinalWalk<'a, 's> {
     index: &'a dyn Index,
     document_count: u32,
     lengths: Lengths<'a>,
-    /// Dead ordinals, ascending.
-    dead: &'s [u32],
+    /// Dead documents, by ordinal.
+    dead: &'s DeadDocs,
     visibility: &'s mut Visibility,
     k: usize,
     heap: &'s mut BinaryHeap<Ranked>,
@@ -2900,25 +2894,21 @@ fn insertion_sort_by<T: Copy>(v: &mut [T], mut less: impl FnMut(&T, &T) -> bool)
 
 /// Removes the dead ordinals of the chunk at `base` from the shared members.
 fn drop_dead(
-    dead: &[u32],
+    dead: &DeadDocs,
     base: u32,
     sparse: bool,
     set: &mut segment::ordinals::Words,
     lows: &mut Vec<u16>,
 ) {
-    let from = dead.partition_point(|o| *o < base);
-    for dead in &dead[from..] {
-        if *dead >= base + segment::ordinals::CHUNK {
-            break;
+    if sparse {
+        if let Some(words) = dead.chunk(base) {
+            lows.retain(|low| {
+                let low = usize::from(*low);
+                words[low / 64] >> (low % 64) & 1 == 0
+            });
         }
-        let low = (dead - base) as usize;
-        if sparse {
-            if let Ok(at) = lows.binary_search(&(low as u16)) {
-                lows.remove(at);
-            }
-        } else {
-            set[low / 64] &= !(1 << (low % 64));
-        }
+    } else {
+        dead.clear(base, set);
     }
 }
 
@@ -3915,20 +3905,7 @@ impl OrdinalWalk<'_, '_> {
         // mask applied to the union before it is rebuilt from the essential
         // terms is lost, and scored a deleted document's location, by then
         // reused by a row that never matched.
-        let from = self.dead.partition_point(|o| *o < base);
-        for dead in &self.dead[from..] {
-            if *dead >= base + segment::ordinals::CHUNK {
-                break;
-            }
-            let low = (dead - base) as usize;
-            if sparse {
-                if let Ok(at) = lows.binary_search(&(low as u16)) {
-                    lows.remove(at);
-                }
-            } else {
-                set[low / 64] &= !(1 << (low % 64));
-            }
-        }
+        drop_dead(self.dead, base, sparse, set, &mut lows);
         let mut sparse_at = 0usize;
         // A sub-block is judged once, at its first word: the walk resolves
         // locations in ordinal order, so the judgment cannot be repeated
@@ -4641,15 +4618,23 @@ impl IndexScorer {
             return max;
         }
         let mut candidates = BTreeSet::new();
-        for (i, (segment, _)) in self.view.sources.iter().enumerate() {
+        for ((segment, dead), label) in self.view.sources.iter().zip(&self.view.labels) {
             let planned = plan(&self.query, &**segment, &Limits::default())
                 .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
             let mut cursor = planned.cursor;
+            if let Some(dead) = dead {
+                let dead = segment_error_in(
+                    crate::storage::dead_cursor(&**segment, dead),
+                    &format!("{label} dead list"),
+                );
+                cursor = Box::new(segment_error_in(
+                    segment::set::Difference::new(cursor, dead),
+                    label,
+                ));
+            }
             while let Some(tid) = cursor.current() {
-                if !self.dead[i].contains(&tid) {
-                    candidates.insert(tid);
-                }
-                segment_error_in(cursor.advance(), &self.view.labels[i]);
+                candidates.insert(tid);
+                segment_error_in(cursor.advance(), label);
             }
         }
         // The index cannot see deletes that VACUUM has not reported yet, so
