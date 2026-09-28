@@ -145,6 +145,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Fixed
 
+- A backend decodes a segment's dead list into a bitmap over its ordinals, at
+  most a bit per document, instead of a set of heap locations plus a vector of
+  ordinals, 16 to 24 bytes per dead document. After VACUUM published 45
+  million dead rows of 150 million, eight query backends held about a
+  gigabyte each, rebuilt it on every query once it overflowed
+  `stannum.reader_cache_mb`, and the server was killed for memory.
 - Draining the pending list, and joining a retired run to the pending chain,
   wait until the meta page is written. An error or crash in between left the
   meta page listing runs whose pages were already free, and a later drain

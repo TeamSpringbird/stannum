@@ -452,16 +452,16 @@ production use.
 ### Per-backend caches
 
 A query captures the directory and the buffer state under one shared meta
-lock, then reads through five caches that live in the backend and key on
+lock, then reads through four caches that live in the backend and key on
 what the meta page says, so every backend sees the same thing without any
 coordination:
 
 - **Segment readers**, by index identity and segment generation. A reader
   keeps the byte ranges it has fetched (dictionary index, dictionary blocks,
   ordinal chunks, payload, document table) for as long as the generation is
-  in the directory, with the segment's dead list and its decoded locations.
-  Generations never repeat within an identity, and REINDEX changes the
-  identity, so a cached reader can never describe a different segment.
+  in the directory, with the segment's dead list as stored and decoded (see
+  below). Generations never repeat within an identity, and REINDEX changes
+  the identity, so a cached reader can never describe a different segment.
 - **Dictionary lookups**, per cached segment: a term's entry or its absence,
   at most 4,096 terms per segment. A statement resolves each of its terms in
   every segment several times (planning, statistics, cursor setup), and the
@@ -470,8 +470,6 @@ coordination:
   so the memo answers repeats without them. Segments are immutable, so the
   memo needs no invalidation of its own; it lives and dies with the reader.
 - **Page tables**, by identity and generation.
-- **Decoded dead lists**, by identity and generation: a dead list as
-  ascending ordinals, for the ranked walk and the count to skip.
 - **The buffer index**, by identity and buffer epoch. It is an in-memory
   inverted index of the buffer's forward records, extended from the last
   byte it covered on each use (an insert by any backend only appends), and
@@ -481,15 +479,27 @@ coordination:
   at the default caps is a few tens of milliseconds; existing backends absorb
   each record once, as it arrives.
 
-Each captured view drops the readers, page tables and decoded dead lists of
-generations its index's directory no longer holds, so a long-lived backend
+A reader decodes its segment's dead list once per published list, into a
+bitmap over the segment's ordinals with an 8 KiB block per 65,536-document
+chunk that holds a dead document and nothing for the others: at most a bit
+per document, however many are dead. The ranked walk and the count clear a
+chunk's dead documents word by word, and the scorer tests a row's ordinal.
+Every other reader of a dead list (bitmap scans, streaming scans, the count's
+fallback, `max_score`) streams it from the stored ordinal stream beside its
+own cursor. The decoded form used to be a set of heap locations plus a
+vector of ordinals, 16 to 24 bytes per dead document in every backend: after
+VACUUM published 45 million dead rows of 150 million, eight query backends
+each held about a gigabyte and the server ran out of memory.
+
+Each captured view drops the readers (with their dead lists) and page tables
+of generations its index's directory no longer holds, so a long-lived backend
 (behind a connection pooler, say) does not keep what merges retired. It then
-adds up the readers' fetched bytes, the dead lists raw and decoded, and the
+adds up the readers' fetched bytes, the dead lists stored and decoded, and the
 page tables, across every index the backend has read; past
-`stannum.reader_cache_mb` (384 MiB) all three caches are emptied together.
-Dead lists count because they grow with deletes, not with what queries read:
-a 10 million document segment with half its documents dead holds on the
-order of 100 MB of them per backend.
+`stannum.reader_cache_mb` (384 MiB) both caches are emptied together. Dead
+lists count because they grow with deletes, not with what queries read, but
+stored and decoded they take at most about a quarter of a byte per document:
+under 40 MB for 150 million documents.
 
 The buffer index is not shared between backends. Sharing it would need a
 shared-memory rendezvous (`shared_preload_libraries` or the DSM registry of

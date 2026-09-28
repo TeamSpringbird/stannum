@@ -18,6 +18,7 @@
 //!   table, as a short list or as 65,536-document chunks of arrays or bitmaps,
 //!   with a score bound per chunk. Cursors support `seek` and report each
 //!   member's rank.
+//! * [`dead`]: a segment's dead list decoded as a bitmap over ordinals.
 //! * [`docs`]: the document table, from ordinal to tuple location and back,
 //!   and the cursors that read a term's documents in heap order or a heap
 //!   page at a time.
@@ -43,6 +44,7 @@ mod varint;
 
 pub mod bound;
 pub mod cache;
+pub mod dead;
 pub mod dictionary;
 pub mod docs;
 pub mod forward;

@@ -7379,9 +7379,9 @@ mod tests {
 
     #[pg_test]
     fn dead_sets_count_against_the_reader_cache_budget() {
-        // A segment's decoded dead list lives beside its reader for as long
-        // as the reader is cached; at 10 million documents half dead it is
-        // tens of megabytes per backend, so `stannum.reader_cache_mb` must
+        // A segment's dead list, stored and decoded, lives beside its reader
+        // for as long as the reader is cached. It grows with deletes rather
+        // than with what queries read, so `stannum.reader_cache_mb` must
         // count it, not the reader's fetched bytes alone.
         use crate::storage::testing::{READER_CACHE_BYTES, READER_CACHE_CLEARS};
         Spi::run(
@@ -7403,9 +7403,11 @@ mod tests {
         Spi::run("DELETE FROM deadweight WHERE id > 1000").unwrap();
         assert_eq!(ranked_ids("deadweight", 10), (1..=10).collect::<Vec<_>>());
         // The next view is captured with the fetched bytes as they are now,
-        // under a budget above them but below them plus the dead locations.
+        // under a budget above them but below them plus the dead list.
         let arena = crate::storage::testing::reader_arena_bytes();
-        let budget = arena + dead.len() * std::mem::size_of::<segment::Tid>() - 1;
+        let dead_bytes = crate::storage::testing::dead_list_bytes();
+        assert!(dead_bytes >= 3000 / 8, "{dead_bytes} bytes of dead lists");
+        let budget = arena + dead_bytes - 1;
         let clears = READER_CACHE_CLEARS.get();
         READER_CACHE_BYTES.set(Some(budget));
         let ids = ranked_ids("deadweight", 10);
@@ -7413,7 +7415,7 @@ mod tests {
         assert_eq!(ids, (1..=10).collect::<Vec<_>>());
         assert!(
             READER_CACHE_CLEARS.get() > clears,
-            "a {arena} byte arena and 2,000 dead locations fit in {budget} bytes"
+            "a {arena} byte arena and {dead_bytes} bytes of dead lists fit in {budget} bytes"
         );
     }
 
