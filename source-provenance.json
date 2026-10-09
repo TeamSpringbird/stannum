@@ -1102,6 +1102,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: bit packing for the ctid-addressed segment format."
     },
+    "segment/src/tinshape/blob.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a segment blob loaded on demand a chunk at a time for the ctid-native paths."
+    },
     "segment/src/tinshape/docs.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ctid grid, document set, DL sidecar and liveness bitmap of the ctid-addressed segment format."
