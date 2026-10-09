@@ -289,13 +289,16 @@ def main():
         assert orphans > 0, 'the merged run was not written before the crash'
         assert sql(entries) == '96'
         assert sql(sealed) == '1'
-        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '98'
+        # The insert's transaction died with the server: its row is not
+        # visible, though the seal it published indexes it.
+        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '97'
         sql(tuned + "INSERT INTO bounded VALUES (99, 'needle w99');")
         assert sql(entries) == '96'
         sql('VACUUM (INDEX_CLEANUP ON) bounded;')
         assert_clean('bounded_idx')
-        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '99'
-        for n in (1, 2, 97, 98, 99):
+        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '98'
+        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'w98';") == '0'
+        for n in (1, 2, 97, 99):
             assert sql(f"SELECT string_agg(id::text, ',') FROM bounded WHERE body ==> 'w{n}';") == str(n), n
         return orphans
 
