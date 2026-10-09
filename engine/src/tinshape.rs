@@ -365,6 +365,12 @@ pub struct TermSet<'a> {
     pub at: usize,
     /// The positions stream and its blob offset.
     pub positions: (segment::tinshape::blob::Bytes<'a>, usize),
+    /// A grouped record's directory, shared with the parsed record (each
+    /// group's [`G`] is made when it is asked for), and where its
+    /// containers start in the blob.
+    dir: std::rc::Rc<[GroupEntry]>,
+    containers: usize,
+    /// Groups of a single or sparse term, over [`Self::locals`].
     groups: Vec<G<'a>>,
     /// Local slots of a single or sparse term, all groups in a row.
     locals: Vec<u32>,
@@ -404,6 +410,8 @@ impl<'a> TermSet<'a> {
         let record_at = term.at;
         let mut groups = Vec::new();
         let mut locals = Vec::new();
+        let mut dir: std::rc::Rc<[GroupEntry]> = std::rc::Rc::new([]);
+        let mut containers = 0;
         match &postings.form {
             Form::Single(slot) => {
                 touch.touch(Part::Payload, record_at, postings.tf_at);
@@ -420,7 +428,6 @@ impl<'a> TermSet<'a> {
                 touch.touch(Part::Footer, record_at, postings.footer_at);
             }
             Form::Grouped(entries) => {
-                groups.reserve_exact(entries.len());
                 // The header and the group directory: per-term metadata,
                 // which TIN would count as the postings footer.
                 touch.touch(Part::Footer, record_at, postings.footer_at);
@@ -429,18 +436,8 @@ impl<'a> TermSet<'a> {
                     record_at + postings.payload_at,
                     postings.containers_at,
                 );
-                let containers = record_at + postings.payload_at + postings.containers_at;
-                for entry in entries {
-                    groups.push(G {
-                        index: entry.index,
-                        count: entry.count,
-                        src: Src::Container {
-                            entry: *entry,
-                            bytes: postings.container(entry),
-                            at: containers + entry.at as usize,
-                        },
-                    });
-                }
+                containers = record_at + postings.payload_at + postings.containers_at;
+                dir = entries.clone();
             }
         }
         Ok(Some(Self {
@@ -449,6 +446,8 @@ impl<'a> TermSet<'a> {
             positions: segment.positions(&term.entry)?,
             postings,
             at: record_at,
+            dir,
+            containers,
             groups,
             locals,
             sought: 0,
@@ -506,11 +505,53 @@ impl<'a> TermSet<'a> {
         let _ = from;
     }
 
-    fn find(&self, group: u32, hint: &mut usize) -> Option<&G<'a>> {
-        while *hint < self.groups.len() && self.groups[*hint].index < group {
+    /// The number of groups the term holds (a sparse term's once
+    /// [`Self::ensure_groups`] has listed them).
+    #[inline]
+    fn group_count(&self) -> usize {
+        if self.dir.is_empty() {
+            self.groups.len()
+        } else {
+            self.dir.len()
+        }
+    }
+
+    /// The geometry index of the term's `i`th group.
+    #[inline]
+    fn group_index(&self, i: usize) -> u32 {
+        if self.dir.is_empty() {
+            self.groups[i].index
+        } else {
+            self.dir[i].index
+        }
+    }
+
+    /// The term's `i`th group.
+    #[inline]
+    fn group_at(&self, i: usize) -> G<'a> {
+        if self.dir.is_empty() {
+            return self.groups[i];
+        }
+        let entry = self.dir[i];
+        G {
+            index: entry.index,
+            count: entry.count,
+            src: Src::Container {
+                entry,
+                bytes: self.postings.container(&entry),
+                at: self.containers + entry.at as usize,
+            },
+        }
+    }
+
+    /// The term's group `group`, if it holds it, looked for from `hint`
+    /// forward (the hint is left at the first group at or after it).
+    fn find(&self, group: u32, hint: &mut usize) -> Option<G<'a>> {
+        let count = self.group_count();
+        while *hint < count && self.group_index(*hint) < group {
             *hint += 1;
         }
-        self.groups.get(*hint).filter(|g| g.index == group)
+        (*hint < count && self.group_index(*hint) == group).then(|| self.group_at(*hint))
     }
 
     // ---- The cursor: slots in order, each with its posting index. ----
@@ -542,19 +583,26 @@ impl<'a> TermSet<'a> {
             return self.current;
         }
         loop {
-            let Some(g) = self.groups.get(self.gpos).copied() else {
+            if self.gpos >= self.group_count() {
                 self.current = None;
                 return None;
-            };
+            }
+            let g = self.group_at(self.gpos);
             let group = &geometry.groups[g.index as usize];
             let base = group.slot_base;
             if base + group.slots() <= target {
                 // Skip the groups wholly before the target.
-                let skip = self.groups[self.gpos..].partition_point(|g| {
-                    let group = &geometry.groups[g.index as usize];
-                    group.slot_base + group.slots() <= target
-                });
-                self.gpos += skip;
+                let (mut lo, mut hi) = (self.gpos, self.group_count());
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let group = &geometry.groups[self.group_index(mid) as usize];
+                    if group.slot_base + group.slots() <= target {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                self.gpos = lo;
                 self.loaded = Loaded::None;
                 continue;
             }
@@ -706,9 +754,9 @@ impl Scratch {
 /// The candidate groups of a node: those that can hold a match.
 fn candidate_groups(node: &Node, terms: &[Option<TermSet<'_>>], all: usize) -> Vec<u32> {
     match node {
-        Node::Term(t) => terms[*t]
-            .as_ref()
-            .map_or_else(Vec::new, |t| t.groups.iter().map(|g| g.index).collect()),
+        Node::Term(t) => terms[*t].as_ref().map_or_else(Vec::new, |t| {
+            (0..t.group_count()).map(|i| t.group_index(i)).collect()
+        }),
         Node::Span { slots, .. } => {
             let sets: Vec<Vec<u32>> = slots
                 .iter()
@@ -946,10 +994,10 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
     fn group_of(&mut self, t: usize, group: u32) -> Option<G<'a>> {
         let hint = &mut self.hints[t];
         let set = self.terms[t].as_ref()?;
-        if *hint > 0 && set.groups.get(*hint - 1).is_some_and(|g| g.index >= group) {
+        if *hint > 0 && *hint <= set.group_count() && set.group_index(*hint - 1) >= group {
             *hint = 0;
         }
-        set.find(group, hint).copied()
+        set.find(group, hint)
     }
 
     fn touch_src(&mut self, src: &Src<'_>) {

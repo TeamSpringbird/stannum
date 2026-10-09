@@ -501,7 +501,8 @@ pub struct GroupEntry {
 pub enum Form<'a> {
     Single(u32),
     Sparse(Ef<'a>),
-    Grouped(Vec<GroupEntry>),
+    /// The group directory, shared by the clones of a parsed record.
+    Grouped(std::rc::Rc<[GroupEntry]>),
 }
 
 /// A term's postings record, parsed.
@@ -705,7 +706,7 @@ impl<'a> Postings<'a> {
                     }
                 };
                 containers_at = at;
-                Form::Grouped(entries)
+                Form::Grouped(entries.into())
             }
             _ => return Err(Error::Corrupt("postings form")),
         };
@@ -740,7 +741,7 @@ impl<'a> Postings<'a> {
             Form::Single(slot) => visit(*slot),
             Form::Sparse(list) => list.for_each(visit),
             Form::Grouped(entries) => {
-                for entry in entries {
+                for entry in entries.iter() {
                     let group = &geometry.groups[entry.index as usize];
                     let base = group.slot_base;
                     for_each_local(entry, self.container(entry).all()?, group, |local| {

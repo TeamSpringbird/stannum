@@ -351,6 +351,16 @@ score, with term cursors kept between rows), `TermSet::{rewind, sought}`;
 `Segment::{docs, liveness}` are `Rc`; `Liveness::is_dead`; `lower` refuses
 spans that do not need every word.
 
+Changed for conjunction and phrase speed (branch
+`tinshape/perf-conj-phrase`): `postings::Form::Grouped` holds the group
+directory as `Rc<[GroupEntry]>`, shared by a parsed record's clones (it was
+a `Vec`), and `engine::tinshape::TermSet` reads a group's entry from it when
+asked rather than copying the directory per query; `TermSet::find` returns
+the entry by value. Added: `ef::Ef::retain_members(&mut Vec<u32>)` (keep
+the values a list holds, its highs passed a word at a time and only the
+lows of the values' buckets read) and `ef::EfCursor::list`;
+`boldi_vigna::PhrasePlan::leaves`.
+
 Changed in phase B (callers of phase A's API): `Group` has `first` and
 `pages` (`slots()` is `pages * width`, `grid_bytes()` new);
 `postings::for_each_local` and `or_into` take `&Group` instead of a width;

@@ -297,10 +297,11 @@ fn next_group(
             .current()
             .map(|slot| geometry.group_of_slot(slot) as u32);
     }
-    while *hint < set.groups.len() && set.groups[*hint].index < from {
+    let count = set.group_count();
+    while *hint < count && set.group_index(*hint) < from {
         *hint += 1;
     }
-    set.groups.get(*hint).map(|g| g.index)
+    (*hint < count).then(|| set.group_index(*hint))
 }
 
 /// Sets `mem`'s count of `set`'s members in group `g` (which it holds)
@@ -370,7 +371,6 @@ fn load<'a>(
     }
     let entry = set
         .find(g, &mut mem.hint)
-        .copied()
         .ok_or(Error::Corrupt("a group the term holds"))?;
     mem.count = entry.count;
     match entry.src {
@@ -1416,7 +1416,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let entry = set
             .find(g, &mut self.mems[t].hint)
-            .copied()
             .ok_or(Error::Corrupt("a group the term holds"))?;
         match entry.src {
             Src::Container {
