@@ -654,8 +654,8 @@ impl IndexScorer {
             let terms = &self.scoring.terms;
             let names = &self.names;
             if let Some(found) =
-                crate::storage::with_native(&self.view, i, names, false, true, |segment| {
-                    engine::tinshape::score_at(segment, terms, tid)
+                crate::storage::with_native_rows(&self.view, i, names, |segment, sets| {
+                    engine::tinshape::score_at_in(segment, terms, sets, tid)
                 })
             {
                 match segment_error_in(found, label) {

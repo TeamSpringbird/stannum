@@ -357,6 +357,8 @@ pub struct TermSet<'a> {
     /// Local slots of a single or sparse term, all groups in a row.
     locals: Vec<u32>,
     // Cursor state, for ranked walks and phrase checks.
+    /// The target of the last seek: the cursor may move forward from it.
+    sought: u32,
     gpos: usize,
     loaded: Loaded,
     current: Option<u32>,
@@ -437,6 +439,7 @@ impl<'a> TermSet<'a> {
             at: record_at,
             groups,
             locals,
+            sought: 0,
             gpos: 0,
             loaded: Loaded::None,
             current: None,
@@ -508,6 +511,7 @@ impl<'a> TermSet<'a> {
         target: u32,
         touch: &mut impl Touch,
     ) -> Option<u32> {
+        self.sought = self.sought.max(target);
         if self.current.is_some_and(|c| c >= target) {
             return self.current;
         }
@@ -641,10 +645,17 @@ impl<'a> TermSet<'a> {
 
     /// Moves the cursor back before the first slot.
     pub fn rewind(&mut self) {
+        self.sought = 0;
         self.gpos = 0;
         self.loaded = Loaded::None;
         self.current = None;
         self.sparse = None;
+    }
+
+    /// The largest target sought since the cursor was opened or rewound:
+    /// a seek to a slot below it needs a [`Self::rewind`] first.
+    pub fn sought(&self) -> u32 {
+        self.sought
     }
 
     /// The current slot's posting index.
@@ -1099,7 +1110,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     let set = self.terms[*t].as_mut().expect("a span's terms exist");
                     // Another span of the query may have read this term
                     // further into the group.
-                    if set.current().is_some_and(|current| current > slot) {
+                    if slot < set.sought() {
                         set.rewind();
                     }
                     set.seek(geometry, slot, self.touch);
@@ -1288,6 +1299,23 @@ pub fn score_at(
     scorers: &[(String, TermScorer)],
     tid: Tid,
 ) -> Result<Option<f32>> {
+    let mut sets = Vec::with_capacity(scorers.len());
+    for (name, _) in scorers {
+        sets.push(TermSet::open(segment, name, &mut NoTouch)?);
+    }
+    score_at_in(segment, scorers, &mut sets, tid)
+}
+
+/// [`score_at`] over the scoring terms opened already, `sets[i]` the term
+/// of `scorers[i]`: a caller scoring row after row keeps them, so a row in
+/// the group of the last reads no container again. Their cursors are moved
+/// back when a row comes before the last.
+pub fn score_at_in<'a>(
+    segment: &Segment<'a>,
+    scorers: &[(String, TermScorer)],
+    sets: &mut [Option<TermSet<'a>>],
+    tid: Tid,
+) -> Result<Option<f32>> {
     let geometry = &segment.docs.geometry;
     let Some(slot) = geometry.slot_of(tid) else {
         return Ok(None);
@@ -1300,10 +1328,14 @@ pub fn score_at(
     }
     let mut total = None::<f32>;
     let mut length = None;
-    for (name, scorer) in scorers {
-        let Some(mut set) = TermSet::open(segment, name, &mut NoTouch)? else {
+    for ((_, scorer), set) in scorers.iter().zip(sets.iter_mut()) {
+        let Some(set) = set.as_mut() else {
             continue;
         };
+        // Sought past this row on an earlier one.
+        if slot < set.sought() {
+            set.rewind();
+        }
         if set.seek(geometry, slot, &mut NoTouch) != Some(slot) {
             continue;
         }
@@ -1841,6 +1873,13 @@ mod tests {
                 }
                 let absent = Tid { block: 5000, offset: 1 };
                 prop_assert_eq!(score_at(&segment, &scorers, absent).unwrap(), None);
+                // Kept term cursors, rows in descending then ascending order.
+                let mut sets: Vec<Option<TermSet<'_>>> = scorers.iter().map(|(n, _)| TermSet::open(&segment, n, &mut NoTouch).unwrap()).collect();
+                for r in (0..docs.len()).rev().chain(0..docs.len()) {
+                    let kept = score_at_in(&segment, &scorers, &mut sets, docs[r]).unwrap();
+                    let alone = score_at(&segment, &scorers, docs[r]).unwrap();
+                    prop_assert_eq!(kept.map(f32::to_bits), alone.map(f32::to_bits));
+                }
                 want.sort_by(crate::walk::rank);
                 want.truncate(k);
                 let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();

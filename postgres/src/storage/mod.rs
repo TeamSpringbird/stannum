@@ -3597,6 +3597,16 @@ impl Blob {
         }
     }
 
+    /// Whether `[offset, offset + len)` is loaded.
+    fn has(&self, offset: u64, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let end = (offset as usize).saturating_add(len).min(self.bytes.len());
+        (offset as usize / BLOB_CHUNK..end.div_ceil(BLOB_CHUNK))
+            .all(|chunk| self.chunks[chunk / 64] >> (chunk % 64) & 1 == 1)
+    }
+
     /// Loads `[offset, offset + len)` from `source` where not loaded yet.
     fn ensure(
         &mut self,
@@ -3653,9 +3663,21 @@ const NO_TERMS: &[u8] = &[0, 0, 0];
 /// from.
 type PublishedLiveness = ((Run, u32), Rc<segment::tinshape::docs::Liveness>);
 
+/// Scoring terms opened for rows scored one at a time, by name.
+type RowTerms = (Vec<String>, Vec<Option<engine::tinshape::TermSet<'static>>>);
+
 /// What the ctid-native paths keep of a segment in this backend.
 #[derive(Default)]
 pub(crate) struct Native {
+    /// The terms rows were last scored by, opened over `segment` and kept
+    /// with it ([`with_native_rows`]).
+    rows: RefCell<Option<RowTerms>>,
+    /// The segment last assembled over `blob`, kept while nothing is loaded
+    /// into the blob and the liveness stays, so the records it parsed are
+    /// parsed once (a row scored alone asks for the same terms per row).
+    /// Declared first: it borrows `blob`'s bytes and is dropped before
+    /// them, and before anything is written into them.
+    segment: RefCell<Option<segment::tinshape::segment::Segment<'static>>>,
     blob: RefCell<Option<Blob>>,
     decoded: RefCell<Option<Decoded>>,
     /// The published liveness in slot space, with the dead run it is of.
@@ -3687,6 +3709,54 @@ pub(crate) fn with_native<R>(
     lengths: bool,
     f: impl FnOnce(&segment::tinshape::segment::Segment<'_>) -> segment::Result<R>,
 ) -> Option<segment::Result<R>> {
+    native_segment(view, i, names, positions, lengths, |_, segment| f(segment))
+}
+
+/// [`with_native`] for rows scored one at a time by the terms `names`:
+/// `f` gets the terms opened over the segment, kept between calls (and
+/// dropped with the segment), so a row in the group of the last reads no
+/// container again.
+pub(crate) fn with_native_rows<R>(
+    view: &View,
+    i: usize,
+    names: &[String],
+    f: impl for<'a> FnOnce(
+        &segment::tinshape::segment::Segment<'a>,
+        &mut [Option<engine::tinshape::TermSet<'a>>],
+    ) -> segment::Result<R>,
+) -> Option<segment::Result<R>> {
+    native_segment(view, i, names, false, true, |native, segment| {
+        let mut rows = native.rows.borrow_mut();
+        if rows
+            .as_ref()
+            .is_none_or(|(held, _)| held.as_slice() != names)
+        {
+            *rows = None;
+            let mut sets = Vec::with_capacity(names.len());
+            for name in names {
+                sets.push(engine::tinshape::TermSet::open(
+                    segment,
+                    name,
+                    &mut engine::tinshape::NoTouch,
+                )?);
+            }
+            *rows = Some((names.to_vec(), sets));
+        }
+        let (_, sets) = rows.as_mut().expect("opened above");
+        f(segment, sets)
+    })
+}
+
+/// [`with_native`] with the segment kept in `Native` (`'static` for as
+/// long as nothing is loaded into its blob).
+fn native_segment<R>(
+    view: &View,
+    i: usize,
+    names: &[String],
+    positions: bool,
+    lengths: bool,
+    f: impl FnOnce(&Native, &segment::tinshape::segment::Segment<'static>) -> segment::Result<R>,
+) -> Option<segment::Result<R>> {
     let (reader, native) = view.natives.get(i)?.as_ref()?;
     // A query run inside another's walk over the same segment (a filter's
     // subquery) reads it the ordinal way: the outer walk holds its bytes.
@@ -3716,6 +3786,22 @@ pub(crate) fn with_native<R>(
         let mut slot = native.blob.borrow_mut();
         let blob = slot.get_or_insert_with(|| Blob::new(header.bounds[7] as usize));
         let mut decoded = native.decoded.borrow_mut();
+        let loads = decoded.is_none()
+            || entries.iter().flatten().any(|entry| {
+                !blob.has(
+                    header.bounds[2] + entry.ordinals.offset,
+                    entry.ordinals.len as usize,
+                ) || positions
+                    && !blob.has(
+                        header.bounds[3] + entry.payload.offset,
+                        entry.payload.len as usize,
+                    )
+            });
+        if loads {
+            // Nothing may borrow the bytes while they are written.
+            native.rows.borrow_mut().take();
+            native.segment.borrow_mut().take();
+        }
         if decoded.is_none() {
             // The header, then the document set, the DL sidecar (bit-packed
             // by block, a little over a byte a document) and the liveness
@@ -3776,18 +3862,38 @@ pub(crate) fn with_native<R>(
         }
         let slot = native.blob.borrow();
         let blob = slot.as_ref().expect("loaded above");
-        let mut segment = segment::tinshape::segment::Segment::assemble(
-            &blob.bytes,
-            segment::dictionary::DictionaryIndex::parse(NO_TERMS)?,
-            decoded.docs.clone(),
-            liveness.as_ref().expect("decoded above").1.clone(),
-        )?;
-        segment.share_footers(native.footers.clone());
+        let live = liveness.as_ref().expect("decoded above").1.clone();
         drop(liveness);
+        let mut cached = native.segment.borrow_mut();
+        if cached
+            .as_ref()
+            .is_some_and(|segment| !Rc::ptr_eq(&segment.liveness, &live))
+        {
+            native.rows.borrow_mut().take();
+            *cached = None;
+        }
+        if cached.is_none() {
+            // SAFETY: the blob's bytes are a boxed slice that never moves
+            // and is dropped after `native.segment`; the segment is dropped
+            // above before any load writes into them, and `slot`, borrowed
+            // until `f` returns, keeps any other call from loading meanwhile.
+            let bytes = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&blob.bytes) };
+            let mut segment = segment::tinshape::segment::Segment::assemble(
+                bytes,
+                segment::dictionary::DictionaryIndex::parse(NO_TERMS)?,
+                decoded.docs.clone(),
+                live,
+            )?;
+            segment.share_footers(native.footers.clone());
+            *cached = Some(segment);
+        }
+        drop(cached);
+        let cached = native.segment.borrow();
+        let segment = cached.as_ref().expect("assembled above");
         for (name, entry) in names.iter().zip(&entries) {
             segment.remember(name, *entry);
         }
-        f(&segment)
+        f(native, segment)
     })())
 }
 
