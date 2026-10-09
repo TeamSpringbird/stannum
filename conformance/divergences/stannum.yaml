@@ -469,15 +469,17 @@ divergences:
     against: tin-1.0.4
     kind: gap
     captures: [script]
-    summary: Stannum's settings are its own (stannum.*), not TIN's debug, build and maintenance settings.
+    summary: Stannum's settings are mostly its own (stannum.*), not TIN's debug and build settings.
     tin: >
       14 settings: build_io_concurrency, eight debug_* calibration settings,
       enable_custom_scan, index_maintenance_mode, maintenance_jobs_per_db,
       rss_baseline, track_page_reuse_stats.
     stannum: >
-      20 settings of its own (build, write buffer, merge, cache, count and
-      expansion limits); enable_custom_scan is the one name both define.
-      TIN's other names are not defined (see catalog.I-07).
+      Settings of its own (build, write buffer, merge, cache, count and
+      expansion limits). enable_custom_scan, index_maintenance_mode
+      (background, foreground, manual; default background) and
+      maintenance_jobs_per_db (sighup, default 0) are the names both
+      define; TIN's other names are not defined.
 
   - id: inventory.functions.1
     against: tin-1.0.4
@@ -492,8 +494,9 @@ divergences:
     stannum: >
       The scoring, highlighting, tokenize, ql_parse, score_inspect and
       segment_info functions without stemmer arguments, highlight() over a
-      bound query, and its own (bind_query, verify_index, wal_rmgr_id and
-      others); no fsck, fsm_rebuild, merge or promote.
+      bound query, promote() and merge() with TIN's signatures, and its
+      own (bind_query, verify_index, maintenance_status, wal_rmgr_id and
+      others); no fsck or fsm_rebuild.
 
   - id: inventory.access_method.1
     against: tin-1.0.4
