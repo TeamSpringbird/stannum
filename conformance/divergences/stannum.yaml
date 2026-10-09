@@ -5,7 +5,8 @@
 # Where Stannum knowingly answers differently from a recorded engine.
 #
 # In check mode the runner reads this file for the engine under test and the
-# recorded engine-version named by `against`. A listed case reports
+# recorded engine-version named by `against` (one version or a list). A
+# listed case reports
 #   IMPROVED  when kind is improvement: the recorded engine raised an ERROR on
 #             each listed capture and Stannum answered;
 #   GAP       when kind is gap: Stannum lacks what the case exercises.
@@ -17,7 +18,7 @@
 
 divergences:
   - id: catalog.S-14
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: improvement
     captures: [different_dense_ratio, row_dependent_k1]
     summary: TIN refuses differing dense_ratio arguments and a row-dependent k1; Stannum scores each call with its own arguments.
@@ -32,7 +33,7 @@ divergences:
       scan, and is a row-dependent k1 refused for the same reason?
 
   - id: catalog.S-15
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: improvement
     captures: [value]
     summary: TIN refuses score() and full_score() on one relation; Stannum returns both.
@@ -45,7 +46,7 @@ divergences:
       score per relation, and would it be accepted if the scan computed both?
 
   - id: catalog.S-22
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: improvement
     captures: [full_bits, score_bits]
     summary: TIN refuses to score with its custom scan disabled; Stannum returns the same scores either way.
@@ -59,7 +60,7 @@ divergences:
       query succeeds.
 
   - id: catalog.K-12
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: improvement
     captures: [custom_scan_off]
     summary: TIN refuses a non-default-tokenization index query without its custom scan; Stannum answers it.
@@ -83,9 +84,10 @@ divergences:
     question: >
       Why is this not supported? The explicit form works; is the implicit
       form missing the index's tokenizer options?
+    note: TIN 1.0.4 answers it as Stannum does, so the entry applies to 1.0.3 only.
 
   - id: catalog.S-07
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
     summary: >
@@ -103,7 +105,7 @@ divergences:
       threshold is an open decision.
 
   - id: catalog.S-07b
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
     summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
@@ -114,7 +116,7 @@ divergences:
     stannum: No promote(); its write buffer is folded into segments by inserts and VACUUM.
 
   - id: catalog.S-07c
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
     summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
@@ -122,7 +124,7 @@ divergences:
     stannum: No promote().
 
   - id: catalog.S-07d
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
     summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
@@ -130,7 +132,7 @@ divergences:
     stannum: No promote().
 
   - id: catalog.S-07e
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
     summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
@@ -138,7 +140,7 @@ divergences:
     stannum: No promote().
 
   - id: catalog.S-07f
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
     summary: Stannum has no promote(), sealed write segments or maintenance modes.
@@ -149,7 +151,7 @@ divergences:
     stannum: No promote(); elision counts every document the index holds.
 
   - id: catalog.S-07g
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
     summary: Stannum has no promote(index, extent_cap_bytes).
@@ -157,7 +159,7 @@ divergences:
     stannum: No promote().
 
   - id: catalog.S-07h
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [value, zero_cap]
     summary: Stannum has no promote() function.
@@ -183,7 +185,7 @@ divergences:
       the line, and is a refusal planned?
 
   - id: limits.regex_size.1
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: limit
     captures: [ids]
     summary: Stannum refuses a regex that compiles past 2 MiB (\w{100}); TIN answers.
@@ -195,10 +197,277 @@ divergences:
       of the backend's memory?
 
   - id: limits.regex_size.2
-    against: tin-1.0.3
+    against: [tin-1.0.3, tin-1.0.4]
     kind: limit
     captures: [ids]
     summary: Stannum refuses a regex that compiles past 2 MiB ([\p{L}]{200}); TIN answers.
     tin: Answers {} in about 0.39 s.
     stannum: 54001 "... regex "[\p{L}]{200}" compiles to more than 2 MiB".
     question: Is a regex compile-size limit documented or planned?
+
+  # ---- TIN 1.0.4: stemming. Stannum has no stemmer: no index option, no
+  # stemmer argument to tokenize() or highlight(). CREATE INDEX WITH
+  # (stemmer = ...) raises 22023 "unrecognized parameter", so every case on
+  # a stemmed corpus is a corpus gap.
+
+  - id: stemming.tokenize.en
+    against: tin-1.0.4
+    kind: gap
+    captures: [value]
+    summary: Stannum's tokenize() has no stemmer argument.
+    tin: tokenize('runs running ...', stemmer => 'en') returns Snowball stems (run, run, runner, ran, easili, ...).
+    stannum: 42883, no tokenize() with a stemmer argument. The unstemmed capture matches.
+
+  - id: stemming.tokenize.fold_order
+    against: tin-1.0.4
+    kind: gap
+    captures: [value, accents_preserved]
+    summary: Stannum's tokenize() has no stemmer argument.
+    tin: Stems after lowercasing and before accent folding (Running CAFÉS -> run, cafe; with accents preserved, café).
+    stannum: 42883, no tokenize() with a stemmer argument.
+
+  - id: stemming.tokenize.languages
+    against: tin-1.0.4
+    kind: gap
+    captures: [value]
+    summary: Stannum has no Snowball stemmers.
+    tin: tokenize(..., stemmer => code) stems in each of the 18 documented languages.
+    stannum: 42883, no tokenize() with a stemmer argument.
+
+  - id: stemming.tokenize.codes
+    against: tin-1.0.4
+    kind: gap
+    captures: [hy, unknown, name, upper, empty, 'null']
+    summary: Stannum's tokenize() has no stemmer argument, so neither the code errors nor stemmer => NULL apply.
+    tin: XX000 "unknown stemmer language code" for hy, xx, english, EN and ''; stemmer => NULL does not stem.
+    stannum: 42883, no tokenize() with a stemmer argument.
+
+  - id: stemming.tokenize.case_preserve
+    against: tin-1.0.4
+    kind: gap
+    captures: [value]
+    summary: Stannum's tokenize() has no stemmer argument.
+    tin: XX000 "stemming requires case_folding = fold".
+    stannum: 42883, no tokenize() with a stemmer argument.
+
+  - id: stemming.ddl.errors
+    against: tin-1.0.4
+    kind: gap
+    captures: [unknown_code, case_preserve, alter_unknown, alter_case_preserve]
+    summary: >
+      Stannum has no stemmer index option, so it refuses it as an unknown
+      parameter (22023) where TIN validates it (XX000).
+    tin: >
+      XX000 "unknown stemmer language code: xx" and "stemming requires
+      case_folding = fold", in CREATE and ALTER INDEX.
+    stannum: 22023 "unrecognized parameter "stemmer"".
+
+  - id: stemming.ddl.alter_reindex
+    against: tin-1.0.4
+    kind: gap
+    captures: [script]
+    summary: Stannum has no stemmer index option; ALTER INDEX SET (stemmer) fails and matching stays unstemmed.
+    tin: >
+      ALTER INDEX SET (stemmer = 'en') stems query terms at once and stored
+      terms after REINDEX; RESET (stemmer) likewise.
+    stannum: 22023 "unrecognized parameter "stemmer"" for SET and RESET; REINDEX changes nothing.
+
+  - id: stemming.match.term
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: run, runs and running match one another; runner and ran stay separate terms.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.match.write_buffer
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Rows in the write buffer are stemmed like built rows.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.match.boolean
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Stemmed terms under AND, OR and NOT.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.match.custom_scan_off
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Answers with the custom scan on; XX000 with it off, as for other non-default tokenization (catalog.K-12).
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.phrase.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Phrases are stemmed; "runs fast" matches "running fast" and "Running FAST".
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.proximity.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: NEAR and THEN over stems.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.positions.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Positional filters over stems; positions are those of the unstemmed text.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.expansion.wildcard
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Wildcards match stored stems unstemmed; runn* matches runner(s) but not running, running* nothing.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.expansion.fuzzy
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Fuzzy terms match stored stems unstemmed; runs~0 matches nothing, runs~1 matches run.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.expansion.regex
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Regular expressions match stored stems; MATCHES running matches nothing.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.expansion.range
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Ranges run over stored stems unstemmed.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.score.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: BM25 over stems; term frequency merges inflections.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.score_inspect.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: score_inspect lists stems (running OR runs -> run, which is dense here and elided).
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.stop_words.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: score_stop_words compares stored stems; 'run' leaves running out of the score, 'running' leaves nothing out.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.highlight.implicit
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: Implicit highlight() marks every inflection the stemmed query matches.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.highlight.explicit
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: highlight(body, query => 'run') stems as the index does, with or without stemmer => 'en'.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.highlight.literal
+    against: tin-1.0.4
+    kind: gap
+    captures: [html, html_phrase, ansi]
+    summary: Stannum's highlight() and highlight_ansi() have no stemmer argument.
+    tin: highlight(text, query => 'run', stemmer => 'en') marks running and runs, not Runners.
+    stannum: 42883, no highlight() or highlight_ansi() with a stemmer argument.
+
+  - id: stemming.language.fr
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: A French-stemmed index matches chante and chanté for chanter.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.language.de
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: A German-stemmed index matches Haus, Häuser and Häusern for one another.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  - id: stemming.language.ru
+    against: tin-1.0.4
+    kind: gap
+    captures: [corpus]
+    summary: Stannum has no stemmer index option, so it cannot build the stemmed corpus.
+    tin: A Russian-stemmed index matches кошка, кошки and кошкой for кошку.
+    stannum: 22023 "unrecognized parameter "stemmer"" at CREATE INDEX.
+
+  # ---- TIN 1.0.4: the catalog inventory. The names differ by design.
+
+  - id: inventory.settings.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [script]
+    summary: Stannum's settings are its own (stannum.*), not TIN's debug, build and maintenance settings.
+    tin: >
+      14 settings: build_io_concurrency, eight debug_* calibration settings,
+      enable_custom_scan, index_maintenance_mode, maintenance_jobs_per_db,
+      rss_baseline, track_page_reuse_stats.
+    stannum: >
+      20 settings of its own (build, write buffer, merge, cache, count and
+      expansion limits); enable_custom_scan is the one name both define.
+      TIN's other names are not defined (see catalog.I-07).
+
+  - id: inventory.functions.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [value]
+    summary: Stannum's schema holds other functions and signatures than TIN's.
+    tin: >
+      28 functions, among them fsck, fsm_rebuild, merge, promote, ql_parse,
+      the planner support functions, and stemmer arguments on tokenize(),
+      highlight(), highlight_ansi() and ql_parse(), with their 1.0.3
+      signatures kept as *_v1_0_3.
+    stannum: >
+      The scoring, highlighting, tokenize, ql_parse, score_inspect and
+      segment_info functions without stemmer arguments, highlight() over a
+      bound query, and its own (bind_query, verify_index, wal_rmgr_id and
+      others); no fsck, fsm_rebuild, merge or promote.
+
+  - id: inventory.access_method.1
+    against: tin-1.0.4
+    kind: gap
+    captures: [operators]
+    summary: Stannum defines a second ==> operator, text ==> stannum.indexed_query, for bound queries.
+    tin: One ==> operator, text ==> text.
+    stannum: text ==> text and text ==> stannum.indexed_query.

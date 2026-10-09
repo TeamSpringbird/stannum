@@ -1,0 +1,40 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: inventory
+description: >
+  The engine's SQL surface as the catalogs list it: its settings
+  (pg_settings rows named {engine}.*), the functions in its schema with
+  their identity arguments and result types, its access method and the ==>
+  operator. Recorded so that a new version's added or changed settings and
+  functions show up as a changed answer. An engine whose names or
+  signatures differ answers differently by design; its divergences file
+  says how.
+cases:
+- id: inventory.settings.1
+  description: >
+    Settings named {engine}.*, with setting, unit, context, type, enum values and description, after a call into the
+    engine has loaded its library (an engine that is not preloaded defines its settings only then).
+  source: pg_settings
+  capture:
+  - script:
+      steps:
+      - {sql: "SELECT {engine}.maybe_quote('x')", capture: false}
+      - {sql: "SELECT coalesce(json_agg(json_build_array(name, setting, unit, context, vartype, enumvals, short_desc)
+          ORDER BY name), '[]') FROM pg_settings WHERE name LIKE '{engine}.%'"}
+- id: inventory.functions.1
+  description: Functions in the {engine} schema, with identity arguments, result type and volatility.
+  source: pg_proc
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(p.proname, pg_get_function_identity_arguments(p.oid),
+        pg_get_function_result(p.oid), p.provolatile) ORDER BY p.proname, pg_get_function_identity_arguments(p.oid)),
+        '[]') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = '{engine}'"}
+- id: inventory.access_method.1
+  description: The access method named {engine} and the ==> operators on text.
+  source: pg_am, pg_operator
+  capture:
+  - value: {sql: "SELECT amtype FROM pg_am WHERE amname = '{engine}'", as: amtype}
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(oprleft::regtype::text, oprright::regtype::text,
+        oprresult::regtype::text) ORDER BY oprleft::regtype::text, oprright::regtype::text), '[]') FROM pg_operator
+        WHERE oprname = '==>'", as: operators}
