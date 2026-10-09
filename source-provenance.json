@@ -28,6 +28,38 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },
+    "bench/Cargo.toml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay and kernel benchmarks of the query engine."
+    },
+    "bench/src/areas.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: segment areas for the offline replay's page accounting."
+    },
+    "bench/src/bin/replay.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay's command line and report."
+    },
+    "bench/src/dump.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: reading script/dump-segments.py's dumps for the offline replay."
+    },
+    "bench/src/lib.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay and kernel benchmarks of the query engine."
+    },
+    "bench/src/paged.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a paged, holdable segment source with page-touch accounting for the offline replay."
+    },
+    "bench/src/replay.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay's query execution through the engine crate."
+    },
+    "bench/src/whatif.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: offline measurement of tighter sub-block bounds."
+    },
     "benchmarks/Dockerfile": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -815,6 +847,10 @@
     "script/reference-oracle": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 44ae79a7b960bdace26fbeccf5b34f9d3c6487fe."
+    },
+    "script/replay-oracle.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay's trace conversion and PostgreSQL oracle."
     },
     "script/source_headers.py": {
       "owner": "ben",
