@@ -13,11 +13,16 @@ description: >
   says how.
 cases:
 - id: inventory.settings.1
-  description: Settings named {engine}.*, with setting, unit, context, type, enum values and description.
+  description: >
+    Settings named {engine}.*, with setting, unit, context, type, enum values and description, after a call into the
+    engine has loaded its library (an engine that is not preloaded defines its settings only then).
   source: pg_settings
   capture:
-  - value: {sql: "SELECT coalesce(json_agg(json_build_array(name, setting, unit, context, vartype, enumvals, short_desc)
-        ORDER BY name), '[]') FROM pg_settings WHERE name LIKE '{engine}.%'"}
+  - script:
+      steps:
+      - {sql: "SELECT {engine}.maybe_quote('x')", capture: false}
+      - {sql: "SELECT coalesce(json_agg(json_build_array(name, setting, unit, context, vartype, enumvals, short_desc)
+          ORDER BY name), '[]') FROM pg_settings WHERE name LIKE '{engine}.%'"}
 - id: inventory.functions.1
   description: Functions in the {engine} schema, with identity arguments, result type and volatility.
   source: pg_proc
