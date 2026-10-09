@@ -256,6 +256,50 @@ impl<'d> Engine<'d> {
         Ok((found, exact))
     }
 
+    /// The first `n` matches of `query` in heap order that `skip` does not
+    /// name, dead documents left out: the candidate stream's first rows, read
+    /// as far as needed, as the custom scan reads them.
+    pub fn first_matches(
+        &self,
+        query: &Query,
+        n: usize,
+        skip: &rustc_hash::FxHashSet<Tid>,
+    ) -> Result<Vec<Tid>, String> {
+        let limits = Limits::default();
+        let error = |error: segment::Error| error.to_string();
+        let mut cursors = Vec::new();
+        for segment in &self.segments {
+            let planned = plan(query, segment as &dyn Index, &limits)
+                .map_err(|error| format!("query plan: {error}"))?;
+            if !planned.exact {
+                return Err("the plan needs a recheck".into());
+            }
+            cursors.push((planned.cursor, segment.doc_table().map_err(error)?));
+        }
+        let mut out: Vec<Tid> = Vec::with_capacity(n);
+        while out.len() < n {
+            // The least location any source holds next.
+            let Some(at) = (0..cursors.len())
+                .filter(|&i| cursors[i].0.current().is_some())
+                .min_by_key(|&i| cursors[i].0.current())
+            else {
+                break;
+            };
+            let tid = cursors[at].0.current().expect("checked");
+            let ordinal = cursors[at]
+                .1
+                .ordinal_of(tid)
+                .map_err(error)?
+                .ok_or("a match missing from its document table")?;
+            if !self.dead[at].contains(ordinal) && !skip.contains(&tid) && out.last() != Some(&tid)
+            {
+                out.push(tid);
+            }
+            cursors[at].0.advance().map_err(error)?;
+        }
+        Ok(out)
+    }
+
     /// `SELECT count(*) ... WHERE body ==> text`: the ordinal fold for a
     /// Boolean combination of terms, else the distinct candidates.
     pub fn count(&self, text: &str) -> Result<u64, String> {
@@ -328,14 +372,10 @@ impl<'d> Engine<'d> {
             return Err("k beyond the pruning cap".into());
         }
         if scorer.scores_nothing() && !scorer.walks_unscored() {
-            let (candidates, exact) = self.candidates(&scorer.query)?;
-            if !exact {
-                return Err("the plan needs a recheck".into());
-            }
-            let rows = candidates
-                .iter()
-                .take(k)
-                .map(|(_, _, tid)| (0.0, *tid))
+            let rows = self
+                .first_matches(&scorer.query, k, &rustc_hash::FxHashSet::default())?
+                .into_iter()
+                .map(|tid| (0.0, tid))
                 .collect();
             return Ok(RankedAnswer {
                 rows,
@@ -353,19 +393,9 @@ impl<'d> Engine<'d> {
         let mut path = Path::Walk;
         if top.zero_fill {
             path = Path::ZeroFill;
-            let (candidates, exact) = self.candidates(&scorer.query)?;
-            if !exact {
-                return Err("the plan needs a recheck".into());
-            }
             let positive: rustc_hash::FxHashSet<Tid> = top.rows.iter().map(|(_, t)| *t).collect();
-            for (_, _, tid) in candidates {
-                if top.rows.len() >= k {
-                    break;
-                }
-                if !positive.contains(&tid) {
-                    top.rows.push((0.0, tid));
-                }
-            }
+            let rest = self.first_matches(&scorer.query, k - top.rows.len(), &positive)?;
+            top.rows.extend(rest.into_iter().map(|tid| (0.0, tid)));
         }
         Ok(RankedAnswer {
             rows: top.rows,
