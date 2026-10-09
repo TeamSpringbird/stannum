@@ -20,14 +20,26 @@ mod operator;
 pub(crate) mod options;
 mod query_limits;
 mod score;
+mod score_binding;
 mod selectivity;
 mod storage;
 mod stream;
 mod udfs;
 
+/// `==> ANY(...)` bound to the index (see the module).
+mod array_search;
+
 /// Stannum against TIN 1.0.3's recorded answers (see the module).
 #[cfg(feature = "pg_test")]
 mod tin_conformance;
+
+/// Stemming against TIN 1.0.4's recorded answers (see the module).
+#[cfg(feature = "pg_test")]
+mod tin_stemming;
+
+/// Which `==>` clauses bind scoring and highlighting (see the module).
+#[cfg(feature = "pg_test")]
+mod binding_tests;
 
 /// The query front end's stack backstop (`tinql::limits::set_stack_check`):
 /// PostgreSQL's `check_stack_depth`, whose ERROR pgrx turns into a panic that
@@ -785,7 +797,261 @@ mod tests {
         assert_eq!(inspect("a AND NOT (b OR c)"), ["a:1"]);
         assert_eq!(inspect("a OR (b AND NOT c)"), ["a:1", "b:1"]);
         assert_eq!(inspect("* AND NOT c"), Vec::<String>::new());
-        assert_eq!(inspect("a NOT OVERLAPPING b"), ["a:1", "b:1"]);
+    }
+
+    /// Lead e3ed2f4 (TIN's fixes, b8018ac): a span weighs each written
+    /// occurrence of a word, a boost on an operand weighs that operand
+    /// alone, and the excluded side of a negated relation only filters.
+    #[pg_test]
+    fn span_leaves_weigh_per_occurrence_and_excluded_sides_add_nothing() {
+        Spi::run(
+            "CREATE TABLE sw(id int primary key, body text);
+             INSERT INTO sw VALUES (1, 'to be or not to be'), (2, 'ipa so hoppy'),
+               (3, 'a b'), (4, 'stout ale');
+             INSERT INTO sw SELECT 100 + n, 'pad' || n FROM generate_series(1, 20) n;
+             CREATE INDEX sw_idx ON sw USING stannum(body);",
+        )
+        .unwrap();
+        let inspect = |query: &str| -> Vec<String> {
+            Spi::get_one::<Vec<String>>(&format!(
+                "SELECT array_agg(term || ':' || weight ORDER BY term) FROM stannum.score_inspect('sw_idx', '{query}', 1.0)"
+            ))
+            .unwrap()
+            .unwrap_or_default()
+        };
+        assert_eq!(
+            inspect("\"to be or not to be\"^2"),
+            ["be:4", "not:2", "or:2", "to:4"]
+        );
+        assert_eq!(inspect("ipa^3 NEAR/5 hoppy"), ["hoppy:1", "ipa:3"]);
+        assert_eq!(inspect("(ipa NEAR/5 hoppy)^3"), ["hoppy:3", "ipa:3"]);
+        assert_eq!(inspect("a NOT OVERLAPPING b"), ["a:1"]);
+        assert_eq!(
+            inspect("(ipa^2 NEAR/3 hoppy) NOT ENCLOSES stout^5"),
+            ["hoppy:1", "ipa:2"]
+        );
+        assert_eq!(inspect("ale NOT ENCLOSED BY \"stout ale\""), ["ale:1"]);
+        // A term on both sides still scores through its included occurrence.
+        assert_eq!(inspect("(a NEAR/1 b) NOT OVERLAPPING b"), ["a:1", "b:1"]);
+        // Scores follow the weights: the excluded side adds nothing.
+        let score = |query: &str| -> f32 {
+            Spi::get_one::<f32>(&format!(
+                "SELECT stannum.full_score(ctid) FROM sw WHERE body ==> '{query}' AND id = 3"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(
+            score("a NOT OVERLAPPING stout").to_bits(),
+            score("a").to_bits()
+        );
+    }
+
+    /// Lead e3ed2f4 (TIN's boldi-vigna fix, b8018ac): a NEAR operand that is
+    /// an OR group may share a word with the other operand; each operand
+    /// takes its own occurrence. The same rows on the index and on the heap.
+    #[pg_test]
+    fn near_slots_sharing_a_word_pair_distinct_occurrences() {
+        Spi::run(
+            "CREATE TABLE ns(id int primary key, body text);
+             INSERT INTO ns VALUES (1, 'alpha the alpha'), (2, 'alpha of alpha'),
+               (3, 'bravo alpha'), (4, 'alpha'), (5, 'a a a a'), (6, 'alpha beta');
+             INSERT INTO ns SELECT 100 + n, 'pad' || n FROM generate_series(1, 20) n;
+             CREATE INDEX ns_idx ON ns USING stannum(body);",
+        )
+        .unwrap();
+        for (scan, index) in [("index", "on"), ("heap", "off")] {
+            let heap = if index == "on" { "off" } else { "on" };
+            Spi::run(&format!(
+                "SET enable_seqscan = {heap}; SET enable_indexscan = {index};
+                 SET enable_bitmapscan = {index}; SET stannum.enable_custom_scan = {index}"
+            ))
+            .unwrap();
+            let ids = |query: &str| -> Vec<i32> {
+                Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT coalesce(array_agg(id ORDER BY id), '{{}}') FROM ns WHERE body ==> '{query}'"
+                ))
+                .unwrap()
+                .unwrap()
+            };
+            assert_eq!(ids("(alpha OR bravo) NEAR/3 alpha"), [1, 2, 3], "{scan}");
+            assert_eq!(ids("alpha NEAR/3 alpha"), [1, 2], "{scan}");
+            assert_eq!(
+                ids("(alpha OR bravo) NEAR/2 (alpha OR charlie)"),
+                [1, 2, 3],
+                "{scan}"
+            );
+            assert_eq!(ids("\"a a\" NEAR/0 \"a a\""), [5], "{scan}");
+            assert_eq!(ids("alpha NEAR/0 [alpha beta]"), [6], "{scan}");
+        }
+        Spi::run(
+            "RESET enable_seqscan; RESET enable_indexscan; RESET enable_bitmapscan;
+             RESET stannum.enable_custom_scan",
+        )
+        .unwrap();
+    }
+
+    // Lead a03e682 ("Support stemming for `body ==> ANY(...)`"): an array
+    // search analyzes each element with the index's tokenizer, on every path.
+    fn any_ids(sql: &str) -> Vec<i32> {
+        Spi::get_one::<Vec<i32>>(sql).unwrap().unwrap_or_default()
+    }
+
+    #[pg_test]
+    fn any_searches_bind_the_index_analysis() {
+        Spi::run(
+            "CREATE TABLE stem_any (id int, body text);
+             INSERT INTO stem_any VALUES
+               (1, 'molded'), (2, 'wines'), (3, 'moldy'), (4, 'beer');
+             CREATE INDEX stem_any_idx ON stem_any USING stannum (body)
+               WITH (stemmer = 'en');",
+        )
+        .unwrap();
+        for setting in ["on", "off"] {
+            Spi::run(&format!("SET LOCAL enable_seqscan = {setting}")).unwrap();
+            for (array, expected) in [
+                ("ARRAY['mold']", vec![1]),
+                ("ARRAY['mold', NULL, 'wine']", vec![1, 2]),
+                ("'{mold,beers}'", vec![1, 4]),
+                ("ARRAY[]::text[]", vec![]),
+            ] {
+                assert_eq!(
+                    any_ids(&format!(
+                        "SELECT array_agg(id ORDER BY id) FROM stem_any
+                         WHERE body ==> ANY({array})"
+                    )),
+                    expected,
+                    "{array}, enable_seqscan = {setting}"
+                );
+            }
+        }
+        assert_eq!(
+            Spi::get_one::<bool>("SELECT body ==> ANY(ARRAY['mold']) FROM stem_any WHERE id = 1")
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            any_ids(
+                "SELECT array_agg(id ORDER BY id) FROM stem_any
+                 WHERE body ==> ANY(ARRAY['mold']) OR body ==> 'wine'"
+            ),
+            vec![1, 2]
+        );
+        assert_eq!(
+            any_ids(
+                "SELECT array_agg(id ORDER BY id) FROM stem_any
+                 WHERE body ==> ALL(ARRAY['mold', 'molds'])"
+            ),
+            vec![1]
+        );
+    }
+
+    #[pg_test]
+    fn any_searches_stay_correct_in_cached_plans() {
+        Spi::run(
+            "CREATE TABLE stem_any_cached (id int, body text);
+             INSERT INTO stem_any_cached VALUES (1, 'molded'), (2, 'wines');
+             CREATE INDEX stem_any_cached_idx ON stem_any_cached USING stannum (body)
+               WITH (stemmer = 'en');
+             PREPARE stem_any_array(text[]) AS
+               SELECT array_agg(id ORDER BY id) FROM stem_any_cached
+               WHERE body ==> ANY($1);
+             PREPARE stem_any_const AS
+               SELECT array_agg(id ORDER BY id) FROM stem_any_cached
+               WHERE body ==> ANY(ARRAY['mold']);",
+        )
+        .unwrap();
+        for mode in ["force_generic_plan", "force_custom_plan"] {
+            Spi::run(&format!("SET LOCAL plan_cache_mode = {mode}")).unwrap();
+            for _ in 0..7 {
+                assert_eq!(
+                    any_ids("EXECUTE stem_any_array(ARRAY['mold', 'wine'])"),
+                    vec![1, 2],
+                    "{mode}"
+                );
+                assert_eq!(any_ids("EXECUTE stem_any_const"), vec![1], "{mode}");
+            }
+        }
+        Spi::run(
+            "ALTER INDEX stem_any_cached_idx RESET (stemmer);
+             REINDEX INDEX stem_any_cached_idx;",
+        )
+        .unwrap();
+        assert!(any_ids("EXECUTE stem_any_const").is_empty());
+        assert!(any_ids("EXECUTE stem_any_array(ARRAY['mold'])").is_empty());
+    }
+
+    #[pg_test]
+    fn any_searches_bind_expression_partitioned_and_join_indexes() {
+        Spi::run(
+            "CREATE TABLE stem_any_expr (id int, body text);
+             INSERT INTO stem_any_expr VALUES (1, 'Molded'), (2, 'beer');
+             CREATE INDEX ON stem_any_expr USING stannum ((lower(body)))
+               WITH (stemmer = 'en');
+             CREATE TABLE stem_any_parts (part int, id int, body text)
+               PARTITION BY LIST (part);
+             CREATE TABLE stem_any_part1 PARTITION OF stem_any_parts FOR VALUES IN (1);
+             CREATE TABLE stem_any_part2 PARTITION OF stem_any_parts FOR VALUES IN (2);
+             INSERT INTO stem_any_parts VALUES
+               (1, 4, 'molded'), (2, 5, 'molds'), (2, 6, 'beer');
+             CREATE INDEX ON stem_any_parts USING stannum (body) WITH (stemmer = 'en');
+             CREATE TABLE stem_any_join (id int, body text);
+             INSERT INTO stem_any_join VALUES (1, 'molded'), (2, 'beer');
+             CREATE INDEX ON stem_any_join USING stannum (body) WITH (stemmer = 'en');
+             CREATE TABLE stem_any_probe (id int, word text);
+             INSERT INTO stem_any_probe VALUES (1, 'mold'), (2, 'wine');",
+        )
+        .unwrap();
+        assert_eq!(
+            any_ids(
+                "SELECT array_agg(id ORDER BY id) FROM stem_any_expr
+                 WHERE lower(body) ==> ANY(ARRAY['mold'])"
+            ),
+            vec![1]
+        );
+        assert!(
+            any_ids(
+                "SELECT array_agg(id ORDER BY id) FROM stem_any_expr
+                 WHERE body ==> ANY(ARRAY['molds'])"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            any_ids(
+                "SELECT array_agg(id ORDER BY id) FROM stem_any_parts
+                 WHERE body ==> ANY(ARRAY['mold'])"
+            ),
+            vec![4, 5]
+        );
+        assert_eq!(
+            any_ids(
+                "SELECT array_agg(p.id ORDER BY p.id)
+                 FROM stem_any_probe p JOIN stem_any_join j
+                   ON j.body ==> ANY(ARRAY[p.word])"
+            ),
+            vec![1]
+        );
+        assert_eq!(
+            any_ids(
+                "SELECT array_agg(j.id ORDER BY j.id)
+                 FROM stem_any_probe p LEFT JOIN stem_any_join j
+                   ON j.body ==> ANY(ARRAY['mold']) AND j.id = p.id
+                 WHERE j.id IS NOT NULL"
+            ),
+            vec![1]
+        );
+        // The same searches written without ANY, for comparison.
+        assert_eq!(
+            any_ids("SELECT array_agg(id ORDER BY id) FROM stem_any_parts WHERE body ==> 'mold'"),
+            vec![4, 5]
+        );
+        assert_eq!(
+            any_ids(
+                "SELECT array_agg(p.id ORDER BY p.id)
+                 FROM stem_any_probe p JOIN stem_any_join j ON j.body ==> p.word"
+            ),
+            vec![1]
+        );
     }
 
     #[pg_test]

@@ -16,6 +16,7 @@ pub struct TokenizerPipelineSpec {
     pub long_tokens: LongTokenSpec,
     pub graphemes: GraphemeMode,
     pub position_gaps: PositionGapMode,
+    pub stemmer: Option<crate::Stemmer>,
 }
 
 impl Default for TokenizerPipelineSpec {
@@ -36,6 +37,7 @@ impl TokenizerPipelineSpec {
             },
             graphemes: GraphemeMode::Emoji,
             position_gaps: PositionGapMode::Preserve,
+            stemmer: None,
         }
     }
 
@@ -53,10 +55,14 @@ impl TokenizerPipelineSpec {
             },
             graphemes: GraphemeMode::Discard,
             position_gaps: PositionGapMode::Collapse,
+            stemmer: None,
         }
     }
 
     pub fn validate(self) -> Result<(), TokenizerPipelineSpecError> {
+        if self.stemmer.is_some() && self.case_folding == Folding::Preserve {
+            return Err(TokenizerPipelineSpecError::StemmerRequiresCaseFolding);
+        }
         if self.long_tokens.max_bytes < MIN_TOKEN_BYTES {
             return Err(TokenizerPipelineSpecError::MaxTokenBytesTooSmall);
         }
@@ -109,6 +115,10 @@ pub enum PositionGapMode {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenizerPipelineSpecError {
+    #[error("stemming requires case_folding = fold")]
+    StemmerRequiresCaseFolding,
+    #[error("unknown stemmer language code: {0}")]
+    UnknownStemmer(String),
     #[error("max_token_bytes must be at least {MIN_TOKEN_BYTES}")]
     MaxTokenBytesTooSmall,
 }
@@ -131,6 +141,7 @@ mod tests {
                 },
                 graphemes: GraphemeMode::Emoji,
                 position_gaps: PositionGapMode::Preserve,
+                stemmer: None,
             }
         );
     }
@@ -159,6 +170,7 @@ mod tests {
                 },
                 graphemes: GraphemeMode::Discard,
                 position_gaps: PositionGapMode::Collapse,
+                stemmer: None,
             }
         );
     }

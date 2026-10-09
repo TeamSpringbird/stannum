@@ -234,8 +234,9 @@ pub fn inputs_of(owned: &[(String, f32, bool)]) -> impl Iterator<Item = ScoringT
         })
 }
 
-/// Boolean NOT contributes nothing to scoring; negative span relations keep
-/// both sides. Wildcards, regexes, ranges and fuzzy terms score every term
+/// Boolean NOT contributes nothing to scoring, nor does the excluded side of
+/// a negative span relation. A span weighs each written occurrence of a
+/// term, times the boosts written on that operand. Wildcards, regexes, ranges and fuzzy terms score every term
 /// they expand to with the node's boost.
 pub fn collect_score_terms<'a>(
     query: &'a Query,
@@ -277,10 +278,18 @@ pub fn collect_score_terms<'a>(
             out.expansions
                 .push((Expansion::Range(lower, upper), boost, explicitly_boosted))
         }
-        Query::Span { term_slots, .. } | Query::SpanExpr { term_slots, .. } => {
-            for slot in term_slots {
+        Query::Span { .. } | Query::SpanExpr { .. } => {
+            // Each written occurrence outside an excluded side, weighted by
+            // the boost written on it (Lead e3ed2f4, from TIN).
+            query.for_each_positive_span_slot(&mut |_, slot, leaf_boost| {
+                let boost = boost * leaf_boost.unwrap_or(1.0);
+                let explicitly_boosted = explicitly_boosted || leaf_boost.is_some();
                 match slot {
-                    SpanTermSlot::Term(text) => push(text),
+                    SpanTermSlot::Term(text) => out.terms.push(ScoringTermInput {
+                        text,
+                        boost,
+                        explicitly_boosted,
+                    }),
                     SpanTermSlot::Regex(regex) => {
                         out.expansions
                             .push((Expansion::Regex(regex), boost, explicitly_boosted))
@@ -304,7 +313,7 @@ pub fn collect_score_terms<'a>(
                         explicitly_boosted,
                     )),
                 }
-            }
+            });
         }
         Query::And(left, right) | Query::Or(left, right) => {
             collect_score_terms(left, boost, explicitly_boosted, out);

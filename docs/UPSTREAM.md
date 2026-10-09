@@ -34,6 +34,26 @@ PR #10 (unlocked fold construction) was still open at audit time. It can
 update from the attribution change once; any new source files need provenance
 entries and headers. Do not hold this migration indefinitely for that work.
 
+## October 2026: Lead `bd95c7e..e3ed2f4`
+
+Lead was synced to
+[`e3ed2f4ce1388167b0254a0c0c706a61d0a37d83`](https://github.com/planetscale/lead/commit/e3ed2f4ce1388167b0254a0c0c706a61d0a37d83)
+(2026-10-07), the reference oracle's new `LEAD_REF`. Lead's commits of
+2026-10-06/07 copy fixes from PlanetScale's TIN, so they show TIN's current
+behavior; TIN 1.0.4's recorded answers (`conformance/expected/tin-1.0.4`)
+were checked as well.
+
+| Upstream commit | Disposition |
+| --- | --- |
+| [b8018ac](https://github.com/planetscale/lead/commit/b8018ac35a1b5328e7bdb472b7fe9316e7a5bad9) / 56dff87 | Ported. boldi-vigna's NEAR over OR-group operands sharing a word (each operand its own occurrence) and the tinql changes imported; span scoring per written occurrence with operand boosts, the excluded side of a negated relation unscored. Lead's crate tests plus two pg_tests (index and heap paths). Both changes differ from TIN 1.0.3/1.0.4 (`catalog.S-11`, `span.minimal_interval.4`–`.6`, declared `newer`); Lead e3ed2f4 answers as Stannum. |
+| [615e9ce](https://github.com/planetscale/lead/commit/615e9ce) / 77f1365 | Already equivalent: segments and the write buffer never record a token-less document (`catalog.S-21`). |
+| [623174d](https://github.com/planetscale/lead/commit/623174d) | Ported: the `stemmer` option and stemmer arguments; see [stemming](compatibility.md#stemming). The stemmer is persisted with the tokenizer settings, so a changed stemmer applies at `REINDEX` (TIN applies it to queries at once). |
+| [a03e682](https://github.com/planetscale/lead/commit/a03e682) | Ported (semantics): `==> ANY(...)`/`ALL(...)` bind to the index's tokenizer from the `get_relation_info` hook, with Lead's tests adapted. Lead's refusal of partitions with differing tokenization was not ported. |
+| [a22cd04](https://github.com/planetscale/lead/commit/a22cd04) | Not ported, for the owner to decide: Lead refuses queries over 2,048 bytes or nested deeper than 64 brackets with SQLSTATE 54000. TIN 1.0.4 answers both (`query_size.or_chain.1000`, `nested.100`, `nested.1000`); Stannum keeps its 10,000-term and 1,000-level limits (54001). |
+| [01d5d6c](https://github.com/planetscale/lead/commit/01d5d6c), [50f8c04](https://github.com/planetscale/lead/commit/50f8c04), [798e58a](https://github.com/planetscale/lead/commit/798e58a), [03c54f5](https://github.com/planetscale/lead/commit/03c54f5), [ca05758](https://github.com/planetscale/lead/commit/ca05758), [11beb68](https://github.com/planetscale/lead/commit/11beb68) | Ported where Stannum differed: parameters and several clauses score and highlight as one ORed query, each text parsed on its own; clauses under `NOT` or on other relations do not bind; inner-join ON search texts score per row; a row no search admits scores NULL; an unproved partial index refuses scoring (0A000). Column sums were already equivalent (`catalog.S-18`). Deferred: `max_score()` over several columns, Lead's index choice, outer-join ON clauses. See [which clauses score](compatibility.md#what-matches-tin-103). |
+| [1abf236](https://github.com/planetscale/lead/commit/1abf236) | Not imported: an explanation for stale installed SQL; Stannum has no released upgrade path yet. |
+| 9c5b8b9, 6117578, 7308d8f, 06cdfa4 | Not imported: Lead's version bump, Docker image and CI. |
+
 For future updates, fetch Lead, pin its SHA, and enumerate commits after the
 last reviewed revision. Record whether each patch is ported, already covered
 by tested Stannum behavior, intentionally divergent, or pending. A cherry-pick
