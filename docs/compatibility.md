@@ -27,10 +27,10 @@ SKIP is a case without a recorded answer):
 
 | Status | TIN 1.0.3 | TIN 1.0.4 | Meaning |
 | --- | ---: | ---: | --- |
-| PASS | 184 | 218 | Every capture equals TIN's answer |
+| PASS | 185 | 219 | Every capture equals TIN's answer |
 | DIFF | 13 | 13 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
 | IMPROVED | 5 | 5 | TIN refuses the query with an ERROR; Stannum answers it |
-| GAP | 7 | 11 | Stannum lacks what the case exercises, or answers it differently |
+| GAP | 6 | 10 | Stannum lacks what the case exercises, or answers it differently |
 | LIMITED | 3 | 2 | Stannum refuses with a limit ERROR where TIN answers |
 | NEWER | 4 | 4 | Stannum follows a later TIN change that Lead has copied |
 | SKIP | 42 | 5 | |
@@ -109,7 +109,7 @@ the last two possible.
 
 | Case | Difference |
 | --- | --- |
-| `catalog.S-07` | `stannum.promote()` folds a write buffer of any size, so after it a term in every row is elided by `score()`; TIN's `promote()` consumes only a sealed write segment and leaves a 20-row buffer mutable, where elision does not count it. |
+| `catalog.S-07b`–`S-07g` | `segment_info()` lists Stannum's own root pages and page counts and a `generation` column; TIN's build writes 200 short rows as two segments where Stannum's writes one, and `promote(index, 1)` splits a sealed segment into as many as Stannum's directory has room for rather than TIN's 68. Sealing, `promote()`'s rows and elision match. |
 
 ## Other known differences
 
