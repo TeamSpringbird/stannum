@@ -236,9 +236,17 @@ footers it decodes between queries (`Segment::resolve_memo`,
   word where every one is a grid, else from the term with the fewest
   members there, a grid by bit and a decoded list by a merge, stopping once
   nothing is left. Each candidate is then bounded by the footer blocks it
-  falls in (a window per run of slots no block boundary crosses), by its
-  length against the window's largest buckets (one division:
-  `TermScorer::length_bound_parts`), and only then scored.
+  falls in (a window per run of slots no block boundary crosses), then by
+  its buckets: each term's bucket from the TF tail, scored at the shortest
+  length its block holds for that bucket or more (the frontier's pairs at
+  or above it), so the DL sidecar is read only for a candidate this leaves
+  in reach, and the score is exact from the buckets and the length. (A
+  required term carrying its lengths inline is read first instead, with a
+  bound by its length against the window's largest buckets,
+  `TermScorer::length_bound_parts`.) At 150 million rows the bucket bound
+  rules out two in three of the candidates the length bound let through,
+  and 11% (conjunction), 20% (disjunction) and 3 to 5% (phrase) of the
+  pages a query pins; CPU is unchanged where a page touch is a memory read.
 - A phrase reads positions only for a candidate that would enter the top
   k. Until the top k fill every match does, so its positions are checked
   first; after, a group's candidates that score into the top k wait and
@@ -249,12 +257,18 @@ footers it decodes between queries (`Segment::resolve_memo`,
 - Any other query is block-max MaxScore over its scoring terms, a group at
   a time. Each term present in the group becomes a row of words (a grid
   copied, a list decoded into bits; a posting's index is a popcount over
-  its row). Each 1,024-slot sub-range is bounded by its terms' blocks and,
+  its row). The group is first planned at its own bounds: its required
+  and essential terms' rows are read and combined into a mask (a document
+  holding none of the essential terms cannot reach the threshold anywhere
+  in the group), a group whose mask is empty reads no other row, and a
+  sub-range whose mask is empty is skipped. Each other 1,024-slot
+  sub-range is bounded by its terms' blocks and,
   unless pruned, planned as `STN3` plans a sub-block: terms without which
   the others cannot reach the threshold are ANDed, the essential ones ORed,
   the rest weighed bit-parallel (`LaneSums`, six slices), term by term over
   the sub-range's 16 words so the lane sums vectorize. A candidate is then
-  bounded by its terms' blocks, by its length, and scored.
+  bounded by its terms' blocks, then by its buckets as above, and scored
+  exactly once its length is read.
 - Candidates come in ctid order, so one that only ties the threshold ranks
   after the k-th row and is skipped like a lower one; every bound is
   compared with a relative margin (`1e-5`) far above `f32` rounding.
