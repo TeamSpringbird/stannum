@@ -1,0 +1,118 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: tiebreak
+description: >
+  Ranked queries with secondary sort keys after the score, `ORDER BY
+  {engine}.score(ctid) DESC, other_col ... LIMIT k`, which PlanetScale's
+  SQL-shapes reference documents ("the extra keys only matter where scores
+  tie") and the TIN v1.0.6 announcement says now use the same top-k plan as
+  plain score ordering. The corpus has groups of rows with equal scores
+  (identical bodies), so the LIMIT cuts through a tie group and the
+  tiebreaker decides which rows make the top k. Every capture lists ids and
+  float4 score bits in the returned order.
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  tb:
+    columns: id int PRIMARY KEY, body text, created int, grp int
+    # 12 rows 'w', 8 rows 'w w', 6 rows 'w w w x', 4 rows 'w x': created is
+    # (id * 7) % 11, NULL for every fifth id; grp is id % 3. pad keeps w and
+    # x below the 10% dense-term threshold.
+    pad: 300
+    setup_sql:
+    - "INSERT INTO {table} (id, body) SELECT n, CASE WHEN n <= 12 THEN 'w' WHEN n <= 20 THEN 'w w' WHEN n <= 26 THEN
+      'w w w x' ELSE 'w x' END FROM generate_series(1, 30) n"
+    - "UPDATE {table} SET created = CASE WHEN id % 5 = 0 THEN NULL ELSE (id * 7) % 11 END, grp = id % 3"
+cases:
+- id: tiebreak.created_desc.1
+  description: score DESC, created DESC, id; LIMIT 15 cuts through the 12-row tie group of 'w'.
+  source: reference/sql-shapes (tiebreakers); blog tin-v106
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(id, encode(float4send(s), 'hex'))), '[]') FROM (SELECT id,
+        {engine}.score(ctid) s FROM {table} WHERE body ==> 'w' ORDER BY {engine}.score(ctid) DESC, created DESC, id
+        LIMIT 15) top", as: score}
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(id, encode(float4send(s), 'hex'))), '[]') FROM (SELECT id,
+        {engine}.full_score(ctid) s FROM {table} WHERE body ==> 'w' ORDER BY {engine}.full_score(ctid) DESC, created
+        DESC, id LIMIT 15) top", as: full_score}
+- id: tiebreak.created_desc.no_limit
+  description: The ordering of tiebreak.created_desc.1 without LIMIT, so the top-k can be compared with its head.
+  source: reference/sql-shapes (tiebreakers)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(id, encode(float4send(s), 'hex'))), '[]') FROM (SELECT id,
+        {engine}.score(ctid) s FROM {table} WHERE body ==> 'w' ORDER BY {engine}.score(ctid) DESC, created DESC, id)
+        top"}
+- id: tiebreak.nulls.1
+  description: A nullable tiebreaker, created DESC NULLS LAST and created ASC NULLS FIRST.
+  source: reference/sql-shapes (tiebreakers)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'w' ORDER BY
+        {engine}.score(ctid) DESC, created DESC NULLS LAST, id LIMIT 15) top", as: desc_nulls_last}
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'w' ORDER BY
+        {engine}.score(ctid) DESC, created ASC NULLS FIRST, id LIMIT 15) top", as: asc_nulls_first}
+- id: tiebreak.id_desc.1
+  description: id DESC as the only tiebreaker, LIMIT 3 inside the top tie group (w w w x).
+  source: reference/sql-shapes (tiebreakers)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'w' ORDER BY
+        {engine}.score(ctid) DESC, id DESC LIMIT 3) top"}
+- id: tiebreak.alias.1
+  description: The score selected under an alias and ordered by the alias, then created and id.
+  source: reference/sql-shapes (ORDER BY score DESC, created_at DESC, id)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id, {engine}.score(ctid) AS score FROM {table}
+        WHERE body ==> 'w' ORDER BY score DESC, created DESC, id LIMIT 10) top"}
+- id: tiebreak.expression.1
+  description: An expression tiebreaker, length(body) DESC then id.
+  source: reference/sql-shapes (tiebreakers)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'w OR x' ORDER BY
+        {engine}.score(ctid) DESC, length(body) DESC, id LIMIT 12) top"}
+- id: tiebreak.filter.1
+  description: A tiebreaker with a filter on another column (grp = 1) and with an id range (id <= 22).
+  source: reference/sql-shapes (filters combined with search)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'w' AND grp = 1 ORDER
+        BY {engine}.score(ctid) DESC, created DESC, id LIMIT 6) top", as: grp}
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'w' AND id <= 22 ORDER
+        BY {engine}.score(ctid) DESC, created, id LIMIT 6) top", as: id_range}
+- id: tiebreak.offset.1
+  description: Paging with OFFSET through a tie group, created DESC, id.
+  source: reference/sql-shapes (tiebreakers)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'w' ORDER BY
+        {engine}.score(ctid) DESC, created DESC, id LIMIT 5 OFFSET 12) top"}
+- id: tiebreak.dense.1
+  description: >
+    A query term in every matching row and in more than 10% of the documents scores 0 under score(), so the
+    tiebreaker alone orders the rows; full_score() for comparison.
+  source: reference/sql-shapes (tiebreakers); scoring (dense-term elision)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(id, encode(float4send(s), 'hex'))), '[]') FROM (SELECT id,
+        {engine}.score(ctid, dense_ratio => 0.05) s FROM {table} WHERE body ==> 'w' ORDER BY {engine}.score(ctid,
+        dense_ratio => 0.05) DESC, created DESC, id LIMIT 8) top", as: score_dense_005}
+- id: tiebreak.ascending.1
+  description: score ASC (the bottom of the ranking) with a tiebreaker.
+  source: reference/sql-shapes
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'w' ORDER BY
+        {engine}.score(ctid) ASC, created DESC, id LIMIT 5) top"}
+- id: tiebreak.lateral.1
+  description: A tiebreaker inside a LATERAL top-2 per group.
+  source: reference/sql-shapes (LATERAL)
+  corpus: tb
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(g, ids) ORDER BY g), '[]') FROM generate_series(0, 2) g,
+        LATERAL (SELECT json_agg(id) ids FROM (SELECT id FROM {table} WHERE body ==> 'w' AND grp = g ORDER BY
+        {engine}.score(ctid) DESC, created DESC, id LIMIT 2) s) top"}

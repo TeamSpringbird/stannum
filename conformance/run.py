@@ -7,7 +7,7 @@
 
     python3 conformance/run.py --engine tin|stannum [--dsn-env NAME]
         [--record OUTDIR | --check EXPECTED_DIR] [--area A] [--case ID]
-        [--skip-crash] [--host-note TEXT]
+        [--exclude ID] [--skip-crash] [--host-note TEXT]
 
 The connection string is read from the environment variable named by
 --dsn-env (default CONFORMANCE_DSN), never from the command line. Every run
@@ -34,7 +34,7 @@ try:
 except ImportError as error:  # pragma: no cover - environment guidance
     sys.exit(f"{error}; install the dependencies with: pip install -r benchmarks/requirements.txt")
 
-RUNNER_VERSION = "2"
+RUNNER_VERSION = "3"
 SUITE = Path(__file__).resolve().parent
 CAPTURES = ("ids", "count", "ranked", "scores", "highlight", "value", "error", "script", "cancel")
 PAD_ROWS_START = 1000
@@ -147,20 +147,29 @@ def normalize_capture(case_id, item):
     return params
 
 
-def selected(cases, areas, patterns):
+def selected(cases, areas, patterns, excluded=()):
     chosen = []
     for case in cases:
         if areas and case["area"] not in areas:
             continue
         if patterns and not any(fnmatch.fnmatchcase(case["id"], p) for p in patterns):
             continue
+        if any(fnmatch.fnmatchcase(case["id"], p) for p in excluded):
+            continue
         chosen.append(case)
     return chosen
 
 
 def crash_tagged(case, engine, version):
+    """Tagged as crashing this engine version (or every version of the engine)."""
     tags = case.get("crashes") or []
     return engine in tags or f"{engine}-{version}" in tags
+
+
+def crash_tagged_any_version(case, engine):
+    """Tagged as crashing some version of the engine: a newer version is not
+    known to be fixed until someone runs the case on a server they may restart."""
+    return any(tag == engine or tag.startswith(f"{engine}-") for tag in case.get("crashes") or [])
 
 
 # ---------------------------------------------------------------- SQL
@@ -701,7 +710,8 @@ def read_divergences(engine, recorded):
             sys.exit(f"{path}: {entry.get('id')}: kind must be one of {', '.join(DIVERGENCE_KINDS)}")
         if not entry.get("captures"):
             sys.exit(f"{path}: {entry.get('id')}: list the captures that diverge")
-        if entry.get("against") == recorded:
+        against = entry.get("against")
+        if recorded in (against if isinstance(against, list) else [against]):
             chosen[entry["id"]] = entry
     return chosen
 
@@ -736,8 +746,16 @@ def limited(recorded, answer):
 def compare_divergent(case, want, got, entry):
     """Checks a documented divergence: exactly the listed captures differ, and
     for an improvement each is one the recorded engine refused and this one
-    answered. Anything else fails, so the file cannot hide a regression."""
+    answered. A gap listing `corpus` says this engine cannot build the case's
+    corpus (for example an index option it lacks) where the recorded engine
+    could. Anything else fails, so the file cannot hide a regression."""
     listed = set(entry["captures"])
+    if listed == {"corpus"}:
+        if entry["kind"] != "gap":
+            return "FAIL", "only a gap may list the corpus"
+        if "corpus_error" in got and "corpus_error" not in want:
+            return "GAP", entry["summary"]
+        return "FAIL", "documented divergence no longer holds for corpus; update divergences/"
     captures = {capture["as"]: capture for capture in case["capture"]}
     unknown = listed - set(captures)
     if unknown:
@@ -821,8 +839,10 @@ def main():
     mode.add_argument("--check", metavar="EXPECTED_DIR", help="compare answers with a recorded directory")
     parser.add_argument("--area", action="append", default=[], help="only this area (repeatable)")
     parser.add_argument("--case", action="append", default=[], help="only this case id or glob (repeatable)")
+    parser.add_argument("--exclude", action="append", default=[],
+                        help="skip this case id or glob (repeatable); excluded cases are not run or reported")
     parser.add_argument("--skip-crash", action="store_true",
-                        help="skip cases tagged as crashing the engine under test")
+                        help="skip cases tagged as crashing any version of the engine under test")
     parser.add_argument("--host-note", default="", help="free-text host description for the source header")
     parser.add_argument("--timings", action="store_true",
                         help="print each capture's elapsed time (never recorded)")
@@ -836,7 +856,7 @@ def main():
         corpora, all_cases = load_cases(Path(args.cases_dir))
     except CaseError as error:
         sys.exit(f"invalid case file: {error}")
-    cases = selected(all_cases, set(args.area), args.case)
+    cases = selected(all_cases, set(args.area), args.case, args.exclude)
     if not cases:
         sys.exit("no case matches the --area/--case filters")
 
@@ -870,8 +890,9 @@ def main():
     print()
     try:
         def skip_reason(case):
-            if crash_tagged(case, args.engine, version) and args.skip_crash:
-                return f"tagged crashes: {args.engine}-{version}"
+            if args.skip_crash and crash_tagged_any_version(case, args.engine):
+                return "tagged crashes: " + ", ".join(
+                    tag for tag in case["crashes"] if tag == args.engine or tag.startswith(f"{args.engine}-"))
             if args.check and case["id"] not in expected:
                 return "no expectation recorded"
             return None
