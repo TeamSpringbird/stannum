@@ -669,8 +669,13 @@ impl<S: Source> Reader<S> {
         let area = self.area_of(offset);
         crate::cache::note_read(area, len);
         let before = crate::cache::disk_pages();
+        let touched = crate::cache::touches();
         let bytes = self.source.read(offset, len)?;
         crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        crate::cache::note_touches(
+            crate::cache::touch_area(area),
+            crate::cache::touches() - touched,
+        );
         if bytes.len() != len {
             return Err(Error::Truncated);
         }
@@ -688,8 +693,13 @@ impl<S: Source> Reader<S> {
         }
         let area = self.area_of(offset);
         let before = crate::cache::disk_pages();
+        let touched = crate::cache::touches();
         let bytes = self.source.read_shared(offset, len)?;
         crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        crate::cache::note_touches(
+            crate::cache::touch_area(area),
+            crate::cache::touches() - touched,
+        );
         if bytes.len() != len {
             return Err(Error::Truncated);
         }
@@ -709,8 +719,13 @@ impl<S: Source> Reader<S> {
         let area = self.area_of(offset);
         crate::cache::note_read(area, len);
         let before = crate::cache::disk_pages();
+        let touched = crate::cache::touches();
         let bytes = self.source.read(offset, len)?.into_boxed_slice();
         crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+        crate::cache::note_touches(
+            crate::cache::touch_area(area),
+            crate::cache::touches() - touched,
+        );
         let pointer: *const [u8] = &*bytes;
         self.arena_bytes.set(self.arena_bytes.get() + bytes.len());
         self.arena.borrow_mut().insert((offset, len), bytes);
@@ -942,6 +957,7 @@ impl<S: Source> Reader<S> {
     #[inline(never)]
     fn held_move(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldSpan>> {
         let before = crate::cache::disk_pages();
+        let touched = crate::cache::touches();
         let span = match self.source.held_span(slot, offset)? {
             Ok(span) => span,
             Err(error) => return Some(Err(error)),
@@ -951,6 +967,10 @@ impl<S: Source> Reader<S> {
             let area = self.area_of(offset);
             crate::cache::note_read(area, span.len);
             crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+            crate::cache::note_touches(
+                crate::cache::touch_area(area),
+                crate::cache::touches() - touched,
+            );
         }
         (offset >= span.start && offset - span.start + len as u64 <= span.len as u64)
             .then_some(Ok(span))
@@ -960,6 +980,7 @@ impl<S: Source> Reader<S> {
     /// `slot`, accounting pages newly pinned to their area.
     fn held_range(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
         let before = crate::cache::disk_pages();
+        let touched = crate::cache::touches();
         let range = match self.source.held_range(slot, offset, len)? {
             Ok(range) => range,
             Err(error) => return Some(Err(error)),
@@ -968,6 +989,14 @@ impl<S: Source> Reader<S> {
             let area = self.area_of(offset);
             crate::cache::note_read(area, range.pinned_bytes);
             crate::cache::note_disk(area, crate::cache::disk_pages() - before);
+            crate::cache::note_touches(
+                if area == 2 {
+                    crate::cache::TOUCH_CHUNKS_HELD
+                } else {
+                    crate::cache::touch_area(area)
+                },
+                crate::cache::touches() - touched,
+            );
         }
         if range.end() < len {
             return Some(Err(Error::Truncated));
@@ -1160,6 +1189,7 @@ impl<S: Source> AreaFetch for Reader<S> {
         }
         let at = self.header.ordinals_at + offset;
         let before = crate::cache::disk_pages();
+        let touched = crate::cache::touches();
         let span = match self.source.held_span(slot, at)? {
             Ok(span) => span,
             Err(error) => return Some(Err(error)),
@@ -1167,6 +1197,10 @@ impl<S: Source> AreaFetch for Reader<S> {
         if span.pinned {
             crate::cache::note_read(2, span.len);
             crate::cache::note_disk(2, crate::cache::disk_pages() - before);
+            crate::cache::note_touches(
+                crate::cache::TOUCH_NIBBLES_HELD,
+                crate::cache::touches() - touched,
+            );
         }
         Some(Ok(HeldSpan {
             start: span.start.wrapping_sub(self.header.ordinals_at),

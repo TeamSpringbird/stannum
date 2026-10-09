@@ -47,6 +47,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bench"
+version = "0.1.0"
+dependencies = [
+ "boldi-vigna",
+ "engine",
+ "rustc-hash",
+ "segment",
+ "tinql",
+ "tokenizer",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -408,6 +420,18 @@ dependencies = [
  "rustversion",
  "scopeguard",
  "simdutf8",
+]
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "boldi-vigna",
+ "rustc-hash",
+ "segment",
+ "thiserror",
+ "tinql",
+ "tokenizer",
 ]
 
 [[package]]
@@ -1691,6 +1715,7 @@ name = "stannum"
 version = "0.1.0"
 dependencies = [
  "boldi-vigna",
+ "engine",
  "pgrx",
  "pgrx-tests",
  "postgres",
