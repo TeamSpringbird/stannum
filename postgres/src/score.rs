@@ -653,6 +653,10 @@ impl IndexScorer {
             let label = self.view.labels[i].as_str();
             let terms = &self.scoring.terms;
             let names = &self.names;
+            // Not this segment's row: the walk below would say so too.
+            if crate::storage::native_holds(&self.view, i, tid) == Some(false) {
+                continue;
+            }
             if let Some(found) =
                 crate::storage::with_native_rows(&self.view, i, names, |segment, sets| {
                     engine::tinshape::score_at_in(segment, terms, sets, tid)

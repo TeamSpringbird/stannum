@@ -1720,13 +1720,33 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
         // buffers hold too, and a query reloads it a chunk at a time, where
         // the readers' page tables and dictionaries reload whole: it keeps
         // at most a share of the budget and goes first, the most first.
-        let mut natives: Vec<(usize, (u64, u32))> = readers
-            .iter()
-            .map(|(key, c)| (c.native.bytes(), *key))
-            .filter(|(held, _)| *held > 0)
-            .collect();
+        let held = |readers: &SegmentReaders| -> Vec<(usize, (u64, u32))> {
+            readers
+                .iter()
+                .map(|(key, c)| (c.native.bytes(), *key))
+                .filter(|(held, _)| *held > 0)
+                .collect()
+        };
+        let mut natives = held(readers);
         let mut native: usize = natives.iter().map(|(held, _)| held).sum();
         if bytes > budget || native > budget / NATIVE_SHARE {
+            // First the parsed records and footers used longest ago, the
+            // largest segments' first: dropping a segment's native state
+            // whole dropped its common words' with it, which nearly every
+            // query parses again.
+            natives.sort_unstable_by(|a, b| b.cmp(a));
+            for (was, key) in &natives {
+                if bytes <= budget && native <= budget / NATIVE_SHARE {
+                    break;
+                }
+                if let Some(cached) = readers.get(key) {
+                    cached.native.shed();
+                    let freed = was.saturating_sub(cached.native.bytes());
+                    bytes -= freed;
+                    native -= freed;
+                }
+            }
+            natives = held(readers);
             natives.sort_unstable_by(|a, b| b.cmp(a));
             for (held, key) in natives {
                 if bytes <= budget && native <= budget / NATIVE_SHARE {
@@ -3796,6 +3816,17 @@ pub(crate) struct Native {
 }
 
 impl Native {
+    /// Halves the larger of the segment's parsed-record and footer memos,
+    /// least recently used first.
+    fn shed(&self) {
+        if let Ok(segment) = self.segment.try_borrow()
+            && let Some(segment) = segment.as_ref()
+        {
+            let held = segment.memo_bytes().max(self.footers.borrow().bytes());
+            segment.shed(held / 2);
+        }
+    }
+
     /// Bytes the native paths keep for the segment in this backend.
     fn bytes(&self) -> usize {
         let blob = self
@@ -3867,6 +3898,22 @@ pub(crate) fn with_native_rows<R>(
             f(segment, sets)
         })
     })
+}
+
+/// Whether source `i` of `view`, a segment in TIN's shape, lists `tid`
+/// (live or dead); `None` when the source has no native reader. A row
+/// scored alone is looked for in each source in turn, and finding the one
+/// holding it from the segment's document set costs a lookup, where
+/// assembling each segment for the row's terms cost a term lookup per term
+/// per segment per row.
+pub(crate) fn native_holds(view: &View, i: usize, tid: segment::Tid) -> Option<bool> {
+    let (reader, _) = view.natives.get(i)?.as_ref()?;
+    let docs = reader.docs().ok()?;
+    Some(
+        docs.geometry
+            .slot_of(tid)
+            .is_some_and(|slot| docs.rank(slot).is_some()),
+    )
 }
 
 /// Clears [`Native::busy`] when a walk ends, unwinding or not.
