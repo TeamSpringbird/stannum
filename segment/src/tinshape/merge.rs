@@ -243,7 +243,7 @@ pub fn merge(
                 reused += 1;
                 Some(Reused {
                     kind: entries[at].kind,
-                    bytes: postings.container(&entries[at]),
+                    bytes: postings.container(&entries[at]).all().ok()?,
                     input_df: *input_df,
                 })
             })?;

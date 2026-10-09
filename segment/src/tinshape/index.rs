@@ -329,7 +329,7 @@ impl<S: Source> Reader<S> {
     pub fn postings(&self, entry: &TermEntry) -> Result<(Vec<u32>, Vec<u8>)> {
         let docs = self.docs()?;
         let record = self.record(entry)?;
-        let postings = Postings::parse(&record, entry.df, &docs.geometry)?;
+        let postings = Postings::parse(&*record, entry.df, &docs.geometry)?;
         let footer = postings.footer(
             self.header.block_size,
             entry.max_tf_bucket,

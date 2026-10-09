@@ -15,6 +15,7 @@
 use boldi_vigna::{SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tinshape::bits;
+use segment::tinshape::blob::Bytes;
 use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::EfCursor;
 use segment::tinshape::positions::Positions;
@@ -327,10 +328,12 @@ pub fn lower(query: &Query, terms: &mut Vec<String>) -> Option<Node> {
 /// Where a group's members are.
 #[derive(Clone, Copy, Debug)]
 enum Src<'a> {
-    /// A container of a grouped record, with its blob offset.
+    /// A container of a grouped record, with its blob offset; its bytes
+    /// are read when the group is (a segment over a lazy blob loads them
+    /// then).
     Container {
         entry: GroupEntry,
-        bytes: &'a [u8],
+        bytes: Bytes<'a>,
         at: usize,
     },
     /// Local slots `from..to` of the term's decoded list.
@@ -342,6 +345,15 @@ struct G<'a> {
     index: u32,
     count: u32,
     src: Src<'a>,
+}
+
+/// A container's bytes, read for a path that cannot return an error: a
+/// failed load is reported as corruption.
+#[inline]
+fn container_bytes(bytes: Bytes<'_>) -> &[u8] {
+    bytes
+        .all()
+        .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
 }
 
 /// One query term opened in a segment.
@@ -554,6 +566,7 @@ impl<'a> TermSet<'a> {
             let first = self.first_of(&g);
             let found = match (&self.loaded, g.src) {
                 (Loaded::Grid, Src::Container { bytes, .. }) => {
+                    let bytes = container_bytes(bytes);
                     let words = bytes.len() / 8;
                     let mut w = local_target as usize / 64;
                     let mut found = None;
@@ -616,6 +629,7 @@ impl<'a> TermSet<'a> {
         match g.src {
             Src::Container { entry, bytes, at } => {
                 touch.touch(Part::Payload, at, bytes.len());
+                let bytes = container_bytes(bytes);
                 if entry.kind == KIND_GRID {
                     let words = bytes.len() / 8;
                     self.prefix.clear();
@@ -833,7 +847,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                         && entry.kind == KIND_GRID
                     {
                         self.touch_src(&g.src);
-                        kernels::and_bytes(out, bytes);
+                        kernels::and_bytes(out, bytes.all()?);
                     } else {
                         let mut other = self.scratch.level(depth, out.len());
                         let any = self.eval(&children[i], group, &mut other, depth + 1)?;
@@ -953,7 +967,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
             && entry.kind == KIND_GRID
         {
             self.touch_src(&g.src);
-            kernels::or_bytes(out, bytes);
+            kernels::or_bytes(out, bytes.all()?);
             return Ok(true);
         }
         self.term_into(t, group, out)
@@ -965,7 +979,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
         let group = self.segment.docs.geometry.groups[g.index as usize];
         match g.src {
             Src::Container { entry, bytes, .. } => {
-                for_each_local(&entry, bytes, &group, |l| list.push(l))?;
+                for_each_local(&entry, bytes.all()?, &group, |l| list.push(l))?;
             }
             Src::Locals { from, to } => {
                 let set = self.terms[t].as_ref().expect("a term with a group");
@@ -1003,6 +1017,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 let Src::Container { bytes, .. } = g.src else {
                     unreachable!()
                 };
+                let bytes = bytes.all()?;
                 if i == 0 {
                     kernels::load(out, bytes);
                 } else {
@@ -1022,6 +1037,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 match g.src {
                     Src::Container { entry, bytes, .. } if entry.kind == KIND_GRID => {
                         self.touch_src(&g.src);
+                        let bytes = bytes.all()?;
                         list.retain(|l| bytes[*l as usize / 8] >> (l % 8) & 1 == 1);
                     }
                     _ => {
@@ -1044,7 +1060,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
             match g.src {
                 Src::Container { entry, bytes, .. } if entry.kind == KIND_GRID => {
                     self.touch_src(&g.src);
-                    for (w, c) in out.iter_mut().zip(bytes.chunks_exact(8)) {
+                    for (w, c) in out.iter_mut().zip(bytes.all()?.chunks_exact(8)) {
                         *w &= !u64::from_le_bytes(c.try_into().expect("eight bytes"));
                     }
                 }
@@ -1071,6 +1087,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
         let set = self.terms[t].as_ref().expect("found above");
         match g.src {
             Src::Container { entry, bytes, .. } => {
+                let bytes = bytes.all()?;
                 if entry.kind == KIND_GRID {
                     kernels::load(out, bytes);
                 } else {
@@ -1478,7 +1495,9 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     ) if ea.kind == KIND_GRID && eb.kind == KIND_GRID => {
                         self.touch_src(&ga.src);
                         self.touch_src(&gb.src);
-                        Some(kernels::and_count_two(xa, xb))
+                        // An unreadable container takes the general path,
+                        // which reports it.
+                        Some(kernels::and_count_two(xa.all().ok()?, xb.all().ok()?))
                     }
                     _ => None,
                 }

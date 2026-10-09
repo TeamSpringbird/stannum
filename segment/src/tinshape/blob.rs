@@ -218,6 +218,12 @@ impl<'a> From<&'a [u8]> for Bytes<'a> {
     }
 }
 
+impl<'a, const N: usize> From<&'a [u8; N]> for Bytes<'a> {
+    fn from(bytes: &'a [u8; N]) -> Self {
+        Self::Slice(bytes)
+    }
+}
+
 impl<'a> From<&'a Vec<u8>> for Bytes<'a> {
     fn from(bytes: &'a Vec<u8>) -> Self {
         Self::Slice(bytes)

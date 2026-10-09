@@ -461,7 +461,7 @@ impl<'a> Segment<'a> {
         if end > self.bounds[Area::Postings as usize + 1] {
             return Err(Error::Truncated);
         }
-        let record = self.bytes.get(start, end)?;
+        let record = self.bytes.sub(start, end)?;
         Ok(Term {
             entry,
             at: self.area_at(Area::Postings) + from,
@@ -699,7 +699,7 @@ mod tests {
                 copied += 1;
                 return Some(postings::Reused {
                     kind: entry.kind,
-                    bytes: term.postings.container(entry),
+                    bytes: term.postings.container(entry).all().ok()?,
                     input_df: term.entry.df,
                 });
             }

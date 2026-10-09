@@ -45,6 +45,7 @@
 //! TF tail and its positions in the positions area.
 
 use super::bits::{self, BitWriter};
+use super::blob::Bytes;
 use super::docs::{Geometry, Group};
 use super::ef::{self, Ef};
 use crate::{Error, Result, varint};
@@ -512,12 +513,15 @@ pub struct Postings<'a> {
     pub footer: &'a [u8],
     pub footer_at: usize,
     /// The payload's bytes (an ef list or the grouped directory and
-    /// containers), and where they start in the record.
-    pub payload: &'a [u8],
+    /// containers), and where they start in the record. Loaded on demand
+    /// for a record over a lazy blob: a grouped record's containers are
+    /// read a group at a time ([`Self::container`]).
+    pub payload: Bytes<'a>,
     pub payload_at: usize,
     /// Where the grouped containers start within the payload.
     pub containers_at: usize,
-    pub tf: &'a [u8],
+    /// The TF tail, read a posting's bits at a time ([`Footer::bucket`]).
+    pub tf: Bytes<'a>,
     pub tf_at: usize,
     /// The documents' lengths, for a term of few postings.
     pub lengths: Option<InlineLengths<'a>>,
@@ -583,12 +587,16 @@ fn encode_inline_lengths(lengths: &[u32], out: &mut Vec<u8>) {
 }
 
 impl<'a> Postings<'a> {
-    /// Parses a record of a term with `df` postings in `geometry`.
-    pub fn parse(record: &'a [u8], df: u32, geometry: &Geometry) -> Result<Self> {
+    /// Parses a record of a term with `df` postings in `geometry`: its
+    /// header, footer, inline lengths and group directory (or sparse list)
+    /// are read, its containers and TF tail only when asked for.
+    pub fn parse(record: impl Into<Bytes<'a>>, df: u32, geometry: &Geometry) -> Result<Self> {
+        let bytes = record.into();
         if df == 0 {
             return Err(Error::Corrupt("a term without postings"));
         }
         if df == 1 {
+            let record = bytes.all()?;
             let mut at = 0;
             let slot = varint::get_u32(record, &mut at)?;
             let lengths = if at < record.len() {
@@ -613,13 +621,15 @@ impl<'a> Postings<'a> {
                 form: Form::Single(slot),
                 footer: &[],
                 footer_at: 0,
-                payload: &record[..at],
+                payload: Bytes::Slice(&record[..at]),
                 payload_at: 0,
                 containers_at: 0,
-                tf: &[],
+                tf: Bytes::default(),
                 tf_at: at,
             });
         }
+        // The form and three varints.
+        let record = bytes.window(0, 1 + 3 * 10)?;
         let form = *record.first().ok_or(Error::Truncated)?;
         let mut at = 1;
         let footer_len = if form & FORM_COMPACT != 0 {
@@ -642,14 +652,14 @@ impl<'a> Postings<'a> {
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
         let tf_at = lengths_at + lengths_len;
-        if tf_at > record.len() {
+        if tf_at > bytes.len() {
             return Err(Error::Truncated);
         }
-        let footer = &record[footer_at..payload_at];
-        let payload = &record[payload_at..lengths_at];
+        let footer = bytes.get(footer_at, payload_at)?;
+        let payload = bytes.sub(payload_at, lengths_at)?;
         let lengths = if lengths_len > 0 {
             Some(InlineLengths::parse(
-                &record[lengths_at..tf_at],
+                bytes.get(lengths_at, tf_at)?,
                 lengths_at,
                 df,
             )?)
@@ -662,10 +672,21 @@ impl<'a> Postings<'a> {
                 if payload.len() != ef::encoded_len(df as usize, geometry.slots) {
                     return Err(Error::Corrupt("sparse postings length"));
                 }
-                Form::Sparse(Ef::parse(payload, df as usize, geometry.slots)?)
+                Form::Sparse(Ef::parse(payload.all()?, df as usize, geometry.slots)?)
             }
             FORM_GROUPED => {
-                let (entries, at) = parse_groups(payload, df, geometry)?;
+                // The directory's length is known only once it is parsed:
+                // read a prefix of the payload, longer until it holds it.
+                let mut want = DIRECTORY_PREFIX.min(payload.len());
+                let (entries, at) = loop {
+                    let directory = payload.window(0, want)?;
+                    match parse_groups(directory, payload.len(), df, geometry) {
+                        Err(Error::Truncated) if want < payload.len() => {
+                            want = want.saturating_mul(4).min(payload.len());
+                        }
+                        parsed => break parsed?,
+                    }
+                };
                 containers_at = at;
                 Form::Grouped(entries)
             }
@@ -679,17 +700,20 @@ impl<'a> Postings<'a> {
             payload,
             payload_at,
             containers_at,
-            tf: &record[tf_at..],
+            tf: bytes.sub(tf_at, bytes.len())?,
             tf_at,
             lengths,
             compact,
         })
     }
 
-    /// The container of a grouped record's entry.
-    pub fn container(&self, entry: &GroupEntry) -> &'a [u8] {
+    /// The container of a grouped record's entry, not read yet (see
+    /// [`Bytes::all`]). The directory was checked to lie within the payload.
+    pub fn container(&self, entry: &GroupEntry) -> Bytes<'a> {
         let at = self.containers_at + entry.at as usize;
-        &self.payload[at..at + entry.len as usize]
+        self.payload
+            .sub(at, at + entry.len as usize)
+            .expect("a container within its payload")
     }
 
     /// Calls `visit` with every slot, in order.
@@ -701,7 +725,7 @@ impl<'a> Postings<'a> {
                 for entry in entries {
                     let group = &geometry.groups[entry.index as usize];
                     let base = group.slot_base;
-                    for_each_local(entry, self.container(entry), group, |local| {
+                    for_each_local(entry, self.container(entry).all()?, group, |local| {
                         visit(base + local);
                     })?;
                 }
@@ -726,7 +750,18 @@ impl<'a> Postings<'a> {
     }
 }
 
-fn parse_groups(payload: &[u8], df: u32, geometry: &Geometry) -> Result<(Vec<GroupEntry>, usize)> {
+/// Bytes of a grouped payload read first for its directory: a few groups'
+/// entries take a few bytes each.
+const DIRECTORY_PREFIX: usize = 4096;
+
+/// A grouped payload's directory, from a prefix of the payload holding it
+/// (`Truncated` when it does not), `payload_len` the whole payload's length.
+fn parse_groups(
+    payload: &[u8],
+    payload_len: usize,
+    df: u32,
+    geometry: &Geometry,
+) -> Result<(Vec<GroupEntry>, usize)> {
     let mut at = 0;
     let groups = varint::get_u32(payload, &mut at)? as usize;
     if groups > geometry.groups.len() {
@@ -770,7 +805,7 @@ fn parse_groups(payload: &[u8], df: u32, geometry: &Geometry) -> Result<(Vec<Gro
         body += len;
         first += count;
     }
-    if first != u64::from(df) || at as u64 + body != payload.len() as u64 {
+    if first != u64::from(df) || at as u64 + body != payload_len as u64 {
         return Err(Error::Corrupt("postings payload length"));
     }
     Ok((entries, at))
@@ -939,9 +974,10 @@ impl Footer {
             let mut last = 0;
             list.for_each(|v| last = v);
             let width = tf_width(max_bucket, adaptive);
+            let tf = postings.tf.all()?;
             let mut pairs = Vec::with_capacity(df as usize);
             for i in 0..df as usize {
-                let bucket = bits::get(postings.tf, i, width)? as u8;
+                let bucket = bits::get(tf, i, width)? as u8;
                 pairs.push((bucket, lengths.get(i as u32)?));
             }
             let frontier = frontier(pairs.into_iter());
@@ -1036,9 +1072,9 @@ impl Footer {
         &self.frontier[self.starts[block] as usize..self.starts[block + 1] as usize]
     }
 
-    /// The bucket of posting `index`.
+    /// The bucket of posting `index`, from its record's TF tail.
     #[inline]
-    pub fn bucket(&self, tf: &[u8], index: u32) -> Result<u8> {
+    pub fn bucket(&self, tf: Bytes<'_>, index: u32) -> Result<u8> {
         if let Some(bucket) = self.single {
             return Ok(bucket);
         }
@@ -1050,8 +1086,12 @@ impl Footer {
                 .get(block)
                 .ok_or(Error::Corrupt("posting index"))?,
         );
-        let at = self.tf_at[block] as usize;
-        Ok(bits::get(&tf[at..], within, width)? as u8)
+        if width == 0 {
+            return Ok(0);
+        }
+        let bit = within * width as usize;
+        let bytes = tf.window(self.tf_at[block] as usize + bit / 8, 8)?;
+        Ok(bits::get_at(bytes, bit % 8, width)? as u8)
     }
 }
 

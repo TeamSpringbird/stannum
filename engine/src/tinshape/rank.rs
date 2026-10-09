@@ -354,6 +354,7 @@ fn load<'a>(
             at,
         } => {
             touch.touch(Part::Payload, at, bytes.len());
+            let bytes = bytes.all()?;
             mem.first = e.first;
             if e.kind == KIND_GRID {
                 mem.kind = Kind::Grid(bytes);
@@ -1340,6 +1341,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 at,
             } => {
                 self.touch.touch(Part::Payload, at, bytes.len());
+                let bytes = bytes.all()?;
                 r.first = e.first;
                 if e.kind == KIND_GRID {
                     kernels::load(row, bytes);
