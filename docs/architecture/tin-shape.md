@@ -520,19 +520,30 @@ the phase A and B codecs, under `segment/src/tinshape/`:
   most groups are copied).
 - `verify::verify_segment`: the checker of `stannum.verify_index()`.
 - `SegmentBuilder::finish_tns` (in `segment.rs`) and `Payload::count`.
-- `Segment::assemble` (a segment over a blob loaded as far as its queries
-  need, from a document set and liveness decoded once and shared, `Rc`),
+- `Segment::assemble` (a segment over a `blob::LazyBlob` loading what queries read,
+  from a document set and liveness decoded once and shared, `Rc`),
   `Segment::remember` (term-map entries found elsewhere) and
   `Segment::share_footers` (decoded footers kept across the segments a
   backend assembles); `Liveness::is_dead`.
 
 **How the extension reads a segment** (`storage::with_native`). A backend
-keeps each segment's blob as far as its queries have read it: the header,
-the document set (decoded once), the DL sidecar and the liveness area, and
-each query term's postings record (and positions, for phrases) the first
-time it is named; the dead list VACUUM published is decoded once into the
-segment's liveness in slot space; term-map lookups are memoized. Every
-query assembles a segment over those bytes.
+keeps a `blob::LazyBlob` per segment, which loads 8 KiB chunks from the
+segment's pages as queries read them (`blob::Bytes`): a term's record
+header, footer and group directory when it is resolved, a group's container
+when a walk reaches the group, a posting's TF bits, the entries of a
+positions stream a phrase checks and the DL sidecar blocks of the documents
+scored. Nothing loads a whole area: at 150M rows loading each query word's
+whole positions stream and every segment's DL sidecar took a backend past
+a gigabyte. A chunk counts as loaded only once its bytes are in place, so a
+read a cancel interrupts is read again by the next query. The document set
+is the paged reader's, decoded once from a transient read; the dead list
+VACUUM published is decoded once into the segment's liveness in slot
+space; term-map lookups are memoized. The segment assembled over the blob
+is kept while the liveness stays. What the blob loaded, the parsed-record
+and footer memos and the liveness count against `stannum.reader_cache_mb`,
+and the loaded chunks keep at most a quarter of it across queries
+(`SET client_min_messages = debug1` reports the parts as a view is
+captured).
 
 **Which paths are native.** A query is lowered (`engine::tinshape::lower`)
 after its wildcards, regexes, ranges and fuzzy terms are expanded against
