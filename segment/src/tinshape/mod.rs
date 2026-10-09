@@ -24,6 +24,7 @@
 //! The extension writes every immutable segment in this shape.
 
 pub mod bits;
+pub mod blob;
 pub mod docs;
 pub mod ef;
 pub mod index;

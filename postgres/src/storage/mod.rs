@@ -3577,74 +3577,7 @@ pub unsafe fn maintenance_pass(index: pg_sys::Relation, request: PassRequest) ->
 // postings record (and positions, for phrases) the first time a query
 // names it. Unread ranges stay zero pages the allocator has not committed.
 
-/// Bytes of a blob loaded at a time.
-const BLOB_CHUNK: usize = 8192;
-
-/// A segment's blob as far as it has been read.
-struct Blob {
-    bytes: Box<[u8]>,
-    /// Bit per [`BLOB_CHUNK`]: loaded.
-    chunks: Vec<u64>,
-    loaded: usize,
-}
-
-impl Blob {
-    fn new(len: usize) -> Self {
-        Self {
-            bytes: vec![0u8; len].into_boxed_slice(),
-            chunks: vec![0u64; len.div_ceil(BLOB_CHUNK).div_ceil(64)],
-            loaded: 0,
-        }
-    }
-
-    /// Whether `[offset, offset + len)` is loaded.
-    fn has(&self, offset: u64, len: usize) -> bool {
-        if len == 0 {
-            return true;
-        }
-        let end = (offset as usize).saturating_add(len).min(self.bytes.len());
-        (offset as usize / BLOB_CHUNK..end.div_ceil(BLOB_CHUNK))
-            .all(|chunk| self.chunks[chunk / 64] >> (chunk % 64) & 1 == 1)
-    }
-
-    /// Loads `[offset, offset + len)` from `source` where not loaded yet.
-    fn ensure(
-        &mut self,
-        source: &dyn segment::source::Source,
-        offset: u64,
-        len: usize,
-    ) -> segment::Result<()> {
-        if len == 0 {
-            return Ok(());
-        }
-        let end = (offset as usize)
-            .checked_add(len)
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or(segment::Error::Truncated)?;
-        let mut chunk = offset as usize / BLOB_CHUNK;
-        while chunk * BLOB_CHUNK < end {
-            if self.chunks[chunk / 64] >> (chunk % 64) & 1 == 1 {
-                chunk += 1;
-                continue;
-            }
-            // A run of missing chunks, read at once.
-            let first = chunk;
-            while chunk * BLOB_CHUNK < end && self.chunks[chunk / 64] >> (chunk % 64) & 1 == 0 {
-                self.chunks[chunk / 64] |= 1 << (chunk % 64);
-                chunk += 1;
-            }
-            let from = first * BLOB_CHUNK;
-            let to = (chunk * BLOB_CHUNK).min(self.bytes.len());
-            let read = source.read(from as u64, to - from)?;
-            if read.len() != to - from {
-                return Err(segment::Error::Truncated);
-            }
-            self.bytes[from..to].copy_from_slice(&read);
-            self.loaded += to - from;
-        }
-        Ok(())
-    }
-}
+use segment::tinshape::blob::Blob;
 
 /// The parts of a segment decoded once per backend (see
 /// [`segment::tinshape::segment::Segment::assemble`]).
@@ -3692,7 +3625,7 @@ pub(crate) struct Native {
 
 impl Native {
     fn bytes(&self) -> usize {
-        self.blob.borrow().as_ref().map_or(0, |blob| blob.loaded) + self.footers.borrow().bytes()
+        self.blob.borrow().as_ref().map_or(0, Blob::loaded) + self.footers.borrow().bytes()
     }
 }
 
@@ -3814,7 +3747,7 @@ fn native_segment<R>(
                 (header.bounds[7] - header.bounds[4]) as usize,
             )?;
             let docs = Rc::new(segment::tinshape::docs::DocSet::decode(
-                &blob.bytes[header.bounds[4] as usize..sidecar as usize],
+                &blob.bytes()[header.bounds[4] as usize..sidecar as usize],
             )?);
             *decoded = Some(Decoded {
                 docs,
@@ -3877,7 +3810,7 @@ fn native_segment<R>(
             // and is dropped after `native.segment`; the segment is dropped
             // above before any load writes into them, and `slot`, borrowed
             // until `f` returns, keeps any other call from loading meanwhile.
-            let bytes = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(&blob.bytes) };
+            let bytes = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(blob.bytes()) };
             let mut segment = segment::tinshape::segment::Segment::assemble(
                 bytes,
                 segment::dictionary::DictionaryIndex::parse(NO_TERMS)?,
