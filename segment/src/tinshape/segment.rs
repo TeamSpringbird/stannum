@@ -454,9 +454,12 @@ impl<'a> Segment<'a> {
         Ok((bytes, self.area_at(Area::Positions) + from))
     }
 
-    /// Where the length of the document of `rank` sits in the blob.
-    pub fn length_at(&self, rank: u32) -> usize {
-        self.area_at(Area::Lengths) + self.lengths.stored_at + rank as usize * 2
+    /// Where the length of the document of `rank` sits in the blob: its
+    /// block's header and its packed bits.
+    pub fn length_at(&self, rank: u32) -> (usize, usize) {
+        let (header, bits) = self.lengths.at(rank);
+        let area = self.area_at(Area::Lengths);
+        (area + header, area + bits)
     }
 }
 

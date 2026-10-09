@@ -867,8 +867,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .docs
             .rank_in(g as usize, local)
             .ok_or(Error::Corrupt("a posting without a document"))?;
-        self.touch
-            .touch(Part::DlSidecar, self.segment.length_at(rank), 2);
+        let (header, bits) = self.segment.length_at(rank);
+        self.touch.touch(Part::DlSidecar, header, 8);
+        self.touch.touch(Part::DlSidecar, bits, 4);
         let length = self.segment.lengths.get(rank)?;
         if theta.is_some() && n > 0 {
             let (_, nsum, dmin, fmin) = self.window_parts;
@@ -1564,8 +1565,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .docs
             .rank_in(g as usize, local)
             .ok_or(Error::Corrupt("a posting without a document"))?;
-        self.touch
-            .touch(Part::DlSidecar, self.segment.length_at(rank), 2);
+        let (header, bits) = self.segment.length_at(rank);
+        self.touch.touch(Part::DlSidecar, header, 8);
+        self.touch.touch(Part::DlSidecar, bits, 4);
         let length = self.segment.lengths.get(rank)?;
         if theta.is_some() {
             let (mut nsum, mut dmin, mut fmin) = (0.0_f64, f64::INFINITY, f64::INFINITY);

@@ -23,8 +23,10 @@
 //!             body* (per group, in order)
 //! body     := grid:   32 * width bytes, the group's slots as a bitmap
 //!           | counts: 256 bytes, page p holding offsets 1..=count[p]
-//! dl       := escapes varint, u16le per document by rank (0xffff: escaped),
-//!             (rank u32le, length u32le)* for the escaped, by rank
+//! dl       := block varint (documents per block), blocks varint,
+//!             (bits_at u32le, base u24le, width u8)* per block,
+//!             per block its lengths less its base, packed at its width
+//!             (byte-aligned), by rank
 //! liveness := dead varint, then when dead > 0 a bitmap of u64le words over
 //!             document ranks, a set bit naming a dead document
 //! ```
@@ -41,9 +43,6 @@ pub const GROUP_PAGES: u32 = 256;
 pub const MAX_OFFSET: u16 = 291;
 /// Bytes of one directory entry of the document set.
 const ENTRY: usize = 11;
-/// A stored length that names an escaped one.
-const ESCAPE: u16 = u16::MAX;
-
 const KIND_GRID: u8 = 0;
 const KIND_COUNTS: u8 = 1;
 
@@ -349,89 +348,103 @@ impl DocSet {
     }
 }
 
+/// Documents per DL sidecar block: each block packs its lengths less its
+/// shortest at the width the longest needs.
+pub const DL_BLOCK: u32 = 256;
+
+/// The largest base a block header holds (24 bits); a block whose shortest
+/// length is above it packs the rest at a wider width.
+const DL_BASE_MAX: u32 = (1 << 24) - 1;
+
 /// Encodes exact document lengths, by rank.
 pub fn encode_lengths(lengths: &[u32]) -> Vec<u8> {
-    let escaped: Vec<(u32, u32)> = lengths
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| **l >= u32::from(ESCAPE))
-        .map(|(rank, l)| (rank as u32, *l))
-        .collect();
-    let mut out = Vec::with_capacity(lengths.len() * 2 + escaped.len() * 8 + 4);
-    varint::put(&mut out, escaped.len() as u64);
-    for length in lengths {
-        let stored = if *length >= u32::from(ESCAPE) {
-            ESCAPE
-        } else {
-            *length as u16
-        };
-        out.extend_from_slice(&stored.to_le_bytes());
+    let blocks = lengths.len().div_ceil(DL_BLOCK as usize);
+    let mut out = Vec::with_capacity(8 + blocks * 8 + lengths.len());
+    varint::put(&mut out, u64::from(DL_BLOCK));
+    varint::put(&mut out, blocks as u64);
+    let mut headers = Vec::with_capacity(blocks * 8);
+    let mut data = Vec::new();
+    for chunk in lengths.chunks(DL_BLOCK as usize) {
+        let base = chunk.iter().copied().min().unwrap_or(0).min(DL_BASE_MAX);
+        let range = chunk.iter().map(|l| l - base).max().unwrap_or(0);
+        let width = 32 - range.leading_zeros();
+        headers.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        headers.extend_from_slice(&(base | width << 24).to_le_bytes());
+        let mut w = bits::BitWriter::new();
+        for l in chunk {
+            w.put(l - base, width);
+        }
+        data.extend_from_slice(&w.finish());
     }
-    for (rank, length) in escaped {
-        out.extend_from_slice(&rank.to_le_bytes());
-        out.extend_from_slice(&length.to_le_bytes());
-    }
+    out.extend_from_slice(&headers);
+    out.extend_from_slice(&data);
     out
 }
 
 /// The DL sidecar: exact lengths by document rank.
 #[derive(Clone, Copy, Debug)]
 pub struct Lengths<'a> {
-    /// Where the stored lengths start within the sidecar's bytes.
-    pub stored_at: usize,
-    stored: &'a [u8],
-    escaped: &'a [u8],
+    /// Where the block headers and the packed lengths start within the
+    /// sidecar's bytes.
+    pub headers_at: usize,
+    pub data_at: usize,
+    documents: u32,
+    block: u32,
+    headers: &'a [u8],
+    data: &'a [u8],
 }
 
 impl<'a> Lengths<'a> {
     pub fn parse(bytes: &'a [u8], documents: u32) -> Result<Self> {
         let mut at = 0;
-        let escapes = varint::get_u32(bytes, &mut at)? as usize;
-        let stored_len = documents as usize * 2;
-        let stored = bytes.get(at..at + stored_len).ok_or(Error::Truncated)?;
-        let escaped = &bytes[at + stored_len..];
-        if escaped.len() != escapes * 8 {
-            return Err(Error::Corrupt("length escapes"));
+        let block = varint::get_u32(bytes, &mut at)?;
+        let blocks = varint::get_u32(bytes, &mut at)? as usize;
+        if block == 0 || blocks != documents.div_ceil(block) as usize {
+            return Err(Error::Corrupt("length blocks"));
         }
+        let headers = bytes.get(at..at + blocks * 8).ok_or(Error::Truncated)?;
+        let headers_at = at;
+        let data_at = at + blocks * 8;
         Ok(Self {
-            stored_at: at,
-            stored,
-            escaped,
+            headers_at,
+            data_at,
+            documents,
+            block,
+            headers,
+            data: &bytes[data_at..],
         })
+    }
+
+    /// Block `b`'s header: where its bits start, its base and its width.
+    #[inline]
+    fn header(&self, b: usize) -> Result<(usize, u32, u32)> {
+        let h = self
+            .headers
+            .get(b * 8..b * 8 + 8)
+            .ok_or(Error::Corrupt("length rank"))?;
+        let at = u32::from_le_bytes(h[0..4].try_into().expect("four bytes")) as usize;
+        let packed = u32::from_le_bytes(h[4..8].try_into().expect("four bytes"));
+        Ok((at, packed & DL_BASE_MAX, packed >> 24))
     }
 
     /// The length of the document at `rank`.
     #[inline]
     pub fn get(&self, rank: u32) -> Result<u32> {
-        let at = rank as usize * 2;
-        let stored = u16::from_le_bytes(
-            self.stored
-                .get(at..at + 2)
-                .ok_or(Error::Corrupt("length rank"))?
-                .try_into()
-                .expect("two bytes"),
-        );
-        if stored != ESCAPE {
-            return Ok(u32::from(stored));
+        if rank >= self.documents {
+            return Err(Error::Corrupt("length rank"));
         }
-        let entries = self.escaped.len() / 8;
-        let entry = |i: usize| {
-            let e = &self.escaped[i * 8..i * 8 + 8];
-            (
-                u32::from_le_bytes(e[0..4].try_into().expect("four bytes")),
-                u32::from_le_bytes(e[4..8].try_into().expect("four bytes")),
-            )
-        };
-        let (mut lo, mut hi) = (0, entries);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            match entry(mid).0.cmp(&rank) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Ok(entry(mid).1),
-            }
-        }
-        Err(Error::Corrupt("escaped length missing"))
+        let (at, base, width) = self.header((rank / self.block) as usize)?;
+        let bytes = self.data.get(at..).ok_or(Error::Truncated)?;
+        Ok(base + bits::get(bytes, (rank % self.block) as usize, width)?)
+    }
+
+    /// Where `rank`'s block header and its packed length lie within the
+    /// sidecar's bytes, for page accounting.
+    pub fn at(&self, rank: u32) -> (usize, usize) {
+        let b = (rank / self.block) as usize;
+        let (at, _, width) = self.header(b).unwrap_or((0, 0, 0));
+        let bit = (rank % self.block) as usize * width as usize;
+        (self.headers_at + b * 8, self.data_at + at + bit / 8)
     }
 }
 
@@ -566,8 +579,10 @@ mod tests {
     }
 
     #[test]
-    fn lengths_escape() {
-        let lengths = [1, 65_534, 65_535, 70_000, 3, u32::MAX];
+    fn lengths_round_trip() {
+        let mut lengths = vec![1, 65_534, 65_535, 70_000, 3, u32::MAX, 0, (1 << 24) + 5];
+        lengths.extend((0..1000u32).map(|i| (i * 7919) % 4096 + 1));
+        lengths.extend([7; 300]);
         let bytes = encode_lengths(&lengths);
         let parsed = Lengths::parse(&bytes, lengths.len() as u32).unwrap();
         for (rank, length) in lengths.iter().enumerate() {
