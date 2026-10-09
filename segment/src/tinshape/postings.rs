@@ -96,6 +96,9 @@ pub struct Options {
     /// A term of at most this many postings carries its documents' lengths
     /// in its record ([`InlineLengths`]): its top k reads no DL sidecar.
     pub inline_lengths_max_df: u32,
+    /// ... in a segment of at least this many documents: a smaller one's DL
+    /// sidecar is a few pages.
+    pub inline_lengths_min_documents: u32,
 }
 
 impl Default for Options {
@@ -109,6 +112,7 @@ impl Default for Options {
             grid_density: 64,
             grid_min_postings: 4096,
             inline_lengths_max_df: 64,
+            inline_lengths_min_documents: 1 << 16,
         }
     }
 }
@@ -221,7 +225,8 @@ pub fn encode_reusing<'r>(
     debug_assert!(slots.windows(2).all(|w| w[0] < w[1]));
     let mut stats = Stats::default();
     let start = out.len();
-    let inline = slots.len() as u64 <= u64::from(options.inline_lengths_max_df);
+    let inline = slots.len() as u64 <= u64::from(options.inline_lengths_max_df)
+        && geometry.documents >= options.inline_lengths_min_documents;
     if slots.len() == 1 {
         varint::put(out, u64::from(slots[0]));
         stats.payload = out.len() - start;
@@ -1130,6 +1135,7 @@ mod tests {
                             grid_density,
                             grid_min_postings: 0,
                             inline_lengths_max_df: if adaptive_tf { 8 } else { 0 },
+                            inline_lengths_min_documents: 0,
                         });
                     }
                 }
