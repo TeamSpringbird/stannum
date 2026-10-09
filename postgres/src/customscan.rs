@@ -114,6 +114,8 @@ pub fn init() {
         let usage = &raw const pg_sys::pgBufferUsage;
         (*usage).shared_blks_read as u64
     });
+    // And every page read or found in shared buffers, to the area it was for.
+    segment::cache::set_touch_probe(|| crate::score::blocks_used() as u64);
     GucRegistry::define_float_guc(
         c"stannum.debug_seed_score",
         c"Measurement aid: prune a ranked walk against this score from the start; negative disables",
@@ -2444,6 +2446,16 @@ unsafe extern "C-unwind" fn explain(
                 .join(", ");
             if let Ok(text) = CString::new(from_disk) {
                 pg_sys::ExplainPropertyText(c"Disk Pages By Area".as_ptr(), text.as_ptr(), es);
+            }
+            let touched = segment::cache::area_touches()
+                .iter()
+                .zip(segment::cache::TOUCH_NAMES)
+                .filter(|(pages, _)| **pages != 0)
+                .map(|(pages, name)| format!("{name} {pages}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(touched) {
+                pg_sys::ExplainPropertyText(c"Page Touches By Area".as_ptr(), text.as_ptr(), es);
             }
             let phases = crate::score::phase_disk()
                 .iter()
