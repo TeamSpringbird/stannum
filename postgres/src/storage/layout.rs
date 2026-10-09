@@ -34,8 +34,10 @@ use pgrx::pg_sys;
 pub const MAGIC: u32 = 0x4c44_5032;
 /// Version 5: segments in TIN's shape (`TNS1`), directory entries that
 /// record their origin, sealed write segments and retired sources on the
-/// meta page. An index of an earlier version must be rebuilt.
-pub const VERSION: u8 = 5;
+/// meta page. Version 6: `TNS1` positions streams with single-position
+/// masks and rare terms' lengths inline in their records. An index of an
+/// earlier version must be rebuilt.
+pub const VERSION: u8 = 6;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();

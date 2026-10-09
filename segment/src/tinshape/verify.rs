@@ -124,7 +124,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 problems.push("postings are not in ctid order".to_owned());
             }
             let (stream, _) = segment.positions(&entry)?;
-            let stream = super::positions::Positions::parse(stream)?.payload();
+            let stream = super::positions::Positions::parse(stream)?.payload()?;
             let payload = Payload::parse(&stream)?;
             if payload.count() != entry.df {
                 problems.push(format!(

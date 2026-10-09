@@ -435,7 +435,7 @@ impl<S: Source> AreaFetch for Reader<S> {
             self.header.at(POSITIONS) + extent.offset,
             extent.len as usize,
         )?;
-        let payload = super::positions::Positions::parse(&stream)?.payload();
+        let payload = super::positions::Positions::parse(&stream)?.payload()?;
         let mut encoded = self.encoded.borrow_mut();
         let found = encoded.push(payload);
         encoded.payloads.insert(extent.offset, found);

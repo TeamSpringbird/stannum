@@ -126,7 +126,7 @@ pub fn merge(
                 segment.adaptive_tf,
             )?;
             let (stream, _) = segment.positions(&entry)?;
-            let stream = super::positions::Positions::parse(stream)?.payload();
+            let stream = super::positions::Positions::parse(stream)?.payload()?;
             let payload = Payload::parse(&stream)?;
             if payload.count() != entry.df {
                 return Err(Error::Corrupt("positions entries against df"));
