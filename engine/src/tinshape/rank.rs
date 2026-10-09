@@ -1285,6 +1285,11 @@ const SUB_WORDS: usize = 16;
 /// `threshold / SIEVE_TARGET`, reach it.
 const SIEVE_TARGET: u32 = LaneSums::MAX_TARGET;
 
+/// Most weighed terms a sub-range's candidates are weighed one by one
+/// for; a query of more weighs every lane of the sub-range bit-sliced
+/// (two in tests, so their small queries take both paths).
+const MAX_WEIGHED: usize = if cfg!(test) { 2 } else { 32 };
+
 /// Bits per lane counter of the sub-range sieve (as [`LaneSums`]).
 const SLICES: usize = 6;
 
@@ -1653,8 +1658,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
     }
 
-    /// The candidates of words `w0..w1` under `plan`, term by term over the
-    /// sub-range's words (the lane sums bit-sliced as [`LaneSums`]).
+    /// The candidates of words `w0..w1` under `plan`: the required terms
+    /// ANDed and the essential ones ORed word by word, then each candidate
+    /// left weighed alone (or, past [`MAX_WEIGHED`] weighed terms, every
+    /// lane at once, bit-sliced as [`LaneSums`]).
     #[inline]
     fn sieve(&self, plan: &Plan, words: usize, w0: usize, w1: usize, out: &mut [u64; SUB_WORDS]) {
         let len = w1 - w0;
@@ -1697,19 +1704,45 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         let live = cand.iter().filter(|c| **c != 0).count();
-        if plan.by_count && live > 0 && live <= SUB_WORDS / 4 {
-            // Few words hold candidates: weigh those alone.
+        if plan.by_count && live > 0 && plan.adds.len() <= MAX_WEIGHED {
+            // Each candidate's weights summed alone: a sub-range's
+            // candidates are a few bits in a few words.
+            let na = plan.adds.len();
+            let mut weight = [0u32; MAX_WEIGHED];
+            let mut at = [0usize; MAX_WEIGHED];
+            for (k, &(i, wt)) in plan.adds.iter().enumerate() {
+                weight[k] = wt;
+                at[k] = i * words + w0;
+            }
+            let mut held = [0u64; MAX_WEIGHED];
             for j in 0..len {
-                if cand[j] != 0 {
-                    let mut lanes = LaneSums::new(plan.start, SIEVE_TARGET);
-                    for &(i, weight) in &plan.adds {
-                        lanes.add(rows[i * words + w0 + j], weight);
-                    }
-                    cand[j] &= lanes.reached();
+                let mut word = cand[j];
+                if word == 0 {
+                    continue;
                 }
+                let mut most = plan.start;
+                for k in 0..na {
+                    held[k] = rows[at[k] + j];
+                    most += weight[k] & 0u32.wrapping_sub(u32::from(held[k] & word != 0));
+                }
+                if most < SIEVE_TARGET {
+                    cand[j] = 0;
+                    continue;
+                }
+                let mut keep = 0u64;
+                while word != 0 {
+                    let bit = word.trailing_zeros();
+                    word &= word - 1;
+                    let mut sum = plan.start;
+                    for k in 0..na {
+                        sum += weight[k] & 0u32.wrapping_sub((held[k] >> bit & 1) as u32);
+                    }
+                    keep |= u64::from(sum >= SIEVE_TARGET) << bit;
+                }
+                cand[j] = keep;
             }
         } else if plan.by_count && live > 0 {
-            // Each lane's counter starts at 2^SLICES - target + start, so it
+            // Many weighed terms: every lane at once. Each lane's counter starts at 2^SLICES - target + start, so it
             // reaches the target as it carries out of the top slice.
             let init = (1u32 << SLICES) - SIEVE_TARGET + plan.start;
             let mut slices = [[0u64; SUB_WORDS]; SLICES];
