@@ -26,10 +26,12 @@ Checked against TIN 1.0.3's recorded answers:
 
 | Status | Cases | Meaning |
 | --- | ---: | --- |
-| PASS | 170 | Every capture equals TIN's answer |
+| PASS | 188 | Every capture equals TIN's answer |
 | DIFF | 13 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
 | IMPROVED | 5 | TIN refuses the query with an ERROR; Stannum answers it |
-| GAP | 1 | Stannum lacks what the case exercises |
+| GAP | 7 | Stannum lacks what the case exercises, or answers it differently |
+| LIMITED | 3 | Stannum refuses at a documented resource limit where TIN answers |
+| SKIP | 1 | No answer recorded for TIN |
 | FAIL | 0 | |
 
 Improvements and gaps are declared in
@@ -89,6 +91,7 @@ the last two possible.
 | Case | Difference |
 | --- | --- |
 | `catalog.S-07` | `stannum.promote()` folds a write buffer of any size, so after it a term in every row is elided by `score()`; TIN's `promote()` consumes only a sealed write segment and leaves a 20-row buffer mutable, where elision does not count it. |
+| `catalog.S-07b`–`S-07g` | The same difference on more shapes, and `segment_info()`'s layout: Stannum has no sealed write segment (inserts fold every 512 rows whatever the maintenance mode), writes one segment per fold whatever `extent_cap_bytes`, lists a `generation` column and reports `npostings` and `origin` as NULL. `promote()`'s signature and its refusal of a cap that is not positive match (`catalog.S-07h`). |
 
 ## Other known differences
 

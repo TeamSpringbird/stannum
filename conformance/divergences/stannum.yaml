@@ -106,66 +106,97 @@ divergences:
     against: tin-1.0.3
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
+    summary: >
+      promote() folds the 20 buffered rows, which TIN leaves in its
+      current write segment; w is elided after it.
     tin: >
-      promote() returns one row (consumed_controls, linked_segments,
-      docs_promoted, terms_added); here all zero, as the 20 rows sit in the
-      current write segment, which promote() does not consume.
-    stannum: No promote(); its write buffer is folded into segments by inserts and VACUUM.
+      promote() returns zeros: the current write segment is not
+      consumed, and w still scores after it.
+    stannum: >
+      promote() returns (1, 1, 20, 21), the rows become an immutable
+      segment, and w, in every row, is elided (score 0) after it.
+      segment_info() differs in layout: Stannum's write buffer and
+      segment pages, its extra generation column, NULL npostings and
+      origin.
 
   - id: catalog.S-07c
     against: tin-1.0.3
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
-    tin: promote() on an index whose rows were all built into an immutable segment returns zeros.
-    stannum: No promote().
+    summary: >
+      segment_info() differs in layout on a built index; promote()
+      returns zeros as TIN's does.
+    tin: >
+      segment_info() lists one build segment with npostings 40, origin
+      build, sequence 0.
+    stannum: >
+      promote() returns zeros and scores match. segment_info() differs
+      in layout: Stannum's write buffer and segment pages, its extra
+      generation column, NULL npostings and origin; sequence is the
+      segment's generation.
 
   - id: catalog.S-07d
     against: tin-1.0.3
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
-    tin: promote() returns zeros with 200 rows in the current write segment; nothing is elided before or after.
-    stannum: No promote().
+    summary: >
+      promote() folds the 200 buffered rows, which TIN leaves in its
+      current write segment; u and w are elided after it.
+    tin: >
+      promote() returns zeros with 200 rows in the current write
+      segment; nothing is elided before or after.
+    stannum: >
+      promote() returns (1, 1, 200, 204); elision then counts the 200
+      rows and drops u and w. segment_info() differs in layout:
+      Stannum's write buffer and segment pages, its extra generation
+      column, NULL npostings and origin.
 
   - id: catalog.S-07e
     against: tin-1.0.3
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
-    tin: promote() returns zeros on a built index.
-    stannum: No promote().
+    summary: >
+      segment_info() differs on a built index: TIN built two segments,
+      Stannum one.
+    tin: >
+      promote() returns zeros on a built index of two build segments
+      (185 and 15 documents).
+    stannum: >
+      promote() returns zeros and scores match; the build wrote one
+      segment. segment_info() differs in layout: Stannum's write buffer
+      and segment pages, its extra generation column, NULL npostings and
+      origin.
 
   - id: catalog.S-07f
     against: tin-1.0.3
     kind: gap
     captures: [script]
-    summary: Stannum has no promote(), sealed write segments or maintenance modes.
+    summary: >
+      Stannum has no sealed write segment: inserts fold at 512
+      documents, so elision counts every folded row long before
+      promote().
     tin: >
       With maintenance manual, 12,288 rows fill a sealed write segment;
       promote() consumes it (1, 1, 12288, 12293) and elision then counts
       the promoted documents only.
-    stannum: No promote(); elision counts every document the index holds.
+    stannum: >
+      Inserts fold the buffer every 512 rows whatever the maintenance
+      mode, so before promote() 12,800 rows are in segments and w and b
+      are already elided; promote() folds the last 200 rows (1, 1, 200,
+      203).
 
   - id: catalog.S-07g
     against: tin-1.0.3
     kind: gap
     captures: [script]
-    summary: Stannum has no promote(index, extent_cap_bytes).
-    tin: promote(index, 1) writes 68 segments of about 185 documents; elision is unchanged.
-    stannum: No promote().
-
-  - id: catalog.S-07h
-    against: tin-1.0.3
-    kind: gap
-    captures: [value, zero_cap]
-    summary: Stannum has no promote() function.
+    summary: >
+      promote() ignores extent_cap_bytes: it writes one segment per fold.
     tin: >
-      promote(index regclass, extent_cap_bytes bigint DEFAULT NULL) returns
-      TABLE(consumed_controls, linked_segments, docs_promoted, terms_added);
-      a cap of 0 is XX000 "extent_cap_bytes must be positive".
-    stannum: No promote().
+      promote(index, 1) writes 68 segments of about 185 documents;
+      elision is unchanged.
+    stannum: >
+      promote(index, 1) folds the 200 buffered rows into one segment (1,
+      1, 200, 203); see catalog.S-07f for elision.
 
   - id: limits.at_least_near.2
     against: tin-1.0.3
