@@ -783,7 +783,98 @@ mod tests {
         assert_eq!(inspect("a AND NOT (b OR c)"), ["a:1"]);
         assert_eq!(inspect("a OR (b AND NOT c)"), ["a:1", "b:1"]);
         assert_eq!(inspect("* AND NOT c"), Vec::<String>::new());
-        assert_eq!(inspect("a NOT OVERLAPPING b"), ["a:1", "b:1"]);
+    }
+
+    /// Lead e3ed2f4 (TIN's fixes, b8018ac): a span weighs each written
+    /// occurrence of a word, a boost on an operand weighs that operand
+    /// alone, and the excluded side of a negated relation only filters.
+    #[pg_test]
+    fn span_leaves_weigh_per_occurrence_and_excluded_sides_add_nothing() {
+        Spi::run(
+            "CREATE TABLE sw(id int primary key, body text);
+             INSERT INTO sw VALUES (1, 'to be or not to be'), (2, 'ipa so hoppy'),
+               (3, 'a b'), (4, 'stout ale');
+             INSERT INTO sw SELECT 100 + n, 'pad' || n FROM generate_series(1, 20) n;
+             CREATE INDEX sw_idx ON sw USING stannum(body);",
+        )
+        .unwrap();
+        let inspect = |query: &str| -> Vec<String> {
+            Spi::get_one::<Vec<String>>(&format!(
+                "SELECT array_agg(term || ':' || weight ORDER BY term) FROM stannum.score_inspect('sw_idx', '{query}', 1.0)"
+            ))
+            .unwrap()
+            .unwrap_or_default()
+        };
+        assert_eq!(
+            inspect("\"to be or not to be\"^2"),
+            ["be:4", "not:2", "or:2", "to:4"]
+        );
+        assert_eq!(inspect("ipa^3 NEAR/5 hoppy"), ["hoppy:1", "ipa:3"]);
+        assert_eq!(inspect("(ipa NEAR/5 hoppy)^3"), ["hoppy:3", "ipa:3"]);
+        assert_eq!(inspect("a NOT OVERLAPPING b"), ["a:1"]);
+        assert_eq!(
+            inspect("(ipa^2 NEAR/3 hoppy) NOT ENCLOSES stout^5"),
+            ["hoppy:1", "ipa:2"]
+        );
+        assert_eq!(inspect("ale NOT ENCLOSED BY \"stout ale\""), ["ale:1"]);
+        // A term on both sides still scores through its included occurrence.
+        assert_eq!(inspect("(a NEAR/1 b) NOT OVERLAPPING b"), ["a:1", "b:1"]);
+        // Scores follow the weights: the excluded side adds nothing.
+        let score = |query: &str| -> f32 {
+            Spi::get_one::<f32>(&format!(
+                "SELECT stannum.full_score(ctid) FROM sw WHERE body ==> '{query}' AND id = 3"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(
+            score("a NOT OVERLAPPING stout").to_bits(),
+            score("a").to_bits()
+        );
+    }
+
+    /// Lead e3ed2f4 (TIN's boldi-vigna fix, b8018ac): a NEAR operand that is
+    /// an OR group may share a word with the other operand; each operand
+    /// takes its own occurrence. The same rows on the index and on the heap.
+    #[pg_test]
+    fn near_slots_sharing_a_word_pair_distinct_occurrences() {
+        Spi::run(
+            "CREATE TABLE ns(id int primary key, body text);
+             INSERT INTO ns VALUES (1, 'alpha the alpha'), (2, 'alpha of alpha'),
+               (3, 'bravo alpha'), (4, 'alpha'), (5, 'a a a a'), (6, 'alpha beta');
+             INSERT INTO ns SELECT 100 + n, 'pad' || n FROM generate_series(1, 20) n;
+             CREATE INDEX ns_idx ON ns USING stannum(body);",
+        )
+        .unwrap();
+        for (scan, index) in [("index", "on"), ("heap", "off")] {
+            let heap = if index == "on" { "off" } else { "on" };
+            Spi::run(&format!(
+                "SET enable_seqscan = {heap}; SET enable_indexscan = {index};
+                 SET enable_bitmapscan = {index}; SET stannum.enable_custom_scan = {index}"
+            ))
+            .unwrap();
+            let ids = |query: &str| -> Vec<i32> {
+                Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT coalesce(array_agg(id ORDER BY id), '{{}}') FROM ns WHERE body ==> '{query}'"
+                ))
+                .unwrap()
+                .unwrap()
+            };
+            assert_eq!(ids("(alpha OR bravo) NEAR/3 alpha"), [1, 2, 3], "{scan}");
+            assert_eq!(ids("alpha NEAR/3 alpha"), [1, 2], "{scan}");
+            assert_eq!(
+                ids("(alpha OR bravo) NEAR/2 (alpha OR charlie)"),
+                [1, 2, 3],
+                "{scan}"
+            );
+            assert_eq!(ids("\"a a\" NEAR/0 \"a a\""), [5], "{scan}");
+            assert_eq!(ids("alpha NEAR/0 [alpha beta]"), [6], "{scan}");
+        }
+        Spi::run(
+            "RESET enable_seqscan; RESET enable_indexscan; RESET enable_bitmapscan;
+             RESET stannum.enable_custom_scan",
+        )
+        .unwrap();
     }
 
     #[pg_test]

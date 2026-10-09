@@ -381,7 +381,7 @@
     "boldi-vigna/src/query.rs": {
       "owner": "planetscale",
       "upstream_path": "boldi-vigna/src/query.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "boldi-vigna/src/solver.rs": {
@@ -411,7 +411,7 @@
     "boldi-vigna/src/state/mod.rs": {
       "owner": "planetscale",
       "upstream_path": "boldi-vigna/src/state/mod.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "boldi-vigna/src/state/ordered.rs": {
@@ -432,6 +432,12 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
+    "boldi-vigna/src/state/shared.rs": {
+      "owner": "planetscale",
+      "upstream_path": "boldi-vigna/src/state/shared.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Byte-identical to the upstream source before notice insertion."
+    },
     "boldi-vigna/src/state/term.rs": {
       "owner": "planetscale",
       "upstream_path": "boldi-vigna/src/state/term.rs",
@@ -441,7 +447,19 @@
     "boldi-vigna/src/state/unordered.rs": {
       "owner": "planetscale",
       "upstream_path": "boldi-vigna/src/state/unordered.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Byte-identical to the upstream source before notice insertion."
+    },
+    "boldi-vigna/tests/near_chain_tests.rs": {
+      "owner": "planetscale",
+      "upstream_path": "boldi-vigna/tests/near_chain_tests.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Byte-identical to the upstream source before notice insertion."
+    },
+    "boldi-vigna/tests/near_slot_tests.rs": {
+      "owner": "planetscale",
+      "upstream_path": "boldi-vigna/tests/near_slot_tests.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "conformance/cases/bm25.yaml": {
@@ -533,7 +551,7 @@
     "docs/query-language/alternatives.md": {
       "owner": "mixed",
       "upstream_path": "tinql/docs/src/alternatives.md",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Relocated/adapted Lead query-language documentation with Stannum SQL names and navigation."
     },
     "docs/query-language/boolean-operators.md": {
@@ -545,7 +563,7 @@
     "docs/query-language/boost.md": {
       "owner": "mixed",
       "upstream_path": "tinql/docs/src/boost.md",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Relocated/adapted Lead query-language documentation with Stannum SQL names and navigation."
     },
     "docs/query-language/introduction.md": {
@@ -581,7 +599,7 @@
     "docs/query-language/proximity.md": {
       "owner": "mixed",
       "upstream_path": "tinql/docs/src/proximity.md",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Relocated/adapted Lead query-language documentation with Stannum SQL names and navigation."
     },
     "docs/query-language/recipes.md": {
@@ -593,7 +611,7 @@
     "docs/query-language/span-relations.md": {
       "owner": "mixed",
       "upstream_path": "tinql/docs/src/span-relations.md",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Relocated/adapted Lead query-language documentation with Stannum SQL names and navigation."
     },
     "docs/query-language/terms.md": {
@@ -1015,8 +1033,8 @@
     "tinql/src/runtime/display.rs": {
       "owner": "planetscale",
       "upstream_path": "tinql/src/runtime/display.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Byte-identical to the upstream source before notice insertion."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "The upstream source with Stannum's stack-depth checks (mechanical) before notice insertion."
     },
     "tinql/src/runtime/estimate.rs": {
       "owner": "ben",
@@ -1025,20 +1043,20 @@
     "tinql/src/runtime/eval.rs": {
       "owner": "mixed",
       "upstream_path": "tinql/src/runtime/eval.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's span leaf weighting (b8018ac) merged in."
     },
     "tinql/src/runtime/lower.rs": {
-      "owner": "planetscale",
+      "owner": "mixed",
       "upstream_path": "tinql/src/runtime/lower.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Byte-identical to the upstream source before notice insertion."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's span leaf weighting (b8018ac) merged in."
     },
     "tinql/src/runtime/mod.rs": {
       "owner": "mixed",
       "upstream_path": "tinql/src/runtime/mod.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's span leaf weighting (b8018ac) merged in."
     },
     "tinql/src/runtime/plan.rs": {
       "owner": "ben",
@@ -1063,14 +1081,14 @@
     "tinql/src/runtime/simplify.rs": {
       "owner": "mixed",
       "upstream_path": "tinql/src/runtime/simplify.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's span leaf weighting (b8018ac) merged in."
     },
     "tinql/src/runtime/span_expr.rs": {
-      "owner": "planetscale",
+      "owner": "mixed",
       "upstream_path": "tinql/src/runtime/span_expr.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Byte-identical to the upstream source before notice insertion."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's span leaf weighting (b8018ac) merged in."
     },
     "tinql/src/runtime/subtokenize.rs": {
       "owner": "mixed",
@@ -1093,6 +1111,12 @@
     "tinql/tests/deep_queries.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: oversized and deeply nested query tests."
+    },
+    "tinql/tests/near_slot_oracle.rs": {
+      "owner": "planetscale",
+      "upstream_path": "tinql/tests/near_slot_oracle.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "tinql/tests/tokenized_doc_cost.rs": {
       "owner": "ben",
