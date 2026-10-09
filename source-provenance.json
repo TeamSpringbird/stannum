@@ -620,6 +620,12 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the PostgreSQL-free query engine crate, split out of the extension."
     },
+    "engine/src/spec.rs": {
+      "owner": "mixed",
+      "upstream_path": "postgres/src/options.rs",
+      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "evidence": "The tokenizer-settings codec and reloption values, moved from postgres/src/options.rs (inherited upstream file with Stannum changes); retain PlanetScale credit."
+    },
     "engine/src/terms.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/score.rs",

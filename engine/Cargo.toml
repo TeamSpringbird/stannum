@@ -20,3 +20,4 @@ rustc-hash.workspace = true
 segment = { path = "../segment" }
 thiserror.workspace = true
 tinql = { path = "../tinql" }
+tokenizer = { path = "../tokenizer" }
