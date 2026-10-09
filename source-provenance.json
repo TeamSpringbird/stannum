@@ -990,6 +990,30 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "segment/src/tinshape/bits.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: bit packing for the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/docs.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid grid, document set, DL sidecar and liveness bitmap of the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/ef.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Elias-Fano coding for the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/mod.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid-addressed segment format in TIN's shape."
+    },
+    "segment/src/tinshape/postings.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: ctid posting sets, footers and TF tails of the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/segment.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid-addressed segment blob and its reader."
+    },
     "segment/src/varint.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
