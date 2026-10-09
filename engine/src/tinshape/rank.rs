@@ -25,7 +25,7 @@ use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
 use segment::tinshape::docs::{GROUP_PAGES, Geometry};
 use segment::tinshape::ef::{Ef, EfCursor};
-use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local};
+use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local, or_into};
 use segment::tinshape::segment::Segment;
 use segment::tinshape::varint;
 use segment::{Error, Result};
@@ -35,6 +35,7 @@ use super::{
     required_terms,
 };
 use crate::bm25::TermScorer;
+use segment::lanes::LaneSums;
 
 /// One scoring term of a walk.
 pub(super) struct Sc {
@@ -543,8 +544,9 @@ fn beats(total: f32, tid: Tid, worst: &Entry) -> bool {
     crate::walk::rank(&(total, tid), &(worst.0, worst.1)) == std::cmp::Ordering::Less
 }
 
-/// The walk of a query some terms of which every match holds.
-struct Led<'s, 'a, T: Touch> {
+/// A ranked walk over one segment: led by required terms (`run`) or a
+/// disjunction of the scoring terms (`run_or`).
+struct Walk<'s, 'a, T: Touch> {
     segment: &'s Segment<'a>,
     geometry: &'s Geometry,
     node: &'s Node,
@@ -556,8 +558,19 @@ struct Led<'s, 'a, T: Touch> {
     sc: Vec<Sc>,
     /// Required terms, rarest first.
     req: Vec<usize>,
-    /// Per scoring term: whether it is required.
+    /// Per scoring term: whether it is required; whether it holds the group
+    /// at hand, and the candidate at hand, and that candidate's block; its
+    /// bound over the sub-range at hand.
     sc_required: Vec<bool>,
+    present: Vec<bool>,
+    held: Vec<bool>,
+    blocks: Vec<usize>,
+    sub_bounds: Vec<f32>,
+    plan: Plan,
+    /// A disjunction's group at hand: per scoring term a row of the
+    /// group's words holding its members, and its index cursor.
+    rows: Vec<u64>,
+    row_state: Vec<Row>,
     /// The window: the last slot of every scoring term's footer block at
     /// the slot it was set at, and its bound, and its length bound's
     /// numerator, denominator and length factor.
@@ -580,7 +593,7 @@ struct Led<'s, 'a, T: Touch> {
     positions: Vec<Vec<u32>>,
 }
 
-impl<'a, T: Touch> Led<'_, 'a, T> {
+impl<'a, T: Touch> Walk<'_, 'a, T> {
     #[inline]
     fn threshold(&self) -> Option<f32> {
         (self.heap.len() >= self.k)
@@ -983,7 +996,7 @@ impl<'a, T: Touch> Led<'_, 'a, T> {
 }
 
 /// [`super::top_k`] for a query some terms of which every match holds.
-pub(super) fn top_k_led(
+pub(super) fn top_k(
     segment: &Segment<'_>,
     node: &Node,
     names: &[String],
@@ -992,7 +1005,6 @@ pub(super) fn top_k_led(
     touch: &mut impl Touch,
 ) -> Result<RankedAnswer> {
     let required = required_terms(node);
-    debug_assert!(!required.is_empty());
     let terms = open_terms(segment, names, touch)?;
     if k == 0 || required.iter().any(|t| terms[*t].is_none()) {
         return Ok(RankedAnswer::default());
@@ -1013,8 +1025,10 @@ pub(super) fn top_k_led(
         );
         sc.push(Sc::new(t, scorer.clone(), footer));
     }
+    // Leaves only: a candidate holding every required term matches a flat
+    // AND, and one holding a scoring term a flat OR.
     let flat = match node {
-        Node::And(c) => c.iter().all(|c| matches!(c, Node::Term(_))),
+        Node::And(c) | Node::Or(c) => c.iter().all(|c| matches!(c, Node::Term(_))),
         Node::Term(_) => true,
         _ => false,
     };
@@ -1033,7 +1047,7 @@ pub(super) fn top_k_led(
     let mut req: Vec<usize> = required.clone();
     req.sort_by_key(|t| terms[*t].as_ref().expect("checked").df);
     let n = sc.len();
-    let mut walk = Led {
+    let mut walk = Walk {
         segment,
         geometry: &segment.docs.geometry,
         node,
@@ -1041,6 +1055,13 @@ pub(super) fn top_k_led(
         mems: (0..terms.len()).map(|_| Mem::default()).collect(),
         terms,
         sc_required: Vec::with_capacity(n),
+        present: vec![false; n],
+        held: vec![false; n],
+        blocks: vec![0; n],
+        sub_bounds: Vec::new(),
+        plan: Plan::default(),
+        rows: Vec::new(),
+        row_state: vec![Row::default(); n],
         window_end: None,
         window_parts: (0.0, 0.0, 0.0, 0.0),
         req,
@@ -1061,9 +1082,28 @@ pub(super) fn top_k_led(
         let r = required.contains(&walk.sc[i].term);
         walk.sc_required.push(r);
     }
-    walk.run()?;
+    if required.is_empty() {
+        walk.run_or()?;
+    } else {
+        walk.run()?;
+    }
     let mut rows: Vec<(f32, Tid)> = walk.heap.into_iter().map(|e| (e.0, e.1)).collect();
+    // Zero fill: fewer than k rows, the rest are matches of non-scoring
+    // terms in ctid order (a led walk saw every match already).
+    if rows.len() < k && required.is_empty() {
+        let seen: std::collections::HashSet<Tid> = rows.iter().map(|r| r.1).collect();
+        let fill = super::first_matches(
+            segment,
+            node,
+            &mut walk.terms,
+            k - rows.len(),
+            &seen,
+            walk.touch,
+        )?;
+        rows.extend(fill.into_iter().map(|t| (0.0, t)));
+    }
     rows.sort_by(crate::walk::rank);
+    rows.truncate(k);
     let mut answer = walk.answer;
     answer.rows = rows;
     Ok(answer)
@@ -1088,4 +1128,464 @@ fn span_check<'a>(
         positions: vec![Vec::new(); slots.len()],
         read: vec![false; slots.len()],
     })))
+}
+
+/// Words of a disjunction's sub-range: a group is planned and sieved this
+/// many words (1,024 slots) at a time.
+const SUB_WORDS: usize = 16;
+
+/// The sieve's target, in units of the threshold: a lane is kept when the
+/// weights of the terms it holds, each strictly above its bound in units of
+/// `threshold / SIEVE_TARGET`, reach it.
+const SIEVE_TARGET: u32 = LaneSums::MAX_TARGET;
+
+/// Bits per lane counter of the sub-range sieve (as [`LaneSums`]).
+const SLICES: usize = 6;
+
+/// A disjunction's plan for a sub-range at one threshold (MaxScore with the
+/// sub-range's bounds, as STN3's word sieve).
+#[derive(Default)]
+struct Plan {
+    /// Scoring terms (indexes into the walk's) every candidate must hold:
+    /// without any one, the others' bounds cannot reach the threshold.
+    required: Vec<usize>,
+    /// The terms a candidate must hold one of, when `by_essential`.
+    essential: Vec<usize>,
+    by_essential: bool,
+    /// The weighted sum's start (the required terms' weights) and the other
+    /// present terms' weights, when `by_count`.
+    by_count: bool,
+    start: u32,
+    adds: Vec<(usize, u32)>,
+    order: Vec<(f32, usize)>,
+}
+
+/// A disjunction term's members in the group at hand, as a row of words in
+/// [`Walk::rows`], and a forward cursor over their posting indexes.
+#[derive(Clone, Copy, Default)]
+struct Row {
+    /// Postings in earlier groups.
+    first: u32,
+    /// Members in words `..w` are `run`.
+    w: usize,
+    run: u32,
+}
+
+impl<'a, T: Touch> Walk<'_, 'a, T> {
+    /// Block-max MaxScore over the scoring terms, a group at a time: a
+    /// group, and a sub-range of it, whose terms' bounds cannot reach the
+    /// threshold is skipped; else each sub-range is planned (required
+    /// terms ANDed, essential terms ORed, the rest weighed bit-parallel)
+    /// and its words sieved; each candidate is bounded by its terms' blocks,
+    /// then by its length, then scored.
+    fn run_or(&mut self) -> Result<()> {
+        let n = self.sc.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let mut next = vec![0u32; n];
+        let mut from = 0u32;
+        let mut fresh = vec![false; n];
+        loop {
+            let mut g = u32::MAX;
+            for i in 0..n {
+                if !fresh[i] || next[i] < from {
+                    let t = self.sc[i].term;
+                    let set = self.terms[t].as_mut().expect("scoring");
+                    next[i] =
+                        next_group(set, self.geometry, from, &mut self.mems[t].hint, self.touch)
+                            .unwrap_or(u32::MAX);
+                    fresh[i] = true;
+                }
+                g = g.min(next[i]);
+            }
+            if g == u32::MAX {
+                break;
+            }
+            for (present, next) in self.present.iter_mut().zip(&next) {
+                *present = *next == g;
+            }
+            self.or_group(g)?;
+            from = g + 1;
+        }
+        Ok(())
+    }
+
+    /// Scoring term `i`'s members in group `g`, which it holds, into its row
+    /// of `words` words.
+    fn or_load(&mut self, i: usize, g: u32, words: usize) -> Result<()> {
+        let t = self.sc[i].term;
+        let group = self.geometry.groups[g as usize];
+        let row = &mut self.rows[i * words..(i + 1) * words];
+        let set = self.terms[t].as_mut().expect("scoring");
+        let r = &mut self.row_state[i];
+        r.w = 0;
+        r.run = 0;
+        if let Form::Sparse(list) = &set.postings.form {
+            row.fill(0);
+            let cursor = set.sparse.get_or_insert_with(|| {
+                self.touch.touch(
+                    Part::Payload,
+                    set.at + set.postings.payload_at,
+                    set.postings.payload.len(),
+                );
+                list.cursor()
+            });
+            cursor.seek(group.slot_base);
+            r.first = cursor.rank() as u32;
+            let end = group.slot_base + group.slots();
+            while let Some(slot) = cursor.current()
+                && slot < end
+            {
+                let l = slot - group.slot_base;
+                row[l as usize / 64] |= 1 << (l % 64);
+                cursor.advance();
+            }
+            return Ok(());
+        }
+        let entry = set
+            .find(g, &mut self.mems[t].hint)
+            .copied()
+            .ok_or(Error::Corrupt("a group the term holds"))?;
+        match entry.src {
+            Src::Container {
+                entry: e,
+                bytes,
+                at,
+            } => {
+                self.touch.touch(Part::Payload, at, bytes.len());
+                r.first = e.first;
+                if e.kind == KIND_GRID {
+                    kernels::load(row, bytes);
+                } else {
+                    row.fill(0);
+                    or_into(&e, bytes, u32::from(group.width), row)?;
+                }
+            }
+            Src::Locals { from, to } => {
+                r.first = from;
+                row.fill(0);
+                for l in &set.locals[from as usize..to as usize] {
+                    row[*l as usize / 64] |= 1 << (l % 64);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn or_group(&mut self, g: u32) -> Result<()> {
+        let n = self.sc.len();
+        let group = self.geometry.groups[g as usize];
+        let base = group.slot_base;
+        let end = base + group.slots() - 1;
+        self.answer.windows += 1;
+        let mut total = 0.0_f64;
+        for i in 0..n {
+            if self.present[i] {
+                total += f64::from(self.sc[i].range_bound(base, end));
+            }
+        }
+        if below(total, self.threshold()) {
+            self.answer.windows_pruned += 1;
+            return Ok(());
+        }
+        let words = group.words();
+        self.rows.clear();
+        self.rows.resize(n * words, 0);
+        for i in 0..n {
+            if self.present[i] {
+                self.or_load(i, g, words)?;
+            }
+        }
+        let dead = self.segment.liveness.groups[g as usize].as_deref();
+        let mut sb = std::mem::take(&mut self.sub_bounds);
+        sb.clear();
+        sb.resize(n, 0.0);
+        let mut plan = std::mem::take(&mut self.plan);
+        let mut w0 = 0;
+        while w0 < words {
+            let w1 = (w0 + SUB_WORDS).min(words);
+            let from = base + (w0 * 64) as u32;
+            let to = (base + (w1 * 64) as u32 - 1).min(end);
+            let mut total = 0.0_f64;
+            for (i, bound) in sb.iter_mut().enumerate() {
+                *bound = if self.present[i] {
+                    self.sc[i].range_bound(from, to)
+                } else {
+                    0.0
+                };
+                total += f64::from(*bound);
+            }
+            let theta = self.threshold();
+            if below(total, theta) {
+                w0 = w1;
+                continue;
+            }
+            self.plan_sub(&mut plan, theta, &sb, total);
+            let mut cand = [0u64; SUB_WORDS];
+            self.sieve(&plan, words, w0, w1, &mut cand);
+            for (j, word) in cand[..w1 - w0].iter().enumerate() {
+                let w = w0 + j;
+                let mut word = *word;
+                if let Some(dead) = dead {
+                    word &= !dead[w];
+                }
+                while word != 0 {
+                    let bit = word.trailing_zeros();
+                    word &= word - 1;
+                    self.or_candidate(g, base, words, w, bit)?;
+                }
+            }
+            w0 = w1;
+        }
+        self.sub_bounds = sb;
+        self.plan = plan;
+        Ok(())
+    }
+
+    /// Plans a sub-range whose present terms' bounds are `sb` (summing to
+    /// `total`) at threshold `theta`.
+    fn plan_sub(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
+        plan.required.clear();
+        plan.essential.clear();
+        plan.adds.clear();
+        plan.order.clear();
+        plan.by_essential = true;
+        plan.by_count = false;
+        let present = (0..sb.len()).filter(|i| self.present[*i]);
+        let t = theta.map_or(0.0, f64::from);
+        // Without a positive threshold every member of every term may enter.
+        if !(t > 0.0 && t.is_finite()) || sb.iter().any(|b| b.is_nan() || *b < 0.0) {
+            plan.essential.extend(present);
+            return;
+        }
+        let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
+        let mut fixed = 0.0_f64;
+        for i in present {
+            if (total - f64::from(sb[i])) * slack < t {
+                plan.required.push(i);
+                fixed += f64::from(sb[i]);
+            } else if sb[i] > 0.0 {
+                plan.order.push((sb[i], i));
+            }
+        }
+        plan.order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut tail = fixed;
+        let mut inessential = 0;
+        for &(bound, _) in &plan.order {
+            let next = tail + f64::from(bound);
+            if next * slack >= t {
+                break;
+            }
+            tail = next;
+            inessential += 1;
+        }
+        plan.by_essential = plan.required.is_empty() || inessential > 0;
+        plan.essential
+            .extend(plan.order[inessential..].iter().map(|&(_, i)| i));
+        // The weights, in units of the threshold.
+        let unit = t / f64::from(SIEVE_TARGET);
+        let weight = |bound: f32| {
+            let units = f64::from(bound) / unit;
+            if units < f64::from(SIEVE_TARGET) {
+                units.floor() as u32 + 1
+            } else {
+                SIEVE_TARGET
+            }
+        };
+        let mut start = 0u32;
+        for &i in &plan.required {
+            start = start.saturating_add(weight(sb[i]));
+        }
+        for &(bound, i) in &plan.order {
+            plan.adds.push((i, weight(bound)));
+        }
+        if start < SIEVE_TARGET {
+            plan.by_count = true;
+            plan.start = start;
+        }
+    }
+
+    /// The candidates of words `w0..w1` under `plan`, term by term over the
+    /// sub-range's words (the lane sums bit-sliced as [`LaneSums`]).
+    #[inline]
+    fn sieve(&self, plan: &Plan, words: usize, w0: usize, w1: usize, out: &mut [u64; SUB_WORDS]) {
+        let len = w1 - w0;
+        let row = |i: usize| -> [u64; SUB_WORDS] {
+            let mut r = [0u64; SUB_WORDS];
+            r[..len].copy_from_slice(&self.rows[i * words + w0..i * words + w1]);
+            r
+        };
+        let mut cand = [0u64; SUB_WORDS];
+        if let Some((&first, rest)) = plan.required.split_first() {
+            cand = row(first);
+            for &i in rest {
+                let r = row(i);
+                for j in 0..SUB_WORDS {
+                    cand[j] &= r[j];
+                }
+            }
+        }
+        if plan.by_essential {
+            let mut any = [0u64; SUB_WORDS];
+            for &i in &plan.essential {
+                let r = row(i);
+                for j in 0..SUB_WORDS {
+                    any[j] |= r[j];
+                }
+            }
+            if plan.required.is_empty() {
+                cand = any;
+            } else {
+                for j in 0..SUB_WORDS {
+                    cand[j] &= any[j];
+                }
+            }
+        }
+        if plan.by_count && cand.iter().any(|c| *c != 0) {
+            // Each lane's counter starts at 2^SLICES - target + start, so it
+            // reaches the target as it carries out of the top slice.
+            let init = (1u32 << SLICES) - SIEVE_TARGET + plan.start;
+            let mut slices = [[0u64; SUB_WORDS]; SLICES];
+            for (s, slice) in slices.iter_mut().enumerate() {
+                if init >> s & 1 != 0 {
+                    *slice = [!0u64; SUB_WORDS];
+                }
+            }
+            let mut reached = [0u64; SUB_WORDS];
+            for &(i, weight) in &plan.adds {
+                let mask = row(i);
+                let mut carry = [0u64; SUB_WORDS];
+                for (s, slice) in slices.iter_mut().enumerate() {
+                    if weight >> s & 1 != 0 {
+                        for j in 0..SUB_WORDS {
+                            let sum = slice[j] ^ mask[j];
+                            let next = (slice[j] & mask[j]) | (carry[j] & sum);
+                            slice[j] = sum ^ carry[j];
+                            carry[j] = next;
+                        }
+                    } else {
+                        for j in 0..SUB_WORDS {
+                            let next = carry[j] & slice[j];
+                            slice[j] ^= carry[j];
+                            carry[j] = next;
+                        }
+                    }
+                }
+                for j in 0..SUB_WORDS {
+                    reached[j] |= carry[j];
+                }
+            }
+            for j in 0..SUB_WORDS {
+                cand[j] &= reached[j];
+            }
+        }
+        *out = cand;
+    }
+
+    /// The posting index of member `local` of scoring term `i`'s row;
+    /// members must be asked in increasing order.
+    #[inline]
+    fn row_index(&mut self, i: usize, words: usize, local: u32) -> u32 {
+        let row = &self.rows[i * words..(i + 1) * words];
+        let r = &mut self.row_state[i];
+        let w = local as usize / 64;
+        if w > r.w {
+            r.run += kernels::popcount(&row[r.w..w]) as u32;
+            r.w = w;
+        }
+        r.first + r.run + (row[w] & ((1u64 << (local % 64)) - 1)).count_ones()
+    }
+
+    /// Bounds, scores and admits the candidate at bit `bit` of word `w` of
+    /// group `g`.
+    fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
+        let n = self.sc.len();
+        let local = (w * 64) as u32 + bit;
+        let slot = base + local;
+        self.answer.candidates += 1;
+        let theta = self.threshold();
+        let mut bound = 0.0_f64;
+        for i in 0..n {
+            self.held[i] = self.present[i] && self.rows[i * words + w] >> bit & 1 == 1;
+            if self.held[i] {
+                let s = &mut self.sc[i];
+                let b = s.block_at(slot).expect("a member's block");
+                self.blocks[i] = b;
+                bound += f64::from(s.bound(b));
+            }
+        }
+        if below(bound, theta) {
+            return Ok(());
+        }
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .ok_or(Error::Corrupt("a posting without a document"))?;
+        self.touch
+            .touch(Part::DlSidecar, self.segment.length_at(rank), 2);
+        let length = self.segment.lengths.get(rank)?;
+        if theta.is_some() {
+            let (mut nsum, mut dmin, mut fmin) = (0.0_f64, f64::INFINITY, f64::INFINITY);
+            for i in 0..n {
+                if self.held[i] {
+                    let s = &self.sc[i];
+                    let mb = s.max_bucket(self.blocks[i]);
+                    nsum += f64::from(s.num[mb]);
+                    dmin = dmin.min(f64::from(s.den[mb]));
+                    fmin = fmin.min(f64::from(s.factor));
+                }
+            }
+            if below(nsum / (dmin + fmin * f64::from(length)), theta) {
+                return Ok(());
+            }
+        }
+        self.answer.scored += 1;
+        let mut total = 0.0_f32;
+        for i in 0..n {
+            if !self.held[i] {
+                continue;
+            }
+            let index = self.row_index(i, words, local);
+            let t = self.sc[i].term;
+            let s = &self.sc[i];
+            let set = self.terms[t].as_ref().expect("scoring");
+            let bucket = s.footer.bucket(set.postings.tf, index)?;
+            if s.footer.single.is_none() {
+                let block = (index / s.footer.block_size) as usize;
+                self.touch.touch(
+                    Part::TfTail,
+                    set.at + set.postings.tf_at + s.footer.tf_at[block] as usize,
+                    1,
+                );
+            }
+            total += s
+                .scorer
+                .score_bucket(TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?, length);
+        }
+        let tid = self.geometry.tid_in(g as usize, local);
+        if let Some(worst) = self.heap.peek()
+            && self.heap.len() >= self.k
+            && !beats(total, tid, worst)
+        {
+            return Ok(());
+        }
+        match &self.verify {
+            Verify::Flat => self.push(total, tid),
+            _ => {
+                if matches(
+                    self.segment,
+                    self.node,
+                    &mut self.node_terms,
+                    slot,
+                    &mut self.positions,
+                    self.touch,
+                )? {
+                    self.push(total, tid);
+                }
+            }
+        }
+        Ok(())
+    }
 }
