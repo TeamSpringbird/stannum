@@ -341,6 +341,16 @@ Changed in round 2 of phase B: `Positions::skip` replaces the free
 `engine::tinshape::{lower, count, top_k, read_positions}` and the builder
 calls are unchanged.
 
+Added in phase C: `engine::tinshape::top_k_into(segment, node, names,
+scorers, &mut TopRows, &mut dyn Visibility, touch)` (the walk into rows
+shared with other sources, no zero fill), `for_each_match` and `tids_in`
+(live matches a group at a time), `score_at` and `score_at_in` (one row's
+score, with term cursors kept between rows), `TermSet::{rewind, sought}`;
+`engine::walk::{NativeSegment, reads_positions, span_requires_all}` and
+`Source::native`; `Segment::share_footers` and `FooterCache`;
+`Segment::{docs, liveness}` are `Rc`; `Liveness::is_dead`; `lower` refuses
+spans that do not need every word.
+
 Changed in phase B (callers of phase A's API): `Group` has `first` and
 `pages` (`slots()` is `pages * width`, `grid_bytes()` new);
 `postings::for_each_local` and `or_into` take `&Group` instead of a width;

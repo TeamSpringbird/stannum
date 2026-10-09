@@ -790,6 +790,10 @@
       "owner": "ben",
       "evidence": "Original Boolean count executor over document ordinals, written for Stannum: the extension's visibility-map read for engine/src/fold.rs."
     },
+    "postgres/src/native.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Boolean matching over segments in TIN's shape for the index scans, written for Stannum."
+    },
     "postgres/src/heap_probe.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a counting allocator for pg_test builds, written for Stannum."

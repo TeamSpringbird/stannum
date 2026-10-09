@@ -23,11 +23,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   frontiers, a TF tail of bucket nibbles at each block's width, positions in
   their own stream, a document set and a DL sidecar of exact lengths; see
   [the TIN-shape guide](docs/architecture/tin-shape.md). Index pages are
-  layout version 5; an index written earlier must be rebuilt (`REINDEX`).
-  The extension reads a segment through a paged reader that hands each term
-  out as an ordinal stream (`STN3`'s, translated once per backend), so the
-  planner, cursors, ranked walk and ordinal count fold read it unchanged.
-  Dead lists are ordinal streams of dead ranks.
+  layout version 6; an index written earlier must be rebuilt (`REINDEX`).
+  Ranked scans (every style, tiebreak keys and filtered walks included),
+  bitmap and plain index scans, counts and `score()` of single rows read
+  segments natively, a 256-page group at a time, with VACUUM's dead list as
+  each segment's liveness; wildcards, regexes, ranges and fuzzy terms are
+  expanded against the segment's term map first. Only queries that still do
+  not lower (spans that do not need every word, position filters, `AT
+  LEAST` of more than one) read a segment's terms translated into ordinal
+  streams, as the write buffer's are. Merges keep the group containers of
+  groups only one input holds. Dead lists are ordinal streams of dead ranks.
 - Counts of Boolean term queries fold the ordinal streams a chunk at a time
   instead of visiting each match: the 302 published Wikipedia count queries
   sum to 39 ms instead of 3,767 ms in the replay harness.
