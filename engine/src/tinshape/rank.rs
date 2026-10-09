@@ -397,10 +397,9 @@ impl<'a> PosCursor<'a> {
             touch.touch(Part::Positions, self.at + m, 4);
         }
         let from = self.next_at;
-        let mut p = self.next_at;
-        for i in self.next..index {
-            p = self.positions.skip(i, p)?;
-        }
+        let mut p = self
+            .positions
+            .skip_entries(self.next, self.next_at, index)?;
         p = self.positions.read_entry(index, p, out)?;
         self.next = index + 1;
         self.next_at = p;
