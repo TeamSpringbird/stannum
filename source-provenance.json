@@ -32,6 +32,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the offline replay and kernel benchmarks of the query engine."
     },
+    "bench/benches/kernels.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: benchmarks of the query engine's kernels."
+    },
     "bench/src/areas.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: segment areas for the offline replay's page accounting."
@@ -835,6 +839,10 @@
       "upstream_path": "rust-toolchain.toml",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Byte-identical to the upstream source before notice insertion."
+    },
+    "script/bench-native": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the kernel benchmarks built for the machine's CPU against a saved baseline."
     },
     "script/dump-segments.py": {
       "owner": "ben",

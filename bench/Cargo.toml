@@ -12,8 +12,13 @@ description = "Stannum's query engine measured outside PostgreSQL: a replay of q
 publish = false
 
 [dependencies]
+boldi-vigna = { path = "../boldi-vigna" }
 engine = { path = "../engine", features = ["kernels", "stats"] }
 rustc-hash.workspace = true
 segment = { path = "../segment" }
 tinql = { path = "../tinql" }
 tokenizer = { path = "../tokenizer" }
+
+[[bench]]
+name = "kernels"
+harness = false
