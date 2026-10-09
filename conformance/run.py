@@ -694,7 +694,7 @@ def compare_case(case, want, got):
 
 # ---------------------------------------------------------------- divergences
 
-DIVERGENCE_KINDS = {"improvement": "IMPROVED", "gap": "GAP", "limit": "LIMITED"}
+DIVERGENCE_KINDS = {"improvement": "IMPROVED", "gap": "GAP", "limit": "LIMITED", "newer": "NEWER"}
 LIMIT_SQLSTATES = ("54000", "54001")  # program_limit_exceeded, statement_too_complex
 
 
@@ -710,6 +710,8 @@ def read_divergences(engine, recorded):
             sys.exit(f"{path}: {entry.get('id')}: kind must be one of {', '.join(DIVERGENCE_KINDS)}")
         if not entry.get("captures"):
             sys.exit(f"{path}: {entry.get('id')}: list the captures that diverge")
+        if entry["kind"] == "newer" and not entry.get("evidence"):
+            sys.exit(f"{path}: {entry.get('id')}: a newer divergence names its evidence")
         against = entry.get("against")
         if recorded in (against if isinstance(against, list) else [against]):
             chosen[entry["id"]] = entry
@@ -961,7 +963,7 @@ def main():
         if unknown:
             print(f"Recorded answers without a case in the suite: {', '.join(unknown)}")
         if divergences:
-            print(f"IMPROVED, GAP and LIMITED are divergences documented in divergences/{args.engine}.yaml")
+            print(f"IMPROVED, GAP, LIMITED and NEWER are divergences documented in divergences/{args.engine}.yaml")
         print(f"Compared {args.engine} {version} against {expected_source.get('engine')} "
               f"{expected_source.get('extension_version')} ({args.check})")
         return 1 if counts.get("FAIL") else 0

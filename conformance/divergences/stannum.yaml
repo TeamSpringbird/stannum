@@ -472,3 +472,20 @@ divergences:
     summary: Stannum defines a second ==> operator, text ==> stannum.indexed_query, for bound queries.
     tin: One ==> operator, text ==> text.
     stannum: text ==> text and text ==> stannum.indexed_query.
+
+  # ---- Later TIN behavior, through Lead.
+
+  - id: catalog.S-11
+    against: [tin-1.0.3, tin-1.0.4]
+    kind: newer
+    captures: [not_overlapping]
+    summary: The excluded side of NOT OVERLAPPING adds no scoring term, as in TIN's later fix; 1.0.3 and 1.0.4 scored it.
+    tin: score_inspect('a NOT OVERLAPPING b') lists a and b, each with weight 1.
+    stannum: Lists a only. The right side of NOT ENCLOSES, NOT ENCLOSED BY and NOT OVERLAPPING only filters, as with AND NOT.
+    evidence: >
+      Lead b8018ac (2026-10-07, "Copy tinql and boldi-vigna bug fixes from
+      TIN") collects scoring terms from a span's included leaves only, and
+      documents it in the query-language guide (span relations, boost).
+    question: >
+      Which TIN release first stops scoring the excluded side of a negated
+      span relation?
