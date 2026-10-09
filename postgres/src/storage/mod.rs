@@ -1505,6 +1505,8 @@ type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
 /// Sized so a directory of a few dozen segments over a hundred million
 /// rows stays resident: at 160 MB eighteen readers' page tables and
 /// dictionary samples overflowed it, so every query reloaded all of them.
+/// The ctid-native paths' loaded chunks count against it too, and keep at
+/// most a quarter of it across queries (see `NATIVE_SHARE`).
 pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(384);
 
 /// `stannum.read_cache_mb`: the budget of [`segment::cache`], the least
@@ -1638,23 +1640,26 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
         if unsafe { pg_sys::message_level_is_interesting(pg_sys::DEBUG1 as _) } {
             report_reader_cache(readers, bytes, budget);
         }
-        if bytes > budget {
-            // What the native paths loaded goes first, the most first: it
-            // reloads a chunk at a time as queries read it, where the
-            // readers' page tables and dictionaries reload whole.
-            let mut natives: Vec<(usize, (u64, u32))> = readers
-                .iter()
-                .map(|(key, c)| (c.native.bytes(), *key))
-                .filter(|(held, _)| *held > 0)
-                .collect();
+        // What the native paths loaded is a copy of index pages that shared
+        // buffers hold too, and a query reloads it a chunk at a time, where
+        // the readers' page tables and dictionaries reload whole: it keeps
+        // at most a share of the budget and goes first, the most first.
+        let mut natives: Vec<(usize, (u64, u32))> = readers
+            .iter()
+            .map(|(key, c)| (c.native.bytes(), *key))
+            .filter(|(held, _)| *held > 0)
+            .collect();
+        let mut native: usize = natives.iter().map(|(held, _)| held).sum();
+        if bytes > budget || native > budget / NATIVE_SHARE {
             natives.sort_unstable_by(|a, b| b.cmp(a));
             for (held, key) in natives {
-                if bytes <= budget {
+                if bytes <= budget && native <= budget / NATIVE_SHARE {
                     break;
                 }
                 if let Some(cached) = readers.get_mut(&key) {
                     cached.native = Rc::default();
                     bytes -= held;
+                    native -= held;
                     #[cfg(feature = "pg_test")]
                     testing::NATIVE_DROPS.set(testing::NATIVE_DROPS.get() + 1);
                 }
@@ -1668,6 +1673,14 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
         }
     });
 }
+
+/// The part of `stannum.reader_cache_mb` the ctid-native paths' loaded
+/// chunks may keep across queries: one in this many bytes. At 150M rows the
+/// readers' page tables, term-map indexes and document sets take about 130
+/// MB of the default 384, and a backend running the mixed workload peaked
+/// near its budget plus a query's reads; eight such backends beside 24 GB
+/// of shared buffers left a 32 GB container too little room.
+const NATIVE_SHARE: usize = 4;
 
 /// Logs at DEBUG1 what the backend's reader cache holds, by part, as a view
 /// is captured: `SET client_min_messages = debug1` to see it.
