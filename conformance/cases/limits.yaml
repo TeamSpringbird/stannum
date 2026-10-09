@@ -26,6 +26,15 @@ description: >
   a one-off probe made before the case was written; it was not run again, so
   it has no recorded answer.
 
+  Recorded against TIN 1.0.4 on 2026-10-09 UTC (2026-10-08 US Eastern) on
+  PlanetScale's PostgreSQL 18.6 test database: all four tagged cases crashed
+  the server, each run once, one at a time, after every other case. 1.0.4
+  restarts the whole server on limits.expansion_score.2 too, where 1.0.3
+  only lost its own backend. limits.at_least_near.2 and
+  limits.large_doc.10mb were not run against 1.0.4 (the database's owner
+  allowed neither AT LEAST of that size inside a proximity operator nor
+  documents over 1 MB).
+
 corpora:
   lim_atleast:
     rows:
@@ -85,7 +94,7 @@ cases:
     30 s statement_timeout.
   corpus: lim_atleast
   risky: true
-  crashes: [tin-1.0.3]
+  crashes: [tin-1.0.3, tin-1.0.4]
   settings:
     statement_timeout: 30s
   query: '(AT LEAST 15 OF [t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23 t24 t25
@@ -128,19 +137,21 @@ cases:
 - id: limits.expansion_score.2
   description: >
     As limits.expansion_score.1 for q0*, about 62,500 terms. TIN 1.0.3's backend was terminated ("administrator
-    command") after about 1 s.
+    command") after about 1 s; TIN 1.0.4 crashed the server after about 1 s.
   corpus: lim_dict
   risky: true
-  crashes: [tin-1.0.3]
+  crashes: [tin-1.0.3, tin-1.0.4]
   expect_if_answered: {value: [[10, 1]]}
   capture:
   - value: {sql: "SELECT count(*), count(DISTINCT s) FROM (SELECT {engine}.full_score(ctid) s FROM {table} WHERE body ==>
         'q0*' ORDER BY {engine}.full_score(ctid) DESC LIMIT 10) top"}
 - id: limits.expansion_count.1
-  description: count(*) of q*, which expands to all 1,000,000 q-terms. Restarted TIN 1.0.3's server (see the area description).
+  description: >
+    count(*) of q*, which expands to all 1,000,000 q-terms. Restarted TIN 1.0.3's server (see the area description)
+    and TIN 1.0.4's.
   corpus: lim_dict
   risky: true
-  crashes: [tin-1.0.3]
+  crashes: [tin-1.0.3, tin-1.0.4]
   query: 'q*'
   capture: [count]
   expect_if_answered: {count: 1000000}
@@ -203,7 +214,7 @@ cases:
     highlighting it.
   corpus: lim_doc50
   risky: true
-  crashes: [tin-1.0.3]
+  crashes: [tin-1.0.3, tin-1.0.4]
   capture:
   - script:
       steps:

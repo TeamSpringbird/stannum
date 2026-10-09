@@ -220,6 +220,19 @@ may restart.
   time and last. `limits.json`'s header reads `8592c98…-dirty` only because
   the answer files being recorded were not yet committed (the runner now
   ignores `expected/` in that check); the cases and runner were at `8592c98`.
+- `expected/tin-1.0.4/` holds TIN 1.0.4's answers, recorded live by
+  `run.py` (runner version 3) on 2026-10-09 UTC (2026-10-08 US Eastern)
+  against PostgreSQL 18.6 on a PlanetScale test database: every area at
+  `5e3f29d` with `--skip-crash` (a second run gave identical answers),
+  `stemming`, `tiebreak` and `inventory` at `41f8e6c`, then, one at a time
+  and last, the seven cases tagged as crashing TIN 1.0.3, merged into
+  `limits.json` and `query_size.json` (whose headers name that last run,
+  at `ee6f940`). All seven crashed the server again and are tagged
+  `tin-1.0.4`. Five cases were not run, beyond what the database's owner
+  allowed (more than 1,000 query terms, a document over 1 MB, AT LEAST 8 OF
+  16 inside NEAR): `catalog.Q-20`, `limits.at_least_near.2`,
+  `limits.large_doc.10mb`, `query_size.words.3000` and
+  `query_size.or_chain.3000`.
 - To see what a new version changed, compare its directory with the
   previous one: `python3 conformance/compare_recordings.py
   conformance/expected/tin-1.0.3 conformance/expected/tin-1.0.4`.

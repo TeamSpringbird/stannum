@@ -4,11 +4,26 @@
   "extension_version": "1.0.4",
   "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
   "host": "PlanetScale Postgres 18.6 (test database)",
-  "date": "2026-10-09T03:36:17Z",
-  "suite_commit": "5e3f29df79ccf3c8807d8d06a9cc8a0f56f15cfe",
+  "date": "2026-10-09T03:40:44Z",
+  "suite_commit": "ee6f9406c879c5122af3b431c0a29ecd08df4728",
   "runner_version": "3"
  },
  "cases": [
+  {
+   "id": "query_size.or_chain.10000",
+   "server_crashed": true,
+   "detail": "the sentinel connection died too (the server reinitialized)"
+  },
+  {
+   "id": "query_size.words.10000",
+   "server_crashed": true,
+   "detail": "the sentinel connection died too (the server reinitialized)"
+  },
+  {
+   "id": "query_size.nested.5000",
+   "server_crashed": true,
+   "detail": "the sentinel connection died too (the server reinitialized)"
+  },
   {
    "id": "query_size.words.1000",
    "captures": {
