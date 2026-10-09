@@ -495,9 +495,26 @@ impl<'text> MixedDefaultIter<'text> {
             };
             return;
         }
+        // An emoji the word segmenter leaves alone reaches the reference's
+        // grapheme scan, which emits it as one Emoji token. But some emoji are
+        // word characters: ℹ, Ⓜ, and 🅰 🅱 🅾 🅿 are Word_Break ALetter, so
+        // the reference emits them, with or without U+FE0F, as Words. The
+        // only emoji words the reference reclassifies are keycaps (an ASCII
+        // digit start). Ask the word source rather than a hand-kept list so
+        // this tier tracks its tables.
         if core.len() <= 256 && emojis::get(core).is_some() {
-            self.active = DefaultRegionIter::Single(folded_token(core, Classification::Emoji));
-            return;
+            let mut words = core.unicode_words();
+            let is_emoji = match (words.next(), words.next()) {
+                (None, _) => true,
+                (Some(word), None) => {
+                    word.len() == core.len() && core.as_bytes()[0].is_ascii_digit()
+                }
+                _ => false,
+            };
+            if is_emoji {
+                self.active = DefaultRegionIter::Single(folded_token(core, Classification::Emoji));
+                return;
+            }
         }
         // A whitespace-delimited field made purely of combining marks
         // normally forms a single UAX#29 segment: marks are word-break
@@ -875,6 +892,14 @@ mod tests {
             // failure on PR #222).
             "a \u{10efa} z",
             "a \u{10efa}\u{10efa} z",
+            // Emoji that are Word_Break ALetter are words, not emoji, with or
+            // without emoji presentation (proptest failure on CI run
+            // 37899439196). Keycaps stay emoji.
+            "\u{1f170}",
+            "a \u{1f170}\u{fe0f} z",
+            "(\u{1f171}) \u{1f17e} \u{1f17f}\u{fe0f}",
+            "\u{2139} \u{24c2}\u{fe0f}",
+            "1\u{fe0f}\u{20e3} #\u{fe0f}\u{20e3}",
         ] {
             assert_eq!(mixed(text), unicode_reference(text), "input {text:?}");
         }
@@ -903,6 +928,97 @@ mod tests {
                 format!("a ({c}) z"),
             ] {
                 assert_eq!(mixed(&text), unicode_reference(&text), "input {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn alphabetic_emoji_are_words_and_keycaps_are_emoji() {
+        use Classification::{Emoji, Word};
+        let shape = |text: &str| {
+            mixed(text)
+                .into_iter()
+                .map(|(text, _, classification, _)| (text, classification))
+                .collect::<Vec<_>>()
+        };
+        for c in [
+            '\u{2139}',
+            '\u{24c2}',
+            '\u{1f170}',
+            '\u{1f171}',
+            '\u{1f17e}',
+            '\u{1f17f}',
+        ] {
+            let expected = c.to_lowercase().collect::<String>();
+            for text in [format!("{c}"), format!("{c}\u{fe0f}")] {
+                assert_eq!(shape(&text), [(expected.clone(), Word)], "input {text:?}");
+            }
+        }
+        assert_eq!(shape("😀"), [("😀".to_owned(), Emoji)]);
+        assert_eq!(
+            shape("1\u{fe0f}\u{20e3}"),
+            // Folding drops the keycap's presentation and enclosing marks.
+            [("1".to_owned(), Emoji)]
+        );
+    }
+
+    #[test]
+    fn every_scalar_matches_reference_alone_and_in_small_contexts() {
+        // Differential sweep of the mixed fast path against the reference
+        // over every Unicode scalar value, alone and in the contexts that
+        // steer field-level tier selection: delimited by ASCII words, fused
+        // with emoji presentation, keycap, and skin-tone modifiers, doubled,
+        // and wrapped in trimmed ASCII punctuation. The emoji tier must not
+        // claim a field the word segmenter treats as a word (U+1F170 NEGATIVE
+        // SQUARED LATIN CAPITAL LETTER A is ALetter, so it is a word even
+        // though it is also an emoji).
+        let mut mismatches = Vec::new();
+        for c in '\0'..=char::MAX {
+            if c.is_ascii() {
+                continue;
+            }
+            for text in [
+                format!("{c}"),
+                format!("a {c} z"),
+                format!("{c}\u{fe0f}"),
+                format!("a {c}\u{fe0f} z"),
+                format!("{c}\u{fe0e}"),
+                format!("{c}\u{20e3}"),
+                format!("{c}\u{1f3fd}"),
+                format!("{c}{c}"),
+                format!("({c})"),
+            ] {
+                if mixed(&text) != unicode_reference(&text) {
+                    mismatches.push(text);
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} mismatches, first {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(40)]
+        );
+    }
+
+    #[test]
+    fn every_emoji_matches_reference_alone_and_delimited() {
+        // Multi-scalar emoji (ZWJ sequences, flags, keycaps, modifiers) are
+        // out of reach of the per-scalar sweep; run every emoji and skin-tone
+        // variant the emoji table knows through the same comparison.
+        for emoji in emojis::iter() {
+            let variants = std::iter::once(emoji)
+                .chain(emoji.skin_tones().into_iter().flatten())
+                .map(emojis::Emoji::as_str);
+            for e in variants {
+                for text in [
+                    e.to_owned(),
+                    format!("a {e} z"),
+                    format!("{e}{e}"),
+                    format!("({e})"),
+                ] {
+                    assert_eq!(mixed(&text), unicode_reference(&text), "input {text:?}");
+                }
             }
         }
     }
