@@ -303,17 +303,24 @@ impl<'a> EfCursor<'a> {
 
     /// Calls `visit` with the current value and each after it below `end`,
     /// and stops at the first at or past it: [`Self::advance`] in one loop,
-    /// the highs word and the lows read in place.
+    /// the highs a word at a time (the word at hand kept, its passed bits
+    /// cleared) and the lows read in place.
     #[inline]
     pub fn drain_below(&mut self, end: u32, mut visit: impl FnMut(u32)) {
         let Some(mut value) = self.current else {
             return;
         };
+        if value >= end {
+            return;
+        }
         let (highs, lows, low, n) = (self.ef.highs, self.ef.lows, self.ef.low, self.ef.n);
-        let total = highs.len() * 8;
+        let words = highs.len().div_ceil(8);
         let mut index = self.index;
         let mut bit = self.bit;
-        while value < end {
+        let mut w = bit / 64;
+        // The current value's word, without its bit and those below.
+        let mut word = bits::word(highs, w) & ((u64::MAX << (bit % 64)) << 1);
+        loop {
             visit(value);
             index += 1;
             if index >= n {
@@ -322,26 +329,23 @@ impl<'a> EfCursor<'a> {
                 self.current = None;
                 return;
             }
-            let mut at = bit + 1;
-            let mut word = if at < total {
-                bits::word(highs, at / 64) >> (at % 64)
-            } else {
-                0
-            };
             while word == 0 {
-                at = (at / 64 + 1) * 64;
-                if at >= total {
+                w += 1;
+                if w >= words {
                     self.index = index;
-                    self.bit = at;
+                    self.bit = w * 64;
                     self.current = None;
                     return;
                 }
-                word = bits::word(highs, at / 64);
+                word = bits::word(highs, w);
             }
-            at += word.trailing_zeros() as usize;
-            bit = at;
-            let high = (at - index) as u32;
+            bit = w * 64 + word.trailing_zeros() as usize;
+            word &= word - 1;
+            let high = (bit - index) as u32;
             value = high << low | bits::get(lows, index, low).unwrap_or(0);
+            if value >= end {
+                break;
+            }
         }
         self.index = index;
         self.bit = bit;
