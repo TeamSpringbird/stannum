@@ -3689,28 +3689,22 @@ pub(crate) fn with_native<R>(
         let blob = slot.get_or_insert_with(|| Blob::new(header.bounds[7] as usize));
         let mut decoded = native.decoded.borrow_mut();
         if decoded.is_none() {
-            // The header, the document set and the liveness area; of the
-            // DL sidecar between them only its escape count and table,
-            // which parsing it checks: a count reads no length.
-            let (sidecar, end) = (header.bounds[5], header.bounds[6]);
+            // The header, then the document set, the DL sidecar (bit-packed
+            // by block, a little over a byte a document) and the liveness
+            // area, which end the blob.
+            let sidecar = header.bounds[5];
             blob.ensure(source, 0, header.bounds[1] as usize)?;
             blob.ensure(
                 source,
                 header.bounds[4],
-                (sidecar - header.bounds[4]) as usize,
+                (header.bounds[7] - header.bounds[4]) as usize,
             )?;
-            blob.ensure(source, end, (header.bounds[7] - end) as usize)?;
-            blob.ensure(source, sidecar, 10.min(end - sidecar) as usize)?;
-            let mut at = sidecar as usize;
-            let escapes = segment::tinshape::varint::get(&blob.bytes, &mut at)?;
-            let table = escapes.checked_mul(8).ok_or(segment::Error::Truncated)?;
-            blob.ensure(source, end.saturating_sub(table), table as usize)?;
             let docs = segment::tinshape::docs::DocSet::decode(
                 &blob.bytes[header.bounds[4] as usize..sidecar as usize],
             )?;
             *decoded = Some(Decoded {
                 docs,
-                lengths: false,
+                lengths: true,
             });
         }
         let decoded = decoded.as_mut().expect("decoded above");
