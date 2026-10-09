@@ -20,7 +20,7 @@ use segment::set::Cursor as _;
 use segment::tf_bucket::TfBucket;
 use segment::tid::MAX_OFFSET;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::plan::{Limits, plan};
 use tinql::runtime::{evaluate, parse_tinql_to_query, parse_tinql_to_scoring_query, tokenize_doc};
@@ -31,11 +31,12 @@ use engine::terms::{
     Collected, Expansion, ScoringError, ScoringPolicy, TooManyTerms, collect_score_terms,
     corpus_universe, inputs_of,
 };
+pub(crate) use engine::walk::walks_pruned;
 pub(crate) use engine::walk::{
     PRUNE_MAX_K, TopK, chunk_loads, position_checks, position_reads, rank, walk_blocks,
     warmup_chunks, warmup_estimate, warmup_threshold,
 };
-use engine::walk::{Ranked, Scorer, Source, WalkConfig};
+use engine::walk::{Ranked, Scorer, Source, TopRows, WalkConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheKey {
@@ -773,31 +774,33 @@ impl IndexScorer {
     /// of megabytes per backend. Bit-identical to that, including tie order.
     ///
     /// `None` when the stream is a superset that needs rechecking.
+    ///
+    /// With `ties`, the rows tied with the k-th score and the next row after
+    /// them are kept too (see [`TopRows`]).
     pub(crate) fn top_k_streamed(
         &mut self,
         stream: &mut crate::stream::CandidateStream,
         k: usize,
+        ties: bool,
     ) -> Option<TopK> {
         if stream.recheck {
             return None;
         }
-        let mut heap = BinaryHeap::with_capacity(k + 1);
+        let mut top = TopRows::new(k, ties);
         let mut scored = 0usize;
         while let Some(tid) = stream.next() {
             pgrx::check_for_interrupts!();
             scored += 1;
             let entry = Ranked(self.score(tid), tid);
-            if heap.len() < k {
-                heap.push(entry);
-            } else if heap.peek().is_some_and(|worst| entry < *worst) {
-                heap.pop();
-                heap.push(entry);
+            if top.admits(&entry) {
+                top.push(entry);
             }
         }
-        let mut rows: Vec<(f32, Tid)> = heap.into_iter().map(|Ranked(s, t)| (s, t)).collect();
-        rows.sort_by(rank);
+        // With ties and no row kept below them, every candidate was kept.
+        let complete = k > 0 && ties && !top.bounded();
+        let rows = top.into_rows();
         Some(TopK {
-            complete: rows.len() < k,
+            complete: complete || rows.len() < k,
             rows,
             scored,
             zero_fill: false,
@@ -811,8 +814,9 @@ impl IndexScorer {
     /// enter the top k only if visible under the active snapshot, trusting
     /// the visibility map, and the walk is repeated against the heap if the
     /// view is no longer current (a dead list was published or the write
-    /// buffer rewritten meanwhile).
-    pub(crate) fn top_k(&self, k: usize) -> Option<TopK> {
+    /// buffer rewritten meanwhile). With `ties`, the rows tied with the k-th
+    /// score and the next row after them are kept too (see [`TopRows`]).
+    pub(crate) fn top_k(&self, k: usize, ties: bool) -> Option<TopK> {
         let sources: Vec<Source<'_>> = (0..self.view.sources.len())
             .map(|i| Source {
                 index: &*self.view.sources[i].0,
@@ -831,6 +835,7 @@ impl IndexScorer {
         self.scoring.top_k(
             &sources,
             k,
+            ties,
             &config,
             |shortcut| unsafe { Visibility::open(heap_oid, shortcut) },
             |visibility| {

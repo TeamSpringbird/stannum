@@ -393,6 +393,13 @@ fn prunable_shape(query: &Query) -> Option<(Combine, Vec<&str>, Option<SpanCheck
     Some((combine, terms, check))
 }
 
+/// Whether [`Scorer::top_k`] walks `query` pruned rather than leaving the
+/// caller to score every candidate, by its shape alone: the planner's
+/// question, before any scorer is built.
+pub fn walks_pruned(query: &Query) -> bool {
+    prunable_shape(query).is_some() || Shape::of(query).is_some()
+}
+
 /// A query of terms and all-required spans that [`prunable_shape`] does not
 /// accept, combined by AND, OR, AT LEAST and AND NOT: `w OR "p q"`,
 /// `(a AND b) OR c`, `a AND (b OR c)`, `a AND NOT b`, boosts anywhere.
@@ -616,6 +623,114 @@ impl Ord for Ranked {
     }
 }
 
+/// The rows a top-k search keeps: the best `k` in output order and, when
+/// asked for ties, every further row whose score equals the k-th best and
+/// then the first row below that score. A caller that orders ties by keys
+/// of its own (`ORDER BY score DESC, id`) needs every row tied with the
+/// k-th, and the row after them to know where the tied rows end; an
+/// incremental sort reads up to it.
+///
+/// The bar a candidate must outrank to be kept is the k-th row, or with
+/// ties the row below them; until there is one, every candidate is kept.
+/// Rows are only ever dropped for ranking below the bar, which only rises,
+/// so the rows kept are those of the exhaustive ordering whatever order
+/// the candidates arrive in.
+pub struct TopRows {
+    k: usize,
+    ties: bool,
+    /// The best `k` rows.
+    best: BinaryHeap<Ranked>,
+    /// With ties, the rows after the best `k` in output order: those tied
+    /// with the k-th score, then at most one row below it.
+    after: Vec<Ranked>,
+}
+
+impl TopRows {
+    pub fn new(k: usize, ties: bool) -> Self {
+        Self {
+            k,
+            ties,
+            best: BinaryHeap::with_capacity(k + 1),
+            after: Vec::new(),
+        }
+    }
+
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    fn clear(&mut self) {
+        self.best.clear();
+        self.after.clear();
+    }
+
+    /// The row a candidate must outrank to be kept, once there is one.
+    pub fn bar(&self) -> Option<(f32, Tid)> {
+        if self.best.len() < self.k {
+            return None;
+        }
+        let kth = self.best.peek()?;
+        if !self.ties {
+            return Some((kth.0, kth.1));
+        }
+        self.after
+            .last()
+            .filter(|row| row.0.total_cmp(&kth.0) == Ordering::Less)
+            .map(|row| (row.0, row.1))
+    }
+
+    /// Whether `candidate` would be kept.
+    pub fn admits(&self, candidate: &Ranked) -> bool {
+        self.bar()
+            .is_none_or(|(score, tid)| *candidate < Ranked(score, tid))
+    }
+
+    /// Keeps `candidate`, which [`Self::admits`].
+    pub fn push(&mut self, candidate: Ranked) {
+        if self.best.len() < self.k {
+            self.best.push(candidate);
+            return;
+        }
+        let Some(kth) = self.best.peek() else {
+            return;
+        };
+        let displaced = if candidate < *kth {
+            let kth = self.best.pop().expect("peeked");
+            self.best.push(candidate);
+            kth
+        } else {
+            candidate
+        };
+        if !self.ties {
+            return;
+        }
+        let at = self.after.partition_point(|row| *row < displaced);
+        self.after.insert(at, displaced);
+        let kth = self.best.peek().expect("full").0;
+        if let Some(below) = self
+            .after
+            .iter()
+            .position(|row| row.0.total_cmp(&kth) == Ordering::Less)
+        {
+            self.after.truncate(below + 1);
+        }
+    }
+
+    /// Whether there is a bar: without ties, `k` rows were kept; with ties,
+    /// a row below the tied rows was, so the rows end before the last match.
+    pub fn bounded(&self) -> bool {
+        self.bar().is_some()
+    }
+
+    /// The rows kept, in output order.
+    pub fn into_rows(self) -> Vec<(f32, Tid)> {
+        let mut rows: Vec<(f32, Tid)> = self.best.into_iter().map(|Ranked(s, t)| (s, t)).collect();
+        rows.sort_by(rank);
+        rows.extend(self.after.into_iter().map(|Ranked(s, t)| (s, t)));
+        rows
+    }
+}
+
 impl Scorer {
     /// True when no term scores: every leaf is absent or an elided dense
     /// term, so every match scores zero and ranks in heap order.
@@ -649,14 +764,20 @@ impl Scorer {
     /// its terms, or a source carries no block bounds; the caller then
     /// scores every candidate.
     ///
+    /// With `ties`, the rows tied with the k-th score and the next row after
+    /// them are kept too (see [`TopRows`]).
+    ///
     /// Each walk over the sources asks `open` for the visibility of its
     /// candidates, saying whether it may take shortcuts (a server's
     /// visibility map); once it ends, `settled` says whether its result
-    /// stands, or the walk is to be repeated without them.
+    /// stands, or the walk is to be repeated without them. A visibility
+    /// that also applies the caller's other restrictions makes the rows the
+    /// best of those that pass them.
     pub fn top_k<V: Visibility>(
         &self,
         sources: &[Source<'_>],
         k: usize,
+        ties: bool,
         config: &WalkConfig,
         mut open: impl FnMut(bool) -> V,
         mut settled: impl FnMut(&V) -> bool,
@@ -719,7 +840,7 @@ impl Scorer {
                 }
             }) != Tri::No;
         }
-        let mut heap = BinaryHeap::with_capacity(k + 1);
+        let mut top = TopRows::new(k, ties);
         let mut scored = 0usize;
         let mut ordinal = false;
         if k > 0 && !(absent && combine == Combine::All) {
@@ -760,8 +881,7 @@ impl Scorer {
                         &filters,
                         warmup,
                         &mut visibility,
-                        k,
-                        &mut heap,
+                        &mut top,
                         &mut scored,
                     );
                     ordinal = true;
@@ -774,8 +894,7 @@ impl Scorer {
                             check.as_ref(),
                             mixed.as_ref(),
                             &mut visibility,
-                            k,
-                            &mut heap,
+                            &mut top,
                             &mut scored,
                         );
                         ordinal = true;
@@ -784,25 +903,37 @@ impl Scorer {
                 if settled(&visibility) {
                     break;
                 }
-                heap.clear();
+                top.clear();
                 scored = 0;
                 shortcut = false;
             }
         }
-        let mut rows: Vec<(f32, Tid)> = heap.into_iter().map(|Ranked(s, t)| (s, t)).collect();
-        rows.sort_by(rank);
+        let bounded = top.bounded();
+        let mut rows = top.into_rows();
         // A location present in two sources is scored by the first only in
         // the unpruned path; leave that case to it.
         let mut seen = FxHashSet::default();
         if !rows.iter().all(|(_, tid)| seen.insert(*tid)) {
             return None;
         }
+        if ties && elided && bounded && rows.last().is_some_and(|(score, _)| *score <= 0.0) {
+            // The row after the ties scores zero, as the unwalked documents
+            // holding only elided terms do, and an earlier one of those may
+            // be the true next row: it is left to a completion.
+            rows.pop();
+        }
         if elided && rows.last().is_some_and(|(score, _)| *score <= 0.0) {
             // Documents holding only elided terms tie at zero and belong here.
             return None;
         }
+        if ties && elided && rows.len() < k {
+            // Every one of the zero-scoring matches would tie with the k-th.
+            return None;
+        }
         let zero_fill = elided && rows.len() < k;
-        let complete = rows.len() < k && !zero_fill;
+        // With ties and no row kept below them, every walked candidate was
+        // kept, and without elided terms every match was walked.
+        let complete = (rows.len() < k || ties && k > 0 && !bounded) && !elided;
         Some(TopK {
             rows,
             scored,
@@ -837,12 +968,11 @@ impl Ranking<'_> {
         check: Option<&SpanCheck<'_>>,
         mixed: Option<&Shape<'_>>,
         visibility: &mut dyn Visibility,
-        k: usize,
-        heap: &mut BinaryHeap<Ranked>,
+        top: &mut TopRows,
         scored: &mut usize,
     ) {
         if let Some(mut parts) = self.open_walk(i, combine, filters, check, mixed) {
-            self.run_walk(&mut parts, visibility, k, heap, scored, Pass::Walk(&[]));
+            self.run_walk(&mut parts, visibility, top, scored, Pass::Walk(&[]));
         }
     }
 
@@ -1002,8 +1132,7 @@ impl Ranking<'_> {
         &'a self,
         parts: &mut WalkParts<'a>,
         visibility: &mut dyn Visibility,
-        k: usize,
-        heap: &mut BinaryHeap<Ranked>,
+        top: &mut TopRows,
         scored: &mut usize,
         pass: Pass<'_>,
     ) {
@@ -1021,8 +1150,7 @@ impl Ranking<'_> {
             lengths: parts.source.lengths(),
             dead: parts.dead,
             visibility,
-            k,
-            heap,
+            top,
             scored,
             iterations: 0,
             // An unscored walk has no score to seed: every match ties at zero.
@@ -1323,20 +1451,16 @@ impl Ranking<'_> {
     /// against a threshold that only rises, and a range is judged by the
     /// location of its first ordinal, which within a source is the earliest
     /// of every document in the range wherever the range lies.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one call site; the arguments are the walk's state"
-    )]
     fn warm_up(
         &self,
         order: &[usize],
         filters: &[&str],
         limit: usize,
         visibility: &mut dyn Visibility,
-        k: usize,
-        heap: &mut BinaryHeap<Ranked>,
+        top: &mut TopRows,
         scored: &mut usize,
     ) {
+        let k = top.k();
         // Each source's streams are opened once, for all three passes.
         let mut walks: Vec<WalkParts<'_>> = order
             .iter()
@@ -1354,14 +1478,7 @@ impl Ranking<'_> {
             let mut bounded = Vec::new();
             for (n, parts) in walks.iter_mut().enumerate() {
                 bounded.clear();
-                self.run_walk(
-                    parts,
-                    visibility,
-                    k,
-                    heap,
-                    scored,
-                    Pass::Bound(&mut bounded),
-                );
+                self.run_walk(parts, visibility, top, scored, Pass::Bound(&mut bounded));
                 picks.extend(bounded.iter().map(|chunk| (n, *chunk)));
             }
         }
@@ -1385,7 +1502,7 @@ impl Ranking<'_> {
         let mut skip = Vec::with_capacity(walks.len());
         for (parts, chunks) in walks.iter_mut().zip(&warmed) {
             if !chunks.is_empty() {
-                self.run_walk(parts, visibility, k, heap, scored, Pass::Warm(chunks));
+                self.run_walk(parts, visibility, top, scored, Pass::Warm(chunks));
             }
             let mut keys: Vec<u16> = chunks.iter().map(|chunk| chunk.key).collect();
             keys.sort_unstable();
@@ -1393,14 +1510,10 @@ impl Ranking<'_> {
         }
         if !picks.is_empty() {
             WARMUP_EVALUATED.set(WARMUP_EVALUATED.get() + picks.len() as i64);
-            WARMUP_THRESHOLD.set(if heap.len() == k {
-                heap.peek().map(|worst| worst.0)
-            } else {
-                None
-            });
+            WARMUP_THRESHOLD.set(top.bar().map(|(score, _)| score));
         }
         for (parts, keys) in walks.iter_mut().zip(&skip) {
-            self.run_walk(parts, visibility, k, heap, scored, Pass::Walk(keys));
+            self.run_walk(parts, visibility, top, scored, Pass::Walk(keys));
         }
     }
 }
@@ -1975,8 +2088,7 @@ struct OrdinalWalk<'a, 's> {
     /// Dead documents, by ordinal.
     dead: &'s DeadDocs,
     visibility: &'s mut dyn Visibility,
-    k: usize,
-    heap: &'s mut BinaryHeap<Ranked>,
+    top: &'s mut TopRows,
     scored: &'s mut usize,
     iterations: u32,
     /// `stannum.debug_seed_score`, read once: the threshold is consulted
@@ -2476,11 +2588,7 @@ impl OrdinalWalk<'_, '_> {
 
     /// Brings the threshold up to date after the heap changed.
     fn raise(&mut self) {
-        let real = if self.heap.len() == self.k {
-            self.heap.peek().map(|w| (w.0, w.1))
-        } else {
-            None
-        };
+        let real = self.top.bar();
         self.bar = match (real, self.seed) {
             (Some(real), Some(seed)) if seed.0 > real.0 => Some(seed),
             (None, seed) => seed,
@@ -2488,12 +2596,9 @@ impl OrdinalWalk<'_, '_> {
         };
     }
 
-    /// Adds `candidate` to the heap, dropping the worst row once it holds k.
+    /// Keeps `candidate`, which ranks above the bar (see [`TopRows`]).
     fn push(&mut self, candidate: Ranked) {
-        if self.heap.len() == self.k {
-            self.heap.pop();
-        }
-        self.heap.push(candidate);
+        self.top.push(candidate);
         self.raise();
     }
 
@@ -2969,8 +3074,7 @@ impl OrdinalWalk<'_, '_> {
                     let Some(total) = self.score_conjunct(low, ordinal, sub, first, pruning) else {
                         continue;
                     };
-                    let admit =
-                        self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
+                    let admit = self.top.bar().is_none_or(|(bar, _)| total >= bar);
                     if !admit {
                         continue;
                     }
@@ -2994,11 +3098,7 @@ impl OrdinalWalk<'_, '_> {
     fn admit(&mut self, total: f32, ordinal: u32) {
         let tid = self.resolve(ordinal);
         let candidate = Ranked(total, tid);
-        if self.heap.len() < self.k {
-            if self.visibility.visible(tid) {
-                self.push(candidate);
-            }
-        } else if self.heap.peek().is_some_and(|w| candidate < *w) && self.visibility.visible(tid) {
+        if self.top.admits(&candidate) && self.visibility.visible(tid) {
             self.push(candidate);
         }
     }
@@ -3028,9 +3128,7 @@ impl OrdinalWalk<'_, '_> {
             let (total, low) = pending[at];
             at += 1;
             let ordinal = base + u32::from(low);
-            if self.heap.len() == self.k
-                && let Some(worst) = self.heap.peek().map(|w| (w.0, w.1))
-            {
+            if let Some(worst) = self.top.bar() {
                 // As `admit` ranks: a better score, or the same from an
                 // earlier location.
                 match total.total_cmp(&worst.0) {
@@ -3588,27 +3686,18 @@ impl OrdinalWalk<'_, '_> {
                 let Some(total) = self.score_candidate(present, low, ordinal, sub, pruning) else {
                     continue;
                 };
-                let admit =
-                    self.heap.len() < self.k || self.heap.peek().is_some_and(|w| total >= w.0);
+                let admit = self.top.bar().is_none_or(|(bar, _)| total >= bar);
                 if !admit {
                     continue;
                 }
                 let tid = self.resolve(ordinal);
                 let candidate = Ranked(total, tid);
                 if certain & (1u64 << (low % 64)) == 0
-                    && (self.heap.len() == self.k
-                        && self.heap.peek().is_none_or(|w| candidate >= *w)
-                        || !self.mixed_holds(key, low, ordinal))
+                    && (!self.top.admits(&candidate) || !self.mixed_holds(key, low, ordinal))
                 {
                     continue;
                 }
-                if self.heap.len() < self.k {
-                    if self.visibility.visible(tid) {
-                        self.push(candidate);
-                    }
-                } else if self.heap.peek().is_some_and(|w| candidate < *w)
-                    && self.visibility.visible(tid)
-                {
+                if self.top.admits(&candidate) && self.visibility.visible(tid) {
                     self.push(candidate);
                 }
             }
@@ -3820,5 +3909,78 @@ impl<'a> OrdinalWalk<'a, '_> {
         let holds = self.condition_holds(&condition, key, low, ordinal);
         self.condition = Some(condition);
         holds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A small linear congruential generator: deterministic, no dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self, below: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % below
+        }
+    }
+
+    /// Candidates with scores from a handful of values, so ties cross most
+    /// k, arriving in a shuffled order.
+    fn candidates(seed: u64, count: usize, values: u64) -> Vec<(f32, Tid)> {
+        let mut random = Lcg(seed);
+        let mut rows: Vec<(f32, Tid)> = (0..count)
+            .map(|n| {
+                let tid = Tid {
+                    block: n as u32 / 7,
+                    offset: (n % 7) as u16 + 1,
+                };
+                (random.next(values) as f32 * 0.25, tid)
+            })
+            .collect();
+        for i in (1..rows.len()).rev() {
+            rows.swap(i, random.next(i as u64 + 1) as usize);
+        }
+        rows
+    }
+
+    #[test]
+    fn top_rows_keep_the_exhaustive_prefix_and_with_ties_the_tied_run_and_the_next_row() {
+        for seed in 0..40 {
+            let rows = candidates(seed, 60, 1 + seed % 9);
+            let mut all = rows.clone();
+            all.sort_by(rank);
+            for k in 0..=all.len() + 1 {
+                // Rows scoring at least the k-th's, and whether any is below.
+                let tied = match k {
+                    0 => 0,
+                    k if k > all.len() => all.len(),
+                    k => all.iter().take_while(|row| row.0 >= all[k - 1].0).count(),
+                };
+                for ties in [false, true] {
+                    let mut top = TopRows::new(k, ties);
+                    for &(score, tid) in &rows {
+                        let row = Ranked(score, tid);
+                        if top.admits(&row) {
+                            top.push(row);
+                        }
+                    }
+                    let bounded = top.bounded();
+                    let kept = top.into_rows();
+                    let case = format!("seed {seed} k {k} ties {ties}");
+                    if ties && k > 0 {
+                        assert_eq!(kept, all[..(tied + 1).min(all.len())], "{case}");
+                        assert_eq!(bounded, tied < all.len(), "{case}");
+                    } else {
+                        assert_eq!(kept, all[..k.min(all.len())], "{case}");
+                        assert_eq!(bounded, k > 0 && k <= all.len(), "{case}");
+                    }
+                }
+            }
+        }
     }
 }

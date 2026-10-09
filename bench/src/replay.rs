@@ -385,7 +385,8 @@ impl<'d> Engine<'d> {
             });
         }
         let sources = self.sources();
-        let top: Option<TopK> = scorer.top_k(&sources, k, &self.config, |_| AllVisible, |_| true);
+        let top: Option<TopK> =
+            scorer.top_k(&sources, k, false, &self.config, |_| AllVisible, |_| true);
         drop(sources);
         let Some(mut top) = top else {
             return self.streamed(scorer, k);
