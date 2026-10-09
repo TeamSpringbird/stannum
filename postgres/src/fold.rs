@@ -39,7 +39,7 @@ pub(crate) fn count_native(
     }
     let mut names = Vec::new();
     let node = engine::tinshape::lower(query, &mut names)?;
-    crate::storage::with_native(view, i, &names, spans(&node), |segment| {
+    crate::storage::with_native(view, i, &names, spans(&node), false, |segment| {
         let geometry = &segment.docs.geometry;
         let mut terms = open_terms(segment, &names, &mut NoTouch)?;
         let mut hidden: Vec<Tid> = Vec::new();

@@ -3613,13 +3613,15 @@ impl Blob {
 /// The parts of a segment decoded once per backend (see
 /// [`segment::tinshape::segment::Segment::assemble`]).
 struct Decoded {
-    /// Parsed over `index_bytes`, declared first so it is dropped first.
-    index: segment::dictionary::DictionaryIndex<'static>,
-    /// Owns the bytes `index` borrows; never read otherwise.
-    #[allow(dead_code)]
-    index_bytes: Box<[u8]>,
     docs: segment::tinshape::docs::DocSet,
+    /// Whether the DL sidecar's stored lengths are loaded.
+    lengths: bool,
 }
+
+/// An empty term map's index: the native paths find their terms through
+/// the paged reader and seed the segment's memo with them, so the
+/// assembled segment never walks its own term map.
+const NO_TERMS: &[u8] = &[0, 0, 0];
 
 /// What the ctid-native paths keep of a segment in this backend.
 #[derive(Default)]
@@ -3646,6 +3648,7 @@ pub(crate) fn with_native<R>(
     i: usize,
     names: &[String],
     positions: bool,
+    lengths: bool,
     f: impl FnOnce(&segment::tinshape::segment::Segment<'_>) -> segment::Result<R>,
 ) -> Option<segment::Result<R>> {
     let (reader, native) = view.natives.get(i)?.as_ref()?;
@@ -3660,36 +3663,33 @@ pub(crate) fn with_native<R>(
         let blob = slot.get_or_insert_with(|| Blob::new(header.bounds[7] as usize));
         let mut decoded = native.decoded.borrow_mut();
         if decoded.is_none() {
-            // The header and the term map's index, then the document set,
-            // DL sidecar and liveness area, which end the blob.
-            let probe = header.bounds[1] as usize + 32.min(header.len(1));
-            blob.ensure(source, 0, probe)?;
-            let prefix = segment::dictionary::DictionaryIndex::prefix_len(
-                &blob.bytes[header.bounds[1] as usize..probe],
-            )?;
-            let at = header.bounds[1] as usize;
-            blob.ensure(source, 0, at + prefix)?;
-            blob.ensure(
-                source,
-                header.bounds[4],
-                (header.bounds[7] - header.bounds[4]) as usize,
-            )?;
-            let index_bytes: Box<[u8]> = blob.bytes[at..at + prefix].into();
-            let index = segment::dictionary::DictionaryIndex::parse(&index_bytes)?;
-            // SAFETY: `index_bytes` is a heap allocation kept beside the
-            // index, never written, and dropped after it (field order).
-            let index: segment::dictionary::DictionaryIndex<'static> =
-                unsafe { std::mem::transmute(index) };
+            // The header, the document set and the liveness area; of the
+            // DL sidecar between them only its escape count and table,
+            // which parsing it checks: a count reads no length.
+            let (sidecar, end) = (header.bounds[5], header.bounds[6]);
+            blob.ensure(source, 0, header.bounds[1] as usize)?;
+            blob.ensure(source, header.bounds[4], (sidecar - header.bounds[4]) as usize)?;
+            blob.ensure(source, end, (header.bounds[7] - end) as usize)?;
+            blob.ensure(source, sidecar, 10.min(end - sidecar) as usize)?;
+            let mut at = sidecar as usize;
+            let escapes = segment::tinshape::varint::get(&blob.bytes, &mut at)?;
+            let table = escapes.checked_mul(8).ok_or(segment::Error::Truncated)?;
+            blob.ensure(source, end.saturating_sub(table), table as usize)?;
             let docs = segment::tinshape::docs::DocSet::decode(
-                &blob.bytes[header.bounds[4] as usize..header.bounds[5] as usize],
+                &blob.bytes[header.bounds[4] as usize..sidecar as usize],
             )?;
             *decoded = Some(Decoded {
-                index,
-                index_bytes,
                 docs,
+                lengths: false,
             });
         }
-        let decoded = decoded.as_ref().expect("decoded above");
+        let decoded = decoded.as_mut().expect("decoded above");
+        if lengths && !decoded.lengths {
+            let (sidecar, end) = (header.bounds[5], header.bounds[6]);
+            blob.ensure(source, sidecar, (end - sidecar) as usize)?;
+            decoded.lengths = true;
+        }
+        let decoded = &*decoded;
         for entry in entries.iter().flatten() {
             blob.ensure(
                 source,
@@ -3726,7 +3726,7 @@ pub(crate) fn with_native<R>(
         let blob = slot.as_ref().expect("loaded above");
         let segment = segment::tinshape::segment::Segment::assemble(
             &blob.bytes,
-            decoded.index.clone(),
+            segment::dictionary::DictionaryIndex::parse(NO_TERMS)?,
             decoded.docs.clone(),
             liveness.as_ref().expect("decoded above").1.clone(),
         )?;
