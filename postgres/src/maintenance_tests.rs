@@ -268,7 +268,10 @@ mod tests {
             ),
             "(2,t,80)"
         );
-        assert_eq!(count("SELECT count(*) FROM extents WHERE body ==> 'w'"), 121);
+        assert_eq!(
+            count("SELECT count(*) FROM extents WHERE body ==> 'w'"),
+            121
+        );
     }
 
     /// TIN refuses a cap that is not positive, with this message (XX000).

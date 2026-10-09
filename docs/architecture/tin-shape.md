@@ -344,6 +344,26 @@ that work on the encoder and the walk (phase B) does not collide with it:
 - `verify::verify_segment`: the checker of `stannum.verify_index()` for a
   `TNS1` blob, returning the ordinal format's `SegmentReport`.
 - `SegmentBuilder::finish_tns` (in `segment.rs`) and `Payload::count`.
+- In `segment.rs`: `Segment::remember`, which seeds the term memo with
+  entries found elsewhere, and `Segment::assemble`, a segment from a
+  document set and liveness decoded once and a term-map index (empty, for
+  the extension's counts). In the engine: `count_terms_visible`, the count
+  fold trusting only slots on all-visible heap pages and handing the others
+  to the caller, and `fold::Visibility::group_bits`.
+
+**Counts.** A count whose query lowers (`engine::tinshape::lower`) folds a
+segment's ctid sets with `count_terms_visible`; members on pages the
+visibility map does not mark all-visible go to the heap a page at a time,
+and VACUUM's dead list is the fold's liveness. A backend keeps each
+segment's blob as far as its counts have read it: the header, the document
+set (decoded once) and the liveness area, and each query term's postings
+record (and positions, for phrases) the first time it is named. At 1M rows
+of the comparison kit, warm counts take what the ordinal fold over
+translated streams takes (0.02 to 0.07 ms, phrases 2.4 ms); a backend's
+first count of a segment pays about 1.5 ms decoding its document set.
+Ranked queries, the plain index and bitmap scans and every other shape read
+the translated ordinal streams; the engine's ctid-native ranked walk is not
+wired in yet.
 
 VACUUM publishes a segment's liveness as a dead list of ranks beside the
 blob, which keeps an all-live liveness area of its own. Merges, promotions

@@ -3668,7 +3668,11 @@ pub(crate) fn with_native<R>(
             // which parsing it checks: a count reads no length.
             let (sidecar, end) = (header.bounds[5], header.bounds[6]);
             blob.ensure(source, 0, header.bounds[1] as usize)?;
-            blob.ensure(source, header.bounds[4], (sidecar - header.bounds[4]) as usize)?;
+            blob.ensure(
+                source,
+                header.bounds[4],
+                (sidecar - header.bounds[4]) as usize,
+            )?;
             blob.ensure(source, end, (header.bounds[7] - end) as usize)?;
             blob.ensure(source, sidecar, 10.min(end - sidecar) as usize)?;
             let mut at = sidecar as usize;
