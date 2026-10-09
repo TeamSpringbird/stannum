@@ -27,10 +27,10 @@ SKIP is a case without a recorded answer):
 
 | Status | TIN 1.0.3 | TIN 1.0.4 | Meaning |
 | --- | ---: | ---: | --- |
-| PASS | 183 | 217 | Every capture equals TIN's answer |
-| DIFF | 12 | 12 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
+| PASS | 184 | 218 | Every capture equals TIN's answer |
+| DIFF | 13 | 13 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
 | IMPROVED | 5 | 5 | TIN refuses the query with an ERROR; Stannum answers it |
-| GAP | 9 | 13 | Stannum lacks what the case exercises |
+| GAP | 7 | 11 | Stannum lacks what the case exercises, or answers it differently |
 | LIMITED | 3 | 2 | Stannum refuses with a limit ERROR where TIN answers |
 | NEWER | 4 | 4 | Stannum follows a later TIN change that Lead has copied |
 | SKIP | 42 | 5 | |
@@ -109,8 +109,8 @@ the last two possible.
 
 | Case | Difference |
 | --- | --- |
-| `catalog.I-07` | Stannum runs no background maintenance workers and has no `maintenance_jobs_per_db` setting, so a session `SET` of it is not refused. |
-| `catalog.S-07` | Stannum has no `promote()` function. Inserts fold the write buffer into segments and VACUUM merges them. |
+| `catalog.S-07` | `stannum.promote()` folds a write buffer of any size, so after it a term in every row is elided by `score()`; TIN's `promote()` consumes only a sealed write segment and leaves a 20-row buffer mutable, where elision does not count it. |
+| `catalog.S-07b`–`S-07g` | The same difference on more shapes, and `segment_info()`'s layout: Stannum has no sealed write segment (inserts fold every 512 rows whatever the maintenance mode), writes one segment per fold whatever `extent_cap_bytes`, lists a `generation` column and reports `npostings` and `origin` as NULL. `promote()`'s signature and its refusal of a cap that is not positive match (`catalog.S-07h`). |
 
 ## Other known differences
 
@@ -145,9 +145,13 @@ the last two possible.
   Unicode case folding (`ß` stays `ß`). TIN's documentation does not specify
   its algorithm; accent folding and word boundaries are likewise unspecified
   there.
-- **Maintenance** runs in inserting backends and VACUUM rather than
-  background workers, so `initial_segment_count` is accepted and ignored with
-  a warning.
+- **Maintenance** runs in a background worker only when the library is
+  preloaded (`shared_preload_libraries = 'stannum'`); otherwise inserting
+  backends and VACUUM do it, as when the worker pool is exhausted. Workers
+  apply the server's settings and the index's options, not an inserting
+  session's `SET`s. VACUUM keeps doing its own merges and rewrites. See
+  [maintenance workers](architecture/maintenance-workers.md).
+  `initial_segment_count` is accepted and ignored with a warning.
 - **Unbound `==>`.** Where no query is planned around the operator (a
   partial-index predicate, a CHECK constraint, a generated column) or the
   document is not an indexed column, `==>` uses the default tokenizer

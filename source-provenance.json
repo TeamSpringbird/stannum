@@ -796,6 +796,30 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },
+    "postgres/src/maintenance/mod.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance/ops.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance/queue.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance/sql.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance/worker.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance_tests.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
     "postgres/src/match_positions.rs": {
       "owner": "planetscale",
       "upstream_path": "postgres/src/match_positions.rs",
@@ -889,6 +913,14 @@
     "postgres/tests/extension_upgrade.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9997c06219d0b106a91e788a959bc2036a7de179."
+    },
+    "postgres/tests/maintenance_worker_crash.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/tests/maintenance_workers.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
     },
     "postgres/tests/merge_lifecycle.py": {
       "owner": "ben",
