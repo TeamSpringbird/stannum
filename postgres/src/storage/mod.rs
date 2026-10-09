@@ -2711,10 +2711,11 @@ fn split_records(stream: &[u8], cap: Option<u64>, pieces: usize) -> Vec<Vec<Forw
         records.push((record, len as u64));
         at += len;
     }
+    let pieces = pieces.max(1);
     let total: u64 = records.iter().map(|(_, len)| *len).sum();
-    let floor = total.div_ceil(pieces.max(1) as u64);
+    let floor = total.div_ceil(pieces as u64);
     let cap = cap.map_or(u64::MAX, |cap| cap.max(floor));
-    let mut out: Vec<Vec<ForwardRecord>> = vec![Vec::new()];
+    let mut out: Vec<Vec<(ForwardRecord, u64)>> = vec![Vec::new()];
     let mut used = 0u64;
     for (record, len) in records {
         if !out.last().expect("a piece").is_empty() && used + len > cap {
@@ -2722,9 +2723,23 @@ fn split_records(stream: &[u8], cap: Option<u64>, pieces: usize) -> Vec<Vec<Forw
             used = 0;
         }
         used += len;
-        out.last_mut().expect("a piece").push(record);
+        out.last_mut().expect("a piece").push((record, len));
     }
-    out
+    if out.len() > pieces {
+        // Records of uneven sizes packed under the floor can need more
+        // pieces than the bound: split by count instead.
+        let records: Vec<_> = out.into_iter().flatten().collect();
+        let per = records.len().div_ceil(pieces);
+        let mut even = Vec::with_capacity(pieces);
+        let mut records = records.into_iter().peekable();
+        while records.peek().is_some() {
+            even.push(records.by_ref().take(per).collect::<Vec<_>>());
+        }
+        out = even;
+    }
+    out.into_iter()
+        .map(|piece| piece.into_iter().map(|(record, _)| record).collect())
+        .collect()
 }
 
 /// What promoting one sealed write segment built.
@@ -3595,10 +3610,22 @@ impl Blob {
     }
 }
 
+/// The parts of a segment decoded once per backend (see
+/// [`segment::tinshape::segment::Segment::assemble`]).
+struct Decoded {
+    /// Parsed over `index_bytes`, declared first so it is dropped first.
+    index: segment::dictionary::DictionaryIndex<'static>,
+    /// Owns the bytes `index` borrows; never read otherwise.
+    #[allow(dead_code)]
+    index_bytes: Box<[u8]>,
+    docs: segment::tinshape::docs::DocSet,
+}
+
 /// What the ctid-native paths keep of a segment in this backend.
 #[derive(Default)]
 pub(crate) struct Native {
     blob: RefCell<Option<Blob>>,
+    decoded: RefCell<Option<Decoded>>,
     /// The published liveness in slot space, with the dead run it is of.
     liveness: RefCell<Option<((Run, u32), segment::tinshape::docs::Liveness)>>,
 }
@@ -3631,7 +3658,8 @@ pub(crate) fn with_native<R>(
         }
         let mut slot = native.blob.borrow_mut();
         let blob = slot.get_or_insert_with(|| Blob::new(header.bounds[7] as usize));
-        if blob.loaded == 0 {
+        let mut decoded = native.decoded.borrow_mut();
+        if decoded.is_none() {
             // The header and the term map's index, then the document set,
             // DL sidecar and liveness area, which end the blob.
             let probe = header.bounds[1] as usize + 32.min(header.len(1));
@@ -3639,13 +3667,29 @@ pub(crate) fn with_native<R>(
             let prefix = segment::dictionary::DictionaryIndex::prefix_len(
                 &blob.bytes[header.bounds[1] as usize..probe],
             )?;
-            blob.ensure(source, 0, header.bounds[1] as usize + prefix)?;
+            let at = header.bounds[1] as usize;
+            blob.ensure(source, 0, at + prefix)?;
             blob.ensure(
                 source,
                 header.bounds[4],
                 (header.bounds[7] - header.bounds[4]) as usize,
             )?;
+            let index_bytes: Box<[u8]> = blob.bytes[at..at + prefix].into();
+            let index = segment::dictionary::DictionaryIndex::parse(&index_bytes)?;
+            // SAFETY: `index_bytes` is a heap allocation kept beside the
+            // index, never written, and dropped after it (field order).
+            let index: segment::dictionary::DictionaryIndex<'static> =
+                unsafe { std::mem::transmute(index) };
+            let docs = segment::tinshape::docs::DocSet::decode(
+                &blob.bytes[header.bounds[4] as usize..header.bounds[5] as usize],
+            )?;
+            *decoded = Some(Decoded {
+                index,
+                index_bytes,
+                docs,
+            });
         }
+        let decoded = decoded.as_ref().expect("decoded above");
         for entry in entries.iter().flatten() {
             blob.ensure(
                 source,
@@ -3661,12 +3705,6 @@ pub(crate) fn with_native<R>(
             }
         }
         drop(slot);
-        let slot = native.blob.borrow();
-        let blob = slot.as_ref().expect("loaded above");
-        let mut segment = segment::tinshape::segment::Segment::parse(&blob.bytes)?;
-        for (name, entry) in names.iter().zip(&entries) {
-            segment.remember(name, *entry);
-        }
         let dead = view.dead_runs[i];
         let mut liveness = native.liveness.borrow_mut();
         if liveness.as_ref().is_none_or(|(run, _)| *run != dead) {
@@ -3674,18 +3712,28 @@ pub(crate) fn with_native<R>(
             let ranks: Vec<u32> = if set.is_empty() {
                 Vec::new()
             } else {
-                (0..segment.documents)
+                (0..header.documents)
                     .filter(|rank| set.contains(*rank))
                     .collect()
             };
-            let decoded = segment::tinshape::docs::Liveness::decode(
-                &segment::tinshape::docs::encode_liveness(segment.documents, &ranks),
-                &segment.docs,
+            let found = segment::tinshape::docs::Liveness::decode(
+                &segment::tinshape::docs::encode_liveness(header.documents, &ranks),
+                &decoded.docs,
             )?;
-            *liveness = Some((dead, decoded));
+            *liveness = Some((dead, found));
         }
-        segment.liveness = liveness.as_ref().expect("decoded above").1.clone();
+        let slot = native.blob.borrow();
+        let blob = slot.as_ref().expect("loaded above");
+        let segment = segment::tinshape::segment::Segment::assemble(
+            &blob.bytes,
+            decoded.index.clone(),
+            decoded.docs.clone(),
+            liveness.as_ref().expect("decoded above").1.clone(),
+        )?;
         drop(liveness);
+        for (name, entry) in names.iter().zip(&entries) {
+            segment.remember(name, *entry);
+        }
         f(&segment)
     })())
 }

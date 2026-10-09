@@ -254,6 +254,21 @@ mod tests {
             40
         );
         assert_eq!(count("SELECT count(*) FROM extents WHERE body ==> 'w'"), 41);
+        // Uneven records under the smallest cap: never more segments than
+        // the directory has room for (here 96 - 40 = 56), every one linked.
+        Spi::run(
+            "INSERT INTO extents SELECT n, 'w k' || n || repeat(' pad', n % 7)
+                 FROM generate_series(42, 121) n;",
+        )
+        .unwrap();
+        assert_eq!(
+            text(
+                "SELECT row(consumed_controls, linked_segments <= 56, docs_promoted)::text
+                 FROM stannum.promote('extents_idx', 1) p"
+            ),
+            "(2,t,80)"
+        );
+        assert_eq!(count("SELECT count(*) FROM extents WHERE body ==> 'w'"), 121);
     }
 
     /// TIN refuses a cap that is not positive, with this message (XX000).

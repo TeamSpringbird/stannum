@@ -348,6 +348,42 @@ impl<'a> Segment<'a> {
         })
     }
 
+    /// A segment over `bytes` from parts a reader decoded once and keeps
+    /// across queries (the term map's index, the document set and the
+    /// liveness, see [`Self::parse`]), so that only the header and the DL
+    /// sidecar's are read per query: the extension's ctid-native paths
+    /// assemble one per query over a blob loaded as far as its queries need.
+    pub fn assemble(
+        bytes: &'a [u8],
+        index: DictionaryIndex<'a>,
+        docs: DocSet,
+        liveness: Liveness,
+    ) -> Result<Self> {
+        let header = super::index::Header::parse(bytes, bytes.len() as u64)?;
+        let mut bounds = [0usize; 8];
+        for (bound, at) in bounds.iter_mut().zip(header.bounds) {
+            *bound = usize::try_from(at).map_err(|_| Error::Truncated)?;
+        }
+        if docs.geometry.documents != header.documents {
+            return Err(Error::Corrupt("document set count"));
+        }
+        let lengths = Lengths::parse(&bytes[bounds[5]..bounds[6]], header.documents)?;
+        Ok(Self {
+            bytes,
+            documents: header.documents,
+            total_length: header.total_length,
+            block_size: header.block_size,
+            adaptive_tf: header.adaptive_tf,
+            bounds,
+            index,
+            docs,
+            lengths,
+            liveness,
+            memo: Default::default(),
+            parsed: Default::default(),
+        })
+    }
+
     pub fn area(&self, area: Area) -> &'a [u8] {
         let a = area as usize;
         &self.bytes[self.bounds[a]..self.bounds[a + 1]]
