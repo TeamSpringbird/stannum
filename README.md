@@ -92,11 +92,11 @@ covers TINQL, and [SQL permissions](docs/SECURITY.md) covers who may call what.
 
 Stannum is checked against PlanetScale TIN 1.0.3 and 1.0.4 by the
 [TIN conformance suite](conformance/README.md), which replays TIN's recorded
-answers. Against 1.0.3: **188 PASS, 13 DIFF** (same SQLSTATE, different
+answers. Against 1.0.3: **184 PASS, 13 DIFF** (same SQLSTATE, different
 error wording), **5 IMPROVED** (queries TIN refuses that Stannum answers),
-**7 GAP**, **3 LIMITED** (refused at a documented resource limit) and
-**0 FAIL**; against 1.0.4: 197 PASS, 13 DIFF, 4 IMPROVED, 37 GAP, 2 LIMITED
-and 0 FAIL. CI also runs a differential oracle against upstream Lead on every
+**7 GAP**, **3 LIMITED** (refused at a documented resource limit), **4
+NEWER** (a later TIN change Lead has copied) and **0 FAIL**; against 1.0.4:
+218 PASS, 13 DIFF, 5 IMPROVED, 11 GAP, 2 LIMITED, 4 NEWER and 0 FAIL. CI also runs a differential oracle against upstream Lead on every
 push. [Compatibility](docs/compatibility.md) lists what matches, the
 documented improvements and gaps, and the index options.
 
