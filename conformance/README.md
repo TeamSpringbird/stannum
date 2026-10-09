@@ -51,6 +51,9 @@ python3 conformance/run.py --engine tin --record conformance/expected --host-not
 # Only some cases
 python3 conformance/run.py --engine stannum --check conformance/expected/tin-1.0.3 --area spans
 python3 conformance/run.py --engine stannum --check conformance/expected/tin-1.0.3 --case 'bm25.k1.*'
+
+# All but some cases (an excluded case is neither run nor reported)
+python3 conformance/run.py --engine tin --record conformance/expected --skip-crash --exclude 'query_size.*.3000'
 ```
 
 With neither `--record` nor `--check` the runner only runs the cases and
@@ -96,6 +99,9 @@ e.g. `tin-1.0.3`), naming the captures that differ:
   capture and this engine answers. Reported as `IMPROVED`, with a
   `question` for the recorded engine's authors (why is this not supported?).
 - `kind: gap`: this engine lacks what the case exercises. Reported as `GAP`.
+  A gap whose `captures` is `[corpus]` says this engine cannot build the
+  case's corpus (an index option it lacks, for example) where the recorded
+  engine built it.
 - `kind: limit`: the recorded engine answered each listed capture (or, in a
   `script`, the step), and this engine refuses it with SQLSTATE 54000
   (program_limit_exceeded) or 54001 (statement_too_complex) by design.
@@ -113,9 +119,10 @@ entry records; the runner only checks its mechanics.
 
 A case may be tagged `crashes: [tin-1.0.3, stannum-0.1.0]`: known to crash
 the server with that engine version (a bare engine name, e.g. `stannum`, tags
-every version). With `--skip-crash`, the runner skips cases tagged for the
-engine and version under test; always use it on a server other sessions
-share. Without it, tagged cases run as risky. Whether a case crashes can
+every version). With `--skip-crash`, the runner skips cases tagged for any
+version of the engine under test, since a newer version is not known to be
+fixed until someone runs the case on a server they may restart; always use
+it on a server other sessions share. Without it, tagged cases run as risky. Whether a case crashes can
 depend on the server's environment (a stack overflow, for example, depends
 on the postmaster's stack limit), so tag a case as soon as it crashes any
 server, and run untagged-but-risky areas such as `query_size` on a
