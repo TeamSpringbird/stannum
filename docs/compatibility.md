@@ -27,9 +27,9 @@ Checked against TIN 1.0.3's recorded answers:
 | Status | Cases | Meaning |
 | --- | ---: | --- |
 | PASS | 170 | Every capture equals TIN's answer |
-| DIFF | 12 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
+| DIFF | 13 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
 | IMPROVED | 5 | TIN refuses the query with an ERROR; Stannum answers it |
-| GAP | 2 | Stannum lacks what the case exercises |
+| GAP | 1 | Stannum lacks what the case exercises |
 | FAIL | 0 | |
 
 Improvements and gaps are declared in
@@ -88,8 +88,7 @@ the last two possible.
 
 | Case | Difference |
 | --- | --- |
-| `catalog.I-07` | Stannum runs no background maintenance workers and has no `maintenance_jobs_per_db` setting, so a session `SET` of it is not refused. |
-| `catalog.S-07` | Stannum has no `promote()` function. Inserts fold the write buffer into segments and VACUUM merges them. |
+| `catalog.S-07` | `stannum.promote()` folds a write buffer of any size, so after it a term in every row is elided by `score()`; TIN's `promote()` consumes only a sealed write segment and leaves a 20-row buffer mutable, where elision does not count it. |
 
 ## Other known differences
 
@@ -102,9 +101,13 @@ the last two possible.
   Unicode case folding (`ß` stays `ß`). TIN's documentation does not specify
   its algorithm; accent folding and word boundaries are likewise unspecified
   there.
-- **Maintenance** runs in inserting backends and VACUUM rather than
-  background workers, so `initial_segment_count` is accepted and ignored with
-  a warning.
+- **Maintenance** runs in a background worker only when the library is
+  preloaded (`shared_preload_libraries = 'stannum'`); otherwise inserting
+  backends and VACUUM do it, as when the worker pool is exhausted. Workers
+  apply the server's settings and the index's options, not an inserting
+  session's `SET`s. VACUUM keeps doing its own merges and rewrites. See
+  [maintenance workers](architecture/maintenance-workers.md).
+  `initial_segment_count` is accepted and ignored with a warning.
 - **Unbound `==>`.** Where no query is planned around the operator (a
   partial-index predicate, a CHECK constraint, a generated column) or the
   document is not an indexed column, `==>` uses the default tokenizer

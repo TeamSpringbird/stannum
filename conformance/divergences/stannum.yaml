@@ -84,21 +84,20 @@ divergences:
       Why is this not supported? The explicit form works; is the implicit
       form missing the index's tokenizer options?
 
-  - id: catalog.I-07
-    against: tin-1.0.3
-    kind: gap
-    captures: [error]
-    summary: Stannum has no maintenance_jobs_per_db setting, so a session SET of it is not refused.
-    tin: 55P02 "parameter "tin.maintenance_jobs_per_db" cannot be changed now".
-    stannum: >
-      Stannum runs no background maintenance workers and defines no such
-      setting. PostgreSQL accepts a SET of any undefined stannum.* name as a
-      placeholder.
-
   - id: catalog.S-07
     against: tin-1.0.3
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() function, so the case's promote step fails.
-    tin: tin.promote(index) moves the mutable segment into an immutable one and returns its statistics.
-    stannum: No promote(); its write buffer is folded into segments by inserts and VACUUM.
+    summary: >
+      Stannum's promote() folds a write buffer of any size, after which w (in
+      every row) is elided; TIN's leaves these 20 rows in its mutable segment.
+    tin: >
+      tin.promote(index) consumes only a sealed write segment (12,288 rows);
+      the 20 rows stay mutable, and elision, which counts immutable segments
+      only, still scores w after it.
+    stannum: >
+      Before the promote step the scores equal TIN's. stannum.promote() folds
+      the 20 buffered rows into a segment, elision then counts them, and w,
+      in every document, scores 0 under score() after it; full_score() is
+      unchanged. Whether promote() should fold a buffer below the sealing
+      threshold is an open decision.

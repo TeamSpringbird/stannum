@@ -80,7 +80,7 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   engine and checks another. Documented divergences report as `IMPROVED`
   (TIN refuses, Stannum answers) or `GAP` (Stannum lacks the feature), and a
   declared divergence cannot hide a regression. Against TIN 1.0.3: 170 PASS,
-  12 DIFF (error wording), 5 IMPROVED, 2 GAP, 0 FAIL.
+  13 DIFF (error wording), 5 IMPROVED, 1 GAP, 0 FAIL.
 - Limits on query size: 1,000 nesting levels, 10,000 terms and 2,000 levels
   of span nesting, each an ERROR naming the byte offset. Every recursive pass
   over a query also calls PostgreSQL's `check_stack_depth`, so a smaller stack
