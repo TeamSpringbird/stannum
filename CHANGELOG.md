@@ -146,6 +146,11 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   the same answers. `bench`'s `tnsreplay` replays a dumped `TNS1` index as
   the extension reads it in place; `script/dump-segments.py` reads page
   layout version 6.
+- A ranked disjunction over `TNS1` weighs each member of a group's mask by
+  the bounds of the terms it holds (a word at a time first, at the group's
+  bounds, then at its 1,024-slot sub-range's) instead of planning and
+  sieving every sub-range bit-parallel. At 150 million rows its replay takes
+  a fifth less CPU (a quarter fewer instructions) for the same answers.
 - TINQL query expressions are parsed by a recursive-descent parser; the pest
   expression grammar remains only as a test-only differential oracle, and
   phrase contents are still parsed with pest. AND and OR chains parse into
