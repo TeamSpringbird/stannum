@@ -118,6 +118,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   match, and checks each row's snapshot visibility as it enters the top k.
   With eight clients ranking disjunctions over 15 million rows beside 1,000
   updates a second, throughput went from 2 to 125 queries a second.
+  If the deepest walk still falls short, a filter that is not volatile is
+  applied by one more walk as it admits rows instead of scoring every match.
+- `ORDER BY score DESC, <other keys> LIMIT k` uses the pruned ranked scan
+  under an incremental sort; its top k keeps every row tied with the k-th
+  score. At a million Stack Exchange rows the comparison kit's tiebreak
+  disjunctions went from 7.7 s (a sequential scan and a sort) to 0.3 ms.
+- The planner prices a pruned ranked scan by the candidates its walks score
+  rather than by every match, so `... AND id <= K ORDER BY score DESC LIMIT
+  10` chooses it over the primary key unless the filter is selective: the
+  comparison kit's filtered disjunctions went from 680 ms to 2.4 ms.
 - A ranked walk reads ordinal chunks, position spans and its candidates'
   length and class pages in place from pinned shared-buffer pages instead of
   copying them per backend.
