@@ -96,7 +96,7 @@ interval:
   every push, and PlanetScale TIN by hand. See
   [compatibility](compatibility.md#reference-oracle-against-lead).
 - **Conformance.** The [TIN conformance suite](../conformance/README.md)
-  checks Stannum against TIN 1.0.3's recorded answers.
+  checks Stannum against TIN 1.0.3's and 1.0.4's recorded answers.
 
 The pgrx suite also compares the pruned top k against exhaustive scoring bit
 for bit, and the ranked-scan fuzzer checks it under concurrent writes; see
@@ -122,6 +122,14 @@ suites; the benchmark tools live in `benchmarks/`, each with `--help`.
    [its README](../benchmarks/local/README.md).
 5. `benchmarks/aws/` holds the CloudFormation stack and host scripts for the
    AWS protocol.
+6. To set one query beside another engine's plan rather than measure
+   throughput, `benchmarks/compare/compare.py` loads the same N rows into a
+   TIN database and a Stannum database and runs trace queries in eleven
+   shapes (term, conjunction, disjunction and phrase, ranked and counted;
+   filtered by id; with an id tiebreaker) under `EXPLAIN (ANALYZE, BUFFERS)`
+   on both. It reports times, shared blocks, plan nodes, TIN's page touches
+   by area and Stannum's bytes fetched by area, and checks that the answers
+   agree; see its `--help`.
 
 Each run writes a manifest (source and image identity, corpus hashes,
 settings), the correctness outputs, per-query and per-family latency, and
