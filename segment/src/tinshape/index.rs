@@ -198,6 +198,20 @@ impl<S: Source> Reader<S> {
 
     /// Bytes this reader holds: fetched ranges, derived tables and
     /// translated streams, for cache budgeting.
+    /// [`Self::cached_bytes`] by part: the arena of ranges kept (term-map
+    /// index and blocks), the ordinal tables, the decoded document set and
+    /// the translated term streams.
+    pub fn cached_parts(&self) -> [usize; 4] {
+        [
+            self.arena_bytes.get(),
+            self.tables
+                .get()
+                .map_or(0, |t| t.offsets.len() + t.pages.len() + t.lengths.len()),
+            self.docs.get().map_or(0, |d| d.heap_bytes()),
+            self.encoded.borrow().bytes,
+        ]
+    }
+
     pub fn cached_bytes(&self) -> usize {
         let tables = self
             .tables

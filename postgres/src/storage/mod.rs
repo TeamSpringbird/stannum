@@ -1635,6 +1635,9 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
             .map(|c| c.reader.cached_bytes() + dead_bytes(c) + c.native.bytes())
             .sum::<usize>();
         let budget = reader_cache_budget();
+        if unsafe { pg_sys::message_level_is_interesting(pg_sys::DEBUG1 as _) } {
+            report_reader_cache(readers, bytes, budget);
+        }
         if bytes > budget {
             // What the native paths loaded goes first, the most first: it
             // reloads a chunk at a time as queries read it, where the
@@ -1664,6 +1667,38 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
             testing::READER_CACHE_CLEARS.set(testing::READER_CACHE_CLEARS.get() + 1);
         }
     });
+}
+
+/// Logs at DEBUG1 what the backend's reader cache holds, by part, as a view
+/// is captured: `SET client_min_messages = debug1` to see it.
+fn report_reader_cache(readers: &SegmentReaders, bytes: usize, budget: usize) {
+    let mut reader = [0usize; 4];
+    let (mut dead, mut native) = (0usize, 0usize);
+    for cached in readers.values() {
+        for (sum, part) in reader.iter_mut().zip(cached.reader.cached_parts()) {
+            *sum += part;
+        }
+        dead += dead_bytes(cached);
+        native += cached.native.bytes();
+    }
+    let tables = PAGE_TABLES.with_borrow(|t| t.values().map(|t| t.len() * 4).sum::<usize>());
+    let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+    pgrx::debug1!(
+        "stannum reader cache: {:.1} of {:.1} MB in {} readers: page tables {:.1}, arenas {:.1}, \
+         ordinal tables {:.1}, document sets {:.1}, translated streams {:.1}, dead lists {:.1}, \
+         native {:.1}; read cache {:.1} MB",
+        mb(bytes),
+        mb(budget),
+        readers.len(),
+        mb(tables),
+        mb(reader[0]),
+        mb(reader[1]),
+        mb(reader[2]),
+        mb(reader[3]),
+        mb(dead),
+        mb(native),
+        mb(segment::cache::bytes()),
+    );
 }
 
 /// Queues a run for reclamation once no scan can still hold it.
