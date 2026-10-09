@@ -20,6 +20,7 @@ mod operator;
 pub(crate) mod options;
 mod query_limits;
 mod score;
+mod score_binding;
 mod selectivity;
 mod storage;
 mod stream;
@@ -31,6 +32,10 @@ mod udfs;
 /// Stannum against TIN 1.0.3's recorded answers (see the module).
 #[cfg(feature = "pg_test")]
 mod tin_conformance;
+
+/// Which `==>` clauses bind scoring and highlighting (see the module).
+#[cfg(feature = "pg_test")]
+mod binding_tests;
 
 /// The query front end's stack backstop (`tinql::limits::set_stack_check`):
 /// PostgreSQL's `check_stack_depth`, whose ERROR pgrx turns into a panic that

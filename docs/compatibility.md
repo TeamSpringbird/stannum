@@ -48,10 +48,24 @@ declaration cannot hide a regression.
   boosts (`a a` scores as `a^2`). `score()` and `full_score()` over `==>`
   clauses on several indexed columns of one table sum one score per column,
   in clause order.
+- **Which clauses score.** A row is scored by the `==>` clauses on its own
+  relation in the WHERE clause, a flattened subquery or CTE, or an inner
+  join's ON clause, whose search text may come from the joined row. Clauses
+  under `NOT` and clauses on other relations contribute nothing. Several
+  clauses on one column score as one ORed query whatever their search texts
+  are (constants or parameters, under custom or generic plans); each text is
+  parsed on its own, so a text `==>` rejects raises `==>`'s error, and an
+  empty text adds nothing. A row that no search admits (the `id = 4` of
+  `body ==> 'gems' OR id = 4`) scores NULL. A partial index scores only when
+  the WHERE clause implies its predicate; with no index to score a relation's
+  searches, `score()`, `full_score()` and `max_score()` raise TIN's
+  `cannot compute scores for this query` (SQLSTATE 0A000) with a `No
+  matching stannum index for: ...` detail.
 - **Highlighting.** `highlight()` and `highlight_ansi()` without a query take
   it from a `==>` clause anywhere in the query's join tree, including a CTE or
-  subquery the planner flattens; with no clause to bind they return the text
-  unmarked.
+  subquery the planner flattens, but not under `NOT`; with no clause to bind
+  they return the text unmarked. Several clauses mark every term of each,
+  parameters included, and their texts are parsed one by one as for scoring.
 - **Index options.** All fifteen documented options are accepted with TIN's
   domains; see [index options](#index-options).
 - **Errors.** An invalid query raises `invalid ==> query at byte N in
@@ -97,7 +111,15 @@ the last two possible.
   Stannum's recursive-descent parser, not TIN's grammar rules; the SQLSTATE
   matches. These are the DIFF cases.
 - **`max_score()`** over several indexed columns reports the first column's
-  best score, while `score()` sums the columns.
+  best score, while `score()` sums the columns. TIN (and Lead) report the
+  highest summed score among the rows that match every column the WHERE
+  clause requires.
+- **Index choice.** Where several stannum indexes cover a scored column,
+  scoring uses the one `==>` binds to: the oldest by OID whose predicate the
+  WHERE clause implies. Lead prefers the newest qualifying partial index,
+  then the newest full one. Only the WHERE clause proves a partial index's
+  predicate, and an outer join's ON clause binds no scoring, where Lead also
+  uses the ON clause on an outer join's nullable side.
 - **Case folding** lowercases Unicode scalar values rather than applying full
   Unicode case folding (`ß` stays `ß`). TIN's documentation does not specify
   its algorithm; accent folding and word boundaries are likewise unspecified
