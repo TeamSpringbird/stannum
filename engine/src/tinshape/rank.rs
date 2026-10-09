@@ -38,7 +38,6 @@ use super::{
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
-use segment::lanes::LaneSums;
 
 /// A required term's Elias-Fano container in a group is probed for the
 /// candidates left rather than decoded when it holds more than this many
@@ -519,6 +518,11 @@ struct Walk<'s, 'a, T: Touch> {
     /// essential terms' union there.
     row_loaded: Vec<bool>,
     any: Vec<u64>,
+    /// A disjunction's sub-range at hand: per present term with a positive
+    /// bound there, where its row starts in `rows` and that bound; and its
+    /// word at hand.
+    or_terms: Vec<(usize, f64)>,
+    or_held: Vec<u64>,
     /// Per scoring term, the candidate at hand's bucket ([`NO_BUCKET`]
     /// when it does not hold the term).
     buckets: Vec<u8>,
@@ -1185,6 +1189,8 @@ pub(super) fn walk_into<'a>(
         row_state: vec![Row::default(); n],
         row_loaded: Vec::new(),
         any: Vec::new(),
+        or_terms: Vec::new(),
+        or_held: Vec::new(),
         buckets: vec![NO_BUCKET; n],
         window_end: None,
         window_parts: (0.0, 0.0, 0.0, 0.0),
@@ -1276,25 +1282,12 @@ fn span_check<'a>(
     })))
 }
 
-/// Words of a disjunction's sub-range: a group is planned and sieved this
-/// many words (1,024 slots) at a time.
+/// Words of a disjunction's sub-range: a group's members are bounded by
+/// their terms' blocks over this many words (1,024 slots) at a time.
 const SUB_WORDS: usize = 16;
 
-/// The sieve's target, in units of the threshold: a lane is kept when the
-/// weights of the terms it holds, each strictly above its bound in units of
-/// `threshold / SIEVE_TARGET`, reach it.
-const SIEVE_TARGET: u32 = LaneSums::MAX_TARGET;
-
-/// Most weighed terms a sub-range's candidates are weighed one by one
-/// for; a query of more weighs every lane of the sub-range bit-sliced
-/// (two in tests, so their small queries take both paths).
-const MAX_WEIGHED: usize = if cfg!(test) { 2 } else { 32 };
-
-/// Bits per lane counter of the sub-range sieve (as [`LaneSums`]).
-const SLICES: usize = 6;
-
-/// A disjunction's plan for a sub-range at one threshold (MaxScore with the
-/// sub-range's bounds, as STN3's word sieve).
+/// A disjunction's plan for a group at one threshold (MaxScore with the
+/// group's bounds).
 #[derive(Default)]
 struct Plan {
     /// Scoring terms (indexes into the walk's) every candidate must hold:
@@ -1303,11 +1296,6 @@ struct Plan {
     /// The terms a candidate must hold one of, when `by_essential`.
     essential: Vec<usize>,
     by_essential: bool,
-    /// The weighted sum's start (the required terms' weights) and the other
-    /// present terms' weights, when `by_count`.
-    by_count: bool,
-    start: u32,
-    adds: Vec<(usize, u32)>,
     order: Vec<(f32, usize)>,
 }
 
@@ -1324,11 +1312,12 @@ struct Row {
 
 impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Block-max MaxScore over the scoring terms, a group at a time: a
-    /// group, and a sub-range of it, whose terms' bounds cannot reach the
-    /// threshold is skipped; else each sub-range is planned (required
-    /// terms ANDed, essential terms ORed, the rest weighed bit-parallel)
-    /// and its words sieved; each candidate is bounded by its terms' blocks,
-    /// then by its length, then scored.
+    /// group whose terms' bounds cannot reach the threshold is skipped; else
+    /// it is planned at its bounds (required terms ANDed, essential terms
+    /// ORed into its mask), and each member of the mask is weighed by the
+    /// bounds over its sub-range of the terms it holds; each one left is
+    /// bounded by its terms' blocks, then by its buckets and length, then
+    /// scored.
     fn run_or(&mut self) -> Result<()> {
         let n = self.sc.len();
         if n == 0 {
@@ -1462,9 +1451,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // group, which only rises. Those terms' rows are read first and
         // combined into the group's mask; a group whose mask is empty reads
         // nothing else, and a sub-range whose mask is empty is skipped
-        // before its bounds are taken. (A sub-range's own plan is at least
-        // as strict, so the mask removes no candidate it would keep.)
-        self.plan_sub(&mut plan, self.threshold(), &sb, total);
+        // before its bounds are taken.
+        self.plan_group(&mut plan, self.threshold(), &sb, total);
         let mut loaded = std::mem::take(&mut self.row_loaded);
         loaded.clear();
         loaded.resize(n, false);
@@ -1533,9 +1521,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         self.row_loaded = loaded;
-        // The plan's threshold and bounds: a block spans many sub-ranges, so
-        // a plan usually holds for the next.
-        let mut planned: Option<(Option<f32>, Vec<f32>)> = None;
+        // Each sub-range the mask leaves anything in, bounded by its terms'
+        // blocks; then each member of the mask weighed alone: the bounds over
+        // the sub-range of the terms it holds, summed (a word's members first
+        // all at once, by the terms holding any of them). A member's blocks
+        // bound it no higher, so one this leaves below the threshold would
+        // fail its candidate check. At 150 million rows a group's mask holds
+        // ~85 members in a third of its words; weighing them alone, without
+        // a plan per sub-range, cost less than sieving every word of it.
+        let mut terms = std::mem::take(&mut self.or_terms);
+        let mut held = std::mem::take(&mut self.or_held);
         let mut w0 = 0;
         while w0 < words {
             let w1 = (w0 + SUB_WORDS).min(words);
@@ -1545,40 +1540,50 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             let from = base + (w0 * 64) as u32;
             let to = (base + (w1 * 64) as u32 - 1).min(end);
+            terms.clear();
             let mut total = 0.0_f64;
-            for (i, bound) in sb.iter_mut().enumerate() {
-                *bound = if self.present[i] {
-                    self.sc[i].range_bound(from, to)
-                } else {
-                    0.0
-                };
-                total += f64::from(*bound);
+            for p in 0..self.present_list.len() {
+                let i = self.present_list[p];
+                let bound = f64::from(self.sc[i].range_bound(from, to));
+                total += bound;
+                if bound > 0.0 {
+                    terms.push((i * words, bound));
+                }
             }
-            let theta = self.threshold();
-            if below(total, theta) {
+            if below(total, self.threshold()) {
                 w0 = w1;
                 continue;
             }
-            if planned
-                .as_ref()
-                .is_none_or(|(t, b)| *t != theta || b.as_slice() != sb.as_slice())
-            {
-                self.plan_sub(&mut plan, theta, &sb, total);
-                match &mut planned {
-                    Some((t, b)) => {
-                        *t = theta;
-                        b.clone_from(&sb);
-                    }
-                    None => planned = Some((theta, sb.clone())),
-                }
-            }
-            let mut cand = [0u64; SUB_WORDS];
-            self.sieve(&plan, words, w0, w1, &mut cand);
-            for (j, word) in cand[..w1 - w0].iter().enumerate() {
+            held.clear();
+            held.resize(terms.len(), 0);
+            for (j, &word) in mask[w0..w1].iter().enumerate() {
                 let w = w0 + j;
-                let mut word = *word;
-                if let Some(dead) = dead {
-                    word &= !dead[w];
+                let mut word = word;
+                if word == 0 {
+                    continue;
+                }
+                let theta = self.threshold();
+                if theta.is_some() {
+                    let mut most = 0.0_f64;
+                    for (h, &(at, bound)) in held.iter_mut().zip(&terms) {
+                        *h = self.rows[at + w];
+                        most += if *h & word != 0 { bound } else { 0.0 };
+                    }
+                    if below(most, theta) {
+                        continue;
+                    }
+                    let mut keep = 0u64;
+                    let mut left = word;
+                    while left != 0 {
+                        let bit = left.trailing_zeros();
+                        left &= left - 1;
+                        let mut sum = 0.0_f64;
+                        for (h, &(_, bound)) in held.iter().zip(&terms) {
+                            sum += if *h >> bit & 1 == 1 { bound } else { 0.0 };
+                        }
+                        keep |= u64::from(!below(sum, theta)) << bit;
+                    }
+                    word = keep;
                 }
                 while word != 0 {
                     let bit = word.trailing_zeros();
@@ -1588,22 +1593,22 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             w0 = w1;
         }
+        self.or_terms = terms;
+        self.or_held = held;
         self.words = mask;
         self.sub_bounds = sb;
         self.plan = plan;
         Ok(())
     }
 
-    /// Plans a sub-range whose present terms' bounds are `sb` (summing to
+    /// Plans a group whose present terms' bounds are `sb` (summing to
     /// `total`) at threshold `theta`.
     #[inline(never)]
-    fn plan_sub(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
+    fn plan_group(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
         plan.required.clear();
         plan.essential.clear();
-        plan.adds.clear();
         plan.order.clear();
         plan.by_essential = true;
-        plan.by_count = false;
         let present = (0..sb.len()).filter(|i| self.present[*i]);
         let t = theta.map_or(0.0, f64::from);
         // Without a positive threshold every member of every term may enter.
@@ -1635,151 +1640,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         plan.by_essential = plan.required.is_empty() || inessential > 0;
         plan.essential
             .extend(plan.order[inessential..].iter().map(|&(_, i)| i));
-        // The weights, in units of the threshold.
-        let unit = t / f64::from(SIEVE_TARGET);
-        let weight = |bound: f32| {
-            let units = f64::from(bound) / unit;
-            if units < f64::from(SIEVE_TARGET) {
-                units.floor() as u32 + 1
-            } else {
-                SIEVE_TARGET
-            }
-        };
-        let mut start = 0u32;
-        for &i in &plan.required {
-            start = start.saturating_add(weight(sb[i]));
-        }
-        for &(bound, i) in &plan.order {
-            plan.adds.push((i, weight(bound)));
-        }
-        if start < SIEVE_TARGET {
-            plan.by_count = true;
-            plan.start = start;
-        }
-    }
-
-    /// The candidates of words `w0..w1` under `plan`: the required terms
-    /// ANDed and the essential ones ORed word by word, then each candidate
-    /// left weighed alone (or, past [`MAX_WEIGHED`] weighed terms, every
-    /// lane at once, bit-sliced as [`LaneSums`]).
-    #[inline]
-    fn sieve(&self, plan: &Plan, words: usize, w0: usize, w1: usize, out: &mut [u64; SUB_WORDS]) {
-        let len = w1 - w0;
-        let rows = &self.rows;
-        // A full sub-range's row is read in place; a short one padded.
-        let row = |i: usize| -> [u64; SUB_WORDS] {
-            let at = i * words + w0;
-            if len == SUB_WORDS {
-                *<&[u64; SUB_WORDS]>::try_from(&rows[at..at + SUB_WORDS]).expect("a full row")
-            } else {
-                let mut r = [0u64; SUB_WORDS];
-                r[..len].copy_from_slice(&rows[at..at + len]);
-                r
-            }
-        };
-        let mut cand = [0u64; SUB_WORDS];
-        if let Some((&first, rest)) = plan.required.split_first() {
-            cand = row(first);
-            for &i in rest {
-                let r = row(i);
-                for j in 0..SUB_WORDS {
-                    cand[j] &= r[j];
-                }
-            }
-        }
-        if plan.by_essential {
-            let mut any = [0u64; SUB_WORDS];
-            for &i in &plan.essential {
-                let r = row(i);
-                for j in 0..SUB_WORDS {
-                    any[j] |= r[j];
-                }
-            }
-            if plan.required.is_empty() {
-                cand = any;
-            } else {
-                for j in 0..SUB_WORDS {
-                    cand[j] &= any[j];
-                }
-            }
-        }
-        let live = cand.iter().filter(|c| **c != 0).count();
-        if plan.by_count && live > 0 && plan.adds.len() <= MAX_WEIGHED {
-            // Each candidate's weights summed alone: a sub-range's
-            // candidates are a few bits in a few words.
-            let na = plan.adds.len();
-            let mut weight = [0u32; MAX_WEIGHED];
-            let mut at = [0usize; MAX_WEIGHED];
-            for (k, &(i, wt)) in plan.adds.iter().enumerate() {
-                weight[k] = wt;
-                at[k] = i * words + w0;
-            }
-            let mut held = [0u64; MAX_WEIGHED];
-            for j in 0..len {
-                let mut word = cand[j];
-                if word == 0 {
-                    continue;
-                }
-                let mut most = plan.start;
-                for k in 0..na {
-                    held[k] = rows[at[k] + j];
-                    most += weight[k] & 0u32.wrapping_sub(u32::from(held[k] & word != 0));
-                }
-                if most < SIEVE_TARGET {
-                    cand[j] = 0;
-                    continue;
-                }
-                let mut keep = 0u64;
-                while word != 0 {
-                    let bit = word.trailing_zeros();
-                    word &= word - 1;
-                    let mut sum = plan.start;
-                    for k in 0..na {
-                        sum += weight[k] & 0u32.wrapping_sub((held[k] >> bit & 1) as u32);
-                    }
-                    keep |= u64::from(sum >= SIEVE_TARGET) << bit;
-                }
-                cand[j] = keep;
-            }
-        } else if plan.by_count && live > 0 {
-            // Many weighed terms: every lane at once. Each lane's counter starts at 2^SLICES - target + start, so it
-            // reaches the target as it carries out of the top slice.
-            let init = (1u32 << SLICES) - SIEVE_TARGET + plan.start;
-            let mut slices = [[0u64; SUB_WORDS]; SLICES];
-            for (s, slice) in slices.iter_mut().enumerate() {
-                if init >> s & 1 != 0 {
-                    *slice = [!0u64; SUB_WORDS];
-                }
-            }
-            let mut reached = [0u64; SUB_WORDS];
-            for &(i, weight) in &plan.adds {
-                let mask = row(i);
-                let mut carry = [0u64; SUB_WORDS];
-                for (s, slice) in slices.iter_mut().enumerate() {
-                    if weight >> s & 1 != 0 {
-                        for j in 0..SUB_WORDS {
-                            let sum = slice[j] ^ mask[j];
-                            let next = (slice[j] & mask[j]) | (carry[j] & sum);
-                            slice[j] = sum ^ carry[j];
-                            carry[j] = next;
-                        }
-                    } else {
-                        for j in 0..SUB_WORDS {
-                            let next = carry[j] & slice[j];
-                            slice[j] ^= carry[j];
-                            carry[j] = next;
-                        }
-                    }
-                }
-                for j in 0..SUB_WORDS {
-                    reached[j] |= carry[j];
-                }
-            }
-            for j in 0..SUB_WORDS {
-                cand[j] &= reached[j];
-            }
-        }
-        *out = cand;
     }
 
     /// The posting index of member `local` of scoring term `i`'s row;
@@ -1800,7 +1660,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// group `g`.
     ///
     /// Kept out of line, as the group and plan steps are: inlined into the
-    /// sieve's word loop it measured 8% slower over the disjunction trace.
+    /// word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
     fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
         let local = (w * 64) as u32 + bit;
