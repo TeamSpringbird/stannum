@@ -233,6 +233,6 @@ fn a_corrupted_length_is_found() {
     assert!(verify_segment(&blob).is_clean());
     let segment = super::segment::Segment::parse(&blob).unwrap();
     let mut broken = blob.clone();
-    broken[segment.length_at(2)] = 3;
+    broken[segment.length_at(2).0] = 3;
     assert!(!verify_segment(&broken).is_clean());
 }

@@ -10,8 +10,10 @@
 //!
 //! Heap blocks are taken in groups of [`GROUP_PAGES`]. A group the segment
 //! holds documents in has a width `w`, the largest line pointer offset of
-//! those documents, and `256 * w` slots: tuple `(block, offset)` is slot
-//! `(block % 256) * w + offset - 1` of group `block / 256`. The groups'
+//! those documents, a first page `f` and a span of `p` pages to its last
+//! (all 256 but at a heap's or a segment's edges), and `p * w` slots: tuple
+//! `(block, offset)` is slot `(block % 256 - f) * w + offset - 1` of group
+//! `block / 256`. The groups'
 //! slots are numbered in a row, so a slot names a ctid and back with one
 //! table of groups and a multiply, and slots sort as ctids do. A term's
 //! postings are a set of slots ([`super::postings`]), so two terms' sets in a
@@ -19,12 +21,15 @@
 //!
 //! ```text
 //! docset   := groups varint,
-//!             (group u32le, width u16le, rank_base u32le, kind u8)*,
+//!             (group u32le, width u16le, first u8, pages - 1 u8,
+//!              rank_base u32le, kind u8)*,
 //!             body* (per group, in order)
-//! body     := grid:   32 * width bytes, the group's slots as a bitmap
-//!           | counts: 256 bytes, page p holding offsets 1..=count[p]
-//! dl       := escapes varint, u16le per document by rank (0xffff: escaped),
-//!             (rank u32le, length u32le)* for the escaped, by rank
+//! body     := grid:   the group's slots as a bitmap of whole u64le words
+//!           | counts: a byte per page, page p holding offsets 1..=count[p]
+//! dl       := block varint (documents per block), blocks varint,
+//!             (bits_at u32le, base u24le, width u8)* per block,
+//!             per block its lengths less its base, packed at its width
+//!             (byte-aligned), by rank
 //! liveness := dead varint, then when dead > 0 a bitmap of u64le words over
 //!             document ranks, a set bit naming a dead document
 //! ```
@@ -40,10 +45,7 @@ pub const GROUP_PAGES: u32 = 256;
 /// The largest line pointer offset an 8 KiB heap page can hold.
 pub const MAX_OFFSET: u16 = 291;
 /// Bytes of one directory entry of the document set.
-const ENTRY: usize = 11;
-/// A stored length that names an escaped one.
-const ESCAPE: u16 = u16::MAX;
-
+const ENTRY: usize = 13;
 const KIND_GRID: u8 = 0;
 const KIND_COUNTS: u8 = 1;
 
@@ -54,6 +56,9 @@ pub struct Group {
     pub id: u32,
     /// Its largest offset: slots per page.
     pub width: u16,
+    /// Its first page (`block % 256`), and the pages from there to its last.
+    pub first: u8,
+    pub pages: u16,
     /// The slot its first page's first offset maps to.
     pub slot_base: u32,
     /// Documents in earlier groups.
@@ -63,12 +68,23 @@ pub struct Group {
 impl Group {
     /// Slots in the group.
     pub const fn slots(&self) -> u32 {
-        GROUP_PAGES * self.width as u32
+        self.pages as u32 * self.width as u32
     }
 
     /// 64-bit words of a bitmap over its slots.
     pub const fn words(&self) -> usize {
-        (GROUP_PAGES as usize * self.width as usize).div_ceil(64)
+        (self.pages as usize * self.width as usize).div_ceil(64)
+    }
+
+    /// Bytes of a grid over its slots: whole words.
+    pub const fn grid_bytes(&self) -> usize {
+        self.words() * 8
+    }
+
+    /// The local slot of `(page, offset)`, `page` being `block % 256`.
+    #[inline]
+    pub const fn local(&self, page: u32, offset: u16) -> u32 {
+        (page - self.first as u32) * self.width as u32 + offset as u32 - 1
     }
 }
 
@@ -95,11 +111,17 @@ impl Geometry {
             }
             previous = Some(*tid);
             let id = tid.block / GROUP_PAGES;
+            let page = tid.block % GROUP_PAGES;
             match groups.last_mut() {
-                Some(group) if group.id == id => group.width = group.width.max(tid.offset),
+                Some(group) if group.id == id => {
+                    group.width = group.width.max(tid.offset);
+                    group.pages = (page - u32::from(group.first) + 1) as u16;
+                }
                 _ => groups.push(Group {
                     id,
                     width: tid.offset,
+                    first: page as u8,
+                    pages: 1,
                     slot_base: 0,
                     rank_base: rank as u32,
                 }),
@@ -129,15 +151,15 @@ impl Geometry {
     /// offset is beyond the group's width.
     pub fn slot_of(&self, tid: Tid) -> Option<u32> {
         let group = &self.groups[self.group_index(tid.block)?];
-        if tid.offset == 0 || tid.offset > group.width {
+        let page = tid.block % GROUP_PAGES;
+        if tid.offset == 0
+            || tid.offset > group.width
+            || page < u32::from(group.first)
+            || page - u32::from(group.first) >= u32::from(group.pages)
+        {
             return None;
         }
-        Some(
-            group.slot_base
-                + (tid.block % GROUP_PAGES) * u32::from(group.width)
-                + u32::from(tid.offset)
-                - 1,
-        )
+        Some(group.slot_base + group.local(page, tid.offset))
     }
 
     /// The group holding `slot`.
@@ -151,7 +173,7 @@ impl Geometry {
         let group = &self.groups[index];
         let width = u32::from(group.width);
         Tid {
-            block: group.id * GROUP_PAGES + local / width,
+            block: group.id * GROUP_PAGES + u32::from(group.first) + local / width,
             offset: (local % width) as u16 + 1,
         }
     }
@@ -176,31 +198,32 @@ pub fn encode_docset(geometry: &Geometry, tids: &[Tid]) -> Vec<u8> {
         }
         let members = &tids[start..at];
         // Pages that hold exactly offsets 1..=n need only n.
-        let mut counts = [0u16; GROUP_PAGES as usize];
+        let mut counts = vec![0u16; usize::from(group.pages)];
         let mut prefix = true;
         for tid in members {
-            let page = (tid.block % GROUP_PAGES) as usize;
+            let page = (tid.block % GROUP_PAGES - u32::from(group.first)) as usize;
             if tid.offset != counts[page] + 1 {
                 prefix = false;
             }
             counts[page] += 1;
         }
-        let kind = if prefix && group.width <= 255 && 256 < 32 * group.width as usize {
+        let kind = if prefix && group.width <= 255 && counts.len() < group.grid_bytes() {
             KIND_COUNTS
         } else {
             KIND_GRID
         };
         out.extend_from_slice(&group.id.to_le_bytes());
         out.extend_from_slice(&group.width.to_le_bytes());
+        out.push(group.first);
+        out.push((group.pages - 1) as u8);
         out.extend_from_slice(&group.rank_base.to_le_bytes());
         out.push(kind);
         if kind == KIND_COUNTS {
             bodies.extend(counts.iter().map(|c| *c as u8));
         } else {
-            let mut grid = vec![0u8; 32 * group.width as usize];
-            let width = u32::from(group.width);
+            let mut grid = vec![0u8; group.grid_bytes()];
             for tid in members {
-                let local = (tid.block % GROUP_PAGES) * width + u32::from(tid.offset) - 1;
+                let local = group.local(tid.block % GROUP_PAGES, tid.offset);
                 grid[local as usize / 8] |= 1 << (local % 8);
             }
             bodies.extend_from_slice(&grid);
@@ -241,9 +264,15 @@ impl DocSet {
         for entry in directory.chunks_exact(ENTRY) {
             let id = u32::from_le_bytes(entry[0..4].try_into().expect("four bytes"));
             let width = u16::from_le_bytes(entry[4..6].try_into().expect("two bytes"));
-            let rank_base = u32::from_le_bytes(entry[6..10].try_into().expect("four bytes"));
-            let kind = entry[10];
-            if width == 0 || width > MAX_OFFSET || rank_base != rank {
+            let first = entry[6];
+            let pages = u16::from(entry[7]) + 1;
+            let rank_base = u32::from_le_bytes(entry[8..12].try_into().expect("four bytes"));
+            let kind = entry[12];
+            if width == 0
+                || width > MAX_OFFSET
+                || rank_base != rank
+                || u32::from(first) + u32::from(pages) > GROUP_PAGES
+            {
                 return Err(Error::Corrupt("document set directory"));
             }
             if geometry.groups.last().is_some_and(|g| g.id >= id) {
@@ -252,6 +281,8 @@ impl DocSet {
             let group = Group {
                 id,
                 width,
+                first,
+                pages,
                 slot_base: geometry.slots,
                 rank_base,
             };
@@ -266,7 +297,7 @@ impl DocSet {
             match kind {
                 KIND_GRID => {
                     let body = bytes
-                        .get(at..at + 32 * width as usize)
+                        .get(at..at + group.grid_bytes())
                         .ok_or(Error::Truncated)?;
                     at += body.len();
                     for (i, word) in grid.iter_mut().enumerate() {
@@ -274,8 +305,10 @@ impl DocSet {
                     }
                 }
                 KIND_COUNTS => {
-                    let body = bytes.get(at..at + 256).ok_or(Error::Truncated)?;
-                    at += 256;
+                    let body = bytes
+                        .get(at..at + usize::from(pages))
+                        .ok_or(Error::Truncated)?;
+                    at += body.len();
                     for (page, &n) in body.iter().enumerate() {
                         if u16::from(n) > width {
                             return Err(Error::Corrupt("document set page count"));
@@ -358,89 +391,103 @@ impl DocSet {
     }
 }
 
+/// Documents per DL sidecar block: each block packs its lengths less its
+/// shortest at the width the longest needs.
+pub const DL_BLOCK: u32 = 256;
+
+/// The largest base a block header holds (24 bits); a block whose shortest
+/// length is above it packs the rest at a wider width.
+const DL_BASE_MAX: u32 = (1 << 24) - 1;
+
 /// Encodes exact document lengths, by rank.
 pub fn encode_lengths(lengths: &[u32]) -> Vec<u8> {
-    let escaped: Vec<(u32, u32)> = lengths
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| **l >= u32::from(ESCAPE))
-        .map(|(rank, l)| (rank as u32, *l))
-        .collect();
-    let mut out = Vec::with_capacity(lengths.len() * 2 + escaped.len() * 8 + 4);
-    varint::put(&mut out, escaped.len() as u64);
-    for length in lengths {
-        let stored = if *length >= u32::from(ESCAPE) {
-            ESCAPE
-        } else {
-            *length as u16
-        };
-        out.extend_from_slice(&stored.to_le_bytes());
+    let blocks = lengths.len().div_ceil(DL_BLOCK as usize);
+    let mut out = Vec::with_capacity(8 + blocks * 8 + lengths.len());
+    varint::put(&mut out, u64::from(DL_BLOCK));
+    varint::put(&mut out, blocks as u64);
+    let mut headers = Vec::with_capacity(blocks * 8);
+    let mut data = Vec::new();
+    for chunk in lengths.chunks(DL_BLOCK as usize) {
+        let base = chunk.iter().copied().min().unwrap_or(0).min(DL_BASE_MAX);
+        let range = chunk.iter().map(|l| l - base).max().unwrap_or(0);
+        let width = 32 - range.leading_zeros();
+        headers.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        headers.extend_from_slice(&(base | width << 24).to_le_bytes());
+        let mut w = bits::BitWriter::new();
+        for l in chunk {
+            w.put(l - base, width);
+        }
+        data.extend_from_slice(&w.finish());
     }
-    for (rank, length) in escaped {
-        out.extend_from_slice(&rank.to_le_bytes());
-        out.extend_from_slice(&length.to_le_bytes());
-    }
+    out.extend_from_slice(&headers);
+    out.extend_from_slice(&data);
     out
 }
 
 /// The DL sidecar: exact lengths by document rank.
 #[derive(Clone, Copy, Debug)]
 pub struct Lengths<'a> {
-    /// Where the stored lengths start within the sidecar's bytes.
-    pub stored_at: usize,
-    stored: &'a [u8],
-    escaped: &'a [u8],
+    /// Where the block headers and the packed lengths start within the
+    /// sidecar's bytes.
+    pub headers_at: usize,
+    pub data_at: usize,
+    documents: u32,
+    block: u32,
+    headers: &'a [u8],
+    data: &'a [u8],
 }
 
 impl<'a> Lengths<'a> {
     pub fn parse(bytes: &'a [u8], documents: u32) -> Result<Self> {
         let mut at = 0;
-        let escapes = varint::get_u32(bytes, &mut at)? as usize;
-        let stored_len = documents as usize * 2;
-        let stored = bytes.get(at..at + stored_len).ok_or(Error::Truncated)?;
-        let escaped = &bytes[at + stored_len..];
-        if escaped.len() != escapes * 8 {
-            return Err(Error::Corrupt("length escapes"));
+        let block = varint::get_u32(bytes, &mut at)?;
+        let blocks = varint::get_u32(bytes, &mut at)? as usize;
+        if block == 0 || blocks != documents.div_ceil(block) as usize {
+            return Err(Error::Corrupt("length blocks"));
         }
+        let headers = bytes.get(at..at + blocks * 8).ok_or(Error::Truncated)?;
+        let headers_at = at;
+        let data_at = at + blocks * 8;
         Ok(Self {
-            stored_at: at,
-            stored,
-            escaped,
+            headers_at,
+            data_at,
+            documents,
+            block,
+            headers,
+            data: &bytes[data_at..],
         })
+    }
+
+    /// Block `b`'s header: where its bits start, its base and its width.
+    #[inline]
+    fn header(&self, b: usize) -> Result<(usize, u32, u32)> {
+        let h = self
+            .headers
+            .get(b * 8..b * 8 + 8)
+            .ok_or(Error::Corrupt("length rank"))?;
+        let at = u32::from_le_bytes(h[0..4].try_into().expect("four bytes")) as usize;
+        let packed = u32::from_le_bytes(h[4..8].try_into().expect("four bytes"));
+        Ok((at, packed & DL_BASE_MAX, packed >> 24))
     }
 
     /// The length of the document at `rank`.
     #[inline]
     pub fn get(&self, rank: u32) -> Result<u32> {
-        let at = rank as usize * 2;
-        let stored = u16::from_le_bytes(
-            self.stored
-                .get(at..at + 2)
-                .ok_or(Error::Corrupt("length rank"))?
-                .try_into()
-                .expect("two bytes"),
-        );
-        if stored != ESCAPE {
-            return Ok(u32::from(stored));
+        if rank >= self.documents {
+            return Err(Error::Corrupt("length rank"));
         }
-        let entries = self.escaped.len() / 8;
-        let entry = |i: usize| {
-            let e = &self.escaped[i * 8..i * 8 + 8];
-            (
-                u32::from_le_bytes(e[0..4].try_into().expect("four bytes")),
-                u32::from_le_bytes(e[4..8].try_into().expect("four bytes")),
-            )
-        };
-        let (mut lo, mut hi) = (0, entries);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            match entry(mid).0.cmp(&rank) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Ok(entry(mid).1),
-            }
-        }
-        Err(Error::Corrupt("escaped length missing"))
+        let (at, base, width) = self.header((rank / self.block) as usize)?;
+        let bytes = self.data.get(at..).ok_or(Error::Truncated)?;
+        Ok(base + bits::get(bytes, (rank % self.block) as usize, width)?)
+    }
+
+    /// Where `rank`'s block header and its packed length lie within the
+    /// sidecar's bytes, for page accounting.
+    pub fn at(&self, rank: u32) -> (usize, usize) {
+        let b = (rank / self.block) as usize;
+        let (at, _, width) = self.header(b).unwrap_or((0, 0, 0));
+        let bit = (rank % self.block) as usize * width as usize;
+        (self.headers_at + b * 8, self.data_at + at + bit / 8)
     }
 }
 
@@ -575,8 +622,10 @@ mod tests {
     }
 
     #[test]
-    fn lengths_escape() {
-        let lengths = [1, 65_534, 65_535, 70_000, 3, u32::MAX];
+    fn lengths_round_trip() {
+        let mut lengths = vec![1, 65_534, 65_535, 70_000, 3, u32::MAX, 0, (1 << 24) + 5];
+        lengths.extend((0..1000u32).map(|i| (i * 7919) % 4096 + 1));
+        lengths.extend([7; 300]);
         let bytes = encode_lengths(&lengths);
         let parsed = Lengths::parse(&bytes, lengths.len() as u32).unwrap();
         for (rank, length) in lengths.iter().enumerate() {

@@ -5,8 +5,9 @@
 //! Ranked top k over a segment in TIN's shape, a 256-page group at a time.
 //!
 //! A query some terms of which every match holds (a conjunction, a phrase)
-//! walks the groups those terms share. In each, their members are ANDed
-//! (word by word over grids; a list's members probed in the others), and
+//! walks the groups its rarest such term holds. In each, the terms' members
+//! are intersected whole (word by word where all are grids, else from the
+//! fewest, a grid by bit and a list by a merge), and
 //! the survivors are bounded, cheapest first, before anything is read for
 //! them: by the footer blocks they fall in (a window per run of slots no
 //! block boundary crosses), then by their length alone against the
@@ -16,6 +17,9 @@
 //! checked first; after, a group's candidates that score into the top k
 //! wait and are checked best first, so a confirmed one raises the
 //! threshold over the rest.
+//!
+//! Any other query is block-max MaxScore over its scoring terms, a group at
+//! a time: see [`Walk::run_or`].
 
 use std::collections::BinaryHeap;
 
@@ -23,11 +27,11 @@ use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
-use segment::tinshape::docs::{GROUP_PAGES, Geometry};
+use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
+use segment::tinshape::positions::{Positions, skip_entry};
 use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local, or_into};
 use segment::tinshape::segment::Segment;
-use segment::tinshape::varint;
 use segment::{Error, Result};
 
 use super::{
@@ -334,12 +338,8 @@ fn load<'a>(
         }
         mem.first = cursor.rank() as u32;
         let end = group.slot_base + group.slots();
-        while let Some(slot) = cursor.current()
-            && slot < end
-        {
-            mem.list.push(slot - group.slot_base);
-            cursor.advance();
-        }
+        let list = &mut mem.list;
+        cursor.drain_below(end, |slot| list.push(slot - group.slot_base));
         mem.count = mem.list.len() as u32;
         return Ok(());
     }
@@ -356,18 +356,17 @@ fn load<'a>(
         } => {
             touch.touch(Part::Payload, at, bytes.len());
             mem.first = e.first;
-            let width = u32::from(group.width);
             if e.kind == KIND_GRID {
                 mem.kind = Kind::Grid(bytes);
             } else if seek && e.kind == KIND_EF {
-                let ef = Ef::parse(bytes, e.count as usize, GROUP_PAGES * width)?;
+                let ef = Ef::parse(bytes, e.count as usize, group.slots())?;
                 mem.kind = Kind::Cursor {
                     cursor: ef.cursor(),
                     offset: 0,
                 };
             } else {
                 let list = &mut mem.list;
-                for_each_local(&e, bytes, width, |l| list.push(l))?;
+                for_each_local(&e, bytes, &group, |l| list.push(l))?;
             }
         }
         Src::Locals { from, to } => {
@@ -379,41 +378,11 @@ fn load<'a>(
     Ok(())
 }
 
-/// Skips `n` varints from byte `p`: each ends at a byte below 0x80.
-#[inline]
-fn skip_varints(bytes: &[u8], mut p: usize, mut n: u32) -> Result<usize> {
-    while n > 0 {
-        if let Some(chunk) = bytes.get(p..p + 8) {
-            let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
-            let mut ends = !word & 0x8080_8080_8080_8080;
-            let c = ends.count_ones();
-            if c < n {
-                n -= c;
-                p += 8;
-                continue;
-            }
-            for _ in 1..n {
-                ends &= ends - 1;
-            }
-            return Ok(p + ends.trailing_zeros() as usize / 8 + 1);
-        }
-        let b = *bytes.get(p).ok_or(Error::Truncated)?;
-        p += 1;
-        if b < 0x80 {
-            n -= 1;
-        }
-    }
-    Ok(p)
-}
-
-/// A term's positions stream read by posting index, forward from the last
-/// entry read where that is nearer than its skip table's entry.
+/// A term's positions read by posting index, forward from the last entry
+/// read where that is nearer than the entry its tables locate.
 struct PosCursor<'a> {
-    bytes: &'a [u8],
+    positions: Positions<'a>,
     at: usize,
-    count: u32,
-    skips_at: usize,
-    data_at: usize,
     /// Entry `next` starts at byte `next_at`.
     next: u32,
     next_at: usize,
@@ -421,65 +390,34 @@ struct PosCursor<'a> {
 
 impl<'a> PosCursor<'a> {
     fn new(stream: (&'a [u8], usize)) -> Result<Self> {
-        let (bytes, at) = stream;
-        let mut pos = 0;
-        let count = varint::get_u32(bytes, &mut pos)?;
-        let slots = if count == 0 {
-            0
-        } else {
-            (count.div_ceil(segment::payload::SKIP_INTERVAL) - 1) as usize
-        };
-        let data_at = pos + slots * 4;
+        let positions = Positions::parse(stream.0)?;
         Ok(Self {
-            bytes,
-            at,
-            count,
-            skips_at: pos,
-            data_at,
             next: 0,
-            next_at: data_at,
+            next_at: positions.data_at,
+            positions,
+            at: stream.1,
         })
     }
 
     /// Reads entry `index` into `out`.
     fn read(&mut self, index: u32, out: &mut Vec<u32>, touch: &mut impl Touch) -> Result<()> {
-        if index >= self.count {
-            return Err(Error::Corrupt("positions index"));
-        }
-        let interval = segment::payload::SKIP_INTERVAL;
-        let slot = index / interval;
-        if index < self.next || slot > self.next / interval {
-            if slot == 0 {
-                self.next = 0;
-                self.next_at = self.data_at;
-            } else {
-                let s = self.skips_at + (slot as usize - 1) * 4;
-                touch.touch(Part::Positions, self.at + s, 4);
-                let skip = self.bytes.get(s..s + 4).ok_or(Error::Truncated)?;
-                self.next_at =
-                    self.data_at + u32::from_le_bytes(skip.try_into().expect("four")) as usize;
-                self.next = slot * interval;
+        let (entry, entry_at, reads) = self.positions.locate(index)?;
+        if index < self.next || entry > self.next {
+            for (at, len) in reads {
+                if len > 0 {
+                    touch.touch(Part::Positions, self.at + at, len);
+                }
             }
+            self.next = entry;
+            self.next_at = entry_at;
         }
+        let bytes = self.positions.bytes;
         let from = self.next_at;
-        let bytes = self.bytes;
         let mut p = self.next_at;
         for _ in self.next..index {
-            let n = varint::get_u32(bytes, &mut p)?;
-            p = skip_varints(bytes, p, n)?;
+            p = skip_entry(bytes, p)?;
         }
-        let n = varint::get_u32(bytes, &mut p)?;
-        out.clear();
-        let mut previous: Option<u32> = None;
-        for _ in 0..n {
-            let v = varint::get_u32(bytes, &mut p)?;
-            let position = match previous {
-                None => v,
-                Some(q) => q + v + 1,
-            };
-            out.push(position);
-            previous = Some(position);
-        }
+        p = self.positions.read_entry(p, out)?;
         self.next = index + 1;
         self.next_at = p;
         touch.touch(Part::Positions, self.at + from, p - from);
@@ -489,8 +427,10 @@ impl<'a> PosCursor<'a> {
 
 /// A top-level span's positions check.
 struct SpanCheck<'a> {
-    /// Per span slot, its term.
+    /// Per span slot, its term, and the first slot of the same term (a
+    /// phrase repeating a word reads its positions once).
     slots: Vec<usize>,
+    first: Vec<usize>,
     cursors: Vec<PosCursor<'a>>,
     solver: SpanSolver,
     plan: Option<PhrasePlan>,
@@ -499,30 +439,47 @@ struct SpanCheck<'a> {
 }
 
 impl SpanCheck<'_> {
+    /// Reads slot `slot`'s positions unless read: its term's first slot's,
+    /// copied, when an earlier slot holds the same term.
+    fn read_slot(&mut self, slot: usize, index: &[u32], touch: &mut impl Touch) -> Result<()> {
+        if std::mem::replace(&mut self.read[slot], true) {
+            return Ok(());
+        }
+        let first = self.first[slot];
+        if first == slot {
+            return self.cursors[slot].read(index[slot], &mut self.positions[slot], touch);
+        }
+        self.read_slot(first, index, touch)?;
+        let (head, tail) = self.positions.split_at_mut(slot);
+        tail[0].clone_from(&head[first]);
+        Ok(())
+    }
+
     /// Whether the candidate whose posting index in each slot's term is
     /// `index[slot]` holds the span.
     fn holds(&mut self, index: &[u32], touch: &mut impl Touch) -> Result<bool> {
         self.read.fill(false);
-        if let Some(plan) = &self.plan {
+        if let Some(plan) = self.plan.take() {
+            let mut kept = true;
             for step in plan.steps() {
-                if !std::mem::replace(&mut self.read[step.slot], true) {
-                    self.cursors[step.slot].read(
-                        index[step.slot],
-                        &mut self.positions[step.slot],
-                        touch,
-                    )?;
+                if let Err(error) = self.read_slot(step.slot, index, touch) {
+                    self.plan = Some(plan);
+                    return Err(error);
                 }
                 if let Some(pair) = step.pair
                     && !plan.pair_keeps(pair, &self.positions)
                 {
-                    return Ok(false);
+                    kept = false;
+                    break;
                 }
             }
-        }
-        for (slot, &at) in index.iter().enumerate() {
-            if !std::mem::replace(&mut self.read[slot], true) {
-                self.cursors[slot].read(at, &mut self.positions[slot], touch)?;
+            self.plan = Some(plan);
+            if !kept {
+                return Ok(false);
             }
+        }
+        for slot in 0..index.len() {
+            self.read_slot(slot, index, touch)?;
         }
         Ok(self.solver.intervals(&self.positions).next().is_some())
     }
@@ -563,7 +520,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// bound over the sub-range at hand.
     sc_required: Vec<bool>,
     present: Vec<bool>,
-    held: Vec<bool>,
+    /// A disjunction's present terms in the group at hand, and those the
+    /// candidate at hand holds, both in the scorer's order.
+    present_list: Vec<usize>,
+    held_list: Vec<usize>,
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
     plan: Plan,
@@ -586,6 +546,7 @@ struct Walk<'s, 'a, T: Touch> {
     pending_index: Vec<u32>,
     span_index: Vec<u32>,
     cands: Vec<u32>,
+    order: Vec<usize>,
     words: Vec<u64>,
     /// The node check's own cursors (the walk moves the terms' sparse
     /// cursors past each group), and its scratch.
@@ -608,84 +569,49 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
     }
 
-    /// Leapfrogs the required terms over slots, led by the rarest: a slot
-    /// they all hold is a candidate. A group every required term holds as a
-    /// grid is sieved whole instead, by the AND of their words. A group and
-    /// a window whose bounds cannot reach the threshold are skipped unread.
+    /// Walks the groups the rarest required term holds. A group whose
+    /// scoring terms' bounds cannot reach the threshold is skipped unread;
+    /// in any other the required terms' members are intersected whole (word
+    /// by word where every one is a grid, else term by term from the fewest)
+    /// and the candidates left are bounded, scored and admitted in order.
     fn run(&mut self) -> Result<()> {
         let lead = self.req[0];
         let n = self.sc.len();
         let mut cursor = 0u32;
-        let mut current: Option<u32> = None;
-        'slots: while let Some(slot) = self.seek(lead, cursor, true)? {
+        while self.seek(lead, cursor)?.is_some() {
             let g = self.mems[lead].loaded - 1;
             let group = self.geometry.groups[g as usize];
             let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
-            if current != Some(g) {
-                if let Some(previous) = current
-                    && !self.pending.is_empty()
-                {
-                    self.verify_pending(previous)?;
-                }
-                current = Some(g);
-                if n == 0 && self.heap.len() >= self.k {
-                    // Nothing scores: every later match ties at zero and
-                    // ranks after the first k.
-                    break;
-                }
-                self.answer.windows += 1;
-                let mut bound = 0.0_f64;
-                for i in 0..n {
-                    bound += f64::from(self.sc[i].range_bound(base, end));
-                }
-                if below(bound, self.threshold()) {
-                    self.answer.windows_pruned += 1;
-                    cursor = end + 1;
-                    continue;
-                }
-                if self.req.len() > 1 && self.all_grids(g) {
-                    self.dense_group(g)?;
-                    cursor = end + 1;
-                    continue;
-                }
-            }
-            if self.window(slot) {
-                // Skip the rest of the window unread.
-                match self.window_end {
-                    Some(e) if e < u32::MAX => cursor = e + 1,
-                    _ => break,
-                }
-                continue;
-            }
-            for r in 1..self.req.len() {
-                let t = self.req[r];
-                match self.seek(t, slot, false)? {
-                    None => break 'slots,
-                    Some(s) if s != slot => {
-                        cursor = s;
-                        continue 'slots;
-                    }
-                    Some(_) => {}
-                }
-            }
-            if !self.process(g, slot - base)? {
+            cursor = end + 1;
+            if n == 0 && self.heap.len() >= self.k {
+                // Nothing scores: every later match ties at zero and ranks
+                // after the first k.
                 break;
             }
-            cursor = slot + 1;
-        }
-        if let Some(g) = current
-            && !self.pending.is_empty()
-        {
-            self.verify_pending(g)?;
+            self.answer.windows += 1;
+            let mut bound = 0.0_f64;
+            for i in 0..n {
+                bound += f64::from(self.sc[i].range_bound(base, end));
+            }
+            if below(bound, self.threshold()) {
+                self.answer.windows_pruned += 1;
+                continue;
+            }
+            let more = if self.all_grids(g) {
+                self.dense_group(g)?
+            } else {
+                self.group_and(g)?
+            };
+            if !more {
+                break;
+            }
         }
         Ok(())
     }
 
     /// Moves term `t` to its first member at or after `target`, loading
-    /// the group that holds it; the member's slot, if any. A term's
-    /// Elias-Fano list is sought rather than decoded where its members far
-    /// outnumber the lead's: the leapfrog visits few of them.
-    fn seek(&mut self, t: usize, mut target: u32, lead: bool) -> Result<Option<u32>> {
+    /// (decoding) the group that holds it; the member's slot, if any.
+    fn seek(&mut self, t: usize, mut target: u32) -> Result<Option<u32>> {
         let geometry = self.geometry;
         loop {
             if target >= geometry.slots {
@@ -706,10 +632,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 if next > g {
                     target = geometry.groups[next as usize].slot_base;
                 }
-                count_in(set, geometry, next, mem);
-                let seek = !lead && mem.count > 4 * self.mems[self.req[0]].count.max(1);
-                let mem = &mut self.mems[t];
-                load(set, geometry, next, mem, seek, self.touch)?;
+                load(set, geometry, next, mem, false, self.touch)?;
             }
             let mem = &mut self.mems[t];
             let group = &geometry.groups[mem.loaded as usize - 1];
@@ -738,11 +661,103 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         true
     }
 
+    /// Intersects the required terms' members in group `g`, which the lead
+    /// holds, term by term from the fewest (a grid's by bit, a list's by a
+    /// merge), and walks the candidates left.
+    fn group_and(&mut self, g: u32) -> Result<bool> {
+        for r in 1..self.req.len() {
+            let t = self.req[r];
+            // A term loaded here already holds the group (a sparse term's
+            // cursor has moved past it).
+            if self.mems[t].loaded == g + 1 {
+                continue;
+            }
+            let set = self.terms[t].as_mut().expect("required");
+            if next_group(set, self.geometry, g, &mut self.mems[t].hint, self.touch) != Some(g) {
+                return Ok(true);
+            }
+        }
+        for r in 0..self.req.len() {
+            let t = self.req[r];
+            let set = self.terms[t].as_ref().expect("required");
+            if self.mems[t].loaded != g + 1 {
+                count_in(set, self.geometry, g, &mut self.mems[t]);
+            }
+        }
+        let mut order = std::mem::take(&mut self.order);
+        order.clear();
+        order.extend_from_slice(&self.req);
+        order.sort_by_key(|t| self.mems[*t].count);
+        let mut cands = std::mem::take(&mut self.cands);
+        cands.clear();
+        for (o, &t) in order.iter().enumerate() {
+            let mem = &self.mems[t];
+            if mem.loaded != g + 1 || matches!(mem.kind, Kind::Cursor { .. }) {
+                let set = self.terms[t].as_mut().expect("required");
+                load(set, self.geometry, g, &mut self.mems[t], false, self.touch)?;
+            }
+            let mem = &self.mems[t];
+            match (o, &mem.kind) {
+                (0, Kind::Grid(bytes)) => {
+                    for w in 0..bytes.len() / 8 {
+                        let mut word = bits::word(bytes, w);
+                        while word != 0 {
+                            cands.push((w * 64) as u32 + word.trailing_zeros());
+                            word &= word - 1;
+                        }
+                    }
+                }
+                (0, _) => cands.extend_from_slice(&mem.list),
+                (_, Kind::Grid(bytes)) => {
+                    cands.retain(|l| bytes[*l as usize / 8] >> (l % 8) & 1 == 1);
+                }
+                (_, _) => super::intersect_sorted(&mut cands, &mem.list),
+            }
+            if cands.is_empty() {
+                break;
+            }
+        }
+        self.order = order;
+        let more = self.walk_candidates(g, &cands)?;
+        self.cands = cands;
+        Ok(more)
+    }
+
+    /// Bounds, scores and admits group `g`'s candidates `cands` (local
+    /// slots, ascending), then checks its pending phrase candidates; false
+    /// once nothing later can enter the top k.
+    fn walk_candidates(&mut self, g: u32, cands: &[u32]) -> Result<bool> {
+        let base = self.geometry.groups[g as usize].slot_base;
+        let mut more = true;
+        let mut at = 0;
+        while at < cands.len() {
+            let local = cands[at];
+            at += 1;
+            if self.window(base + local) {
+                // Skip the rest of the window unread.
+                match self.window_end {
+                    Some(e) if e < u32::MAX => {
+                        at += cands[at..].partition_point(|l| base + *l <= e);
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+            if !self.process(g, local)? {
+                more = false;
+                break;
+            }
+        }
+        if !self.pending.is_empty() {
+            self.verify_pending(g)?;
+        }
+        Ok(more)
+    }
+
     /// Sieves group `g`, every required term of which is a grid there, by
     /// the AND of their words, and walks its candidates.
-    fn dense_group(&mut self, g: u32) -> Result<()> {
+    fn dense_group(&mut self, g: u32) -> Result<bool> {
         let group = self.geometry.groups[g as usize];
-        let base = group.slot_base;
         for r in 0..self.req.len() {
             let t = self.req[r];
             if self.mems[t].loaded != g + 1 {
@@ -776,28 +791,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 word &= word - 1;
             }
         }
-        let mut at = 0;
-        while at < cands.len() {
-            let local = cands[at];
-            at += 1;
-            if self.window(base + local) {
-                match self.window_end {
-                    Some(e) if e < u32::MAX => {
-                        at += cands[at..].partition_point(|l| base + *l <= e);
-                        continue;
-                    }
-                    _ => break,
-                }
-            }
-            if !self.process(g, local)? {
-                break;
-            }
-        }
+        let more = self.walk_candidates(g, &cands)?;
         self.cands = cands;
-        if !self.pending.is_empty() {
-            self.verify_pending(g)?;
-        }
-        Ok(())
+        Ok(more)
     }
 
     /// Moves the window to `slot` and says whether its bound falls short
@@ -867,8 +863,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .docs
             .rank_in(g as usize, local)
             .ok_or(Error::Corrupt("a posting without a document"))?;
-        self.touch
-            .touch(Part::DlSidecar, self.segment.length_at(rank), 2);
+        let (header, bits) = self.segment.length_at(rank);
+        self.touch.touch(Part::DlSidecar, header, 8);
+        self.touch.touch(Part::DlSidecar, bits, 4);
         let length = self.segment.lengths.get(rank)?;
         if theta.is_some() && n > 0 {
             let (_, nsum, dmin, fmin) = self.window_parts;
@@ -1054,7 +1051,8 @@ pub(super) fn top_k(
         terms,
         sc_required: Vec::with_capacity(n),
         present: vec![false; n],
-        held: vec![false; n],
+        present_list: Vec::with_capacity(n),
+        held_list: Vec::with_capacity(n),
         blocks: vec![0; n],
         sub_bounds: Vec::new(),
         plan: Plan::default(),
@@ -1070,6 +1068,7 @@ pub(super) fn top_k(
         pending_index: Vec::new(),
         span_index: Vec::new(),
         cands: Vec::new(),
+        order: Vec::new(),
         words: Vec::new(),
         positions: Vec::new(),
         node_terms,
@@ -1118,8 +1117,17 @@ fn span_check<'a>(
     let cursors = (0..slots.len())
         .map(|slot| PosCursor::new(set(slot).positions))
         .collect::<Result<Vec<_>>>()?;
+    let first = (0..slots.len())
+        .map(|slot| {
+            slots
+                .iter()
+                .position(|t| *t == slots[slot])
+                .expect("the slot itself")
+        })
+        .collect();
     Ok(Verify::Span(Box::new(SpanCheck {
         slots: slots.to_vec(),
+        first,
         cursors,
         solver,
         plan,
@@ -1200,8 +1208,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if g == u32::MAX {
                 break;
             }
-            for (present, next) in self.present.iter_mut().zip(&next) {
+            self.present_list.clear();
+            for (i, (present, next)) in self.present.iter_mut().zip(&next).enumerate() {
                 *present = *next == g;
+                if *present {
+                    self.present_list.push(i);
+                }
             }
             self.or_group(g)?;
             from = g + 1;
@@ -1233,13 +1245,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             cursor.seek(group.slot_base);
             r.first = cursor.rank() as u32;
             let end = group.slot_base + group.slots();
-            while let Some(slot) = cursor.current()
-                && slot < end
-            {
+            cursor.drain_below(end, |slot| {
                 let l = slot - group.slot_base;
                 row[l as usize / 64] |= 1 << (l % 64);
-                cursor.advance();
-            }
+            });
             return Ok(());
         }
         let entry = set
@@ -1258,7 +1267,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     kernels::load(row, bytes);
                 } else {
                     row.fill(0);
-                    or_into(&e, bytes, u32::from(group.width), row)?;
+                    or_into(&e, bytes, &group, row)?;
                 }
             }
             Src::Locals { from, to } => {
@@ -1541,15 +1550,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// sieve's word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
     fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
-        let n = self.sc.len();
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
         self.answer.candidates += 1;
         let theta = self.threshold();
         let mut bound = 0.0_f64;
-        for i in 0..n {
-            self.held[i] = self.present[i] && self.rows[i * words + w] >> bit & 1 == 1;
-            if self.held[i] {
+        self.held_list.clear();
+        for p in 0..self.present_list.len() {
+            let i = self.present_list[p];
+            if self.rows[i * words + w] >> bit & 1 == 1 {
+                self.held_list.push(i);
                 let s = &mut self.sc[i];
                 let b = s.block_at(slot).expect("a member's block");
                 self.blocks[i] = b;
@@ -1564,13 +1574,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .docs
             .rank_in(g as usize, local)
             .ok_or(Error::Corrupt("a posting without a document"))?;
-        self.touch
-            .touch(Part::DlSidecar, self.segment.length_at(rank), 2);
+        let (header, bits) = self.segment.length_at(rank);
+        self.touch.touch(Part::DlSidecar, header, 8);
+        self.touch.touch(Part::DlSidecar, bits, 4);
         let length = self.segment.lengths.get(rank)?;
         if theta.is_some() {
             let (mut nsum, mut dmin, mut fmin) = (0.0_f64, f64::INFINITY, f64::INFINITY);
-            for i in 0..n {
-                if self.held[i] {
+            for &i in &self.held_list {
+                {
                     let s = &self.sc[i];
                     let mb = s.max_bucket(self.blocks[i]);
                     nsum += f64::from(s.num[mb]);
@@ -1584,10 +1595,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         self.answer.scored += 1;
         let mut total = 0.0_f32;
-        for i in 0..n {
-            if !self.held[i] {
-                continue;
-            }
+        // The held terms are in the scorer's order: the sum is exact.
+        for h in 0..self.held_list.len() {
+            let i = self.held_list[h];
             let index = self.row_index(i, words, local);
             let t = self.sc[i].term;
             let s = &self.sc[i];

@@ -9,6 +9,7 @@
 //! ```text
 //! cargo run -p bench --release --bin tinshape -- --dump DIR --out DIR \
 //!     [--block 128] [--no-paged] [--no-ef-groups] [--no-sparse] [--fixed-tf] [--grid-density N] \
+//!     [--grid-min-postings N] [--subset ROWS [--rows-per-page R]] \
 //!     [--no-verify] [--no-write] [--label NAME] \
 //!     [--trace trace.tsv --expect pg.tsv [--ranked] [--k 10] [--repeat 3] \
 //!      [--per-query FILE]]
@@ -19,6 +20,10 @@
 //! median of `--repeat` passes on one thread, and the pages each query
 //! touches, by the areas TIN's EXPLAIN names, counted in pages of the
 //! paged source's size. Every row is visible, as in the ordinal replay.
+//!
+//! `--subset ROWS` converts an STN3 segment of the dump's first ROWS
+//! documents instead, rebuilt by STN3's builder (a small table's size
+//! against STN3's), laid out `R` rows to a page with `--rows-per-page`.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -44,12 +49,17 @@ struct Args {
     k: usize,
     repeat: usize,
     per_query: Option<PathBuf>,
+    /// Convert an STN3 segment of the dump's first this many documents.
+    subset: Option<u32>,
+    /// With --subset: lay the documents out this many rows to a page.
+    rows_per_page: Option<u16>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: tinshape --dump DIR --out DIR [--block N] [--no-paged] [--no-ef-groups] \
-         [--no-sparse] [--fixed-tf] [--grid-density N] [--no-verify] [--no-write] [--label NAME] \
+         [--no-sparse] [--fixed-tf] [--grid-density N] [--grid-min-postings N] \
+         [--subset ROWS [--rows-per-page R]] [--no-verify] [--no-write] [--label NAME] \
          [--trace FILE --expect FILE [--ranked] [--k N] [--repeat N] [--per-query FILE]]"
     );
     std::process::exit(2)
@@ -70,6 +80,8 @@ fn args() -> Args {
         k: 10,
         repeat: 3,
         per_query: None,
+        subset: None,
+        rows_per_page: None,
     };
     let value = |it: &mut dyn Iterator<Item = String>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -81,6 +93,9 @@ fn args() -> Args {
             "--no-ef-groups" => a.options.ef_groups = false,
             "--no-sparse" => a.options.sparse = false,
             "--fixed-tf" => a.options.adaptive_tf = false,
+            "--grid-min-postings" => {
+                a.options.grid_min_postings = value(&mut it).parse().unwrap_or_else(|_| usage())
+            }
             "--grid-density" => {
                 a.options.grid_density = value(&mut it).parse().unwrap_or_else(|_| usage())
             }
@@ -93,6 +108,10 @@ fn args() -> Args {
             "--k" => a.k = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--repeat" => a.repeat = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--per-query" => a.per_query = Some(value(&mut it).into()),
+            "--subset" => a.subset = Some(value(&mut it).parse().unwrap_or_else(|_| usage())),
+            "--rows-per-page" => {
+                a.rows_per_page = Some(value(&mut it).parse().unwrap_or_else(|_| usage()))
+            }
             _ => usage(),
         }
     }
@@ -769,6 +788,15 @@ fn run() -> Result<bool, String> {
     let dump = Dump::open(&args.dump)?;
     std::fs::create_dir_all(&args.out).map_err(|e| e.to_string())?;
     let mut converted = Vec::new();
+    let mut dump = dump;
+    if let Some(n) = args.subset {
+        for dumped in &mut dump.segments {
+            let blob = bench::tinshape::subset(dumped, n, args.rows_per_page)?;
+            dumped.documents = n.min(dumped.documents);
+            dumped.blob = std::sync::Arc::new(blob);
+            dumped.dead = None;
+        }
+    }
     for dumped in &dump.segments {
         let start = Instant::now();
         let c = convert(dumped, args.options)?;

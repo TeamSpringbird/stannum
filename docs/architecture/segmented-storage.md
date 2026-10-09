@@ -290,7 +290,7 @@ other suites.
 
 ## Segment format
 
-Index pages carry the signature `LDP2` with page layout version 4, and
+Index pages carry the signature `LDP2` with page layout version 5, and
 segments the signature `TNS1`, the ctid-addressed format of [the TIN-shape
 guide](tin-shape.md). The page layouts are defined in
 `postgres/src/storage/layout.rs` and the segment layout in the `segment`

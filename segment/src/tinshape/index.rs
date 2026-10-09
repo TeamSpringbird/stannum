@@ -121,6 +121,9 @@ struct Encoded {
     /// A term's ordinal-format entry by its record's offset in the postings
     /// area.
     terms: FxHashMap<u64, TermEntry>,
+    /// A term's positions as an STN3 payload stream, by its extent's offset
+    /// in the positions area.
+    payloads: FxHashMap<u64, Extent>,
     bytes: usize,
 }
 
@@ -420,10 +423,20 @@ impl<S: Source> AreaFetch for Reader<S> {
         if end > self.header.len(POSITIONS) as u64 {
             return Err(Error::Truncated);
         }
-        self.load(
+        // The ordinal interface reads STN3's payload streams: a term's
+        // positions are translated once, like its postings.
+        if let Some(found) = self.encoded.borrow().payloads.get(&extent.offset) {
+            return self.encoded.borrow().range(found.offset, found.len as usize);
+        }
+        let stream = self.read(
             self.header.at(POSITIONS) + extent.offset,
             extent.len as usize,
-        )
+        )?;
+        let payload = super::positions::Positions::parse(&stream)?.payload();
+        let mut encoded = self.encoded.borrow_mut();
+        let found = encoded.push(payload);
+        encoded.payloads.insert(extent.offset, found);
+        encoded.range(found.offset, found.len as usize)
     }
 
     fn doc_table(&self) -> Result<DocTable<'_>> {

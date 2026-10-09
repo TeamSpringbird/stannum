@@ -15,11 +15,11 @@
 use boldi_vigna::{SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tinshape::bits;
-use segment::tinshape::docs::Geometry;
+use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::EfCursor;
+use segment::tinshape::positions::{Positions, skip_entry};
 use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings, for_each_local};
 use segment::tinshape::segment::{Area, Segment};
-use segment::tinshape::varint;
 use segment::{Error, Result};
 use tinql::runtime::{Query, SpanTermSlot};
 
@@ -538,10 +538,10 @@ impl<'a> TermSet<'a> {
                 self.loaded = Loaded::None;
                 continue;
             }
-            let width = u32::from(group.width);
+            let group = *group;
             let local_target = target.saturating_sub(base);
             if matches!(self.loaded, Loaded::None) {
-                self.load(&g, width, touch);
+                self.load(&g, &group, touch);
             }
             let first = self.first_of(&g);
             let found = match (&self.loaded, g.src) {
@@ -603,7 +603,7 @@ impl<'a> TermSet<'a> {
         }
     }
 
-    fn load(&mut self, g: &G<'a>, width: u32, touch: &mut impl Touch) {
+    fn load(&mut self, g: &G<'a>, group: &Group, touch: &mut impl Touch) {
         self.pos = 0;
         match g.src {
             Src::Container { entry, bytes, at } => {
@@ -620,7 +620,7 @@ impl<'a> TermSet<'a> {
                 } else {
                     let mut list = std::mem::take(&mut self.list);
                     list.clear();
-                    for_each_local(&entry, bytes, width, |l| list.push(l))
+                    for_each_local(&entry, bytes, group, |l| list.push(l))
                         .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")));
                     self.list = list;
                     self.loaded = Loaded::List;
@@ -939,10 +939,10 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
     /// The members of term `t`'s group `g`, appended to `list` in order.
     fn decode(&mut self, t: usize, g: &G<'a>, list: &mut Vec<u32>) -> Result<()> {
         self.touch_src(&g.src);
-        let width = u32::from(self.segment.docs.geometry.groups[g.index as usize].width);
+        let group = self.segment.docs.geometry.groups[g.index as usize];
         match g.src {
             Src::Container { entry, bytes, .. } => {
-                for_each_local(&entry, bytes, width, |l| list.push(l))?;
+                for_each_local(&entry, bytes, &group, |l| list.push(l))?;
             }
             Src::Locals { from, to } => {
                 let set = self.terms[t].as_ref().expect("a term with a group");
@@ -1044,14 +1044,14 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
             return Ok(false);
         };
         self.touch_src(&g.src);
-        let width = u32::from(self.segment.docs.geometry.groups[group as usize].width);
+        let geometry_group = self.segment.docs.geometry.groups[group as usize];
         let set = self.terms[t].as_ref().expect("found above");
         match g.src {
             Src::Container { entry, bytes, .. } => {
                 if entry.kind == KIND_GRID {
                     kernels::load(out, bytes);
                 } else {
-                    for_each_local(&entry, bytes, width, |l| {
+                    for_each_local(&entry, bytes, &geometry_group, |l| {
                         out[l as usize / 64] |= 1 << (l % 64)
                     })?;
                 }
@@ -1100,8 +1100,8 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
     }
 }
 
-/// Reads entry `index` of a positions stream (a [`segment::payload`]
-/// stream) into `out`.
+/// Reads entry `index` of a positions stream (a
+/// [`segment::tinshape::positions`] stream) into `out`.
 pub fn read_positions(
     stream: (&[u8], usize),
     index: u32,
@@ -1109,52 +1109,20 @@ pub fn read_positions(
     touch: &mut impl Touch,
 ) -> Result<()> {
     let (bytes, at) = stream;
-    let mut pos = 0;
-    let count = varint::get_u32(bytes, &mut pos)?;
-    if index >= count {
-        return Err(Error::Corrupt("positions index"));
-    }
-    let interval = segment::payload::SKIP_INTERVAL;
-    let slots = if count == 0 {
-        0
-    } else {
-        (count.div_ceil(interval) - 1) as usize
-    };
-    let skips_at = pos;
-    let data_at = skips_at + slots * 4;
-    let slot = (index / interval) as usize;
-    let mut entry_at = data_at;
-    if slot > 0 {
-        let s = skips_at + (slot - 1) * 4;
-        touch.touch(Part::Positions, at + s, 4);
-        entry_at += u32::from_le_bytes(
-            bytes
-                .get(s..s + 4)
-                .ok_or(Error::Truncated)?
-                .try_into()
-                .expect("four"),
-        ) as usize;
-    }
-    let from = entry_at;
-    for _ in slot as u32 * interval..index {
-        let n = varint::get_u32(bytes, &mut entry_at)?;
-        for _ in 0..n {
-            varint::get(bytes, &mut entry_at)?;
+    let positions = Positions::parse(bytes)?;
+    let (mut entry, mut p, reads) = positions.locate(index)?;
+    for (read_at, len) in reads {
+        if len > 0 {
+            touch.touch(Part::Positions, at + read_at, len);
         }
     }
-    let n = varint::get_u32(bytes, &mut entry_at)?;
-    out.clear();
-    let mut previous: Option<u32> = None;
-    for _ in 0..n {
-        let v = varint::get_u32(bytes, &mut entry_at)?;
-        let p = match previous {
-            None => v,
-            Some(p) => p + v + 1,
-        };
-        out.push(p);
-        previous = Some(p);
+    let from = p;
+    while entry < index {
+        p = skip_entry(bytes, p)?;
+        entry += 1;
     }
-    touch.touch(Part::Positions, at + from, entry_at - from);
+    let end = positions.read_entry(p, out)?;
+    touch.touch(Part::Positions, at + from, end - from);
     Ok(())
 }
 
@@ -1668,7 +1636,7 @@ mod tests {
                     }
                 }
             }
-            let options = Options { block_size, grid_density, ..Options::default() };
+            let options = Options { block_size, grid_density, grid_min_postings: 0, ..Options::default() };
             let blob = build(&docs, &members, options);
             let segment = Segment::parse(&blob).unwrap();
             let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();

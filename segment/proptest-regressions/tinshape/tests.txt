@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dd16482072505df4f423e5058c436cf64b971351db94d9fe8c846341255c1f6e # shrinks to docs = [(Tid { block: 0, offset: 1 }, [("w", 0)])], parts = 1, dead = {}, options = Options { block_size: 256, paged: true, ef_groups: true, sparse: true, adaptive_tf: true, grid_density: 64, grid_min_postings: 4096 }
+cc e7b332f6a0432e2955bfe1e44b48263def016b66012d2b03f216e16ab690d222 # shrinks to docs = [(Tid { block: 0, offset: 1 }, [("w", 0)])], options = Options { block_size: 256, paged: true, ef_groups: true, sparse: true, adaptive_tf: true, grid_density: 64, grid_min_postings: 4096 }

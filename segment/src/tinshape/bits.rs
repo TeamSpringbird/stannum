@@ -78,10 +78,13 @@ pub fn get(bytes: &[u8], index: usize, width: u32) -> Result<u32> {
     if last >= bytes.len() {
         return Err(Error::Truncated);
     }
-    let mut word = [0u8; 8];
-    let take = (last - first + 1).min(8);
-    word[..take].copy_from_slice(&bytes[first..first + take]);
-    let value = u64::from_le_bytes(word) >> (bit % 8);
+    // Fewer than eight bytes remain: assembled a byte at a time (a slice
+    // copy here is a call to memcpy).
+    let mut word = 0u64;
+    for (i, b) in bytes[first..=last].iter().enumerate() {
+        word |= u64::from(*b) << (8 * i);
+    }
+    let value = word >> (bit % 8);
     Ok((value & ((1u64 << width) - 1)) as u32)
 }
 
@@ -92,9 +95,11 @@ pub fn word(bytes: &[u8], i: usize) -> u64 {
     if let Some(chunk) = bytes.get(at..at + 8) {
         u64::from_le_bytes(chunk.try_into().expect("eight bytes"))
     } else if at < bytes.len() {
-        let mut word = [0u8; 8];
-        word[..bytes.len() - at].copy_from_slice(&bytes[at..]);
-        u64::from_le_bytes(word)
+        let mut word = 0u64;
+        for (i, b) in bytes[at..].iter().enumerate() {
+            word |= u64::from(*b) << (8 * i);
+        }
+        word
     } else {
         0
     }

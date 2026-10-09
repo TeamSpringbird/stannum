@@ -221,6 +221,53 @@ impl EfCursor<'_> {
         self.index
     }
 
+    /// Calls `visit` with the current value and each after it below `end`,
+    /// and stops at the first at or past it: [`Self::advance`] in one loop,
+    /// the highs word and the lows read in place.
+    #[inline]
+    pub fn drain_below(&mut self, end: u32, mut visit: impl FnMut(u32)) {
+        let Some(mut value) = self.current else {
+            return;
+        };
+        let (highs, lows, low, n) = (self.ef.highs, self.ef.lows, self.ef.low, self.ef.n);
+        let total = highs.len() * 8;
+        let mut index = self.index;
+        let mut bit = self.bit;
+        while value < end {
+            visit(value);
+            index += 1;
+            if index >= n {
+                self.index = n;
+                self.bit = bit + 1;
+                self.current = None;
+                return;
+            }
+            let mut at = bit + 1;
+            let mut word = if at < total {
+                bits::word(highs, at / 64) >> (at % 64)
+            } else {
+                0
+            };
+            while word == 0 {
+                at = (at / 64 + 1) * 64;
+                if at >= total {
+                    self.index = index;
+                    self.bit = at;
+                    self.current = None;
+                    return;
+                }
+                word = bits::word(highs, at / 64);
+            }
+            at += word.trailing_zeros() as usize;
+            bit = at;
+            let high = (at - index) as u32;
+            value = high << low | bits::get(lows, index, low).unwrap_or(0);
+        }
+        self.index = index;
+        self.bit = bit;
+        self.current = Some(value);
+    }
+
     pub fn advance(&mut self) {
         if self.current.is_none() {
             return;
@@ -231,42 +278,55 @@ impl EfCursor<'_> {
     }
 
     /// Moves to the first value at or after `target`.
+    ///
+    /// Values whose high part falls short of the target's are passed by
+    /// their high bits alone (a word of them at a time where every one of a
+    /// word does), and only values in the target's high bucket have their
+    /// low bits read.
     pub fn seek(&mut self, target: u32) {
+        match self.current {
+            Some(current) if current < target => {}
+            _ => return,
+        }
+        let high_target = (target >> self.ef.low) as usize;
+        let highs = self.ef.highs;
+        let total = highs.len() * 8;
+        // The next value's rank and the highs bit to look from.
+        let mut index = self.index + 1;
+        let mut at = self.bit + 1;
+        'words: loop {
+            if index >= self.ef.n || at >= total {
+                self.index = index.min(self.ef.n);
+                self.current = None;
+                return;
+            }
+            let next_at = (at / 64 + 1) * 64;
+            let mut word = bits::word(highs, at / 64) >> (at % 64);
+            let ones = word.count_ones() as usize;
+            // A value at bit `p` with rank `r` has high part `p - r`; the
+            // word's last has the largest, at most `next_at - index - ones`.
+            if ones == 0 || next_at - (index + ones) < high_target {
+                index += ones;
+                at = next_at;
+                continue;
+            }
+            while word != 0 {
+                let p = at + word.trailing_zeros() as usize;
+                if p - index >= high_target {
+                    self.index = index;
+                    self.bit = p;
+                    self.load();
+                    break 'words;
+                }
+                index += 1;
+                word &= word - 1;
+            }
+            at = next_at;
+        }
+        // Values of the target's high bucket with lower low bits.
         while let Some(current) = self.current {
             if current >= target {
                 return;
-            }
-            // Skip whole words of the highs whose values all fall short:
-            // the next value's high part is at least the zeros passed.
-            let high_target = (target >> self.ef.low) as usize;
-            let floor_bit = high_target + self.index;
-            if floor_bit > self.bit + 64 {
-                // Count the ones (values) between here and the word holding
-                // `floor_bit`'s neighborhood; each one passed is a value
-                // whose high part is below the target's.
-                let mut at = self.bit + 1;
-                let mut index = self.index + 1;
-                while at / 64 < floor_bit.min(self.ef.highs.len() * 8) / 64 {
-                    let word = bits::word(self.ef.highs, at / 64) >> (at % 64);
-                    let ones = word.count_ones() as usize;
-                    // A value at bit `p` with rank `r` has high part
-                    // `p - r`; the word's last value has the largest, at
-                    // most `next_at - (index + ones)`. Skip the word only
-                    // when that falls short of the target's high part.
-                    let next_at = (at / 64 + 1) * 64;
-                    if next_at - (index + ones) >= high_target {
-                        break;
-                    }
-                    index += ones;
-                    at = next_at;
-                }
-                if index > self.index + 1 {
-                    // Resume from the word boundary with the rank there.
-                    self.index = index;
-                    self.bit = at;
-                    self.load();
-                    continue;
-                }
             }
             self.advance();
         }
@@ -312,6 +372,24 @@ mod tests {
         // 1,000 values in a universe of 1,000,000: l = 9, about 11 bits each.
         let len = encoded_len(1000, 1_000_000);
         assert!(len * 8 <= 1000 * 12, "{len}");
+    }
+
+    #[test]
+    fn drains_runs() {
+        let values: Vec<u32> = (0..3000u32).map(|i| i * 7 + i % 5).collect();
+        let mut out = Vec::new();
+        encode(&values, 30_000, &mut out);
+        let ef = Ef::parse(&out, values.len(), 30_000).unwrap();
+        let mut cursor = ef.cursor();
+        let mut seen = Vec::new();
+        for end in [0, 1, 50, 51, 999, 10_000, 20_996, 21_005, 30_000] {
+            cursor.drain_below(end, |v| seen.push(v));
+            let rank = cursor.rank();
+            assert_eq!(seen.len(), rank);
+            assert_eq!(cursor.current(), values.get(rank).copied());
+            assert!(cursor.current().is_none_or(|c| c >= end));
+        }
+        assert_eq!(seen, values);
     }
 
     proptest! {
