@@ -8,8 +8,8 @@
 //! The values are also the extension's reloption enumeration values.
 
 use tokenizer::{
-    Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, TokenizerPipelineSpec,
-    TokenizerSpec,
+    Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, Stemmer,
+    TokenizerPipelineSpec, TokenizerSpec,
 };
 
 pub const TOKENIZER_UNICODE: i32 = 0;
@@ -25,8 +25,36 @@ pub const GRAPHEME_RETAIN: i32 = 2;
 pub const GAPS_COLLAPSE: i32 = 0;
 pub const GAPS_PRESERVE: i32 = 1;
 
+/// The supported stemmers in their stored order: a spec stores a stemmer as
+/// its position here plus one, zero for none. Append only.
+const STEMMERS: [Stemmer; 18] = [
+    Stemmer::Arabic,
+    Stemmer::Danish,
+    Stemmer::Dutch,
+    Stemmer::English,
+    Stemmer::Finnish,
+    Stemmer::French,
+    Stemmer::German,
+    Stemmer::Greek,
+    Stemmer::Hungarian,
+    Stemmer::Italian,
+    Stemmer::Norwegian,
+    Stemmer::Portuguese,
+    Stemmer::Romanian,
+    Stemmer::Russian,
+    Stemmer::Spanish,
+    Stemmer::Swedish,
+    Stemmer::Tamil,
+    Stemmer::Turkish,
+];
+
+/// Bits of spec byte 0 below the stemmer; the tokenizer uses the lowest.
+const STEMMER_SHIFT: u32 = 3;
+
 /// Serialized tokenizer settings stored in the index meta page, so scans and
-/// inserts analyze text exactly as the build did.
+/// inserts analyze text exactly as the build did. Byte 0 holds the tokenizer
+/// in its low bits and the stemmer above [`STEMMER_SHIFT`]; an index built
+/// before stemming existed has zero there, no stemmer.
 pub const SPEC_BYTES: usize = 8;
 
 pub fn encode_spec(spec: &TokenizerPipelineSpec) -> [u8; SPEC_BYTES] {
@@ -35,10 +63,18 @@ pub fn encode_spec(spec: &TokenizerPipelineSpec) -> [u8; SPEC_BYTES] {
         Folding::Fold => FOLDING_FOLD,
     } as u8;
     let mut out = [0u8; SPEC_BYTES];
+    let stemmer = spec.stemmer.map_or(0, |stemmer| {
+        STEMMERS
+            .iter()
+            .position(|&known| known == stemmer)
+            .expect("every stemmer has a stored code")
+            + 1
+    }) as u8;
     out[0] = match spec.tokenizer {
         TokenizerSpec::Unicode => TOKENIZER_UNICODE,
         TokenizerSpec::Whitespace => TOKENIZER_WHITESPACE,
-    } as u8;
+    } as u8
+        | stemmer << STEMMER_SHIFT;
     out[1] = folding(spec.case_folding);
     out[2] = folding(spec.accent_folding);
     out[3] = match spec.long_tokens.mode {
@@ -65,8 +101,12 @@ pub fn decode_spec(bytes: &[u8; SPEC_BYTES]) -> Option<TokenizerPipelineSpec> {
         FOLDING_FOLD => Some(Folding::Fold),
         _ => None,
     };
+    let stemmer = match usize::from(bytes[0] >> STEMMER_SHIFT) {
+        0 => None,
+        code => Some(*STEMMERS.get(code - 1)?),
+    };
     let spec = TokenizerPipelineSpec {
-        tokenizer: match i32::from(bytes[0]) {
+        tokenizer: match i32::from(bytes[0] & ((1 << STEMMER_SHIFT) - 1)) {
             TOKENIZER_UNICODE => TokenizerSpec::Unicode,
             TOKENIZER_WHITESPACE => TokenizerSpec::Whitespace,
             _ => return None,
@@ -93,6 +133,7 @@ pub fn decode_spec(bytes: &[u8; SPEC_BYTES]) -> Option<TokenizerPipelineSpec> {
             GAPS_PRESERVE => PositionGapMode::Preserve,
             _ => return None,
         },
+        stemmer,
     };
     spec.validate().ok()?;
     Some(spec)
@@ -114,11 +155,37 @@ mod tests {
             },
             graphemes: GraphemeMode::Retain,
             position_gaps: PositionGapMode::Collapse,
+            stemmer: None,
         };
         assert_eq!(decode_spec(&encode_spec(&spec)), Some(spec));
         let default = TokenizerPipelineSpec::stannum_default();
         assert_eq!(decode_spec(&encode_spec(&default)), Some(default));
-        assert_eq!(decode_spec(&[9, 0, 0, 0, 0, 1, 0, 0]), None);
+        assert_eq!(decode_spec(&[2, 0, 0, 0, 0, 1, 0, 0]), None);
         assert_eq!(decode_spec(&[0, 0, 0, 0, 1, 0, 0, 0]), None);
+        // Past the last stored stemmer.
+        assert_eq!(decode_spec(&[19 << 3, 1, 1, 2, 0, 1, 1, 1]), None);
+    }
+
+    #[test]
+    fn spec_bytes_round_trip_every_stemmer() {
+        let mut spec = TokenizerPipelineSpec {
+            tokenizer: TokenizerSpec::Whitespace,
+            ..TokenizerPipelineSpec::stannum_default()
+        };
+        for stemmer in STEMMERS {
+            spec.stemmer = Some(stemmer);
+            assert_eq!(decode_spec(&encode_spec(&spec)), Some(spec), "{stemmer}");
+        }
+        // An index built before stemming existed reads as unstemmed: its
+        // byte 0 was the tokenizer alone.
+        let before = [1, 1, 1, 2, 0, 1, 1, 1];
+        assert_eq!(
+            decode_spec(&before).map(|spec| (spec.tokenizer, spec.stemmer)),
+            Some((TokenizerSpec::Whitespace, None))
+        );
+        assert_eq!(
+            encode_spec(&TokenizerPipelineSpec::stannum_default()),
+            [0, 1, 1, 2, 0, 1, 1, 1]
+        );
     }
 }

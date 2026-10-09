@@ -6,21 +6,23 @@
 use pgrx::iter::TableIterator;
 use pgrx::{PgRelation, default, iter::SetOfIterator, name, pg_extern};
 use tokenizer::{
-    Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, Tokenizer,
+    Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, Stemmer, Tokenizer,
     TokenizerPipelineSpec, TokenizerSpec,
 };
 
 pub const MAX_TOKEN_BYTES: usize = 2_692;
 
 #[derive(Debug, Clone, Copy)]
-struct TokenizeOptions<'a> {
-    tokenizer: &'a str,
-    case_folding: &'a str,
-    accent_folding: &'a str,
-    long_tokens: &'a str,
-    max_token_bytes: i32,
-    graphemes: &'a str,
-    position_gaps: &'a str,
+pub(crate) struct TokenizeOptions<'a> {
+    pub(crate) tokenizer: &'a str,
+    pub(crate) case_folding: &'a str,
+    pub(crate) accent_folding: &'a str,
+    pub(crate) long_tokens: &'a str,
+    pub(crate) max_token_bytes: i32,
+    pub(crate) graphemes: &'a str,
+    pub(crate) position_gaps: &'a str,
+    /// A Snowball language code; `None` stems nothing.
+    pub(crate) stemmer: Option<&'a str>,
 }
 
 impl TokenizeOptions<'_> {
@@ -45,6 +47,11 @@ impl TokenizeOptions<'_> {
             },
             graphemes: parse_graphemes(self.graphemes)?,
             position_gaps: parse_position_gaps(self.position_gaps)?,
+            stemmer: self
+                .stemmer
+                .map(str::parse::<Stemmer>)
+                .transpose()
+                .map_err(|error| error.to_string())?,
         })
     }
 }
@@ -101,7 +108,9 @@ fn parse_position_gaps(value: &str) -> Result<PositionGapMode, String> {
     }
 }
 
-fn compile_options(options: TokenizeOptions<'_>) -> tokenizer::CompiledTokenizerPipeline {
+pub(crate) fn compile_options(
+    options: TokenizeOptions<'_>,
+) -> tokenizer::CompiledTokenizerPipeline {
     options
         .into_spec()
         .and_then(|spec| spec.compile().map_err(|e| e.to_string()))
@@ -128,6 +137,7 @@ pub fn tokenize<'a>(
     max_token_bytes: default!(i32, 256),
     graphemes: default!(&str, "'emoji'"),
     position_gaps: default!(&str, "'preserve'"),
+    stemmer: default!(Option<&str>, "NULL"),
 ) -> SetOfIterator<'a, String> {
     let pipeline = compile_options(TokenizeOptions {
         tokenizer,
@@ -137,6 +147,7 @@ pub fn tokenize<'a>(
         max_token_bytes,
         graphemes,
         position_gaps,
+        stemmer,
     });
     match text {
         Some(text) => SetOfIterator::new(
@@ -166,6 +177,7 @@ pub fn ql_parse(
     max_token_bytes: default!(i32, 256),
     graphemes: default!(&str, "'emoji'"),
     position_gaps: default!(&str, "'preserve'"),
+    stemmer: default!(Option<&str>, "NULL"),
 ) -> Option<String> {
     let query = query?;
     let pipeline = compile_options(TokenizeOptions {
@@ -176,6 +188,7 @@ pub fn ql_parse(
         max_token_bytes,
         graphemes,
         position_gaps,
+        stemmer,
     });
     let parsed =
         tinql::parse(query, tinql::ImplicitOp::And).unwrap_or_else(|error| pgrx::error!("{error}"));
@@ -206,6 +219,7 @@ mod tests {
             max_token_bytes: 32,
             graphemes: "retain",
             position_gaps: "collapse",
+            stemmer: None,
         }
         .into_spec()
         .unwrap();
@@ -238,8 +252,18 @@ mod tests {
             max_token_bytes: 3,
             graphemes: "emoji",
             position_gaps: "preserve",
+            stemmer: None,
         };
         assert!(options.into_spec().is_err());
+        let unknown = TokenizeOptions {
+            max_token_bytes: 256,
+            stemmer: Some("EN"),
+            ..options
+        };
+        assert_eq!(
+            unknown.into_spec().err().as_deref(),
+            Some("unknown stemmer language code: EN")
+        );
     }
 }
 

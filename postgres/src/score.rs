@@ -9,8 +9,7 @@ use crate::bm25::{
 };
 use pgrx::iter::TableIterator;
 use pgrx::{
-    FromDatum, Internal, IntoDatum, PgList, PgRelation, Spi, default, name, pg_extern, pg_guard,
-    pg_sys,
+    Internal, IntoDatum, PgList, PgRelation, Spi, default, name, pg_extern, pg_guard, pg_sys,
 };
 use rustc_hash::FxHashMap;
 use segment::Tid;
@@ -23,7 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_void};
 use tinql::runtime::plan::{Limits, plan};
-use tinql::runtime::{evaluate, parse_tinql_to_query, parse_tinql_to_scoring_query, tokenize_doc};
+use tinql::runtime::{evaluate, parse_tinql_to_scoring_query, tokenize_doc};
 use tokenizer::Tokenizer;
 
 use crate::storage::View;
@@ -44,7 +43,9 @@ pub(crate) struct CacheKey {
     statement: u64,
     heap_oid: u32,
     index_oid: u32,
-    query: String,
+    /// The search texts, one per `==>` clause; see
+    /// [`crate::score_binding::parse_searches`].
+    queries: Vec<String>,
     full: bool,
     dense: u32,
     k1: Option<u32>,
@@ -334,11 +335,72 @@ fn score_bound(
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
 ) -> f32 {
+    score_heap(
+        document,
+        &[query],
+        (heap_oid, index_oid, mode),
+        dense_ratio,
+        k1,
+        b,
+        term_add,
+        term_replace,
+    )
+}
+
+/// [`score_bound`] for several `==>` clauses on one document expression,
+/// each search text parsed on its own.
+#[pg_extern(volatile, parallel_unsafe)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SQL signature used by the scoring support function"
+)]
+fn score_bound_searches(
+    document: &str,
+    queries: Vec<Option<String>>,
+    heap_oid: i32,
+    index_oid: i32,
+    mode: i32,
+    dense_ratio: Option<f32>,
+    k1: Option<f32>,
+    b: Option<f32>,
+    term_add: Option<Vec<String>>,
+    term_replace: Option<Vec<String>>,
+) -> f32 {
+    let queries = crate::score_binding::search_texts(&queries);
+    if queries.is_empty() {
+        return 0.0;
+    }
+    score_heap(
+        document,
+        &queries,
+        (heap_oid, index_oid, mode),
+        dense_ratio,
+        k1,
+        b,
+        term_add,
+        term_replace,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the bound scoring functions' arguments"
+)]
+fn score_heap(
+    document: &str,
+    queries: &[&str],
+    (heap_oid, index_oid, mode): (i32, i32, i32),
+    dense_ratio: Option<f32>,
+    k1: Option<f32>,
+    b: Option<f32>,
+    term_add: Option<Vec<String>>,
+    term_replace: Option<Vec<String>>,
+) -> f32 {
     let key = CacheKey {
         statement: current_statement(),
         heap_oid: heap_oid as u32,
         index_oid: index_oid as u32,
-        query: query.to_owned(),
+        queries: queries.iter().map(|&query| query.to_owned()).collect(),
         full: mode == 1 || mode == 3,
         dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
         k1: bits(k1),
@@ -382,6 +444,67 @@ fn score_bound_indexed(
     term_add: Option<Vec<String>>,
     term_replace: Option<Vec<String>>,
 ) -> f32 {
+    score_indexed(
+        ctid,
+        &[query],
+        (heap_oid, index_oid, mode),
+        dense_ratio,
+        k1,
+        b,
+        term_add,
+        term_replace,
+    )
+}
+
+/// [`score_bound_indexed`] for several `==>` clauses on one document
+/// expression, each search text parsed on its own.
+#[pg_extern(volatile, parallel_unsafe)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SQL signature used by the scoring support function"
+)]
+fn score_bound_indexed_searches(
+    ctid: pg_sys::ItemPointerData,
+    queries: Vec<Option<String>>,
+    heap_oid: i32,
+    index_oid: i32,
+    mode: i32,
+    dense_ratio: Option<f32>,
+    k1: Option<f32>,
+    b: Option<f32>,
+    term_add: Option<Vec<String>>,
+    term_replace: Option<Vec<String>>,
+) -> f32 {
+    let queries = crate::score_binding::search_texts(&queries);
+    if queries.is_empty() {
+        return 0.0;
+    }
+    score_indexed(
+        ctid,
+        &queries,
+        (heap_oid, index_oid, mode),
+        dense_ratio,
+        k1,
+        b,
+        term_add,
+        term_replace,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the bound scoring functions' arguments"
+)]
+fn score_indexed(
+    ctid: pg_sys::ItemPointerData,
+    queries: &[&str],
+    (heap_oid, index_oid, mode): (i32, i32, i32),
+    dense_ratio: Option<f32>,
+    k1: Option<f32>,
+    b: Option<f32>,
+    term_add: Option<Vec<String>>,
+    term_replace: Option<Vec<String>>,
+) -> f32 {
     let statement = current_statement();
     let dense = dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits();
     // Per-row calls compare against the cached key without allocating; the
@@ -393,7 +516,12 @@ fn score_bound_indexed(
             && key.dense == dense
             && key.k1 == bits(k1)
             && key.b == bits(b)
-            && key.query == query
+            && key.queries.len() == queries.len()
+            && key
+                .queries
+                .iter()
+                .zip(queries)
+                .all(|(key, query)| key == query)
             && key.add.as_deref() == term_add.as_deref()
             && key.replace.as_deref() == term_replace.as_deref()
     };
@@ -451,7 +579,7 @@ fn score_bound_indexed(
                 statement,
                 heap_oid: heap_oid as u32,
                 index_oid: index_oid as u32,
-                query: query.to_owned(),
+                queries: queries.iter().map(|&query| query.to_owned()).collect(),
                 full: mode == 1 || mode == 3,
                 dense,
                 k1: bits(k1),
@@ -1055,7 +1183,7 @@ pub(crate) fn scorer_for_scan(
         statement: current_statement(),
         heap_oid,
         index_oid,
-        query: query.to_owned(),
+        queries: vec![query.to_owned()],
         full,
         dense: dense_ratio.unwrap_or(DenseRatio::DEFAULT).to_bits(),
         k1: bits(k1),
@@ -1143,16 +1271,8 @@ fn build_index_scorer_inner(
     if !key.full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let query = parse_tinql_to_query(&key.query, tokenizer.as_ref()).unwrap_or_else(|error| {
-        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
-    });
-    let scoring =
-        parse_tinql_to_scoring_query(&key.query, tokenizer.as_ref()).unwrap_or_else(|error| {
-            crate::operator::raise_query_error(
-                &error,
-                format!("Stannum score query error: {error}"),
-            )
-        });
+    let query = crate::score_binding::parse_searches(&key.queries, tokenizer.as_ref(), false);
+    let scoring = crate::score_binding::parse_searches(&key.queries, tokenizer.as_ref(), true);
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -1277,12 +1397,8 @@ fn build_corpus(
     if !key.full && !dense.is_valid() {
         pgrx::error!("dense_ratio must be finite and non-negative");
     }
-    let query = parse_tinql_to_query(&key.query, &tokenizer).unwrap_or_else(|error| {
-        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
-    });
-    let scoring = parse_tinql_to_scoring_query(&key.query, &tokenizer).unwrap_or_else(|error| {
-        crate::operator::raise_query_error(&error, format!("Stannum score query error: {error}"))
-    });
+    let query = crate::score_binding::parse_searches(&key.queries, &tokenizer, false);
+    let scoring = crate::score_binding::parse_searches(&key.queries, &tokenizer, true);
     let edit = TermSetEdit::from_bound_arrays(term_add, term_replace)
         .unwrap_or_else(|error| pgrx::error!("stannum.score(): {error}"))
         .analyzed_with(|text| {
@@ -1572,53 +1688,6 @@ fn score_inspect(
     TableIterator::new(rows)
 }
 
-/// The `==>` clauses of a qual tree as (document, text query, bound index).
-struct QualBinding {
-    matches: Vec<(*mut pg_sys::Node, *mut pg_sys::Node, Option<pg_sys::Oid>)>,
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn find_qual(node: *mut pg_sys::Node, context: *mut c_void) -> bool {
-    if node.is_null() {
-        return false;
-    }
-    let binding = unsafe { &mut *context.cast::<QualBinding>() };
-    if let Some(clause) = unsafe { crate::operator::search_clause(node) } {
-        binding
-            .matches
-            .push((clause.document, clause.query, clause.index));
-    }
-    unsafe { pg_sys::expression_tree_walker(node, Some(find_qual), context) }
-}
-
-/// Pulling EXISTS/NOT EXISTS up can wrap the original FromExpr in a join,
-/// leaving the new top-level FromExpr with no quals. Keep finding its WHERE
-/// clauses without treating JOIN ON expressions or nested query scopes as
-/// additional scoring predicates. Visit parent quals first to retain binding order.
-unsafe fn find_where_quals(node: *mut pg_sys::Node, binding: &mut QualBinding) {
-    unsafe {
-        if node.is_null() {
-            return;
-        }
-        pg_sys::check_stack_depth();
-        match (*node).type_ {
-            pg_sys::NodeTag::T_FromExpr => {
-                let from = &*node.cast::<pg_sys::FromExpr>();
-                find_qual(from.quals, (binding as *mut QualBinding).cast());
-                for i in 0..pg_sys::list_length(from.fromlist) {
-                    find_where_quals(pg_sys::list_nth(from.fromlist, i).cast(), binding);
-                }
-            }
-            pg_sys::NodeTag::T_JoinExpr => {
-                let join = &*node.cast::<pg_sys::JoinExpr>();
-                find_where_quals(join.larg, binding);
-                find_where_quals(join.rarg, binding);
-            }
-            _ => {}
-        }
-    }
-}
-
 /// The index a clause bound to `bound` should be answered by, among
 /// `candidates` (in OID order): the bound index when it is one of them,
 /// otherwise the first with the same tokenizer settings, so an index scan
@@ -1648,6 +1717,12 @@ pub(crate) unsafe fn matching_stannum_indexes(
     query_varno: i32,
     operand: *mut pg_sys::Node,
 ) -> Vec<pg_sys::Oid> {
+    // The operand is normalized to varno 1 below to compare it with stored
+    // index expressions, so an operand on another relation (which may be
+    // varno 1) must be rejected first.
+    if unsafe { crate::operator::single_varno(operand) } != Some(query_varno) {
+        return Vec::new();
+    }
     let stannum_name = CString::new("stannum").expect("static access method name is valid");
     let stannum_am = unsafe { pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
     let normalized = unsafe { pg_sys::copyObjectImpl(operand.cast()).cast::<pg_sys::Node>() };
@@ -1698,7 +1773,7 @@ struct ScoreCalls {
     ctid: *const pg_sys::Var,
     document: *mut pg_sys::Node,
     support: pg_sys::Oid,
-    bound: pg_sys::Oid,
+    bound: [pg_sys::Oid; 2],
     dense: bool,
     full: bool,
 }
@@ -1716,7 +1791,7 @@ unsafe extern "C-unwind" fn find_score_calls(
         if (*node).type_ == pg_sys::NodeTag::T_FuncExpr {
             let function = &*node.cast::<pg_sys::FuncExpr>();
             // Earlier query clauses may already contain the rewritten scorer.
-            if function.funcid == binding.bound {
+            if binding.bound.contains(&function.funcid) {
                 let mode = pg_sys::list_nth(function.args, 4).cast::<pg_sys::Const>();
                 if (*mode).xpr.type_ == pg_sys::NodeTag::T_Const
                     && pg_sys::equal(pg_sys::list_nth(function.args, 0), binding.document.cast())
@@ -1785,36 +1860,51 @@ fn score_support(request: Internal) -> Internal {
             return unhandled();
         }
         let parse = (*request.root).parse;
-        let mut binding = QualBinding {
-            matches: Vec::new(),
-        };
-        find_where_quals((*parse).jointree.cast(), &mut binding);
         let rte = pg_sys::list_nth((*parse).rtable, (ctid.varno - 1) as i32)
             .cast::<pg_sys::RangeTblEntry>();
         if rte.is_null() || (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return unhandled();
         }
+        // This relation's searches, outside NOT; see `score_binding`.
+        let searches = crate::score_binding::collect_searches((*parse).jointree.cast())
+            .into_iter()
+            .filter(|search| crate::operator::single_varno(search.document) == Some(ctid.varno))
+            .collect::<Vec<_>>();
         // Each searched document expression of this relation that an index
         // covers, in the order of its first clause, with the index that
         // clause is bound to, so scoring statistics and matching use the
         // same analyzer. As in TIN, a row's score sums one score per
         // expression (a row matching one column scores that column's), and
         // clauses on one expression score as one query (see below).
+        // A partial index answers only where the restrictions imply its
+        // predicate, as for `==>` itself; with no index to answer any
+        // search, TIN refuses to score.
         let mut documents: Vec<(*mut pg_sys::Node, *mut pg_sys::Node, pg_sys::Oid)> = Vec::new();
-        for &(document, query, bound) in &binding.matches {
+        let mut unindexed = Vec::new();
+        for search in &searches {
+            let document = search.document;
             if documents
                 .iter()
                 .any(|&(seen, _, _)| pg_sys::equal(seen.cast(), document.cast()))
             {
                 continue;
             }
-            let candidates = matching_stannum_indexes((*rte).relid, ctid.varno, document);
-            if let Some(index_oid) = pick_index(&candidates, bound) {
-                documents.push((document, query, index_oid));
+            let candidates = matching_stannum_indexes((*rte).relid, ctid.varno, document)
+                .into_iter()
+                .filter(|&index_oid| {
+                    crate::operator::predicate_holds(request.root, ctid.varno, index_oid)
+                })
+                .collect::<Vec<_>>();
+            match pick_index(&candidates, search.index) {
+                Some(index_oid) => documents.push((document, search.query, index_oid)),
+                None => unindexed.push(document),
             }
         }
         let Some(&(document, _, index_oid)) = documents.first() else {
-            return unhandled();
+            if searches.is_empty() {
+                return unhandled();
+            }
+            crate::score_binding::refuse_unindexed_scoring(rte, ctid.varno, &unindexed);
         };
         let original_nargs = pg_sys::list_length((*request.fcall).args);
         let function_name = pg_sys::get_func_name((*request.fcall).funcid);
@@ -1831,7 +1921,10 @@ fn score_support(request: Internal) -> Internal {
                 ctid,
                 document: if segmented { ctid_node } else { document },
                 support: pg_sys::get_func_support((*request.fcall).funcid),
-                bound: lookup_score_bound(segmented),
+                bound: [
+                    lookup_score_bound(segmented, false),
+                    lookup_score_bound(segmented, true),
+                ],
                 dense: false,
                 full: false,
             };
@@ -1855,7 +1948,7 @@ fn score_support(request: Internal) -> Internal {
             let call = bound_score_call(
                 request,
                 ctid_node,
-                &binding,
+                &searches,
                 (*rte).relid,
                 (document, first_query, index_oid),
                 mode,
@@ -1879,6 +1972,30 @@ fn score_support(request: Internal) -> Internal {
                 .cast()
             };
         }
+        // A row that no search admits has no score; where a search is a
+        // top-level conjunct (every ranked scan's shape), every row has one.
+        let required = searches.iter().any(|search| {
+            search.required
+                && documents
+                    .iter()
+                    .any(|&(seen, _, _)| pg_sys::equal(seen.cast(), search.document.cast()))
+        });
+        if mode < 2 && !required {
+            let scored = searches
+                .iter()
+                .filter_map(|search| {
+                    documents
+                        .iter()
+                        .find(|&&(seen, _, _)| pg_sys::equal(seen.cast(), search.document.cast()))
+                        .map(|&(_, _, index_oid)| (search.document, search.query, index_oid))
+                })
+                .collect::<Vec<_>>();
+            if let Some(guarded) =
+                crate::score_binding::unless_unsearched(request.root, ctid, &scored, replacement)
+            {
+                replacement = guarded;
+            }
+        }
         Internal::from(Some(pg_sys::Datum::from(replacement as usize)))
     }
 }
@@ -1888,7 +2005,7 @@ fn score_support(request: Internal) -> Internal {
 unsafe fn bound_score_call(
     request: &pg_sys::SupportRequestSimplify,
     ctid_node: *mut pg_sys::Node,
-    binding: &QualBinding,
+    searches: &[crate::score_binding::Search],
     heap_oid: pg_sys::Oid,
     (document, first_query, index_oid): (*mut pg_sys::Node, *mut pg_sys::Node, pg_sys::Oid),
     mode: i32,
@@ -1902,20 +2019,26 @@ unsafe fn bound_score_call(
         } else {
             args.push(pg_sys::copyObjectImpl(document.cast()).cast());
         }
-        let same_expression = binding
-            .matches
+        let queries = searches
             .iter()
-            .filter(|(candidate, _, _)| pg_sys::equal((*candidate).cast(), document.cast()))
-            .map(|&(candidate, query, _)| (candidate, query))
+            .filter(|search| pg_sys::equal(search.document.cast(), document.cast()))
+            .map(|search| search.query)
             .collect::<Vec<_>>();
-        let combined_query = combine_constant_queries(&same_expression)
-            .unwrap_or_else(|| pg_sys::copyObjectImpl(first_query.cast()).cast());
-        // This query came from the parse tree's quals, not the already
-        // simplified arguments of the supported function. In a custom
-        // prepared plan it can still contain a bound Param. Simplify the
-        // copy so the score and search clause expose the same constant to
-        // ranked-path recognition. Generic plans retain their parameters.
-        args.push(pg_sys::eval_const_expressions(request.root, combined_query));
+        // Several clauses on the expression score as one ORed query: their
+        // texts go to the scorer as an array, parsed one by one at run
+        // time, so parameters contribute too.
+        let several = queries.len() > 1;
+        if several {
+            args.push(crate::score_binding::query_array(request.root, &queries));
+        } else {
+            // This query came from the parse tree's quals, not the already
+            // simplified arguments of the supported function. In a custom
+            // prepared plan it can still contain a bound Param. Simplify the
+            // copy so the score and search clause expose the same constant to
+            // ranked-path recognition. Generic plans retain their parameters.
+            let query = pg_sys::copyObjectImpl(first_query.cast()).cast();
+            args.push(pg_sys::eval_const_expressions(request.root, query));
+        }
         args.push(make_int4_const(heap_oid.to_u32() as i32).cast());
         args.push(make_int4_const(index_oid.to_u32() as i32).cast());
         args.push(make_int4_const(mode).cast());
@@ -1949,7 +2072,7 @@ unsafe fn bound_score_call(
             args.push(null_array().cast());
         }
         pg_sys::makeFuncExpr(
-            lookup_score_bound(segmented),
+            lookup_score_bound(segmented, several),
             pg_sys::FLOAT4OID,
             args.into_pg(),
             pg_sys::InvalidOid,
@@ -1958,43 +2081,6 @@ unsafe fn bound_score_call(
         )
         .cast()
     }
-}
-
-unsafe fn combine_constant_queries(
-    matches: &[(*mut pg_sys::Node, *mut pg_sys::Node)],
-) -> Option<*mut pg_sys::Node> {
-    if matches.len() < 2 {
-        return None;
-    }
-    let mut queries = Vec::with_capacity(matches.len());
-    for &(_, node) in matches {
-        if node.is_null() || unsafe { (*node).type_ } != pg_sys::NodeTag::T_Const {
-            return None;
-        }
-        let value = unsafe { &*node.cast::<pg_sys::Const>() };
-        if value.constisnull || value.consttype != pg_sys::TEXTOID {
-            return None;
-        }
-        queries.push(unsafe { String::from_datum(value.constvalue, false)? });
-    }
-    let combined = queries
-        .into_iter()
-        .map(|query| format!("({query})"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    let datum = combined.into_datum()?;
-    Some(unsafe {
-        pg_sys::makeConst(
-            pg_sys::TEXTOID,
-            -1,
-            pg_sys::DEFAULT_COLLATION_OID,
-            -1,
-            datum,
-            false,
-            false,
-        )
-        .cast()
-    })
 }
 
 unsafe fn make_int4_const(value: i32) -> *mut pg_sys::Const {
@@ -2025,11 +2111,14 @@ unsafe fn make_null_const(type_oid: pg_sys::Oid) -> *mut pg_sys::Const {
     }
 }
 
-unsafe fn lookup_score_bound(segmented: bool) -> pg_sys::Oid {
-    let name = CString::new(if segmented {
-        "stannum.score_bound_indexed"
-    } else {
-        "stannum.score_bound"
+/// The bound scorer: by heap row or by location (`segmented`), for one search
+/// text or an array of several.
+unsafe fn lookup_score_bound(segmented: bool, several: bool) -> pg_sys::Oid {
+    let name = CString::new(match (segmented, several) {
+        (true, false) => "stannum.score_bound_indexed",
+        (true, true) => "stannum.score_bound_indexed_searches",
+        (false, false) => "stannum.score_bound",
+        (false, true) => "stannum.score_bound_searches",
     })
     .unwrap();
     let names = unsafe { pg_sys::stringToQualifiedNameList(name.as_ptr(), std::ptr::null_mut()) };
@@ -2039,7 +2128,11 @@ unsafe fn lookup_score_bound(segmented: bool) -> pg_sys::Oid {
         } else {
             pg_sys::TEXTOID
         },
-        pg_sys::TEXTOID,
+        if several {
+            pg_sys::TEXTARRAYOID
+        } else {
+            pg_sys::TEXTOID
+        },
         pg_sys::INT4OID,
         pg_sys::INT4OID,
         pg_sys::INT4OID,
@@ -2060,6 +2153,8 @@ ALTER FUNCTION @extschema@.score(pg_catalog.tid, pg_catalog.float4, pg_catalog.f
 ALTER FUNCTION @extschema@.max_score(pg_catalog.tid) SUPPORT @extschema@.score_support;
 REVOKE ALL ON FUNCTION @extschema@.score_bound(pg_catalog.text, pg_catalog.text, pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION @extschema@.score_bound_indexed(pg_catalog.tid, pg_catalog.text, pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION @extschema@.score_bound_searches(pg_catalog.text, pg_catalog.text[], pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION @extschema@.score_bound_indexed_searches(pg_catalog.tid, pg_catalog.text[], pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
 "#,
     name = "score_support_bindings",
     requires = [
@@ -2069,6 +2164,8 @@ REVOKE ALL ON FUNCTION @extschema@.score_bound_indexed(pg_catalog.tid, pg_catalo
         max_score,
         score_bound,
         score_bound_indexed,
+        score_bound_searches,
+        score_bound_indexed_searches,
         score_support
     ]
 );

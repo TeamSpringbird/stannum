@@ -7,8 +7,8 @@ use pgrx::{PgList, pg_guard, pg_sys};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokenizer::{
-    Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, TokenizerPipelineSpec,
-    TokenizerSpec,
+    Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, Stemmer,
+    TokenizerPipelineSpec, TokenizerSpec,
 };
 
 use crate::bm25::Bm25Params;
@@ -87,6 +87,7 @@ struct IndexOptions {
     k1: f64,
     b: f64,
     score_stop_words: i32,
+    stemmer: i32,
 }
 
 pub fn init() {
@@ -236,7 +237,28 @@ pub fn init() {
             None,
             lock,
         );
+        pg_sys::add_string_reloption(
+            kind,
+            c"stemmer".as_ptr(),
+            c"Snowball stemmer language code; unset stems nothing".as_ptr(),
+            std::ptr::null(),
+            Some(validate_stemmer),
+            lock,
+        );
         OPTION_KIND.store(kind, Ordering::Relaxed);
+    }
+}
+
+/// Refuses a stemmer code outside the supported list when a statement sets
+/// one, with TIN's message.
+#[pg_guard]
+unsafe extern "C-unwind" fn validate_stemmer(value: *const std::ffi::c_char) {
+    if value.is_null() {
+        return;
+    }
+    let code = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+    if let Err(error) = code.parse::<Stemmer>() {
+        pgrx::error!("{error}");
     }
 }
 
@@ -335,6 +357,11 @@ pub unsafe extern "C-unwind" fn amoptions(
             pg_sys::relopt_type::RELOPT_TYPE_STRING,
             std::mem::offset_of!(IndexOptions, score_stop_words),
         ),
+        parse_entry(
+            c"stemmer".as_ptr(),
+            pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            std::mem::offset_of!(IndexOptions, stemmer),
+        ),
     ];
     unsafe {
         let options = pg_sys::build_reloptions(
@@ -344,9 +371,19 @@ pub unsafe extern "C-unwind" fn amoptions(
             std::mem::size_of::<IndexOptions>(),
             entries.as_ptr(),
             entries.len() as i32,
-        )
-        .cast();
+        );
         if validate {
+            // A stemmer needs lowercased input; the combination is refused at
+            // CREATE INDEX and ALTER INDEX, as TIN does.
+            if let Some(options) = options.cast::<IndexOptions>().cast_const().as_ref()
+                && options.case_folding == FOLDING_PRESERVE
+                && string_option(options, options.stemmer).is_some()
+            {
+                pgrx::error!(
+                    "{}",
+                    tokenizer::TokenizerPipelineSpecError::StemmerRequiresCaseFolding
+                );
+            }
             for option in
                 PgList::<pg_sys::DefElem>::from_pg(pg_sys::untransformRelOptions(reloptions))
                     .iter_ptr()
@@ -359,7 +396,7 @@ pub unsafe extern "C-unwind" fn amoptions(
                 }
             }
         }
-        options
+        options.cast()
     }
 }
 
@@ -422,7 +459,18 @@ pub unsafe fn tokenizer_spec(index: pg_sys::Relation) -> TokenizerPipelineSpec {
             GAPS_COLLAPSE => PositionGapMode::Collapse,
             _ => PositionGapMode::Preserve,
         },
+        // The code was validated when the option was set.
+        stemmer: string_option(options, options.stemmer).and_then(|code| code.parse().ok()),
     }
+}
+
+/// The string option stored at `offset` in `options`, when it is set.
+fn string_option(options: &IndexOptions, offset: i32) -> Option<&str> {
+    let offset = usize::try_from(offset).ok().filter(|&offset| offset != 0)?;
+    let ptr = std::ptr::from_ref(options).cast::<u8>();
+    unsafe { CStr::from_ptr(ptr.add(offset).cast()) }
+        .to_str()
+        .ok()
 }
 
 fn decode_folding(value: i32) -> Folding {
@@ -450,15 +498,7 @@ pub unsafe fn bm25(index: pg_sys::Relation) -> Bm25Params {
 
 pub unsafe fn score_stop_words(index: pg_sys::Relation) -> Option<String> {
     let options = unsafe { parsed(index) }?;
-    let offset = usize::try_from(options.score_stop_words).ok()?;
-    if offset == 0 {
-        return None;
-    }
-    let ptr = std::ptr::from_ref(options).cast::<u8>();
-    unsafe { CStr::from_ptr(ptr.add(offset).cast()) }
-        .to_str()
-        .ok()
-        .map(str::to_owned)
+    string_option(options, options.score_stop_words).map(str::to_owned)
 }
 
 #[cfg(test)]

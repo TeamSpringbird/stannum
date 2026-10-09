@@ -371,6 +371,7 @@ fn prunable_shape(query: &Query) -> Option<(Combine, Vec<&str>, Option<SpanCheck
             term_slots,
             span_query,
             position_filter,
+            ..
         } if !term_slots.is_empty() && span_requires_all(span_query) => {
             let slots: Vec<&str> = term_slots
                 .iter()
@@ -467,6 +468,7 @@ impl<'q> Shape<'q> {
                 term_slots,
                 span_query,
                 position_filter,
+                ..
             } if !term_slots.is_empty() && span_requires_all(span_query) => {
                 Self::Phrase(SpanCheck {
                     slots: term_slots

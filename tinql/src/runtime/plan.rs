@@ -495,6 +495,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
                 term_slots,
                 span_query,
                 position_filter,
+                ..
             } => {
                 let Some(slots) = self.slots(term_slots)? else {
                     return self.inexact_universe();
@@ -521,6 +522,7 @@ impl<'a, I: Index + ?Sized> Planner<'a, '_, I> {
             Query::SpanExpr {
                 term_slots,
                 span_expr,
+                ..
             } => {
                 let Some(slots) = self.slots(term_slots)? else {
                     return self.inexact_universe();
