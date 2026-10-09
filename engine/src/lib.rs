@@ -20,6 +20,7 @@ use std::sync::OnceLock;
 
 pub mod bm25;
 pub mod fold;
+pub mod terms;
 pub mod walk;
 
 static INTERRUPT_CHECK: OnceLock<fn()> = OnceLock::new();

@@ -620,6 +620,12 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the PostgreSQL-free query engine crate, split out of the extension."
     },
+    "engine/src/terms.rs": {
+      "owner": "mixed",
+      "upstream_path": "postgres/src/score.rs",
+      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "evidence": "Scoring-term collection, moved from postgres/src/score.rs (inherited upstream file with Stannum changes), and the statistics fold of the indexed scorer; retain PlanetScale credit."
+    },
     "engine/src/walk.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/score.rs",
