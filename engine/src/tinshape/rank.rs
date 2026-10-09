@@ -521,7 +521,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// bound over the sub-range at hand.
     sc_required: Vec<bool>,
     present: Vec<bool>,
-    held: Vec<bool>,
+    /// A disjunction's present terms in the group at hand, and those the
+    /// candidate at hand holds, both in the scorer's order.
+    present_list: Vec<usize>,
+    held_list: Vec<usize>,
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
     plan: Plan,
@@ -1013,7 +1016,8 @@ pub(super) fn top_k(
         terms,
         sc_required: Vec::with_capacity(n),
         present: vec![false; n],
-        held: vec![false; n],
+        present_list: Vec::with_capacity(n),
+        held_list: Vec::with_capacity(n),
         blocks: vec![0; n],
         sub_bounds: Vec::new(),
         plan: Plan::default(),
@@ -1168,8 +1172,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if g == u32::MAX {
                 break;
             }
-            for (present, next) in self.present.iter_mut().zip(&next) {
+            self.present_list.clear();
+            for (i, (present, next)) in self.present.iter_mut().zip(&next).enumerate() {
                 *present = *next == g;
+                if *present {
+                    self.present_list.push(i);
+                }
             }
             self.or_group(g)?;
             from = g + 1;
@@ -1509,15 +1517,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// sieve's word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
     fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
-        let n = self.sc.len();
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
         self.answer.candidates += 1;
         let theta = self.threshold();
         let mut bound = 0.0_f64;
-        for i in 0..n {
-            self.held[i] = self.present[i] && self.rows[i * words + w] >> bit & 1 == 1;
-            if self.held[i] {
+        self.held_list.clear();
+        for p in 0..self.present_list.len() {
+            let i = self.present_list[p];
+            if self.rows[i * words + w] >> bit & 1 == 1 {
+                self.held_list.push(i);
                 let s = &mut self.sc[i];
                 let b = s.block_at(slot).expect("a member's block");
                 self.blocks[i] = b;
@@ -1538,8 +1547,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let length = self.segment.lengths.get(rank)?;
         if theta.is_some() {
             let (mut nsum, mut dmin, mut fmin) = (0.0_f64, f64::INFINITY, f64::INFINITY);
-            for i in 0..n {
-                if self.held[i] {
+            for &i in &self.held_list {
+                {
                     let s = &self.sc[i];
                     let mb = s.max_bucket(self.blocks[i]);
                     nsum += f64::from(s.num[mb]);
@@ -1553,10 +1562,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         self.answer.scored += 1;
         let mut total = 0.0_f32;
-        for i in 0..n {
-            if !self.held[i] {
-                continue;
-            }
+        // The held terms are in the scorer's order: the sum is exact.
+        for h in 0..self.held_list.len() {
+            let i = self.held_list[h];
             let index = self.row_index(i, words, local);
             let t = self.sc[i].term;
             let s = &self.sc[i];
