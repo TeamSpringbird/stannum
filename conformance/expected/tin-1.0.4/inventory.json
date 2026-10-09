@@ -4,165 +4,167 @@
   "extension_version": "1.0.4",
   "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
   "host": "PlanetScale Postgres 18.6 (test database)",
-  "date": "2026-10-09T03:39:27Z",
-  "suite_commit": "41f8e6c47f70d77ad23ae5ed2d1ed37518443354",
+  "date": "2026-10-09T03:50:33Z",
+  "suite_commit": "7d7d589070a0eb105f8f8643944d71fc64441d77",
   "runner_version": "3"
  },
  "cases": [
   {
    "id": "inventory.settings.1",
    "captures": {
-    "value": [
+    "script": [
      [
-      "tin.build_io_concurrency",
-      "0",
-      null,
-      "user",
-      "integer",
-      null,
-      "Maximum concurrent I/O participants per index build phase (0 = auto)"
-     ],
-     [
-      "tin.debug_disable_count_pushdown",
-      "off",
-      null,
-      "user",
-      "bool",
-      null,
-      "Calibration scaffolding: suppress the Tin Count upper path"
-     ],
-     [
-      "tin.debug_disable_index_probe",
-      "off",
-      null,
-      "user",
-      "bool",
-      null,
-      "Calibration scaffolding: suppress Index TID Probe leaf admission"
-     ],
-     [
-      "tin.debug_force_boolean_family",
-      "Auto",
-      null,
-      "user",
-      "enum",
       [
-       "Auto",
-       "Fused",
-       "Factored"
+       "tin.build_io_concurrency",
+       "0",
+       null,
+       "user",
+       "integer",
+       null,
+       "Maximum concurrent I/O participants per index build phase (0 = auto)"
       ],
-      "Calibration scaffolding: force fused vs factored multi-index lowering"
-     ],
-     [
-      "tin.debug_force_conjunction_mode",
-      "Auto",
-      null,
-      "user",
-      "enum",
       [
-       "Auto",
-       "Generic",
-       "Pushdown",
-       "NoAdaptive"
+       "tin.debug_disable_count_pushdown",
+       "off",
+       null,
+       "user",
+       "bool",
+       null,
+       "Calibration scaffolding: suppress the Tin Count upper path"
       ],
-      "Calibration scaffolding: override the conjunction execution-mode heuristic"
-     ],
-     [
-      "tin.debug_force_multi_index_drive",
-      "Auto",
-      null,
-      "user",
-      "enum",
       [
-       "Auto",
-       "Sparse",
-       "Stripe"
+       "tin.debug_disable_index_probe",
+       "off",
+       null,
+       "user",
+       "bool",
+       null,
+       "Calibration scaffolding: suppress Index TID Probe leaf admission"
       ],
-      "Calibration scaffolding: force sparse vs stripe multi-index execution"
-     ],
-     [
-      "tin.debug_force_parallel",
-      "off",
-      null,
-      "user",
-      "bool",
-      null,
-      "Calibration scaffolding: suppress serial tin paths that have a parallel sibling"
-     ],
-     [
-      "tin.debug_force_topk",
-      "Auto",
-      null,
-      "user",
-      "enum",
       [
+       "tin.debug_force_boolean_family",
        "Auto",
-       "TopK",
-       "Exhaustive"
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "Fused",
+        "Factored"
+       ],
+       "Calibration scaffolding: force fused vs factored multi-index lowering"
       ],
-      "Calibration scaffolding: force bounded top-k vs exhaustive scored traversal"
-     ],
-     [
-      "tin.debug_force_visibility",
-      "Auto",
-      null,
-      "user",
-      "enum",
       [
+       "tin.debug_force_conjunction_mode",
        "Auto",
-       "Streaming",
-       "Sorted"
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "Generic",
+        "Pushdown",
+        "NoAdaptive"
+       ],
+       "Calibration scaffolding: override the conjunction execution-mode heuristic"
       ],
-      "Calibration scaffolding: force streaming vs sorted final visibility"
-     ],
-     [
-      "tin.enable_custom_scan",
-      "on",
-      null,
-      "user",
-      "bool",
-      null,
-      "Enable the tin base custom scan"
-     ],
-     [
-      "tin.index_maintenance_mode",
-      "background",
-      null,
-      "user",
-      "enum",
       [
+       "tin.debug_force_multi_index_drive",
+       "Auto",
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "Sparse",
+        "Stripe"
+       ],
+       "Calibration scaffolding: force sparse vs stripe multi-index execution"
+      ],
+      [
+       "tin.debug_force_parallel",
+       "off",
+       null,
+       "user",
+       "bool",
+       null,
+       "Calibration scaffolding: suppress serial tin paths that have a parallel sibling"
+      ],
+      [
+       "tin.debug_force_topk",
+       "Auto",
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "TopK",
+        "Exhaustive"
+       ],
+       "Calibration scaffolding: force bounded top-k vs exhaustive scored traversal"
+      ],
+      [
+       "tin.debug_force_visibility",
+       "Auto",
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "Streaming",
+        "Sorted"
+       ],
+       "Calibration scaffolding: force streaming vs sorted final visibility"
+      ],
+      [
+       "tin.enable_custom_scan",
+       "on",
+       null,
+       "user",
+       "bool",
+       null,
+       "Enable the tin base custom scan"
+      ],
+      [
+       "tin.index_maintenance_mode",
        "background",
-       "foreground",
-       "manual"
+       null,
+       "user",
+       "enum",
+       [
+        "background",
+        "foreground",
+        "manual"
+       ],
+       "How tin dispatches automatic index maintenance"
       ],
-      "How tin dispatches automatic index maintenance"
-     ],
-     [
-      "tin.maintenance_jobs_per_db",
-      "0",
-      null,
-      "sighup",
-      "integer",
-      null,
-      "Own-database jobs a tin maintenance worker finishes before yielding to another database"
-     ],
-     [
-      "tin.rss_baseline",
-      "256",
-      "MB",
-      "user",
-      "integer",
-      null,
-      "Coarse per-worker RSS baseline used by the tin builder"
-     ],
-     [
-      "tin.track_page_reuse_stats",
-      "off",
-      null,
-      "user",
-      "bool",
-      null,
-      "Track unique tin index page touches in EXPLAIN"
+      [
+       "tin.maintenance_jobs_per_db",
+       "0",
+       null,
+       "sighup",
+       "integer",
+       null,
+       "Own-database jobs a tin maintenance worker finishes before yielding to another database"
+      ],
+      [
+       "tin.rss_baseline",
+       "256",
+       "MB",
+       "user",
+       "integer",
+       null,
+       "Coarse per-worker RSS baseline used by the tin builder"
+      ],
+      [
+       "tin.track_page_reuse_stats",
+       "off",
+       null,
+       "user",
+       "bool",
+       null,
+       "Track unique tin index page touches in EXPLAIN"
+      ]
      ]
     ]
    }

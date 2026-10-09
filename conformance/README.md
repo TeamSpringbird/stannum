@@ -224,7 +224,9 @@ may restart.
   `run.py` (runner version 3) on 2026-10-09 UTC (2026-10-08 US Eastern)
   against PostgreSQL 18.6 on a PlanetScale test database: every area at
   `5e3f29d` with `--skip-crash` (a second run gave identical answers),
-  `stemming`, `tiebreak` and `inventory` at `41f8e6c`, then, one at a time
+  `stemming`, `tiebreak` and `inventory` at `41f8e6c` (`inventory.json`'s
+  header names `7d7d589`, where `inventory.settings.1` was recorded again
+  after it learned to load the engine's library first), then, one at a time
   and last, the seven cases tagged as crashing TIN 1.0.3, merged into
   `limits.json` and `query_size.json` (whose headers name that last run,
   at `ee6f940`). All seven crashed the server again and are tagged
