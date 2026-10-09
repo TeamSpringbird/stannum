@@ -63,6 +63,10 @@ pub(super) struct Sc {
     num: [f32; BUCKET_COUNT],
     den: [f32; BUCKET_COUNT],
     factor: f32,
+    /// [`Self::bucket_bound`] per bucket in the block last asked about,
+    /// NaN until asked: a rare term's block spans many groups' candidates.
+    bb_block: usize,
+    bb: [f32; BUCKET_COUNT],
 }
 
 impl Sc {
@@ -78,6 +82,8 @@ impl Sc {
             num,
             den,
             factor,
+            bb_block: usize::MAX,
+            bb: [f32::NAN; BUCKET_COUNT],
         }
     }
 
@@ -148,6 +154,23 @@ impl Sc {
             .unwrap_or(0);
         self.scorer
             .bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
+    }
+
+    /// [`Self::bucket_bound`], kept per bucket for the block last asked
+    /// about.
+    #[inline]
+    fn bucket_bound_kept(&mut self, b: usize, bucket: u8) -> f32 {
+        if self.bb_block != b {
+            self.bb_block = b;
+            self.bb = [f32::NAN; BUCKET_COUNT];
+        }
+        let known = self.bb[usize::from(bucket)];
+        if !known.is_nan() {
+            return known;
+        }
+        let v = self.bucket_bound(b, bucket);
+        self.bb[usize::from(bucket)] = v;
+        v
     }
 
     /// Block `b`'s largest bucket: its frontier's last pair.
@@ -977,7 +1000,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     1,
                 );
             }
-            reach += f64::from(s.bucket_bound(block, bucket));
+            reach += f64::from(self.sc[i].bucket_bound_kept(block, bucket));
             self.buckets[i] = bucket;
         }
         Ok(reach)

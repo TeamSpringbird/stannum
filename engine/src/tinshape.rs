@@ -1902,6 +1902,20 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn intersects_sorted_lists(
+            a in prop::collection::btree_set(0u32..2_000, 0..80),
+            b in prop::collection::btree_set(0u32..2_000, 0..300),
+        ) {
+            let mut list: Vec<u32> = a.iter().copied().collect();
+            let other: Vec<u32> = b.iter().copied().collect();
+            intersect_sorted(&mut list, &other);
+            let want: Vec<u32> = a.intersection(&b).copied().collect();
+            prop_assert_eq!(list, want);
+        }
+    }
+
+    proptest! {
         #![proptest_config(ProptestConfig::with_cases(48))]
         #[test]
         fn counts_and_top_k_match_brute_force(
