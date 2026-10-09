@@ -23,7 +23,7 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   frontiers, a TF tail of bucket nibbles at each block's width, positions in
   their own stream, a document set and a DL sidecar of exact lengths; see
   [the TIN-shape guide](docs/architecture/tin-shape.md). Index pages are
-  layout version 3; an index written earlier must be rebuilt (`REINDEX`).
+  layout version 4; an index written earlier must be rebuilt (`REINDEX`).
   The extension reads a segment through a paged reader that hands each term
   out as an ordinal stream (`STN3`'s, translated once per backend), so the
   planner, cursors, ranked walk and ordinal count fold read it unchanged.

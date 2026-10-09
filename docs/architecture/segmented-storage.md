@@ -290,7 +290,7 @@ other suites.
 
 ## Segment format
 
-Index pages carry the signature `LDP2` with page layout version 3, and
+Index pages carry the signature `LDP2` with page layout version 4, and
 segments the signature `TNS1`, the ctid-addressed format of [the TIN-shape
 guide](tin-shape.md). The page layouts are defined in
 `postgres/src/storage/layout.rs` and the segment layout in the `segment`
@@ -300,7 +300,7 @@ write-buffer state, the sealed write segments, the segment directory with
 each entry's origin, and runs awaiting reclamation), write-buffer pages
 (the buffer's and the sealed segments' chains), run pages holding an
 immutable blob (a segment, its page table or a dead list), and free pages.
-An index of page layout version 2 (`STN3` segments) is not read: `REINDEX`
+An index of an earlier page layout (version 2 held `STN3` segments) is not read: `REINDEX`
 rebuilds it.
 
 A `TNS1` segment's postings are sets of ctids, laid out as [the TIN-shape
