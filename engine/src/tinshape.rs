@@ -1564,7 +1564,7 @@ mod tests {
                     }
                 }
             }
-            let options = Options { block_size, grid_density, grid_min_postings: 0, ..Options::default() };
+            let options = Options { block_size, grid_density, grid_min_postings: 0, inline_lengths_min_documents: 0, ..Options::default() };
             let blob = build(&docs, &members, options);
             let segment = Segment::parse(&blob).unwrap();
             let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();
