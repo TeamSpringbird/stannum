@@ -1556,12 +1556,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             held.clear();
             held.resize(terms.len(), 0);
-            for (j, &word) in mask[w0..w1].iter().enumerate() {
-                let w = w0 + j;
-                let mut word = word;
-                if word == 0 {
-                    continue;
-                }
+            // The live words, walked by their bits rather than tested.
+            let mut live = 0u32;
+            for (j, word) in mask[w0..w1].iter().enumerate() {
+                live |= u32::from(*word != 0) << j;
+            }
+            while live != 0 {
+                let w = w0 + live.trailing_zeros() as usize;
+                live &= live - 1;
+                let mut word = mask[w];
                 let theta = self.threshold();
                 if theta.is_some() {
                     let mut most = 0.0_f64;
