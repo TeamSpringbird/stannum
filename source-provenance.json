@@ -612,6 +612,10 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },
+    "engine/src/fold.rs": {
+      "owner": "ben",
+      "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
+    },
     "engine/src/lib.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the PostgreSQL-free query engine crate, split out of the extension."
@@ -648,7 +652,7 @@
     },
     "postgres/src/fold.rs": {
       "owner": "ben",
-      "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
+      "evidence": "Original Boolean count executor over document ordinals, written for Stannum: the extension's visibility-map read for engine/src/fold.rs."
     },
     "postgres/src/heap_probe.rs": {
       "owner": "ben",

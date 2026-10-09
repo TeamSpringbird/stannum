@@ -1875,7 +1875,7 @@ unsafe fn settle_view(
     unsafe {
         let mut attempts = 0;
         loop {
-            let visibility = crate::fold::Visibility::read(exec.heap);
+            let visibility = crate::fold::read_visibility(exec.heap);
             if crate::storage::view_is_current(index_oid, &view) {
                 return (view, visibility);
             }

@@ -417,6 +417,7 @@ dependencies = [
  "rustc-hash",
  "segment",
  "thiserror",
+ "tinql",
 ]
 
 [[package]]
