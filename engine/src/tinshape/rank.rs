@@ -5,8 +5,9 @@
 //! Ranked top k over a segment in TIN's shape, a 256-page group at a time.
 //!
 //! A query some terms of which every match holds (a conjunction, a phrase)
-//! walks the groups those terms share. In each, their members are ANDed
-//! (word by word over grids; a list's members probed in the others), and
+//! walks the groups its rarest such term holds. In each, the terms' members
+//! are intersected whole (word by word where all are grids, else from the
+//! fewest, a grid by bit and a list by a merge), and
 //! the survivors are bounded, cheapest first, before anything is read for
 //! them: by the footer blocks they fall in (a window per run of slots no
 //! block boundary crosses), then by their length alone against the
@@ -16,6 +17,9 @@
 //! checked first; after, a group's candidates that score into the top k
 //! wait and are checked best first, so a confirmed one raises the
 //! threshold over the rest.
+//!
+//! Any other query is block-max MaxScore over its scoring terms, a group at
+//! a time: see [`Walk::run_or`].
 
 use std::collections::BinaryHeap;
 
@@ -543,6 +547,7 @@ struct Walk<'s, 'a, T: Touch> {
     pending_index: Vec<u32>,
     span_index: Vec<u32>,
     cands: Vec<u32>,
+    order: Vec<usize>,
     words: Vec<u64>,
     /// The node check's own cursors (the walk moves the terms' sparse
     /// cursors past each group), and its scratch.
@@ -565,84 +570,49 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
     }
 
-    /// Leapfrogs the required terms over slots, led by the rarest: a slot
-    /// they all hold is a candidate. A group every required term holds as a
-    /// grid is sieved whole instead, by the AND of their words. A group and
-    /// a window whose bounds cannot reach the threshold are skipped unread.
+    /// Walks the groups the rarest required term holds. A group whose
+    /// scoring terms' bounds cannot reach the threshold is skipped unread;
+    /// in any other the required terms' members are intersected whole (word
+    /// by word where every one is a grid, else term by term from the fewest)
+    /// and the candidates left are bounded, scored and admitted in order.
     fn run(&mut self) -> Result<()> {
         let lead = self.req[0];
         let n = self.sc.len();
         let mut cursor = 0u32;
-        let mut current: Option<u32> = None;
-        'slots: while let Some(slot) = self.seek(lead, cursor, true)? {
+        while self.seek(lead, cursor)?.is_some() {
             let g = self.mems[lead].loaded - 1;
             let group = self.geometry.groups[g as usize];
             let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
-            if current != Some(g) {
-                if let Some(previous) = current
-                    && !self.pending.is_empty()
-                {
-                    self.verify_pending(previous)?;
-                }
-                current = Some(g);
-                if n == 0 && self.heap.len() >= self.k {
-                    // Nothing scores: every later match ties at zero and
-                    // ranks after the first k.
-                    break;
-                }
-                self.answer.windows += 1;
-                let mut bound = 0.0_f64;
-                for i in 0..n {
-                    bound += f64::from(self.sc[i].range_bound(base, end));
-                }
-                if below(bound, self.threshold()) {
-                    self.answer.windows_pruned += 1;
-                    cursor = end + 1;
-                    continue;
-                }
-                if self.req.len() > 1 && self.all_grids(g) {
-                    self.dense_group(g)?;
-                    cursor = end + 1;
-                    continue;
-                }
-            }
-            if self.window(slot) {
-                // Skip the rest of the window unread.
-                match self.window_end {
-                    Some(e) if e < u32::MAX => cursor = e + 1,
-                    _ => break,
-                }
-                continue;
-            }
-            for r in 1..self.req.len() {
-                let t = self.req[r];
-                match self.seek(t, slot, false)? {
-                    None => break 'slots,
-                    Some(s) if s != slot => {
-                        cursor = s;
-                        continue 'slots;
-                    }
-                    Some(_) => {}
-                }
-            }
-            if !self.process(g, slot - base)? {
+            cursor = end + 1;
+            if n == 0 && self.heap.len() >= self.k {
+                // Nothing scores: every later match ties at zero and ranks
+                // after the first k.
                 break;
             }
-            cursor = slot + 1;
-        }
-        if let Some(g) = current
-            && !self.pending.is_empty()
-        {
-            self.verify_pending(g)?;
+            self.answer.windows += 1;
+            let mut bound = 0.0_f64;
+            for i in 0..n {
+                bound += f64::from(self.sc[i].range_bound(base, end));
+            }
+            if below(bound, self.threshold()) {
+                self.answer.windows_pruned += 1;
+                continue;
+            }
+            let more = if self.all_grids(g) {
+                self.dense_group(g)?
+            } else {
+                self.group_and(g)?
+            };
+            if !more {
+                break;
+            }
         }
         Ok(())
     }
 
     /// Moves term `t` to its first member at or after `target`, loading
-    /// the group that holds it; the member's slot, if any. A term's
-    /// Elias-Fano list is sought rather than decoded where its members far
-    /// outnumber the lead's: the leapfrog visits few of them.
-    fn seek(&mut self, t: usize, mut target: u32, lead: bool) -> Result<Option<u32>> {
+    /// (decoding) the group that holds it; the member's slot, if any.
+    fn seek(&mut self, t: usize, mut target: u32) -> Result<Option<u32>> {
         let geometry = self.geometry;
         loop {
             if target >= geometry.slots {
@@ -663,10 +633,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 if next > g {
                     target = geometry.groups[next as usize].slot_base;
                 }
-                count_in(set, geometry, next, mem);
-                let seek = !lead && mem.count > 4 * self.mems[self.req[0]].count.max(1);
-                let mem = &mut self.mems[t];
-                load(set, geometry, next, mem, seek, self.touch)?;
+                load(set, geometry, next, mem, false, self.touch)?;
             }
             let mem = &mut self.mems[t];
             let group = &geometry.groups[mem.loaded as usize - 1];
@@ -695,11 +662,103 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         true
     }
 
+    /// Intersects the required terms' members in group `g`, which the lead
+    /// holds, term by term from the fewest (a grid's by bit, a list's by a
+    /// merge), and walks the candidates left.
+    fn group_and(&mut self, g: u32) -> Result<bool> {
+        for r in 1..self.req.len() {
+            let t = self.req[r];
+            // A term loaded here already holds the group (a sparse term's
+            // cursor has moved past it).
+            if self.mems[t].loaded == g + 1 {
+                continue;
+            }
+            let set = self.terms[t].as_mut().expect("required");
+            if next_group(set, self.geometry, g, &mut self.mems[t].hint, self.touch) != Some(g) {
+                return Ok(true);
+            }
+        }
+        for r in 0..self.req.len() {
+            let t = self.req[r];
+            let set = self.terms[t].as_ref().expect("required");
+            if self.mems[t].loaded != g + 1 {
+                count_in(set, self.geometry, g, &mut self.mems[t]);
+            }
+        }
+        let mut order = std::mem::take(&mut self.order);
+        order.clear();
+        order.extend_from_slice(&self.req);
+        order.sort_by_key(|t| self.mems[*t].count);
+        let mut cands = std::mem::take(&mut self.cands);
+        cands.clear();
+        for (o, &t) in order.iter().enumerate() {
+            let mem = &self.mems[t];
+            if mem.loaded != g + 1 || matches!(mem.kind, Kind::Cursor { .. }) {
+                let set = self.terms[t].as_mut().expect("required");
+                load(set, self.geometry, g, &mut self.mems[t], false, self.touch)?;
+            }
+            let mem = &self.mems[t];
+            match (o, &mem.kind) {
+                (0, Kind::Grid(bytes)) => {
+                    for w in 0..bytes.len() / 8 {
+                        let mut word = bits::word(bytes, w);
+                        while word != 0 {
+                            cands.push((w * 64) as u32 + word.trailing_zeros());
+                            word &= word - 1;
+                        }
+                    }
+                }
+                (0, _) => cands.extend_from_slice(&mem.list),
+                (_, Kind::Grid(bytes)) => {
+                    cands.retain(|l| bytes[*l as usize / 8] >> (l % 8) & 1 == 1);
+                }
+                (_, _) => super::intersect_sorted(&mut cands, &mem.list),
+            }
+            if cands.is_empty() {
+                break;
+            }
+        }
+        self.order = order;
+        let more = self.walk_candidates(g, &cands)?;
+        self.cands = cands;
+        Ok(more)
+    }
+
+    /// Bounds, scores and admits group `g`'s candidates `cands` (local
+    /// slots, ascending), then checks its pending phrase candidates; false
+    /// once nothing later can enter the top k.
+    fn walk_candidates(&mut self, g: u32, cands: &[u32]) -> Result<bool> {
+        let base = self.geometry.groups[g as usize].slot_base;
+        let mut more = true;
+        let mut at = 0;
+        while at < cands.len() {
+            let local = cands[at];
+            at += 1;
+            if self.window(base + local) {
+                // Skip the rest of the window unread.
+                match self.window_end {
+                    Some(e) if e < u32::MAX => {
+                        at += cands[at..].partition_point(|l| base + *l <= e);
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+            if !self.process(g, local)? {
+                more = false;
+                break;
+            }
+        }
+        if !self.pending.is_empty() {
+            self.verify_pending(g)?;
+        }
+        Ok(more)
+    }
+
     /// Sieves group `g`, every required term of which is a grid there, by
     /// the AND of their words, and walks its candidates.
-    fn dense_group(&mut self, g: u32) -> Result<()> {
+    fn dense_group(&mut self, g: u32) -> Result<bool> {
         let group = self.geometry.groups[g as usize];
-        let base = group.slot_base;
         for r in 0..self.req.len() {
             let t = self.req[r];
             if self.mems[t].loaded != g + 1 {
@@ -733,28 +792,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 word &= word - 1;
             }
         }
-        let mut at = 0;
-        while at < cands.len() {
-            let local = cands[at];
-            at += 1;
-            if self.window(base + local) {
-                match self.window_end {
-                    Some(e) if e < u32::MAX => {
-                        at += cands[at..].partition_point(|l| base + *l <= e);
-                        continue;
-                    }
-                    _ => break,
-                }
-            }
-            if !self.process(g, local)? {
-                break;
-            }
-        }
+        let more = self.walk_candidates(g, &cands)?;
         self.cands = cands;
-        if !self.pending.is_empty() {
-            self.verify_pending(g)?;
-        }
-        Ok(())
+        Ok(more)
     }
 
     /// Moves the window to `slot` and says whether its bound falls short
@@ -1029,6 +1069,7 @@ pub(super) fn top_k(
         pending_index: Vec::new(),
         span_index: Vec::new(),
         cands: Vec::new(),
+        order: Vec::new(),
         words: Vec::new(),
         positions: Vec::new(),
         node_terms,
