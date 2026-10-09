@@ -665,36 +665,52 @@ outputs: `stannum-lab/tinshape/perf-storage/`.
   segment, and consecutive reads share a data page 14 / 80 / 20 times on
   average, so one pin serves them. Liveness is decoded once per backend into
   slot-space words and reads no page.
-- 64-byte lines: a run page's data starts at byte 28 of the page, so no unit
-  is line-aligned by construction. Units of a few bytes (directory entries,
-  footer block entries, a posting's TF bits, a DL word) touch an extra line
-  as often as `(length - 1) / 64`; see `tnsunits` for the counts per kind.
-  The group directory and the footer are variable-length records (varints)
-  of structures in a row (AoS) and are decoded whole before use; a block's
-  bounds are compared one at a time after decoding.
+- Stitched containers, by length (replay, 150 queries per style, every
+  pass): 62% to 64% of the stitched container reads are of at most 1 KiB
+  (35% to 38% of their bytes), the rest 1 to 4 KiB; none is longer. Sparse
+  lists and footers stitched are mostly longer than a page (whole lists and
+  footers read to be decoded), and a record's directory is read in a 16 KiB
+  window once 4 KiB does not hold it.
+- 64-byte lines (`tnsunits`): a run page's data starts at byte 28 of the
+  page, so no unit is line-aligned by construction. Lines touched per unit
+  against the fewest its length needs: containers 3.45 / 3.06 (37.7% touch
+  one more), TF blocks 2.11 / 1.32 (77.7%), DL blocks 5.31 / 4.72 (56.9%),
+  positions blocks 1.67 / 1.34 (33.5%), footer block entries 1.17 / 1.00
+  (17.3%), directories 1.24 / 1.17 (7.1%). The group directory and the
+  footer are variable-length records (varints) of structures in a row
+  (AoS), decoded whole before use; the decoded footer is a structure of
+  arrays (`last`, `starts`, `frontier`, `tf_at`, `widths`), but the
+  frontier is (bucket, length) pairs and a block's bound is computed one
+  block at a time.
 
 Proposals (not built; layout only, the same structures):
 
 - Pad the writer so that no unit of at most 1 KiB spans a page: about
   0.9% of the blob at 150M (containers 208 MB, positions blocks 108 MB,
   TF blocks, sparse lists and positions streams 14 MB each, DL blocks
-  3 MB), against reads that span pages in 5.5% of payload reads. Units
-  could also start on a 64-byte line of the page (page offsets that are
-  multiples of 64: data offsets of 36 + 64k on a page, since a page's data
-  starts at byte 28); that costs half a line per unit and only pays for
-  units of a line or more.
+  3 MB). It removes about 63% of the stitched container reads but only 37%
+  of their bytes; padding containers of up to 4 KiB too removes all of
+  them for 462 MB (1.2%; with the rest about 1.6%). The copies cost little
+  (1.3 to 4.2 MB a query, well under a millisecond); the second pin is the
+  larger part. Without padding, a walk could read a container across two
+  pages in place, a run of words per page (a grid's rows are copied into
+  a row anyway in the disjunction walk), which needs the walks to take a
+  container as up to two slices. Units could also start on a 64-byte line
+  of the page (page offsets that are multiples of 64: data offsets of
+  36 + 64k on a page): 507 MB for containers, 730 MB for TF blocks,
+  2.9 GB for positions blocks (`tnsunits`, "line pad"), which only pays
+  for units of a line or more.
 - Decode footers by the blocks a walk reaches instead of whole: a common
   word's footer at 150M is some 20,000 blocks per segment, decoded per
   query whenever its memo entry was dropped (5.7% of a looping
   conjunction's samples in the server, `Postings::footer`). The walks read
   `Footer::last` and the frontier by block, so this is an API change for
   `engine/src/tinshape/rank.rs`.
-- `TermSet::open` (conjunction and phrase walks' code) clones the term's
-  group directory and builds a cursor entry per group per segment per
-  query: 9.2% of a conjunction replay's samples. Keeping the built groups
-  beside the parsed record (`Rc`), as an experiment on this branch did
-  (since undone), cut that to 2.4%; it raises a kept grouped record's
-  memory from 24 to about 104 bytes per group.
+- `TermSet::open` cloned the term's group directory and built a cursor
+  entry per group per segment per query: 9.2% of a conjunction replay's
+  samples (2.4% with the built groups kept beside the parsed record, an
+  experiment since undone). The conjunction and phrase branch's lazy
+  directory reads (`b7776bd`) cover it.
 
 ## Open
 

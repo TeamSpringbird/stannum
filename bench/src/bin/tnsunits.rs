@@ -59,6 +59,8 @@ struct Tally {
     extra_line: u64,
     /// Padding to start every unit of at least a line on a line.
     line_padding: u64,
+    /// Straddling units by length: at most 1 KiB, at most a page, longer.
+    straddling_by_length: [u64; 3],
 }
 
 /// A run page's data starts after the page header and the chain's next
@@ -93,6 +95,13 @@ impl Units {
             t.line_padding += ((LINE - within % LINE) % LINE) as u64;
         }
         if last > first {
+            t.straddling_by_length[if len <= 1024 {
+                0
+            } else if len <= PAGE_DATA {
+                1
+            } else {
+                2
+            }] += 1;
             t.straddling += 1;
             t.straddling_bytes += len as u64;
             if small {
@@ -160,6 +169,10 @@ fn main() {
         if t.units == 0 {
             continue;
         }
+        let [small_, page, longer] = t.straddling_by_length;
+        eprintln!(
+            "{kind}: straddling by length: <= 1 KiB {small_}, <= a page {page}, longer {longer}"
+        );
         println!(
             "{:<30} {:>12} {:>10.1} {:>12} {:>8.2}% {:>9.2}% {:>12.1} {:>8.3}% {:>5.2}/{:<5.2} {:>9.1}% {:>14.1}",
             kind,
