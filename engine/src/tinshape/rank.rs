@@ -1445,14 +1445,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let base = group.slot_base;
         let end = base + group.slots() - 1;
         self.answer.windows += 1;
+        // The present terms' bounds over the group.
+        let mut sb = std::mem::take(&mut self.sub_bounds);
+        sb.clear();
+        sb.resize(n, 0.0);
         let mut total = 0.0_f64;
-        for i in 0..n {
+        for (i, bound) in sb.iter_mut().enumerate() {
             if self.present[i] {
-                total += f64::from(self.sc[i].range_bound(base, end));
+                *bound = self.sc[i].range_bound(base, end);
+                total += f64::from(*bound);
             }
         }
         if below(total, self.threshold()) {
             self.answer.windows_pruned += 1;
+            self.sub_bounds = sb;
             return Ok(());
         }
         let words = group.words();
@@ -1461,9 +1467,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.rows.resize(n * words, 0);
         }
         let dead = self.segment.liveness.groups[g as usize].as_deref();
-        let mut sb = std::mem::take(&mut self.sub_bounds);
-        sb.clear();
-        sb.resize(n, 0.0);
         let mut plan = std::mem::take(&mut self.plan);
         // The group's plan at its own bounds and the threshold now: a
         // document holding none of its essential terms (or lacking one of
@@ -1473,13 +1476,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // nothing else, and a sub-range whose mask is empty is skipped
         // before its bounds are taken. (A sub-range's own plan is at least
         // as strict, so the mask removes no candidate it would keep.)
-        for (i, bound) in sb.iter_mut().enumerate() {
-            *bound = if self.present[i] {
-                self.sc[i].range_bound(base, end)
-            } else {
-                0.0
-            };
-        }
         self.plan_sub(&mut plan, self.threshold(), &sb, total);
         let mut loaded = std::mem::take(&mut self.row_loaded);
         loaded.clear();

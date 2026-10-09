@@ -76,11 +76,33 @@ PGHOST=127.0.0.1 PGPORT=55432 PGUSER=postgres PGPASSWORD=postgres \
     --data-directory /tmp/db-copy/18/docker --out DIR
 ```
 
-The replay reads segments of the current format (`STN3`). A database built
-by an older image whose segments have another signature must be rebuilt
-with a current image first (`REINDEX INDEX documents_body_idx`), which at
-15 million rows is a long build; the dump script prints each blob's
-signature.
+The script reads page layout version 6; it prints each blob's signature.
+The `replay` binary reads `STN3` segments; an index of the current format
+(`TNS1`) is replayed by `tnsreplay` (below). A saved database can be
+copied without using disk space with `cp -c -R` (APFS clones) and served
+from the copy, bind-mounted, by a container of the image that built it.
+
+## Replaying a TNS1 index as the extension reads it
+
+```sh
+$STANNUM_PYTHON script/replay-oracle.py postgres --trace trace.tsv --ranked-only --out pg.tsv
+cargo run -p bench --release --bin tnsreplay -- --dump DIR --trace trace.tsv --expect pg.tsv \
+    [--style S] [--limit N] [--repeat 3] [--pin-ns N] [--memory [--keep]] [--seed] \
+    [--per-query FILE] [--out FILE] [--threads N --seconds S]
+```
+
+Each segment is assembled over a `LazyBlob` read within a span per query
+from a source that pins 8,156-byte pages (a run page's bytes) and forgets
+them when the span closes, as the extension's in-place reads do;
+`--pin-ns` adds a simulated buffer-manager cost per pin, `--memory` reads
+the blob from memory instead. The answer is `Scorer::top_k` over native
+sources; a second, instrumented pass of the same walk (which must agree)
+reports pages by TIN's areas, pins, candidates examined and scored, and
+groups visited and skipped. `--seed` prunes against the final answer from
+the first candidate, to see what a perfect threshold would save. At 150
+million rows, time A/B comparisons by the process's user CPU over
+interleaved runs: wall time on a shared machine and counters read around
+short sections (`isb; mrs cntvct_el0`) both misled.
 
 ## Replaying a trace
 
