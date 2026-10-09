@@ -100,7 +100,7 @@ order, counts, float4 bit patterns, highlight text.
 
 `divergences/<engine>.yaml` lists the cases where the engine under test
 knowingly answers differently from a recorded engine version (`against`,
-e.g. `tin-1.0.3`), naming the captures that differ:
+e.g. `tin-1.0.3`, or a list of versions), naming the captures that differ:
 
 - `kind: improvement`: the recorded engine raised an ERROR on each listed
   capture and this engine answers. Reported as `IMPROVED`, with a

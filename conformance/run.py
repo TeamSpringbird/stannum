@@ -710,7 +710,8 @@ def read_divergences(engine, recorded):
             sys.exit(f"{path}: {entry.get('id')}: kind must be one of {', '.join(DIVERGENCE_KINDS)}")
         if not entry.get("captures"):
             sys.exit(f"{path}: {entry.get('id')}: list the captures that diverge")
-        if entry.get("against") == recorded:
+        against = entry.get("against")
+        if recorded in (against if isinstance(against, list) else [against]):
             chosen[entry["id"]] = entry
     return chosen
 
