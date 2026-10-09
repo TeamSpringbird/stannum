@@ -35,6 +35,7 @@
 //! caller drops whatever borrowed the span's slices first.
 
 use std::cell::{Cell, RefCell};
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 use crate::source::Source;
@@ -101,6 +102,8 @@ pub struct KindStats {
     pub pinned: u64,
     /// Bytes stitched across page boundaries into a span's buffers.
     pub stitched: u64,
+    /// Reads stitched.
+    pub stitches: u64,
 }
 
 const NO_STATS: KindStats = KindStats {
@@ -108,6 +111,7 @@ const NO_STATS: KindStats = KindStats {
     copied_pages: 0,
     pinned: 0,
     stitched: 0,
+    stitches: 0,
 };
 
 thread_local! {
@@ -127,19 +131,23 @@ fn count(kind: Kind, add: impl FnOnce(&mut KindStats)) {
     STATS.with_borrow_mut(|s| add(&mut s[kind as usize]));
 }
 
-/// Pages a span's reads remember, direct-mapped by page.
-const PAGE_MEMO: usize = 256;
+/// Pages a span's reads remember, direct-mapped by page. An entry holds
+/// the span it was pinned in, so closing a span forgets them all without
+/// touching them.
+const PAGE_MEMO: usize = 1024;
 
-/// A page a span pinned: its index, its bytes and their length.
+/// A page a span pinned: its index, the span, its bytes and their length.
 #[derive(Clone, Copy)]
 struct PageRef {
     page: usize,
+    span: u64,
     data: *const u8,
     len: usize,
 }
 
 const NO_PAGE: PageRef = PageRef {
     page: usize::MAX,
+    span: 0,
     data: std::ptr::null(),
     len: 0,
 };
@@ -148,45 +156,101 @@ const NO_PAGE: PageRef = PageRef {
 /// current one, or into a buffer of its own when larger than a quarter.
 const STITCH_BLOCK: usize = 64 * 1024;
 
+/// Bytes of stitch buffers a blob keeps for its next span: a query
+/// stitches some kilobytes per segment (a record's directory, a footer, a
+/// sparse list), which allocating and freeing per span cost again each time
+/// (a large one mapped and zeroed by the kernel).
+const STITCH_KEEP: usize = 1 << 20;
+
+type Buffer = Box<[MaybeUninit<u8>]>;
+
 /// A span's stitch buffers. A buffer is never reallocated, so a slice of
-/// one stays valid until the span closes.
+/// one stays valid until the span closes; then the buffers are kept, up to
+/// [`STITCH_KEEP`] bytes, for the next span. Nothing is zeroed: a stitch
+/// writes every byte it hands out.
 #[derive(Default)]
 struct Stitches {
-    /// Full or own-sized buffers.
-    full: Vec<Box<[u8]>>,
-    /// The buffer being filled, and the bytes of it used.
-    current: Option<Box<[u8]>>,
+    /// Blocks of [`STITCH_BLOCK`] handed out in the span; the last is being
+    /// filled, `used` bytes of it.
+    blocks: Vec<Buffer>,
     used: usize,
+    /// Buffers of their own handed out in the span.
+    large: Vec<Buffer>,
+    /// Kept for the next span.
+    free_blocks: Vec<Buffer>,
+    free_large: Vec<Buffer>,
     /// Bytes stitched in the span.
     bytes: usize,
 }
 
 impl Stitches {
-    /// A buffer of `len` bytes, valid until [`Self::clear`].
+    /// A buffer of `len` bytes, valid until [`Self::clear`], its contents
+    /// unspecified: the caller writes them all before reading any.
     fn alloc(&mut self, len: usize) -> *mut u8 {
         self.bytes += len;
         if len > STITCH_BLOCK / 4 {
-            let mut own = vec![0u8; len].into_boxed_slice();
-            let at = own.as_mut_ptr();
-            self.full.push(own);
+            let reuse = self
+                .free_large
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.len() >= len)
+                .min_by_key(|(_, b)| b.len())
+                .map(|(i, _)| i);
+            let mut own = match reuse {
+                Some(i) => self.free_large.swap_remove(i),
+                None => Box::new_uninit_slice(len.next_power_of_two()),
+            };
+            let at = own.as_mut_ptr().cast::<u8>();
+            self.large.push(own);
             return at;
         }
-        if self.current.is_none() || self.used + len > STITCH_BLOCK {
-            if let Some(full) = self.current.take() {
-                self.full.push(full);
-            }
-            self.current = Some(vec![0u8; STITCH_BLOCK].into_boxed_slice());
+        if self.blocks.is_empty() || self.used + len > STITCH_BLOCK {
+            let block = self
+                .free_blocks
+                .pop()
+                .unwrap_or_else(|| Box::new_uninit_slice(STITCH_BLOCK));
+            self.blocks.push(block);
             self.used = 0;
         }
-        let block = self.current.as_mut().expect("a buffer");
+        let block = self.blocks.last_mut().expect("a buffer");
         // SAFETY: `used + len` lies within the buffer.
-        let at = unsafe { block.as_mut_ptr().add(self.used) };
+        let at = unsafe { block.as_mut_ptr().cast::<u8>().add(self.used) };
         self.used += len;
         at
     }
 
+    /// Ends the span: its buffers become free, the largest dropped past
+    /// [`STITCH_KEEP`] bytes.
     fn clear(&mut self) {
-        *self = Self::default();
+        self.bytes = 0;
+        self.used = 0;
+        self.free_blocks.append(&mut self.blocks);
+        self.free_large.append(&mut self.large);
+        let mut kept = self.free_blocks.len() * STITCH_BLOCK;
+        while kept > STITCH_KEEP && self.free_blocks.pop().is_some() {
+            kept -= STITCH_BLOCK;
+        }
+        self.free_large.sort_unstable_by_key(|b| b.len());
+        let mut cut = self.free_large.len();
+        for (i, b) in self.free_large.iter().enumerate() {
+            if kept + b.len() > STITCH_KEEP {
+                cut = i;
+                break;
+            }
+            kept += b.len();
+        }
+        self.free_large.truncate(cut);
+    }
+
+    /// Bytes of the buffers held, in use or kept.
+    fn capacity(&self) -> usize {
+        (self.blocks.len() + self.free_blocks.len()) * STITCH_BLOCK
+            + self
+                .large
+                .iter()
+                .chain(&self.free_large)
+                .map(|b| b.len())
+                .sum::<usize>()
     }
 }
 
@@ -203,8 +267,10 @@ pub struct LazyBlob {
     page_len: usize,
     /// Open [`Self::open_span`]s.
     spans: Cell<u32>,
+    /// The outermost span open or last opened, numbering them from 1.
+    span: Cell<u64>,
     /// Pages the open span pinned, by page modulo [`PAGE_MEMO`].
-    pages: Box<[Cell<PageRef>]>,
+    pages: Box<[Cell<PageRef>; PAGE_MEMO]>,
     stitches: RefCell<Stitches>,
 }
 
@@ -246,7 +312,8 @@ impl LazyBlob {
             source,
             page_len,
             spans: Cell::new(0),
-            pages: (0..PAGE_MEMO).map(|_| Cell::new(NO_PAGE)).collect(),
+            span: Cell::new(0),
+            pages: Box::new([const { Cell::new(NO_PAGE) }; PAGE_MEMO]),
             stitches: RefCell::default(),
         }
     }
@@ -264,10 +331,12 @@ impl LazyBlob {
         self.loaded.get()
     }
 
-    /// Bytes the blob holds besides its loaded chunks: the chunk bitmap and
-    /// the span's page memo.
+    /// Bytes the blob holds besides its loaded chunks: the chunk bitmap,
+    /// the span's page memo and the stitch buffers it keeps.
     pub fn overhead(&self) -> usize {
-        self.chunks.len() * 8 + self.pages.len() * std::mem::size_of::<PageRef>()
+        self.chunks.len() * 8
+            + self.pages.len() * std::mem::size_of::<PageRef>()
+            + self.stitches.borrow().capacity()
     }
 
     /// Bytes the open span stitched so far, freed when it closes.
@@ -290,6 +359,9 @@ impl LazyBlob {
     /// into the blob. Spans nest.
     pub fn open_span(&self) {
         self.source.hold(true);
+        if self.spans.get() == 0 {
+            self.span.set(self.span.get() + 1);
+        }
         self.spans.set(self.spans.get() + 1);
     }
 
@@ -305,9 +377,7 @@ impl LazyBlob {
         let depth = self.spans.get().saturating_sub(1);
         self.spans.set(depth);
         if depth == 0 {
-            for page in self.pages.iter() {
-                page.set(NO_PAGE);
-            }
+            // The page memo's entries name the span: none is served after.
             self.stitches.borrow_mut().clear();
         }
         self.source.hold(false);
@@ -318,12 +388,17 @@ impl LazyBlob {
     }
 
     /// Whether `[offset, offset + len)` is loaded.
+    #[inline]
     pub fn has(&self, offset: usize, len: usize) -> bool {
         if len == 0 {
             return true;
         }
         let end = offset.saturating_add(len).min(self.len);
-        (offset / CHUNK..end.div_ceil(CHUNK)).all(|chunk| self.is_loaded(chunk))
+        let first = offset / CHUNK;
+        if end <= (first + 1) * CHUNK {
+            return self.is_loaded(first);
+        }
+        (first..end.div_ceil(CHUNK)).all(|chunk| self.is_loaded(chunk))
     }
 
     /// Loads `[from, to)` where not loaded yet.
@@ -391,8 +466,29 @@ impl LazyBlob {
         self.get_kind(from, to, Kind::Other)
     }
 
-    #[inline]
+    /// `[from, to)` of `kind`: a range on a page the open span pinned
+    /// already, the common case, read here; anything else in
+    /// [`Self::get_slow`].
+    #[inline(always)]
     fn get_kind(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
+        if self.spans.get() > 0 && from < to && self.page_len > 0 {
+            let n = self.page_len;
+            let page = from / n;
+            let known = self.pages[page % PAGE_MEMO].get();
+            if known.page == page && known.span == self.span.get() && to <= page * n + known.len {
+                // SAFETY: within a page the open span pinned, as in
+                // `in_place`; the caller of `close_span` drops this slice
+                // first.
+                return Ok(unsafe {
+                    std::slice::from_raw_parts(known.data.add(from - page * n), to - from)
+                });
+            }
+        }
+        self.get_slow(from, to, kind)
+    }
+
+    #[inline(never)]
+    fn get_slow(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if from > to {
             return Err(Error::Truncated);
         }
@@ -419,7 +515,7 @@ impl LazyBlob {
     fn page(&self, page: usize, kind: Kind) -> Result<Option<(*const u8, usize)>> {
         let memo = &self.pages[page % PAGE_MEMO];
         let known = memo.get();
-        if known.page == page {
+        if known.page == page && known.span == self.span.get() {
             return Ok(Some((known.data, known.len)));
         }
         match self.source.pinned_page((page * self.page_len) as u64) {
@@ -431,6 +527,7 @@ impl LazyBlob {
                 }
                 memo.set(PageRef {
                     page,
+                    span: self.span.get(),
                     data: span.data,
                     len: span.len,
                 });
@@ -487,7 +584,10 @@ impl LazyBlob {
             }
             at += take;
         }
-        count(kind, |s| s.stitched += (to - from) as u64);
+        count(kind, |s| {
+            s.stitched += (to - from) as u64;
+            s.stitches += 1;
+        });
         // SAFETY: the buffer holds `to - from` bytes, written above, and
         // lives until the span closes.
         Ok(unsafe { std::slice::from_raw_parts(out, to - from) })
@@ -575,7 +675,7 @@ impl<'a> Bytes<'a> {
     }
 
     /// Bytes `[from, to)`; `Truncated` past the end.
-    #[inline]
+    #[inline(always)]
     pub fn get(&self, from: usize, to: usize) -> Result<&'a [u8]> {
         match *self {
             Self::Slice(bytes) => bytes.get(from..to).ok_or(Error::Truncated),
@@ -841,6 +941,42 @@ mod tests {
         assert_eq!(bytes.get(150, 420).unwrap(), &state.bytes[150..420]);
         assert_eq!(bytes.get(510, 520).unwrap(), &state.bytes[510..520]);
         unsafe { blob.close_span() };
+    }
+
+    /// Stitch buffers outlive their span for the next one's stitches, and a
+    /// page remembered in one span is pinned afresh in the next.
+    #[test]
+    fn spans_reuse_stitch_buffers_and_repin_pages() {
+        let (source, blob) = pinning(64 * 1000, 1000);
+        let state = &source.0;
+        let bytes = blob.bytes();
+        let mut previous: Option<(usize, usize)> = None;
+        for round in 0..4 {
+            blob.open_span();
+            // Small stitches into a shared block, and one of its own.
+            let small = bytes.get(990, 1010).unwrap();
+            assert_eq!(small, &state.bytes[990..1010]);
+            let large = bytes.get(1500, 1500 + 40_000).unwrap();
+            assert_eq!(large, &state.bytes[1500..41_500]);
+            let within = bytes.get(5, 15).unwrap();
+            assert_eq!(within, &state.bytes[5..15]);
+            let at = (small.as_ptr() as usize, large.as_ptr() as usize);
+            if let Some(previous) = previous {
+                assert_eq!(previous, at, "round {round}: the buffers reused");
+            }
+            previous = Some(at);
+            let pins = state.pins.get();
+            unsafe { blob.close_span() };
+            assert!(state.pinned.borrow().is_empty());
+            blob.open_span();
+            // The page memo from the closed span is not served: the page is
+            // pinned again (a poisoned stale copy would read 0xA5).
+            assert_eq!(bytes.get(5, 15).unwrap(), &state.bytes[5..15]);
+            assert_eq!(state.pins.get(), pins + 1);
+            unsafe { blob.close_span() };
+        }
+        assert!(blob.overhead() >= 40_000, "kept buffers count as held");
+        assert_eq!(blob.loaded(), 0);
     }
 
     #[test]
