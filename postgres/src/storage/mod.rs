@@ -937,8 +937,15 @@ impl RunSource {
     /// Pins page `page` of the run, checked as a run page, and releases
     /// its content lock.
     fn pin(&self, page: usize) -> segment::Result<HeldPage> {
+        crate::score::charging("run source", || self.pin_page(page, true))
+    }
+
+    /// [`Self::pin`], the page's storage read charged to a phase of its own
+    /// when `charge`: a read in place pins a page per page it touches, and
+    /// its caller charges the read as a whole ([`with_native`]).
+    fn pin_page(&self, page: usize, charge: bool) -> segment::Result<HeldPage> {
         let block = *self.table.get(page).ok_or(segment::Error::Truncated)?;
-        crate::score::charging("run source", || {
+        {
             // SAFETY: as in `read_into`; the relcache reference is held
             // until the span ends, within the statement, and the pin is
             // released by `release_held`.
@@ -954,7 +961,11 @@ impl RunSource {
                 // Pinned only: a run page is never written while published
                 // (see `HeldPage`), so its content lock guards nothing, and
                 // a walk pins a page or two per chunk it loads.
-                let buffer = crate::score::charging("buffer read", || pin_block(index, block));
+                let buffer = if charge {
+                    crate::score::charging("buffer read", || pin_block(index, block))
+                } else {
+                    pin_block(index, block)
+                };
                 let contents = std::slice::from_raw_parts(page_of(buffer), PAGE_SIZE);
                 let checked = match layout::kind(contents) {
                     Ok(KIND_RUN) => layout::chain(contents)
@@ -981,7 +992,7 @@ impl RunSource {
                 SCAN_PINS.set(SCAN_PINS.get() + 1);
                 Ok(held)
             }
-        })
+        }
     }
 }
 
@@ -1311,7 +1322,7 @@ impl segment::source::Source for RunSource {
                 if pinned.len() >= PINNED_LIMIT {
                     return None;
                 }
-                let held = match self.pin(page) {
+                let held = match self.pin_page(page, false) {
                     Ok(held) => held,
                     Err(error) => return Some(Err(error)),
                 };
