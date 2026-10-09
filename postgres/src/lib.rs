@@ -3127,6 +3127,51 @@ mod tests {
                 }
             }
         }
+        // `id % 7 < 5` rejects the 3,000 best-ranked rows, which all have
+        // `id % 7` of 5 or 6, so no walk the completions deepen to holds ten
+        // passing rows. The last walk applies the filter as it admits rows
+        // instead of scoring every candidate; a volatile filter is not
+        // applied early, and the scan scores every candidate.
+        Spi::run(
+            "SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        for (filter, early) in [
+            ("id % 7 < 5", true),
+            ("id % 7 < 5 AND random() >= 0", false),
+        ] {
+            for order in ["", ", id", ", id DESC"] {
+                let sql = format!(
+                    "SELECT id, stannum.full_score(ctid) FROM filtered
+                     WHERE body ==> '{query}' AND {filter}
+                     ORDER BY stannum.full_score(ctid) DESC{order} LIMIT 10"
+                );
+                let case = format!("{filter} ORDER BY score DESC{order}");
+                Spi::run("SET LOCAL stannum.enable_custom_scan = off").unwrap();
+                let expected = id_scores(&sql);
+                Spi::run("SET LOCAL stannum.enable_custom_scan = on").unwrap();
+                let answer = id_scores(&sql);
+                let scores = |rows: &[(i32, u32)]| rows.iter().map(|r| r.1).collect::<Vec<_>>();
+                assert_eq!(scores(&answer), scores(&expected), "{case}");
+                if !order.is_empty() {
+                    assert_eq!(answer, expected, "{case}");
+                }
+                let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                let scan =
+                    find_search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{case}: {plan}"));
+                if early {
+                    assert_eq!(scan["Filtered Walks"], 1, "{case}: {scan}");
+                    assert_eq!(scan["Exhaustive Score Calls"], 0, "{case}: {scan}");
+                } else {
+                    assert_eq!(scan["Filtered Walks"], 0, "{case}: {scan}");
+                    assert_eq!(scan["Exhaustive Score Calls"], 30000, "{case}: {scan}");
+                }
+            }
+        }
     }
 
     #[pg_test]
