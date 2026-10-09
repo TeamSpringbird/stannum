@@ -2874,6 +2874,282 @@ mod tests {
         assert_eq!(scan["Scored Candidates"], 0, "{scan}");
     }
 
+    /// Plan nodes in pre-order, a custom scan by its provider's name.
+    fn plan_nodes(node: &serde_json::Value, out: &mut Vec<String>) {
+        out.push(
+            node["Custom Plan Provider"]
+                .as_str()
+                .or(node["Node Type"].as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        for child in node["Plans"].as_array().into_iter().flatten() {
+            plan_nodes(child, out);
+        }
+    }
+
+    fn find_search_scan(node: &serde_json::Value) -> Option<&serde_json::Value> {
+        if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
+            return Some(node);
+        }
+        node["Plans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(find_search_scan)
+    }
+
+    /// Every row of `sql` as (id, score bits).
+    fn id_scores(sql: &str) -> Vec<(i32, u32)> {
+        Spi::connect(|client| {
+            client
+                .select(sql, None, &[])
+                .unwrap()
+                .map(|row| {
+                    (
+                        row.get::<i32>(1).unwrap().unwrap(),
+                        row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[pg_test]
+    fn tiebreak_top_k_ranks_with_the_ties_at_its_boundary() {
+        // Twelve bodies hold `alpha`, so a dozen or more rows share each
+        // score and every k-th row ties with others. Ids permute the heap
+        // order and every seventh tag is NULL, so the tiebreak keys order
+        // ties differently from the scan.
+        Spi::run(
+            "CREATE TABLE tiebreak(id int PRIMARY KEY, tag text, body text);
+             INSERT INTO tiebreak
+             SELECT (n * 7) % 3001, CASE WHEN n % 7 = 0 THEN NULL ELSE 'g' || (n % 3) END,
+                    CASE WHEN n % 15 = 0
+                         THEN repeat('alpha ', 1 + (n / 15) % 4) || repeat('beta ', (n / 15) % 3) || 'pad'
+                         WHEN n % 23 = 0 THEN 'gamma ' || repeat('beta ', n % 2) || 'pad'
+                         ELSE 'filler' || (n % 50) || ' pad' END
+               FROM generate_series(1, 3000) n;
+             CREATE INDEX tiebreak_body ON tiebreak USING stannum(body);
+             ANALYZE tiebreak;",
+        )
+        .unwrap();
+        let deep: &[(usize, usize)] = &[
+            (1, 0),
+            (10, 0),
+            (49, 0),
+            (50, 0),
+            (60, 0),
+            (120, 0),
+            (10, 45),
+        ];
+        // The planner takes a conjunction's words as independent and expects
+        // a dozen matches where there are 133, so for more rows than that it
+        // rightly finds a bitmap scan and a sort as cheap.
+        let shallow: &[(usize, usize)] = &[(1, 0), (10, 0), (4, 3)];
+        let or = "alpha OR beta";
+        let score = "stannum.score(ctid)";
+        let cases = [
+            (or, score, "", "id", deep),
+            (or, score, "", "id DESC", deep),
+            (or, score, "", "tag NULLS FIRST, id", deep),
+            (or, score, "", "tag DESC, id DESC", deep),
+            (
+                or,
+                "stannum.full_score(ctid)",
+                "",
+                "tag NULLS LAST, id DESC",
+                deep,
+            ),
+            ("alpha OR gamma", score, "", "id", deep),
+            ("alpha AND beta", score, "", "tag, id", shallow),
+            ("\"alpha beta\"", score, "", "id DESC", shallow),
+            (or, score, "AND id <= 2000", "id", deep),
+        ];
+        for (query, score, filter, tiebreak, limits) in cases {
+            let every = id_scores(&format!(
+                "SELECT id, {score} FROM tiebreak WHERE body ==> '{query}' {filter}
+                 ORDER BY 2 DESC"
+            ));
+            for &(limit, offset) in limits {
+                let sql = format!(
+                    "SELECT id, {score} FROM tiebreak WHERE body ==> '{query}' {filter}
+                     ORDER BY {score} DESC, {tiebreak} LIMIT {limit} OFFSET {offset}"
+                );
+                let case = format!(
+                    "{query} {filter} ORDER BY {score} DESC, {tiebreak} LIMIT {limit} OFFSET {offset}"
+                );
+                Spi::run("SET LOCAL stannum.enable_custom_scan = off").unwrap();
+                let expected = id_scores(&sql);
+                Spi::run("SET LOCAL stannum.enable_custom_scan = on").unwrap();
+                assert_eq!(id_scores(&sql), expected, "{case}");
+                // The ranked scan answers, its top k widened to every row tied
+                // with the k-th score and the one row after them, which tells
+                // the incremental sort above it that the tied group ended.
+                let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                let mut nodes = Vec::new();
+                plan_nodes(&plan[0]["Plan"], &mut nodes);
+                assert!(
+                    nodes.iter().any(|n| n == "Incremental Sort"),
+                    "{case}: {nodes:?}"
+                );
+                assert!(
+                    !nodes.iter().any(|n| n == "Sort" || n == "Seq Scan"),
+                    "{case}: {nodes:?}"
+                );
+                let scan =
+                    find_search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{case}: {plan}"));
+                let k = limit + offset;
+                assert_eq!(scan["Order"], "score DESC", "{case}: {scan}");
+                assert_eq!(scan["Top K"], k, "{case}: {scan}");
+                assert_eq!(scan["Top K Ties"], "kept", "{case}: {scan}");
+                assert_eq!(scan["Exhaustive Score Calls"], 0, "{case}: {scan}");
+                if filter.is_empty() {
+                    assert_eq!(scan["Top-K Completions"], 0, "{case}: {scan}");
+                    let kth = every[k - 1].1;
+                    let tied = every
+                        .iter()
+                        .filter(|(_, s)| f32::from_bits(*s) >= f32::from_bits(kth))
+                        .count();
+                    let emitted = (tied + 1).min(every.len());
+                    assert_eq!(
+                        scan["Actual Rows"].as_f64(),
+                        Some(emitted as f64),
+                        "{case}: {scan}"
+                    );
+                }
+            }
+        }
+        // Every k up to past the third run of equal scores, both directions.
+        for tiebreak in ["id", "tag DESC NULLS LAST, id DESC"] {
+            for limit in 1..=70 {
+                let sql = format!(
+                    "SELECT id, stannum.score(ctid) FROM tiebreak WHERE body ==> '{or}'
+                     ORDER BY stannum.score(ctid) DESC, {tiebreak} LIMIT {limit}"
+                );
+                Spi::run("SET LOCAL stannum.enable_custom_scan = off").unwrap();
+                let expected = id_scores(&sql);
+                Spi::run("SET LOCAL stannum.enable_custom_scan = on").unwrap();
+                assert_eq!(id_scores(&sql), expected, "{tiebreak} LIMIT {limit}");
+            }
+        }
+    }
+
+    #[pg_test]
+    fn filtered_top_k_prefers_the_pruned_ranked_scan_until_the_filter_is_selective() {
+        // Every row matches, with a score of its own mix of the two words.
+        // Ids follow the heap order, as a serial key does, and rows are wide,
+        // so a range of ids is a cheap btree scan of few pages. ANALYZE reads
+        // every row of a table this size, so the estimates are fixed.
+        Spi::run(
+            "CREATE TABLE filtered(id int PRIMARY KEY, body text, pad text);
+             INSERT INTO filtered
+             SELECT n, repeat('alpha ', 1 + n % 5) || repeat('beta ', n % 7) || 'w' || (n % 101),
+                    repeat('x', 300)
+               FROM generate_series(1, 30000) n;
+             CREATE INDEX filtered_body ON filtered USING stannum(body);
+             ANALYZE filtered;",
+        )
+        .unwrap();
+        let query = "alpha OR beta";
+        // A tenth of the rows pass `id <= 3000`: the walk is expected to find
+        // ten of them within its top 160, so it scores some hundreds of the
+        // 30,000 candidates where the btree scan tests `==>` on 3,000 rows. A
+        // thousandth pass `id <= 30`: ten of them are not expected within
+        // the deepest walk, the scan would score every candidate, and the
+        // btree scan tests thirty rows.
+        for (cutoff, ranked) in [(3000, true), (30, false)] {
+            for order in ["", ", id"] {
+                let sql = format!(
+                    "SELECT id, stannum.full_score(ctid) FROM filtered
+                     WHERE body ==> '{query}' AND id <= {cutoff}
+                     ORDER BY stannum.full_score(ctid) DESC{order} LIMIT 10"
+                );
+                let case = format!("id <= {cutoff} ORDER BY score DESC{order}");
+                Spi::run("SET LOCAL stannum.enable_custom_scan = off").unwrap();
+                let expected = id_scores(&sql);
+                Spi::run("SET LOCAL stannum.enable_custom_scan = on").unwrap();
+                let answer = id_scores(&sql);
+                if order.is_empty() {
+                    // Without a tiebreak only the scores are determined.
+                    let scores = |rows: &[(i32, u32)]| rows.iter().map(|r| r.1).collect::<Vec<_>>();
+                    assert_eq!(scores(&answer), scores(&expected), "{case}");
+                } else {
+                    assert_eq!(answer, expected, "{case}");
+                }
+                assert_eq!(answer.len(), 10, "{case}");
+                let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                let mut nodes = Vec::new();
+                plan_nodes(&plan[0]["Plan"], &mut nodes);
+                match find_search_scan(&plan[0]["Plan"]) {
+                    Some(scan) => {
+                        assert!(ranked, "{case}: {nodes:?}");
+                        assert_eq!(scan["Exhaustive Score Calls"], 0, "{case}: {scan}");
+                        assert!(
+                            scan["Top-K Completions"].as_i64().unwrap() <= 3,
+                            "{case}: {scan}"
+                        );
+                    }
+                    None => {
+                        assert!(!ranked, "{case}: {nodes:?}");
+                        assert!(nodes.iter().any(|n| n == "Index Scan"), "{case}: {nodes:?}");
+                    }
+                }
+            }
+        }
+        // `id % 7 < 5` rejects the 3,000 best-ranked rows, which all have
+        // `id % 7` of 5 or 6, so no walk the completions deepen to holds ten
+        // passing rows. The last walk applies the filter as it admits rows
+        // instead of scoring every candidate; a volatile filter is not
+        // applied early, and the scan scores every candidate.
+        Spi::run(
+            "SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        for (filter, early) in [
+            ("id % 7 < 5", true),
+            ("id % 7 < 5 AND random() >= 0", false),
+        ] {
+            for order in ["", ", id", ", id DESC"] {
+                let sql = format!(
+                    "SELECT id, stannum.full_score(ctid) FROM filtered
+                     WHERE body ==> '{query}' AND {filter}
+                     ORDER BY stannum.full_score(ctid) DESC{order} LIMIT 10"
+                );
+                let case = format!("{filter} ORDER BY score DESC{order}");
+                Spi::run("SET LOCAL stannum.enable_custom_scan = off").unwrap();
+                let expected = id_scores(&sql);
+                Spi::run("SET LOCAL stannum.enable_custom_scan = on").unwrap();
+                let answer = id_scores(&sql);
+                let scores = |rows: &[(i32, u32)]| rows.iter().map(|r| r.1).collect::<Vec<_>>();
+                assert_eq!(scores(&answer), scores(&expected), "{case}");
+                if !order.is_empty() {
+                    assert_eq!(answer, expected, "{case}");
+                }
+                let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                let scan =
+                    find_search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{case}: {plan}"));
+                if early {
+                    assert_eq!(scan["Filtered Walks"], 1, "{case}: {scan}");
+                    assert_eq!(scan["Exhaustive Score Calls"], 0, "{case}: {scan}");
+                } else {
+                    assert_eq!(scan["Filtered Walks"], 0, "{case}: {scan}");
+                    assert_eq!(scan["Exhaustive Score Calls"], 30000, "{case}: {scan}");
+                }
+            }
+        }
+    }
+
     #[pg_test]
     fn filtered_literal_prefix_rescans_preserve_consumed_rows() {
         Spi::run(

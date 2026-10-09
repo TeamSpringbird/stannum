@@ -289,6 +289,10 @@ struct Ordering {
     /// Rows the query will consume (offset plus limit) when the planner
     /// knows; only that many are sorted up front.
     top_k: Option<usize>,
+    /// Later sort keys break the score's ties above the scan, so its top k
+    /// keeps every row tied with the k-th score, and the row after them to
+    /// mark where they end (see [`engine::walk::TopRows`]).
+    ties: bool,
 }
 
 /// The text of a non-null `Const` node.
@@ -388,7 +392,8 @@ unsafe fn predicate_proven(rel: *mut pg_sys::RelOptInfo, index_oid: pg_sys::Oid)
 }
 
 /// Recognizes `ORDER BY stannum.score(ctid) DESC` and friends after the scoring
-/// support function has bound them to this index.
+/// support function has bound them to this index, alone or followed by
+/// other sort keys that break its ties (`ORDER BY score DESC, id`).
 unsafe fn find_ordering(
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
@@ -396,7 +401,7 @@ unsafe fn find_ordering(
 ) -> Option<Ordering> {
     unsafe {
         let pathkeys = (*root).sort_pathkeys;
-        if pg_sys::list_length(pathkeys) != 1 {
+        if pg_sys::list_length(pathkeys) < 1 {
             return None;
         }
         let pathkey = pg_sys::list_nth(pathkeys, 0).cast::<pg_sys::PathKey>();
@@ -458,6 +463,7 @@ unsafe fn find_ordering(
                 term_add,
                 term_replace,
                 top_k,
+                ties: pg_sys::list_length(pathkeys) > 1,
             });
         }
         None
@@ -516,6 +522,7 @@ impl Clone for Ordering {
             term_add: self.term_add.clone(),
             term_replace: self.term_replace.clone(),
             top_k: self.top_k,
+            ties: self.ties,
         }
     }
 }
@@ -538,6 +545,7 @@ impl Private {
                     list.push(make_array_or_null(&ordering.term_add));
                     list.push(make_array_or_null(&ordering.term_replace));
                     list.push(make_int(ordering.top_k.map_or(-1, |k| k as i64)));
+                    list.push(make_int(i64::from(ordering.ties)));
                 }
             }
             list.into_pg()
@@ -575,6 +583,7 @@ impl Private {
                     term_add: array(8),
                     term_replace: array(9),
                     top_k: usize::try_from(int(10)).ok(),
+                    ties: int(11) == 1,
                 }),
             };
             (
@@ -588,6 +597,95 @@ impl Private {
             )
         }
     }
+}
+
+/// The selectivity of `rel`'s restrictions other than the `==>` clause
+/// `ours`: the share of the rows the scan ranks that the query keeps.
+unsafe fn other_selectivity(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+    ours: *mut pg_sys::OpExpr,
+) -> f64 {
+    unsafe {
+        let mut others = PgList::<pg_sys::RestrictInfo>::new();
+        for info in PgList::<pg_sys::RestrictInfo>::from_pg((*rel).baserestrictinfo).iter_ptr() {
+            if (*info).clause.cast::<pg_sys::OpExpr>() != ours {
+                others.push(info);
+            }
+        }
+        if others.is_empty() {
+            return 1.0;
+        }
+        pg_sys::clauselist_selectivity(
+            root,
+            others.into_pg(),
+            0,
+            pg_sys::JoinType::JOIN_INNER,
+            std::ptr::null_mut(),
+        )
+        .clamp(0.0, 1.0)
+    }
+}
+
+/// Whether the scan is expected to walk the top k of `query` pruned (see
+/// [`engine::walk::Scorer::top_k`]): by its shape, when it is known at
+/// plan time and its scoring terms are its own.
+unsafe fn prunable(index_oid: pg_sys::Oid, query: Option<&str>, ordering: &Ordering) -> bool {
+    if ordering.term_add.is_some() || ordering.term_replace.is_some() {
+        return false;
+    }
+    let Some(query) = query else {
+        return false;
+    };
+    unsafe {
+        let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as _);
+        let tokenizer = crate::storage::index_tokenizer(index);
+        pg_sys::index_close(index, pg_sys::AccessShareLock as _);
+        tinql::runtime::parse_tinql_to_query(query, tokenizer.as_ref())
+            .is_ok_and(|query| crate::score::walks_pruned(&query))
+    }
+}
+
+/// The k a completion deepens a pruned top `k` to (see [`complete`]), if it
+/// still prunes.
+fn deeper_k(k: usize) -> Option<usize> {
+    let deeper = k.saturating_mul(4).max(40);
+    (deeper <= crate::score::PRUNE_MAX_K).then_some(deeper)
+}
+
+/// Candidates a pruned walk for the top `k` scores: fitted to the walks of
+/// the comparison kit's disjunctions over a million Stack Exchange posts,
+/// which scored 70 to 90 candidates for a top 10, 2,400 to 3,500 for a
+/// top 640 and 6,900 to 10,500 for a top 2,560.
+fn walk_scored(k: usize) -> f64 {
+    11.0 * (k as f64).powf(0.85)
+}
+
+/// The candidates a ranked scan's pruned walks are expected to score when a
+/// share `pass` of the rows it ranks pass the rest of the query: the walk
+/// for the top `k`, then each completion's deeper walk until one is expected
+/// to hold `k` passing rows. `None` when the deepest walk is not expected to
+/// hold twice as many, as a filter's rows need not spread evenly through
+/// the ranking: the scan is then expected to score every candidate.
+fn pruned_scored(k: usize, pass: f64) -> Option<f64> {
+    if k == 0 || k > crate::score::PRUNE_MAX_K {
+        return None;
+    }
+    let needed = k as f64 / pass.max(f64::MIN_POSITIVE);
+    let mut deepest = k;
+    while let Some(deeper) = deeper_k(deepest) {
+        deepest = deeper;
+    }
+    if pass < 1.0 && 2.0 * needed > deepest as f64 {
+        return None;
+    }
+    let mut size = k;
+    let mut scored = walk_scored(size);
+    while (size as f64) < needed {
+        size = deeper_k(size)?;
+        scored += walk_scored(size);
+    }
+    Some(scored)
 }
 
 #[pg_guard]
@@ -679,19 +777,51 @@ unsafe extern "C-unwind" fn rel_pathlist_hook(
         } else {
             index.candidates * pg_sys::cpu_index_tuple_cost
         };
-        let mut startup =
-            (index.total - index_run).max(index.startup) + (*rel).baserestrictcost.startup;
+        let mut index_read = (index.total - index_run).max(index.startup);
+        let mut scoring_cost = 0.0;
         if let Some(ordering) = &private.ordering {
-            // Scoring every candidate, then ordering the ones the query
-            // consumes (or all of them).
+            // Scoring candidates, then ordering the ones the query consumes
+            // (or all of them).
             let sorted = ordering
                 .top_k
                 .map_or(index.candidates, |k| (k as f64).min(index.candidates))
                 .max(2.0);
-            startup += index.candidates * pg_sys::cpu_operator_cost * 2.0
-                + index.candidates * sorted.log2() * pg_sys::cpu_operator_cost;
-            path.path.pathkeys = (*root).sort_pathkeys;
+            let scoring = |scored: f64| {
+                scored * pg_sys::cpu_operator_cost * 2.0
+                    + scored * sorted.log2() * pg_sys::cpu_operator_cost
+            };
+            // The rows the scan ranks must also pass the rest of the
+            // restrictions, which are applied after ranking.
+            let pass = other_selectivity(root, rel, found.clause);
+            let pruned = ordering
+                .top_k
+                .filter(|_| prunable(found.index_oid, found.query.as_deref(), ordering))
+                .and_then(|k| pruned_scored(k, pass))
+                .map(|scored| scored.min(index.candidates));
+            scoring_cost = match pruned {
+                // A pruned walk reads the postings of the candidates it
+                // scores and skips the rest, in place of reading them all.
+                Some(scored) => {
+                    let share = scored / index.candidates.max(1.0);
+                    let pages = (index.pages * share).max(index.pages.min(2.0));
+                    index_read = index.startup
+                        + pages * index.random_page_cost
+                        + scored * pg_sys::cpu_index_tuple_cost;
+                    scoring(scored)
+                }
+                None => scoring(index.candidates),
+            };
+            // With tiebreak keys the scan supplies the score order alone and
+            // an incremental sort above it orders each run of equal scores.
+            path.path.pathkeys = if ordering.ties {
+                let mut first = PgList::<pg_sys::PathKey>::new();
+                first.push(pg_sys::list_nth((*root).sort_pathkeys, 0).cast());
+                first.into_pg()
+            } else {
+                (*root).sort_pathkeys
+            };
         }
+        let startup = index_read + (*rel).baserestrictcost.startup + scoring_cost;
         path.path.startup_cost = startup;
         path.path.total_cost =
             startup + index_run + heap_pages * cost_per_page + index.candidates * per_tuple;
@@ -1015,6 +1145,12 @@ struct ScanExec {
     /// exhaustive ranking, not block-max traversal or score projection.
     exhaustive_score_calls: usize,
     top_k_completions: usize,
+    /// The scan's qual when a walk may apply it (see [`complete`]).
+    row_filter: Option<crate::score::RowFilter>,
+    /// The k of the last walk that applied it, if one has.
+    filtered_k: Option<usize>,
+    /// Walks that applied it, cumulative across rescans.
+    filtered_walks: usize,
     fetched: usize,
     skipped_pages: usize,
     page_masks: Option<bool>,
@@ -1138,6 +1274,18 @@ unsafe extern "C-unwind" fn begin_scan(
         let runtime_limit = pg_sys::ExecInitExpr(expression(1), node.cast());
         let runtime_offset = pg_sys::ExecInitExpr(expression(2), node.cast());
         let ordered = private.ordering.is_some();
+        // A volatile qual, or one running subplans per row, is evaluated only
+        // as the executor does, once per row returned.
+        let qual = (*cscan).scan.plan.qual.cast::<pg_sys::Node>();
+        let row_filter = (ordered
+            && !qual.is_null()
+            && !(*node).ss.ps.qual.is_null()
+            && !pg_sys::contain_volatile_functions(qual)
+            && !pg_sys::contain_subplans(qual))
+        .then(|| crate::score::RowFilter {
+            qual: (*node).ss.ps.qual,
+            econtext: (*node).ss.ps.ps_ExprContext,
+        });
         let exec = ScanExec {
             private,
             clause,
@@ -1169,6 +1317,9 @@ unsafe extern "C-unwind" fn begin_scan(
             scored: None,
             exhaustive_score_calls: 0,
             top_k_completions: 0,
+            row_filter,
+            filtered_k: None,
+            filtered_walks: 0,
             fetched: 0,
             skipped_pages: 0,
             page_masks: None,
@@ -1216,8 +1367,10 @@ unsafe fn gather(exec: &mut ScanExec) {
             )
         });
         let top_k = exec.private.ordering.as_ref().and_then(|o| o.top_k);
+        let ties = exec.private.ordering.as_ref().is_some_and(|o| o.ties);
         if let Some(k) = top_k
             && k <= crate::score::PRUNE_MAX_K
+            && !ties
             && scorer
                 .as_ref()
                 .is_some_and(|scorer| scorer.scores_nothing() && !scorer.walks_unscored())
@@ -1227,7 +1380,8 @@ unsafe fn gather(exec: &mut ScanExec) {
             // stopwords need not collect and sort its million matches. A
             // conjunction or phrase of them is walked by ordinal instead
             // (`top_rows`): the stream seeks every word's cursor per
-            // candidate, the walk folds whole chunks.
+            // candidate, the walk folds whole chunks. With tiebreak keys
+            // every match ties with the k-th, so all are needed.
             let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
             let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
             if !stream.recheck {
@@ -1256,7 +1410,9 @@ unsafe fn gather(exec: &mut ScanExec) {
         }
         if let Some(k) = top_k
             && k <= crate::score::PRUNE_MAX_K
-            && let Some(top) = scorer.as_mut().and_then(|scorer| top_rows(exec, scorer, k))
+            && let Some(top) = scorer
+                .as_mut()
+                .and_then(|scorer| top_rows(exec, scorer, k, ties, None))
         {
             exec.candidates = top.complete.then_some(top.rows.len());
             if top.streamed {
@@ -1294,15 +1450,25 @@ unsafe fn gather(exec: &mut ScanExec) {
 ///
 /// A query the scorer cannot prune, such as a phrase, is scored from the
 /// candidate stream instead, holding only the top `k`.
+///
+/// With `ties` the rows tied with the k-th score and the row after them are
+/// kept too (see [`engine::walk::TopRows`]); the scorer then never asks for
+/// a zero fill. With a `filter` the walk keeps only rows that pass it; a
+/// query it cannot prune is then left to the caller.
 unsafe fn top_rows(
     exec: &ScanExec,
     scorer: &mut crate::score::IndexScorer,
     k: usize,
+    ties: bool,
+    filter: Option<crate::score::RowFilter>,
 ) -> Option<crate::score::TopK> {
-    let Some(mut top) = scorer.top_k(k) else {
+    let Some(mut top) = scorer.top_k(k, ties, filter) else {
+        if filter.is_some() {
+            return None;
+        }
         let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
         let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
-        return scorer.top_k_streamed(&mut stream, k);
+        return scorer.top_k_streamed(&mut stream, k, ties);
     };
     if top.zero_fill {
         let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
@@ -1469,24 +1635,33 @@ unsafe fn complete(exec: &mut ScanExec) {
         // same score, send the parent past k. The same scorer's top 4k, 16k
         // and so on extend the rows already emitted, so the search deepens
         // before it gives up pruning and scores every match.
-        let deeper = exec.pruned_k.saturating_mul(4).max(40);
-        if exec.pruned_k > 0 && deeper <= crate::score::PRUNE_MAX_K {
+        let ties = ordering.ties;
+        let first_k = ordering.top_k.unwrap_or(exec.pruned_k);
+        if exec.pruned_k > 0
+            && exec.filtered_k.is_none()
+            && let Some(deeper) = deeper_k(exec.pruned_k)
+        {
             let rows = if scorer.scores_nothing() && !scorer.walks_unscored() {
-                let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
-                let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
-                (!stream.recheck).then(|| {
-                    let mut rows = Vec::with_capacity(deeper);
-                    while rows.len() < deeper {
-                        match stream.next() {
-                            Some(tid) => rows.push((0.0_f32, tid)),
-                            None => break,
+                if ties {
+                    // Every match ties at zero: score them all below.
+                    None
+                } else {
+                    let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
+                    let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+                    (!stream.recheck).then(|| {
+                        let mut rows = Vec::with_capacity(deeper);
+                        while rows.len() < deeper {
+                            match stream.next() {
+                                Some(tid) => rows.push((0.0_f32, tid)),
+                                None => break,
+                            }
                         }
-                    }
-                    let complete = rows.len() < deeper;
-                    (rows, complete)
-                })
+                        let complete = rows.len() < deeper;
+                        (rows, complete)
+                    })
+                }
             } else {
-                top_rows(exec, &mut scorer, deeper).map(|top| {
+                top_rows(exec, &mut scorer, deeper, ties, None).map(|top| {
                     if top.streamed {
                         exec.exhaustive_score_calls += top.scored;
                     }
@@ -1502,6 +1677,36 @@ unsafe fn complete(exec: &mut ScanExec) {
                 exec.next = 0;
                 exec.pruned = !complete;
                 exec.pruned_k = deeper;
+                return;
+            }
+        }
+        // Even the deepest walk held too few rows passing the rest of the
+        // restrictions, which reject the best-ranked rows. A walk that
+        // applies them as it admits rows finds the best k that pass, where
+        // the scan would otherwise score every candidate. Its rows that the
+        // parent already has are the best of those that pass, as everything
+        // emitted so far was a prefix of the ranking.
+        let filtered_k = match exec.filtered_k {
+            None => Some(first_k),
+            Some(k) => deeper_k(k),
+        };
+        if let Some(filter) = exec.row_filter
+            && exec.pruned_k > 0
+            && let Some(k) = filtered_k
+            && (!scorer.scores_nothing() || scorer.walks_unscored())
+        {
+            exec.filtered_walks += 1;
+            exec.filtered_k = Some(k);
+            if let Some(top) = top_rows(exec, &mut scorer, k, ties, Some(filter)) {
+                let mut rows = top.rows;
+                crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);
+                rows.retain(|(_, tid)| !consumed.contains(tid));
+                exec.scores = rows.iter().map(|(score, _)| *score).collect();
+                exec.tids = rows.iter().map(|(_, tid)| *tid).collect();
+                exec.sorted = exec.tids.len();
+                exec.next = 0;
+                exec.pruned = !top.complete;
+                exec.pruned_k = k;
                 return;
             }
         }
@@ -2196,6 +2401,7 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
             exec.sorted = 0;
             exec.pruned = false;
             exec.pruned_k = 0;
+            exec.filtered_k = None;
             exec.emitted.clear();
             exec.recheck = false;
             exec.candidates = None;
@@ -2235,6 +2441,9 @@ unsafe extern "C-unwind" fn explain(
             pg_sys::ExplainPropertyText(c"Order".as_ptr(), c"score DESC".as_ptr(), es);
             if let Some(k) = exec.private.ordering.as_ref().and_then(|o| o.top_k) {
                 pg_sys::ExplainPropertyInteger(c"Top K".as_ptr(), std::ptr::null(), k as i64, es);
+                if exec.private.ordering.as_ref().is_some_and(|o| o.ties) {
+                    pg_sys::ExplainPropertyText(c"Top K Ties".as_ptr(), c"kept".as_ptr(), es);
+                }
             }
         }
         if (*es).analyze {
@@ -2510,6 +2719,12 @@ unsafe extern "C-unwind" fn explain(
                     c"Top-K Completions".as_ptr(),
                     std::ptr::null(),
                     exec.top_k_completions as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Filtered Walks".as_ptr(),
+                    std::ptr::null(),
+                    exec.filtered_walks as i64,
                     es,
                 );
             }

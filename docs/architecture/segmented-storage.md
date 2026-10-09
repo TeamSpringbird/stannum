@@ -682,19 +682,38 @@ gets a scorer of its own; `stannum.max_expansion_terms` (default 65,536)
 bounds their number per query, past which ranking fails with SQLSTATE 54000
 rather than scoring some of them. `EXPLAIN ANALYZE` reports
 `Pruning: ordinal`, `Scored Candidates`, `Positions Checked`,
-`Top-K Completions` and `Exhaustive Score Calls`; the last two are cumulative
-across rescans.
+`Top-K Completions`, `Filtered Walks` and `Exhaustive Score Calls`; the last
+three are cumulative across rescans.
+
+Sort keys after the score (`ORDER BY score DESC, id`) break its ties. The scan
+then provides the score order alone and an incremental sort above it orders
+each run of equal scores. Its top k keeps every row tied with the k-th score
+and the first row below them (`Top K Ties: kept`): the incremental sort reads
+up to that row to learn the tied run ended. The walk's bar is that row, so a
+row tying the k-th score is never skipped, and the answer is the exhaustive
+one whatever the later keys and their NULLs.
 
 Residual SQL filters run after ranking, on the rows the scan returns. The
 walk checks each row's snapshot visibility as it enters the top k, so the
 dead version an update leaves beside its successor never takes a place. When
 the parent still reads past the pruned top k (the filter rejects rows, or
 top rows were deleted), the scan deepens the same pruned search, to four
-times the previous depth and at least 40 rows, up to 4,096, before it scores
-every remaining match. Each deepening is a `Top-K Completion`. Rows already
-emitted are not repeated, and documents indexed since the top k was built can
-rank into the completed ordering, so a completion is not resumed by
-position.
+times the previous depth and at least 40 rows, up to 4,096. Each deepening is
+a `Top-K Completion`. If the deepest walk still falls short, a filter that is
+neither volatile nor runs subplans is applied by one more walk as it admits
+rows (a `Filtered Walk`), reading each admitted row from the heap, so its top
+k is the best that pass; otherwise the scan scores every remaining match.
+Rows already emitted are not repeated, and documents indexed since the top k
+was built can rank into the completed ordering, so a completion is not
+resumed by position.
+
+The planner prices a pruned scan by the candidates its walks are expected to
+score (fitted to the comparison kit's queries: about 80 for a top 10, 9,000
+for a top 2,560), deepening until a walk is expected to hold k rows passing the
+other restrictions. When even the deepest walk is not expected to hold twice
+that many, it is priced as scoring every candidate, and a selective filter
+keeps its btree plan: at a million rows, `id <= K` switches to the ranked scan
+near K = 8,000.
 
 A ranked scan keeps its scorer for as long as it lives, under its own
 identity, with the score of every row it ranked: a cursor fetched across
