@@ -9,7 +9,7 @@
 //! ```text
 //! cargo run -p bench --release --bin tinshape -- --dump DIR --out DIR \
 //!     [--block 128] [--no-paged] [--no-ef-groups] [--no-sparse] [--fixed-tf] [--grid-density N] \
-//!     [--grid-min-postings N] [--subset ROWS [--rows-per-page R]] \
+//!     [--grid-min-postings N] [--inline-lengths MAXDF] [--subset ROWS [--rows-per-page R]] \
 //!     [--no-verify] [--no-write] [--label NAME] \
 //!     [--trace trace.tsv --expect pg.tsv [--ranked] [--k 10] [--repeat 3] \
 //!      [--per-query FILE]]
@@ -93,6 +93,9 @@ fn args() -> Args {
             "--no-ef-groups" => a.options.ef_groups = false,
             "--no-sparse" => a.options.sparse = false,
             "--fixed-tf" => a.options.adaptive_tf = false,
+            "--inline-lengths" => {
+                a.options.inline_lengths_max_df = value(&mut it).parse().unwrap_or_else(|_| usage())
+            }
             "--grid-min-postings" => {
                 a.options.grid_min_postings = value(&mut it).parse().unwrap_or_else(|_| usage())
             }
@@ -207,6 +210,7 @@ fn report(args: &Args, converted: &[Converted], dump: &Dump) -> String {
         s.footer += t.footer;
         s.payload += t.payload;
         s.tf += t.tf;
+        s.inline_lengths += t.inline_lengths;
         s.positions += t.positions;
         s.docset += t.docset;
         s.lengths += t.lengths;
@@ -261,7 +265,7 @@ fn report(args: &Args, converted: &[Converted], dump: &Dump) -> String {
     let _ = writeln!(md, "## Bytes per area\n");
     let _ = writeln!(md, "| area | STN3 (MB) | TNS1 (MB) | TNS1 / STN3 |");
     let _ = writeln!(md, "| --- | ---: | ---: | ---: |");
-    let tns_postings = s.record_headers + s.footer + s.payload + s.tf;
+    let tns_postings = s.record_headers + s.footer + s.payload + s.tf + s.inline_lengths;
     let rows: Vec<(&str, u64, u64)> = vec![
         ("header / metadata", stn3_header, s.header),
         ("term map (dictionary)", stn3_dict, s.dictionary),
@@ -277,6 +281,7 @@ fn report(args: &Args, converted: &[Converted], dump: &Dump) -> String {
             s.record_headers + s.footer,
         ),
         ("  TF tail", 0, s.tf),
+        ("  inline lengths (rare terms)", 0, s.inline_lengths),
         ("positions", stn3_pay, s.positions),
         (
             "document table / document set",
@@ -788,6 +793,29 @@ fn run() -> Result<bool, String> {
     let dump = Dump::open(&args.dump)?;
     std::fs::create_dir_all(&args.out).map_err(|e| e.to_string())?;
     let mut converted = Vec::new();
+    // TNS_LIST_TERMS=MIN,MAX,EVERY prints every EVERY-th lowercase term of
+    // MIN to MAX postings, with its df, and stops: a lab aid for building
+    // single-term traces by document frequency.
+    if let Ok(spec) = std::env::var("TNS_LIST_TERMS") {
+        let v: Vec<u32> = spec.split(',').map(|x| x.parse().unwrap()).collect();
+        let reader = segment::segment::Reader::parse(&dump.segments[0].blob).unwrap();
+        let dictionary = reader.dictionary().unwrap();
+        let mut i = 0u32;
+        for block in 0..dictionary.index().blocks() {
+            for (term, entry, _) in dictionary.block_sizes(block).unwrap() {
+                if entry.df >= v[0]
+                    && entry.df <= v[1]
+                    && term.chars().all(|c| c.is_ascii_lowercase())
+                {
+                    i += 1;
+                    if i % v[2] == 0 {
+                        println!("{term}	{}", entry.df);
+                    }
+                }
+            }
+        }
+        return Ok(true);
+    }
     let mut dump = dump;
     if let Some(n) = args.subset {
         for dumped in &mut dump.segments {

@@ -51,6 +51,8 @@ use crate::{Error, Result, varint};
 
 pub const FORM_SPARSE: u8 = 1;
 pub const FORM_GROUPED: u8 = 2;
+/// Set in a record's form when it carries [`InlineLengths`].
+pub const FORM_LENGTHS: u8 = 0x80;
 
 pub const KIND_GRID: u8 = 0;
 pub const KIND_EF: u8 = 1;
@@ -83,6 +85,9 @@ pub struct Options {
     /// smaller term whole costs microseconds, and a small table, every
     /// term of which is small, would pay for grids it never needs.
     pub grid_min_postings: u32,
+    /// A term of at most this many postings carries its documents' lengths
+    /// in its record ([`InlineLengths`]): its top k reads no DL sidecar.
+    pub inline_lengths_max_df: u32,
 }
 
 impl Default for Options {
@@ -95,6 +100,7 @@ impl Default for Options {
             adaptive_tf: true,
             grid_density: 64,
             grid_min_postings: 4096,
+            inline_lengths_max_df: 64,
         }
     }
 }
@@ -114,11 +120,13 @@ pub struct Stats {
     pub kind_bytes: [usize; 3],
     /// Groups made grids by [`Options::grid_density`].
     pub forced: usize,
+    /// Bytes of inline lengths ([`InlineLengths`]).
+    pub lengths: usize,
 }
 
 impl Stats {
     pub fn total(&self) -> usize {
-        self.header + self.footer + self.payload + self.tf
+        self.header + self.footer + self.payload + self.tf + self.lengths
     }
 }
 
@@ -205,9 +213,15 @@ pub fn encode_reusing<'r>(
     debug_assert!(slots.windows(2).all(|w| w[0] < w[1]));
     let mut stats = Stats::default();
     let start = out.len();
+    let inline = slots.len() as u64 <= u64::from(options.inline_lengths_max_df);
     if slots.len() == 1 {
         varint::put(out, u64::from(slots[0]));
         stats.payload = out.len() - start;
+        if inline {
+            let before = out.len();
+            varint::put(out, u64::from(lengths[0]));
+            stats.lengths = out.len() - before;
+        }
         stats.sparse = true;
         return stats;
     }
@@ -254,16 +268,27 @@ pub fn encode_reusing<'r>(
     // A term with a group dense enough to be a grid stays grouped.
     let use_sparse = options.sparse && grouped_stats.forced == 0 && sparse.len() <= grouped.len();
     let payload = if use_sparse { &sparse } else { &grouped };
-    out.push(if use_sparse {
-        FORM_SPARSE
-    } else {
-        FORM_GROUPED
-    });
+    let mut inline_bytes = Vec::new();
+    if inline {
+        encode_inline_lengths(lengths, &mut inline_bytes);
+    }
+    out.push(
+        if use_sparse {
+            FORM_SPARSE
+        } else {
+            FORM_GROUPED
+        } | if inline { FORM_LENGTHS } else { 0 },
+    );
     varint::put(out, footer.len() as u64);
     varint::put(out, payload.len() as u64);
+    if inline {
+        varint::put(out, inline_bytes.len() as u64);
+    }
     stats.header = out.len() - start;
     out.extend_from_slice(&footer);
     out.extend_from_slice(payload);
+    out.extend_from_slice(&inline_bytes);
+    stats.lengths = inline_bytes.len();
     out.extend_from_slice(&tf_bytes);
     stats.footer = footer.len();
     stats.payload = payload.len();
@@ -472,6 +497,65 @@ pub struct Postings<'a> {
     pub containers_at: usize,
     pub tf: &'a [u8],
     pub tf_at: usize,
+    /// The documents' lengths, for a term of few postings.
+    pub lengths: Option<InlineLengths<'a>>,
+}
+
+/// A rare term's documents' lengths, in posting order: a base, a width
+/// and the lengths less the base packed at it.
+///
+/// ```text
+/// lengths := base varint, width u8, (length - base) packed at width
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct InlineLengths<'a> {
+    base: u32,
+    width: u32,
+    packed: &'a [u8],
+    /// Where they start in the record.
+    pub at: usize,
+}
+
+impl<'a> InlineLengths<'a> {
+    fn parse(bytes: &'a [u8], at: usize, df: u32) -> Result<Self> {
+        let mut p = 0;
+        let base = varint::get_u32(bytes, &mut p)?;
+        let width = u32::from(*bytes.get(p).ok_or(Error::Truncated)?);
+        p += 1;
+        if width > 32 || bytes.len() - p != bits::packed_len(df as usize, width) {
+            return Err(Error::Corrupt("inline lengths"));
+        }
+        Ok(Self {
+            base,
+            width,
+            packed: &bytes[p..],
+            at,
+        })
+    }
+
+    /// The length of posting `index`'s document.
+    #[inline]
+    pub fn get(&self, index: u32) -> Result<u32> {
+        Ok(self.base + bits::get(self.packed, index as usize, self.width)?)
+    }
+
+    /// Where posting `index`'s length lies in the record.
+    pub fn at_of(&self, index: u32) -> usize {
+        self.at + (index as usize * self.width as usize) / 8
+    }
+}
+
+fn encode_inline_lengths(lengths: &[u32], out: &mut Vec<u8>) {
+    let base = lengths.iter().copied().min().unwrap_or(0);
+    let range = lengths.iter().map(|l| l - base).max().unwrap_or(0);
+    let width = 32 - range.leading_zeros();
+    varint::put(out, u64::from(base));
+    out.push(width as u8);
+    let mut w = BitWriter::new();
+    for l in lengths {
+        w.put(l - base, width);
+    }
+    out.extend_from_slice(&w.finish());
 }
 
 impl<'a> Postings<'a> {
@@ -483,10 +567,23 @@ impl<'a> Postings<'a> {
         if df == 1 {
             let mut at = 0;
             let slot = varint::get_u32(record, &mut at)?;
+            let lengths = if at < record.len() {
+                let from = at;
+                let length = varint::get_u32(record, &mut at)?;
+                Some(InlineLengths {
+                    base: length,
+                    width: 0,
+                    packed: &[],
+                    at: from,
+                })
+            } else {
+                None
+            };
             if slot >= geometry.slots || at != record.len() {
                 return Err(Error::Corrupt("single posting"));
             }
             return Ok(Self {
+                lengths,
                 df,
                 form: Form::Single(slot),
                 footer: &[],
@@ -502,14 +599,30 @@ impl<'a> Postings<'a> {
         let mut at = 1;
         let footer_len = varint::get_u32(record, &mut at)? as usize;
         let payload_len = varint::get_u32(record, &mut at)? as usize;
+        let lengths_len = if form & FORM_LENGTHS != 0 {
+            varint::get_u32(record, &mut at)? as usize
+        } else {
+            0
+        };
+        let form = form & !FORM_LENGTHS;
         let footer_at = at;
         let payload_at = footer_at + footer_len;
-        let tf_at = payload_at + payload_len;
+        let lengths_at = payload_at + payload_len;
+        let tf_at = lengths_at + lengths_len;
         if tf_at > record.len() {
             return Err(Error::Truncated);
         }
         let footer = &record[footer_at..payload_at];
-        let payload = &record[payload_at..tf_at];
+        let payload = &record[payload_at..lengths_at];
+        let lengths = if lengths_len > 0 {
+            Some(InlineLengths::parse(
+                &record[lengths_at..tf_at],
+                lengths_at,
+                df,
+            )?)
+        } else {
+            None
+        };
         let mut containers_at = 0;
         let form = match form {
             FORM_SPARSE => {
@@ -535,6 +648,7 @@ impl<'a> Postings<'a> {
             containers_at,
             tf: &record[tf_at..],
             tf_at,
+            lengths,
         })
     }
 
@@ -955,6 +1069,7 @@ mod tests {
                             adaptive_tf,
                             grid_density,
                             grid_min_postings: 0,
+                            inline_lengths_max_df: if adaptive_tf { 8 } else { 0 },
                         });
                     }
                 }

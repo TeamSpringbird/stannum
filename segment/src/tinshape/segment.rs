@@ -57,6 +57,8 @@ pub struct BuildStats {
     pub header: u64,
     pub dictionary: u64,
     pub record_headers: u64,
+    /// Rare terms' inline lengths.
+    pub inline_lengths: u64,
     pub footer: u64,
     pub payload: u64,
     pub tf: u64,
@@ -189,6 +191,7 @@ impl Builder {
         s.footer += stats.footer as u64;
         s.payload += stats.payload as u64;
         s.tf += stats.tf as u64;
+        s.inline_lengths += stats.lengths as u64;
         s.blocks += stats.blocks as u64;
         s.positions += positions.len() as u64;
         if ranks.len() == 1 {
