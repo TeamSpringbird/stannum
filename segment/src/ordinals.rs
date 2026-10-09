@@ -859,17 +859,28 @@ impl<'a> Ordinals<'a> {
         if let Body::List(list) = &self.body {
             return Ok(list.clone());
         }
+        // The count is unverified: reserve no more than the chunks can hold.
+        let chunks = self.chunk_count();
+        let mut out = Vec::with_capacity((self.count as usize).min(chunks * CHUNK as usize));
+        self.each_chunk(|key, words| {
+            members(words, u32::from(key) << 16, &mut out);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Calls `f` with the key and members of every chunk the stream
+    /// occupies, in ascending key order.
+    pub fn each_chunk(&self, mut f: impl FnMut(u16, &Words) -> Result<()>) -> Result<()> {
         let mut keys = BTreeSet::new();
         self.keys(&mut keys);
-        // The count is unverified: reserve no more than the chunks can hold.
-        let mut out = Vec::with_capacity((self.count as usize).min(keys.len() * CHUNK as usize));
         let mut at = 0;
         let mut words = Box::new([0u64; WORDS]);
         for key in keys {
             self.combine(key, &mut at, Op::Assign, &mut words)?;
-            members(&words, u32::from(key) << 16, &mut out);
+            f(key, &words)?;
         }
-        Ok(out)
+        Ok(())
     }
 }
 

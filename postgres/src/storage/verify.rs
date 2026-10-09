@@ -719,7 +719,7 @@ unsafe extern "C-unwind" fn heap_callback(
             return;
         }
         let text = String::from_datum(*values, false).expect("non-null indexed text");
-        if tokens_of(&state.tokenizer, &text).is_empty() {
+        if tokens_of(&state.tokenizer, &text).next().is_none() {
             // Empty documents are dropped at fold time, so their presence
             // in the index is not required.
             return;

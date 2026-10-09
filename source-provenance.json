@@ -148,6 +148,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6."
     },
+    "benchmarks/local/timeseries.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Added on branch bench/long-run on 2026-09-27."
+    },
     "benchmarks/local/workload.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6. Moved from benchmarks/local/mock-run.sh, merged with the duplicate runner in benchmarks/local/run150m.sh (now a wrapper)."
@@ -646,6 +650,10 @@
       "owner": "ben",
       "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
     },
+    "postgres/src/heap_probe.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a counting allocator for pg_test builds, written for Stannum."
+    },
     "postgres/src/highlight.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/highlight.rs",
@@ -826,6 +834,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 7372fc6fb8f0bbf469f1b6b3340dbe8af787bcdf."
     },
+    "segment/src/dead.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: dead lists decoded as a bitmap over segment ordinals, written for Stannum."
+    },
     "segment/src/dictionary.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -919,6 +931,14 @@
     "segment/tests/buffer_cost.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "segment/tests/record_memory.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the peak-memory test of grouping a document's tokens by term."
+    },
+    "segment/tests/record_throughput.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a timing probe of grouping tokenized documents by term."
     },
     "tinql/Cargo.toml": {
       "owner": "mixed",
@@ -1081,6 +1101,10 @@
     "tinql/tests/deep_queries.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: oversized and deeply nested query tests."
+    },
+    "tinql/tests/tokenized_doc_cost.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a timing probe of tokenizing short documents for exact evaluation."
     },
     "tokenizer/Cargo.toml": {
       "owner": "planetscale",

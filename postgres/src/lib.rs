@@ -11,6 +11,8 @@ mod am;
 mod bm25;
 mod customscan;
 mod fold;
+#[cfg(feature = "pg_test")]
+mod heap_probe;
 mod highlight;
 mod highlight_udfs;
 mod match_positions;
@@ -5040,6 +5042,175 @@ mod tests {
         assert_clean("direct_merge_cancel_idx");
     }
 
+    type Counter<T> = std::rc::Rc<std::cell::Cell<T>>;
+
+    /// Queues a cancel at the first merge checkpoint a statement reaches.
+    /// Returns whether it was queued, the interrupt holdoff there, and how
+    /// many merge checkpoints ran after it.
+    fn cancel_at_first_merge_checkpoint() -> (Counter<bool>, Counter<u32>, Counter<u32>) {
+        use std::{cell::Cell, rc::Rc};
+        let queued = Rc::new(Cell::new(false));
+        let holdoff = Rc::new(Cell::new(0));
+        let after = Rc::new(Cell::new(0));
+        let (q, h, a) = (queued.clone(), holdoff.clone(), after.clone());
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name != "merge:checkpoint" && name != "maintenance:checkpoint" {
+                return;
+            }
+            if q.replace(true) {
+                a.set(a.get() + 1);
+            } else {
+                unsafe {
+                    h.set(pg_sys::InterruptHoldoffCount);
+                    pg_sys::QueryCancelPending = 1;
+                    pg_sys::InterruptPending = 1;
+                }
+            }
+        })));
+        (queued, holdoff, after)
+    }
+
+    #[pg_test]
+    fn a_canceled_build_stops_compacting_at_the_next_merge_checkpoint() {
+        // Twenty build segments and a tier factor too high for any tier to
+        // fill: the build's only merge is the compaction at its end.
+        Spi::run(
+            "CREATE TABLE build_cancel(id int, body text);
+             INSERT INTO build_cancel SELECT n, (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 20) k) FROM generate_series(1, 400) n;
+             SET LOCAL stannum.build_segment_docs = 20;
+             SET LOCAL stannum.merge_tier_factor = 64;",
+        )
+        .unwrap();
+        let (queued, holdoff, after) = cancel_at_first_merge_checkpoint();
+        Spi::run(
+            "DO $$BEGIN
+            CREATE INDEX build_cancel_idx ON build_cancel USING stannum(body);
+            RAISE EXCEPTION 'the build was not canceled';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(queued.get(), "the build reached no merge checkpoint");
+        assert_eq!(
+            (holdoff.get(), after.get()),
+            (0, 0),
+            "a build merges with interrupts deliverable and stops at the checkpoint that sees the cancel"
+        );
+        assert!(
+            Spi::get_one::<bool>("SELECT to_regclass('build_cancel_idx') IS NULL")
+                .unwrap()
+                .unwrap()
+        );
+        Spi::run("CREATE INDEX build_cancel_idx ON build_cancel USING stannum(body)").unwrap();
+        assert_eq!(
+            value("SELECT count(*) FROM stannum.segment_info('build_cancel_idx')"),
+            1
+        );
+        assert_clean("build_cancel_idx");
+    }
+
+    #[pg_test]
+    fn a_canceled_insert_stops_the_directory_bound_merge_at_the_next_checkpoint() {
+        // One segment per insert and no budgeted merges: 97 inserts leave the
+        // on-disk directory full (96 entries) and one document buffered, so
+        // the next fold must first merge the two smallest entries.
+        Spi::run(
+            "CREATE TABLE bound_cancel(id int, body text);
+             CREATE INDEX bound_cancel_idx ON bound_cancel USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.max_merge_docs = 0;
+             SET LOCAL stannum.deferred_merge_docs = 0;
+             INSERT INTO bound_cancel SELECT n, 'needle ' || (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 20) k) FROM generate_series(1, 97) n;",
+        )
+        .unwrap();
+        let entries = "SELECT count(*) FROM stannum.segment_info('bound_cancel_idx') WHERE kind = 'immutable'";
+        assert_eq!(value(entries), 96);
+        let (queued, holdoff, after) = cancel_at_first_merge_checkpoint();
+        Spi::run(
+            "DO $$BEGIN
+            INSERT INTO bound_cancel VALUES (98, 'needle w98');
+            RAISE EXCEPTION 'the insert was not canceled';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert!(queued.get(), "the insert reached no merge checkpoint");
+        assert_eq!(
+            (holdoff.get(), after.get()),
+            (0, 0),
+            "the directory-bound merge runs with interrupts deliverable and stops at the checkpoint that sees the cancel"
+        );
+        Spi::run("SET LOCAL enable_seqscan = off").unwrap();
+        assert_eq!(value(entries), 96);
+        assert_eq!(
+            value("SELECT count(*) FROM bound_cancel WHERE body ==> 'needle'"),
+            97
+        );
+        Spi::run("INSERT INTO bound_cancel VALUES (98, 'needle w98')").unwrap();
+        assert_eq!(value(entries), 96);
+        assert_eq!(
+            value("SELECT count(*) FROM bound_cancel WHERE body ==> 'needle'"),
+            98
+        );
+        let index = unsafe { pgrx::PgRelation::open_with_name("bound_cancel_idx") }.unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("bound_cancel_idx");
+    }
+
+    /// Every segment of `index` as it lies on disk (its placement, counts,
+    /// generation and the digest of its bytes), and the relation's size.
+    fn build_digest(index: &str) -> String {
+        Spi::get_one::<String>(&format!(
+            "SELECT string_agg(concat_ws(',', root_block, docs, sum_doc_lengths, total_pages,
+                    generation, md5(tests.segment_blob('{index}'::regclass::oid, ordinal))),
+                    ';' ORDER BY ordinal)
+                    || ' size ' || pg_relation_size('{index}')
+             FROM stannum.segment_info('{index}')"
+        ))
+        .unwrap()
+        .unwrap()
+    }
+
+    #[pg_test]
+    fn index_builds_are_byte_for_byte_reproducible() {
+        // Tier merges while the build writes its segments, trimmed to a small
+        // merge cap, then the compaction and packing that end a build: the
+        // segments, their bytes and their pages are those recorded here from
+        // the build that merged under the meta lock. The uncapped build
+        // compacts to one segment.
+        Spi::run(
+            "CREATE TABLE reproducible(id int, body text);
+             INSERT INTO reproducible SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 1009), ' ')
+             FROM generate_series(1, 30) k) FROM generate_series(1, 6000) n;
+             SET LOCAL stannum.build_segment_docs = 150;",
+        )
+        .unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(200 << 10));
+        Spi::run("CREATE INDEX reproducible_capped ON reproducible USING stannum(body)").unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(None);
+        Spi::run("CREATE INDEX reproducible_whole ON reproducible USING stannum(body)").unwrap();
+        assert_eq!(
+            build_digest("reproducible_capped"),
+            "56,900,27900,15,9,ae0c93790dc792b76cefcb5ac997350b;\
+             102,900,27900,15,16,dd5b8d00ea07c3c5e74a4efedb3d3436;\
+             78,900,27900,15,23,89ce88852f2b101249dde1f7636bafc0;\
+             62,900,27900,15,30,5a8e51148ea4c6c288d60f736cb7ee52;\
+             30,900,27900,15,37,13a5b66972e1f6b71bc78fed2aa12f9e;\
+             14,900,27900,15,44,6a7c5b6ce2cecc129f0ef094f9f531e6;\
+             2,600,18600,11,47,ce729ed109fa944b0e16c29f9a604554 size 901120"
+        );
+        assert_eq!(
+            build_digest("reproducible_whole"),
+            "2,6000,186000,115,46,d6398d2a106f33c3f02a604d8a8bba58 size 966656"
+        );
+        assert_clean("reproducible_capped");
+        assert_clean("reproducible_whole");
+    }
+
     #[pg_test]
     fn insert_defers_large_merges_and_cleanup_finishes_them() {
         Spi::run(
@@ -5352,6 +5523,96 @@ mod tests {
             4
         );
         assert_clean("insert_race_idx");
+    }
+
+    /// Runs `sql` with a cancel requested at the first interrupt check of
+    /// tokenization (the `tokenize` race point), and returns the SQLSTATE it
+    /// ended with (`None`: it completed) and how many such checks ran.
+    fn cancel_at_first_tokenize_check(sql: &str) -> (Option<String>, usize) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let checks = Rc::new(Cell::new(0));
+        let counted = checks.clone();
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "tokenize" {
+                counted.set(counted.get() + 1);
+                if counted.get() == 1 {
+                    unsafe {
+                        pg_sys::QueryCancelPending = 1;
+                        pg_sys::InterruptPending = 1;
+                    }
+                }
+            }
+        })));
+        let outcome = Spi::get_one::<String>(&format!(
+            "DO $$DECLARE state text;
+             BEGIN
+                 {sql};
+                 CREATE TEMP TABLE IF NOT EXISTS tokenize_cancel_outcome(state text);
+                 TRUNCATE tokenize_cancel_outcome;
+                 INSERT INTO tokenize_cancel_outcome VALUES (NULL);
+             EXCEPTION WHEN query_canceled OR others THEN
+                 GET STACKED DIAGNOSTICS state = RETURNED_SQLSTATE;
+                 CREATE TEMP TABLE IF NOT EXISTS tokenize_cancel_outcome(state text);
+                 TRUNCATE tokenize_cancel_outcome;
+                 INSERT INTO tokenize_cancel_outcome VALUES (state);
+             END$$;
+             SELECT state FROM tokenize_cancel_outcome"
+        ));
+        crate::storage::testing::set_race_hook(None);
+        let state = outcome.unwrap_or_else(|error| panic!("{sql}: {error}"));
+        (state, checks.get())
+    }
+
+    /// Tokenizing a value for an insert, an index build or exact evaluation
+    /// checks for interrupts every 65,536 tokens, so a cancel or
+    /// `statement_timeout` ends it within that many tokens instead of after
+    /// the whole value. An insert tokenizes before it takes any index lock,
+    /// a build between heap tuples, and evaluation holds no buffer lock, so
+    /// the ERROR unwinds with nothing held.
+    #[pg_test]
+    fn tokenizing_a_large_value_answers_a_cancel() {
+        // 200,000 tokens: three checks, the first of which cancels.
+        let large = "repeat('word ', 200000)";
+        Spi::run(
+            "CREATE TABLE tokenize_insert(id int, body text);
+             CREATE INDEX tokenize_insert_idx ON tokenize_insert USING stannum(body);
+             CREATE TABLE tokenize_build(id int, body text);",
+        )
+        .unwrap();
+        Spi::run(&format!("INSERT INTO tokenize_build VALUES (1, {large})")).unwrap();
+        for sql in [
+            format!("INSERT INTO tokenize_insert VALUES (1, {large})"),
+            "CREATE INDEX tokenize_build_idx ON tokenize_build USING stannum(body)".to_owned(),
+            format!("PERFORM {large} ==> 'absent'"),
+        ] {
+            assert_eq!(
+                cancel_at_first_tokenize_check(&sql),
+                (Some("57014".to_owned()), 1),
+                "{sql}"
+            );
+        }
+        assert_eq!(value("SELECT count(*) FROM tokenize_insert"), 0);
+        assert_eq!(
+            value("SELECT count(*) FROM pg_class WHERE relname = 'tokenize_build_idx'"),
+            0
+        );
+        // Uncanceled, both complete and index the value.
+        for sql in [
+            format!("INSERT INTO tokenize_insert VALUES (1, {large})"),
+            "CREATE INDEX tokenize_build_idx ON tokenize_build USING stannum(body)".to_owned(),
+        ] {
+            Spi::run(&sql).unwrap();
+        }
+        for table in ["tokenize_insert", "tokenize_build"] {
+            assert_eq!(
+                value(&format!(
+                    "SELECT count(*) FROM {table} WHERE body ==> 'word'"
+                )),
+                1,
+                "{table}"
+            );
+        }
     }
 
     #[pg_extern]
@@ -5953,6 +6214,37 @@ mod tests {
                 );
             }
         })));
+    }
+
+    /// Queues this session's termination, as `pg_terminate_backend` does, at
+    /// the first race point named in `at` it reaches, and logs every such
+    /// race point it passes afterwards: a backend that delivers the
+    /// termination at once logs none. Driven by
+    /// postgres/tests/crash_before_publication.py.
+    #[pg_extern]
+    fn terminate_at_race_point(at: Vec<String>) {
+        let mut queued = false;
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if !at.iter().any(|at| at == name) {
+                return;
+            }
+            if queued {
+                pgrx::log!("race point {name} passed after termination");
+            } else {
+                queued = true;
+                unsafe {
+                    pg_sys::ProcDiePending = 1;
+                    pg_sys::InterruptPending = 1;
+                }
+            }
+        })));
+    }
+
+    /// The bytes of directory entry `ordinal` of the index.
+    #[pg_extern]
+    fn segment_blob(index_oid: pg_sys::Oid, ordinal: i64) -> Vec<u8> {
+        let index = unsafe { pgrx::PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _) };
+        unsafe { crate::storage::testing::segment_blob(index.as_ptr(), ordinal as usize) }
     }
 
     /// The number of runs on the index's pending list.
@@ -7087,9 +7379,9 @@ mod tests {
 
     #[pg_test]
     fn dead_sets_count_against_the_reader_cache_budget() {
-        // A segment's decoded dead list lives beside its reader for as long
-        // as the reader is cached; at 10 million documents half dead it is
-        // tens of megabytes per backend, so `stannum.reader_cache_mb` must
+        // A segment's dead list, stored and decoded, lives beside its reader
+        // for as long as the reader is cached. It grows with deletes rather
+        // than with what queries read, so `stannum.reader_cache_mb` must
         // count it, not the reader's fetched bytes alone.
         use crate::storage::testing::{READER_CACHE_BYTES, READER_CACHE_CLEARS};
         Spi::run(
@@ -7111,9 +7403,11 @@ mod tests {
         Spi::run("DELETE FROM deadweight WHERE id > 1000").unwrap();
         assert_eq!(ranked_ids("deadweight", 10), (1..=10).collect::<Vec<_>>());
         // The next view is captured with the fetched bytes as they are now,
-        // under a budget above them but below them plus the dead locations.
+        // under a budget above them but below them plus the dead list.
         let arena = crate::storage::testing::reader_arena_bytes();
-        let budget = arena + dead.len() * std::mem::size_of::<segment::Tid>() - 1;
+        let dead_bytes = crate::storage::testing::dead_list_bytes();
+        assert!(dead_bytes >= 3000 / 8, "{dead_bytes} bytes of dead lists");
+        let budget = arena + dead_bytes - 1;
         let clears = READER_CACHE_CLEARS.get();
         READER_CACHE_BYTES.set(Some(budget));
         let ids = ranked_ids("deadweight", 10);
@@ -7121,8 +7415,146 @@ mod tests {
         assert_eq!(ids, (1..=10).collect::<Vec<_>>());
         assert!(
             READER_CACHE_CLEARS.get() > clears,
-            "a {arena} byte arena and 2,000 dead locations fit in {budget} bytes"
+            "a {arena} byte arena and {dead_bytes} bytes of dead lists fit in {budget} bytes"
         );
+    }
+
+    #[pg_test]
+    fn a_backend_holds_dead_documents_in_about_a_bit_per_document() {
+        // VACUUM publishes a dead list per segment, and every backend that
+        // queries the segment decodes it. Held as a set of locations plus a
+        // vector of ordinals it cost over 20 bytes per dead row per backend:
+        // at 150 million rows with 45 million dead, eight query backends
+        // held about a gigabyte each and the server was killed for memory.
+        // A segment's dead documents must cost about a bit per document,
+        // whatever fraction of them is dead, in what a ranked query and a
+        // count hold at their peak and in what the backend keeps after.
+        const DOCS: usize = 100_000;
+        Spi::run(&format!(
+            "CREATE TABLE dead_memory(id int primary key, body text);
+             INSERT INTO dead_memory SELECT n, 'needle pad' FROM generate_series(1, {DOCS}) n;
+             CREATE INDEX dead_memory_idx ON dead_memory USING stannum(body);
+             SET LOCAL enable_seqscan = off;"
+        ))
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'dead_memory_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        // A query from empty caches: its peak and what it leaves cached.
+        let measure = || {
+            crate::storage::testing::clear_reader_caches();
+            let (ids, peak, kept) = crate::heap_probe::measure(|| {
+                let ids = ranked_ids("dead_memory", 10);
+                let count =
+                    Spi::get_one::<i64>("SELECT count(*) FROM dead_memory WHERE body ==> 'needle'")
+                        .unwrap()
+                        .unwrap();
+                (ids, count)
+            });
+            (ids, peak, kept.max(0) as usize)
+        };
+        let (_, clean_peak, clean_kept) = measure();
+        let mut report = Vec::new();
+        let mut within = true;
+        for tenths in [1, 3, 5] {
+            // Each round adds to the rows the earlier rounds deleted.
+            let dead = tids(&format!(
+                "SELECT ctid::text FROM dead_memory WHERE id % 10 < {tenths}"
+            ));
+            let index =
+                unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+            unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+            drop(index);
+            Spi::run(&format!("DELETE FROM dead_memory WHERE id % 10 < {tenths}")).unwrap();
+            let ((ids, count), peak, kept) = measure();
+            let dead = DOCS * tenths as usize / 10;
+            assert_eq!(count, (DOCS - dead) as i64);
+            assert_eq!(ids.len(), 10);
+            assert!(ids.iter().all(|id| id % 10 >= tenths), "{ids:?}");
+            let extra_peak = peak.saturating_sub(clean_peak);
+            let extra_kept = kept.saturating_sub(clean_kept);
+            // Two bits per document: the dead list as stored plus decoded.
+            let bound = DOCS / 4 + 16 * 1024;
+            within &= extra_peak <= bound && extra_kept <= bound;
+            report.push(format!(
+                "{} dead: {extra_peak} bytes more at peak ({:.1} per dead row), \
+                 {extra_kept} more kept ({:.1} per dead row), bound {bound}",
+                dead,
+                extra_peak as f64 / dead as f64,
+                extra_kept as f64 / dead as f64,
+            ));
+        }
+        assert!(
+            within,
+            "dead documents cost more than a bit each (clean: {clean_peak} peak, \
+             {clean_kept} kept):\n{}",
+            report.join("\n")
+        );
+    }
+
+    #[pg_test]
+    fn a_fold_clears_dense_dead_lists_a_word_at_a_time() {
+        // After a delete and VACUUM a segment's dead list is as dense as the
+        // deletes were. A count that cleared each dead document from each
+        // chunk it folded worked in proportion to the segment's dead
+        // documents on every count: at 5 million Wikipedia rows with 30 %
+        // deleted and vacuumed, counts ran 4.8 times slower than on the fresh
+        // index although the visibility map was all-visible again. Clearing
+        // a chunk's dead documents costs at most its `WORDS` words, whatever
+        // their number.
+        Spi::run(
+            "CREATE TABLE dense_dead(id int primary key, body text);
+             INSERT INTO dense_dead SELECT n,
+               CASE WHEN n % 5 = 0 THEN 'needle pad' ELSE 'pad' END
+               FROM generate_series(1, 6000) n;
+             CREATE INDEX dense_dead_idx ON dense_dead USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.enable_custom_scan = on;",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'dense_dead_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let dead = tids("SELECT ctid::text FROM dense_dead WHERE id % 10 < 3");
+        assert_eq!(dead.len(), 1800);
+        Spi::run("DELETE FROM dense_dead WHERE id % 10 < 3").unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        drop(index);
+        assert_eq!(
+            value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('dense_dead_idx')"),
+            1800,
+            "the dead list is published, not rewritten away"
+        );
+        for (query, like) in [
+            ("needle", "%needle%"),
+            ("pad", "%pad%"),
+            ("needle OR pad", "%pad%"),
+            ("needle AND pad", "%needle%"),
+        ] {
+            let sql = format!("SELECT count(*) FROM dense_dead WHERE body ==> '{query}'");
+            let before = crate::fold::dead_clear_steps();
+            let counted = value(&sql);
+            let steps = crate::fold::dead_clear_steps() - before;
+            assert_eq!(
+                counted,
+                value(&format!(
+                    "SELECT count(*) FROM dense_dead WHERE body LIKE '{like}'"
+                )),
+                "{query}"
+            );
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0;
+            assert_eq!(plan[0]["Plan"]["Count Strategy"], "ordinal fold", "{query}");
+            // Every document is in chunk 0, which holds all 1,800 dead.
+            assert!(
+                steps <= segment::ordinals::WORDS as u64,
+                "{query}: {steps} steps to clear 1,800 dead documents from one chunk"
+            );
+        }
     }
 
     #[pg_test]

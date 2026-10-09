@@ -17,6 +17,9 @@
 //!           positions: first absolute, then (delta - 1); terms sorted, unique
 //! ```
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+
 use crate::payload::{decode_positions, encode_positions, validate_positions};
 use crate::reader::Reader;
 use crate::{Error, Result, Tid, varint};
@@ -44,6 +47,46 @@ pub struct ForwardRecord {
     pub terms: Vec<ForwardTerm>,
 }
 
+/// Tokens between two interrupt checks while a tokenizer's output is
+/// grouped by term. A `text` value can hold hundreds of millions of tokens.
+pub const TOKENIZE_INTERRUPT_INTERVAL: u32 = 1 << 16;
+
+/// A document's positions grouped by term, sorted by term bytes.
+pub(crate) type ByTerm<'t> = BTreeMap<Cow<'t, str>, Vec<u32>>;
+
+/// Groups `(term, position)` tokens in document order by term, returning
+/// the document length and the groups. Positions must be strictly
+/// increasing. A token's text becomes a key only the first time its term
+/// occurs, and is otherwise dropped: a text borrowed from the document costs
+/// nothing and one that folding changed was owned already, so memory grows
+/// with the positions and the distinct terms, not with a string per token.
+/// `interruptible` calls [`crate::check_interrupts`] every
+/// [`TOKENIZE_INTERRUPT_INTERVAL`] tokens, for callers that hold no lock.
+pub(crate) fn group_by_term<'t, T: Into<Cow<'t, str>>>(
+    tokens: impl IntoIterator<Item = (T, u32)>,
+    interruptible: bool,
+) -> Result<(u32, ByTerm<'t>)> {
+    let mut by_term = ByTerm::new();
+    let mut doc_len = 0u32;
+    let mut last_position = None;
+    for (term, position) in tokens {
+        let term = term.into();
+        if term.is_empty() {
+            return Err(Error::EmptyTerm);
+        }
+        if last_position.is_some_and(|last| last >= position) {
+            return Err(Error::InvalidPositions);
+        }
+        last_position = Some(position);
+        doc_len += 1;
+        if interruptible && doc_len.is_multiple_of(TOKENIZE_INTERRUPT_INTERVAL) {
+            crate::check_interrupts("tokenize");
+        }
+        by_term.entry(term).or_default().push(position);
+    }
+    Ok((doc_len, by_term))
+}
+
 impl ForwardRecord {
     /// Groups a token stream by term. `tokens` are `(term, position)` in
     /// document order; positions must be strictly increasing.
@@ -51,31 +94,34 @@ impl ForwardRecord {
         tid: Tid,
         tokens: impl IntoIterator<Item = (&'t str, u32)>,
     ) -> Result<Self> {
-        let mut by_term = std::collections::BTreeMap::<&str, Vec<u32>>::new();
-        let mut doc_len = 0u32;
-        let mut last_position = None;
-        for (term, position) in tokens {
-            if term.is_empty() {
-                return Err(Error::EmptyTerm);
-            }
-            if last_position.is_some_and(|last| last >= position) {
-                return Err(Error::InvalidPositions);
-            }
-            last_position = Some(position);
-            doc_len += 1;
-            by_term.entry(term).or_default().push(position);
-        }
-        Ok(Self {
+        Ok(Self::from_groups(tid, group_by_term(tokens, false)?))
+    }
+
+    /// Groups a tokenizer's output by term, as an insert does: `(text,
+    /// position)` in document order, as [`from_tokens`](Self::from_tokens)
+    /// takes them, with each token's text borrowed from the document or
+    /// owned when folding changed it. Checks for interrupts every
+    /// [`TOKENIZE_INTERRUPT_INTERVAL`] tokens, so the caller must hold no
+    /// buffer lock.
+    pub fn from_token_stream<'t>(
+        tid: Tid,
+        tokens: impl IntoIterator<Item = (Cow<'t, str>, u32)>,
+    ) -> Result<Self> {
+        Ok(Self::from_groups(tid, group_by_term(tokens, true)?))
+    }
+
+    fn from_groups(tid: Tid, (doc_len, by_term): (u32, ByTerm<'_>)) -> Self {
+        Self {
             tid,
             doc_len,
             terms: by_term
                 .into_iter()
                 .map(|(term, positions)| ForwardTerm {
-                    term: term.to_owned(),
+                    term: term.into_owned(),
                     positions,
                 })
                 .collect(),
-        })
+        }
     }
 
     fn validate(&self) -> Result<()> {

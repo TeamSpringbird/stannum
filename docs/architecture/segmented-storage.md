@@ -74,28 +74,35 @@ not invalidate the prepared record. An identity/settings change retries
 preparation. Current reloptions are not substituted for the persisted pipeline.
 
 Text preparation is therefore outside the exclusive critical section. Folding,
-segment writes, foreground merges, and publication remain locked. In particular,
-orphan reclamation relies on that lock to exclude unpublished foreground runs;
-moving their writes outside it requires a separate reservation protocol.
+its segment write, the budgeted merges of a fold, and publication remain
+locked. Every run written without the meta lock and not yet published (a
+deferred merge, a merge that makes room in a full directory, a build's
+merges) is written under the maintenance lock instead, which orphan
+reclamation also takes, so it never frees such a run.
 
 ### Merge policy
 
 A merge walks its inputs' sorted dictionaries and merges each term's ordinal
 streams directly, dropping dead documents and recomputing statistics and score
-bounds, rather than rebuilding documents and sorting them again. Foreground
-merges call the segment crate's validated direct-merge API under the metadata
-lock. It validates every source before reusing any of it. Source blobs and dead
+bounds, rather than rebuilding documents and sorting them again. A fold's
+budgeted merges call the segment crate's validated direct-merge API under the
+metadata lock. It validates every source before reusing any of it. Source blobs and dead
 sets are retained through construction, then freed before writing the output
 run. Aggregate encoded inputs or document counts beyond `u32::MAX` fall back to
 rebuilding documents from the inputs, since deletion can still yield a
 representable output. These format bounds do not impose a peak-memory cap.
+An unlocked merge's output is the same segment as a locked one's, byte for
+byte, so a build writes the same index either way.
 
 PostgreSQL defers interrupts while the metadata buffer lock is held. Merge
 checkpoints respect that deferral; insert checks again immediately after
-publication releases the lock. An interrupted pre-publication write may leave
-orphan pages, which VACUUM reclaims. VACUUM also uses the validated API for deferred
-merges and deletion rewrites, retaining owned source blobs while unlocked. Its
-checkpoints can deliver cancellation during construction. Decoder failures are
+publication releases the lock. That is why only the budgeted merges run
+there: at most `max_merge_docs` input documents. Every other merge (VACUUM's,
+an insert's deferred merge and its merge to make room in a full directory,
+and every merge of an index build) uses the validated API on owned source
+blobs without the lock, so its checkpoints deliver a cancel or a termination
+during construction. An interrupted pre-publication write may leave orphan
+pages, which VACUUM reclaims. Decoder failures are
 reported as corruption only if the identity and every captured input still match;
 retired inputs cause a retry. Publication revalidates the complete entries and
 discards stale output. All-dead inputs have no successor. Oversized aggregate
@@ -116,6 +123,13 @@ as used in the free space map, and truncates the rest: tier merges retire
 about as many pages as they keep, and freed pages are reusable but never
 returned to the operating system, so without packing a built index would keep
 every page its merges retired.
+
+A build merges and packs without the meta lock, publishing each merge as
+VACUUM does and taking the lock only for that, so canceling or terminating a
+`CREATE INDEX` or `REINDEX` takes effect at the next merge checkpoint rather
+than after minutes of merging up to the segment byte cap. No other backend
+writes an index being built (plain builds lock it, and a concurrent build's
+index takes no inserts until it is ready), so its merges always publish.
 
 Each segment belongs to a size tier by document count: tier *t* holds
 segments with `factor^t` to `factor^(t+1) - 1` documents. The lowest full tier
@@ -147,8 +161,12 @@ insert performs that merge only when it fits the remaining budget, preferring
 a due tier merge that fits, and otherwise lets the directory grow for VACUUM
 to shrink. VACUUM merges due tiers and then the smallest entries until the
 directory fits, with no budget. The on-disk directory of 96 entries is the
-hard bound: an insert that would leave 97 entries merges the two smallest
-whatever they cost. **That is the only unbudgeted merge.** A fixed document
+hard bound: an insert that would fold into a full directory first merges its
+two smallest entries whatever they cost. **That is the only unbudgeted merge
+an insert performs.** It runs without the meta lock, under the maintenance
+lock, the way a deferred merge does, so readers and other writers proceed
+and a cancel stops it; the insert then takes the lock again, and makes room
+again should a concurrent fold have taken it. A fixed document
 ceiling is impossible alongside a fixed 96-entry directory when all 96
 entries already exceed that ceiling.
 
@@ -338,7 +356,9 @@ custom scan nodes:
 - **Count** of a Boolean combination of plain terms folds document ordinals.
   The count combines the terms' chunks word by word in fixed scratch buffers,
   visits only chunks some term occupies, clears the segment's dead documents
-  (a dead list is itself an ordinal stream) and counts set bits.
+  a word at a time from the backend's bitmap of them, so a count after a
+  large delete and VACUUM costs close to what it costs on a fresh index, and
+  counts set bits.
   The visibility map is read once, after the view; if a dead list was published
   in between, the count starts over, because a page VACUUM marked all-visible
   may hold tuples the older view still lists. Matches on pages that are not
@@ -434,16 +454,16 @@ production use.
 ### Per-backend caches
 
 A query captures the directory and the buffer state under one shared meta
-lock, then reads through five caches that live in the backend and key on
+lock, then reads through four caches that live in the backend and key on
 what the meta page says, so every backend sees the same thing without any
 coordination:
 
 - **Segment readers**, by index identity and segment generation. A reader
   keeps the byte ranges it has fetched (dictionary index, dictionary blocks,
   ordinal chunks, payload, document table) for as long as the generation is
-  in the directory, with the segment's dead list and its decoded locations.
-  Generations never repeat within an identity, and REINDEX changes the
-  identity, so a cached reader can never describe a different segment.
+  in the directory, with the segment's dead list as stored and decoded (see
+  below). Generations never repeat within an identity, and REINDEX changes
+  the identity, so a cached reader can never describe a different segment.
 - **Dictionary lookups**, per cached segment: a term's entry or its absence,
   at most 4,096 terms per segment. A statement resolves each of its terms in
   every segment several times (planning, statistics, cursor setup), and the
@@ -452,8 +472,6 @@ coordination:
   so the memo answers repeats without them. Segments are immutable, so the
   memo needs no invalidation of its own; it lives and dies with the reader.
 - **Page tables**, by identity and generation.
-- **Decoded dead lists**, by identity and generation: a dead list as
-  ascending ordinals, for the ranked walk and the count to skip.
 - **The buffer index**, by identity and buffer epoch. It is an in-memory
   inverted index of the buffer's forward records, extended from the last
   byte it covered on each use (an insert by any backend only appends), and
@@ -463,15 +481,27 @@ coordination:
   at the default caps is a few tens of milliseconds; existing backends absorb
   each record once, as it arrives.
 
-Each captured view drops the readers, page tables and decoded dead lists of
-generations its index's directory no longer holds, so a long-lived backend
+A reader decodes its segment's dead list once per published list, into a
+bitmap over the segment's ordinals with an 8 KiB block per 65,536-document
+chunk that holds a dead document and nothing for the others: at most a bit
+per document, however many are dead. The ranked walk and the count clear a
+chunk's dead documents word by word, and the scorer tests a row's ordinal.
+Every other reader of a dead list (bitmap scans, streaming scans, the count's
+fallback, `max_score`) streams it from the stored ordinal stream beside its
+own cursor. The decoded form used to be a set of heap locations plus a
+vector of ordinals, 16 to 24 bytes per dead document in every backend: after
+VACUUM published 45 million dead rows of 150 million, eight query backends
+each held about a gigabyte and the server ran out of memory.
+
+Each captured view drops the readers (with their dead lists) and page tables
+of generations its index's directory no longer holds, so a long-lived backend
 (behind a connection pooler, say) does not keep what merges retired. It then
-adds up the readers' fetched bytes, the dead lists raw and decoded, and the
+adds up the readers' fetched bytes, the dead lists stored and decoded, and the
 page tables, across every index the backend has read; past
-`stannum.reader_cache_mb` (384 MiB) all three caches are emptied together.
-Dead lists count because they grow with deletes, not with what queries read:
-a 10 million document segment with half its documents dead holds on the
-order of 100 MB of them per backend.
+`stannum.reader_cache_mb` (384 MiB) both caches are emptied together. Dead
+lists count because they grow with deletes, not with what queries read, but
+stored and decoded they take at most about a quarter of a byte per document:
+under 40 MB for 150 million documents.
 
 The buffer index is not shared between backends. Sharing it would need a
 shared-memory rendezvous (`shared_preload_libraries` or the DSM registry of
@@ -661,9 +691,10 @@ rather than a walk of the run under the meta lock.
 
 VACUUM's cleanup reclaims such orphans. It holds the index's **maintenance
 lock** (a heavyweight lock on page 0) for the whole pass; an insert's
-deferred merge takes the same lock conditionally while it writes an
-unpublished run, so the pass never frees a run that is about to be
-published. The pass computes every page the captured directory references
+deferred merge takes the same lock conditionally, and an insert's merge to
+make room in a full directory and a build's merges take it unconditionally,
+while they write an unpublished run, so the pass never frees a run that is
+about to be published. The pass computes every page the captured directory references
 (page 0, each entry's run through its page table, the page-table and
 dead-list chains, the whole buffer chain, pending runs up to their recorded
 lengths), reads the kind of every other page that existed at the capture,
@@ -776,8 +807,8 @@ inconsistent, the table is the source of truth; `REINDEX` rebuilds from it.
 - Unordered custom scans are worker-safe but do not split a scan across workers.
 - Fresh connections rebuild their own buffer index. Large buffers increase
   first-query latency; connection pooling amortizes that work.
-- Folding and insert-side merging hold the meta lock for their duration, so
-  concurrent inserts and readers wait for them. VACUUM holds it exclusively
+- Folding and a fold's budgeted merges hold the meta lock for their
+  duration, so concurrent inserts and readers wait for them. VACUUM holds it exclusively
   only to publish (a few page writes per merge, rewrite, dead list or
   reclamation), plus the scan of whatever inserts folded during its last
   unlocked round and the rewrite of the write buffer without dead records.

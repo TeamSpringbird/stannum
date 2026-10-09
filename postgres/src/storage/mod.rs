@@ -10,12 +10,16 @@
 //! works from a directory captured under a shared lock: it reads runs,
 //! builds segments and dead lists, writes their runs and walks chains with
 //! no meta lock at all, then takes the lock exclusively only to publish,
-//! after matching every input against the directory again. Readers hold it
-//! shared while copying the directory and the write buffer, then read
-//! immutable segment runs without any lock beyond the per-page content
-//! lock. Runs released by a merge or VACUUM wait on the meta page's pending
-//! list until their transaction id is older than every snapshot, so a
-//! reader holding an old directory never sees a reused page.
+//! after matching every input against the directory again. So do an
+//! insert's deferred merge and its merge to make room in a full directory,
+//! and every merge of an index build: PostgreSQL holds interrupts off under
+//! the meta page's content lock, so only the budgeted merges of a fold run
+//! under it. Readers hold it shared while copying the directory and the
+//! write buffer, then read immutable segment runs without any lock beyond
+//! the per-page content lock. Runs released by a merge or VACUUM wait on
+//! the meta page's pending list until their transaction id is older than
+//! every snapshot, so a reader holding an old directory never sees a reused
+//! page.
 //!
 //! Lock order: meta page, then buffer or run pages, then the relation
 //! extension lock. No operation holds two run pages at once.
@@ -39,6 +43,7 @@ pub mod layout;
 pub mod verify;
 pub mod wal;
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -104,7 +109,7 @@ pub const MAX_MERGE_TIER_FACTOR: i32 = 64;
 pub fn init() {
     GucRegistry::define_enum_guc(
         c"stannum.experimental_vacuum_merge_strategy",
-        c"Experimental VACUUM merge strategy for controlled comparisons",
+        c"Experimental strategy of the merges built without the metadata lock (VACUUM, deferred, build and full-directory merges), for controlled comparisons",
         c"Auto currently selects direct. Reconstruct performs full validation. Oversized inputs retain the legacy fallback regardless of this setting.",
         &VACUUM_MERGE_STRATEGY,
         GucContext::Userset,
@@ -616,11 +621,15 @@ pub unsafe fn tokenizer_by_oid(index_oid: pg_sys::Oid) -> Rc<CompiledTokenizerPi
     tokenizer_for(&unsafe { spec_by_oid(index_oid) })
 }
 
-fn tokens_of(tokenizer: &CompiledTokenizerPipeline, text: &str) -> Vec<(String, u32)> {
+/// The `(text, position)` stream the index records for `text`: each token's
+/// text borrowed from `text`, or owned when folding changed it.
+fn tokens_of<'t>(
+    tokenizer: &CompiledTokenizerPipeline,
+    text: &'t str,
+) -> impl Iterator<Item = (Cow<'t, str>, u32)> {
     tokenizer
         .tokenize(text)
-        .map(|token| (token.text.into_owned(), token.pos))
-        .collect()
+        .map(|token| (token.text, token.pos))
 }
 
 fn tid_of(pointer: pg_sys::ItemPointerData) -> Tid {
@@ -1402,8 +1411,11 @@ type TermMemo = Rc<RefCell<FxHashMap<String, Option<TermEntry>>>>;
 /// Memoized lookups per segment before the memo is emptied.
 const TERM_MEMO_LIMIT: usize = 4096;
 
-/// A segment's dead list, decoded once per backend and dead run.
-type DeadSet = Rc<BTreeSet<Tid>>;
+/// A segment's dead list, decoded once per backend and dead run into a
+/// bitmap over the segment's ordinals: at most a bit per document, however
+/// many are dead. A set of locations cost 16 to 24 bytes per dead document
+/// in every backend, a gigabyte each once VACUUM had published 45 million.
+pub(crate) type DeadSet = Rc<segment::dead::DeadDocs>;
 
 /// A segment reader kept per backend with the bytes it has fetched, plus the
 /// segment's dead list as of the directory entry it was last checked against.
@@ -1414,7 +1426,8 @@ struct CachedSegment {
     terms: TermMemo,
     dead_run: (Run, u32),
     dead: Option<Rc<Vec<u8>>>,
-    /// `dead` decoded once per dead run, for scorers that test membership.
+    /// `dead` decoded once per dead run, for the walks and counts over
+    /// ordinals and for scorers that test membership.
     dead_set: DeadSet,
 }
 
@@ -1566,10 +1579,10 @@ unsafe fn cached_segment(
     });
     let dead_set = Rc::new(match &dead {
         Some(bytes) => codec_in(
-            dead_tids(&*segment.reader, bytes),
+            segment::dead::DeadDocs::decode(bytes, segment.reader.document_count()),
             &format!("{} dead list", generation_label(entry.generation)),
         ),
-        None => BTreeSet::new(),
+        None => segment::dead::DeadDocs::default(),
     });
     SEGMENT_READERS.with_borrow_mut(|readers| {
         readers.insert(
@@ -1596,18 +1609,16 @@ fn reader_cache_budget() -> usize {
 }
 
 /// Memory a cached segment holds besides its reader's arena: the raw dead
-/// list and its decoded locations. Ascending inserts leave a `BTreeSet`'s
-/// nodes about half full, so a location costs about twice its size.
+/// list and its decoded bitmap.
 fn dead_bytes(cached: &CachedSegment) -> usize {
-    cached.dead.as_ref().map_or(0, |dead| dead.len())
-        + cached.dead_set.len() * 2 * std::mem::size_of::<Tid>()
+    cached.dead.as_ref().map_or(0, |dead| dead.capacity()) + cached.dead_set.heap_bytes()
 }
 
 /// Drops what the backend caches for segments no longer in the directory:
-/// readers with their dictionary memos and dead sets, page tables and
-/// decoded dead lists. Then empties all three caches once together they
-/// exceed `stannum.reader_cache_mb`. Live views keep their own references,
-/// so dropping here only releases what nothing else holds.
+/// readers with their dictionary memos and dead lists, and page tables.
+/// Then empties both caches once together they exceed
+/// `stannum.reader_cache_mb`. Live views keep their own references, so
+/// dropping here only releases what nothing else holds.
 ///
 /// Runs once per captured view, over at most a few thousand cache entries.
 fn trim_reader_cache(identity: u64, meta: &Meta) {
@@ -1615,8 +1626,7 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
     let live = |(id, generation): (u64, u32)| {
         id != identity || meta.segments.iter().any(|e| e.generation == generation)
     };
-    let mut bytes = crate::fold::retain_dead_ordinals(live);
-    bytes += PAGE_TABLES.with_borrow_mut(|tables| {
+    let mut bytes = PAGE_TABLES.with_borrow_mut(|tables| {
         tables.retain(|key, _| live(*key));
         tables.values().map(|table| table.len() * 4).sum::<usize>()
     });
@@ -1629,7 +1639,6 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
         if bytes > reader_cache_budget() {
             readers.clear();
             PAGE_TABLES.with_borrow_mut(HashMap::clear);
-            crate::fold::retain_dead_ordinals(|_| false);
             #[cfg(feature = "pg_test")]
             testing::READER_CACHE_CLEARS.set(testing::READER_CACHE_CLEARS.get() + 1);
         }
@@ -2255,8 +2264,11 @@ unsafe fn release_entry(index: pg_sys::Relation, meta: &mut Meta, entry: Segment
 }
 
 /// Publishes a built segment: writes its run, appends a directory entry and
-/// then spends the caller's merge budget and enforces the hard bound, so the directory
-/// never leaves this function with more than `stannum.max_segments` entries.
+/// then spends the caller's merge budget.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively, and the directory
+/// has room for the entry (see [`make_room`]).
 unsafe fn add_segment(
     index: pg_sys::Relation,
     meta: &mut Meta,
@@ -2359,20 +2371,14 @@ fn merge_candidates(docs: &[u32], factor: u32, limit: usize) -> Option<Vec<usize
 /// `limit` (`stannum.max_segments`) is a soft bound: over it, the insert
 /// performs the cheapest merge that fits the budget, whether the due tier or
 /// the smallest entries, and otherwise lets the directory grow for VACUUM to
-/// shrink. The on-disk directory of [`MAX_SEGMENTS`] entries is the hard
-/// bound: over it, the smallest `len - MAX_SEGMENTS + 1` entries (normally
-/// two) merge whatever they cost. No fixed document ceiling can also
-/// guarantee space in a fixed-size directory when every entry is already
-/// larger than that ceiling, so that merge is the only unbudgeted one.
+/// shrink. The on-disk bound of [`MAX_SEGMENTS`] entries is not this
+/// function's: an insert makes room before it folds (see [`room_candidates`]).
 fn bounded_merge_candidates(
     docs: &[u32],
     factor: u32,
     limit: usize,
     budget: u64,
 ) -> Option<Vec<usize>> {
-    if docs.len() > MAX_SEGMENTS {
-        return Some(smallest_entries(docs, MAX_SEGMENTS));
-    }
     let cost = |positions: &[usize]| positions.iter().map(|p| u64::from(docs[*p])).sum::<u64>();
     if let Some(positions) = due_tier(docs, factor)
         && cost(&positions) <= budget
@@ -2388,8 +2394,18 @@ fn bounded_merge_candidates(
     None
 }
 
-/// Applies merges within the remaining budget, and the unbudgeted merge that
-/// keeps the directory within its on-disk bound. The rest waits for VACUUM.
+/// The entries to merge so that a directory at its on-disk bound of
+/// [`MAX_SEGMENTS`] entries can take one more: the smallest
+/// `len - MAX_SEGMENTS + 2` (normally two), whatever they cost. No fixed
+/// document ceiling can also guarantee space in a fixed-size directory when
+/// every entry is already larger than that ceiling, so this merge is the
+/// only unbudgeted one an insert performs. `None` when there is room.
+fn room_candidates(docs: &[u32]) -> Option<Vec<usize>> {
+    (docs.len() >= MAX_SEGMENTS).then(|| smallest_entries(docs, MAX_SEGMENTS - 1))
+}
+
+/// Applies merges within the remaining budget. The rest waits for VACUUM or
+/// an insert's deferred merge.
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively.
@@ -2401,17 +2417,9 @@ unsafe fn maintain(index: pg_sys::Relation, meta: &mut Meta, mut budget: u64) {
         pgrx::check_for_interrupts!();
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
         let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
-        let candidates = bounded_merge_candidates(&docs, factor, limit, budget);
-        if candidates.is_some() && docs.len() > MAX_SEGMENTS {
-            // The one merge that cannot be skipped must still fit a run.
-            if within_run(candidates.clone().expect("checked"), &bytes, cap).is_none() {
-                pgrx::error!(
-                    "Stannum index directory is full of segments too large to merge; \
-                     VACUUM the table, or REINDEX"
-                );
-            }
-        }
-        match candidates.and_then(|positions| within_run(positions, &bytes, cap)) {
+        match bounded_merge_candidates(&docs, factor, limit, budget)
+            .and_then(|positions| within_run(positions, &bytes, cap))
+        {
             Some(positions) => {
                 let work: u64 = positions.iter().map(|p| u64::from(docs[*p])).sum();
                 budget = budget.saturating_sub(work);
@@ -2420,6 +2428,82 @@ unsafe fn maintain(index: pg_sys::Relation, meta: &mut Meta, mut budget: u64) {
             None => break,
         }
     }
+}
+
+/// Takes the maintenance lock of `index` (see [`MAINTENANCE_LOCK`]),
+/// waiting for its holder.
+///
+/// # Safety
+/// `index` is open; the caller holds no buffer lock.
+unsafe fn lock_maintenance(index: pg_sys::Relation) {
+    unsafe { pg_sys::LockPage(index, MAINTENANCE_LOCK, MAINTENANCE_LOCK_MODE) };
+}
+
+/// Releases the maintenance lock taken by [`lock_maintenance`]. An error in
+/// between releases it with the transaction.
+///
+/// # Safety
+/// The caller holds the maintenance lock of `index`.
+unsafe fn unlock_maintenance(index: pg_sys::Relation) {
+    unsafe { pg_sys::UnlockPage(index, MAINTENANCE_LOCK, MAINTENANCE_LOCK_MODE) };
+}
+
+/// Merges what `select` picks from the directory, as positions given the
+/// entries' document counts and run bytes, until it picks nothing. Each
+/// merge is built without the meta lock and published by
+/// [`replace_entries`] only if its inputs are still listed, so PostgreSQL
+/// delivers a cancel or a termination at the merge's next checkpoint rather
+/// than after the whole merge. Inputs merge in directory order, as a merge
+/// under the lock takes them, so the result is the same segment.
+///
+/// # Safety
+/// The caller holds the maintenance lock of `index` and no buffer lock.
+unsafe fn merge_unlocked(
+    index: pg_sys::Relation,
+    mut select: impl FnMut(&[u32], &[u32]) -> Option<Vec<usize>>,
+) {
+    loop {
+        pgrx::check_for_interrupts!();
+        let meta = unsafe { read_meta(index, false) }.1;
+        let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
+        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let Some(mut positions) = select(&docs, &bytes) else {
+            return;
+        };
+        positions.sort_unstable();
+        let inputs: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
+        unsafe { replace_entries(index, meta.identity, &inputs) };
+    }
+}
+
+/// Makes room for one more entry in a directory at its on-disk bound by
+/// merging its smallest entries (see [`room_candidates`]) without the meta
+/// lock. The merge publishes only if its inputs are unchanged; a writer that
+/// raced it may have taken the room, so the caller checks again under the
+/// lock and calls this again if it must.
+///
+/// # Safety
+/// The caller holds the maintenance lock of `index` and no buffer lock.
+unsafe fn make_room(index: pg_sys::Relation, identity: u64) {
+    let meta = unsafe { read_meta(index, false) }.1;
+    if meta.identity != identity {
+        return;
+    }
+    let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
+    let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+    let Some(candidates) = room_candidates(&docs) else {
+        return;
+    };
+    let Some(mut positions) = within_run(candidates, &bytes, unsafe { segment_bytes_cap(index) })
+    else {
+        pgrx::error!(
+            "Stannum index directory is full of segments too large to merge; \
+             VACUUM the table, or REINDEX"
+        );
+    };
+    positions.sort_unstable();
+    let inputs: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
+    unsafe { replace_entries(index, identity, &inputs) };
 }
 
 /// Rewrites the segments at `positions` into one, dropping dead documents.
@@ -2711,17 +2795,19 @@ impl Builder {
                 return;
             }
             let text = String::from_datum(*values, false).expect("non-null indexed text");
-            let tokens = tokens_of(&tokenizer, &text);
-            codec(self.segment.add_document(
-                tid_of(*tid),
-                tokens.iter().map(|(term, pos)| (term.as_str(), *pos)),
-            ));
+            codec(
+                self.segment
+                    .add_token_stream(tid_of(*tid), tokens_of(&tokenizer, &text)),
+            );
             if self.segment.document_count() >= BUILD_SEGMENT_DOCS.get().max(1) as usize {
                 self.flush(index);
             }
         }
     }
 
+    /// Writes the accumulated segment and publishes it, then merges the due
+    /// tiers the way VACUUM does: built without the meta lock, so a cancel
+    /// or a termination reaches the build at its next merge checkpoint.
     unsafe fn flush(&mut self, index: pg_sys::Relation) {
         if self.segment.document_count() == 0 {
             return;
@@ -2729,9 +2815,24 @@ impl Builder {
         let builder = std::mem::take(&mut self.segment);
         let (blob, docs, total_length) = finish_builder(builder);
         unsafe {
+            lock_maintenance(index);
+            let identity = read_meta(index, false).1.identity;
+            make_room(index, identity);
+            let (run, map) = write_segment_run(index, &blob);
+            drop(blob);
             let (meta_buffer, mut meta) = read_meta(index, true);
-            add_segment(index, &mut meta, blob, docs, total_length, u64::MAX);
+            let entry = new_entry(&mut meta, run, map, docs, total_length);
+            meta.segments.push(entry);
             write_meta(index, &meta_buffer, &meta);
+            drop(meta_buffer);
+            let factor = merge_tier_factor();
+            let limit = max_segments(index);
+            let cap = segment_bytes_cap(index);
+            merge_unlocked(index, |docs, bytes| {
+                merge_candidates(docs, factor, limit)
+                    .and_then(|positions| within_run(positions, bytes, cap))
+            });
+            unlock_maintenance(index);
         }
     }
 
@@ -2741,8 +2842,10 @@ impl Builder {
         if self.tokenizer.is_some() {
             unsafe {
                 self.flush(index);
+                lock_maintenance(index);
+                compact(index);
+                unlock_maintenance(index);
                 let (meta_buffer, mut meta) = read_meta(index, true);
-                compact(index, &mut meta);
                 // No reader holds a view of an index being created, so every
                 // run the build's own merges retired is free at once rather
                 // than a bounded slice per later insert; a built relation is
@@ -2768,12 +2871,16 @@ impl Builder {
 /// pages as they keep, and freed pages are reusable but never returned, so
 /// without this a built relation is two to three times its live size.
 ///
+/// The runs are copied without the meta lock, which PostgreSQL holds
+/// interrupts off under, so a cancel reaches the build while it packs; the
+/// lock is taken only to publish the moved entries.
+///
 /// # Safety
 /// `index` is being built: no reader holds a view of it and no writer
 /// shares it, so its pages may be moved and its extent cut.
 unsafe fn pack(index: pg_sys::Relation) {
     unsafe {
-        let (meta_buffer, mut meta) = read_meta(index, true);
+        let meta = read_meta(index, false).1;
         let nblocks = blocks(index);
         let referenced = match verify::referenced_pages(index, &meta, nblocks, None) {
             Ok(referenced) => referenced,
@@ -2812,6 +2919,16 @@ unsafe fn pack(index: pg_sys::Relation) {
             }
             entries[i].run = run;
             entries[i].map = map;
+        }
+        let (meta_buffer, mut meta) = read_meta(index, true);
+        if meta.segments.len() != entries.len()
+            || meta
+                .segments
+                .iter()
+                .zip(&entries)
+                .any(|(was, now)| was.generation != now.generation)
+        {
+            pgrx::error!("Stannum index changed while its build packed it");
         }
         meta.segments = entries;
         write_meta(index, &meta_buffer, &meta);
@@ -2867,7 +2984,8 @@ unsafe fn write_run_into(
                         // The free space map still lists the page: an
                         // allocation that took it from there read it, found
                         // it in use and tried the next, for every page the
-                        // pack reused, under the exclusive meta lock.
+                        // pack reused. No other writer allocates in an index
+                        // being built.
                         pg_sys::RecordUsedIndexPage(index, block);
                         blocks.push(block);
                     }
@@ -2906,23 +3024,29 @@ unsafe fn write_run_into(
 /// allows: repeatedly the smallest entries that fit one run together. Every
 /// query pays a dictionary lookup and a stream head per term per segment, so
 /// a build ends with as few segments as the cap permits; tier merges alone
-/// leave the leftovers of every tier behind.
+/// leave the leftovers of every tier behind. The merges run without the meta
+/// lock (see [`merge_unlocked`]): at the segment byte cap one takes minutes.
 ///
 /// # Safety
-/// The caller holds the meta page of `index` exclusively.
-unsafe fn compact(index: pg_sys::Relation, meta: &mut Meta) {
+/// The caller holds the maintenance lock of `index` and no buffer lock.
+unsafe fn compact(index: pg_sys::Relation) {
     let cap = unsafe { segment_bytes_cap(index) };
-    loop {
-        pgrx::check_for_interrupts!();
-        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
-        match within_run((0..bytes.len()).collect(), &bytes, cap) {
-            Some(positions) => unsafe { merge(index, meta, positions) },
-            None => break,
-        }
-    }
+    unsafe {
+        merge_unlocked(index, |_, bytes| {
+            within_run((0..bytes.len()).collect(), bytes, cap)
+        })
+    };
 }
 
 // --- Insert -------------------------------------------------------------------
+
+/// Whether appending a record of `bytes` to `buffer` folds it first: the
+/// buffer holds a document and the record would pass either cap.
+unsafe fn folds(index: pg_sys::Relation, buffer: &BufferState, bytes: usize) -> bool {
+    buffer.docs > 0
+        && (buffer.bytes as usize + bytes > unsafe { write_buffer_bytes(index) }
+            || buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32)
+}
 
 /// # Safety
 /// `index` is live and locked for insertion. The pointers reference the first
@@ -2951,18 +3075,36 @@ pub unsafe fn insert(
             // tokenization and forward-record encoding run.
             let bytes = {
                 let tokenizer = tokenizer_for(&spec);
-                let tokens = tokens_of(&tokenizer, &text);
-                let record = codec(ForwardRecord::from_tokens(
+                let record = codec(ForwardRecord::from_token_stream(
                     tid_of(*tid),
-                    tokens.iter().map(|(term, pos)| (term.as_str(), *pos)),
+                    tokens_of(&tokenizer, &text),
                 ));
                 let mut bytes = Vec::new();
                 codec(record.encode(&mut bytes));
                 bytes
             };
             race_point("insert:prepared");
-            let (guard, current) = read_meta(index, true);
-            if current.identity == identity && current.spec == spec {
+            let locked = loop {
+                let (guard, current) = read_meta(index, true);
+                if current.identity != identity || current.spec != spec {
+                    drop(guard);
+                    break None;
+                }
+                if current.segments.len() < MAX_SEGMENTS
+                    || !folds(index, &current.buffer, bytes.len())
+                {
+                    break Some((guard, current));
+                }
+                // The fold would overflow the on-disk directory. Merging to
+                // make room under this lock would hold off cancellation and
+                // every reader for as long as the merge takes, whatever its
+                // size, so it runs unlocked and this insert looks again.
+                drop(guard);
+                lock_maintenance(index);
+                make_room(index, identity);
+                unlock_maintenance(index);
+            };
+            if let Some((guard, current)) = locked {
                 // Use the latest buffer/directory. Appends, folds and VACUUM
                 // during preparation do not invalidate this row's encoding.
                 break (guard, current, bytes);
@@ -2970,11 +3112,8 @@ pub unsafe fn insert(
             // Rebuilds normally conflict with the caller's relation lock;
             // validate the persisted tokenizer nevertheless, never publishing
             // bytes encoded for a different index identity or pipeline.
-            drop(guard);
         };
-        let folded = meta.buffer.docs > 0
-            && (meta.buffer.bytes as usize + bytes.len() > write_buffer_bytes(index)
-                || meta.buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32);
+        let folded = folds(index, &meta.buffer, bytes.len());
         if folded {
             fold(index, &mut meta, &bytes);
         } else {
@@ -2993,11 +3132,12 @@ pub unsafe fn insert(
     }
 }
 
-/// The block whose heavyweight page lock is the maintenance lock: held by an
-/// insert's deferred merge for as long as it has pages written and not yet
-/// published or freed, and by VACUUM's orphan reclamation, which must not
-/// see those pages. It is independent of the meta page's buffer lock, which
-/// neither holder waits for it beneath.
+/// The block whose heavyweight page lock is the maintenance lock: held by
+/// every writer that has pages written without the meta lock and not yet
+/// published or freed (an insert's deferred merge or its merge to make room
+/// in a full directory, and a build's merges), and by VACUUM's orphan
+/// reclamation, which must not see those pages. It is independent of the
+/// meta page's buffer lock, which no holder waits for it beneath.
 const MAINTENANCE_LOCK: u32 = 0;
 const MAINTENANCE_LOCK_MODE: pg_sys::LOCKMODE = pg_sys::ExclusiveLock as pg_sys::LOCKMODE;
 
@@ -3667,7 +3807,11 @@ unsafe fn maintenance_merge_blob(
         VacuumMergeStrategy::Reconstruct => Policy::ForceReconstruct,
     };
     let plan = segment::merge_strategy::choose(facts, policy);
-    pgrx::debug1!("Stannum VACUUM merge: {:?}: {}", plan.strategy, plan.reason);
+    pgrx::debug1!(
+        "Stannum unlocked merge: {:?}: {}",
+        plan.strategy,
+        plan.reason
+    );
     if plan.strategy == Strategy::LegacyOversized {
         return unsafe { maintenance_reconstruct_blob(index, identity, inputs) };
     }
@@ -3711,9 +3855,9 @@ unsafe fn maintenance_merge_blob(
             match error {
                 segment::merge::MergeError::Codec(_)
                 | segment::merge::MergeError::InvalidInput { .. } => {
-                    corrupt(format!("VACUUM segment merge: {error}"));
+                    corrupt(format!("unlocked segment merge: {error}"));
                 }
-                _ => pgrx::error!("Stannum VACUUM segment merge failed: {error}"),
+                _ => pgrx::error!("Stannum unlocked segment merge failed: {error}"),
             }
         }
     }
@@ -4044,8 +4188,26 @@ pub mod testing {
                 .with_borrow(|readers| readers.keys().filter(|(id, _)| *id == identity).count()),
             page_tables: PAGE_TABLES
                 .with_borrow(|tables| tables.keys().filter(|(id, _)| *id == identity).count()),
-            dead_lists: crate::fold::cached_dead_lists(identity),
+            dead_lists: SEGMENT_READERS.with_borrow(|readers| {
+                readers
+                    .iter()
+                    .filter(|((id, _), cached)| *id == identity && cached.dead.is_some())
+                    .count()
+            }),
         }
+    }
+
+    /// Empties this backend's segment readers with their dead lists, and
+    /// its page tables, as exceeding `stannum.reader_cache_mb` does.
+    pub fn clear_reader_caches() {
+        SEGMENT_READERS.with_borrow_mut(HashMap::clear);
+        PAGE_TABLES.with_borrow_mut(HashMap::clear);
+    }
+
+    /// Bytes the cached readers' dead lists hold, stored and decoded, as the
+    /// reader cache budget counts them.
+    pub fn dead_list_bytes() -> usize {
+        SEGMENT_READERS.with_borrow(|readers| readers.values().map(dead_bytes).sum())
     }
 
     /// Bytes the cached readers' arenas hold, across every index.
@@ -4134,6 +4296,18 @@ pub mod testing {
                     (chain(entry.run), chain(entry.map))
                 })
                 .collect()
+        }
+    }
+
+    /// The blob of directory entry `i`.
+    ///
+    /// # Safety
+    /// `index` is a live LDP2 index.
+    pub unsafe fn segment_blob(index: pg_sys::Relation, i: usize) -> Vec<u8> {
+        unsafe {
+            let (_, meta) = read_meta(index, false);
+            let entry = meta.segments[i];
+            read_run(index, entry.run, &generation_label(entry.generation))
         }
     }
 
@@ -4340,8 +4514,8 @@ mod tests {
     }
 
     use super::{
-        MAX_SEGMENTS, SEGMENT_BYTES_CAP, bounded_merge_candidates, merge_candidates, tier,
-        within_run,
+        MAX_SEGMENTS, SEGMENT_BYTES_CAP, bounded_merge_candidates, merge_candidates,
+        room_candidates, tier, within_run,
     };
 
     #[test]
@@ -4371,14 +4545,14 @@ mod tests {
             bounded_merge_candidates(&mixed, 8, 4, 514),
             Some(vec![0, 1, 2])
         );
-        // The on-disk bound is hard: the two smallest merge whatever the budget.
-        let mut full = vec![u32::MAX; MAX_SEGMENTS + 1];
+        // The on-disk bound is hard: a full directory makes room for one
+        // more entry by merging its two smallest, whatever they cost.
+        let mut full = vec![u32::MAX; MAX_SEGMENTS];
         full[5] = 7;
         full[9] = 3;
-        assert_eq!(
-            bounded_merge_candidates(&full, 2, MAX_SEGMENTS, 0),
-            Some(vec![9, 5])
-        );
+        assert_eq!(bounded_merge_candidates(&full, 2, MAX_SEGMENTS, 0), None);
+        assert_eq!(room_candidates(&full), Some(vec![9, 5]));
+        assert_eq!(room_candidates(&full[1..]), None);
         assert_eq!(
             bounded_merge_candidates(&[u32::MAX, u32::MAX], 2, 128, u64::from(u32::MAX)),
             None
