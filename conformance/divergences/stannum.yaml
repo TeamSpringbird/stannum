@@ -285,8 +285,8 @@ divergences:
       The scoring, highlighting, tokenize, ql_parse, score_inspect and
       segment_info functions without stemmer arguments, merge() and
       promote() with TIN's signatures, highlight() over a bound query, and
-      its own (bind_query, verify_index, wal_rmgr_id, maintenance_jobs and
-      others); no fsck or fsm_rebuild.
+      its own (bind_query, verify_index, maintenance_status,
+      maintenance_jobs, wal_rmgr_id and others); no fsck or fsm_rebuild.
 
   - id: inventory.access_method.1
     against: tin-1.0.4

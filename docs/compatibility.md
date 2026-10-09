@@ -27,10 +27,10 @@ SKIP is a case without a recorded answer):
 
 | Status | TIN 1.0.3 | TIN 1.0.4 | Meaning |
 | --- | ---: | ---: | --- |
-| PASS | 183 | 217 | Every capture equals TIN's answer |
-| DIFF | 12 | 12 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
+| PASS | 184 | 218 | Every capture equals TIN's answer |
+| DIFF | 13 | 13 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
 | IMPROVED | 5 | 5 | TIN refuses the query with an ERROR; Stannum answers it |
-| GAP | 9 | 13 | Stannum lacks what the case exercises |
+| GAP | 7 | 11 | Stannum lacks what the case exercises, or answers it differently |
 | LIMITED | 3 | 2 | Stannum refuses with a limit ERROR where TIN answers |
 | NEWER | 4 | 4 | Stannum follows a later TIN change that Lead has copied |
 | SKIP | 42 | 5 | |
