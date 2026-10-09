@@ -1,0 +1,361 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.4",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6 (test database)",
+  "date": "2026-10-09T03:50:33Z",
+  "suite_commit": "7d7d589070a0eb105f8f8643944d71fc64441d77",
+  "runner_version": "3"
+ },
+ "cases": [
+  {
+   "id": "inventory.settings.1",
+   "captures": {
+    "script": [
+     [
+      [
+       "tin.build_io_concurrency",
+       "0",
+       null,
+       "user",
+       "integer",
+       null,
+       "Maximum concurrent I/O participants per index build phase (0 = auto)"
+      ],
+      [
+       "tin.debug_disable_count_pushdown",
+       "off",
+       null,
+       "user",
+       "bool",
+       null,
+       "Calibration scaffolding: suppress the Tin Count upper path"
+      ],
+      [
+       "tin.debug_disable_index_probe",
+       "off",
+       null,
+       "user",
+       "bool",
+       null,
+       "Calibration scaffolding: suppress Index TID Probe leaf admission"
+      ],
+      [
+       "tin.debug_force_boolean_family",
+       "Auto",
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "Fused",
+        "Factored"
+       ],
+       "Calibration scaffolding: force fused vs factored multi-index lowering"
+      ],
+      [
+       "tin.debug_force_conjunction_mode",
+       "Auto",
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "Generic",
+        "Pushdown",
+        "NoAdaptive"
+       ],
+       "Calibration scaffolding: override the conjunction execution-mode heuristic"
+      ],
+      [
+       "tin.debug_force_multi_index_drive",
+       "Auto",
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "Sparse",
+        "Stripe"
+       ],
+       "Calibration scaffolding: force sparse vs stripe multi-index execution"
+      ],
+      [
+       "tin.debug_force_parallel",
+       "off",
+       null,
+       "user",
+       "bool",
+       null,
+       "Calibration scaffolding: suppress serial tin paths that have a parallel sibling"
+      ],
+      [
+       "tin.debug_force_topk",
+       "Auto",
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "TopK",
+        "Exhaustive"
+       ],
+       "Calibration scaffolding: force bounded top-k vs exhaustive scored traversal"
+      ],
+      [
+       "tin.debug_force_visibility",
+       "Auto",
+       null,
+       "user",
+       "enum",
+       [
+        "Auto",
+        "Streaming",
+        "Sorted"
+       ],
+       "Calibration scaffolding: force streaming vs sorted final visibility"
+      ],
+      [
+       "tin.enable_custom_scan",
+       "on",
+       null,
+       "user",
+       "bool",
+       null,
+       "Enable the tin base custom scan"
+      ],
+      [
+       "tin.index_maintenance_mode",
+       "background",
+       null,
+       "user",
+       "enum",
+       [
+        "background",
+        "foreground",
+        "manual"
+       ],
+       "How tin dispatches automatic index maintenance"
+      ],
+      [
+       "tin.maintenance_jobs_per_db",
+       "0",
+       null,
+       "sighup",
+       "integer",
+       null,
+       "Own-database jobs a tin maintenance worker finishes before yielding to another database"
+      ],
+      [
+       "tin.rss_baseline",
+       "256",
+       "MB",
+       "user",
+       "integer",
+       null,
+       "Coarse per-worker RSS baseline used by the tin builder"
+      ],
+      [
+       "tin.track_page_reuse_stats",
+       "off",
+       null,
+       "user",
+       "bool",
+       null,
+       "Track unique tin index page touches in EXPLAIN"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "inventory.functions.1",
+   "captures": {
+    "value": [
+     [
+      "amhandler",
+      "internal",
+      "index_am_handler",
+      "i"
+     ],
+     [
+      "fsck",
+      "index regclass, heapcheck boolean",
+      "TABLE(segment bigint, structure text, blockno bigint, message text)",
+      "v"
+     ],
+     [
+      "fsm_rebuild",
+      "index regclass",
+      "TABLE(start_nblocks bigint, marked_blocks bigint, swept_blocks bigint, swept_runs bigint)",
+      "v"
+     ],
+     [
+      "full_score",
+      "ctid tid",
+      "real",
+      "i"
+     ],
+     [
+      "full_score",
+      "ctid tid, k1 real, b real",
+      "real",
+      "i"
+     ],
+     [
+      "highlight",
+      "text text, begin_tag text, end_tag text, query text, tokenizer text, case_folding text, accent_folding text, long_tokens text, max_token_bytes integer, graphemes text, position_gaps text, stemmer text",
+      "text",
+      "i"
+     ],
+     [
+      "highlight_ansi",
+      "text text, wrap_to integer, query text, tokenizer text, case_folding text, accent_folding text, long_tokens text, max_token_bytes integer, graphemes text, position_gaps text, stemmer text",
+      "text",
+      "i"
+     ],
+     [
+      "highlight_ansi_v1_0_3",
+      "text text, wrap_to integer, query text",
+      "text",
+      "i"
+     ],
+     [
+      "highlight_v1_0_3",
+      "text text, begin_tag text, end_tag text, query text",
+      "text",
+      "i"
+     ],
+     [
+      "max_score",
+      "ctid tid",
+      "real",
+      "i"
+     ],
+     [
+      "maybe_quote",
+      "text text",
+      "text",
+      "i"
+     ],
+     [
+      "merge",
+      "index regclass, target_segment_count integer, high_water_multiplier integer, max_fan_in integer, force boolean",
+      "TABLE(considered_segments integer, retired_only_segments integer, merged_segments integer, linked_segments integer, output_docs bigint, output_postings bigint, replayed_kills bigint, no_op_reason text)",
+      "v"
+     ],
+     [
+      "promote",
+      "index regclass, extent_cap_bytes bigint",
+      "TABLE(consumed_controls integer, linked_segments integer, docs_promoted bigint, terms_added bigint)",
+      "v"
+     ],
+     [
+      "ql_parse",
+      "query text, surface boolean, tokenizer text, case_folding text, accent_folding text, long_tokens text, max_token_bytes integer, graphemes text, position_gaps text, stemmer text",
+      "text",
+      "i"
+     ],
+     [
+      "ql_parse_v1_0_3",
+      "query text, surface boolean, tokenizer text, case_folding text, accent_folding text, long_tokens text, max_token_bytes integer, graphemes text, position_gaps text",
+      "text",
+      "i"
+     ],
+     [
+      "score",
+      "ctid tid, dense_ratio real, k1 real, b real, term_add text[], term_replace text[]",
+      "real",
+      "i"
+     ],
+     [
+      "score_inspect",
+      "index regclass, query text, dense_ratio real, term_add text[], term_replace text[]",
+      "TABLE(term text, weight real)",
+      "s"
+     ],
+     [
+      "score_support",
+      "request internal",
+      "internal",
+      "i"
+     ],
+     [
+      "segment_info",
+      "index regclass",
+      "TABLE(ordinal bigint, kind text, root_block bigint, docs bigint, dead_docs bigint, sum_doc_lengths bigint, npostings bigint, total_pages bigint, source_state text, origin text, sequence bigint)",
+      "v"
+     ],
+     [
+      "tin_text_cmpfunc",
+      "lhs text, rhs text",
+      "boolean",
+      "i"
+     ],
+     [
+      "tin_text_cmpfunc_indexed",
+      "lhs text, rhs text, index oid",
+      "boolean",
+      "s"
+     ],
+     [
+      "tin_text_cmpfunc_indexed_support",
+      "request internal",
+      "internal",
+      "i"
+     ],
+     [
+      "tin_text_cmpfunc_support",
+      "request internal",
+      "internal",
+      "i"
+     ],
+     [
+      "tin_text_join",
+      "_planner_info internal, _operator_oid oid, _args internal, _join_type smallint, _special_join_info internal",
+      "double precision",
+      "s"
+     ],
+     [
+      "tin_text_restrict",
+      "planner_info internal, _operator_oid oid, args internal, _var_relid integer",
+      "double precision",
+      "i"
+     ],
+     [
+      "tin_text_term_array_cmpfunc_indexed",
+      "lhs text, rhs text[], use_or boolean, index oid",
+      "boolean",
+      "s"
+     ],
+     [
+      "tokenize",
+      "text text, tokenizer text, case_folding text, accent_folding text, long_tokens text, max_token_bytes integer, graphemes text, position_gaps text, stemmer text",
+      "SETOF text",
+      "i"
+     ],
+     [
+      "tokenize_v1_0_3",
+      "text text, tokenizer text, case_folding text, accent_folding text, long_tokens text, max_token_bytes integer, graphemes text, position_gaps text",
+      "SETOF text",
+      "i"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "inventory.access_method.1",
+   "captures": {
+    "amtype": "i",
+    "operators": [
+     [
+      "text",
+      "text",
+      "boolean"
+     ]
+    ]
+   }
+  }
+ ]
+}

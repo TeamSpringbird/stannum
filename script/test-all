@@ -147,9 +147,11 @@ conformance_check() {
         cat "$dir/server.log"
         return 1
     }
-    CONFORMANCE_DSN="host=$dir port=$port user=postgres dbname=postgres" \
-        "$PYTHON" conformance/run.py --engine stannum --check conformance/expected/tin-1.0.3
-    status=$?
+    status=0
+    for expected in conformance/expected/tin-1.0.3 conformance/expected/tin-1.0.4; do
+        CONFORMANCE_DSN="host=$dir port=$port user=postgres dbname=postgres" \
+            "$PYTHON" conformance/run.py --engine stannum --check "$expected" || status=1
+    done
     pg_ctl -D "$dir/data" -m fast -w stop >/dev/null
     if [ $status -eq 0 ]; then rm -rf "$dir"; else echo "conformance: server log kept in $dir"; fi
     return $status
