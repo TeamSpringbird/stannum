@@ -186,8 +186,6 @@ struct Mem<'a> {
     /// term.
     count: u32,
     grid: bool,
-    /// Slots in the group.
-    end: u32,
     /// Grid: members in words `..w` are `run`. List: the next member is at
     /// `pos`.
     w: usize,
@@ -198,47 +196,6 @@ struct Mem<'a> {
 }
 
 impl Mem<'_> {
-    /// The first member at or after `local`, if the group holds one.
-    #[inline]
-    fn next_from(&mut self, local: u32) -> Option<u32> {
-        match &mut self.kind {
-            Kind::Grid(bytes) => {
-                let words = bytes.len() / 8;
-                let mut w = local as usize / 64;
-                if w >= words {
-                    return None;
-                }
-                let mut word = bits::word(bytes, w) & (u64::MAX << (local % 64));
-                loop {
-                    if word != 0 {
-                        return Some((w * 64) as u32 + word.trailing_zeros());
-                    }
-                    w += 1;
-                    if w >= words {
-                        return None;
-                    }
-                    word = bits::word(bytes, w);
-                }
-            }
-            Kind::List => {
-                let list = &self.list;
-                let mut pos = self.pos;
-                while pos < list.len() && list[pos] < local {
-                    pos += 1;
-                }
-                self.pos = pos;
-                list.get(pos).copied()
-            }
-            Kind::Cursor { cursor, offset } => {
-                cursor.seek(*offset + local);
-                cursor
-                    .current()
-                    .map(|slot| slot - *offset)
-                    .filter(|l| *l < self.end)
-            }
-        }
-    }
-
     /// The posting index of `local` if the term holds it; slots must be
     /// asked in increasing order (asking one again is allowed).
     #[inline]
@@ -343,7 +300,6 @@ fn load<'a>(
     mem.run = 0;
     mem.pos = 0;
     let group = geometry.groups[g as usize];
-    mem.end = group.slots();
     if let Form::Sparse(list) = &set.postings.form {
         let cursor = set.sparse.get_or_insert_with(|| {
             touch.touch(
@@ -628,12 +584,23 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn run(&mut self) -> Result<()> {
         let lead = self.req[0];
         let n = self.sc.len();
-        let mut cursor = 0u32;
-        while self.seek(lead, cursor)?.is_some() {
-            let g = self.mems[lead].loaded - 1;
+        let mut from = 0u32;
+        loop {
+            // The lead's next group, from its directory (or its list): its
+            // members are read only once the group's bound passes.
+            let set = self.terms[lead].as_mut().expect("the lead");
+            let Some(g) = next_group(
+                set,
+                self.geometry,
+                from,
+                &mut self.mems[lead].hint,
+                self.touch,
+            ) else {
+                break;
+            };
+            from = g + 1;
             let group = self.geometry.groups[g as usize];
             let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
-            cursor = end + 1;
             if n == 0 && self.unscored_done(self.geometry.tid_in(g as usize, 0)) {
                 // Nothing scores: every later match ties at zero and ranks
                 // after the bar.
@@ -643,6 +610,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if self.group_below(base, end) {
                 self.answer.windows_pruned += 1;
                 continue;
+            }
+            if self.mems[lead].loaded != g + 1 {
+                let set = self.terms[lead].as_mut().expect("the lead");
+                load(
+                    set,
+                    self.geometry,
+                    g,
+                    &mut self.mems[lead],
+                    false,
+                    self.touch,
+                )?;
             }
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
@@ -674,40 +652,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         // Nothing scoring: every match scores zero, which ties a bar of zero.
         below(bound, Some(theta))
-    }
-
-    /// Moves term `t` to its first member at or after `target`, loading
-    /// (decoding) the group that holds it; the member's slot, if any.
-    fn seek(&mut self, t: usize, mut target: u32) -> Result<Option<u32>> {
-        let geometry = self.geometry;
-        loop {
-            if target >= geometry.slots {
-                return Ok(None);
-            }
-            let mem = &self.mems[t];
-            let within = mem.loaded > 0 && {
-                let group = &geometry.groups[mem.loaded as usize - 1];
-                group.slot_base <= target && target < group.slot_base + group.slots()
-            };
-            if !within {
-                let g = geometry.group_of_slot(target) as u32;
-                let set = self.terms[t].as_mut().expect("a term of the walk");
-                let mem = &mut self.mems[t];
-                let Some(next) = next_group(set, geometry, g, &mut mem.hint, self.touch) else {
-                    return Ok(None);
-                };
-                if next > g {
-                    target = geometry.groups[next as usize].slot_base;
-                }
-                load(set, geometry, next, mem, false, self.touch)?;
-            }
-            let mem = &mut self.mems[t];
-            let group = &geometry.groups[mem.loaded as usize - 1];
-            match mem.next_from(target - group.slot_base) {
-                Some(local) => return Ok(Some(group.slot_base + local)),
-                None => target = group.slot_base + group.slots(),
-            }
-        }
     }
 
     /// Whether every required term holds group `g` as a grid.
