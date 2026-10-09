@@ -19,7 +19,7 @@ use segment::tinshape::blob::Bytes;
 use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::EfCursor;
 use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings, for_each_local};
+use segment::tinshape::postings::{Form, KIND_GRID, Postings, for_each_local};
 use segment::tinshape::segment::{Area, Segment};
 use segment::{Error, Result};
 use tinql::runtime::{Query, SpanTermSlot};
@@ -325,26 +325,42 @@ pub fn lower(query: &Query, terms: &mut Vec<String>) -> Option<Node> {
     })
 }
 
-/// Where a group's members are.
-#[derive(Clone, Copy, Debug)]
-enum Src<'a> {
-    /// A container of a grouped record, with its blob offset; its bytes
-    /// are read when the group is (a segment over a lazy blob loads them
-    /// then).
-    Container {
-        entry: GroupEntry,
-        bytes: Bytes<'a>,
-        at: usize,
-    },
-    /// Local slots `from..to` of the term's decoded list.
-    Locals { from: u32, to: u32 },
+// Where a group's members are, and a group a term holds: the segment
+// crate's, so a segment keeps a grouped term's groups with its record
+// (`Segment::term_groups`) rather than every query building them.
+use segment::tinshape::postings::{GroupSrc as Src, TermGroup as G};
+
+/// A term's groups: a grouped term's, shared with the segment's memo, or
+/// built for the term (a single posting, a decoded sparse list).
+#[derive(Clone)]
+enum Groups<'a> {
+    Shared(std::rc::Rc<[G<'a>]>),
+    Own(Vec<G<'a>>),
 }
 
-#[derive(Clone, Copy, Debug)]
-struct G<'a> {
-    index: u32,
-    count: u32,
-    src: Src<'a>,
+impl<'a> std::ops::Deref for Groups<'a> {
+    type Target = [G<'a>];
+
+    #[inline]
+    fn deref(&self) -> &[G<'a>] {
+        match self {
+            Self::Shared(groups) => groups,
+            Self::Own(groups) => groups,
+        }
+    }
+}
+
+impl<'a> Groups<'a> {
+    /// The groups to build on, owned.
+    fn own(&mut self) -> &mut Vec<G<'a>> {
+        if let Self::Shared(groups) = self {
+            *self = Self::Own(groups.to_vec());
+        }
+        match self {
+            Self::Own(groups) => groups,
+            Self::Shared(_) => unreachable!("owned above"),
+        }
+    }
 }
 
 /// A container's bytes, read for a path that cannot return an error: a
@@ -365,7 +381,7 @@ pub struct TermSet<'a> {
     pub at: usize,
     /// The positions stream and its blob offset.
     pub positions: (segment::tinshape::blob::Bytes<'a>, usize),
-    groups: Vec<G<'a>>,
+    groups: Groups<'a>,
     /// Local slots of a single or sparse term, all groups in a row.
     locals: Vec<u32>,
     // Cursor state, for ranked walks and phrase checks.
@@ -402,14 +418,14 @@ impl<'a> TermSet<'a> {
         let geometry = &segment.docs.geometry;
         let postings = term.postings;
         let record_at = term.at;
-        let mut groups = Vec::new();
+        let mut groups = Groups::Own(Vec::new());
         let mut locals = Vec::new();
         match &postings.form {
             Form::Single(slot) => {
                 touch.touch(Part::Payload, record_at, postings.tf_at);
                 let index = geometry.group_of_slot(*slot);
                 locals.push(slot - geometry.groups[index].slot_base);
-                groups.push(G {
+                groups.own().push(G {
                     index: index as u32,
                     count: 1,
                     src: Src::Locals { from: 0, to: 1 },
@@ -419,8 +435,7 @@ impl<'a> TermSet<'a> {
                 // The header only; the list is read where it is decoded.
                 touch.touch(Part::Footer, record_at, postings.footer_at);
             }
-            Form::Grouped(entries) => {
-                groups.reserve_exact(entries.len());
+            Form::Grouped(_) => {
                 // The header and the group directory: per-term metadata,
                 // which TIN would count as the postings footer.
                 touch.touch(Part::Footer, record_at, postings.footer_at);
@@ -429,18 +444,7 @@ impl<'a> TermSet<'a> {
                     record_at + postings.payload_at,
                     postings.containers_at,
                 );
-                let containers = record_at + postings.payload_at + postings.containers_at;
-                for entry in entries {
-                    groups.push(G {
-                        index: entry.index,
-                        count: entry.count,
-                        src: Src::Container {
-                            entry: *entry,
-                            bytes: postings.container(entry),
-                            at: containers + entry.at as usize,
-                        },
-                    });
-                }
+                groups = Groups::Shared(segment.term_groups(record_at, &postings));
             }
         }
         Ok(Some(Self {
@@ -485,7 +489,7 @@ impl<'a> TermSet<'a> {
                 index += 1;
             }
             let local = slot - geometry.groups[index].slot_base;
-            match self.groups.last_mut() {
+            match self.groups.own().last_mut() {
                 Some(g) if g.index == index as u32 => {
                     g.count += 1;
                     if let Src::Locals { to, .. } = &mut g.src {
@@ -494,7 +498,7 @@ impl<'a> TermSet<'a> {
                 }
                 _ => {
                     from = i as u32;
-                    self.groups.push(G {
+                    self.groups.own().push(G {
                         index: index as u32,
                         count: 1,
                         src: Src::Locals { from, to: from + 1 },
