@@ -181,7 +181,7 @@ def crash_between_run_write_and_publication(sql, command, env, data, root, start
         free_after = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0"))
         assert free_after >= free_before + orphans, (free_before, free_after, orphans)
         # The interrupted promotion repeats and takes the reclaimed pages first.
-        sql("SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0; INSERT INTO docs VALUES (98000, 'orphan')")
+        sql("SELECT stannum.promote('docs_idx')")
         assert int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0")) < free_after
         assert sql(page_warnings) == "0"
         return orphans
