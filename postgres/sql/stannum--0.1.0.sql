@@ -23,7 +23,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:279
+-- postgres/src/score.rs:281
 -- stannum::score::full_score
 CREATE  FUNCTION "full_score"(
 	"ctid" tid /* pg_sys :: ItemPointerData */
@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'full_score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:285
+-- postgres/src/score.rs:287
 -- stannum::score::full_score
 CREATE  FUNCTION "full_score"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -246,7 +246,7 @@ AS 'MODULE_PATHNAME', 'logs_removal_horizons_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:308
+-- postgres/src/score.rs:310
 -- stannum::score::max_score
 CREATE  FUNCTION "max_score"(
 	"ctid" tid /* pg_sys :: ItemPointerData */
@@ -288,7 +288,7 @@ AS 'MODULE_PATHNAME', 'ql_parse_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:295
+-- postgres/src/score.rs:297
 -- stannum::score::score
 CREATE  FUNCTION "score"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -304,7 +304,7 @@ AS 'MODULE_PATHNAME', 'score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:318
+-- postgres/src/score.rs:320
 -- stannum::score::score_bound
 CREATE  FUNCTION "score_bound"(
 	"document" TEXT, /* & str */
@@ -324,7 +324,7 @@ AS 'MODULE_PATHNAME', 'score_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:427
+-- postgres/src/score.rs:429
 -- stannum::score::score_bound_indexed
 CREATE  FUNCTION "score_bound_indexed"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -344,7 +344,7 @@ AS 'MODULE_PATHNAME', 'score_bound_indexed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:458
+-- postgres/src/score.rs:460
 -- stannum::score::score_bound_indexed_searches
 CREATE  FUNCTION "score_bound_indexed_searches"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -364,7 +364,7 @@ AS 'MODULE_PATHNAME', 'score_bound_indexed_searches_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:349
+-- postgres/src/score.rs:351
 -- stannum::score::score_bound_searches
 CREATE  FUNCTION "score_bound_searches"(
 	"document" TEXT, /* & str */
@@ -384,7 +384,7 @@ AS 'MODULE_PATHNAME', 'score_bound_searches_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:5194
+-- postgres/src/score.rs:1523
 -- stannum::score::score_inspect
 CREATE  FUNCTION "score_inspect"(
 	"index" regclass, /* Option < PgRelation > */
@@ -402,7 +402,7 @@ AS 'MODULE_PATHNAME', 'score_inspect_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:5455
+-- postgres/src/score.rs:1788
 -- stannum::score::score_support
 CREATE  FUNCTION "score_support"(
 	"request" internal /* Internal */
@@ -413,7 +413,7 @@ AS 'MODULE_PATHNAME', 'score_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:5764
+-- postgres/src/score.rs:2097
 -- requires:
 --   full_score
 --   full_score_with_bm25
