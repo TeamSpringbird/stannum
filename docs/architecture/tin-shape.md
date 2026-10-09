@@ -95,9 +95,12 @@ the term's postings record and positions stream.
 ### Postings record
 
 ```text
-record  := slot varint                          when df = 1 (the bucket is the
+record  := slot varint [length varint]           when df = 1 (the bucket is the
                                                  dictionary's largest bucket)
-         | form u8, footer_len, payload_len, footer, payload, tf
+         | form u8, [footer_len], payload_len, [lengths_len],
+           [footer], payload, [lengths], tf
+form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
+lengths := base varint, width u8, (length - base) packed at width, by posting
 payload := sparse:  Elias-Fano over the term's slots, universe = all slots
          | grouped: groups, (index gap, (count - 1) << 2 | kind, [len])*,
                     one container per group the term occupies
@@ -122,6 +125,15 @@ that span many groups. The paged container is TIN's two-level bitmap
 proper; on this corpus it is almost never the smallest (402 of 331,137
 group containers), because pages hold few rows and a term rarely has two
 on one page.
+
+A term of at most 64 postings in a segment of at least 65,536 documents
+(`Options::inline_lengths_max_df`, `inline_lengths_min_documents`)
+carries its documents' lengths (`Postings::lengths`), so a rare term's top
+k reads no random DL sidecar pages: TIN's probes found its rare-term top k
+bound by them. Such a term of at most 8 postings, sparse and in one block,
+has no footer at all (`Postings::compact`): a reader derives its last slot
+from the list, its frontier from its buckets and lengths, and its TF width
+from the dictionary's largest bucket.
 
 The group directory holds each group's posting count and where its
 container starts: a single-term count is `df`, and an OR of terms in a
@@ -151,14 +163,19 @@ width (13.1 MB against 22.8 MB).
 
 `STN3`'s positions stream (`segment::tinshape::positions`): per term,
 entries in posting order with a skip table every 32, its head
-(`count << 1 | subs`) flagging a finer table for a term in at least one
-document in 16 (and 4,096 postings): a `u16` offset of every 8th entry from
-its 32-entry block's start, `0xffff` past 64 KiB. A posting's index (its
+(`count << 2 | masks << 1 | subs`) flagging two tables. Subs, for a term in
+at least one document in 16 (and 4,096 postings): a `u16` offset of every
+8th entry from its 32-entry block's start, `0xffff` past 64 KiB. Masks,
+where they save bytes: per block a `u32` naming the entries holding one
+position, whose count is then left out (a byte saved on most postings, at
+a bit each: 28.6 MB at 1M rows). A posting's index (its
 rank in slot order, which is ctid order, which was `STN3`'s ordinal order)
 addresses it. A phrase checks a common word's positions for candidates far
 apart in its posting order: from a skip it decoded up to 31 entries to
 reach one, from a sub at most 7. `Builder::add_term` takes the
 `segment::payload` stream; `Positions::payload` gives it back.
+`Positions::skip(index, at)` and `read_entry(index, at, out)` take the
+entry's index (for its mask bit).
 
 ### DL sidecar
 
@@ -313,6 +330,14 @@ Stable for phase C; every signature below is as of `tinshape/phase-b`:
   `Builder::finish(dead) -> (blob, BuildStats)`; `Options::default()`
   (block 256, grid at 1 in 64 for terms of 4,096 postings or more).
 
+Changed in round 2 of phase B: `Positions::skip` replaces the free
+`skip_entry`, `Positions::read_entry` and `skip` take the entry's index,
+`Positions::payload` returns a `Result`; `Postings` has `lengths`
+(`InlineLengths`) and `compact`; `Options` has `inline_lengths_max_df` and
+`inline_lengths_min_documents`; `BuildStats` has `inline_lengths`.
+`engine::tinshape::{lower, count, top_k, read_positions}` and the builder
+calls are unchanged.
+
 Changed in phase B (callers of phase A's API): `Group` has `first` and
 `pages` (`slots()` is `pages * width`, `grid_bytes()` new);
 `postings::for_each_local` and `or_into` take `&Group` instead of a width;
@@ -335,9 +360,17 @@ position and length against `STN3`. Experiment log and outputs:
 
 | ranked, µs | STN3 p50 / p99 | TNS1 phase A | TNS1 phase B |
 | --- | ---: | ---: | ---: |
-| conjunction | 37.0 / 392 | 36.0 / 790 | **21.9 / 216** |
-| disjunction | 379 / 1,381 | 547 / 3,228 | **244 / 874** |
-| phrase | 34.5 / 1,244 | 38.7 / 4,166 | **23.0 / 745** |
+| conjunction | 34.8 / 375 | 36.0 / 790 | **22.1 / 229** |
+| disjunction | 368 / 1,355 | 547 / 3,228 | **254 / 874** |
+| phrase | 32.9 / 1,255 | 38.7 / 4,166 | **23.0 / 785** |
+
+(Round 2's interleaved runs; round 1 measured 21.9 / 216, 244 / 874 and
+23.0 / 745 against 37.0 / 392, 379 / 1,381 and 34.5 / 1,244.)
+
+Single-term queries of rare terms (983 terms, df 2 to 4,096; answers equal
+to `STN3`'s): p50 0.6 / 1.6 / 7.3 / 25 µs for df 2–8 / 9–64 / 65–512 /
+513–4K against `STN3`'s 5.3 / 16.5 / 27 / 57; DL pages 0 / 0 / 61 / 94
+(inline lengths; 4.4 / 18 without).
 
 | ranked, pages per query (footer / payload / TF / DL / positions) | phase A | phase B |
 | --- | --- | --- |
@@ -350,12 +383,14 @@ Candidates examined (scored exactly) over the trace: conjunction 624K
 (619K, 409K position checks). `STN3` examines 965K / 5.5M / 1.14M.
 
 Size against `STN3` (the first N rows of the 1M dump rebuilt by `STN3`'s
-builder, `tinshape --subset N [--rows-per-page R]`): 6,000 rows 0.717
-(0.705 packed 250 rows to a page), 100k rows 0.806, 1M rows 0.900
-(246.2 MB: positions 134.9, postings 103.2, DL 1.04; phase A 0.895).
+builder, `tinshape --subset N [--rows-per-page R]`): 6,000 rows 0.633
+(0.621 packed 250 rows to a page), 100k rows 0.716, 1M rows 0.802
+(219.3 MB, 4.81 bytes per term-document pair against TIN's 4.7: positions
+106.3, postings 104.8 with 2.5 of inline lengths, term map 7.0, DL 1.04;
+phase A 0.895).
 
-Counts (offline, µs p50 / p99, `STN3` then `TNS1`): AND 57 / 176 and
-35 / 117; OR 34 / 102 and 58 / 140; phrase 128 / 31,086 and 52 / 9,906.
+Counts (offline, µs p50 / p99, `STN3` then `TNS1`): AND 52 / 159 and
+34 / 108; OR 32 / 97 and 57 / 132; phrase 121 / 26,873 and 52 / 9,449.
 OR counts remain slower: a union decodes each Elias-Fano group container a
 member at a time into the group's words.
 
@@ -449,12 +484,17 @@ of 3.9 MB.
 
 ## Open
 
-- OR counts are about 1.7 times `STN3`'s offline (phase C measures AND and
-  OR counts at about 3 times in the extension): unions decode Elias-Fano
-  containers member by member. Word-parallel unions need denser
-  containers (the grid threshold trades size for it: 1 in 32 is 0.811 of
-  `STN3` at 1M and 45% slower counts than 1 in 64), or a faster decode
-  into words.
+- OR counts are about 1.8 times `STN3`'s offline. A union reads every
+  term's grid in every group, and a grid is 1.61 slots per document (a
+  dense term's grids are 25K words at 1M rows against `STN3`'s 16K); the
+  rest is decoding Elias-Fano containers into words. Fusing the ORs with
+  the count, NEON grid kernels, merging short lists instead of a bitmap,
+  saturating early and a table-free Elias-Fano decode all measured no
+  faster (log, round 2). Grids over document ranks rather than slots
+  would remove the inflation; that is a format change.
+- Positions are still 49% of the blob (2.3 bytes per posting; TIN's
+  synthetic probes measured 0.14 per posting at tf 1). Bit-packing
+  positions per block against the document's length is the next step.
 - Per-block counts in the footer (TIN answers single-term counts from its
   footer): a single-term count is the dictionary's `df` here already; the
   group directory's per-group counts settle groups one term holds.
