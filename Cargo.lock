@@ -411,6 +411,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "segment",
+ "thiserror",
+]
+
+[[package]]
 name = "enum-map"
 version = "2.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1681,6 +1690,7 @@ name = "stannum"
 version = "0.1.0"
 dependencies = [
  "boldi-vigna",
+ "engine",
  "pgrx",
  "pgrx-tests",
  "postgres",

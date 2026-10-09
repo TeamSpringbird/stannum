@@ -30,6 +30,7 @@ tokenizer = { path = "../tokenizer" }
 tinql = { path = "../tinql" }
 boldi-vigna = { path = "../boldi-vigna" }
 segment = { path = "../segment" }
+engine = { path = "../engine" }
 
 [dev-dependencies]
 pgrx-tests = "=0.19.1"

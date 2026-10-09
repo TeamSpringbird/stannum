@@ -3,12 +3,12 @@
 //
 // See LICENSE in the repository root for license terms.
 
+use engine::bm25;
 use pgrx::pg_guard;
 
 ::pgrx::pg_module_magic!(name);
 
 mod am;
-mod bm25;
 mod customscan;
 mod fold;
 #[cfg(feature = "pg_test")]
@@ -23,9 +23,6 @@ mod score;
 mod selectivity;
 mod storage;
 mod stream;
-mod tf_bucket {
-    pub(crate) use segment::tf_bucket::*;
-}
 mod udfs;
 
 /// Stannum against TIN 1.0.3's recorded answers (see the module).

@@ -602,6 +602,20 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Relocated/adapted Lead query-language documentation with Stannum SQL names and navigation."
     },
+    "engine/Cargo.toml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the PostgreSQL-free query engine crate, split out of the extension."
+    },
+    "engine/src/bm25.rs": {
+      "owner": "mixed",
+      "upstream_path": "postgres/src/bm25.rs",
+      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+    },
+    "engine/src/lib.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the PostgreSQL-free query engine crate, split out of the extension."
+    },
     "postgres/Cargo.toml": {
       "owner": "mixed",
       "upstream_path": "postgres/Cargo.toml",
@@ -625,12 +639,6 @@
     "postgres/src/am.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/am.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
-    },
-    "postgres/src/bm25.rs": {
-      "owner": "mixed",
-      "upstream_path": "postgres/src/bm25.rs",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },

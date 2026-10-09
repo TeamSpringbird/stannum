@@ -1,0 +1,16 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Stannum's query engine over segments, without PostgreSQL: BM25 scoring, the ranked ordinal walk and the count fold"
+
+[dependencies]
+rustc-hash.workspace = true
+segment = { path = "../segment" }
+thiserror.workspace = true
