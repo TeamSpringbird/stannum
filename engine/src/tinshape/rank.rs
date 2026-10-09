@@ -28,7 +28,7 @@ use segment::tinshape::bits;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local, or_into};
+use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local};
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
@@ -1316,6 +1316,32 @@ struct Plan {
     order: Vec<(f32, usize)>,
 }
 
+/// Sets a group's local slots, given in ascending order, in a row of words
+/// cleared before: the word at hand's bits are kept in a register and
+/// stored whole at each member, so a member never reads back the word the
+/// one before it stored.
+struct RowBits<'r> {
+    row: &'r mut [u64],
+    w: usize,
+    bits: u64,
+}
+
+impl<'r> RowBits<'r> {
+    fn new(row: &'r mut [u64]) -> Self {
+        Self { row, w: 0, bits: 0 }
+    }
+
+    #[inline]
+    fn set(&mut self, local: u32) {
+        let w = local as usize / 64;
+        debug_assert!(w >= self.w, "local slots in ascending order");
+        let kept = if w == self.w { self.bits } else { 0 };
+        self.bits = kept | 1 << (local % 64);
+        self.w = w;
+        self.row[w] = self.bits;
+    }
+}
+
 /// A disjunction term's members in the group at hand, as a row of words in
 /// [`Walk::rows`], and a forward cursor over their posting indexes.
 #[derive(Clone, Copy, Default)]
@@ -1396,10 +1422,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             cursor.seek(group.slot_base);
             r.first = cursor.rank() as u32;
             let end = group.slot_base + group.slots();
-            cursor.drain_below(end, |slot| {
-                let l = slot - group.slot_base;
-                row[l as usize / 64] |= 1 << (l % 64);
-            });
+            let mut out = RowBits::new(row);
+            cursor.drain_below(end, |slot| out.set(slot - group.slot_base));
             return Ok(());
         }
         let entry = set
@@ -1418,14 +1442,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     kernels::load(row, bytes);
                 } else {
                     row.fill(0);
-                    or_into(&e, bytes, &group, row)?;
+                    let mut out = RowBits::new(row);
+                    for_each_local(&e, bytes, &group, |l| out.set(l))?;
                 }
             }
             Src::Locals { from, to } => {
                 r.first = from;
                 row.fill(0);
+                let mut out = RowBits::new(row);
                 for l in &set.locals[from as usize..to as usize] {
-                    row[*l as usize / 64] |= 1 << (l % 64);
+                    out.set(*l);
                 }
             }
         }
