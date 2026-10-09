@@ -162,6 +162,55 @@ impl<'a> Ef<'a> {
         out
     }
 
+    /// Keeps the values of `values` (ascending, distinct) the list holds.
+    ///
+    /// The highs are passed a word at a time to each value's high bucket
+    /// (its high part is the number of zeros before it), and only the lows
+    /// of that bucket's members are read: for a few values against a long
+    /// list, a small part of what decoding the list reads.
+    pub fn retain_members(&self, values: &mut Vec<u32>) {
+        let (highs, lows, low, n) = (self.highs, self.lows, self.low, self.n);
+        let total = highs.len() * 8;
+        let mask = if low == 0 { 0 } else { (1u32 << low) - 1 };
+        // The highs bit the scan stands at, and the ones before it (the
+        // rank of the next member); the zeros before it are the difference.
+        let mut bit = 0usize;
+        let mut index = 0usize;
+        values.retain(|&v| {
+            let h = (v >> low) as usize;
+            // Move to bucket `h`'s first bit, `h` zeros in.
+            while bit - index < h {
+                if bit >= total {
+                    return false;
+                }
+                let need = h - (bit - index);
+                let off = bit % 64;
+                let word = bits::word(highs, bit / 64) >> off;
+                let ones = word.count_ones() as usize;
+                let zeros = 64 - off - ones;
+                if zeros < need {
+                    index += ones;
+                    bit += 64 - off;
+                    continue;
+                }
+                let p = select(!word, need - 1) as usize;
+                index += (word & ((1u64 << p) - 1)).count_ones() as usize;
+                bit += p + 1;
+            }
+            // The bucket's members, until its closing zero.
+            let want = v & mask;
+            while index < n && bit < total && highs[bit / 8] >> (bit % 8) & 1 == 1 {
+                let have = bits::get(lows, index, low).unwrap_or(0);
+                if have >= want {
+                    return have == want;
+                }
+                index += 1;
+                bit += 1;
+            }
+            false
+        });
+    }
+
     /// A cursor at the first value.
     pub fn cursor(&self) -> EfCursor<'a> {
         let mut cursor = EfCursor {
@@ -175,6 +224,32 @@ impl<'a> Ef<'a> {
     }
 }
 
+/// The position of the set bit of rank `k` (from 0) in `x`, which has more
+/// than `k`: the byte by prefix sums of byte counts, then the bit.
+#[inline]
+fn select(x: u64, k: usize) -> u32 {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let mut c = x - ((x >> 1) & 0x5555_5555_5555_5555);
+    c = (c & 0x3333_3333_3333_3333) + ((c >> 2) & 0x3333_3333_3333_3333);
+    c = (c + (c >> 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    // Byte `i` of `prefix`: the set bits of bytes `0..=i`.
+    let prefix = c.wrapping_mul(ONES);
+    let mut byte = 0u32;
+    while ((prefix >> (8 * byte)) & 0xff) as usize <= k {
+        byte += 1;
+    }
+    let before = if byte == 0 {
+        0
+    } else {
+        ((prefix >> (8 * (byte - 1))) & 0xff) as usize
+    };
+    let mut b = (x >> (8 * byte)) & 0xff;
+    for _ in before..k {
+        b &= b - 1;
+    }
+    8 * byte + b.trailing_zeros()
+}
+
 /// Reads an [`Ef`] list forward, with its rank.
 #[derive(Clone, Debug)]
 pub struct EfCursor<'a> {
@@ -186,7 +261,7 @@ pub struct EfCursor<'a> {
     current: Option<u32>,
 }
 
-impl EfCursor<'_> {
+impl<'a> EfCursor<'a> {
     fn load(&mut self) {
         if self.index >= self.ef.n {
             self.current = None;
@@ -214,6 +289,11 @@ impl EfCursor<'_> {
 
     pub fn current(&self) -> Option<u32> {
         self.current
+    }
+
+    /// The list the cursor reads.
+    pub fn list(&self) -> Ef<'a> {
+        self.ef
     }
 
     /// The rank of the current value in the list.
@@ -392,7 +472,71 @@ mod tests {
         assert_eq!(seen, values);
     }
 
+    fn check_retain(values: &[u32], universe: u32, probes: &[u32]) {
+        let mut out = Vec::new();
+        encode(values, universe, &mut out);
+        let ef = Ef::parse(&out, values.len(), universe).unwrap();
+        let mut kept = probes.to_vec();
+        ef.retain_members(&mut kept);
+        let expected: Vec<u32> = probes
+            .iter()
+            .copied()
+            .filter(|p| values.binary_search(p).is_ok())
+            .collect();
+        assert_eq!(
+            kept, expected,
+            "values {values:?} universe {universe} probes {probes:?}"
+        );
+    }
+
+    #[test]
+    fn selects() {
+        for x in [1u64, u64::MAX, 0x8000_0000_0000_0000, 0xf0f0_0000_ff00_0101] {
+            let mut bits = Vec::new();
+            for i in 0..64 {
+                if x >> i & 1 == 1 {
+                    bits.push(i);
+                }
+            }
+            for (k, b) in bits.iter().enumerate() {
+                assert_eq!(select(x, k), *b, "{x:#x} {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn retains_members() {
+        check_retain(&[], 1, &[0]);
+        check_retain(&[0], 1, &[0]);
+        check_retain(&[5], 6, &[0, 4, 5]);
+        let dense: Vec<u32> = (0..1000).collect();
+        check_retain(&dense, 1000, &[0, 63, 64, 500, 999]);
+        let every_third: Vec<u32> = (0..2000).map(|i| i * 3).collect();
+        let probes: Vec<u32> = (0..6100).step_by(7).collect();
+        check_retain(&every_third, 6001, &probes);
+        // Long runs of empty buckets, then a crowded one.
+        let mut clustered: Vec<u32> = (0..40).map(|i| i * 4_000).collect();
+        clustered.extend(160_001..160_100);
+        check_retain(
+            &clustered,
+            170_000,
+            &[0, 3_999, 4_000, 80_000, 160_000, 160_050, 169_999],
+        );
+    }
+
     proptest! {
+        #[test]
+        fn retains(values in prop::collection::btree_set(0u32..50_000, 0..600), extra in 1u32..100, probes in prop::collection::btree_set(0u32..50_100, 0..80), pick in prop::collection::vec(any::<prop::sample::Index>(), 0..40)) {
+            let values: Vec<u32> = values.into_iter().collect();
+            let universe = values.last().map_or(1, |v| v + extra);
+            let mut probes: std::collections::BTreeSet<u32> = probes;
+            if !values.is_empty() {
+                probes.extend(pick.iter().map(|i| values[i.index(values.len())]));
+            }
+            let probes: Vec<u32> = probes.into_iter().collect();
+            check_retain(&values, universe, &probes);
+        }
+
         #[test]
         fn round_trips(mut values in prop::collection::btree_set(0u32..200_000, 0..400), extra in 1u32..1000) {
             let values: Vec<u32> = std::mem::take(&mut values).into_iter().collect();
