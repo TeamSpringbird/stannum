@@ -270,15 +270,16 @@ footers it decodes between queries (`Segment::resolve_memo`,
   its row). The group is first planned at its own bounds: its required
   and essential terms' rows are read and combined into a mask (a document
   holding none of the essential terms cannot reach the threshold anywhere
-  in the group), a group whose mask is empty reads no other row, and a
-  sub-range whose mask is empty is skipped. Each other 1,024-slot
-  sub-range is bounded by its terms' blocks and, unless pruned, each member
-  of its mask is weighed alone: the sub-range bounds of the terms it holds,
-  summed, must reach the threshold (a word's members are first weighed
-  together by the terms holding any of them). At 150 million rows a
-  group's mask holds about 85 members in a third of its words, and this
-  costs less than planning each sub-range as `STN3` planned a sub-block and
-  sieving all its words bit-parallel (`LaneSums`), and lets fewer through.
+  in the group), and a group whose mask is empty reads no other row. Each
+  member of the mask is then weighed alone: the bounds of the terms it
+  holds, summed, must reach the threshold. A word's members are first
+  weighed together by the terms holding any of them, at the group's
+  bounds, and a word left in reach again at its 1,024-slot sub-range's
+  (taken once per sub-range, from the terms' blocks), then member by
+  member. At 150 million rows a group's mask holds about 85 members in a
+  third of its words, and this costs less than planning each sub-range
+  as `STN3` planned a sub-block and sieving all its words bit-parallel
+  (`LaneSums`), and lets fewer through.
   A candidate is then bounded by its terms' blocks, then by its buckets as
   above, and scored exactly once its length is read.
 - Candidates come in ctid order, so one that only ties the threshold ranks

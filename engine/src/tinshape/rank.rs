@@ -524,10 +524,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// essential terms' union there.
     row_loaded: Vec<bool>,
     any: Vec<u64>,
-    /// A disjunction's sub-range at hand: per present term with a positive
-    /// bound there, where its row starts in `rows` and that bound; and its
-    /// word at hand.
-    or_terms: Vec<(usize, f64)>,
+    /// A disjunction's group at hand: per present term with a positive
+    /// bound there, where its row starts in `rows`, that bound and its bound
+    /// over the sub-range at hand; and its word at hand.
+    or_terms: Vec<(usize, f64, f64)>,
     or_held: Vec<u64>,
     /// Per scoring term, the candidate at hand's bucket ([`NO_BUCKET`]
     /// when it does not hold the term).
@@ -1538,46 +1538,36 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         self.row_loaded = loaded;
-        // Each sub-range the mask leaves anything in, bounded by its terms'
-        // blocks; then each member of the mask weighed alone: the bounds over
-        // the sub-range of the terms it holds, summed (a word's members first
-        // all at once, by the terms holding any of them). A member's blocks
-        // bound it no higher, so one this leaves below the threshold would
-        // fail its candidate check. At 150 million rows a group's mask holds
-        // ~85 members in a third of its words; weighing them alone, without
-        // a plan per sub-range, cost less than sieving every word of it.
+        // Each member of the mask weighed alone: the bounds of the terms it
+        // holds, summed, must reach the threshold (a word's members first
+        // all at once, by the terms holding any of them). A word is weighed
+        // by the group's bounds first, and only a word they leave in reach by
+        // its sub-range's (1,024 slots), taken once per sub-range: tighter,
+        // but a range bound per term. A member's blocks bound it no higher,
+        // so one this leaves below the threshold would fail its candidate
+        // check. At 150 million rows a group's mask holds ~85 members in a
+        // third of its words; weighing them alone, without a plan per
+        // sub-range, cost less than sieving every word of it.
         let mut terms = std::mem::take(&mut self.or_terms);
         let mut held = std::mem::take(&mut self.or_held);
+        terms.clear();
+        for p in 0..self.present_list.len() {
+            let i = self.present_list[p];
+            if sb[i] > 0.0 {
+                terms.push((i * words, f64::from(sb[i]), 0.0));
+            }
+        }
+        held.clear();
+        held.resize(terms.len(), 0);
         let mut w0 = 0;
         while w0 < words {
             let w1 = (w0 + SUB_WORDS).min(words);
-            if mask[w0..w1].iter().all(|m| *m == 0) {
-                w0 = w1;
-                continue;
-            }
-            let from = base + (w0 * 64) as u32;
-            let to = (base + (w1 * 64) as u32 - 1).min(end);
-            terms.clear();
-            let mut total = 0.0_f64;
-            for p in 0..self.present_list.len() {
-                let i = self.present_list[p];
-                let bound = f64::from(self.sc[i].range_bound(from, to));
-                total += bound;
-                if bound > 0.0 {
-                    terms.push((i * words, bound));
-                }
-            }
-            if below(total, self.threshold()) {
-                w0 = w1;
-                continue;
-            }
-            held.clear();
-            held.resize(terms.len(), 0);
             // The live words, walked by their bits rather than tested.
             let mut live = 0u32;
             for (j, word) in mask[w0..w1].iter().enumerate() {
                 live |= u32::from(*word != 0) << j;
             }
+            let mut bounded = false;
             while live != 0 {
                 let w = w0 + live.trailing_zeros() as usize;
                 live &= live - 1;
@@ -1585,8 +1575,29 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let theta = self.threshold();
                 if theta.is_some() {
                     let mut most = 0.0_f64;
-                    for (h, &(at, bound)) in held.iter_mut().zip(&terms) {
+                    for (h, &(at, bound, _)) in held.iter_mut().zip(&terms) {
                         *h = self.rows[at + w];
+                        most += if *h & word != 0 { bound } else { 0.0 };
+                    }
+                    if below(most, theta) {
+                        continue;
+                    }
+                    if !bounded {
+                        bounded = true;
+                        let from = base + (w0 * 64) as u32;
+                        let to = (base + (w1 * 64) as u32 - 1).min(end);
+                        let mut total = 0.0_f64;
+                        for term in terms.iter_mut() {
+                            let bound = f64::from(self.sc[term.0 / words].range_bound(from, to));
+                            term.2 = bound;
+                            total += bound;
+                        }
+                        if below(total, theta) {
+                            break;
+                        }
+                    }
+                    let mut most = 0.0_f64;
+                    for (h, &(_, _, bound)) in held.iter().zip(&terms) {
                         most += if *h & word != 0 { bound } else { 0.0 };
                     }
                     if below(most, theta) {
@@ -1598,7 +1609,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         let bit = left.trailing_zeros();
                         left &= left - 1;
                         let mut sum = 0.0_f64;
-                        for (h, &(_, bound)) in held.iter().zip(&terms) {
+                        for (h, &(_, _, bound)) in held.iter().zip(&terms) {
                             sum += if *h >> bit & 1 == 1 { bound } else { 0.0 };
                         }
                         keep |= u64::from(!below(sum, theta)) << bit;
