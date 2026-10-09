@@ -13,6 +13,11 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Added
 
+- On x86-64, the word kernels of segments in TIN's shape (grid AND, OR and
+  AND NOT, popcount, AND-popcount, masked counts) run AVX-512 or AVX2 bodies
+  chosen once at runtime, as PostgreSQL's `pg_popcount` does, so baseline
+  x86-64 packages use the CPU's vectors; aarch64 keeps NEON.
+  `STANNUM_KERNELS` forces a level for tests and comparisons.
 - Queries read segments in TIN's shape in place from pinned shared buffers
   rather than copying what they read into per-backend chunks: at 150M rows
   the copies overflowed each backend's cache and every query copied some
