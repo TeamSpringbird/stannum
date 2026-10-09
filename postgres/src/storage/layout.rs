@@ -35,7 +35,8 @@ pub const MAGIC: u32 = 0x4c44_5032;
 /// Version 5: segments in TIN's shape (`TNS1`), directory entries that
 /// record their origin, sealed write segments and retired sources on the
 /// meta page. Version 6: `TNS1` positions streams with single-position
-/// masks and rare terms' lengths inline in their records. An index of an
+/// masks, rare terms' lengths inline in their records and records without
+/// a footer (phase B, round 2). An index of an
 /// earlier version must be rebuilt.
 pub const VERSION: u8 = 6;
 pub const SPECIAL_SIZE: usize = 8;
