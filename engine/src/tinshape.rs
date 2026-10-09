@@ -300,13 +300,14 @@ pub fn lower(query: &Query, terms: &mut Vec<String>) -> Option<Node> {
         Query::Not(inner) => Node::Not(Box::new(lower(inner, terms)?)),
         Query::Boost { inner, .. } => lower(inner, terms)?,
         // Leaf boosts weigh a span's terms in a score, not which documents
-        // match it.
+        // match it. A span is folded as the AND of its words, then checked
+        // by positions: only one every word of which must occur.
         Query::Span {
             term_slots,
             span_query,
             position_filter: None,
             ..
-        } => {
+        } if crate::walk::span_requires_all(span_query) => {
             let mut slots = Vec::with_capacity(term_slots.len());
             for slot in term_slots {
                 match slot {
@@ -636,6 +637,14 @@ impl<'a> TermSet<'a> {
                 self.loaded = Loaded::List;
             }
         }
+    }
+
+    /// Moves the cursor back before the first slot.
+    pub fn rewind(&mut self) {
+        self.gpos = 0;
+        self.loaded = Loaded::None;
+        self.current = None;
+        self.sparse = None;
     }
 
     /// The current slot's posting index.
@@ -1088,6 +1097,11 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 let slot = base + (w * 64) as u32 + bit;
                 for (i, t) in slots.iter().enumerate() {
                     let set = self.terms[*t].as_mut().expect("a span's terms exist");
+                    // Another span of the query may have read this term
+                    // further into the group.
+                    if set.current().is_some_and(|current| current > slot) {
+                        set.rewind();
+                    }
                     set.seek(geometry, slot, self.touch);
                     debug_assert_eq!(set.current(), Some(slot));
                     let index = set.index();
@@ -1213,6 +1227,110 @@ pub fn count_terms<'a>(
         total += kernels::popcount(&out);
     }
     Ok(total)
+}
+
+/// The live documents of `segment` matching `node`, a group at a time:
+/// `emit` is called with each group holding any, ascending, and the
+/// group's words over its slots (bit `local` for slot `local`; see
+/// [`Geometry::tid_in`]). Ctid order is group order, then slot order.
+pub fn for_each_match<'a>(
+    segment: &Segment<'a>,
+    node: &Node,
+    terms: &mut [Option<TermSet<'a>>],
+    touch: &mut impl Touch,
+    emit: &mut dyn FnMut(usize, &[u64]),
+) -> Result<()> {
+    let live = &segment.liveness;
+    touch.touch(Part::Liveness, segment.area_at(Area::Liveness), 1);
+    let geometry = &segment.docs.geometry;
+    for set in terms.iter_mut().flatten() {
+        set.ensure_groups(geometry, touch);
+    }
+    let all = geometry.groups.len();
+    let groups = candidate_groups(node, terms, all);
+    let hints = vec![0usize; terms.len()];
+    let mut fold = Fold {
+        segment,
+        terms,
+        hints,
+        scratch: Scratch::default(),
+        touch,
+        list: Vec::new(),
+        other: Vec::new(),
+    };
+    let mut out = Vec::new();
+    for group in groups {
+        crate::check_interrupts();
+        let words = geometry.groups[group as usize].words();
+        out.clear();
+        out.resize(words, 0);
+        if !fold.eval(node, group, &mut out, 0)? {
+            continue;
+        }
+        if let Some(dead) = live.groups[group as usize].as_deref() {
+            for (o, d) in out.iter_mut().zip(dead) {
+                *o &= !d;
+            }
+        }
+        if out.iter().any(|w| *w != 0) {
+            emit(group as usize, &out);
+        }
+    }
+    Ok(())
+}
+
+/// The score of the document at `tid` by the summed `scorers` (in their
+/// order, as the walks sum), or `None` when the segment does not hold it
+/// live or it holds no scoring term: a row looked up alone, as `score()`
+/// projects one.
+pub fn score_at(
+    segment: &Segment<'_>,
+    scorers: &[(String, TermScorer)],
+    tid: Tid,
+) -> Result<Option<f32>> {
+    let geometry = &segment.docs.geometry;
+    let Some(slot) = geometry.slot_of(tid) else {
+        return Ok(None);
+    };
+    let Some(rank) = segment.docs.rank(slot) else {
+        return Ok(None);
+    };
+    if segment.liveness.is_dead(geometry, slot) {
+        return Ok(None);
+    }
+    let mut total = None::<f32>;
+    let mut length = None;
+    for (name, scorer) in scorers {
+        let Some(mut set) = TermSet::open(segment, name, &mut NoTouch)? else {
+            continue;
+        };
+        if set.seek(geometry, slot, &mut NoTouch) != Some(slot) {
+            continue;
+        }
+        let footer = segment.footer_memo(set.at, &set.postings, set.max_bucket)?;
+        let bucket = footer.bucket(set.postings.tf, set.index())?;
+        let length = match length {
+            Some(length) => length,
+            None => *length.insert(segment.lengths.get(rank)?),
+        };
+        let score = scorer.score_bucket(
+            segment::tf_bucket::TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?,
+            length,
+        );
+        total = Some(total.unwrap_or(0.0) + score);
+    }
+    Ok(total)
+}
+
+/// The documents set in `words`, group `group`'s matches, in ctid order.
+pub fn tids_in(geometry: &Geometry, group: usize, words: &[u64], mut visit: impl FnMut(Tid)) {
+    for (w, word) in words.iter().enumerate() {
+        let mut word = *word;
+        while word != 0 {
+            visit(geometry.tid_in(group, (w * 64) as u32 + word.trailing_zeros()));
+            word &= word - 1;
+        }
+    }
 }
 
 /// [`count_terms`] trusting only the slots on all-visible heap pages, as an
@@ -1492,10 +1610,7 @@ fn first_matches<'a>(
 ) -> Result<Vec<Tid>> {
     // Fresh cursors: the walk moved them.
     for set in terms.iter_mut().flatten() {
-        set.gpos = 0;
-        set.loaded = Loaded::None;
-        set.current = None;
-        set.sparse = None;
+        set.rewind();
     }
     let geometry = &segment.docs.geometry;
     let mut out = Vec::new();
@@ -1627,6 +1742,17 @@ mod tests {
                 },
                 Term(0),
             ]),
+            // Two spans reading one word: each from the group's start.
+            Or(vec![
+                Span {
+                    slots: vec![0, 1],
+                    query: SpanQuery::phrase([0, 1]),
+                },
+                Span {
+                    slots: vec![0, 2],
+                    query: SpanQuery::phrase([0, 1]),
+                },
+            ]),
         ]
     }
 
@@ -1668,6 +1794,14 @@ mod tests {
                 let want = (0..docs.len()).filter(|r| eval(&node, &members, *r)).count() as u64;
                 let got = count(&segment, &node, &names, &mut NoTouch).unwrap();
                 prop_assert_eq!(got, want, "count of {:?}", node);
+                let mut terms = open_terms(&segment, &names, &mut NoTouch).unwrap();
+                let mut listed = Vec::new();
+                for_each_match(&segment, &node, &mut terms, &mut NoTouch, &mut |group, words| {
+                    tids_in(&segment.docs.geometry, group, words, |tid| listed.push(tid));
+                })
+                .unwrap();
+                let expected: Vec<Tid> = (0..docs.len()).filter(|r| eval(&node, &members, *r)).map(|r| docs[r]).collect();
+                prop_assert_eq!(listed, expected, "matches of {:?}", node);
                 if matches!(node, Node::Not(_)) {
                     continue;
                 }
@@ -1694,6 +1828,19 @@ mod tests {
                         (total, docs[r])
                     })
                     .collect();
+                for r in 0..docs.len() {
+                    let mut total = None::<f32>;
+                    for (name, scorer) in &scorers {
+                        let t: usize = name[1..].parse().unwrap();
+                        if let Some(tf) = holds(&members, t, r) {
+                            total = Some(total.unwrap_or(0.0) + scorer.score_bucket(TfBucket::from_count(tf), lengths[r]));
+                        }
+                    }
+                    let got = score_at(&segment, &scorers, docs[r]).unwrap();
+                    prop_assert_eq!(got.map(f32::to_bits), total.map(f32::to_bits), "score of {:?}", docs[r]);
+                }
+                let absent = Tid { block: 5000, offset: 1 };
+                prop_assert_eq!(score_at(&segment, &scorers, absent).unwrap(), None);
                 want.sort_by(crate::walk::rank);
                 want.truncate(k);
                 let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
@@ -1701,6 +1848,28 @@ mod tests {
                 prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
             }
         }
+    }
+
+    #[test]
+    fn only_spans_needing_every_word_lower() {
+        let span = |span_query| Query::Span {
+            term_slots: vec![
+                SpanTermSlot::Term("a".into()),
+                SpanTermSlot::Term("b".into()),
+            ],
+            span_query,
+            position_filter: None,
+            leaf_boosts: Default::default(),
+        };
+        let mut names = Vec::new();
+        assert!(lower(&span(SpanQuery::phrase([0, 1])), &mut names).is_some());
+        // `a NOT ENCLOSES b` matches documents without b: its words are not
+        // an AND to fold.
+        let not_containing = SpanQuery::NotContaining {
+            big: Box::new(SpanQuery::Term(0)),
+            little: Box::new(SpanQuery::Term(1)),
+        };
+        assert!(lower(&span(not_containing), &mut Vec::new()).is_none());
     }
 
     /// Rejects every fifth ctid, as a heap visibility check or a scan's
@@ -1809,6 +1978,18 @@ mod tests {
                         want.push(row);
                     }
                 }
+                // The live matches, segment by segment.
+                let mut listed = Vec::new();
+                for segment in &segments {
+                    let mut terms = open_terms(segment, &names, &mut NoTouch).unwrap();
+                    for_each_match(segment, &node, &mut terms, &mut NoTouch, &mut |group, words| {
+                        tids_in(&segment.docs.geometry, group, words, |tid| listed.push(tid));
+                    })
+                    .unwrap();
+                }
+                listed.sort_unstable();
+                let live: Vec<Tid> = (0..docs.len()).filter(|r| !dead[*r] && eval(&node, &members, *r)).map(|r| docs[r]).collect();
+                prop_assert_eq!(listed, live, "live matches of {:?}", node);
                 let mut top = crate::walk::TopRows::new(k, ties);
                 let mut visibility = EveryFifth(0);
                 for segment in segments.iter().rev() {

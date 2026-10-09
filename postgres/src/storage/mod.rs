@@ -3663,6 +3663,9 @@ pub(crate) struct Native {
     /// Footers the ranked walks decoded, kept across the segments
     /// [`with_native`] assembles.
     footers: Rc<RefCell<segment::tinshape::segment::FooterCache>>,
+    /// Term-map lookups made so far: a row scored alone asks for the same
+    /// terms once per row.
+    terms: RefCell<FxHashMap<String, Option<TermEntry>>>,
 }
 
 impl Native {
@@ -3695,7 +3698,20 @@ pub(crate) fn with_native<R>(
         let source: &dyn segment::source::Source = &**reader.source();
         let mut entries = Vec::with_capacity(names.len());
         for name in names {
-            entries.push(reader.term_entry(name)?);
+            let known = native.terms.borrow().get(name.as_str()).copied();
+            let entry = match known {
+                Some(entry) => entry,
+                None => {
+                    let entry = reader.term_entry(name)?;
+                    let mut terms = native.terms.borrow_mut();
+                    if terms.len() >= TERM_MEMO_LIMIT {
+                        terms.clear();
+                    }
+                    terms.insert(name.clone(), entry);
+                    entry
+                }
+            };
+            entries.push(entry);
         }
         let mut slot = native.blob.borrow_mut();
         let blob = slot.get_or_insert_with(|| Blob::new(header.bounds[7] as usize));
@@ -4038,8 +4054,26 @@ pub unsafe fn scan(
             }
         };
 
-        for ((segment, dead_bytes), label) in view.sources.iter().zip(&view.labels) {
+        // Segments in TIN's shape fold the query over their ctid sets; the
+        // write buffer, sealed segments and queries that do not lower are
+        // planned over ordinal streams.
+        let lowering = crate::native::Lowering::new(queries);
+        for (i, ((segment, dead_bytes), label)) in view.sources.iter().zip(&view.labels).enumerate()
+        {
             pgrx::check_for_interrupts!();
+            if let Some(lowered) = lowering.get(&view, i)
+                && crate::native::visit_matches(&view, i, &lowered, &mut |tid| {
+                    pending.push(pointer_of(tid));
+                    added += 1;
+                    if pending.len() == BITMAP_BATCH {
+                        pgrx::check_for_interrupts!();
+                        flush(&mut pending, false);
+                    }
+                })
+            {
+                flush(&mut pending, false);
+                continue;
+            }
             let mut exact = true;
             let mut cursors: Vec<Box<dyn Cursor>> = Vec::with_capacity(queries.len());
             for query in queries {

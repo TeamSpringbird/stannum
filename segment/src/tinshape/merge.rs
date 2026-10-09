@@ -8,16 +8,17 @@
 //!
 //! Nothing is renumbered in the sense the ordinal format meant: a posting
 //! is a ctid, and the merged segment's grid is derived from the merged
-//! documents. Every term's slot set, footer and TF tail are re-encoded and
-//! its positions entries re-packed in the merged posting order. Copying a
-//! group's containers unchanged when only one input holds the group is the
-//! cheaper merge the format allows ([the TIN-shape guide](../../../docs/architecture/tin-shape.md)),
-//! not done yet.
+//! documents. A group only one input holds, with the input's geometry and
+//! no dead document there, keeps each term's container as the input wrote
+//! it ([`Builder::add_term_reusing`]); every other group is re-encoded over
+//! the merged grid. Footers and TF tails are rebuilt and positions entries
+//! re-packed in the merged posting order, since posting indexes interleave
+//! ([the TIN-shape guide](../../../docs/architecture/tin-shape.md)).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use super::postings::Options;
+use super::postings::{Form, Options, Postings, Reused};
 use super::segment::{Builder, Segment};
 use crate::dead::DeadDocs;
 use crate::dictionary::TermEntry;
@@ -40,6 +41,8 @@ pub struct Merged {
     pub terms: u64,
     /// One per term and document.
     pub postings: u64,
+    /// Group containers offered to the builder as an input wrote them.
+    pub reused: u64,
 }
 
 /// Terms between two calls of a merge's checkpoint.
@@ -59,14 +62,21 @@ pub fn merge(
         .collect::<Result<Vec<_>>>()?;
     // The live documents in ctid order, each with where it came from.
     let mut documents: Vec<(Tid, u32, usize, u32)> = Vec::new();
+    // Per input, per group of its own, whether a document there is dead.
+    let mut dead_in: Vec<Vec<bool>> = Vec::with_capacity(segments.len());
     for (i, segment) in segments.iter().enumerate() {
         checkpoint()?;
+        let geometry = &segment.docs.geometry;
+        let mut dead = vec![false; geometry.groups.len()];
         for (rank, tid) in segment.docs.tids().into_iter().enumerate() {
             let rank = rank as u32;
             if !inputs[i].dead.contains(rank) {
                 documents.push((tid, segment.lengths.get(rank)?, i, rank));
+            } else if let Some(group) = geometry.group_index(tid.block) {
+                dead[group] = true;
             }
         }
+        dead_in.push(dead);
     }
     documents.sort_unstable_by_key(|d| d.0);
     if documents.windows(2).any(|w| w[0].0 == w[1].0) {
@@ -88,6 +98,35 @@ pub fn merge(
     let count = documents.len() as u32;
     drop(documents);
     let mut builder = Builder::new(tids, lengths, options)?;
+    // Per group of the output, the input (and its group) whose containers
+    // it may keep: the only input with a live document there, with the
+    // same width, first page and span, and no dead document there.
+    let owners: Vec<Option<(usize, u32)>> = builder
+        .geometry()
+        .groups
+        .iter()
+        .map(|out| {
+            let mut owner = None;
+            for (i, segment) in segments.iter().enumerate() {
+                let groups = &segment.docs.geometry.groups;
+                let Ok(g) = groups.binary_search_by_key(&out.id, |g| g.id) else {
+                    continue;
+                };
+                if owner.is_some() {
+                    return None;
+                }
+                let held = &groups[g];
+                if dead_in[i][g]
+                    || (held.width, held.first, held.pages) != (out.width, out.first, out.pages)
+                {
+                    return None;
+                }
+                owner = Some((i, g as u32));
+            }
+            owner
+        })
+        .collect();
+    drop(dead_in);
 
     let dictionaries: Vec<_> = segments.iter().map(Segment::dictionary).collect();
     let mut iters: Vec<_> = dictionaries.iter().map(|d| d.iter()).collect();
@@ -105,7 +144,9 @@ pub fn merge(
     let mut positions: Vec<u32> = Vec::new();
     let mut scratch: Vec<u32> = Vec::new();
     let mut holders: Vec<usize> = Vec::new();
-    let (mut terms, mut written) = (0u64, 0u64);
+    // The holders' records of the term at hand, by input.
+    let mut records: Vec<Option<(Postings<'_>, u32)>> = vec![None; segments.len()];
+    let (mut terms, mut written, mut reused) = (0u64, 0u64, 0u64);
     let mut since_checkpoint = 0usize;
     while let Some(Reverse((term, first))) = heap.pop() {
         holders.clear();
@@ -116,6 +157,7 @@ pub fn merge(
         }
         postings.clear();
         positions.clear();
+        records.iter_mut().for_each(|record| *record = None);
         for &i in &holders {
             let entry = heads[i].take().expect("a head per heap item");
             let segment = &segments[i];
@@ -173,6 +215,7 @@ pub fn merge(
             if index != entry.df {
                 return Err(Error::Corrupt("postings against df"));
             }
+            records[i] = Some((found.postings, entry.df));
             if let Some(item) = iters[i].next() {
                 let (next, entry) = item?;
                 if next <= term {
@@ -190,7 +233,20 @@ pub fn merge(
             for p in &postings {
                 payload.push(&positions[p.2 as usize..(p.2 + p.3) as usize])?;
             }
-            builder.add_term(&term, &ranks, &buckets, &payload.finish())?;
+            builder.add_term_reusing(&term, &ranks, &buckets, &payload.finish(), &mut |out| {
+                let (i, g) = owners[out]?;
+                let (postings, input_df) = records[i].as_ref()?;
+                let Form::Grouped(entries) = &postings.form else {
+                    return None;
+                };
+                let at = entries.binary_search_by_key(&g, |e| e.index).ok()?;
+                reused += 1;
+                Some(Reused {
+                    kind: entries[at].kind,
+                    bytes: postings.container(&entries[at]),
+                    input_df: *input_df,
+                })
+            })?;
             terms += 1;
             written += ranks.len() as u64;
         }
@@ -208,5 +264,6 @@ pub fn merge(
         total_length,
         terms,
         postings: written,
+        reused,
     }))
 }

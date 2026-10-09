@@ -1529,8 +1529,15 @@ unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
 fn candidates_in_view(exec: &mut ScanExec, query: &Query, view: &crate::storage::View) -> Vec<Tid> {
     let limits = Limits::default();
     let mut tids = Vec::new();
-    for ((segment, dead), label) in view.sources.iter().zip(&view.labels) {
+    // Segments in TIN's shape fold the query over their ctid sets.
+    let lowering = crate::native::Lowering::new(std::slice::from_ref(query));
+    for (i, ((segment, dead), label)) in view.sources.iter().zip(&view.labels).enumerate() {
         pgrx::check_for_interrupts!();
+        if let Some(lowered) = lowering.get(view, i)
+            && crate::native::visit_matches(view, i, &lowered, &mut |tid| tids.push(tid))
+        {
+            continue;
+        }
         let planned = plan(query, segment, &limits)
             .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
         let mut cursor: Box<dyn segment::set::Cursor> = planned.cursor;

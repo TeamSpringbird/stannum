@@ -60,14 +60,35 @@ impl CandidateStream {
         // This is the same owning-reader pattern used by IndexScorer.
         let view = unsafe { std::mem::transmute::<&View, &'static View>(&self.view) };
         let limits = Limits::default();
-        self.page_masks = view.sources.iter().any(|(source, _)| {
-            prefers_pages(&self.query, source)
-                .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"))
-        });
+        // Segments in TIN's shape hand over their matches folded over their
+        // ctid sets (see [`crate::native`]); only the others are planned.
+        let query = std::slice::from_ref(&self.query);
+        let lowering = crate::native::Lowering::new(query);
+        let mut natives: Vec<Option<crate::native::Matches>> = (0..view.sources.len())
+            .map(|i| {
+                pgrx::check_for_interrupts!();
+                lowering
+                    .get(view, i)
+                    .and_then(|lowered| crate::native::matches(view, i, &lowered))
+            })
+            .collect();
+        self.page_masks = view
+            .sources
+            .iter()
+            .zip(&natives)
+            .any(|((source, _), native)| {
+                native.is_none()
+                    && prefers_pages(&self.query, source)
+                        .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"))
+            });
         if self.page_masks {
             let mut inputs: Vec<Box<dyn pages::Cursor>> = Vec::new();
-            for ((source, dead), label) in view.sources.iter().zip(&view.labels) {
+            for (i, ((source, dead), label)) in view.sources.iter().zip(&view.labels).enumerate() {
                 pgrx::check_for_interrupts!();
+                if let Some(native) = natives[i].take() {
+                    inputs.push(Box::new(native));
+                    continue;
+                }
                 let planned = page_plan(&self.query, source, &limits)
                     .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
                 self.recheck |= !planned.exact;
@@ -81,8 +102,12 @@ impl CandidateStream {
             self.cursor = Some(Cursor::Pages(Box::new(pages::Union::new(inputs))));
         } else {
             let mut inputs: Vec<Box<dyn set::Cursor>> = Vec::new();
-            for ((source, dead), label) in view.sources.iter().zip(&view.labels) {
+            for (i, ((source, dead), label)) in view.sources.iter().zip(&view.labels).enumerate() {
                 pgrx::check_for_interrupts!();
+                if let Some(native) = natives[i].take() {
+                    inputs.push(Box::new(native));
+                    continue;
+                }
                 let planned = plan(&self.query, source, &limits)
                     .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
                 self.recheck |= !planned.exact;

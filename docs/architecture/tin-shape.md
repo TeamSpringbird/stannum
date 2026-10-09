@@ -10,7 +10,7 @@ replay in the bench crate, all measured offline against `STN3` on the same
 data. Phase C (below, [Integration](#integration-phase-c)) makes `TNS1` the
 extension's only segment format.
 
-data. Phase B (branch `tinshape/phase-b`) made ranked queries faster than
+Phase B (branch `tinshape/phase-b`) made ranked queries faster than
 `STN3`'s, median and tail, in every query style
 ([measurements](#measurements-phase-b)) and tightened the format for small
 tables; phase C (branch `tinshape/phase-c`) integrates it into the
@@ -487,60 +487,98 @@ of 3.9 MB.
 
 ## Integration (phase C)
 
-The extension writes and reads only `TNS1`; the page layout went to version
-3 and an older index must be rebuilt. What the segment crate gained for it,
-beside the phase A codecs, all in new files under `segment/src/tinshape/` so
-that work on the encoder and the walk (phase B) does not collide with it:
+The extension writes and reads only `TNS1`; the page layout is version 6
+(phase B's positions masks, inline lengths and footer-less records) and an
+older index must be rebuilt. What the segment crate gained for it, beside
+the phase A and B codecs, under `segment/src/tinshape/`:
 
 - `index::Reader<S: Source>`: a segment read a range at a time from the
-  extension's run pages, implementing `segment::index::Index`. A term is
-  handed out as an ordinal stream (ranks through the document set, buckets
-  from the TF tail, lengths from the DL sidecar), translated once per reader
-  and kept; positions need no translation. Every query shape the planner,
-  the Boolean cursors, the ordinal walk and the ordinal count fold handle
-  works over it unchanged. Its `Header::parse` reads the blob header from a
-  prefix; a change to the header must change it too.
-- `merge::merge`: the inputs' live documents in ctid order, every term's
-  postings re-encoded over the merged grid and its positions entries
-  re-packed. A property test checks a merge is byte for byte a build of the
-  live documents. Copying a group's containers when one input holds it is
-  not done yet.
-- `verify::verify_segment`: the checker of `stannum.verify_index()` for a
-  `TNS1` blob, returning the ordinal format's `SegmentReport`.
+  extension's run pages, implementing `segment::index::Index` for the term
+  map (statistics, expansions) and, for what the native paths do not
+  handle, ordinal streams. A term's postings are translated into an
+  ordinal stream only when a cursor first reads them
+  (`AreaFetch::ordinals_extent`), so a lookup for its statistics costs
+  nothing more. Its `Header::parse` reads the blob header from a prefix; a
+  change to the header must change it too.
+- `merge::merge`: the inputs' live documents in ctid order. A group of the
+  merged grid only one input holds, with that input's width, first page and
+  span and no dead document of it there, keeps each term's container as
+  the input wrote it (`Builder::add_term_reusing`); every other group is
+  re-encoded. Footers, TF tails and positions skip tables are rebuilt. A
+  property test checks a merge is byte for byte a build of the live
+  documents, with inputs interleaved by ctid and in runs of ctids (where
+  most groups are copied).
+- `verify::verify_segment`: the checker of `stannum.verify_index()`.
 - `SegmentBuilder::finish_tns` (in `segment.rs`) and `Payload::count`.
-- In `segment.rs`: `Segment::remember`, which seeds the term memo with
-  entries found elsewhere, and `Segment::assemble`, a segment from a
-  document set and liveness decoded once and a term-map index (empty, for
-  the extension's counts). In the engine: `count_terms_visible`, the count
-  fold trusting only slots on all-visible heap pages and handing the others
-  to the caller, and `fold::Visibility::group_bits`.
+- `Segment::assemble` (a segment over a blob loaded as far as its queries
+  need, from a document set and liveness decoded once and shared, `Rc`),
+  `Segment::remember` (term-map entries found elsewhere) and
+  `Segment::share_footers` (decoded footers kept across the segments a
+  backend assembles); `Liveness::is_dead`.
 
-**Counts.** A count whose query lowers (`engine::tinshape::lower`) folds a
-segment's ctid sets with `count_terms_visible`; members on pages the
-visibility map does not mark all-visible go to the heap a page at a time,
-and VACUUM's dead list is the fold's liveness. A backend keeps each
-segment's blob as far as its counts have read it: the header, the document
-set (decoded once) and the liveness area, and each query term's postings
-record (and positions, for phrases) the first time it is named. At 1M rows
-of the comparison kit, warm counts take what the ordinal fold over
-translated streams takes (0.02 to 0.07 ms, phrases 2.4 ms); a backend's
-first count of a segment pays about 1.5 ms decoding its document set.
-Ranked queries, the plain index and bitmap scans and every other shape read
-the translated ordinal streams; the engine's ctid-native ranked walk is not
-wired in yet.
+**How the extension reads a segment** (`storage::with_native`). A backend
+keeps each segment's blob as far as its queries have read it: the header,
+the document set (decoded once), the DL sidecar and the liveness area, and
+each query term's postings record (and positions, for phrases) the first
+time it is named; the dead list VACUUM published is decoded once into the
+segment's liveness in slot space; term-map lookups are memoized. Every
+query assembles a segment over those bytes.
+
+**Which paths are native.** A query is lowered (`engine::tinshape::lower`)
+after its wildcards, regexes, ranges and fuzzy terms are expanded against
+the segment's term map (`tinql::runtime::plan::expand_terms`); a span is
+lowered only when every word of it must occur (a phrase, `NEAR`, ordered
+and unordered spans; not `NOT ENCLOSES` and the like).
+
+- Counts: `count_terms_visible`, members on pages the visibility map does
+  not mark all-visible checked against the heap a page at a time.
+- Ranked scans (`ORDER BY score()` or `full_score()` with `LIMIT`, every
+  style, with tiebreak keys and filtered walks):
+  `engine::tinshape::top_k_into` per segment, into the scan's `TopRows`.
+  The engine walks the segments natively, largest first, then the write
+  buffer and sealed segments over their ordinal streams, all pruning
+  against one bar. A walk keeps a row only through the scan's visibility
+  check, which reads the visibility map (and the heap where a page is not
+  all-visible) and, in a filtered walk, the scan's other quals; it is
+  asked once per row that would be kept, so heap visibility costs a lookup
+  per kept row, not per candidate. Dead documents are the segment's
+  liveness, cleared in the walk before anything is read for them. Scores
+  come from the scorers the binding built, so `^` boosts and span leaf
+  boosts weigh as in the ordinal walk. EXPLAIN's `Pruning` reads `ctid`,
+  `ordinal` or `ctid+ordinal`.
+- Bitmap index scans, the custom scan's candidate stream (plain scans,
+  unordered scans and the exhaustive scoring of shapes the walks do not
+  prune) and the candidates of `max_score`: `engine::tinshape::for_each_match`,
+  a group of live matches at a time as words over the group's slots. The
+  stream keeps a segment's matches as those words (at most 1.6 bits a
+  document) and walks them in ctid order.
+- `score()` and `full_score()` of a row the scan did not rank:
+  `engine::tinshape::score_at`, the row's slot found by a multiply, each
+  scoring term's posting by a seek.
+
+**What remains ordinal.** The write buffer and sealed write segments are
+in-memory ordinal indexes (`MutableIndex`), so the ordinal walk, planner,
+fold and codecs (`segment::ordinals`, `payload`, `docs`, `forward`) stay
+for them. A segment is read through the translating reader only for a
+query that still does not lower there (`NOT ENCLOSES` and other spans that
+do not need every word, position filters, `AT LEAST` of more than one, a
+match of every document, an expansion past `max_expansion_terms`,
+expansions inside a span), for a query run inside another's walk over the same segment (a
+filter's subquery), and by the planner's selectivity estimate, which
+reads the term map and, in a segment with dead documents, a term of at
+most 1,024 postings. `STN3`'s blob reader and builder remain for the bench crate's
+converter and replays; its merge and checker are gone.
 
 VACUUM publishes a segment's liveness as a dead list of ranks beside the
 blob, which keeps an all-live liveness area of its own. Merges, promotions
 and dead-fraction rewrites all go through `merge::merge` or
 `finish_tns`.
 
-Size on tiny tables: a heap under 256 pages is one partly filled group, and
-the grid rule (a group holding one slot in 64 or more is a grid) makes every
-mid-frequency term a bitmap over all 256 pages; a 6,000-row test table
-indexes to 1.8 MB against `STN3`'s 0.97 MB. Counting the group's used pages
-in the rule is the obvious fix, for the encoder's owners.
-
-## Open for phase B
+Ties: the native walks prune a window or candidate only when its bound is
+below the bar by more than rounding can explain, so a candidate that can
+only tie the bar is scored (and ranks after it, by ctid); a segment whose
+best documents all tie scores them all. The ordinal walk skipped such
+sub-blocks by their first ordinal's location.
 
 ## Open
 
@@ -561,4 +599,8 @@ in the rule is the obvious fix, for the encoder's owners.
 - Positions are 55% of the blob.
 - Terms of 2 to 7 postings spend more on their footer and header than on
   their slots; a footer is unnecessary below a few postings.
-- The write segment, the visibility-map fold and external TID filters.
+- External TID filters (a btree's result as a TID bitmap) folded into the
+  native walks; a plain scan's stream holding a segment's matches lazily,
+  a group at a time, rather than all of them at its start.
+- `score()` of rows the scan did not rank opens each term per row; an
+  exhaustive scoring of many rows at 150M would want a per-term cursor.

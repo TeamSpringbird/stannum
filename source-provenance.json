@@ -1008,14 +1008,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
     },
-    "segment/examples/merge_memory.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
-    },
-    "segment/examples/vacuum_diagnostic.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in a70ba90f4658fdc1f3b91cfb313a55429a76810c."
-    },
     "segment/src/bound.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in b961ded6db3c05c4ab918f680c01ef309ffba9cb."
@@ -1059,14 +1051,6 @@
     "segment/src/lib.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
-    },
-    "segment/src/merge.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 26b9d1ec0f2cad8e84386cf26b63afe3dadcd42c."
-    },
-    "segment/src/merge_strategy.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 6f8189c269c66d941502d0da662e142e1f898cc4."
     },
     "segment/src/ordinals.rs": {
       "owner": "ben",

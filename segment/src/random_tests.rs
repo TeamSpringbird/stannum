@@ -381,7 +381,6 @@ proptest! {
         let mut blob = crate::segment::MAGIC.to_vec();
         blob.extend_from_slice(&bytes);
         let _ = Segment::parse(&blob).and_then(|s| s.records(|_| false));
-        let _ = crate::verify::verify_segment(&blob);
         let _ = OwnedDictionary::parse(&bytes).map(|d| d.view().iter().count());
         let _ = OwnedDictionary::parse(&bytes).and_then(|d| d.view().get("a"));
         let _ = ForwardRecord::decode(&bytes);

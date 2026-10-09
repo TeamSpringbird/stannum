@@ -652,6 +652,7 @@ impl PayloadCursor<'_> {
 
     /// Validate every position and return its count without materializing it.
     /// Unlike `skip_entry`, this checks cumulative position overflow as well.
+    #[cfg(test)]
     pub(crate) fn next_count(&mut self) -> Result<usize> {
         if self.next_ordinal >= self.payload.count {
             return Err(Error::Corrupt("payload read past end"));

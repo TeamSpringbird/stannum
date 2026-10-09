@@ -354,7 +354,7 @@ struct SpanCheck<'q> {
 }
 
 /// Whether every term the span query names must occur for it to match.
-fn span_requires_all(query: &boldi_vigna::SpanQuery) -> bool {
+pub fn span_requires_all(query: &boldi_vigna::SpanQuery) -> bool {
     use boldi_vigna::SpanQuery::*;
     match query {
         Term(_) => true,

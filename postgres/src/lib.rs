@@ -17,6 +17,7 @@ mod highlight;
 mod highlight_udfs;
 mod maintenance;
 mod match_positions;
+mod native;
 mod operator;
 pub(crate) mod options;
 mod query_limits;
@@ -149,10 +150,12 @@ mod tests {
 
     #[pg_test]
     fn a_build_packs_its_segments_into_its_lowest_pages() {
-        // Small build segments and a low merge cap (2 MB, below the smallest
-        // max_merged_segment_size): the build's tier merges retire many runs
-        // and end with several segments among their holes.
-        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(2 << 20));
+        // Small build segments and a low merge cap (1.25 MiB, below the
+        // smallest max_merged_segment_size): the build's tier merges retire
+        // many runs and end with several segments among their holes. The
+        // packing is greedy (highest run first): at some caps, 1 MiB among
+        // them, the runs it moves leave holes it cannot fill.
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(5 << 18));
         Spi::run(
             "CREATE TABLE packed(id int, body text);
              INSERT INTO packed SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 1009), ' ')
@@ -177,9 +180,11 @@ mod tests {
             .map(|(run, map)| (run.len() + map.len()) as i64)
             .sum();
         // Meta page, the write buffer's page, and the runs: nothing else.
+        let pending = unsafe { crate::storage::testing::pending_entries(index.as_ptr()) };
         assert_eq!(
             value("SELECT pg_relation_size('packed_idx') / 8192"),
-            live + 2
+            live + 2,
+            "{pending} pending runs"
         );
         // And the free space map lists none of them: a reused page left
         // there is a page every later allocation reads under the meta lock.
@@ -1898,8 +1903,11 @@ mod tests {
         assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         // Three chunks in the first chunk of ordinals; delta and gamma in
         // the second, whose AND leaves nothing for alpha's chunk to settle.
-        // Loading every present term's chunk up front read six.
-        assert_eq!(scan["Chunks Loaded"], 5, "{scan}");
+        // Loading every present term's chunk up front read six. (Chunks are
+        // the ordinal walk's; a segment in TIN's shape is walked natively.)
+        if scan["Pruning"] == "ordinal" {
+            assert_eq!(scan["Chunks Loaded"], 5, "{scan}");
+        }
     }
 
     #[pg_test]
@@ -2096,13 +2104,25 @@ mod tests {
         // The ten best rows share the best score and are the earliest such
         // rows, so once they are found every later sub-block of 1,024
         // ordinals is skipped; the first ones are scored to the last tie.
+        // The native walk prunes only bounds below the bar: a candidate that
+        // can tie it is scored (and then ranks after it, by ctid).
         let scored = scan["Scored Candidates"].as_i64().unwrap();
-        assert!(scored > 0 && scored < 1500, "{scan}");
+        let most = if scan["Pruning"] == "ordinal" {
+            1500
+        } else {
+            3001
+        };
+        assert!(scored > 0 && scored < most, "{scan}");
         // ...and the conjunction and disjunction too.
         for (query, pruning) in [("alpha AND beta", "ordinal"), ("alpha OR gamma", "ordinal")] {
             let scan = explain(query);
             assert_eq!(walk_kind(&scan["Pruning"]), pruning, "{query}");
-            assert!(scan["Scored Candidates"].as_i64().unwrap() < 1500, "{scan}");
+            let most = if scan["Pruning"] == "ordinal" {
+                1500
+            } else {
+                3001
+            };
+            assert!(scan["Scored Candidates"].as_i64().unwrap() < most, "{scan}");
         }
         // Mixed shapes walk the disjunction of their scoring terms, and
         // score nothing exhaustively.
@@ -2120,8 +2140,13 @@ mod tests {
             let scan = explain(query);
             assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{query}: {scan}");
             assert_eq!(scan["Exhaustive Score Calls"], 0, "{query}: {scan}");
+            let most = if scan["Pruning"] == "ordinal" {
+                1500
+            } else {
+                3001
+            };
             assert!(
-                scan["Scored Candidates"].as_i64().unwrap() < 1500,
+                scan["Scored Candidates"].as_i64().unwrap() < most,
                 "{query}: {scan}"
             );
         }
@@ -2129,7 +2154,11 @@ mod tests {
         // would rank and that no other child already admits.
         let scan = explain("\"alpha beta\" OR \"beta gamma\"");
         let checked = scan["Positions Checked"].as_i64().unwrap();
-        assert!(checked > 0 && checked < 1300, "{scan}");
+        // The native walk checks a candidate's span when it would rank.
+        assert!(
+            (scan["Pruning"] != "ordinal" || checked > 0) && checked < 1300,
+            "{scan}"
+        );
         let scan = explain("gamma OR \"alpha beta\"");
         assert!(scan["Positions Checked"].as_i64().unwrap() < 1300, "{scan}");
         // An expansion is left to full scoring.
@@ -2749,6 +2778,11 @@ mod tests {
             .0;
             let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
             assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{query}: {scan}");
+            // Warm-up ranks the ordinal walk's chunks; segments in TIN's
+            // shape are walked natively, before it.
+            if scan["Pruning"] != "ordinal" {
+                continue;
+            }
             assert_eq!(
                 scan["Warm-up Chunks"].as_i64(),
                 chunks,
@@ -2869,7 +2903,9 @@ mod tests {
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
         assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
-        assert_eq!(scan["Warm-up Chunks"].as_i64(), Some(1), "{scan}");
+        if scan["Pruning"] == "ordinal" {
+            assert_eq!(scan["Warm-up Chunks"].as_i64(), Some(1), "{scan}");
+        }
     }
 
     #[pg_test]
@@ -5558,15 +5594,14 @@ mod tests {
         Spi::run("CREATE INDEX reproducible_whole ON reproducible USING stannum(body)").unwrap();
         assert_eq!(
             build_digest("reproducible_capped"),
-            "76,900,27900,13,16,38cbf0fa4653e607523a674d0792a9b5;\
-             62,900,27900,13,23,96dbbebcee0f60b553ce7a61547e8dac;\
-             48,900,27900,13,37,428e2c5ca2a0ceef3f65a9bccd33788a;\
-             27,1500,46500,20,48,9f02b36f56c367f44d21de90d357b9bc;\
-             2,1800,55800,24,49,58d86fe46cc643df2d8efe3b9137ff6f size 851968"
+            "56,900,27900,11,23,585d76ebccc5108fabfc42dfe2a47c46;\
+             39,1500,46500,16,47,e0f12e923b58264a66044089ed072f83;\
+             21,1800,55800,17,48,7a1f28ed7c80595e379f705db8a685c1;\
+             2,1800,55800,18,49,a1f0044029e6f0ba6957644e8d70776b size 557056"
         );
         assert_eq!(
             build_digest("reproducible_whole"),
-            "2,6000,186000,71,46,2fc4f1b560db644dc9585f1d3c0a1f33 size 606208"
+            "2,6000,186000,52,46,f1c0281de0329ea53e75dc2cc6d998ef size 450560"
         );
         assert_clean("reproducible_capped");
         assert_clean("reproducible_whole");
@@ -7203,7 +7238,9 @@ mod tests {
         .0;
         let scan = &plan[0]["Plan"]["Plans"][0];
         assert_eq!(scan["Custom Plan Provider"], "Stannum Text Search Scan");
-        assert_eq!(scan["Candidate Strategy"], "streaming page bitmaps");
+        // The segment hands over its matches folded over its ctid sets, a
+        // document at a time; page bitmaps are the write buffer's.
+        assert_eq!(scan["Candidate Strategy"], "streaming scalar");
         assert_eq!(scan["Candidates Visited"], 10);
         assert!(
             scan.get("Candidates").is_none(),
@@ -7986,8 +8023,11 @@ mod tests {
             assert!(ids.iter().all(|id| id % 10 >= tenths), "{ids:?}");
             let extra_peak = peak.saturating_sub(clean_peak);
             let extra_kept = kept.saturating_sub(clean_kept);
-            // Two bits per document: the dead list as stored plus decoded.
-            let bound = DOCS / 4 + 16 * 1024;
+            // Four bits per document: the dead list as stored, decoded by
+            // ordinal (for the write segment's paths and queries that do not
+            // lower), and as the segment's liveness in slot space (1.6 slots
+            // a document on Stack Exchange's heap) for the native walks.
+            let bound = DOCS / 2 + 16 * 1024;
             within &= extra_peak <= bound && extra_kept <= bound;
             report.push(format!(
                 "{} dead: {extra_peak} bytes more at peak ({:.1} per dead row), \

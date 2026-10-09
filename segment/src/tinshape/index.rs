@@ -388,9 +388,11 @@ impl<S: Source> Reader<S> {
         Ok(translated)
     }
 
-    /// Resolves a term-map entry obtained from this segment.
+    /// Resolves a term-map entry obtained from this segment. Its postings
+    /// are translated when a cursor first reads them
+    /// ([`AreaFetch::ordinals_extent`]).
     pub fn resolve(&self, entry: TermEntry) -> Result<Term<'_>> {
-        Ok(Term::new(self.translate(entry)?, self))
+        Ok(Term::new(entry, self))
     }
 
     pub fn term_entry(&self, term: &str) -> Result<Option<TermEntry>> {
@@ -413,6 +415,10 @@ impl<S: Source> BlockFetch for Reader<S> {
 impl<S: Source> AreaFetch for Reader<S> {
     fn ordinals_bytes(&self, offset: u64, len: usize) -> Result<&[u8]> {
         self.encoded.borrow().range(offset, len)
+    }
+
+    fn ordinals_extent(&self, entry: &TermEntry) -> Result<Extent> {
+        Ok(self.translate(*entry)?.ordinals)
     }
 
     fn payload_bytes(&self, extent: Extent) -> Result<&[u8]> {

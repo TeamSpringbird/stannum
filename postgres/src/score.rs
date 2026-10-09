@@ -70,6 +70,8 @@ pub(crate) struct IndexScorer {
     dead: Vec<crate::storage::DeadSet>,
     /// The scoring terms and the query, which the ranked walk reads.
     scoring: Scorer,
+    /// The scoring terms' names, in the scorer's order.
+    names: Vec<String>,
     /// Computed on first request: the maximum over matching documents.
     max: Option<f32>,
     /// Scores the search scan already computed for the rows it emits, so the
@@ -643,9 +645,24 @@ impl IndexScorer {
     }
 
     /// Score of the document at `tid` in the first source listing it live.
+    /// A segment in TIN's shape finds it by its slot (see
+    /// [`engine::tinshape::score_at`]); the write buffer and sealed segments
+    /// by ordinal.
     fn score_listed(&mut self, tid: Tid) -> Option<f32> {
         for i in 0..self.view.sources.len() {
             let label = self.view.labels[i].as_str();
+            let terms = &self.scoring.terms;
+            let names = &self.names;
+            if let Some(found) =
+                crate::storage::with_native(&self.view, i, names, false, true, |segment| {
+                    engine::tinshape::score_at(segment, terms, tid)
+                })
+            {
+                match segment_error_in(found, label) {
+                    Some(score) => return Some(score),
+                    None => continue,
+                }
+            }
             let reader = &mut self.sources[i];
             let Some(ordinal) = reader.ordinal_of(tid, label) else {
                 continue;
@@ -1290,6 +1307,7 @@ fn build_index_scorer_inner(
         sources,
         view,
         dead,
+        names: scorers.iter().map(|(name, _)| name.clone()).collect(),
         scoring: Scorer {
             terms: scorers,
             query,
@@ -1307,7 +1325,17 @@ impl IndexScorer {
             return max;
         }
         let mut candidates = BTreeSet::new();
-        for ((segment, dead), label) in self.view.sources.iter().zip(&self.view.labels) {
+        let lowering = crate::native::Lowering::new(std::slice::from_ref(&self.scoring.query));
+        for (i, ((segment, dead), label)) in
+            self.view.sources.iter().zip(&self.view.labels).enumerate()
+        {
+            if let Some(lowered) = lowering.get(&self.view, i)
+                && crate::native::visit_matches(&self.view, i, &lowered, &mut |tid| {
+                    candidates.insert(tid);
+                })
+            {
+                continue;
+            }
             let planned = plan(&self.scoring.query, &**segment, &Limits::default())
                 .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
             let mut cursor = planned.cursor;

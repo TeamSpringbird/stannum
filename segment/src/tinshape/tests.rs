@@ -172,12 +172,17 @@ proptest! {
         parts in 1usize..5,
         dead in prop::collection::btree_set(0usize..500, 0..120),
         options in options(),
+        ranges in any::<bool>(),
     ) {
         // The k-th document goes to input k % parts: inputs interleave by
-        // ctid, as rows updated into pages other segments cover do.
+        // ctid, as rows updated into pages other segments cover do. Or each
+        // input takes a run of ctids, as segments of appended rows do, and
+        // most groups have one input, whose containers the merge keeps.
         let mut inputs: Vec<Vec<Doc>> = vec![Vec::new(); parts];
+        let run = docs.len().div_ceil(parts).max(1);
         for (i, doc) in docs.iter().enumerate() {
-            inputs[i % parts].push(doc.clone());
+            let input = if ranges { i / run } else { i % parts };
+            inputs[input].push(doc.clone());
         }
         inputs.retain(|input| !input.is_empty());
         let blobs: Vec<Vec<u8>> = inputs.iter().map(|input| tns(input, options)).collect();
@@ -217,6 +222,68 @@ proptest! {
             }
         }
     }
+}
+
+#[test]
+fn a_merge_keeps_the_containers_of_groups_one_input_holds() {
+    // Two inputs over two 256-page groups each, every page full to the same
+    // offset, so each group's geometry survives the merge; a dense word and
+    // a common one make grids and lists. One dead document leaves its group
+    // to be re-encoded.
+    let docs = |groups: std::ops::Range<u32>| -> Vec<Doc> {
+        let mut out = Vec::new();
+        for group in groups {
+            for page in 0..40 {
+                for offset in 1..=6u16 {
+                    let n = group * 1000 + page * 6 + u32::from(offset);
+                    let mut tokens = vec![("w".to_owned(), 0)];
+                    if n % 3 == 0 {
+                        tokens.push(("c".to_owned(), 1));
+                    }
+                    if n % 97 == 0 {
+                        tokens.push(("r".to_owned(), 2));
+                    }
+                    out.push((Tid::new(group * 256 + page, offset).unwrap(), tokens));
+                }
+            }
+        }
+        out
+    };
+    let options = Options {
+        block_size: 16,
+        grid_min_postings: 0,
+        ..Options::default()
+    };
+    let (a, b) = (docs(0..2), docs(2..4));
+    let blobs = [tns(&a, options), tns(&b, options)];
+    let none = DeadDocs::decode(&crate::ordinals::encode(&[]), a.len() as u32).unwrap();
+    let one = DeadDocs::decode(&crate::ordinals::encode(&[7]), b.len() as u32).unwrap();
+    let merged = merge(
+        &[
+            Input {
+                bytes: &blobs[0],
+                dead: &none,
+            },
+            Input {
+                bytes: &blobs[1],
+                dead: &one,
+            },
+        ],
+        options,
+        || Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    let mut live = a.clone();
+    live.extend(
+        b.iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 7)
+            .map(|(_, d)| d.clone()),
+    );
+    assert!(merged.reused >= 6, "{}", merged.reused);
+    assert!(verify_segment(&merged.blob).is_clean());
+    assert_eq!(merged.blob, tns(&live, options));
 }
 
 #[test]

@@ -33,9 +33,10 @@ naming any that is missing. Install the Python packages from
 
 ## Scripts
 
-- `mock-build.sh IMAGE` builds the 15M database once and saves it to
-  `$STANNUM_MOCK/db`. A saved database is only valid for the segment format its
-  image wrote. It waits up to `STANNUM_IMAGE_WAIT_SECONDS` (3600) for the image.
+- `mock-build.sh [mock15m|150m] IMAGE` builds the database of that profile
+  (default the 15M prefix) once and saves it to `$STANNUM_MOCK/db`. A saved
+  database is only valid for the segment format its image wrote. It waits up
+  to `STANNUM_IMAGE_WAIT_SECONDS` (3600) for the image.
 - `workload.sh PROFILE IMAGE LABEL STYLE UPDATES [SECONDS]` runs a workload from
   that copy and prints one line: QPS, latency, disk read per query and CPU.
   `PROFILE` is `mock15m` or `150m`; the latter sizes the container like the
@@ -50,3 +51,49 @@ naming any that is missing. Install the Python packages from
 
 Pages touched and candidates scored transfer to the full corpus directly; QPS is
 relative.
+
+## A fresh 150M database in TIN's shape (`TNS1`)
+
+A database saved by an image of an earlier segment format does not load into
+a `TNS1` build (page layout version 6); build one afresh. The build takes
+hours (`STN3`'s took five at 150M rows on AWS) and its container gets 64 GB,
+so raise the OrbStack VM first (that restarts the VM and bounces its other
+containers) and lower it again before measuring.
+
+```sh
+# The branch's commit, built from a clean export rather than a moving worktree.
+SHA=$(git rev-parse --short tinshape/phase-c)
+SRC=/Users/uri/stannum-lab/local150m-tns1/src-$SHA
+mkdir -p "$SRC" && git archive "$SHA" | tar -x -C "$SRC"
+
+# The benchmark driver (k6 with the PostgreSQL extension), once.
+python3 "$SRC/benchmarks/tin.py" --driver /Users/uri/stannum-lab/driver prepare
+python3 "$SRC/benchmarks/tin.py" --driver /Users/uri/stannum-lab/driver build
+
+# The image, native to the host (ARM): a few minutes.
+IMAGE=stannum-bench:tns1-$SHA
+(cd "$SRC" && python3 benchmarks/tin.py build-image --image "$IMAGE" \
+    --base postgres:18-trixie --output /Users/uri/stannum-lab/local150m-tns1/image-$SHA)
+
+export STANNUM_MOCK=/Users/uri/stannum-lab/local150m-tns1
+export STANNUM_DRIVER=/Users/uri/stannum-lab/driver
+export STANNUM_DATASET="$HOME/Library/Application Support/LeadBenchmarks/datasets/planetscale-stackexchange"
+export STANNUM_SOURCE=$STANNUM_MOCK/image-$SHA/source.json
+
+# Build and save: import, CREATE INDEX, VACUUM ANALYZE and validation, then
+# the data volume copied to $STANNUM_MOCK/db.
+orb config set memory_mib 81920 && orb stop && orb start
+(cd "$SRC" && bash benchmarks/local/mock-build.sh 150m "$IMAGE")
+
+# Measure from the saved database, the VM back near the instance's size.
+orb config set memory_mib 40960 && orb stop && orb start
+(cd "$SRC" && bash benchmarks/local/run150m.sh "$IMAGE" tns1 mixed 0 600)
+(cd "$SRC" && bash benchmarks/local/run150m.sh "$IMAGE" tns1 conjunction-phrase 0 600)
+(cd "$SRC" && bash benchmarks/local/run150m.sh "$IMAGE" tns1 disjunction 100 600)
+```
+
+Each run prints its line and keeps its results under
+`$STANNUM_MOCK/runs/tns1-<style>-u<updates>/`; the build's log and report are
+`$STANNUM_MOCK/build.log` and `$STANNUM_MOCK/build/`. The third run is the
+published disjunction-updates workload: 100 updates a second beside the
+queries.
