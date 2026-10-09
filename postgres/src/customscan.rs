@@ -282,7 +282,7 @@ struct Ordering {
     top_k: Option<usize>,
     /// Later sort keys break the score's ties above the scan, so its top k
     /// keeps every row tied with the k-th score, and the row after them to
-    /// mark where they end (see [`crate::score::TopRows`]).
+    /// mark where they end (see [`engine::walk::TopRows`]).
     ties: bool,
 }
 
@@ -619,7 +619,7 @@ unsafe fn other_selectivity(
 }
 
 /// Whether the scan is expected to walk the top k of `query` pruned (see
-/// [`crate::score::IndexScorer::top_k`]): by its shape, when it is known at
+/// [`engine::walk::Scorer::top_k`]): by its shape, when it is known at
 /// plan time and its scoring terms are its own.
 unsafe fn prunable(index_oid: pg_sys::Oid, query: Option<&str>, ordering: &Ordering) -> bool {
     if ordering.term_add.is_some() || ordering.term_replace.is_some() {
@@ -1440,7 +1440,7 @@ unsafe fn gather(exec: &mut ScanExec) {
 /// candidate stream instead, holding only the top `k`.
 ///
 /// With `ties` the rows tied with the k-th score and the row after them are
-/// kept too (see [`crate::score::TopRows`]); the scorer then never asks for
+/// kept too (see [`engine::walk::TopRows`]); the scorer then never asks for
 /// a zero fill. With a `filter` the walk keeps only rows that pass it; a
 /// query it cannot prune is then left to the caller.
 unsafe fn top_rows(
