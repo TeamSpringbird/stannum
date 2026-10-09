@@ -253,7 +253,8 @@ pub fn verify(dumped: &DumpedSegment, tns: &[u8]) -> Result<u64, String> {
             let (positions, _) = segment.positions(&found.entry).map_err(err)?;
             let positions = segment::tinshape::positions::Positions::parse(positions)
                 .map_err(err)?
-                .payload();
+                .payload()
+                .map_err(err)?;
             if positions != dumped.blob[from..from + entry.payload.len as usize] {
                 return Err(format!("term {term:?}: positions differ"));
             }

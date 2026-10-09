@@ -698,9 +698,12 @@ mod tests {
                     );
                 }
                 let (bytes, _) = segment.positions(&found.entry).unwrap();
-                let payload = crate::payload::Payload::parse(bytes).unwrap();
+                let stream = super::super::positions::Positions::parse(bytes).unwrap();
+                let mut at = stream.data_at;
+                let mut out = Vec::new();
                 for (i, (_, positions)) in docs.iter().enumerate() {
-                    assert_eq!(&payload.get(i as u32).unwrap().positions, positions);
+                    at = stream.read_entry(i as u32, at, &mut out).unwrap();
+                    assert_eq!(&out, positions);
                 }
             }
             assert!(segment.term("delta").unwrap().is_none());

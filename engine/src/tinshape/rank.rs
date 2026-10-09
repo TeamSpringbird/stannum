@@ -29,7 +29,7 @@ use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
-use segment::tinshape::positions::{Positions, skip_entry};
+use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local, or_into};
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -411,13 +411,15 @@ impl<'a> PosCursor<'a> {
             self.next = entry;
             self.next_at = entry_at;
         }
-        let bytes = self.positions.bytes;
+        if let Some(m) = self.positions.mask_at(index) {
+            touch.touch(Part::Positions, self.at + m, 4);
+        }
         let from = self.next_at;
         let mut p = self.next_at;
-        for _ in self.next..index {
-            p = skip_entry(bytes, p)?;
+        for i in self.next..index {
+            p = self.positions.skip(i, p)?;
         }
-        p = self.positions.read_entry(p, out)?;
+        p = self.positions.read_entry(index, p, out)?;
         self.next = index + 1;
         self.next_at = p;
         touch.touch(Part::Positions, self.at + from, p - from);
