@@ -23,3 +23,9 @@ pub mod docs;
 pub mod ef;
 pub mod postings;
 pub mod segment;
+
+/// The varint codec the format's headers use, for readers outside the
+/// crate.
+pub mod varint {
+    pub use crate::varint::{get, get_u32, put};
+}

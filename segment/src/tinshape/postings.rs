@@ -75,6 +75,10 @@ pub struct Options {
     pub sparse: bool,
     /// Whether the TF tail packs each block at its own width (else 4 bits).
     pub adaptive_tf: bool,
+    /// A group holding at least one slot in this many is a grid bitmap
+    /// whatever else would be smaller, so a fold reads it word by word
+    /// rather than decoding a member at a time; 0 chooses by size alone.
+    pub grid_density: u32,
 }
 
 impl Default for Options {
@@ -85,6 +89,7 @@ impl Default for Options {
             ef_groups: true,
             sparse: true,
             adaptive_tf: true,
+            grid_density: 64,
         }
     }
 }
@@ -102,6 +107,8 @@ pub struct Stats {
     pub kinds: [usize; 3],
     /// Bytes per container kind.
     pub kind_bytes: [usize; 3],
+    /// Groups made grids by [`Options::grid_density`].
+    pub forced: usize,
 }
 
 impl Stats {
@@ -205,7 +212,8 @@ pub fn encode(
     }
     let mut grouped_stats = Stats::default();
     let grouped = encode_groups(geometry, slots, options, &mut grouped_stats);
-    let use_sparse = options.sparse && sparse.len() <= grouped.len();
+    // A term with a group dense enough to be a grid stays grouped.
+    let use_sparse = options.sparse && grouped_stats.forced == 0 && sparse.len() <= grouped.len();
     let payload = if use_sparse { &sparse } else { &grouped };
     out.push(if use_sparse {
         FORM_SPARSE
@@ -225,6 +233,7 @@ pub fn encode(
     if !use_sparse {
         stats.kinds = grouped_stats.kinds;
         stats.kind_bytes = grouped_stats.kind_bytes;
+        stats.forced = grouped_stats.forced;
     }
     stats
 }
@@ -312,14 +321,19 @@ fn encode_groups(
         let width = u32::from(group.width);
         let mut kind = KIND_GRID;
         let mut best = 32 * width as usize;
-        if options.ef_groups {
+        let forced = options.grid_density > 0
+            && locals.len() as u64 * u64::from(options.grid_density) >= u64::from(group.slots());
+        if forced {
+            stats.forced += 1;
+        }
+        if options.ef_groups && !forced {
             let len = ef::encoded_len(locals.len(), GROUP_PAGES * width);
             if len < best {
                 best = len;
                 kind = KIND_EF;
             }
         }
-        if options.paged {
+        if options.paged && !forced {
             candidate.clear();
             encode_paged(&locals, width, &mut candidate);
             if candidate.len() < best {
@@ -876,13 +890,16 @@ mod tests {
                 (false, false, true),
             ] {
                 for adaptive_tf in [true, false] {
-                    out.push(Options {
-                        block_size,
-                        paged,
-                        ef_groups,
-                        sparse,
-                        adaptive_tf,
-                    });
+                    for grid_density in [0, 4] {
+                        out.push(Options {
+                            block_size,
+                            paged,
+                            ef_groups,
+                            sparse,
+                            adaptive_tf,
+                            grid_density,
+                        });
+                    }
                 }
             }
         }
@@ -974,9 +991,16 @@ mod tests {
         // A bit per slot, a bit per bucket.
         assert_eq!(stats.payload, 2 * 32 * 40 + 1 + 2 * (1 + 3));
         assert_eq!(stats.tf, tids.len() / 8);
-        // Whole pages are runs, smaller still.
-        let stats = round_trip(&geometry, &slots, &buckets, &lengths, &Options::default());
+        // Whole pages are runs, smaller still, when size alone decides; the
+        // default keeps groups this dense as grids.
+        let by_size = Options {
+            grid_density: 0,
+            ..Options::default()
+        };
+        let stats = round_trip(&geometry, &slots, &buckets, &lengths, &by_size);
         assert_eq!(stats.kinds, [0, 0, 2]);
+        let stats = round_trip(&geometry, &slots, &buckets, &lengths, &Options::default());
+        assert_eq!((stats.kinds, stats.forced), ([2, 0, 0], 2));
         check_all(&tids, &tids, &buckets);
         // Every tenth document, and runs of whole pages.
         let tenth: Vec<Tid> = tids.iter().step_by(10).copied().collect();

@@ -111,6 +111,13 @@ impl<'a> Ef<'a> {
         } else {
             (1u64 << self.low) - 1
         };
+        // The lows are read as a stream: a 64-bit buffer refilled four
+        // bytes at a time.
+        let low_bits = self.low;
+        let mut acc = 0u64;
+        let mut avail = 0u32;
+        let mut next = 0usize;
+        let lows = self.lows;
         for w in 0..words {
             let mut word = bits::word(self.highs, w);
             while word != 0 {
@@ -119,18 +126,29 @@ impl<'a> Ef<'a> {
                 }
                 let at = w * 64 + word.trailing_zeros() as usize;
                 let high = (at - i) as u32;
-                let low = if self.low == 0 {
+                let low = if low_bits == 0 {
                     0
                 } else {
-                    let bit = i * self.low as usize;
-                    // Fast path for widths that fit a word read.
-                    let first = bit / 8;
-                    let mut buf = [0u8; 8];
-                    let take = (self.lows.len() - first).min(8);
-                    buf[..take].copy_from_slice(&self.lows[first..first + take]);
-                    ((u64::from_le_bytes(buf) >> (bit % 8)) & mask) as u32
+                    if avail < low_bits {
+                        if let Some(four) = lows.get(next..next + 4) {
+                            acc |= u64::from(u32::from_le_bytes(four.try_into().expect("four")))
+                                << avail;
+                            avail += 32;
+                            next += 4;
+                        } else {
+                            while avail < low_bits && next < lows.len() {
+                                acc |= u64::from(lows[next]) << avail;
+                                avail += 8;
+                                next += 1;
+                            }
+                        }
+                    }
+                    let low = (acc & mask) as u32;
+                    acc >>= low_bits;
+                    avail -= low_bits.min(avail);
+                    low
                 };
-                visit(high << self.low | low);
+                visit(high << low_bits | low);
                 i += 1;
                 word &= word - 1;
             }

@@ -185,8 +185,8 @@ impl Builder {
     }
 
     /// The blob, with `dead` (document ranks, ascending) cleared in the
-    /// liveness bitmap.
-    pub fn finish(mut self, dead: &[u32]) -> Vec<u8> {
+    /// liveness bitmap, and where its bytes went.
+    pub fn finish(mut self, dead: &[u32]) -> (Vec<u8>, BuildStats) {
         let dictionary = std::mem::take(&mut self.dictionary).finish();
         let docset = docs::encode_docset(&self.geometry, &self.tids);
         let lengths = docs::encode_lengths(&self.lengths);
@@ -236,7 +236,7 @@ impl Builder {
         ] {
             out.extend_from_slice(section);
         }
-        out
+        (out, self.stats)
     }
 }
 
@@ -253,7 +253,12 @@ pub struct Segment<'a> {
     pub docs: DocSet,
     pub lengths: Lengths<'a>,
     pub liveness: Liveness,
+    /// Dictionary lookups answered so far, as a reader's memo keeps them.
+    memo: std::cell::RefCell<rustc_hash::FxHashMap<String, Option<TermEntry>>>,
 }
+
+/// Lookups a memo holds before it is emptied.
+const MEMO_LIMIT: usize = 4096;
 
 /// A term found in a segment.
 #[derive(Clone, Debug)]
@@ -312,6 +317,7 @@ impl<'a> Segment<'a> {
             docs,
             lengths,
             liveness,
+            memo: Default::default(),
         })
     }
 
@@ -342,6 +348,21 @@ impl<'a> Segment<'a> {
             at: self.area_at(Area::Postings) + from,
             postings: Postings::parse(record, entry.df, &self.docs.geometry)?,
         })
+    }
+
+    /// [`Self::term`] through the memo of earlier lookups.
+    pub fn term_memo(&self, term: &str) -> Result<Option<Term<'a>>> {
+        if let Some(entry) = self.memo.borrow().get(term) {
+            return entry.map(|entry| self.resolve(entry)).transpose();
+        }
+        let entry = self.dictionary().get(term)?;
+        let mut memo = self.memo.borrow_mut();
+        if memo.len() >= MEMO_LIMIT {
+            memo.clear();
+        }
+        memo.insert(term.to_owned(), entry);
+        drop(memo);
+        entry.map(|entry| self.resolve(entry)).transpose()
     }
 
     pub fn term(&self, term: &str) -> Result<Option<Term<'a>>> {
@@ -410,6 +431,7 @@ mod tests {
             Options {
                 block_size: 2,
                 adaptive_tf: false,
+                grid_density: 2,
                 ..Options::default()
             },
         ] {
@@ -428,7 +450,7 @@ mod tests {
                     .add_term(term, &ranks, &buckets, &payload.finish())
                     .unwrap();
             }
-            let blob = builder.finish(&[1]);
+            let (blob, _) = builder.finish(&[1]);
             let segment = Segment::parse(&blob).unwrap();
             assert_eq!(segment.documents, 5);
             assert_eq!(segment.liveness.dead, 1);
