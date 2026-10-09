@@ -591,6 +591,8 @@ struct Row {
     pages: Pages,
     answer: tin::RankedAnswer,
     pins: u64,
+    /// The instrumented pass's reads by kind of structure.
+    kinds: [segment::tinshape::blob::KindStats; segment::tinshape::blob::KINDS],
 }
 
 fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Result<(), String> {
@@ -698,6 +700,7 @@ fn run() -> Result<bool, String> {
         }
         let mut pages = Pages::default();
         let pins0 = PINS.get();
+        segment::tinshape::blob::reset_stats();
         let (direct, counters) = reader
             .instrumented(
                 &scorer,
@@ -718,6 +721,7 @@ fn run() -> Result<bool, String> {
             pages,
             answer: counters,
             pins: PINS.get() - pins0,
+            kinds: segment::tinshape::blob::stats(),
         });
         if (n + 1) % 500 == 0 {
             eprintln!("{} of {}", n + 1, trace.len());
@@ -826,6 +830,50 @@ fn run() -> Result<bool, String> {
             let _ = write!(line, " {:>20}", format!("{d:.1} ({a:.0})"));
         }
         println!("{line} {total:>8.1}");
+    }
+    println!(
+        "\nreads per query by area, mean: reads, spanning two pages (%), page switches, back to an earlier page"
+    );
+    for style in &styles {
+        let rs: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = rs.len().max(1) as f64;
+        let mut line = format!("{style:<12}");
+        for part in Part::ALL {
+            let sum = |f: fn(&bench::tinshape::ReadOrder) -> u64| -> f64 {
+                rs.iter()
+                    .filter_map(|r| r.pages.order.get(&part))
+                    .map(f)
+                    .sum::<u64>() as f64
+            };
+            let reads = sum(|o| o.reads);
+            if reads == 0.0 {
+                continue;
+            }
+            let _ = write!(
+                line,
+                "  {}: {:.0} ({:.2}%) sw {:.0} back {:.0}",
+                part.name(),
+                reads / n,
+                100.0 * sum(|o| o.straddles) / reads,
+                sum(|o| o.switches) / n,
+                sum(|o| o.back) / n,
+            );
+        }
+        println!("{line}");
+    }
+    println!("\nstitched per query by kind, mean: reads, bytes");
+    for style in &styles {
+        let rs: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = rs.len().max(1) as f64;
+        let mut line = format!("{style:<12}");
+        for (k, name) in segment::tinshape::blob::KIND_NAMES.iter().enumerate() {
+            let reads = rs.iter().map(|r| r.kinds[k].stitches).sum::<u64>() as f64 / n;
+            let bytes = rs.iter().map(|r| r.kinds[k].stitched).sum::<u64>() as f64 / n;
+            if reads > 0.0 {
+                let _ = write!(line, "  {name}: {reads:.1} ({:.1} KB)", bytes / 1024.0);
+            }
+        }
+        println!("{line}");
     }
     println!("\npages pinned per query (in place), mean");
     for style in &styles {
