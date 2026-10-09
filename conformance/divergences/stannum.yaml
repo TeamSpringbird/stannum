@@ -101,3 +101,104 @@ divergences:
       in every document, scores 0 under score() after it; full_score() is
       unchanged. Whether promote() should fold a buffer below the sealing
       threshold is an open decision.
+
+  - id: catalog.S-07b
+    against: tin-1.0.3
+    kind: gap
+    captures: [script]
+    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
+    tin: >
+      promote() returns one row (consumed_controls, linked_segments,
+      docs_promoted, terms_added); here all zero, as the 20 rows sit in the
+      current write segment, which promote() does not consume.
+    stannum: No promote(); its write buffer is folded into segments by inserts and VACUUM.
+
+  - id: catalog.S-07c
+    against: tin-1.0.3
+    kind: gap
+    captures: [script]
+    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
+    tin: promote() on an index whose rows were all built into an immutable segment returns zeros.
+    stannum: No promote().
+
+  - id: catalog.S-07d
+    against: tin-1.0.3
+    kind: gap
+    captures: [script]
+    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
+    tin: promote() returns zeros with 200 rows in the current write segment; nothing is elided before or after.
+    stannum: No promote().
+
+  - id: catalog.S-07e
+    against: tin-1.0.3
+    kind: gap
+    captures: [script]
+    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
+    tin: promote() returns zeros on a built index.
+    stannum: No promote().
+
+  - id: catalog.S-07f
+    against: tin-1.0.3
+    kind: gap
+    captures: [script]
+    summary: Stannum has no promote(), sealed write segments or maintenance modes.
+    tin: >
+      With maintenance manual, 12,288 rows fill a sealed write segment;
+      promote() consumes it (1, 1, 12288, 12293) and elision then counts
+      the promoted documents only.
+    stannum: No promote(); elision counts every document the index holds.
+
+  - id: catalog.S-07g
+    against: tin-1.0.3
+    kind: gap
+    captures: [script]
+    summary: Stannum has no promote(index, extent_cap_bytes).
+    tin: promote(index, 1) writes 68 segments of about 185 documents; elision is unchanged.
+    stannum: No promote().
+
+  - id: catalog.S-07h
+    against: tin-1.0.3
+    kind: gap
+    captures: [value, zero_cap]
+    summary: Stannum has no promote() function.
+    tin: >
+      promote(index regclass, extent_cap_bytes bigint DEFAULT NULL) returns
+      TABLE(consumed_controls, linked_segments, docs_promoted, terms_added);
+      a cap of 0 is XX000 "extent_cap_bytes must be positive".
+    stannum: No promote().
+
+  - id: limits.at_least_near.2
+    against: tin-1.0.3
+    kind: limit
+    captures: [ids]
+    summary: Stannum refuses AT LEAST inside a proximity operator past 10,000 combinations (C(16, 8) = 12,870); TIN answers.
+    tin: Answers {3} in about 0.65 s over 27 rows.
+    stannum: >
+      54001 "... AT LEAST 8 OF 16 operands inside a proximity operator expands
+      to more than 10000 combinations". The same expansion at C(30, 15)
+      (limits.at_least_near.3) crashed TIN's server.
+    question: >
+      Does TIN bound the combinations an AT LEAST inside NEAR or THEN
+      expands to? 8 of 16 answers, 15 of 30 restarts the server; where is
+      the line, and is a refusal planned?
+
+  - id: limits.regex_size.1
+    against: tin-1.0.3
+    kind: limit
+    captures: [ids]
+    summary: Stannum refuses a regex that compiles past 2 MiB (\w{100}); TIN answers.
+    tin: Answers {4} (a 100-letter term) in about 0.25 s.
+    stannum: 54001 "... regex "\w{100}" compiles to more than 2 MiB".
+    question: >
+      What bounds the compiled size of one regex, and of all the regexes of
+      one query? 200 regexes of \w{10} each answer; is there a limit short
+      of the backend's memory?
+
+  - id: limits.regex_size.2
+    against: tin-1.0.3
+    kind: limit
+    captures: [ids]
+    summary: Stannum refuses a regex that compiles past 2 MiB ([\p{L}]{200}); TIN answers.
+    tin: Answers {} in about 0.39 s.
+    stannum: 54001 "... regex "[\p{L}]{200}" compiles to more than 2 MiB".
+    question: Is a regex compile-size limit documented or planned?

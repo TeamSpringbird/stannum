@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+# Runs the query engine's kernel benchmarks (bench/benches/kernels.rs) built
+# for this machine's CPU, and prints each against a saved baseline.
+#
+#   script/bench-native [--save-baseline] [--portable] [--against FILE] [FILTER]
+#
+# The build uses RUSTFLAGS='-C target-cpu=native' (NEON and every other
+# extension the CPU has) in its own target directory, target/native, so the
+# workspace's ordinary builds and the extension's install stay as they are.
+# --portable builds without it, in target/portable, to see what the flag
+# buys. Results go to target/bench-native/<build>-latest.tsv; the baseline is
+# target/bench-native/<build>-baseline.tsv, written by --save-baseline from
+# the run it makes; --against compares with another results file instead,
+# such as the portable build's latest. STANNUM_BENCH_DUMP, a directory
+# written by script/dump-segments.py, adds kernels over blocks of a real
+# segment.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+
+save=0
+build=native
+against=''
+filter=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --save-baseline) save=1; shift ;;
+        --portable) build=portable; shift ;;
+        --against) against=$(cd "$(dirname "${2:?--against needs a file}")" && pwd)/$(basename "$2"); shift 2 ;;
+        -h|--help) sed -n '/^# Runs the query/,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+        *) filter+=("$1"); shift ;;
+    esac
+done
+
+# The toolchain rust-toolchain.toml pins, when no rustup proxy is on PATH.
+if ! command -v cargo >/dev/null 2>&1; then
+    channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+    for bin in "${RUSTUP_HOME:-$HOME/.rustup}"/toolchains/"$channel"-*/bin; do
+        [ -x "$bin/cargo" ] && PATH="$bin:$PATH" && break
+    done
+fi
+
+out="$ROOT/target/bench-native"
+mkdir -p "$out"
+export CARGO_TARGET_DIR="$ROOT/target/$build"
+if [ "$build" = native ]; then
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-cpu=native"
+fi
+latest="$out/$build-latest.tsv"
+baseline=${against:-"$out/$build-baseline.tsv"}
+cargo bench --quiet -p bench --bench kernels -- --save "$latest" --baseline "$baseline" ${filter[@]+"${filter[@]}"}
+if [ "$save" = 1 ]; then
+    cp "$latest" "$out/$build-baseline.tsv"
+    echo "saved $out/$build-baseline.tsv"
+fi

@@ -1,0 +1,24 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Stannum's query engine measured outside PostgreSQL: a replay of query traces over dumped segments, and kernel benchmarks"
+publish = false
+
+[dependencies]
+boldi-vigna = { path = "../boldi-vigna" }
+engine = { path = "../engine", features = ["kernels", "stats"] }
+rustc-hash.workspace = true
+segment = { path = "../segment" }
+tinql = { path = "../tinql" }
+tokenizer = { path = "../tokenizer" }
+
+[[bench]]
+name = "kernels"
+harness = false

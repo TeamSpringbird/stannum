@@ -1,0 +1,191 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.3",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6, us-east-1",
+  "date": "2026-09-27T01:03:57Z",
+  "suite_commit": "8592c98432e4077103d878c383f6f07bdbfc11e8-dirty",
+  "runner_version": "2"
+ },
+ "cases": [
+  {
+   "id": "limits.large_doc.50mb",
+   "server_crashed": true,
+   "detail": "the sentinel connection died too (the server reinitialized)"
+  },
+  {
+   "id": "limits.at_least_near.3",
+   "server_crashed": true,
+   "detail": "the sentinel connection died too (the server reinitialized)"
+  },
+  {
+   "id": "limits.regex_many.3",
+   "captures": {
+    "ids": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "limits.regex_many.2",
+   "captures": {
+    "ids": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "limits.expansion_score.2",
+   "captures": {
+    "connection_lost": "terminating connection due to administrator command"
+   }
+  },
+  {
+   "id": "limits.at_least_near.1",
+   "captures": {
+    "ids": [
+     1,
+     6
+    ]
+   }
+  },
+  {
+   "id": "limits.at_least_then.1",
+   "captures": {
+    "ids": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "limits.at_least_near.2",
+   "captures": {
+    "ids": [
+     3
+    ]
+   }
+  },
+  {
+   "id": "limits.at_least.1",
+   "captures": {
+    "ids": [
+     3,
+     4,
+     5
+    ]
+   }
+  },
+  {
+   "id": "limits.expansion_cancel.1",
+   "captures": {
+    "count": 2,
+    "cancel": {
+     "canceled": true,
+     "sqlstate": "57014",
+     "prompt": true
+    }
+   }
+  },
+  {
+   "id": "limits.expansion_cancel.2",
+   "captures": {
+    "count": 1,
+    "cancel": {
+     "canceled": true,
+     "sqlstate": "57014",
+     "prompt": true
+    }
+   }
+  },
+  {
+   "id": "limits.expansion_cancel.3",
+   "captures": {
+    "value": [
+     1000001,
+     1000002
+    ],
+    "cancel": {
+     "canceled": true,
+     "sqlstate": "57014",
+     "prompt": true
+    }
+   }
+  },
+  {
+   "id": "limits.expansion_score.1",
+   "captures": {
+    "value": [
+     [
+      10,
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "limits.regex_size.1",
+   "captures": {
+    "ids": [
+     4
+    ]
+   }
+  },
+  {
+   "id": "limits.regex_size.2",
+   "captures": {
+    "ids": []
+   }
+  },
+  {
+   "id": "limits.regex_size.3",
+   "captures": {
+    "ids": []
+   }
+  },
+  {
+   "id": "limits.regex_size.4",
+   "captures": {
+    "ids": [
+     2,
+     4
+    ]
+   }
+  },
+  {
+   "id": "limits.regex_many.1",
+   "captures": {
+    "ids": [
+     1
+    ]
+   }
+  },
+  {
+   "id": "limits.large_doc.10mb",
+   "captures": {
+    "script": [
+     null,
+     [
+      [
+       1,
+       10485787,
+       "3ed87e8dd20fc88097bdf0da0cf43047",
+       10485775
+      ]
+     ],
+     1
+    ]
+   }
+  },
+  {
+   "id": "limits.create_index_cancel.1",
+   "captures": {
+    "cancel": {
+     "canceled": true,
+     "sqlstate": "57014",
+     "prompt": true
+    }
+   }
+  }
+ ]
+}

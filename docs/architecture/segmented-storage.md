@@ -8,7 +8,9 @@ ranking statistics in index pages and uses them to find matching row locations.
 
 | Directory | Responsibility |
 | --- | --- |
-| `postgres/src/` | PostgreSQL integration, SQL functions, query planning, and scoring |
+| `postgres/src/` | PostgreSQL integration, SQL functions, query planning, and the score functions |
+| `engine/src/` | The query engine without PostgreSQL: BM25, the ranked walk over ordinals, the count fold |
+| `bench/` | The engine measured outside PostgreSQL: trace replay over dumped segments, kernel benchmarks ([how](../offline-engine.md)) |
 | `postgres/src/storage/` | Index pages, write buffer, segments, WAL, and reclamation |
 | `segment/src/` | Dictionaries, ordinal streams, the document table, positions, document lengths, and cursors |
 | `tinql/src/` | Query parsing, reference evaluation, and indexed query planning |
@@ -452,8 +454,12 @@ selects the PostgreSQL bitmap path for comparison.
 ### Read accounting
 
 `EXPLAIN (ANALYZE, BUFFERS)` on the custom scan reports where reads go:
-`Bytes Fetched` and `Disk Pages By Area` per segment area, `Disk Pages By
-Phase` for reads outside the segment reader, `Walk Setup Blocks` and
+`Bytes Fetched` and `Disk Pages By Area` per segment area, `Page Touches By
+Area` (every page read or found in shared buffers, with the ordinals split
+into what is copied, which includes stream heads and bounds, chunks read in
+place and bucket nibbles read in place, for comparing with engines that count
+page touches), `Disk Pages By Phase` for reads outside the segment reader,
+`Walk Setup Blocks` and
 `Walk Body Blocks`, `Chunks Loaded`, `Position Lists Read`, `Visibility
 Checks`, `Visibility Map Hits` and `Heap Fetches`, and the pins a walk held
 (`Pages Pinned`, `Pages Held Peak`). `stannum.debug_seed_score`

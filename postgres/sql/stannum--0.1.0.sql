@@ -23,7 +23,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:278
+-- postgres/src/score.rs:280
 -- stannum::score::full_score
 CREATE  FUNCTION "full_score"(
 	"ctid" tid /* pg_sys :: ItemPointerData */
@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'full_score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:284
+-- postgres/src/score.rs:286
 -- stannum::score::full_score
 CREATE  FUNCTION "full_score"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -129,15 +129,16 @@ CREATE TYPE indexed_query (
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/operator.rs:228
--- stannum::operator::bind_query
-CREATE  FUNCTION "bind_query"(
-	"query" TEXT, /* & str */
-	"index" oid /* pg_sys :: Oid */
-) RETURNS indexed_query /* indexed_query */
-IMMUTABLE STRICT PARALLEL SAFE
+-- postgres/src/highlight_udfs.rs:108
+-- stannum::highlight_udfs::highlight_ansi
+CREATE  FUNCTION "highlight_ansi"(
+	"text" TEXT, /* Option < & str > */
+	"wrap_to" INT, /* Option < i32 > */
+	"query" indexed_query /* indexed_query */
+) RETURNS TEXT /* Option < String > */
+STABLE PARALLEL SAFE 
 LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'bind_query_wrapper';
+AS 'MODULE_PATHNAME', 'highlight_ansi_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -155,19 +156,6 @@ AS 'MODULE_PATHNAME', 'highlight_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:108
--- stannum::highlight_udfs::highlight_ansi
-CREATE  FUNCTION "highlight_ansi"(
-	"text" TEXT, /* Option < & str > */
-	"wrap_to" INT, /* Option < i32 > */
-	"query" indexed_query /* indexed_query */
-) RETURNS TEXT /* Option < String > */
-STABLE PARALLEL SAFE 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'highlight_ansi_bound_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
 -- postgres/src/highlight_udfs.rs:283
 -- requires:
 --   highlight
@@ -181,6 +169,18 @@ ALTER FUNCTION @extschema@.highlight(pg_catalog.text, pg_catalog.text, pg_catalo
     SUPPORT @extschema@.highlight_support;
 ALTER FUNCTION @extschema@.highlight_ansi(pg_catalog.text, pg_catalog.int4, pg_catalog.text)
     SUPPORT @extschema@.highlight_support;
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/operator.rs:228
+-- stannum::operator::bind_query
+CREATE  FUNCTION "bind_query"(
+	"query" TEXT, /* & str */
+	"index" oid /* pg_sys :: Oid */
+) RETURNS indexed_query /* indexed_query */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'bind_query_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -231,7 +231,7 @@ AS 'MODULE_PATHNAME', 'maintenance_status_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:307
+-- postgres/src/score.rs:309
 -- stannum::score::max_score
 CREATE  FUNCTION "max_score"(
 	"ctid" tid /* pg_sys :: ItemPointerData */
@@ -313,7 +313,7 @@ AS 'MODULE_PATHNAME', 'ql_parse_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:294
+-- postgres/src/score.rs:296
 -- stannum::score::score
 CREATE  FUNCTION "score"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -329,7 +329,7 @@ AS 'MODULE_PATHNAME', 'score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:317
+-- postgres/src/score.rs:319
 -- stannum::score::score_bound
 CREATE  FUNCTION "score_bound"(
 	"document" TEXT, /* & str */
@@ -349,7 +349,7 @@ AS 'MODULE_PATHNAME', 'score_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:365
+-- postgres/src/score.rs:367
 -- stannum::score::score_bound_indexed
 CREATE  FUNCTION "score_bound_indexed"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -369,7 +369,7 @@ AS 'MODULE_PATHNAME', 'score_bound_indexed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:5067
+-- postgres/src/score.rs:1407
 -- stannum::score::score_inspect
 CREATE  FUNCTION "score_inspect"(
 	"index" regclass, /* Option < PgRelation > */
@@ -387,7 +387,7 @@ AS 'MODULE_PATHNAME', 'score_inspect_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:5369
+-- postgres/src/score.rs:1713
 -- stannum::score::score_support
 CREATE  FUNCTION "score_support"(
 	"request" internal /* Internal */
@@ -398,7 +398,7 @@ AS 'MODULE_PATHNAME', 'score_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:5660
+-- postgres/src/score.rs:2004
 -- requires:
 --   full_score
 --   full_score_with_bm25

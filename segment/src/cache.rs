@@ -75,11 +75,79 @@ pub const AREA_NAMES: [&str; AREAS] = [
     "pages",
 ];
 
+/// Areas pages are touched in, for comparing with engines that count every
+/// page a query reads or finds in memory: the [`AREAS`] with the ordinals
+/// split by how they are read. A chunk read in place from pinned pages is a
+/// ranked walk's; its bucket nibbles past those pages are read through a
+/// page of their own; everything else of the ordinals area (stream heads,
+/// directories and bounds, and chunks read through the read cache, as a
+/// count reads them) is copied.
+pub const TOUCH_AREAS: usize = 10;
+/// Names of [`TOUCH_AREAS`], in order.
+pub const TOUCH_NAMES: [&str; TOUCH_AREAS] = [
+    "header",
+    "dictionary",
+    "ordinals copied",
+    "ordinal chunks in place",
+    "nibbles in place",
+    "positions",
+    "documents",
+    "lengths",
+    "classes",
+    "pages",
+];
+/// The touch area of chunks read in place from pinned pages.
+pub const TOUCH_CHUNKS_HELD: usize = 3;
+/// The touch area of bucket nibbles read in place.
+pub const TOUCH_NIBBLES_HELD: usize = 4;
+
+/// The touch area of segment area `area` read any way but in place from the
+/// ordinals.
+pub fn touch_area(area: usize) -> usize {
+    match area {
+        0..=2 => area,
+        area => (area + 2).min(TOUCH_AREAS - 1),
+    }
+}
+
 thread_local! {
     static AREA_BYTES: Cell<[u64; AREAS]> = const { Cell::new([0; AREAS]) };
     static AREA_DISK: Cell<[u64; AREAS]> = const { Cell::new([0; AREAS]) };
+    static AREA_TOUCHES: Cell<[u64; TOUCH_AREAS]> = const { Cell::new([0; TOUCH_AREAS]) };
     /// The host's count of pages read from storage, where it offers one.
     static DISK_PROBE: Cell<Option<fn() -> u64>> = const { Cell::new(None) };
+    /// The host's count of pages read or found in memory, where it offers one.
+    static TOUCH_PROBE: Cell<Option<fn() -> u64>> = const { Cell::new(None) };
+}
+
+/// Installs the host's counter of pages read or found in memory (a
+/// PostgreSQL buffer hit or read), so fetches can be attributed to the touch
+/// area that caused them (see [`TOUCH_AREAS`]).
+pub fn set_touch_probe(probe: fn() -> u64) {
+    TOUCH_PROBE.set(Some(probe));
+}
+
+/// The host's count of pages read or found in memory; zero without a probe.
+#[inline]
+pub fn touches() -> u64 {
+    TOUCH_PROBE.get().map_or(0, |probe| probe())
+}
+
+/// Records pages touched in touch area `area`.
+pub fn note_touches(area: usize, pages: u64) {
+    if pages == 0 {
+        return;
+    }
+    AREA_TOUCHES.with(|counts| {
+        let mut all = counts.get();
+        all[area.min(TOUCH_AREAS - 1)] += pages;
+        counts.set(all);
+    });
+}
+
+/// Pages touched per touch area since the last reset.
+pub fn area_touches() -> [u64; TOUCH_AREAS] {
+    AREA_TOUCHES.with(Cell::get)
 }
 
 /// Installs the host's counter of pages read from storage, so fetches can be
@@ -128,6 +196,7 @@ pub fn area_bytes() -> [u64; AREAS] {
 pub fn reset_areas() {
     AREA_BYTES.with(|counts| counts.set([0; AREAS]));
     AREA_DISK.with(|counts| counts.set([0; AREAS]));
+    AREA_TOUCHES.with(|counts| counts.set([0; TOUCH_AREAS]));
 }
 
 /// A fresh identity for a reader, so its ranges never collide with another
