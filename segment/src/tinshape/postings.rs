@@ -84,7 +84,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            block_size: 128,
+            block_size: 256,
             paged: true,
             ef_groups: true,
             sparse: true,
