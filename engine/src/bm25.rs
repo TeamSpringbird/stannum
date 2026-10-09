@@ -415,6 +415,24 @@ impl TermScorer {
             .fold(0.0_f32, f32::max)
     }
 
+    /// What bounds a score from its bucket and length alone: per bucket
+    /// `b`, the largest numerator and the smallest denominator constant
+    /// over the buckets up to `b`, and the length factor. Every bucket up to
+    /// `b` scores at most `n[b] / (d[b] + f * length)` as real numbers, a
+    /// relative `f32` rounding or two below what [`Self::score_bucket`]
+    /// returns; terms sharing `f` bound their sum by the sum of their
+    /// numerators over the least of their denominators.
+    #[must_use]
+    pub fn length_bound_parts(&self) -> ([f32; BUCKET_COUNT], [f32; BUCKET_COUNT], f32) {
+        let mut numerator = self.numerator;
+        let mut denominator = self.denominator_constant;
+        for b in 1..BUCKET_COUNT {
+            numerator[b] = numerator[b].max(numerator[b - 1]);
+            denominator[b] = denominator[b].min(denominator[b - 1]);
+        }
+        (numerator, denominator, self.document_length_factor)
+    }
+
     #[must_use]
     pub fn score_count(&self, term_frequency: u32, document_length: u32) -> f32 {
         self.score_bucket(TfBucket::from_count(term_frequency), document_length)

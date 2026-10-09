@@ -68,6 +68,12 @@ pub fn get(bytes: &[u8], index: usize, width: u32) -> Result<u32> {
     }
     let bit = index * width as usize;
     let first = bit / 8;
+    // One unaligned load where eight bytes remain: a value of at most 32
+    // bits at a bit offset below 8 fits in them.
+    if let Some(chunk) = bytes.get(first..first + 8) {
+        let value = u64::from_le_bytes(chunk.try_into().expect("eight bytes")) >> (bit % 8);
+        return Ok((value & ((1u64 << width) - 1)) as u32);
+    }
     let last = (bit + width as usize - 1) / 8;
     if last >= bytes.len() {
         return Err(Error::Truncated);

@@ -18,6 +18,7 @@ pub fn put(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+#[inline]
 pub fn get(bytes: &[u8], at: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     let mut shift = 0u32;
@@ -38,6 +39,7 @@ pub fn get(bytes: &[u8], at: &mut usize) -> Result<u64> {
     }
 }
 
+#[inline]
 pub fn get_u32(bytes: &[u8], at: &mut usize) -> Result<u32> {
     u32::try_from(get(bytes, at)?).map_err(|_| Error::Corrupt("value exceeds 32 bits"))
 }

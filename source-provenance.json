@@ -692,6 +692,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: counts and ranked top-k over the ctid-addressed segment format."
     },
+    "engine/src/tinshape/rank.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: ranked top-k over the ctid-addressed segment format, a 256-page group at a time."
+    },
     "engine/src/walk.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/score.rs",

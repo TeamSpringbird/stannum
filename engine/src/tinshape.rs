@@ -26,6 +26,8 @@ use tinql::runtime::{Query, SpanTermSlot};
 
 use crate::bm25::TermScorer;
 
+mod rank;
+
 /// The parts of a segment a query reads, named as TIN's EXPLAIN names its
 /// page touches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -104,6 +106,56 @@ pub mod kernels {
         }
         #[cfg(not(target_arch = "aarch64"))]
         words.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
+
+    /// Set bits in a byte string (a grid's words, as stored).
+    #[inline]
+    pub fn popcount_bytes(bytes: &[u8]) -> u32 {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is baseline on aarch64; every load is within `bytes`.
+        // Each 16-bit lane gains at most 32 per step, so it cannot overflow
+        // below 2,048 steps (64 KiB; a group's grid is at most 9.3 KiB).
+        unsafe {
+            use core::arch::aarch64::*;
+            let n = bytes.len();
+            let p = bytes.as_ptr();
+            let mut i = 0;
+            let mut total = 0u32;
+            while i + 32 <= n {
+                let mut acc = vdupq_n_u16(0);
+                let end = (i + 32 * 2048).min(n - n % 32);
+                while i < end {
+                    let a = vcntq_u8(vld1q_u8(p.add(i)));
+                    let b = vcntq_u8(vld1q_u8(p.add(i + 16)));
+                    acc = vpadalq_u8(acc, vaddq_u8(a, b));
+                    i += 32;
+                }
+                total += vaddlvq_u16(acc);
+            }
+            while i + 8 <= n {
+                total +=
+                    u64::from_le_bytes(bytes[i..i + 8].try_into().expect("eight")).count_ones();
+                i += 8;
+            }
+            while i < n {
+                total += bytes[i].count_ones();
+                i += 1;
+            }
+            total
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut chunks = bytes.chunks_exact(8);
+            let mut total: u32 = (&mut chunks)
+                .map(|c| u64::from_le_bytes(c.try_into().expect("eight")).count_ones())
+                .sum();
+            total += chunks
+                .remainder()
+                .iter()
+                .map(|b| b.count_ones())
+                .sum::<u32>();
+            total
+        }
     }
 
     /// `out = bytes` read as little-endian words.
@@ -351,6 +403,7 @@ impl<'a> TermSet<'a> {
                 touch.touch(Part::Footer, record_at, postings.footer_at);
             }
             Form::Grouped(entries) => {
+                groups.reserve_exact(entries.len());
                 // The header and the group directory: per-term metadata,
                 // which TIN would count as the postings footer.
                 touch.touch(Part::Footer, record_at, postings.footer_at);
@@ -1253,9 +1306,14 @@ struct Scoring {
 #[derive(Debug, Default)]
 pub struct RankedAnswer {
     pub rows: Vec<(f32, Tid)>,
+    /// Candidates scored exactly.
     pub scored: u64,
     pub windows: u64,
     pub windows_pruned: u64,
+    /// Candidates the walk examined (bounded before anything was read for
+    /// them), and those whose positions were checked.
+    pub candidates: u64,
+    pub position_checks: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1291,6 +1349,21 @@ fn below(bound: f64, theta: Option<f32>) -> bool {
 /// tested. Candidates come in ctid order, so a candidate scoring exactly
 /// the threshold ranks after the `k`-th row and is skipped like a lower one.
 pub fn top_k(
+    segment: &Segment<'_>,
+    node: &Node,
+    names: &[String],
+    scorers: &[(String, TermScorer)],
+    k: usize,
+    touch: &mut impl Touch,
+) -> Result<RankedAnswer> {
+    if !required_terms(node).is_empty() {
+        return rank::top_k_led(segment, node, names, scorers, k, touch);
+    }
+    top_k_maxscore(segment, node, names, scorers, k, touch)
+}
+
+/// The phase A walk, for disjunctions.
+fn top_k_maxscore(
     segment: &Segment<'_>,
     node: &Node,
     names: &[String],
@@ -1580,7 +1653,7 @@ pub fn top_k(
                                 bound += f64::from(ub[i]);
                             }
                         }
-                        answer.scored += 1;
+                        answer.candidates += 1;
                         let mut left = rest;
                         let mut pruned = below(bound + left, theta);
                         if !pruned {
@@ -1604,6 +1677,7 @@ pub fn top_k(
                         if pruned {
                             continue;
                         }
+                        answer.scored += 1;
                         let mut length = None;
                         for i in 0..n {
                             if held[i].is_some() {
@@ -2015,7 +2089,20 @@ mod tests {
             Node::And(c) => c.iter().all(|c| eval(c, members, rank)),
             Node::Or(c) => c.iter().any(|c| eval(c, members, rank)),
             Node::Not(inner) => !eval(inner, members, rank),
-            Node::Span { .. } => unreachable!(),
+            // Term `t` of a document holding it `tf` times is at positions
+            // `0..tf` (see `build`).
+            Node::Span { slots, query } => {
+                let positions: Vec<Vec<u32>> = slots
+                    .iter()
+                    .map(|t| holds(members, *t, rank).map_or_else(Vec::new, |tf| (0..tf).collect()))
+                    .collect();
+                !positions.iter().any(Vec::is_empty)
+                    && SpanSolver::new(query)
+                        .unwrap()
+                        .intervals(&positions)
+                        .next()
+                        .is_some()
+            }
         }
     }
 
@@ -2030,6 +2117,21 @@ mod tests {
             And(vec![Or(vec![Term(1), Term(2)]), Not(Box::new(Term(3)))]),
             Or(vec![And(vec![Term(0), Term(1)]), Term(3)]),
             Not(Box::new(Term(0))),
+            Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+            Span {
+                slots: vec![2, 0, 2],
+                query: SpanQuery::phrase([0, 1, 2]),
+            },
+            And(vec![
+                Span {
+                    slots: vec![1, 3],
+                    query: SpanQuery::phrase([0, 1]),
+                },
+                Term(0),
+            ]),
         ]
     }
 
