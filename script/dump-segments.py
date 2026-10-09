@@ -35,22 +35,24 @@ PAGE_SIZE = 8192
 PAGE_HEADER = 24
 SPECIAL_SIZE = 8
 MAGIC = 0x4C445032
-VERSION = 2
+VERSION = 6
 KIND_META = 1
 KIND_RUN = 3
 SPEC_BYTES = 8
 NONE = 0xFFFFFFFF
 FILE_BLOCKS = (1 << 30) // PAGE_SIZE
-# storage/layout.rs: a run is first, blocks, bytes and last page; an entry is
-# the segment's run, its page table's run, its dead list's run, the dead
-# list's stamp, documents, total length and generation.
+# storage/layout.rs (page version 6): a run is first, blocks, bytes and last
+# page; an entry is the segment's run, its page table's run, its dead list's
+# run, the dead list's stamp, documents, total length, generation and origin
+# (a byte padded to four).
 RUN_BYTES = 16
-ENTRY_BYTES = RUN_BYTES * 3 + 4 + 4 + 8 + 4
+ENTRY_BYTES = RUN_BYTES * 3 + 4 + 4 + 8 + 4 + 4
 # The meta page: identity, tokenizer settings, the write buffer's version,
 # epoch, head, tail, tail use, bytes and documents, then the next generation
-# and the segment and pending counts.
+# and the segment, pending, sealed and retired counts.
 BUFFER_AT = 8 + SPEC_BYTES
 COUNTS_AT = BUFFER_AT + 28
+COUNTS_BYTES = 20
 
 
 def psql(dbname, sql, **variables):
@@ -129,8 +131,8 @@ def main():
         raise SystemExit("block 0 is not the meta page")
     spec = meta[8:8 + SPEC_BYTES]
     buffer_docs, = struct.unpack_from("<I", meta, BUFFER_AT + 24)
-    _next_generation, segment_count, _pending = struct.unpack_from("<III", meta, COUNTS_AT)
-    at = COUNTS_AT + 12
+    _next_generation, segment_count, _pending, sealed, _retired = struct.unpack_from("<IIIII", meta, COUNTS_AT)
+    at = COUNTS_AT + COUNTS_BYTES
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     manifest = ["format\tstannum-dump 1", f"spec\t{spec.hex()}"]
@@ -157,6 +159,8 @@ def main():
     (out / "manifest.tsv").write_text("\n".join(manifest) + "\n")
     if buffer_docs:
         print(f"warning: the write buffer holds {buffer_docs} documents, which are not dumped")
+    if sealed:
+        print(f"warning: {sealed} sealed write segments are not dumped")
     if args.id_column:
         table = psql(args.dbname, "SELECT indrelid::regclass FROM pg_index "
                      "WHERE indexrelid = :'index'::regclass", index=args.index)

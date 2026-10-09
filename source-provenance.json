@@ -48,6 +48,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ctid-addressed format's converter, size report and trace replay."
     },
+    "bench/src/bin/tnsreplay.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ranked trace replay over dumped TNS1 segments, read in place as the extension reads them."
+    },
     "bench/src/dump.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: reading script/dump-segments.py's dumps for the offline replay."
