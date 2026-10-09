@@ -41,6 +41,16 @@ pub(crate) fn count_native(
     let node = engine::tinshape::lower(query, &mut names)?;
     crate::storage::with_native(view, i, &names, spans(&node), false, |segment| {
         let geometry = &segment.docs.geometry;
+        // A term alone on an all-visible heap is its document frequency
+        // when nothing in the segment is dead.
+        if let Node::Term(t) = &node
+            && visibility.all
+            && segment.liveness.dead == 0
+        {
+            return Ok(segment
+                .term_memo(&names[*t])?
+                .map_or(0, |term| u64::from(term.entry.df)));
+        }
         let mut terms = open_terms(segment, &names, &mut NoTouch)?;
         let mut hidden: Vec<Tid> = Vec::new();
         let total = count_terms_visible(
@@ -49,12 +59,14 @@ pub(crate) fn count_native(
             &mut terms,
             &mut NoTouch,
             &mut |group, mask| {
+                if visibility.all {
+                    return true;
+                }
                 let g = &geometry.groups[group as usize];
                 let bits = visibility.group_bits(g.id * segment::tinshape::docs::GROUP_PAGES);
                 // The group's slots cover its pages `first..first + pages`.
                 let (first, pages) = (usize::from(g.first), usize::from(g.pages));
-                let covered = (first..first + pages).all(|p| bits[p / 64] >> (p % 64) & 1 == 1);
-                if covered {
+                if covers(&bits, first, first + pages) {
                     return true;
                 }
                 // Each all-visible page's slots, a run of `width` bits.
@@ -96,6 +108,23 @@ pub(crate) fn count_native(
             pending(page[0].block, &offsets);
         }
         Ok(total)
+    })
+}
+
+/// Whether bits `[from, to)` of `bits` are all set.
+fn covers(bits: &[u64; 4], from: usize, to: usize) -> bool {
+    (0..4).all(|w| {
+        let (lo, hi) = (from.max(w * 64), to.min(w * 64 + 64));
+        if lo >= hi {
+            return true;
+        }
+        let width = hi - lo;
+        let run = if width == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << width) - 1) << (lo - w * 64)
+        };
+        bits[w] & run == run
     })
 }
 
