@@ -1,0 +1,756 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.4",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6 (test database)",
+  "date": "2026-10-09T03:39:27Z",
+  "suite_commit": "41f8e6c47f70d77ad23ae5ed2d1ed37518443354",
+  "runner_version": "3"
+ },
+ "cases": [
+  {
+   "id": "stemming.tokenize.en",
+   "captures": {
+    "value": [
+     "run",
+     "run",
+     "runner",
+     "ran",
+     "easili",
+     "connect",
+     "connect",
+     "generous",
+     "poni"
+    ],
+    "unstemmed": [
+     "runs",
+     "running",
+     "runner",
+     "ran",
+     "easily",
+     "connection",
+     "connected",
+     "generously",
+     "ponies"
+    ]
+   }
+  },
+  {
+   "id": "stemming.tokenize.fold_order",
+   "captures": {
+    "value": [
+     "run",
+     "cafe",
+     "naiv",
+     "resume"
+    ],
+    "accents_preserved": [
+     "run",
+     "caf\u00e9",
+     "na\u00efv",
+     "r\u00e9sum\u00e9"
+    ]
+   }
+  },
+  {
+   "id": "stemming.tokenize.languages",
+   "captures": {
+    "value": [
+     [
+      "ar",
+      [
+       "\u0645\u0643\u062a\u0628",
+       "\u064a\u0643\u062a\u0628"
+      ]
+     ],
+     [
+      "da",
+      [
+       "l\u00f8b",
+       "l\u00f8b",
+       "hest"
+      ]
+     ],
+     [
+      "de",
+      [
+       "haus",
+       "lauf",
+       "gelauf",
+       "katz"
+      ]
+     ],
+     [
+      "el",
+      [
+       "\u03b1\u03bd\u03b8\u03c1\u03c9\u03c0",
+       "\u03b1\u03bd\u03b8\u03c1\u03c9\u03c0"
+      ]
+     ],
+     [
+      "en",
+      [
+       "run",
+       "run",
+       "poni"
+      ]
+     ],
+     [
+      "es",
+      [
+       "habl",
+       "habl",
+       "gat"
+      ]
+     ],
+     [
+      "fi",
+      [
+       "talo",
+       "talo",
+       "kis"
+      ]
+     ],
+     [
+      "fr",
+      [
+       "chant",
+       "chanton",
+       "chant",
+       "continuel"
+      ]
+     ],
+     [
+      "hu",
+      [
+       "haz",
+       "kert"
+      ]
+     ],
+     [
+      "it",
+      [
+       "parl",
+       "parl",
+       "gatt"
+      ]
+     ],
+     [
+      "nl",
+      [
+       "lop",
+       "loopt",
+       "gelop",
+       "huiz"
+      ]
+     ],
+     [
+      "no",
+      [
+       "hest",
+       "l\u00f8p",
+       "b\u00f8k"
+      ]
+     ],
+     [
+      "pt",
+      [
+       "fal",
+       "fal",
+       "gat"
+      ]
+     ],
+     [
+      "ro",
+      [
+       "cant",
+       "pisic"
+      ]
+     ],
+     [
+      "ru",
+      [
+       "\u0431\u0435\u0433\u0443\u0449",
+       "\u0431\u0435\u0433\u0430",
+       "\u043a\u043e\u0448\u043a"
+      ]
+     ],
+     [
+      "sv",
+      [
+       "spring",
+       "hast"
+      ]
+     ],
+     [
+      "ta",
+      [
+       "\u0baa\u0bb3\u0bb3\u0b95\u0b95\u0b9f\u0bae"
+      ]
+     ],
+     [
+      "tr",
+      [
+       "kitap",
+       "ev"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "stemming.tokenize.codes",
+   "captures": {
+    "hy": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "unknown stemmer language code: hy"
+     }
+    },
+    "unknown": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "unknown stemmer language code: xx"
+     }
+    },
+    "name": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "unknown stemmer language code: english"
+     }
+    },
+    "upper": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "unknown stemmer language code: EN"
+     }
+    },
+    "empty": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "unknown stemmer language code: "
+     }
+    },
+    "null": [
+     "running"
+    ]
+   }
+  },
+  {
+   "id": "stemming.tokenize.case_preserve",
+   "captures": {
+    "value": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "stemming requires case_folding = fold"
+     }
+    }
+   }
+  },
+  {
+   "id": "stemming.ddl.errors",
+   "captures": {
+    "unknown_code": {
+     "sqlstate": "XX000",
+     "message": "unknown stemmer language code: xx"
+    },
+    "case_preserve": {
+     "sqlstate": "XX000",
+     "message": "stemming requires case_folding = fold"
+    },
+    "alter_unknown": {
+     "sqlstate": "XX000",
+     "message": "unknown stemmer language code: xx"
+    },
+    "alter_case_preserve": {
+     "sqlstate": "XX000",
+     "message": "stemming requires case_folding = fold"
+    }
+   }
+  },
+  {
+   "id": "stemming.ddl.alter_reindex",
+   "captures": {
+    "script": [
+     [
+      3
+     ],
+     null,
+     [
+      3
+     ],
+     [
+      3
+     ],
+     null,
+     [
+      1,
+      2,
+      3
+     ],
+     [
+      1,
+      2,
+      3
+     ],
+     null,
+     [
+      1,
+      2,
+      3
+     ],
+     [],
+     null,
+     [
+      3
+     ],
+     [
+      1
+     ]
+    ]
+   }
+  },
+  {
+   "id": "stemming.match.term",
+   "captures": {
+    "run": [
+     1,
+     2,
+     3,
+     5,
+     6
+    ],
+    "running": [
+     1,
+     2,
+     3,
+     5,
+     6
+    ],
+    "runners": [
+     4,
+     5
+    ],
+    "ran": [
+     4
+    ],
+    "connections": [
+     7
+    ],
+    "generosity": [
+     9
+    ],
+    "cafe": [
+     8
+    ],
+    "plain_run": [
+     1
+    ],
+    "plain_running": [
+     3,
+     5,
+     6
+    ],
+    "count": 5
+   }
+  },
+  {
+   "id": "stemming.match.write_buffer",
+   "captures": {
+    "run": [
+     1,
+     2,
+     3,
+     5,
+     6
+    ],
+    "running": [
+     1,
+     2,
+     3,
+     5,
+     6
+    ],
+    "phrase": [
+     2,
+     3,
+     6
+    ],
+    "count": 5
+   }
+  },
+  {
+   "id": "stemming.match.boolean",
+   "captures": {
+    "and": [
+     2,
+     3,
+     6
+    ],
+    "or": [
+     4,
+     5,
+     7
+    ],
+    "not": [
+     1,
+     5
+    ]
+   }
+  },
+  {
+   "id": "stemming.match.custom_scan_off",
+   "captures": {
+    "custom_scan_on": [
+     1,
+     2,
+     3,
+     5,
+     6
+    ],
+    "custom_scan_off": {
+     "error": {
+      "sqlstate": "XX000",
+      "message": "queries targeting a tin index with non-default tokenization require a usable tin custom scan path"
+     }
+    }
+   }
+  },
+  {
+   "id": "stemming.phrase.1",
+   "captures": {
+    "runs_fast": [
+     2,
+     3,
+     6
+    ],
+    "running_shoe": [
+     5
+    ],
+    "plain_runs_fast": [
+     2
+    ]
+   }
+  },
+  {
+   "id": "stemming.proximity.1",
+   "captures": {
+    "near": [
+     2,
+     3,
+     6
+    ],
+    "then_reversed": [],
+    "then_2": [
+     5
+    ]
+   }
+  },
+  {
+   "id": "stemming.positions.1",
+   "captures": {
+    "first_1": [
+     5,
+     6
+    ],
+    "last_1": [],
+    "fasting_last": [
+     2,
+     3,
+     6
+    ],
+    "words_1_2": [
+     4
+    ]
+   }
+  },
+  {
+   "id": "stemming.expansion.wildcard",
+   "captures": {
+    "runn": [
+     4,
+     5
+    ],
+    "running": [],
+    "run": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ],
+    "generos": [
+     9
+    ],
+    "plain_runn": [
+     3,
+     4,
+     5,
+     6
+    ]
+   }
+  },
+  {
+   "id": "stemming.expansion.fuzzy",
+   "captures": {
+    "runs_0": [],
+    "runs_1": [
+     1,
+     2,
+     3,
+     5,
+     6
+    ],
+    "runnin_1": []
+   }
+  },
+  {
+   "id": "stemming.expansion.regex",
+   "captures": {
+    "runn": [
+     4,
+     5
+    ],
+    "running": [],
+    "connect": [
+     7
+    ]
+   }
+  },
+  {
+   "id": "stemming.expansion.range",
+   "captures": {
+    "run_runz": [
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ],
+    "running_runningz": []
+   }
+  },
+  {
+   "id": "stemming.score.1",
+   "captures": {
+    "stemmed": {
+     "1": "3f97d7da",
+     "2": "3fb52090",
+     "3": "3f97d7da",
+     "5": "3f97d7da",
+     "6": "3fe067c8"
+    },
+    "stemmed_or": {
+     "1": "4017d7da",
+     "2": "40352090",
+     "3": "4017d7da",
+     "5": "4017d7da",
+     "6": "406067c8"
+    },
+    "plain": {
+     "1": "3ffb4696"
+    },
+    "ranked": [
+     6,
+     2,
+     1,
+     3,
+     5
+    ]
+   }
+  },
+  {
+   "id": "stemming.score_inspect.1",
+   "captures": {
+    "value": [
+     [
+      "fast",
+      "3f800000"
+     ],
+     [
+      "runner",
+      "3f800000"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "stemming.stop_words.1",
+   "captures": {
+    "stop_run": [
+     [
+      "fast",
+      "3f800000"
+     ]
+    ],
+    "stop_running": [
+     [
+      "fast",
+      "3f800000"
+     ],
+     [
+      "run",
+      "3f800000"
+     ]
+    ],
+    "ids": [
+     1,
+     2
+    ],
+    "stop_run_scores": {
+     "1": "3ff926ae",
+     "2": "00000000",
+     "3": "3ff926ae"
+    }
+   }
+  },
+  {
+   "id": "stemming.highlight.implicit",
+   "captures": {
+    "run": [
+     [
+      1,
+      "I <b>run</b> every day"
+     ],
+     [
+      2,
+      "she <b>runs</b> fast"
+     ],
+     [
+      3,
+      "they were <b>running</b> fast"
+     ],
+     [
+      5,
+      "<b>running</b> shoes for runners"
+     ],
+     [
+      6,
+      "<b>Running</b> FAST"
+     ]
+    ],
+    "phrase": [
+     [
+      2,
+      "she <b>runs fast</b>"
+     ],
+     [
+      3,
+      "they were <b>running fast</b>"
+     ],
+     [
+      6,
+      "<b>Running FAST</b>"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "stemming.highlight.explicit",
+   "captures": {
+    "no_stemmer": [
+     [
+      1,
+      "I <b>run</b> every day"
+     ],
+     [
+      2,
+      "she <b>runs</b> fast"
+     ],
+     [
+      3,
+      "they were <b>running</b> fast"
+     ],
+     [
+      5,
+      "<b>running</b> shoes for runners"
+     ],
+     [
+      6,
+      "<b>Running</b> FAST"
+     ]
+    ],
+    "stemmer_en": [
+     [
+      1,
+      "I <b>run</b> every day"
+     ],
+     [
+      2,
+      "she <b>runs</b> fast"
+     ],
+     [
+      3,
+      "they were <b>running</b> fast"
+     ],
+     [
+      5,
+      "<b>running</b> shoes for runners"
+     ],
+     [
+      6,
+      "<b>Running</b> FAST"
+     ]
+    ]
+   }
+  },
+  {
+   "id": "stemming.highlight.literal",
+   "captures": {
+    "html": "Runners were <b>running</b>; she <b>runs</b>.",
+    "html_phrase": "<b>Runners</b> were running; she runs.",
+    "ansi": "736865201b5b313b33366d72756e731b5b306d"
+   }
+  },
+  {
+   "id": "stemming.language.fr",
+   "captures": {
+    "chanter": [
+     1,
+     3
+    ],
+    "chantez": [
+     1,
+     3
+    ],
+    "chanteurs": [
+     4
+    ]
+   }
+  },
+  {
+   "id": "stemming.language.de",
+   "captures": {
+    "haeuser": [
+     1,
+     2,
+     3
+    ],
+    "haus": [
+     1,
+     2,
+     3
+    ],
+    "laeuft": [
+     4
+    ]
+   }
+  },
+  {
+   "id": "stemming.language.ru",
+   "captures": {
+    "koshku": [
+     1,
+     2,
+     3
+    ],
+    "kot": [
+     4
+    ]
+   }
+  }
+ ]
+}
