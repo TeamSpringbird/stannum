@@ -25,6 +25,7 @@
 //! filters read only postings, a ranked query adds the TF tail and the DL
 //! sidecar, and a phrase adds positions.
 
+use super::blob::Bytes;
 use super::docs::{self, DocSet, Geometry, Lengths, Liveness};
 use super::postings::{self, Footer, Options, Postings, Stats};
 use crate::dictionary::{
@@ -264,7 +265,9 @@ impl Builder {
 
 /// A segment in this shape, read from memory.
 pub struct Segment<'a> {
-    pub bytes: &'a [u8],
+    /// The blob, in memory ([`Self::parse`]) or loaded on demand
+    /// ([`Self::assemble`]).
+    pub bytes: Bytes<'a>,
     pub documents: u32,
     pub total_length: u64,
     pub block_size: u32,
@@ -303,6 +306,9 @@ impl FooterCache {
         self.bytes
     }
 }
+
+/// Most bytes of a blob's header: the magic and ten varints.
+const HEADER_MAX: usize = 4 + 10 * 10;
 
 /// Lookups a memo holds before it is emptied.
 const MEMO_LIMIT: usize = 4096;
@@ -374,7 +380,7 @@ impl<'a> Segment<'a> {
         let lengths = Lengths::parse(area(5), documents)?;
         let liveness = std::rc::Rc::new(Liveness::decode(area(6), &docs)?);
         Ok(Self {
-            bytes,
+            bytes: Bytes::Slice(bytes),
             documents,
             total_length,
             block_size,
@@ -394,14 +400,15 @@ impl<'a> Segment<'a> {
     /// across queries (the term map's index, the document set and the
     /// liveness, see [`Self::parse`]), so that only the header and the DL
     /// sidecar's are read per query: the extension's ctid-native paths
-    /// assemble one per query over a blob loaded as far as its queries need.
+    /// assemble one over a blob that loads what its queries read
+    /// ([`super::blob::LazyBlob`]).
     pub fn assemble(
-        bytes: &'a [u8],
+        bytes: Bytes<'a>,
         index: DictionaryIndex<'a>,
         docs: std::rc::Rc<DocSet>,
         liveness: std::rc::Rc<Liveness>,
     ) -> Result<Self> {
-        let header = super::index::Header::parse(bytes, bytes.len() as u64)?;
+        let header = super::index::Header::parse(bytes.window(0, HEADER_MAX)?, bytes.len() as u64)?;
         let mut bounds = [0usize; 8];
         for (bound, at) in bounds.iter_mut().zip(header.bounds) {
             *bound = usize::try_from(at).map_err(|_| Error::Truncated)?;
@@ -409,7 +416,7 @@ impl<'a> Segment<'a> {
         if docs.geometry.documents != header.documents {
             return Err(Error::Corrupt("document set count"));
         }
-        let lengths = Lengths::parse(&bytes[bounds[5]..bounds[6]], header.documents)?;
+        let lengths = Lengths::parse(bytes.sub(bounds[5], bounds[6])?, header.documents)?;
         Ok(Self {
             bytes,
             documents: header.documents,
@@ -427,9 +434,10 @@ impl<'a> Segment<'a> {
         })
     }
 
-    pub fn area(&self, area: Area) -> &'a [u8] {
+    /// Area `area`'s bytes, all of them loaded.
+    pub fn area(&self, area: Area) -> Result<&'a [u8]> {
         let a = area as usize;
-        &self.bytes[self.bounds[a]..self.bounds[a + 1]]
+        self.bytes.get(self.bounds[a], self.bounds[a + 1])
     }
 
     /// Where `area` starts in the blob.
@@ -438,22 +446,33 @@ impl<'a> Segment<'a> {
     }
 
     pub fn dictionary(&self) -> Dictionary<'_> {
-        let bytes = self.area(Area::TermMap);
+        // A segment over a lazy blob loads its term map whole the first time
+        // it is walked; the extension finds terms through its paged reader
+        // and seeds the memo instead. A failed load reads as an empty map.
+        let bytes = self.area(Area::TermMap).unwrap_or(&[]);
         Dictionary::new(&self.index, Blocks::Slice(&bytes[self.index.header_len..]))
     }
 
     /// Resolves a dictionary entry.
     pub fn resolve(&self, entry: TermEntry) -> Result<Term<'a>> {
-        let area = self.area(Area::Postings);
         let from = usize::try_from(entry.ordinals.offset).map_err(|_| Error::Truncated)?;
-        let record = area
-            .get(from..from + entry.ordinals.len as usize)
-            .ok_or(Error::Truncated)?;
+        let start = self.area_at(Area::Postings) + from;
+        let end = start + entry.ordinals.len as usize;
+        if end > self.bounds[Area::Postings as usize + 1] {
+            return Err(Error::Truncated);
+        }
+        let record = self.bytes.get(start, end)?;
         Ok(Term {
             entry,
             at: self.area_at(Area::Postings) + from,
             postings: Postings::parse(record, entry.df, &self.docs.geometry)?,
         })
+    }
+
+    /// Bytes the memos of parsed records and dictionary lookups hold,
+    /// roughly (decoded footers are counted by their [`FooterCache`]).
+    pub fn memo_bytes(&self) -> usize {
+        self.parsed.borrow().bytes + self.memo.borrow().len() * 64
     }
 
     /// Records `term`'s term-map entry (or its absence) in the memo, found
@@ -547,13 +566,14 @@ impl<'a> Segment<'a> {
 
     /// A term's positions stream (a [`super::positions`] stream), and where
     /// it starts in the blob.
-    pub fn positions(&self, entry: &TermEntry) -> Result<(&'a [u8], usize)> {
-        let area = self.area(Area::Positions);
+    pub fn positions(&self, entry: &TermEntry) -> Result<(Bytes<'a>, usize)> {
         let from = usize::try_from(entry.payload.offset).map_err(|_| Error::Truncated)?;
-        let bytes = area
-            .get(from..from + entry.payload.len as usize)
-            .ok_or(Error::Truncated)?;
-        Ok((bytes, self.area_at(Area::Positions) + from))
+        let start = self.area_at(Area::Positions) + from;
+        let end = start + entry.payload.len as usize;
+        if end > self.bounds[Area::Positions as usize + 1] {
+            return Err(Error::Truncated);
+        }
+        Ok((self.bytes.sub(start, end)?, start))
     }
 
     /// Where the length of the document of `rank` sits in the blob: its

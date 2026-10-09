@@ -38,6 +38,7 @@
 //! its slot; `rank_base` is the number of documents in earlier groups.
 
 use super::bits;
+use super::blob::Bytes;
 use crate::{Error, Result, Tid, varint};
 
 /// Heap blocks per group.
@@ -348,6 +349,14 @@ impl DocSet {
         })
     }
 
+    /// Bytes the decoded set holds on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.words.capacity() * 8
+            + self.word_base.capacity() * std::mem::size_of::<usize>()
+            + self.word_rank.capacity() * 4
+            + self.geometry.groups.capacity() * std::mem::size_of::<Group>()
+    }
+
     /// The rank of the document at slot `local` of group `index`, `None`
     /// when no document is there.
     #[inline]
@@ -424,7 +433,9 @@ pub fn encode_lengths(lengths: &[u32]) -> Vec<u8> {
     out
 }
 
-/// The DL sidecar: exact lengths by document rank.
+/// The DL sidecar: exact lengths by document rank. Its bytes may load on
+/// demand ([`Bytes::Lazy`]): a length reads its block's header and the
+/// bytes its bits fall in.
 #[derive(Clone, Copy, Debug)]
 pub struct Lengths<'a> {
     /// Where the block headers and the packed lengths start within the
@@ -433,19 +444,21 @@ pub struct Lengths<'a> {
     pub data_at: usize,
     documents: u32,
     block: u32,
-    headers: &'a [u8],
-    data: &'a [u8],
+    headers: Bytes<'a>,
+    data: Bytes<'a>,
 }
 
 impl<'a> Lengths<'a> {
-    pub fn parse(bytes: &'a [u8], documents: u32) -> Result<Self> {
+    pub fn parse(bytes: impl Into<Bytes<'a>>, documents: u32) -> Result<Self> {
+        let bytes = bytes.into();
         let mut at = 0;
-        let block = varint::get_u32(bytes, &mut at)?;
-        let blocks = varint::get_u32(bytes, &mut at)? as usize;
+        let prefix = bytes.window(0, 20)?;
+        let block = varint::get_u32(prefix, &mut at)?;
+        let blocks = varint::get_u32(prefix, &mut at)? as usize;
         if block == 0 || blocks != documents.div_ceil(block) as usize {
             return Err(Error::Corrupt("length blocks"));
         }
-        let headers = bytes.get(at..at + blocks * 8).ok_or(Error::Truncated)?;
+        let headers = bytes.sub(at, at + blocks * 8)?;
         let headers_at = at;
         let data_at = at + blocks * 8;
         Ok(Self {
@@ -454,7 +467,7 @@ impl<'a> Lengths<'a> {
             documents,
             block,
             headers,
-            data: &bytes[data_at..],
+            data: bytes.sub(data_at, bytes.len())?,
         })
     }
 
@@ -463,8 +476,8 @@ impl<'a> Lengths<'a> {
     fn header(&self, b: usize) -> Result<(usize, u32, u32)> {
         let h = self
             .headers
-            .get(b * 8..b * 8 + 8)
-            .ok_or(Error::Corrupt("length rank"))?;
+            .get(b * 8, b * 8 + 8)
+            .map_err(|_| Error::Corrupt("length rank"))?;
         let at = u32::from_le_bytes(h[0..4].try_into().expect("four bytes")) as usize;
         let packed = u32::from_le_bytes(h[4..8].try_into().expect("four bytes"));
         Ok((at, packed & DL_BASE_MAX, packed >> 24))
@@ -477,8 +490,18 @@ impl<'a> Lengths<'a> {
             return Err(Error::Corrupt("length rank"));
         }
         let (at, base, width) = self.header((rank / self.block) as usize)?;
-        let bytes = self.data.get(at..).ok_or(Error::Truncated)?;
-        Ok(base + bits::get(bytes, (rank % self.block) as usize, width)?)
+        if width == 0 {
+            // No bits to read, but the block must still start in the data.
+            return if at <= self.data.len() {
+                Ok(base)
+            } else {
+                Err(Error::Truncated)
+            };
+        }
+        let bit = (rank % self.block) as usize * width as usize;
+        let from = at + bit / 8;
+        let bytes = self.data.window(from, 8)?;
+        Ok(base + bits::get_at(bytes, bit % 8, width)?)
     }
 
     /// Where `rank`'s block header and its packed length lie within the
@@ -519,6 +542,17 @@ pub struct Liveness {
 }
 
 impl Liveness {
+    /// Bytes its dead groups' bitmaps hold on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.groups.capacity() * std::mem::size_of::<Option<Box<[u64]>>>()
+            + self
+                .groups
+                .iter()
+                .flatten()
+                .map(|words| words.len() * 8)
+                .sum::<usize>()
+    }
+
     /// Whether the document at `slot` is dead.
     pub fn is_dead(&self, geometry: &Geometry, slot: u32) -> bool {
         if self.dead == 0 {

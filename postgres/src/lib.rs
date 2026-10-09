@@ -7970,6 +7970,62 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_ranked_phrase_of_common_words_keeps_what_it_reads() {
+        // Every row holds both words of the phrase, many times. A backend
+        // loaded each query word's whole positions stream (and the whole DL
+        // sidecar) into private memory and kept it: at 150M rows one phrase
+        // of two common words grew a backend by over a gigabyte, and eight
+        // clients overran a 32 GB container. It must keep only what the
+        // walk reads, and what it keeps must count against
+        // `stannum.reader_cache_mb`.
+        use crate::storage::testing::{NATIVE_DROPS, READER_CACHE_BYTES, native_bytes};
+        Spi::run(
+            "CREATE TABLE commonwords(id int primary key, body text);
+             INSERT INTO commonwords
+             SELECT n, repeat('alpha beta ', 1 + n % 37) || repeat('pad ', n % 101) || 'w' || n
+             FROM generate_series(1, 20000) n;
+             CREATE INDEX commonwords_idx ON commonwords USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let index_bytes = Spi::get_one::<i64>("SELECT pg_relation_size('commonwords_idx')")
+            .unwrap()
+            .unwrap() as usize;
+        crate::storage::testing::clear_reader_caches();
+        let ranked = || -> Vec<i32> {
+            Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT id FROM commonwords WHERE body ==> '\"alpha beta\"'
+                         ORDER BY stannum.score(ctid) DESC LIMIT 10",
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                    .collect()
+            })
+        };
+        let first = ranked();
+        assert_eq!(first.len(), 10);
+        let held = native_bytes();
+        assert!(held > 0, "the phrase did not take the native path");
+        assert!(
+            held < index_bytes / 4,
+            "a ranked phrase kept {held} bytes of a {index_bytes} byte index"
+        );
+        // Under a budget below what it keeps, the next view drops it.
+        let drops = NATIVE_DROPS.get();
+        READER_CACHE_BYTES.set(Some(
+            crate::storage::testing::reader_arena_bytes() + held / 2,
+        ));
+        let again = ranked();
+        READER_CACHE_BYTES.set(None);
+        assert_eq!(again, first);
+        assert!(NATIVE_DROPS.get() > drops, "{held} native bytes were kept");
+    }
+
+    #[pg_test]
     fn a_backend_holds_dead_documents_in_about_a_bit_per_document() {
         // VACUUM publishes a dead list per segment, and every backend that
         // queries the segment decodes it. Held as a set of locations plus a

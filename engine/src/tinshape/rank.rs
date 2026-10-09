@@ -388,7 +388,7 @@ struct PosCursor<'a> {
 }
 
 impl<'a> PosCursor<'a> {
-    fn new(stream: (&'a [u8], usize)) -> Result<Self> {
+    fn new(stream: (segment::tinshape::blob::Bytes<'a>, usize)) -> Result<Self> {
         let positions = Positions::parse(stream.0)?;
         Ok(Self {
             next: 0,

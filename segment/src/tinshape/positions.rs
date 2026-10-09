@@ -31,6 +31,7 @@
 //! says entry `b * SKIP_INTERVAL + i` holds one position: a byte saved for
 //! most postings, at a bit each.
 
+use super::blob::Bytes;
 use crate::payload::{PayloadBuilder, SKIP_INTERVAL};
 use crate::{Error, Result, varint};
 
@@ -156,10 +157,13 @@ pub fn encode(stream: &[u8], documents: u32) -> Result<Vec<u8>> {
 /// bytes read to find it as `(offset, length)` pairs (length 0: none).
 pub type Located = (u32, usize, [(usize, usize); 2]);
 
-/// A term's positions stream in this shape, parsed.
+/// A term's positions stream in this shape, parsed. Its bytes may load on
+/// demand ([`Bytes::Lazy`]): every read asks for the bytes it needs, an
+/// entry at a time, so checking a few candidates of a common word reads a
+/// few pages of its stream, not all of it.
 #[derive(Clone, Copy, Debug)]
 pub struct Positions<'a> {
-    pub bytes: &'a [u8],
+    pub bytes: Bytes<'a>,
     pub count: u32,
     skips_at: usize,
     /// Where the subs and the masks start, when present.
@@ -168,10 +172,14 @@ pub struct Positions<'a> {
     pub data_at: usize,
 }
 
+/// Most bytes of a varint.
+const VARINT_MAX: usize = 5;
+
 impl<'a> Positions<'a> {
-    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
+    pub fn parse(bytes: impl Into<Bytes<'a>>) -> Result<Self> {
+        let bytes = bytes.into();
         let mut at = 0;
-        let head = varint::get(bytes, &mut at)?;
+        let head = varint::get(bytes.window(0, 10)?, &mut at)?;
         let count = u32::try_from(head >> 2).map_err(|_| Error::Corrupt("positions count"))?;
         let blocks = count.div_ceil(SKIP_INTERVAL) as usize;
         let slots = blocks.saturating_sub(1);
@@ -213,7 +221,7 @@ impl<'a> Positions<'a> {
         if slot > 0 {
             let s = self.skips_at + (slot - 1) * 4;
             reads[0] = (s, 4);
-            let skip = self.bytes.get(s..s + 4).ok_or(Error::Truncated)?;
+            let skip = self.bytes.get(s, s + 4)?;
             at += u32::from_le_bytes(skip.try_into().expect("four bytes")) as usize;
         }
         let j = ((index % SKIP_INTERVAL) / SUB_INTERVAL) as usize;
@@ -222,13 +230,7 @@ impl<'a> Positions<'a> {
         {
             let s = subs_at + (slot * SUBS + j - 1) * 2;
             reads[1] = (s, 2);
-            let sub = u16::from_le_bytes(
-                self.bytes
-                    .get(s..s + 2)
-                    .ok_or(Error::Truncated)?
-                    .try_into()
-                    .expect("two bytes"),
-            );
+            let sub = u16::from_le_bytes(self.bytes.get(s, s + 2)?.try_into().expect("two bytes"));
             if sub != NO_SUB {
                 entry += j as u32 * SUB_INTERVAL;
                 at += usize::from(sub);
@@ -249,38 +251,43 @@ impl<'a> Positions<'a> {
     fn head(&self, index: u32, p: usize) -> Result<(u32, usize)> {
         if let Some(m) = self.masks_at {
             let at = m + (index / SKIP_INTERVAL) as usize * 4;
-            let mask = u32::from_le_bytes(
-                self.bytes
-                    .get(at..at + 4)
-                    .ok_or(Error::Truncated)?
-                    .try_into()
-                    .expect("four bytes"),
-            );
+            let mask =
+                u32::from_le_bytes(self.bytes.get(at, at + 4)?.try_into().expect("four bytes"));
             if mask >> (index % SKIP_INTERVAL) & 1 == 1 {
                 return Ok((1, p));
             }
         }
-        let mut p = p;
-        let n = varint::get_u32(self.bytes, &mut p)?;
-        Ok((n, p))
+        let window = self.bytes.window(p, VARINT_MAX)?;
+        let mut q = 0;
+        let n = varint::get_u32(window, &mut q)?;
+        Ok((n, p + q))
+    }
+
+    /// The bytes from `p` that hold `n` varints: at most five each.
+    #[inline]
+    fn varints(&self, p: usize, n: u32) -> Result<&'a [u8]> {
+        self.bytes
+            .window(p, (n as usize).saturating_mul(VARINT_MAX))
     }
 
     /// Skips entry `index`, starting at byte `p`; where the next starts.
     #[inline]
     pub fn skip(&self, index: u32, p: usize) -> Result<usize> {
         let (n, p) = self.head(index, p)?;
-        skip_varints(self.bytes, p, n)
+        Ok(p + skip_varints(self.varints(p, n)?, 0, n)?)
     }
 
     /// Decodes entry `index`, starting at byte `at`, into `out`; where the
     /// next starts.
     #[inline]
     pub fn read_entry(&self, index: u32, at: usize, out: &mut Vec<u32>) -> Result<usize> {
-        let (n, mut p) = self.head(index, at)?;
+        let (n, p) = self.head(index, at)?;
+        let bytes = self.varints(p, n)?;
+        let mut q = 0;
         out.clear();
         let mut previous: Option<u32> = None;
         for _ in 0..n {
-            let v = varint::get_u32(self.bytes, &mut p)?;
+            let v = varint::get_u32(bytes, &mut q)?;
             let position = match previous {
                 None => v,
                 Some(q) => q + v + 1,
@@ -288,7 +295,7 @@ impl<'a> Positions<'a> {
             out.push(position);
             previous = Some(position);
         }
-        Ok(p)
+        Ok(p + q)
     }
 
     /// The [`crate::payload`] stream it was encoded from.

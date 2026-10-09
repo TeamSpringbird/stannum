@@ -203,10 +203,7 @@ impl<S: Source> Reader<S> {
             .tables
             .get()
             .map_or(0, |t| t.offsets.len() + t.pages.len() + t.lengths.len());
-        let docs = self
-            .docs
-            .get()
-            .map_or(0, |d| d.words.len() * 12 + d.geometry.groups.len() * 16);
+        let docs = self.docs.get().map_or(0, |d| d.heap_bytes());
         self.arena_bytes.get() + tables + docs + self.encoded.borrow().bytes
     }
 
@@ -265,7 +262,7 @@ impl<S: Source> Reader<S> {
         let docs = self.docs()?;
         let tids = docs.tids();
         let sidecar = self.read(self.header.at(LENGTHS), self.header.len(LENGTHS))?;
-        let sidecar = SidecarLengths::parse(&sidecar, self.header.documents)?;
+        let sidecar = SidecarLengths::parse(&*sidecar, self.header.documents)?;
         let mut lengths = Vec::with_capacity(tids.len() * 4);
         for rank in 0..self.header.documents {
             lengths.extend_from_slice(&sidecar.get(rank)?.to_le_bytes());
@@ -441,7 +438,7 @@ impl<S: Source> AreaFetch for Reader<S> {
             self.header.at(POSITIONS) + extent.offset,
             extent.len as usize,
         )?;
-        let payload = super::positions::Positions::parse(&stream)?.payload()?;
+        let payload = super::positions::Positions::parse(&*stream)?.payload()?;
         let mut encoded = self.encoded.borrow_mut();
         let found = encoded.push(payload);
         encoded.payloads.insert(extent.offset, found);

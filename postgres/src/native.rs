@@ -31,7 +31,6 @@ use crate::storage::{View, codec_in, with_native};
 pub(crate) struct Lowered {
     pub(crate) node: Node,
     pub(crate) names: Vec<String>,
-    positions: bool,
 }
 
 impl Lowered {
@@ -46,12 +45,7 @@ impl Lowered {
         } else {
             Node::And(nodes)
         };
-        let positions = engine::walk::reads_positions(&node);
-        Some(Self {
-            node,
-            names,
-            positions,
-        })
+        Some(Self { node, names })
     }
 }
 
@@ -103,26 +97,19 @@ pub(crate) fn visit_matches(
     lowered: &Lowered,
     visit: &mut dyn FnMut(Tid),
 ) -> bool {
-    let found = with_native(
-        view,
-        i,
-        &lowered.names,
-        lowered.positions,
-        true,
-        |segment| {
-            let mut terms = open_terms(segment, &lowered.names, &mut NoTouch)?;
-            let geometry = &segment.docs.geometry;
-            for_each_match(
-                segment,
-                &lowered.node,
-                &mut terms,
-                &mut NoTouch,
-                &mut |group, words| {
-                    tids_in(geometry, group, words, &mut *visit);
-                },
-            )
-        },
-    );
+    let found = with_native(view, i, &lowered.names, |segment| {
+        let mut terms = open_terms(segment, &lowered.names, &mut NoTouch)?;
+        let geometry = &segment.docs.geometry;
+        for_each_match(
+            segment,
+            &lowered.node,
+            &mut terms,
+            &mut NoTouch,
+            &mut |group, words| {
+                tids_in(geometry, group, words, &mut *visit);
+            },
+        )
+    });
     match found {
         Some(result) => {
             codec_in(result, &view.labels[i]);
@@ -135,32 +122,25 @@ pub(crate) fn visit_matches(
 /// Source `i`'s live matches of `lowered`, held a group at a time; `None`
 /// when the source has no native reader.
 pub(crate) fn matches(view: &View, i: usize, lowered: &Lowered) -> Option<Matches> {
-    let found = with_native(
-        view,
-        i,
-        &lowered.names,
-        lowered.positions,
-        true,
-        |segment| {
-            let mut terms = open_terms(segment, &lowered.names, &mut NoTouch)?;
-            let mut groups = Vec::new();
-            for_each_match(
-                segment,
-                &lowered.node,
-                &mut terms,
-                &mut NoTouch,
-                &mut |group, words| {
-                    groups.push((group, Box::<[u64]>::from(words)));
-                },
-            )?;
-            Ok(Matches {
-                docs: segment.docs.clone(),
-                groups,
-                group: 0,
-                bit: 0,
-            })
-        },
-    )?;
+    let found = with_native(view, i, &lowered.names, |segment| {
+        let mut terms = open_terms(segment, &lowered.names, &mut NoTouch)?;
+        let mut groups = Vec::new();
+        for_each_match(
+            segment,
+            &lowered.node,
+            &mut terms,
+            &mut NoTouch,
+            &mut |group, words| {
+                groups.push((group, Box::<[u64]>::from(words)));
+            },
+        )?;
+        Ok(Matches {
+            docs: segment.docs.clone(),
+            groups,
+            group: 0,
+            bit: 0,
+        })
+    })?;
     let mut matches = codec_in(found, &view.labels[i]);
     matches.settle();
     Some(matches)

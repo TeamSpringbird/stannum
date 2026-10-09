@@ -29,17 +29,9 @@ pub(crate) fn count_native(
     mut pending: impl FnMut(u32, &[u16]),
 ) -> Option<segment::Result<u64>> {
     use engine::tinshape::{NoTouch, Node, count_terms_visible, open_terms};
-    fn spans(node: &Node) -> bool {
-        match node {
-            Node::Span { .. } => true,
-            Node::Term(_) => false,
-            Node::Not(inner) => spans(inner),
-            Node::And(children) | Node::Or(children) => children.iter().any(spans),
-        }
-    }
     let mut names = Vec::new();
     let node = engine::tinshape::lower(query, &mut names)?;
-    crate::storage::with_native(view, i, &names, spans(&node), false, |segment| {
+    crate::storage::with_native(view, i, &names, |segment| {
         let geometry = &segment.docs.geometry;
         // A term alone on an all-visible heap is its document frequency
         // when nothing in the segment is dead.

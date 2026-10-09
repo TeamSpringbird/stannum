@@ -352,7 +352,7 @@ pub struct TermSet<'a> {
     /// Where its record starts in the blob.
     pub at: usize,
     /// The positions stream and its blob offset.
-    pub positions: (&'a [u8], usize),
+    pub positions: (segment::tinshape::blob::Bytes<'a>, usize),
     groups: Vec<G<'a>>,
     /// Local slots of a single or sparse term, all groups in a row.
     locals: Vec<u32>,
@@ -1131,7 +1131,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
 /// Reads entry `index` of a positions stream (a
 /// [`segment::tinshape::positions`] stream) into `out`.
 pub fn read_positions(
-    stream: (&[u8], usize),
+    stream: (segment::tinshape::blob::Bytes<'_>, usize),
     index: u32,
     out: &mut Vec<u32>,
     touch: &mut impl Touch,
@@ -1689,8 +1689,27 @@ mod tests {
     use proptest::prelude::*;
     use segment::payload::PayloadBuilder;
     use segment::tf_bucket::TfBucket;
+    use segment::tinshape::blob::LazyBlob;
     use segment::tinshape::postings::Options;
     use segment::tinshape::segment::Builder;
+
+    /// `parsed`'s blob assembled over `lazy`, which loads what is read, as
+    /// the extension assembles a segment.
+    fn assembled<'a>(lazy: &'a LazyBlob, parsed: &Segment<'_>) -> Segment<'a> {
+        let term_map = lazy
+            .bytes()
+            .get(parsed.bounds[1], parsed.bounds[2])
+            .unwrap();
+        let prefix = segment::dictionary::DictionaryIndex::prefix_len(term_map).unwrap();
+        let index = segment::dictionary::DictionaryIndex::parse(&term_map[..prefix]).unwrap();
+        Segment::assemble(
+            lazy.bytes(),
+            index,
+            parsed.docs.clone(),
+            parsed.liveness.clone(),
+        )
+        .unwrap()
+    }
 
     /// A segment of `docs` (ctids ascending) where term `t` holds the
     /// documents `members[t]` with `tfs`, and its brute-force view.
@@ -1820,12 +1839,15 @@ mod tests {
             let options = Options { block_size, grid_density, grid_min_postings: 0, inline_lengths_min_documents: 0, ..Options::default() };
             let blob = build(&docs, &members, options);
             let segment = Segment::parse(&blob).unwrap();
+            let lazy_blob = LazyBlob::new(Box::new(blob.clone()));
+            let lazy = assembled(&lazy_blob, &segment);
             let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();
             let lengths: Vec<u32> = (0..docs.len()).map(|i| (i as u32 * 37) % 90 + 5).collect();
             for node in shapes() {
                 let want = (0..docs.len()).filter(|r| eval(&node, &members, *r)).count() as u64;
                 let got = count(&segment, &node, &names, &mut NoTouch).unwrap();
                 prop_assert_eq!(got, want, "count of {:?}", node);
+                prop_assert_eq!(count(&lazy, &node, &names, &mut NoTouch).unwrap(), want, "lazy count of {:?}", node);
                 let mut terms = open_terms(&segment, &names, &mut NoTouch).unwrap();
                 let mut listed = Vec::new();
                 for_each_match(&segment, &node, &mut terms, &mut NoTouch, &mut |group, words| {
@@ -1885,8 +1907,76 @@ mod tests {
                 let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
                 let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
                 prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
+                let lazily = top_k(&lazy, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+                prop_assert_eq!(bits(&lazily.rows), bits(&want), "lazy top {} of {:?}", k, node);
             }
         }
+    }
+
+    /// A phrase of two words in every document, ranked over a segment that
+    /// loads what it reads, reads a few of their positions' pages and a few
+    /// of the DL sidecar's, not their areas: a backend's memory must not
+    /// grow with a common word's positions (at 150M rows a phrase of two
+    /// common words loaded over a gigabyte of positions per backend).
+    #[test]
+    fn a_ranked_phrase_loads_what_it_reads() {
+        let docs: Vec<Tid> = (0..60_000u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        let lengths: Vec<u32> = (0..docs.len()).map(|i| (i as u32 * 37) % 90 + 5).collect();
+        let mut builder = Builder::new(docs.clone(), lengths, Options::default()).unwrap();
+        let ranks: Vec<u32> = (0..docs.len() as u32).collect();
+        for (name, at) in [("a", 0u32), ("b", 1)] {
+            let mut payload = PayloadBuilder::default();
+            let mut buckets = Vec::new();
+            for r in 0..docs.len() as u32 {
+                // Positions a document apart, so entries are several bytes.
+                let positions: Vec<u32> = (0..(r % 7 + 1)).map(|p| p * 10 + at).collect();
+                buckets.push(TfBucket::from_count(positions.len() as u32).value());
+                payload.push(&positions).unwrap();
+            }
+            builder
+                .add_term(name, &ranks, &buckets, &payload.finish())
+                .unwrap();
+        }
+        let blob = builder.finish(&[]).0;
+        let parsed = Segment::parse(&blob).unwrap();
+        let names = vec!["a".to_owned(), "b".to_owned()];
+        let node = Node::Span {
+            slots: vec![0, 1],
+            query: SpanQuery::phrase([0, 1]),
+        };
+        let scorers: Vec<(String, TermScorer)> = names
+            .iter()
+            .map(|n| {
+                let scorer = TermScorer::from_statistics(
+                    docs.len() as u64,
+                    docs.len() as u64,
+                    1.0,
+                    Bm25Params::default(),
+                    50.0,
+                )
+                .unwrap();
+                (n.clone(), scorer)
+            })
+            .collect();
+        let want = top_k(&parsed, &node, &names, &scorers, 10, &mut NoTouch).unwrap();
+        let lazy = LazyBlob::new(Box::new(blob.clone()));
+        let segment = assembled(&lazy, &parsed);
+        let before = lazy.loaded();
+        let got = top_k(&segment, &node, &names, &scorers, 10, &mut NoTouch).unwrap();
+        assert_eq!(got.rows, want.rows);
+        let read = lazy.loaded() - before;
+        let positions = parsed.bounds[4] - parsed.bounds[3];
+        let sidecar = parsed.bounds[6] - parsed.bounds[5];
+        assert!(positions > 400_000, "{positions}");
+        assert!(
+            read < (positions + sidecar) / 4,
+            "read {read} bytes of {positions} of positions and {sidecar} of lengths"
+        );
     }
 
     #[test]

@@ -66,7 +66,15 @@ pub fn get(bytes: &[u8], index: usize, width: u32) -> Result<u32> {
     if width == 0 {
         return Ok(0);
     }
-    let bit = index * width as usize;
+    get_at(bytes, index * width as usize, width)
+}
+
+/// The `width`-bit value at bit `bit` of `bytes`.
+#[inline]
+pub fn get_at(bytes: &[u8], bit: usize, width: u32) -> Result<u32> {
+    if width == 0 {
+        return Ok(0);
+    }
     let first = bit / 8;
     // One unaligned load where eight bytes remain: a value of at most 32
     // bits at a bit offset below 8 fits in them.
