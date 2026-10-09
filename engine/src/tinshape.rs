@@ -299,10 +299,13 @@ pub fn lower(query: &Query, terms: &mut Vec<String>) -> Option<Node> {
         ),
         Query::Not(inner) => Node::Not(Box::new(lower(inner, terms)?)),
         Query::Boost { inner, .. } => lower(inner, terms)?,
+        // Leaf boosts weigh a span's terms in a score, not which documents
+        // match it.
         Query::Span {
             term_slots,
             span_query,
             position_filter: None,
+            ..
         } => {
             let mut slots = Vec::with_capacity(term_slots.len());
             for slot in term_slots {

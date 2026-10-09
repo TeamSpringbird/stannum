@@ -426,7 +426,10 @@ impl<S: Source> AreaFetch for Reader<S> {
         // The ordinal interface reads STN3's payload streams: a term's
         // positions are translated once, like its postings.
         if let Some(found) = self.encoded.borrow().payloads.get(&extent.offset) {
-            return self.encoded.borrow().range(found.offset, found.len as usize);
+            return self
+                .encoded
+                .borrow()
+                .range(found.offset, found.len as usize);
         }
         let stream = self.read(
             self.header.at(POSITIONS) + extent.offset,
