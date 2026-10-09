@@ -63,6 +63,10 @@ pub(super) struct Sc {
     num: [f32; BUCKET_COUNT],
     den: [f32; BUCKET_COUNT],
     factor: f32,
+    /// [`Self::bucket_bound`] per bucket in the block last asked about,
+    /// NaN until asked: a rare term's block spans many groups' candidates.
+    bb_block: usize,
+    bb: [f32; BUCKET_COUNT],
 }
 
 impl Sc {
@@ -78,6 +82,8 @@ impl Sc {
             num,
             den,
             factor,
+            bb_block: usize::MAX,
+            bb: [f32::NAN; BUCKET_COUNT],
         }
     }
 
@@ -150,6 +156,23 @@ impl Sc {
             .bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
     }
 
+    /// [`Self::bucket_bound`], kept per bucket for the block last asked
+    /// about.
+    #[inline]
+    fn bucket_bound_kept(&mut self, b: usize, bucket: u8) -> f32 {
+        if self.bb_block != b {
+            self.bb_block = b;
+            self.bb = [f32::NAN; BUCKET_COUNT];
+        }
+        let known = self.bb[usize::from(bucket)];
+        if !known.is_nan() {
+            return known;
+        }
+        let v = self.bucket_bound(b, bucket);
+        self.bb[usize::from(bucket)] = v;
+        v
+    }
+
     /// Block `b`'s largest bucket: its frontier's last pair.
     #[inline]
     fn max_bucket(&self, b: usize) -> usize {
@@ -185,9 +208,6 @@ struct Mem<'a> {
     /// Members in the group: from the directory, or estimated for a sparse
     /// term.
     count: u32,
-    grid: bool,
-    /// Slots in the group.
-    end: u32,
     /// Grid: members in words `..w` are `run`. List: the next member is at
     /// `pos`.
     w: usize,
@@ -198,47 +218,6 @@ struct Mem<'a> {
 }
 
 impl Mem<'_> {
-    /// The first member at or after `local`, if the group holds one.
-    #[inline]
-    fn next_from(&mut self, local: u32) -> Option<u32> {
-        match &mut self.kind {
-            Kind::Grid(bytes) => {
-                let words = bytes.len() / 8;
-                let mut w = local as usize / 64;
-                if w >= words {
-                    return None;
-                }
-                let mut word = bits::word(bytes, w) & (u64::MAX << (local % 64));
-                loop {
-                    if word != 0 {
-                        return Some((w * 64) as u32 + word.trailing_zeros());
-                    }
-                    w += 1;
-                    if w >= words {
-                        return None;
-                    }
-                    word = bits::word(bytes, w);
-                }
-            }
-            Kind::List => {
-                let list = &self.list;
-                let mut pos = self.pos;
-                while pos < list.len() && list[pos] < local {
-                    pos += 1;
-                }
-                self.pos = pos;
-                list.get(pos).copied()
-            }
-            Kind::Cursor { cursor, offset } => {
-                cursor.seek(*offset + local);
-                cursor
-                    .current()
-                    .map(|slot| slot - *offset)
-                    .filter(|l| *l < self.end)
-            }
-        }
-    }
-
     /// The posting index of `local` if the term holds it; slots must be
     /// asked in increasing order (asking one again is allowed).
     #[inline]
@@ -304,38 +283,20 @@ fn next_group(
     (*hint < count).then(|| set.group_index(*hint))
 }
 
-/// Sets `mem`'s count of `set`'s members in group `g` (which it holds)
-/// without reading them: the directory's, or for a sparse term its share
-/// of the term's postings by slots.
-fn count_in(set: &TermSet<'_>, geometry: &Geometry, g: u32, mem: &mut Mem<'_>) {
-    if let Form::Sparse(_) = &set.postings.form {
-        let slots = u64::from(geometry.groups[g as usize].slots());
-        mem.count = (u64::from(set.df) * slots / u64::from(geometry.slots).max(1)).max(1) as u32;
-        mem.grid = false;
-        return;
-    }
-    match set.find(g, &mut mem.hint) {
-        Some(entry) => {
-            mem.count = entry.count;
-            mem.grid = matches!(entry.src, Src::Container { entry, .. } if entry.kind == KIND_GRID);
-        }
-        None => {
-            mem.count = 0;
-            mem.grid = false;
-        }
-    }
-}
-
-/// Loads `set`'s members in group `g`, which it holds: decoded into a list,
-/// or, when `seek`, an Elias-Fano list left to be sought.
+/// Loads `set`'s members in group `g`: decoded into a list, or an
+/// Elias-Fano list of more than `probe_over` members left to be sought
+/// (for a sparse term, which must hold the group, its share of the term's
+/// postings by slots stands for its count there). False, with nothing
+/// loaded, when a grouped term does not hold the group: the directory is
+/// looked up once.
 fn load<'a>(
     set: &mut TermSet<'a>,
     geometry: &Geometry,
     g: u32,
     mem: &mut Mem<'a>,
-    seek: bool,
+    probe_over: usize,
     touch: &mut impl Touch,
-) -> Result<()> {
+) -> Result<bool> {
     mem.loaded = g + 1;
     mem.kind = Kind::List;
     mem.list.clear();
@@ -343,7 +304,6 @@ fn load<'a>(
     mem.run = 0;
     mem.pos = 0;
     let group = geometry.groups[g as usize];
-    mem.end = group.slots();
     if let Form::Sparse(list) = &set.postings.form {
         let cursor = set.sparse.get_or_insert_with(|| {
             touch.touch(
@@ -354,24 +314,27 @@ fn load<'a>(
             list.cursor()
         });
         cursor.seek(group.slot_base);
-        if seek {
+        let share = u64::from(set.df) * u64::from(group.slots()) / u64::from(geometry.slots).max(1);
+        if share.max(1) > probe_over as u64 {
+            mem.count = share.max(1) as u32;
             mem.first = 0;
             mem.kind = Kind::Cursor {
                 cursor: cursor.clone(),
                 offset: group.slot_base,
             };
-            return Ok(());
+            return Ok(true);
         }
         mem.first = cursor.rank() as u32;
         let end = group.slot_base + group.slots();
         let list = &mut mem.list;
         cursor.drain_below(end, |slot| list.push(slot - group.slot_base));
         mem.count = mem.list.len() as u32;
-        return Ok(());
+        return Ok(true);
     }
-    let entry = set
-        .find(g, &mut mem.hint)
-        .ok_or(Error::Corrupt("a group the term holds"))?;
+    let Some(entry) = set.find(g, &mut mem.hint) else {
+        mem.count = 0;
+        return Ok(false);
+    };
     mem.count = entry.count;
     match entry.src {
         Src::Container {
@@ -384,7 +347,7 @@ fn load<'a>(
             mem.first = e.first;
             if e.kind == KIND_GRID {
                 mem.kind = Kind::Grid(bytes);
-            } else if seek && e.kind == KIND_EF {
+            } else if e.kind == KIND_EF && e.count as usize > probe_over {
                 let ef = Ef::parse(bytes, e.count as usize, group.slots())?;
                 mem.kind = Kind::Cursor {
                     cursor: ef.cursor(),
@@ -401,7 +364,7 @@ fn load<'a>(
                 .extend_from_slice(&set.locals[from as usize..to as usize]);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A term's positions read by posting index, forward from the last entry
@@ -441,10 +404,9 @@ impl<'a> PosCursor<'a> {
             touch.touch(Part::Positions, self.at + m, 4);
         }
         let from = self.next_at;
-        let mut p = self.next_at;
-        for i in self.next..index {
-            p = self.positions.skip(i, p)?;
-        }
+        let mut p = self
+            .positions
+            .skip_entries(self.next, self.next_at, index)?;
         p = self.positions.read_entry(index, p, out)?;
         self.next = index + 1;
         self.next_at = p;
@@ -574,6 +536,9 @@ struct Walk<'s, 'a, T: Touch> {
     /// A required term whose record carries its documents' lengths, the
     /// led walk reads them from.
     inline: Option<usize>,
+    /// A phrase's scoring terms it uses more than once, by index into `sc`,
+    /// each with the least bucket of a count reaching their number of uses.
+    repeats: Vec<(usize, u8)>,
     answer: RankedAnswer,
     verify: Verify<'a>,
     /// Phrase candidates of the group that scored into the top k, awaiting
@@ -625,12 +590,23 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn run(&mut self) -> Result<()> {
         let lead = self.req[0];
         let n = self.sc.len();
-        let mut cursor = 0u32;
-        while self.seek(lead, cursor)?.is_some() {
-            let g = self.mems[lead].loaded - 1;
+        let mut from = 0u32;
+        loop {
+            // The lead's next group, from its directory (or its list): its
+            // members are read only once the group's bound passes.
+            let set = self.terms[lead].as_mut().expect("the lead");
+            let Some(g) = next_group(
+                set,
+                self.geometry,
+                from,
+                &mut self.mems[lead].hint,
+                self.touch,
+            ) else {
+                break;
+            };
+            from = g + 1;
             let group = self.geometry.groups[g as usize];
             let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
-            cursor = end + 1;
             if n == 0 && self.unscored_done(self.geometry.tid_in(g as usize, 0)) {
                 // Nothing scores: every later match ties at zero and ranks
                 // after the bar.
@@ -640,6 +616,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if self.group_below(base, end) {
                 self.answer.windows_pruned += 1;
                 continue;
+            }
+            if self.mems[lead].loaded != g + 1 {
+                let set = self.terms[lead].as_mut().expect("the lead");
+                load(
+                    set,
+                    self.geometry,
+                    g,
+                    &mut self.mems[lead],
+                    usize::MAX,
+                    self.touch,
+                )?;
             }
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
@@ -671,40 +658,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         // Nothing scoring: every match scores zero, which ties a bar of zero.
         below(bound, Some(theta))
-    }
-
-    /// Moves term `t` to its first member at or after `target`, loading
-    /// (decoding) the group that holds it; the member's slot, if any.
-    fn seek(&mut self, t: usize, mut target: u32) -> Result<Option<u32>> {
-        let geometry = self.geometry;
-        loop {
-            if target >= geometry.slots {
-                return Ok(None);
-            }
-            let mem = &self.mems[t];
-            let within = mem.loaded > 0 && {
-                let group = &geometry.groups[mem.loaded as usize - 1];
-                group.slot_base <= target && target < group.slot_base + group.slots()
-            };
-            if !within {
-                let g = geometry.group_of_slot(target) as u32;
-                let set = self.terms[t].as_mut().expect("a term of the walk");
-                let mem = &mut self.mems[t];
-                let Some(next) = next_group(set, geometry, g, &mut mem.hint, self.touch) else {
-                    return Ok(None);
-                };
-                if next > g {
-                    target = geometry.groups[next as usize].slot_base;
-                }
-                load(set, geometry, next, mem, false, self.touch)?;
-            }
-            let mem = &mut self.mems[t];
-            let group = &geometry.groups[mem.loaded as usize - 1];
-            match mem.next_from(target - group.slot_base) {
-                Some(local) => return Ok(Some(group.slot_base + local)),
-                None => target = group.slot_base + group.slots(),
-            }
-        }
     }
 
     /// Whether every required term holds group `g` as a grid.
@@ -757,14 +710,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if self.mems[t].loaded != g + 1 {
                 let set = self.terms[t].as_mut().expect("required");
                 let mem = &mut self.mems[t];
-                if next_group(set, self.geometry, g, &mut mem.hint, self.touch) != Some(g) {
+                let sparse = matches!(set.postings.form, Form::Sparse(_));
+                if sparse && next_group(set, self.geometry, g, &mut mem.hint, self.touch) != Some(g)
+                {
                     cands.clear();
                     break;
                 }
-                count_in(set, self.geometry, g, mem);
-                let seek = !matches!(set.postings.form, Form::Sparse(_))
-                    && mem.count as usize > SEEK_RATIO * cands.len();
-                load(set, self.geometry, g, mem, seek, self.touch)?;
+                let probe_over = if sparse {
+                    usize::MAX
+                } else {
+                    SEEK_RATIO * cands.len()
+                };
+                if !load(set, self.geometry, g, mem, probe_over, self.touch)? {
+                    cands.clear();
+                    break;
+                }
             }
             let mem = &self.mems[t];
             match &mem.kind {
@@ -823,8 +783,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let t = self.req[r];
             if self.mems[t].loaded != g + 1 {
                 let set = self.terms[t].as_mut().expect("required");
-                count_in(set, self.geometry, g, &mut self.mems[t]);
-                load(set, self.geometry, g, &mut self.mems[t], false, self.touch)?;
+                load(
+                    set,
+                    self.geometry,
+                    g,
+                    &mut self.mems[t],
+                    usize::MAX,
+                    self.touch,
+                )?;
             }
         }
         let grid = |m: &Mem<'a>| match m.kind {
@@ -890,11 +856,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let set = self.terms[t].as_mut().expect("a term of the walk");
         let mem = &mut self.mems[t];
-        if next_group(set, self.geometry, g, &mut mem.hint, self.touch) == Some(g) {
-            count_in(set, self.geometry, g, mem);
-            let seek = mem.count > 64;
-            load(set, self.geometry, g, mem, seek, self.touch)?;
-        } else {
+        let held = !matches!(set.postings.form, Form::Sparse(_))
+            || next_group(set, self.geometry, g, &mut mem.hint, self.touch) == Some(g);
+        if !(held && load(set, self.geometry, g, mem, 64, self.touch)?) {
             mem.loaded = g + 1;
             mem.kind = Kind::List;
             mem.list.clear();
@@ -937,6 +901,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     }
                 }
                 self.read_buckets(g, local)?;
+                if self.too_few() {
+                    return Ok(true);
+                }
                 length
             }
             // The candidate's buckets first, each against the shortest
@@ -946,7 +913,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // candidates fell short on their buckets alone.
             None => {
                 let reach = self.read_buckets(g, local)?;
-                if below(reach, theta) {
+                if below(reach, theta) || self.too_few() {
                     return Ok(true);
                 }
                 self.dl_length(g, local)?
@@ -1033,10 +1000,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     1,
                 );
             }
-            reach += f64::from(s.bucket_bound(block, bucket));
+            reach += f64::from(self.sc[i].bucket_bound_kept(block, bucket));
             self.buckets[i] = bucket;
         }
         Ok(reach)
+    }
+
+    /// Whether the candidate at hand, its buckets read, holds a word its
+    /// phrase repeats fewer times than the phrase does (its bucket's counts
+    /// all fall short), so cannot match.
+    #[inline]
+    fn too_few(&self) -> bool {
+        self.repeats
+            .iter()
+            .any(|&(i, least)| self.buckets[i] < least)
     }
 
     /// The length of the document at slot `local` of group `g`, from the DL
@@ -1229,6 +1206,7 @@ pub(super) fn walk_into<'a>(
         window_end: None,
         window_parts: (0.0, 0.0, 0.0, 0.0),
         inline: None,
+        repeats: Vec::new(),
         req,
         answer: RankedAnswer::default(),
         verify,
@@ -1250,6 +1228,22 @@ pub(super) fn walk_into<'a>(
     let mut bound_order: Vec<usize> = (0..n).collect();
     bound_order.sort_by_key(|i| walk.terms[walk.sc[*i].term].as_ref().map_or(0, |s| s.df));
     walk.bound_order = bound_order;
+    if let Verify::Span(check) = &walk.verify
+        && let Some(plan) = &check.plan
+    {
+        // A phrase's leaves sit at distinct positions: a word that is
+        // several of them needs a count of at least that many.
+        for i in 0..n {
+            let uses = plan
+                .leaves()
+                .iter()
+                .filter(|slot| check.slots[**slot] == walk.sc[i].term)
+                .count() as u32;
+            if uses > 1 {
+                walk.repeats.push((i, TfBucket::from_count(uses).value()));
+            }
+        }
+    }
     walk.inline = walk.req.iter().copied().find(|t| {
         walk.terms[*t]
             .as_ref()

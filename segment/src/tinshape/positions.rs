@@ -277,6 +277,44 @@ impl<'a> Positions<'a> {
         Ok(p + skip_varints(self.varints(p, n)?, 0, n)?)
     }
 
+    /// Skips entries `from..to`, entry `from` starting at byte `at`; where
+    /// entry `to` starts. A block's mask is read once, a run of entries it
+    /// names (a position each, no count) is skipped as one run of varints,
+    /// and another entry's count and positions are read from one window
+    /// where they fit in it.
+    pub fn skip_entries(&self, from: u32, at: usize, to: u32) -> Result<usize> {
+        let mut p = at;
+        let mut i = from;
+        while i < to {
+            let end = ((i / SKIP_INTERVAL + 1) * SKIP_INTERVAL).min(to);
+            let mask = match self.masks_at {
+                Some(m) => {
+                    let s = m + (i / SKIP_INTERVAL) as usize * 4;
+                    u32::from_le_bytes(self.bytes.get(s, s + 4)?.try_into().expect("four bytes"))
+                }
+                None => 0,
+            };
+            while i < end {
+                let ones = (mask >> (i % SKIP_INTERVAL)).trailing_ones().min(end - i);
+                if ones > 0 {
+                    p += skip_varints(self.varints(p, ones)?, 0, ones)?;
+                    i += ones;
+                    continue;
+                }
+                let window = self.bytes.window(p, 3 * VARINT_MAX)?;
+                let mut q = 0;
+                let n = varint::get_u32(window, &mut q)?;
+                p += match skip_varints(window, q, n) {
+                    Ok(next) => next,
+                    // Positions past the window: read them on their own.
+                    Err(_) => q + skip_varints(self.varints(p + q, n)?, 0, n)?,
+                };
+                i += 1;
+            }
+        }
+        Ok(p)
+    }
+
     /// Decodes entry `index`, starting at byte `at`, into `out`; where the
     /// next starts.
     #[inline]
@@ -331,15 +369,38 @@ mod tests {
         assert_eq!(positions.payload().unwrap(), original);
         let count = entries.len() as u32;
         let mut out = Vec::new();
+        let mut starts = vec![positions.data_at];
+        for index in 0..count {
+            let at = positions.skip(index, *starts.last().unwrap()).unwrap();
+            starts.push(at);
+        }
         for index in (0..count).step_by(1 + count as usize / 500) {
             let (mut entry, mut at, _) = positions.locate(index).unwrap();
             assert!(entry <= index && index - entry < SKIP_INTERVAL);
+            assert_eq!(
+                positions.skip_entries(entry, at, index).unwrap(),
+                starts[index as usize]
+            );
             while entry < index {
                 at = positions.skip(entry, at).unwrap();
                 entry += 1;
             }
+            assert_eq!(at, starts[index as usize]);
             positions.read_entry(index, at, &mut out).unwrap();
             assert_eq!(out, entries[index as usize]);
+        }
+        // Runs across blocks, from every few entries.
+        for from in (0..count).step_by(1 + count as usize / 40) {
+            for to in [from, from + 1, from + 31, from + 33, from + 100, count] {
+                let to = to.min(count);
+                assert_eq!(
+                    positions
+                        .skip_entries(from, starts[from as usize], to)
+                        .unwrap(),
+                    starts[to as usize],
+                    "{from}..{to} of {count}"
+                );
+            }
         }
         assert!(positions.locate(count).is_err());
         positions
