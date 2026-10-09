@@ -12,7 +12,7 @@ ranking statistics in index pages and uses them to find matching row locations.
 | `engine/src/` | The query engine without PostgreSQL: BM25, the ranked walk over ordinals, the count fold |
 | `bench/` | The engine measured outside PostgreSQL: trace replay over dumped segments, kernel benchmarks ([how](../offline-engine.md)) |
 | `postgres/src/storage/` | Index pages, write buffer, segments, WAL, and reclamation |
-| `segment/src/` | Dictionaries, ordinal streams, the document table, positions, document lengths, and cursors |
+| `segment/src/` | Dictionaries, ordinal streams, the document table, positions, document lengths, and cursors; `tinshape/` holds the ctid-addressed format replacing them ([TIN shape](tin-shape.md), not yet read by the extension) |
 | `tinql/src/` | Query parsing, reference evaluation, and indexed query planning |
 | `tokenizer/src/` | Text normalization and token positions |
 | `boldi-vigna/src/` | Minimal-interval evaluation of phrases, proximity and span operators over token positions |

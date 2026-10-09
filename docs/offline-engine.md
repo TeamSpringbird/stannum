@@ -151,3 +151,15 @@ samply`) gives a Firefox Profiler view without Xcode. Release builds keep
 symbols; add `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` for source lines.
 There is no `perf` on macOS; Linux's `perf stat -e
 cycles,instructions,cache-misses` works on the same binaries there.
+
+## The ctid-addressed format (phase A)
+
+`cargo run -p bench --release --bin tinshape -- --dump DIR --out OUT` converts
+a dump to the TIN-shaped format of [the TIN-shape guide](architecture/tin-shape.md)
+(`TNS1`), checks every posting, bucket, position and length against the
+dump, writes the blob and a size report by area and document frequency
+(`OUT/sizes-LABEL.md` and `.json`), and with `--trace FILE --expect FILE
+[--ranked]` replays the trace's counts and ranked top k over it through
+`engine::tinshape`, failing on any difference, with latency and page touches
+by TIN's EXPLAIN areas. `--block`, `--grid-density`, `--no-paged`,
+`--no-ef-groups`, `--no-sparse` and `--fixed-tf` vary the encoder.

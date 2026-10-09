@@ -44,6 +44,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the offline replay's command line and report."
     },
+    "bench/src/bin/tinshape.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid-addressed format's converter, size report and trace replay."
+    },
     "bench/src/dump.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: reading script/dump-segments.py's dumps for the offline replay."
@@ -59,6 +63,10 @@
     "bench/src/replay.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the offline replay's query execution through the engine crate."
+    },
+    "bench/src/tinshape.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: conversion of dumped ordinal segments to the ctid-addressed format, its exact check and page accounting."
     },
     "bench/src/whatif.rs": {
       "owner": "ben",
@@ -680,6 +688,10 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Scoring-term collection, moved from postgres/src/score.rs (inherited upstream file with Stannum changes), and the statistics fold of the indexed scorer; retain PlanetScale credit."
     },
+    "engine/src/tinshape.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: counts and ranked top-k over the ctid-addressed segment format."
+    },
     "engine/src/walk.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/score.rs",
@@ -997,6 +1009,30 @@
     "segment/src/tid.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "segment/src/tinshape/bits.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: bit packing for the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/docs.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid grid, document set, DL sidecar and liveness bitmap of the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/ef.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Elias-Fano coding for the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/mod.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid-addressed segment format in TIN's shape."
+    },
+    "segment/src/tinshape/postings.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: ctid posting sets, footers and TF tails of the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/segment.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid-addressed segment blob and its reader."
     },
     "segment/src/varint.rs": {
       "owner": "ben",

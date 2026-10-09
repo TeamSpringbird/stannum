@@ -1,8 +1,13 @@
 ---
-status: accepted
+status: superseded
 extends: 0003
+superseded-by: 0005
 ---
 # Rank by document ordinal
+
+> Superseded by [ADR 0005](0005-address-postings-by-ctid.md): ranked walks
+> move to ctid-addressed postings with per-block impact bounds. The
+> extension ranks this way until that format is integrated.
 
 Ranked queries walk the same ordinal streams that counts fold
 ([ADR 0003](0003-address-postings-by-document-ordinal.md)). Nothing a ranked

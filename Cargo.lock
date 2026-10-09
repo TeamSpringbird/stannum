@@ -427,6 +427,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "boldi-vigna",
+ "proptest",
  "rustc-hash",
  "segment",
  "thiserror",

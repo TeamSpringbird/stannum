@@ -22,6 +22,7 @@ pub mod bm25;
 pub mod fold;
 pub mod spec;
 pub mod terms;
+pub mod tinshape;
 pub mod walk;
 
 static INTERRUPT_CHECK: OnceLock<fn()> = OnceLock::new();

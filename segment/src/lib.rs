@@ -31,6 +31,8 @@
 //! * [`segment`]: assembles the components above into one immutable segment
 //!   with a document table of lengths, and reads them back.
 //! * [`tf_bucket`]: the production-compatible term-frequency quantization.
+//! * [`tinshape`]: the ctid-addressed segment format replacing the ordinal
+//!   one (phase A: codecs measured offline, not yet read by the extension).
 //! * [`verify`]: whole-blob consistency checks that list every problem found
 //!   instead of stopping at the first, for an index checker.
 //!
@@ -61,6 +63,7 @@ pub mod set;
 pub mod source;
 pub mod tf_bucket;
 pub mod tid;
+pub mod tinshape;
 pub mod verify;
 
 pub use error::{Error, Result};
