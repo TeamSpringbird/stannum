@@ -16,6 +16,9 @@ test-hooks = []
 # Pruning counters and a sub-block observer for offline measurement (the
 # bench crate); the extension never enables it.
 stats = []
+# The walk's private word kernels, exposed for the bench crate's benchmarks;
+# the extension never enables it.
+kernels = []
 
 [dependencies]
 boldi-vigna = { path = "../boldi-vigna" }

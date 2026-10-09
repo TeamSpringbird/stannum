@@ -157,6 +157,12 @@ pub mod stats {
         pub subs: u64,
         /// Of those, skipped by the sub-block's bound.
         pub subs_pruned: u64,
+        /// Candidates the walk examined in the sub-blocks it kept: each a
+        /// member it bounded and maybe scored.
+        pub candidates: u64,
+        /// Length classes and exact lengths read for candidates.
+        pub class_reads: u64,
+        pub length_reads: u64,
     }
 
     /// A sub-block the walk judged by its bound.
@@ -176,6 +182,9 @@ pub mod stats {
         pub pruned: bool,
         /// Candidates the walk had scored before the sub-block.
         pub scored: usize,
+        /// Candidates the walk had examined before the sub-block (see
+        /// [`Counters::candidates`]).
+        pub examined: u64,
     }
 
     type Observer = Box<dyn FnMut(&SubBlock<'_>)>;
@@ -203,6 +212,11 @@ pub mod stats {
         let mut counters = COUNTERS.get();
         add(&mut counters);
         COUNTERS.set(counters);
+    }
+
+    /// The candidates examined so far.
+    pub(super) fn examined() -> u64 {
+        COUNTERS.get().candidates
     }
 
     pub(super) fn sub_block(event: &SubBlock<'_>) {
@@ -2293,6 +2307,52 @@ impl WordSieve {
     }
 }
 
+/// The walk's word-level kernels, for benchmarks: compiled only with the
+/// `kernels` feature, which the extension never enables.
+#[cfg(feature = "kernels")]
+pub mod kernels {
+    use segment::dead::DeadDocs;
+
+    /// Sub-blocks per chunk.
+    pub const SUBS: usize = super::SUBS;
+
+    /// The walk's word sieve (see [`super::WordSieve`]).
+    #[derive(Default)]
+    pub struct Sieve(super::WordSieve);
+
+    impl Sieve {
+        /// Plans the sieve of sub-block `sub` at `threshold`, given per
+        /// present term its bounds per sub-block and whether it is required.
+        pub fn plan(
+            &mut self,
+            threshold: f32,
+            subs: &[[f32; SUBS]],
+            sub: usize,
+            required: &[bool],
+        ) {
+            self.0.plan(threshold, subs, sub, required);
+        }
+
+        /// The lanes of `word` the sieve keeps, given per term its word.
+        #[inline]
+        pub fn keep(&self, word: u64, words: &[u64]) -> u64 {
+            self.0.keep(word, words)
+        }
+    }
+
+    /// Removes the dead ordinals of the chunk at `base` from a chunk's
+    /// shared members, `lows` when `sparse`, else `set`.
+    pub fn drop_dead(
+        dead: &DeadDocs,
+        base: u32,
+        sparse: bool,
+        set: &mut segment::ordinals::Words,
+        lows: &mut Vec<u16>,
+    ) {
+        super::drop_dead(dead, base, sparse, set, lows);
+    }
+}
+
 /// Sorts `v` by `less`, stably, by insertion: the walk sorts a few terms
 /// per chunk, mostly in order already, where the general sort's setup and
 /// partitioning cost more than the comparisons.
@@ -2760,6 +2820,7 @@ impl OrdinalWalk<'_, '_> {
             threshold: self.threshold(),
             pruned,
             scored: *self.scored,
+            examined: stats::examined(),
         });
     }
 
@@ -2879,6 +2940,8 @@ impl OrdinalWalk<'_, '_> {
                 while word != 0 {
                     let low = ((sub * SUB_WORDS + w) * 64) as u16 + word.trailing_zeros() as u16;
                     word &= word - 1;
+                    #[cfg(feature = "stats")]
+                    stats::count(|c| c.candidates += 1);
                     let ordinal = base + u32::from(low);
                     let pruning = self.threshold().is_some();
                     if !pruning && self.phrase.is_some() {
@@ -3037,6 +3100,8 @@ impl OrdinalWalk<'_, '_> {
                 return None;
             }
             let class = segment_error(self.index.length_class(ordinal));
+            #[cfg(feature = "stats")]
+            stats::count(|c| c.class_reads += 1);
             let (stamp, bound) = self.class_bounds[usize::from(class)];
             let bound = if stamp == self.class_stamp {
                 bound
@@ -3100,6 +3165,8 @@ impl OrdinalWalk<'_, '_> {
             return None;
         }
         let length = segment_error(self.lengths.get(ordinal));
+        #[cfg(feature = "stats")]
+        stats::count(|c| c.length_reads += 1);
         let total = at(self, &buckets, length);
         self.buckets = buckets;
         if pruning && !self.can_beat(total, ordinal) {
@@ -3200,6 +3267,8 @@ impl OrdinalWalk<'_, '_> {
         // rejects most of them without the read.
         let class = if pruning {
             let class = segment_error(self.index.length_class(ordinal));
+            #[cfg(feature = "stats")]
+            stats::count(|c| c.class_reads += 1);
             let floor = segment::length_class::min_length(class);
             for &(_, n) in uppers.iter() {
                 let term = &self.terms[present[n]];
@@ -3256,6 +3325,8 @@ impl OrdinalWalk<'_, '_> {
             }
         }
         let length = segment_error(self.lengths.get(ordinal));
+        #[cfg(feature = "stats")]
+        stats::count(|c| c.length_reads += 1);
         for &(_, n) in uppers.iter() {
             let slot = self.terms[present[n]].slot;
             values[n] = self.scorer.terms[slot].1.score_bucket(buckets[n], length);
@@ -3413,6 +3484,7 @@ impl OrdinalWalk<'_, '_> {
                         threshold: self.threshold(),
                         pruned: skip_sub,
                         scored: *self.scored,
+                        examined: stats::examined(),
                     });
                 }
                 required.fill(false);
@@ -3497,6 +3569,8 @@ impl OrdinalWalk<'_, '_> {
             while word != 0 {
                 let low = (i * 64) as u16 + word.trailing_zeros() as u16;
                 word &= word - 1;
+                #[cfg(feature = "stats")]
+                stats::count(|c| c.candidates += 1);
                 let ordinal = base + u32::from(low);
                 let pruning = self.threshold().is_some();
                 if pruning {
