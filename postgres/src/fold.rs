@@ -51,7 +51,10 @@ pub(crate) fn count_native(
             &mut |group, mask| {
                 let g = &geometry.groups[group as usize];
                 let bits = visibility.group_bits(g.id * segment::tinshape::docs::GROUP_PAGES);
-                if bits == [u64::MAX; 4] {
+                // The group's slots cover its pages `first..first + pages`.
+                let (first, pages) = (usize::from(g.first), usize::from(g.pages));
+                let covered = (first..first + pages).all(|p| bits[p / 64] >> (p % 64) & 1 == 1);
+                if covered {
                     return true;
                 }
                 // Each all-visible page's slots, a run of `width` bits.
@@ -60,7 +63,10 @@ pub(crate) fn count_native(
                     let mut word = *word;
                     while word != 0 {
                         let page = w * 64 + word.trailing_zeros() as usize;
-                        set_range(mask, page * width, (page + 1) * width);
+                        if page >= first && page < first + pages {
+                            let local = page - first;
+                            set_range(mask, local * width, (local + 1) * width);
+                        }
                         word &= word - 1;
                     }
                 }
