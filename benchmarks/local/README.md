@@ -61,10 +61,12 @@ so raise the OrbStack VM first (that restarts the VM and bounces its other
 containers) and lower it again before measuring.
 
 ```sh
-# The branch's commit, built from a clean export rather than a moving worktree.
+# The branch's commit in a checkout of its own, so the working tree may move
+# on meanwhile (build-image records the checkout's files and commit, so it
+# needs a git checkout, not an archive).
 SHA=$(git rev-parse --short tinshape/phase-c)
 SRC=/Users/uri/stannum-lab/local150m-tns1/src-$SHA
-mkdir -p "$SRC" && git archive "$SHA" | tar -x -C "$SRC"
+git worktree add --detach "$SRC" "$SHA"
 
 # The benchmark driver (k6 with the PostgreSQL extension), once.
 python3 "$SRC/benchmarks/tin.py" --driver /Users/uri/stannum-lab/driver prepare
