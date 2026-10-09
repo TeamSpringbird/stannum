@@ -562,7 +562,7 @@ impl Drop for Reentry {
 
 /// Whether the query's restrictions imply the index's predicate, as the
 /// planner will decide once it has built the relation's index list.
-unsafe fn predicate_holds(
+pub(crate) unsafe fn predicate_holds(
     root: *mut pg_sys::PlannerInfo,
     varno: i32,
     index_oid: pg_sys::Oid,
@@ -651,6 +651,30 @@ pub(crate) unsafe fn bound_operand(
             )
             .cast(),
         )
+    }
+}
+
+/// `document ==> query` in the form bound to `index`.
+pub(crate) unsafe fn bound_search(
+    document: *mut pg_sys::Node,
+    query: *mut pg_sys::Node,
+    index: pg_sys::Oid,
+) -> Option<*mut pg_sys::Node> {
+    unsafe {
+        let operand = bound_operand(query, index)?;
+        let (opno, opfuncid) = bound_operator()?;
+        let expr = pg_sys::make_opclause(
+            opno,
+            pg_sys::BOOLOID,
+            false,
+            document.cast(),
+            operand.cast(),
+            pg_sys::InvalidOid,
+            pg_sys::DEFAULT_COLLATION_OID,
+        )
+        .cast::<pg_sys::OpExpr>();
+        (*expr).opfuncid = opfuncid;
+        Some(expr.cast())
     }
 }
 

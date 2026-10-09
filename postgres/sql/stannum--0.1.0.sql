@@ -12,7 +12,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/am.rs:13
+-- postgres/src/am.rs:18
 -- stannum::am::amhandler
 
     CREATE OR REPLACE FUNCTION @extschema@.amhandler(internal)
@@ -23,7 +23,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:144
+-- postgres/src/score.rs:279
 -- stannum::score::full_score
 CREATE  FUNCTION "full_score"(
 	"ctid" tid /* pg_sys :: ItemPointerData */
@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'full_score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:150
+-- postgres/src/score.rs:285
 -- stannum::score::full_score
 CREATE  FUNCTION "full_score"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -47,7 +47,7 @@ AS 'MODULE_PATHNAME', 'full_score_with_bm25_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:60
+-- postgres/src/highlight_udfs.rs:109
 -- stannum::highlight_udfs::highlight
 CREATE  FUNCTION "highlight"(
 	"text" TEXT, /* Option < & str > */
@@ -61,7 +61,7 @@ AS 'MODULE_PATHNAME', 'highlight_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:91
+-- postgres/src/highlight_udfs.rs:181
 -- stannum::highlight_udfs::highlight_ansi
 CREATE  FUNCTION "highlight_ansi"(
 	"text" TEXT, /* Option < & str > */
@@ -74,7 +74,36 @@ AS 'MODULE_PATHNAME', 'highlight_ansi_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:183
+-- postgres/src/highlight_udfs.rs:163
+-- stannum::highlight_udfs::highlight_ansi_searches
+CREATE  FUNCTION "highlight_ansi_searches"(
+	"text" TEXT, /* Option < & str > */
+	"wrap_to" INT, /* Option < i32 > */
+	"index" oid, /* pg_sys :: Oid */
+	"queries" TEXT[] /* Vec < Option < String > > */
+) RETURNS TEXT /* Option < String > */
+STABLE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'highlight_ansi_searches_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/highlight_udfs.rs:148
+-- stannum::highlight_udfs::highlight_searches
+CREATE  FUNCTION "highlight_searches"(
+	"text" TEXT, /* Option < & str > */
+	"begin_tag" TEXT, /* & str */
+	"end_tag" TEXT, /* & str */
+	"index" oid, /* pg_sys :: Oid */
+	"queries" TEXT[] /* Vec < Option < String > > */
+) RETURNS TEXT /* Option < String > */
+STABLE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'highlight_searches_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/highlight_udfs.rs:335
 -- stannum::highlight_udfs::highlight_support
 CREATE  FUNCTION "highlight_support"(
 	"request" internal /* Internal */
@@ -85,7 +114,7 @@ AS 'MODULE_PATHNAME', 'highlight_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/storage/wal.rs:260
+-- postgres/src/storage/wal.rs:264
 -- stannum::storage::wal::index_reads_allowed
 CREATE  FUNCTION "index_reads_allowed"(
 	"index" regclass /* pgrx :: PgRelation */
@@ -96,11 +125,11 @@ AS 'MODULE_PATHNAME', 'index_reads_allowed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/operator.rs:43
+-- postgres/src/operator.rs:60
 -- indexed_query
 CREATE TYPE indexed_query;
 
--- postgres/src/operator.rs:43
+-- postgres/src/operator.rs:60
 -- stannum::operator::indexed_query_in
 CREATE  FUNCTION "indexed_query_in"(
 	"input" cstring /* Option < & :: core :: ffi :: CStr > */
@@ -109,7 +138,7 @@ IMMUTABLE PARALLEL SAFE
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'indexed_query_in_wrapper';
 
--- postgres/src/operator.rs:43
+-- postgres/src/operator.rs:60
 -- stannum::operator::indexed_query_out
 CREATE  FUNCTION "indexed_query_out"(
 	"input" indexed_query /* indexed_query */
@@ -118,7 +147,7 @@ IMMUTABLE STRICT PARALLEL SAFE
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'indexed_query_out_wrapper';
 
--- postgres/src/operator.rs:43
+-- postgres/src/operator.rs:60
 -- indexed_query
 CREATE TYPE indexed_query (
 	INTERNALLENGTH = variable,
@@ -129,19 +158,7 @@ CREATE TYPE indexed_query (
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/operator.rs:149
--- stannum::operator::bind_query
-CREATE  FUNCTION "bind_query"(
-	"query" TEXT, /* & str */
-	"index" oid /* pg_sys :: Oid */
-) RETURNS indexed_query /* indexed_query */
-IMMUTABLE STRICT PARALLEL SAFE
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'bind_query_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:76
+-- postgres/src/highlight_udfs.rs:125
 -- stannum::highlight_udfs::highlight
 CREATE  FUNCTION "highlight"(
 	"text" TEXT, /* Option < & str > */
@@ -155,7 +172,7 @@ AS 'MODULE_PATHNAME', 'highlight_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:100
+-- postgres/src/highlight_udfs.rs:195
 -- stannum::highlight_udfs::highlight_ansi
 CREATE  FUNCTION "highlight_ansi"(
 	"text" TEXT, /* Option < & str > */
@@ -168,12 +185,14 @@ AS 'MODULE_PATHNAME', 'highlight_ansi_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:275
+-- postgres/src/highlight_udfs.rs:433
 -- requires:
 --   highlight
 --   highlight_ansi
 --   highlight_bound
 --   highlight_ansi_bound
+--   highlight_searches
+--   highlight_ansi_searches
 --   highlight_support
 
 
@@ -184,7 +203,19 @@ ALTER FUNCTION @extschema@.highlight_ansi(pg_catalog.text, pg_catalog.int4, pg_c
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/storage/wal.rs:251
+-- postgres/src/operator.rs:228
+-- stannum::operator::bind_query
+CREATE  FUNCTION "bind_query"(
+	"query" TEXT, /* & str */
+	"index" oid /* pg_sys :: Oid */
+) RETURNS indexed_query /* indexed_query */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'bind_query_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/storage/wal.rs:255
 -- stannum::storage::wal::logs_removal_horizons
 CREATE  FUNCTION "logs_removal_horizons"(
 	"index" regclass /* pgrx :: PgRelation */
@@ -195,7 +226,7 @@ AS 'MODULE_PATHNAME', 'logs_removal_horizons_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:173
+-- postgres/src/score.rs:308
 -- stannum::score::max_score
 CREATE  FUNCTION "max_score"(
 	"ctid" tid /* pg_sys :: ItemPointerData */
@@ -206,7 +237,7 @@ AS 'MODULE_PATHNAME', 'max_score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:147
+-- postgres/src/udfs.rs:152
 -- stannum::udfs::maybe_quote
 CREATE  FUNCTION "maybe_quote"(
 	"text" TEXT /* Option < & str > */
@@ -217,7 +248,7 @@ AS 'MODULE_PATHNAME', 'maybe_quote_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:152
+-- postgres/src/udfs.rs:157
 -- stannum::udfs::ql_parse
 CREATE  FUNCTION "ql_parse"(
 	"query" TEXT, /* Option < & str > */
@@ -236,7 +267,7 @@ AS 'MODULE_PATHNAME', 'ql_parse_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:160
+-- postgres/src/score.rs:295
 -- stannum::score::score
 CREATE  FUNCTION "score"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -252,7 +283,7 @@ AS 'MODULE_PATHNAME', 'score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:183
+-- postgres/src/score.rs:318
 -- stannum::score::score_bound
 CREATE  FUNCTION "score_bound"(
 	"document" TEXT, /* & str */
@@ -272,7 +303,7 @@ AS 'MODULE_PATHNAME', 'score_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:227
+-- postgres/src/score.rs:427
 -- stannum::score::score_bound_indexed
 CREATE  FUNCTION "score_bound_indexed"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -292,7 +323,47 @@ AS 'MODULE_PATHNAME', 'score_bound_indexed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:1542
+-- postgres/src/score.rs:458
+-- stannum::score::score_bound_indexed_searches
+CREATE  FUNCTION "score_bound_indexed_searches"(
+	"ctid" tid, /* pg_sys :: ItemPointerData */
+	"queries" TEXT[], /* Vec < Option < String > > */
+	"heap_oid" INT, /* i32 */
+	"index_oid" INT, /* i32 */
+	"mode" INT, /* i32 */
+	"dense_ratio" real, /* Option < f32 > */
+	"k1" real, /* Option < f32 > */
+	"b" real, /* Option < f32 > */
+	"term_add" TEXT[], /* :: std :: option :: Option < Vec < String > > */
+	"term_replace" TEXT[] /* :: std :: option :: Option < Vec < String > > */
+) RETURNS real /* f32 */
+VOLATILE PARALLEL UNSAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'score_bound_indexed_searches_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/score.rs:349
+-- stannum::score::score_bound_searches
+CREATE  FUNCTION "score_bound_searches"(
+	"document" TEXT, /* & str */
+	"queries" TEXT[], /* Vec < Option < String > > */
+	"heap_oid" INT, /* i32 */
+	"index_oid" INT, /* i32 */
+	"mode" INT, /* i32 */
+	"dense_ratio" real, /* Option < f32 > */
+	"k1" real, /* Option < f32 > */
+	"b" real, /* Option < f32 > */
+	"term_add" TEXT[], /* :: std :: option :: Option < Vec < String > > */
+	"term_replace" TEXT[] /* :: std :: option :: Option < Vec < String > > */
+) RETURNS real /* f32 */
+VOLATILE PARALLEL UNSAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'score_bound_searches_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/score.rs:5183
 -- stannum::score::score_inspect
 CREATE  FUNCTION "score_inspect"(
 	"index" regclass, /* Option < PgRelation > */
@@ -310,7 +381,7 @@ AS 'MODULE_PATHNAME', 'score_inspect_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:1822
+-- postgres/src/score.rs:5444
 -- stannum::score::score_support
 CREATE  FUNCTION "score_support"(
 	"request" internal /* Internal */
@@ -321,7 +392,7 @@ AS 'MODULE_PATHNAME', 'score_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:2050
+-- postgres/src/score.rs:5753
 -- requires:
 --   full_score
 --   full_score_with_bm25
@@ -329,6 +400,8 @@ AS 'MODULE_PATHNAME', 'score_support_wrapper';
 --   max_score
 --   score_bound
 --   score_bound_indexed
+--   score_bound_searches
+--   score_bound_indexed_searches
 --   score_support
 
 
@@ -338,10 +411,12 @@ ALTER FUNCTION @extschema@.score(pg_catalog.tid, pg_catalog.float4, pg_catalog.f
 ALTER FUNCTION @extschema@.max_score(pg_catalog.tid) SUPPORT @extschema@.score_support;
 REVOKE ALL ON FUNCTION @extschema@.score_bound(pg_catalog.text, pg_catalog.text, pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
 REVOKE ALL ON FUNCTION @extschema@.score_bound_indexed(pg_catalog.tid, pg_catalog.text, pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION @extschema@.score_bound_searches(pg_catalog.text, pg_catalog.text[], pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION @extschema@.score_bound_indexed_searches(pg_catalog.tid, pg_catalog.text[], pg_catalog.int4, pg_catalog.int4, pg_catalog.int4, pg_catalog.float4, pg_catalog.float4, pg_catalog.float4, pg_catalog.text[], pg_catalog.text[]) FROM PUBLIC;
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:242
+-- postgres/src/udfs.rs:247
 -- stannum::udfs::segment_info
 CREATE  FUNCTION "segment_info"(
 	"index" regclass /* PgRelation */
@@ -361,7 +436,7 @@ AS 'MODULE_PATHNAME', 'segment_info_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/operator.rs:129
+-- postgres/src/operator.rs:210
 -- stannum::operator::stannum_text_cmpfunc
 CREATE  FUNCTION "stannum_text_cmpfunc"(
 	"document" TEXT, /* & str */
@@ -373,7 +448,7 @@ AS 'MODULE_PATHNAME', 'stannum_text_cmpfunc_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/operator.rs:136
+-- postgres/src/operator.rs:216
 -- stannum::operator::stannum_text_cmpfunc_indexed
 CREATE  FUNCTION "stannum_text_cmpfunc_indexed"(
 	"document" TEXT, /* & str */
@@ -385,7 +460,7 @@ AS 'MODULE_PATHNAME', 'stannum_text_cmpfunc_indexed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/operator.rs:537
+-- postgres/src/operator.rs:671
 -- stannum::operator::stannum_text_cmpfunc_support
 CREATE  FUNCTION "stannum_text_cmpfunc_support"(
 	"request" internal /* Internal */
@@ -396,7 +471,7 @@ AS 'MODULE_PATHNAME', 'stannum_text_cmpfunc_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/selectivity.rs:139
+-- postgres/src/selectivity.rs:143
 -- stannum::selectivity::stannum_text_restrict
 
     CREATE OR REPLACE FUNCTION @extschema@.stannum_text_restrict(internal, oid, internal, integer)
@@ -406,7 +481,7 @@ AS 'MODULE_PATHNAME', 'stannum_text_cmpfunc_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/operator.rs:591
+-- postgres/src/operator.rs:922
 -- requires:
 --   amhandler
 --   indexed_query
@@ -441,7 +516,7 @@ ALTER FUNCTION @extschema@.stannum_text_cmpfunc(pg_catalog.text, pg_catalog.text
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:115
+-- postgres/src/udfs.rs:120
 -- stannum::udfs::tokenize
 CREATE  FUNCTION "tokenize"(
 	"text" TEXT, /* Option < & '_ str > */
@@ -459,7 +534,7 @@ AS 'MODULE_PATHNAME', 'tokenize_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:325
+-- postgres/src/udfs.rs:330
 -- stannum::udfs::verify_index
 CREATE  FUNCTION "verify_index"(
 	"index" regclass, /* PgRelation */
@@ -475,7 +550,7 @@ AS 'MODULE_PATHNAME', 'verify_index_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:376
+-- postgres/src/udfs.rs:381
 -- stannum::udfs::version
 CREATE  FUNCTION "version"() RETURNS TEXT /* & '_ str */
 IMMUTABLE STRICT PARALLEL SAFE
@@ -484,7 +559,7 @@ AS 'MODULE_PATHNAME', 'version_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/storage/wal.rs:243
+-- postgres/src/storage/wal.rs:247
 -- stannum::storage::wal::wal_rmgr_id
 CREATE  FUNCTION "wal_rmgr_id"() RETURNS INT /* Option < i32 > */
 STRICT STABLE PARALLEL SAFE
