@@ -2738,8 +2738,8 @@ unsafe extern "C-unwind" fn explain(
                 .filter(|(s, _)| **s != segment::tinshape::blob::KindStats::default())
                 .map(|(s, name)| {
                     format!(
-                        "{name}: copied {} B in {} pages, pinned {}, stitched {} B",
-                        s.copied, s.copied_pages, s.pinned, s.stitched
+                        "{name}: copied {} B in {} pages, pinned {}, stitched {} B in {} reads",
+                        s.copied, s.copied_pages, s.pinned, s.stitched, s.stitches
                     )
                 })
                 .collect::<Vec<_>>()

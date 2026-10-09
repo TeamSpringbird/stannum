@@ -288,6 +288,22 @@ pub fn verify(dumped: &DumpedSegment, tns: &[u8]) -> Result<u64, String> {
 pub struct Pages {
     pub pages: BTreeMap<Part, rustc_hash::FxHashSet<usize>>,
     pub accesses: BTreeMap<Part, u64>,
+    /// Per part, how its reads fall on pages, in the order made.
+    pub order: BTreeMap<Part, ReadOrder>,
+}
+
+/// How a part's reads fall on pages: reads (touches), those spanning two
+/// pages or more (a stitch and a second pin when read in place), reads on
+/// another page than the part's last one, and of those the ones moving
+/// back to an earlier page of the same blob (a read out of rank order).
+/// Blobs are told apart by offsets past 2^40, as the replay counts them.
+#[derive(Default, Clone, Copy)]
+pub struct ReadOrder {
+    pub reads: u64,
+    pub straddles: u64,
+    pub switches: u64,
+    pub back: u64,
+    last: Option<usize>,
 }
 
 impl Touch for Pages {
@@ -299,6 +315,19 @@ impl Touch for Pages {
             set.insert(page);
         }
         *self.accesses.entry(part).or_default() += (last - first + 1) as u64;
+        let order = self.order.entry(part).or_default();
+        order.reads += 1;
+        order.straddles += u64::from(last > first);
+        match order.last {
+            Some(previous) if previous == first => {}
+            Some(previous) => {
+                order.switches += 1;
+                let same_blob = (previous * PAGE_DATA) >> 40 == at >> 40;
+                order.back += u64::from(same_blob && first < previous);
+            }
+            None => order.switches += 1,
+        }
+        order.last = Some(last);
     }
 }
 

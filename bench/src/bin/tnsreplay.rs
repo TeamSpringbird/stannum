@@ -591,6 +591,8 @@ struct Row {
     pages: Pages,
     answer: tin::RankedAnswer,
     pins: u64,
+    /// The instrumented pass's reads by kind of structure.
+    kinds: [segment::tinshape::blob::KindStats; segment::tinshape::blob::KINDS],
 }
 
 fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Result<(), String> {
@@ -615,6 +617,7 @@ fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Resu
                     }
                 }
                 start.wait();
+                let cpu0 = process_cpu();
                 let began = Instant::now();
                 let mut i = t * 7919 % n;
                 let mut done = 0u64;
@@ -630,6 +633,14 @@ fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Resu
                     e.0 += 1;
                     e.1 += at.elapsed().as_nanos() as u64;
                     done += 1;
+                }
+                let cpu1 = process_cpu();
+                if t == 0 {
+                    println!(
+                        "cpu window: user {:.3} s, sys {:.3} s, {done} queries (thread 0; process-wide)",
+                        cpu1.0 - cpu0.0,
+                        cpu1.1 - cpu0.1
+                    );
                 }
                 total.fetch_add(done, std::sync::atomic::Ordering::Relaxed);
                 let mut all = per_style.lock().expect("lock");
@@ -698,6 +709,7 @@ fn run() -> Result<bool, String> {
         }
         let mut pages = Pages::default();
         let pins0 = PINS.get();
+        segment::tinshape::blob::reset_stats();
         let (direct, counters) = reader
             .instrumented(
                 &scorer,
@@ -718,6 +730,7 @@ fn run() -> Result<bool, String> {
             pages,
             answer: counters,
             pins: PINS.get() - pins0,
+            kinds: segment::tinshape::blob::stats(),
         });
         if (n + 1) % 500 == 0 {
             eprintln!("{} of {}", n + 1, trace.len());
@@ -827,6 +840,50 @@ fn run() -> Result<bool, String> {
         }
         println!("{line} {total:>8.1}");
     }
+    println!(
+        "\nreads per query by area, mean: reads, spanning two pages (%), page switches, back to an earlier page"
+    );
+    for style in &styles {
+        let rs: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = rs.len().max(1) as f64;
+        let mut line = format!("{style:<12}");
+        for part in Part::ALL {
+            let sum = |f: fn(&bench::tinshape::ReadOrder) -> u64| -> f64 {
+                rs.iter()
+                    .filter_map(|r| r.pages.order.get(&part))
+                    .map(f)
+                    .sum::<u64>() as f64
+            };
+            let reads = sum(|o| o.reads);
+            if reads == 0.0 {
+                continue;
+            }
+            let _ = write!(
+                line,
+                "  {}: {:.0} ({:.2}%) sw {:.0} back {:.0}",
+                part.name(),
+                reads / n,
+                100.0 * sum(|o| o.straddles) / reads,
+                sum(|o| o.switches) / n,
+                sum(|o| o.back) / n,
+            );
+        }
+        println!("{line}");
+    }
+    println!("\nstitched per query by kind, mean: reads, bytes");
+    for style in &styles {
+        let rs: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = rs.len().max(1) as f64;
+        let mut line = format!("{style:<12}");
+        for (k, name) in segment::tinshape::blob::KIND_NAMES.iter().enumerate() {
+            let reads = rs.iter().map(|r| r.kinds[k].stitches).sum::<u64>() as f64 / n;
+            let bytes = rs.iter().map(|r| r.kinds[k].stitched).sum::<u64>() as f64 / n;
+            if reads > 0.0 {
+                let _ = write!(line, "  {name}: {reads:.1} ({:.1} KB)", bytes / 1024.0);
+            }
+        }
+        println!("{line}");
+    }
     println!("\npages pinned per query (in place), mean");
     for style in &styles {
         let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
@@ -890,4 +947,30 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// The process's user and system CPU seconds so far (`getrusage`).
+fn process_cpu() -> (f64, f64) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Timeval {
+        sec: i64,
+        usec: i64,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rusage {
+        utime: Timeval,
+        stime: Timeval,
+        rest: [i64; 14],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    let mut usage = Rusage::default();
+    // SAFETY: RUSAGE_SELF into a struct laid out as the C one (timeval's
+    // microseconds are padded to eight bytes on 64-bit targets).
+    unsafe { getrusage(0, &mut usage) };
+    let t = |v: &Timeval| v.sec as f64 + v.usec as f64 * 1e-6;
+    (t(&usage.utime), t(&usage.stime))
 }

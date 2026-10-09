@@ -175,7 +175,9 @@ a bit each: 28.6 MB at 1M rows). A posting's index (its
 rank in slot order, which is ctid order, which was `STN3`'s ordinal order)
 addresses it. A phrase checks a common word's positions for candidates far
 apart in its posting order: from a skip it decoded up to 31 entries to
-reach one, from a sub at most 7. `Builder::add_term` takes the
+reach one, from a sub at most 7 (`Positions::skip_entries`: a block's mask
+read once, a run of masked entries skipped as one run of varints).
+`Builder::add_term` takes the
 `segment::payload` stream; `Positions::payload` gives it back.
 `Positions::skip(index, at)` and `read_entry(index, at, out)` take the
 entry's index (for its mask bit).
@@ -230,30 +232,38 @@ footers it decodes between queries (`Segment::resolve_memo`,
 `Segment::footer_memo`, 16 MiB), as `STN3`'s walk keeps decoded bounds.
 
 - A query some terms of which every match holds (a conjunction, a phrase)
-  walks the groups its rarest such term holds. A group whose scoring
-  terms' footer blocks cannot reach the threshold is skipped unread;
-  otherwise the required terms' members are intersected whole: word by
-  word where every one is a grid, else from the term with the fewest
-  members there, a grid by bit and a decoded list by a merge, stopping once
-  nothing is left. Each candidate is then bounded by the footer blocks it
-  falls in (a window per run of slots no block boundary crosses), then by
-  its buckets: each term's bucket from the TF tail, scored at the shortest
-  length its block holds for that bucket or more (the frontier's pairs at
-  or above it), so the DL sidecar is read only for a candidate this leaves
-  in reach, and the score is exact from the buckets and the length. (A
-  required term carrying its lengths inline is read first instead, with a
-  bound by its length against the window's largest buckets,
-  `TermScorer::length_bound_parts`.) At 150 million rows the bucket bound
-  rules out two in three of the candidates the length bound let through,
-  and 11% (conjunction), 20% (disjunction) and 3 to 5% (phrase) of the
-  pages a query pins; CPU is unchanged where a page touch is a memory read.
+  walks the groups its rarest such term holds, taken from its directory. A
+  group whose scoring terms' footer blocks cannot reach the threshold is
+  skipped unread (the sum stops once it reaches the threshold, rarest term
+  first); otherwise the required terms' members are intersected: word by
+  word where every one is a grid, else the rarest term's members filtered
+  by each other required term in order of `df`, each looked up only while
+  candidates are left (at 150M rows nothing is left after one or two terms
+  in nine groups of ten), by a grid's bits, by probing an Elias-Fano
+  container of more than four times their number in place
+  (`Ef::retain_members`), or by merging a shorter list. Each candidate is
+  then bounded by the footer blocks it falls in (a window per run of slots
+  no block boundary crosses), then by its buckets: each term's bucket from
+  the TF tail, scored at the shortest length its block holds for that
+  bucket or more (the frontier's pairs at or above it), so the DL sidecar
+  is read only for a candidate this leaves in reach, and the score is exact
+  from the buckets and the length. (A required term carrying its lengths
+  inline is read first instead, with a bound by its length against the
+  window's largest buckets, `TermScorer::length_bound_parts`.) At 150
+  million rows the bucket bound rules out two in three of the candidates
+  the length bound let through, and 11% (conjunction), 20% (disjunction)
+  and 3 to 5% (phrase) of the pages a query pins; CPU is unchanged where a
+  page touch is a memory read.
 - A phrase reads positions only for a candidate that would enter the top
   k. Until the top k fill every match does, so its positions are checked
   first; after, a group's candidates that score into the top k wait and
   are checked best first, so a confirmed one raises the threshold over the
   rest (admission compares score and ctid, so the order is free). The
   rarest slot is read first and each pair of leaves tested as it is read
-  (`PhrasePlan`); a word repeated in the phrase is read once.
+  (`PhrasePlan`); a word repeated in the phrase is read once, and a
+  candidate whose bucket for it falls short of the number of times the
+  phrase uses it is dropped before its length is read (a phrase's leaves
+  sit at distinct positions).
 - Any other query is block-max MaxScore over its scoring terms, a group at
   a time. Each term present in the group becomes a row of words (a grid
   copied, a list decoded into bits; a posting's index is a popcount over
@@ -375,6 +385,7 @@ asked rather than copying the directory per query; `TermSet::find` returns
 the entry by value. Added: `ef::Ef::retain_members(&mut Vec<u32>)` (keep
 the values a list holds, its highs passed a word at a time and only the
 lows of the values' buckets read) and `ef::EfCursor::list`;
+`positions::Positions::skip_entries(from, at, to)`;
 `boldi_vigna::PhrasePlan::leaves`.
 
 Changed in phase B (callers of phase A's API): `Group` has `first` and
@@ -558,8 +569,12 @@ reads a segment within a span of the segment's `blob::LazyBlob`
 on one page is a slice of the page, which the run source pins (through the
 buffer it was last pinned in, as STN3's held pages) the first time the span
 asks for it and keeps pinned until the span ends; a range across a page
-boundary is copied into a stitch buffer the span frees. A term's record
-header and group directory are read when it is resolved, a group's container
+boundary is copied into a stitch buffer, which the blob keeps (up to 1 MiB,
+unzeroed) for its next span. The blob remembers the pages a span pinned by
+page, each entry naming its span, so a range on a page the span holds is a
+lookup and a slice, and closing a span forgets them without touching them.
+A term's record header and group directory are read when it is resolved, a
+group's container
 when a walk reaches the group, a posting's TF bits, the entries of a
 positions stream a phrase checks and the DL sidecar words of the documents
 scored; nothing is kept but what is parsed from them. The span ends when
@@ -581,10 +596,15 @@ memoized term-map lookups, decoded footers, and parsed grouped records
 assembled over the blob is kept while the liveness stays. These, and any
 chunks copied outside spans, count against `stannum.reader_cache_mb`, the
 chunks at most a quarter of it (`SET client_min_messages = debug1` reports
-the parts as a view is captured). `EXPLAIN ANALYZE` reports per kind of
-structure (record, footer, container, sparse list, TF tail, inline lengths,
+the parts as a view is captured). Past their budgets the records and
+footers used longest ago go first: a segment's memos down to half of their
+16 MiB, and over the native quarter the largest segments' memos are halved
+before any segment's state is dropped whole. At 150M rows a common word's
+directory and footer, which most queries parse, were dropped with the rest
+every few queries when the memos emptied whole. `EXPLAIN ANALYZE` reports
+per kind of structure (record, footer, container, sparse list, TF tail, inline lengths,
 DL sidecar, positions) the bytes copied and their pages, the pages pinned
-and the bytes stitched, and buffer accesses by phase.
+and the bytes and reads stitched, and buffer accesses by phase.
 
 **Which paths are native.** A query is lowered (`engine::tinshape::lower`)
 after its wildcards, regexes, ranges and fuzzy terms are expanded against
@@ -616,7 +636,9 @@ and unordered spans; not `NOT ENCLOSES` and the like).
   document) and walks them in ctid order.
 - `score()` and `full_score()` of a row the scan did not rank:
   `engine::tinshape::score_at`, the row's slot found by a multiply, each
-  scoring term's posting by a seek.
+  scoring term's posting by a seek, in the segment whose document set holds
+  the row (`storage::native_holds`), not by assembling every segment for the
+  row's terms in turn.
 
 **What remains ordinal.** The write buffer and sealed write segments are
 in-memory ordinal indexes (`MutableIndex`), so the ordinal walk, planner,
@@ -642,6 +664,81 @@ only tie the bar is scored (and ranks after it, by ctid); a segment whose
 best documents all tie scores them all. The ordinal walk skipped such
 sub-blocks by their first ordinal's location.
 
+## Storage-layer costs at 150M rows (branch `tinshape/perf-storage`)
+
+Measured on the 150M dump (14 segments, 37.5 GB) with `tnsreplay` and
+`tnsunits`, and in PostgreSQL on a copy of the saved 150M database (24 GB
+of shared buffers, `perf` sampling in the server's PID namespace). Log and
+outputs: `stannum-lab/tinshape/perf-storage/`.
+
+- Pins: a query pins 2,600 (conjunction), 8,100 (disjunction) and 3,700
+  (phrase) pages, a page once per segment it touches; `ReadRecentBuffer`
+  finds 33% to 55% of them in the buffer the backend last pinned them in
+  (cold backend, 300 queries in). The others go through the buffer mapping
+  table, whose hash lookups were 3% of a looping conjunction's samples;
+  thousands of pins held at once overflow PostgreSQL's private refcount
+  array into its hash table, so every pin and release looks up a hash.
+- Reads spanning two pages (a stitch, a copy and a second pin), as a query
+  makes them (replay, 300 queries per style): containers 5.3% to 5.7% of
+  payload reads (1,450 / 4,450 / 1,650 a query, 1.3 / 4.2 / 1.5 MB), footer
+  reads 41% (whole footers, decoded per term), sparse lists 16 a query
+  (0.7 MB, re-read every query: a sparse record borrows its span's bytes),
+  TF 0.00%, DL 0.06%, positions 0.12%. Over every unit of the segments
+  (`tnsunits`): containers 1.9% straddle, positions blocks 0.5%, TF blocks
+  0.9%, DL blocks (256 documents, 277 bytes) 3.4%, footer block entries
+  0.14%.
+- DL reads go in rank order: of 1.5M / 10.4M / 6.6M DL reads (three
+  styles), 16 / 15 / 5 went to a lower rank than the read before in the same
+  segment, and consecutive reads share a data page 14 / 80 / 20 times on
+  average, so one pin serves them. Liveness is decoded once per backend into
+  slot-space words and reads no page.
+- Stitched containers, by length (replay, 150 queries per style, every
+  pass): 62% to 64% of the stitched container reads are of at most 1 KiB
+  (35% to 38% of their bytes), the rest 1 to 4 KiB; none is longer. Sparse
+  lists and footers stitched are mostly longer than a page (whole lists and
+  footers read to be decoded), and a record's directory is read in a 16 KiB
+  window once 4 KiB does not hold it.
+- 64-byte lines (`tnsunits`): a run page's data starts at byte 28 of the
+  page, so no unit is line-aligned by construction. Lines touched per unit
+  against the fewest its length needs: containers 3.45 / 3.06 (37.7% touch
+  one more), TF blocks 2.11 / 1.32 (77.7%), DL blocks 5.31 / 4.72 (56.9%),
+  positions blocks 1.67 / 1.34 (33.5%), footer block entries 1.17 / 1.00
+  (17.3%), directories 1.24 / 1.17 (7.1%). The group directory and the
+  footer are variable-length records (varints) of structures in a row
+  (AoS), decoded whole before use; the decoded footer is a structure of
+  arrays (`last`, `starts`, `frontier`, `tf_at`, `widths`), but the
+  frontier is (bucket, length) pairs and a block's bound is computed one
+  block at a time.
+
+Proposals (not built; layout only, the same structures):
+
+- Pad the writer so that no unit of at most 1 KiB spans a page: about
+  0.9% of the blob at 150M (containers 208 MB, positions blocks 108 MB,
+  TF blocks, sparse lists and positions streams 14 MB each, DL blocks
+  3 MB). It removes about 63% of the stitched container reads but only 37%
+  of their bytes; padding containers of up to 4 KiB too removes all of
+  them for 462 MB (1.2%; with the rest about 1.6%). The copies cost little
+  (1.3 to 4.2 MB a query, well under a millisecond); the second pin is the
+  larger part. Without padding, a walk could read a container across two
+  pages in place, a run of words per page (a grid's rows are copied into
+  a row anyway in the disjunction walk), which needs the walks to take a
+  container as up to two slices. Units could also start on a 64-byte line
+  of the page (page offsets that are multiples of 64: data offsets of
+  36 + 64k on a page): 507 MB for containers, 730 MB for TF blocks,
+  2.9 GB for positions blocks (`tnsunits`, "line pad"), which only pays
+  for units of a line or more.
+- Decode footers by the blocks a walk reaches instead of whole: a common
+  word's footer at 150M is some 20,000 blocks per segment, decoded per
+  query whenever its memo entry was dropped (5.7% of a looping
+  conjunction's samples in the server, `Postings::footer`). The walks read
+  `Footer::last` and the frontier by block, so this is an API change for
+  `engine/src/tinshape/rank.rs`.
+- `TermSet::open` cloned the term's group directory and built a cursor
+  entry per group per segment per query: 9.2% of a conjunction replay's
+  samples (2.4% with the built groups kept beside the parsed record, an
+  experiment since undone). The conjunction and phrase branch's lazy
+  directory reads (`b7776bd`) cover it.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
@@ -653,8 +750,14 @@ sub-blocks by their first ordinal's location.
   faster (log, round 2). Grids over document ranks rather than slots
   would remove the inflation; that is a format change.
 - Positions are still 49% of the blob (2.3 bytes per posting; TIN's
-  synthetic probes measured 0.14 per posting at tf 1). Bit-packing
-  positions per block against the document's length is the next step.
+  synthetic probes measured 0.14 per posting at tf 1, on documents of one
+  to three words). At 150M rows (18.4 GB of positions, 2.7 bytes per
+  posting, 71% of postings at tf 1) bit-packing each block's counts, first
+  positions and gaps at the block's widths would save about a tenth
+  (1.8 to 2.2 GB, 5 to 6% of the index) and 8 to 15% of a phrase's
+  positions pages: a first position or a gap takes 9 bits on average in
+  these documents, against a one- or two-byte varint now. Not worth a
+  format change alone.
 - Per-block counts in the footer (TIN answers single-term counts from its
   footer): a single-term count is the dictionary's `df` here already; the
   group directory's per-group counts settle groups one term holds.

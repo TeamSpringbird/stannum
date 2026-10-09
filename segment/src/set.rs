@@ -152,6 +152,13 @@ impl<C: Cursor> Cursor for Intersection<C> {
 pub struct Union<C> {
     cursors: Vec<C>,
     current: Option<Tid>,
+    /// The cursor on `current`, and the least position of the others: while
+    /// the lead stays below it, advancing the union advances the lead alone.
+    /// A plain scan unions a cursor per segment, and segments mostly hold
+    /// runs of ctids apart, so a row costs one cursor's step, not a step and
+    /// a comparison per cursor.
+    lead: usize,
+    bound: Option<Tid>,
 }
 
 impl<C: Cursor> Union<C> {
@@ -159,13 +166,32 @@ impl<C: Cursor> Union<C> {
         let mut this = Self {
             cursors,
             current: None,
+            lead: 0,
+            bound: None,
         };
         this.align();
         this
     }
 
     fn align(&mut self) {
-        self.current = self.cursors.iter().filter_map(Cursor::current).min();
+        let mut best: Option<(Tid, usize)> = None;
+        let mut second: Option<Tid> = None;
+        for (i, cursor) in self.cursors.iter().enumerate() {
+            let Some(tid) = cursor.current() else {
+                continue;
+            };
+            match best {
+                None => best = Some((tid, i)),
+                Some((least, _)) if tid < least => {
+                    second = Some(least);
+                    best = Some((tid, i));
+                }
+                Some(_) => second = Some(second.map_or(tid, |s| s.min(tid))),
+            }
+        }
+        self.current = best.map(|(tid, _)| tid);
+        self.lead = best.map_or(0, |(_, i)| i);
+        self.bound = second;
     }
 }
 
@@ -177,6 +203,17 @@ impl<C: Cursor> Cursor for Union<C> {
         let Some(current) = self.current else {
             return Ok(());
         };
+        if self.bound.is_none_or(|bound| bound > current) {
+            // Only the lead is on `current`.
+            let lead = &mut self.cursors[self.lead];
+            lead.advance()?;
+            match (lead.current(), self.bound) {
+                (Some(next), Some(bound)) if next < bound => self.current = Some(next),
+                (next, None) => self.current = next,
+                _ => self.align(),
+            }
+            return Ok(());
+        }
         for cursor in &mut self.cursors {
             if cursor.current() == Some(current) {
                 cursor.advance()?;
@@ -393,6 +430,57 @@ mod tests {
             count(AtLeast::new(vec![Slice::new(&a)], 2).unwrap()).unwrap(),
             0
         );
+    }
+
+    proptest::proptest! {
+        /// A union is the sorted, deduplicated merge of its inputs, read by
+        /// advancing and by seeking, whether the inputs hold runs apart (a
+        /// plain scan's segments) or interleave and share members.
+        #[test]
+        fn union_is_the_merge_of_its_inputs(
+            inputs in proptest::collection::vec(
+                (proptest::collection::btree_set(0u32..400, 0..60), 0u32..3),
+                0..6,
+            ),
+            seeks in proptest::collection::vec(0u32..1300, 0..8),
+        ) {
+            let lists: Vec<Vec<Tid>> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, (blocks, spread))| {
+                    blocks
+                        .iter()
+                        .map(|b| Tid::new(b + i as u32 * 200 * spread, 1).unwrap())
+                        .collect()
+                })
+                .collect();
+            let mut want: Vec<Tid> = lists.iter().flatten().copied().collect();
+            want.sort_unstable();
+            want.dedup();
+            let union = Union::new(lists.iter().map(|l| Slice::new(l)).collect());
+            proptest::prop_assert_eq!(collect(union).unwrap(), want.clone());
+            let mut union = Union::new(lists.iter().map(|l| Slice::new(l)).collect());
+            let mut seeks = seeks;
+            seeks.sort_unstable();
+            // Cursors move forward only: a seek lands on the first member at
+            // or after the target not yet stepped past.
+            let mut past: Option<Tid> = None;
+            for target in seeks {
+                let target = Tid::new(target, 1).unwrap();
+                union.seek(target).unwrap();
+                let expected = want
+                    .iter()
+                    .copied()
+                    .find(|t| *t >= target && past.is_none_or(|p| *t > p));
+                proptest::prop_assert_eq!(union.current(), expected);
+                if let Some(at) = union.current() {
+                    union.advance().unwrap();
+                    past = Some(at);
+                    let next = want.iter().copied().find(|t| *t > at);
+                    proptest::prop_assert_eq!(union.current(), next);
+                }
+            }
+        }
     }
 
     #[test]

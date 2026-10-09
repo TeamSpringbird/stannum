@@ -52,6 +52,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ranked trace replay over dumped TNS1 segments, read in place as the extension reads them."
     },
+    "bench/src/bin/tnsunits.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: counts of TNS1 units spanning page boundaries and 64-byte lines over a dump, with the padding that would avoid them."
+    },
     "bench/src/dump.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: reading script/dump-segments.py's dumps for the offline replay."

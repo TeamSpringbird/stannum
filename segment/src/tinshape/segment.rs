@@ -292,12 +292,12 @@ pub struct Segment<'a> {
     footers: std::rc::Rc<std::cell::RefCell<FooterCache>>,
 }
 
-/// Decoded footers by their record's blob offset, emptied past
-/// [`PARSED_BUDGET`] bytes; see [`Segment::share_footers`].
+/// Decoded footers by their record's blob offset, the least recently used
+/// dropped past [`PARSED_BUDGET`] bytes; see [`Segment::share_footers`].
 #[derive(Default)]
 pub struct FooterCache {
     bytes: usize,
-    footers: rustc_hash::FxHashMap<usize, std::rc::Rc<Footer>>,
+    footers: rustc_hash::FxHashMap<usize, (std::rc::Rc<Footer>, std::cell::Cell<u64>)>,
 }
 
 impl FooterCache {
@@ -305,6 +305,46 @@ impl FooterCache {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Drops the least recently used footers until at most `keep` bytes
+    /// remain.
+    pub fn shed(&mut self, keep: usize) {
+        if self.bytes <= keep {
+            return;
+        }
+        let mut by_use: Vec<(u64, usize)> = self
+            .footers
+            .iter()
+            .map(|(at, (_, used))| (used.get(), *at))
+            .collect();
+        by_use.sort_unstable();
+        for (_, at) in by_use {
+            if self.bytes <= keep {
+                break;
+            }
+            if let Some((footer, _)) = self.footers.remove(&at) {
+                self.bytes -= footer_bytes(&footer);
+            }
+        }
+    }
+}
+
+/// Bytes a decoded footer holds, roughly.
+fn footer_bytes(footer: &Footer) -> usize {
+    footer.blocks() * 24 + footer.frontier.len() * 8 + 64
+}
+
+thread_local! {
+    /// Uses of kept records and footers, numbered: what was used longest
+    /// ago is dropped first.
+    static TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn tick() -> u64 {
+    TICK.with(|t| {
+        t.set(t.get() + 1);
+        t.get()
+    })
 }
 
 /// Most bytes of a blob's header: the magic and ten varints.
@@ -319,17 +359,52 @@ const PARSED_BUDGET: usize = 16 << 20;
 #[derive(Default)]
 struct Parsed<'a> {
     bytes: usize,
-    records: rustc_hash::FxHashMap<usize, Postings<'a>>,
+    /// Records by offset, with their last use.
+    records: rustc_hash::FxHashMap<usize, (Postings<'a>, std::cell::Cell<u64>)>,
 }
 
 impl Parsed<'_> {
-    /// Makes room for `bytes` more.
+    /// Makes room for `bytes` more: past the budget, the least recently
+    /// used records go until half of it is left. A query's common words
+    /// (whose directories and footers cost the most to parse) recur in most
+    /// queries, and emptying the memo whole dropped them with the rest.
     fn room(&mut self, bytes: usize) {
         if self.bytes + bytes > PARSED_BUDGET {
-            self.records.clear();
-            self.bytes = 0;
+            self.shed(PARSED_BUDGET / 2);
         }
         self.bytes += bytes;
+    }
+
+    /// Drops the least recently used records until at
+    /// most `keep` bytes remain.
+    fn shed(&mut self, keep: usize) {
+        if self.bytes <= keep {
+            return;
+        }
+        let mut by_use: Vec<(u64, usize)> = self
+            .records
+            .iter()
+            .map(|(at, (_, used))| (used.get(), *at))
+            .collect();
+        by_use.sort_unstable();
+        for (_, at) in by_use {
+            if self.bytes <= keep {
+                break;
+            }
+            if let Some((postings, _)) = self.records.remove(&at) {
+                self.bytes = self.bytes.saturating_sub(record_bytes(&postings));
+            }
+        }
+    }
+}
+
+/// Bytes a kept record of `postings` costs.
+fn record_bytes(postings: &Postings<'_>) -> usize {
+    64 + match &postings.form {
+        postings::Form::Grouped(entries) => {
+            entries.len() * std::mem::size_of::<postings::GroupEntry>()
+        }
+        _ => 0,
     }
 }
 
@@ -474,6 +549,13 @@ impl<'a> Segment<'a> {
         })
     }
 
+    /// Drops the least recently used parsed records and decoded footers
+    /// until each memo holds at most `keep` bytes.
+    pub fn shed(&self, keep: usize) {
+        self.parsed.borrow_mut().shed(keep);
+        self.footers.borrow_mut().shed(keep);
+    }
+
     /// Bytes the memos of parsed records and dictionary lookups hold,
     /// roughly (decoded footers are counted by their [`FooterCache`]).
     pub fn memo_bytes(&self) -> usize {
@@ -486,19 +568,16 @@ impl<'a> Segment<'a> {
     /// only those past it.
     pub fn forget_borrowed(&self) {
         let mut parsed = self.parsed.borrow_mut();
-        if parsed.records.values().all(Postings::is_detached) {
+        if parsed.records.values().all(|(p, _)| p.is_detached()) {
             return;
         }
-        parsed.records.retain(|_, postings| postings.is_detached());
-        parsed.bytes = parsed
+        parsed
             .records
+            .retain(|_, (postings, _)| postings.is_detached());
+        let Parsed { records, bytes } = &mut *parsed;
+        *bytes = records
             .values()
-            .map(|postings| match &postings.form {
-                postings::Form::Grouped(entries) => {
-                    entries.len() * std::mem::size_of::<postings::GroupEntry>() + 64
-                }
-                _ => 64,
-            })
+            .map(|(postings, _)| record_bytes(postings))
             .sum();
     }
 
@@ -507,6 +586,9 @@ impl<'a> Segment<'a> {
     /// [`Self::term_memo`] need not read the term map's blocks.
     pub fn remember(&self, term: &str, entry: Option<TermEntry>) {
         let mut memo = self.memo.borrow_mut();
+        if memo.get(term) == Some(&entry) {
+            return;
+        }
         if memo.len() >= MEMO_LIMIT {
             memo.clear();
         }
@@ -517,7 +599,8 @@ impl<'a> Segment<'a> {
     pub fn resolve_memo(&self, entry: TermEntry) -> Result<Term<'a>> {
         let from = usize::try_from(entry.ordinals.offset).map_err(|_| Error::Truncated)?;
         let at = self.area_at(Area::Postings) + from;
-        if let Some(postings) = self.parsed.borrow().records.get(&at) {
+        if let Some((postings, used)) = self.parsed.borrow().records.get(&at) {
+            used.set(tick());
             return Ok(Term {
                 entry,
                 at,
@@ -525,15 +608,11 @@ impl<'a> Segment<'a> {
             });
         }
         let term = self.resolve(entry)?;
-        let bytes = match &term.postings.form {
-            postings::Form::Grouped(entries) => {
-                entries.len() * std::mem::size_of::<postings::GroupEntry>()
-            }
-            _ => 0,
-        } + 64;
         let mut parsed = self.parsed.borrow_mut();
-        parsed.room(bytes);
-        parsed.records.insert(at, term.postings.clone());
+        parsed.room(record_bytes(&term.postings));
+        parsed
+            .records
+            .insert(at, (term.postings.clone(), std::cell::Cell::new(tick())));
         Ok(term)
     }
 
@@ -546,19 +625,21 @@ impl<'a> Segment<'a> {
         postings: &Postings<'a>,
         max_bucket: u8,
     ) -> Result<std::rc::Rc<Footer>> {
-        if let Some(footer) = self.footers.borrow().footers.get(&at) {
+        if let Some((footer, used)) = self.footers.borrow().footers.get(&at) {
+            used.set(tick());
             return Ok(footer.clone());
         }
         let footer =
             std::rc::Rc::new(postings.footer(self.block_size, max_bucket, self.adaptive_tf)?);
-        let bytes = footer.blocks() * 24 + footer.frontier.len() * 8 + 64;
+        let bytes = footer_bytes(&footer);
         let mut cache = self.footers.borrow_mut();
         if cache.bytes + bytes > PARSED_BUDGET {
-            cache.footers.clear();
-            cache.bytes = 0;
+            cache.shed(PARSED_BUDGET / 2);
         }
         cache.bytes += bytes;
-        cache.footers.insert(at, footer.clone());
+        cache
+            .footers
+            .insert(at, (footer.clone(), std::cell::Cell::new(tick())));
         Ok(footer)
     }
 
@@ -742,6 +823,60 @@ mod tests {
             fresh == reusing,
             "a copying merge differs from a fresh build"
         );
+    }
+
+    /// Past its budget a memo drops what was used longest ago, not all of
+    /// it: the record used again stays.
+    #[test]
+    fn memos_drop_the_least_recently_used() {
+        let tids: Vec<Tid> = (0..800u32)
+            .flat_map(|block| (1..=4u16).map(move |offset| Tid { block, offset }))
+            .collect();
+        let options = Options {
+            grid_min_postings: 16,
+            ..Options::default()
+        };
+        let mut builder = Builder::new(tids.clone(), vec![5; tids.len()], options).unwrap();
+        let names = ["a", "b", "c"];
+        for (i, name) in names.iter().enumerate() {
+            let ranks: Vec<u32> = (0..tids.len() as u32).skip(i).step_by(2 + i).collect();
+            let mut payload = PayloadBuilder::default();
+            for _ in &ranks {
+                payload.push(&[0]).unwrap();
+            }
+            builder
+                .add_term(name, &ranks, &vec![1u8; ranks.len()], &payload.finish())
+                .unwrap();
+        }
+        let (blob, _) = builder.finish(&[]);
+        let segment = Segment::parse(&blob).unwrap();
+        let mut at = Vec::new();
+        for name in names {
+            let term = segment.term_memo(name).unwrap().unwrap();
+            segment
+                .footer_memo(term.at, &term.postings, term.entry.max_tf_bucket)
+                .unwrap();
+            at.push(term.at);
+        }
+        // `a` used again: `b` is now the least recently used.
+        let a = segment.term_memo("a").unwrap().unwrap();
+        segment
+            .footer_memo(a.at, &a.postings, a.entry.max_tf_bucket)
+            .unwrap();
+        let held = segment.parsed.borrow().bytes;
+        let footers = segment.footers.borrow().bytes();
+        segment.shed(held.min(footers) * 3 / 4);
+        let parsed = segment.parsed.borrow();
+        let kept: Vec<bool> = at
+            .iter()
+            .map(|at| parsed.records.contains_key(at))
+            .collect();
+        assert!(!kept[1], "the least recently used record is dropped");
+        assert!(kept[0], "the record used again stays");
+        let cache = segment.footers.borrow();
+        assert!(!cache.footers.contains_key(&at[1]));
+        assert!(cache.footers.contains_key(&at[0]));
+        assert!(parsed.bytes <= held.min(footers) * 3 / 4);
     }
 
     #[test]

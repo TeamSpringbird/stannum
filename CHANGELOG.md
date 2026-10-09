@@ -18,8 +18,10 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   the copies overflowed each backend's cache and every query copied some
   15,000 pages again. `stannum.native_in_place` (on) switches back for
   comparison; `EXPLAIN ANALYZE` reports native reads by kind (bytes copied,
-  pages pinned, bytes stitched across page boundaries) and buffer accesses
-  by phase.
+  pages pinned, bytes and reads stitched across page boundaries) and buffer
+  accesses by phase. A segment's blob keeps its stitch buffers for the next
+  read, and its memos of parsed records and decoded footers drop what was
+  used longest ago rather than emptying whole.
 
 - A PostgreSQL 17 and 18 index access method, `stannum`, with TINQL matching
   through `==>`, BM25 ranking (`stannum.score`, `full_score`, `max_score`,
@@ -206,6 +208,14 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   catalog-dependent SQL functions are STABLE rather than IMMUTABLE.
 - `stannum.debug_seed_score` is superuser-only: a plain role could set it and
   make a ranked query return wrong or no rows.
+- Ranked conjunctions and phrases over `TNS1` segments do less work per
+  256-page group: the lead term's groups come from its directory and its
+  members are read only past the group's bound, the other required terms
+  are consulted rarest first only while candidates are left (long
+  Elias-Fano containers probed in place rather than decoded), a term's
+  group directory is shared rather than copied per query, positions skip
+  runs of single-position entries at once, and a phrase repeating a word
+  drops candidates whose bucket for it is too low. Answers are unchanged.
 
 ### Fixed
 
