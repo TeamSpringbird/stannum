@@ -10,6 +10,12 @@
 //! place then stitches it, a copy and a second pin), and what padding the
 //! writer would add so that no unit of at most `--small` bytes spans a
 //! page: per straddling small unit, the bytes left on its first page.
+//! Against 64-byte cache lines (x86 and Arm server cores; Apple's 128-byte
+//! lines are two of them): a run page's data starts at byte 28 of the page,
+//! which shared buffers align, so a unit's lines are counted from its offset
+//! within the page; how many units touch a line more than their length
+//! needs, and the padding that would start every unit of 64 bytes or more
+//! on a line.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsunits -- --dump DIR [--small 1024] [--segments N]
@@ -46,7 +52,19 @@ struct Tally {
     padding: u64,
     /// Units of at most `small` bytes.
     small: u64,
+    /// 64-byte lines touched, and the fewest the units' lengths need.
+    lines: u64,
+    min_lines: u64,
+    /// Units touching a line more than their length needs.
+    extra_line: u64,
+    /// Padding to start every unit of at least a line on a line.
+    line_padding: u64,
 }
+
+/// A run page's data starts after the page header and the chain's next
+/// link.
+const DATA_START: usize = 24 + 4;
+const LINE: usize = 64;
 
 struct Units {
     small: usize,
@@ -65,6 +83,15 @@ impl Units {
         t.small += u64::from(small);
         let first = at / PAGE_DATA;
         let last = (at + len - 1) / PAGE_DATA;
+        let within = DATA_START + at % PAGE_DATA;
+        let lines = ((within + len - 1) / LINE - within / LINE + 1) as u64;
+        let fewest = len.div_ceil(LINE) as u64;
+        t.lines += lines;
+        t.min_lines += fewest;
+        t.extra_line += u64::from(last == first && lines > fewest);
+        if len >= LINE {
+            t.line_padding += ((LINE - within % LINE) % LINE) as u64;
+        }
         if last > first {
             t.straddling += 1;
             t.straddling_bytes += len as u64;
@@ -116,15 +143,25 @@ fn main() {
         blob_bytes as f64 / 1e9
     );
     println!(
-        "{:<30} {:>12} {:>10} {:>12} {:>9} {:>10} {:>12} {:>9}",
-        "unit", "units", "mean B", "straddling", "%", "small %", "padding MB", "% blob"
+        "{:<30} {:>12} {:>10} {:>12} {:>9} {:>10} {:>12} {:>9} {:>11} {:>10} {:>14}",
+        "unit",
+        "units",
+        "mean B",
+        "straddling",
+        "%",
+        "small %",
+        "padding MB",
+        "% blob",
+        "lines/unit",
+        "extra %",
+        "line pad MB"
     );
     for (kind, t) in KINDS.iter().zip(&units.tallies) {
         if t.units == 0 {
             continue;
         }
         println!(
-            "{:<30} {:>12} {:>10.1} {:>12} {:>8.2}% {:>9.2}% {:>12.1} {:>8.3}%",
+            "{:<30} {:>12} {:>10.1} {:>12} {:>8.2}% {:>9.2}% {:>12.1} {:>8.3}% {:>5.2}/{:<5.2} {:>9.1}% {:>14.1}",
             kind,
             t.units,
             t.bytes as f64 / t.units as f64,
@@ -132,7 +169,11 @@ fn main() {
             100.0 * t.straddling as f64 / t.units as f64,
             100.0 * t.small as f64 / t.units as f64,
             t.padding as f64 / 1e6,
-            100.0 * t.padding as f64 / blob_bytes as f64
+            100.0 * t.padding as f64 / blob_bytes as f64,
+            t.lines as f64 / t.units as f64,
+            t.min_lines as f64 / t.units as f64,
+            100.0 * t.extra_line as f64 / t.units as f64,
+            t.line_padding as f64 / 1e6
         );
     }
 }

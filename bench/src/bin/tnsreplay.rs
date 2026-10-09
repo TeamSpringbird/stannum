@@ -617,6 +617,7 @@ fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Resu
                     }
                 }
                 start.wait();
+                let cpu0 = process_cpu();
                 let began = Instant::now();
                 let mut i = t * 7919 % n;
                 let mut done = 0u64;
@@ -632,6 +633,14 @@ fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Resu
                     e.0 += 1;
                     e.1 += at.elapsed().as_nanos() as u64;
                     done += 1;
+                }
+                let cpu1 = process_cpu();
+                if t == 0 {
+                    println!(
+                        "cpu window: user {:.3} s, sys {:.3} s, {done} queries (thread 0; process-wide)",
+                        cpu1.0 - cpu0.0,
+                        cpu1.1 - cpu0.1
+                    );
                 }
                 total.fetch_add(done, std::sync::atomic::Ordering::Relaxed);
                 let mut all = per_style.lock().expect("lock");
@@ -938,4 +947,30 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// The process's user and system CPU seconds so far (`getrusage`).
+fn process_cpu() -> (f64, f64) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Timeval {
+        sec: i64,
+        usec: i64,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rusage {
+        utime: Timeval,
+        stime: Timeval,
+        rest: [i64; 14],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    let mut usage = Rusage::default();
+    // SAFETY: RUSAGE_SELF into a struct laid out as the C one (timeval's
+    // microseconds are padded to eight bytes on 64-bit targets).
+    unsafe { getrusage(0, &mut usage) };
+    let t = |v: &Timeval| v.sec as f64 + v.usec as f64 * 1e-6;
+    (t(&usage.utime), t(&usage.stime))
 }
