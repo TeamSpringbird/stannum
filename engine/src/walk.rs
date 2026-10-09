@@ -133,6 +133,91 @@ fn chunk_loaded() {
     }
 }
 
+/// Counters of the walk's pruning and an observer of every sub-block it
+/// judges, for measuring bounds offline (the `bench` crate's replay). Only
+/// the `stats` feature compiles them; the extension never enables it, so its
+/// walk carries none of this.
+#[cfg(feature = "stats")]
+pub mod stats {
+    use std::cell::{Cell, RefCell};
+
+    use segment::Tid;
+
+    /// What the walk pruned since the last [`reset`].
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Counters {
+        /// Chunks every term the walk needs there occupies, which it bounds:
+        /// a disjunction's pivot chunks, a conjunction's aligned chunks.
+        pub chunks: u64,
+        /// Of those, skipped by the chunk's bound from the directory.
+        pub chunks_pruned_by_bound: u64,
+        /// Skipped because no sub-block's bound reached the threshold.
+        pub chunks_pruned_by_subs: u64,
+        /// Sub-blocks of the chunks evaluated that hold candidates.
+        pub subs: u64,
+        /// Of those, skipped by the sub-block's bound.
+        pub subs_pruned: u64,
+    }
+
+    /// A sub-block the walk judged by its bound.
+    pub struct SubBlock<'a> {
+        /// The source, by the address of its index.
+        pub index: *const (),
+        pub key: u16,
+        pub sub: usize,
+        /// The scoring terms the bound sums, by slot in the scorer.
+        pub slots: &'a [usize],
+        /// For a conjunction, the length every shared document has at least.
+        pub min_length: Option<u32>,
+        /// The bound the walk judged the sub-block by; infinite when the
+        /// walk had no threshold to judge it against.
+        pub bound: f32,
+        pub threshold: Option<(f32, Tid)>,
+        pub pruned: bool,
+        /// Candidates the walk had scored before the sub-block.
+        pub scored: usize,
+    }
+
+    type Observer = Box<dyn FnMut(&SubBlock<'_>)>;
+
+    thread_local! {
+        static COUNTERS: Cell<Counters> = Cell::new(Counters::default());
+        static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
+    }
+
+    /// The counters since the last reset.
+    pub fn counters() -> Counters {
+        COUNTERS.get()
+    }
+
+    pub fn reset() {
+        COUNTERS.set(Counters::default());
+    }
+
+    /// Has `observer` called with every sub-block the walk judges.
+    pub fn observe(observer: Option<Observer>) {
+        OBSERVER.set(observer);
+    }
+
+    pub(super) fn count(add: impl FnOnce(&mut Counters)) {
+        let mut counters = COUNTERS.get();
+        add(&mut counters);
+        COUNTERS.set(counters);
+    }
+
+    pub(super) fn sub_block(event: &SubBlock<'_>) {
+        count(|c| {
+            c.subs += 1;
+            c.subs_pruned += u64::from(event.pruned);
+        });
+        OBSERVER.with_borrow_mut(|observer| {
+            if let Some(observer) = observer {
+                observer(event);
+            }
+        });
+    }
+}
+
 /// What a query scores with: one scorer per scoring term, in lexical term
 /// order, and the query its terms came from.
 pub struct Scorer {
@@ -1372,7 +1457,11 @@ impl OrdinalWalk<'_, '_> {
                 crate::check_interrupts();
             }
             let base = u32::from(chunk.key) << 16;
+            #[cfg(feature = "stats")]
+            stats::count(|c| c.chunks += 1);
             if self.threshold().is_some() && !self.can_beat(chunk.bound, base) {
+                #[cfg(feature = "stats")]
+                stats::count(|c| c.chunks_pruned_by_bound += 1);
                 continue;
             }
             for term in self.terms.iter_mut().chain(self.filters.iter_mut()) {
@@ -2432,9 +2521,13 @@ impl OrdinalWalk<'_, '_> {
                 let scorer = &self.scorer.terms[self.terms[t].slot].1;
                 bound += f64::from(self.terms[t].bound_score(pos, scorer));
             }
+            #[cfg(feature = "stats")]
+            stats::count(|c| c.chunks += 1);
             if threshold.is_some_and(|(threshold, _)| {
                 bound * (1.0 + f64::from(f32::EPSILON) * 256.0) < f64::from(threshold)
             }) {
+                #[cfg(feature = "stats")]
+                stats::count(|c| c.chunks_pruned_by_bound += 1);
                 for &t in &order[..=p] {
                     self.terms[t].pos += 1;
                 }
@@ -2526,7 +2619,11 @@ impl OrdinalWalk<'_, '_> {
                 bound += scorer.bound_with_min_length(&term.bound_block(term.pos), min_length);
             }
             let base = u32::from(key) << 16;
+            #[cfg(feature = "stats")]
+            stats::count(|c| c.chunks += 1);
             if self.threshold().is_some() && !self.can_beat(bound, base) {
+                #[cfg(feature = "stats")]
+                stats::count(|c| c.chunks_pruned_by_bound += 1);
                 self.step_all();
                 continue;
             }
@@ -2649,6 +2746,23 @@ impl OrdinalWalk<'_, '_> {
         true
     }
 
+    /// Reports a conjunction's sub-block to [`stats`].
+    #[cfg(feature = "stats")]
+    fn note_conjunct_sub(&self, key: u16, sub: usize, min_length: u32, bound: f32, pruned: bool) {
+        let slots: Vec<usize> = self.terms.iter().map(|t| t.slot).collect();
+        stats::sub_block(&stats::SubBlock {
+            index: std::ptr::from_ref(self.index).cast::<()>(),
+            key,
+            sub,
+            slots: &slots,
+            min_length: Some(min_length),
+            bound,
+            threshold: self.threshold(),
+            pruned,
+            scored: *self.scored,
+        });
+    }
+
     /// Moves every term and filter past its current chunk.
     fn step_all(&mut self) {
         for term in &mut self.terms {
@@ -2678,6 +2792,8 @@ impl OrdinalWalk<'_, '_> {
             if !(0..SUBS).any(|sub| {
                 !sub_empty[sub] && self.can_beat(sub_scores[sub], base + (sub * SUB) as u32)
             }) {
+                #[cfg(feature = "stats")]
+                stats::count(|c| c.chunks_pruned_by_subs += 1);
                 return;
             }
         }
@@ -2742,9 +2858,16 @@ impl OrdinalWalk<'_, '_> {
             if self.threshold().is_some() {
                 let (sub_scores, sub_empty) =
                     *subs.get_or_insert_with(|| self.sub_bounds_all(min_length));
-                if sub_empty[sub] || !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32) {
+                let pruned =
+                    sub_empty[sub] || !self.can_beat(sub_scores[sub], base + (sub * SUB) as u32);
+                #[cfg(feature = "stats")]
+                self.note_conjunct_sub(key, sub, min_length, sub_scores[sub], pruned);
+                if pruned {
                     continue;
                 }
+            } else {
+                #[cfg(feature = "stats")]
+                self.note_conjunct_sub(key, sub, min_length, f32::INFINITY, false);
             }
             self.class_stamp = self.class_stamp.wrapping_add(1);
             if self.class_stamp == 0 {
@@ -3179,6 +3302,8 @@ impl OrdinalWalk<'_, '_> {
         if self.threshold().is_some()
             && !(0..SUBS).any(|sub| self.can_beat(sub_scores[sub], base + (sub * SUB) as u32))
         {
+            #[cfg(feature = "stats")]
+            stats::count(|c| c.chunks_pruned_by_subs += 1);
             return;
         }
         // The essential terms: sorted by chunk bound, the fewest whose absence
@@ -3270,6 +3395,25 @@ impl OrdinalWalk<'_, '_> {
                     }
                 } else {
                     block.copy_from_slice(&set[i..i + SUB_WORDS]);
+                }
+                #[cfg(feature = "stats")]
+                if block.iter().any(|word| *word != 0) {
+                    let slots: Vec<usize> = present.iter().map(|&t| self.terms[t].slot).collect();
+                    stats::sub_block(&stats::SubBlock {
+                        index: std::ptr::from_ref(self.index).cast::<()>(),
+                        key,
+                        sub,
+                        slots: &slots,
+                        min_length: None,
+                        bound: if pruning {
+                            sub_scores[sub]
+                        } else {
+                            f32::INFINITY
+                        },
+                        threshold: self.threshold(),
+                        pruned: skip_sub,
+                        scored: *self.scored,
+                    });
                 }
                 required.fill(false);
                 required_at = None;

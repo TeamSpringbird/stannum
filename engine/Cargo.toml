@@ -13,6 +13,9 @@ description = "Stannum's query engine over segments, without PostgreSQL: BM25 sc
 [features]
 # Counters, hooks and checks the extension's pg_test build asserts on.
 test-hooks = []
+# Pruning counters and a sub-block observer for offline measurement (the
+# bench crate); the extension never enables it.
+stats = []
 
 [dependencies]
 boldi-vigna = { path = "../boldi-vigna" }
