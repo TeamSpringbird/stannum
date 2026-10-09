@@ -678,6 +678,12 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },
+    "postgres/src/array_search.rs": {
+      "owner": "mixed",
+      "upstream_path": "postgres/src/array_analysis.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Stannum implementation following the design of Lead's array_analysis.rs (a03e682): rewrite array searches from get_relation_info_hook; Stannum binds with indexed_query instead of tagged text."
+    },
     "postgres/src/bm25.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/bm25.rs",

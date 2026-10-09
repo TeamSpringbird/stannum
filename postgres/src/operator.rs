@@ -290,8 +290,20 @@ pub(crate) unsafe fn extension_function_oid(name: &CStr, types: &[pg_sys::Oid]) 
     }
 }
 
+/// `pg_catalog.==>(text, text)`, or `None` outside the extension.
+pub(crate) unsafe fn text_operator() -> Option<pg_sys::Oid> {
+    let opno = unsafe {
+        pg_sys::OpernameGetOprid(
+            name_list(&[c"pg_catalog", c"==>"]),
+            pg_sys::TEXTOID,
+            pg_sys::TEXTOID,
+        )
+    };
+    (opno != pg_sys::InvalidOid).then_some(opno)
+}
+
 /// `pg_catalog.==>(text, stannum.indexed_query)` and its function.
-unsafe fn bound_operator() -> Option<(pg_sys::Oid, pg_sys::Oid)> {
+pub(crate) unsafe fn bound_operator() -> Option<(pg_sys::Oid, pg_sys::Oid)> {
     unsafe {
         let type_oid = indexed_query_type_oid();
         if type_oid == pg_sys::InvalidOid {
@@ -332,7 +344,7 @@ pub(crate) unsafe fn make_text_const(text: &str) -> *mut pg_sys::Node {
     }
 }
 
-unsafe fn make_oid_const(oid: pg_sys::Oid) -> *mut pg_sys::Node {
+pub(crate) unsafe fn make_oid_const(oid: pg_sys::Oid) -> *mut pg_sys::Node {
     unsafe {
         pg_sys::makeConst(
             pg_sys::OIDOID,
@@ -775,6 +787,7 @@ unsafe extern "C-unwind" fn relation_info_hook(
         if let Some(previous) = PREVIOUS_RELATION_INFO_HOOK {
             previous(root, relation_oid, inhparent, rel);
         }
+        crate::array_search::bind_array_searches(root);
         bind_index_predicates(root, rel);
     }
 }
