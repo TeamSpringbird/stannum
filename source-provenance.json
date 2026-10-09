@@ -1030,6 +1030,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ctid-addressed segment format in TIN's shape."
     },
+    "segment/src/tinshape/positions.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: positions streams of the ctid-addressed format with finer skips for frequent terms."
+    },
     "segment/src/tinshape/postings.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: ctid posting sets, footers and TF tails of the ctid-addressed segment format."

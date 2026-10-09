@@ -17,9 +17,9 @@ use segment::Tid;
 use segment::tinshape::bits;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::EfCursor;
+use segment::tinshape::positions::{Positions, skip_entry};
 use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings, for_each_local};
 use segment::tinshape::segment::{Area, Segment};
-use segment::tinshape::varint;
 use segment::{Error, Result};
 use tinql::runtime::{Query, SpanTermSlot};
 
@@ -1100,8 +1100,8 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
     }
 }
 
-/// Reads entry `index` of a positions stream (a [`segment::payload`]
-/// stream) into `out`.
+/// Reads entry `index` of a positions stream (a
+/// [`segment::tinshape::positions`] stream) into `out`.
 pub fn read_positions(
     stream: (&[u8], usize),
     index: u32,
@@ -1109,52 +1109,20 @@ pub fn read_positions(
     touch: &mut impl Touch,
 ) -> Result<()> {
     let (bytes, at) = stream;
-    let mut pos = 0;
-    let count = varint::get_u32(bytes, &mut pos)?;
-    if index >= count {
-        return Err(Error::Corrupt("positions index"));
-    }
-    let interval = segment::payload::SKIP_INTERVAL;
-    let slots = if count == 0 {
-        0
-    } else {
-        (count.div_ceil(interval) - 1) as usize
-    };
-    let skips_at = pos;
-    let data_at = skips_at + slots * 4;
-    let slot = (index / interval) as usize;
-    let mut entry_at = data_at;
-    if slot > 0 {
-        let s = skips_at + (slot - 1) * 4;
-        touch.touch(Part::Positions, at + s, 4);
-        entry_at += u32::from_le_bytes(
-            bytes
-                .get(s..s + 4)
-                .ok_or(Error::Truncated)?
-                .try_into()
-                .expect("four"),
-        ) as usize;
-    }
-    let from = entry_at;
-    for _ in slot as u32 * interval..index {
-        let n = varint::get_u32(bytes, &mut entry_at)?;
-        for _ in 0..n {
-            varint::get(bytes, &mut entry_at)?;
+    let positions = Positions::parse(bytes)?;
+    let (mut entry, mut p, reads) = positions.locate(index)?;
+    for (read_at, len) in reads {
+        if len > 0 {
+            touch.touch(Part::Positions, at + read_at, len);
         }
     }
-    let n = varint::get_u32(bytes, &mut entry_at)?;
-    out.clear();
-    let mut previous: Option<u32> = None;
-    for _ in 0..n {
-        let v = varint::get_u32(bytes, &mut entry_at)?;
-        let p = match previous {
-            None => v,
-            Some(p) => p + v + 1,
-        };
-        out.push(p);
-        previous = Some(p);
+    let from = p;
+    while entry < index {
+        p = skip_entry(bytes, p)?;
+        entry += 1;
     }
-    touch.touch(Part::Positions, at + from, entry_at - from);
+    let end = positions.read_entry(p, out)?;
+    touch.touch(Part::Positions, at + from, end - from);
     Ok(())
 }
 

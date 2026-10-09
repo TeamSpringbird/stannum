@@ -173,7 +173,10 @@ pub fn verify(dumped: &DumpedSegment, tns: &[u8]) -> Result<u64, String> {
             }
             let from = payload_at + entry.payload.offset as usize;
             let (positions, _) = segment.positions(&found.entry).map_err(err)?;
-            if positions != &dumped.blob[from..from + entry.payload.len as usize] {
+            let positions = segment::tinshape::positions::Positions::parse(positions)
+                .map_err(err)?
+                .payload();
+            if positions != dumped.blob[from..from + entry.payload.len as usize] {
                 return Err(format!("term {term:?}: positions differ"));
             }
             postings += i as u64;

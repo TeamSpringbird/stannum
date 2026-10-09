@@ -13,8 +13,8 @@
 //!                      `ordinals` extent locating the term's postings
 //!                      record and its `payload` extent its positions
 //!         postings     one [`super::postings`] record per term
-//!         positions    one [`crate::payload`] stream per term, entries in
-//!                      posting order
+//!         positions    one [`super::positions`] stream per term, entries
+//!                      in posting order
 //!         docset       the ctid grid and the document set
 //!                      ([`super::docs`])
 //!         lengths      the DL sidecar, by document rank
@@ -112,7 +112,8 @@ impl Builder {
     }
 
     /// Adds a term: its documents' ranks (ascending), each one's bucket, and
-    /// its positions stream (a [`crate::payload`] stream in that order).
+    /// its positions stream (a [`crate::payload`] stream in that order),
+    /// stored as [`super::positions`] streams are.
     pub fn add_term(
         &mut self,
         term: &str,
@@ -140,6 +141,8 @@ impl Builder {
         if self.slots.windows(2).any(|w| w[0] >= w[1]) {
             return Err(Error::Unordered);
         }
+        let positions = super::positions::encode(positions, self.tids.len() as u32)?;
+        let positions = positions.as_slice();
         let at = self.postings.len();
         let stats = postings::encode(
             &self.geometry,
@@ -444,7 +447,8 @@ impl<'a> Segment<'a> {
             .transpose()
     }
 
-    /// A term's positions stream, and where it starts in the blob.
+    /// A term's positions stream (a [`super::positions`] stream), and where
+    /// it starts in the blob.
     pub fn positions(&self, entry: &TermEntry) -> Result<(&'a [u8], usize)> {
         let area = self.area(Area::Positions);
         let from = usize::try_from(entry.payload.offset).map_err(|_| Error::Truncated)?;

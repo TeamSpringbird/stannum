@@ -25,9 +25,9 @@ use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
 use segment::tinshape::docs::{GROUP_PAGES, Geometry};
 use segment::tinshape::ef::{Ef, EfCursor};
+use segment::tinshape::positions::{Positions, skip_entry};
 use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local, or_into};
 use segment::tinshape::segment::Segment;
-use segment::tinshape::varint;
 use segment::{Error, Result};
 
 use super::{
@@ -379,41 +379,11 @@ fn load<'a>(
     Ok(())
 }
 
-/// Skips `n` varints from byte `p`: each ends at a byte below 0x80.
-#[inline]
-fn skip_varints(bytes: &[u8], mut p: usize, mut n: u32) -> Result<usize> {
-    while n > 0 {
-        if let Some(chunk) = bytes.get(p..p + 8) {
-            let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
-            let mut ends = !word & 0x8080_8080_8080_8080;
-            let c = ends.count_ones();
-            if c < n {
-                n -= c;
-                p += 8;
-                continue;
-            }
-            for _ in 1..n {
-                ends &= ends - 1;
-            }
-            return Ok(p + ends.trailing_zeros() as usize / 8 + 1);
-        }
-        let b = *bytes.get(p).ok_or(Error::Truncated)?;
-        p += 1;
-        if b < 0x80 {
-            n -= 1;
-        }
-    }
-    Ok(p)
-}
-
-/// A term's positions stream read by posting index, forward from the last
-/// entry read where that is nearer than its skip table's entry.
+/// A term's positions read by posting index, forward from the last entry
+/// read where that is nearer than the entry its tables locate.
 struct PosCursor<'a> {
-    bytes: &'a [u8],
+    positions: Positions<'a>,
     at: usize,
-    count: u32,
-    skips_at: usize,
-    data_at: usize,
     /// Entry `next` starts at byte `next_at`.
     next: u32,
     next_at: usize,
@@ -421,65 +391,34 @@ struct PosCursor<'a> {
 
 impl<'a> PosCursor<'a> {
     fn new(stream: (&'a [u8], usize)) -> Result<Self> {
-        let (bytes, at) = stream;
-        let mut pos = 0;
-        let count = varint::get_u32(bytes, &mut pos)?;
-        let slots = if count == 0 {
-            0
-        } else {
-            (count.div_ceil(segment::payload::SKIP_INTERVAL) - 1) as usize
-        };
-        let data_at = pos + slots * 4;
+        let positions = Positions::parse(stream.0)?;
         Ok(Self {
-            bytes,
-            at,
-            count,
-            skips_at: pos,
-            data_at,
             next: 0,
-            next_at: data_at,
+            next_at: positions.data_at,
+            positions,
+            at: stream.1,
         })
     }
 
     /// Reads entry `index` into `out`.
     fn read(&mut self, index: u32, out: &mut Vec<u32>, touch: &mut impl Touch) -> Result<()> {
-        if index >= self.count {
-            return Err(Error::Corrupt("positions index"));
-        }
-        let interval = segment::payload::SKIP_INTERVAL;
-        let slot = index / interval;
-        if index < self.next || slot > self.next / interval {
-            if slot == 0 {
-                self.next = 0;
-                self.next_at = self.data_at;
-            } else {
-                let s = self.skips_at + (slot as usize - 1) * 4;
-                touch.touch(Part::Positions, self.at + s, 4);
-                let skip = self.bytes.get(s..s + 4).ok_or(Error::Truncated)?;
-                self.next_at =
-                    self.data_at + u32::from_le_bytes(skip.try_into().expect("four")) as usize;
-                self.next = slot * interval;
+        let (entry, entry_at, reads) = self.positions.locate(index)?;
+        if index < self.next || entry > self.next {
+            for (at, len) in reads {
+                if len > 0 {
+                    touch.touch(Part::Positions, self.at + at, len);
+                }
             }
+            self.next = entry;
+            self.next_at = entry_at;
         }
+        let bytes = self.positions.bytes;
         let from = self.next_at;
-        let bytes = self.bytes;
         let mut p = self.next_at;
         for _ in self.next..index {
-            let n = varint::get_u32(bytes, &mut p)?;
-            p = skip_varints(bytes, p, n)?;
+            p = skip_entry(bytes, p)?;
         }
-        let n = varint::get_u32(bytes, &mut p)?;
-        out.clear();
-        let mut previous: Option<u32> = None;
-        for _ in 0..n {
-            let v = varint::get_u32(bytes, &mut p)?;
-            let position = match previous {
-                None => v,
-                Some(q) => q + v + 1,
-            };
-            out.push(position);
-            previous = Some(position);
-        }
+        p = self.positions.read_entry(p, out)?;
         self.next = index + 1;
         self.next_at = p;
         touch.touch(Part::Positions, self.at + from, p - from);
@@ -489,8 +428,10 @@ impl<'a> PosCursor<'a> {
 
 /// A top-level span's positions check.
 struct SpanCheck<'a> {
-    /// Per span slot, its term.
+    /// Per span slot, its term, and the first slot of the same term (a
+    /// phrase repeating a word reads its positions once).
     slots: Vec<usize>,
+    first: Vec<usize>,
     cursors: Vec<PosCursor<'a>>,
     solver: SpanSolver,
     plan: Option<PhrasePlan>,
@@ -499,30 +440,47 @@ struct SpanCheck<'a> {
 }
 
 impl SpanCheck<'_> {
+    /// Reads slot `slot`'s positions unless read: its term's first slot's,
+    /// copied, when an earlier slot holds the same term.
+    fn read_slot(&mut self, slot: usize, index: &[u32], touch: &mut impl Touch) -> Result<()> {
+        if std::mem::replace(&mut self.read[slot], true) {
+            return Ok(());
+        }
+        let first = self.first[slot];
+        if first == slot {
+            return self.cursors[slot].read(index[slot], &mut self.positions[slot], touch);
+        }
+        self.read_slot(first, index, touch)?;
+        let (head, tail) = self.positions.split_at_mut(slot);
+        tail[0].clone_from(&head[first]);
+        Ok(())
+    }
+
     /// Whether the candidate whose posting index in each slot's term is
     /// `index[slot]` holds the span.
     fn holds(&mut self, index: &[u32], touch: &mut impl Touch) -> Result<bool> {
         self.read.fill(false);
-        if let Some(plan) = &self.plan {
+        if let Some(plan) = self.plan.take() {
+            let mut kept = true;
             for step in plan.steps() {
-                if !std::mem::replace(&mut self.read[step.slot], true) {
-                    self.cursors[step.slot].read(
-                        index[step.slot],
-                        &mut self.positions[step.slot],
-                        touch,
-                    )?;
+                if let Err(error) = self.read_slot(step.slot, index, touch) {
+                    self.plan = Some(plan);
+                    return Err(error);
                 }
                 if let Some(pair) = step.pair
                     && !plan.pair_keeps(pair, &self.positions)
                 {
-                    return Ok(false);
+                    kept = false;
+                    break;
                 }
             }
-        }
-        for (slot, &at) in index.iter().enumerate() {
-            if !std::mem::replace(&mut self.read[slot], true) {
-                self.cursors[slot].read(at, &mut self.positions[slot], touch)?;
+            self.plan = Some(plan);
+            if !kept {
+                return Ok(false);
             }
+        }
+        for slot in 0..index.len() {
+            self.read_slot(slot, index, touch)?;
         }
         Ok(self.solver.intervals(&self.positions).next().is_some())
     }
@@ -1119,8 +1077,17 @@ fn span_check<'a>(
     let cursors = (0..slots.len())
         .map(|slot| PosCursor::new(set(slot).positions))
         .collect::<Result<Vec<_>>>()?;
+    let first = (0..slots.len())
+        .map(|slot| {
+            slots
+                .iter()
+                .position(|t| *t == slots[slot])
+                .expect("the slot itself")
+        })
+        .collect();
     Ok(Verify::Span(Box::new(SpanCheck {
         slots: slots.to_vec(),
+        first,
         cursors,
         solver,
         plan,
