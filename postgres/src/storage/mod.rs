@@ -50,8 +50,8 @@ use std::rc::Rc;
 
 use layout::{
     BufferState, CHAIN_CAPACITY, FLAG_REMOVAL_HORIZONS, KIND_BUFFER, KIND_FREE, KIND_META,
-    KIND_RUN, MAX_PENDING, MAX_SEGMENTS, Meta, NONE, Origin, PAGE_SIZE, Pending, Run, SPECIAL_SIZE,
-    SegmentEntry,
+    KIND_RUN, MAX_PENDING, MAX_SEALED, MAX_SEGMENTS, Meta, NONE, Origin, PAGE_SIZE, Pending, Run,
+    SPECIAL_SIZE, SegmentEntry,
 };
 use pgrx::{
     FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgLogLevel, PgRelation,
@@ -72,7 +72,7 @@ use tinql::runtime::plan::{Limits, plan};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
 /// Encoded forward-record bytes buffered before folding.
-static WRITE_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1024 * 1024);
+static WRITE_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(4 * 1024 * 1024);
 /// Total input documents ordinary insert-side merges may rewrite per fold.
 static MAX_MERGE_DOCS: GucSetting<i32> = GucSetting::<i32>::new(1024);
 /// Total input documents of the one merge an insert may run after a fold,
@@ -81,7 +81,7 @@ static DEFERRED_MERGE_DOCS: GucSetting<i32> = GucSetting::<i32>::new(262_144);
 const BITMAP_BATCH: usize = 1024;
 
 /// Documents the write buffer holds before folding into a segment.
-static WRITE_BUFFER_DOCS: GucSetting<i32> = GucSetting::<i32>::new(512);
+static WRITE_BUFFER_DOCS: GucSetting<i32> = GucSetting::<i32>::new(12_288);
 /// Documents an index build accumulates before writing a segment.
 static BUILD_SEGMENT_DOCS: GucSetting<i32> = GucSetting::<i32>::new(32_768);
 /// Soft bound on directory entries; the tiered policy normally stays well
@@ -117,8 +117,8 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"stannum.write_buffer_bytes",
-        c"Encoded bytes buffered before folding into a Stannum segment",
-        c"A fold happens before either the byte or document cap is exceeded. A single oversized document is allowed.",
+        c"Encoded bytes the write segment holds before it is sealed",
+        c"The write segment is sealed before either the byte or the document cap is exceeded, and promoted into an immutable segment. A single oversized document is allowed. TIN's max_mutable_segment_size; an index's option of that name overrides it.",
         &WRITE_BUFFER_BYTES,
         1024,
         64 * 1024 * 1024,
@@ -147,8 +147,8 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"stannum.write_buffer_docs",
-        c"Documents buffered before folding into a Stannum segment",
-        c"Lower values fold sooner, producing more and smaller segments.",
+        c"Documents the write segment holds before it is sealed",
+        c"Lower values seal and promote sooner, producing more and smaller segments. 12,288 is where TIN seals a write segment of short documents.",
         &WRITE_BUFFER_DOCS,
         1,
         1_000_000,
@@ -709,6 +709,14 @@ fn run_page<'a>(buffer: &'a Buffer, what: &str) -> Result<(u32, &'a [u8]), Strin
     }
     layout::chain(buffer.page())
         .map_err(|message| format!("Stannum {what}: page {block}: {message}"))
+}
+
+/// Fails unless the page is a page a retired chain may hold: a run page,
+/// or a buffer page of a promoted write segment.
+fn expect_retired_page(buffer: &Buffer, what: &str) {
+    if buffer.kind() != KIND_BUFFER {
+        expect_run_page(buffer, what);
+    }
 }
 
 /// Fails unless the page is a run page of `what`.
@@ -1708,7 +1716,7 @@ unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
 unsafe fn expect_chain_end(index: pg_sys::Relation, run: Run) {
     let what = format!("released run at page {}", run.first);
     let last = unsafe { Buffer::read(index, run.last, false) };
-    expect_run_page(&last, &what);
+    expect_retired_page(&last, &what);
     if last.chain().0 != NONE {
         corrupt(format!(
             "Stannum {what}: page {} is not the chain's last page",
@@ -1726,9 +1734,10 @@ unsafe fn expect_chain_end(index: pg_sys::Relation, run: Run) {
 unsafe fn link_chain(index: pg_sys::Relation, last: u32, next: u32) {
     unsafe {
         let buffer = Buffer::read(index, last, true);
-        expect_run_page(&buffer, &format!("released run ending at page {last}"));
+        expect_retired_page(&buffer, &format!("released run ending at page {last}"));
+        let kind = buffer.kind();
         let payload = layout::chain_payload(next, buffer.chain().1);
-        write_page(index, &buffer, false, KIND_RUN, &payload);
+        write_page(index, &buffer, false, kind, &payload);
     }
 }
 
@@ -1780,7 +1789,7 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
                 index,
                 pending.run.first,
                 pending.run.blocks.min(budget),
-                KIND_RUN,
+                verify::RETIRED,
             );
             let freed = pages.len() as u32;
             budget -= freed;
@@ -1823,6 +1832,50 @@ struct BufferIndex {
 
 thread_local! {
     static BUFFER_INDEX: RefCell<Option<BufferIndex>> = const { RefCell::new(None) };
+    /// Sealed write segments as in-memory indexes, by index identity and
+    /// stamp; a sealed segment never changes, so an index is built once.
+    static SEALED_INDEXES: RefCell<Vec<(u64, u32, Rc<MutableIndex>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Sealed segments' indexes a backend keeps: two per index, for a few.
+const SEALED_INDEXES_KEPT: usize = 8;
+
+/// A sealed write segment as an in-memory index, built on first use. `None`
+/// when a page read is stale against `published` (see [`read_buffer_range`]).
+///
+/// # Safety
+/// The caller holds the meta page of `index`, which lists `state` sealed.
+unsafe fn sealed_index(
+    index: pg_sys::Relation,
+    identity: u64,
+    state: &BufferState,
+    published: Option<u64>,
+) -> Option<Rc<MutableIndex>> {
+    let found = SEALED_INDEXES.with_borrow(|cached| {
+        cached
+            .iter()
+            .find(|(id, stamp, _)| *id == identity && *stamp == state.epoch)
+            .map(|(_, _, index)| index.clone())
+    });
+    if found.is_some() {
+        return found;
+    }
+    let mut pages = vec![state.head];
+    let stream =
+        unsafe { read_buffer_range(index, &mut pages, 0, state.bytes as usize, published) }?;
+    let built = Rc::new(MutableIndex::default());
+    let mut at = 0;
+    while at < stream.len() {
+        at += codec_in(built.add_encoded(&stream[at..]), "sealed write segment");
+    }
+    SEALED_INDEXES.with_borrow_mut(|cached| {
+        if cached.len() >= SEALED_INDEXES_KEPT {
+            cached.remove(0);
+        }
+        cached.push((identity, state.epoch, built.clone()));
+    });
+    Some(built)
 }
 
 /// Reads buffer bytes `[from, to)` using and extending the page map.
@@ -2086,6 +2139,50 @@ fn expect_buffer_page(buffer: &Buffer) {
     }
 }
 
+/// Writes `data`, holding `docs` documents, to a chain of fresh buffer
+/// pages: a sealed write segment's contents under stamp `epoch`. Nothing
+/// published references the pages until the caller's [`write_meta`];
+/// should that never happen, they are orphans for VACUUM's orphan pass.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn write_chain(index: pg_sys::Relation, data: &[u8], docs: u32, epoch: u32) -> BufferState {
+    unsafe {
+        let chunks: Vec<&[u8]> = if data.is_empty() {
+            vec![&[][..]]
+        } else {
+            data.chunks(CHAIN_CAPACITY).collect()
+        };
+        // Last page first, so each links to one already written.
+        let mut next = NONE;
+        let mut tail = NONE;
+        for (i, chunk) in chunks.iter().enumerate().rev() {
+            pgrx::check_for_interrupts!();
+            let buffer = Buffer::allocate(index);
+            write_page(
+                index,
+                &buffer,
+                true,
+                KIND_BUFFER,
+                &layout::chain_payload(next, chunk),
+            );
+            next = buffer.block();
+            if i + 1 == chunks.len() {
+                tail = next;
+            }
+        }
+        BufferState {
+            version: 0,
+            epoch,
+            head: next,
+            tail,
+            tail_used: chunks.last().expect("one chunk at least").len() as u32,
+            bytes: data.len() as u32,
+            docs,
+        }
+    }
+}
+
 /// Replaces the write buffer's contents with `data`, holding `docs`
 /// documents, without changing a byte the published buffer reads.
 ///
@@ -2118,7 +2215,7 @@ unsafe fn replace_buffer(index: pg_sys::Relation, state: &mut BufferState, data:
             (next, data.to_vec())
         };
         let (stale, rest) =
-            verify::chain_pages(index, after_tail, chunks.len() as u32, KIND_BUFFER);
+            verify::chain_pages(index, after_tail, chunks.len() as u32, &[KIND_BUFFER]);
         if stale.len() < chunks.len() && rest != NONE {
             corrupt(format!(
                 "Stannum write buffer: page {rest} past the tail is not a buffer page"
@@ -2265,30 +2362,6 @@ unsafe fn release_entry(index: pg_sys::Relation, meta: &mut Meta, entry: Segment
         release(index, meta, entry.run);
         release(index, meta, entry.map);
         release(index, meta, entry.dead);
-    }
-}
-
-/// Publishes a built segment: writes its run, appends a directory entry and
-/// then spends the caller's merge budget.
-///
-/// # Safety
-/// The caller holds the meta page of `index` exclusively, and the directory
-/// has room for the entry (see [`make_room`]).
-unsafe fn add_segment(
-    index: pg_sys::Relation,
-    meta: &mut Meta,
-    built: Built,
-    origin: Origin,
-    budget: u64,
-) {
-    unsafe {
-        let (run, map) = write_segment_run(index, &built.blob);
-        // Maintenance reads published segments into owned buffers. Release the
-        // caller's encoded copy before that read and any subsequent merge.
-        let entry = new_entry(meta, run, map, &built, origin);
-        drop(built);
-        meta.segments.push(entry);
-        maintain(index, meta, budget);
     }
 }
 
@@ -2572,37 +2645,208 @@ unsafe fn merge_segments(index: pg_sys::Relation, entries: &[SegmentEntry]) -> O
     built
 }
 
-/// The write buffer's documents as one segment blob, with its document
-/// count and total length.
-///
-/// # Safety
-/// The caller holds the meta page of `index`; `buffer` is what it records.
-unsafe fn buffer_segment(index: pg_sys::Relation, buffer: &BufferState) -> Option<Built> {
-    let stream = unsafe { read_buffer_stream(index, buffer) };
-    let mut builder = SegmentBuilder::default();
-    for record in segment::forward::records(&stream) {
-        codec_in(
-            builder.add_record(&codec_in(record, "write buffer")),
-            "write buffer",
-        );
-    }
-    finish_builder(builder)
-}
+// --- Sealing and promotion ------------------------------------------------------
+//
+// The write buffer is TIN's mutable write segment. When it is full it is
+// sealed in place: its chain stops taking documents and joins the sealed
+// list, and a fresh chain takes the next insert. Sealing writes one page.
+// Promotion turns a sealed write segment into an immutable segment: it is
+// built from the sealed chain without the meta lock and published as one
+// directory change that adds the segment and retires the chain. Until then
+// readers see the sealed documents through the sealed chain, as a mutable
+// source: its documents count towards BM25's statistics but not towards
+// elision, which counts immutable segments only (TIN's rule).
 
-/// Folds the write buffer into a new segment, spends up to `budget` input
-/// documents on merges under the lock, and starts the buffer over with the
-/// encoded documents `records` (see [`replace_buffer`]).
+/// Seals the write buffer and starts an empty one. Writes one page, the new
+/// buffer's head; the sealed chain is left as it is.
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively; `meta` is what it
-/// records, the buffer holds a document, and the directory has room.
-unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta, records: &[u8], docs: u32, budget: u64) {
+/// records, the buffer holds a document and the sealed list has room.
+unsafe fn seal(index: pg_sys::Relation, meta: &mut Meta) {
     unsafe {
-        if let Some(built) = buffer_segment(index, &meta.buffer) {
-            add_segment(index, meta, built, Origin::Promotion, budget);
-        }
-        replace_buffer(index, &mut meta.buffer, records, docs);
+        let head = Buffer::allocate(index);
+        write_page(
+            index,
+            &head,
+            true,
+            KIND_BUFFER,
+            &layout::chain_payload(NONE, &[]),
+        );
+        let stamp = meta.next_generation;
+        meta.next_generation = meta.next_generation.checked_add(1).unwrap_or_else(|| {
+            pgrx::error!("Stannum segment generations exhausted; REINDEX required")
+        });
+        let old = meta.buffer;
+        meta.sealed.push(BufferState {
+            epoch: stamp,
+            ..old
+        });
+        meta.buffer = BufferState {
+            version: old.version.wrapping_add(1),
+            epoch: old.epoch.wrapping_add(1),
+            head: head.block(),
+            tail: head.block(),
+            tail_used: 0,
+            bytes: 0,
+            docs: 0,
+        };
     }
+}
+
+/// Splits encoded forward records into consecutive pieces of at most `cap`
+/// bytes each (a record larger than `cap` alone), and into at most `pieces`
+/// pieces whatever the cap.
+fn split_records(stream: &[u8], cap: Option<u64>, pieces: usize) -> Vec<Vec<ForwardRecord>> {
+    let mut records: Vec<(ForwardRecord, u64)> = Vec::new();
+    let mut at = 0usize;
+    while at < stream.len() {
+        let (record, len) = codec_in(ForwardRecord::decode(&stream[at..]), "sealed write segment");
+        records.push((record, len as u64));
+        at += len;
+    }
+    let total: u64 = records.iter().map(|(_, len)| *len).sum();
+    let floor = total.div_ceil(pieces.max(1) as u64);
+    let cap = cap.map_or(u64::MAX, |cap| cap.max(floor));
+    let mut out: Vec<Vec<ForwardRecord>> = vec![Vec::new()];
+    let mut used = 0u64;
+    for (record, len) in records {
+        if !out.last().expect("a piece").is_empty() && used + len > cap {
+            out.push(Vec::new());
+            used = 0;
+        }
+        used += len;
+        out.last_mut().expect("a piece").push(record);
+    }
+    out
+}
+
+/// What promoting one sealed write segment built.
+struct Promoted {
+    built: Vec<Built>,
+    /// Distinct terms over every piece.
+    terms: u64,
+}
+
+/// Builds the segments a sealed write segment promotes into: one, or with
+/// `cap` pieces of about `cap` encoded bytes, at most `pieces`.
+fn promoted_segments(stream: &[u8], cap: Option<u64>, pieces: usize) -> Promoted {
+    let split = split_records(stream, cap, pieces);
+    let several = split.len() > 1;
+    let mut terms = rustc_hash::FxHashSet::<String>::default();
+    let mut built = Vec::with_capacity(split.len());
+    for piece in split {
+        let mut builder = SegmentBuilder::default();
+        for record in &piece {
+            pgrx::check_for_interrupts!();
+            if several {
+                terms.extend(record.terms.iter().map(|term| term.term.clone()));
+            }
+            codec_in(builder.add_record(record), "sealed write segment");
+        }
+        built.extend(finish_builder(builder));
+    }
+    let terms = if several {
+        terms.len() as u64
+    } else {
+        built.first().map_or(0, |built| built.terms)
+    };
+    Promoted { built, terms }
+}
+
+/// Promotes up to `limit` sealed write segments, oldest first, each into an
+/// immutable segment of origin promotion (with `cap`, several of about `cap`
+/// encoded bytes), spending up to `budget` input documents on merges under
+/// the lock as each is published. Each is built without the meta lock,
+/// under the maintenance lock, so that neither another promotion nor
+/// VACUUM's orphan pass touches what it writes before publication, and is
+/// published only if the sealed segment is still listed unchanged: the
+/// segments join the directory and the sealed chain is retired in one meta
+/// page write.
+///
+/// # Safety
+/// `index` is a live LDP2 index the caller may write; no buffer is locked.
+pub unsafe fn promote_sealed(
+    index: pg_sys::Relation,
+    limit: usize,
+    cap: Option<u64>,
+    budget: u64,
+) -> FoldReport {
+    let mut report = FoldReport::default();
+    unsafe { lock_maintenance(index) };
+    let mut attempts = 0;
+    while (report.consumed as usize) < limit && attempts < 2 * MAX_SEALED + 2 * limit {
+        attempts += 1;
+        pgrx::check_for_interrupts!();
+        let meta = unsafe { read_meta(index, false) }.1;
+        let Some(state) = meta.sealed.first().copied() else {
+            break;
+        };
+        let identity = meta.identity;
+        let room = MAX_SEGMENTS.saturating_sub(meta.segments.len());
+        if room == 0 {
+            unsafe { make_room(index, identity) };
+            continue;
+        }
+        let stream = unsafe { read_buffer_stream(index, &state) };
+        let (chain, ended) =
+            unsafe { verify::chain_pages(index, state.head, u32::MAX, &[KIND_BUFFER]) };
+        if ended != NONE || chain.is_empty() {
+            // Rewritten by VACUUM meanwhile: look again.
+            continue;
+        }
+        let promoted = promoted_segments(&stream, cap, room);
+        drop(stream);
+        race_point("promote:built");
+        let mut runs = Vec::with_capacity(promoted.built.len());
+        for built in &promoted.built {
+            runs.push(unsafe { write_segment_run(index, &built.blob) });
+        }
+        race_point("promote:written");
+        let (guard, mut meta) = unsafe { read_meta(index, true) };
+        if meta.identity != identity
+            || meta.sealed.first() != Some(&state)
+            || meta.segments.len() + runs.len() > MAX_SEGMENTS
+        {
+            drop(guard);
+            for (run, map) in runs {
+                unsafe {
+                    discard_run(index, run);
+                    discard_run(index, map);
+                }
+            }
+            continue;
+        }
+        meta.sealed.remove(0);
+        for ((run, map), built) in runs.into_iter().zip(&promoted.built) {
+            let entry = new_entry(&mut meta, run, map, built, Origin::Promotion);
+            meta.segments.push(entry);
+        }
+        let retired = Run {
+            first: state.head,
+            blocks: chain.len() as u32,
+            bytes: state.bytes,
+            last: *chain.last().expect("a chain has a head"),
+        };
+        unsafe {
+            release(index, &mut meta, retired);
+            maintain(index, &mut meta, budget);
+        }
+        race_point("promote:released");
+        unsafe { write_meta(index, &guard, &meta) };
+        drop(guard);
+        pgrx::check_for_interrupts!();
+        report.consumed += 1;
+        report.segments += promoted.built.len() as u32;
+        report.docs += promoted
+            .built
+            .iter()
+            .map(|built| u64::from(built.documents))
+            .sum::<u64>();
+        report.terms += promoted.terms;
+    }
+    unsafe { unlock_maintenance(index) };
+    report
 }
 
 // --- Build --------------------------------------------------------------------
@@ -2659,6 +2903,7 @@ unsafe fn empty_meta(index: pg_sys::Relation) -> Meta {
             next_generation: 1,
             segments: Vec::new(),
             pending: Vec::new(),
+            sealed: Vec::new(),
         }
     }
 }
@@ -2811,8 +3056,12 @@ impl Builder {
                 for retired in pending {
                     pgrx::check_for_interrupts!();
                     wal::log_reclaim(index, retired.xid);
-                    let (pages, _) =
-                        verify::chain_pages(index, retired.run.first, retired.run.blocks, KIND_RUN);
+                    let (pages, _) = verify::chain_pages(
+                        index,
+                        retired.run.first,
+                        retired.run.blocks,
+                        verify::RETIRED,
+                    );
                     free_pages(index, &pages, retired.xid);
                 }
                 pack(index);
@@ -2868,7 +3117,7 @@ unsafe fn pack(index: pg_sys::Relation) {
             }
             let (map, _) = write_run_into(index, &table, &mut free);
             for old in [entry.run, entry.map] {
-                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, KIND_RUN);
+                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, &[KIND_RUN]);
                 free_pages(index, &pages, stamp);
                 free.extend(pages);
             }
@@ -2995,9 +3244,9 @@ unsafe fn compact(index: pg_sys::Relation) {
 
 // --- Insert -------------------------------------------------------------------
 
-/// Whether appending a record of `bytes` to `buffer` folds it first: the
+/// Whether appending a record of `bytes` to `buffer` seals it first: the
 /// buffer holds a document and the record would pass either cap.
-unsafe fn folds(index: pg_sys::Relation, buffer: &BufferState, bytes: usize) -> bool {
+unsafe fn seals(index: pg_sys::Relation, buffer: &BufferState, bytes: usize) -> bool {
     buffer.docs > 0
         && (buffer.bytes as usize + bytes > unsafe { write_buffer_bytes(index) }
             || buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32)
@@ -3045,19 +3294,16 @@ pub unsafe fn insert(
                     drop(guard);
                     break None;
                 }
-                if current.segments.len() < MAX_SEGMENTS
-                    || !folds(index, &current.buffer, bytes.len())
+                if current.sealed.len() < MAX_SEALED || !seals(index, &current.buffer, bytes.len())
                 {
                     break Some((guard, current));
                 }
-                // The fold would overflow the on-disk directory. Merging to
-                // make room under this lock would hold off cancellation and
-                // every reader for as long as the merge takes, whatever its
-                // size, so it runs unlocked and this insert looks again.
+                // A third sealed write segment: the oldest is promoted first,
+                // without this lock, which would hold off cancellation and
+                // every reader for as long as the build takes, and this insert
+                // looks again.
                 drop(guard);
-                lock_maintenance(index);
-                make_room(index, identity);
-                unlock_maintenance(index);
+                promote_sealed(index, 1, None, 0);
             };
             if let Some((guard, current)) = locked {
                 // Use the latest buffer/directory. Appends, folds and VACUUM
@@ -3068,39 +3314,40 @@ pub unsafe fn insert(
             // validate the persisted tokenizer nevertheless, never publishing
             // bytes encoded for a different index identity or pipeline.
         };
-        let folded = folds(index, &meta.buffer, bytes.len());
-        // Who runs the merges this fold leaves behind (see
-        // crate::maintenance): a worker, this session, or nobody. When
-        // nobody here does, the fold spends no merge budget under the lock.
-        let plan = if folded {
+        let sealed = seals(index, &meta.buffer, bytes.len());
+        // Who promotes the write segment this seal leaves behind and runs
+        // the merges after it (see crate::maintenance): a worker, this
+        // session after publishing, or nobody until promote(), VACUUM or a
+        // third seal.
+        let plan = if sealed {
             crate::maintenance::plan(index)
         } else {
             crate::maintenance::Plan::Skip
         };
-        if folded {
-            let budget = match plan {
-                crate::maintenance::Plan::Inline => MAX_MERGE_DOCS.get().max(0) as u64,
-                crate::maintenance::Plan::Defer | crate::maintenance::Plan::Skip => 0,
-            };
-            fold(index, &mut meta, &bytes, 1, budget);
-        } else {
-            append_to_buffer(index, &mut meta.buffer, &bytes);
-            meta.buffer.docs += 1;
+        if sealed {
+            seal(index, &mut meta);
+            race_point("insert:sealed");
         }
+        append_to_buffer(index, &mut meta.buffer, &bytes);
+        meta.buffer.docs += 1;
         race_point("insert:buffered");
         write_meta(index, &meta_buffer, &meta);
         drop(meta_buffer);
         // Buffer content locks defer PostgreSQL cancel/die interrupts.
         // Publication is complete; deliver any pending cancel now.
         pgrx::check_for_interrupts!();
+        let inline = || {
+            promote_sealed(index, MAX_SEALED, None, MAX_MERGE_DOCS.get().max(0) as u64);
+            merge_deferred(index);
+        };
         match plan {
             crate::maintenance::Plan::Defer => {
-                if !crate::maintenance::request(index, crate::maintenance::queue::kind::AFTER_FOLD)
+                if !crate::maintenance::request(index, crate::maintenance::queue::kind::AFTER_SEAL)
                 {
-                    merge_deferred(index);
+                    inline();
                 }
             }
-            crate::maintenance::Plan::Inline => merge_deferred(index),
+            crate::maintenance::Plan::Inline => inline(),
             crate::maintenance::Plan::Skip => {}
         }
     }
@@ -3185,50 +3432,6 @@ unsafe fn merge_deferred(index: pg_sys::Relation) {
 
 use crate::maintenance::ops::{FoldReport, MergeReport, MergeRequest, PassReport, PassRequest};
 
-/// Folds the write buffer into a segment now, whatever its size, and
-/// leaves it empty; merges nothing. An empty buffer is left alone. A
-/// directory at its on-disk bound first makes room, as an insert does.
-///
-/// # Safety
-/// `index` is a live LDP2 index the caller may write; no buffer is locked.
-pub unsafe fn fold_buffer(index: pg_sys::Relation) -> FoldReport {
-    unsafe {
-        loop {
-            pgrx::check_for_interrupts!();
-            let (guard, mut meta) = read_meta(index, true);
-            if meta.buffer.docs == 0 {
-                return FoldReport::default();
-            }
-            if meta.segments.len() >= MAX_SEGMENTS {
-                let identity = meta.identity;
-                drop(guard);
-                lock_maintenance(index);
-                make_room(index, identity);
-                unlock_maintenance(index);
-                continue;
-            }
-            let built = buffer_segment(index, &meta.buffer);
-            let (docs, terms) = built
-                .as_ref()
-                .map_or((0, 0), |built| (built.documents, built.terms));
-            let segments = u32::from(built.is_some());
-            if let Some(built) = built {
-                add_segment(index, &mut meta, built, Origin::Promotion, 0);
-            }
-            replace_buffer(index, &mut meta.buffer, &[], 0);
-            race_point("promote:folded");
-            write_meta(index, &guard, &meta);
-            drop(guard);
-            pgrx::check_for_interrupts!();
-            return FoldReport {
-                docs: u64::from(docs),
-                terms,
-                segments,
-            };
-        }
-    }
-}
-
 /// Merges the smallest segments, at most `max_fan_in` at a time and within
 /// the merge input cap, until the directory holds `target` segments. Each
 /// merge is built without the meta lock under the maintenance lock and
@@ -3307,6 +3510,9 @@ pub unsafe fn merge_toward(index: pg_sys::Relation, request: MergeRequest) -> Me
 /// `index` is a live LDP2 index the caller may write; no buffer is locked.
 pub unsafe fn maintenance_pass(index: pg_sys::Relation, request: PassRequest) -> PassReport {
     unsafe {
+        if request.promote {
+            promote_sealed(index, MAX_SEALED, None, 0);
+        }
         if request.reclaim {
             reclaim_pending(index);
         }
@@ -3326,7 +3532,8 @@ pub type Source = (Box<dyn Index>, Option<Rc<Vec<u8>>>);
 /// Segment pages are fetched on demand through the readers; the view keeps
 /// the index relation open for as long as it lives.
 pub struct View {
-    /// Immutable segments first, then the write buffer as in-memory segments.
+    /// Immutable segments first, then the sealed write segments and the
+    /// write buffer as in-memory segments.
     pub sources: Vec<Source>,
     /// How many leading entries of `sources` are immutable segments.
     pub immutable_sources: usize,
@@ -3343,6 +3550,9 @@ pub struct View {
     /// The write buffer's epoch: VACUUM starts a new one when it rewrites
     /// the buffer without the documents it removed.
     buffer_epoch: u32,
+    /// The sealed write segments' stamps: VACUUM gives a sealed segment it
+    /// rewrites without the documents it removed a new one.
+    sealed_stamps: Vec<u32>,
 }
 
 /// Whether the directory still lists exactly `view`'s segments with the dead
@@ -3359,6 +3569,11 @@ pub unsafe fn view_is_current(index_oid: pg_sys::Oid, view: &View) -> bool {
         let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
         let (_buffer, meta) = read_meta(relation.as_ptr(), false);
         meta.buffer.epoch == view.buffer_epoch
+            && meta
+                .sealed
+                .iter()
+                .map(|state| state.epoch)
+                .eq(view.sealed_stamps.iter().copied())
             && meta.segments.len() == view.keys.len()
             && meta
                 .segments
@@ -3403,8 +3618,15 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 );
             }
             let published = recovery.then(|| meta_buffer.lsn());
+            let sealed: Option<Vec<Rc<MutableIndex>>> = meta
+                .sealed
+                .iter()
+                .map(|state| sealed_index(index, meta.identity, state, published))
+                .collect();
             let buffer = if meta.buffer.docs > 0 {
-                match buffer_index(index, meta.identity, &meta.buffer, published) {
+                match buffer_index(index, meta.identity, &meta.buffer, published)
+                    .filter(|_| sealed.is_some())
+                {
                     Some(buffer) => Some(buffer),
                     None => {
                         // Replay changed a buffer page after the meta page we
@@ -3425,6 +3647,12 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 }
             } else {
                 None
+            };
+            let Some(sealed) = sealed else {
+                drop(meta_buffer);
+                stale_reads += 1;
+                pg_sys::pg_usleep(1000);
+                continue;
             };
             // The meta page is released before the segment readers load:
             // segment runs are freed only past every snapshot that could
@@ -3456,13 +3684,19 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 dead_sets.push(dead_set);
             }
             let immutable_sources = sources.len();
+            for sealed in sealed {
+                sources.push((Box::new(sealed), None));
+                labels.push("sealed write segment".to_owned());
+                dead_sets.push(Rc::default());
+            }
             if let Some(buffer) = buffer {
                 sources.push((Box::new(buffer), None));
                 labels.push("write buffer".to_owned());
                 dead_sets.push(Rc::default());
             }
-            // Segments are immutable; the buffer index was extended under the
-            // shared meta lock, so a fold cannot rewrite pages underneath it.
+            // Segments are immutable; the buffer index was extended and the
+            // sealed ones built under the shared meta lock, so neither a seal
+            // nor VACUUM rewrote pages underneath them.
             drop(relation);
             return View {
                 sources,
@@ -3472,6 +3706,7 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 keys,
                 dead_runs,
                 buffer_epoch: meta.buffer.epoch,
+                sealed_stamps: meta.sealed.iter().map(|state| state.epoch).collect(),
             };
         }
     }
@@ -3657,7 +3892,7 @@ unsafe fn discard_run(index: pg_sys::Relation, run: Run) {
     if run.is_empty() {
         return;
     }
-    let (pages, _) = unsafe { verify::chain_pages(index, run.first, run.blocks, KIND_RUN) };
+    let (pages, _) = unsafe { verify::chain_pages(index, run.first, run.blocks, &[KIND_RUN]) };
     let stamp = unsafe { pg_sys::ReadNextTransactionId() }.into_inner();
     unsafe { free_pages(index, &pages, stamp) };
 }
@@ -3800,6 +4035,54 @@ pub unsafe fn bulk_delete(
                 live += scanned_live;
                 removed += scanned_removed;
             }
+            // Sealed write segments are rewritten without their dead
+            // documents into fresh chains, the old ones retired; at most two
+            // of them, each bounded by the buffer's caps.
+            let mut position = 0;
+            while position < meta.sealed.len() {
+                let state = meta.sealed[position];
+                let stream = unsafe { read_buffer_stream(index, &state) };
+                let mut kept = Vec::with_capacity(stream.len());
+                let mut kept_docs = 0u32;
+                let mut dropped = false;
+                for record in segment::forward::records(&stream) {
+                    let record = codec_in(record, "sealed write segment");
+                    if is_dead(record.tid) {
+                        removed += 1;
+                        dropped = true;
+                    } else {
+                        live += 1;
+                        kept_docs += 1;
+                        codec(record.encode(&mut kept));
+                    }
+                }
+                if !dropped {
+                    position += 1;
+                    continue;
+                }
+                changed = true;
+                let (chain, _) =
+                    unsafe { verify::chain_pages(index, state.head, u32::MAX, &[KIND_BUFFER]) };
+                let retired = Run {
+                    first: state.head,
+                    blocks: chain.len() as u32,
+                    bytes: state.bytes,
+                    last: *chain.last().expect("a chain has a head"),
+                };
+                if kept_docs == 0 {
+                    meta.sealed.remove(position);
+                } else {
+                    let stamp = meta.next_generation;
+                    meta.next_generation =
+                        meta.next_generation.checked_add(1).unwrap_or_else(|| {
+                            pgrx::error!("Stannum segment generations exhausted; REINDEX required")
+                        });
+                    meta.sealed[position] = unsafe { write_chain(index, &kept, kept_docs, stamp) };
+                    position += 1;
+                }
+                unsafe { release(index, &mut meta, retired) };
+                race_point("bulk_delete:sealed");
+            }
             if meta.buffer.docs > 0 {
                 let stream = unsafe { read_buffer_stream(index, &meta.buffer) };
                 let mut kept = Vec::with_capacity(stream.len());
@@ -3845,6 +4128,11 @@ pub unsafe fn bulk_delete(
 /// `index` is a live LDP2 index locked for VACUUM.
 pub unsafe fn cleanup(index: pg_sys::Relation) {
     unsafe {
+        // Sealed write segments wait for promote() or a third seal in
+        // manual mode, as in TIN; otherwise VACUUM promotes what is left.
+        if !crate::maintenance::manual() {
+            promote_sealed(index, MAX_SEALED, None, 0);
+        }
         maintain_segments(index);
         reclaim_pending(index);
         reclaim_orphans(index);
@@ -4084,7 +4372,7 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
         // held up the insert that triggered the fold for minutes.
         let limit = pending.run.blocks.min(left as u32);
         let (pages, next) =
-            unsafe { verify::chain_pages(index, pending.run.first, limit, KIND_RUN) };
+            unsafe { verify::chain_pages(index, pending.run.first, limit, verify::RETIRED) };
         left -= pages.len().min(left);
         removable.push((*pending, pages, next));
     }
@@ -4383,7 +4671,7 @@ pub mod testing {
             let run = write_run(index, &segment::ordinals::encode(&ordinals));
             let old = attach_dead_list(&mut meta, i, run);
             if !old.is_empty() {
-                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, KIND_RUN);
+                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, &[KIND_RUN]);
                 let stamp = pg_sys::ReadNextTransactionId().into_inner();
                 free_pages(index, &pages, stamp);
                 // Searches read the map's upper levels, which only a vacuum
@@ -4406,7 +4694,7 @@ pub mod testing {
                 .iter()
                 .map(|entry| {
                     let chain =
-                        |run: Run| verify::chain_pages(index, run.first, run.blocks, KIND_RUN).0;
+                        |run: Run| verify::chain_pages(index, run.first, run.blocks, &[KIND_RUN]).0;
                     (chain(entry.run), chain(entry.map))
                 })
                 .collect()
@@ -4604,6 +4892,26 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 sequence: None,
             });
         }
+        for (i, state) in meta.sealed.iter().enumerate() {
+            let stream = read_buffer_stream(index, state);
+            let lengths: u64 = segment::forward::records(&stream)
+                .map(|record| u64::from(codec_in(record, "sealed write segment").doc_len))
+                .sum();
+            let (pages, _) = verify::chain_pages(index, state.head, u32::MAX, &[KIND_BUFFER]);
+            rows.push(SegmentRow {
+                ordinal: (meta.segments.len() + usize::from(meta.buffer.docs > 0) + i) as i64,
+                kind: "sealed".to_owned(),
+                root_block: i64::from(state.head),
+                docs: i64::from(state.docs),
+                dead_docs: 0,
+                sum_doc_lengths: lengths as i64,
+                total_pages: pages.len() as i64,
+                generation: i64::from(state.epoch),
+                npostings: None,
+                origin: None,
+                sequence: None,
+            });
+        }
         rows
     }
 }
@@ -4650,6 +4958,11 @@ pub unsafe fn document_count(index: pg_sys::Relation) -> u64 {
         .iter()
         .map(|entry| u64::from(entry.docs))
         .sum::<u64>()
+        + meta
+            .sealed
+            .iter()
+            .map(|state| u64::from(state.docs))
+            .sum::<u64>()
         + u64::from(meta.buffer.docs)
 }
 

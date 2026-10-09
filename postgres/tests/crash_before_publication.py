@@ -13,12 +13,21 @@ a race point, after flushing WAL, and checks the recovered index:
 
 - drain: a merge that drained a full pending list of removable runs and
   joined the runs it retired into the list (race point merge:released);
-- fold: an insert that folded the write buffer and started it over with
-  its own document (insert:buffered);
+- fold: an insert that sealed the write buffer and appended its own
+  document to a fresh one (insert:buffered);
+- seal: the same insert crashing right after the seal wrote the fresh
+  buffer's head page (insert:sealed);
+- promote: promote() having written the segment of a sealed write segment
+  (promote:written), and having retired the sealed chain and spent its
+  merge budget (promote:released), before the meta page;
 - vacuum: VACUUM rewriting the write buffer without its dead documents
   (bulk_delete:buffered);
-- bound: an insert into a full directory (96 entries) merging its two
-  smallest entries without the meta lock before it folds
+- sealed: VACUUM rewriting a sealed write segment without its dead
+  documents into a fresh chain (bulk_delete:sealed);
+- liveness: VACUUM having written segments' new dead lists, which say
+  which documents are dead, before publishing them (bulk_delete:scanned);
+- bound: an insert into a full directory (96 entries) whose promotion
+  merges the two smallest entries without the meta lock first
   (maintenance:built).
 
 One case terminates instead of crashing:
@@ -134,9 +143,104 @@ def main():
             assert sql(f"SELECT string_agg(id::text, ',') FROM drained WHERE body ==> 'w{n}';") == str(n), n
         return orphans
 
+    def seal():
+        """An insert seals the buffer, writes the fresh buffer's head page
+        and crashes before the meta page: the buffer is as it was."""
+        tuned = ('SET stannum.write_buffer_docs=2; SET stannum.index_maintenance_mode=manual; '
+                 'SET stannum.deferred_merge_docs=0;')
+        sql('CREATE TABLE sealing(id int, body text); CREATE INDEX sealing_idx ON sealing USING stannum(body);')
+        sql(tuned + "INSERT INTO sealing VALUES (1, 'needle one'), (2, 'needle two');")
+        crash(tuned, "INSERT INTO sealing VALUES (3, 'needle three');", 'insert:sealed')
+        orphans = assert_only_orphans('sealing_idx')
+        assert orphans > 0, 'the fresh head page was not written before the crash'
+        assert sql("SELECT string_agg(kind || ':' || docs, ',' ORDER BY ordinal) "
+                   "FROM stannum.segment_info('sealing_idx');") == 'mutable:2'
+        sql(tuned + "INSERT INTO sealing VALUES (3, 'needle three');")
+        assert sql("SELECT string_agg(kind || ':' || docs, ',' ORDER BY ordinal) "
+                   "FROM stannum.segment_info('sealing_idx');") == 'mutable:1,sealed:2'
+        sql('VACUUM (INDEX_CLEANUP ON) sealing;')
+        assert_clean('sealing_idx')
+        assert sql("SELECT string_agg(id::text, ',' ORDER BY id) FROM sealing WHERE body ==> 'needle';") == '1,2,3'
+        return orphans
+
+    def promote():
+        """promote() writes a sealed write segment's segment and crashes
+        before the meta page, at both points: the sealed segment is still
+        listed and its rows found; a later promote() publishes."""
+        tuned = 'SET stannum.write_buffer_docs=3; SET stannum.index_maintenance_mode=manual;'
+        directory = ("SELECT string_agg(kind || ':' || docs || coalesce(':' || origin, ''), ',' "
+                     "ORDER BY ordinal) FROM stannum.segment_info('promoted_idx');")
+        sql('CREATE TABLE promoted(id int, body text); CREATE INDEX promoted_idx ON promoted USING stannum(body);')
+        sql(tuned + "INSERT INTO promoted SELECT n, 'needle w' || n FROM generate_series(1, 4) n;")
+        assert sql(directory) == 'mutable:1,sealed:3', sql(directory)
+        orphans = 0
+        for at in ('promote:written', 'promote:released'):
+            crash(tuned, "SELECT stannum.promote('promoted_idx');", at)
+            found = assert_only_orphans('promoted_idx')
+            assert found > orphans, (at, 'the segment was not written before the crash')
+            orphans = found
+            assert sql(directory) == 'mutable:1,sealed:3', (at, sql(directory))
+            assert sql("SELECT count(*) FROM promoted WHERE body ==> 'needle';") == '4'
+        assert sql("SELECT row(p.*)::text FROM stannum.promote('promoted_idx') p;") == '(1,1,3,4)'
+        assert sql(directory) == 'immutable:3:promotion,mutable:1'
+        sql('VACUUM (INDEX_CLEANUP ON) promoted;')
+        assert_clean('promoted_idx')
+        for n in (1, 3, 4):
+            assert sql(f"SELECT string_agg(id::text, ',') FROM promoted WHERE body ==> 'w{n}';") == str(n), n
+        return orphans
+
+    def sealed():
+        """VACUUM rewrites a sealed write segment without its dead half into
+        a fresh chain and crashes before the meta page."""
+        sql("CREATE TABLE sealed_vac(id int, body text);"
+            "CREATE INDEX sealed_vac_idx ON sealed_vac USING stannum(body);"
+            "SET stannum.write_buffer_docs=300; SET stannum.index_maintenance_mode=manual;"
+            "INSERT INTO sealed_vac SELECT n, 'needle w' || n || repeat(' filler', 20) "
+            "FROM generate_series(1, 301) n;")
+        directory = ("SELECT string_agg(kind || ':' || docs, ',' ORDER BY ordinal) "
+                     "FROM stannum.segment_info('sealed_vac_idx');")
+        assert sql(directory) == 'mutable:1,sealed:300', sql(directory)
+        dead = sql("WITH gone AS (DELETE FROM sealed_vac WHERE id % 2 = 0 AND id <= 300 RETURNING ctid) "
+                   "SELECT array_agg(ctid::text) FROM gone;")
+        crash('', f"SELECT tests.direct_bulk_delete('sealed_vac_idx'::regclass::oid, '{dead}');",
+              'bulk_delete:sealed')
+        orphans = assert_only_orphans('sealed_vac_idx')
+        assert orphans > 0, 'the fresh chain was not written before the crash'
+        assert sql(directory) == 'mutable:1,sealed:300'
+        assert sql("SELECT count(*) FROM sealed_vac WHERE body ==> 'needle';") == '151'
+        sql("SET stannum.index_maintenance_mode=manual; VACUUM (INDEX_CLEANUP ON) sealed_vac;")
+        assert sql(directory) == 'mutable:1,sealed:150', sql(directory)
+        assert_clean('sealed_vac_idx')
+        assert sql("SELECT count(*) FROM sealed_vac WHERE body ==> 'needle';") == '151'
+        return orphans
+
+    def liveness():
+        """VACUUM writes segments' new dead lists and crashes before
+        publishing them: the segments keep their old lists."""
+        sql("CREATE TABLE lively(id int, body text);"
+            "INSERT INTO lively SELECT n, 'needle w' || n FROM generate_series(1, 600) n;"
+            "SET stannum.build_segment_docs=200; SET stannum.merge_tier_factor=64;"
+            "CREATE INDEX lively_idx ON lively USING stannum(body);")
+        dead_docs = "SELECT sum(dead_docs) FROM stannum.segment_info('lively_idx');"
+        assert sql(dead_docs) == '0'
+        dead = sql("WITH gone AS (DELETE FROM lively WHERE id % 3 = 0 RETURNING ctid) "
+                   "SELECT array_agg(ctid::text) FROM gone;")
+        crash('', f"SELECT tests.direct_bulk_delete('lively_idx'::regclass::oid, '{dead}');",
+              'bulk_delete:scanned')
+        orphans = assert_only_orphans('lively_idx')
+        assert orphans > 0, 'no dead list was written before the crash'
+        assert sql(dead_docs) == '0'
+        assert sql("SELECT count(*) FROM lively WHERE body ==> 'needle';") == '400'
+        sql('VACUUM (INDEX_CLEANUP OFF) lively;')
+        assert sql(dead_docs) == '200', sql(dead_docs)
+        sql('VACUUM (INDEX_CLEANUP ON) lively;')
+        assert_clean('lively_idx')
+        assert sql("SELECT count(*) FROM lively WHERE body ==> 'needle';") == '400'
+        return orphans
+
     def fold():
-        """An insert folds the buffer, starts it over with its own document
-        and crashes before the meta page."""
+        """An insert seals the buffer, starts a fresh one with its own
+        document and crashes before the meta page."""
         tuned = 'SET stannum.write_buffer_docs=2; SET stannum.max_merge_docs=0; SET stannum.deferred_merge_docs=0;'
         sql('CREATE TABLE folded(id int, body text); CREATE INDEX folded_idx ON folded USING stannum(body);')
         sql(tuned + "INSERT INTO folded VALUES (1, 'needle one'); INSERT INTO folded VALUES (2, 'needle two');")
@@ -173,22 +277,25 @@ def main():
         without the meta lock and crashes before publishing the merge."""
         tuned = 'SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0; SET stannum.deferred_merge_docs=0;'
         entries = "SELECT count(*) FROM stannum.segment_info('bounded_idx') WHERE kind = 'immutable';"
+        sealed = "SELECT count(*) FROM stannum.segment_info('bounded_idx') WHERE kind = 'sealed';"
         sql('CREATE TABLE bounded(id int, body text); CREATE INDEX bounded_idx ON bounded USING stannum(body);')
-        # One segment per insert: 96 entries, the on-disk bound, and one
-        # document buffered, so the next fold must make room first.
+        # One segment per insert, promoted inline: 96 entries, the on-disk
+        # bound, and one document buffered, so the next seal's promotion
+        # must make room first. The seal publishes before it.
         sql(tuned + "INSERT INTO bounded SELECT n, 'needle w' || n FROM generate_series(1, 97) n;")
         assert sql(entries) == '96'
         crash(tuned, "INSERT INTO bounded VALUES (98, 'needle w98');", 'maintenance:built')
         orphans = assert_only_orphans('bounded_idx')
         assert orphans > 0, 'the merged run was not written before the crash'
         assert sql(entries) == '96'
-        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '97'
-        sql(tuned + "INSERT INTO bounded VALUES (98, 'needle w98');")
+        assert sql(sealed) == '1'
+        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '98'
+        sql(tuned + "INSERT INTO bounded VALUES (99, 'needle w99');")
         assert sql(entries) == '96'
         sql('VACUUM (INDEX_CLEANUP ON) bounded;')
         assert_clean('bounded_idx')
-        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '98'
-        for n in (1, 2, 97, 98):
+        assert sql("SELECT count(*) FROM bounded WHERE body ==> 'needle';") == '99'
+        for n in (1, 2, 97, 98, 99):
             assert sql(f"SELECT string_agg(id::text, ',') FROM bounded WHERE body ==> 'w{n}';") == str(n), n
         return orphans
 
@@ -220,7 +327,8 @@ def main():
         assert sql("SELECT count(*) FROM stannum.segment_info('terminated_idx');") == '1'
         return 0
 
-    cases = {'drain': drain, 'fold': fold, 'vacuum': vacuum, 'bound': bound, 'terminate': terminate}
+    cases = {'drain': drain, 'fold': fold, 'seal': seal, 'promote': promote, 'vacuum': vacuum,
+             'sealed': sealed, 'liveness': liveness, 'bound': bound, 'terminate': terminate}
     selected = sys.argv[1:] or list(cases)
     try:
         command(['initdb', '-D', str(data), '-U', 'postgres', '-A', 'trust', '--no-locale',

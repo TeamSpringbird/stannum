@@ -104,6 +104,12 @@ fn preloaded() -> bool {
     PRELOADED.load(Ordering::Acquire)
 }
 
+/// Whether `stannum.index_maintenance_mode` is manual: sealed write segments
+/// wait for `promote()` (or a third seal), merges for VACUUM and `merge()`.
+pub fn manual() -> bool {
+    MODE.get() == Mode::Manual
+}
+
 /// What the writing session does with the maintenance its fold leaves behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plan {

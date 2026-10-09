@@ -158,17 +158,6 @@ divergences:
     tin: promote(index, 1) writes 68 segments of about 185 documents; elision is unchanged.
     stannum: No promote().
 
-  - id: catalog.S-07h
-    against: [tin-1.0.3, tin-1.0.4]
-    kind: gap
-    captures: [value, zero_cap]
-    summary: Stannum has no promote() function.
-    tin: >
-      promote(index regclass, extent_cap_bytes bigint DEFAULT NULL) returns
-      TABLE(consumed_controls, linked_segments, docs_promoted, terms_added);
-      a cap of 0 is XX000 "extent_cap_bytes must be positive".
-    stannum: No promote().
-
   - id: limits.at_least_near.2
     against: tin-1.0.3
     kind: limit

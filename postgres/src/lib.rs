@@ -4685,9 +4685,20 @@ mod tests {
             value("SELECT count(*) FROM direct_merge_cancel WHERE body ==> 'needle'"),
             2
         );
+        // The insert sealed the write segment holding the second document
+        // and published its own before the promotion failed: the aborted
+        // row's entry stays, as any index's would, until VACUUM; the sealed
+        // segment waits for the next promotion.
         assert_eq!(
             value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx')"),
-            2
+            3
+        );
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('direct_merge_cancel_idx')
+                 WHERE kind = 'sealed'"
+            ),
+            1
         );
         Spi::run("INSERT INTO direct_merge_cancel VALUES (3,'needle third')").unwrap();
         assert_eq!(
@@ -5512,6 +5523,52 @@ mod tests {
         assert_clean("direct_vacuum_idx");
     }
 
+    /// VACUUM removes dead documents from sealed write segments: each is
+    /// rewritten without them under a new stamp and its old chain retired;
+    /// one left without a document goes. Promotion then sees the rest.
+    #[pg_test]
+    fn bulk_delete_rewrites_sealed_write_segments() {
+        Spi::run(
+            "CREATE TABLE sealed_vac(id int, body text);
+             CREATE INDEX sealed_vac_idx ON sealed_vac USING stannum(body);
+             SET LOCAL stannum.index_maintenance_mode = manual;
+             SET LOCAL stannum.write_buffer_docs = 4;
+             INSERT INTO sealed_vac SELECT n, 'needle k' || n FROM generate_series(1, 9) n;",
+        )
+        .unwrap();
+        let directory = || {
+            Spi::get_one::<String>(
+                "SELECT string_agg(kind || ':' || docs, ',' ORDER BY ordinal)
+                 FROM stannum.segment_info('sealed_vac_idx')",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(directory(), "mutable:1,sealed:4,sealed:4");
+        let dead = tids("DELETE FROM sealed_vac WHERE id IN (2, 5, 6, 7, 8) RETURNING ctid::text");
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'sealed_vac_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        let (live, removed) =
+            unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        assert_eq!((live, removed), (4, 5));
+        assert_eq!(directory(), "mutable:1,sealed:3");
+        assert_clean("sealed_vac_idx");
+        assert_eq!(
+            value("SELECT count(*) FROM sealed_vac WHERE body ==> 'needle'"),
+            4
+        );
+        Spi::run("SELECT stannum.promote('sealed_vac_idx')").unwrap();
+        assert_eq!(directory(), "immutable:3,mutable:1");
+        assert_clean("sealed_vac_idx");
+        assert_eq!(
+            value("SELECT sum(id)::bigint FROM sealed_vac WHERE body ==> 'needle'"),
+            17
+        );
+    }
+
     #[pg_test]
     fn vacuum_publishes_against_a_directory_inserts_changed_meanwhile() {
         Spi::run(
@@ -5828,9 +5885,11 @@ mod tests {
     #[pg_test]
     fn failure_after_a_chain_join_before_publication_leaves_published_runs_whole() {
         direct_merge_fixture();
-        // The third insert folds and merges both singletons; retiring their
-        // runs joins them into one pending chain. The merge then fails
-        // before the meta page is written, so both are still published.
+        // The third insert seals and promotes the second document, and the
+        // promotion merges both singletons; retiring their runs joins them
+        // into one pending chain. The merge then fails before the meta page
+        // is written, so both are still published, the sealed segment still
+        // waits, and the insert's own entry, published by the seal, stays.
         let fired = fail_at_race_point("merge:released");
         Spi::run(
             "DO $$BEGIN
@@ -5845,7 +5904,7 @@ mod tests {
         assert_only_orphans("direct_merge_cancel_idx");
         assert_eq!(
             value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx')"),
-            2
+            3
         );
         // The same merge again retires the same published runs.
         Spi::run("INSERT INTO direct_merge_cancel VALUES (3,'needle third')").unwrap();

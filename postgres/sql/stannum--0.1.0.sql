@@ -429,12 +429,12 @@ CREATE  FUNCTION "segment_info"(
 	"docs" bigint,  /* i64 */
 	"dead_docs" bigint,  /* i64 */
 	"sum_doc_lengths" bigint,  /* i64 */
-	"total_pages" bigint,  /* i64 */
-	"generation" bigint,  /* i64 */
 	"npostings" bigint,  /* Option < i64 > */
+	"total_pages" bigint,  /* i64 */
 	"source_state" TEXT,  /* String */
 	"origin" TEXT,  /* Option < String > */
-	"sequence" bigint  /* Option < i64 > */
+	"sequence" bigint,  /* Option < i64 > */
+	"generation" bigint  /* i64 */
 )
 STRICT VOLATILE PARALLEL UNSAFE
 LANGUAGE c /* Rust */

@@ -25,12 +25,12 @@ pub mod kind {
     pub const REWRITE: u8 = 1 << 1;
     /// Free retired runs that no snapshot can still read.
     pub const RECLAIM: u8 = 1 << 2;
-    /// Reserved: promote a sealed write segment. Today's format folds its
-    /// write buffer in the writing session (see the design note), so no
-    /// backend queues this yet.
+    /// Promote the sealed write segments into immutable segments.
     pub const PROMOTE: u8 = 1 << 3;
-    /// Everything a fold leaves behind.
+    /// Everything a merge or rewrite leaves behind.
     pub const AFTER_FOLD: u8 = MERGE | REWRITE | RECLAIM;
+    /// Everything a seal leaves behind: its promotion, then merges.
+    pub const AFTER_SEAL: u8 = PROMOTE | AFTER_FOLD;
     /// Kinds a job may carry.
     pub const ALL: u8 = MERGE | REWRITE | RECLAIM | PROMOTE;
 }

@@ -40,8 +40,8 @@ mod tests {
     }
 
     /// A table `name` with a stannum index `name_idx` and one segment per
-    /// row of 1..=rows after the first (each insert folds the one before),
-    /// merging nothing.
+    /// row of 1..=rows after the first (each insert seals the one before,
+    /// and promote() makes the sealed ones immutable), merging nothing.
     fn one_segment_per_row(name: &str, rows: i32) {
         Spi::run(&format!(
             "CREATE TABLE {name}(id int, body text);
@@ -53,7 +53,25 @@ mod tests {
         for id in 1..=rows {
             Spi::run(&format!("INSERT INTO {name} VALUES ({id}, 'needle w{id}')")).unwrap();
         }
+        Spi::run(&format!("SELECT stannum.promote('{name}_idx')")).unwrap();
         Spi::run("RESET stannum.write_buffer_docs; RESET stannum.index_maintenance_mode").unwrap();
+    }
+
+    /// The directory as `kind:docs[:origin]` in segment_info's order.
+    fn directory(index: &str) -> String {
+        text(&format!(
+            "SELECT coalesce(string_agg(kind || ':' || docs || coalesce(':' || origin, ''), ','
+                 ORDER BY ordinal), '')
+             FROM stannum.segment_info('{index}')"
+        ))
+    }
+
+    /// score_inspect's terms with weights, elided terms left out.
+    fn inspect(index: &str, query: &str) -> String {
+        text(&format!(
+            "SELECT coalesce(string_agg(term, ',' ORDER BY term), '')
+             FROM stannum.score_inspect('{index}'::regclass, '{query}')"
+        ))
     }
 
     fn segments(index: &str) -> i64 {
@@ -92,42 +110,150 @@ mod tests {
         );
     }
 
-    /// promote() folds the write buffer into one segment now and reports
-    /// it; a second call finds the buffer empty. Searches see the same rows.
+    /// promote() consumes sealed write segments only, as TIN's does: rows
+    /// in the write segment stay mutable, and elision, which counts
+    /// immutable segments only, still scores `w`, in every row, before and
+    /// after (catalog.S-07).
     #[pg_test]
-    fn promote_folds_the_write_buffer_and_reports_it() {
+    fn promote_leaves_the_write_segment_alone() {
         Spi::run(
             "CREATE TABLE promoted(id int, body text);
              CREATE INDEX promoted_idx ON promoted USING stannum(body);
              INSERT INTO promoted SELECT n, 'w k' || n FROM generate_series(1, 20) n;",
         )
         .unwrap();
-        assert_eq!(
-            text("SELECT kind FROM stannum.segment_info('promoted_idx')"),
-            "mutable"
-        );
+        let scores = || {
+            text(
+                "SELECT string_agg(stannum.score(ctid)::text || '/' || stannum.full_score(ctid)::text,
+                     ',' ORDER BY id)
+                 FROM promoted WHERE body ==> 'w' AND id <= 3",
+            )
+        };
+        let before = scores();
+        assert!(!before.starts_with("0/"), "{before}");
+        assert_eq!(directory("promoted_idx"), "mutable:20");
+        assert_eq!(inspect("promoted_idx", "w OR k1"), "k1,w");
         assert_eq!(
             text("SELECT row(p.*)::text FROM stannum.promote('promoted_idx') p"),
-            "(1,1,20,21)"
-        );
-        assert_eq!(
-            text(
-                "SELECT string_agg(kind || ':' || docs, ',') FROM stannum.segment_info('promoted_idx')"
-            ),
-            "immutable:20"
-        );
-        assert_eq!(
-            text("SELECT row(p.*)::text FROM stannum.promote('promoted_idx', 4096) p"),
             "(0,0,0,0)"
         );
+        assert_eq!(directory("promoted_idx"), "mutable:20");
+        assert_eq!(scores(), before);
         assert_eq!(
             count("SELECT count(*) FROM promoted WHERE body ==> 'w AND k7'"),
             1
         );
+    }
+
+    /// A full write segment is sealed in place and, in manual mode, waits
+    /// for promote(), which makes it immutable (origin promotion) and
+    /// reports TIN's columns; searches see sealed rows throughout. Elision
+    /// counts the promoted documents only: `a` (3 of 20, 15%) and `w` are
+    /// elided after it, `b` (2 of 20, exactly 10%) and `e` (only in the
+    /// write segment) are not (catalog.S-07f).
+    #[pg_test]
+    fn sealed_write_segments_wait_for_promote_in_manual_mode() {
+        Spi::run(
+            "CREATE TABLE sealing(id int, body text);
+             CREATE INDEX sealing_idx ON sealing USING stannum(body);
+             SET LOCAL stannum.index_maintenance_mode = manual;
+             SET LOCAL stannum.write_buffer_docs = 10;
+             INSERT INTO sealing SELECT n, 'w k' || n
+                 || CASE WHEN n <= 2 THEN ' a b' WHEN n = 3 THEN ' a' WHEN n = 21 THEN ' e' ELSE '' END
+                 FROM generate_series(1, 21) n;",
+        )
+        .unwrap();
+        assert_eq!(directory("sealing_idx"), "mutable:1,sealed:10,sealed:10");
+        assert_eq!(count("SELECT count(*) FROM sealing WHERE body ==> 'w'"), 21);
         assert_eq!(
-            count("SELECT count(*) FROM promoted WHERE body ==> 'w'"),
-            20
+            count("SELECT count(*) FROM sealing WHERE body ==> 'w AND k7'"),
+            1
         );
+        let query = "w OR a OR b OR e OR k1";
+        assert_eq!(inspect("sealing_idx", query), "a,b,e,k1,w");
+        assert_eq!(
+            text("SELECT row(p.*)::text FROM stannum.promote('sealing_idx') p"),
+            "(2,2,20,24)"
+        );
+        assert_eq!(
+            directory("sealing_idx"),
+            "immutable:10:promotion,immutable:10:promotion,mutable:1"
+        );
+        assert_eq!(inspect("sealing_idx", query), "b,e,k1");
+        assert_eq!(
+            text("SELECT row(p.*)::text FROM stannum.promote('sealing_idx') p"),
+            "(0,0,0,0)"
+        );
+        assert_eq!(count("SELECT count(*) FROM sealing WHERE body ==> 'w'"), 21);
+        assert_eq!(count("SELECT count(*) FROM sealing WHERE body ==> 'a'"), 3);
+    }
+
+    /// A third seal in manual mode promotes the oldest sealed segment
+    /// first, as TIN does, so at most two wait.
+    #[pg_test]
+    fn a_third_seal_promotes_the_oldest_first() {
+        Spi::run(
+            "CREATE TABLE thirds(id int, body text);
+             CREATE INDEX thirds_idx ON thirds USING stannum(body);
+             SET LOCAL stannum.index_maintenance_mode = manual;
+             SET LOCAL stannum.write_buffer_docs = 10;
+             INSERT INTO thirds SELECT n, 'w k' || n FROM generate_series(1, 35) n;",
+        )
+        .unwrap();
+        assert_eq!(
+            directory("thirds_idx"),
+            "immutable:10:promotion,mutable:5,sealed:10,sealed:10"
+        );
+        assert_eq!(count("SELECT count(*) FROM thirds WHERE body ==> 'w'"), 35);
+    }
+
+    /// Without workers to take it (this server does not preload the
+    /// library) the inserting session promotes the segment it sealed.
+    #[pg_test]
+    fn a_sealed_write_segment_is_promoted_inline_without_workers() {
+        Spi::run(
+            "CREATE TABLE inline_seal(id int, body text);
+             CREATE INDEX inline_seal_idx ON inline_seal USING stannum(body);
+             SET LOCAL stannum.write_buffer_docs = 10;
+             INSERT INTO inline_seal SELECT n, 'w k' || n FROM generate_series(1, 25) n;",
+        )
+        .unwrap();
+        assert_eq!(
+            directory("inline_seal_idx"),
+            "immutable:10:promotion,immutable:10:promotion,mutable:5"
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM inline_seal WHERE body ==> 'w'"),
+            25
+        );
+    }
+
+    /// promote(index, extent_cap_bytes) splits each sealed segment into
+    /// segments of about that many bytes of input; the smallest cap gives
+    /// one document each here, terms_added counts distinct terms.
+    #[pg_test]
+    fn promote_splits_a_sealed_segment_by_its_extent_cap() {
+        Spi::run(
+            "CREATE TABLE extents(id int, body text);
+             CREATE INDEX extents_idx ON extents USING stannum(body);
+             SET LOCAL stannum.index_maintenance_mode = manual;
+             SET LOCAL stannum.write_buffer_docs = 40;
+             INSERT INTO extents SELECT n, 'w k' || n FROM generate_series(1, 41) n;",
+        )
+        .unwrap();
+        assert_eq!(directory("extents_idx"), "mutable:1,sealed:40");
+        assert_eq!(
+            text("SELECT row(p.*)::text FROM stannum.promote('extents_idx', 1) p"),
+            "(1,40,40,41)"
+        );
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM stannum.segment_info('extents_idx')
+                 WHERE kind = 'immutable' AND docs = 1 AND origin = 'promotion'"
+            ),
+            40
+        );
+        assert_eq!(count("SELECT count(*) FROM extents WHERE body ==> 'w'"), 41);
     }
 
     /// TIN refuses a cap that is not positive, with this message (XX000).
@@ -352,9 +478,14 @@ mod tests {
             for id in 1..=9 {
                 Spi::run(&format!("INSERT INTO {name} VALUES ({id}, 'needle')")).unwrap();
             }
-            // Eight folds of one document: unmerged, eight entries; merged
-            // two by two after each fold, as a deferred merge does, fewer.
-            let merged = segments(&format!("{name}_idx")) < 8;
+            // Eight seals of one document: unmerged, eight entries, sealed
+            // or promoted (in manual mode at most two wait sealed, a third
+            // seal promoting the oldest); merged two by two after each
+            // promotion, as a deferred merge does, fewer.
+            let merged = count(&format!(
+                "SELECT count(*) FROM stannum.segment_info('{name}_idx')
+                 WHERE kind IN ('immutable', 'sealed')"
+            )) < 8;
             assert_eq!(merged, expected, "{mode}");
             assert_eq!(
                 count(&format!(
@@ -404,6 +535,20 @@ mod tests {
             ),
             "(immutable,40,current,build,0);(mutable,,current,,)"
         );
+        Spi::run(
+            "SET LOCAL stannum.write_buffer_docs = 1;
+             SET LOCAL stannum.index_maintenance_mode = manual;
+             INSERT INTO described VALUES (22, 'w k22');",
+        )
+        .unwrap();
+        assert_eq!(
+            text(
+                "SELECT string_agg(row(kind, docs, npostings, origin, sequence)::text, ';'
+                     ORDER BY ordinal)
+                 FROM stannum.segment_info('described_idx')"
+            ),
+            "(immutable,20,40,build,0);(mutable,1,,,);(sealed,1,,,)"
+        );
         Spi::run("SELECT stannum.promote('described_idx'::regclass)").unwrap();
         Spi::run("SELECT stannum.merge('described_idx'::regclass, 1)").unwrap();
         assert_eq!(
@@ -412,7 +557,7 @@ mod tests {
                      ORDER BY ordinal)
                  FROM stannum.segment_info('described_idx')"
             ),
-            "(immutable,21,43,merge,0)"
+            "(immutable,21,43,merge,0);(mutable,1,,,)"
         );
     }
 }

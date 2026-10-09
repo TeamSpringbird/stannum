@@ -60,6 +60,9 @@ pub const MAX_SEGMENTS: usize = 96;
 /// Runs the meta page can hold while they wait for readers to drain: what
 /// fits beside a full directory.
 pub const MAX_PENDING: usize = 48;
+/// Sealed write segments waiting for promotion. A seal that would make a
+/// third promotes the oldest first, as TIN does in manual mode.
+pub const MAX_SEALED: usize = 2;
 
 const LOWER: usize = offset_of!(pg_sys::PageHeaderData, pd_lower);
 const UPPER: usize = offset_of!(pg_sys::PageHeaderData, pd_upper);
@@ -244,12 +247,16 @@ pub struct Pending {
 
 const PENDING_BYTES: usize = RUN_BYTES + 4;
 
+/// The write buffer (the mutable write segment), or a sealed write segment:
+/// a chain of buffer pages holding forward records.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BufferState {
     /// Incremented on every change, so backends can cache the buffer's contents.
     pub version: u32,
-    /// Incremented when the buffer is rewritten from its head (fold, VACUUM),
+    /// Incremented when the buffer is rewritten from its head (seal, VACUUM),
     /// so a cached prefix knows appends since it was built are still valid.
+    /// A sealed segment's is a stamp from the index's generation counter,
+    /// never repeated, under which backends cache its contents.
     pub epoch: u32,
     pub head: u32,
     /// Page holding the byte after the last written one.
@@ -269,9 +276,39 @@ pub struct Meta {
     pub next_generation: u32,
     pub segments: Vec<SegmentEntry>,
     pub pending: Vec<Pending>,
+    /// Sealed write segments, oldest first: full write buffers that take no
+    /// more documents and wait to be promoted into immutable segments.
+    pub sealed: Vec<BufferState>,
 }
 
-const META_HEADER: usize = 8 + crate::options::SPEC_BYTES + 28 + 4 + 4 + 4;
+const BUFFER_BYTES: usize = 28;
+const META_HEADER: usize = 8 + crate::options::SPEC_BYTES + BUFFER_BYTES + 4 + 4 + 4 + 4;
+
+fn put_buffer(out: &mut Vec<u8>, buffer: &BufferState) {
+    for n in [
+        buffer.version,
+        buffer.epoch,
+        buffer.head,
+        buffer.tail,
+        buffer.tail_used,
+        buffer.bytes,
+        buffer.docs,
+    ] {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+fn get_buffer(bytes: &[u8], at: usize) -> BufferState {
+    BufferState {
+        version: u32_at(bytes, at),
+        epoch: u32_at(bytes, at + 4),
+        head: u32_at(bytes, at + 8),
+        tail: u32_at(bytes, at + 12),
+        tail_used: u32_at(bytes, at + 16),
+        bytes: u32_at(bytes, at + 20),
+        docs: u32_at(bytes, at + 24),
+    }
+}
 
 fn put_run(out: &mut Vec<u8>, run: Run) {
     out.extend_from_slice(&run.first.to_le_bytes());
@@ -291,24 +328,25 @@ fn get_run(bytes: &[u8], at: usize) -> Run {
 
 impl Meta {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        if self.segments.len() > MAX_SEGMENTS || self.pending.len() > MAX_PENDING {
+        if self.segments.len() > MAX_SEGMENTS
+            || self.pending.len() > MAX_PENDING
+            || self.sealed.len() > MAX_SEALED
+        {
             return Err("Stannum meta page overflow");
         }
         let mut out = Vec::with_capacity(
-            META_HEADER + self.segments.len() * ENTRY_BYTES + self.pending.len() * PENDING_BYTES,
+            META_HEADER
+                + self.segments.len() * ENTRY_BYTES
+                + self.pending.len() * PENDING_BYTES
+                + self.sealed.len() * BUFFER_BYTES,
         );
         out.extend_from_slice(&self.identity.to_le_bytes());
         out.extend_from_slice(&self.spec);
-        out.extend_from_slice(&self.buffer.version.to_le_bytes());
-        out.extend_from_slice(&self.buffer.epoch.to_le_bytes());
-        out.extend_from_slice(&self.buffer.head.to_le_bytes());
-        out.extend_from_slice(&self.buffer.tail.to_le_bytes());
-        out.extend_from_slice(&self.buffer.tail_used.to_le_bytes());
-        out.extend_from_slice(&self.buffer.bytes.to_le_bytes());
-        out.extend_from_slice(&self.buffer.docs.to_le_bytes());
+        put_buffer(&mut out, &self.buffer);
         out.extend_from_slice(&self.next_generation.to_le_bytes());
         out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.pending.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.sealed.len() as u32).to_le_bytes());
         for entry in &self.segments {
             put_run(&mut out, entry.run);
             put_run(&mut out, entry.map);
@@ -322,6 +360,9 @@ impl Meta {
         for pending in &self.pending {
             put_run(&mut out, pending.run);
             out.extend_from_slice(&pending.xid.to_le_bytes());
+        }
+        for sealed in &self.sealed {
+            put_buffer(&mut out, sealed);
         }
         if out.len() > CAPACITY {
             return Err("Stannum meta page overflow");
@@ -337,23 +378,21 @@ impl Meta {
         let mut spec = [0u8; crate::options::SPEC_BYTES];
         spec.copy_from_slice(&bytes[8..8 + crate::options::SPEC_BYTES]);
         let mut at = 8 + crate::options::SPEC_BYTES;
-        let buffer = BufferState {
-            version: u32_at(bytes, at),
-            epoch: u32_at(bytes, at + 4),
-            head: u32_at(bytes, at + 8),
-            tail: u32_at(bytes, at + 12),
-            tail_used: u32_at(bytes, at + 16),
-            bytes: u32_at(bytes, at + 20),
-            docs: u32_at(bytes, at + 24),
-        };
-        at += 28;
+        let buffer = get_buffer(bytes, at);
+        at += BUFFER_BYTES;
         let next_generation = u32_at(bytes, at);
         let segment_count = u32_at(bytes, at + 4) as usize;
         let pending_count = u32_at(bytes, at + 8) as usize;
-        at += 12;
+        let sealed_count = u32_at(bytes, at + 12) as usize;
+        at += 16;
         if segment_count > MAX_SEGMENTS
             || pending_count > MAX_PENDING
-            || bytes.len() != at + segment_count * ENTRY_BYTES + pending_count * PENDING_BYTES
+            || sealed_count > MAX_SEALED
+            || bytes.len()
+                != at
+                    + segment_count * ENTRY_BYTES
+                    + pending_count * PENDING_BYTES
+                    + sealed_count * BUFFER_BYTES
         {
             return Err("invalid Stannum meta page");
         }
@@ -383,6 +422,11 @@ impl Meta {
             });
             at += PENDING_BYTES;
         }
+        let mut sealed = Vec::with_capacity(sealed_count);
+        for _ in 0..sealed_count {
+            sealed.push(get_buffer(bytes, at));
+            at += BUFFER_BYTES;
+        }
         Ok(Self {
             identity,
             spec,
@@ -390,6 +434,7 @@ impl Meta {
             next_generation,
             segments,
             pending,
+            sealed,
         })
     }
 }
@@ -463,6 +508,15 @@ mod tests {
                 },
                 xid: 77,
             }],
+            sealed: vec![BufferState {
+                version: 9,
+                epoch: 31,
+                head: 40,
+                tail: 44,
+                tail_used: 100,
+                bytes: 5 * 8000,
+                docs: 1200,
+            }],
         }
     }
 
@@ -479,9 +533,13 @@ mod tests {
         let mut full = meta.clone();
         full.segments = vec![meta.segments[0]; MAX_SEGMENTS];
         full.pending = vec![meta.pending[0]; MAX_PENDING];
+        full.sealed = vec![meta.sealed[0]; MAX_SEALED];
         let bytes = full.encode().unwrap();
         assert!(bytes.len() <= CAPACITY);
         assert_eq!(Meta::decode(&bytes).unwrap(), full);
+        let mut overfull = full.clone();
+        overfull.sealed.push(meta.sealed[0]);
+        assert!(overfull.encode().is_err());
     }
 
     #[test]
