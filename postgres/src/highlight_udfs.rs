@@ -6,12 +6,13 @@
 //! `stannum.highlight` and `stannum.highlight_ansi`.
 //!
 //! Each has two forms. The text-query form analyzes the query and the
-//! document with the default tokenizer settings. The planner support
-//! function rewrites a call whose document expression is covered by a
-//! stannum index (the index a `==>` clause on the same expression is bound
-//! to, or the one `==>` itself would bind to) into the `indexed_query`
-//! form, which analyzes both with that index's settings, so highlights
-//! agree with matches. A NULL query is taken from the `==>` clauses on the
+//! document with the tokenizer settings its arguments give (TIN 1.0.4's
+//! `tokenizer` through `stemmer`), each unset one at its default. The
+//! planner support function rewrites a call that sets none of them, and
+//! whose document expression is covered by a stannum index (the index a
+//! `==>` clause on the same expression is bound to, or the one `==>` itself
+//! would bind to), into the `indexed_query` form, which analyzes both with
+//! that index's settings, so highlights agree with matches. A NULL query is taken from the `==>` clauses on the
 //! same expression anywhere in the statement's join tree; with none, the
 //! text is returned unmarked, as TIN does.
 
@@ -21,6 +22,62 @@ use pgrx::{Internal, IntoDatum, PgList, default, pg_extern, pg_guard, pg_sys};
 use std::borrow::Cow;
 use std::ffi::{CStr, c_void};
 use tokenizer::CompiledTokenizerPipeline;
+
+#[derive(Clone, Copy)]
+struct AnalysisArgs<'a> {
+    tokenizer: Option<&'a str>,
+    case_folding: Option<&'a str>,
+    accent_folding: Option<&'a str>,
+    long_tokens: Option<&'a str>,
+    max_token_bytes: Option<i32>,
+    graphemes: Option<&'a str>,
+    position_gaps: Option<&'a str>,
+    stemmer: Option<&'a str>,
+}
+
+impl AnalysisArgs<'_> {
+    /// The pipeline these arguments name, each unset one at its default.
+    fn pipeline(self) -> Pipeline {
+        if self.tokenizer.is_none()
+            && self.case_folding.is_none()
+            && self.accent_folding.is_none()
+            && self.long_tokens.is_none()
+            && self.max_token_bytes.is_none()
+            && self.graphemes.is_none()
+            && self.position_gaps.is_none()
+            && self.stemmer.is_none()
+        {
+            return Pipeline::Default;
+        }
+        Pipeline::Given(crate::udfs::compile_options(crate::udfs::TokenizeOptions {
+            tokenizer: self.tokenizer.unwrap_or("unicode"),
+            case_folding: self.case_folding.unwrap_or("fold"),
+            accent_folding: self.accent_folding.unwrap_or("fold"),
+            long_tokens: self.long_tokens.unwrap_or("split"),
+            max_token_bytes: self.max_token_bytes.unwrap_or(256),
+            graphemes: self.graphemes.unwrap_or("emoji"),
+            position_gaps: self.position_gaps.unwrap_or("preserve"),
+            stemmer: self.stemmer,
+        }))
+    }
+}
+
+/// The default pipeline, or one the arguments compiled.
+enum Pipeline {
+    Default,
+    Given(CompiledTokenizerPipeline),
+}
+
+impl std::ops::Deref for Pipeline {
+    type Target = CompiledTokenizerPipeline;
+
+    fn deref(&self) -> &CompiledTokenizerPipeline {
+        match self {
+            Self::Default => tokenizer::presets::default_pipeline(),
+            Self::Given(pipeline) => pipeline,
+        }
+    }
+}
 
 fn render_highlight(
     pipeline: &CompiledTokenizerPipeline,
@@ -66,19 +123,33 @@ fn render_highlight_ansi(
 }
 
 #[pg_extern(name = "highlight", immutable, parallel_safe)]
+#[expect(clippy::too_many_arguments, reason = "TIN-compatible SQL signature")]
 fn highlight(
     text: Option<&str>,
     begin_tag: default!(&str, "'<b>'"),
     end_tag: default!(&str, "'</b>'"),
     query: default!(Option<&str>, "NULL"),
+    tokenizer: default!(Option<&str>, "NULL"),
+    case_folding: default!(Option<&str>, "NULL"),
+    accent_folding: default!(Option<&str>, "NULL"),
+    long_tokens: default!(Option<&str>, "NULL"),
+    max_token_bytes: default!(Option<i32>, "NULL"),
+    graphemes: default!(Option<&str>, "NULL"),
+    position_gaps: default!(Option<&str>, "NULL"),
+    stemmer: default!(Option<&str>, "NULL"),
 ) -> Option<String> {
-    render_highlight(
-        tokenizer::presets::default_pipeline(),
-        text,
-        begin_tag,
-        end_tag,
-        query,
-    )
+    let pipeline = AnalysisArgs {
+        tokenizer,
+        case_folding,
+        accent_folding,
+        long_tokens,
+        max_token_bytes,
+        graphemes,
+        position_gaps,
+        stemmer,
+    }
+    .pipeline();
+    render_highlight(&pipeline, text, begin_tag, end_tag, query)
 }
 
 #[pg_extern(name = "highlight", stable, parallel_safe)]
@@ -97,12 +168,32 @@ fn highlight_bound(
 }
 
 #[pg_extern(name = "highlight_ansi", immutable, parallel_safe)]
+#[expect(clippy::too_many_arguments, reason = "TIN-compatible SQL signature")]
 fn highlight_ansi(
     text: Option<&str>,
     wrap_to: default!(Option<i32>, "NULL"),
     query: default!(Option<&str>, "NULL"),
+    tokenizer: default!(Option<&str>, "NULL"),
+    case_folding: default!(Option<&str>, "NULL"),
+    accent_folding: default!(Option<&str>, "NULL"),
+    long_tokens: default!(Option<&str>, "NULL"),
+    max_token_bytes: default!(Option<i32>, "NULL"),
+    graphemes: default!(Option<&str>, "NULL"),
+    position_gaps: default!(Option<&str>, "NULL"),
+    stemmer: default!(Option<&str>, "NULL"),
 ) -> Option<String> {
-    render_highlight_ansi(tokenizer::presets::default_pipeline(), text, wrap_to, query)
+    let pipeline = AnalysisArgs {
+        tokenizer,
+        case_folding,
+        accent_folding,
+        long_tokens,
+        max_token_bytes,
+        graphemes,
+        position_gaps,
+        stemmer,
+    }
+    .pipeline();
+    render_highlight_ansi(&pipeline, text, wrap_to, query)
 }
 
 #[pg_extern(name = "highlight_ansi", stable, parallel_safe)]
@@ -209,8 +300,20 @@ fn highlight_support(request: Internal) -> Internal {
             b"highlight_ansi" => 2,
             _ => return unhandled(),
         };
-        if pg_sys::list_length((*request.fcall).args) <= query_position as i32 {
+        let arguments = pg_sys::list_length((*request.fcall).args);
+        if arguments <= query_position as i32 {
             return unhandled();
+        }
+        // Analysis settings the call gives explicitly are what it analyzes
+        // with; only a call that leaves them all unset takes the index's.
+        for position in query_position as i32 + 1..arguments {
+            let argument = pg_sys::list_nth((*request.fcall).args, position).cast::<pg_sys::Node>();
+            let unset = !argument.is_null()
+                && (*argument).type_ == pg_sys::NodeTag::T_Const
+                && (*argument.cast::<pg_sys::Const>()).constisnull;
+            if !unset {
+                return unhandled();
+            }
         }
         let supplied_query =
             pg_sys::list_nth((*request.fcall).args, query_position as i32).cast::<pg_sys::Node>();
@@ -265,7 +368,8 @@ fn highlight_support(request: Internal) -> Internal {
         }
         let replacement = pg_sys::copyObjectImpl(request.fcall.cast()).cast::<pg_sys::FuncExpr>();
         let mut args = PgList::<pg_sys::Node>::new();
-        for position in 0..pg_sys::list_length((*request.fcall).args) {
+        // The bound overload ends at the query: the index decides analysis.
+        for position in 0..=query_position as i32 {
             let argument = if position == query_position as i32 {
                 operand
             } else {
@@ -282,9 +386,13 @@ fn highlight_support(request: Internal) -> Internal {
 
 pgrx::extension_sql!(
     r#"
-ALTER FUNCTION @extschema@.highlight(pg_catalog.text, pg_catalog.text, pg_catalog.text, pg_catalog.text)
+ALTER FUNCTION @extschema@.highlight(pg_catalog.text, pg_catalog.text, pg_catalog.text, pg_catalog.text,
+    pg_catalog.text, pg_catalog.text, pg_catalog.text, pg_catalog.text, pg_catalog.int4, pg_catalog.text,
+    pg_catalog.text, pg_catalog.text)
     SUPPORT @extschema@.highlight_support;
-ALTER FUNCTION @extschema@.highlight_ansi(pg_catalog.text, pg_catalog.int4, pg_catalog.text)
+ALTER FUNCTION @extschema@.highlight_ansi(pg_catalog.text, pg_catalog.int4, pg_catalog.text,
+    pg_catalog.text, pg_catalog.text, pg_catalog.text, pg_catalog.text, pg_catalog.int4, pg_catalog.text,
+    pg_catalog.text, pg_catalog.text)
     SUPPORT @extschema@.highlight_support;
 "#,
     name = "highlight_support_bindings",

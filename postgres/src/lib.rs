@@ -32,6 +32,10 @@ mod udfs;
 #[cfg(feature = "pg_test")]
 mod tin_conformance;
 
+/// Stemming against TIN 1.0.4's recorded answers (see the module).
+#[cfg(feature = "pg_test")]
+mod tin_stemming;
+
 /// The query front end's stack backstop (`tinql::limits::set_stack_check`):
 /// PostgreSQL's `check_stack_depth`, whose ERROR pgrx turns into a panic that
 /// unwinds out of the query pass and is raised again at the extension's

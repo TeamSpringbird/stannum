@@ -7,8 +7,8 @@ use pgrx::{PgList, pg_guard, pg_sys};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokenizer::{
-    Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, TokenizerPipelineSpec,
-    TokenizerSpec,
+    Folding, GraphemeMode, LongTokenMode, LongTokenSpec, PositionGapMode, Stemmer,
+    TokenizerPipelineSpec, TokenizerSpec,
 };
 
 use crate::bm25::Bm25Params;
@@ -94,6 +94,7 @@ struct IndexOptions {
     k1: f64,
     b: f64,
     score_stop_words: i32,
+    stemmer: i32,
 }
 
 pub fn init() {
@@ -243,7 +244,28 @@ pub fn init() {
             None,
             lock,
         );
+        pg_sys::add_string_reloption(
+            kind,
+            c"stemmer".as_ptr(),
+            c"Snowball stemmer language code; unset stems nothing".as_ptr(),
+            std::ptr::null(),
+            Some(validate_stemmer),
+            lock,
+        );
         OPTION_KIND.store(kind, Ordering::Relaxed);
+    }
+}
+
+/// Refuses a stemmer code outside the supported list when a statement sets
+/// one, with TIN's message.
+#[pg_guard]
+unsafe extern "C-unwind" fn validate_stemmer(value: *const std::ffi::c_char) {
+    if value.is_null() {
+        return;
+    }
+    let code = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+    if let Err(error) = code.parse::<Stemmer>() {
+        pgrx::error!("{error}");
     }
 }
 
@@ -342,6 +364,11 @@ pub unsafe extern "C-unwind" fn amoptions(
             pg_sys::relopt_type::RELOPT_TYPE_STRING,
             std::mem::offset_of!(IndexOptions, score_stop_words),
         ),
+        parse_entry(
+            c"stemmer".as_ptr(),
+            pg_sys::relopt_type::RELOPT_TYPE_STRING,
+            std::mem::offset_of!(IndexOptions, stemmer),
+        ),
     ];
     unsafe {
         let options = pg_sys::build_reloptions(
@@ -351,9 +378,19 @@ pub unsafe extern "C-unwind" fn amoptions(
             std::mem::size_of::<IndexOptions>(),
             entries.as_ptr(),
             entries.len() as i32,
-        )
-        .cast();
+        );
         if validate {
+            // A stemmer needs lowercased input; the combination is refused at
+            // CREATE INDEX and ALTER INDEX, as TIN does.
+            if let Some(options) = options.cast::<IndexOptions>().cast_const().as_ref()
+                && options.case_folding == FOLDING_PRESERVE
+                && string_option(options, options.stemmer).is_some()
+            {
+                pgrx::error!(
+                    "{}",
+                    tokenizer::TokenizerPipelineSpecError::StemmerRequiresCaseFolding
+                );
+            }
             for option in
                 PgList::<pg_sys::DefElem>::from_pg(pg_sys::untransformRelOptions(reloptions))
                     .iter_ptr()
@@ -366,7 +403,7 @@ pub unsafe extern "C-unwind" fn amoptions(
                 }
             }
         }
-        options
+        options.cast()
     }
 }
 
@@ -429,11 +466,50 @@ pub unsafe fn tokenizer_spec(index: pg_sys::Relation) -> TokenizerPipelineSpec {
             GAPS_COLLAPSE => PositionGapMode::Collapse,
             _ => PositionGapMode::Preserve,
         },
+        // The code was validated when the option was set.
+        stemmer: string_option(options, options.stemmer).and_then(|code| code.parse().ok()),
     }
 }
 
+/// The string option stored at `offset` in `options`, when it is set.
+fn string_option(options: &IndexOptions, offset: i32) -> Option<&str> {
+    let offset = usize::try_from(offset).ok().filter(|&offset| offset != 0)?;
+    let ptr = std::ptr::from_ref(options).cast::<u8>();
+    unsafe { CStr::from_ptr(ptr.add(offset).cast()) }
+        .to_str()
+        .ok()
+}
+
+/// The supported stemmers in their stored order: a spec stores a stemmer as
+/// its position here plus one, zero for none. Append only.
+const STEMMERS: [Stemmer; 18] = [
+    Stemmer::Arabic,
+    Stemmer::Danish,
+    Stemmer::Dutch,
+    Stemmer::English,
+    Stemmer::Finnish,
+    Stemmer::French,
+    Stemmer::German,
+    Stemmer::Greek,
+    Stemmer::Hungarian,
+    Stemmer::Italian,
+    Stemmer::Norwegian,
+    Stemmer::Portuguese,
+    Stemmer::Romanian,
+    Stemmer::Russian,
+    Stemmer::Spanish,
+    Stemmer::Swedish,
+    Stemmer::Tamil,
+    Stemmer::Turkish,
+];
+
+/// Bits of spec byte 0 below the stemmer; the tokenizer uses the lowest.
+const STEMMER_SHIFT: u32 = 3;
+
 /// Serialized tokenizer settings stored in the index meta page, so scans and
-/// inserts analyze text exactly as the build did.
+/// inserts analyze text exactly as the build did. Byte 0 holds the tokenizer
+/// in its low bits and the stemmer above [`STEMMER_SHIFT`]; an index built
+/// before stemming existed has zero there, no stemmer.
 pub const SPEC_BYTES: usize = 8;
 
 pub fn encode_spec(spec: &TokenizerPipelineSpec) -> [u8; SPEC_BYTES] {
@@ -442,10 +518,18 @@ pub fn encode_spec(spec: &TokenizerPipelineSpec) -> [u8; SPEC_BYTES] {
         Folding::Fold => FOLDING_FOLD,
     } as u8;
     let mut out = [0u8; SPEC_BYTES];
+    let stemmer = spec.stemmer.map_or(0, |stemmer| {
+        STEMMERS
+            .iter()
+            .position(|&known| known == stemmer)
+            .expect("every stemmer has a stored code")
+            + 1
+    }) as u8;
     out[0] = match spec.tokenizer {
         TokenizerSpec::Unicode => TOKENIZER_UNICODE,
         TokenizerSpec::Whitespace => TOKENIZER_WHITESPACE,
-    } as u8;
+    } as u8
+        | stemmer << STEMMER_SHIFT;
     out[1] = folding(spec.case_folding);
     out[2] = folding(spec.accent_folding);
     out[3] = match spec.long_tokens.mode {
@@ -472,8 +556,12 @@ pub fn decode_spec(bytes: &[u8; SPEC_BYTES]) -> Option<TokenizerPipelineSpec> {
         FOLDING_FOLD => Some(Folding::Fold),
         _ => None,
     };
+    let stemmer = match usize::from(bytes[0] >> STEMMER_SHIFT) {
+        0 => None,
+        code => Some(*STEMMERS.get(code - 1)?),
+    };
     let spec = TokenizerPipelineSpec {
-        tokenizer: match i32::from(bytes[0]) {
+        tokenizer: match i32::from(bytes[0] & ((1 << STEMMER_SHIFT) - 1)) {
             TOKENIZER_UNICODE => TokenizerSpec::Unicode,
             TOKENIZER_WHITESPACE => TokenizerSpec::Whitespace,
             _ => return None,
@@ -500,6 +588,7 @@ pub fn decode_spec(bytes: &[u8; SPEC_BYTES]) -> Option<TokenizerPipelineSpec> {
             GAPS_PRESERVE => PositionGapMode::Preserve,
             _ => return None,
         },
+        stemmer,
     };
     spec.validate().ok()?;
     Some(spec)
@@ -530,15 +619,7 @@ pub unsafe fn bm25(index: pg_sys::Relation) -> Bm25Params {
 
 pub unsafe fn score_stop_words(index: pg_sys::Relation) -> Option<String> {
     let options = unsafe { parsed(index) }?;
-    let offset = usize::try_from(options.score_stop_words).ok()?;
-    if offset == 0 {
-        return None;
-    }
-    let ptr = std::ptr::from_ref(options).cast::<u8>();
-    unsafe { CStr::from_ptr(ptr.add(offset).cast()) }
-        .to_str()
-        .ok()
-        .map(str::to_owned)
+    string_option(options, options.score_stop_words).map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -557,12 +638,38 @@ mod tests {
             },
             graphemes: GraphemeMode::Retain,
             position_gaps: PositionGapMode::Collapse,
+            stemmer: None,
         };
         assert_eq!(decode_spec(&encode_spec(&spec)), Some(spec));
         let default = TokenizerPipelineSpec::stannum_default();
         assert_eq!(decode_spec(&encode_spec(&default)), Some(default));
-        assert_eq!(decode_spec(&[9, 0, 0, 0, 0, 1, 0, 0]), None);
+        assert_eq!(decode_spec(&[2, 0, 0, 0, 0, 1, 0, 0]), None);
         assert_eq!(decode_spec(&[0, 0, 0, 0, 1, 0, 0, 0]), None);
+        // Past the last stored stemmer.
+        assert_eq!(decode_spec(&[19 << 3, 1, 1, 2, 0, 1, 1, 1]), None);
+    }
+
+    #[test]
+    fn spec_bytes_round_trip_every_stemmer() {
+        let mut spec = TokenizerPipelineSpec {
+            tokenizer: TokenizerSpec::Whitespace,
+            ..TokenizerPipelineSpec::stannum_default()
+        };
+        for stemmer in STEMMERS {
+            spec.stemmer = Some(stemmer);
+            assert_eq!(decode_spec(&encode_spec(&spec)), Some(spec), "{stemmer}");
+        }
+        // An index built before stemming existed reads as unstemmed: its
+        // byte 0 was the tokenizer alone.
+        let before = [1, 1, 1, 2, 0, 1, 1, 1];
+        assert_eq!(
+            decode_spec(&before).map(|spec| (spec.tokenizer, spec.stemmer)),
+            Some((TokenizerSpec::Whitespace, None))
+        );
+        assert_eq!(
+            encode_spec(&TokenizerPipelineSpec::stannum_default()),
+            [0, 1, 1, 2, 0, 1, 1, 1]
+        );
     }
 
     #[test]

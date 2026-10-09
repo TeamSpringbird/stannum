@@ -674,7 +674,7 @@
       "owner": "mixed",
       "upstream_path": "postgres/src/highlight_udfs.rs",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Stemming adapted from Lead 623174d."
     },
     "postgres/src/lib.rs": {
       "owner": "mixed",
@@ -698,7 +698,7 @@
       "owner": "mixed",
       "upstream_path": "postgres/src/options.rs",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Stemming adapted from Lead 623174d."
     },
     "postgres/src/query_limits.rs": {
       "owner": "ben",
@@ -738,11 +738,15 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation, written 2026-09-26 to record and replay PlanetScale TIN 1.0.3 responses."
     },
+    "postgres/src/tin_stemming.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum tests of stemming against TIN 1.0.4's recorded answers."
+    },
     "postgres/src/udfs.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/udfs.rs",
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Stemming adapted from Lead 623174d."
     },
     "postgres/stannum.control": {
       "owner": "mixed",
@@ -1093,8 +1097,8 @@
     "tinql/src/runtime/subtokenize.rs": {
       "owner": "mixed",
       "upstream_path": "tinql/src/runtime/subtokenize.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's stemming (623174d) merged in."
     },
     "tinql/src/tests.rs": {
       "owner": "planetscale",
@@ -1125,14 +1129,14 @@
     "tokenizer/Cargo.toml": {
       "owner": "planetscale",
       "upstream_path": "tokenizer/Cargo.toml",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "tokenizer/src/compiled.rs": {
       "owner": "mixed",
       "upstream_path": "tokenizer/src/compiled.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's stemming (623174d) merged in."
     },
     "tokenizer/src/folder.rs": {
       "owner": "planetscale",
@@ -1143,13 +1147,19 @@
     "tokenizer/src/lib.rs": {
       "owner": "planetscale",
       "upstream_path": "tokenizer/src/lib.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "tokenizer/src/long_tokens.rs": {
       "owner": "planetscale",
       "upstream_path": "tokenizer/src/long_tokens.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Byte-identical to the upstream source before notice insertion."
+    },
+    "tokenizer/src/normalizer.rs": {
+      "owner": "planetscale",
+      "upstream_path": "tokenizer/src/normalizer.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "tokenizer/src/presets.rs": {
@@ -1161,14 +1171,20 @@
     "tokenizer/src/source_spans.rs": {
       "owner": "mixed",
       "upstream_path": "tokenizer/src/source_spans.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's stemming (623174d) merged in."
     },
     "tokenizer/src/spec.rs": {
       "owner": "mixed",
       "upstream_path": "tokenizer/src/spec.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit. Lead's stemming (623174d) merged in."
+    },
+    "tokenizer/src/stemmer.rs": {
+      "owner": "planetscale",
+      "upstream_path": "tokenizer/src/stemmer.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "tokenizer/src/tokenizers.rs": {
       "owner": "planetscale",
@@ -1179,18 +1195,34 @@
     "tokenizer/src/tokenizers/unicode.rs": {
       "owner": "planetscale",
       "upstream_path": "tokenizer/src/tokenizers/unicode.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
     "tokenizer/src/tokenizers/whitespace.rs": {
       "owner": "planetscale",
       "upstream_path": "tokenizer/src/tokenizers/whitespace.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Byte-identical to the upstream source before notice insertion."
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "The upstream source with one test renamed, before notice insertion."
     },
     "tokenizer/tests/compatibility.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 82157ed1e4da3e195b0837dbb868897a8f57ad48."
+    },
+    "tokenizer/tests/pipeline_properties.rs": {
+      "owner": "planetscale",
+      "upstream_path": "tokenizer/tests/pipeline_properties.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "The upstream source with its preset names changed to Stannum's (stannum_default), before notice insertion."
+    },
+    "tokenizer/tests/stemming.rs": {
+      "owner": "planetscale",
+      "upstream_path": "tokenizer/tests/stemming.rs",
+      "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
+      "evidence": "The upstream source with its preset names changed to Stannum's (stannum_default), before notice insertion."
+    },
+    "tokenizer/tests/tin_stemming.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum tests of stemmed tokenization against TIN 1.0.4's recorded answers."
     }
   }
 }
