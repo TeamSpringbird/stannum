@@ -797,22 +797,32 @@ thread_local! {
     /// that segment areas do not cover: the heap, and the index structures
     /// storage reads without a segment reader.
     static PHASE_DISK: RefCell<Vec<(&'static str, i64)>> = const { RefCell::new(Vec::new()) };
+    /// Shared buffers accessed (hit or read) per named phase: phases nest
+    /// (a run source's page reads within a native read), so they overlap.
+    static PHASE_BLOCKS: RefCell<Vec<(&'static str, i64)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Runs `body`, charging the pages it reads from storage to `label`.
 pub(crate) fn charging<T>(label: &'static str, body: impl FnOnce() -> T) -> T {
     let before = disk_pages();
+    let accessed = blocks_used();
     let value = body();
-    let pages = disk_pages() - before;
-    if pages != 0 {
-        PHASE_DISK.with_borrow_mut(|phases| {
+    let add = |phases: &mut Vec<(&'static str, i64)>, pages: i64| {
+        if pages != 0 {
             match phases.iter_mut().find(|(name, _)| *name == label) {
                 Some(entry) => entry.1 += pages,
                 None => phases.push((label, pages)),
             }
-        });
-    }
+        }
+    };
+    PHASE_DISK.with_borrow_mut(|phases| add(phases, disk_pages() - before));
+    PHASE_BLOCKS.with_borrow_mut(|phases| add(phases, blocks_used() - accessed));
     value
+}
+
+/// Shared buffers accessed per phase since the counters were reset.
+pub(crate) fn phase_blocks() -> Vec<(&'static str, i64)> {
+    PHASE_BLOCKS.with_borrow(Clone::clone)
 }
 
 /// Pages read from storage per phase since the counters were reset.
@@ -846,6 +856,8 @@ pub(crate) fn reset_walk_blocks() {
     VISIBILITY_CHECKS.set(0);
     VM_HITS.set(0);
     PHASE_DISK.with_borrow_mut(Vec::clear);
+    PHASE_BLOCKS.with_borrow_mut(Vec::clear);
+    segment::tinshape::blob::reset_stats();
     crate::storage::reset_held_peak();
 }
 

@@ -1928,10 +1928,12 @@ mod tests {
         // At exit it leaves both to the resource owner, so releasing them
         // here, as exit processing would, releases each once: a second
         // release raises "not owned by resource owner".
-        let (buffer, relation) = unsafe { crate::storage::drop_holding_source(oid, true) };
+        let (buffers, relation) = unsafe { crate::storage::drop_holding_source(oid, true) };
         assert_eq!(crate::storage::held_pages().0, before);
         unsafe {
-            pg_sys::ReleaseBuffer(buffer);
+            for buffer in buffers {
+                pg_sys::ReleaseBuffer(buffer);
+            }
             pg_sys::RelationClose(relation);
         }
     }
@@ -7978,6 +7980,8 @@ mod tests {
         // clients overran a 32 GB container. It must keep only what the
         // walk reads, and what it keeps must count against
         // `stannum.reader_cache_mb`.
+        // (Reads that copy what they read: in place, a query keeps none of
+        // it, see `ranked_queries_read_segments_in_place_and_keep_nothing`.)
         use crate::storage::testing::{NATIVE_DROPS, READER_CACHE_BYTES, native_bytes};
         Spi::run(
             "CREATE TABLE commonwords(id int primary key, body text);
@@ -7985,7 +7989,8 @@ mod tests {
              SELECT n, repeat('alpha beta ', 1 + n % 37) || repeat('pad ', n % 101) || 'w' || n
              FROM generate_series(1, 20000) n;
              CREATE INDEX commonwords_idx ON commonwords USING stannum(body);
-             SET LOCAL enable_seqscan = off;",
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.native_in_place = off;",
         )
         .unwrap();
         let index_bytes = Spi::get_one::<i64>("SELECT pg_relation_size('commonwords_idx')")
@@ -8023,6 +8028,93 @@ mod tests {
         READER_CACHE_BYTES.set(None);
         assert_eq!(again, first);
         assert!(NATIVE_DROPS.get() > drops, "{held} native bytes were kept");
+    }
+
+    #[pg_test]
+    fn ranked_queries_read_segments_in_place_and_keep_nothing() {
+        // At 150M rows the chunks the native paths copied into a backend
+        // overflowed its share of the reader cache, so every query copied
+        // again what the last had: some 15,000 pages a query. Read in place
+        // from pinned shared buffers, a query answers as the copies did,
+        // keeps nothing it read and holds no pin once it ends, error or not.
+        use crate::storage::testing::{NATIVE_READ_FAULT, clear_reader_caches, native_loaded};
+        Spi::run(
+            "CREATE TABLE inplace(id int primary key, body text);
+             INSERT INTO inplace
+             SELECT n, repeat('alpha beta ', 1 + n % 37) || repeat('pad ', n % 101)
+                       || 'w' || n || ' v' || (n % 97)
+             FROM generate_series(1, 20000) n;
+             CREATE INDEX inplace_idx ON inplace USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let queries = [
+            "alpha AND v5",
+            "alpha OR v5",
+            "\"alpha beta\"",
+            "v5 OR v7 OR w9",
+        ];
+        let answers = || -> Vec<(Vec<i32>, i64)> {
+            queries
+                .iter()
+                .map(|q| {
+                    let ids = Spi::connect(|client| {
+                        client
+                            .select(
+                                &format!(
+                                    "SELECT id FROM inplace WHERE body ==> '{q}'
+                                     ORDER BY stannum.score(ctid) DESC LIMIT 10"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap()
+                            .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                            .collect::<Vec<i32>>()
+                    });
+                    let count = Spi::get_one::<i64>(&format!(
+                        "SELECT count(*) FROM inplace WHERE body ==> '{q}'"
+                    ))
+                    .unwrap()
+                    .unwrap();
+                    (ids, count)
+                })
+                .collect()
+        };
+        Spi::run("SET LOCAL stannum.native_in_place = off").unwrap();
+        clear_reader_caches();
+        let copied = answers();
+        assert!(
+            native_loaded() > 0,
+            "the queries did not take the native path"
+        );
+        Spi::run("SET LOCAL stannum.native_in_place = on").unwrap();
+        clear_reader_caches();
+        let pinned = crate::storage::held_pages().0;
+        assert_eq!(answers(), copied);
+        assert_eq!(
+            native_loaded(),
+            0,
+            "a query read in place kept what it read"
+        );
+        assert_eq!(crate::storage::held_pages().0, pinned);
+        // An error raised with the read's pages still pinned releases them
+        // as it unwinds.
+        NATIVE_READ_FAULT.set(true);
+        Spi::run(
+            "DO $$ BEGIN
+               PERFORM id FROM inplace WHERE body ==> 'alpha OR v5'
+               ORDER BY stannum.score(ctid) DESC LIMIT 10;
+               RAISE EXCEPTION 'no fault';
+             EXCEPTION WHEN OTHERS THEN
+               IF SQLERRM NOT LIKE '%fault injected%' THEN RAISE; END IF;
+             END $$",
+        )
+        .unwrap();
+        NATIVE_READ_FAULT.set(false);
+        assert_eq!(crate::storage::held_pages().0, pinned);
+        assert_eq!(answers(), copied);
+        assert_eq!(native_loaded(), 0);
     }
 
     #[pg_test]

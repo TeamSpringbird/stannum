@@ -848,10 +848,18 @@ pub struct RunSource {
     /// [`Source::held_slot`](segment::source::Source::held_slot) in the
     /// open span, at most [`HELD_SLOT_LIMIT`] in all.
     slots: RefCell<Vec<HeldSlot>>,
+    /// Pages pinned for the open span by
+    /// [`Source::pinned_page`](segment::source::Source::pinned_page), by
+    /// page, each until the span ends: at most [`PINNED_LIMIT`].
+    pinned: RefCell<FxHashMap<usize, HeldPage>>,
     /// The index, opened at the first page a span pins and closed when it
     /// ends, rather than looked up per page: a walk pins a page per chunk.
     relation: Cell<pg_sys::Relation>,
 }
+
+/// Most pages a span of one run source keeps pinned for in-place reads
+/// (64 MiB of shared buffers); past it the reader copies what it reads.
+const PINNED_LIMIT: usize = 8192;
 
 thread_local! {
     /// Outermost hold spans opened by the backend's run sources, numbering
@@ -898,6 +906,7 @@ impl RunSource {
             holding: Cell::new(0),
             generation: Cell::new(0),
             slots: RefCell::new(vec![Default::default(); segment::source::HELD_SLOTS]),
+            pinned: RefCell::default(),
             relation: Cell::new(std::ptr::null_mut()),
         }
     }
@@ -915,6 +924,9 @@ impl RunSource {
             }
         }
         slots.truncate(segment::source::HELD_SLOTS);
+        for (_, held) in self.pinned.borrow_mut().drain() {
+            unpin(held);
+        }
         let relation = self.relation.replace(std::ptr::null_mut());
         if !relation.is_null() && !exiting() {
             // SAFETY: opened by `pin` within the span now ending.
@@ -1130,10 +1142,11 @@ impl Drop for RunSource {
 }
 
 /// Holds page 0 of the first segment of `index_oid` pinned in a hold span
-/// of a source of its own, then drops the source, open span and all, as a
-/// reader dropped at exit is, with `proc_exit_inprogress` set to
-/// `exiting`. Returns the buffer and relation reference the span held; the
-/// caller releases them if the drop did not.
+/// of a source of its own, in a slot and for an in-place read, then drops
+/// the source, open span and all, as a reader dropped at exit is, with
+/// `proc_exit_inprogress` set to `exiting`. Returns the buffers and
+/// relation reference the span held; the caller releases them if the drop
+/// did not.
 ///
 /// # Safety
 ///
@@ -1142,7 +1155,7 @@ impl Drop for RunSource {
 pub(crate) unsafe fn drop_holding_source(
     index_oid: pg_sys::Oid,
     exiting: bool,
-) -> (pg_sys::Buffer, pg_sys::Relation) {
+) -> ([pg_sys::Buffer; 2], pg_sys::Relation) {
     use segment::source::Source as _;
     // SAFETY: per the contract; the flag is set only while the source
     // drops.
@@ -1159,13 +1172,21 @@ pub(crate) unsafe fn drop_holding_source(
             .held_span(0, 0)
             .expect("a held span")
             .expect("a pinned page");
+        assert!(
+            source
+                .pinned_page(0)
+                .expect("a pinned page")
+                .expect("pinned")
+                .pinned
+        );
         let buffer = source.slots.borrow()[0][0].expect("the pinned page").buffer;
+        let in_place = source.pinned.borrow()[&0].buffer;
         let held = source.relation.get();
         assert!(!held.is_null());
         pg_sys::proc_exit_inprogress = exiting;
         drop(source);
         pg_sys::proc_exit_inprogress = false;
-        (buffer, held)
+        ([buffer, in_place], held)
     }
 }
 
@@ -1265,6 +1286,45 @@ impl segment::source::Source for RunSource {
 
     fn hold_generation(&self) -> u64 {
         self.generation.get()
+    }
+
+    fn holding(&self) -> bool {
+        self.holding.get() > 0
+    }
+
+    fn page_len(&self) -> usize {
+        CHAIN_CAPACITY
+    }
+
+    fn pinned_page(&self, offset: u64) -> Option<segment::Result<segment::source::HeldSpan>> {
+        if self.holding.get() == 0 {
+            return None;
+        }
+        if offset >= u64::from(self.run.bytes) {
+            return Some(Err(segment::Error::Truncated));
+        }
+        let page = (offset / CHAIN_CAPACITY as u64) as usize;
+        let mut pinned = self.pinned.borrow_mut();
+        let (held, fresh) = match pinned.get(&page) {
+            Some(held) => (*held, false),
+            None => {
+                if pinned.len() >= PINNED_LIMIT {
+                    return None;
+                }
+                let held = match self.pin(page) {
+                    Ok(held) => held,
+                    Err(error) => return Some(Err(error)),
+                };
+                pinned.insert(page, held);
+                (held, true)
+            }
+        };
+        Some(Ok(segment::source::HeldSpan {
+            start: page as u64 * CHAIN_CAPACITY as u64,
+            data: held.data,
+            len: held.len,
+            pinned: fresh,
+        }))
     }
 
     fn held_slot(&self) -> Option<usize> {
@@ -1508,6 +1568,11 @@ type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
 /// The ctid-native paths' loaded chunks count against it too, and keep at
 /// most a quarter of it across queries (see `NATIVE_SHARE`).
 pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(384);
+
+/// `stannum.native_in_place`: the ctid-native paths read a segment's
+/// structures in place from pinned shared buffers (see [`native_segment`]);
+/// off, they copy what they read into chunks each backend keeps.
+pub static NATIVE_IN_PLACE: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 
 /// `stannum.read_cache_mb`: the budget of [`segment::cache`], the least
 /// recently used ranges cursors sweep, applied whenever a view is captured.
@@ -3675,6 +3740,22 @@ impl segment::source::Source for ReaderSource {
     fn read(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
         self.0.source().read(offset, len)
     }
+
+    fn hold(&self, open: bool) {
+        self.0.source().hold(open);
+    }
+
+    fn holding(&self) -> bool {
+        self.0.source().holding()
+    }
+
+    fn page_len(&self) -> usize {
+        self.0.source().page_len()
+    }
+
+    fn pinned_page(&self, offset: u64) -> Option<segment::Result<segment::source::HeldSpan>> {
+        self.0.source().pinned_page(offset)
+    }
 }
 
 /// What the ctid-native paths keep of a segment in this backend.
@@ -3731,7 +3812,11 @@ pub(crate) fn with_native<R>(
     names: &[String],
     f: impl FnOnce(&segment::tinshape::segment::Segment<'_>) -> segment::Result<R>,
 ) -> Option<segment::Result<R>> {
-    native_segment(view, i, names, |_, segment| f(segment))
+    crate::score::charging("native read", || {
+        native_segment(view, i, names, NATIVE_IN_PLACE.get(), |_, segment| {
+            f(segment)
+        })
+    })
 }
 
 /// [`with_native`] for rows scored one at a time by the terms `names`:
@@ -3747,25 +3832,29 @@ pub(crate) fn with_native_rows<R>(
         &mut [Option<engine::tinshape::TermSet<'a>>],
     ) -> segment::Result<R>,
 ) -> Option<segment::Result<R>> {
-    native_segment(view, i, names, |native, segment| {
-        let mut rows = native.rows.borrow_mut();
-        if rows
-            .as_ref()
-            .is_none_or(|(held, _)| held.as_slice() != names)
-        {
-            *rows = None;
-            let mut sets = Vec::with_capacity(names.len());
-            for name in names {
-                sets.push(engine::tinshape::TermSet::open(
-                    segment,
-                    name,
-                    &mut engine::tinshape::NoTouch,
-                )?);
+    // Outside a span: the terms are kept between rows, so what they read
+    // must outlive the call, and is copied into the blob.
+    crate::score::charging("native row read", || {
+        native_segment(view, i, names, false, |native, segment| {
+            let mut rows = native.rows.borrow_mut();
+            if rows
+                .as_ref()
+                .is_none_or(|(held, _)| held.as_slice() != names)
+            {
+                *rows = None;
+                let mut sets = Vec::with_capacity(names.len());
+                for name in names {
+                    sets.push(engine::tinshape::TermSet::open(
+                        segment,
+                        name,
+                        &mut engine::tinshape::NoTouch,
+                    )?);
+                }
+                *rows = Some((names.to_vec(), sets));
             }
-            *rows = Some((names.to_vec(), sets));
-        }
-        let (_, sets) = rows.as_mut().expect("opened above");
-        f(segment, sets)
+            let (_, sets) = rows.as_mut().expect("opened above");
+            f(segment, sets)
+        })
     })
 }
 
@@ -3778,12 +3867,42 @@ impl Drop for NotBusy<'_> {
     }
 }
 
+/// Closes a native read's span (see [`native_segment`]) when the read
+/// ends, unwinding or not: forgets the parsed records that borrow the
+/// span's pages, then releases them.
+struct Span<'a> {
+    native: &'a Native,
+    blob: &'a LazyBlob,
+}
+
+impl Drop for Span<'_> {
+    fn drop(&mut self) {
+        if let Ok(segment) = self.native.segment.try_borrow()
+            && let Some(segment) = segment.as_ref()
+        {
+            segment.forget_borrowed();
+        }
+        // SAFETY: the walk that read within the span has returned or
+        // unwound, and `f`'s result cannot borrow the segment; the records
+        // the segment keeps past the span borrow nothing (above), and the
+        // rows' terms are read outside spans.
+        unsafe { self.blob.close_span() };
+    }
+}
+
 /// [`with_native`] with the segment kept in `Native` (`'static`: it
 /// borrows the boxed blob `Native` keeps and drops after it).
+///
+/// With `in_place`, `f` reads within a span of the blob: what it reads is
+/// read in place from pinned shared buffers (or stitched, across a page
+/// boundary) and nothing of it is kept, rather than copied into the blob
+/// for later queries. At 150 million rows the copies overflowed the
+/// backend's budget and every query made them again.
 fn native_segment<R>(
     view: &View,
     i: usize,
     names: &[String],
+    in_place: bool,
     f: impl FnOnce(&Native, &segment::tinshape::segment::Segment<'static>) -> segment::Result<R>,
 ) -> Option<segment::Result<R>> {
     let (reader, native) = view.natives.get(i)?.as_ref()?;
@@ -3815,6 +3934,13 @@ fn native_segment<R>(
         let blob = native
             .blob
             .get_or_init(|| Box::new(LazyBlob::new(Box::new(ReaderSource(reader.clone())))));
+        let _span = in_place.then(|| {
+            blob.open_span();
+            Span {
+                native,
+                blob,
+            }
+        });
         // The reader's, decoded once from a transient read (and counted in
         // its cached bytes): the blob keeps no copy of the set's bytes.
         let docs = reader.docs()?;
@@ -3865,7 +3991,12 @@ fn native_segment<R>(
         for (name, entry) in names.iter().zip(&entries) {
             segment.remember(name, *entry);
         }
-        f(native, segment)
+        let result = f(native, segment);
+        #[cfg(feature = "pg_test")]
+        if testing::NATIVE_READ_FAULT.get() {
+            pgrx::error!("Stannum test: a fault injected at the end of a native read");
+        }
+        result
     })())
 }
 
@@ -4968,6 +5099,20 @@ pub mod testing {
         pub static READER_CACHE_CLEARS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
         /// Times a segment's native bytes were dropped to fit the budget.
         pub static NATIVE_DROPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// Raise an error at the end of every native read, with what it
+        /// read still pinned.
+        pub static NATIVE_READ_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Bytes the cached segments' blobs copied in and keep.
+    pub fn native_loaded() -> usize {
+        SEGMENT_READERS.with_borrow(|readers| {
+            readers
+                .values()
+                .filter_map(|c| c.native.blob.get())
+                .map(|blob| blob.loaded())
+                .sum()
+        })
     }
 
     /// What a backend's per-segment caches hold for one index.

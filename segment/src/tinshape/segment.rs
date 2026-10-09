@@ -416,7 +416,12 @@ impl<'a> Segment<'a> {
         if docs.geometry.documents != header.documents {
             return Err(Error::Corrupt("document set count"));
         }
-        let lengths = Lengths::parse(bytes.sub(bounds[5], bounds[6])?, header.documents)?;
+        let lengths = Lengths::parse(
+            bytes
+                .sub(bounds[5], bounds[6])?
+                .tag(super::blob::Kind::Lengths),
+            header.documents,
+        )?;
         Ok(Self {
             bytes,
             documents: header.documents,
@@ -473,6 +478,28 @@ impl<'a> Segment<'a> {
     /// roughly (decoded footers are counted by their [`FooterCache`]).
     pub fn memo_bytes(&self) -> usize {
         self.parsed.borrow().bytes + self.memo.borrow().len() * 64
+    }
+
+    /// Forgets the records parsed so far that borrow the blob's bytes
+    /// rather than reading them when asked ([`Postings::is_detached`]): a
+    /// segment over a [`super::blob::LazyBlob`] read within a span keeps
+    /// only those past it.
+    pub fn forget_borrowed(&self) {
+        let mut parsed = self.parsed.borrow_mut();
+        if parsed.records.values().all(Postings::is_detached) {
+            return;
+        }
+        parsed.records.retain(|_, postings| postings.is_detached());
+        parsed.bytes = parsed
+            .records
+            .values()
+            .map(|postings| match &postings.form {
+                postings::Form::Grouped(entries) => {
+                    entries.len() * std::mem::size_of::<postings::GroupEntry>() + 64
+                }
+                _ => 64,
+            })
+            .sum();
     }
 
     /// Records `term`'s term-map entry (or its absence) in the memo, found
@@ -573,7 +600,12 @@ impl<'a> Segment<'a> {
         if end > self.bounds[Area::Positions as usize + 1] {
             return Err(Error::Truncated);
         }
-        Ok((self.bytes.sub(start, end)?, start))
+        Ok((
+            self.bytes
+                .sub(start, end)?
+                .tag(super::blob::Kind::Positions),
+            start,
+        ))
     }
 
     /// Where the length of the document of `rank` sits in the blob: its

@@ -1730,6 +1730,33 @@ mod tests {
         .unwrap()
     }
 
+    /// `parsed`'s blob `raw` assembled over `pinned`, which reads in place
+    /// within spans, as the extension assembles one: within a span, so
+    /// nothing is copied into the blob, and over a term map index of its
+    /// own.
+    fn assembled_in_place<'a>(
+        pinned: &'a LazyBlob,
+        parsed: &Segment<'_>,
+        raw: &[u8],
+    ) -> Segment<'a> {
+        let term_map = &raw[parsed.bounds[1]..parsed.bounds[2]];
+        let prefix = segment::dictionary::DictionaryIndex::prefix_len(term_map).unwrap();
+        let index: &'static [u8] = Box::leak(term_map[..prefix].to_vec().into_boxed_slice());
+        let index = segment::dictionary::DictionaryIndex::parse(index).unwrap();
+        pinned.open_span();
+        let segment = Segment::assemble(
+            pinned.bytes(),
+            index,
+            parsed.docs.clone(),
+            parsed.liveness.clone(),
+        )
+        .unwrap();
+        // SAFETY: the segment keeps no slice of what assembling read.
+        unsafe { pinned.close_span() };
+        assert_eq!(pinned.loaded(), 0);
+        segment
+    }
+
     /// A segment of `docs` (ctids ascending) where term `t` holds the
     /// documents `members[t]` with `tfs`, and its brute-force view.
     fn build(docs: &[Tid], members: &[Vec<(usize, u32)>], options: Options) -> Vec<u8> {
@@ -1836,6 +1863,7 @@ mod tests {
             grid_density in prop::sample::select(vec![0u32, 4, 64]),
             block_size in prop::sample::select(vec![2u32, 16, 128]),
             k in 1usize..12,
+            page_len in prop::sample::select(vec![37usize, 509, 8160]),
         ) {
             let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
             // Term t holds a document with probability density[t] percent.
@@ -1860,6 +1888,21 @@ mod tests {
             let segment = Segment::parse(&blob).unwrap();
             let lazy_blob = LazyBlob::new(Box::new(blob.clone()));
             let lazy = assembled(&lazy_blob, &segment);
+            // Read in place from pages pinned per span, poisoned once it
+            // closes: the records the segment keeps past a span must not
+            // borrow its pages.
+            let pinned_blob = LazyBlob::new(Box::new(
+                segment::tinshape::blob::PinningSource::new(blob.clone(), page_len),
+            ));
+            let in_place = assembled_in_place(&pinned_blob, &segment, &blob);
+            let in_span = |read: &mut dyn FnMut()| {
+                pinned_blob.open_span();
+                read();
+                in_place.forget_borrowed();
+                // SAFETY: `read` returned owned results only.
+                unsafe { pinned_blob.close_span() };
+                assert_eq!(pinned_blob.loaded(), 0, "a span copies nothing into the blob");
+            };
             let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();
             let lengths: Vec<u32> = (0..docs.len()).map(|i| (i as u32 * 37) % 90 + 5).collect();
             for node in shapes() {
@@ -1867,6 +1910,21 @@ mod tests {
                 let got = count(&segment, &node, &names, &mut NoTouch).unwrap();
                 prop_assert_eq!(got, want, "count of {:?}", node);
                 prop_assert_eq!(count(&lazy, &node, &names, &mut NoTouch).unwrap(), want, "lazy count of {:?}", node);
+                for round in 0..2 {
+                    let mut got = None;
+                    let mut listed = Vec::new();
+                    in_span(&mut || {
+                        got = Some(count(&in_place, &node, &names, &mut NoTouch).unwrap());
+                        let mut terms = open_terms(&in_place, &names, &mut NoTouch).unwrap();
+                        for_each_match(&in_place, &node, &mut terms, &mut NoTouch, &mut |group, words| {
+                            tids_in(&in_place.docs.geometry, group, words, |tid| listed.push(tid));
+                        })
+                        .unwrap();
+                    });
+                    prop_assert_eq!(got, Some(want), "in-place count of {:?}, round {}", node, round);
+                    let expected: Vec<Tid> = (0..docs.len()).filter(|r| eval(&node, &members, *r)).map(|r| docs[r]).collect();
+                    prop_assert_eq!(listed, expected, "in-place matches of {:?}, round {}", node, round);
+                }
                 let mut terms = open_terms(&segment, &names, &mut NoTouch).unwrap();
                 let mut listed = Vec::new();
                 for_each_match(&segment, &node, &mut terms, &mut NoTouch, &mut |group, words| {
@@ -1928,6 +1986,17 @@ mod tests {
                 prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
                 let lazily = top_k(&lazy, &node, &names, &scorers, k, &mut NoTouch).unwrap();
                 prop_assert_eq!(bits(&lazily.rows), bits(&want), "lazy top {} of {:?}", k, node);
+                for round in 0..2 {
+                    let mut rows = Vec::new();
+                    let mut scores = Vec::new();
+                    in_span(&mut || {
+                        rows = top_k(&in_place, &node, &names, &scorers, k, &mut NoTouch).unwrap().rows;
+                        scores = docs.iter().map(|tid| score_at(&in_place, &scorers, *tid).unwrap().map(f32::to_bits)).collect();
+                    });
+                    prop_assert_eq!(bits(&rows), bits(&want), "in-place top {} of {:?}, round {}", k, node, round);
+                    let alone: Vec<Option<u32>> = docs.iter().map(|tid| score_at(&segment, &scorers, *tid).unwrap().map(f32::to_bits)).collect();
+                    prop_assert_eq!(scores, alone, "in-place scores, round {}", round);
+                }
             }
         }
     }

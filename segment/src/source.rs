@@ -235,6 +235,31 @@ pub trait Source {
         let _ = (slot, offset, len);
         None
     }
+
+    /// Whether a [`Source::hold`] span is open.
+    fn holding(&self) -> bool {
+        false
+    }
+
+    /// Bytes of the source each page holds (the last may hold fewer), for
+    /// a source that pins pages ([`Source::pinned_page`]); zero otherwise.
+    fn page_len(&self) -> usize {
+        0
+    }
+
+    /// The page covering `offset`, pinned until the outermost
+    /// [`Source::hold`] span closes: a page asked for again in the span is
+    /// the same pin. For a reader that reads a segment's structures in place
+    /// rather than copying them ([`crate::tinshape::blob::LazyBlob`]).
+    /// `None` outside a span, for a source that holds nothing, and once the
+    /// span holds the source's bound of pages; the caller then copies.
+    ///
+    /// The span's bytes stay valid until the outermost span closes; the
+    /// caller must not read through `data` after.
+    fn pinned_page(&self, offset: u64) -> Option<Result<HeldSpan>> {
+        let _ = offset;
+        None
+    }
 }
 
 fn check(total: u64, offset: u64, len: usize) -> Result<usize> {
@@ -322,6 +347,15 @@ impl Source for Box<dyn Source> {
     }
     fn held_range(&self, slot: usize, offset: u64, len: usize) -> Option<Result<HeldRange>> {
         (**self).held_range(slot, offset, len)
+    }
+    fn holding(&self) -> bool {
+        (**self).holding()
+    }
+    fn page_len(&self) -> usize {
+        (**self).page_len()
+    }
+    fn pinned_page(&self, offset: u64) -> Option<Result<HeldSpan>> {
+        (**self).pinned_page(offset)
     }
 }
 

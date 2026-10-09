@@ -45,7 +45,7 @@
 //! TF tail and its positions in the positions area.
 
 use super::bits::{self, BitWriter};
-use super::blob::Bytes;
+use super::blob::{Bytes, Kind};
 use super::docs::{Geometry, Group};
 use super::ef::{self, Ef};
 use crate::{Error, Result, varint};
@@ -509,8 +509,9 @@ pub enum Form<'a> {
 pub struct Postings<'a> {
     pub df: u32,
     pub form: Form<'a>,
-    /// The footer's bytes, and where they start in the record.
-    pub footer: &'a [u8],
+    /// The footer's bytes, and where they start in the record: read when
+    /// the footer is decoded ([`Self::footer`]), which a reader keeps.
+    pub footer: Bytes<'a>,
     pub footer_at: usize,
     /// The payload's bytes (an ef list or the grouped directory and
     /// containers), and where they start in the record. Loaded on demand
@@ -587,16 +588,28 @@ fn encode_inline_lengths(lengths: &[u32], out: &mut Vec<u8>) {
 }
 
 impl<'a> Postings<'a> {
+    /// Whether the parsed record holds no slice of the blob, only ranges
+    /// it reads when asked ([`Bytes::is_lazy`]): a grouped record without
+    /// inline lengths. Such a record may be kept beyond the span it was
+    /// parsed in (see [`super::blob::LazyBlob::close_span`]).
+    pub fn is_detached(&self) -> bool {
+        matches!(self.form, Form::Grouped(_))
+            && self.lengths.is_none()
+            && self.footer.is_lazy()
+            && self.payload.is_lazy()
+            && self.tf.is_lazy()
+    }
+
     /// Parses a record of a term with `df` postings in `geometry`: its
     /// header, footer, inline lengths and group directory (or sparse list)
     /// are read, its containers and TF tail only when asked for.
     pub fn parse(record: impl Into<Bytes<'a>>, df: u32, geometry: &Geometry) -> Result<Self> {
-        let bytes = record.into();
+        let bytes = record.into().tag(Kind::Record);
         if df == 0 {
             return Err(Error::Corrupt("a term without postings"));
         }
         if df == 1 {
-            let record = bytes.all()?;
+            let record = bytes.tag(Kind::Sparse).all()?;
             let mut at = 0;
             let slot = varint::get_u32(record, &mut at)?;
             let lengths = if at < record.len() {
@@ -619,7 +632,7 @@ impl<'a> Postings<'a> {
                 lengths,
                 df,
                 form: Form::Single(slot),
-                footer: &[],
+                footer: Bytes::default(),
                 footer_at: 0,
                 payload: Bytes::Slice(&record[..at]),
                 payload_at: 0,
@@ -655,11 +668,11 @@ impl<'a> Postings<'a> {
         if tf_at > bytes.len() {
             return Err(Error::Truncated);
         }
-        let footer = bytes.get(footer_at, payload_at)?;
+        let footer = bytes.sub(footer_at, payload_at)?.tag(Kind::Footer);
         let payload = bytes.sub(payload_at, lengths_at)?;
         let lengths = if lengths_len > 0 {
             Some(InlineLengths::parse(
-                bytes.get(lengths_at, tf_at)?,
+                bytes.tag(Kind::InlineLengths).get(lengths_at, tf_at)?,
                 lengths_at,
                 df,
             )?)
@@ -672,7 +685,11 @@ impl<'a> Postings<'a> {
                 if payload.len() != ef::encoded_len(df as usize, geometry.slots) {
                     return Err(Error::Corrupt("sparse postings length"));
                 }
-                Form::Sparse(Ef::parse(payload.all()?, df as usize, geometry.slots)?)
+                Form::Sparse(Ef::parse(
+                    payload.tag(Kind::Sparse).all()?,
+                    df as usize,
+                    geometry.slots,
+                )?)
             }
             FORM_GROUPED => {
                 // The directory's length is known only once it is parsed:
@@ -700,7 +717,7 @@ impl<'a> Postings<'a> {
             payload,
             payload_at,
             containers_at,
-            tf: bytes.sub(tf_at, bytes.len())?,
+            tf: bytes.sub(tf_at, bytes.len())?.tag(Kind::Tf),
             tf_at,
             lengths,
             compact,
@@ -714,6 +731,7 @@ impl<'a> Postings<'a> {
         self.payload
             .sub(at, at + entry.len as usize)
             .expect("a container within its payload")
+            .tag(Kind::Container)
     }
 
     /// Calls `visit` with every slot, in order.
@@ -1020,7 +1038,7 @@ impl Footer {
             entry_at: Vec::with_capacity(blocks),
             single: None,
         };
-        let bytes = postings.footer;
+        let bytes = postings.footer.all()?;
         let mut at = 0usize;
         let mut last = 0u64;
         let mut tf = 0u64;

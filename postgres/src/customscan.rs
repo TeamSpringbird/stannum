@@ -180,6 +180,14 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"stannum.native_in_place",
+        c"Read segments in TIN's shape in place from pinned shared buffers",
+        c"Off copies what queries read into per-backend chunks kept across queries, for comparison.",
+        &crate::storage::NATIVE_IN_PLACE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"stannum.count_fold",
         c"Count Boolean term queries by folding document-ordinal streams",
         c"Off keeps the scalar and page-bitmap strategies; other query shapes always use those.",
@@ -2711,6 +2719,33 @@ unsafe extern "C-unwind" fn explain(
                 .join(", ");
             if let Ok(text) = CString::new(touched) {
                 pg_sys::ExplainPropertyText(c"Page Touches By Area".as_ptr(), text.as_ptr(), es);
+            }
+            let phases = crate::score::phase_blocks()
+                .iter()
+                .map(|(name, pages)| format!("{name} {pages}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(phases) {
+                pg_sys::ExplainPropertyText(
+                    c"Buffer Accesses By Phase".as_ptr(),
+                    text.as_ptr(),
+                    es,
+                );
+            }
+            let native = segment::tinshape::blob::stats()
+                .iter()
+                .zip(segment::tinshape::blob::KIND_NAMES)
+                .filter(|(s, _)| **s != segment::tinshape::blob::KindStats::default())
+                .map(|(s, name)| {
+                    format!(
+                        "{name}: copied {} B in {} pages, pinned {}, stitched {} B",
+                        s.copied, s.copied_pages, s.pinned, s.stitched
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            if let Ok(text) = CString::new(native) {
+                pg_sys::ExplainPropertyText(c"Native Reads By Kind".as_ptr(), text.as_ptr(), es);
             }
             let phases = crate::score::phase_disk()
                 .iter()
