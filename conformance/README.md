@@ -16,12 +16,19 @@ implements the interface.
 conformance/
   README.md
   run.py                       the runner
+  compare_recordings.py        lists the cases whose answers differ between two
+                               recorded directories (e.g. two engine versions)
   cases/<area>.yaml            declarative cases, grouped by area
   cases/catalog.*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9,
                                and catalog.promote.yaml, which asks catalog.S-07's
                                question again
   cases/limits.yaml            resource limits: expansion, regex size, large
                                documents, cancellation
+  cases/stemming.yaml          the stemmer index option and tokenize(stemmer =>)
+                               (new in TIN 1.0.4)
+  cases/tiebreak.yaml          ORDER BY score DESC, other columns ... LIMIT k
+  cases/inventory.yaml         the engine's settings, functions, access method
+                               and operator as the catalogs list them
   expected/<engine>-<version>/<area>.json
                                recorded answers of one engine version
   divergences/<engine>.yaml    where an engine knowingly answers differently
@@ -51,6 +58,9 @@ python3 conformance/run.py --engine tin --record conformance/expected --host-not
 # Only some cases
 python3 conformance/run.py --engine stannum --check conformance/expected/tin-1.0.3 --area spans
 python3 conformance/run.py --engine stannum --check conformance/expected/tin-1.0.3 --case 'bm25.k1.*'
+
+# All but some cases (an excluded case is neither run nor reported)
+python3 conformance/run.py --engine tin --record conformance/expected --skip-crash --exclude 'query_size.*.3000'
 ```
 
 With neither `--record` nor `--check` the runner only runs the cases and
@@ -90,12 +100,15 @@ order, counts, float4 bit patterns, highlight text.
 
 `divergences/<engine>.yaml` lists the cases where the engine under test
 knowingly answers differently from a recorded engine version (`against`,
-e.g. `tin-1.0.3`), naming the captures that differ:
+e.g. `tin-1.0.3`, or a list of versions), naming the captures that differ:
 
 - `kind: improvement`: the recorded engine raised an ERROR on each listed
   capture and this engine answers. Reported as `IMPROVED`, with a
   `question` for the recorded engine's authors (why is this not supported?).
 - `kind: gap`: this engine lacks what the case exercises. Reported as `GAP`.
+  A gap whose `captures` is `[corpus]` says this engine cannot build the
+  case's corpus (an index option it lacks, for example) where the recorded
+  engine built it.
 - `kind: limit`: the recorded engine answered each listed capture (or, in a
   `script`, the step), and this engine refuses it with SQLSTATE 54000
   (program_limit_exceeded) or 54001 (statement_too_complex) by design.
@@ -113,9 +126,10 @@ entry records; the runner only checks its mechanics.
 
 A case may be tagged `crashes: [tin-1.0.3, stannum-0.1.0]`: known to crash
 the server with that engine version (a bare engine name, e.g. `stannum`, tags
-every version). With `--skip-crash`, the runner skips cases tagged for the
-engine and version under test; always use it on a server other sessions
-share. Without it, tagged cases run as risky. Whether a case crashes can
+every version). With `--skip-crash`, the runner skips cases tagged for any
+version of the engine under test, since a newer version is not known to be
+fixed until someone runs the case on a server they may restart; always use
+it on a server other sessions share. Without it, tagged cases run as risky. Whether a case crashes can
 depend on the server's environment (a stack overflow, for example, depends
 on the postmaster's stack limit), so tag a case as soon as it crashes any
 server, and run untagged-but-risky areas such as `query_size` on a
@@ -206,6 +220,24 @@ may restart.
   time and last. `limits.json`'s header reads `8592c98…-dirty` only because
   the answer files being recorded were not yet committed (the runner now
   ignores `expected/` in that check); the cases and runner were at `8592c98`.
+- `expected/tin-1.0.4/` holds TIN 1.0.4's answers, recorded live by
+  `run.py` (runner version 3) on 2026-10-09 UTC (2026-10-08 US Eastern)
+  against PostgreSQL 18.6 on a PlanetScale test database: every area at
+  `5e3f29d` with `--skip-crash` (a second run gave identical answers),
+  `stemming`, `tiebreak` and `inventory` at `41f8e6c` (`inventory.json`'s
+  header names `7d7d589`, where `inventory.settings.1` was recorded again
+  after it learned to load the engine's library first), then, one at a time
+  and last, the seven cases tagged as crashing TIN 1.0.3, merged into
+  `limits.json` and `query_size.json` (whose headers name that last run,
+  at `ee6f940`). All seven crashed the server again and are tagged
+  `tin-1.0.4`. Five cases were not run, beyond what the database's owner
+  allowed (more than 1,000 query terms, a document over 1 MB, AT LEAST 8 OF
+  16 inside NEAR): `catalog.Q-20`, `limits.at_least_near.2`,
+  `limits.large_doc.10mb`, `query_size.words.3000` and
+  `query_size.or_chain.3000`.
+- To see what a new version changed, compare its directory with the
+  previous one: `python3 conformance/compare_recordings.py
+  conformance/expected/tin-1.0.3 conformance/expected/tin-1.0.4`.
 - A case without recorded answers for an engine is not a failure; it is
   reported as SKIP until someone records that engine.
 

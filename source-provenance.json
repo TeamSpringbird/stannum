@@ -64,6 +64,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
+    "benchmarks/compare/compare.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the TIN vs Stannum comparison kit, written for this repository on 2026-10-09."
+    },
     "benchmarks/contention.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in e0fe96d06f4378ba3c88cf3a0633d3f2739cb6be."
@@ -211,6 +215,10 @@
     "benchmarks/test_campaign.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "benchmarks/test_compare.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the TIN vs Stannum comparison kit, written for this repository on 2026-10-09."
     },
     "benchmarks/test_contention.py": {
       "owner": "ben",
@@ -522,6 +530,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_topk.yaml."
     },
+    "conformance/cases/inventory.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
+    },
     "conformance/cases/limits.yaml": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
@@ -541,6 +553,18 @@
     "conformance/cases/spans.yaml": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
+    },
+    "conformance/cases/stemming.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
+    },
+    "conformance/cases/tiebreak.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
+    },
+    "conformance/compare_recordings.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
     },
     "conformance/divergences/stannum.yaml": {
       "owner": "ben",

@@ -131,9 +131,9 @@ jobs:
       - name: Cluster tests
         run: script/test-all cluster
 
-      # Every conformance case against TIN 1.0.3's recorded answers, in a
+      # Every conformance case against TIN 1.0.3's and 1.0.4's recorded answers, in a
       # throwaway cluster. The answers were recorded on PostgreSQL 18.
-      - name: Conformance against TIN 1.0.3
+      - name: Conformance against TIN 1.0.3 and 1.0.4
         if: matrix.postgres == 18
         run: script/test-all conformance
 

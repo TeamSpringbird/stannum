@@ -1,0 +1,1238 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.4",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18.6 (test database)",
+  "date": "2026-10-09T03:36:17Z",
+  "suite_commit": "5e3f29df79ccf3c8807d8d06a9cc8a0f56f15cfe",
+  "runner_version": "3"
+ },
+ "cases": [
+  {
+   "id": "catalog.S-07b",
+   "captures": {
+    "script": [
+     [
+      {
+       "ordinal": 0,
+       "kind": "mutable",
+       "root_block": 55,
+       "docs": 20,
+       "dead_docs": 0,
+       "sum_doc_lengths": 40,
+       "npostings": null,
+       "total_pages": 55,
+       "source_state": "current",
+       "origin": null,
+       "sequence": null
+      }
+     ],
+     [
+      [
+       "k1",
+       "3f800000"
+      ],
+      [
+       "w",
+       "3f800000"
+      ]
+     ],
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ],
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ],
+     [
+      {
+       "consumed_controls": 0,
+       "linked_segments": 0,
+       "docs_promoted": 0,
+       "terms_added": 0
+      }
+     ],
+     [
+      {
+       "ordinal": 0,
+       "kind": "mutable",
+       "root_block": 55,
+       "docs": 20,
+       "dead_docs": 0,
+       "sum_doc_lengths": 40,
+       "npostings": null,
+       "total_pages": 55,
+       "source_state": "current",
+       "origin": null,
+       "sequence": null
+      }
+     ],
+     [
+      [
+       "k1",
+       "3f800000"
+      ],
+      [
+       "w",
+       "3f800000"
+      ]
+     ],
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ],
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-07c",
+   "captures": {
+    "script": [
+     [
+      {
+       "ordinal": 0,
+       "kind": "immutable",
+       "root_block": 12,
+       "docs": 20,
+       "dead_docs": 0,
+       "sum_doc_lengths": 40,
+       "npostings": 40,
+       "total_pages": 11,
+       "source_state": "current",
+       "origin": "build",
+       "sequence": 0
+      }
+     ],
+     [
+      [
+       "k1",
+       "3f800000"
+      ]
+     ],
+     [
+      [
+       1,
+       "00000000"
+      ],
+      [
+       2,
+       "00000000"
+      ],
+      [
+       3,
+       "00000000"
+      ],
+      [
+       4,
+       "00000000"
+      ],
+      [
+       5,
+       "00000000"
+      ],
+      [
+       6,
+       "00000000"
+      ],
+      [
+       7,
+       "00000000"
+      ],
+      [
+       8,
+       "00000000"
+      ],
+      [
+       9,
+       "00000000"
+      ],
+      [
+       10,
+       "00000000"
+      ],
+      [
+       11,
+       "00000000"
+      ],
+      [
+       12,
+       "00000000"
+      ],
+      [
+       13,
+       "00000000"
+      ],
+      [
+       14,
+       "00000000"
+      ],
+      [
+       15,
+       "00000000"
+      ],
+      [
+       16,
+       "00000000"
+      ],
+      [
+       17,
+       "00000000"
+      ],
+      [
+       18,
+       "00000000"
+      ],
+      [
+       19,
+       "00000000"
+      ],
+      [
+       20,
+       "00000000"
+      ]
+     ],
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ],
+     [
+      {
+       "consumed_controls": 0,
+       "linked_segments": 0,
+       "docs_promoted": 0,
+       "terms_added": 0
+      }
+     ],
+     [
+      {
+       "ordinal": 0,
+       "kind": "immutable",
+       "root_block": 12,
+       "docs": 20,
+       "dead_docs": 0,
+       "sum_doc_lengths": 40,
+       "npostings": 40,
+       "total_pages": 11,
+       "source_state": "current",
+       "origin": "build",
+       "sequence": 0
+      }
+     ],
+     [
+      [
+       "k1",
+       "3f800000"
+      ]
+     ],
+     [
+      [
+       1,
+       "00000000"
+      ],
+      [
+       2,
+       "00000000"
+      ],
+      [
+       3,
+       "00000000"
+      ],
+      [
+       4,
+       "00000000"
+      ],
+      [
+       5,
+       "00000000"
+      ],
+      [
+       6,
+       "00000000"
+      ],
+      [
+       7,
+       "00000000"
+      ],
+      [
+       8,
+       "00000000"
+      ],
+      [
+       9,
+       "00000000"
+      ],
+      [
+       10,
+       "00000000"
+      ],
+      [
+       11,
+       "00000000"
+      ],
+      [
+       12,
+       "00000000"
+      ],
+      [
+       13,
+       "00000000"
+      ],
+      [
+       14,
+       "00000000"
+      ],
+      [
+       15,
+       "00000000"
+      ],
+      [
+       16,
+       "00000000"
+      ],
+      [
+       17,
+       "00000000"
+      ],
+      [
+       18,
+       "00000000"
+      ],
+      [
+       19,
+       "00000000"
+      ],
+      [
+       20,
+       "00000000"
+      ]
+     ],
+     [
+      [
+       1,
+       "3cc5683a"
+      ],
+      [
+       2,
+       "3cc5683a"
+      ],
+      [
+       3,
+       "3cc5683a"
+      ],
+      [
+       4,
+       "3cc5683a"
+      ],
+      [
+       5,
+       "3cc5683a"
+      ],
+      [
+       6,
+       "3cc5683a"
+      ],
+      [
+       7,
+       "3cc5683a"
+      ],
+      [
+       8,
+       "3cc5683a"
+      ],
+      [
+       9,
+       "3cc5683a"
+      ],
+      [
+       10,
+       "3cc5683a"
+      ],
+      [
+       11,
+       "3cc5683a"
+      ],
+      [
+       12,
+       "3cc5683a"
+      ],
+      [
+       13,
+       "3cc5683a"
+      ],
+      [
+       14,
+       "3cc5683a"
+      ],
+      [
+       15,
+       "3cc5683a"
+      ],
+      [
+       16,
+       "3cc5683a"
+      ],
+      [
+       17,
+       "3cc5683a"
+      ],
+      [
+       18,
+       "3cc5683a"
+      ],
+      [
+       19,
+       "3cc5683a"
+      ],
+      [
+       20,
+       "3cc5683a"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-07d",
+   "captures": {
+    "script": [
+     [
+      {
+       "ordinal": 0,
+       "kind": "mutable",
+       "root_block": 55,
+       "docs": 200,
+       "dead_docs": 0,
+       "sum_doc_lengths": 460,
+       "npostings": null,
+       "total_pages": 61,
+       "source_state": "current",
+       "origin": null,
+       "sequence": null
+      }
+     ],
+     [
+      [
+       "k1",
+       "3f800000"
+      ],
+      [
+       "u",
+       "3f800000"
+      ],
+      [
+       "v",
+       "3f800000"
+      ],
+      [
+       "w",
+       "3f800000"
+      ],
+      [
+       "z",
+       "3f800000"
+      ]
+     ],
+     [
+      [
+       1,
+       "3adc8b03"
+      ],
+      [
+       2,
+       "3adc8b03"
+      ],
+      [
+       3,
+       "3adc8b03"
+      ]
+     ],
+     [
+      {
+       "consumed_controls": 0,
+       "linked_segments": 0,
+       "docs_promoted": 0,
+       "terms_added": 0
+      }
+     ],
+     [
+      {
+       "ordinal": 0,
+       "kind": "mutable",
+       "root_block": 55,
+       "docs": 200,
+       "dead_docs": 0,
+       "sum_doc_lengths": 460,
+       "npostings": null,
+       "total_pages": 61,
+       "source_state": "current",
+       "origin": null,
+       "sequence": null
+      }
+     ],
+     [
+      [
+       "k1",
+       "3f800000"
+      ],
+      [
+       "u",
+       "3f800000"
+      ],
+      [
+       "v",
+       "3f800000"
+      ],
+      [
+       "w",
+       "3f800000"
+      ],
+      [
+       "z",
+       "3f800000"
+      ]
+     ],
+     [
+      [
+       1,
+       "3adc8b03"
+      ],
+      [
+       2,
+       "3adc8b03"
+      ],
+      [
+       3,
+       "3adc8b03"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-07e",
+   "captures": {
+    "script": [
+     [
+      {
+       "ordinal": 0,
+       "kind": "immutable",
+       "root_block": 21,
+       "docs": 185,
+       "dead_docs": 0,
+       "sum_doc_lengths": 430,
+       "npostings": 430,
+       "total_pages": 11,
+       "source_state": "current",
+       "origin": "build",
+       "sequence": 0
+      },
+      {
+       "ordinal": 1,
+       "kind": "immutable",
+       "root_block": 19,
+       "docs": 15,
+       "dead_docs": 0,
+       "sum_doc_lengths": 30,
+       "npostings": 30,
+       "total_pages": 11,
+       "source_state": "current",
+       "origin": "build",
+       "sequence": 1
+      }
+     ],
+     [
+      [
+       "k1",
+       "3f800000"
+      ],
+      [
+       "v",
+       "3f800000"
+      ],
+      [
+       "z",
+       "3f800000"
+      ]
+     ],
+     [
+      [
+       1,
+       "00000000"
+      ],
+      [
+       2,
+       "00000000"
+      ],
+      [
+       3,
+       "00000000"
+      ]
+     ],
+     [
+      {
+       "consumed_controls": 0,
+       "linked_segments": 0,
+       "docs_promoted": 0,
+       "terms_added": 0
+      }
+     ],
+     [
+      {
+       "ordinal": 0,
+       "kind": "immutable",
+       "root_block": 21,
+       "docs": 185,
+       "dead_docs": 0,
+       "sum_doc_lengths": 430,
+       "npostings": 430,
+       "total_pages": 11,
+       "source_state": "current",
+       "origin": "build",
+       "sequence": 0
+      },
+      {
+       "ordinal": 1,
+       "kind": "immutable",
+       "root_block": 19,
+       "docs": 15,
+       "dead_docs": 0,
+       "sum_doc_lengths": 30,
+       "npostings": 30,
+       "total_pages": 11,
+       "source_state": "current",
+       "origin": "build",
+       "sequence": 1
+      }
+     ],
+     [
+      [
+       "k1",
+       "3f800000"
+      ],
+      [
+       "v",
+       "3f800000"
+      ],
+      [
+       "z",
+       "3f800000"
+      ]
+     ],
+     [
+      [
+       1,
+       "00000000"
+      ],
+      [
+       2,
+       "00000000"
+      ],
+      [
+       3,
+       "00000000"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-07f",
+   "captures": {
+    "script": [
+     null,
+     [
+      {
+       "ordinal": 0,
+       "kind": "mutable",
+       "root_block": 624,
+       "docs": 712,
+       "dead_docs": 0,
+       "sum_doc_lengths": 2848,
+       "npostings": null,
+       "total_pages": 79,
+       "source_state": "current",
+       "origin": null,
+       "sequence": null
+      },
+      {
+       "ordinal": 1,
+       "kind": "sealed",
+       "root_block": 627,
+       "docs": 12288,
+       "dead_docs": 0,
+       "sum_doc_lengths": 29483,
+       "npostings": null,
+       "total_pages": 510,
+       "source_state": "current",
+       "origin": null,
+       "sequence": null
+      }
+     ],
+     [
+      [
+       "a",
+       "3f800000"
+      ],
+      [
+       "b",
+       "3f800000"
+      ],
+      [
+       "c",
+       "3f800000"
+      ],
+      [
+       "d",
+       "3f800000"
+      ],
+      [
+       "e",
+       "3f800000"
+      ],
+      [
+       "k1",
+       "3f800000"
+      ],
+      [
+       "w",
+       "3f800000"
+      ]
+     ],
+     [
+      {
+       "consumed_controls": 1,
+       "linked_segments": 1,
+       "docs_promoted": 12288,
+       "terms_added": 12293
+      }
+     ],
+     [
+      {
+       "ordinal": 0,
+       "kind": "immutable",
+       "root_block": 708,
+       "docs": 12288,
+       "dead_docs": 0,
+       "sum_doc_lengths": 29483,
+       "npostings": 29483,
+       "total_pages": 17,
+       "source_state": "current",
+       "origin": "promotion",
+       "sequence": 0
+      },
+      {
+       "ordinal": 1,
+       "kind": "mutable",
+       "root_block": 624,
+       "docs": 712,
+       "dead_docs": 0,
+       "sum_doc_lengths": 2848,
+       "npostings": null,
+       "total_pages": 79,
+       "source_state": "current",
+       "origin": null,
+       "sequence": null
+      },
+      {
+       "ordinal": 2,
+       "kind": "retired",
+       "root_block": 627,
+       "docs": 12288,
+       "dead_docs": 0,
+       "sum_doc_lengths": 29483,
+       "npostings": null,
+       "total_pages": 510,
+       "source_state": "retired",
+       "origin": null,
+       "sequence": null
+      }
+     ],
+     [
+      [
+       "b",
+       "3f800000"
+      ],
+      [
+       "d",
+       "3f800000"
+      ],
+      [
+       "e",
+       "3f800000"
+      ],
+      [
+       "k1",
+       "3f800000"
+      ]
+     ],
+     [
+      {
+       "consumed_controls": 0,
+       "linked_segments": 0,
+       "docs_promoted": 0,
+       "terms_added": 0
+      }
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-07g",
+   "captures": {
+    "script": [
+     null,
+     [
+      {
+       "consumed_controls": 1,
+       "linked_segments": 68,
+       "docs_promoted": 12288,
+       "terms_added": 12293
+      }
+     ],
+     [
+      [
+       70,
+       "25288",
+       112,
+       12288,
+       [
+        "immutable",
+        "mutable",
+        "retired"
+       ]
+      ]
+     ],
+     [
+      [
+       "b",
+       "3f800000"
+      ],
+      [
+       "d",
+       "3f800000"
+      ],
+      [
+       "e",
+       "3f800000"
+      ],
+      [
+       "k1",
+       "3f800000"
+      ]
+     ]
+    ]
+   }
+  },
+  {
+   "id": "catalog.S-07h",
+   "captures": {
+    "value": [
+     [
+      "index regclass, extent_cap_bytes bigint DEFAULT NULL::bigint",
+      "TABLE(consumed_controls integer, linked_segments integer, docs_promoted bigint, terms_added bigint)"
+     ]
+    ],
+    "zero_cap": {
+     "sqlstate": "XX000",
+     "message": "extent_cap_bytes must be positive"
+    }
+   }
+  }
+ ]
+}
