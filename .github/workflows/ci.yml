@@ -191,7 +191,9 @@ jobs:
     env:
       PG_MAJOR: 18
       LEAD_REPOSITORY: planetscale/lead
-      LEAD_REF: main
+      # Pinned so upstream changes cannot fail unrelated pull requests; move it
+      # forward deliberately, together with the Stannum changes it requires.
+      LEAD_REF: bd95c7e51b6afce81396790852ee2f2c169570ad
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
