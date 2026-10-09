@@ -3936,10 +3936,7 @@ fn native_segment<R>(
             .get_or_init(|| Box::new(LazyBlob::new(Box::new(ReaderSource(reader.clone())))));
         let _span = in_place.then(|| {
             blob.open_span();
-            Span {
-                native,
-                blob,
-            }
+            Span { native, blob }
         });
         // The reader's, decoded once from a transient read (and counted in
         // its cached bytes): the blob keeps no copy of the set's bytes.
