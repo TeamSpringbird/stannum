@@ -18,7 +18,7 @@ crate-type = ["cdylib", "rlib"]
 default = ["pg18"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
-pg_test = ["dep:serde_json"]
+pg_test = ["dep:serde_json", "engine/test-hooks"]
 
 [dependencies]
 pgrx = "=0.19.1"
@@ -30,6 +30,7 @@ tokenizer = { path = "../tokenizer" }
 tinql = { path = "../tinql" }
 boldi-vigna = { path = "../boldi-vigna" }
 segment = { path = "../segment" }
+engine = { path = "../engine" }
 
 [dev-dependencies]
 pgrx-tests = "=0.19.1"

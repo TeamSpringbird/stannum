@@ -11,21 +11,21 @@ use rustc_hash::FxHashSet;
 use segment::bound::BlockBound;
 use thiserror::Error;
 
-use crate::tf_bucket::{BUCKET_COUNT, TfBucket};
+use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Bm25Params {
-    pub(crate) k1: f32,
-    pub(crate) b: f32,
+pub struct Bm25Params {
+    pub k1: f32,
+    pub b: f32,
 }
 
 impl Bm25Params {
-    pub(crate) const DEFAULT_K1: f32 = 1.2;
-    pub(crate) const DEFAULT_B: f32 = 0.75;
-    pub(crate) const K1_MAX: f32 = 1.0e4;
+    pub const DEFAULT_K1: f32 = 1.2;
+    pub const DEFAULT_B: f32 = 0.75;
+    pub const K1_MAX: f32 = 1.0e4;
 
     #[must_use]
-    pub(crate) const fn default_bm25() -> Self {
+    pub const fn default_bm25() -> Self {
         Self {
             k1: Self::DEFAULT_K1,
             b: Self::DEFAULT_B,
@@ -33,11 +33,11 @@ impl Bm25Params {
     }
 
     #[must_use]
-    pub(crate) fn is_valid(self) -> bool {
+    pub fn is_valid(self) -> bool {
         (0.0..=Self::K1_MAX).contains(&self.k1) && (0.0..=1.0).contains(&self.b)
     }
 
-    pub(crate) fn checked(self) -> Result<Self, Bm25Error> {
+    pub fn checked(self) -> Result<Self, Bm25Error> {
         self.is_valid().then_some(self).ok_or(Bm25Error::Parameters)
     }
 }
@@ -49,14 +49,14 @@ impl Default for Bm25Params {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct Bm25Overrides {
-    pub(crate) k1: Option<f32>,
-    pub(crate) b: Option<f32>,
+pub struct Bm25Overrides {
+    pub k1: Option<f32>,
+    pub b: Option<f32>,
 }
 
 impl Bm25Overrides {
     #[must_use]
-    pub(crate) fn resolve(self, defaults: Bm25Params) -> Bm25Params {
+    pub fn resolve(self, defaults: Bm25Params) -> Bm25Params {
         Bm25Params {
             k1: self.k1.unwrap_or(defaults.k1),
             b: self.b.unwrap_or(defaults.b),
@@ -65,30 +65,30 @@ impl Bm25Overrides {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct DenseRatio(f32);
+pub struct DenseRatio(f32);
 
 impl DenseRatio {
-    pub(crate) const DEFAULT: f32 = 0.10;
+    pub const DEFAULT: f32 = 0.10;
 
     #[must_use]
-    pub(crate) fn new(value: Option<f32>) -> Self {
+    pub fn new(value: Option<f32>) -> Self {
         Self(value.unwrap_or(Self::DEFAULT))
     }
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn value(self) -> f32 {
+    pub const fn value(self) -> f32 {
         self.0
     }
 
     #[must_use]
-    pub(crate) fn is_valid(self) -> bool {
+    pub fn is_valid(self) -> bool {
         self.0.is_finite() && self.0 >= 0.0
     }
 
     /// Uses immutable-only statistics and the production `f64` comparison.
     #[must_use]
-    pub(crate) fn elides(self, pinned: bool, immutable_df: u64, immutable_docs: u64) -> bool {
+    pub fn elides(self, pinned: bool, immutable_df: u64, immutable_docs: u64) -> bool {
         !pinned
             && immutable_df > 0
             && immutable_df as f64 >= f64::from(self.0) * immutable_docs as f64
@@ -96,13 +96,13 @@ impl DenseRatio {
 }
 
 #[derive(Debug)]
-pub(crate) struct ScoreStopWords<'a> {
+pub struct ScoreStopWords<'a> {
     terms: FxHashSet<&'a str>,
 }
 
 impl<'a> ScoreStopWords<'a> {
     #[must_use]
-    pub(crate) fn from_csv(csv: &'a str) -> Option<Self> {
+    pub fn from_csv(csv: &'a str) -> Option<Self> {
         let terms = csv
             .split(',')
             .map(str::trim)
@@ -112,13 +112,13 @@ impl<'a> ScoreStopWords<'a> {
     }
 
     #[must_use]
-    pub(crate) fn contains(&self, term: &str) -> bool {
+    pub fn contains(&self, term: &str) -> bool {
         self.terms.contains(term)
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) enum TermSetEdit {
+pub enum TermSetEdit {
     #[default]
     None,
     Add(Vec<String>),
@@ -126,7 +126,7 @@ pub(crate) enum TermSetEdit {
 }
 
 impl TermSetEdit {
-    pub(crate) fn from_bound_arrays(
+    pub fn from_bound_arrays(
         add: Option<Vec<String>>,
         replace: Option<Vec<String>>,
     ) -> Result<Self, TermSetEditError> {
@@ -140,7 +140,7 @@ impl TermSetEdit {
 
     /// Applies the caller's index tokenizer to raw edit elements.
     #[must_use]
-    pub(crate) fn analyzed_with<F, I>(&self, mut analyze: F) -> Self
+    pub fn analyzed_with<F, I>(&self, mut analyze: F) -> Self
     where
         F: FnMut(&str) -> I,
         I: IntoIterator<Item = String>,
@@ -166,22 +166,22 @@ impl TermSetEdit {
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub(crate) enum TermSetEditError {
+pub enum TermSetEditError {
     #[error("term_add and term_replace cannot both be non-NULL")]
     ConflictingEdits,
 }
 
 /// One occurrence collected from the lowered query before term-set edits.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ScoringTermInput<'a> {
-    pub(crate) text: &'a str,
-    pub(crate) boost: f32,
+pub struct ScoringTermInput<'a> {
+    pub text: &'a str,
+    pub boost: f32,
     /// True for an explicit boost node, including an explicit `^1.0`.
-    pub(crate) explicitly_boosted: bool,
+    pub explicitly_boosted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ScoringTerm {
+pub struct ScoringTerm {
     text: String,
     boost: f32,
     pinned: bool,
@@ -189,25 +189,25 @@ pub(crate) struct ScoringTerm {
 
 impl ScoringTerm {
     #[must_use]
-    pub(crate) fn text(&self) -> &str {
+    pub fn text(&self) -> &str {
         &self.text
     }
 
     #[must_use]
-    pub(crate) const fn boost(&self) -> f32 {
+    pub const fn boost(&self) -> f32 {
         self.boost
     }
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn pinned(&self) -> bool {
+    pub const fn pinned(&self) -> bool {
         self.pinned
     }
 
     /// Terms absent from every source never score. Dense filtering is optional
     /// so `full_score` can retain the complete, non-stopped program.
     #[must_use]
-    pub(crate) fn is_retained(
+    pub fn is_retained(
         &self,
         total_df: u64,
         immutable_df: u64,
@@ -224,7 +224,7 @@ impl ScoringTerm {
 /// Repeated query occurrences add their boosts. Edit terms are idempotent,
 /// pin existing query terms without changing their weight, and enter at 1.0.
 #[must_use]
-pub(crate) fn compile_scoring_terms<'query>(
+pub fn compile_scoring_terms<'query>(
     query_terms: impl IntoIterator<Item = ScoringTermInput<'query>>,
     edit: &TermSetEdit,
     stop_words: Option<&ScoreStopWords<'_>>,
@@ -268,7 +268,7 @@ pub(crate) fn compile_scoring_terms<'query>(
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub(crate) enum Bm25Error {
+pub enum Bm25Error {
     #[error("invalid BM25 parameters")]
     Parameters,
     #[error("average document length must be finite and positive")]
@@ -280,7 +280,7 @@ pub(crate) enum Bm25Error {
 /// Canonical production IDF: `ln(1 + (N - df + 0.5) / (df + 0.5))`.
 /// Stale statistics with `df > N` are floored at zero.
 #[must_use]
-pub(crate) fn bm25_idf(total_docs: u64, df: u64) -> f64 {
+pub fn bm25_idf(total_docs: u64, df: u64) -> f64 {
     let inner = 1.0 + (total_docs as f64 - df as f64 + 0.5) / (df as f64 + 0.5);
     if inner <= 1.0 { 0.0 } else { inner.ln() }
 }
@@ -288,7 +288,7 @@ pub(crate) fn bm25_idf(total_docs: u64, df: u64) -> f64 {
 /// Precomputed one-term scorer. Its field construction and score expression
 /// deliberately preserve production's `f32` operation order.
 #[derive(Clone, Debug)]
-pub(crate) struct TermScorer {
+pub struct TermScorer {
     numerator: [f32; BUCKET_COUNT],
     denominator_constant: [f32; BUCKET_COUNT],
     document_length_factor: f32,
@@ -329,7 +329,7 @@ fn rises_with_the_bucket(
 }
 
 impl TermScorer {
-    pub(crate) fn from_statistics(
+    pub fn from_statistics(
         total_docs: u64,
         df: u64,
         boost: f32,
@@ -344,7 +344,7 @@ impl TermScorer {
         )
     }
 
-    pub(crate) fn new(
+    pub fn new(
         idf: f32,
         boost: f32,
         params: Bm25Params,
@@ -381,7 +381,7 @@ impl TermScorer {
     }
 
     #[must_use]
-    pub(crate) fn score_bucket(&self, bucket: TfBucket, document_length: u32) -> f32 {
+    pub fn score_bucket(&self, bucket: TfBucket, document_length: u32) -> f32 {
         let index = usize::from(bucket.value());
         let denominator =
             self.denominator_constant[index] + self.document_length_factor * document_length as f32;
@@ -401,7 +401,7 @@ impl TermScorer {
     /// bucket at every length this is the score at `bucket`; otherwise it
     /// is the running best over the buckets up to it.
     #[must_use]
-    pub(crate) fn bound_through(&self, bucket: TfBucket, document_length: u32) -> f32 {
+    pub fn bound_through(&self, bucket: TfBucket, document_length: u32) -> f32 {
         if self.rises {
             return self.score_bucket(bucket, document_length);
         }
@@ -416,7 +416,7 @@ impl TermScorer {
     }
 
     #[must_use]
-    pub(crate) fn score_count(&self, term_frequency: u32, document_length: u32) -> f32 {
+    pub fn score_count(&self, term_frequency: u32, document_length: u32) -> f32 {
         self.score_bucket(TfBucket::from_count(term_frequency), document_length)
     }
 
@@ -430,7 +430,7 @@ impl TermScorer {
     /// document with that bucket. The bound is attained by one of them, so
     /// it is the block's exact maximum.
     #[must_use]
-    pub(crate) fn bound(&self, block: &BlockBound) -> f32 {
+    pub fn bound(&self, block: &BlockBound) -> f32 {
         let mut bound = 0.0_f32;
         for (bucket, min_len) in block.buckets() {
             let bucket = TfBucket::new(bucket).expect("block bounds hold valid buckets");
@@ -441,7 +441,7 @@ impl TermScorer {
 
     /// Conjunction members share one document length. Every matching document
     /// is at least `min_length` long and also respects its bucket's minimum.
-    pub(crate) fn bound_with_min_length(&self, block: &BlockBound, min_length: u32) -> f32 {
+    pub fn bound_with_min_length(&self, block: &BlockBound, min_length: u32) -> f32 {
         block
             .buckets()
             .map(|(bucket, length)| {
@@ -458,7 +458,7 @@ impl TermScorer {
     /// bounds a sub-block at [`Self::bound_through`] its largest bucket
     /// instead, which is at least this maximum; the tests below check that.
     #[cfg(test)]
-    pub(crate) fn bound_for_length(&self, block: &BlockBound, length: u32) -> f32 {
+    pub fn bound_for_length(&self, block: &BlockBound, length: u32) -> f32 {
         let mut bound = 0.0_f32;
         for (bucket, _) in block.buckets() {
             let bucket = TfBucket::new(bucket).expect("block bounds hold valid buckets");
@@ -474,7 +474,7 @@ impl TermScorer {
     /// the chunk's shortest document paired a high term frequency with a
     /// document that never carried it; this table pairs each bucket with
     /// the shortest document that does.
-    pub(crate) fn bounds_by_bucket(
+    pub fn bounds_by_bucket(
         &self,
         block: &BlockBound,
         min_length: u32,
@@ -496,7 +496,7 @@ impl TermScorer {
 /// Sums already ordered term contributions with production's left-to-right
 /// `f32` fold. Callers own the canonical term ordering.
 #[must_use]
-pub(crate) fn sum_scores_in_order(scores: impl IntoIterator<Item = f32>) -> f32 {
+pub fn sum_scores_in_order(scores: impl IntoIterator<Item = f32>) -> f32 {
     let mut total = 0.0_f32;
     for score in scores {
         total += score;

@@ -1,0 +1,29 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Stannum's query engine over segments, without PostgreSQL: BM25 scoring, the ranked ordinal walk and the count fold"
+
+[features]
+# Counters, hooks and checks the extension's pg_test build asserts on.
+test-hooks = []
+# Pruning counters and a sub-block observer for offline measurement (the
+# bench crate); the extension never enables it.
+stats = []
+# The walk's private word kernels, exposed for the bench crate's benchmarks;
+# the extension never enables it.
+kernels = []
+
+[dependencies]
+boldi-vigna = { path = "../boldi-vigna" }
+rustc-hash.workspace = true
+segment = { path = "../segment" }
+thiserror.workspace = true
+tinql = { path = "../tinql" }
+tokenizer = { path = "../tokenizer" }
