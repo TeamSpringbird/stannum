@@ -174,6 +174,20 @@ CREATE TYPE indexed_query (
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- postgres/src/highlight_udfs.rs:196
+-- stannum::highlight_udfs::highlight
+CREATE  FUNCTION "highlight"(
+	"text" TEXT, /* Option < & str > */
+	"begin_tag" TEXT, /* & str */
+	"end_tag" TEXT, /* & str */
+	"query" indexed_query /* indexed_query */
+) RETURNS TEXT /* Option < String > */
+STABLE PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'highlight_bound_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- postgres/src/operator.rs:228
 -- stannum::operator::bind_query
 CREATE  FUNCTION "bind_query"(
@@ -196,20 +210,6 @@ CREATE  FUNCTION "highlight_ansi"(
 STABLE PARALLEL SAFE 
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'highlight_ansi_bound_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:196
--- stannum::highlight_udfs::highlight
-CREATE  FUNCTION "highlight"(
-	"text" TEXT, /* Option < & str > */
-	"begin_tag" TEXT, /* & str */
-	"end_tag" TEXT, /* & str */
-	"query" indexed_query /* indexed_query */
-) RETURNS TEXT /* Option < String > */
-STABLE PARALLEL SAFE 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'highlight_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -246,6 +246,42 @@ AS 'MODULE_PATHNAME', 'logs_removal_horizons_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- postgres/src/maintenance/sql.rs:208
+-- stannum::maintenance::sql::maintenance_jobs
+CREATE  FUNCTION "maintenance_jobs"() RETURNS TABLE (
+	"database" oid,  /* pg_sys :: Oid */
+	"index" oid,  /* pg_sys :: Oid */
+	"kinds" TEXT[],  /* Vec < String > */
+	"state" TEXT  /* String */
+)
+STRICT VOLATILE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'maintenance_jobs_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/maintenance/sql.rs:160
+-- stannum::maintenance::sql::maintenance_status
+CREATE  FUNCTION "maintenance_status"() RETURNS TABLE (
+	"preloaded" bool,  /* bool */
+	"launcher_pid" INT,  /* Option < i32 > */
+	"worker_pid" INT,  /* Option < i32 > */
+	"worker_database" oid,  /* Option < pg_sys :: Oid > */
+	"queued_jobs" bigint,  /* Option < i64 > */
+	"running_jobs" bigint,  /* Option < i64 > */
+	"requested" bigint,  /* Option < i64 > */
+	"completed" bigint,  /* Option < i64 > */
+	"abandoned" bigint,  /* Option < i64 > */
+	"inline_fallbacks" bigint,  /* Option < i64 > */
+	"launches" bigint,  /* Option < i64 > */
+	"launch_failures" bigint  /* Option < i64 > */
+)
+STRICT VOLATILE PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'maintenance_status_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- postgres/src/score.rs:310
 -- stannum::score::max_score
 CREATE  FUNCTION "max_score"(
@@ -265,6 +301,47 @@ CREATE  FUNCTION "maybe_quote"(
 IMMUTABLE PARALLEL SAFE
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'maybe_quote_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/maintenance/sql.rs:100
+-- stannum::maintenance::sql::merge
+CREATE  FUNCTION "merge"(
+	"index" regclass, /* PgRelation */
+	"target_segment_count" INT DEFAULT NULL, /* Option < i32 > */
+	"high_water_multiplier" INT DEFAULT NULL, /* Option < i32 > */
+	"max_fan_in" INT DEFAULT NULL, /* Option < i32 > */
+	"force" bool DEFAULT NULL /* Option < bool > */
+) RETURNS TABLE (
+	"considered_segments" INT,  /* i32 */
+	"retired_only_segments" INT,  /* i32 */
+	"merged_segments" INT,  /* i32 */
+	"linked_segments" INT,  /* i32 */
+	"output_docs" bigint,  /* i64 */
+	"output_postings" bigint,  /* i64 */
+	"replayed_kills" bigint,  /* i64 */
+	"no_op_reason" TEXT  /* Option < String > */
+)
+VOLATILE PARALLEL UNSAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'merge_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- postgres/src/maintenance/sql.rs:60
+-- stannum::maintenance::sql::promote
+CREATE  FUNCTION "promote"(
+	"index" regclass, /* PgRelation */
+	"extent_cap_bytes" bigint DEFAULT NULL /* Option < i64 > */
+) RETURNS TABLE (
+	"consumed_controls" INT,  /* i32 */
+	"linked_segments" INT,  /* i32 */
+	"docs_promoted" bigint,  /* i64 */
+	"terms_added" bigint  /* i64 */
+)
+VOLATILE PARALLEL UNSAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'promote_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -437,7 +514,7 @@ REVOKE ALL ON FUNCTION @extschema@.score_bound_indexed_searches(pg_catalog.tid, 
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:271
+-- postgres/src/udfs.rs:273
 -- stannum::udfs::segment_info
 CREATE  FUNCTION "segment_info"(
 	"index" regclass /* PgRelation */
@@ -449,7 +526,11 @@ CREATE  FUNCTION "segment_info"(
 	"dead_docs" bigint,  /* i64 */
 	"sum_doc_lengths" bigint,  /* i64 */
 	"total_pages" bigint,  /* i64 */
-	"generation" bigint  /* i64 */
+	"generation" bigint,  /* i64 */
+	"npostings" bigint,  /* Option < i64 > */
+	"source_state" TEXT,  /* String */
+	"origin" TEXT,  /* Option < String > */
+	"sequence" bigint  /* Option < i64 > */
 )
 STRICT VOLATILE PARALLEL UNSAFE
 LANGUAGE c /* Rust */
@@ -556,7 +637,7 @@ AS 'MODULE_PATHNAME', 'tokenize_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:354
+-- postgres/src/udfs.rs:373
 -- stannum::udfs::verify_index
 CREATE  FUNCTION "verify_index"(
 	"index" regclass, /* PgRelation */
@@ -572,7 +653,7 @@ AS 'MODULE_PATHNAME', 'verify_index_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:405
+-- postgres/src/udfs.rs:424
 -- stannum::udfs::version
 CREATE  FUNCTION "version"() RETURNS TEXT /* & '_ str */
 IMMUTABLE STRICT PARALLEL SAFE

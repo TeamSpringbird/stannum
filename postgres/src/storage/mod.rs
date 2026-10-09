@@ -2472,7 +2472,7 @@ unsafe fn merge_unlocked(
         };
         positions.sort_unstable();
         let inputs: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
-        unsafe { replace_entries(index, meta.identity, &inputs) };
+        unsafe { replace_entries(index, meta.identity, &inputs, false) };
     }
 }
 
@@ -2503,7 +2503,7 @@ unsafe fn make_room(index: pg_sys::Relation, identity: u64) {
     };
     positions.sort_unstable();
     let inputs: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
-    unsafe { replace_entries(index, identity, &inputs) };
+    unsafe { replace_entries(index, identity, &inputs, false) };
 }
 
 /// Rewrites the segments at `positions` into one, dropping dead documents.
@@ -2623,32 +2623,35 @@ unsafe fn merge_segments_reconstructed(
     finish_builder(builder)
 }
 
-/// Folds the write buffer into a new segment and starts it over with the
-/// one encoded document `record` (see [`replace_buffer`]).
+/// The write buffer's documents as one segment blob, with its document
+/// count and total length.
+///
+/// # Safety
+/// The caller holds the meta page of `index`; `buffer` is what it records.
+unsafe fn buffer_segment(index: pg_sys::Relation, buffer: &BufferState) -> (Vec<u8>, u32, u64) {
+    let stream = unsafe { read_buffer_stream(index, buffer) };
+    let mut builder = SegmentBuilder::default();
+    for record in segment::forward::records(&stream) {
+        codec_in(
+            builder.add_record(&codec_in(record, "write buffer")),
+            "write buffer",
+        );
+    }
+    finish_builder(builder)
+}
+
+/// Folds the write buffer into a new segment, spends up to `budget` input
+/// documents on merges under the lock, and starts the buffer over with the
+/// encoded documents `records` (see [`replace_buffer`]).
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively; `meta` is what it
-/// records, and the buffer holds a document.
-unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta, record: &[u8]) {
+/// records, the buffer holds a document, and the directory has room.
+unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta, records: &[u8], docs: u32, budget: u64) {
     unsafe {
-        let stream = read_buffer_stream(index, &meta.buffer);
-        let mut builder = SegmentBuilder::default();
-        for record in segment::forward::records(&stream) {
-            codec_in(
-                builder.add_record(&codec_in(record, "write buffer")),
-                "write buffer",
-            );
-        }
-        let (blob, docs, total_length) = finish_builder(builder);
-        add_segment(
-            index,
-            meta,
-            blob,
-            docs,
-            total_length,
-            MAX_MERGE_DOCS.get() as u64,
-        );
-        replace_buffer(index, &mut meta.buffer, record, 1);
+        let (blob, folded, total_length) = buffer_segment(index, &meta.buffer);
+        add_segment(index, meta, blob, folded, total_length, budget);
+        replace_buffer(index, &mut meta.buffer, records, docs);
     }
 }
 
@@ -3114,8 +3117,20 @@ pub unsafe fn insert(
             // bytes encoded for a different index identity or pipeline.
         };
         let folded = folds(index, &meta.buffer, bytes.len());
+        // Who runs the merges this fold leaves behind (see
+        // crate::maintenance): a worker, this session, or nobody. When
+        // nobody here does, the fold spends no merge budget under the lock.
+        let plan = if folded {
+            crate::maintenance::plan(index)
+        } else {
+            crate::maintenance::Plan::Skip
+        };
         if folded {
-            fold(index, &mut meta, &bytes);
+            let budget = match plan {
+                crate::maintenance::Plan::Inline => MAX_MERGE_DOCS.get().max(0) as u64,
+                crate::maintenance::Plan::Defer | crate::maintenance::Plan::Skip => 0,
+            };
+            fold(index, &mut meta, &bytes, 1, budget);
         } else {
             append_to_buffer(index, &mut meta.buffer, &bytes);
             meta.buffer.docs += 1;
@@ -3126,8 +3141,15 @@ pub unsafe fn insert(
         // Buffer content locks defer PostgreSQL cancel/die interrupts.
         // Publication is complete; deliver any pending cancel now.
         pgrx::check_for_interrupts!();
-        if folded {
-            merge_deferred(index);
+        match plan {
+            crate::maintenance::Plan::Defer => {
+                if !crate::maintenance::request(index, crate::maintenance::queue::kind::AFTER_FOLD)
+                {
+                    merge_deferred(index);
+                }
+            }
+            crate::maintenance::Plan::Inline => merge_deferred(index),
+            crate::maintenance::Plan::Skip => {}
         }
     }
 }
@@ -3197,9 +3219,142 @@ unsafe fn merge_deferred(index: pg_sys::Relation) {
             })
         {
             let inputs: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
-            replace_entries(index, meta.identity, &inputs);
+            replace_entries(index, meta.identity, &inputs, false);
         }
         pg_sys::UnlockPage(index, MAINTENANCE_LOCK, MAINTENANCE_LOCK_MODE);
+    }
+}
+
+// --- Maintenance operations ---------------------------------------------------
+//
+// What `crate::maintenance::ops` calls: this format's implementation of
+// promote(), merge() and a maintenance worker's job, in the interface's
+// types. Each takes the locks and publishes the way the paths above do.
+
+use crate::maintenance::ops::{FoldReport, MergeReport, MergeRequest, PassReport, PassRequest};
+
+/// Folds the write buffer into a segment now, whatever its size, and
+/// leaves it empty; merges nothing. An empty buffer is left alone. A
+/// directory at its on-disk bound first makes room, as an insert does.
+///
+/// # Safety
+/// `index` is a live LDP2 index the caller may write; no buffer is locked.
+pub unsafe fn fold_buffer(index: pg_sys::Relation) -> FoldReport {
+    unsafe {
+        loop {
+            pgrx::check_for_interrupts!();
+            let (guard, mut meta) = read_meta(index, true);
+            if meta.buffer.docs == 0 {
+                return FoldReport::default();
+            }
+            if meta.segments.len() >= MAX_SEGMENTS {
+                let identity = meta.identity;
+                drop(guard);
+                lock_maintenance(index);
+                make_room(index, identity);
+                unlock_maintenance(index);
+                continue;
+            }
+            let (blob, docs, total_length) = buffer_segment(index, &meta.buffer);
+            let terms = codec(codec(Segment::parse(&blob)).dictionary()).len() as u64;
+            add_segment(index, &mut meta, blob, docs, total_length, 0);
+            replace_buffer(index, &mut meta.buffer, &[], 0);
+            race_point("promote:folded");
+            write_meta(index, &guard, &meta);
+            drop(guard);
+            pgrx::check_for_interrupts!();
+            return FoldReport {
+                docs: u64::from(docs),
+                terms,
+                segments: 1,
+            };
+        }
+    }
+}
+
+/// Merges the smallest segments, at most `max_fan_in` at a time and within
+/// the merge input cap, until the directory holds `target` segments. Each
+/// merge is built without the meta lock under the maintenance lock and
+/// published as VACUUM publishes its merges.
+///
+/// # Safety
+/// `index` is a live LDP2 index the caller may write; no buffer is locked.
+pub unsafe fn merge_toward(index: pg_sys::Relation, request: MergeRequest) -> MergeReport {
+    let target = request
+        .target
+        .unwrap_or_else(|| unsafe { max_segments(index) })
+        .max(1);
+    let high_water = request.high_water.unwrap_or(1).max(1);
+    let fan_in = request.max_fan_in.unwrap_or(MAX_SEGMENTS).max(2);
+    let cap = unsafe { segment_bytes_cap(index) };
+    let considered = unsafe { read_meta(index, false) }.1.segments.len();
+    let mut report = MergeReport {
+        considered: considered as u32,
+        ..MergeReport::default()
+    };
+    if considered <= target {
+        report.no_op_reason = Some("at or below target_segment_count");
+        return report;
+    }
+    if !request.force && considered <= target.saturating_mul(high_water) {
+        report.no_op_reason = Some("below the high-water mark");
+        return report;
+    }
+    for _ in 0..2 * considered + 1 {
+        pgrx::check_for_interrupts!();
+        let meta = unsafe { read_meta(index, false) }.1;
+        if meta.segments.len() <= target {
+            break;
+        }
+        let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
+        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let mut smallest = smallest_entries(&docs, target);
+        smallest.truncate(fan_in);
+        let Some(mut positions) = within_run(smallest, &bytes, cap) else {
+            if report.merged + report.retired_only == 0 {
+                report.no_op_reason = Some("the smallest segments exceed max_merged_segment_size");
+            }
+            break;
+        };
+        positions.sort_unstable();
+        let inputs: Vec<SegmentEntry> = positions.iter().map(|p| meta.segments[*p]).collect();
+        unsafe { lock_maintenance(index) };
+        let published = unsafe { replace_entries(index, meta.identity, &inputs, true) };
+        unsafe { unlock_maintenance(index) };
+        let Some(Published { docs, postings }) = published else {
+            continue;
+        };
+        let input_docs: u64 = inputs.iter().map(|entry| u64::from(entry.docs)).sum();
+        if docs == 0 {
+            report.retired_only += inputs.len() as u32;
+        } else {
+            report.merged += inputs.len() as u32;
+            report.linked += 1;
+        }
+        report.output_docs += u64::from(docs);
+        report.output_postings += postings;
+        report.replayed_kills += input_docs.saturating_sub(u64::from(docs));
+    }
+    if report.merged + report.retired_only == 0 && report.no_op_reason.is_none() {
+        report.no_op_reason = Some("concurrent changes retired every chosen input");
+    }
+    report
+}
+
+/// A maintenance worker's job: frees retired runs no snapshot can read,
+/// then merges and rewrites as VACUUM's cleanup does, holding the
+/// maintenance lock around each job so that a VACUUM's orphan pass in
+/// another backend never frees a run before it is published.
+///
+/// # Safety
+/// `index` is a live LDP2 index the caller may write; no buffer is locked.
+pub unsafe fn maintenance_pass(index: pg_sys::Relation, request: PassRequest) -> PassReport {
+    unsafe {
+        if request.reclaim {
+            reclaim_pending(index);
+        }
+        let (merges, rewrites) = maintain_directory(index, request.merge, request.rewrite, true);
+        PassReport { merges, rewrites }
     }
 }
 
@@ -3730,36 +3885,73 @@ pub unsafe fn cleanup(index: pg_sys::Relation) {
     }
 }
 
-/// VACUUM owns maintenance scheduling; no preload library or worker slots
-/// are required. One job at a time: the lowest full tier, else the cheapest
-/// merge of a directory over `stannum.max_segments`, else a segment at least
-/// half dead. Each job reads and builds unlocked and publishes only against
-/// an unchanged directory; a job an insert invalidated is retried against
-/// the new one. Attempts are bounded by the directory size on entry so a
-/// steady stream of inserts cannot keep VACUUM here forever.
+/// VACUUM's directory maintenance: every due merge and rewrite, in this
+/// backend (see [`maintain_directory`]).
 unsafe fn maintain_segments(index: pg_sys::Relation) {
+    unsafe { maintain_directory(index, true, true, false) };
+}
+
+/// Merges and rewrites the directory toward its shape, one job at a time:
+/// with `merge`, the lowest full tier, else the cheapest merge of a
+/// directory over `stannum.max_segments`; with `rewrite`, a segment whose
+/// dead fraction reached `dead_percent_threshold`. Each job reads and builds
+/// unlocked and publishes only against an unchanged directory; a job an
+/// insert invalidated is retried against the new one. Attempts are bounded
+/// by the directory size on entry so a steady stream of inserts cannot keep
+/// the caller here forever. Returns the merges and rewrites published.
+///
+/// `locked` takes the maintenance lock around each job, for a caller other
+/// than VACUUM: VACUUM's own orphan pass runs after its jobs, in the same
+/// backend, but another backend's could otherwise free a run between its
+/// write and its publication.
+///
+/// # Safety
+/// `index` is a live LDP2 index the caller may write; no buffer is locked.
+unsafe fn maintain_directory(
+    index: pg_sys::Relation,
+    merge: bool,
+    rewrite: bool,
+    locked: bool,
+) -> (u32, u32) {
     let factor = merge_tier_factor();
     let limit = unsafe { max_segments(index) };
     let cap = unsafe { segment_bytes_cap(index) };
     let attempts = 2 * unsafe { read_meta(index, false) }.1.segments.len() + 1;
     let mut considered: HashSet<u32> = HashSet::new();
+    let (mut merges, mut rewrites) = (0, 0);
     for _ in 0..attempts {
         pgrx::check_for_interrupts!();
         let meta = unsafe { read_meta(index, false) }.1;
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
         let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
-        let inputs: Vec<SegmentEntry> = if let Some(positions) =
-            merge_candidates(&docs, factor, limit)
-                .and_then(|positions| within_run(positions, &bytes, cap))
-        {
+        let due = merge
+            .then(|| {
+                merge_candidates(&docs, factor, limit)
+                    .and_then(|positions| within_run(positions, &bytes, cap))
+            })
+            .flatten();
+        let inputs: Vec<SegmentEntry> = if let Some(positions) = due {
             positions.iter().map(|p| meta.segments[*p]).collect()
-        } else if let Some(entry) = unsafe { mostly_dead(index, &meta, &mut considered) } {
+        } else if rewrite && let Some(entry) = unsafe { mostly_dead(index, &meta, &mut considered) }
+        {
             vec![entry]
         } else {
-            return;
+            break;
         };
-        unsafe { replace_entries(index, meta.identity, &inputs) };
+        if locked {
+            unsafe { lock_maintenance(index) };
+        }
+        let published = unsafe { replace_entries(index, meta.identity, &inputs, false) };
+        if locked {
+            unsafe { unlock_maintenance(index) };
+        }
+        match (published, inputs.len()) {
+            (None, _) => {}
+            (Some(_), 1) => rewrites += 1,
+            (Some(_), _) => merges += 1,
+        }
     }
+    (merges, rewrites)
 }
 
 /// The first segment at least half dead that this cleanup has not yet
@@ -3893,18 +4085,41 @@ unsafe fn maintenance_reconstruct_blob(
     Some(finish_builder(builder).0)
 }
 
+/// What [`replace_entries`] published: the segment's documents (zero: the
+/// inputs left with no successor) and, when asked for, its postings (one per
+/// term and document).
+#[derive(Clone, Copy, Debug)]
+struct Published {
+    docs: u32,
+    postings: u64,
+}
+
 /// Rewrites `inputs` into one segment of their live documents, unlocked,
 /// and publishes it only if every input is still in the directory, entry
-/// for entry including the dead-list run. Returns whether it published.
-/// Inputs without a live document leave the directory with no successor. A
-/// single input keeps its position; several merge to the end.
-unsafe fn replace_entries(index: pg_sys::Relation, identity: u64, inputs: &[SegmentEntry]) -> bool {
-    let Some(blob) = (unsafe { maintenance_merge_blob(index, identity, inputs) }) else {
-        return false;
-    };
+/// for entry including the dead-list run. Returns what it published, or
+/// `None` when it did not publish. `count_postings` walks the merged
+/// segment's dictionary in memory to count its postings. A single input
+/// keeps its position; several merge to the end.
+unsafe fn replace_entries(
+    index: pg_sys::Relation,
+    identity: u64,
+    inputs: &[SegmentEntry],
+    count_postings: bool,
+) -> Option<Published> {
+    let blob = unsafe { maintenance_merge_blob(index, identity, inputs) }?;
     let segment = codec(Segment::parse(&blob));
     let docs = segment.document_count();
     let total_length = segment.total_length();
+    let postings = if count_postings {
+        let dictionary = codec(segment.dictionary());
+        let mut postings = 0u64;
+        for term in dictionary.iter_from("") {
+            postings += u64::from(codec(term).1.df);
+        }
+        postings
+    } else {
+        0
+    };
     let output = (docs > 0).then(|| {
         let (run, map) = unsafe { write_segment_run(index, &blob) };
         (run, map, docs, total_length)
@@ -3919,7 +4134,7 @@ unsafe fn replace_entries(index: pg_sys::Relation, identity: u64, inputs: &[Segm
                 discard_run(index, map);
             }
         }
-        return false;
+        return None;
     }
     let position = meta
         .segments
@@ -3939,7 +4154,7 @@ unsafe fn replace_entries(index: pg_sys::Relation, identity: u64, inputs: &[Segm
         unsafe { release_entry(index, &mut meta, *entry) };
     }
     unsafe { write_meta(index, &guard, &meta) };
-    true
+    Some(Published { docs, postings })
 }
 
 /// Frees the pending runs no snapshot can still read. Their chains are
@@ -4405,6 +4620,11 @@ pub struct SegmentRow {
     pub sum_doc_lengths: i64,
     pub total_pages: i64,
     pub generation: i64,
+    /// TIN's `npostings`, one per term and document: STN3 does not record it,
+    /// and counting it reads every dictionary, so `None`.
+    pub npostings: Option<i64>,
+    /// TIN's `sequence`: the segment's generation; `None` for the buffer.
+    pub sequence: Option<i64>,
 }
 
 /// The directory as rows: immutable segments first, then the write buffer.
@@ -4432,6 +4652,8 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 sum_doc_lengths: entry.total_length as i64,
                 total_pages: i64::from(entry.run.blocks + entry.dead.blocks),
                 generation: i64::from(entry.generation),
+                npostings: None,
+                sequence: Some(i64::from(entry.generation)),
             });
         }
         if meta.buffer.docs > 0 {
@@ -4448,6 +4670,8 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 sum_doc_lengths: lengths as i64,
                 total_pages: i64::from(meta.buffer.bytes.div_ceil(CHAIN_CAPACITY as u32).max(1)),
                 generation: i64::from(meta.buffer.version),
+                npostings: None,
+                sequence: None,
             });
         }
         rows

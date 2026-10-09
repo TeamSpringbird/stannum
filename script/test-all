@@ -181,6 +181,7 @@ step() {
                 --features "$(features pg_test)"; then
                 run crash-before-publication python3 postgres/tests/crash_before_publication.py
                 run count-under-vacuum python3 postgres/tests/count_under_vacuum.py
+                run maintenance-worker-crash python3 postgres/tests/maintenance_worker_crash.py
             fi
             echo "== note: a pg_test build is installed; 'script/test-all install' restores the release build" ;;
         install)
@@ -191,6 +192,7 @@ step() {
             run extension-upgrade python3 postgres/tests/extension_upgrade.py
             run postings-lifecycle python3 postgres/tests/postings_lifecycle.py
             run merge-lifecycle python3 postgres/tests/merge_lifecycle.py
+            run maintenance-workers python3 postgres/tests/maintenance_workers.py
             run ranked-fuzz-smoke python3 postgres/tests/ranked_fuzz.py --smoke
             run vacuum-cleanup-pins python3 postgres/tests/vacuum_cleanup_pins.py
             run mutation-targets python3 benchmarks/mutation_targets.py ;;
