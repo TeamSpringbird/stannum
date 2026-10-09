@@ -15,6 +15,7 @@ mod fold;
 mod heap_probe;
 mod highlight;
 mod highlight_udfs;
+mod maintenance;
 mod match_positions;
 mod operator;
 pub(crate) mod options;
@@ -62,6 +63,7 @@ pub extern "C-unwind" fn _PG_init() {
     options::init();
     storage::init();
     storage::wal::init();
+    maintenance::init();
     operator::init();
     customscan::init();
 }

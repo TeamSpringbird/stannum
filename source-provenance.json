@@ -664,6 +664,26 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },
+    "postgres/src/maintenance/mod.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance/ops.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance/queue.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance/sql.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
+    "postgres/src/maintenance/worker.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."
+    },
     "postgres/src/maintenance_tests.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation, written 2026-10-09: background maintenance workers, promote() and merge()."

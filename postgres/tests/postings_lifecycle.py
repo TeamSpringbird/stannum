@@ -168,7 +168,12 @@ def main():
         # Small thresholds drive folds, merges, dead lists, segment rewrites
         # and page reclamation through the FSM. Results must stay exact and
         # the index must stop growing once freed pages are reused.
-        tuned = 'SET stannum.write_buffer_docs=4; SET stannum.max_segments=3; SET stannum.merge_tier_factor=2;'
+        # These settings shape the inserting session's own merges. The cluster
+        # preloads Stannum, so in the default background mode a maintenance
+        # worker would merge instead, later and with the server's settings;
+        # foreground mode keeps the merges in this session, done when it is.
+        tuned = ('SET stannum.write_buffer_docs=4; SET stannum.max_segments=3; SET stannum.merge_tier_factor=2;'
+                 'SET stannum.index_maintenance_mode=foreground;')
         def check_folded():
             verify('folded_search')
             for term in ('needle', 'common', 'missing'):

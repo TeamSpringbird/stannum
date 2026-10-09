@@ -49,6 +49,23 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   and deferred merges, dead lists and rewrites in VACUUM, which holds the
   metadata lock only to publish. Merges combine the inputs' sorted
   dictionaries and streams directly through a validated, interruptible API.
+- Background maintenance workers when the library is preloaded
+  (`shared_preload_libraries = 'stannum'`): a launcher starts one worker at a
+  time for a database with queued work, and a fold queues the merges,
+  rewrites and reclamation it leaves behind instead of running them in the
+  writing session, which falls back to its inline merges when the worker pool
+  or the queue is full. `stannum.index_maintenance_mode` (`background`,
+  `foreground`, `manual`) chooses who maintains; `stannum.maintenance_jobs_per_db`
+  (a reload setting, as in TIN) shares the worker between databases.
+  `stannum.maintenance_status()` and `stannum.maintenance_jobs()` show the
+  launcher, the worker and the queue. Hot standbys run no workers. See
+  [maintenance workers](docs/architecture/maintenance-workers.md).
+- `stannum.promote(index, extent_cap_bytes)` folds the write buffer into a
+  segment now, and `stannum.merge(index, target_segment_count,
+  high_water_multiplier, max_fan_in, force)` merges toward a target; both
+  have TIN's signatures and need the `MAINTAIN` privilege.
+  `stannum.segment_info` adds TIN's `npostings`, `source_state`, `origin` and
+  `sequence` columns.
 - The TIN-named index options `target_segment_count`,
   `max_mutable_segment_size`, `max_merged_segment_size` and
   `dead_percent_threshold` shape maintenance for the index that sets them,

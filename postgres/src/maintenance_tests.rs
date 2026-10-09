@@ -383,10 +383,10 @@ mod tests {
         assert_eq!(count("SELECT count(*) FROM stannum.maintenance_jobs()"), 0);
     }
 
-    /// segment_info carries TIN's extra columns: npostings is an immutable
-    /// segment's token positions and NULL for the write buffer, as TIN's is
-    /// for its mutable segment; every listed entry is current; sequence is
-    /// a segment's generation.
+    /// segment_info carries TIN's extra columns: npostings is not recorded
+    /// (NULL), every listed entry is current, origin is not recorded, and
+    /// sequence is a segment's generation (NULL for the write buffer, as
+    /// TIN's is for its mutable segment).
     #[pg_test]
     fn segment_info_has_tins_extra_columns() {
         Spi::run(
@@ -402,7 +402,7 @@ mod tests {
                      sequence = generation)::text, ';' ORDER BY ordinal)
                  FROM stannum.segment_info('described_idx')"
             ),
-            "(immutable,40,current,,t);(mutable,,current,,)"
+            "(immutable,,current,,t);(mutable,,current,,)"
         );
     }
 }
