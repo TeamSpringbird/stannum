@@ -13,6 +13,14 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Added
 
+- Queries read segments in TIN's shape in place from pinned shared buffers
+  rather than copying what they read into per-backend chunks: at 150M rows
+  the copies overflowed each backend's cache and every query copied some
+  15,000 pages again. `stannum.native_in_place` (on) switches back for
+  comparison; `EXPLAIN ANALYZE` reports native reads by kind (bytes copied,
+  pages pinned, bytes stitched across page boundaries) and buffer accesses
+  by phase.
+
 - A PostgreSQL 17 and 18 index access method, `stannum`, with TINQL matching
   through `==>`, BM25 ranking (`stannum.score`, `full_score`, `max_score`,
   `score_inspect`), highlighting (`stannum.highlight`, `highlight_ansi`),

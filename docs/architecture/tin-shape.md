@@ -526,24 +526,39 @@ the phase A and B codecs, under `segment/src/tinshape/`:
   `Segment::share_footers` (decoded footers kept across the segments a
   backend assembles); `Liveness::is_dead`.
 
-**How the extension reads a segment** (`storage::with_native`). A backend
-keeps a `blob::LazyBlob` per segment, which loads 8 KiB chunks from the
-segment's pages as queries read them (`blob::Bytes`): a term's record
-header, footer and group directory when it is resolved, a group's container
+**How the extension reads a segment** (`storage::with_native`). A query
+reads a segment within a span of the segment's `blob::LazyBlob`
+(`blob::Bytes`), in place from the index's pages in shared buffers: a range
+on one page is a slice of the page, which the run source pins (through the
+buffer it was last pinned in, as STN3's held pages) the first time the span
+asks for it and keeps pinned until the span ends; a range across a page
+boundary is copied into a stitch buffer the span frees. A term's record
+header and group directory are read when it is resolved, a group's container
 when a walk reaches the group, a posting's TF bits, the entries of a
-positions stream a phrase checks and the DL sidecar blocks of the documents
-scored. Nothing loads a whole area: at 150M rows loading each query word's
-whole positions stream and every segment's DL sidecar took a backend past
-a gigabyte. A chunk counts as loaded only once its bytes are in place, so a
-read a cancel interrupts is read again by the next query. The document set
-is the paged reader's, decoded once from a transient read; the dead list
-VACUUM published is decoded once into the segment's liveness in slot
-space; term-map lookups are memoized. The segment assembled over the blob
-is kept while the liveness stays. What the blob loaded, the parsed-record
-and footer memos and the liveness count against `stannum.reader_cache_mb`,
-and the loaded chunks keep at most a quarter of it across queries
-(`SET client_min_messages = debug1` reports the parts as a view is
-captured).
+positions stream a phrase checks and the DL sidecar words of the documents
+scored; nothing is kept but what is parsed from them. The span ends when
+the read returns or unwinds (an error, a cancel): it forgets the parsed
+records that borrow its pages, then releases them; a backend exiting
+mid-read leaves the pins to PostgreSQL, as held pages are. At 150M rows the
+earlier design, which copied what queries read into 8 KiB chunks each
+backend kept, overflowed every backend's share of the budget and copied
+again per query what the last had, some 15,000 pages a query (2.4x fewer
+queries per second than STN3); `stannum.native_in_place = off` restores it
+for comparison, and `score()` of single rows, which keeps its terms between
+rows, reads that way.
+
+What a backend keeps per segment is small parsed metadata: the document set
+(the paged reader's, decoded once from a transient read), the dead list
+VACUUM published decoded once into the segment's liveness in slot space,
+memoized term-map lookups, decoded footers, and parsed grouped records
+(their group directories; ranges of the blob, no bytes). The segment
+assembled over the blob is kept while the liveness stays. These, and any
+chunks copied outside spans, count against `stannum.reader_cache_mb`, the
+chunks at most a quarter of it (`SET client_min_messages = debug1` reports
+the parts as a view is captured). `EXPLAIN ANALYZE` reports per kind of
+structure (record, footer, container, sparse list, TF tail, inline lengths,
+DL sidecar, positions) the bytes copied and their pages, the pages pinned
+and the bytes stitched, and buffer accesses by phase.
 
 **Which paths are native.** A query is lowered (`engine::tinshape::lower`)
 after its wildcards, regexes, ranges and fuzzy terms are expanded against
