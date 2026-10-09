@@ -1211,6 +1211,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Scoring term `i`'s members in group `g`, which it holds, into its row
     /// of `words` words.
+    #[inline(never)]
     fn or_load(&mut self, i: usize, g: u32, words: usize) -> Result<()> {
         let t = self.sc[i].term;
         let group = self.geometry.groups[g as usize];
@@ -1271,6 +1272,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
+    #[inline(never)]
     fn or_group(&mut self, g: u32) -> Result<()> {
         let n = self.sc.len();
         let group = self.geometry.groups[g as usize];
@@ -1288,8 +1290,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(());
         }
         let words = group.words();
-        self.rows.clear();
-        self.rows.resize(n * words, 0);
+        // Rows are overwritten where read: only present terms' are.
+        if self.rows.len() < n * words {
+            self.rows.resize(n * words, 0);
+        }
         for i in 0..n {
             if self.present[i] {
                 self.or_load(i, g, words)?;
@@ -1300,6 +1304,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         sb.clear();
         sb.resize(n, 0.0);
         let mut plan = std::mem::take(&mut self.plan);
+        // The plan's threshold and bounds: a block spans many sub-ranges, so
+        // a plan usually holds for the next.
+        let mut planned: Option<(Option<f32>, Vec<f32>)> = None;
         let mut w0 = 0;
         while w0 < words {
             let w1 = (w0 + SUB_WORDS).min(words);
@@ -1319,7 +1326,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 w0 = w1;
                 continue;
             }
-            self.plan_sub(&mut plan, theta, &sb, total);
+            if planned
+                .as_ref()
+                .is_none_or(|(t, b)| *t != theta || b.as_slice() != sb.as_slice())
+            {
+                self.plan_sub(&mut plan, theta, &sb, total);
+                match &mut planned {
+                    Some((t, b)) => {
+                        *t = theta;
+                        b.clone_from(&sb);
+                    }
+                    None => planned = Some((theta, sb.clone())),
+                }
+            }
             let mut cand = [0u64; SUB_WORDS];
             self.sieve(&plan, words, w0, w1, &mut cand);
             for (j, word) in cand[..w1 - w0].iter().enumerate() {
@@ -1343,6 +1362,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Plans a sub-range whose present terms' bounds are `sb` (summing to
     /// `total`) at threshold `theta`.
+    #[inline(never)]
     fn plan_sub(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
         plan.required.clear();
         plan.essential.clear();
@@ -1409,10 +1429,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     #[inline]
     fn sieve(&self, plan: &Plan, words: usize, w0: usize, w1: usize, out: &mut [u64; SUB_WORDS]) {
         let len = w1 - w0;
+        let rows = &self.rows;
+        // A full sub-range's row is read in place; a short one padded.
         let row = |i: usize| -> [u64; SUB_WORDS] {
-            let mut r = [0u64; SUB_WORDS];
-            r[..len].copy_from_slice(&self.rows[i * words + w0..i * words + w1]);
-            r
+            let at = i * words + w0;
+            if len == SUB_WORDS {
+                *<&[u64; SUB_WORDS]>::try_from(&rows[at..at + SUB_WORDS]).expect("a full row")
+            } else {
+                let mut r = [0u64; SUB_WORDS];
+                r[..len].copy_from_slice(&rows[at..at + len]);
+                r
+            }
         };
         let mut cand = [0u64; SUB_WORDS];
         if let Some((&first, rest)) = plan.required.split_first() {
@@ -1440,7 +1467,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
         }
-        if plan.by_count && cand.iter().any(|c| *c != 0) {
+        let live = cand.iter().filter(|c| **c != 0).count();
+        if plan.by_count && live > 0 && live <= SUB_WORDS / 4 {
+            // Few words hold candidates: weigh those alone.
+            for j in 0..len {
+                if cand[j] != 0 {
+                    let mut lanes = LaneSums::new(plan.start, SIEVE_TARGET);
+                    for &(i, weight) in &plan.adds {
+                        lanes.add(rows[i * words + w0 + j], weight);
+                    }
+                    cand[j] &= lanes.reached();
+                }
+            }
+        } else if plan.by_count && live > 0 {
             // Each lane's counter starts at 2^SLICES - target + start, so it
             // reaches the target as it carries out of the top slice.
             let init = (1u32 << SLICES) - SIEVE_TARGET + plan.start;
@@ -1497,6 +1536,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Bounds, scores and admits the candidate at bit `bit` of word `w` of
     /// group `g`.
+    ///
+    /// Kept out of line, as the group and plan steps are: inlined into the
+    /// sieve's word loop it measured 8% slower over the disjunction trace.
+    #[inline(never)]
     fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
         let n = self.sc.len();
         let local = (w * 64) as u32 + bit;
