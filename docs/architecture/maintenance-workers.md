@@ -1,9 +1,10 @@
 # Background maintenance workers
 
-A fold turns the write buffer into a segment, and the segments it adds must
-later be merged, rewritten when they are mostly dead, and their retired runs
-freed. Without workers the inserting session that folded does that merge
-after publishing (an insert's *deferred merge*, see
+A full write buffer (TIN's mutable write segment) is sealed in place, and a
+sealed segment must be promoted into an immutable segment; the segments
+promotions add must later be merged, rewritten when they are mostly dead,
+and their retired runs freed. Without workers the inserting session that
+sealed promotes and does that merge after publishing (an insert's *deferred merge*, see
 [segmented storage](segmented-storage.md#merge-policy)), and VACUUM does the
 rest. TIN does this in a cluster-wide background worker instead, so a merge
 never runs in a writing session unless the worker pool is exhausted. With
@@ -37,27 +38,29 @@ queue, plain data and logic), `worker.rs` (the launcher and the worker),
   cluster-wide maintenance worker"; merges of one index are serialized by
   its maintenance lock in any case.
 - **The queue** lives in shared memory under one LWLock: 256 job slots keyed
-  by (database, index OID), each with a set of kinds (merge, rewrite,
-  reclaim, and a reserved promote), the worker slot, and counters. A request
+  by (database, index OID), each with a set of kinds (promote, merge,
+  rewrite, reclaim), the worker slot, and counters. A request
   for an index that already has a queued job joins it; a job a worker is
   running does not absorb a new request, because the work it asks for may
   postdate what the worker read. The queue holds hints, not state: the
   segment directory records what is due, so losing the queue (a crash, a
-  restart, an abandoned job) loses nothing but a wakeup, and the next fold
-  queues the index again.
+  restart, an abandoned job) loses nothing but a wakeup, and the next seal
+  queues the index again; sealed segments left behind are promoted by the
+  next job, by VACUUM outside manual mode, or by a third seal.
 
 ## How backends hand work over
 
-`storage::insert` asks `maintenance::plan` once per fold, under the meta
-lock it already holds for the fold (lock order: meta page, then the queue's
-LWLock; no queue holder takes a buffer lock):
+`storage::insert` asks `maintenance::plan` once per seal, under the meta
+lock it already holds for the seal (lock order: meta page, then the queue's
+LWLock; no queue holder takes a buffer lock). The seal itself writes one
+page and publishes; what follows runs after publication:
 
-| `stannum.index_maintenance_mode` | workers can take it | the fold's budgeted merges | after publication |
-| --- | --- | --- | --- |
-| `background` (default) | yes | none | queue merge, rewrite and reclaim for a worker |
-| `background` | no | up to `stannum.max_merge_docs` | the deferred merge, inline |
-| `foreground` | either | up to `stannum.max_merge_docs` | the deferred merge, inline |
-| `manual` | either | none | nothing |
+| `stannum.index_maintenance_mode` | workers can take it | after publication |
+| --- | --- | --- |
+| `background` (default) | yes | queue promote, merge, rewrite and reclaim for a worker |
+| `background` | no | promote inline, spending up to `stannum.max_merge_docs` on merges as it publishes, then the deferred merge |
+| `foreground` | either | the same, inline |
+| `manual` | either | nothing; a seal that would make a third sealed segment first promotes the oldest, merging nothing |
 
 "Workers can take it" means the library is preloaded, the launcher is
 running, its last worker registration succeeded, and the index is not a
@@ -161,13 +164,12 @@ preloaded, so a session `SET` of it is refused in every configuration.
 
 ## What still runs in the writing session
 
-- **The fold.** The format has one write buffer, and an insert that finds it
-  full must fold it before appending, so the fold (TIN's sealing and
-  promotion together) runs under the meta lock in the writing session. A
-  format with a sealed write segment can seal inline and queue a promote job
-  (the reserved `promote` kind).
-- **Making room in a full directory.** An insert into a directory at its
-  96-entry on-disk bound must merge before it can fold, whatever the mode.
+- **The seal.** An insert that finds the write buffer full seals it before
+  appending: one page and the meta page, under the meta lock.
+- **A third seal.** With two sealed segments waiting, an insert promotes the
+  oldest (without the meta lock) before it seals, whatever the mode.
+- **Making room in a full directory.** A promotion into a directory at its
+  96-entry on-disk bound must merge first, whatever the mode.
 - **Everything, when workers cannot take it**: without preload, when the
   pool has no free slot for a worker (`max_worker_processes`), or when the
   queue is full. TIN documents the same fallback.
@@ -181,14 +183,16 @@ arguments and result columns and run in the calling session, under the same
 locks and publication as a worker's job. Both need the `MAINTAIN` privilege
 on the table (owners and `pg_maintain` have it).
 
-- `promote` folds the write buffer into a segment now, whatever its size,
-  and merges nothing: `consumed_controls` and `linked_segments` are 1 when it
-  folded and 0 for an empty buffer, `docs_promoted` the documents folded,
-  `terms_added` the new segment's distinct terms. `extent_cap_bytes` must be
-  positive (XX000, TIN's message) and otherwise has no effect: Stannum writes
-  one segment per fold. Unlike TIN's, it folds a buffer below the sealing
-  threshold, and it does not change which terms scoring elides (TIN counts
-  only promoted documents there; conformance case catalog.S-07).
+- `promote` promotes the sealed write segments now and merges nothing, as
+  TIN's does; the write buffer is left alone below its sealing threshold.
+  `consumed_controls` counts the sealed segments consumed, `linked_segments`
+  the segments published, `docs_promoted` their documents and `terms_added`
+  each promotion's distinct terms. `extent_cap_bytes` must be positive
+  (XX000, TIN's message); with it each sealed segment is split into segments
+  of about that many bytes of forward records, at most as many as the
+  directory has room for. Elision counts immutable segments only, so what
+  promote() consumes changes which terms `score` elides (conformance cases
+  catalog.S-07 to S-07g).
 - `merge` merges the smallest segments, at most `max_fan_in` at a time
   (default: no limit) and within the merge input cap, until the directory
   holds `target_segment_count` (default: the index's target). Unless `force`,
@@ -202,12 +206,13 @@ on the table (owners and `pg_maintain` have it).
   documents dropped, and `no_op_reason` why nothing was merged, when nothing
   was.
 
-`stannum.segment_info` adds TIN's `npostings` (NULL: TIN counts one posting
-per term and document, which STN3 does not record and counting would read
-every dictionary), `source_state` (`current`: retired
-runs wait on the pending list and are not listed), `origin` (NULL: the
-directory does not record how a segment was made) and `sequence` (the
-segment's generation) after its own eight columns.
+`stannum.segment_info` has TIN's columns in TIN's order: `npostings` (one
+per term and document, from the segment's term map; NULL for the write
+buffer and sealed segments, as TIN's), `source_state` (`current`: retired
+runs wait on the pending list and are not listed), `origin` (`build`,
+`promotion` or `merge`) and `sequence` (the segment's place among the
+immutable segments), then Stannum's `generation`. Sealed segments are listed
+after the write buffer.
 
 ## The operation interface
 
@@ -217,9 +222,9 @@ types and three functions, each of which calls the format:
 
 | function | today (`storage`) | a format provides |
 | --- | --- | --- |
-| `promote(index) -> FoldReport` | `fold_buffer`: fold the write buffer | seal the write segment, if any, and promote what is sealed |
+| `promote(index, cap) -> FoldReport` | `promote_sealed`: promote what is sealed | promote its sealed write segments |
 | `merge(index, MergeRequest) -> MergeReport` | `merge_toward`: smallest entries down to the target | its merge policy toward the target |
-| `run_job` → the format's pass, `PassRequest -> PassReport` | `maintenance_pass`: reclaim, tier merges, rewrites | the same kinds, plus `promote` once it queues it |
+| `run_job` → the format's pass, `PassRequest -> PassReport` | `maintenance_pass`: promote, reclaim, tier merges, rewrites | the same kinds |
 
 The contract, stated in the module: the caller holds the table and index in
 `RowExclusiveLock` inside a transaction and no buffer lock; long work runs

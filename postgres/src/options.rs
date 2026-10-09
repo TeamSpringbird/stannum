@@ -117,7 +117,7 @@ pub fn init() {
             ),
             (
                 c"max_mutable_segment_size",
-                c"Write buffer bytes before a fold; unset uses stannum.write_buffer_bytes",
+                c"Write segment bytes before it is sealed; unset uses stannum.write_buffer_bytes",
                 131_072,
                 i32::MAX,
             ),

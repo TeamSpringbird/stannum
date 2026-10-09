@@ -17,20 +17,25 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   through `==>`, BM25 ranking (`stannum.score`, `full_score`, `max_score`,
   `score_inspect`), highlighting (`stannum.highlight`, `highlight_ansi`),
   segmented indexes and exact counts under concurrent writes.
-- Segment format `STN3`. A term's documents are stored once, as ordinals into
-  the segment's document table, with each member's term-frequency bucket
-  beside it and a score bound per 65,536-document chunk and per
-  1,024-document sub-block, so scoring never reads positions. Positions have
-  their own stream, read only by positional queries. The document table maps
-  ordinals to heap locations and back through a page table and a two-byte
-  offset per document, and a one-byte length class per document lets a
-  ranked walk bound a candidate before reading its length. Dead lists are
-  ordinal streams. On the 150 million row Stack Exchange corpus the index is
-  47 GB.
+- Segment format `TNS1`, in TIN's shape: a term's postings are a set of heap
+  ctids over a grid of 256-page groups (Elias-Fano lists, grid bitmaps or
+  per-page containers, the smallest), with a footer of per-block impact
+  frontiers, a TF tail of bucket nibbles at each block's width, positions in
+  their own stream, a document set and a DL sidecar of exact lengths; see
+  [the TIN-shape guide](docs/architecture/tin-shape.md). Index pages are
+  layout version 3; an index written earlier must be rebuilt (`REINDEX`).
+  The extension reads a segment through a paged reader that hands each term
+  out as an ordinal stream (`STN3`'s, translated once per backend), so the
+  planner, cursors, ranked walk and ordinal count fold read it unchanged.
+  Dead lists are ordinal streams of dead ranks.
 - Counts of Boolean term queries fold the ordinal streams a chunk at a time
   instead of visiting each match: the 302 published Wikipedia count queries
   sum to 39 ms instead of 3,767 ms in the replay harness.
   `stannum.count_fold = off` selects the page-mask and scalar strategies.
+  Where the query lowers to it (terms, `AND`, `OR`, `NOT`, phrases and spans
+  of plain terms) a segment is counted over its ctid sets instead, a
+  256-page group at a time, trusting the visibility map per heap page
+  (`stannum.count_native`).
 - Pruned ranked retrieval over the ordinal streams (block-max WAND with
   per-chunk and per-sub-block bounds), with the same rows, scores and tie
   order as exhaustive scoring. It covers flat conjunctions and disjunctions,
@@ -60,12 +65,20 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   `stannum.maintenance_status()` and `stannum.maintenance_jobs()` show the
   launcher, the worker and the queue. Hot standbys run no workers. See
   [maintenance workers](docs/architecture/maintenance-workers.md).
-- `stannum.promote(index, extent_cap_bytes)` folds the write buffer into a
-  segment now, and `stannum.merge(index, target_segment_count,
-  high_water_multiplier, max_fan_in, force)` merges toward a target; both
-  have TIN's signatures and need the `MAINTAIN` privilege.
-  `stannum.segment_info` adds TIN's `npostings`, `source_state`, `origin` and
-  `sequence` columns.
+- The write buffer is TIN's mutable write segment: at
+  `stannum.write_buffer_docs` (12,288) or `write_buffer_bytes` (4 MiB, the
+  index's `max_mutable_segment_size`) it is sealed in place, and a sealed
+  segment is promoted into an immutable one by a worker, by the inserting
+  session after publishing, or in manual mode by `promote()`, VACUUM or a
+  third seal. Searches read sealed segments; elision counts immutable
+  segments only, as TIN's does.
+- `stannum.promote(index, extent_cap_bytes)` promotes the sealed write
+  segments now (with a cap, into several segments each), and
+  `stannum.merge(index, target_segment_count, high_water_multiplier,
+  max_fan_in, force)` merges toward a target; both have TIN's signatures and
+  need the `MAINTAIN` privilege. `stannum.segment_info` has TIN's columns
+  (`npostings`, `source_state`, `origin`, `sequence` among them) in TIN's
+  order, lists sealed segments, and adds `generation`.
 - The TIN-named index options `target_segment_count`,
   `max_mutable_segment_size`, `max_merged_segment_size` and
   `dead_percent_threshold` shape maintenance for the index that sets them,

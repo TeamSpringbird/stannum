@@ -136,7 +136,7 @@ are accepted. Stannum's registration is in
 | `score_stop_words` | comma-separated text; unset | Analyzed terms omitted from default scoring | Same; matching unchanged, full scoring ignores the list |
 | `initial_segment_count` | integer `1..4096` | Build partitions | Accepted and ignored, with a warning |
 | `target_segment_count` | integer `1..4096` | Maintenance target | Soft directory bound in place of `stannum.max_segments` |
-| `max_mutable_segment_size` | integer `>= 131072` bytes; `4194304` | Write buffer size before promotion | Fold size in place of `stannum.write_buffer_bytes`; `stannum.write_buffer_docs` still applies |
+| `max_mutable_segment_size` | integer `>= 131072` bytes; `4194304` | Write segment size before it is sealed and promoted | The size at which the write buffer is sealed, in place of `stannum.write_buffer_bytes` (also 4 MiB); `stannum.write_buffer_docs` (12,288) still applies |
 | `max_merged_segment_size` | integer `>= 100` MB; `2000` | Merge size ceiling | Most input megabytes one merge takes, within the 3 GiB a run can record |
 | `dead_percent_threshold` | real `0..1`; `0.5` | Dead fraction that triggers a rewrite | VACUUM rewrites a segment at this dead fraction |
 
