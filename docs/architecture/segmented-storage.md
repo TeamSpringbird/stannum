@@ -12,7 +12,7 @@ ranking statistics in index pages and uses them to find matching row locations.
 | `engine/src/` | The query engine without PostgreSQL: BM25, the ranked walk over ordinals, the count fold |
 | `bench/` | The engine measured outside PostgreSQL: trace replay over dumped segments, kernel benchmarks ([how](../offline-engine.md)) |
 | `postgres/src/storage/` | Index pages, write buffer, segments, WAL, and reclamation |
-| `segment/src/` | Dictionaries, ordinal streams, the document table, positions, document lengths, and cursors; `tinshape/` holds the ctid-addressed format replacing them ([TIN shape](tin-shape.md), not yet read by the extension) |
+| `segment/src/` | Dictionaries, ordinal streams, the document table, positions, document lengths, and cursors; `tinshape/` holds the ctid-addressed format the extension writes and reads ([TIN shape](tin-shape.md)), which the ordinal codecs still serve through translation |
 | `tinql/src/` | Query parsing, reference evaluation, and indexed query planning |
 | `tokenizer/src/` | Text normalization and token positions |
 | `boldi-vigna/src/` | Minimal-interval evaluation of phrases, proximity and span operators over token positions |
@@ -20,22 +20,36 @@ ranking statistics in index pages and uses them to find matching row locations.
 
 ## Writing an index
 
-An index contains a mutable **write buffer** and immutable **segments**. Each
-segment maps terms to PostgreSQL tuple locations (`ctid`) and stores token
-positions, term frequencies, and document lengths.
+An index contains a mutable **write buffer** (TIN's mutable write segment), at
+most two **sealed write segments** and immutable **segments**. Each segment
+maps terms to PostgreSQL tuple locations (`ctid`) and stores token positions,
+term frequencies, and document lengths, in TIN's shape ([TNS1](tin-shape.md)).
 
-1. Index creation tokenizes existing rows into segments.
+1. Index creation tokenizes existing rows into segments (origin `build`).
 2. Inserts append a document's tokens to the write buffer. Updates that change
    indexed content add a new tuple version; PostgreSQL controls its visibility.
-3. When the buffer fills, the inserting backend converts it into a segment.
-4. Segments merge in size tiers, like the levels of a log-structured merge
+3. When the buffer fills it is **sealed** in place: its chain of pages stops
+   taking documents and joins the sealed list, and a fresh page starts the
+   next buffer. Sealing writes one page under the meta lock and copies
+   nothing.
+4. A sealed segment is **promoted** into an immutable segment (origin
+   `promotion`): by a background worker when one can take it, otherwise by
+   the inserting backend after it has published the seal. In manual
+   maintenance mode it waits for `stannum.promote()` or VACUUM, except that
+   a third seal promotes the oldest first, as TIN does.
+5. Segments merge in size tiers, like the levels of a log-structured merge
    tree, so the directory stays small without ever rewriting the whole index
-   at once. VACUUM identifies dead tuple references and can rewrite segments
-   to reclaim space.
+   at once (origin `merge`). VACUUM identifies dead tuple references and can
+   rewrite segments to reclaim space.
 
-Searches read both segments and the buffer, so new rows do not wait for a fold to
-be searchable. Per-backend caches reuse immutable segment data and incrementally
-index new buffer records (see [per-backend caches](#per-backend-caches)).
+Searches read segments, sealed segments and the buffer, so new rows do not
+wait for a promotion to be searchable. Sealed segments and the buffer count
+towards BM25's statistics but not towards elision, which counts immutable
+segments only: TIN's rule, so a word in every row of a write segment is
+scored until the segment is promoted. Per-backend caches reuse immutable
+segment data, build each sealed segment's in-memory index once and
+incrementally index new buffer records (see [per-backend
+caches](#per-backend-caches)).
 Retained document cursors keep their encoded length
 array from the same buffer state. Refreshing the buffer can insert a reused heap
 location before existing rows; looking up old ordinals in a new length array
@@ -44,10 +58,10 @@ would change scores midway through a ranked scan.
 | Setting | Default | Purpose |
 | --- | ---: | --- |
 | `stannum.build_segment_docs` | 32,768 | Documents per segment during index creation |
-| `stannum.write_buffer_docs` | 512 | Documents before folding the write buffer |
-| `stannum.write_buffer_bytes` | 1,048,576 | Encoded forward-record bytes before folding |
-| `stannum.max_merge_docs` | 1,024 | Total input documents ordinary insert merges may rewrite per fold |
-| `stannum.deferred_merge_docs` | 262,144 | Input documents of the one merge an insert may run after a fold, outside the metadata lock |
+| `stannum.write_buffer_docs` | 12,288 | Documents before the write buffer is sealed (where TIN seals one of short documents) |
+| `stannum.write_buffer_bytes` | 4,194,304 | Encoded forward-record bytes before the write buffer is sealed (TIN's `max_mutable_segment_size`) |
+| `stannum.max_merge_docs` | 1,024 | Total input documents ordinary merges may rewrite under the lock as a promotion publishes |
+| `stannum.deferred_merge_docs` | 262,144 | Input documents of the one merge an insert may run after promoting, outside the metadata lock |
 | `stannum.merge_tier_factor` | 8 | Segments per size tier before they merge |
 | `stannum.max_segments` | 96 | Soft bound on directory entries; 96 is the hard on-disk bound |
 
@@ -57,13 +71,21 @@ options: `max_mutable_segment_size` (bytes) for `write_buffer_bytes`,
 (megabytes) for the merge input ceiling. `dead_percent_threshold` sets the dead
 fraction at which VACUUM rewrites a segment, 0.5 by default.
 
-The next insert folds a nonempty buffer before appending a record that would
+The next insert seals a nonempty buffer before appending a record that would
 exceed either cap. A single document may exceed the byte cap: it remains one
-record and is folded before the following insert. The two caps bound document
+record and is sealed before the following insert. The two caps bound document
 count and encoded input size, not elapsed time or tokenizer cost. At 2.8 KiB
-per record the byte limit folds roughly 365 documents; short documents hit the
-512-document limit first. Small folds also bound the amount a fresh reader must
-index before its first query.
+per record the byte limit seals roughly 1,500 documents (TIN 1.0.4 seals about
+2,000 short rows by size); short documents hit the 12,288-document limit
+first, where TIN 1.0.3 and 1.0.4 seal the rows of `catalog.S-07f`.
+
+Promotion is built from the sealed chain without the meta lock, under the
+maintenance lock, and published in one meta page write that adds the
+segment, retires the sealed chain to the pending list (whose reclamation
+frees buffer pages as it frees runs) and spends the budgeted merges. A
+promotion whose sealed segment VACUUM rewrote meanwhile is discarded and
+retried. `stannum.promote(index, extent_cap_bytes)` splits each sealed
+segment into segments of about that many bytes of forward records.
 
 ### Insert preparation
 
@@ -268,16 +290,30 @@ other suites.
 
 ## Segment format
 
-Index pages carry the signature `LDP2` (page layout version 2) and segments
-the signature `STN3`. The page layouts are defined in
+Index pages carry the signature `LDP2` with page layout version 3, and
+segments the signature `TNS1`, the ctid-addressed format of [the TIN-shape
+guide](tin-shape.md). The page layouts are defined in
 `postgres/src/storage/layout.rs` and the segment layout in the `segment`
-crate. Every page is a standard PostgreSQL page whose special area names its
-kind: the meta page (block 0: tokenizer settings, write-buffer state, segment
-directory and runs awaiting reclamation), write-buffer pages, run pages
-holding an immutable blob (a segment, its page table or a dead list), and
-free pages.
+crate (`segment::tinshape`). Every page is a standard PostgreSQL page whose
+special area names its kind: the meta page (block 0: tokenizer settings,
+write-buffer state, the sealed write segments, the segment directory with
+each entry's origin, and runs awaiting reclamation), write-buffer pages
+(the buffer's and the sealed segments' chains), run pages holding an
+immutable blob (a segment, its page table or a dead list), and free pages.
+An index of page layout version 2 (`STN3` segments) is not read: `REINDEX`
+rebuilds it.
 
-A segment is one blob, stored across a chain of run pages:
+A `TNS1` segment's postings are sets of ctids, laid out as [the TIN-shape
+guide](tin-shape.md#the-format) describes. Its documents' rank in ctid order
+is what the ordinal format called an ordinal, and the extension reads a
+segment through `segment::tinshape::index::Reader`, which hands each term out
+as an ordinal stream translated once per backend, so the planner, the
+Boolean cursors, the ordinal walk and the count fold below read either
+format. A dead list (the published liveness of a segment) is an ordinal
+stream of dead ranks.
+
+The rest of this section describes `STN3`, the ordinal format the
+translation produces and the write buffer's in-memory index still encodes.
 
 ```text
 blob := "STN3", doc_count, total_length, section lengths,

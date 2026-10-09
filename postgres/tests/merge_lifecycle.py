@@ -172,12 +172,15 @@ def crash_between_run_write_and_publication(sql, command, env, data, root, start
             continue
         assert grown, "orphans without observed growth"
         free_before = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0"))
-        sql("VACUUM (INDEX_CLEANUP ON) docs")
+        # The seal was published before the crash, so its write segment is
+        # still sealed; in manual mode VACUUM leaves its promotion to the
+        # insert below rather than taking the reclaimed pages itself.
+        sql("SET stannum.index_maintenance_mode=manual;\nVACUUM (INDEX_CLEANUP ON) docs")
         assert sql(page_warnings) == "0"
         assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx', true) WHERE severity = 'error'") == "0"
         free_after = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0"))
         assert free_after >= free_before + orphans, (free_before, free_after, orphans)
-        # The interrupted fold repeats and takes the reclaimed pages first.
+        # The interrupted promotion repeats and takes the reclaimed pages first.
         sql("SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0; INSERT INTO docs VALUES (98000, 'orphan')")
         assert int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0")) < free_after
         assert sql(page_warnings) == "0"

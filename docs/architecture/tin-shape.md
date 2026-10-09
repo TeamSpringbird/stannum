@@ -7,7 +7,8 @@ target format, `TNS1`, and how queries, merges and VACUUM use it. Phase A,
 done, defines the format and its codecs in `segment/src/tinshape/`, counts
 and ranked top-k over it in `engine/src/tinshape.rs`, and a converter and
 replay in the bench crate, all measured offline against `STN3` on the same
-data. Nothing in the extension reads `TNS1` yet; integration is phase B.
+data. Phase C (below, [Integration](#integration-phase-c)) makes `TNS1` the
+extension's only segment format.
 
 Stannum's earlier ctid formats (LSG1 to LSG5) stored one six-byte TID per
 match and reached 246.5 GB at 150 million Stack Exchange rows. The size of
@@ -204,12 +205,12 @@ the answers are bit-identical to scoring every match.
 
 ## Writing and maintaining it
 
-**Building and the write segment.** A build or a fold produces `TNS1` from
-documents as `STN3` builders do today: sort the segment's ctids, derive the
-grid, encode each term's slots. The mutable write segment and TIN's
-seal-and-promote cycle with background workers are a separate workstream;
-until it lands, the write buffer of forward records stays as it is and
-folds into `TNS1` segments.
+**Building and the write segment.** A build or a promotion produces `TNS1`
+from documents (`SegmentBuilder::finish_tns`): sort the segment's ctids,
+derive the grid, encode each term's slots. The write buffer of forward
+records is TIN's mutable write segment: sealed in place when full, then
+promoted into a `TNS1` segment (see [segmented
+storage](segmented-storage.md#writing-an-index)).
 
 **Merges.** Nothing is renumbered. A merge's grid is the union of its
 inputs' groups, each group's width the largest of the inputs'. Containers
@@ -319,6 +320,41 @@ Small blocks prune more windows but cost a window per block; the
 disjunction sieve works per group and hardly depends on the block. 256 is
 the default: conjunction and phrase medians at or below `STN3`'s, a footer
 of 3.9 MB.
+
+## Integration (phase C)
+
+The extension writes and reads only `TNS1`; the page layout went to version
+3 and an older index must be rebuilt. What the segment crate gained for it,
+beside the phase A codecs, all in new files under `segment/src/tinshape/` so
+that work on the encoder and the walk (phase B) does not collide with it:
+
+- `index::Reader<S: Source>`: a segment read a range at a time from the
+  extension's run pages, implementing `segment::index::Index`. A term is
+  handed out as an ordinal stream (ranks through the document set, buckets
+  from the TF tail, lengths from the DL sidecar), translated once per reader
+  and kept; positions need no translation. Every query shape the planner,
+  the Boolean cursors, the ordinal walk and the ordinal count fold handle
+  works over it unchanged. Its `Header::parse` reads the blob header from a
+  prefix; a change to the header must change it too.
+- `merge::merge`: the inputs' live documents in ctid order, every term's
+  postings re-encoded over the merged grid and its positions entries
+  re-packed. A property test checks a merge is byte for byte a build of the
+  live documents. Copying a group's containers when one input holds it is
+  not done yet.
+- `verify::verify_segment`: the checker of `stannum.verify_index()` for a
+  `TNS1` blob, returning the ordinal format's `SegmentReport`.
+- `SegmentBuilder::finish_tns` (in `segment.rs`) and `Payload::count`.
+
+VACUUM publishes a segment's liveness as a dead list of ranks beside the
+blob, which keeps an all-live liveness area of its own. Merges, promotions
+and dead-fraction rewrites all go through `merge::merge` or
+`finish_tns`.
+
+Size on tiny tables: a heap under 256 pages is one partly filled group, and
+the grid rule (a group holding one slot in 64 or more is a grid) makes every
+mid-frequency term a bitmap over all 256 pages; a 6,000-row test table
+indexes to 1.8 MB against `STN3`'s 0.97 MB. Counting the group's used pages
+in the rule is the obvious fix, for the encoder's owners.
 
 ## Open for phase B
 

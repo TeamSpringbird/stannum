@@ -2,14 +2,95 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Boolean counts over segment-local document ordinals: the fold itself is
-//! [`engine::fold`]; this reads the heap's visibility map for it.
+//! Boolean counts: over a segment's ctid sets with [`engine::tinshape`]'s
+//! fold where the query lowers to it ([`count_native`]), else over
+//! segment-local document ordinals with [`engine::fold`]; and the heap's
+//! visibility map both read.
 
 use pgrx::pg_sys;
+use segment::Tid;
+use tinql::runtime::Query;
 
 #[cfg(feature = "pg_test")]
 pub(crate) use engine::fold::dead_clear_steps;
 pub(crate) use engine::fold::{Visibility, count_segment, supported};
+
+/// Counts the live matches of `query` in the view's immutable source `i`
+/// through its ctid sets, a 256-page group at a time: members on pages
+/// `visibility` saw all-visible are counted, the others handed to
+/// `pending` a heap page at a time (ascending) for the heap to settle, as
+/// [`count_segment`] does over ordinals. `None` when the query does not
+/// lower to the ctid fold or the source has no ctid-native reader.
+pub(crate) fn count_native(
+    view: &crate::storage::View,
+    i: usize,
+    query: &Query,
+    visibility: &Visibility,
+    mut pending: impl FnMut(u32, &[u16]),
+) -> Option<segment::Result<u64>> {
+    use engine::tinshape::{NoTouch, Node, count_terms_visible, open_terms};
+    fn spans(node: &Node) -> bool {
+        match node {
+            Node::Span { .. } => true,
+            Node::Term(_) => false,
+            Node::Not(inner) => spans(inner),
+            Node::And(children) | Node::Or(children) => children.iter().any(spans),
+        }
+    }
+    let mut names = Vec::new();
+    let node = engine::tinshape::lower(query, &mut names)?;
+    crate::storage::with_native(view, i, &names, spans(&node), |segment| {
+        let geometry = &segment.docs.geometry;
+        let mut terms = open_terms(segment, &names, &mut NoTouch)?;
+        let mut hidden: Vec<Tid> = Vec::new();
+        let total = count_terms_visible(
+            segment,
+            &node,
+            &mut terms,
+            &mut NoTouch,
+            &mut |group, mask| {
+                if visibility.all {
+                    return true;
+                }
+                let g = &geometry.groups[group as usize];
+                let width = usize::from(g.width);
+                let first = g.id * segment::tinshape::docs::GROUP_PAGES;
+                for page in 0..segment::tinshape::docs::GROUP_PAGES as usize {
+                    if visibility.is_visible(first + page as u32) {
+                        let (from, to) = (page * width, (page + 1) * width);
+                        for bit in from..to {
+                            mask[bit / 64] |= 1 << (bit % 64);
+                        }
+                    }
+                }
+                let index = group as usize;
+                segment
+                    .docs
+                    .group_words(index)
+                    .iter()
+                    .zip(mask.iter())
+                    .all(|(docs, visible)| docs & !visible == 0)
+            },
+            &mut |group, words| {
+                for (w, word) in words.iter().enumerate() {
+                    let mut word = *word;
+                    while word != 0 {
+                        let local = w as u32 * 64 + word.trailing_zeros();
+                        hidden.push(geometry.tid_in(group as usize, local));
+                        word &= word - 1;
+                    }
+                }
+            },
+        )?;
+        let mut offsets = Vec::new();
+        for page in hidden.chunk_by(|a, b| a.block == b.block) {
+            offsets.clear();
+            offsets.extend(page.iter().map(|tid| tid.offset));
+            pending(page[0].block, &offsets);
+        }
+        Ok(total)
+    })
+}
 
 /// Reads the visibility map a page at a time: `visibilitymap_get_status`
 /// pins the map page covering a heap block, and the page's bits are then

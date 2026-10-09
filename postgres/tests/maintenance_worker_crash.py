@@ -115,17 +115,19 @@ def main():
         wait_for('the reload', lambda: sql('SHOW stannum.debug_maintenance_race;') == setting)
 
     def prepare(table):
-        """Three segments and four buffered rows, all written in manual mode,
-        so no job is queued yet; the next background insert folds and queues
-        a merge."""
+        """Three segments and four buffered rows, all written in manual mode
+        and promoted by promote(), so no job is queued yet; the next
+        background insert seals and queues a promotion and a merge."""
         sql(f'CREATE TABLE {table}(id int, body text);'
             f'CREATE INDEX {table}_idx ON {table} USING stannum(body) WITH (target_segment_count = 2);')
         statements = '\n'.join(f"INSERT INTO {table} VALUES ({n}, 'needle w{n}');" for n in range(1, 17))
-        sql(f'SET stannum.write_buffer_docs = 4; SET stannum.index_maintenance_mode = manual;\n{statements}')
+        sql(f'SET stannum.write_buffer_docs = 4; SET stannum.index_maintenance_mode = manual;\n{statements}\n'
+            f"SELECT stannum.promote('{table}_idx');")
         assert segments(f'{table}_idx') == 3
 
     def fold(table, first):
-        """Four inserts in background mode; the last folds and queues a job."""
+        """Four inserts in background mode; the last seals the write segment
+        and queues a job, which promotes it and merges."""
         statements = '\n'.join(f"INSERT INTO {table} VALUES ({n}, 'needle w{n}');" for n in range(first, first + 4))
         return subprocess.run(['psql', '-X', '-qAt', '-v', 'ON_ERROR_STOP=1'], env=env, text=True,
                               capture_output=True, input=f'SET stannum.write_buffer_docs = 4;\n{statements}\n')

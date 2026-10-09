@@ -1437,6 +1437,8 @@ struct CachedSegment {
     /// `dead` decoded once per dead run, for the walks and counts over
     /// ordinals and for scorers that test membership.
     dead_set: DeadSet,
+    /// The bytes and liveness the ctid-native paths read.
+    native: Rc<Native>,
 }
 
 /// An immutable segment as a query source: the shared reader plus the
@@ -1543,7 +1545,7 @@ unsafe fn cached_segment(
     index_oid: pg_sys::Oid,
     identity: u64,
     entry: &SegmentEntry,
-) -> (MemoizedSegment, Option<Rc<Vec<u8>>>, DeadSet) {
+) -> (MemoizedSegment, Option<Rc<Vec<u8>>>, DeadSet, Rc<Native>) {
     let key = (identity, entry.generation);
     let found = SEGMENT_READERS.with_borrow(|readers| {
         readers.get(&key).map(|cached| {
@@ -1552,14 +1554,17 @@ unsafe fn cached_segment(
                     reader: cached.reader.clone(),
                     terms: cached.terms.clone(),
                 },
+                cached.native.clone(),
                 (cached.dead_run == (entry.dead, entry.dead_stamp))
                     .then(|| (cached.dead.clone(), cached.dead_set.clone())),
             )
         })
     });
-    let (segment, dead) = match found {
-        Some((segment, Some((dead, dead_set)))) => return (segment, dead, dead_set),
-        Some((segment, None)) => (segment, None),
+    let (segment, native, dead) = match found {
+        Some((segment, native, Some((dead, dead_set)))) => {
+            return (segment, dead, dead_set, native);
+        }
+        Some((segment, native, None)) => (segment, native, None),
         None => {
             let label = generation_label(entry.generation);
             let source: Box<dyn segment::source::Source> = Box::new(RunSource::new(
@@ -1572,7 +1577,7 @@ unsafe fn cached_segment(
                 reader: Rc::new(codec_in(Reader::new(source), &label)),
                 terms: Rc::default(),
             };
-            (segment, None)
+            (segment, Rc::default(), None)
         }
     };
     let dead = dead.unwrap_or_else(|| {
@@ -1602,10 +1607,11 @@ unsafe fn cached_segment(
                 dead_run: (entry.dead, entry.dead_stamp),
                 dead: dead.clone(),
                 dead_set: dead_set.clone(),
+                native: native.clone(),
             },
         );
     });
-    (segment, dead, dead_set)
+    (segment, dead, dead_set, native)
 }
 
 /// `stannum.reader_cache_mb` in bytes.
@@ -1643,7 +1649,7 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
         readers.retain(|key, _| live(*key));
         bytes += readers
             .values()
-            .map(|c| c.reader.cached_bytes() + dead_bytes(c))
+            .map(|c| c.reader.cached_bytes() + dead_bytes(c) + c.native.bytes())
             .sum::<usize>();
         if bytes > reader_cache_budget() {
             readers.clear();
@@ -3521,6 +3527,169 @@ pub unsafe fn maintenance_pass(index: pg_sys::Relation, request: PassRequest) ->
     }
 }
 
+// --- Ctid-native reads ------------------------------------------------------------
+//
+// The engine's ctid-native count (`engine::tinshape`) reads a segment as one
+// contiguous blob. A backend keeps each segment's bytes as far as its
+// queries have needed them: the header, the term map's index, the document
+// set, the DL sidecar and the liveness area once, and each query term's
+// postings record (and positions, for phrases) the first time a query
+// names it. Unread ranges stay zero pages the allocator has not committed.
+
+/// Bytes of a blob loaded at a time.
+const BLOB_CHUNK: usize = 8192;
+
+/// A segment's blob as far as it has been read.
+struct Blob {
+    bytes: Box<[u8]>,
+    /// Bit per [`BLOB_CHUNK`]: loaded.
+    chunks: Vec<u64>,
+    loaded: usize,
+}
+
+impl Blob {
+    fn new(len: usize) -> Self {
+        Self {
+            bytes: vec![0u8; len].into_boxed_slice(),
+            chunks: vec![0u64; len.div_ceil(BLOB_CHUNK).div_ceil(64)],
+            loaded: 0,
+        }
+    }
+
+    /// Loads `[offset, offset + len)` from `source` where not loaded yet.
+    fn ensure(
+        &mut self,
+        source: &dyn segment::source::Source,
+        offset: u64,
+        len: usize,
+    ) -> segment::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = (offset as usize)
+            .checked_add(len)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or(segment::Error::Truncated)?;
+        let mut chunk = offset as usize / BLOB_CHUNK;
+        while chunk * BLOB_CHUNK < end {
+            if self.chunks[chunk / 64] >> (chunk % 64) & 1 == 1 {
+                chunk += 1;
+                continue;
+            }
+            // A run of missing chunks, read at once.
+            let first = chunk;
+            while chunk * BLOB_CHUNK < end && self.chunks[chunk / 64] >> (chunk % 64) & 1 == 0 {
+                self.chunks[chunk / 64] |= 1 << (chunk % 64);
+                chunk += 1;
+            }
+            let from = first * BLOB_CHUNK;
+            let to = (chunk * BLOB_CHUNK).min(self.bytes.len());
+            let read = source.read(from as u64, to - from)?;
+            if read.len() != to - from {
+                return Err(segment::Error::Truncated);
+            }
+            self.bytes[from..to].copy_from_slice(&read);
+            self.loaded += to - from;
+        }
+        Ok(())
+    }
+}
+
+/// What the ctid-native paths keep of a segment in this backend.
+#[derive(Default)]
+pub(crate) struct Native {
+    blob: RefCell<Option<Blob>>,
+    /// The published liveness in slot space, with the dead run it is of.
+    liveness: RefCell<Option<((Run, u32), segment::tinshape::docs::Liveness)>>,
+}
+
+impl Native {
+    fn bytes(&self) -> usize {
+        self.blob.borrow().as_ref().map_or(0, |blob| blob.loaded)
+    }
+}
+
+/// A view's immutable source `i` as a ctid-addressed segment, for the
+/// engine's ctid-native paths: `f` runs over the segment with `names`'
+/// postings records (and their positions, with `positions`) loaded and
+/// their term-map entries memoized, and the liveness VACUUM published.
+/// `None` when the source has no native reader.
+pub(crate) fn with_native<R>(
+    view: &View,
+    i: usize,
+    names: &[String],
+    positions: bool,
+    f: impl FnOnce(&segment::tinshape::segment::Segment<'_>) -> segment::Result<R>,
+) -> Option<segment::Result<R>> {
+    let (reader, native) = view.natives.get(i)?.as_ref()?;
+    Some((|| {
+        let header = *reader.header();
+        let source: &dyn segment::source::Source = &**reader.source();
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            entries.push(reader.term_entry(name)?);
+        }
+        let mut slot = native.blob.borrow_mut();
+        let blob = slot.get_or_insert_with(|| Blob::new(header.bounds[7] as usize));
+        if blob.loaded == 0 {
+            // The header and the term map's index, then the document set,
+            // DL sidecar and liveness area, which end the blob.
+            let probe = header.bounds[1] as usize + 32.min(header.len(1));
+            blob.ensure(source, 0, probe)?;
+            let prefix = segment::dictionary::DictionaryIndex::prefix_len(
+                &blob.bytes[header.bounds[1] as usize..probe],
+            )?;
+            blob.ensure(source, 0, header.bounds[1] as usize + prefix)?;
+            blob.ensure(
+                source,
+                header.bounds[4],
+                (header.bounds[7] - header.bounds[4]) as usize,
+            )?;
+        }
+        for entry in entries.iter().flatten() {
+            blob.ensure(
+                source,
+                header.bounds[2] + entry.ordinals.offset,
+                entry.ordinals.len as usize,
+            )?;
+            if positions {
+                blob.ensure(
+                    source,
+                    header.bounds[3] + entry.payload.offset,
+                    entry.payload.len as usize,
+                )?;
+            }
+        }
+        drop(slot);
+        let slot = native.blob.borrow();
+        let blob = slot.as_ref().expect("loaded above");
+        let mut segment = segment::tinshape::segment::Segment::parse(&blob.bytes)?;
+        for (name, entry) in names.iter().zip(&entries) {
+            segment.remember(name, *entry);
+        }
+        let dead = view.dead_runs[i];
+        let mut liveness = native.liveness.borrow_mut();
+        if liveness.as_ref().is_none_or(|(run, _)| *run != dead) {
+            let set = &view.dead_sets[i];
+            let ranks: Vec<u32> = if set.is_empty() {
+                Vec::new()
+            } else {
+                (0..segment.documents)
+                    .filter(|rank| set.contains(*rank))
+                    .collect()
+            };
+            let decoded = segment::tinshape::docs::Liveness::decode(
+                &segment::tinshape::docs::encode_liveness(segment.documents, &ranks),
+                &segment.docs,
+            )?;
+            *liveness = Some((dead, decoded));
+        }
+        segment.liveness = liveness.as_ref().expect("decoded above").1.clone();
+        drop(liveness);
+        f(&segment)
+    })())
+}
+
 // --- Scan ---------------------------------------------------------------------
 
 /// A queryable index (a cached segment reader or the buffer's in-memory
@@ -3553,6 +3722,9 @@ pub struct View {
     /// The sealed write segments' stamps: VACUUM gives a sealed segment it
     /// rewrites without the documents it removed a new one.
     sealed_stamps: Vec<u32>,
+    /// Per immutable source, its reader and what the ctid-native paths keep
+    /// (see [`with_native`]).
+    natives: Vec<Option<(SharedReader, Rc<Native>)>>,
 }
 
 /// Whether the directory still lists exactly `view`'s segments with the dead
@@ -3675,10 +3847,12 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 .map(|entry| (entry.dead, entry.dead_stamp))
                 .collect();
             trim_reader_cache(meta.identity, &meta);
+            let mut natives = Vec::with_capacity(meta.segments.len());
             for entry in &meta.segments {
                 pgrx::check_for_interrupts!();
-                let (segment, dead, dead_set) =
+                let (segment, dead, dead_set, native) =
                     cached_segment(index, index_oid, meta.identity, entry);
+                natives.push(Some((segment.reader.clone(), native)));
                 sources.push((Box::new(segment), dead));
                 labels.push(generation_label(entry.generation));
                 dead_sets.push(dead_set);
@@ -3707,6 +3881,7 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 dead_runs,
                 buffer_epoch: meta.buffer.epoch,
                 sealed_stamps: meta.sealed.iter().map(|state| state.epoch).collect(),
+                natives,
             };
         }
     }

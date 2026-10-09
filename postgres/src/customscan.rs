@@ -43,6 +43,7 @@ static PROFILE_COUNT_SELECTION: GucSetting<bool> = GucSetting::<bool>::new(false
 static COUNT_PAGE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
 static FORCE_COUNT_PAGES: GucSetting<bool> = GucSetting::<bool>::new(false);
 static COUNT_FOLD: GucSetting<bool> = GucSetting::<bool>::new(true);
+static COUNT_NATIVE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Method tables hold C string pointers; they are immutable and never
 /// touched off the backend's main thread.
@@ -183,6 +184,14 @@ pub fn init() {
         c"Count Boolean term queries by folding document-ordinal streams",
         c"Off keeps the scalar and page-bitmap strategies; other query shapes always use those.",
         &COUNT_FOLD,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"stannum.count_native",
+        c"Fold counts over segments' ctid sets where the query lowers to that fold",
+        c"Off folds every segment's translated ordinal streams instead, for comparison.",
+        &COUNT_NATIVE,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -1010,6 +1019,8 @@ struct ScanExec {
     skipped_pages: usize,
     page_masks: Option<bool>,
     count_fold: bool,
+    /// Segments a count folded through their ctid sets.
+    ctid_folds: usize,
     selection_calls: usize,
     selection_time: std::time::Duration,
     estimation_time: std::time::Duration,
@@ -1162,6 +1173,7 @@ unsafe extern "C-unwind" fn begin_scan(
             skipped_pages: 0,
             page_masks: None,
             count_fold: false,
+            ctid_folds: 0,
             selection_calls: 0,
             selection_time: std::time::Duration::ZERO,
             estimation_time: std::time::Duration::ZERO,
@@ -1909,16 +1921,31 @@ unsafe fn fold_count(
             pgrx::check_for_interrupts!();
             if i < view.immutable_sources {
                 let mut pending: Vec<(u32, Vec<u16>)> = Vec::new();
-                let sure = crate::storage::codec_in(
-                    crate::fold::count_segment(
-                        source.as_ref(),
-                        &view.dead_sets[i],
-                        query,
-                        &visibility,
-                        |block, offsets| pending.push((block, offsets.to_vec())),
+                // The segment's ctid sets where the query lowers to their
+                // fold, else its ordinal streams.
+                let native = (COUNT_NATIVE.get() && !exec.recheck)
+                    .then(|| {
+                        crate::fold::count_native(&view, i, query, &visibility, |block, offsets| {
+                            pending.push((block, offsets.to_vec()))
+                        })
+                    })
+                    .flatten();
+                let sure = match native {
+                    Some(result) => {
+                        exec.ctid_folds += 1;
+                        Some(crate::storage::codec_in(result, label))
+                    }
+                    None => crate::storage::codec_in(
+                        crate::fold::count_segment(
+                            source.as_ref(),
+                            &view.dead_sets[i],
+                            query,
+                            &visibility,
+                            |block, offsets| pending.push((block, offsets.to_vec())),
+                        ),
+                        label,
                     ),
-                    label,
-                );
+                };
                 if let Some(sure) = sure {
                     exec.skipped_pages += usize::from(sure > 0);
                     candidates += sure as usize;
@@ -2300,6 +2327,13 @@ unsafe extern "C-unwind" fn explain(
                 pg_sys::ExplainPropertyText(
                     c"Count Strategy".as_ptr(),
                     c"ordinal fold".as_ptr(),
+                    es,
+                );
+                // Segments counted through their ctid sets instead.
+                pg_sys::ExplainPropertyInteger(
+                    c"Ctid Folds".as_ptr(),
+                    std::ptr::null(),
+                    exec.ctid_folds as i64,
                     es,
                 );
             } else if let Some(pages) = exec.page_masks {

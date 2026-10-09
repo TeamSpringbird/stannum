@@ -231,7 +231,7 @@ def main():
         assert orphans > 0, 'no dead list was written before the crash'
         assert sql(dead_docs) == '0'
         assert sql("SELECT count(*) FROM lively WHERE body ==> 'needle';") == '400'
-        sql('VACUUM (INDEX_CLEANUP OFF) lively;')
+        sql(f"SELECT tests.direct_bulk_delete('lively_idx'::regclass::oid, '{dead}');")
         assert sql(dead_docs) == '200', sql(dead_docs)
         sql('VACUUM (INDEX_CLEANUP ON) lively;')
         assert_clean('lively_idx')

@@ -86,77 +86,102 @@ divergences:
       form missing the index's tokenizer options?
     note: TIN 1.0.4 answers it as Stannum does, so the entry applies to 1.0.3 only.
 
-  - id: catalog.S-07
-    against: [tin-1.0.3, tin-1.0.4]
-    kind: gap
-    captures: [script]
-    summary: >
-      Stannum's promote() folds a write buffer of any size, after which w (in
-      every row) is elided; TIN's leaves these 20 rows in its mutable segment.
-    tin: >
-      tin.promote(index) consumes only a sealed write segment (12,288 rows);
-      the 20 rows stay mutable, and elision, which counts immutable segments
-      only, still scores w after it.
-    stannum: >
-      Before the promote step the scores equal TIN's. stannum.promote() folds
-      the 20 buffered rows into a segment, elision then counts them, and w,
-      in every document, scores 0 under score() after it; full_score() is
-      unchanged. Whether promote() should fold a buffer below the sealing
-      threshold is an open decision.
-
   - id: catalog.S-07b
     against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
+    summary: >
+      Only segment_info()'s page numbers and Stannum's extra generation
+      column differ; promote() and the scores match TIN.
     tin: >
-      promote() returns one row (consumed_controls, linked_segments,
-      docs_promoted, terms_added); here all zero, as the 20 rows sit in the
-      current write segment, which promote() does not consume.
-    stannum: No promote(); its write buffer is folded into segments by inserts and VACUUM.
+      One mutable segment of 20 documents at root block 55 over 55
+      preallocated pages; promote() returns all zeros, as the 20 rows sit in
+      the current write segment, which it does not consume.
+    stannum: >
+      The same rows, kinds, counts and NULLs, and the same zeros from
+      promote(); the write segment's root_block and total_pages are those of
+      its own chain (one page here), and each row carries Stannum's
+      generation.
 
   - id: catalog.S-07c
     against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
-    tin: promote() on an index whose rows were all built into an immutable segment returns zeros.
-    stannum: No promote().
+    summary: >
+      Only segment_info()'s page numbers and Stannum's extra generation
+      column differ; promote() and the scores match TIN.
+    tin: >
+      One immutable segment (origin build, npostings 40, sequence 0) at root
+      block 12 over 11 pages; w is elided; promote() returns zeros.
+    stannum: >
+      The same segment row but for root_block and total_pages, its blob's
+      own, and the generation column; the same elision, scores and zeros.
 
   - id: catalog.S-07d
     against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
-    tin: promote() returns zeros with 200 rows in the current write segment; nothing is elided before or after.
-    stannum: No promote().
+    summary: >
+      Only segment_info()'s page numbers and Stannum's extra generation
+      column differ; promote() and the scores match TIN.
+    tin: 200 rows in the current write segment (61 pages); promote() returns zeros; nothing is elided before or after.
+    stannum: The same, but for root_block, total_pages and the generation column.
 
   - id: catalog.S-07e
     against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
-    summary: Stannum has no promote() and its segment_info() has other columns, so the promote steps differ.
-    tin: promote() returns zeros on a built index.
-    stannum: No promote().
+    summary: >
+      TIN's build writes the 200 rows as two segments (185 and 15
+      documents), Stannum's as one; elision, pooled over immutable segments,
+      and the scores match.
+    tin: >
+      Two build segments of 185 and 15 documents, 11 pages each; promote()
+      returns zeros; u (21 rows, 10.5%) and w are elided, v (exactly 10%) is
+      not.
+    stannum: >
+      One build segment of 200 documents; the same elision, scores and
+      zeros. Where TIN splits a build at about 185 short rows is its
+      segment layout's, not reproduced.
 
   - id: catalog.S-07f
     against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
-    summary: Stannum has no promote(), sealed write segments or maintenance modes.
+    summary: >
+      Sealing, promote()'s row and elision over the promoted documents match
+      TIN; segment_info() differs in page numbers, the generation column, and
+      in not listing the retired source.
     tin: >
-      With maintenance manual, 12,288 rows fill a sealed write segment;
-      promote() consumes it (1, 1, 12288, 12293) and elision then counts
-      the promoted documents only.
-    stannum: No promote(); elision counts every document the index holds.
+      With maintenance manual, 12,288 rows fill a sealed write segment (root
+      627, 510 pages) and 712 stay mutable; promote() consumes it (1, 1,
+      12288, 12293); after it, segment_info() lists the immutable segment
+      (origin promotion, npostings 29483), the mutable one and the sealed
+      source as retired, and elision counts the promoted documents only:
+      a and c elided, b, d and e kept.
+    stannum: >
+      The same seal at 12,288, the same promote() row, the same elision
+      before and after and the same second promote(); segment_info()'s
+      root_block and total_pages are Stannum's own, each row carries its
+      generation, and the retired chain waits on the pending list, which
+      segment_info() does not list.
 
   - id: catalog.S-07g
     against: [tin-1.0.3, tin-1.0.4]
     kind: gap
     captures: [script]
-    summary: Stannum has no promote(index, extent_cap_bytes).
-    tin: promote(index, 1) writes 68 segments of about 185 documents; elision is unchanged.
-    stannum: No promote().
+    summary: >
+      promote(index, 1) splits the sealed segment differently: TIN into 68
+      segments of its extent size, Stannum into as many as its directory has
+      room for; elision is unchanged in both.
+    tin: >
+      promote(index, 1) writes 68 segments (112 to about 185 documents);
+      segment_info() then counts 70 rows: those, the mutable segment and
+      the retired source.
+    stannum: >
+      The smallest cap splits the 12,288 documents into as many segments as
+      the 96-entry directory has room for, by bytes of forward records, and
+      lists no retired row; terms_added and the elision match TIN's.
 
   - id: limits.at_least_near.2
     against: tin-1.0.3
@@ -433,9 +458,11 @@ divergences:
       enable_custom_scan, index_maintenance_mode, maintenance_jobs_per_db,
       rss_baseline, track_page_reuse_stats.
     stannum: >
-      20 settings of its own (build, write buffer, merge, cache, count and
-      expansion limits); enable_custom_scan is the one name both define.
-      TIN's other names are not defined (see catalog.I-07).
+      Settings of its own (build, write segment, merge, cache, count and
+      expansion limits); enable_custom_scan, index_maintenance_mode and
+      maintenance_jobs_per_db are the names both define. TIN's debug,
+      build_io_concurrency, rss_baseline and track_page_reuse_stats are not
+      defined.
 
   - id: inventory.functions.1
     against: tin-1.0.4
@@ -449,9 +476,10 @@ divergences:
       signatures kept as *_v1_0_3.
     stannum: >
       The scoring, highlighting, tokenize, ql_parse, score_inspect and
-      segment_info functions without stemmer arguments, highlight() over a
-      bound query, and its own (bind_query, verify_index, wal_rmgr_id and
-      others); no fsck, fsm_rebuild, merge or promote.
+      segment_info functions without stemmer arguments, merge() and
+      promote() with TIN's signatures, highlight() over a bound query, and
+      its own (bind_query, verify_index, wal_rmgr_id, maintenance_jobs and
+      others); no fsck or fsm_rebuild.
 
   - id: inventory.access_method.1
     against: tin-1.0.4

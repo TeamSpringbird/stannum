@@ -350,6 +350,17 @@ impl<'a> Segment<'a> {
         })
     }
 
+    /// Records `term`'s term-map entry (or its absence) in the memo, found
+    /// elsewhere (the extension's paged reader), so lookups through
+    /// [`Self::term_memo`] need not read the term map's blocks.
+    pub fn remember(&self, term: &str, entry: Option<TermEntry>) {
+        let mut memo = self.memo.borrow_mut();
+        if memo.len() >= MEMO_LIMIT {
+            memo.clear();
+        }
+        memo.insert(term.to_owned(), entry);
+    }
+
     /// [`Self::term`] through the memo of earlier lookups.
     pub fn term_memo(&self, term: &str) -> Result<Option<Term<'a>>> {
         if let Some(entry) = self.memo.borrow().get(term) {

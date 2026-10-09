@@ -1189,6 +1189,81 @@ pub fn count_terms<'a>(
     Ok(total)
 }
 
+/// [`count_terms`] trusting only the slots on all-visible heap pages, as an
+/// index-only count must: per candidate group, `visible` fills a mask of
+/// the group's slots on all-visible pages (zeroed when called) and returns
+/// whether it covers every document of the group; members on other slots
+/// are not counted but handed to `hidden` (the group and its words of
+/// hidden members), for the caller to check against the heap.
+pub fn count_terms_visible<'a>(
+    segment: &Segment<'a>,
+    node: &Node,
+    terms: &mut [Option<TermSet<'a>>],
+    touch: &mut impl Touch,
+    visible: &mut dyn FnMut(u32, &mut [u64]) -> bool,
+    hidden: &mut dyn FnMut(u32, &[u64]),
+) -> Result<u64> {
+    let live = &segment.liveness;
+    touch.touch(Part::Liveness, segment.area_at(Area::Liveness), 1);
+    let geometry = &segment.docs.geometry;
+    for set in terms.iter_mut().flatten() {
+        set.ensure_groups(geometry, touch);
+    }
+    let all = geometry.groups.len();
+    let groups = candidate_groups(node, terms, all);
+    let hints = vec![0usize; terms.len()];
+    let mut fold = Fold {
+        segment,
+        terms,
+        hints,
+        scratch: Scratch::default(),
+        touch,
+        list: Vec::new(),
+        other: Vec::new(),
+    };
+    let mut total = 0u64;
+    let mut out = Vec::new();
+    let mut mask = Vec::new();
+    for group in groups {
+        let words = geometry.groups[group as usize].words();
+        mask.clear();
+        mask.resize(words, 0);
+        let whole = visible(group, &mut mask);
+        let dead = live.groups[group as usize].as_deref();
+        if whole
+            && dead.is_none()
+            && let Some(n) = fold.shortcut(node, group)
+        {
+            total += n;
+            continue;
+        }
+        out.clear();
+        out.resize(words, 0);
+        if !fold.eval(node, group, &mut out, 0)? {
+            continue;
+        }
+        if let Some(dead) = dead {
+            for (o, d) in out.iter_mut().zip(dead) {
+                *o &= !d;
+            }
+        }
+        if whole {
+            total += kernels::popcount(&out);
+            continue;
+        }
+        let mut any = false;
+        for (o, m) in out.iter_mut().zip(&mask) {
+            total += u64::from((*o & m).count_ones());
+            *o &= !m;
+            any |= *o != 0;
+        }
+        if any {
+            hidden(group, &out);
+        }
+    }
+    Ok(total)
+}
+
 impl<'a, T: Touch> Fold<'_, 'a, T> {
     fn shortcut(&mut self, node: &Node, group: u32) -> Option<u64> {
         match node {

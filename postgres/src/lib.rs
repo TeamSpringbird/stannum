@@ -5523,6 +5523,95 @@ mod tests {
         assert_clean("direct_vacuum_idx");
     }
 
+    /// Counts folded over segments' ctid sets agree with the ordinal fold
+    /// and with the heap, over several segments with a published dead list,
+    /// rows deleted since (whose pages the heap settles) and a sealed
+    /// segment and buffer beside them; and the plan says how many segments
+    /// the ctid fold counted.
+    #[pg_test]
+    fn ctid_counts_match_the_ordinal_fold_and_the_heap() {
+        Spi::run(
+            "CREATE TABLE ctid_counts(id int, body text);
+             INSERT INTO ctid_counts SELECT n, 'w' || (n % 7) || ' x' || (n % 13)
+                 || CASE WHEN n % 5 = 0 THEN ' rare' ELSE '' END || ' tail'
+                 FROM generate_series(1, 3000) n;
+             SET LOCAL stannum.build_segment_docs = 1000;
+             SET LOCAL stannum.merge_tier_factor = 64;",
+        )
+        .unwrap();
+        // A merge cap no two segments fit under: the build keeps three.
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(1));
+        Spi::run("CREATE INDEX ctid_counts_idx ON ctid_counts USING stannum(body)").unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(None);
+        let dead = tids("DELETE FROM ctid_counts WHERE id % 11 = 0 RETURNING ctid::text");
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'ctid_counts_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        unsafe {
+            let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+            crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead);
+        }
+        Spi::run(
+            "DELETE FROM ctid_counts WHERE id % 17 = 0;
+             SET LOCAL stannum.index_maintenance_mode = manual;
+             SET LOCAL stannum.write_buffer_docs = 4;
+             INSERT INTO ctid_counts SELECT n, 'w1 x2 rare fresh' FROM generate_series(3001, 3006) n;",
+        )
+        .unwrap();
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('ctid_counts_idx')
+                 WHERE kind = 'immutable' AND dead_docs > 0"
+            ),
+            3
+        );
+        let count = |query: &str, native: bool| {
+            Spi::run(&format!(
+                "SET LOCAL stannum.count_native = {native}; SET LOCAL enable_seqscan = off;"
+            ))
+            .unwrap();
+            value(&format!(
+                "SELECT count(*) FROM ctid_counts WHERE body ==> '{query}'"
+            ))
+        };
+        for query in [
+            "w1",
+            "w1 AND x2",
+            "w1 OR rare",
+            "rare AND NOT w3",
+            "\"w2 x5\"",
+            "w1 OR w2 OR x3",
+            "(w1 OR w2) AND (x3 OR rare)",
+            "tail AND NOT rare",
+            "absent OR w6",
+        ] {
+            let native = count(query, true);
+            assert_eq!(native, count(query, false), "{query}");
+            Spi::run(
+                "SET LOCAL stannum.enable_custom_scan = off; SET LOCAL enable_indexscan = off;
+                 SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = on;",
+            )
+            .unwrap();
+            let heap = value(&format!(
+                "SELECT count(*) FROM ctid_counts WHERE body ==> '{query}'"
+            ));
+            Spi::run(
+                "RESET stannum.enable_custom_scan; RESET enable_indexscan; RESET enable_bitmapscan;",
+            )
+            .unwrap();
+            assert_eq!(native, heap, "{query}");
+        }
+        Spi::run("SET LOCAL stannum.count_native = on; SET LOCAL enable_seqscan = off").unwrap();
+        let plan = Spi::get_one::<pgrx::Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ctid_counts WHERE body ==> 'w1 AND x2'",
+        )
+        .unwrap()
+        .unwrap()
+        .0
+        .to_string();
+        assert!(plan.contains("\"Ctid Folds\":3"), "{plan}");
+    }
+
     /// VACUUM removes dead documents from sealed write segments: each is
     /// rewritten without them under a new stamp and its old chain retired;
     /// one left without a document goes. Promotion then sees the rest.
