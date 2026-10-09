@@ -32,7 +32,9 @@ use std::mem::{offset_of, size_of};
 use pgrx::pg_sys;
 
 pub const MAGIC: u32 = 0x4c44_5032;
-pub const VERSION: u8 = 2;
+/// Version 3: segments in TIN's shape (`TNS1`) and directory entries that
+/// record their origin. An index of an earlier version must be rebuilt.
+pub const VERSION: u8 = 3;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();
@@ -97,7 +99,9 @@ pub fn kind(page: &[u8]) -> Result<u8> {
         return Err("not a Stannum LDP2 page");
     }
     if page[special + 5] != VERSION {
-        return Err("unsupported Stannum page version");
+        return Err(
+            "unsupported Stannum page version: the index was written in another storage format; REINDEX it",
+        );
     }
     Ok(page[special + 4])
 }
@@ -192,10 +196,43 @@ pub struct SegmentEntry {
     pub docs: u32,
     pub total_length: u64,
     pub generation: u32,
+    pub origin: Origin,
+}
+
+/// How a segment came to be, as TIN's `segment_info()` reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Origin {
+    /// Written by CREATE INDEX or REINDEX.
+    #[default]
+    Build = 1,
+    /// Promoted from the write segment.
+    Promotion = 2,
+    /// Merged from other segments, or rewritten without its dead documents.
+    Merge = 3,
+}
+
+impl Origin {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Promotion => "promotion",
+            Self::Merge => "merge",
+        }
+    }
+
+    fn decode(byte: u8) -> Result<Self> {
+        Ok(match byte {
+            1 => Self::Build,
+            2 => Self::Promotion,
+            3 => Self::Merge,
+            _ => return Err("invalid Stannum segment origin"),
+        })
+    }
 }
 
 const RUN_BYTES: usize = 16;
-const ENTRY_BYTES: usize = RUN_BYTES * 3 + 4 + 4 + 8 + 4;
+const ENTRY_BYTES: usize = RUN_BYTES * 3 + 4 + 4 + 8 + 4 + 4;
 
 /// A run waiting until every scan that could still read it has finished.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -280,6 +317,7 @@ impl Meta {
             out.extend_from_slice(&entry.docs.to_le_bytes());
             out.extend_from_slice(&entry.total_length.to_le_bytes());
             out.extend_from_slice(&entry.generation.to_le_bytes());
+            out.extend_from_slice(&[entry.origin as u8, 0, 0, 0]);
         }
         for pending in &self.pending {
             put_run(&mut out, pending.run);
@@ -329,6 +367,7 @@ impl Meta {
                 docs: u32_at(bytes, at + 3 * RUN_BYTES + 4),
                 total_length: u64_at(bytes, at + 3 * RUN_BYTES + 8),
                 generation: u32_at(bytes, at + 3 * RUN_BYTES + 16),
+                origin: Origin::decode(bytes[at + 3 * RUN_BYTES + 20])?,
             };
             if entry.run.is_empty() || entry.run.blocks == 0 {
                 return Err("invalid Stannum segment entry");
@@ -392,6 +431,7 @@ mod tests {
                     docs: 100,
                     total_length: 12_345,
                     generation: 1,
+                    origin: Origin::Build,
                 },
                 SegmentEntry {
                     run: Run {
@@ -411,6 +451,7 @@ mod tests {
                     docs: 1,
                     total_length: 2,
                     generation: 2,
+                    origin: Origin::Merge,
                 },
             ],
             pending: vec![Pending {

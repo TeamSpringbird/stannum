@@ -243,9 +243,8 @@ mod tests {
     }
 }
 
-/// The index's segment directory: immutable segments and the write buffer.
-/// The first eight columns are Stannum's; `npostings`, `source_state`,
-/// `origin` and `sequence` follow, named as TIN names them.
+/// The index's segment directory: immutable segments and the write buffer,
+/// in TIN's columns, then Stannum's `generation`.
 #[pg_extern(volatile, parallel_unsafe)]
 #[allow(clippy::type_complexity)]
 fn segment_info(
@@ -259,12 +258,12 @@ fn segment_info(
         name!(docs, i64),
         name!(dead_docs, i64),
         name!(sum_doc_lengths, i64),
-        name!(total_pages, i64),
-        name!(generation, i64),
         name!(npostings, Option<i64>),
+        name!(total_pages, i64),
         name!(source_state, String),
         name!(origin, Option<String>),
         name!(sequence, Option<i64>),
+        name!(generation, i64),
     ),
 > {
     require_stannum_index(&index, "segment_info");
@@ -280,15 +279,14 @@ fn segment_info(
             row.docs,
             row.dead_docs,
             row.sum_doc_lengths,
-            row.total_pages,
-            row.generation,
             row.npostings,
+            row.total_pages,
             // Every listed entry is current: retired runs wait on the
             // pending list, which segment_info does not list.
             "current".to_owned(),
-            // The directory does not record how a segment was made.
-            None,
+            row.origin.map(str::to_owned),
             row.sequence,
+            row.generation,
         )
     }))
 }

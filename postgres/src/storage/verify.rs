@@ -18,7 +18,7 @@
 //!    the next one), pending-free entries and the buffer state;
 //! 2. every directory run and its page table: page kinds, chain length, byte
 //!    counts, the page table listing exactly the chain's blocks;
-//! 3. every segment blob through [`segment::verify::verify_segment`], plus
+//! 3. every segment blob through [`segment::tinshape::verify::verify_segment`], plus
 //!    its directory entry's document count and total length;
 //! 4. every dead list: decodes, sorted, a subset of the document table;
 //! 5. the write buffer chain and stream: page kinds, full pages before the
@@ -37,7 +37,8 @@ use std::ffi::c_void;
 
 use pgrx::{FromDatum, pg_guard, pg_sys};
 use segment::Tid;
-use segment::verify::{Finding, Findings, verify_dead_list, verify_forward_stream, verify_segment};
+use segment::tinshape::verify::verify_segment;
+use segment::verify::{Finding, Findings, verify_dead_list, verify_forward_stream};
 
 use super::layout::{
     self, BufferState, CHAIN_CAPACITY, KIND_BUFFER, KIND_FREE, KIND_META, KIND_RUN, Meta, NONE, Run,

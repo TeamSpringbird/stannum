@@ -13,19 +13,28 @@
 //!   per-block impact frontiers and its TF tail.
 //! * [`segment`]: the blob that holds them with the term map and positions.
 //! * [`ef`], [`bits`]: the Elias-Fano and bit-packing codecs underneath.
+//! * [`index`]: a segment read through a [`crate::source::Source`] behind
+//!   the query interface every source offers, for the query shapes the
+//!   ctid-native paths do not take.
+//! * [`merge`]: merging segments without their dead documents.
+//! * [`verify`]: checking a blob for corruption.
 //!
-//! This is phase A of the move: the format and its codecs, measured offline
-//! against the ordinal format (`STN3`) by the bench crate's `tinshape`
-//! binary. Nothing in the extension reads it yet.
+//! The extension writes every immutable segment in this shape.
 
 pub mod bits;
 pub mod docs;
 pub mod ef;
+pub mod index;
+pub mod merge;
 pub mod postings;
 pub mod segment;
+pub mod verify;
 
 /// The varint codec the format's headers use, for readers outside the
 /// crate.
 pub mod varint {
     pub use crate::varint::{get, get_u32, put};
 }
+
+#[cfg(test)]
+mod tests;

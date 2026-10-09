@@ -198,6 +198,51 @@ impl SegmentBuilder {
         self.lengths.len()
     }
 
+    /// The documents as a segment in TIN's shape (`TNS1`, see
+    /// [`crate::tinshape`]) and what it holds. `None` when no document was
+    /// recorded.
+    pub fn finish_tns(
+        self,
+        options: crate::tinshape::postings::Options,
+    ) -> Result<Option<crate::tinshape::merge::Merged>> {
+        if self.lengths.is_empty() {
+            return Ok(None);
+        }
+        let documents: Vec<Tid> = self.lengths.keys().copied().collect();
+        let lengths: Vec<u32> = self.lengths.values().copied().collect();
+        let total_length = lengths.iter().map(|l| u64::from(*l)).sum();
+        let count = documents.len() as u32;
+        let mut builder =
+            crate::tinshape::segment::Builder::new(documents.clone(), lengths, options)?;
+        let mut ranks = Vec::new();
+        let mut buckets = Vec::new();
+        for (term, mut occurrences) in self.terms {
+            occurrences.sort_unstable_by_key(|occurrence| occurrence.tid);
+            let mut payload = PayloadBuilder::default();
+            ranks.clear();
+            buckets.clear();
+            for occurrence in &occurrences {
+                buckets.push(TfBucket::from_count(occurrence.positions.len() as u32).value());
+                ranks.push(
+                    documents
+                        .binary_search(&occurrence.tid)
+                        .expect("every occurrence belongs to a recorded document")
+                        as u32,
+                );
+                payload.push(&occurrence.positions)?;
+            }
+            builder.add_term(&term, &ranks, &buckets, &payload.finish())?;
+        }
+        let (blob, stats) = builder.finish(&[]);
+        Ok(Some(crate::tinshape::merge::Merged {
+            blob,
+            documents: count,
+            total_length,
+            terms: stats.terms as u64,
+            postings: stats.postings,
+        }))
+    }
+
     pub fn finish(self) -> Vec<u8> {
         let mut dictionary = DictionaryBuilder::default();
         let mut ordinals_area = Vec::new();

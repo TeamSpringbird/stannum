@@ -713,36 +713,6 @@ pub(crate) fn vm_hits() -> i64 {
     VM_HITS.get()
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-thread_local! {
-    /// For tests: the chunk load of a scan at which to cancel the query,
-    /// zero for none, and the pages held pinned when it was canceled.
-    static CANCEL_AT_LOAD: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
-}
-
-/// Cancels the running query at its `load`-th chunk load, as a user's
-/// cancel request arriving mid-walk would; returns the pages held pinned
-/// at the last such cancel.
-#[cfg(any(test, feature = "pg_test"))]
-pub(crate) fn cancel_at_chunk_load(load: i64) -> i64 {
-    engine::walk::set_chunk_load_hook(Some(cancel_if_asked));
-    CANCEL_AT_LOAD.replace((load, 0)).1
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-fn cancel_if_asked() {
-    let (at, _) = CANCEL_AT_LOAD.get();
-    if at != 0 && engine::walk::chunk_loads() >= at {
-        CANCEL_AT_LOAD.set((0, crate::storage::held_pages().0));
-        // SAFETY: the flags a cancel request's signal handler sets.
-        unsafe {
-            pg_sys::QueryCancelPending = 1;
-            pg_sys::InterruptPending = 1;
-        }
-        pgrx::check_for_interrupts!();
-    }
-}
-
 /// The seeded threshold, if any: ties are admitted, as the latest location.
 fn seeded_threshold() -> Option<(f32, Tid)> {
     let seed = DEBUG_SEED_SCORE.get();

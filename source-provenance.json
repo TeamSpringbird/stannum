@@ -1078,6 +1078,14 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: Elias-Fano coding for the ctid-addressed segment format."
     },
+    "segment/src/tinshape/index.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a ctid-addressed segment read through a page source behind the ordinal query interface."
+    },
+    "segment/src/tinshape/merge.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: merging ctid-addressed segments without their dead documents."
+    },
     "segment/src/tinshape/mod.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ctid-addressed segment format in TIN's shape."
@@ -1089,6 +1097,14 @@
     "segment/src/tinshape/segment.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ctid-addressed segment blob and its reader."
+    },
+    "segment/src/tinshape/tests.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: property tests of the ctid-addressed reader and merge against the ordinal format."
+    },
+    "segment/src/tinshape/verify.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: corruption checks of a ctid-addressed segment blob."
     },
     "segment/src/varint.rs": {
       "owner": "ben",

@@ -383,10 +383,10 @@ mod tests {
         assert_eq!(count("SELECT count(*) FROM stannum.maintenance_jobs()"), 0);
     }
 
-    /// segment_info carries TIN's extra columns: npostings is not recorded
-    /// (NULL), every listed entry is current, origin is not recorded, and
-    /// sequence is a segment's generation (NULL for the write buffer, as
-    /// TIN's is for its mutable segment).
+    /// segment_info carries TIN's columns: npostings (one per term and
+    /// document) and origin for segments, NULL for the write buffer as for
+    /// TIN's mutable segment; every listed entry is current; sequence counts
+    /// the immutable segments from 0. A merge's output is of origin merge.
     #[pg_test]
     fn segment_info_has_tins_extra_columns() {
         Spi::run(
@@ -399,10 +399,20 @@ mod tests {
         assert_eq!(
             text(
                 "SELECT string_agg(row(kind, npostings, source_state, origin,
-                     sequence = generation)::text, ';' ORDER BY ordinal)
+                     sequence)::text, ';' ORDER BY ordinal)
                  FROM stannum.segment_info('described_idx')"
             ),
-            "(immutable,,current,,t);(mutable,,current,,)"
+            "(immutable,40,current,build,0);(mutable,,current,,)"
+        );
+        Spi::run("SELECT stannum.promote('described_idx'::regclass)").unwrap();
+        Spi::run("SELECT stannum.merge('described_idx'::regclass, 1)").unwrap();
+        assert_eq!(
+            text(
+                "SELECT string_agg(row(kind, docs, npostings, origin, sequence)::text, ';'
+                     ORDER BY ordinal)
+                 FROM stannum.segment_info('described_idx')"
+            ),
+            "(immutable,21,43,merge,0)"
         );
     }
 }

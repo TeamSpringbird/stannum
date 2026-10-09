@@ -50,7 +50,7 @@ use std::rc::Rc;
 
 use layout::{
     BufferState, CHAIN_CAPACITY, FLAG_REMOVAL_HORIZONS, KIND_BUFFER, KIND_FREE, KIND_META,
-    KIND_RUN, MAX_PENDING, MAX_SEGMENTS, Meta, NONE, PAGE_SIZE, Pending, Run, SPECIAL_SIZE,
+    KIND_RUN, MAX_PENDING, MAX_SEGMENTS, Meta, NONE, Origin, PAGE_SIZE, Pending, Run, SPECIAL_SIZE,
     SegmentEntry,
 };
 use pgrx::{
@@ -64,9 +64,9 @@ use segment::docs::{DocCursor, DocTable, PageCursor, PageTable, TidCursor};
 use segment::forward::ForwardRecord;
 use segment::index::{Expanded, Index, MutableIndex, Window};
 use segment::ordinals::Ordinals;
-use segment::segment::{Lengths, Reader, Term};
-use segment::segment::{Segment, SegmentBuilder};
+use segment::segment::{Lengths, SegmentBuilder, Term};
 use segment::set::{Cursor, Difference, Intersection};
+use segment::tinshape::index::Reader;
 use tinql::runtime::Query;
 use tinql::runtime::plan::{Limits, plan};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
@@ -1456,13 +1456,14 @@ impl Index for MemoizedSegment {
         if let Some(entry) = self.terms.borrow().get(term) {
             return entry.map(|entry| self.reader.resolve(entry)).transpose();
         }
-        let found = self.reader.term(term)?;
+        let found = self.reader.term_entry(term)?;
         let mut memo = self.terms.borrow_mut();
         if memo.len() >= TERM_MEMO_LIMIT {
             memo.clear();
         }
-        memo.insert(term.to_owned(), found.map(|found| found.entry));
-        Ok(found)
+        memo.insert(term.to_owned(), found);
+        drop(memo);
+        found.map(|entry| self.reader.resolve(entry)).transpose()
     }
 
     fn expand(
@@ -1970,17 +1971,6 @@ pub fn cache_probe() -> CacheProbe {
     }
 }
 
-/// The dead list of `segment`, an ordinal stream, as the locations it names.
-fn dead_tids(segment: &dyn Index, dead: &[u8]) -> segment::Result<BTreeSet<Tid>> {
-    let docs = segment.doc_table()?;
-    let mut resolver = docs.resolver();
-    let mut out = BTreeSet::new();
-    for ordinal in Ordinals::parse(dead)?.to_vec()? {
-        out.insert(resolver.tid_at(ordinal)?);
-    }
-    Ok(out)
-}
-
 /// A source's dead list as a cursor over its locations, in heap order.
 pub(crate) fn dead_cursor<'a>(
     source: &'a dyn Index,
@@ -1995,30 +1985,6 @@ pub(crate) fn dead_pages<'a>(
     dead: &'a [u8],
 ) -> segment::Result<PageCursor<'a>> {
     PageCursor::new(Ordinals::parse(dead)?.cursor()?, source.doc_table()?)
-}
-
-/// Documents of the parsed `segment` dead in `entry`'s dead list.
-unsafe fn dead_set(
-    index: pg_sys::Relation,
-    entry: &SegmentEntry,
-    segment: &Segment<'_>,
-) -> BTreeSet<Tid> {
-    unsafe { try_dead_set(index, entry, segment) }.unwrap_or_else(|message| corrupt(message))
-}
-
-/// The dead list of an entry, read like [`try_read_run`]: without the meta
-/// lock, a failure may be a race rather than corruption.
-unsafe fn try_dead_set(
-    index: pg_sys::Relation,
-    entry: &SegmentEntry,
-    segment: &Segment<'_>,
-) -> Result<BTreeSet<Tid>, String> {
-    if entry.dead.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let what = format!("{} dead list", generation_label(entry.generation));
-    let bytes = unsafe { try_read_run(index, entry.dead, &what) }?;
-    dead_tids(segment, &bytes).map_err(|error| format!("Stannum {what}: {error}"))
 }
 
 // --- Write buffer -------------------------------------------------------------
@@ -2202,16 +2168,54 @@ unsafe fn replace_buffer(index: pg_sys::Relation, state: &mut BufferState, data:
 
 // --- Segments -----------------------------------------------------------------
 
-fn finish_builder(builder: SegmentBuilder) -> (Vec<u8>, u32, u64) {
-    let docs = builder.document_count() as u32;
-    let blob = builder.finish();
-    let total_length = codec(Segment::parse(&blob)).total_length();
-    (blob, docs, total_length)
+/// A segment written in TIN's shape (`TNS1`) and what it holds.
+pub(crate) type Built = segment::tinshape::merge::Merged;
+
+/// The options every segment is encoded with.
+fn encoding() -> segment::tinshape::postings::Options {
+    segment::tinshape::postings::Options::default()
+}
+
+/// The builder's documents as a segment; `None` when it recorded none (only
+/// documents without a token were added).
+fn finish_builder(builder: SegmentBuilder) -> Option<Built> {
+    codec(builder.finish_tns(encoding()))
+}
+
+/// The dead list of `entry` by rank, read like [`try_read_run`]: without
+/// the meta lock, a failure may be a race rather than corruption.
+unsafe fn try_dead_docs(
+    index: pg_sys::Relation,
+    entry: &SegmentEntry,
+) -> Result<segment::dead::DeadDocs, String> {
+    if entry.dead.is_empty() {
+        return Ok(segment::dead::DeadDocs::default());
+    }
+    let what = format!("{} dead list", generation_label(entry.generation));
+    let bytes = unsafe { try_read_run(index, entry.dead, &what) }?;
+    segment::dead::DeadDocs::decode(&bytes, entry.docs)
+        .map_err(|error| format!("Stannum {what}: {error}"))
+}
+
+/// Merges segment blobs without their dead documents. An input that fails
+/// to decode is reported through `corrupt` by the caller.
+fn merge_blobs(
+    inputs: &[(Vec<u8>, segment::dead::DeadDocs)],
+    mut checkpoint: impl FnMut(),
+) -> segment::Result<Option<Built>> {
+    let inputs = inputs
+        .iter()
+        .map(|(bytes, dead)| segment::tinshape::merge::Input { bytes, dead })
+        .collect::<Vec<_>>();
+    segment::tinshape::merge::merge(&inputs, encoding(), || {
+        checkpoint();
+        Ok(())
+    })
 }
 
 /// A directory entry for a freshly written segment run, with the next
 /// generation number. Generations never repeat within an index identity.
-fn new_entry(meta: &mut Meta, run: Run, map: Run, docs: u32, total_length: u64) -> SegmentEntry {
+fn new_entry(meta: &mut Meta, run: Run, map: Run, built: &Built, origin: Origin) -> SegmentEntry {
     let generation = meta.next_generation;
     meta.next_generation = meta
         .next_generation
@@ -2222,9 +2226,10 @@ fn new_entry(meta: &mut Meta, run: Run, map: Run, docs: u32, total_length: u64) 
         map,
         dead: Run::EMPTY,
         dead_stamp: 0,
-        docs,
-        total_length,
+        docs: built.documents,
+        total_length: built.total_length,
         generation,
+        origin,
     }
 }
 
@@ -2272,17 +2277,16 @@ unsafe fn release_entry(index: pg_sys::Relation, meta: &mut Meta, entry: Segment
 unsafe fn add_segment(
     index: pg_sys::Relation,
     meta: &mut Meta,
-    blob: Vec<u8>,
-    docs: u32,
-    total_length: u64,
+    built: Built,
+    origin: Origin,
     budget: u64,
 ) {
     unsafe {
-        let (run, map) = write_segment_run(index, &blob);
+        let (run, map) = write_segment_run(index, &built.blob);
         // Maintenance reads published segments into owned buffers. Release the
         // caller's encoded copy before that read and any subsequent merge.
-        drop(blob);
-        let entry = new_entry(meta, run, map, docs, total_length);
+        let entry = new_entry(meta, run, map, &built, origin);
+        drop(built);
         meta.segments.push(entry);
         maintain(index, meta, budget);
     }
@@ -2520,16 +2524,11 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
             old.push(meta.segments.remove(position));
         }
         old.reverse();
-        let (blob, docs, total_length) = match direct_merge_limits(&old) {
-            Some(limits) => merge_segments_direct(index, &old, limits),
-            // Aggregate input can exceed one run's u32 byte/document limit
-            // while dropping dead tuples still produces a representable run.
-            // Preserve the old per-input reconstruction path in that case.
-            None => merge_segments_reconstructed(index, &old),
-        };
-        let (run, map) = write_segment_run(index, &blob);
-        let entry = new_entry(meta, run, map, docs, total_length);
-        meta.segments.push(entry);
+        if let Some(built) = merge_segments(index, &old) {
+            let (run, map) = write_segment_run(index, &built.blob);
+            let entry = new_entry(meta, run, map, &built, Origin::Merge);
+            meta.segments.push(entry);
+        }
         for entry in old {
             release_entry(index, meta, entry);
         }
@@ -2539,30 +2538,10 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
     }
 }
 
-/// Admission is based on existing directory metadata, before retaining blobs.
-/// These are format bounds, not a peak-memory budget.
-fn direct_merge_limits(entries: &[SegmentEntry]) -> Option<segment::merge::MergeLimits> {
-    let bytes = entries
-        .iter()
-        .try_fold(0u32, |n, entry| n.checked_add(entry.run.bytes))?;
-    let docs = entries
-        .iter()
-        .try_fold(0u32, |n, entry| n.checked_add(entry.docs))?;
-    Some(segment::merge::MergeLimits {
-        max_inputs: MAX_SEGMENTS,
-        max_input_bytes: bytes as usize,
-        max_documents: docs as usize,
-        max_output_bytes: u32::MAX as usize,
-    })
-}
-
-/// The caller retains exclusive metadata access through construction/publication.
-unsafe fn merge_segments_direct(
-    index: pg_sys::Relation,
-    entries: &[SegmentEntry],
-    limits: segment::merge::MergeLimits,
-) -> (Vec<u8>, u32, u64) {
-    use segment::merge::{MergeError, MergeInput};
+/// Merges `entries`, which the caller has taken out of the directory under
+/// the exclusive metadata lock it holds through publication; `None` when
+/// every document was dead.
+unsafe fn merge_segments(index: pg_sys::Relation, entries: &[SegmentEntry]) -> Option<Built> {
     // Owned input bytes are released when this function returns, before WAL
     // output allocation. The merger never borrows a PostgreSQL buffer page.
     let mut owned = Vec::with_capacity(entries.len());
@@ -2570,57 +2549,27 @@ unsafe fn merge_segments_direct(
         pgrx::check_for_interrupts!();
         let label = generation_label(entry.generation);
         let bytes = unsafe { read_run(index, entry.run, &label) };
-        let dead = unsafe { dead_set(index, entry, &codec_in(Segment::parse(&bytes), &label)) };
+        let dead =
+            unsafe { try_dead_docs(index, entry) }.unwrap_or_else(|message| corrupt(message));
         owned.push((bytes, dead));
     }
-    let inputs = owned
-        .iter()
-        .map(|(bytes, dead)| MergeInput { bytes, dead })
-        .collect::<Vec<_>>();
-    let blob = segment::merge::merge(&inputs, limits, || {
+    let built = merge_blobs(&owned, || {
         // PostgreSQL defers interrupts while the metadata LWLock is held.
         // Do not bypass that protection; insert checks again after release.
         race_point("merge:checkpoint");
         pgrx::check_for_interrupts!();
-        Ok(())
     })
-    .unwrap_or_else(|error| match error {
-        MergeError::Codec(_) | MergeError::InvalidInput { .. } => {
-            let generations = entries
-                .iter()
-                .map(|entry| entry.generation)
-                .collect::<Vec<_>>();
-            corrupt(format!(
-                "merge of segment generations {generations:?}: {error}"
-            ))
-        }
-        _ => pgrx::error!("Stannum segment merge failed: {error}"),
+    .unwrap_or_else(|error| {
+        let generations = entries
+            .iter()
+            .map(|entry| entry.generation)
+            .collect::<Vec<_>>();
+        corrupt(format!(
+            "merge of segment generations {generations:?}: {error}"
+        ))
     });
-    let segment = codec(Segment::parse(&blob));
-    let docs = segment.document_count();
-    let total_length = segment.total_length();
     race_point("merge:built");
-    (blob, docs, total_length)
-}
-
-/// Compatibility fallback for aggregate input beyond the direct API's limits.
-unsafe fn merge_segments_reconstructed(
-    index: pg_sys::Relation,
-    entries: &[SegmentEntry],
-) -> (Vec<u8>, u32, u64) {
-    let mut builder = SegmentBuilder::default();
-    for entry in entries {
-        pgrx::check_for_interrupts!();
-        let label = generation_label(entry.generation);
-        let bytes = unsafe { read_run(index, entry.run, &label) };
-        let segment = codec_in(Segment::parse(&bytes), &label);
-        let dead = unsafe { dead_set(index, entry, &segment) };
-        for record in codec_in(segment.records(|tid| dead.contains(&tid)), &label) {
-            pgrx::check_for_interrupts!();
-            codec_in(builder.add_record(&record), &label);
-        }
-    }
-    finish_builder(builder)
+    built
 }
 
 /// The write buffer's documents as one segment blob, with its document
@@ -2628,7 +2577,7 @@ unsafe fn merge_segments_reconstructed(
 ///
 /// # Safety
 /// The caller holds the meta page of `index`; `buffer` is what it records.
-unsafe fn buffer_segment(index: pg_sys::Relation, buffer: &BufferState) -> (Vec<u8>, u32, u64) {
+unsafe fn buffer_segment(index: pg_sys::Relation, buffer: &BufferState) -> Option<Built> {
     let stream = unsafe { read_buffer_stream(index, buffer) };
     let mut builder = SegmentBuilder::default();
     for record in segment::forward::records(&stream) {
@@ -2649,8 +2598,9 @@ unsafe fn buffer_segment(index: pg_sys::Relation, buffer: &BufferState) -> (Vec<
 /// records, the buffer holds a document, and the directory has room.
 unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta, records: &[u8], docs: u32, budget: u64) {
     unsafe {
-        let (blob, folded, total_length) = buffer_segment(index, &meta.buffer);
-        add_segment(index, meta, blob, folded, total_length, budget);
+        if let Some(built) = buffer_segment(index, &meta.buffer) {
+            add_segment(index, meta, built, Origin::Promotion, budget);
+        }
         replace_buffer(index, &mut meta.buffer, records, docs);
     }
 }
@@ -2816,15 +2766,17 @@ impl Builder {
             return;
         }
         let builder = std::mem::take(&mut self.segment);
-        let (blob, docs, total_length) = finish_builder(builder);
+        let Some(built) = finish_builder(builder) else {
+            return;
+        };
         unsafe {
             lock_maintenance(index);
             let identity = read_meta(index, false).1.identity;
             make_room(index, identity);
-            let (run, map) = write_segment_run(index, &blob);
-            drop(blob);
+            let (run, map) = write_segment_run(index, &built.blob);
             let (meta_buffer, mut meta) = read_meta(index, true);
-            let entry = new_entry(&mut meta, run, map, docs, total_length);
+            let entry = new_entry(&mut meta, run, map, &built, Origin::Build);
+            drop(built);
             meta.segments.push(entry);
             write_meta(index, &meta_buffer, &meta);
             drop(meta_buffer);
@@ -3255,9 +3207,14 @@ pub unsafe fn fold_buffer(index: pg_sys::Relation) -> FoldReport {
                 unlock_maintenance(index);
                 continue;
             }
-            let (blob, docs, total_length) = buffer_segment(index, &meta.buffer);
-            let terms = codec(codec(Segment::parse(&blob)).dictionary()).len() as u64;
-            add_segment(index, &mut meta, blob, docs, total_length, 0);
+            let built = buffer_segment(index, &meta.buffer);
+            let (docs, terms) = built
+                .as_ref()
+                .map_or((0, 0), |built| (built.documents, built.terms));
+            let segments = u32::from(built.is_some());
+            if let Some(built) = built {
+                add_segment(index, &mut meta, built, Origin::Promotion, 0);
+            }
             replace_buffer(index, &mut meta.buffer, &[], 0);
             race_point("promote:folded");
             write_meta(index, &guard, &meta);
@@ -3266,7 +3223,7 @@ pub unsafe fn fold_buffer(index: pg_sys::Relation) -> FoldReport {
             return FoldReport {
                 docs: u64::from(docs),
                 terms,
-                segments: 1,
+                segments,
             };
         }
     }
@@ -3717,38 +3674,48 @@ unsafe fn scan_dead(
 ) -> Result<DeadScan, String> {
     pgrx::check_for_interrupts!();
     let label = generation_label(entry.generation);
-    let bytes = unsafe { try_read_run(index, entry.run, &label) }?;
-    let segment = Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
-    let mut dead = unsafe { try_dead_set(index, entry, &segment) }?;
-    let before = dead.len();
+    let documents = unsafe { try_read_documents(index, entry, &label) }?;
+    let known = unsafe { try_dead_docs(index, entry) }?;
+    let mut dead = BTreeSet::new();
     let (mut live, mut removed) = (0u64, 0u64);
-    let mut ordinals = Vec::with_capacity(dead.len());
-    let mut documents = segment
-        .documents()
-        .map_err(|error| format!("Stannum {label}: {error}"))?;
-    while let Some(tid) = documents.current() {
-        if dead.contains(&tid) {
+    let mut ordinals = Vec::with_capacity(known.len() as usize);
+    for (rank, tid) in documents.into_iter().enumerate() {
+        let rank = rank as u32;
+        if rank.is_multiple_of(4096) {
+            pgrx::check_for_interrupts!();
+        }
+        if known.contains(rank) {
             // Already dead: nothing to report.
-            ordinals.push(documents.ordinal());
+            dead.insert(tid);
+            ordinals.push(rank);
         } else if is_dead(tid) {
             dead.insert(tid);
-            ordinals.push(documents.ordinal());
+            ordinals.push(rank);
             removed += 1;
         } else {
             live += 1;
         }
-        documents
-            .advance()
-            .map_err(|error| format!("Stannum {label}: {error}"))?;
     }
-    let grew = dead.len() != before;
     Ok((
         dead,
-        grew,
+        removed > 0,
         live,
         removed,
         segment::ordinals::encode(&ordinals),
     ))
+}
+
+/// The ctids of `entry`'s documents in rank order, read without the meta
+/// lock (see [`try_read_run`]).
+unsafe fn try_read_documents(
+    index: pg_sys::Relation,
+    entry: &SegmentEntry,
+    label: &str,
+) -> Result<Vec<Tid>, String> {
+    let bytes = unsafe { try_read_run(index, entry.run, label) }?;
+    segment::tinshape::segment::Segment::parse(&bytes)
+        .map(|segment| segment.docs.tids())
+        .map_err(|error| format!("Stannum {label}: {error}"))
 }
 
 /// Records dead tuples: per segment as a dead list, and by rewriting the write
@@ -3983,39 +3950,18 @@ unsafe fn mostly_dead(
 
 /// Unlocked sources can be retired/reused while being read. A merge failure
 /// is corruption only when the complete captured input set still applies.
-unsafe fn maintenance_merge_blob(
+/// `None` when an input changed; `Some(None)` when every document was dead.
+unsafe fn maintenance_merge(
     index: pg_sys::Relation,
     identity: u64,
     inputs: &[SegmentEntry],
-) -> Option<Vec<u8>> {
-    use segment::merge_strategy::{Facts, Policy, Strategy};
-    let facts = Facts {
-        input_bytes: inputs.iter().map(|entry| u64::from(entry.run.bytes)).sum(),
-        documents: inputs.iter().map(|entry| u64::from(entry.docs)).sum(),
-    };
-    let policy = match VACUUM_MERGE_STRATEGY.get() {
-        VacuumMergeStrategy::Auto => Policy::Auto,
-        VacuumMergeStrategy::Direct => Policy::ForceDirect,
-        VacuumMergeStrategy::Reconstruct => Policy::ForceReconstruct,
-    };
-    let plan = segment::merge_strategy::choose(facts, policy);
-    pgrx::debug1!(
-        "Stannum unlocked merge: {:?}: {}",
-        plan.strategy,
-        plan.reason
-    );
-    if plan.strategy == Strategy::LegacyOversized {
-        return unsafe { maintenance_reconstruct_blob(index, identity, inputs) };
-    }
-    let limits = direct_merge_limits(inputs).expect("planner admitted aggregate format limits");
+) -> Option<Option<Built>> {
     let mut owned = Vec::with_capacity(inputs.len());
     for entry in inputs {
         pgrx::check_for_interrupts!();
         let label = generation_label(entry.generation);
         let read = unsafe { try_read_run(index, entry.run, &label) }.and_then(|bytes| {
-            let segment =
-                Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
-            let dead = unsafe { try_dead_set(index, entry, &segment) }?;
+            let dead = unsafe { try_dead_docs(index, entry) }?;
             Ok((bytes, dead))
         });
         owned.push(unsafe { unlocked(index, identity, entry, read) }?);
@@ -4025,17 +3971,13 @@ unsafe fn maintenance_merge_blob(
     if testing::CORRUPT_MAINTENANCE_INPUT.with(|flag| flag.replace(false)) {
         owned[0].0[0] ^= 0xff;
     }
-    let sources = owned
-        .iter()
-        .map(|(bytes, dead)| segment::merge::MergeInput { bytes, dead })
-        .collect::<Vec<_>>();
-    let result = segment::merge_strategy::execute(plan.strategy, &sources, limits, || {
+    let result = merge_blobs(&owned, || {
         race_point("maintenance:checkpoint");
         pgrx::check_for_interrupts!();
-        Ok(())
     });
+    drop(owned);
     match result {
-        Ok(blob) => Some(blob),
+        Ok(built) => Some(built),
         Err(error) => {
             let (guard, meta) = unsafe { read_meta(index, false) };
             let applies = meta.identity == identity
@@ -4044,45 +3986,9 @@ unsafe fn maintenance_merge_blob(
             if !applies {
                 return None;
             }
-            match error {
-                segment::merge::MergeError::Codec(_)
-                | segment::merge::MergeError::InvalidInput { .. } => {
-                    corrupt(format!("unlocked segment merge: {error}"));
-                }
-                _ => pgrx::error!("Stannum unlocked segment merge failed: {error}"),
-            }
+            corrupt(format!("unlocked segment merge: {error}"));
         }
     }
-}
-
-/// Preserve the previous per-source path for oversized aggregate inputs.
-unsafe fn maintenance_reconstruct_blob(
-    index: pg_sys::Relation,
-    identity: u64,
-    inputs: &[SegmentEntry],
-) -> Option<Vec<u8>> {
-    let mut builder = SegmentBuilder::default();
-    for entry in inputs {
-        pgrx::check_for_interrupts!();
-        let label = generation_label(entry.generation);
-        let result = unsafe { try_read_run(index, entry.run, &label) }.and_then(|bytes| {
-            let segment =
-                Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
-            let dead = unsafe { try_dead_set(index, entry, &segment) }?;
-            let records = segment
-                .records(|tid| dead.contains(&tid))
-                .map_err(|error| format!("Stannum {label}: {error}"))?;
-            for record in records {
-                pgrx::check_for_interrupts!();
-                builder
-                    .add_record(&record)
-                    .map_err(|error| format!("Stannum {label}: {error}"))?;
-            }
-            Ok(())
-        });
-        unsafe { unlocked(index, identity, entry, result) }?;
-    }
-    Some(finish_builder(builder).0)
 }
 
 /// What [`replace_entries`] published: the segment's documents (zero: the
@@ -4097,8 +4003,8 @@ struct Published {
 /// Rewrites `inputs` into one segment of their live documents, unlocked,
 /// and publishes it only if every input is still in the directory, entry
 /// for entry including the dead-list run. Returns what it published, or
-/// `None` when it did not publish. `count_postings` walks the merged
-/// segment's dictionary in memory to count its postings. A single input
+/// `None` when it did not publish; its postings only when `count_postings`
+/// asks. A single input
 /// keeps its position; several merge to the end.
 unsafe fn replace_entries(
     index: pg_sys::Relation,
@@ -4106,29 +4012,23 @@ unsafe fn replace_entries(
     inputs: &[SegmentEntry],
     count_postings: bool,
 ) -> Option<Published> {
-    let blob = unsafe { maintenance_merge_blob(index, identity, inputs) }?;
-    let segment = codec(Segment::parse(&blob));
-    let docs = segment.document_count();
-    let total_length = segment.total_length();
+    let built = unsafe { maintenance_merge(index, identity, inputs) }?;
+    let docs = built.as_ref().map_or(0, |built| built.documents);
     let postings = if count_postings {
-        let dictionary = codec(segment.dictionary());
-        let mut postings = 0u64;
-        for term in dictionary.iter_from("") {
-            postings += u64::from(codec(term).1.df);
-        }
-        postings
+        built.as_ref().map_or(0, |built| built.postings)
     } else {
         0
     };
-    let output = (docs > 0).then(|| {
-        let (run, map) = unsafe { write_segment_run(index, &blob) };
-        (run, map, docs, total_length)
+    let output = built.map(|mut built| {
+        let (run, map) = unsafe { write_segment_run(index, &built.blob) };
+        built.blob = Vec::new();
+        (run, map, built)
     });
     race_point("maintenance:built");
     let (guard, mut meta) = unsafe { read_meta(index, true) };
     if meta.identity != identity || !inputs.iter().all(|entry| meta.segments.contains(entry)) {
         drop(guard);
-        if let Some((run, map, _, _)) = output {
+        if let Some((run, map, _)) = output {
             unsafe {
                 discard_run(index, run);
                 discard_run(index, map);
@@ -4142,8 +4042,8 @@ unsafe fn replace_entries(
         .position(|entry| *entry == inputs[0])
         .expect("every input is present");
     meta.segments.retain(|entry| !inputs.contains(entry));
-    if let Some((run, map, docs, total_length)) = output {
-        let entry = new_entry(&mut meta, run, map, docs, total_length);
+    if let Some((run, map, built)) = output {
+        let entry = new_entry(&mut meta, run, map, &built, Origin::Merge);
         if inputs.len() == 1 {
             meta.segments.insert(position, entry);
         } else {
@@ -4474,12 +4374,11 @@ pub mod testing {
             let (guard, mut meta) = read_meta(index, true);
             let entry = meta.segments[i];
             let label = generation_label(entry.generation);
-            let bytes = read_run(index, entry.run, &label);
-            let segment = codec_in(Segment::parse(&bytes), &label);
-            let docs = codec_in(segment.doc_table(), &label);
+            let documents = try_read_documents(index, &entry, &label)
+                .unwrap_or_else(|message| corrupt(message));
             let ordinals: Vec<u32> = dead
                 .iter()
-                .filter_map(|tid| codec_in(docs.ordinal_of(*tid), &label))
+                .filter_map(|tid| documents.binary_search(tid).ok().map(|rank| rank as u32))
                 .collect();
             let run = write_run(index, &segment::ordinals::encode(&ordinals));
             let old = attach_dead_list(&mut meta, i, run);
@@ -4620,11 +4519,39 @@ pub struct SegmentRow {
     pub sum_doc_lengths: i64,
     pub total_pages: i64,
     pub generation: i64,
-    /// TIN's `npostings`, one per term and document: STN3 does not record it,
-    /// and counting it reads every dictionary, so `None`.
+    /// TIN's `npostings`, one per term and document; `None` for the write
+    /// buffer, as TIN's is for its mutable segment.
     pub npostings: Option<i64>,
-    /// TIN's `sequence`: the segment's generation; `None` for the buffer.
+    /// How the segment was made (TIN's `origin`); `None` for the buffer.
+    pub origin: Option<&'static str>,
+    /// TIN's `sequence`: the segment's place among the immutable segments,
+    /// from 0; `None` for the buffer.
     pub sequence: Option<i64>,
+}
+
+/// A segment's postings, one per term and document: the sum of its terms'
+/// document frequencies, read from its term map.
+///
+/// # Safety
+/// `index` is a live LDP2 index listing `entry`.
+unsafe fn segment_postings(index: pg_sys::Relation, entry: &SegmentEntry) -> u64 {
+    let label = generation_label(entry.generation);
+    let source = RunSource::new(
+        unsafe { (*index).rd_id },
+        entry.run,
+        unsafe { page_table(index, read_meta(index, false).1.identity, entry) },
+        label.clone(),
+    );
+    let reader = codec_in(Reader::new(source), &label);
+    let dictionary = codec_in(reader.dictionary(), &label);
+    let mut postings = 0u64;
+    for (i, item) in dictionary.iter().enumerate() {
+        if i.is_multiple_of(4096) {
+            pgrx::check_for_interrupts!();
+        }
+        postings += u64::from(codec_in(item, &label).1.df);
+    }
+    postings
 }
 
 /// The directory as rows: immutable segments first, then the write buffer.
@@ -4643,6 +4570,7 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 let bytes = read_run(index, entry.dead, &what);
                 i64::from(codec_in(Ordinals::parse(&bytes), &what).count())
             };
+            let npostings = segment_postings(index, entry);
             rows.push(SegmentRow {
                 ordinal: ordinal as i64,
                 kind: "immutable".to_owned(),
@@ -4652,8 +4580,9 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 sum_doc_lengths: entry.total_length as i64,
                 total_pages: i64::from(entry.run.blocks + entry.dead.blocks),
                 generation: i64::from(entry.generation),
-                npostings: None,
-                sequence: Some(i64::from(entry.generation)),
+                npostings: Some(npostings as i64),
+                origin: Some(entry.origin.name()),
+                sequence: Some(ordinal as i64),
             });
         }
         if meta.buffer.docs > 0 {
@@ -4671,6 +4600,7 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 total_pages: i64::from(meta.buffer.bytes.div_ceil(CHAIN_CAPACITY as u32).max(1)),
                 generation: i64::from(meta.buffer.version),
                 npostings: None,
+                origin: None,
                 sequence: None,
             });
         }
@@ -4725,18 +4655,6 @@ pub unsafe fn document_count(index: pg_sys::Relation) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn direct_merge_admission_preserves_oversized_aggregate_fallback() {
-        let mut entry = super::SegmentEntry::default();
-        entry.run.bytes = u32::MAX;
-        entry.docs = 1;
-        assert!(super::direct_merge_limits(&[entry]).is_some());
-        assert!(super::direct_merge_limits(&[entry, entry]).is_none());
-        entry.run.bytes = 1;
-        entry.docs = u32::MAX;
-        assert!(super::direct_merge_limits(&[entry, entry]).is_none());
-    }
-
     use super::{
         MAX_SEGMENTS, SEGMENT_BYTES_CAP, bounded_merge_candidates, merge_candidates,
         room_candidates, tier, within_run,
