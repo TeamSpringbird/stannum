@@ -127,6 +127,9 @@ struct Record {
     count_ns: Vec<u64>,
     ranked_touches: Touches,
     count_touches: Touches,
+    /// The ranked query's touches as the segment reader attributes them,
+    /// which is what the extension's EXPLAIN reports.
+    explain_touches: [u64; segment::cache::TOUCH_AREAS],
     cold_ranked: Touches,
     cold_count: Touches,
     path: &'static str,
@@ -186,10 +189,12 @@ fn pass(
                 .filter(|_| first)
                 .map(|_| collect_events());
             take_touches();
+            segment::cache::reset_areas();
             let started = Instant::now();
             let answer = engine.ranked(&query.text, options.k);
             let elapsed = started.elapsed().as_nanos() as u64;
             record.ranked_touches = take_touches();
+            record.explain_touches = segment::cache::area_touches();
             engine::walk::stats::observe(None);
             let answer = answer.map_err(|error| format!("{}: {error}", query.name))?;
             record.ranked_ns.push(elapsed);
@@ -429,6 +434,7 @@ fn run() -> Result<bool, String> {
         );
     }
     engine::set_blocks_probe(|| bench::paged::touches_so_far() as i64);
+    segment::cache::set_touch_probe(bench::paged::touches_so_far);
     let engine = Engine::open(&dump)?;
     let mut analyzer = if options.whatif {
         Some(Analyzer::new(&dump)?)
@@ -605,6 +611,23 @@ fn run() -> Result<bool, String> {
         touch_table(&mut out, "ranked, warm", &by_style, &|r: &Record| {
             &r.ranked_touches
         });
+    }
+    if options.ranked {
+        let _ = writeln!(
+            out,
+            "  as the extension's EXPLAIN reports them (Page Touches By Area), mean per query:"
+        );
+        for (style, records) in &by_style {
+            let n = records.len().max(1) as f64;
+            let _ = write!(out, "  {style:<10}");
+            for (a, name) in segment::cache::TOUCH_NAMES.iter().enumerate() {
+                let mean = records.iter().map(|r| r.explain_touches[a]).sum::<u64>() as f64 / n;
+                if mean > 0.0 {
+                    let _ = write!(out, " {name}={mean:.1}");
+                }
+            }
+            let _ = writeln!(out);
+        }
     }
     if options.count {
         touch_table(&mut out, "count, warm", &by_style, &|r: &Record| {
