@@ -45,7 +45,7 @@
 //! TF tail and its positions in the positions area.
 
 use super::bits::{self, BitWriter};
-use super::docs::{GROUP_PAGES, Geometry};
+use super::docs::{Geometry, Group};
 use super::ef::{self, Ef};
 use crate::{Error, Result, varint};
 
@@ -79,6 +79,10 @@ pub struct Options {
     /// whatever else would be smaller, so a fold reads it word by word
     /// rather than decoding a member at a time; 0 chooses by size alone.
     pub grid_density: u32,
+    /// ... but only for a term of at least this many postings: decoding a
+    /// smaller term whole costs microseconds, and a small table, every
+    /// term of which is small, would pay for grids it never needs.
+    pub grid_min_postings: u32,
 }
 
 impl Default for Options {
@@ -90,6 +94,7 @@ impl Default for Options {
             sparse: true,
             adaptive_tf: true,
             grid_density: 64,
+            grid_min_postings: 4096,
         }
     }
 }
@@ -320,14 +325,15 @@ fn encode_groups(
         }
         let width = u32::from(group.width);
         let mut kind = KIND_GRID;
-        let mut best = 32 * width as usize;
+        let mut best = group.grid_bytes();
         let forced = options.grid_density > 0
+            && slots.len() as u64 >= u64::from(options.grid_min_postings)
             && locals.len() as u64 * u64::from(options.grid_density) >= u64::from(group.slots());
         if forced {
             stats.forced += 1;
         }
         if options.ef_groups && !forced {
-            let len = ef::encoded_len(locals.len(), GROUP_PAGES * width);
+            let len = ef::encoded_len(locals.len(), group.slots());
             if len < best {
                 best = len;
                 kind = KIND_EF;
@@ -354,13 +360,13 @@ fn encode_groups(
         let before = bodies.len();
         match kind {
             KIND_GRID => {
-                let mut grid = vec![0u8; 32 * width as usize];
+                let mut grid = vec![0u8; group.grid_bytes()];
                 for local in &locals {
                     grid[*local as usize / 8] |= 1 << (local % 8);
                 }
                 bodies.extend_from_slice(&grid);
             }
-            KIND_EF => ef::encode(&locals, GROUP_PAGES * width, &mut bodies),
+            KIND_EF => ef::encode(&locals, group.slots(), &mut bodies),
             _ => {
                 varint::put(&mut directory, candidate.len() as u64);
                 bodies.extend_from_slice(&candidate);
@@ -495,9 +501,9 @@ impl<'a> Postings<'a> {
             Form::Sparse(list) => list.for_each(visit),
             Form::Grouped(entries) => {
                 for entry in entries {
-                    let base = geometry.groups[entry.index as usize].slot_base;
-                    let width = u32::from(geometry.groups[entry.index as usize].width);
-                    for_each_local(entry, self.container(entry), width, |local| {
+                    let group = &geometry.groups[entry.index as usize];
+                    let base = group.slot_base;
+                    for_each_local(entry, self.container(entry), group, |local| {
                         visit(base + local);
                     })?;
                 }
@@ -550,7 +556,7 @@ fn parse_groups(payload: &[u8], df: u32, geometry: &Geometry) -> Result<(Vec<Gro
             return Err(Error::Corrupt("postings group count"));
         }
         let len = match kind {
-            KIND_GRID => 32 * u64::from(group.width),
+            KIND_GRID => group.grid_bytes() as u64,
             KIND_EF => ef::encoded_len(count as usize, group.slots()) as u64,
             KIND_PAGED => varint::get(payload, &mut at)?,
             _ => return Err(Error::Corrupt("postings group kind")),
@@ -578,7 +584,7 @@ fn parse_groups(payload: &[u8], df: u32, geometry: &Geometry) -> Result<(Vec<Gro
 pub fn for_each_local(
     entry: &GroupEntry,
     bytes: &[u8],
-    width: u32,
+    group: &Group,
     mut visit: impl FnMut(u32),
 ) -> Result<()> {
     match entry.kind {
@@ -594,24 +600,24 @@ pub fn for_each_local(
             Ok(())
         }
         KIND_EF => {
-            Ef::parse(bytes, entry.count as usize, GROUP_PAGES * width)?.for_each(visit);
+            Ef::parse(bytes, entry.count as usize, group.slots())?.for_each(visit);
             Ok(())
         }
-        _ => paged_for_each(bytes, width, visit),
+        _ => paged_for_each(bytes, u32::from(group.width), visit),
     }
 }
 
 /// Sets every member of a group container in `words`, a bitmap over the
 /// group's slots.
 #[inline]
-pub fn or_into(entry: &GroupEntry, bytes: &[u8], width: u32, words: &mut [u64]) -> Result<()> {
+pub fn or_into(entry: &GroupEntry, bytes: &[u8], group: &Group, words: &mut [u64]) -> Result<()> {
     if entry.kind == KIND_GRID {
         for (i, word) in words.iter_mut().enumerate() {
             *word |= bits::word(bytes, i);
         }
         return Ok(());
     }
-    for_each_local(entry, bytes, width, |local| {
+    for_each_local(entry, bytes, group, |local| {
         words[local as usize / 64] |= 1 << (local % 64);
     })
 }
@@ -898,6 +904,7 @@ mod tests {
                             sparse,
                             adaptive_tf,
                             grid_density,
+                            grid_min_postings: 0,
                         });
                     }
                 }
@@ -1025,7 +1032,11 @@ mod tests {
             &slots,
             &[0; 10],
             &[1; 10],
-            &Options::default(),
+            // Dense enough for a grid, whatever its size.
+            &Options {
+                grid_min_postings: 0,
+                ..Options::default()
+            },
             &mut out,
         );
         let wrong_df =

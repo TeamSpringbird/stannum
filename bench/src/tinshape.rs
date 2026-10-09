@@ -44,6 +44,84 @@ fn err(e: segment::Error) -> String {
     e.to_string()
 }
 
+/// An STN3 segment of the first `n` documents of a dumped one in ctid order,
+/// as a table of that many rows (the heap's first pages) indexes them: the
+/// same tokens, rebuilt by STN3's segment builder (for size reports: a
+/// token sharing its position with another moves up by one).
+pub fn subset(
+    dumped: &DumpedSegment,
+    n: u32,
+    rows_per_page: Option<u16>,
+) -> Result<Vec<u8>, String> {
+    let blob: &[u8] = &dumped.blob;
+    let reader = Reader::parse(blob).map_err(err)?;
+    let sections = reader.sections();
+    let n = n.min(reader.document_count());
+    let mut tids = reader.doc_table().map_err(err)?.to_vec().map_err(err)?;
+    // A denser heap: `rows_per_page` rows on every page, in rank order.
+    if let Some(per) = rows_per_page {
+        for (rank, tid) in tids.iter_mut().enumerate() {
+            *tid = Tid {
+                block: (rank / usize::from(per)) as u32,
+                offset: (rank % usize::from(per)) as u16 + 1,
+            };
+        }
+    }
+    let payload_at = sections.header + sections.dictionary + sections.ordinals;
+    let mut names: Vec<String> = Vec::new();
+    let mut docs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n as usize];
+    let dictionary = reader.dictionary().map_err(err)?;
+    let mut positions = Vec::new();
+    for block in 0..dictionary.index().blocks() {
+        for (term, entry, _) in dictionary.block_sizes(block).map_err(err)? {
+            let resolved = reader.resolve(entry).map_err(err)?;
+            let mut cursor = resolved.ordinals().map_err(err)?.cursor().map_err(err)?;
+            let from = payload_at + entry.payload.offset as usize;
+            let payload =
+                segment::payload::Payload::parse(&blob[from..from + entry.payload.len as usize])
+                    .map_err(err)?;
+            let mut entries = payload.cursor();
+            let t = names.len() as u32;
+            let mut used = false;
+            while let Some(ordinal) = cursor.current() {
+                if ordinal >= n {
+                    break;
+                }
+                positions.clear();
+                entries.next_into(&mut positions).map_err(err)?;
+                for p in &positions {
+                    docs[ordinal as usize].push((t, *p));
+                }
+                used = true;
+                cursor.advance().map_err(err)?;
+            }
+            if used {
+                names.push(term);
+            }
+        }
+    }
+    let mut builder = segment::segment::SegmentBuilder::default();
+    for (rank, tokens) in docs.iter_mut().enumerate() {
+        // STN3's builder takes one token per position; a few tokens share
+        // one in the dump, and move up by one (a size measure).
+        tokens.sort_unstable_by_key(|(t, p)| (*p, *t));
+        let mut next = 0u32;
+        for (_, p) in tokens.iter_mut() {
+            *p = (*p).max(next);
+            next = *p + 1;
+        }
+        builder
+            .add_document(
+                tids[rank],
+                tokens
+                    .iter()
+                    .map(|(t, p)| (names[*t as usize].as_str(), *p)),
+            )
+            .map_err(err)?;
+    }
+    Ok(builder.finish())
+}
+
 /// Converts a dumped STN3 segment.
 pub fn convert(dumped: &DumpedSegment, options: Options) -> Result<Converted, String> {
     let blob: &[u8] = &dumped.blob;

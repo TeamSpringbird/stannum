@@ -10,8 +10,10 @@
 //!
 //! Heap blocks are taken in groups of [`GROUP_PAGES`]. A group the segment
 //! holds documents in has a width `w`, the largest line pointer offset of
-//! those documents, and `256 * w` slots: tuple `(block, offset)` is slot
-//! `(block % 256) * w + offset - 1` of group `block / 256`. The groups'
+//! those documents, a first page `f` and a span of `p` pages to its last
+//! (all 256 but at a heap's or a segment's edges), and `p * w` slots: tuple
+//! `(block, offset)` is slot `(block % 256 - f) * w + offset - 1` of group
+//! `block / 256`. The groups'
 //! slots are numbered in a row, so a slot names a ctid and back with one
 //! table of groups and a multiply, and slots sort as ctids do. A term's
 //! postings are a set of slots ([`super::postings`]), so two terms' sets in a
@@ -19,10 +21,11 @@
 //!
 //! ```text
 //! docset   := groups varint,
-//!             (group u32le, width u16le, rank_base u32le, kind u8)*,
+//!             (group u32le, width u16le, first u8, pages - 1 u8,
+//!              rank_base u32le, kind u8)*,
 //!             body* (per group, in order)
-//! body     := grid:   32 * width bytes, the group's slots as a bitmap
-//!           | counts: 256 bytes, page p holding offsets 1..=count[p]
+//! body     := grid:   the group's slots as a bitmap of whole u64le words
+//!           | counts: a byte per page, page p holding offsets 1..=count[p]
 //! dl       := block varint (documents per block), blocks varint,
 //!             (bits_at u32le, base u24le, width u8)* per block,
 //!             per block its lengths less its base, packed at its width
@@ -42,7 +45,7 @@ pub const GROUP_PAGES: u32 = 256;
 /// The largest line pointer offset an 8 KiB heap page can hold.
 pub const MAX_OFFSET: u16 = 291;
 /// Bytes of one directory entry of the document set.
-const ENTRY: usize = 11;
+const ENTRY: usize = 13;
 const KIND_GRID: u8 = 0;
 const KIND_COUNTS: u8 = 1;
 
@@ -53,6 +56,9 @@ pub struct Group {
     pub id: u32,
     /// Its largest offset: slots per page.
     pub width: u16,
+    /// Its first page (`block % 256`), and the pages from there to its last.
+    pub first: u8,
+    pub pages: u16,
     /// The slot its first page's first offset maps to.
     pub slot_base: u32,
     /// Documents in earlier groups.
@@ -62,12 +68,23 @@ pub struct Group {
 impl Group {
     /// Slots in the group.
     pub const fn slots(&self) -> u32 {
-        GROUP_PAGES * self.width as u32
+        self.pages as u32 * self.width as u32
     }
 
     /// 64-bit words of a bitmap over its slots.
     pub const fn words(&self) -> usize {
-        (GROUP_PAGES as usize * self.width as usize).div_ceil(64)
+        (self.pages as usize * self.width as usize).div_ceil(64)
+    }
+
+    /// Bytes of a grid over its slots: whole words.
+    pub const fn grid_bytes(&self) -> usize {
+        self.words() * 8
+    }
+
+    /// The local slot of `(page, offset)`, `page` being `block % 256`.
+    #[inline]
+    pub const fn local(&self, page: u32, offset: u16) -> u32 {
+        (page - self.first as u32) * self.width as u32 + offset as u32 - 1
     }
 }
 
@@ -94,11 +111,17 @@ impl Geometry {
             }
             previous = Some(*tid);
             let id = tid.block / GROUP_PAGES;
+            let page = tid.block % GROUP_PAGES;
             match groups.last_mut() {
-                Some(group) if group.id == id => group.width = group.width.max(tid.offset),
+                Some(group) if group.id == id => {
+                    group.width = group.width.max(tid.offset);
+                    group.pages = (page - u32::from(group.first) + 1) as u16;
+                }
                 _ => groups.push(Group {
                     id,
                     width: tid.offset,
+                    first: page as u8,
+                    pages: 1,
                     slot_base: 0,
                     rank_base: rank as u32,
                 }),
@@ -128,15 +151,15 @@ impl Geometry {
     /// offset is beyond the group's width.
     pub fn slot_of(&self, tid: Tid) -> Option<u32> {
         let group = &self.groups[self.group_index(tid.block)?];
-        if tid.offset == 0 || tid.offset > group.width {
+        let page = tid.block % GROUP_PAGES;
+        if tid.offset == 0
+            || tid.offset > group.width
+            || page < u32::from(group.first)
+            || page - u32::from(group.first) >= u32::from(group.pages)
+        {
             return None;
         }
-        Some(
-            group.slot_base
-                + (tid.block % GROUP_PAGES) * u32::from(group.width)
-                + u32::from(tid.offset)
-                - 1,
-        )
+        Some(group.slot_base + group.local(page, tid.offset))
     }
 
     /// The group holding `slot`.
@@ -150,7 +173,7 @@ impl Geometry {
         let group = &self.groups[index];
         let width = u32::from(group.width);
         Tid {
-            block: group.id * GROUP_PAGES + local / width,
+            block: group.id * GROUP_PAGES + u32::from(group.first) + local / width,
             offset: (local % width) as u16 + 1,
         }
     }
@@ -175,31 +198,32 @@ pub fn encode_docset(geometry: &Geometry, tids: &[Tid]) -> Vec<u8> {
         }
         let members = &tids[start..at];
         // Pages that hold exactly offsets 1..=n need only n.
-        let mut counts = [0u16; GROUP_PAGES as usize];
+        let mut counts = vec![0u16; usize::from(group.pages)];
         let mut prefix = true;
         for tid in members {
-            let page = (tid.block % GROUP_PAGES) as usize;
+            let page = (tid.block % GROUP_PAGES - u32::from(group.first)) as usize;
             if tid.offset != counts[page] + 1 {
                 prefix = false;
             }
             counts[page] += 1;
         }
-        let kind = if prefix && group.width <= 255 && 256 < 32 * group.width as usize {
+        let kind = if prefix && group.width <= 255 && counts.len() < group.grid_bytes() {
             KIND_COUNTS
         } else {
             KIND_GRID
         };
         out.extend_from_slice(&group.id.to_le_bytes());
         out.extend_from_slice(&group.width.to_le_bytes());
+        out.push(group.first);
+        out.push((group.pages - 1) as u8);
         out.extend_from_slice(&group.rank_base.to_le_bytes());
         out.push(kind);
         if kind == KIND_COUNTS {
             bodies.extend(counts.iter().map(|c| *c as u8));
         } else {
-            let mut grid = vec![0u8; 32 * group.width as usize];
-            let width = u32::from(group.width);
+            let mut grid = vec![0u8; group.grid_bytes()];
             for tid in members {
-                let local = (tid.block % GROUP_PAGES) * width + u32::from(tid.offset) - 1;
+                let local = group.local(tid.block % GROUP_PAGES, tid.offset);
                 grid[local as usize / 8] |= 1 << (local % 8);
             }
             bodies.extend_from_slice(&grid);
@@ -240,9 +264,15 @@ impl DocSet {
         for entry in directory.chunks_exact(ENTRY) {
             let id = u32::from_le_bytes(entry[0..4].try_into().expect("four bytes"));
             let width = u16::from_le_bytes(entry[4..6].try_into().expect("two bytes"));
-            let rank_base = u32::from_le_bytes(entry[6..10].try_into().expect("four bytes"));
-            let kind = entry[10];
-            if width == 0 || width > MAX_OFFSET || rank_base != rank {
+            let first = entry[6];
+            let pages = u16::from(entry[7]) + 1;
+            let rank_base = u32::from_le_bytes(entry[8..12].try_into().expect("four bytes"));
+            let kind = entry[12];
+            if width == 0
+                || width > MAX_OFFSET
+                || rank_base != rank
+                || u32::from(first) + u32::from(pages) > GROUP_PAGES
+            {
                 return Err(Error::Corrupt("document set directory"));
             }
             if geometry.groups.last().is_some_and(|g| g.id >= id) {
@@ -251,6 +281,8 @@ impl DocSet {
             let group = Group {
                 id,
                 width,
+                first,
+                pages,
                 slot_base: geometry.slots,
                 rank_base,
             };
@@ -265,7 +297,7 @@ impl DocSet {
             match kind {
                 KIND_GRID => {
                     let body = bytes
-                        .get(at..at + 32 * width as usize)
+                        .get(at..at + group.grid_bytes())
                         .ok_or(Error::Truncated)?;
                     at += body.len();
                     for (i, word) in grid.iter_mut().enumerate() {
@@ -273,8 +305,10 @@ impl DocSet {
                     }
                 }
                 KIND_COUNTS => {
-                    let body = bytes.get(at..at + 256).ok_or(Error::Truncated)?;
-                    at += 256;
+                    let body = bytes
+                        .get(at..at + usize::from(pages))
+                        .ok_or(Error::Truncated)?;
+                    at += body.len();
                     for (page, &n) in body.iter().enumerate() {
                         if u16::from(n) > width {
                             return Err(Error::Corrupt("document set page count"));

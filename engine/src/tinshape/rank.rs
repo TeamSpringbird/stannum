@@ -27,7 +27,7 @@ use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
-use segment::tinshape::docs::{GROUP_PAGES, Geometry};
+use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::{Positions, skip_entry};
 use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local, or_into};
@@ -356,18 +356,17 @@ fn load<'a>(
         } => {
             touch.touch(Part::Payload, at, bytes.len());
             mem.first = e.first;
-            let width = u32::from(group.width);
             if e.kind == KIND_GRID {
                 mem.kind = Kind::Grid(bytes);
             } else if seek && e.kind == KIND_EF {
-                let ef = Ef::parse(bytes, e.count as usize, GROUP_PAGES * width)?;
+                let ef = Ef::parse(bytes, e.count as usize, group.slots())?;
                 mem.kind = Kind::Cursor {
                     cursor: ef.cursor(),
                     offset: 0,
                 };
             } else {
                 let list = &mut mem.list;
-                for_each_local(&e, bytes, width, |l| list.push(l))?;
+                for_each_local(&e, bytes, &group, |l| list.push(l))?;
             }
         }
         Src::Locals { from, to } => {
@@ -1268,7 +1267,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     kernels::load(row, bytes);
                 } else {
                     row.fill(0);
-                    or_into(&e, bytes, u32::from(group.width), row)?;
+                    or_into(&e, bytes, &group, row)?;
                 }
             }
             Src::Locals { from, to } => {
