@@ -361,9 +361,6 @@ struct Parsed<'a> {
     bytes: usize,
     /// Records by offset, with their last use.
     records: rustc_hash::FxHashMap<usize, (Postings<'a>, std::cell::Cell<u64>)>,
-    /// A kept grouped record's groups as cursors walk them, by the record's
-    /// offset ([`Segment::term_groups`]).
-    groups: rustc_hash::FxHashMap<usize, std::rc::Rc<[postings::TermGroup<'a>]>>,
 }
 
 impl Parsed<'_> {
@@ -378,7 +375,7 @@ impl Parsed<'_> {
         self.bytes += bytes;
     }
 
-    /// Drops the least recently used records, with their groups, until at
+    /// Drops the least recently used records until at
     /// most `keep` bytes remain.
     fn shed(&mut self, keep: usize) {
         if self.bytes <= keep {
@@ -395,25 +392,17 @@ impl Parsed<'_> {
                 break;
             }
             if let Some((postings, _)) = self.records.remove(&at) {
-                let groups = self.groups.remove(&at).is_some();
-                self.bytes = self.bytes.saturating_sub(record_bytes(&postings, groups));
+                self.bytes = self.bytes.saturating_sub(record_bytes(&postings));
             }
         }
     }
 }
 
-/// Bytes a kept record of `postings` costs, its groups included once a
-/// cursor asks for them.
-fn record_bytes(postings: &Postings<'_>, groups: bool) -> usize {
+/// Bytes a kept record of `postings` costs.
+fn record_bytes(postings: &Postings<'_>) -> usize {
     64 + match &postings.form {
         postings::Form::Grouped(entries) => {
-            entries.len()
-                * (std::mem::size_of::<postings::GroupEntry>()
-                    + if groups {
-                        std::mem::size_of::<postings::TermGroup<'_>>()
-                    } else {
-                        0
-                    })
+            entries.len() * std::mem::size_of::<postings::GroupEntry>()
         }
         _ => 0,
     }
@@ -585,15 +574,10 @@ impl<'a> Segment<'a> {
         parsed
             .records
             .retain(|_, (postings, _)| postings.is_detached());
-        let Parsed {
-            records,
-            groups,
-            bytes,
-        } = &mut *parsed;
-        groups.retain(|at, _| records.contains_key(at));
+        let Parsed { records, bytes } = &mut *parsed;
         *bytes = records
-            .iter()
-            .map(|(at, (postings, _))| record_bytes(postings, groups.contains_key(at)))
+            .values()
+            .map(|(postings, _)| record_bytes(postings))
             .sum();
     }
 
@@ -625,36 +609,11 @@ impl<'a> Segment<'a> {
         }
         let term = self.resolve(entry)?;
         let mut parsed = self.parsed.borrow_mut();
-        parsed.room(record_bytes(&term.postings, false));
+        parsed.room(record_bytes(&term.postings));
         parsed
             .records
             .insert(at, (term.postings.clone(), std::cell::Cell::new(tick())));
         Ok(term)
-    }
-
-    /// A grouped term's groups as a reader's cursor walks them
-    /// ([`Postings::term_groups`]), kept with its record when the record is
-    /// kept ([`Self::resolve_memo`]): a common term's directory has an entry
-    /// per heap group the segment covers, and every query naming the term
-    /// walks it.
-    pub fn term_groups(
-        &self,
-        at: usize,
-        record: &Postings<'a>,
-    ) -> std::rc::Rc<[postings::TermGroup<'a>]> {
-        if let Some(groups) = self.parsed.borrow().groups.get(&at) {
-            return groups.clone();
-        }
-        let groups: std::rc::Rc<[postings::TermGroup<'a>]> = record.term_groups(at).into();
-        let mut parsed = self.parsed.borrow_mut();
-        if parsed.records.contains_key(&at) {
-            let extra = record_bytes(&record, true) - record_bytes(&record, false);
-            if parsed.bytes + extra <= PARSED_BUDGET {
-                parsed.bytes += extra;
-                parsed.groups.insert(at, groups.clone());
-            }
-        }
-        groups
     }
 
     /// The footer of the record at blob offset `at` (`postings`, of a term
@@ -864,65 +823,6 @@ mod tests {
             fresh == reusing,
             "a copying merge differs from a fresh build"
         );
-    }
-
-    /// A grouped term's groups are built once while its record is kept, and
-    /// forgotten with it.
-    #[test]
-    fn a_kept_records_groups_are_kept_with_it() {
-        let tids: Vec<Tid> = (0..800u32)
-            .flat_map(|block| (1..=4u16).map(move |offset| Tid { block, offset }))
-            .collect();
-        let lengths = vec![5; tids.len()];
-        let options = Options {
-            grid_min_postings: 16,
-            ..Options::default()
-        };
-        let mut builder = Builder::new(tids.clone(), lengths, options).unwrap();
-        let ranks: Vec<u32> = (0..tids.len() as u32).step_by(3).collect();
-        let buckets = vec![0u8; ranks.len()];
-        let mut payload = PayloadBuilder::default();
-        for _ in &ranks {
-            payload.push(&[0]).unwrap();
-        }
-        builder
-            .add_term("t", &ranks, &buckets, &payload.finish())
-            .unwrap();
-        let (blob, _) = builder.finish(&[]);
-        let segment = Segment::parse(&blob).unwrap();
-        let term = segment.term_memo("t").unwrap().unwrap();
-        let postings::Form::Grouped(entries) = &term.postings.form else {
-            panic!("a grouped term");
-        };
-        assert!(entries.len() > 1);
-        let first = segment.term_groups(term.at, &term.postings);
-        let again = segment.term_groups(term.at, &term.postings);
-        assert!(std::rc::Rc::ptr_eq(&first, &again), "built once");
-        let built = term.postings.term_groups(term.at);
-        assert_eq!(first.len(), entries.len());
-        for (kept, fresh) in first.iter().zip(&built) {
-            assert_eq!((kept.index, kept.count), (fresh.index, fresh.count));
-            let (
-                postings::GroupSrc::Container { entry, bytes, at },
-                postings::GroupSrc::Container {
-                    entry: e,
-                    bytes: b,
-                    at: a,
-                },
-            ) = (kept.src, fresh.src)
-            else {
-                panic!("containers");
-            };
-            assert_eq!((entry, at), (e, a));
-            assert_eq!(bytes.all().unwrap(), b.all().unwrap());
-            assert_eq!(&blob[at..at + bytes.len()], bytes.all().unwrap());
-        }
-        // A record over borrowed bytes is forgotten past a span, its groups
-        // with it.
-        segment.forget_borrowed();
-        let after = segment.term_groups(term.at, &term.postings);
-        assert!(!std::rc::Rc::ptr_eq(&first, &after));
-        assert_eq!(segment.memo_bytes(), segment.memo.borrow().len() * 64);
     }
 
     /// Past its budget a memo drops what was used longest ago, not all of

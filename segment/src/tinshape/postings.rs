@@ -501,34 +501,7 @@ pub struct GroupEntry {
 pub enum Form<'a> {
     Single(u32),
     Sparse(Ef<'a>),
-    /// The group directory, shared: a record a segment keeps is handed to
-    /// every query naming the term, and a common term's directory has an
-    /// entry per heap group of the segment.
-    Grouped(std::rc::Rc<[GroupEntry]>),
-}
-
-/// Where a term's members in one group are, as a reader walks them: a
-/// grouped record's container, or a run of a decoded list's local slots.
-#[derive(Clone, Copy, Debug)]
-pub enum GroupSrc<'a> {
-    /// A container of a grouped record and its blob offset; its bytes are
-    /// read when the group is (a segment over a lazy blob loads them then).
-    Container {
-        entry: GroupEntry,
-        bytes: Bytes<'a>,
-        at: usize,
-    },
-    /// Local slots `from..to` of the term's decoded list.
-    Locals { from: u32, to: u32 },
-}
-
-/// A group a term holds members in, for a reader's cursor: the group's
-/// index in the geometry, the term's members there, and where they are.
-#[derive(Clone, Copy, Debug)]
-pub struct TermGroup<'a> {
-    pub index: u32,
-    pub count: u32,
-    pub src: GroupSrc<'a>,
+    Grouped(Vec<GroupEntry>),
 }
 
 /// A term's postings record, parsed.
@@ -732,7 +705,7 @@ impl<'a> Postings<'a> {
                     }
                 };
                 containers_at = at;
-                Form::Grouped(entries.into())
+                Form::Grouped(entries)
             }
             _ => return Err(Error::Corrupt("postings form")),
         };
@@ -761,34 +734,13 @@ impl<'a> Postings<'a> {
             .tag(Kind::Container)
     }
 
-    /// A grouped record's groups as a reader's cursor walks them, the
-    /// record starting at blob offset `record_at`; empty for another form.
-    pub fn term_groups(&self, record_at: usize) -> Vec<TermGroup<'a>> {
-        let Form::Grouped(entries) = &self.form else {
-            return Vec::new();
-        };
-        let containers = record_at + self.payload_at + self.containers_at;
-        entries
-            .iter()
-            .map(|entry| TermGroup {
-                index: entry.index,
-                count: entry.count,
-                src: GroupSrc::Container {
-                    entry: *entry,
-                    bytes: self.container(entry),
-                    at: containers + entry.at as usize,
-                },
-            })
-            .collect()
-    }
-
     /// Calls `visit` with every slot, in order.
     pub fn for_each_slot(&self, geometry: &Geometry, mut visit: impl FnMut(u32)) -> Result<()> {
         match &self.form {
             Form::Single(slot) => visit(*slot),
             Form::Sparse(list) => list.for_each(visit),
             Form::Grouped(entries) => {
-                for entry in entries.iter() {
+                for entry in entries {
                     let group = &geometry.groups[entry.index as usize];
                     let base = group.slot_base;
                     for_each_local(entry, self.container(entry).all()?, group, |local| {
