@@ -1986,6 +1986,15 @@ mod tests {
                 prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
                 let lazily = top_k(&lazy, &node, &names, &scorers, k, &mut NoTouch).unwrap();
                 prop_assert_eq!(bits(&lazily.rows), bits(&want), "lazy top {} of {:?}", k, node);
+                // Nothing scoring (every term elided): the first k matches
+                // in ctid order, each scoring zero.
+                let first: Vec<(f32, Tid)> = (0..docs.len())
+                    .filter(|r| eval(&node, &members, *r))
+                    .map(|r| (0.0, docs[r]))
+                    .take(k)
+                    .collect();
+                let unscored = top_k(&segment, &node, &names, &[], k, &mut NoTouch).unwrap();
+                prop_assert_eq!(bits(&unscored.rows), bits(&first), "unscored top {} of {:?}", k, node);
                 for round in 0..2 {
                     let mut rows = Vec::new();
                     let mut scores = Vec::new();
@@ -2214,6 +2223,25 @@ mod tests {
                 }
                 let bits = |rows: Vec<(f32, Tid)>| rows.into_iter().map(|(s, t)| (s.to_bits(), t)).collect::<Vec<_>>();
                 prop_assert_eq!(bits(top.into_rows()), bits(want.into_rows()), "top {} ties {} of {:?}", k, ties, node);
+                // Nothing scoring (every term elided) in a led walk: the
+                // first k live matches in ctid order, though the segment
+                // walked first fills the rows with later ones.
+                if required_terms(&node).is_empty() {
+                    continue;
+                }
+                let mut want = crate::walk::TopRows::new(k, ties);
+                for r in 0..docs.len() {
+                    let row = crate::walk::Ranked(0.0, docs[r]);
+                    if !dead[r] && eval(&node, &members, r) && !(docs[r].block + u32::from(docs[r].offset)).is_multiple_of(5) && want.admits(&row) {
+                        want.push(row);
+                    }
+                }
+                let mut top = crate::walk::TopRows::new(k, ties);
+                let mut visibility = EveryFifth(0);
+                for segment in segments.iter().rev() {
+                    top_k_into(segment, &node, &names, &[], &mut top, &mut visibility, &mut NoTouch).unwrap();
+                }
+                prop_assert_eq!(bits(top.into_rows()), bits(want.into_rows()), "unscored top {} ties {} of {:?}", k, ties, node);
             }
         }
     }

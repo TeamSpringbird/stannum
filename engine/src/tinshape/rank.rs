@@ -40,6 +40,11 @@ use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
 use segment::lanes::LaneSums;
 
+/// A required term's Elias-Fano container in a group is probed for the
+/// candidates left rather than decoded when it holds more than this many
+/// times as many members.
+const SEEK_RATIO: usize = 4;
+
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
 
@@ -534,6 +539,8 @@ struct Walk<'s, 'a, T: Touch> {
     /// Per term (by index into `terms`), its members in the group at hand.
     mems: Vec<Mem<'a>>,
     sc: Vec<Sc>,
+    /// The scoring terms (indexes into `sc`), rarest first.
+    bound_order: Vec<usize>,
     /// Required terms, rarest first.
     req: Vec<usize>,
     /// Per scoring term: whether it is required; whether it holds the group
@@ -576,7 +583,6 @@ struct Walk<'s, 'a, T: Touch> {
     pending_index: Vec<u32>,
     span_index: Vec<u32>,
     cands: Vec<u32>,
-    order: Vec<usize>,
     words: Vec<u64>,
     /// The node check's own cursors (the walk moves the terms' sparse
     /// cursors past each group), and its scratch.
@@ -631,11 +637,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 break;
             }
             self.answer.windows += 1;
-            let mut bound = 0.0_f64;
-            for i in 0..n {
-                bound += f64::from(self.sc[i].range_bound(base, end));
-            }
-            if below(bound, self.threshold()) {
+            if self.group_below(base, end) {
                 self.answer.windows_pruned += 1;
                 continue;
             }
@@ -649,6 +651,26 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         Ok(())
+    }
+
+    /// Whether the scoring terms' bounds over slots `base..=end` fall short
+    /// of the threshold. Bounds are not negative, so the sum stops once it
+    /// reaches the threshold; it is taken in [`Walk::bound_order`], rarest
+    /// term first, which most often gets there soonest.
+    #[inline]
+    fn group_below(&mut self, base: u32, end: u32) -> bool {
+        let Some(theta) = self.threshold() else {
+            return false;
+        };
+        let mut bound = 0.0_f64;
+        for o in 0..self.bound_order.len() {
+            bound += f64::from(self.sc[self.bound_order[o]].range_bound(base, end));
+            if !below(bound, Some(theta)) {
+                return false;
+            }
+        }
+        // Nothing scoring: every match scores zero, which ties a bar of zero.
+        below(bound, Some(theta))
     }
 
     /// Moves term `t` to its first member at or after `target`, loading
@@ -704,62 +726,59 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// Intersects the required terms' members in group `g`, which the lead
-    /// holds, term by term from the fewest (a grid's by bit, a list's by a
-    /// merge), and walks the candidates left.
+    /// holds and has loaded: the lead's members, then each other required
+    /// term's, rarest first, only while candidates are left (in most groups
+    /// a rare lead's few members leave none after one or two terms). A grid
+    /// filters them by bit, an Elias-Fano list much longer than they are by
+    /// probing its high bits in place, any other list by a merge. Then walks
+    /// the candidates left.
     fn group_and(&mut self, g: u32) -> Result<bool> {
-        for r in 1..self.req.len() {
-            let t = self.req[r];
-            // A term loaded here already holds the group (a sparse term's
-            // cursor has moved past it).
-            if self.mems[t].loaded == g + 1 {
-                continue;
-            }
-            let set = self.terms[t].as_mut().expect("required");
-            if next_group(set, self.geometry, g, &mut self.mems[t].hint, self.touch) != Some(g) {
-                return Ok(true);
-            }
-        }
-        for r in 0..self.req.len() {
-            let t = self.req[r];
-            let set = self.terms[t].as_ref().expect("required");
-            if self.mems[t].loaded != g + 1 {
-                count_in(set, self.geometry, g, &mut self.mems[t]);
-            }
-        }
-        let mut order = std::mem::take(&mut self.order);
-        order.clear();
-        order.extend_from_slice(&self.req);
-        order.sort_by_key(|t| self.mems[*t].count);
         let mut cands = std::mem::take(&mut self.cands);
         cands.clear();
-        for (o, &t) in order.iter().enumerate() {
-            let mem = &self.mems[t];
-            if mem.loaded != g + 1 || matches!(mem.kind, Kind::Cursor { .. }) {
-                let set = self.terms[t].as_mut().expect("required");
-                load(set, self.geometry, g, &mut self.mems[t], false, self.touch)?;
-            }
-            let mem = &self.mems[t];
-            match (o, &mem.kind) {
-                (0, Kind::Grid(bytes)) => {
-                    for w in 0..bytes.len() / 8 {
-                        let mut word = bits::word(bytes, w);
-                        while word != 0 {
-                            cands.push((w * 64) as u32 + word.trailing_zeros());
-                            word &= word - 1;
-                        }
+        let lead = &self.mems[self.req[0]];
+        match &lead.kind {
+            Kind::Grid(bytes) => {
+                for w in 0..bytes.len() / 8 {
+                    let mut word = bits::word(bytes, w);
+                    while word != 0 {
+                        cands.push((w * 64) as u32 + word.trailing_zeros());
+                        word &= word - 1;
                     }
                 }
-                (0, _) => cands.extend_from_slice(&mem.list),
-                (_, Kind::Grid(bytes)) => {
-                    cands.retain(|l| bytes[*l as usize / 8] >> (l % 8) & 1 == 1);
-                }
-                (_, _) => super::intersect_sorted(&mut cands, &mem.list),
             }
+            Kind::List => cands.extend_from_slice(&lead.list),
+            Kind::Cursor { .. } => unreachable!("a lead is loaded whole"),
+        }
+        for r in 1..self.req.len() {
             if cands.is_empty() {
                 break;
             }
+            let t = self.req[r];
+            if self.mems[t].loaded != g + 1 {
+                let set = self.terms[t].as_mut().expect("required");
+                let mem = &mut self.mems[t];
+                if next_group(set, self.geometry, g, &mut mem.hint, self.touch) != Some(g) {
+                    cands.clear();
+                    break;
+                }
+                count_in(set, self.geometry, g, mem);
+                let seek = !matches!(set.postings.form, Form::Sparse(_))
+                    && mem.count as usize > SEEK_RATIO * cands.len();
+                load(set, self.geometry, g, mem, seek, self.touch)?;
+            }
+            let mem = &self.mems[t];
+            match &mem.kind {
+                Kind::Grid(bytes) => {
+                    cands.retain(|l| bytes[*l as usize / 8] >> (l % 8) & 1 == 1);
+                }
+                Kind::Cursor { cursor, offset: 0 } => cursor.list().retain_members(&mut cands),
+                Kind::Cursor { .. } => {
+                    let mem = &mut self.mems[t];
+                    cands.retain(|l| mem.find(*l).is_some());
+                }
+                Kind::List => super::intersect_sorted(&mut cands, &mem.list),
+            }
         }
-        self.order = order;
         let more = self.walk_candidates(g, &cands)?;
         self.cands = cands;
         Ok(more)
@@ -1217,7 +1236,7 @@ pub(super) fn walk_into<'a>(
         pending_index: Vec::new(),
         span_index: Vec::new(),
         cands: Vec::new(),
-        order: Vec::new(),
+        bound_order: Vec::new(),
         words: Vec::new(),
         positions: Vec::new(),
         node_terms,
@@ -1228,6 +1247,9 @@ pub(super) fn walk_into<'a>(
         let r = required.contains(&walk.sc[i].term);
         walk.sc_required.push(r);
     }
+    let mut bound_order: Vec<usize> = (0..n).collect();
+    bound_order.sort_by_key(|i| walk.terms[walk.sc[*i].term].as_ref().map_or(0, |s| s.df));
+    walk.bound_order = bound_order;
     walk.inline = walk.req.iter().copied().find(|t| {
         walk.terms[*t]
             .as_ref()
