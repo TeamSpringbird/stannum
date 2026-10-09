@@ -532,8 +532,12 @@ reads a segment within a span of the segment's `blob::LazyBlob`
 on one page is a slice of the page, which the run source pins (through the
 buffer it was last pinned in, as STN3's held pages) the first time the span
 asks for it and keeps pinned until the span ends; a range across a page
-boundary is copied into a stitch buffer the span frees. A term's record
-header and group directory are read when it is resolved, a group's container
+boundary is copied into a stitch buffer, which the blob keeps (up to 1 MiB,
+unzeroed) for its next span. The blob remembers the pages a span pinned by
+page, each entry naming its span, so a range on a page the span holds is a
+lookup and a slice, and closing a span forgets them without touching them.
+A term's record header and group directory are read when it is resolved, a
+group's container
 when a walk reaches the group, a posting's TF bits, the entries of a
 positions stream a phrase checks and the DL sidecar words of the documents
 scored; nothing is kept but what is parsed from them. The span ends when
@@ -555,10 +559,15 @@ memoized term-map lookups, decoded footers, and parsed grouped records
 assembled over the blob is kept while the liveness stays. These, and any
 chunks copied outside spans, count against `stannum.reader_cache_mb`, the
 chunks at most a quarter of it (`SET client_min_messages = debug1` reports
-the parts as a view is captured). `EXPLAIN ANALYZE` reports per kind of
-structure (record, footer, container, sparse list, TF tail, inline lengths,
+the parts as a view is captured). Past their budgets the records and
+footers used longest ago go first: a segment's memos down to half of their
+16 MiB, and over the native quarter the largest segments' memos are halved
+before any segment's state is dropped whole. At 150M rows a common word's
+directory and footer, which most queries parse, were dropped with the rest
+every few queries when the memos emptied whole. `EXPLAIN ANALYZE` reports
+per kind of structure (record, footer, container, sparse list, TF tail, inline lengths,
 DL sidecar, positions) the bytes copied and their pages, the pages pinned
-and the bytes stitched, and buffer accesses by phase.
+and the bytes and reads stitched, and buffer accesses by phase.
 
 **Which paths are native.** A query is lowered (`engine::tinshape::lower`)
 after its wildcards, regexes, ranges and fuzzy terms are expanded against
@@ -590,7 +599,9 @@ and unordered spans; not `NOT ENCLOSES` and the like).
   document) and walks them in ctid order.
 - `score()` and `full_score()` of a row the scan did not rank:
   `engine::tinshape::score_at`, the row's slot found by a multiply, each
-  scoring term's posting by a seek.
+  scoring term's posting by a seek, in the segment whose document set holds
+  the row (`storage::native_holds`), not by assembling every segment for the
+  row's terms in turn.
 
 **What remains ordinal.** The write buffer and sealed write segments are
 in-memory ordinal indexes (`MutableIndex`), so the ordinal walk, planner,
@@ -615,6 +626,65 @@ below the bar by more than rounding can explain, so a candidate that can
 only tie the bar is scored (and ranks after it, by ctid); a segment whose
 best documents all tie scores them all. The ordinal walk skipped such
 sub-blocks by their first ordinal's location.
+
+## Storage-layer costs at 150M rows (branch `tinshape/perf-storage`)
+
+Measured on the 150M dump (14 segments, 37.5 GB) with `tnsreplay` and
+`tnsunits`, and in PostgreSQL on a copy of the saved 150M database (24 GB
+of shared buffers, `perf` sampling in the server's PID namespace). Log and
+outputs: `stannum-lab/tinshape/perf-storage/`.
+
+- Pins: a query pins 2,600 (conjunction), 8,100 (disjunction) and 3,700
+  (phrase) pages, a page once per segment it touches; `ReadRecentBuffer`
+  finds 33% to 55% of them in the buffer the backend last pinned them in
+  (cold backend, 300 queries in). The others go through the buffer mapping
+  table, whose hash lookups were 3% of a looping conjunction's samples;
+  thousands of pins held at once overflow PostgreSQL's private refcount
+  array into its hash table, so every pin and release looks up a hash.
+- Reads spanning two pages (a stitch, a copy and a second pin), as a query
+  makes them (replay, 300 queries per style): containers 5.3% to 5.7% of
+  payload reads (1,450 / 4,450 / 1,650 a query, 1.3 / 4.2 / 1.5 MB), footer
+  reads 41% (whole footers, decoded per term), sparse lists 16 a query
+  (0.7 MB, re-read every query: a sparse record borrows its span's bytes),
+  TF 0.00%, DL 0.06%, positions 0.12%. Over every unit of the segments
+  (`tnsunits`): containers 1.9% straddle, positions blocks 0.5%, TF blocks
+  0.9%, DL blocks (256 documents, 277 bytes) 3.4%, footer block entries
+  0.14%.
+- DL reads go in rank order: of 1.5M / 10.4M / 6.6M DL reads (three
+  styles), 16 / 15 / 5 went to a lower rank than the read before in the same
+  segment, and consecutive reads share a data page 14 / 80 / 20 times on
+  average, so one pin serves them. Liveness is decoded once per backend into
+  slot-space words and reads no page.
+- 64-byte lines: a run page's data starts at byte 28 of the page, so no unit
+  is line-aligned by construction. Units of a few bytes (directory entries,
+  footer block entries, a posting's TF bits, a DL word) touch an extra line
+  as often as `(length - 1) / 64`; see `tnsunits` for the counts per kind.
+  The group directory and the footer are variable-length records (varints)
+  of structures in a row (AoS) and are decoded whole before use; a block's
+  bounds are compared one at a time after decoding.
+
+Proposals (not built; layout only, the same structures):
+
+- Pad the writer so that no unit of at most 1 KiB spans a page: about
+  0.9% of the blob at 150M (containers 208 MB, positions blocks 108 MB,
+  TF blocks, sparse lists and positions streams 14 MB each, DL blocks
+  3 MB), against reads that span pages in 5.5% of payload reads. Units
+  could also start on a 64-byte line of the page (page offsets that are
+  multiples of 64: data offsets of 36 + 64k on a page, since a page's data
+  starts at byte 28); that costs half a line per unit and only pays for
+  units of a line or more.
+- Decode footers by the blocks a walk reaches instead of whole: a common
+  word's footer at 150M is some 20,000 blocks per segment, decoded per
+  query whenever its memo entry was dropped (5.7% of a looping
+  conjunction's samples in the server, `Postings::footer`). The walks read
+  `Footer::last` and the frontier by block, so this is an API change for
+  `engine/src/tinshape/rank.rs`.
+- `TermSet::open` (conjunction and phrase walks' code) clones the term's
+  group directory and builds a cursor entry per group per segment per
+  query: 9.2% of a conjunction replay's samples. Keeping the built groups
+  beside the parsed record (`Rc`), as an experiment on this branch did
+  (since undone), cut that to 2.4%; it raises a kept grouped record's
+  memory from 24 to about 104 bytes per group.
 
 ## Open
 
