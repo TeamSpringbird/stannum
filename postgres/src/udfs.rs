@@ -244,6 +244,8 @@ mod tests {
 }
 
 /// The index's segment directory: immutable segments and the write buffer.
+/// The first eight columns are Stannum's; `npostings`, `source_state`,
+/// `origin` and `sequence` follow, named as TIN names them.
 #[pg_extern(volatile, parallel_unsafe)]
 #[allow(clippy::type_complexity)]
 fn segment_info(
@@ -259,6 +261,10 @@ fn segment_info(
         name!(sum_doc_lengths, i64),
         name!(total_pages, i64),
         name!(generation, i64),
+        name!(npostings, Option<i64>),
+        name!(source_state, String),
+        name!(origin, Option<String>),
+        name!(sequence, Option<i64>),
     ),
 > {
     require_stannum_index(&index, "segment_info");
@@ -276,6 +282,13 @@ fn segment_info(
             row.sum_doc_lengths,
             row.total_pages,
             row.generation,
+            row.npostings,
+            // Every listed entry is current: retired runs wait on the
+            // pending list, which segment_info does not list.
+            "current".to_owned(),
+            // The directory does not record how a segment was made.
+            None,
+            row.sequence,
         )
     }))
 }
@@ -286,12 +299,18 @@ pub(crate) fn require_stannum_index(index: &PgRelation, function: &str) {
 }
 
 pub(crate) fn validate_stannum_index(index: &PgRelation, function: &str) {
-    let stannum_name =
-        std::ffi::CString::new("stannum").expect("static access method name is valid");
-    let stannum_am = unsafe { pgrx::pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
-    if unsafe { (*(*index.as_ptr()).rd_rel).relam } != stannum_am {
+    if !unsafe { is_stannum_index(index.as_ptr()) } {
         pgrx::error!("stannum.{function}() requires a stannum index");
     }
+}
+
+/// Whether `index` uses the `stannum` access method.
+///
+/// # Safety
+/// `index` is an open relation.
+pub(crate) unsafe fn is_stannum_index(index: pgrx::pg_sys::Relation) -> bool {
+    let stannum_am = unsafe { pgrx::pg_sys::get_index_am_oid(c"stannum".as_ptr(), false) };
+    unsafe { (*(*index).rd_rel).relam == stannum_am }
 }
 
 /// Diagnostics expose physical contents, so require table-wide SELECT (column

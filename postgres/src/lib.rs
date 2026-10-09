@@ -15,6 +15,7 @@ mod fold;
 mod heap_probe;
 mod highlight;
 mod highlight_udfs;
+mod maintenance;
 mod match_positions;
 mod operator;
 pub(crate) mod options;
@@ -28,6 +29,10 @@ mod udfs;
 /// Stannum against TIN 1.0.3's recorded answers (see the module).
 #[cfg(feature = "pg_test")]
 mod tin_conformance;
+
+/// Maintenance functions and settings without preloading (see the module).
+#[cfg(feature = "pg_test")]
+mod maintenance_tests;
 
 /// The query front end's stack backstop (`tinql::limits::set_stack_check`):
 /// PostgreSQL's `check_stack_depth`, whose ERROR pgrx turns into a panic that
@@ -60,6 +65,7 @@ pub extern "C-unwind" fn _PG_init() {
     options::init();
     storage::init();
     storage::wal::init();
+    maintenance::init();
     operator::init();
     customscan::init();
 }

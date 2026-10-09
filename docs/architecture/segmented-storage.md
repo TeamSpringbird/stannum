@@ -156,6 +156,15 @@ insert waits. Without it, a table that autovacuum has not reached yet fills
 its directory quickly under sustained updates, and the full pending list is
 then freed under the metadata lock, stalling every query. Zero disables it.
 
+With `shared_preload_libraries = 'stannum'`, a fold in the default
+`background` maintenance mode spends no merge budget under the lock and
+queues the index for a background maintenance worker instead of running the
+deferred merge; the worker merges and reclaims without a document budget, as
+VACUUM does. Inserts fall back to the inline merges above when no worker can
+take the job. `stannum.index_maintenance_mode = manual` leaves these merges
+to VACUUM and `stannum.merge()`. See
+[maintenance workers](maintenance-workers.md).
+
 `max_segments` is a soft bound. A directory over it merges its smallest
 `entry_count - max_segments + 1` entries (normally two), which is the cheapest
 set of that size and therefore the cheapest way back under the bound; an
@@ -186,11 +195,12 @@ VACUUM work still matter.
 ### Deferred merges and autovacuum
 
 Large merges run from `amvacuumcleanup`. PostgreSQL already supplies per-table
-maintenance scheduling, relation locking, process lifetime and error cleanup;
-using it avoids a second queue, worker-slot exhaustion, dynamic-worker launch
-races and a new preload requirement. No `shared_preload_libraries` entry is
-needed. The segment directory itself records deferred work, so restart does
-not lose a maintenance queue.
+maintenance scheduling, relation locking, process lifetime and error cleanup,
+so no `shared_preload_libraries` entry is needed for an index to stay in
+shape. Preloading adds background workers that take an insert's merges (see
+[maintenance workers](maintenance-workers.md)); VACUUM's cleanup still runs
+its own. The segment directory itself records deferred work, so restart does
+not lose it: the workers' queue holds only wakeups.
 
 VACUUM holds the meta lock exclusively only to publish. Every phase works
 from a directory captured under a shared lock and then runs with no meta
@@ -670,7 +680,9 @@ extension preloaded, freeing pages first logs a removal horizon through a
 custom WAL resource manager so hot standbys resolve the same conflict on replay.
 VACUUM records dead tuples, rewrites sufficiently dead segments, and reclaims
 pages.
-`stannum.segment_info('index_name')` exposes the segment layout for inspection.
+`stannum.segment_info('index_name')` exposes the segment layout for inspection;
+`stannum.promote()` folds the write buffer and `stannum.merge()` merges toward a
+target on demand (see [maintenance workers](maintenance-workers.md#sql-functions)).
 
 Page writes survive an aborted transaction, and WAL replay can apply any
 prefix of them, so storage follows one rule: **nothing the on-disk meta page
