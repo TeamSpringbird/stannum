@@ -121,6 +121,21 @@ impl Builder {
         buckets: &[u8],
         positions: &[u8],
     ) -> Result<Stats> {
+        self.add_term_reusing(term, ranks, buckets, positions, &mut |_| None)
+    }
+
+    /// [`Self::add_term`] for a merge: `reuse` gives, for a group of
+    /// [`Self::geometry`] (by index) an input holds unchanged, that input's
+    /// container of the term, copied where [`postings::Reused`]'s conditions
+    /// hold. The blob is byte for byte the one [`Self::add_term`] builds.
+    pub fn add_term_reusing<'r>(
+        &mut self,
+        term: &str,
+        ranks: &[u32],
+        buckets: &[u8],
+        positions: &[u8],
+        reuse: &mut dyn FnMut(usize) -> Option<postings::Reused<'r>>,
+    ) -> Result<Stats> {
         if ranks.is_empty() || ranks.len() != buckets.len() {
             return Err(Error::Corrupt("term postings"));
         }
@@ -144,13 +159,14 @@ impl Builder {
         let positions = super::positions::encode(positions, self.tids.len() as u32)?;
         let positions = positions.as_slice();
         let at = self.postings.len();
-        let stats = postings::encode(
+        let stats = postings::encode_reusing(
             &self.geometry,
             &self.slots,
             buckets,
             &self.term_lengths,
             &self.options,
             &mut self.postings,
+            reuse,
         );
         let entry = TermEntry {
             df: ranks.len() as u32,
@@ -469,9 +485,130 @@ impl<'a> Segment<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::docs::Geometry;
     use super::*;
     use crate::payload::PayloadBuilder;
     use crate::tf_bucket::TfBucket;
+
+    /// Two inputs, one holding groups 0 and 1, the other groups 1 to 3 (so
+    /// group 1 is shared), merged afresh and by copying the containers of
+    /// groups one input holds alone: the blobs are the same bytes.
+    #[test]
+    fn merges_by_copying_containers() {
+        let tids = |blocks: std::ops::Range<u32>, step: u32| -> Vec<Tid> {
+            blocks
+                .step_by(step as usize)
+                .flat_map(|b| {
+                    (1..=(b % 23 + 3) as u16).map(move |o| Tid {
+                        block: b,
+                        offset: o,
+                    })
+                })
+                .collect()
+        };
+        let a = tids(0..300, 1);
+        let b: Vec<Tid> = tids(301..400, 7)
+            .into_iter()
+            .chain(tids(512..1000, 1))
+            .collect();
+        let mut merged: Vec<Tid> = a.iter().chain(&b).copied().collect();
+        merged.sort_unstable();
+        fn length(t: &Tid) -> u32 {
+            (t.block * 7 + u32::from(t.offset)) % 50 + 1
+        }
+        // Term `t` holds a document with a density that falls with `t`, and
+        // twice as often past block 300, so some terms cross the floor.
+        fn holds(t: u32, tid: &Tid) -> bool {
+            let h = (tid.block.wrapping_mul(2_654_435_761) ^ (u32::from(tid.offset) * 40_503))
+                .wrapping_add(t * 97);
+            let rate = if tid.block > 300 { 2 } else { 1 };
+            h % (2 + t * t) < rate
+        }
+        const TERMS: u32 = 12;
+        fn build<'r>(
+            docs: &[Tid],
+            reuse: &mut dyn FnMut(u32, usize) -> Option<postings::Reused<'r>>,
+        ) -> Vec<u8> {
+            let options = Options {
+                grid_min_postings: 400,
+                block_size: 64,
+                ..Options::default()
+            };
+            let lengths = docs.iter().map(length).collect();
+            let mut builder = Builder::new(docs.to_vec(), lengths, options).unwrap();
+            for t in 0..TERMS {
+                let ranks: Vec<u32> = (0..docs.len() as u32)
+                    .filter(|r| holds(t, &docs[*r as usize]))
+                    .collect();
+                if ranks.is_empty() {
+                    continue;
+                }
+                let buckets: Vec<u8> = ranks.iter().map(|r| (r % 3) as u8).collect();
+                let mut payload = PayloadBuilder::default();
+                for r in &ranks {
+                    payload.push(&[r % 5]).unwrap();
+                }
+                let name = format!("t{t:02}");
+                builder
+                    .add_term_reusing(&name, &ranks, &buckets, &payload.finish(), &mut |g| {
+                        reuse(t, g)
+                    })
+                    .unwrap();
+            }
+            builder.finish(&[]).0
+        }
+        let blob_a = build(&a, &mut |_, _| None);
+        let blob_b = build(&b, &mut |_, _| None);
+        let fresh = build(&merged, &mut |_, _| None);
+        let inputs = [
+            (Segment::parse(&blob_a).unwrap(), &a),
+            (Segment::parse(&blob_b).unwrap(), &b),
+        ];
+        let geometry = Geometry::of(&merged).unwrap();
+        let mut copied = 0;
+        let reusing = build(&merged, &mut |t, g| {
+            let group = geometry.groups[g];
+            let docs: Vec<Tid> = merged
+                .iter()
+                .filter(|tid| tid.block / 256 == group.id)
+                .copied()
+                .collect();
+            for (segment, input) in &inputs {
+                let geometry_in = &segment.docs.geometry;
+                let Some(i) = geometry_in.group_index(group.id * 256) else {
+                    continue;
+                };
+                let held = geometry_in.groups[i];
+                let input_docs: Vec<Tid> = input
+                    .iter()
+                    .filter(|tid| tid.block / 256 == group.id)
+                    .copied()
+                    .collect();
+                if (held.width, held.first, held.pages) != (group.width, group.first, group.pages)
+                    || input_docs != docs
+                {
+                    return None;
+                }
+                let term = segment.term(&format!("t{t:02}")).unwrap()?;
+                let postings::Form::Grouped(entries) = &term.postings.form else {
+                    return None;
+                };
+                let entry = entries.iter().find(|e| e.index as usize == i)?;
+                copied += 1;
+                return Some(postings::Reused {
+                    kind: entry.kind,
+                    bytes: term.postings.container(entry),
+                    input_df: term.entry.df,
+                });
+            }
+            None
+        });
+        assert!(copied > 10, "only {copied} containers copied");
+        assert!(
+            fresh == reusing,
+            "a copying merge differs from a fresh build"
+        );
+    }
 
     #[test]
     fn builds_and_reads_back() {

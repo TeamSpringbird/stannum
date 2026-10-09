@@ -157,6 +157,23 @@ pub fn frontier(postings: impl Iterator<Item = (u8, u32)>) -> Vec<(u8, u32)> {
     out
 }
 
+/// A group container an input segment holds that a merge may copy: its
+/// kind and bytes (as [`Postings::container`] gives them), and the postings
+/// of the input term that holds it.
+///
+/// A copy is what a fresh encoding writes when the output group has the
+/// input's geometry (the same width, first page and span), its members are
+/// exactly the input's there (no dead document, no other input), the
+/// options are the same, and the two terms fall on the same side of
+/// [`Options::grid_min_postings`]; the caller vouches for all but the last,
+/// which the encoder checks, re-encoding the group when it fails.
+#[derive(Clone, Copy, Debug)]
+pub struct Reused<'a> {
+    pub kind: u8,
+    pub bytes: &'a [u8],
+    pub input_df: u32,
+}
+
 /// Encodes a term's postings: `slots` strictly increasing, with each
 /// posting's bucket and its document's length. Returns where the bytes went.
 pub fn encode(
@@ -166,6 +183,23 @@ pub fn encode(
     lengths: &[u32],
     options: &Options,
     out: &mut Vec<u8>,
+) -> Stats {
+    encode_reusing(geometry, slots, buckets, lengths, options, out, &mut |_| {
+        None
+    })
+}
+
+/// [`encode`], copying the containers `reuse` gives for a group (by its
+/// index in `geometry`) where [`Reused`]'s conditions hold: the bytes are
+/// those a fresh encoding writes.
+pub fn encode_reusing<'r>(
+    geometry: &Geometry,
+    slots: &[u32],
+    buckets: &[u8],
+    lengths: &[u32],
+    options: &Options,
+    out: &mut Vec<u8>,
+    reuse: &mut dyn FnMut(usize) -> Option<Reused<'r>>,
 ) -> Stats {
     assert!(!slots.is_empty() && slots.len() == buckets.len() && slots.len() == lengths.len());
     debug_assert!(slots.windows(2).all(|w| w[0] < w[1]));
@@ -216,7 +250,7 @@ pub fn encode(
         ef::encode(slots, geometry.slots, &mut sparse);
     }
     let mut grouped_stats = Stats::default();
-    let grouped = encode_groups(geometry, slots, options, &mut grouped_stats);
+    let grouped = encode_groups(geometry, slots, options, reuse, &mut grouped_stats);
     // A term with a group dense enough to be a grid stays grouped.
     let use_sparse = options.sparse && grouped_stats.forced == 0 && sparse.len() <= grouped.len();
     let payload = if use_sparse { &sparse } else { &grouped };
@@ -299,10 +333,11 @@ fn encode_paged(locals: &[u32], width: u32, out: &mut Vec<u8>) {
     }
 }
 
-fn encode_groups(
+fn encode_groups<'r>(
     geometry: &Geometry,
     slots: &[u32],
     options: &Options,
+    reuse: &mut dyn FnMut(usize) -> Option<Reused<'r>>,
     stats: &mut Stats,
 ) -> Vec<u8> {
     let mut directory = Vec::new();
@@ -326,20 +361,28 @@ fn encode_groups(
         let width = u32::from(group.width);
         let mut kind = KIND_GRID;
         let mut best = group.grid_bytes();
-        let forced = options.grid_density > 0
-            && slots.len() as u64 >= u64::from(options.grid_min_postings)
+        let dense = options.grid_density > 0
             && locals.len() as u64 * u64::from(options.grid_density) >= u64::from(group.slots());
+        let forced = dense && slots.len() as u64 >= u64::from(options.grid_min_postings);
         if forced {
             stats.forced += 1;
         }
-        if options.ef_groups && !forced {
+        // An input's container, where its term was forced as this one is.
+        let reused = reuse(index).filter(|r| {
+            !dense || (u64::from(r.input_df) >= u64::from(options.grid_min_postings)) == forced
+        });
+        if let Some(r) = reused {
+            kind = r.kind;
+            best = r.bytes.len();
+        }
+        if options.ef_groups && !forced && reused.is_none() {
             let len = ef::encoded_len(locals.len(), group.slots());
             if len < best {
                 best = len;
                 kind = KIND_EF;
             }
         }
-        if options.paged && !forced {
+        if options.paged && !forced && reused.is_none() {
             candidate.clear();
             encode_paged(&locals, width, &mut candidate);
             if candidate.len() < best {
@@ -358,18 +401,25 @@ fn encode_groups(
             ((locals.len() as u64 - 1) << 2) | u64::from(kind),
         );
         let before = bodies.len();
-        match kind {
-            KIND_GRID => {
-                let mut grid = vec![0u8; group.grid_bytes()];
-                for local in &locals {
-                    grid[*local as usize / 8] |= 1 << (local % 8);
-                }
-                bodies.extend_from_slice(&grid);
+        if let Some(r) = reused {
+            if kind == KIND_PAGED {
+                varint::put(&mut directory, r.bytes.len() as u64);
             }
-            KIND_EF => ef::encode(&locals, group.slots(), &mut bodies),
-            _ => {
-                varint::put(&mut directory, candidate.len() as u64);
-                bodies.extend_from_slice(&candidate);
+            bodies.extend_from_slice(r.bytes);
+        } else {
+            match kind {
+                KIND_GRID => {
+                    let mut grid = vec![0u8; group.grid_bytes()];
+                    for local in &locals {
+                        grid[*local as usize / 8] |= 1 << (local % 8);
+                    }
+                    bodies.extend_from_slice(&grid);
+                }
+                KIND_EF => ef::encode(&locals, group.slots(), &mut bodies),
+                _ => {
+                    varint::put(&mut directory, candidate.len() as u64);
+                    bodies.extend_from_slice(&candidate);
+                }
             }
         }
         debug_assert_eq!(bodies.len() - before, best);
