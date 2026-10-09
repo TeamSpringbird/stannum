@@ -322,7 +322,7 @@ impl Touch for Pages {
             Some(previous) if previous == first => {}
             Some(previous) => {
                 order.switches += 1;
-                let same_blob = previous * PAGE_DATA >> 40 == at >> 40;
+                let same_blob = (previous * PAGE_DATA) >> 40 == at >> 40;
                 order.back += u64::from(same_blob && first < previous);
             }
             None => order.switches += 1,
