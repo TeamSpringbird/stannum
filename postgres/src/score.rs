@@ -862,6 +862,7 @@ pub(crate) fn reset_walk_blocks() {
     PHASE_DISK.with_borrow_mut(Vec::clear);
     PHASE_BLOCKS.with_borrow_mut(Vec::clear);
     segment::tinshape::blob::reset_stats();
+    segment::tinshape::segment::reset_memo_counts();
     crate::storage::reset_held_peak();
 }
 

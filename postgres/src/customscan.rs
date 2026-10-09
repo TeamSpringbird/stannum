@@ -2676,6 +2676,21 @@ unsafe extern "C-unwind" fn explain(
                 recent,
                 es,
             );
+            let memo = segment::tinshape::segment::memo_counts();
+            for (label, n) in [
+                (c"Records Parsed", memo.records_parsed),
+                (c"Records Kept", memo.records_kept),
+                (c"Footers Decoded", memo.footers_decoded),
+                (c"Footers Kept", memo.footers_kept),
+                (c"Records Forgotten", memo.records_forgotten),
+            ] {
+                pg_sys::ExplainPropertyInteger(
+                    label.as_ptr(),
+                    std::ptr::null(),
+                    i64::try_from(n).unwrap_or(i64::MAX),
+                    es,
+                );
+            }
             pg_sys::ExplainPropertyInteger(
                 c"Positions Checked".as_ptr(),
                 std::ptr::null(),

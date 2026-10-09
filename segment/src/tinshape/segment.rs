@@ -340,6 +340,46 @@ thread_local! {
     static TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Memo outcomes since [`reset_memo_counts`], for `EXPLAIN ANALYZE`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoCounts {
+    /// Records found parsed in a memo, and records parsed.
+    pub records_kept: u64,
+    pub records_parsed: u64,
+    /// Footers found decoded in a memo, and footers decoded.
+    pub footers_kept: u64,
+    pub footers_decoded: u64,
+    /// Records forgotten when their span closed (they borrowed its pages).
+    pub records_forgotten: u64,
+}
+
+thread_local! {
+    static MEMO_COUNTS: std::cell::Cell<MemoCounts> = const {
+        std::cell::Cell::new(MemoCounts {
+            records_kept: 0,
+            records_parsed: 0,
+            footers_kept: 0,
+            footers_decoded: 0,
+            records_forgotten: 0,
+        })
+    };
+}
+
+/// This thread's memo outcomes since the last [`reset_memo_counts`].
+pub fn memo_counts() -> MemoCounts {
+    MEMO_COUNTS.get()
+}
+
+pub fn reset_memo_counts() {
+    MEMO_COUNTS.set(MemoCounts::default());
+}
+
+fn count_memo(add: impl FnOnce(&mut MemoCounts)) {
+    let mut counts = MEMO_COUNTS.get();
+    add(&mut counts);
+    MEMO_COUNTS.set(counts);
+}
+
 fn tick() -> u64 {
     TICK.with(|t| {
         t.set(t.get() + 1);
@@ -571,9 +611,12 @@ impl<'a> Segment<'a> {
         if parsed.records.values().all(|(p, _)| p.is_detached()) {
             return;
         }
+        let before = parsed.records.len();
         parsed
             .records
             .retain(|_, (postings, _)| postings.is_detached());
+        let gone = (before - parsed.records.len()) as u64;
+        count_memo(|c| c.records_forgotten += gone);
         let Parsed { records, bytes } = &mut *parsed;
         *bytes = records
             .values()
@@ -601,6 +644,7 @@ impl<'a> Segment<'a> {
         let at = self.area_at(Area::Postings) + from;
         if let Some((postings, used)) = self.parsed.borrow().records.get(&at) {
             used.set(tick());
+            count_memo(|c| c.records_kept += 1);
             return Ok(Term {
                 entry,
                 at,
@@ -608,6 +652,7 @@ impl<'a> Segment<'a> {
             });
         }
         let term = self.resolve(entry)?;
+        count_memo(|c| c.records_parsed += 1);
         let mut parsed = self.parsed.borrow_mut();
         parsed.room(record_bytes(&term.postings));
         parsed
@@ -627,8 +672,10 @@ impl<'a> Segment<'a> {
     ) -> Result<std::rc::Rc<Footer>> {
         if let Some((footer, used)) = self.footers.borrow().footers.get(&at) {
             used.set(tick());
+            count_memo(|c| c.footers_kept += 1);
             return Ok(footer.clone());
         }
+        count_memo(|c| c.footers_decoded += 1);
         let footer =
             std::rc::Rc::new(postings.footer(self.block_size, max_bucket, self.adaptive_tf)?);
         let bytes = footer_bytes(&footer);
