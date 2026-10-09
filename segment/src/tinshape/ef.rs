@@ -231,42 +231,55 @@ impl EfCursor<'_> {
     }
 
     /// Moves to the first value at or after `target`.
+    ///
+    /// Values whose high part falls short of the target's are passed by
+    /// their high bits alone (a word of them at a time where every one of a
+    /// word does), and only values in the target's high bucket have their
+    /// low bits read.
     pub fn seek(&mut self, target: u32) {
+        match self.current {
+            Some(current) if current < target => {}
+            _ => return,
+        }
+        let high_target = (target >> self.ef.low) as usize;
+        let highs = self.ef.highs;
+        let total = highs.len() * 8;
+        // The next value's rank and the highs bit to look from.
+        let mut index = self.index + 1;
+        let mut at = self.bit + 1;
+        'words: loop {
+            if index >= self.ef.n || at >= total {
+                self.index = index.min(self.ef.n);
+                self.current = None;
+                return;
+            }
+            let next_at = (at / 64 + 1) * 64;
+            let mut word = bits::word(highs, at / 64) >> (at % 64);
+            let ones = word.count_ones() as usize;
+            // A value at bit `p` with rank `r` has high part `p - r`; the
+            // word's last has the largest, at most `next_at - index - ones`.
+            if ones == 0 || next_at - (index + ones) < high_target {
+                index += ones;
+                at = next_at;
+                continue;
+            }
+            while word != 0 {
+                let p = at + word.trailing_zeros() as usize;
+                if p - index >= high_target {
+                    self.index = index;
+                    self.bit = p;
+                    self.load();
+                    break 'words;
+                }
+                index += 1;
+                word &= word - 1;
+            }
+            at = next_at;
+        }
+        // Values of the target's high bucket with lower low bits.
         while let Some(current) = self.current {
             if current >= target {
                 return;
-            }
-            // Skip whole words of the highs whose values all fall short:
-            // the next value's high part is at least the zeros passed.
-            let high_target = (target >> self.ef.low) as usize;
-            let floor_bit = high_target + self.index;
-            if floor_bit > self.bit + 64 {
-                // Count the ones (values) between here and the word holding
-                // `floor_bit`'s neighborhood; each one passed is a value
-                // whose high part is below the target's.
-                let mut at = self.bit + 1;
-                let mut index = self.index + 1;
-                while at / 64 < floor_bit.min(self.ef.highs.len() * 8) / 64 {
-                    let word = bits::word(self.ef.highs, at / 64) >> (at % 64);
-                    let ones = word.count_ones() as usize;
-                    // A value at bit `p` with rank `r` has high part
-                    // `p - r`; the word's last value has the largest, at
-                    // most `next_at - (index + ones)`. Skip the word only
-                    // when that falls short of the target's high part.
-                    let next_at = (at / 64 + 1) * 64;
-                    if next_at - (index + ones) >= high_target {
-                        break;
-                    }
-                    index += ones;
-                    at = next_at;
-                }
-                if index > self.index + 1 {
-                    // Resume from the word boundary with the rank there.
-                    self.index = index;
-                    self.bit = at;
-                    self.load();
-                    continue;
-                }
             }
             self.advance();
         }
