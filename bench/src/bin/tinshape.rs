@@ -9,6 +9,7 @@
 //! ```text
 //! cargo run -p bench --release --bin tinshape -- --dump DIR --out DIR \
 //!     [--block 128] [--no-paged] [--no-ef-groups] [--no-sparse] [--fixed-tf] [--grid-density N] \
+//!     [--grid-min-postings N] [--subset ROWS [--rows-per-page R]] \
 //!     [--no-verify] [--no-write] [--label NAME] \
 //!     [--trace trace.tsv --expect pg.tsv [--ranked] [--k 10] [--repeat 3] \
 //!      [--per-query FILE]]
@@ -19,6 +20,10 @@
 //! median of `--repeat` passes on one thread, and the pages each query
 //! touches, by the areas TIN's EXPLAIN names, counted in pages of the
 //! paged source's size. Every row is visible, as in the ordinal replay.
+//!
+//! `--subset ROWS` converts an STN3 segment of the dump's first ROWS
+//! documents instead, rebuilt by STN3's builder (a small table's size
+//! against STN3's), laid out `R` rows to a page with `--rows-per-page`.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -53,7 +58,8 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: tinshape --dump DIR --out DIR [--block N] [--no-paged] [--no-ef-groups] \
-         [--no-sparse] [--fixed-tf] [--grid-density N] [--no-verify] [--no-write] [--label NAME] \
+         [--no-sparse] [--fixed-tf] [--grid-density N] [--grid-min-postings N] \
+         [--subset ROWS [--rows-per-page R]] [--no-verify] [--no-write] [--label NAME] \
          [--trace FILE --expect FILE [--ranked] [--k N] [--repeat N] [--per-query FILE]]"
     );
     std::process::exit(2)
