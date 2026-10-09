@@ -208,11 +208,13 @@ on the table (owners and `pg_maintain` have it).
 
 `stannum.segment_info` has TIN's columns in TIN's order: `npostings` (one
 per term and document, from the segment's term map; NULL for the write
-buffer and sealed segments, as TIN's), `source_state` (`current`: retired
-runs wait on the pending list and are not listed), `origin` (`build`,
-`promotion` or `merge`) and `sequence` (the segment's place among the
-immutable segments), then Stannum's `generation`. Sealed segments are listed
-after the write buffer.
+buffer and sealed segments, as TIN's), `source_state` (`current`, or
+`retired` for the rows of kind `retired`), `origin` (`build`, `promotion`
+or `merge`) and `sequence` (the segment's place among the immutable
+segments), then Stannum's `generation`. Sealed segments follow the write
+buffer, and the sources promotions and merges retired follow them until
+their pages are reclaimed: up to four, recorded on the meta page for
+display only (their runs wait on the pending list).
 
 ## The operation interface
 

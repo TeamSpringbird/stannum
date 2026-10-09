@@ -2351,14 +2351,14 @@ mod tests {
         .unwrap();
         let layout = Spi::get_one::<String>(
             "SELECT string_agg(kind || ' ' || docs, ', ' ORDER BY ordinal)
-             FROM stannum.segment_info('warm_idx')",
+             FROM stannum.segment_info('warm_idx') WHERE source_state = 'current'",
         )
         .unwrap()
         .unwrap();
         // `alpha`, `beta` and `gamma` are in every chunk of ordinals of
         // every source.
         let every = Spi::get_one::<i64>(
-            "SELECT sum((docs + 65535) / 65536)::bigint FROM stannum.segment_info('warm_idx')",
+            "SELECT sum((docs + 65535) / 65536)::bigint FROM stannum.segment_info('warm_idx') WHERE source_state = 'current'",
         )
         .unwrap()
         .unwrap();
@@ -2432,7 +2432,7 @@ mod tests {
         .unwrap();
         let layout = Spi::get_one::<String>(
             "SELECT string_agg(kind || ' ' || docs, ', ' ORDER BY ordinal)
-             FROM stannum.segment_info('warm_span_idx')",
+             FROM stannum.segment_info('warm_span_idx') WHERE source_state = 'current'",
         )
         .unwrap()
         .unwrap();
@@ -2708,7 +2708,7 @@ mod tests {
             client
                 .select(
                     "SELECT kind, docs, dead_docs, sum_doc_lengths, total_pages
-                     FROM stannum.segment_info('si_idx') ORDER BY ordinal",
+                     FROM stannum.segment_info('si_idx') WHERE source_state = 'current' ORDER BY ordinal",
                     None,
                     &[],
                 )
@@ -4690,7 +4690,9 @@ mod tests {
         // row's entry stays, as any index's would, until VACUUM; the sealed
         // segment waits for the next promotion.
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx') WHERE source_state = 'current'"
+            ),
             3
         );
         assert_eq!(
@@ -4828,7 +4830,9 @@ mod tests {
         );
         Spi::run("CREATE INDEX build_cancel_idx ON build_cancel USING stannum(body)").unwrap();
         assert_eq!(
-            value("SELECT count(*) FROM stannum.segment_info('build_cancel_idx')"),
+            value(
+                "SELECT count(*) FROM stannum.segment_info('build_cancel_idx') WHERE source_state = 'current'"
+            ),
             1
         );
         assert_clean("build_cancel_idx");
@@ -4979,7 +4983,9 @@ mod tests {
             1
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('merge_budget_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('merge_budget_idx') WHERE source_state = 'current'"
+            ),
             33
         );
         assert_eq!(
@@ -5037,7 +5043,9 @@ mod tests {
             96
         );
         assert_eq!(
-            value("SELECT max(docs) FROM stannum.segment_info('merge_full_idx')"),
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_full_idx') WHERE source_state = 'current'"
+            ),
             2
         );
         // With a budget that covers it, the cheapest merge brings the
@@ -5053,7 +5061,9 @@ mod tests {
             3
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('merge_full_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('merge_full_idx') WHERE source_state = 'current'"
+            ),
             100
         );
         assert_eq!(
@@ -5095,7 +5105,9 @@ mod tests {
         Spi::run("INSERT INTO merge_soft VALUES ('needle')").unwrap();
         assert_eq!(segments(), 5);
         assert_eq!(
-            value("SELECT max(docs) FROM stannum.segment_info('merge_soft_idx')"),
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_soft_idx') WHERE source_state = 'current'"
+            ),
             2
         );
         Spi::run("INSERT INTO merge_soft VALUES ('needle')").unwrap();
@@ -5106,7 +5118,9 @@ mod tests {
             .unwrap();
         assert_eq!(segments(), 4);
         assert_eq!(
-            value("SELECT max(docs) FROM stannum.segment_info('merge_soft_idx')"),
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_soft_idx') WHERE source_state = 'current'"
+            ),
             5
         );
         // VACUUM's cleanup enforces the soft bound with no budget at all.
@@ -5216,7 +5230,7 @@ mod tests {
             "insert:prepared",
             "INSERT INTO insert_race_observed SELECT
                  (SELECT count(*) FROM insert_race WHERE body ==> 'Beer'),
-                 (SELECT sum(docs) FROM stannum.segment_info('insert_race_idx'));
+                 (SELECT sum(docs) FROM stannum.segment_info('insert_race_idx') WHERE source_state = 'current');
              INSERT INTO insert_race VALUES (2, 'Craft Beer'), (3, 'craft beer');",
         );
         Spi::run("INSERT INTO insert_race VALUES (4, 'Craft Beer')").unwrap();
@@ -5239,7 +5253,9 @@ mod tests {
             vec![1, 2, 4]
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('insert_race_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('insert_race_idx') WHERE source_state = 'current'"
+            ),
             4
         );
         assert_clean("insert_race_idx");
@@ -5357,35 +5373,12 @@ mod tests {
     }
 
     #[pg_test]
-    fn reconstructed_vacuum_cancels_before_output_and_retries() {
-        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
-        direct_vacuum_cancels_before_output_and_retries();
-    }
-
-    #[pg_test]
-    fn reconstructed_vacuum_discards_retired_inputs() {
-        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
-        direct_vacuum_discards_inputs_retired_during_construction();
-    }
-
-    #[pg_test]
-    fn reconstructed_vacuum_classifies_corruption_and_stale_errors() {
-        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
-        direct_vacuum_distinguishes_corruption_from_retired_inputs();
-    }
-
-    #[pg_test]
-    fn reconstructed_vacuum_removes_all_dead_sources() {
-        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
-        direct_vacuum_removes_all_dead_sources_without_empty_successors();
-    }
-
-    #[pg_test]
     fn direct_vacuum_cancels_before_output_and_retries() {
         use std::{cell::Cell, rc::Rc};
         direct_vacuum_fixture();
-        let before =
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')");
+        let before = value(
+            "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx') WHERE source_state = 'current'",
+        );
         let queued = Rc::new(Cell::new(false));
         let built = Rc::new(Cell::new(false));
         let q = queued.clone();
@@ -5417,7 +5410,9 @@ mod tests {
             "cancel before writing merge output"
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx') WHERE source_state = 'current'"
+            ),
             before
         );
         assert_clean("direct_vacuum_idx");
@@ -5459,7 +5454,9 @@ mod tests {
             19
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx') WHERE source_state = 'current'"
+            ),
             19
         );
         assert_clean("direct_vacuum_idx");
@@ -5511,7 +5508,9 @@ mod tests {
         }
         unsafe { crate::storage::cleanup(index.as_ptr()) };
         assert_eq!(
-            value("SELECT count(*) FROM stannum.segment_info('direct_vacuum_idx')"),
+            value(
+                "SELECT count(*) FROM stannum.segment_info('direct_vacuum_idx') WHERE source_state = 'current'"
+            ),
             0
         );
         assert_clean("direct_vacuum_idx");
@@ -5650,6 +5649,14 @@ mod tests {
             4
         );
         Spi::run("SELECT stannum.promote('sealed_vac_idx')").unwrap();
+        assert_eq!(directory(), "immutable:3,mutable:1,retired:3");
+        // Once its pages are reclaimed the retired source is no longer listed.
+        crate::storage::testing::PENDING_REMOVABLE.set(true);
+        unsafe {
+            let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+            crate::storage::cleanup(index.as_ptr());
+        }
+        crate::storage::testing::PENDING_REMOVABLE.set(false);
         assert_eq!(directory(), "immutable:3,mutable:1");
         assert_clean("sealed_vac_idx");
         assert_eq!(
@@ -5683,7 +5690,9 @@ mod tests {
                 value(
                     "SELECT count(*) FROM stannum.segment_info('vac_race_idx') WHERE kind = 'immutable'",
                 ),
-                value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('vac_race_idx')"),
+                value(
+                    "SELECT sum(dead_docs)::bigint FROM stannum.segment_info('vac_race_idx') WHERE source_state = 'current'",
+                ),
             )
         };
         assert_eq!(counts(), (29, 0));
@@ -5992,7 +6001,9 @@ mod tests {
         assert!(fired.get());
         assert_only_orphans("direct_merge_cancel_idx");
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx') WHERE source_state = 'current'"
+            ),
             3
         );
         // The same merge again retires the same published runs.
@@ -6162,7 +6173,9 @@ mod tests {
         assert!(fired.get());
         assert_only_orphans("vacuum_buffer_idx");
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx') WHERE source_state = 'current'"
+            ),
             400
         );
         assert_eq!(
@@ -6177,7 +6190,9 @@ mod tests {
             200
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx') WHERE source_state = 'current'"
+            ),
             200
         );
         let index = unsafe { pgrx::PgRelation::open_with_name("vacuum_buffer_idx") }.unwrap();
@@ -6257,7 +6272,9 @@ mod tests {
             2
         );
         assert_eq!(
-            value("SELECT max(docs) FROM stannum.segment_info('merge_bytes_idx')"),
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_bytes_idx') WHERE source_state = 'current'"
+            ),
             1
         );
         assert_eq!(
@@ -6374,7 +6391,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('np_part')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('np_part') WHERE source_state = 'current'"
+            ),
             4
         );
         // CHECK constraints and stored generated columns likewise.
@@ -7380,7 +7399,9 @@ mod tests {
         unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
         drop(index);
         assert_eq!(
-            value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('dense_dead_idx')"),
+            value(
+                "SELECT sum(dead_docs)::bigint FROM stannum.segment_info('dense_dead_idx') WHERE source_state = 'current'"
+            ),
             1800,
             "the dead list is published, not rewritten away"
         );

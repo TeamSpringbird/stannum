@@ -89,15 +89,6 @@ static BUILD_SEGMENT_DOCS: GucSetting<i32> = GucSetting::<i32>::new(32_768);
 static MAX_SEGMENTS_GUC: GucSetting<i32> = GucSetting::<i32>::new(MAX_SEGMENTS as i32);
 /// Segments a size tier holds before they merge into one segment of the next tier.
 static MERGE_TIER_FACTOR: GucSetting<i32> = GucSetting::<i32>::new(8);
-/// Experimental comparison control; Auto has no density heuristic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, pgrx::PostgresGucEnum)]
-enum VacuumMergeStrategy {
-    Auto,
-    Direct,
-    Reconstruct,
-}
-static VACUUM_MERGE_STRATEGY: GucSetting<VacuumMergeStrategy> =
-    GucSetting::<VacuumMergeStrategy>::new(VacuumMergeStrategy::Auto);
 
 /// Smallest `stannum.merge_tier_factor` value; below it every fold would merge.
 pub const MIN_MERGE_TIER_FACTOR: i32 = 2;
@@ -107,14 +98,6 @@ pub const MAX_MERGE_TIER_FACTOR: i32 = 64;
 /// Registers the tunables. Low values exist so tests can drive folds,
 /// merges and reclamation at small scale; the defaults are the intended ones.
 pub fn init() {
-    GucRegistry::define_enum_guc(
-        c"stannum.experimental_vacuum_merge_strategy",
-        c"Experimental strategy of the merges built without the metadata lock (VACUUM, deferred, build and full-directory merges), for controlled comparisons",
-        c"Auto currently selects direct. Reconstruct performs full validation. Oversized inputs retain the legacy fallback regardless of this setting.",
-        &VACUUM_MERGE_STRATEGY,
-        GucContext::Userset,
-        GucFlags::default(),
-    );
     GucRegistry::define_int_guc(
         c"stannum.write_buffer_bytes",
         c"Encoded bytes the write segment holds before it is sealed",
@@ -1818,6 +1801,9 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
             }
         }
         meta.pending = still_pending;
+        AFTER_PUBLICATION.with_borrow(|after| {
+            forget_retired(meta, after.frees.iter().flat_map(|(_, pages)| pages));
+        });
     }
 }
 
@@ -2359,11 +2345,39 @@ fn attach_dead_list(meta: &mut Meta, i: usize, run: Run) -> Run {
     std::mem::replace(&mut entry.dead, run)
 }
 
+/// Lists a retired source for `segment_info()`, forgetting the oldest
+/// should the list be full.
+fn note_retired(meta: &mut Meta, retired: layout::Retired) {
+    if meta.retired.len() >= layout::MAX_RETIRED {
+        meta.retired.remove(0);
+    }
+    meta.retired.push(retired);
+}
+
+/// Forgets the retired sources whose first page is among `freed`.
+fn forget_retired<'a>(meta: &mut Meta, freed: impl Iterator<Item = &'a u32>) {
+    if meta.retired.is_empty() {
+        return;
+    }
+    let freed: HashSet<u32> = freed.copied().collect();
+    meta.retired
+        .retain(|retired| !freed.contains(&retired.first));
+}
+
 /// Queues every run of a retired directory entry for reclamation.
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively.
 unsafe fn release_entry(index: pg_sys::Relation, meta: &mut Meta, entry: SegmentEntry) {
+    note_retired(
+        meta,
+        layout::Retired {
+            first: entry.run.first,
+            pages: entry.run.blocks + entry.dead.blocks,
+            docs: entry.docs,
+            total_length: entry.total_length,
+        },
+    );
     unsafe {
         release(index, meta, entry.run);
         release(index, meta, entry.map);
@@ -2849,6 +2863,16 @@ pub unsafe fn promote_sealed(
             bytes: state.bytes,
             last: *chain.last().expect("a chain has a head"),
         };
+        let lengths: u64 = promoted.built.iter().map(|built| built.total_length).sum();
+        note_retired(
+            &mut meta,
+            layout::Retired {
+                first: state.head,
+                pages: chain.len() as u32,
+                docs: state.docs,
+                total_length: lengths,
+            },
+        );
         unsafe {
             release(index, &mut meta, retired);
             maintain(index, &mut meta, budget);
@@ -2925,6 +2949,7 @@ unsafe fn empty_meta(index: pg_sys::Relation) -> Meta {
             segments: Vec::new(),
             pending: Vec::new(),
             sealed: Vec::new(),
+            retired: Vec::new(),
         }
     }
 }
@@ -3072,6 +3097,7 @@ impl Builder {
                 // than a bounded slice per later insert; a built relation is
                 // its live segments and nothing else.
                 let pending = std::mem::take(&mut meta.pending);
+                meta.retired.clear();
                 write_meta(index, &meta_buffer, &meta);
                 drop(meta_buffer);
                 for retired in pending {
@@ -4640,6 +4666,7 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
     if freeing.is_empty() {
         return;
     }
+    forget_retired(&mut meta, freeing.iter().flat_map(|(_, pages)| pages));
     unsafe { write_meta(index, &guard, &meta) };
     drop(guard);
     for (xid, pages) in freeing {
@@ -5042,6 +5069,8 @@ pub struct SegmentRow {
     /// TIN's `sequence`: the segment's place among the immutable segments,
     /// from 0; `None` for the buffer.
     pub sequence: Option<i64>,
+    /// A retired source (TIN's `source_state` `retired`).
+    pub retired: bool,
 }
 
 /// A segment's postings, one per term and document: the sum of its terms'
@@ -5098,6 +5127,7 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 npostings: Some(npostings as i64),
                 origin: Some(entry.origin.name()),
                 sequence: Some(ordinal as i64),
+                retired: false,
             });
         }
         if meta.buffer.docs > 0 {
@@ -5117,6 +5147,7 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 npostings: None,
                 origin: None,
                 sequence: None,
+                retired: false,
             });
         }
         for (i, state) in meta.sealed.iter().enumerate() {
@@ -5137,6 +5168,23 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 npostings: None,
                 origin: None,
                 sequence: None,
+                retired: false,
+            });
+        }
+        for retired in &meta.retired {
+            rows.push(SegmentRow {
+                ordinal: rows.len() as i64,
+                kind: "retired".to_owned(),
+                root_block: i64::from(retired.first),
+                docs: i64::from(retired.docs),
+                dead_docs: 0,
+                sum_doc_lengths: retired.total_length as i64,
+                total_pages: i64::from(retired.pages),
+                generation: 0,
+                npostings: None,
+                origin: None,
+                sequence: None,
+                retired: true,
             });
         }
         rows

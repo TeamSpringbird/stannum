@@ -243,8 +243,9 @@ mod tests {
     }
 }
 
-/// The index's segment directory: immutable segments and the write buffer,
-/// in TIN's columns, then Stannum's `generation`.
+/// The index's segment directory: immutable segments, the write buffer,
+/// sealed write segments and retired sources not reclaimed yet, in TIN's
+/// columns, then Stannum's `generation`.
 #[pg_extern(volatile, parallel_unsafe)]
 #[allow(clippy::type_complexity)]
 fn segment_info(
@@ -281,9 +282,7 @@ fn segment_info(
             row.sum_doc_lengths,
             row.npostings,
             row.total_pages,
-            // Every listed entry is current: retired runs wait on the
-            // pending list, which segment_info does not list.
-            "current".to_owned(),
+            if row.retired { "retired" } else { "current" }.to_owned(),
             row.origin.map(str::to_owned),
             row.sequence,
             row.generation,

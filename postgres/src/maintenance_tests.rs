@@ -175,9 +175,18 @@ mod tests {
             text("SELECT row(p.*)::text FROM stannum.promote('sealing_idx') p"),
             "(2,2,20,24)"
         );
+        // The sealed sources stay listed as retired until reclaimed, as
+        // TIN lists them.
         assert_eq!(
             directory("sealing_idx"),
-            "immutable:10:promotion,immutable:10:promotion,mutable:1"
+            "immutable:10:promotion,immutable:10:promotion,mutable:1,retired:10,retired:10"
+        );
+        assert_eq!(
+            text(
+                "SELECT string_agg(source_state, ',' ORDER BY ordinal)
+                 FROM stannum.segment_info('sealing_idx') WHERE kind = 'retired'"
+            ),
+            "retired,retired"
         );
         assert_eq!(inspect("sealing_idx", query), "b,e,k1");
         assert_eq!(
@@ -202,7 +211,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             directory("thirds_idx"),
-            "immutable:10:promotion,mutable:5,sealed:10,sealed:10"
+            "immutable:10:promotion,mutable:5,sealed:10,sealed:10,retired:10"
         );
         assert_eq!(count("SELECT count(*) FROM thirds WHERE body ==> 'w'"), 35);
     }
@@ -220,7 +229,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             directory("inline_seal_idx"),
-            "immutable:10:promotion,immutable:10:promotion,mutable:5"
+            "immutable:10:promotion,immutable:10:promotion,mutable:5,retired:10,retired:10"
         );
         assert_eq!(
             count("SELECT count(*) FROM inline_seal WHERE body ==> 'w'"),
@@ -575,7 +584,7 @@ mod tests {
                      ORDER BY ordinal)
                  FROM stannum.segment_info('described_idx')"
             ),
-            "(immutable,21,43,merge,0);(mutable,1,,,)"
+            "(immutable,21,43,merge,0);(mutable,1,,,);(retired,1,,,);(retired,20,,,);(retired,1,,,)"
         );
     }
 }

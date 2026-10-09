@@ -169,7 +169,7 @@ def main():
         listed and its rows found; a later promote() publishes."""
         tuned = 'SET stannum.write_buffer_docs=3; SET stannum.index_maintenance_mode=manual;'
         directory = ("SELECT string_agg(kind || ':' || docs || coalesce(':' || origin, ''), ',' "
-                     "ORDER BY ordinal) FROM stannum.segment_info('promoted_idx');")
+                     "ORDER BY ordinal) FROM stannum.segment_info('promoted_idx') WHERE source_state = 'current';")
         sql('CREATE TABLE promoted(id int, body text); CREATE INDEX promoted_idx ON promoted USING stannum(body);')
         sql(tuned + "INSERT INTO promoted SELECT n, 'needle w' || n FROM generate_series(1, 4) n;")
         assert sql(directory) == 'mutable:1,sealed:3', sql(directory)

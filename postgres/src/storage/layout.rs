@@ -63,6 +63,23 @@ pub const MAX_PENDING: usize = 48;
 /// Sealed write segments waiting for promotion. A seal that would make a
 /// third promotes the oldest first, as TIN does in manual mode.
 pub const MAX_SEALED: usize = 2;
+/// Retired sources `segment_info()` lists until their pages are reclaimed;
+/// past this the oldest is forgotten (the list is for display only).
+pub const MAX_RETIRED: usize = 4;
+
+/// A segment or sealed write segment a promotion or merge retired, as
+/// `segment_info()` shows it until its pages are reclaimed. It references
+/// no page: its run waits on the pending list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Retired {
+    /// The first page of its run or chain.
+    pub first: u32,
+    pub pages: u32,
+    pub docs: u32,
+    pub total_length: u64,
+}
+
+const RETIRED_BYTES: usize = 20;
 
 const LOWER: usize = offset_of!(pg_sys::PageHeaderData, pd_lower);
 const UPPER: usize = offset_of!(pg_sys::PageHeaderData, pd_upper);
@@ -279,10 +296,12 @@ pub struct Meta {
     /// Sealed write segments, oldest first: full write buffers that take no
     /// more documents and wait to be promoted into immutable segments.
     pub sealed: Vec<BufferState>,
+    /// Retired sources, oldest first (see [`Retired`]).
+    pub retired: Vec<Retired>,
 }
 
 const BUFFER_BYTES: usize = 28;
-const META_HEADER: usize = 8 + crate::options::SPEC_BYTES + BUFFER_BYTES + 4 + 4 + 4 + 4;
+const META_HEADER: usize = 8 + crate::options::SPEC_BYTES + BUFFER_BYTES + 4 + 4 + 4 + 4 + 4;
 
 fn put_buffer(out: &mut Vec<u8>, buffer: &BufferState) {
     for n in [
@@ -331,6 +350,7 @@ impl Meta {
         if self.segments.len() > MAX_SEGMENTS
             || self.pending.len() > MAX_PENDING
             || self.sealed.len() > MAX_SEALED
+            || self.retired.len() > MAX_RETIRED
         {
             return Err("Stannum meta page overflow");
         }
@@ -347,6 +367,7 @@ impl Meta {
         out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.pending.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.sealed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(self.retired.len() as u32).to_le_bytes());
         for entry in &self.segments {
             put_run(&mut out, entry.run);
             put_run(&mut out, entry.map);
@@ -363,6 +384,12 @@ impl Meta {
         }
         for sealed in &self.sealed {
             put_buffer(&mut out, sealed);
+        }
+        for retired in &self.retired {
+            out.extend_from_slice(&retired.first.to_le_bytes());
+            out.extend_from_slice(&retired.pages.to_le_bytes());
+            out.extend_from_slice(&retired.docs.to_le_bytes());
+            out.extend_from_slice(&retired.total_length.to_le_bytes());
         }
         if out.len() > CAPACITY {
             return Err("Stannum meta page overflow");
@@ -384,15 +411,18 @@ impl Meta {
         let segment_count = u32_at(bytes, at + 4) as usize;
         let pending_count = u32_at(bytes, at + 8) as usize;
         let sealed_count = u32_at(bytes, at + 12) as usize;
-        at += 16;
+        let retired_count = u32_at(bytes, at + 16) as usize;
+        at += 20;
         if segment_count > MAX_SEGMENTS
             || pending_count > MAX_PENDING
             || sealed_count > MAX_SEALED
+            || retired_count > MAX_RETIRED
             || bytes.len()
                 != at
                     + segment_count * ENTRY_BYTES
                     + pending_count * PENDING_BYTES
                     + sealed_count * BUFFER_BYTES
+                    + retired_count * RETIRED_BYTES
         {
             return Err("invalid Stannum meta page");
         }
@@ -427,6 +457,16 @@ impl Meta {
             sealed.push(get_buffer(bytes, at));
             at += BUFFER_BYTES;
         }
+        let mut retired = Vec::with_capacity(retired_count);
+        for _ in 0..retired_count {
+            retired.push(Retired {
+                first: u32_at(bytes, at),
+                pages: u32_at(bytes, at + 4),
+                docs: u32_at(bytes, at + 8),
+                total_length: u64_at(bytes, at + 12),
+            });
+            at += RETIRED_BYTES;
+        }
         Ok(Self {
             identity,
             spec,
@@ -435,6 +475,7 @@ impl Meta {
             segments,
             pending,
             sealed,
+            retired,
         })
     }
 }
@@ -517,6 +558,12 @@ mod tests {
                 bytes: 5 * 8000,
                 docs: 1200,
             }],
+            retired: vec![Retired {
+                first: 50,
+                pages: 3,
+                docs: 7,
+                total_length: 90,
+            }],
         }
     }
 
@@ -534,6 +581,7 @@ mod tests {
         full.segments = vec![meta.segments[0]; MAX_SEGMENTS];
         full.pending = vec![meta.pending[0]; MAX_PENDING];
         full.sealed = vec![meta.sealed[0]; MAX_SEALED];
+        full.retired = vec![meta.retired[0]; MAX_RETIRED];
         let bytes = full.encode().unwrap();
         assert!(bytes.len() <= CAPACITY);
         assert_eq!(Meta::decode(&bytes).unwrap(), full);

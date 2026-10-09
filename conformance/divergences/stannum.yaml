@@ -150,8 +150,8 @@ divergences:
     captures: [script]
     summary: >
       Sealing, promote()'s row and elision over the promoted documents match
-      TIN; segment_info() differs in page numbers, the generation column, and
-      in not listing the retired source.
+      TIN; segment_info() differs only in page numbers and the generation
+      column.
     tin: >
       With maintenance manual, 12,288 rows fill a sealed write segment (root
       627, 510 pages) and 712 stay mutable; promote() consumes it (1, 1,
@@ -162,9 +162,8 @@ divergences:
     stannum: >
       The same seal at 12,288, the same promote() row, the same elision
       before and after and the same second promote(); segment_info()'s
-      root_block and total_pages are Stannum's own, each row carries its
-      generation, and the retired chain waits on the pending list, which
-      segment_info() does not list.
+      root_block and total_pages are Stannum's own and each row carries its
+      generation; the retired source is listed as TIN lists it.
 
   - id: catalog.S-07g
     against: [tin-1.0.3, tin-1.0.4]
@@ -180,8 +179,8 @@ divergences:
       the retired source.
     stannum: >
       The smallest cap splits the 12,288 documents into as many segments as
-      the 96-entry directory has room for, by bytes of forward records, and
-      lists no retired row; terms_added and the elision match TIN's.
+      the 96-entry directory has room for, by bytes of forward records;
+      terms_added, the retired row and the elision match TIN's.
 
   - id: limits.at_least_near.2
     against: tin-1.0.3

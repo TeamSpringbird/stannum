@@ -280,9 +280,18 @@ impl DocSet {
                         if u16::from(n) > width {
                             return Err(Error::Corrupt("document set page count"));
                         }
-                        let first = page * width as usize;
-                        for local in first..first + n as usize {
-                            grid[local / 64] |= 1 << (local % 64);
+                        // Offsets 1..n: a run of n slots, set a word at a time.
+                        let mut local = page * width as usize;
+                        let end = local + n as usize;
+                        while local < end {
+                            let bit = local % 64;
+                            let take = (64 - bit).min(end - local);
+                            grid[local / 64] |= if take == 64 {
+                                u64::MAX
+                            } else {
+                                ((1u64 << take) - 1) << bit
+                            };
+                            local += take;
                         }
                     }
                 }

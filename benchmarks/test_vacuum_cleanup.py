@@ -11,7 +11,7 @@ import threading
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches, verify_strategy, ranked_accounting, validate_cleanup, sample_rss
+from vacuum_cleanup import phase_lines, load_metrics, term_expression, membership_query, ranked_script, validate_workload, percentage, require_selective_matches, ranked_accounting, validate_cleanup, sample_rss
 
 
 class TrafficTests(unittest.TestCase):
@@ -89,19 +89,6 @@ class FixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no live w7 matches'):
             require_selective_matches(expected)
         require_selective_matches(1)
-
-
-class StrategySettingTests(unittest.TestCase):
-    def test_registration_is_checked_in_backend_that_loads_extension(self):
-        def fresh_backend(statement):
-            # Registration in a previous sql() backend is not inherited.
-            return 'Direct' if statement.startswith("LOAD 'stannum';") else ''
-        verify_strategy(fresh_backend, 'direct')
-
-    def test_absent_registered_setting_and_wrong_setting_are_rejected(self):
-        for observed in ('', 'auto'):
-            with self.assertRaisesRegex(ValueError, 'not registered'):
-                verify_strategy(lambda statement: observed, 'reconstruct')
 
 
 class RankedAccountingTests(unittest.TestCase):

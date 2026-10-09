@@ -35,7 +35,7 @@ def main():
         return command(['psql', '-XqAt', '-v', 'ON_ERROR_STOP=1'], input=statement)
 
     def layout():
-        return json.loads(sql("SELECT json_agg(s) FROM stannum.segment_info('docs_idx') s"))
+        return json.loads(sql("SELECT json_agg(s) FROM stannum.segment_info('docs_idx') s WHERE source_state = 'current'"))
 
     def check():
         assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx',true)") == '0'
