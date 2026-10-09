@@ -92,6 +92,7 @@ compares against, runs the cases that have a recorded answer (the rest report SK
 | `IMPROVED` | a documented improvement: the recorded engine refused with an ERROR and the engine under test answered (see Divergences) |
 | `GAP` | a documented gap: the engine under test lacks what the case exercises (see Divergences) |
 | `LIMITED` | a documented limit: the recorded engine answered and the engine under test refused with a limit ERROR, 54000 or 54001 (see Divergences) |
+| `NEWER` | a documented later change: the recorded engine changed this answer after the recorded version, and the engine under test follows the change (see Divergences) |
 
 The run exits 1 if any case FAILs. Answers are compared exactly: id lists in
 order, counts, float4 bit patterns, highlight text.
@@ -115,6 +116,11 @@ e.g. `tin-1.0.3`, or a list of versions), naming the captures that differ:
   Reported as `LIMITED`, with the recorded engine's behavior, this engine's
   limit and a `question`. (Where the recorded engine crashed the server, no
   entry is needed: any ERROR passes, see Crashes.)
+- `kind: newer`: the recorded engine changed this answer after the recorded
+  version, and this engine follows the change. `evidence` names where the
+  later behavior is published (for TIN, the Lead commit that copies the
+  fix). Reported as `NEWER`; drop the entry once a recording of a version
+  with the change replaces the old one.
 
 The entries cannot hide a regression: the case FAILs if a capture that is
 not listed differs, a listed capture matches the recorded answer again, a
