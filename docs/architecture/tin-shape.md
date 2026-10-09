@@ -175,7 +175,9 @@ a bit each: 28.6 MB at 1M rows). A posting's index (its
 rank in slot order, which is ctid order, which was `STN3`'s ordinal order)
 addresses it. A phrase checks a common word's positions for candidates far
 apart in its posting order: from a skip it decoded up to 31 entries to
-reach one, from a sub at most 7. `Builder::add_term` takes the
+reach one, from a sub at most 7 (`Positions::skip_entries`: a block's mask
+read once, a run of masked entries skipped as one run of varints).
+`Builder::add_term` takes the
 `segment::payload` stream; `Positions::payload` gives it back.
 `Positions::skip(index, at)` and `read_entry(index, at, out)` take the
 entry's index (for its mask bit).
@@ -230,14 +232,20 @@ footers it decodes between queries (`Segment::resolve_memo`,
 `Segment::footer_memo`, 16 MiB), as `STN3`'s walk keeps decoded bounds.
 
 - A query some terms of which every match holds (a conjunction, a phrase)
-  walks the groups its rarest such term holds. A group whose scoring
-  terms' footer blocks cannot reach the threshold is skipped unread;
-  otherwise the required terms' members are intersected whole: word by
-  word where every one is a grid, else from the term with the fewest
-  members there, a grid by bit and a decoded list by a merge, stopping once
-  nothing is left. Each candidate is then bounded by the footer blocks it
-  falls in (a window per run of slots no block boundary crosses), by its
-  length against the window's largest buckets (one division:
+  walks the groups its rarest such term holds, taken from its directory. A
+  group whose scoring terms' footer blocks cannot reach the threshold is
+  skipped unread (the sum stops once it reaches the threshold, rarest term
+  first); otherwise the required terms' members are intersected: word by
+  word where every one is a grid, else the rarest term's members filtered
+  by each other required term in order of `df`, each looked up only while
+  candidates are left (at 150M rows nothing is left after one or two terms
+  in nine groups of ten), by a grid's bits, by probing an Elias-Fano
+  container of more than four times their number in place
+  (`Ef::retain_members`), or by merging a shorter list. Each candidate is
+  then bounded by the footer blocks it falls in (a window per run of slots
+  no block boundary crosses), by its buckets, each scored at the shortest
+  document of its block holding that bucket or more, by its length against
+  the window's largest buckets (one division:
   `TermScorer::length_bound_parts`), and only then scored.
 - A phrase reads positions only for a candidate that would enter the top
   k. Until the top k fill every match does, so its positions are checked
@@ -245,7 +253,10 @@ footers it decodes between queries (`Segment::resolve_memo`,
   are checked best first, so a confirmed one raises the threshold over the
   rest (admission compares score and ctid, so the order is free). The
   rarest slot is read first and each pair of leaves tested as it is read
-  (`PhrasePlan`); a word repeated in the phrase is read once.
+  (`PhrasePlan`); a word repeated in the phrase is read once, and a
+  candidate whose bucket for it falls short of the number of times the
+  phrase uses it is dropped before its length is read (a phrase's leaves
+  sit at distinct positions).
 - Any other query is block-max MaxScore over its scoring terms, a group at
   a time. Each term present in the group becomes a row of words (a grid
   copied, a list decoded into bits; a posting's index is a popcount over
@@ -359,6 +370,7 @@ asked rather than copying the directory per query; `TermSet::find` returns
 the entry by value. Added: `ef::Ef::retain_members(&mut Vec<u32>)` (keep
 the values a list holds, its highs passed a word at a time and only the
 lows of the values' buckets read) and `ef::EfCursor::list`;
+`positions::Positions::skip_entries(from, at, to)`;
 `boldi_vigna::PhrasePlan::leaves`.
 
 Changed in phase B (callers of phase A's API): `Group` has `first` and
@@ -637,8 +649,14 @@ sub-blocks by their first ordinal's location.
   faster (log, round 2). Grids over document ranks rather than slots
   would remove the inflation; that is a format change.
 - Positions are still 49% of the blob (2.3 bytes per posting; TIN's
-  synthetic probes measured 0.14 per posting at tf 1). Bit-packing
-  positions per block against the document's length is the next step.
+  synthetic probes measured 0.14 per posting at tf 1, on documents of one
+  to three words). At 150M rows (18.4 GB of positions, 2.7 bytes per
+  posting, 71% of postings at tf 1) bit-packing each block's counts, first
+  positions and gaps at the block's widths would save about a tenth
+  (1.8 to 2.2 GB, 5 to 6% of the index) and 8 to 15% of a phrase's
+  positions pages: a first position or a gap takes 9 bits on average in
+  these documents, against a one- or two-byte varint now. Not worth a
+  format change alone.
 - Per-block counts in the footer (TIN answers single-term counts from its
   footer): a single-term count is the dictionary's `df` here already; the
   group directory's per-group counts settle groups one term holds.

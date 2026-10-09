@@ -197,6 +197,14 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   catalog-dependent SQL functions are STABLE rather than IMMUTABLE.
 - `stannum.debug_seed_score` is superuser-only: a plain role could set it and
   make a ranked query return wrong or no rows.
+- Ranked conjunctions and phrases over `TNS1` segments do less work per
+  256-page group: the lead term's groups come from its directory and its
+  members are read only past the group's bound, the other required terms
+  are consulted rarest first only while candidates are left (long
+  Elias-Fano containers probed in place rather than decoded), a term's
+  group directory is shared rather than copied per query, positions skip
+  runs of single-position entries at once, and a phrase repeating a word
+  drops candidates whose bucket for it is too low. Answers are unchanged.
 
 ### Fixed
 
