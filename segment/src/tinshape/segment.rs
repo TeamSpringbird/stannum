@@ -272,15 +272,36 @@ pub struct Segment<'a> {
     /// Where each area starts, in [`Area`] order, and the end.
     pub bounds: [usize; 8],
     index: DictionaryIndex<'a>,
-    pub docs: DocSet,
+    /// Shared, so a reader that decodes them once assembles a segment per
+    /// query without copying them (see [`Self::assemble`]).
+    pub docs: std::rc::Rc<DocSet>,
     pub lengths: Lengths<'a>,
-    pub liveness: Liveness,
+    pub liveness: std::rc::Rc<Liveness>,
     /// Dictionary lookups answered so far, as a reader's memo keeps them.
     memo: std::cell::RefCell<rustc_hash::FxHashMap<String, Option<TermEntry>>>,
     /// Records parsed and footers decoded so far, by the record's offset,
     /// as a reader's caches keep them (STN3's walk keeps its terms' decoded
     /// bounds the same way); emptied past [`PARSED_BUDGET`] bytes.
     parsed: std::cell::RefCell<Parsed<'a>>,
+    /// Footers decoded so far, by the record's offset: owned data, so a
+    /// reader can keep them across the segments it assembles
+    /// ([`Self::share_footers`]).
+    footers: std::rc::Rc<std::cell::RefCell<FooterCache>>,
+}
+
+/// Decoded footers by their record's blob offset, emptied past
+/// [`PARSED_BUDGET`] bytes; see [`Segment::share_footers`].
+#[derive(Default)]
+pub struct FooterCache {
+    bytes: usize,
+    footers: rustc_hash::FxHashMap<usize, std::rc::Rc<Footer>>,
+}
+
+impl FooterCache {
+    /// Bytes the decoded footers hold, roughly.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 /// Lookups a memo holds before it is emptied.
@@ -293,7 +314,6 @@ const PARSED_BUDGET: usize = 16 << 20;
 struct Parsed<'a> {
     bytes: usize,
     records: rustc_hash::FxHashMap<usize, Postings<'a>>,
-    footers: rustc_hash::FxHashMap<usize, std::rc::Rc<Footer>>,
 }
 
 impl Parsed<'_> {
@@ -301,7 +321,6 @@ impl Parsed<'_> {
     fn room(&mut self, bytes: usize) {
         if self.bytes + bytes > PARSED_BUDGET {
             self.records.clear();
-            self.footers.clear();
             self.bytes = 0;
         }
         self.bytes += bytes;
@@ -348,12 +367,12 @@ impl<'a> Segment<'a> {
         let dictionary = area(1);
         let prefix = DictionaryIndex::prefix_len(dictionary)?;
         let index = DictionaryIndex::parse(dictionary.get(..prefix).ok_or(Error::Truncated)?)?;
-        let docs = DocSet::decode(area(4))?;
+        let docs = std::rc::Rc::new(DocSet::decode(area(4))?);
         if docs.geometry.documents != documents {
             return Err(Error::Corrupt("document set count"));
         }
         let lengths = Lengths::parse(area(5), documents)?;
-        let liveness = Liveness::decode(area(6), &docs)?;
+        let liveness = std::rc::Rc::new(Liveness::decode(area(6), &docs)?);
         Ok(Self {
             bytes,
             documents,
@@ -367,6 +386,7 @@ impl<'a> Segment<'a> {
             liveness,
             memo: Default::default(),
             parsed: Default::default(),
+            footers: Default::default(),
         })
     }
 
@@ -378,8 +398,8 @@ impl<'a> Segment<'a> {
     pub fn assemble(
         bytes: &'a [u8],
         index: DictionaryIndex<'a>,
-        docs: DocSet,
-        liveness: Liveness,
+        docs: std::rc::Rc<DocSet>,
+        liveness: std::rc::Rc<Liveness>,
     ) -> Result<Self> {
         let header = super::index::Header::parse(bytes, bytes.len() as u64)?;
         let mut bounds = [0usize; 8];
@@ -403,6 +423,7 @@ impl<'a> Segment<'a> {
             liveness,
             memo: Default::default(),
             parsed: Default::default(),
+            footers: Default::default(),
         })
     }
 
@@ -479,16 +500,27 @@ impl<'a> Segment<'a> {
         postings: &Postings<'a>,
         max_bucket: u8,
     ) -> Result<std::rc::Rc<Footer>> {
-        if let Some(footer) = self.parsed.borrow().footers.get(&at) {
+        if let Some(footer) = self.footers.borrow().footers.get(&at) {
             return Ok(footer.clone());
         }
         let footer =
             std::rc::Rc::new(postings.footer(self.block_size, max_bucket, self.adaptive_tf)?);
         let bytes = footer.blocks() * 24 + footer.frontier.len() * 8 + 64;
-        let mut parsed = self.parsed.borrow_mut();
-        parsed.room(bytes);
-        parsed.footers.insert(at, footer.clone());
+        let mut cache = self.footers.borrow_mut();
+        if cache.bytes + bytes > PARSED_BUDGET {
+            cache.footers.clear();
+            cache.bytes = 0;
+        }
+        cache.bytes += bytes;
+        cache.footers.insert(at, footer.clone());
         Ok(footer)
+    }
+
+    /// Has this segment keep the footers it decodes in `cache`, and find
+    /// those decoded by earlier segments over the same blob there: a
+    /// reader that assembles a segment per query keeps one per blob.
+    pub fn share_footers(&mut self, cache: std::rc::Rc<std::cell::RefCell<FooterCache>>) {
+        self.footers = cache;
     }
 
     /// [`Self::term`] through the memo of earlier lookups.

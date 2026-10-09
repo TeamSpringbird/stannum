@@ -903,6 +903,7 @@ impl IndexScorer {
             scored,
             zero_fill: false,
             ordinal: false,
+            native: false,
             streamed: true,
         })
     }
@@ -917,12 +918,17 @@ impl IndexScorer {
     /// With a `filter`, only rows that pass it are kept, so the rows are the
     /// best of those.
     pub(crate) fn top_k(&self, k: usize, ties: bool, filter: Option<RowFilter>) -> Option<TopK> {
+        let natives = crate::storage::natives(&self.view);
         let sources: Vec<Source<'_>> = (0..self.view.sources.len())
             .map(|i| Source {
                 index: &*self.view.sources[i].0,
                 label: &self.view.labels[i],
                 dead: &self.view.dead_sets[i],
                 key: self.view.keys.get(i).copied(),
+                native: natives
+                    .get(i)
+                    .and_then(Option::as_ref)
+                    .map(|native| native as &dyn engine::walk::NativeSegment),
             })
             .collect();
         let config = WalkConfig {

@@ -3639,7 +3639,7 @@ impl Blob {
 /// The parts of a segment decoded once per backend (see
 /// [`segment::tinshape::segment::Segment::assemble`]).
 struct Decoded {
-    docs: segment::tinshape::docs::DocSet,
+    docs: Rc<segment::tinshape::docs::DocSet>,
     /// Whether the DL sidecar's stored lengths are loaded.
     lengths: bool,
 }
@@ -3649,18 +3649,25 @@ struct Decoded {
 /// assembled segment never walks its own term map.
 const NO_TERMS: &[u8] = &[0, 0, 0];
 
+/// A segment's liveness in slot space, with the dead run it was decoded
+/// from.
+type PublishedLiveness = ((Run, u32), Rc<segment::tinshape::docs::Liveness>);
+
 /// What the ctid-native paths keep of a segment in this backend.
 #[derive(Default)]
 pub(crate) struct Native {
     blob: RefCell<Option<Blob>>,
     decoded: RefCell<Option<Decoded>>,
     /// The published liveness in slot space, with the dead run it is of.
-    liveness: RefCell<Option<((Run, u32), segment::tinshape::docs::Liveness)>>,
+    liveness: RefCell<Option<PublishedLiveness>>,
+    /// Footers the ranked walks decoded, kept across the segments
+    /// [`with_native`] assembles.
+    footers: Rc<RefCell<segment::tinshape::segment::FooterCache>>,
 }
 
 impl Native {
     fn bytes(&self) -> usize {
-        self.blob.borrow().as_ref().map_or(0, |blob| blob.loaded)
+        self.blob.borrow().as_ref().map_or(0, |blob| blob.loaded) + self.footers.borrow().bytes()
     }
 }
 
@@ -3678,6 +3685,11 @@ pub(crate) fn with_native<R>(
     f: impl FnOnce(&segment::tinshape::segment::Segment<'_>) -> segment::Result<R>,
 ) -> Option<segment::Result<R>> {
     let (reader, native) = view.natives.get(i)?.as_ref()?;
+    // A query run inside another's walk over the same segment (a filter's
+    // subquery) reads it the ordinal way: the outer walk holds its bytes.
+    if native.blob.try_borrow_mut().is_err() {
+        return None;
+    }
     Some((|| {
         let header = *reader.header();
         let source: &dyn segment::source::Source = &**reader.source();
@@ -3699,9 +3711,9 @@ pub(crate) fn with_native<R>(
                 header.bounds[4],
                 (header.bounds[7] - header.bounds[4]) as usize,
             )?;
-            let docs = segment::tinshape::docs::DocSet::decode(
+            let docs = Rc::new(segment::tinshape::docs::DocSet::decode(
                 &blob.bytes[header.bounds[4] as usize..sidecar as usize],
-            )?;
+            )?);
             *decoded = Some(Decoded {
                 docs,
                 lengths: true,
@@ -3744,22 +3756,55 @@ pub(crate) fn with_native<R>(
                 &segment::tinshape::docs::encode_liveness(header.documents, &ranks),
                 &decoded.docs,
             )?;
-            *liveness = Some((dead, found));
+            *liveness = Some((dead, Rc::new(found)));
         }
         let slot = native.blob.borrow();
         let blob = slot.as_ref().expect("loaded above");
-        let segment = segment::tinshape::segment::Segment::assemble(
+        let mut segment = segment::tinshape::segment::Segment::assemble(
             &blob.bytes,
             segment::dictionary::DictionaryIndex::parse(NO_TERMS)?,
             decoded.docs.clone(),
             liveness.as_ref().expect("decoded above").1.clone(),
         )?;
+        segment.share_footers(native.footers.clone());
         drop(liveness);
         for (name, entry) in names.iter().zip(&entries) {
             segment.remember(name, *entry);
         }
         f(&segment)
     })())
+}
+
+/// A view's immutable source as the engine's ranked walk reads it in TIN's
+/// shape (see [`with_native`]).
+pub(crate) struct NativeSource<'v> {
+    view: &'v View,
+    i: usize,
+}
+
+/// Per source of `view`, its native reader if it has one.
+pub(crate) fn natives(view: &View) -> Vec<Option<NativeSource<'_>>> {
+    (0..view.sources.len())
+        .map(|i| {
+            view.natives
+                .get(i)
+                .is_some_and(Option::is_some)
+                .then_some(NativeSource { view, i })
+        })
+        .collect()
+}
+
+impl engine::walk::NativeSegment for NativeSource<'_> {
+    fn walk(
+        &self,
+        names: &[String],
+        positions: bool,
+        walk: &mut dyn FnMut(&segment::tinshape::segment::Segment<'_>) -> segment::Result<()>,
+    ) -> Option<segment::Result<()>> {
+        with_native(self.view, self.i, names, positions, true, |segment| {
+            walk(segment)
+        })
+    }
 }
 
 // --- Scan ---------------------------------------------------------------------

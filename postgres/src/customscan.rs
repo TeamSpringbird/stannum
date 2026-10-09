@@ -1133,6 +1133,8 @@ struct ScanExec {
     pruned_k: usize,
     /// The pruned walk ran over the ordinal streams.
     ordinal_walk: bool,
+    /// The pruned walk read segments in TIN's shape.
+    native_walk: bool,
     /// Index pages the ordinal walk spent before it started, and walking.
     walk_blocks: (i64, i64),
     /// Every location emitted before a completion, across completions.
@@ -1311,6 +1313,7 @@ unsafe extern "C-unwind" fn begin_scan(
             pruned: false,
             pruned_k: 0,
             ordinal_walk: false,
+            native_walk: false,
             walk_blocks: (0, 0),
             emitted: FxHashSet::default(),
             candidates: None,
@@ -1427,6 +1430,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             exec.pruned = !top.complete;
             exec.pruned_k = k;
             exec.ordinal_walk = top.ordinal;
+            exec.native_walk = top.native;
             exec.walk_blocks = crate::score::walk_blocks();
             let scorer = scorer.take().expect("a top k needs a scorer");
             crate::score::publish_scan_scorer(exec.scan_id, scorer, &top.rows);
@@ -2567,10 +2571,11 @@ unsafe extern "C-unwind" fn explain(
             if let Some(scored) = exec.scored {
                 pg_sys::ExplainPropertyText(
                     c"Pruning".as_ptr(),
-                    if exec.ordinal_walk {
-                        c"ordinal".as_ptr()
-                    } else {
-                        c"block-max".as_ptr()
+                    match (exec.native_walk, exec.ordinal_walk) {
+                        (true, true) => c"ctid+ordinal".as_ptr(),
+                        (true, false) => c"ctid".as_ptr(),
+                        (false, true) => c"ordinal".as_ptr(),
+                        (false, false) => c"block-max".as_ptr(),
                     },
                     es,
                 );

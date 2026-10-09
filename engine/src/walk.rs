@@ -251,6 +251,36 @@ pub struct Source<'a> {
     /// under which its terms' parsed bounds are kept across queries; `None`
     /// for the write buffer.
     pub key: Option<(u64, u32)>,
+    /// The segment in TIN's shape, which a query the native walk handles
+    /// ([`crate::tinshape::lower`]) walks instead of `index`'s ordinal
+    /// streams; `None` for the write buffer and sealed segments.
+    pub native: Option<&'a dyn NativeSegment>,
+}
+
+/// An immutable segment read in TIN's shape by the native walks
+/// ([`crate::tinshape`]).
+pub trait NativeSegment {
+    /// Runs `walk` over the segment with the postings records of `names`
+    /// (and with `positions` their positions) loaded, its liveness the dead
+    /// documents the view lists. `None` when it cannot be read so now; the
+    /// caller then reads `index`'s ordinal streams.
+    fn walk(
+        &self,
+        names: &[String],
+        positions: bool,
+        walk: &mut dyn FnMut(&segment::tinshape::segment::Segment<'_>) -> segment::Result<()>,
+    ) -> Option<segment::Result<()>>;
+}
+
+/// Whether a lowered query reads positions.
+pub fn reads_positions(node: &crate::tinshape::Node) -> bool {
+    use crate::tinshape::Node;
+    match node {
+        Node::Term(_) => false,
+        Node::And(children) | Node::Or(children) => children.iter().any(reads_positions),
+        Node::Not(inner) => reads_positions(inner),
+        Node::Span { .. } => true,
+    }
 }
 
 /// The settings a walk runs with.
@@ -292,6 +322,8 @@ pub struct TopK {
     pub zero_fill: bool,
     /// The walk ran over the ordinal streams.
     pub ordinal: bool,
+    /// The walk ran over segments in TIN's shape ([`NativeSegment`]).
+    pub native: bool,
     /// Every candidate was scored from the stream (see
     /// the extension's `IndexScorer::top_k_streamed`): nothing was pruned.
     pub streamed: bool,
@@ -845,6 +877,7 @@ impl Scorer {
         let mut top = TopRows::new(k, ties);
         let mut scored = 0usize;
         let mut ordinal = false;
+        let mut native = false;
         if k > 0 && !(absent && combine == Combine::All) {
             // Admission trusts the visibility map for all-visible pages. A
             // page VACUUM marked all-visible after the view was captured may
@@ -875,11 +908,49 @@ impl Scorer {
                 sources,
                 config,
             };
+            // Segments in TIN's shape are walked natively, first and
+            // largest first; the others' ordinal walks then prune against
+            // the rows they kept.
+            let mut names = Vec::new();
+            let node = crate::tinshape::lower(&self.query, &mut names);
+            let positions = node.as_ref().is_some_and(reads_positions);
+            let mut rest = Vec::with_capacity(order.len());
             loop {
                 let mut visibility = open(shortcut);
-                if warmup > 0 {
+                rest.clear();
+                for &i in &order {
+                    let source = &sources[i];
+                    let walked = match (&node, source.native) {
+                        (Some(node), Some(native)) => {
+                            native.walk(&names, positions, &mut |segment| {
+                                let answer = crate::tinshape::top_k_into(
+                                    segment,
+                                    node,
+                                    &names,
+                                    &self.terms,
+                                    &mut top,
+                                    &mut visibility,
+                                    &mut crate::tinshape::NoTouch,
+                                )?;
+                                scored += answer.scored as usize;
+                                POSITION_CHECKS
+                                    .set(POSITION_CHECKS.get() + answer.position_checks as i64);
+                                Ok(())
+                            })
+                        }
+                        _ => None,
+                    };
+                    match walked {
+                        Some(result) => {
+                            segment_error_in(result, source.label);
+                            native = true;
+                        }
+                        None => rest.push(i),
+                    }
+                }
+                if !rest.is_empty() && warmup > 0 {
                     ranking.warm_up(
-                        &order,
+                        &rest,
                         &filters,
                         warmup,
                         &mut visibility,
@@ -887,8 +958,8 @@ impl Scorer {
                         &mut scored,
                     );
                     ordinal = true;
-                } else {
-                    for &i in &order {
+                } else if !rest.is_empty() {
+                    for &i in &rest {
                         ranking.walk_by_ordinal(
                             i,
                             combine,
@@ -942,6 +1013,7 @@ impl Scorer {
             complete,
             zero_fill,
             ordinal,
+            native,
             streamed: false,
         })
     }

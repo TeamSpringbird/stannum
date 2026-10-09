@@ -98,6 +98,23 @@ mod tests {
     use pgrx::Json;
     use pgrx::prelude::*;
 
+    /// A ranked scan's `Pruning`, a pruned walk's labels (`ctid` over
+    /// segments in TIN's shape, `ordinal` over the write segment's streams,
+    /// or both) read as `ordinal`; the streamed path's `block-max` as is.
+    fn walk_kind(pruning: &serde_json::Value) -> serde_json::Value {
+        match pruning.as_str() {
+            Some("ctid" | "ctid+ordinal") => "ordinal".into(),
+            _ => pruning.clone(),
+        }
+    }
+
+    /// Whether an EXPLAIN in JSON shows a pruned walk.
+    fn walked(plan: &str) -> bool {
+        ["ctid", "ordinal", "ctid+ordinal"]
+            .iter()
+            .any(|kind| plan.contains(&format!("\"Pruning\":\"{kind}\"")))
+    }
+
     #[pg_test]
     fn bitmap_index_rechecks_heap_pages_without_preloading() {
         assert_eq!(
@@ -1226,7 +1243,7 @@ mod tests {
                             assert!(plan.contains("\"Order\":\"score DESC\""), "{query}: {plan}");
                             assert!(plan.contains("\"Top K\":10"), "{query}: {plan}");
                             if scorer == "stannum.full_score(ctid)" && query == "common OR rare" {
-                                assert!(plan.contains("\"Pruning\":\"ordinal\""), "{plan}");
+                                assert!(walked(&plan), "{plan}");
                             }
                         }
                         let scores = |sql: &str| -> Vec<u32> {
@@ -1580,6 +1597,83 @@ mod tests {
     }
 
     #[pg_test]
+    fn ranked_scans_walk_segments_in_tin_shape_with_their_dead_documents() {
+        Spi::run(
+            "CREATE TABLE native_rank(id int, body text);
+             INSERT INTO native_rank SELECT n,
+               CASE WHEN n % 17 = 0 THEN 'alpha beta ' ELSE 'alpha ' END
+               || repeat('pad ', n % 11) || CASE WHEN n % 23 = 0 THEN 'gamma' ELSE '' END
+               FROM generate_series(1, 3000) n;
+             CREATE INDEX native_rank_idx ON native_rank USING stannum(body);",
+        )
+        .unwrap();
+        let pruning = |query: &str| -> String {
+            Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off")
+                .unwrap();
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM native_rank
+                 WHERE body ==> '{query}' ORDER BY stannum.score(ctid) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+            ["ctid+ordinal", "ctid", "ordinal", "block-max"]
+                .into_iter()
+                .find(|kind| plan.contains(&format!("\"Pruning\":\"{kind}\"")))
+                .unwrap_or_else(|| panic!("{query}: {plan}"))
+                .to_owned()
+        };
+        let queries = [
+            "alpha AND beta",
+            "beta OR gamma",
+            "\"alpha beta\"",
+            "beta AND NOT gamma",
+        ];
+        let check = |kind: &str| {
+            for query in queries {
+                assert_eq!(pruning(query), kind, "{query}");
+                for order_by in ["stannum.score(ctid)", "stannum.full_score(ctid)"] {
+                    assert_eq!(
+                        ranked_in("native_rank", true, query, order_by, "LIMIT 10"),
+                        ranked_in("native_rank", false, query, order_by, "LIMIT 10"),
+                        "{query} by {order_by}"
+                    );
+                }
+            }
+        };
+        // A built index is one segment: every walk reads it natively.
+        check("ctid");
+        // Rows VACUUM lists dead are skipped inside the walk, even while
+        // their heap tuples stay visible (a slot reused after VACUUM).
+        let dead = tids("SELECT ctid::text FROM native_rank WHERE id % 4 = 0");
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'native_rank_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        drop(index);
+        check("ctid");
+        for query in queries {
+            let ids = ranked_in(
+                "native_rank",
+                true,
+                query,
+                "stannum.score(ctid)",
+                "LIMIT 3000",
+            );
+            assert!(ids.iter().all(|(id, _)| id % 4 != 0), "{query}: {ids:?}");
+        }
+        // Rows in the write buffer are walked over its ordinal streams.
+        Spi::run(
+            "INSERT INTO native_rank SELECT n, 'alpha beta beta gamma' FROM generate_series(5001, 5020) n",
+        )
+        .unwrap();
+        check("ctid+ordinal");
+    }
+
+    #[pg_test]
     fn buffered_scoring_keeps_document_lengths_when_heap_space_is_reused() {
         Spi::run(
             "CREATE TABLE length_snapshot(id int, body text) WITH (fillfactor=50);
@@ -1724,7 +1818,7 @@ mod tests {
         .unwrap()
         .0
         .to_string();
-        assert!(plan.contains("\"Pruning\":\"ordinal\""), "{plan}");
+        assert!(walked(&plan), "{plan}");
     }
 
     /// A disjunction's walk loads a term's chunk only where a candidate
@@ -1801,7 +1895,7 @@ mod tests {
                 .find_map(search_scan)
         }
         let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         // Three chunks in the first chunk of ordinals; delta and gamma in
         // the second, whose AND leaves nothing for alpha's chunk to settle.
         // Loading every present term's chunk up front read six.
@@ -1998,7 +2092,7 @@ mod tests {
         assert_eq!(scan["Top K"], 10);
         // A disjunction, of one term here, walks the ordinal streams; a
         // conjunction walks the TID postings with block bounds.
-        assert_eq!(scan["Pruning"], "ordinal");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal");
         // The ten best rows share the best score and are the earliest such
         // rows, so once they are found every later sub-block of 1,024
         // ordinals is skipped; the first ones are scored to the last tie.
@@ -2007,7 +2101,7 @@ mod tests {
         // ...and the conjunction and disjunction too.
         for (query, pruning) in [("alpha AND beta", "ordinal"), ("alpha OR gamma", "ordinal")] {
             let scan = explain(query);
-            assert_eq!(scan["Pruning"], pruning, "{query}");
+            assert_eq!(walk_kind(&scan["Pruning"]), pruning, "{query}");
             assert!(scan["Scored Candidates"].as_i64().unwrap() < 1500, "{scan}");
         }
         // Mixed shapes walk the disjunction of their scoring terms, and
@@ -2024,7 +2118,7 @@ mod tests {
             "AT LEAST 2 OF [alpha beta gamma]",
         ] {
             let scan = explain(query);
-            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
+            assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{query}: {scan}");
             assert_eq!(scan["Exhaustive Score Calls"], 0, "{query}: {scan}");
             assert!(
                 scan["Scored Candidates"].as_i64().unwrap() < 1500,
@@ -2056,7 +2150,7 @@ mod tests {
             .0;
             let scan = search_scan(&plan[0]["Plan"]).unwrap();
             assert_eq!(
-                scan["Pruning"] == "ordinal",
+                walk_kind(&scan["Pruning"]) == "ordinal",
                 pruned,
                 "LIMIT {limit}: {scan}"
             );
@@ -2071,7 +2165,7 @@ mod tests {
         .unwrap()
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         // A phrase or conjunction of elided words alone still walks by
         // ordinal, as a conjunction of filters: nothing is scored, and the
         // walk stops at the first k matches in heap order, so the positions
@@ -2091,7 +2185,7 @@ mod tests {
             .unwrap()
             .0;
             let scan = search_scan(&plan[0]["Plan"]).unwrap();
-            assert_eq!(scan["Pruning"], pruning, "{query}: {scan}");
+            assert_eq!(walk_kind(&scan["Pruning"]), pruning, "{query}: {scan}");
             assert_eq!(scan["Scored Candidates"], 0, "{query}: {scan}");
             assert!(
                 scan["Positions Checked"].as_i64().unwrap() < 100,
@@ -2120,7 +2214,7 @@ mod tests {
         .unwrap()
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal");
         // The walk checks visibility as rows enter its top k, so the deleted
         // rows never take a place and the scan needs no completion.
         assert_eq!(scan["Top-K Completions"], 0, "{scan}");
@@ -2134,7 +2228,7 @@ mod tests {
         // documents holding both words.
         Spi::run("SET LOCAL stannum.enable_custom_scan = on;").unwrap();
         let scan = explain("\"alpha beta\"");
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         let checked = scan["Positions Checked"].as_i64().unwrap();
         assert!(checked > 0 && checked < 1300, "{scan}");
         // A span shape not every slot of which must occur is left to full
@@ -2654,7 +2748,7 @@ mod tests {
             .unwrap()
             .0;
             let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
+            assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{query}: {scan}");
             assert_eq!(
                 scan["Warm-up Chunks"].as_i64(),
                 chunks,
@@ -2774,7 +2868,7 @@ mod tests {
         .unwrap()
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         assert_eq!(scan["Warm-up Chunks"].as_i64(), Some(1), "{scan}");
     }
 
@@ -2813,7 +2907,7 @@ mod tests {
             |query: &str, filter: &str| explain_by(query, filter, "stannum.full_score(ctid)");
         let ordinary = explain("alpha", "");
         let scan = search_scan(&ordinary[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal");
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(scan["Top-K Completions"], 0);
 
@@ -2822,7 +2916,7 @@ mod tests {
         // 640 and 2,560 rows; the last holds all 1,000 and the ten that pass.
         let filtered = explain("alpha", "AND id > 990");
         let scan = search_scan(&filtered[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal");
         assert_eq!(scan["Top-K Completions"], 4);
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(filtered[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
@@ -2831,7 +2925,7 @@ mod tests {
         // positions only for the candidates that enter its top ten.
         let phrase = explain("\"alpha beta\"", "");
         let scan = search_scan(&phrase[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         assert_eq!(scan["Top-K Completions"], 0);
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(scan["Positions Checked"], 10, "{scan}");
@@ -2850,7 +2944,7 @@ mod tests {
         // and only their positions are read.
         let elided = explain_by("\"alpha beta\"", "", "stannum.score(ctid)");
         let scan = search_scan(&elided[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         assert_eq!(scan["Scored Candidates"], 0, "{scan}");
         assert_eq!(scan["Positions Checked"], 10, "{scan}");
         assert_eq!(scan["Top-K Completions"], 0);
@@ -2861,7 +2955,7 @@ mod tests {
         // admits alone: 10 + 40 + 160 + 640 + 1,000.
         let elided = explain_by("\"alpha beta\"", "AND id > 990", "stannum.score(ctid)");
         let scan = search_scan(&elided[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         assert_eq!(scan["Top-K Completions"], 4, "{scan}");
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(scan["Positions Checked"], 1850, "{scan}");
@@ -2870,7 +2964,7 @@ mod tests {
         // the candidate stream.
         let single = explain_by("alpha", "", "stannum.score(ctid)");
         let scan = search_scan(&single[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "block-max", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "block-max", "{scan}");
         assert_eq!(scan["Scored Candidates"], 0, "{scan}");
     }
 

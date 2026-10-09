@@ -519,6 +519,18 @@ pub struct Liveness {
 }
 
 impl Liveness {
+    /// Whether the document at `slot` is dead.
+    pub fn is_dead(&self, geometry: &Geometry, slot: u32) -> bool {
+        if self.dead == 0 {
+            return false;
+        }
+        let group = geometry.group_of_slot(slot);
+        let local = slot - geometry.groups[group].slot_base;
+        self.groups[group]
+            .as_deref()
+            .is_some_and(|dead| dead[local as usize / 64] >> (local % 64) & 1 == 1)
+    }
+
     /// Every document live.
     pub fn all_live(docs: &DocSet) -> Self {
         Self {

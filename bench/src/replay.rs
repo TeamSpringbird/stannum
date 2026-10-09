@@ -213,6 +213,7 @@ impl<'d> Engine<'d> {
                 label: &self.labels[i],
                 dead: &self.dead[i],
                 key: Some(self.keys[i]),
+                native: None,
             })
             .collect()
     }

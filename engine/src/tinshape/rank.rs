@@ -21,8 +21,6 @@
 //! Any other query is block-max MaxScore over its scoring terms, a group at
 //! a time: see [`Walk::run_or`].
 
-use std::collections::BinaryHeap;
-
 use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
@@ -35,10 +33,11 @@ use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Entry, Node, Part, RankedAnswer, Src, TermSet, Touch, below, kernels, matches, open_terms,
+    Node, Part, RankedAnswer, Src, TermSet, Touch, below, kernels, matches, open_terms,
     required_terms,
 };
 use crate::bm25::TermScorer;
+use crate::walk::{Ranked, TopRows, Visibility};
 use segment::lanes::LaneSums;
 
 /// One scoring term of a walk.
@@ -497,19 +496,17 @@ enum Verify<'a> {
     Node,
 }
 
-/// Whether `(total, tid)` ranks before the heap's worst.
-#[inline]
-fn beats(total: f32, tid: Tid, worst: &Entry) -> bool {
-    crate::walk::rank(&(total, tid), &(worst.0, worst.1)) == std::cmp::Ordering::Less
-}
-
 /// A ranked walk over one segment: led by required terms (`run`) or a
 /// disjunction of the scoring terms (`run_or`).
 struct Walk<'s, 'a, T: Touch> {
     segment: &'s Segment<'a>,
     geometry: &'s Geometry,
     node: &'s Node,
-    k: usize,
+    /// The rows kept so far, shared with the walks over other sources, and
+    /// the check a row passes as it is kept (heap visibility, the scan's
+    /// other restrictions).
+    top: &'s mut TopRows,
+    visibility: &'s mut dyn Visibility,
     touch: &'s mut T,
     terms: Vec<Option<TermSet<'a>>>,
     /// Per term (by index into `terms`), its members in the group at hand.
@@ -541,7 +538,6 @@ struct Walk<'s, 'a, T: Touch> {
     /// A required term whose record carries its documents' lengths, the
     /// led walk reads them from.
     inline: Option<usize>,
-    heap: BinaryHeap<Entry>,
     answer: RankedAnswer,
     verify: Verify<'a>,
     /// Phrase candidates of the group that scored into the top k, awaiting
@@ -562,16 +558,28 @@ struct Walk<'s, 'a, T: Touch> {
 impl<'a, T: Touch> Walk<'_, 'a, T> {
     #[inline]
     fn threshold(&self) -> Option<f32> {
-        (self.heap.len() >= self.k)
-            .then(|| self.heap.peek().map(|e| e.0))
-            .flatten()
+        self.top.bar().map(|bar| bar.0)
     }
 
+    /// Whether `(total, tid)` would be kept.
+    #[inline]
+    fn admits(&self, total: f32, tid: Tid) -> bool {
+        self.top.admits(&Ranked(total, tid))
+    }
+
+    /// Keeps `(total, tid)` if it ranks above the bar and passes the check.
     fn push(&mut self, total: f32, tid: Tid) {
-        self.heap.push(Entry(total, tid));
-        if self.heap.len() > self.k {
-            self.heap.pop();
+        let row = Ranked(total, tid);
+        if self.top.admits(&row) && self.visibility.visible(tid) {
+            self.top.push(row);
         }
+    }
+
+    /// With nothing scoring, whether no match from `tid` on can be kept:
+    /// each scores zero, and the bar ranks before it (rows of other
+    /// sources may sit anywhere in ctid order).
+    fn unscored_done(&self, tid: Tid) -> bool {
+        !self.admits(0.0, tid)
     }
 
     /// Walks the groups the rarest required term holds. A group whose
@@ -588,9 +596,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let group = self.geometry.groups[g as usize];
             let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
             cursor = end + 1;
-            if n == 0 && self.heap.len() >= self.k {
+            if n == 0 && self.unscored_done(self.geometry.tid_in(g as usize, 0)) {
                 // Nothing scores: every later match ties at zero and ranks
-                // after the first k.
+                // after the bar.
                 break;
             }
             self.answer.windows += 1;
@@ -852,7 +860,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// enter the top k.
     fn process(&mut self, g: u32, local: u32) -> Result<bool> {
         let n = self.sc.len();
-        if n == 0 && self.heap.len() >= self.k {
+        if n == 0 && self.unscored_done(self.geometry.tid_in(g as usize, local)) {
             return Ok(false);
         }
         if let Some(dead) = self.segment.liveness.groups[g as usize].as_deref()
@@ -887,7 +895,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A span checks positions before scoring while the top k fill:
         // every match enters them.
         let tid = self.geometry.tid_in(g as usize, local);
-        let span_first = matches!(self.verify, Verify::Span(_)) && self.heap.len() < self.k;
+        let span_first = matches!(self.verify, Verify::Span(_)) && self.top.bar().is_none();
         if span_first {
             self.span_indexes(local);
             let Verify::Span(check) = &mut self.verify else {
@@ -898,7 +906,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 return Ok(true);
             }
         }
-        self.answer.scored += 1;
+        // A walk with nothing to score (every term elided) scores nothing.
+        self.answer.scored += u64::from(n > 0);
         let mut total = 0.0_f32;
         for i in 0..n {
             let t = self.sc[i].term;
@@ -923,10 +932,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 .scorer
                 .score_bucket(TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?, length);
         }
-        if let Some(worst) = self.heap.peek()
-            && self.heap.len() >= self.k
-            && !beats(total, tid, worst)
-        {
+        if !self.admits(total, tid) {
             return Ok(true);
         }
         match &self.verify {
@@ -998,10 +1004,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for i in order {
             let (total, local) = self.pending[i];
             let tid = self.geometry.tid_in(g as usize, local);
-            if let Some(worst) = self.heap.peek()
-                && self.heap.len() >= self.k
-                && !beats(total, tid, worst)
-            {
+            if !self.admits(total, tid) {
                 continue;
             }
             let Verify::Span(check) = &mut self.verify else {
@@ -1018,7 +1021,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 }
 
-/// [`super::top_k`] for a query some terms of which every match holds.
+/// Every row is visible.
+struct Everything;
+
+impl Visibility for Everything {
+    fn visible(&mut self, _: Tid) -> bool {
+        true
+    }
+}
+
+/// [`super::top_k`]: the walk into fresh rows, then the zero fill.
 pub(super) fn top_k(
     segment: &Segment<'_>,
     node: &Node,
@@ -1027,10 +1039,57 @@ pub(super) fn top_k(
     k: usize,
     touch: &mut impl Touch,
 ) -> Result<RankedAnswer> {
+    let mut top = TopRows::new(k, false);
+    let mut answer = RankedAnswer::default();
+    let mut terms = walk_into(
+        segment,
+        node,
+        names,
+        scorers,
+        &mut top,
+        &mut Everything,
+        touch,
+        &mut answer,
+    )?;
+    let mut rows = top.into_rows();
+    // Zero fill: fewer than k rows, the rest are matches of non-scoring
+    // terms in ctid order (a led walk saw every match already).
+    if rows.len() < k
+        && required_terms(node).is_empty()
+        && let Some(terms) = terms.as_mut()
+    {
+        let seen: std::collections::HashSet<Tid> = rows.iter().map(|r| r.1).collect();
+        let fill = super::first_matches(segment, node, terms, k - rows.len(), &seen, touch)?;
+        rows.extend(fill.into_iter().map(|t| (0.0, t)));
+        rows.sort_by(crate::walk::rank);
+        rows.truncate(k);
+    }
+    answer.rows = rows;
+    Ok(answer)
+}
+
+/// [`super::top_k_into`]: walks `segment` into `top`, keeping only rows
+/// `visibility` passes, and adds what it did to `answer`. Returns the
+/// opened terms, for a zero fill; `None` when nothing can match.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the walk's inputs and its two outputs"
+)]
+pub(super) fn walk_into<'a>(
+    segment: &Segment<'a>,
+    node: &Node,
+    names: &[String],
+    scorers: &[(String, TermScorer)],
+    top: &mut TopRows,
+    visibility: &mut dyn Visibility,
+    touch: &mut impl Touch,
+    answer: &mut RankedAnswer,
+) -> Result<Option<Vec<Option<TermSet<'a>>>>> {
+    let k = top.k();
     let required = required_terms(node);
     let terms = open_terms(segment, names, touch)?;
     if k == 0 || required.iter().any(|t| terms[*t].is_none()) {
-        return Ok(RankedAnswer::default());
+        return Ok(None);
     }
     let mut sc: Vec<Sc> = Vec::new();
     for (name, scorer) in scorers {
@@ -1072,7 +1131,8 @@ pub(super) fn top_k(
         segment,
         geometry: &segment.docs.geometry,
         node,
-        k,
+        top,
+        visibility,
         mems: (0..terms.len()).map(|_| Mem::default()).collect(),
         terms,
         sc_required: Vec::with_capacity(n),
@@ -1088,7 +1148,6 @@ pub(super) fn top_k(
         window_parts: (0.0, 0.0, 0.0, 0.0),
         inline: None,
         req,
-        heap: BinaryHeap::with_capacity(k + 1),
         answer: RankedAnswer::default(),
         verify,
         pending: Vec::new(),
@@ -1116,26 +1175,13 @@ pub(super) fn top_k(
     } else {
         walk.run()?;
     }
-    let mut rows: Vec<(f32, Tid)> = walk.heap.into_iter().map(|e| (e.0, e.1)).collect();
-    // Zero fill: fewer than k rows, the rest are matches of non-scoring
-    // terms in ctid order (a led walk saw every match already).
-    if rows.len() < k && required.is_empty() {
-        let seen: std::collections::HashSet<Tid> = rows.iter().map(|r| r.1).collect();
-        let fill = super::first_matches(
-            segment,
-            node,
-            &mut walk.terms,
-            k - rows.len(),
-            &seen,
-            walk.touch,
-        )?;
-        rows.extend(fill.into_iter().map(|t| (0.0, t)));
-    }
-    rows.sort_by(crate::walk::rank);
-    rows.truncate(k);
-    let mut answer = walk.answer;
-    answer.rows = rows;
-    Ok(answer)
+    let done = walk.answer;
+    answer.scored += done.scored;
+    answer.windows += done.windows;
+    answer.windows_pruned += done.windows_pruned;
+    answer.candidates += done.candidates;
+    answer.position_checks += done.position_checks;
+    Ok(Some(walk.terms))
 }
 
 fn span_check<'a>(
@@ -1655,10 +1701,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 .score_bucket(TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?, length);
         }
         let tid = self.geometry.tid_in(g as usize, local);
-        if let Some(worst) = self.heap.peek()
-            && self.heap.len() >= self.k
-            && !beats(total, tid, worst)
-        {
+        if !self.admits(total, tid) {
             return Ok(());
         }
         match &self.verify {

@@ -1354,21 +1354,6 @@ pub struct RankedAnswer {
     pub position_checks: u64,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct Entry(f32, Tid);
-impl Eq for Entry {}
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for Entry {
-    /// Best first, as [`crate::walk::rank`]; the heap's top is the worst.
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        crate::walk::rank(&(self.0, self.1), &(other.0, other.1))
-    }
-}
-
 /// A bound below the threshold by more than rounding can explain: partial
 /// sums are taken in another order than the score's.
 #[inline]
@@ -1393,6 +1378,36 @@ pub fn top_k(
     touch: &mut impl Touch,
 ) -> Result<RankedAnswer> {
     rank::top_k(segment, node, names, scorers, k, touch)
+}
+
+/// [`top_k`] into rows shared with walks over other sources: the walk
+/// keeps a row only if it ranks above `top`'s bar and `visibility` passes
+/// it (asked once per row so kept, in no particular order), and prunes
+/// against the bar as it rises, from rows of any source. Dead documents
+/// (the segment's liveness) are never candidates. Matches holding no
+/// scoring term are not walked: a caller wanting them fills them in, as
+/// [`top_k`] does. Returns the walk's counters.
+pub fn top_k_into(
+    segment: &Segment<'_>,
+    node: &Node,
+    names: &[String],
+    scorers: &[(String, TermScorer)],
+    top: &mut crate::walk::TopRows,
+    visibility: &mut dyn crate::walk::Visibility,
+    touch: &mut impl Touch,
+) -> Result<RankedAnswer> {
+    let mut answer = RankedAnswer::default();
+    rank::walk_into(
+        segment,
+        node,
+        names,
+        scorers,
+        top,
+        visibility,
+        touch,
+        &mut answer,
+    )?;
+    Ok(answer)
 }
 
 /// Terms every match holds.
@@ -1498,7 +1513,9 @@ fn first_matches<'a>(
             }
         }
         let Some(slot) = next else { break };
-        if matches(segment, node, terms, slot, &mut positions, touch)? {
+        if !segment.liveness.is_dead(geometry, slot)
+            && matches(segment, node, terms, slot, &mut positions, touch)?
+        {
             let tid = geometry.tid_of(slot);
             if !skip.contains(&tid) {
                 out.push(tid);
@@ -1682,6 +1699,123 @@ mod tests {
                 let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
                 let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
                 prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
+            }
+        }
+    }
+
+    /// Rejects every fifth ctid, as a heap visibility check or a scan's
+    /// other restriction would.
+    struct EveryFifth(usize);
+
+    impl crate::walk::Visibility for EveryFifth {
+        fn visible(&mut self, tid: Tid) -> bool {
+            self.0 += 1;
+            !(tid.block + u32::from(tid.offset)).is_multiple_of(5)
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        /// Walks over two segments into shared rows, with dead documents, a
+        /// visibility check and ties kept or not, keep what a brute force
+        /// over the eligible matches keeps.
+        #[test]
+        fn shared_walks_keep_the_eligible_top_rows(
+            doc_set in prop::collection::btree_set((0u32..900, 1u16..=30), 2..500),
+            density in prop::collection::vec(1u32..100, 4),
+            seed in any::<u64>(),
+            k in 1usize..12,
+            ties in any::<bool>(),
+        ) {
+            let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
+            let mut state = seed | 1;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            // Few distinct frequencies and lengths, so scores tie.
+            let lengths: Vec<u32> = (0..docs.len()).map(|i| (i as u32 % 3) * 10 + 5).collect();
+            let mut members: Vec<Vec<(usize, u32)>> = vec![Vec::new(); density.len()];
+            for (t, d) in density.iter().enumerate() {
+                for r in 0..docs.len() {
+                    if next() % 100 < u64::from(*d) {
+                        members[t].push((r, (next() % 2 + 1) as u32));
+                    }
+                }
+            }
+            let side: Vec<usize> = (0..docs.len()).map(|_| (next() % 2) as usize).collect();
+            let dead: Vec<bool> = (0..docs.len()).map(|_| next() % 7 == 0).collect();
+            let options = Options { block_size: 16, grid_min_postings: 0, ..Options::default() };
+            let blobs: Vec<Vec<u8>> = (0..2)
+                .map(|half| {
+                    let local: Vec<usize> = (0..docs.len()).filter(|r| side[*r] == half).collect();
+                    let tids: Vec<Tid> = local.iter().map(|r| docs[*r]).collect();
+                    let mut builder = Builder::new(tids, local.iter().map(|r| lengths[*r]).collect(), options).unwrap();
+                    for (t, m) in members.iter().enumerate() {
+                        let held: Vec<(u32, u32)> = m
+                            .iter()
+                            .filter_map(|(r, tf)| local.iter().position(|l| l == r).map(|i| (i as u32, *tf)))
+                            .collect();
+                        if held.is_empty() {
+                            continue;
+                        }
+                        let ranks: Vec<u32> = held.iter().map(|(i, _)| *i).collect();
+                        let buckets: Vec<u8> = held.iter().map(|(_, tf)| TfBucket::from_count(*tf).value()).collect();
+                        let mut payload = PayloadBuilder::default();
+                        for (_, tf) in &held {
+                            payload.push(&(0..*tf).collect::<Vec<u32>>()).unwrap();
+                        }
+                        builder.add_term(&format!("t{t}"), &ranks, &buckets, &payload.finish()).unwrap();
+                    }
+                    let gone: Vec<u32> = local
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| dead[**r])
+                        .map(|(i, _)| i as u32)
+                        .collect();
+                    builder.finish(&gone).0
+                })
+                .collect();
+            let segments: Vec<Segment<'_>> = blobs.iter().map(|b| Segment::parse(b).unwrap()).collect();
+            let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();
+            for node in shapes() {
+                if matches!(node, Node::Not(_)) {
+                    continue;
+                }
+                let mut scorers = Vec::new();
+                for t in leaf_terms(&node) {
+                    if members[t].is_empty() || scorers.iter().any(|(n, _): &(String, TermScorer)| *n == names[t]) {
+                        continue;
+                    }
+                    let scorer = TermScorer::from_statistics(docs.len() as u64, members[t].len() as u64, 1.0, Bm25Params::default(), 15.0).unwrap();
+                    scorers.push((names[t].clone(), scorer));
+                }
+                let mut want = crate::walk::TopRows::new(k, ties);
+                for r in 0..docs.len() {
+                    if dead[r] || !eval(&node, &members, r) || (docs[r].block + u32::from(docs[r].offset)).is_multiple_of(5) {
+                        continue;
+                    }
+                    let mut total = 0.0_f32;
+                    for (name, scorer) in &scorers {
+                        let t: usize = name[1..].parse().unwrap();
+                        if let Some(tf) = holds(&members, t, r) {
+                            total += scorer.score_bucket(TfBucket::from_count(tf), lengths[r]);
+                        }
+                    }
+                    let row = crate::walk::Ranked(total, docs[r]);
+                    if want.admits(&row) {
+                        want.push(row);
+                    }
+                }
+                let mut top = crate::walk::TopRows::new(k, ties);
+                let mut visibility = EveryFifth(0);
+                for segment in segments.iter().rev() {
+                    top_k_into(segment, &node, &names, &scorers, &mut top, &mut visibility, &mut NoTouch).unwrap();
+                }
+                let bits = |rows: Vec<(f32, Tid)>| rows.into_iter().map(|(s, t)| (s.to_bits(), t)).collect::<Vec<_>>();
+                prop_assert_eq!(bits(top.into_rows()), bits(want.into_rows()), "top {} ties {} of {:?}", k, ties, node);
             }
         }
     }
