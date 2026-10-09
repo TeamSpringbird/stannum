@@ -41,7 +41,7 @@ use segment::lanes::LaneSums;
 pub(super) struct Sc {
     pub(super) term: usize,
     pub(super) scorer: TermScorer,
-    pub(super) footer: Footer,
+    pub(super) footer: std::rc::Rc<Footer>,
     /// Per footer block, its bound; NaN until asked.
     bounds: Vec<f32>,
     /// The block a range bound starts from, moved forward only.
@@ -55,7 +55,7 @@ pub(super) struct Sc {
 }
 
 impl Sc {
-    pub(super) fn new(term: usize, scorer: TermScorer, footer: Footer) -> Self {
+    pub(super) fn new(term: usize, scorer: TermScorer, footer: std::rc::Rc<Footer>) -> Self {
         let (num, den, factor) = scorer.length_bound_parts();
         Self {
             term,
@@ -1015,9 +1015,7 @@ pub(super) fn top_k(
             continue;
         };
         let Some(set) = &terms[t] else { continue };
-        let footer =
-            set.postings
-                .footer(segment.block_size, set.max_bucket, segment.adaptive_tf)?;
+        let footer = segment.footer_memo(set.at, &set.postings, set.max_bucket)?;
         touch.touch(
             Part::Footer,
             set.at + set.postings.footer_at,
