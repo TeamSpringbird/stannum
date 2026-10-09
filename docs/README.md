@@ -56,6 +56,9 @@ search. Run commands from the repository root.
 - [Testing](testing.md): every kind of test and how to run it.
 - [Benchmarks](benchmarks.md): workloads, correctness checks, current results
   and how to reproduce them.
+- [Measuring the query engine outside PostgreSQL](offline-engine.md): the
+  engine crate, replaying a query trace over a dumped index, and kernel
+  benchmarks.
 - [Local benchmark runs](../benchmarks/local/README.md): rehearsing the
   published workloads on a laptop when the index does not fit in memory.
 

@@ -560,6 +560,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
     },
+    "docs/offline-engine.md": {
+      "owner": "ben",
+      "evidence": "Original Stannum documentation of the engine crate, the offline replay and the kernel benchmarks."
+    },
     "docs/query-language/README.md": {
       "owner": "mixed",
       "upstream_path": "tinql/docs/src/SUMMARY.md",

@@ -8,7 +8,9 @@ ranking statistics in index pages and uses them to find matching row locations.
 
 | Directory | Responsibility |
 | --- | --- |
-| `postgres/src/` | PostgreSQL integration, SQL functions, query planning, and scoring |
+| `postgres/src/` | PostgreSQL integration, SQL functions, query planning, and the score functions |
+| `engine/src/` | The query engine without PostgreSQL: BM25, the ranked walk over ordinals, the count fold |
+| `bench/` | The engine measured outside PostgreSQL: trace replay over dumped segments, kernel benchmarks ([how](../offline-engine.md)) |
 | `postgres/src/storage/` | Index pages, write buffer, segments, WAL, and reclamation |
 | `segment/src/` | Dictionaries, ordinal streams, the document table, positions, document lengths, and cursors |
 | `tinql/src/` | Query parsing, reference evaluation, and indexed query planning |
