@@ -193,7 +193,7 @@ jobs:
       LEAD_REPOSITORY: planetscale/lead
       # Pinned so upstream changes cannot fail unrelated pull requests; move it
       # forward deliberately, together with the Stannum changes it requires.
-      LEAD_REF: bd95c7e51b6afce81396790852ee2f2c169570ad
+      LEAD_REF: e3ed2f4ce1388167b0254a0c0c706a61d0a37d83
     steps:
       - name: Check out source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0

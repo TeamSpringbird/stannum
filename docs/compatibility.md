@@ -45,7 +45,9 @@ declaration cannot hide a regression.
   and boosts, as described in the [query language guide](query-language/introduction.md).
 - **Scoring.** BM25 scores are bit-identical to TIN's, including at `k1 = 0`,
   and the pruned top k is the exhaustive top k. A term repeated in a flat `AND` or `OR` chain adds its
-  boosts (`a a` scores as `a^2`). `score()` and `full_score()` over `==>`
+  boosts (`a a` scores as `a^2`), and so does a word written more than once
+  in a phrase or span (`"to be or not to be"`); a boost on an operand inside
+  a span weighs that operand alone (`ipa^3 NEAR/5 hoppy`). `score()` and `full_score()` over `==>`
   clauses on several indexed columns of one table sum one score per column,
   in clause order.
 - **Which clauses score.** A row is scored by the `==>` clauses on its own
@@ -66,8 +68,9 @@ declaration cannot hide a regression.
   subquery the planner flattens, but not under `NOT`; with no clause to bind
   they return the text unmarked. Several clauses mark every term of each,
   parameters included, and their texts are parsed one by one as for scoring.
-- **Index options.** All fifteen documented options are accepted with TIN's
-  domains; see [index options](#index-options).
+- **Index options.** All sixteen documented options are accepted with TIN's
+  domains, `stemmer` (TIN 1.0.4) included; see [index options](#index-options)
+  and [stemming](#stemming).
 - **Errors.** An invalid query raises `invalid ==> query at byte N in
   "QUERY": ...` with TIN's SQLSTATE, except a query past a size limit
   (below). `target_segment_count`,
@@ -107,6 +110,15 @@ the last two possible.
 
 ## Other known differences
 
+- **Negated span relations** (`catalog.S-11`). The right side of `NOT
+  ENCLOSES`, `NOT ENCLOSED BY` and `NOT OVERLAPPING` adds no scoring term,
+  as with `AND NOT`. TIN 1.0.3 and 1.0.4 score it; Lead b8018ac copies TIN's
+  later fix, which Stannum follows (a `newer` divergence).
+- **A changed stemmer** takes effect at `REINDEX`, like every tokenizer
+  option in Stannum: queries and stored terms are always analyzed alike.
+  TIN 1.0.4 stems query terms as soon as `ALTER INDEX ... SET (stemmer)`
+  runs and stored terms only after `REINDEX`, so between the two its
+  inflected queries miss rows (`stemming.ddl.alter_reindex`).
 - **Error wording.** Syntax errors name what was expected in the words of
   Stannum's recursive-descent parser, not TIN's grammar rules; the SQLSTATE
   matches. These are the DIFF cases.
@@ -152,7 +164,8 @@ are accepted. Stannum's registration is in
 | `position_gaps` | `preserve`, `collapse`; `preserve` | Positions consumed by removed tokens | Same; discarded long tokens leave gaps only in preserve mode |
 | `k1` | real `0..10000`; `1.2` | BM25 saturation | Same; query-time, no rebuild |
 | `b` | real `0..1`; `0.75` | BM25 length normalization | Same; query-time, no rebuild |
-| `score_stop_words` | comma-separated text; unset | Analyzed terms omitted from default scoring | Same; matching unchanged, full scoring ignores the list |
+| `score_stop_words` | comma-separated text; unset | Analyzed terms omitted from default scoring | Same; matching unchanged, full scoring ignores the list; on a stemmed index, written as stems |
+| `stemmer` | `ar`, `da`, `de`, `el`, `en`, `es`, `fi`, `fr`, `hu`, `it`, `nl`, `no`, `pt`, `ro`, `ru`, `sv`, `ta`, `tr`; unset | Snowball stemming of indexed and query terms | Same; persisted at build with the other tokenizer settings |
 | `initial_segment_count` | integer `1..4096` | Build partitions | Accepted and ignored, with a warning |
 | `target_segment_count` | integer `1..4096` | Maintenance target | Soft directory bound in place of `stannum.max_segments` |
 | `max_mutable_segment_size` | integer `>= 131072` bytes; `4194304` | Write buffer size before promotion | Fold size in place of `stannum.write_buffer_bytes`; `stannum.write_buffer_docs` still applies |
@@ -164,10 +177,40 @@ The storage options are reloptions read when maintenance runs, so
 [storage settings](architecture/segmented-storage.md#writing-an-index) apply.
 None of them enforces a memory limit or starts workers. Tokenizer options
 change stored terms and need `REINDEX`, as TIN's reference states. TIN
-documents no stemming, language selection or indexing-time stop words, and
-Stannum adds none. TIN's server and session
+documents no language selection beyond the stemmer and no indexing-time stop
+words, and Stannum adds none. TIN's server and session
 [settings](https://planetscale.com/docs/postgres/search/reference/settings) are
 not index options and are not accepted as reloptions.
+
+## Stemming
+
+`WITH (stemmer = '<code>')` stems every analyzed term with the Snowball
+stemmer of that language (rust-stemmers 1.2.0, as Lead), at index time and
+at query time: `run`, `runs` and `running` are stored and searched as `run`,
+while `runner` and `ran` stay apart. The pipeline lowercases, normalizes to
+NFC, stems, and then folds accents if `accent_folding = fold`, so `résumés`
+stems to `résumé` and folds to `resume`. Phrases, proximity and positional
+filters work on stems; positions are the unstemmed text's. Wildcard, fuzzy,
+regular-expression and range literals are not stemmed and match the stored
+stems as written (`runn*` matches `runner`, not `running`). Scores are
+BM25 over stems; `score_inspect` lists stems, and `score_stop_words` is
+compared with stems. Highlighting marks the source words whose stems
+match.
+
+An unknown code raises XX000 `unknown stemmer language code: <code>` (the
+code is case-sensitive and must be one of the eighteen), and a stemmer with
+`case_folding = preserve` raises XX000 `stemming requires case_folding =
+fold`, at `CREATE INDEX` and `ALTER INDEX` alike, as TIN 1.0.4 does.
+`stannum.tokenize` and `ql_parse` take a trailing `stemmer` argument (NULL
+stems nothing). `highlight` and `highlight_ansi` take TIN 1.0.4's
+`tokenizer` through `stemmer` arguments after `query`: a call that sets none
+of them analyzes with the bound index's settings, as before, and one that
+sets any analyzes with exactly those settings, each unset one at its
+default. `==> ANY(...)` and `ALL(...)` bind to the index's settings too.
+
+The stemmer is stored with the tokenizer settings in the index's meta page,
+in bits that indexes built before stemming hold as zero, so those indexes
+read as unstemmed and the on-disk format is unchanged.
 
 ## Reference oracle against Lead
 
@@ -186,9 +229,9 @@ ANSI highlighted strings must agree, highlights through the one-argument
 functions so implicit binding is exercised. Two known deviations of Lead are
 allowed for:
 
-- Score bits are not compared. Lead counts a document with no tokens at index
-  build time in its corpus size, which shifts every IDF in the last bits; TIN
-  and Stannum do not.
+- Score bits are not compared. Lead before 615e9ce counted a document with
+  no tokens at index build time in its corpus size, which shifted every IDF
+  in the last bits; TIN and Stannum do not, nor does Lead since.
 - Expansion shapes (wildcards, regular expressions, ranges) compare match
   sets and highlights only, because Lead scores their matches as zero where
   TIN scores the expanded terms.
