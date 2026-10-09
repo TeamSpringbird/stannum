@@ -38,6 +38,9 @@ COPY tinql tinql
 COPY tokenizer tokenizer
 COPY boldi-vigna boldi-vigna
 COPY segment segment
+COPY engine engine
+# A workspace member: cargo reads its manifest; nothing here builds it.
+COPY bench bench
 # Keep optimized code and line tables for the owned perf diagnostics.
 RUN CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none cargo pgrx install --package stannum --no-default-features --features pg18 --release
 
