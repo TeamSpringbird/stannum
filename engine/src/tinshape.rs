@@ -2063,6 +2063,67 @@ mod tests {
     /// of the DL sidecar's, not their areas: a backend's memory must not
     /// grow with a common word's positions (at 150M rows a phrase of two
     /// common words loaded over a gigabyte of positions per backend).
+    /// A phrase repeating a word needs that word at as many positions: a
+    /// document whose bucket puts its count below that is no match, and
+    /// its positions are not read (TIN's ranked `"zp zp"` reads none for
+    /// documents of tf 1).
+    #[test]
+    fn a_phrase_repeating_a_word_reads_no_positions_for_too_few() {
+        let docs: Vec<Tid> = (0..2_000u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        // Every document holds the word once, every 50th twice.
+        let members = vec![
+            (0..docs.len())
+                .map(|r| (r, if r % 50 == 0 { 2 } else { 1 }))
+                .collect::<Vec<_>>(),
+        ];
+        let blob = build(&docs, &members, Options::default());
+        let segment = Segment::parse(&blob).unwrap();
+        let names = vec!["t0".to_owned()];
+        let node = Node::Span {
+            slots: vec![0, 0],
+            query: SpanQuery::phrase([0, 1]),
+        };
+        let scorer = TermScorer::from_statistics(
+            docs.len() as u64,
+            docs.len() as u64,
+            1.0,
+            Bm25Params::default(),
+            50.0,
+        )
+        .unwrap();
+        let got = top_k(
+            &segment,
+            &node,
+            &names,
+            &[("t0".to_owned(), scorer)],
+            10,
+            &mut NoTouch,
+        )
+        .unwrap();
+        let mut want: Vec<Tid> = (0..docs.len())
+            .filter(|r| r % 50 == 0)
+            .map(|r| docs[r])
+            .collect();
+        let rows: Vec<Tid> = got.rows.iter().map(|r| r.1).collect();
+        want.retain(|t| rows.contains(t));
+        assert_eq!(rows.len(), 10);
+        assert_eq!(
+            rows.len(),
+            want.len(),
+            "only documents holding the word twice"
+        );
+        assert!(
+            got.position_checks <= 40,
+            "{} position checks for 40 documents holding the word twice",
+            got.position_checks
+        );
+    }
+
     #[test]
     fn a_ranked_phrase_loads_what_it_reads() {
         let docs: Vec<Tid> = (0..60_000u32)

@@ -93,6 +93,13 @@ impl PhrasePlan {
         Some(plan)
     }
 
+    /// The slot of each leaf, in the span's order. In a matching interval
+    /// each leaf sits at least one position after the one before it, so
+    /// a slot that is the leaf of several needs as many positions.
+    pub fn leaves(&self) -> &[usize] {
+        &self.leaves
+    }
+
     /// The reads in order; each slot appears at its first read only if the
     /// caller skips slots read already.
     pub fn steps(&self) -> &[Step] {

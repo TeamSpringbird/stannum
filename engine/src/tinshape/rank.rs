@@ -574,6 +574,9 @@ struct Walk<'s, 'a, T: Touch> {
     /// A required term whose record carries its documents' lengths, the
     /// led walk reads them from.
     inline: Option<usize>,
+    /// A phrase's scoring terms it uses more than once, by index into `sc`,
+    /// each with the least bucket of a count reaching their number of uses.
+    repeats: Vec<(usize, u8)>,
     answer: RankedAnswer,
     verify: Verify<'a>,
     /// Phrase candidates of the group that scored into the top k, awaiting
@@ -937,6 +940,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     }
                 }
                 self.read_buckets(g, local)?;
+                if self.too_few() {
+                    return Ok(true);
+                }
                 length
             }
             // The candidate's buckets first, each against the shortest
@@ -946,7 +952,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // candidates fell short on their buckets alone.
             None => {
                 let reach = self.read_buckets(g, local)?;
-                if below(reach, theta) {
+                if below(reach, theta) || self.too_few() {
                     return Ok(true);
                 }
                 self.dl_length(g, local)?
@@ -1037,6 +1043,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.buckets[i] = bucket;
         }
         Ok(reach)
+    }
+
+    /// Whether the candidate at hand, its buckets read, holds a word its
+    /// phrase repeats fewer times than the phrase does (its bucket's counts
+    /// all fall short), so cannot match.
+    #[inline]
+    fn too_few(&self) -> bool {
+        self.repeats
+            .iter()
+            .any(|&(i, least)| self.buckets[i] < least)
     }
 
     /// The length of the document at slot `local` of group `g`, from the DL
@@ -1229,6 +1245,7 @@ pub(super) fn walk_into<'a>(
         window_end: None,
         window_parts: (0.0, 0.0, 0.0, 0.0),
         inline: None,
+        repeats: Vec::new(),
         req,
         answer: RankedAnswer::default(),
         verify,
@@ -1250,6 +1267,22 @@ pub(super) fn walk_into<'a>(
     let mut bound_order: Vec<usize> = (0..n).collect();
     bound_order.sort_by_key(|i| walk.terms[walk.sc[*i].term].as_ref().map_or(0, |s| s.df));
     walk.bound_order = bound_order;
+    if let Verify::Span(check) = &walk.verify
+        && let Some(plan) = &check.plan
+    {
+        // A phrase's leaves sit at distinct positions: a word that is
+        // several of them needs a count of at least that many.
+        for i in 0..n {
+            let uses = plan
+                .leaves()
+                .iter()
+                .filter(|slot| check.slots[**slot] == walk.sc[i].term)
+                .count() as u32;
+            if uses > 1 {
+                walk.repeats.push((i, TfBucket::from_count(uses).value()));
+            }
+        }
+    }
     walk.inline = walk.req.iter().copied().find(|t| {
         walk.terms[*t]
             .as_ref()
