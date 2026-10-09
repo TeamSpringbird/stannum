@@ -808,7 +808,7 @@ fn run() -> Result<bool, String> {
                     && term.chars().all(|c| c.is_ascii_lowercase())
                 {
                     i += 1;
-                    if i % v[2] == 0 {
+                    if i.is_multiple_of(v[2]) {
                         println!("{term}	{}", entry.df);
                     }
                 }
