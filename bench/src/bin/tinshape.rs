@@ -496,7 +496,7 @@ fn answer_line(dump: &Dump, rows: &[(f32, segment::Tid)]) -> String {
 
 /// A ranked answer with the walk's candidates scored, windows and windows
 /// pruned.
-type RankedRun = (Vec<(f32, segment::Tid)>, u64, u64, u64);
+type RankedRun = (Vec<(f32, segment::Tid)>, [u64; 5]);
 
 fn ranked(
     segments: &[Segment<'_>],
@@ -507,18 +507,24 @@ fn ranked(
     touch: &mut impl tin::Touch,
 ) -> Result<RankedRun, String> {
     let mut rows = Vec::new();
-    let (mut scored, mut windows, mut pruned) = (0, 0, 0);
+    let mut counts = [0u64; 5];
     for segment in segments {
         let answer =
             tin::top_k(segment, node, names, scorers, k, touch).map_err(|e| e.to_string())?;
         rows.extend(answer.rows);
-        scored += answer.scored;
-        windows += answer.windows;
-        pruned += answer.windows_pruned;
+        for (c, v) in counts.iter_mut().zip([
+            answer.scored,
+            answer.windows,
+            answer.windows_pruned,
+            answer.candidates,
+            answer.position_checks,
+        ]) {
+            *c += v;
+        }
     }
     rows.sort_by(engine::walk::rank);
     rows.truncate(k);
-    Ok((rows, scored, windows, pruned))
+    Ok((rows, counts))
 }
 
 fn replay(args: &Args, dump: &Dump, blobs: &[Vec<u8>]) -> Result<bool, String> {
@@ -548,11 +554,14 @@ fn replay(args: &Args, dump: &Dump, blobs: &[Vec<u8>]) -> Result<bool, String> {
         scored: u64,
         windows: u64,
         pruned: u64,
+        candidates: u64,
+        checks: u64,
     }
     let mut rows: Vec<Row> = Vec::new();
     let (mut same, mut differ, mut unsupported) = (0usize, 0usize, 0usize);
-    let mut per_query =
-        String::from("name\tstyle\tcount_us\tranked_us\tcount_pages\tranked_pages\tscored\n");
+    let mut per_query = String::from(
+        "name\tstyle\tcount_us\tranked_us\tcount_pages\tranked_pages\tscored\tcandidates\tchecks\n",
+    );
     for q in &trace {
         let query = engine.parse(&q.text)?;
         let mut names = Vec::new();
@@ -570,6 +579,8 @@ fn replay(args: &Args, dump: &Dump, blobs: &[Vec<u8>]) -> Result<bool, String> {
             scored: 0,
             windows: 0,
             pruned: 0,
+            candidates: 0,
+            checks: 0,
         };
         // Count: a recorded pass for pages and the answer, then timed ones.
         let mut total = 0u64;
@@ -606,7 +617,7 @@ fn replay(args: &Args, dump: &Dump, blobs: &[Vec<u8>]) -> Result<bool, String> {
                 let _ = segment;
                 row.ranked_pages.touch(Part::Metadata, 0, 1);
             }
-            let (top, scored, windows, pruned) = ranked(
+            let (top, [scored, windows, pruned, candidates, checks]) = ranked(
                 &segments,
                 &node,
                 &names,
@@ -617,6 +628,8 @@ fn replay(args: &Args, dump: &Dump, blobs: &[Vec<u8>]) -> Result<bool, String> {
             row.scored = scored;
             row.windows = windows;
             row.pruned = pruned;
+            row.candidates = candidates;
+            row.checks = checks;
             let mut times = Vec::with_capacity(args.repeat);
             for _ in 0..args.repeat {
                 let start = Instant::now();
@@ -647,14 +660,16 @@ fn replay(args: &Args, dump: &Dump, blobs: &[Vec<u8>]) -> Result<bool, String> {
         }
         let _ = writeln!(
             per_query,
-            "{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}",
+            "{}\t{}\t{:.1}\t{:.1}\t{}\t{}\t{}\t{}\t{}",
             q.name,
             q.style,
             row.count_ns as f64 / 1e3,
             row.ranked_ns as f64 / 1e3,
             row.count_pages.total(),
             row.ranked_pages.total(),
-            row.scored
+            row.scored,
+            row.candidates,
+            row.checks
         );
         rows.push(row);
     }
@@ -730,13 +745,17 @@ fn replay(args: &Args, dump: &Dump, blobs: &[Vec<u8>]) -> Result<bool, String> {
         }
     }
     if args.ranked {
-        println!("\nranked walk per style, summed: candidates scored, windows, windows pruned");
+        println!(
+            "\nranked walk per style, summed: candidates examined, scored exactly, positions checked; windows, windows pruned"
+        );
         for style in &styles {
             let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
             println!(
-                "{:<12} scored {:>10} windows {:>10} pruned {:>10}",
+                "{:<12} examined {:>10} scored {:>10} checked {:>9} windows {:>9} pruned {:>9}",
                 style,
+                of.iter().map(|r| r.candidates).sum::<u64>(),
                 of.iter().map(|r| r.scored).sum::<u64>(),
+                of.iter().map(|r| r.checks).sum::<u64>(),
                 of.iter().map(|r| r.windows).sum::<u64>(),
                 of.iter().map(|r| r.pruned).sum::<u64>()
             );

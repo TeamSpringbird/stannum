@@ -14,17 +14,18 @@
 
 use boldi_vigna::{SpanQuery, SpanSolver};
 use segment::Tid;
-use segment::tf_bucket::TfBucket;
 use segment::tinshape::bits;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::EfCursor;
-use segment::tinshape::postings::{Footer, Form, GroupEntry, KIND_GRID, Postings, for_each_local};
+use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings, for_each_local};
 use segment::tinshape::segment::{Area, Segment};
 use segment::tinshape::varint;
 use segment::{Error, Result};
 use tinql::runtime::{Query, SpanTermSlot};
 
 use crate::bm25::TermScorer;
+
+mod rank;
 
 /// The parts of a segment a query reads, named as TIN's EXPLAIN names its
 /// page touches.
@@ -104,6 +105,56 @@ pub mod kernels {
         }
         #[cfg(not(target_arch = "aarch64"))]
         words.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
+
+    /// Set bits in a byte string (a grid's words, as stored).
+    #[inline]
+    pub fn popcount_bytes(bytes: &[u8]) -> u32 {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is baseline on aarch64; every load is within `bytes`.
+        // Each 16-bit lane gains at most 32 per step, so it cannot overflow
+        // below 2,048 steps (64 KiB; a group's grid is at most 9.3 KiB).
+        unsafe {
+            use core::arch::aarch64::*;
+            let n = bytes.len();
+            let p = bytes.as_ptr();
+            let mut i = 0;
+            let mut total = 0u32;
+            while i + 32 <= n {
+                let mut acc = vdupq_n_u16(0);
+                let end = (i + 32 * 2048).min(n - n % 32);
+                while i < end {
+                    let a = vcntq_u8(vld1q_u8(p.add(i)));
+                    let b = vcntq_u8(vld1q_u8(p.add(i + 16)));
+                    acc = vpadalq_u8(acc, vaddq_u8(a, b));
+                    i += 32;
+                }
+                total += vaddlvq_u16(acc);
+            }
+            while i + 8 <= n {
+                total +=
+                    u64::from_le_bytes(bytes[i..i + 8].try_into().expect("eight")).count_ones();
+                i += 8;
+            }
+            while i < n {
+                total += bytes[i].count_ones();
+                i += 1;
+            }
+            total
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut chunks = bytes.chunks_exact(8);
+            let mut total: u32 = (&mut chunks)
+                .map(|c| u64::from_le_bytes(c.try_into().expect("eight")).count_ones())
+                .sum();
+            total += chunks
+                .remainder()
+                .iter()
+                .map(|b| b.count_ones())
+                .sum::<u32>();
+            total
+        }
     }
 
     /// `out = bytes` read as little-endian words.
@@ -351,6 +402,7 @@ impl<'a> TermSet<'a> {
                 touch.touch(Part::Footer, record_at, postings.footer_at);
             }
             Form::Grouped(entries) => {
+                groups.reserve_exact(entries.len());
                 // The header and the group directory: per-term metadata,
                 // which TIN would count as the postings footer.
                 touch.touch(Part::Footer, record_at, postings.footer_at);
@@ -1314,23 +1366,18 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
 
 // ---- Ranked top-k ----
 
-/// One scoring term of a ranked walk.
-struct Scoring {
-    term: usize,
-    scorer: TermScorer,
-    footer: Footer,
-    /// Per footer block, its score bound.
-    bounds: Vec<f32>,
-    block: usize,
-}
-
 /// A ranked answer and what the walk did.
 #[derive(Debug, Default)]
 pub struct RankedAnswer {
     pub rows: Vec<(f32, Tid)>,
+    /// Candidates scored exactly.
     pub scored: u64,
     pub windows: u64,
     pub windows_pruned: u64,
+    /// Candidates the walk examined (bounded before anything was read for
+    /// them), and those whose positions were checked.
+    pub candidates: u64,
+    pub position_checks: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1360,11 +1407,9 @@ fn below(bound: f64, theta: Option<f32>) -> bool {
 /// pruning; ties by ctid. Matches holding no scoring term score zero.
 ///
 /// A query some terms of which every match holds (a conjunction, a phrase)
-/// is led by the rarest of them; any other by block-max MaxScore over its
-/// scoring terms: the essential terms, those whose bounds with every lower
-/// one's reach the threshold, propose candidates, the others are only
-/// tested. Candidates come in ctid order, so a candidate scoring exactly
-/// the threshold ranks after the `k`-th row and is skipped like a lower one.
+/// is led by the rarest of them; any other is block-max MaxScore over its
+/// scoring terms, a group at a time (see [`rank`]). Candidates come in ctid
+/// order, so one that only ties the threshold ranks after the `k`-th row.
 pub fn top_k(
     segment: &Segment<'_>,
     node: &Node,
@@ -1373,550 +1418,7 @@ pub fn top_k(
     k: usize,
     touch: &mut impl Touch,
 ) -> Result<RankedAnswer> {
-    let mut terms = open_terms(segment, names, touch)?;
-    let geometry = &segment.docs.geometry;
-    let mut answer = RankedAnswer::default();
-    let mut scoring: Vec<Scoring> = Vec::new();
-    for (name, scorer) in scorers {
-        let Some(t) = names.iter().position(|n| n == name) else {
-            continue;
-        };
-        let Some(set) = &terms[t] else { continue };
-        let footer =
-            set.postings
-                .footer(segment.block_size, set.max_bucket, segment.adaptive_tf)?;
-        touch.touch(
-            Part::Footer,
-            set.at + set.postings.footer_at,
-            set.postings.footer.len(),
-        );
-        let bounds: Vec<f32> = (0..footer.blocks())
-            .map(|b| {
-                footer
-                    .frontier_of(b)
-                    .iter()
-                    .map(|(bucket, length)| {
-                        scorer
-                            .bound_through(TfBucket::new(*bucket).expect("a valid bucket"), *length)
-                    })
-                    .fold(0.0_f32, f32::max)
-            })
-            .collect();
-        scoring.push(Scoring {
-            term: t,
-            scorer: scorer.clone(),
-            footer,
-            bounds,
-            block: 0,
-        });
-    }
-    let required = required_terms(node);
-    if required.iter().any(|t| terms[*t].is_none()) {
-        return Ok(answer);
-    }
-    // Leaves only: a candidate holding a scoring term matches a flat OR, and
-    // one holding every required term matches a flat AND.
-    let flat = match node {
-        Node::Or(c) | Node::And(c) => c.iter().all(|c| matches!(c, Node::Term(_))),
-        Node::Term(_) => true,
-        _ => false,
-    };
-    let mut heap: std::collections::BinaryHeap<Entry> =
-        std::collections::BinaryHeap::with_capacity(k + 1);
-    let threshold = |heap: &std::collections::BinaryHeap<Entry>| {
-        (heap.len() >= k)
-            .then(|| heap.peek().map(|e| e.0))
-            .flatten()
-    };
-    let mut positions: Vec<Vec<u32>> = Vec::new();
-    let n = scoring.len();
-    let mut held: Vec<Option<f32>> = vec![None; n];
-    let mut wb = vec![0.0_f32; n];
-    let mut walk = Walk {
-        segment,
-        geometry,
-        node,
-        flat,
-        k,
-        group: std::cell::Cell::new(0),
-    };
-
-    if !required.is_empty() {
-        // Led by the rarest required term; the others probed rarest first.
-        let mut req: Vec<(u32, usize)> = required
-            .iter()
-            .map(|t| (terms[*t].as_ref().expect("checked").df, *t))
-            .collect();
-        req.sort_unstable();
-        let lead = req[0].1;
-        let mut cursor = 0u32;
-        'windows: while let Some(mut slot) = terms[lead]
-            .as_mut()
-            .expect("lead")
-            .seek(geometry, cursor, touch)
-        {
-            let window_end = scoring
-                .iter()
-                .map(|s| block_end(&s.footer, slot))
-                .min()
-                .unwrap_or(u32::MAX);
-            answer.windows += 1;
-            let theta = threshold(&heap);
-            if theta.is_some() {
-                let mut bound = 0.0_f64;
-                for s in scoring.iter_mut() {
-                    bound += f64::from(window_bound(s, slot, window_end));
-                }
-                if below(bound, theta) {
-                    answer.windows_pruned += 1;
-                    if window_end == u32::MAX {
-                        break;
-                    }
-                    cursor = window_end + 1;
-                    continue;
-                }
-            }
-            loop {
-                // Every required term, rarest first; a miss moves the lead.
-                let mut miss = None;
-                for (_, t) in &req[1..] {
-                    let at = terms[*t]
-                        .as_mut()
-                        .expect("required")
-                        .seek(geometry, slot, touch);
-                    if at != Some(slot) {
-                        miss = Some(at);
-                        break;
-                    }
-                }
-                let next_target = match miss {
-                    Some(None) => break 'windows,
-                    Some(Some(at)) => at,
-                    None => {
-                        walk.consider(
-                            &mut terms,
-                            &scoring,
-                            &mut held,
-                            slot,
-                            &mut heap,
-                            &mut positions,
-                            &mut answer,
-                            touch,
-                        )?;
-                        // Nothing scores: every later match ties at zero and
-                        // ranks after the first k.
-                        if n == 0 && heap.len() >= k {
-                            break 'windows;
-                        }
-                        slot + 1
-                    }
-                };
-                if next_target > window_end {
-                    if window_end == u32::MAX {
-                        break 'windows;
-                    }
-                    cursor = next_target;
-                    continue 'windows;
-                }
-                match terms[lead]
-                    .as_mut()
-                    .expect("lead")
-                    .seek(geometry, next_target, touch)
-                {
-                    Some(s) if s <= window_end => slot = s,
-                    Some(s) => {
-                        cursor = s;
-                        continue 'windows;
-                    }
-                    None => break 'windows,
-                }
-                // A raised threshold may now prune the rest of the window.
-                if threshold(&heap) != theta {
-                    cursor = slot;
-                    continue 'windows;
-                }
-            }
-        }
-    } else if n > 0 {
-        // Block-max MaxScore sieved a group at a time. A group whose terms'
-        // block bounds cannot reach the threshold is skipped unread. Else
-        // each term's members there become a bitmap; the essential terms
-        // (whose group bounds, with every lower one's, reach the threshold)
-        // propose candidates 64 slots at a time, and a candidate is bounded
-        // by the bucket of each term it holds at its block's shortest
-        // document before its length is read. A posting's index is its
-        // group's first plus the members before it, counted by words.
-        for set in terms.iter_mut().flatten() {
-            set.ensure_groups(geometry, touch);
-        }
-        let all = geometry.groups.len();
-        let mut present_groups = vec![0u64; all.div_ceil(64)];
-        for sc in &scoring {
-            for g in &terms[sc.term].as_ref().expect("scoring").groups {
-                present_groups[g.index as usize / 64] |= 1 << (g.index % 64);
-            }
-        }
-        let mut hints = vec![0usize; n];
-        let mut entry: Vec<Option<G<'_>>> = vec![None; n];
-        let mut tw: Vec<Vec<u64>> = vec![Vec::new(); n];
-        let mut run = vec![0u32; n];
-        let mut idx = vec![0u32; n];
-        let mut order: Vec<usize> = Vec::with_capacity(n);
-        let mut ub = vec![0.0_f32; n];
-        for (pw, word) in present_groups.iter().enumerate() {
-            let mut word = *word;
-            while word != 0 {
-                let g = (pw * 64) as u32 + word.trailing_zeros();
-                word &= word - 1;
-                let group = geometry.groups[g as usize];
-                let start = group.slot_base;
-                let end = start + group.slots() - 1;
-                let mut theta = threshold(&heap);
-                answer.windows += 1;
-                let mut total = 0.0_f64;
-                for i in 0..n {
-                    let set = terms[scoring[i].term].as_ref().expect("scoring");
-                    entry[i] = set.find(g, &mut hints[i]).copied();
-                    wb[i] = if entry[i].is_some() {
-                        window_bound(&mut scoring[i], start, end)
-                    } else {
-                        0.0
-                    };
-                    total += f64::from(wb[i]);
-                }
-                if below(total, theta) {
-                    answer.windows_pruned += 1;
-                    continue;
-                }
-                order.clear();
-                order.extend((0..n).filter(|i| entry[*i].is_some()));
-                order.sort_unstable_by(|a, b| wb[*a].total_cmp(&wb[*b]));
-                let mut first = 0;
-                let mut rest = 0.0_f64;
-                while first < order.len() && below(rest + f64::from(wb[order[first]]), theta) {
-                    rest += f64::from(wb[order[first]]);
-                    first += 1;
-                }
-                let (non, essential) = order.split_at(first);
-                // The members of every present term, as words.
-                let words = group.words();
-                let width = u32::from(group.width);
-                for &i in non.iter().chain(essential) {
-                    let e = entry[i].expect("present");
-                    let set = terms[scoring[i].term].as_ref().expect("scoring");
-                    let out = &mut tw[i];
-                    out.clear();
-                    out.resize(words, 0);
-                    match e.src {
-                        Src::Container {
-                            entry: ge,
-                            bytes,
-                            at,
-                        } => {
-                            touch.touch(Part::Payload, at, bytes.len());
-                            if ge.kind == KIND_GRID {
-                                kernels::load(out, bytes);
-                            } else {
-                                for_each_local(&ge, bytes, width, |l| {
-                                    out[l as usize / 64] |= 1 << (l % 64)
-                                })?;
-                            }
-                            run[i] = ge.first;
-                        }
-                        Src::Locals { from, to } => {
-                            for l in &set.locals[from as usize..to as usize] {
-                                out[*l as usize / 64] |= 1 << (l % 64);
-                            }
-                            run[i] = from;
-                        }
-                    }
-                }
-                // Each term's word `w` is read alongside the others'.
-                #[allow(clippy::needless_range_loop)]
-                for w in 0..words {
-                    let mut cand = 0u64;
-                    for &i in essential {
-                        cand |= tw[i][w];
-                    }
-                    while cand != 0 {
-                        let bit = cand.trailing_zeros();
-                        cand &= cand - 1;
-                        let below_bit = (1u64 << bit) - 1;
-                        let slot = start + (w * 64) as u32 + bit;
-                        held.iter_mut().for_each(|h| *h = None);
-                        let mut bound = 0.0_f64;
-                        for &i in essential {
-                            let x = tw[i][w];
-                            if x >> bit & 1 == 1 {
-                                idx[i] = run[i] + (x & below_bit).count_ones();
-                                let set = terms[scoring[i].term].as_ref().expect("scoring");
-                                ub[i] = walk.bucket_bound_at(set, &scoring[i], idx[i], touch)?;
-                                held[i] = Some(0.0);
-                                bound += f64::from(ub[i]);
-                            }
-                        }
-                        answer.scored += 1;
-                        let mut left = rest;
-                        let mut pruned = below(bound + left, theta);
-                        if !pruned {
-                            for &i in non.iter().rev() {
-                                let x = tw[i][w];
-                                if x >> bit & 1 == 1 {
-                                    idx[i] = run[i] + (x & below_bit).count_ones();
-                                    let set = terms[scoring[i].term].as_ref().expect("scoring");
-                                    ub[i] =
-                                        walk.bucket_bound_at(set, &scoring[i], idx[i], touch)?;
-                                    held[i] = Some(0.0);
-                                    bound += f64::from(ub[i]);
-                                }
-                                left -= f64::from(wb[i]);
-                                if below(bound + left, theta) {
-                                    pruned = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if pruned {
-                            continue;
-                        }
-                        let mut length = None;
-                        for i in 0..n {
-                            if held[i].is_some() {
-                                let set = terms[scoring[i].term].as_ref().expect("scoring");
-                                held[i] = Some(walk.contribution_at(
-                                    set,
-                                    &scoring[i],
-                                    idx[i],
-                                    slot,
-                                    &mut length,
-                                    touch,
-                                )?);
-                            }
-                        }
-                        walk.admit(&mut terms, &held, slot, &mut heap, &mut positions, touch)?;
-                        theta = threshold(&heap);
-                    }
-                    for &i in non.iter().chain(essential) {
-                        run[i] += tw[i][w].count_ones();
-                    }
-                }
-            }
-        }
-    }
-    // Zero fill: fewer than k rows, the rest are matches of non-scoring
-    // terms in ctid order (a led walk saw every match already).
-    let positive = heap.len();
-    let mut rows: Vec<(f32, Tid)> = heap.into_iter().map(|e| (e.0, e.1)).collect();
-    if positive < k && required.is_empty() {
-        let seen: std::collections::HashSet<Tid> = rows.iter().map(|r| r.1).collect();
-        let fill = first_matches(segment, node, &mut terms, k - positive, &seen, touch)?;
-        rows.extend(fill.into_iter().map(|t| (0.0, t)));
-    }
-    rows.sort_by(crate::walk::rank);
-    rows.truncate(k);
-    answer.rows = rows;
-    Ok(answer)
-}
-
-/// What a walk's candidates share.
-struct Walk<'s, 'a> {
-    segment: &'s Segment<'a>,
-    geometry: &'s Geometry,
-    node: &'s Node,
-    flat: bool,
-    k: usize,
-    /// The group of the last rank asked for.
-    group: std::cell::Cell<usize>,
-}
-
-impl<'a> Walk<'_, 'a> {
-    /// The document rank of `slot`, through the last group asked for.
-    #[inline]
-    fn rank(&self, slot: u32) -> Option<u32> {
-        let groups = &self.geometry.groups;
-        let mut g = self.group.get();
-        let within = |g: usize| {
-            groups[g].slot_base <= slot && slot < groups[g].slot_base + groups[g].slots()
-        };
-        if g >= groups.len() || !within(g) {
-            g = self.geometry.group_of_slot(slot);
-            self.group.set(g);
-        }
-        self.segment.docs.rank_in(g, slot - groups[g].slot_base)
-    }
-
-    /// A held term's score for the candidate at `slot`, its bucket from the
-    /// TF tail and its length from the DL sidecar (read once).
-    #[inline]
-    fn contribution(
-        &self,
-        set: &TermSet<'a>,
-        s: &Scoring,
-        slot: u32,
-        length: &mut Option<u32>,
-        touch: &mut impl Touch,
-    ) -> Result<f32> {
-        let index = set.index();
-        let bucket = s.footer.bucket(set.postings.tf, index)?;
-        if s.footer.single.is_none() {
-            let block = (index / s.footer.block_size) as usize;
-            touch.touch(
-                Part::TfTail,
-                set.at + set.postings.tf_at + s.footer.tf_at[block] as usize,
-                1,
-            );
-        }
-        let length = match *length {
-            Some(l) => l,
-            None => {
-                let rank = self
-                    .rank(slot)
-                    .ok_or(Error::Corrupt("a posting without a document"))?;
-                touch.touch(Part::DlSidecar, self.segment.length_at(rank), 2);
-                let l = self.segment.lengths.get(rank)?;
-                *length = Some(l);
-                l
-            }
-        };
-        Ok(s.scorer
-            .score_bucket(TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?, length))
-    }
-
-    /// [`Self::bucket_bound`] of posting `index`.
-    #[inline]
-    fn bucket_bound_at(
-        &self,
-        set: &TermSet<'a>,
-        s: &Scoring,
-        index: u32,
-        touch: &mut impl Touch,
-    ) -> Result<f32> {
-        let bucket = s.footer.bucket(set.postings.tf, index)?;
-        let block = if s.footer.single.is_some() {
-            0
-        } else {
-            (index / s.footer.block_size) as usize
-        };
-        if s.footer.single.is_none() {
-            touch.touch(
-                Part::TfTail,
-                set.at + set.postings.tf_at + s.footer.tf_at[block] as usize,
-                1,
-            );
-        }
-        let shortest = s.footer.frontier_of(block)[0].1;
-        Ok(s.scorer.bound_through(
-            TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?,
-            shortest,
-        ))
-    }
-
-    /// [`Self::contribution`] of posting `index`.
-    #[inline]
-    fn contribution_at(
-        &self,
-        set: &TermSet<'a>,
-        s: &Scoring,
-        index: u32,
-        slot: u32,
-        length: &mut Option<u32>,
-        touch: &mut impl Touch,
-    ) -> Result<f32> {
-        let bucket = s.footer.bucket(set.postings.tf, index)?;
-        let length = match *length {
-            Some(l) => l,
-            None => {
-                let rank = self
-                    .rank(slot)
-                    .ok_or(Error::Corrupt("a posting without a document"))?;
-                touch.touch(Part::DlSidecar, self.segment.length_at(rank), 2);
-                let l = self.segment.lengths.get(rank)?;
-                *length = Some(l);
-                l
-            }
-        };
-        Ok(s.scorer
-            .score_bucket(TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?, length))
-    }
-
-    /// Scores a led candidate holding every required term.
-    #[allow(clippy::too_many_arguments)]
-    fn consider(
-        &mut self,
-        terms: &mut [Option<TermSet<'a>>],
-        scoring: &[Scoring],
-        held: &mut [Option<f32>],
-        slot: u32,
-        heap: &mut std::collections::BinaryHeap<Entry>,
-        positions: &mut Vec<Vec<u32>>,
-        answer: &mut RankedAnswer,
-        touch: &mut impl Touch,
-    ) -> Result<()> {
-        answer.scored += 1;
-        let mut length = None;
-        for (i, s) in scoring.iter().enumerate() {
-            let set = terms[s.term].as_mut().expect("scoring");
-            held[i] = if set.seek(self.geometry, slot, touch) == Some(slot) {
-                Some(self.contribution(set, s, slot, &mut length, touch)?)
-            } else {
-                None
-            };
-        }
-        self.admit(terms, held, slot, heap, positions, touch)
-    }
-
-    /// Adds the candidate at `slot` to the top k if its score, summed in
-    /// the scorer's order, beats the threshold and it matches the query.
-    fn admit(
-        &mut self,
-        terms: &mut [Option<TermSet<'a>>],
-        held: &[Option<f32>],
-        slot: u32,
-        heap: &mut std::collections::BinaryHeap<Entry>,
-        positions: &mut Vec<Vec<u32>>,
-        touch: &mut impl Touch,
-    ) -> Result<()> {
-        let mut total = 0.0_f32;
-        for c in held.iter().flatten() {
-            total += c;
-        }
-        let full = heap.len() >= self.k;
-        if full && heap.peek().is_some_and(|worst| total <= worst.0) {
-            return Ok(());
-        }
-        if !self.flat && !matches(self.segment, self.node, terms, slot, positions, touch)? {
-            return Ok(());
-        }
-        heap.push(Entry(total, self.geometry.tid_of(slot)));
-        if heap.len() > self.k {
-            heap.pop();
-        }
-        Ok(())
-    }
-}
-
-/// The last slot of the footer block holding `slot`, or before it.
-fn block_end(footer: &Footer, slot: u32) -> u32 {
-    let b = footer.last.partition_point(|l| *l < slot);
-    footer.last.get(b).copied().unwrap_or(u32::MAX)
-}
-
-/// The best bound of `s`'s blocks overlapping `from..=to`.
-fn window_bound(s: &mut Scoring, from: u32, to: u32) -> f32 {
-    let last = &s.footer.last;
-    while s.block < last.len() && last[s.block] < from {
-        s.block += 1;
-    }
-    let mut bound = 0.0_f32;
-    let mut b = s.block;
-    while b < last.len() {
-        bound = bound.max(s.bounds[b]);
-        if last[b] >= to {
-            break;
-        }
-        b += 1;
-    }
-    bound
+    rank::top_k(segment, node, names, scorers, k, touch)
 }
 
 /// Terms every match holds.
@@ -2048,6 +1550,7 @@ mod tests {
     use crate::bm25::Bm25Params;
     use proptest::prelude::*;
     use segment::payload::PayloadBuilder;
+    use segment::tf_bucket::TfBucket;
     use segment::tinshape::postings::Options;
     use segment::tinshape::segment::Builder;
 
@@ -2090,7 +1593,20 @@ mod tests {
             Node::And(c) => c.iter().all(|c| eval(c, members, rank)),
             Node::Or(c) => c.iter().any(|c| eval(c, members, rank)),
             Node::Not(inner) => !eval(inner, members, rank),
-            Node::Span { .. } => unreachable!(),
+            // Term `t` of a document holding it `tf` times is at positions
+            // `0..tf` (see `build`).
+            Node::Span { slots, query } => {
+                let positions: Vec<Vec<u32>> = slots
+                    .iter()
+                    .map(|t| holds(members, *t, rank).map_or_else(Vec::new, |tf| (0..tf).collect()))
+                    .collect();
+                !positions.iter().any(Vec::is_empty)
+                    && SpanSolver::new(query)
+                        .unwrap()
+                        .intervals(&positions)
+                        .next()
+                        .is_some()
+            }
         }
     }
 
@@ -2105,6 +1621,21 @@ mod tests {
             And(vec![Or(vec![Term(1), Term(2)]), Not(Box::new(Term(3)))]),
             Or(vec![And(vec![Term(0), Term(1)]), Term(3)]),
             Not(Box::new(Term(0))),
+            Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+            Span {
+                slots: vec![2, 0, 2],
+                query: SpanQuery::phrase([0, 1, 2]),
+            },
+            And(vec![
+                Span {
+                    slots: vec![1, 3],
+                    query: SpanQuery::phrase([0, 1]),
+                },
+                Term(0),
+            ]),
         ]
     }
 

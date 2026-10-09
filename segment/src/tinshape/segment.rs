@@ -26,7 +26,7 @@
 //! sidecar, and a phrase adds positions.
 
 use super::docs::{self, DocSet, Geometry, Lengths, Liveness};
-use super::postings::{self, Options, Postings, Stats};
+use super::postings::{self, Footer, Options, Postings, Stats};
 use crate::dictionary::{
     Blocks, Dictionary, DictionaryBuilder, DictionaryIndex, Extent, TermEntry,
 };
@@ -255,10 +255,36 @@ pub struct Segment<'a> {
     pub liveness: Liveness,
     /// Dictionary lookups answered so far, as a reader's memo keeps them.
     memo: std::cell::RefCell<rustc_hash::FxHashMap<String, Option<TermEntry>>>,
+    /// Records parsed and footers decoded so far, by the record's offset,
+    /// as a reader's caches keep them (STN3's walk keeps its terms' decoded
+    /// bounds the same way); emptied past [`PARSED_BUDGET`] bytes.
+    parsed: std::cell::RefCell<Parsed<'a>>,
 }
 
 /// Lookups a memo holds before it is emptied.
 const MEMO_LIMIT: usize = 4096;
+
+/// Bytes of parsed records and footers a segment keeps.
+const PARSED_BUDGET: usize = 16 << 20;
+
+#[derive(Default)]
+struct Parsed<'a> {
+    bytes: usize,
+    records: rustc_hash::FxHashMap<usize, Postings<'a>>,
+    footers: rustc_hash::FxHashMap<usize, std::rc::Rc<Footer>>,
+}
+
+impl Parsed<'_> {
+    /// Makes room for `bytes` more.
+    fn room(&mut self, bytes: usize) {
+        if self.bytes + bytes > PARSED_BUDGET {
+            self.records.clear();
+            self.footers.clear();
+            self.bytes = 0;
+        }
+        self.bytes += bytes;
+    }
+}
 
 /// A term found in a segment.
 #[derive(Clone, Debug)]
@@ -318,6 +344,7 @@ impl<'a> Segment<'a> {
             lengths,
             liveness,
             memo: Default::default(),
+            parsed: Default::default(),
         })
     }
 
@@ -361,10 +388,55 @@ impl<'a> Segment<'a> {
         memo.insert(term.to_owned(), entry);
     }
 
+    /// [`Self::resolve`] through the memo of records parsed earlier.
+    pub fn resolve_memo(&self, entry: TermEntry) -> Result<Term<'a>> {
+        let from = usize::try_from(entry.ordinals.offset).map_err(|_| Error::Truncated)?;
+        let at = self.area_at(Area::Postings) + from;
+        if let Some(postings) = self.parsed.borrow().records.get(&at) {
+            return Ok(Term {
+                entry,
+                at,
+                postings: postings.clone(),
+            });
+        }
+        let term = self.resolve(entry)?;
+        let bytes = match &term.postings.form {
+            postings::Form::Grouped(entries) => {
+                entries.len() * std::mem::size_of::<postings::GroupEntry>()
+            }
+            _ => 0,
+        } + 64;
+        let mut parsed = self.parsed.borrow_mut();
+        parsed.room(bytes);
+        parsed.records.insert(at, term.postings.clone());
+        Ok(term)
+    }
+
+    /// The footer of the record at blob offset `at` (`postings`, of a term
+    /// whose largest bucket is `max_bucket`) decoded, through the memo of
+    /// footers decoded earlier.
+    pub fn footer_memo(
+        &self,
+        at: usize,
+        postings: &Postings<'a>,
+        max_bucket: u8,
+    ) -> Result<std::rc::Rc<Footer>> {
+        if let Some(footer) = self.parsed.borrow().footers.get(&at) {
+            return Ok(footer.clone());
+        }
+        let footer =
+            std::rc::Rc::new(postings.footer(self.block_size, max_bucket, self.adaptive_tf)?);
+        let bytes = footer.blocks() * 24 + footer.frontier.len() * 8 + 64;
+        let mut parsed = self.parsed.borrow_mut();
+        parsed.room(bytes);
+        parsed.footers.insert(at, footer.clone());
+        Ok(footer)
+    }
+
     /// [`Self::term`] through the memo of earlier lookups.
     pub fn term_memo(&self, term: &str) -> Result<Option<Term<'a>>> {
         if let Some(entry) = self.memo.borrow().get(term) {
-            return entry.map(|entry| self.resolve(entry)).transpose();
+            return entry.map(|entry| self.resolve_memo(entry)).transpose();
         }
         let entry = self.dictionary().get(term)?;
         let mut memo = self.memo.borrow_mut();
@@ -373,7 +445,7 @@ impl<'a> Segment<'a> {
         }
         memo.insert(term.to_owned(), entry);
         drop(memo);
-        entry.map(|entry| self.resolve(entry)).transpose()
+        entry.map(|entry| self.resolve_memo(entry)).transpose()
     }
 
     pub fn term(&self, term: &str) -> Result<Option<Term<'a>>> {
