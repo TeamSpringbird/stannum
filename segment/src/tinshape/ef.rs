@@ -221,6 +221,53 @@ impl EfCursor<'_> {
         self.index
     }
 
+    /// Calls `visit` with the current value and each after it below `end`,
+    /// and stops at the first at or past it: [`Self::advance`] in one loop,
+    /// the highs word and the lows read in place.
+    #[inline]
+    pub fn drain_below(&mut self, end: u32, mut visit: impl FnMut(u32)) {
+        let Some(mut value) = self.current else {
+            return;
+        };
+        let (highs, lows, low, n) = (self.ef.highs, self.ef.lows, self.ef.low, self.ef.n);
+        let total = highs.len() * 8;
+        let mut index = self.index;
+        let mut bit = self.bit;
+        while value < end {
+            visit(value);
+            index += 1;
+            if index >= n {
+                self.index = n;
+                self.bit = bit + 1;
+                self.current = None;
+                return;
+            }
+            let mut at = bit + 1;
+            let mut word = if at < total {
+                bits::word(highs, at / 64) >> (at % 64)
+            } else {
+                0
+            };
+            while word == 0 {
+                at = (at / 64 + 1) * 64;
+                if at >= total {
+                    self.index = index;
+                    self.bit = at;
+                    self.current = None;
+                    return;
+                }
+                word = bits::word(highs, at / 64);
+            }
+            at += word.trailing_zeros() as usize;
+            bit = at;
+            let high = (at - index) as u32;
+            value = high << low | bits::get(lows, index, low).unwrap_or(0);
+        }
+        self.index = index;
+        self.bit = bit;
+        self.current = Some(value);
+    }
+
     pub fn advance(&mut self) {
         if self.current.is_none() {
             return;
@@ -325,6 +372,24 @@ mod tests {
         // 1,000 values in a universe of 1,000,000: l = 9, about 11 bits each.
         let len = encoded_len(1000, 1_000_000);
         assert!(len * 8 <= 1000 * 12, "{len}");
+    }
+
+    #[test]
+    fn drains_runs() {
+        let values: Vec<u32> = (0..3000u32).map(|i| i * 7 + i % 5).collect();
+        let mut out = Vec::new();
+        encode(&values, 30_000, &mut out);
+        let ef = Ef::parse(&out, values.len(), 30_000).unwrap();
+        let mut cursor = ef.cursor();
+        let mut seen = Vec::new();
+        for end in [0, 1, 50, 51, 999, 10_000, 20_996, 21_005, 30_000] {
+            cursor.drain_below(end, |v| seen.push(v));
+            let rank = cursor.rank();
+            assert_eq!(seen.len(), rank);
+            assert_eq!(cursor.current(), values.get(rank).copied());
+            assert!(cursor.current().is_none_or(|c| c >= end));
+        }
+        assert_eq!(seen, values);
     }
 
     proptest! {

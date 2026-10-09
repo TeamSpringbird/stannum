@@ -334,12 +334,8 @@ fn load<'a>(
         }
         mem.first = cursor.rank() as u32;
         let end = group.slot_base + group.slots();
-        while let Some(slot) = cursor.current()
-            && slot < end
-        {
-            mem.list.push(slot - group.slot_base);
-            cursor.advance();
-        }
+        let list = &mut mem.list;
+        cursor.drain_below(end, |slot| list.push(slot - group.slot_base));
         mem.count = mem.list.len() as u32;
         return Ok(());
     }
@@ -1209,13 +1205,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             cursor.seek(group.slot_base);
             r.first = cursor.rank() as u32;
             let end = group.slot_base + group.slots();
-            while let Some(slot) = cursor.current()
-                && slot < end
-            {
+            cursor.drain_below(end, |slot| {
                 let l = slot - group.slot_base;
                 row[l as usize / 64] |= 1 << (l % 64);
-                cursor.advance();
-            }
+            });
             return Ok(());
         }
         let entry = set
