@@ -188,6 +188,14 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"stannum.share_buffer_hints",
+        c"Find the shared buffer an index page was last pinned in through a table every backend shares",
+        c"Off keeps a table per backend, for comparison.",
+        &crate::storage::SHARE_BUFFER_HINTS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"stannum.count_fold",
         c"Count Boolean term queries by folding document-ordinal streams",
         c"Off keeps the scalar and page-bitmap strategies; other query shapes always use those.",

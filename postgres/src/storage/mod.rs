@@ -1006,9 +1006,12 @@ thread_local! {
     static SCAN_PINS: Cell<i64> = const { Cell::new(0) };
     static SCAN_RECENT: Cell<i64> = const { Cell::new(0) };
     /// Per backend, the buffer a block was last pinned in (see
-    /// [`pin_block`]), direct-mapped by block and relation.
+    /// [`pin_block`]), direct-mapped by block and relation: used where the
+    /// shared table ([`shared_hints`]) is off or could not be had.
     static RECENT_BUFFERS: RefCell<Box<[RecentBuffer]>> =
         RefCell::new(vec![RecentBuffer::default(); RECENT_BUFFERS_LEN].into_boxed_slice());
+    /// This backend's mapping of the shared hint table, once attached.
+    static SHARED_HINTS: Cell<SharedHints> = const { Cell::new(SharedHints::Unknown) };
 }
 
 /// Entries of [`RECENT_BUFFERS`], 2 MiB per backend. A pass over the 60
@@ -1025,38 +1028,221 @@ struct RecentBuffer {
     buffer: pg_sys::Buffer,
 }
 
+/// `stannum.share_buffer_hints`: whether [`pin_block`] finds the buffer a
+/// page was last pinned in through the table every backend shares
+/// ([`shared_hints`]); off, through a table of the backend's own.
+pub static SHARE_BUFFER_HINTS: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+
+/// The shared hint table as this backend has it.
+#[derive(Clone, Copy)]
+enum SharedHints {
+    /// Not asked for yet.
+    Unknown,
+    /// Could not be had (no postmaster, a parallel worker, or no dynamic
+    /// shared memory to spare): the backend's own table serves.
+    Unavailable,
+    /// Mapped: `len` entries (a power of two) at `entries`.
+    Attached {
+        entries: *const std::sync::atomic::AtomicU64,
+        len: usize,
+    },
+}
+
+/// Name of the dynamic shared memory segment holding the hint table.
+const SHARED_HINTS_NAME: &std::ffi::CStr = c"stannum buffer hints";
+
+/// The table, shared by every backend of the server, of the buffer each
+/// index page was last pinned in: 8 bytes an entry, the block number above
+/// the buffer number, in buckets of two by block and relation, as many
+/// entries as shared buffers (rounded up to a power of two; 32 MB for 24 GB
+/// of shared buffers). A backend pins most pages of a query for the first
+/// time (at 150M rows only a third to a half of a query's pins found a
+/// buffer in the backend's own table), and other backends have pinned most
+/// of them. An entry is a hint: `ReadRecentBuffer` checks the buffer's tag,
+/// so a torn bucket, a buffer since given to another page or an entry of
+/// another relation with the same block number only costs the lookup the
+/// hint would have saved. Created on first use in a named dynamic shared
+/// memory segment (PostgreSQL 17's registry), so it needs no
+/// `shared_preload_libraries`; `None` where it cannot be had.
+///
+/// # Safety
+///
+/// Called inside a transaction, from a backend's main thread.
+unsafe fn shared_hints() -> Option<&'static [std::sync::atomic::AtomicU64]> {
+    match SHARED_HINTS.get() {
+        SharedHints::Attached { entries, len } => {
+            // SAFETY: the segment stays mapped for the backend's life
+            // (the registry pins the mapping) and holds `len` entries.
+            return Some(unsafe { std::slice::from_raw_parts(entries, len) });
+        }
+        SharedHints::Unavailable => return None,
+        SharedHints::Unknown => {}
+    }
+    // Asked once: a failure below must not be retried per pin.
+    SHARED_HINTS.set(SharedHints::Unavailable);
+    // SAFETY: plain reads of the backend's globals; the attach runs in a
+    // subtransaction of its own, so an error creating the segment (no room
+    // in /dev/shm, no free slot) rolls back what it took, such as the
+    // registry's lock, and leaves the query to go on without the table.
+    unsafe {
+        if !pg_sys::IsUnderPostmaster || pg_sys::IsInParallelMode() {
+            return None;
+        }
+        let len = (pg_sys::NBuffers.max(1) as usize)
+            .next_power_of_two()
+            .max(1 << 14);
+        let memory = pg_sys::CurrentMemoryContext;
+        let owner = pg_sys::CurrentResourceOwner;
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        let attached = pgrx::PgTryBuilder::new(|| {
+            let mut found = false;
+            let at = pg_sys::GetNamedDSMSegment(
+                SHARED_HINTS_NAME.as_ptr(),
+                len * 8,
+                Some(zero_hints),
+                &raw mut found,
+            );
+            pg_sys::ReleaseCurrentSubTransaction();
+            Some(at)
+        })
+        .catch_others(|_| {
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            None
+        })
+        .execute();
+        pg_sys::MemoryContextSwitchTo(memory);
+        pg_sys::CurrentResourceOwner = owner;
+        let at = attached.filter(|at| !at.is_null())?;
+        let entries = at.cast::<std::sync::atomic::AtomicU64>().cast_const();
+        SHARED_HINTS.set(SharedHints::Attached { entries, len });
+        Some(std::slice::from_raw_parts(entries, len))
+    }
+}
+
+/// Zeroes a new hint table (no entry names a buffer).
+unsafe extern "C-unwind" fn zero_hints(at: *mut std::ffi::c_void) {
+    // SAFETY: the registry passes the new segment, sized as requested; its
+    // size is recomputed as `shared_hints` computed it (NBuffers is fixed
+    // for the server's life).
+    unsafe {
+        let len = (pg_sys::NBuffers.max(1) as usize)
+            .next_power_of_two()
+            .max(1 << 14);
+        std::ptr::write_bytes(at.cast::<u8>(), 0, len * 8);
+    }
+}
+
+/// Where block `block` of the relation numbered `relation` is hinted: an
+/// entry of the backend's table, or the first of a bucket of the shared one.
+#[inline]
+fn hint_slot(relation: u32, block: pg_sys::BlockNumber) -> usize {
+    block as usize ^ (relation as usize).wrapping_mul(0x9e37_79b9)
+}
+
+/// Raises the usage count of shared buffer `buffer`, pinned by this
+/// backend, as `ReadBuffer` does on every pin and `ReadRecentBuffer` does
+/// not: the clock sweep evicts the buffers whose count has fallen to zero,
+/// and an index whose pages are pinned through hints would otherwise look
+/// unused next to the heap pages read by `ReadBuffer`. Skipped while the
+/// buffer header is locked (someone is changing it; the count is advisory).
+///
+/// # Safety
+///
+/// `buffer` is a shared buffer this backend holds pinned.
+#[inline]
+unsafe fn count_use(buffer: pg_sys::Buffer) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // SAFETY: a pinned shared buffer's descriptor lies at its index in the
+    // descriptor array; its state is a 32-bit atomic that PostgreSQL
+    // updates by compare-and-swap whenever the header is not locked, as
+    // `PinBuffer` does to raise the count.
+    unsafe {
+        let desc = pg_sys::BufferDescriptors.add(buffer as usize - 1);
+        let state = &*std::ptr::addr_of!((*desc).bufferdesc.state.value).cast::<AtomicU32>();
+        let mut old = state.load(Ordering::Relaxed);
+        while old & pg_sys::BM_LOCKED == 0
+            && (old & pg_sys::BUF_USAGECOUNT_MASK) >> pg_sys::BUF_USAGECOUNT_SHIFT
+                < pg_sys::BM_MAX_USAGE_COUNT
+        {
+            match state.compare_exchange_weak(
+                old,
+                old + pg_sys::BUF_USAGECOUNT_ONE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => old = now,
+            }
+        }
+    }
+}
+
 /// Pins block `block` of `index`: through the buffer it was last pinned
-/// in while that buffer still holds it, which skips the buffer mapping
-/// table's partition lock and hash lookup, else through `ReadBuffer`. A
-/// walk pins a page per chunk it loads, most of them pinned by an earlier
-/// query of the backend.
+/// in (by any backend, see [`shared_hints`]) while that buffer still holds
+/// it, which skips the buffer mapping table's partition lock and hash
+/// lookup, else through `ReadBuffer`. A walk pins a page per chunk it
+/// loads, most of them pinned by an earlier query.
 ///
 /// # Safety
 ///
 /// `index` is a live index relation held open by the caller.
 unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_sys::Buffer {
+    use std::sync::atomic::Ordering;
     // SAFETY: per the contract. `ReadRecentBuffer` checks the buffer's tag
     // under its header lock before pinning it, so a remembered buffer since
     // given to another page is refused rather than pinned.
     unsafe {
         let locator = (*index).rd_locator;
-        let at = (block as usize ^ (locator.relNumber.to_u32() as usize).wrapping_mul(0x9e37_79b9))
-            & (RECENT_BUFFERS_LEN - 1);
-        let recent = RECENT_BUFFERS.with_borrow(|recent| recent[at]);
-        if recent.buffer > 0
-            && recent.block == block
-            && pg_sys::ReadRecentBuffer(
-                locator,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-                block,
-                recent.buffer,
-            )
+        let slot = hint_slot(locator.relNumber.to_u32(), block);
+        let recent = |buffer: pg_sys::Buffer| {
+            buffer > 0
+                && pg_sys::ReadRecentBuffer(
+                    locator,
+                    pg_sys::ForkNumber::MAIN_FORKNUM,
+                    block,
+                    buffer,
+                )
+        };
+        if SHARE_BUFFER_HINTS.get()
+            && let Some(table) = shared_hints()
         {
+            let bucket = slot & (table.len() - 1) & !1;
+            let first = table[bucket].load(Ordering::Relaxed);
+            let second = table[bucket + 1].load(Ordering::Relaxed);
+            for entry in [first, second] {
+                if (entry >> 32) as u32 == block {
+                    let buffer = entry as u32 as pg_sys::Buffer;
+                    if recent(buffer) {
+                        count_use(buffer);
+                        SCAN_RECENT.set(SCAN_RECENT.get() + 1);
+                        return buffer;
+                    }
+                    break;
+                }
+            }
+            let buffer = pg_sys::ReadBuffer(index, block);
+            // Local buffers (a temporary index) are left to `ReadBuffer`.
+            if buffer > 0 {
+                // Newest first; the entry it displaces moves second, unless
+                // it was this block's (a stale hint).
+                if first != 0 && (first >> 32) as u32 != block {
+                    table[bucket + 1].store(first, Ordering::Relaxed);
+                }
+                table[bucket].store(
+                    (u64::from(block) << 32) | u64::from(buffer as u32),
+                    Ordering::Relaxed,
+                );
+            }
+            return buffer;
+        }
+        let at = slot & (RECENT_BUFFERS_LEN - 1);
+        let hint = RECENT_BUFFERS.with_borrow(|recent| recent[at]);
+        if hint.block == block && recent(hint.buffer) {
+            count_use(hint.buffer);
             SCAN_RECENT.set(SCAN_RECENT.get() + 1);
-            return recent.buffer;
+            return hint.buffer;
         }
         let buffer = pg_sys::ReadBuffer(index, block);
-        // Local buffers (a temporary index) are left to `ReadBuffer`.
         if buffer > 0 {
             RECENT_BUFFERS.with_borrow_mut(|recent| recent[at] = RecentBuffer { block, buffer });
         }
@@ -5202,6 +5388,50 @@ pub mod testing {
                     .filter(|((id, _), cached)| *id == identity && cached.dead.is_some())
                     .count()
             }),
+        }
+    }
+
+    /// Forgets the buffers this backend pinned pages in, in its own hint
+    /// table, as a backend that never pinned them knows nothing of them.
+    pub fn forget_recent_buffers() {
+        RECENT_BUFFERS.with_borrow_mut(|recent| recent.fill(RecentBuffer::default()));
+    }
+
+    /// Pins a block of index `oid` whose buffer's usage count is below the
+    /// most, then pins it `pins` more times through its hint; the usage
+    /// count after the first pin and after the last.
+    ///
+    /// # Safety
+    /// `oid` is a Stannum index.
+    pub unsafe fn usage_through_hints(oid: pg_sys::Oid, pins: usize) -> (u32, u32) {
+        unsafe {
+            let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let usage = |buffer: pg_sys::Buffer| {
+                let desc = pg_sys::BufferDescriptors.add(buffer as usize - 1);
+                let state =
+                    std::ptr::read_volatile(std::ptr::addr_of!((*desc).bufferdesc.state.value));
+                (state & pg_sys::BUF_USAGECOUNT_MASK) >> pg_sys::BUF_USAGECOUNT_SHIFT
+            };
+            let blocks =
+                pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
+            let mut found = (pg_sys::BM_MAX_USAGE_COUNT, pg_sys::BM_MAX_USAGE_COUNT);
+            for block in 1..blocks {
+                let buffer = pin_block(index, block);
+                let before = usage(buffer);
+                pg_sys::ReleaseBuffer(buffer);
+                if before >= pg_sys::BM_MAX_USAGE_COUNT {
+                    continue;
+                }
+                let mut last = buffer;
+                for _ in 0..pins {
+                    last = pin_block(index, block);
+                    pg_sys::ReleaseBuffer(last);
+                }
+                found = (before, usage(last));
+                break;
+            }
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            found
         }
     }
 

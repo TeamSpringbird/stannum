@@ -8117,6 +8117,127 @@ mod tests {
         assert_eq!(native_loaded(), 0);
     }
 
+    /// A table of 20,000 rows indexed as `hints_idx` (immutable segments),
+    /// and its ranked answers to a few queries, as ids.
+    fn buffer_hint_fixture() -> impl Fn() -> Vec<Vec<i32>> {
+        Spi::run(
+            "CREATE TABLE hints(id int primary key, body text);
+             INSERT INTO hints
+             SELECT n, repeat('alpha beta ', 1 + n % 37) || repeat('pad ', n % 101)
+                       || 'w' || n || ' v' || (n % 97)
+             FROM generate_series(1, 20000) n;
+             CREATE INDEX hints_idx ON hints USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        || {
+            ["alpha AND v5", "alpha OR v5", "\"alpha beta\" v7"]
+                .iter()
+                .map(|q| {
+                    Spi::connect(|client| {
+                        client
+                            .select(
+                                &format!(
+                                    "SELECT id FROM hints WHERE body ==> '{q}'
+                                     ORDER BY stannum.score(ctid) DESC LIMIT 10"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap()
+                            .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                            .collect::<Vec<i32>>()
+                    })
+                })
+                .collect()
+        }
+    }
+
+    #[pg_test]
+    fn a_backend_pins_pages_other_backends_pinned_through_their_buffers() {
+        // At 150M rows a backend found a third to a half of the pages it
+        // pinned in the buffer it had last pinned them in; the rest, pages
+        // it had not pinned before (other backends had) or whose entry in
+        // its own table another page had taken, went through the buffer
+        // mapping table's hash and partition lock. Where a page was last
+        // pinned is shared by every backend, so a backend that never read
+        // a page still pins it through its buffer.
+        use crate::storage::testing::{clear_reader_caches, forget_recent_buffers};
+        let ranked = buffer_hint_fixture();
+        let first = ranked();
+        // This backend forgets which buffers it pinned pages in, as one
+        // that never ran these queries knows nothing of them.
+        forget_recent_buffers();
+        clear_reader_caches();
+        Spi::run("SET LOCAL stannum.share_buffer_hints = off").unwrap();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(pins > 0, "the last query pinned no page");
+        // (A page the query pins again, in another span, it pins through
+        // the buffer it pinned it in moments before.)
+        assert!(
+            recent * 4 < pins,
+            "{recent} of {pins} forgotten pages pinned through their buffer"
+        );
+        forget_recent_buffers();
+        clear_reader_caches();
+        Spi::run("SET LOCAL stannum.share_buffer_hints = on").unwrap();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(pins > 0, "the last query pinned no page");
+        assert!(
+            recent * 10 >= pins * 9,
+            "{recent} of {pins} pages pinned through the buffer they were last pinned in"
+        );
+    }
+
+    #[pg_test]
+    fn a_buffer_hint_left_by_a_rebuilt_index_pins_nothing_of_it() {
+        // A hint names a buffer, not a page: once the index is rebuilt in a
+        // new file its blocks are new pages, and a hint left by the old
+        // file's pages must be refused (ReadRecentBuffer checks the tag).
+        let ranked = buffer_hint_fixture();
+        let first = ranked();
+        Spi::run("REINDEX INDEX hints_idx").unwrap();
+        crate::storage::testing::forget_recent_buffers();
+        crate::storage::testing::clear_reader_caches();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(pins > 0, "the last query pinned no page");
+        // Only the pages it pins a second time, in another span.
+        assert!(
+            recent * 4 < pins,
+            "{recent} of {pins} pages of the rebuilt index pinned through old hints"
+        );
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(
+            recent * 10 >= pins * 9,
+            "{recent} of {pins} pinned through hints"
+        );
+    }
+
+    #[pg_test]
+    fn a_page_pinned_through_its_buffer_counts_as_used() {
+        // `ReadRecentBuffer` pins without raising the buffer's usage count,
+        // which `ReadBuffer` raises (up to 5) on every pin: with nearly all
+        // of an index's pins taken through hints, its pages would look
+        // unused to the clock sweep and be evicted before the heap's.
+        let _ = buffer_hint_fixture();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'hints_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let (before, after) = unsafe { crate::storage::testing::usage_through_hints(oid, 6) };
+        assert!(
+            before < 5,
+            "no block of the index had a usage count below 5"
+        );
+        assert_eq!(
+            after, 5,
+            "usage count {before} became {after} after six pins"
+        );
+    }
+
     #[pg_test]
     fn a_backend_holds_dead_documents_in_about_a_bit_per_document() {
         // VACUUM publishes a dead list per segment, and every backend that
