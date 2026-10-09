@@ -1136,6 +1136,12 @@ struct ScanExec {
     /// exhaustive ranking, not block-max traversal or score projection.
     exhaustive_score_calls: usize,
     top_k_completions: usize,
+    /// The scan's qual when a walk may apply it (see [`complete`]).
+    row_filter: Option<crate::score::RowFilter>,
+    /// The k of the last walk that applied it, if one has.
+    filtered_k: Option<usize>,
+    /// Walks that applied it, cumulative across rescans.
+    filtered_walks: usize,
     fetched: usize,
     skipped_pages: usize,
     page_masks: Option<bool>,
@@ -1257,6 +1263,18 @@ unsafe extern "C-unwind" fn begin_scan(
         let runtime_limit = pg_sys::ExecInitExpr(expression(1), node.cast());
         let runtime_offset = pg_sys::ExecInitExpr(expression(2), node.cast());
         let ordered = private.ordering.is_some();
+        // A volatile qual, or one running subplans per row, is evaluated only
+        // as the executor does, once per row returned.
+        let qual = (*cscan).scan.plan.qual.cast::<pg_sys::Node>();
+        let row_filter = (ordered
+            && !qual.is_null()
+            && !(*node).ss.ps.qual.is_null()
+            && !pg_sys::contain_volatile_functions(qual)
+            && !pg_sys::contain_subplans(qual))
+        .then(|| crate::score::RowFilter {
+            qual: (*node).ss.ps.qual,
+            econtext: (*node).ss.ps.ps_ExprContext,
+        });
         let exec = ScanExec {
             private,
             clause,
@@ -1288,6 +1306,9 @@ unsafe extern "C-unwind" fn begin_scan(
             scored: None,
             exhaustive_score_calls: 0,
             top_k_completions: 0,
+            row_filter,
+            filtered_k: None,
+            filtered_walks: 0,
             fetched: 0,
             skipped_pages: 0,
             page_masks: None,
@@ -1379,7 +1400,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             && k <= crate::score::PRUNE_MAX_K
             && let Some(top) = scorer
                 .as_mut()
-                .and_then(|scorer| top_rows(exec, scorer, k, ties))
+                .and_then(|scorer| top_rows(exec, scorer, k, ties, None))
         {
             exec.candidates = top.complete.then_some(top.rows.len());
             if top.streamed {
@@ -1420,14 +1441,19 @@ unsafe fn gather(exec: &mut ScanExec) {
 ///
 /// With `ties` the rows tied with the k-th score and the row after them are
 /// kept too (see [`crate::score::TopRows`]); the scorer then never asks for
-/// a zero fill.
+/// a zero fill. With a `filter` the walk keeps only rows that pass it; a
+/// query it cannot prune is then left to the caller.
 unsafe fn top_rows(
     exec: &ScanExec,
     scorer: &mut crate::score::IndexScorer,
     k: usize,
     ties: bool,
+    filter: Option<crate::score::RowFilter>,
 ) -> Option<crate::score::TopK> {
-    let Some(mut top) = scorer.top_k(k, ties) else {
+    let Some(mut top) = scorer.top_k(k, ties, filter) else {
+        if filter.is_some() {
+            return None;
+        }
         let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
         let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
         return scorer.top_k_streamed(&mut stream, k, ties);
@@ -1598,7 +1624,9 @@ unsafe fn complete(exec: &mut ScanExec) {
         // and so on extend the rows already emitted, so the search deepens
         // before it gives up pruning and scores every match.
         let ties = ordering.ties;
+        let first_k = ordering.top_k.unwrap_or(exec.pruned_k);
         if exec.pruned_k > 0
+            && exec.filtered_k.is_none()
             && let Some(deeper) = deeper_k(exec.pruned_k)
         {
             let rows = if scorer.scores_nothing() && !scorer.walks_unscored() {
@@ -1621,7 +1649,7 @@ unsafe fn complete(exec: &mut ScanExec) {
                     })
                 }
             } else {
-                top_rows(exec, &mut scorer, deeper, ties).map(|top| {
+                top_rows(exec, &mut scorer, deeper, ties, None).map(|top| {
                     if top.streamed {
                         exec.exhaustive_score_calls += top.scored;
                     }
@@ -1637,6 +1665,36 @@ unsafe fn complete(exec: &mut ScanExec) {
                 exec.next = 0;
                 exec.pruned = !complete;
                 exec.pruned_k = deeper;
+                return;
+            }
+        }
+        // Even the deepest walk held too few rows passing the rest of the
+        // restrictions, which reject the best-ranked rows. A walk that
+        // applies them as it admits rows finds the best k that pass, where
+        // the scan would otherwise score every candidate. Its rows that the
+        // parent already has are the best of those that pass, as everything
+        // emitted so far was a prefix of the ranking.
+        let filtered_k = match exec.filtered_k {
+            None => Some(first_k),
+            Some(k) => deeper_k(k),
+        };
+        if let Some(filter) = exec.row_filter
+            && exec.pruned_k > 0
+            && let Some(k) = filtered_k
+            && (!scorer.scores_nothing() || scorer.walks_unscored())
+        {
+            exec.filtered_walks += 1;
+            exec.filtered_k = Some(k);
+            if let Some(top) = top_rows(exec, &mut scorer, k, ties, Some(filter)) {
+                let mut rows = top.rows;
+                crate::score::publish_scan_scorer(exec.scan_id, scorer, &rows);
+                rows.retain(|(_, tid)| !consumed.contains(tid));
+                exec.scores = rows.iter().map(|(score, _)| *score).collect();
+                exec.tids = rows.iter().map(|(_, tid)| *tid).collect();
+                exec.sorted = exec.tids.len();
+                exec.next = 0;
+                exec.pruned = !top.complete;
+                exec.pruned_k = k;
                 return;
             }
         }
@@ -2316,6 +2374,7 @@ unsafe extern "C-unwind" fn rescan(node: *mut pg_sys::CustomScanState) {
             exec.sorted = 0;
             exec.pruned = false;
             exec.pruned_k = 0;
+            exec.filtered_k = None;
             exec.emitted.clear();
             exec.recheck = false;
             exec.candidates = None;
@@ -2626,6 +2685,12 @@ unsafe extern "C-unwind" fn explain(
                     c"Top-K Completions".as_ptr(),
                     std::ptr::null(),
                     exec.top_k_completions as i64,
+                    es,
+                );
+                pg_sys::ExplainPropertyInteger(
+                    c"Filtered Walks".as_ptr(),
+                    std::ptr::null(),
+                    exec.filtered_walks as i64,
                     es,
                 );
             }

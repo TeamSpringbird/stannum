@@ -816,7 +816,9 @@ impl IndexScorer {
     /// view is no longer current (a dead list was published or the write
     /// buffer rewritten meanwhile). With `ties`, the rows tied with the k-th
     /// score and the next row after them are kept too (see [`TopRows`]).
-    pub(crate) fn top_k(&self, k: usize, ties: bool) -> Option<TopK> {
+    /// With a `filter`, only rows that pass it are kept, so the rows are the
+    /// best of those.
+    pub(crate) fn top_k(&self, k: usize, ties: bool, filter: Option<RowFilter>) -> Option<TopK> {
         let sources: Vec<Source<'_>> = (0..self.view.sources.len())
             .map(|i| Source {
                 index: &*self.view.sources[i].0,
@@ -837,12 +839,45 @@ impl IndexScorer {
             k,
             ties,
             &config,
-            |shortcut| unsafe { Visibility::open(heap_oid, shortcut) },
+            |shortcut| {
+                let mut visibility = unsafe { Visibility::open(heap_oid, shortcut) };
+                visibility.filter = filter;
+                visibility
+            },
             |visibility| {
                 !visibility.shortcuts
                     || unsafe { crate::storage::view_is_current(index_oid, &self.view) }
             },
         )
+    }
+}
+
+/// The rest of a ranked scan's restrictions, which a walk can apply to a
+/// candidate's visible tuple as it admits it: its top k is then the best k
+/// rows that pass them. The qual must not be volatile, as the scan
+/// evaluates it again on each row it returns.
+#[derive(Clone, Copy)]
+pub(crate) struct RowFilter {
+    /// The scan's qual, compiled in its node.
+    pub(crate) qual: *mut pg_sys::ExprState,
+    /// The node's expression context; its per-tuple memory is reset after
+    /// each evaluation, as the walk evaluates the qual once per admission.
+    pub(crate) econtext: *mut pg_sys::ExprContext,
+}
+
+impl RowFilter {
+    /// Whether the tuple in `slot` passes the qual.
+    ///
+    /// # Safety
+    /// The scan node `qual` and `econtext` belong to is executing; `slot`
+    /// holds a tuple of its relation.
+    unsafe fn passes(&self, slot: *mut pg_sys::TupleTableSlot) -> bool {
+        unsafe {
+            (*self.econtext).ecxt_scantuple = slot;
+            let passes = pg_sys::ExecQual(self.qual, self.econtext);
+            pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
+            passes
+        }
     }
 }
 
@@ -859,6 +894,9 @@ struct Visibility {
     shortcut: bool,
     /// Whether any check was answered by the map.
     shortcuts: bool,
+    /// Restrictions a visible tuple must pass too; the map cannot answer
+    /// for them, so the tuple is always read.
+    filter: Option<RowFilter>,
 }
 
 impl Visibility {
@@ -876,15 +914,23 @@ impl Visibility {
                 vmbuf: pg_sys::InvalidBuffer as pg_sys::Buffer,
                 shortcut,
                 shortcuts: false,
+                filter: None,
             }
         }
     }
 
-    /// Whether the snapshot sees a tuple at `tid` or on its HOT chain. On an
-    /// all-visible page every tuple is visible to every snapshot, and the
-    /// index lists no tuple VACUUM removed, so the map alone answers.
+    /// Whether the snapshot sees a tuple at `tid` or on its HOT chain, and
+    /// it passes the filter if there is one. On an all-visible page every
+    /// tuple is visible to every snapshot, and the index lists no tuple
+    /// VACUUM removed, so without a filter the map alone answers.
     fn visible(&mut self, tid: Tid) -> bool {
         VISIBILITY_CHECKS.set(VISIBILITY_CHECKS.get() + 1);
+        if let Some(filter) = self.filter {
+            // SAFETY: the walk runs inside the scan node the filter is of,
+            // and the slot holds the visible version of `tid`.
+            return charging("heap visibility", || self.visible_inner(tid))
+                && unsafe { filter.passes(self.slot) };
+        }
         if self.shortcut {
             let status =
                 unsafe { pg_sys::visibilitymap_get_status(self.heap, tid.block, &mut self.vmbuf) };
