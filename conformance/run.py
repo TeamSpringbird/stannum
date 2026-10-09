@@ -34,9 +34,9 @@ try:
 except ImportError as error:  # pragma: no cover - environment guidance
     sys.exit(f"{error}; install the dependencies with: pip install -r benchmarks/requirements.txt")
 
-RUNNER_VERSION = "1"
+RUNNER_VERSION = "2"
 SUITE = Path(__file__).resolve().parent
-CAPTURES = ("ids", "count", "ranked", "scores", "highlight", "value", "error", "script")
+CAPTURES = ("ids", "count", "ranked", "scores", "highlight", "value", "error", "script", "cancel")
 PAD_ROWS_START = 1000
 DEFAULT_SCORE = "{engine}.full_score(ctid)"
 DEFAULT_TIMEOUT = "60s"
@@ -122,6 +122,9 @@ def validate_case(case, seen):
             raise CaseError(f"{case_id}: capture {capture['as']} needs 'query' or 'query_sql'")
         if capture["kind"] == "value" and "sql" not in capture and "sql" not in case:
             raise CaseError(f"{case_id}: capture value needs 'sql'")
+        if capture["kind"] == "cancel":
+            if "sql" not in capture or not isinstance(capture.get("timeout_ms"), int):
+                raise CaseError(f"{case_id}: capture cancel needs 'sql' and an integer 'timeout_ms'")
         if capture["kind"] == "script":
             steps = capture.get("steps")
             if not steps or not all(isinstance(step, dict) and "sql" in step for step in steps):
@@ -204,6 +207,7 @@ class Session:
     def __init__(self, dsn, schema):
         self.dsn, self.schema = dsn, schema
         self.connection = self.sentinel = None
+        self.elapsed = None  # seconds the last statement of run() took, answered or not
         self.connect()
 
     def open(self):
@@ -259,6 +263,7 @@ class Session:
     def run(self, sql, settings, fetch=True):
         """Run sql in its own transaction with SET LOCAL settings; always roll back."""
         connection = self.connection
+        self.elapsed = None
         try:
             connection.autocommit = False
             try:
@@ -268,8 +273,12 @@ class Session:
                     for name, value in settings.items():
                         if name != "statement_timeout":
                             cursor.execute("SELECT set_config(%s, %s, true)", (name, str(value)))
-                    cursor.execute(sql)
-                    rows = cursor.fetchall() if fetch and cursor.description else []
+                    started = time.monotonic()
+                    try:
+                        cursor.execute(sql)
+                        rows = cursor.fetchall() if fetch and cursor.description else []
+                    finally:
+                        self.elapsed = time.monotonic() - started
             finally:
                 if not connection.closed:
                     connection.rollback()
@@ -302,7 +311,8 @@ def suite_commit():
     try:
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=SUITE, text=True,
                                        stderr=subprocess.DEVNULL).strip()
-        dirty = subprocess.check_output(["git", "status", "--porcelain", "--", "."], cwd=SUITE,
+        # Uncommitted recorded answers (expected/) do not change what was run.
+        dirty = subprocess.check_output(["git", "status", "--porcelain", "--", ".", ":!expected"], cwd=SUITE,
                                         text=True, stderr=subprocess.DEVNULL).strip()
         return head + ("-dirty" if dirty else "")
     except (OSError, subprocess.CalledProcessError):
@@ -436,6 +446,7 @@ def run_script(session, capture, values, settings):
                         connection.execute("SELECT set_config(%s, %s, false)", (key, str(value)))
                 connections[name] = connection
             sql = substitute(step["sql"], values)
+            started = time.monotonic()
             try:
                 with connections[name].cursor() as cursor:
                     cursor.execute(sql)
@@ -447,6 +458,8 @@ def run_script(session, capture, values, settings):
                 outcome = {"error": error_of(error)}
             except psycopg.Error as error:
                 outcome = {"error": error_of(error)}
+            finally:
+                report_timing(f"step {len(results) + 1}", time.monotonic() - started)
             if step.get("capture", True):
                 results.append(outcome)
     finally:
@@ -456,6 +469,33 @@ def run_script(session, capture, values, settings):
             except Exception:
                 pass
     return results
+
+
+TIMINGS = []  # (label, seconds) of the case being run, printed with --timings; never recorded
+
+
+def report_timing(label, seconds):
+    TIMINGS.append((label, seconds))
+
+
+def run_cancel(session, capture, sql, settings):
+    """Runs sql under statement_timeout = timeout_ms and records whether it was
+    canceled, not how long it took: {"canceled": true, "sqlstate": "57014",
+    "prompt": ...}, where prompt says the cancel came within within_ms
+    (default 250) of the timeout; {"canceled": false, "answer": ...} if it
+    answered first; {"error": ...} for any other ERROR."""
+    timeout = capture["timeout_ms"]
+    within = int(capture.get("within_ms", 250))
+    try:
+        rows = session.run(sql, {**settings, "statement_timeout": f"{timeout}ms"})
+    except ConnectionLost:
+        raise
+    except psycopg.Error as error:
+        if error.sqlstate == "57014":
+            return {"canceled": True, "sqlstate": "57014",
+                    "prompt": session.elapsed * 1000 <= timeout + within}
+        return {"error": error_of(error)}
+    return {"canceled": False, "answer": shape("value", rows) if rows else None}
 
 
 def run_capture(session, case, capture, values, settings):
@@ -473,6 +513,11 @@ def run_capture(session, case, capture, values, settings):
     if capture["kind"] == "script":
         return run_script(session, capture, local, settings)
     sql = substitute(capture_sql(case, capture, local), local)
+    if capture["kind"] == "cancel":
+        try:
+            return run_cancel(session, capture, sql, settings)
+        finally:
+            report_timing(capture["as"], session.elapsed)
     try:
         rows = session.run(sql, settings)
     except ConnectionLost:
@@ -480,6 +525,8 @@ def run_capture(session, case, capture, values, settings):
     except psycopg.Error as error:
         failure = error_of(error)
         return failure if capture["kind"] == "error" else {"error": failure}
+    finally:
+        report_timing(capture["as"], session.elapsed)
     if capture["kind"] == "error":
         return {"no_error": shape("value", rows)}
     return shape(capture["kind"], rows)
@@ -602,20 +649,22 @@ def compare_case(case, want, got):
         return "FAIL", "the server crashed" + (" (as the recorded engine did)" if want.get("server_crashed") else "")
     if "connection_lost" in (got.get("captures") or {}):
         return "FAIL", f"connection lost: {got['captures']['connection_lost']}"
-    if want.get("server_crashed"):
-        # The recorded engine crashed: an ERROR or a correct answer passes; a crash fails.
+    if want.get("server_crashed") or "connection_lost" in (want.get("captures") or {}):
+        # The recorded engine crashed the server or lost its backend: an ERROR
+        # or a correct answer passes; a crash fails.
+        what = "crashed" if want.get("server_crashed") else "lost its connection"
         if only_errors(got):
             states = sorted({(v.get("error") or v)["sqlstate"] for v in got["captures"].values()})
-            return "PASS", f"recorded engine crashed; answered ERROR {', '.join(states)}"
+            return "PASS", f"recorded engine {what}; answered ERROR {', '.join(states)}"
         expect = case.get("expect_if_answered")
         if expect is None:
-            return "PASS", "recorded engine crashed; answered (no reference answer to check)"
+            return "PASS", f"recorded engine {what}; answered (no reference answer to check)"
         wrong = [name for name, value in expect.items()
                  if name in got["captures"] and got["captures"][name] != value]
         if wrong:
-            return "FAIL", "recorded engine crashed; answered wrongly: " + ", ".join(
+            return "FAIL", f"recorded engine {what}; answered wrongly: " + ", ".join(
                 f"{name} {brief(got['captures'][name])}, correct {brief(expect[name])}" for name in wrong)
-        return "PASS", "recorded engine crashed; answered correctly"
+        return "PASS", f"recorded engine {what}; answered correctly"
     statuses, details, compared = [], [], 0
     for capture in case["capture"]:
         name = capture["as"]
@@ -636,7 +685,8 @@ def compare_case(case, want, got):
 
 # ---------------------------------------------------------------- divergences
 
-DIVERGENCE_KINDS = {"improvement": "IMPROVED", "gap": "GAP"}
+DIVERGENCE_KINDS = {"improvement": "IMPROVED", "gap": "GAP", "limit": "LIMITED"}
+LIMIT_SQLSTATES = ("54000", "54001")  # program_limit_exceeded, statement_too_complex
 
 
 def read_divergences(engine, recorded):
@@ -669,6 +719,20 @@ def recorded_an_error(value):
     return False
 
 
+def sqlstate_of(value):
+    return (value.get("error") or value).get("sqlstate") if is_error(value) else None
+
+
+def limited(recorded, answer):
+    """This engine refused with a limit ERROR (54000 or 54001) where the
+    recorded engine did not raise an ERROR; in a script, at some step."""
+    if is_error(answer):
+        return sqlstate_of(answer) in LIMIT_SQLSTATES and not recorded_an_error(recorded)
+    if isinstance(answer, list) and isinstance(recorded, list) and len(answer) == len(recorded):
+        return any(limited(want, got) for want, got in zip(recorded, answer))
+    return False
+
+
 def compare_divergent(case, want, got, entry):
     """Checks a documented divergence: exactly the listed captures differ, and
     for an improvement each is one the recorded engine refused and this one
@@ -695,6 +759,11 @@ def compare_divergent(case, want, got, entry):
             recorded, answer = want["captures"][name], got["captures"][name]
             if not recorded_an_error(recorded) or is_error(answer):
                 return "FAIL", f"{name}: an improvement must answer where the recorded engine raised an ERROR"
+    if entry["kind"] == "limit":
+        for name in sorted(listed):
+            if not limited(want["captures"][name], got["captures"][name]):
+                return "FAIL", (f"{name}: a limit must raise {' or '.join(LIMIT_SQLSTATES)} "
+                                "where the recorded engine answered")
     return DIVERGENCE_KINDS[entry["kind"]], entry["summary"]
 
 
@@ -755,6 +824,8 @@ def main():
     parser.add_argument("--skip-crash", action="store_true",
                         help="skip cases tagged as crashing the engine under test")
     parser.add_argument("--host-note", default="", help="free-text host description for the source header")
+    parser.add_argument("--timings", action="store_true",
+                        help="print each capture's elapsed time (never recorded)")
     parser.add_argument("--cases-dir", default=str(SUITE / "cases"), help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -818,6 +889,7 @@ def main():
             if reason:
                 emit("SKIP", case["id"], reason)
                 continue
+            TIMINGS.clear()
             failed = [corpus_errors[name] for name in case_corpora(case) if name in corpus_errors]
             if failed:
                 record = {"corpus_error": failed[0]}
@@ -844,6 +916,10 @@ def main():
                     errors = [n for n, v in record["captures"].items()
                               if isinstance(v, dict) and ("error" in v or "sqlstate" in v or "variants_disagree" in v)]
                     emit("OK", case["id"], ("ERROR or disagreement in: " + ", ".join(errors)) if errors else "")
+            if args.timings and TIMINGS:
+                print("         timings: " + ", ".join(
+                    f"{label} {'?' if seconds is None else f'{seconds:.3f}s'}" for label, seconds in TIMINGS),
+                    flush=True)
     finally:
         try:
             if not session.sentinel_alive() or session.connection.closed:
@@ -864,7 +940,7 @@ def main():
         if unknown:
             print(f"Recorded answers without a case in the suite: {', '.join(unknown)}")
         if divergences:
-            print(f"IMPROVED and GAP are divergences documented in divergences/{args.engine}.yaml")
+            print(f"IMPROVED, GAP and LIMITED are divergences documented in divergences/{args.engine}.yaml")
         print(f"Compared {args.engine} {version} against {expected_source.get('engine')} "
               f"{expected_source.get('extension_version')} ({args.check})")
         return 1 if counts.get("FAIL") else 0
