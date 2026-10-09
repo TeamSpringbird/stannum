@@ -53,6 +53,14 @@ pub const FORM_SPARSE: u8 = 1;
 pub const FORM_GROUPED: u8 = 2;
 /// Set in a record's form when it carries [`InlineLengths`].
 pub const FORM_LENGTHS: u8 = 0x80;
+/// Set in a record's form when it has no footer: a sparse term of at most
+/// [`COMPACT_MAX`] postings (and one block) carrying its lengths, whose
+/// footer a reader derives (its last slot from the list, its frontier from
+/// its buckets and lengths, its TF width from its largest bucket).
+pub const FORM_COMPACT: u8 = 0x40;
+
+/// Postings a footer-less record holds at most.
+pub const COMPACT_MAX: u32 = 8;
 
 pub const KIND_GRID: u8 = 0;
 pub const KIND_EF: u8 = 1;
@@ -272,14 +280,23 @@ pub fn encode_reusing<'r>(
     if inline {
         encode_inline_lengths(lengths, &mut inline_bytes);
     }
+    let compact = use_sparse
+        && inline
+        && slots.len() as u64 <= u64::from(COMPACT_MAX)
+        && slots.len() <= block;
     out.push(
         if use_sparse {
             FORM_SPARSE
         } else {
             FORM_GROUPED
-        } | if inline { FORM_LENGTHS } else { 0 },
+        } | if inline { FORM_LENGTHS } else { 0 }
+            | if compact { FORM_COMPACT } else { 0 },
     );
-    varint::put(out, footer.len() as u64);
+    if compact {
+        footer.clear();
+    } else {
+        varint::put(out, footer.len() as u64);
+    }
     varint::put(out, payload.len() as u64);
     if inline {
         varint::put(out, inline_bytes.len() as u64);
@@ -499,6 +516,8 @@ pub struct Postings<'a> {
     pub tf_at: usize,
     /// The documents' lengths, for a term of few postings.
     pub lengths: Option<InlineLengths<'a>>,
+    /// Whether the record has no footer ([`FORM_COMPACT`]).
+    pub compact: bool,
 }
 
 /// A rare term's documents' lengths, in posting order: a base, a width
@@ -583,6 +602,7 @@ impl<'a> Postings<'a> {
                 return Err(Error::Corrupt("single posting"));
             }
             return Ok(Self {
+                compact: false,
                 lengths,
                 df,
                 form: Form::Single(slot),
@@ -597,14 +617,22 @@ impl<'a> Postings<'a> {
         }
         let form = *record.first().ok_or(Error::Truncated)?;
         let mut at = 1;
-        let footer_len = varint::get_u32(record, &mut at)? as usize;
+        let footer_len = if form & FORM_COMPACT != 0 {
+            if form & FORM_LENGTHS == 0 || form & 3 != FORM_SPARSE || df > COMPACT_MAX {
+                return Err(Error::Corrupt("compact postings"));
+            }
+            0
+        } else {
+            varint::get_u32(record, &mut at)? as usize
+        };
         let payload_len = varint::get_u32(record, &mut at)? as usize;
         let lengths_len = if form & FORM_LENGTHS != 0 {
             varint::get_u32(record, &mut at)? as usize
         } else {
             0
         };
-        let form = form & !FORM_LENGTHS;
+        let compact = form & FORM_COMPACT != 0;
+        let form = form & !(FORM_LENGTHS | FORM_COMPACT);
         let footer_at = at;
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
@@ -649,6 +677,7 @@ impl<'a> Postings<'a> {
             tf: &record[tf_at..],
             tf_at,
             lengths,
+            compact,
         })
     }
 
@@ -896,6 +925,37 @@ impl Footer {
         adaptive: bool,
     ) -> Result<Self> {
         let df = postings.df;
+        if postings.compact
+            && let (Form::Sparse(list), Some(lengths)) = (&postings.form, &postings.lengths)
+        {
+            if df > block_size {
+                return Err(Error::Corrupt("compact postings"));
+            }
+            let mut last = 0;
+            list.for_each(|v| last = v);
+            let width = tf_width(max_bucket, adaptive);
+            let mut pairs = Vec::with_capacity(df as usize);
+            for i in 0..df as usize {
+                let bucket = bits::get(postings.tf, i, width)? as u8;
+                pairs.push((bucket, lengths.get(i as u32)?));
+            }
+            let frontier = frontier(pairs.into_iter());
+            if frontier.last().map(|f| f.0) != Some(max_bucket)
+                || postings.tf.len() != bits::packed_len(df as usize, width)
+            {
+                return Err(Error::Corrupt("compact postings"));
+            }
+            return Ok(Self {
+                block_size,
+                last: vec![last],
+                starts: vec![0, frontier.len() as u32],
+                frontier,
+                tf_at: vec![0],
+                widths: vec![width as u8],
+                entry_at: vec![0],
+                single: None,
+            });
+        }
         if let Form::Single(slot) = postings.form {
             return Ok(Self {
                 block_size,
