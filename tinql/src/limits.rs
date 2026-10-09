@@ -90,9 +90,10 @@ pub fn set_stack_check(check: fn()) {
     let _ = STACK_CHECK.set(check);
 }
 
-/// Calls the installed stack check, if any.
+/// Calls the installed stack check, if any: for passes over a query outside
+/// this crate, such as the ranked walk's reading of its shape.
 #[inline]
-pub(crate) fn check_stack() {
+pub fn check_stack() {
     if let Some(check) = STACK_CHECK.get() {
         check();
     }

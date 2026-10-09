@@ -11,10 +11,11 @@ license.workspace = true
 description = "Stannum's query engine over segments, without PostgreSQL: BM25 scoring, the ranked ordinal walk and the count fold"
 
 [features]
-# Counters and checks the extension's pg_test build asserts on.
+# Counters, hooks and checks the extension's pg_test build asserts on.
 test-hooks = []
 
 [dependencies]
+boldi-vigna = { path = "../boldi-vigna" }
 rustc-hash.workspace = true
 segment = { path = "../segment" }
 thiserror.workspace = true

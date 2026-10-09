@@ -52,6 +52,11 @@ fn check_for_interrupts(site: &'static str) {
 pub extern "C-unwind" fn _PG_init() {
     tinql::limits::set_stack_check(check_stack_depth);
     segment::set_interrupt_check(check_for_interrupts);
+    engine::set_interrupt_check(|| {
+        pgrx::check_for_interrupts!();
+    });
+    engine::set_corruption_report(|message| storage::corrupt(message));
+    engine::set_blocks_probe(score::blocks_used);
     options::init();
     storage::init();
     storage::wal::init();
