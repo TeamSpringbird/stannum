@@ -28,6 +28,42 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },
+    "bench/Cargo.toml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay and kernel benchmarks of the query engine."
+    },
+    "bench/benches/kernels.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: benchmarks of the query engine's kernels."
+    },
+    "bench/src/areas.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: segment areas for the offline replay's page accounting."
+    },
+    "bench/src/bin/replay.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay's command line and report."
+    },
+    "bench/src/dump.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: reading script/dump-segments.py's dumps for the offline replay."
+    },
+    "bench/src/lib.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay and kernel benchmarks of the query engine."
+    },
+    "bench/src/paged.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a paged, holdable segment source with page-touch accounting for the offline replay."
+    },
+    "bench/src/replay.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay's query execution through the engine crate."
+    },
+    "bench/src/whatif.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: offline measurement of tighter sub-block bounds."
+    },
     "benchmarks/Dockerfile": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -556,6 +592,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
     },
+    "docs/offline-engine.md": {
+      "owner": "ben",
+      "evidence": "Original Stannum documentation of the engine crate, the offline replay and the kernel benchmarks."
+    },
     "docs/query-language/README.md": {
       "owner": "mixed",
       "upstream_path": "tinql/docs/src/SUMMARY.md",
@@ -634,6 +674,42 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Relocated/adapted Lead query-language documentation with Stannum SQL names and navigation."
     },
+    "engine/Cargo.toml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the PostgreSQL-free query engine crate, split out of the extension."
+    },
+    "engine/src/bm25.rs": {
+      "owner": "mixed",
+      "upstream_path": "postgres/src/bm25.rs",
+      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
+    },
+    "engine/src/fold.rs": {
+      "owner": "ben",
+      "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
+    },
+    "engine/src/lib.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the PostgreSQL-free query engine crate, split out of the extension."
+    },
+    "engine/src/spec.rs": {
+      "owner": "mixed",
+      "upstream_path": "postgres/src/options.rs",
+      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "evidence": "The tokenizer-settings codec and reloption values, moved from postgres/src/options.rs (inherited upstream file with Stannum changes); retain PlanetScale credit."
+    },
+    "engine/src/terms.rs": {
+      "owner": "mixed",
+      "upstream_path": "postgres/src/score.rs",
+      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "evidence": "Scoring-term collection, moved from postgres/src/score.rs (inherited upstream file with Stannum changes), and the statistics fold of the indexed scorer; retain PlanetScale credit."
+    },
+    "engine/src/walk.rs": {
+      "owner": "mixed",
+      "upstream_path": "postgres/src/score.rs",
+      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
+      "evidence": "The ranked ordinal walk, moved from postgres/src/score.rs (inherited upstream file with Stannum changes); retain PlanetScale credit."
+    },
     "postgres/Cargo.toml": {
       "owner": "mixed",
       "upstream_path": "postgres/Cargo.toml",
@@ -660,19 +736,13 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
     },
-    "postgres/src/bm25.rs": {
-      "owner": "mixed",
-      "upstream_path": "postgres/src/bm25.rs",
-      "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
-      "evidence": "Inherited upstream file with Stannum changes; retain PlanetScale credit."
-    },
     "postgres/src/customscan.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
     "postgres/src/fold.rs": {
       "owner": "ben",
-      "evidence": "Original Boolean count executor over document ordinals, written for Stannum."
+      "evidence": "Original Boolean count executor over document ordinals, written for Stannum: the extension's visibility-map read for engine/src/fold.rs."
     },
     "postgres/src/heap_probe.rs": {
       "owner": "ben",
@@ -806,6 +876,10 @@
       "upstream_revision": "300ad3afbcaae42a90ef963cb3eb445784c733b3",
       "evidence": "Byte-identical to the upstream source before notice insertion."
     },
+    "script/bench-native": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the kernel benchmarks built for the machine's CPU against a saved baseline."
+    },
     "script/dump-segments.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
@@ -817,6 +891,10 @@
     "script/reference-oracle": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 44ae79a7b960bdace26fbeccf5b34f9d3c6487fe."
+    },
+    "script/replay-oracle.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the offline replay's trace conversion and PostgreSQL oracle."
     },
     "script/source_headers.py": {
       "owner": "ben",
