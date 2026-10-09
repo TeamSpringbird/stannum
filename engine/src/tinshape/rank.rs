@@ -29,7 +29,7 @@ use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
-use segment::tinshape::positions::{Positions, skip_entry};
+use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local, or_into};
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -411,13 +411,15 @@ impl<'a> PosCursor<'a> {
             self.next = entry;
             self.next_at = entry_at;
         }
-        let bytes = self.positions.bytes;
+        if let Some(m) = self.positions.mask_at(index) {
+            touch.touch(Part::Positions, self.at + m, 4);
+        }
         let from = self.next_at;
         let mut p = self.next_at;
-        for _ in self.next..index {
-            p = skip_entry(bytes, p)?;
+        for i in self.next..index {
+            p = self.positions.skip(i, p)?;
         }
-        p = self.positions.read_entry(p, out)?;
+        p = self.positions.read_entry(index, p, out)?;
         self.next = index + 1;
         self.next_at = p;
         touch.touch(Part::Positions, self.at + from, p - from);
@@ -536,6 +538,9 @@ struct Walk<'s, 'a, T: Touch> {
     /// numerator, denominator and length factor.
     window_end: Option<u32>,
     window_parts: (f64, f64, f64, f64),
+    /// A required term whose record carries its documents' lengths, the
+    /// led walk reads them from.
+    inline: Option<usize>,
     heap: BinaryHeap<Entry>,
     answer: RankedAnswer,
     verify: Verify<'a>,
@@ -857,16 +862,22 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         self.answer.candidates += 1;
         let theta = self.threshold();
-        // The length alone, against the window's largest buckets.
-        let rank = self
-            .segment
-            .docs
-            .rank_in(g as usize, local)
-            .ok_or(Error::Corrupt("a posting without a document"))?;
-        let (header, bits) = self.segment.length_at(rank);
-        self.touch.touch(Part::DlSidecar, header, 8);
-        self.touch.touch(Part::DlSidecar, bits, 4);
-        let length = self.segment.lengths.get(rank)?;
+        // The length alone, against the window's largest buckets: from a
+        // rare required term's record when one carries lengths, else from
+        // the DL sidecar.
+        let length = match self.inline {
+            Some(t) => {
+                let index = self.mems[t]
+                    .find(local)
+                    .expect("a candidate holds every required term");
+                let set = self.terms[t].as_ref().expect("required");
+                let inline = set.postings.lengths.as_ref().expect("inline lengths");
+                self.touch
+                    .touch(Part::Payload, set.at + inline.at_of(index), 4);
+                inline.get(index)?
+            }
+            None => self.dl_length(g, local)?,
+        };
         if theta.is_some() && n > 0 {
             let (_, nsum, dmin, fmin) = self.window_parts;
             if below(nsum / (dmin + fmin * f64::from(length)), theta) {
@@ -941,6 +952,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         Ok(true)
+    }
+
+    /// The length of the document at slot `local` of group `g`, from the DL
+    /// sidecar.
+    #[inline]
+    fn dl_length(&mut self, g: u32, local: u32) -> Result<u32> {
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .ok_or(Error::Corrupt("a posting without a document"))?;
+        let (header, bits) = self.segment.length_at(rank);
+        self.touch.touch(Part::DlSidecar, header, 8);
+        self.touch.touch(Part::DlSidecar, bits, 4);
+        self.segment.lengths.get(rank)
     }
 
     /// The candidate's posting index in each span slot's term.
@@ -1060,6 +1086,7 @@ pub(super) fn top_k(
         row_state: vec![Row::default(); n],
         window_end: None,
         window_parts: (0.0, 0.0, 0.0, 0.0),
+        inline: None,
         req,
         heap: BinaryHeap::with_capacity(k + 1),
         answer: RankedAnswer::default(),
@@ -1079,6 +1106,11 @@ pub(super) fn top_k(
         let r = required.contains(&walk.sc[i].term);
         walk.sc_required.push(r);
     }
+    walk.inline = walk.req.iter().copied().find(|t| {
+        walk.terms[*t]
+            .as_ref()
+            .is_some_and(|s| s.postings.lengths.is_some())
+    });
     if required.is_empty() {
         walk.run_or()?;
     } else {
@@ -1569,15 +1601,22 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if below(bound, theta) {
             return Ok(());
         }
-        let rank = self
-            .segment
-            .docs
-            .rank_in(g as usize, local)
-            .ok_or(Error::Corrupt("a posting without a document"))?;
-        let (header, bits) = self.segment.length_at(rank);
-        self.touch.touch(Part::DlSidecar, header, 8);
-        self.touch.touch(Part::DlSidecar, bits, 4);
-        let length = self.segment.lengths.get(rank)?;
+        let carrier = self.held_list.iter().copied().find(|i| {
+            self.terms[self.sc[*i].term]
+                .as_ref()
+                .is_some_and(|s| s.postings.lengths.is_some())
+        });
+        let length = match carrier {
+            Some(i) => {
+                let index = self.row_index(i, words, local);
+                let set = self.terms[self.sc[i].term].as_ref().expect("scoring");
+                let inline = set.postings.lengths.as_ref().expect("inline lengths");
+                self.touch
+                    .touch(Part::Payload, set.at + inline.at_of(index), 4);
+                inline.get(index)?
+            }
+            None => self.dl_length(g, local)?,
+        };
         if theta.is_some() {
             let (mut nsum, mut dmin, mut fmin) = (0.0_f64, f64::INFINITY, f64::INFINITY);
             for &i in &self.held_list {

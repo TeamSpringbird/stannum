@@ -17,7 +17,7 @@ use segment::Tid;
 use segment::tinshape::bits;
 use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::EfCursor;
-use segment::tinshape::positions::{Positions, skip_entry};
+use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings, for_each_local};
 use segment::tinshape::segment::{Area, Segment};
 use segment::{Error, Result};
@@ -1119,12 +1119,15 @@ pub fn read_positions(
             touch.touch(Part::Positions, at + read_at, len);
         }
     }
+    if let Some(m) = positions.mask_at(index) {
+        touch.touch(Part::Positions, at + m, 4);
+    }
     let from = p;
     while entry < index {
-        p = skip_entry(bytes, p)?;
+        p = positions.skip(entry, p)?;
         entry += 1;
     }
-    let end = positions.read_entry(p, out)?;
+    let end = positions.read_entry(index, p, out)?;
     touch.touch(Part::Positions, at + from, end - from);
     Ok(())
 }

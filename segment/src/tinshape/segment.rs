@@ -57,6 +57,8 @@ pub struct BuildStats {
     pub header: u64,
     pub dictionary: u64,
     pub record_headers: u64,
+    /// Rare terms' inline lengths.
+    pub inline_lengths: u64,
     pub footer: u64,
     pub payload: u64,
     pub tf: u64,
@@ -189,6 +191,7 @@ impl Builder {
         s.footer += stats.footer as u64;
         s.payload += stats.payload as u64;
         s.tf += stats.tf as u64;
+        s.inline_lengths += stats.lengths as u64;
         s.blocks += stats.blocks as u64;
         s.positions += positions.len() as u64;
         if ranks.len() == 1 {
@@ -745,9 +748,12 @@ mod tests {
                     );
                 }
                 let (bytes, _) = segment.positions(&found.entry).unwrap();
-                let payload = crate::payload::Payload::parse(bytes).unwrap();
+                let stream = super::super::positions::Positions::parse(bytes).unwrap();
+                let mut at = stream.data_at;
+                let mut out = Vec::new();
                 for (i, (_, positions)) in docs.iter().enumerate() {
-                    assert_eq!(&payload.get(i as u32).unwrap().positions, positions);
+                    at = stream.read_entry(i as u32, at, &mut out).unwrap();
+                    assert_eq!(&out, positions);
                 }
             }
             assert!(segment.term("delta").unwrap().is_none());
