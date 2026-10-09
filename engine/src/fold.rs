@@ -94,6 +94,17 @@ impl Visibility {
         }
     }
 
+    /// The all-visible bits of the 256 heap blocks from `first`, a multiple
+    /// of 256, as four words (bit `i` of word `w`: block `first + 64w + i`);
+    /// blocks past the map read as not all-visible.
+    pub fn group_bits(&self, first: u32) -> [u64; 4] {
+        if self.all {
+            return [u64::MAX; 4];
+        }
+        let base = first as usize / 64;
+        std::array::from_fn(|i| self.visible.get(base + i).copied().unwrap_or(0))
+    }
+
     pub fn is_visible(&self, block: u32) -> bool {
         self.visible
             .get(block as usize / 64)

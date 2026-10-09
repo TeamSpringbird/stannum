@@ -49,18 +49,19 @@ pub(crate) fn count_native(
             &mut terms,
             &mut NoTouch,
             &mut |group, mask| {
-                if visibility.all {
+                let g = &geometry.groups[group as usize];
+                let bits = visibility.group_bits(g.id * segment::tinshape::docs::GROUP_PAGES);
+                if bits == [u64::MAX; 4] {
                     return true;
                 }
-                let g = &geometry.groups[group as usize];
+                // Each all-visible page's slots, a run of `width` bits.
                 let width = usize::from(g.width);
-                let first = g.id * segment::tinshape::docs::GROUP_PAGES;
-                for page in 0..segment::tinshape::docs::GROUP_PAGES as usize {
-                    if visibility.is_visible(first + page as u32) {
-                        let (from, to) = (page * width, (page + 1) * width);
-                        for bit in from..to {
-                            mask[bit / 64] |= 1 << (bit % 64);
-                        }
+                for (w, word) in bits.iter().enumerate() {
+                    let mut word = *word;
+                    while word != 0 {
+                        let page = w * 64 + word.trailing_zeros() as usize;
+                        set_range(mask, page * width, (page + 1) * width);
+                        word &= word - 1;
                     }
                 }
                 let index = group as usize;
@@ -90,6 +91,22 @@ pub(crate) fn count_native(
         }
         Ok(total)
     })
+}
+
+/// Sets bits `[from, to)` of `words`.
+fn set_range(words: &mut [u64], from: usize, to: usize) {
+    let mut at = from;
+    while at < to {
+        let bit = at % 64;
+        let take = (64 - bit).min(to - at);
+        let run = if take == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << take) - 1) << bit
+        };
+        words[at / 64] |= run;
+        at += take;
+    }
 }
 
 /// Reads the visibility map a page at a time: `visibilitymap_get_status`
