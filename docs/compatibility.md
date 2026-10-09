@@ -22,15 +22,19 @@ load the data, and build indexes with `USING stannum`.
 
 ## Conformance summary
 
-Checked against TIN 1.0.3's recorded answers:
+Checked against TIN 1.0.3's and TIN 1.0.4's recorded answers (258 cases;
+SKIP is a case without a recorded answer):
 
-| Status | Cases | Meaning |
-| --- | ---: | --- |
-| PASS | 170 | Every capture equals TIN's answer |
-| DIFF | 12 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
-| IMPROVED | 5 | TIN refuses the query with an ERROR; Stannum answers it |
-| GAP | 2 | Stannum lacks what the case exercises |
-| FAIL | 0 | |
+| Status | TIN 1.0.3 | TIN 1.0.4 | Meaning |
+| --- | ---: | ---: | --- |
+| PASS | 183 | 217 | Every capture equals TIN's answer |
+| DIFF | 12 | 12 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
+| IMPROVED | 5 | 5 | TIN refuses the query with an ERROR; Stannum answers it |
+| GAP | 9 | 13 | Stannum lacks what the case exercises |
+| LIMITED | 3 | 2 | Stannum refuses with a limit ERROR where TIN answers |
+| NEWER | 4 | 4 | Stannum follows a later TIN change that Lead has copied |
+| SKIP | 42 | 5 | |
+| FAIL | 0 | 0 | |
 
 Improvements and gaps are declared in
 [`conformance/divergences/stannum.yaml`](../conformance/divergences/stannum.yaml).
@@ -114,6 +118,11 @@ the last two possible.
   ENCLOSES`, `NOT ENCLOSED BY` and `NOT OVERLAPPING` adds no scoring term,
   as with `AND NOT`. TIN 1.0.3 and 1.0.4 score it; Lead b8018ac copies TIN's
   later fix, which Stannum follows (a `newer` divergence).
+- **NEAR with a shared word** (`span.minimal_interval.4` to `.6`). Each
+  operand of NEAR takes its own occurrence, so `"a b" NEAR/2 b` matches
+  "a b b c d" through the second `b`. TIN 1.0.3 and 1.0.4 match none of
+  these rows; Lead b8018ac copies TIN's later boldi-vigna fix, and Lead
+  e3ed2f4 answers as Stannum does (a `newer` divergence).
 - **A changed stemmer** takes effect at `REINDEX`, like every tokenizer
   option in Stannum: queries and stored terms are always analyzed alike.
   TIN 1.0.4 stems query terms as soon as `ALTER INDEX ... SET (stemmer)`
