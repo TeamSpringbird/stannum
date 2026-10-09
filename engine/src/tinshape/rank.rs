@@ -1286,6 +1286,11 @@ const SUB_WORDS: usize = 16;
 /// `threshold / SIEVE_TARGET`, reach it.
 const SIEVE_TARGET: u32 = LaneSums::MAX_TARGET;
 
+/// Present terms up to which a disjunction's group narrows its mask to the
+/// sets of terms that reach the threshold together (see
+/// [`Walk::reach_mask`]).
+const REACH_MAX_TERMS: usize = 6;
+
 /// Bits per lane counter of the sub-range sieve (as [`LaneSums`]).
 const SLICES: usize = 6;
 
@@ -1533,6 +1538,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.or_load(i, g, words)?;
             }
         }
+        if self.reach_mask(&sb, words, &mut mask) {
+            self.answer.windows_pruned += 1;
+            self.words = mask;
+            self.row_loaded = loaded;
+            self.sub_bounds = sb;
+            self.plan = plan;
+            return Ok(());
+        }
         self.row_loaded = loaded;
         // The plan's threshold and bounds: a block spans many sub-ranges, so
         // a plan usually holds for the next.
@@ -1593,6 +1606,80 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.sub_bounds = sb;
         self.plan = plan;
         Ok(())
+    }
+
+    /// Narrows a group's `mask` to the documents holding a set of present
+    /// terms whose group bounds `sb` together reach the threshold: the OR,
+    /// over the smallest such sets, of the AND of their rows (every present
+    /// term's row is loaded). A document holding no such set is bounded
+    /// below the threshold by its terms' blocks, so its candidate check
+    /// would rule it out. Only for a few present terms, enumerated; true
+    /// when the mask is left empty.
+    fn reach_mask(&self, sb: &[f32], words: usize, mask: &mut [u64]) -> bool {
+        let Some(theta) = self.threshold() else {
+            return false;
+        };
+        let t = f64::from(theta);
+        let present = &self.present_list;
+        let np = present.len();
+        if !(t > 0.0 && t.is_finite() && (2..=REACH_MAX_TERMS).contains(&np)) {
+            return false;
+        }
+        // As the plan decides that terms cannot reach the threshold.
+        let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
+        let mut minimal = [0u32; 1 << REACH_MAX_TERMS];
+        let mut sets = 0;
+        for set in 1u32..1 << np {
+            let (mut sum, mut least) = (0.0_f64, f64::INFINITY);
+            for (j, &i) in present.iter().enumerate() {
+                if set >> j & 1 == 1 {
+                    let b = f64::from(sb[i]);
+                    if b.is_nan() || b < 0.0 {
+                        return false;
+                    }
+                    sum += b;
+                    least = least.min(b);
+                }
+            }
+            // Reaching, and without its weakest member falling short.
+            if sum * slack >= t && (sum - least) * slack < t {
+                minimal[sets] = set;
+                sets += 1;
+            }
+        }
+        if sets == np && minimal[..sets].iter().all(|set| set.count_ones() == 1) {
+            // Every present term reaches alone: nothing to narrow.
+            return false;
+        }
+        let rows = &self.rows;
+        let mut w0 = 0;
+        let mut empty = true;
+        // A chunk of words at a time, so the sets' ANDs stay in registers.
+        while w0 < words {
+            let w1 = (w0 + 8).min(words);
+            let mut reach = [0u64; 8];
+            for &set in &minimal[..sets] {
+                let mut all = [!0u64; 8];
+                let mut rest = set;
+                while rest != 0 {
+                    let j = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    let row = &rows[present[j] * words..];
+                    for (k, a) in all[..w1 - w0].iter_mut().enumerate() {
+                        *a &= row[w0 + k];
+                    }
+                }
+                for (r, a) in reach.iter_mut().zip(&all) {
+                    *r |= *a;
+                }
+            }
+            for (m, r) in mask[w0..w1].iter_mut().zip(&reach) {
+                *m &= *r;
+                empty &= *m == 0;
+            }
+            w0 = w1;
+        }
+        empty
     }
 
     /// Plans a sub-range whose present terms' bounds are `sb` (summing to
