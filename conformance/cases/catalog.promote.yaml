@@ -1,0 +1,158 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: catalog.promote
+description: >
+  catalog.S-07's question asked again: when does promote() change what
+  score() elides? catalog.S-07 inserted 20 rows 'w k<n>' into an index built
+  on an empty table and found w scored (not elided) before and after
+  promote(), although w is in every row. These cases record what promote()
+  returns, segment_info() (every column) before and after, score_inspect()
+  and the scores, for rows inserted after the index is built and for rows
+  the index is built over, at 20, 200 and 13,000 rows. The 13,000-row cases
+  run with {engine}.index_maintenance_mode = manual so that no background
+  worker promotes the full (sealed) write segment before the case does, and
+  place terms at the 10% dense ratio counted over the immutable documents
+  only or over all documents.
+
+defaults:
+  capture: [script]
+
+corpora:
+  cat_s07b:
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}(body)']
+    after_index_sql:
+      - "INSERT INTO {table} SELECT n, 'w k' || n FROM generate_series(1, 20) n"
+  cat_s07c:
+    setup_sql:
+      - "INSERT INTO {table} SELECT n, 'w k' || n FROM generate_series(1, 20) n"
+  cat_s07d:
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}(body)']
+    after_index_sql:
+      - >-
+        INSERT INTO {table} SELECT n, 'w k' || n || CASE WHEN n <= 19 THEN ' u v z' WHEN n = 20 THEN ' u v'
+        WHEN n = 21 THEN ' u' ELSE '' END FROM generate_series(1, 200) n
+  cat_s07e:
+    setup_sql:
+      - >-
+        INSERT INTO {table} SELECT n, 'w k' || n || CASE WHEN n <= 19 THEN ' u v z' WHEN n = 20 THEN ' u v'
+        WHEN n = 21 THEN ' u' ELSE '' END FROM generate_series(1, 200) n
+  cat_s07f:
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}(body)']
+  cat_s07g:
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}(body)']
+
+cases:
+- id: catalog.S-07b
+  description: >
+    catalog.S-07 in full: index on an empty table, 20 rows 'w k<n>' inserted; segment_info, score_inspect of w
+    and the scores of w before and after promote, and every column promote returns.
+  source: docs/tin-behavior-catalog.md §9 S-07; behavior §3 S10
+  corpus: cat_s07b
+  capture:
+  - script:
+      steps: &promote_steps
+      - {sql: 'SELECT coalesce(json_agg(to_json(s) ORDER BY s.ordinal), ''[]'') FROM {engine}.segment_info(''{index}'') s'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY term), ''[]'')
+          FROM {engine}.score_inspect(''{index}''::regclass, ''w OR k1'')'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.full_score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
+      - {sql: 'SELECT coalesce(json_agg(to_json(p)), ''[]'') FROM {engine}.promote(''{index}''::regclass) p'}
+      - {sql: 'SELECT coalesce(json_agg(to_json(s) ORDER BY s.ordinal), ''[]'') FROM {engine}.segment_info(''{index}'') s'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY term), ''[]'')
+          FROM {engine}.score_inspect(''{index}''::regclass, ''w OR k1'')'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send({engine}.full_score(ctid)), ''hex''))
+          ORDER BY id), ''[]'') FROM {table} WHERE body ==> ''w'''}
+- id: catalog.S-07c
+  description: >
+    Control for catalog.S-07b: the same 20 rows inserted before CREATE INDEX, so the build writes them to an
+    immutable segment; the same steps.
+  source: docs/tin-behavior-catalog.md §9 S-07; behavior §3 S10
+  corpus: cat_s07c
+  capture:
+  - script: {steps: *promote_steps}
+- id: catalog.S-07d
+  description: >
+    200 rows inserted after the index is built: w in all of them, u in 21, v in 20 (exactly 10%), z in 19;
+    segment_info, score_inspect and promote's row before and after promote.
+  source: docs/tin-behavior-catalog.md §9 S-07; behavior §3 S10
+  corpus: cat_s07d
+  capture:
+  - script:
+      steps: &promote_steps_200
+      - {sql: 'SELECT coalesce(json_agg(to_json(s) ORDER BY s.ordinal), ''[]'') FROM {engine}.segment_info(''{index}'') s'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY term), ''[]'')
+          FROM {engine}.score_inspect(''{index}''::regclass, ''w OR u OR v OR z OR k1'')'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send(s), ''hex'')) ORDER BY id), ''[]'')
+          FROM (SELECT id, {engine}.score(ctid) s FROM {table} WHERE body ==> ''w'' ORDER BY id LIMIT 3) top'}
+      - {sql: 'SELECT coalesce(json_agg(to_json(p)), ''[]'') FROM {engine}.promote(''{index}''::regclass) p'}
+      - {sql: 'SELECT coalesce(json_agg(to_json(s) ORDER BY s.ordinal), ''[]'') FROM {engine}.segment_info(''{index}'') s'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY term), ''[]'')
+          FROM {engine}.score_inspect(''{index}''::regclass, ''w OR u OR v OR z OR k1'')'}
+      - {sql: 'SELECT coalesce(json_agg(json_build_array(id, encode(float4send(s), ''hex'')) ORDER BY id), ''[]'')
+          FROM (SELECT id, {engine}.score(ctid) s FROM {table} WHERE body ==> ''w'' ORDER BY id LIMIT 3) top'}
+- id: catalog.S-07e
+  description: Control for catalog.S-07d, the same 200 rows inserted before CREATE INDEX; the same steps.
+  source: docs/tin-behavior-catalog.md §9 S-07; behavior §3 S10
+  corpus: cat_s07e
+  capture:
+  - script: {steps: *promote_steps_200}
+- id: catalog.S-07f
+  description: >
+    13,000 rows inserted after the index is built, with maintenance manual, so the first 12,288 fill a sealed
+    write segment that promote() makes immutable and 712 stay in the write buffer. w is in every row, e only in
+    the last 712; a in rows 1-1250 (10.2% of the promoted 12,288, 9.6% of all 13,000); b in rows 1-1200 and the
+    last 712 (9.8% of the promoted, 14.7% of all); c in 1-1229 (10.002% of the promoted) and d in 1-1228
+    (9.993%). score_inspect and segment_info before and after promote, and promote's row.
+  source: docs/tin-behavior-catalog.md §9 S-07; behavior §3 S10
+  corpus: cat_s07f
+  settings:
+    "{engine}.index_maintenance_mode": manual
+  capture:
+  - script:
+      steps:
+      - sql: >-
+          INSERT INTO {table} SELECT n, 'w k' || n || CASE WHEN n <= 1200 THEN ' a b c d' WHEN n <= 1228 THEN ' a c d'
+          WHEN n = 1229 THEN ' a c' WHEN n <= 1250 THEN ' a' WHEN n > 12288 THEN ' b e' ELSE '' END
+          FROM generate_series(1, 13000) n
+      - &segments {sql: 'SELECT coalesce(json_agg(to_json(s) ORDER BY s.ordinal), ''[]'') FROM {engine}.segment_info(''{index}'') s'}
+      - &inspect13k {sql: 'SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), ''hex'')) ORDER BY term),
+          ''[]'') FROM {engine}.score_inspect(''{index}''::regclass, ''w OR a OR b OR c OR d OR e OR k1'')'}
+      - {sql: 'SELECT coalesce(json_agg(to_json(p)), ''[]'') FROM {engine}.promote(''{index}''::regclass) p'}
+      - *segments
+      - *inspect13k
+      - {sql: 'SELECT coalesce(json_agg(to_json(p)), ''[]'') FROM {engine}.promote(''{index}''::regclass) p'}
+- id: catalog.S-07g
+  description: >
+    catalog.S-07f's rows promoted with promote(index, extent_cap_bytes => 1), the smallest extent cap: how many
+    segments promotion writes, and whether score_inspect's elision still follows the promoted documents as a
+    whole.
+  source: docs/tin-behavior-catalog.md §9 S-07; behavior §3 S10
+  corpus: cat_s07g
+  settings:
+    "{engine}.index_maintenance_mode": manual
+  capture:
+  - script:
+      steps:
+      - sql: >-
+          INSERT INTO {table} SELECT n, 'w k' || n || CASE WHEN n <= 1200 THEN ' a b c d' WHEN n <= 1228 THEN ' a c d'
+          WHEN n = 1229 THEN ' a c' WHEN n <= 1250 THEN ' a' WHEN n > 12288 THEN ' b e' ELSE '' END
+          FROM generate_series(1, 13000) n
+      - {sql: 'SELECT coalesce(json_agg(to_json(p)), ''[]'') FROM {engine}.promote(''{index}''::regclass, 1) p'}
+      - {sql: 'SELECT count(*), sum(docs), min(docs), max(docs), array_agg(DISTINCT kind ORDER BY kind)
+          FROM {engine}.segment_info(''{index}'')'}
+      - *inspect13k
+- id: catalog.S-07h
+  description: promote()'s signature, from pg_proc, and promote with an extent cap of 0 bytes.
+  source: docs/tin-behavior-catalog.md §9 S-07
+  corpus: cat_s07c
+  capture:
+  - value: {sql: 'SELECT coalesce(json_agg(json_build_array(pg_get_function_arguments(p.oid), pg_get_function_result(p.oid))
+        ORDER BY p.oid), ''[]'') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = ''{engine}'' AND p.proname = ''promote'''}
+  - error: {sql: 'SELECT * FROM {engine}.promote(''{index}''::regclass, 0)', as: zero_cap}

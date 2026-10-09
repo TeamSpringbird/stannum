@@ -1,0 +1,221 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: limits
+description: >
+  Resource limits TIN documents nowhere: AT LEAST inside a proximity
+  operator, cancellation of dictionary scans and of CREATE INDEX, scoring
+  large expansions, compiled regex size, and large documents. Each case
+  records the answer, the ERROR, a crash, or, for a cancel capture, whether
+  statement_timeout ended the statement and whether it did so promptly (the
+  elapsed time itself is not recorded; run with --timings to see it). An
+  engine may refuse these with a limit ERROR (54000 program_limit_exceeded or
+  54001 statement_too_complex) where TIN answers: divergences of kind limit.
+
+  Cases marked risky may restart the server; record them one at a time,
+  last, and tag those that crash. Per-connection cache growth (handoff card
+  L-7) cannot be measured through SQL from a remote client and has no case.
+
+  Recorded against TIN 1.0.3 on 2026-09-26 (PlanetScale Postgres 18.6):
+  limits.at_least_near.3 and limits.large_doc.50mb crashed the server (every
+  connection ended; it recovered within seconds), and
+  limits.expansion_score.2 ended its own backend ("terminating connection
+  due to administrator command") while the server stayed up. They are tagged
+  and were each run once. limits.expansion_count.1 restarted TIN's server in
+  a one-off probe made before the case was written; it was not run again, so
+  it has no recorded answer.
+
+corpora:
+  lim_atleast:
+    rows:
+      - [1, t1 t2 t3 t4 t5 t6 x]
+      - [2, t1 t2 x]
+      - [3, t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 x]
+      - [4, t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 t30 x]
+      - [5, t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23 t24 t25 t26 t27 t28 t29 t30]
+      - [6, x t1 t2 t3]
+      - [7, x]
+    pad: 20
+  lim_dict:
+    # 1,000,000 rows of one distinct term each ('q' and 12 hex digits, so
+    # none contains a z), plus two rows the expansions below match.
+    rows:
+      - [1000001, fizzbuzz]
+      - [1000002, zzzzzy]
+    setup_sql:
+      - "INSERT INTO {table} SELECT n, 'q' || substr(md5(n::text), 1, 12) FROM generate_series(1, 1000000) n"
+  lim_regex:
+    rows:
+      - [1, abcdefghij1 x]
+      - [2, abcdefghijklmnopqrst x]
+      - [3, hello world]
+      - [4, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+  lim_doc10:
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}(body)']
+  lim_doc50:
+    index_sql: ['CREATE INDEX {index} ON {table} USING {engine}(body)']
+
+cases:
+# ---- L-1: AT LEAST inside NEAR/THEN
+- id: limits.at_least_near.1
+  description: AT LEAST 3 OF 6 terms NEAR/5 x.
+  corpus: lim_atleast
+  query: '(AT LEAST 3 OF [t1 t2 t3 t4 t5 t6]) NEAR/5 x'
+  capture: [ids]
+- id: limits.at_least_then.1
+  description: AT LEAST 3 OF 6 terms THEN/5 x.
+  corpus: lim_atleast
+  query: '(AT LEAST 3 OF [t1 t2 t3 t4 t5 t6]) THEN/5 x'
+  capture: [ids]
+- id: limits.at_least_near.2
+  description: AT LEAST 8 OF 16 terms NEAR/5 x (12,870 combinations).
+  corpus: lim_atleast
+  query: '(AT LEAST 8 OF [t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16]) NEAR/5 x'
+  capture: [ids]
+- id: limits.at_least.1
+  description: Control outside a proximity operator, AT LEAST 15 OF 30 terms.
+  corpus: lim_atleast
+  query: 'AT LEAST 15 OF [t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23 t24 t25
+    t26 t27 t28 t29 t30]'
+  capture: [ids]
+- id: limits.at_least_near.3
+  description: >
+    AT LEAST 15 OF 30 terms NEAR/5 x (155,117,520 combinations), with one document holding all 30 and x, under a
+    30 s statement_timeout.
+  corpus: lim_atleast
+  risky: true
+  crashes: [tin-1.0.3]
+  settings:
+    statement_timeout: 30s
+  query: '(AT LEAST 15 OF [t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16 t17 t18 t19 t20 t21 t22 t23 t24 t25
+    t26 t27 t28 t29 t30]) NEAR/5 x'
+  capture: [count]
+
+# ---- L-2: cancelling a dictionary scan
+- id: limits.expansion_cancel.1
+  description: >
+    A regex with no fixed prefix over a dictionary of 1,000,002 terms, uncancelled and under a 50 ms
+    statement_timeout (prompt: canceled within 250 ms of it).
+  corpus: lim_dict
+  capture:
+  - count: {query: 'MATCHES .*zz.*'}
+  - cancel: {sql: "SELECT count(*) FROM {table} WHERE body ==> 'MATCHES .*zz.*'", timeout_ms: 50}
+- id: limits.expansion_cancel.2
+  description: A fuzzy term with no fixed prefix over the same dictionary, uncancelled and under a 50 ms statement_timeout.
+  corpus: lim_dict
+  capture:
+  - count: {query: 'zzzzzz~0:2'}
+  - cancel: {sql: "SELECT count(*) FROM {table} WHERE body ==> 'zzzzzz~0:2'", timeout_ms: 50}
+- id: limits.expansion_cancel.3
+  description: The regex of limits.expansion_cancel.1 ranked by score, uncancelled and under a 50 ms statement_timeout.
+  corpus: lim_dict
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(id ORDER BY id), '[]') FROM (SELECT id FROM {table} WHERE body ==> 'MATCHES
+        .*zz.*' ORDER BY {engine}.score(ctid) DESC LIMIT 10) top"}
+  - cancel: {sql: "SELECT id FROM {table} WHERE body ==> 'MATCHES .*zz.*' ORDER BY {engine}.score(ctid) DESC LIMIT 10",
+      timeout_ms: 50}
+
+# ---- L-3: scoring a large expansion
+- id: limits.expansion_score.1
+  description: >
+    Ranked top 10 by full_score of q00*, which expands to about 3,900 dictionary terms: how many rows, and how
+    many distinct scores among them.
+  corpus: lim_dict
+  capture:
+  - value: {sql: "SELECT count(*), count(DISTINCT s) FROM (SELECT {engine}.full_score(ctid) s FROM {table} WHERE body ==>
+        'q00*' ORDER BY {engine}.full_score(ctid) DESC LIMIT 10) top"}
+- id: limits.expansion_score.2
+  description: >
+    As limits.expansion_score.1 for q0*, about 62,500 terms. TIN 1.0.3's backend was terminated ("administrator
+    command") after about 1 s.
+  corpus: lim_dict
+  risky: true
+  crashes: [tin-1.0.3]
+  expect_if_answered: {value: [[10, 1]]}
+  capture:
+  - value: {sql: "SELECT count(*), count(DISTINCT s) FROM (SELECT {engine}.full_score(ctid) s FROM {table} WHERE body ==>
+        'q0*' ORDER BY {engine}.full_score(ctid) DESC LIMIT 10) top"}
+- id: limits.expansion_count.1
+  description: count(*) of q*, which expands to all 1,000,000 q-terms. Restarted TIN 1.0.3's server (see the area description).
+  corpus: lim_dict
+  risky: true
+  crashes: [tin-1.0.3]
+  query: 'q*'
+  capture: [count]
+  expect_if_answered: {count: 1000000}
+
+# ---- L-4: regex compile size
+- id: limits.regex_size.1
+  description: A regex that compiles large, \w{100}.
+  corpus: lim_regex
+  capture:
+  - ids: {query: 'MATCHES \w{100}'}
+- id: limits.regex_size.2
+  description: A regex that compiles large, [\p{L}]{200}.
+  corpus: lim_regex
+  capture:
+  - ids: {query: 'MATCHES [\p{L}]{200}'}
+- id: limits.regex_size.3
+  description: A regex that compiles large, .{500}.
+  corpus: lim_regex
+  capture:
+  - ids: {query: 'MATCHES .{500}'}
+- id: limits.regex_size.4
+  description: Control, \w{20}\w*, which is small.
+  corpus: lim_regex
+  capture:
+  - ids: {query: 'MATCHES \w{20}\w*'}
+- id: limits.regex_many.1
+  description: 50 regexes \w{10}<n>, OR-ed.
+  corpus: lim_regex
+  query_sql: "SELECT string_agg('MATCHES \\w{10}' || n, ' OR ') FROM generate_series(1, 50) n"
+  capture: [ids]
+- id: limits.regex_many.2
+  description: 200 regexes \w{10}<n>, OR-ed.
+  corpus: lim_regex
+  risky: true
+  query_sql: "SELECT string_agg('MATCHES \\w{10}' || n, ' OR ') FROM generate_series(1, 200) n"
+  capture: [ids]
+- id: limits.regex_many.3
+  description: 200 regexes \w{10}<n>, OR-ed, NEAR/5 x.
+  corpus: lim_regex
+  risky: true
+  query_sql: "SELECT '(' || string_agg('MATCHES \\w{10}' || n, ' OR ') || ') NEAR/5 x' FROM generate_series(1, 200) n"
+  capture: [ids]
+
+# ---- L-5: large documents
+- id: limits.large_doc.10mb
+  description: >
+    A 10 MiB document inserted into an indexed table, then matched and highlighted: the highlight's length, md5 and
+    first tag position, and the count of a term that repeats through it.
+  corpus: lim_doc10
+  capture:
+  - script:
+      steps:
+      - {sql: "INSERT INTO {table} VALUES (1, repeat('lorem ipsum dolor sit amet ', 388362) || 'needle')"}
+      - &large_highlight {sql: "SELECT id, length(h), md5(h), position('<b>' in h) FROM (SELECT id, {engine}.highlight(body) h
+          FROM {table} WHERE body ==> 'needle') s ORDER BY id"}
+      - &large_count {sql: "SELECT count(*) FROM {table} WHERE body ==> 'lorem AND needle'"}
+- id: limits.large_doc.50mb
+  description: >
+    As limits.large_doc.10mb with a 50 MiB document. TIN 1.0.3 inserted it and crashed the server while
+    highlighting it.
+  corpus: lim_doc50
+  risky: true
+  crashes: [tin-1.0.3]
+  capture:
+  - script:
+      steps:
+      - {sql: "INSERT INTO {table} VALUES (1, repeat('lorem ipsum dolor sit amet ', 1941807) || 'needle')"}
+      - *large_highlight
+      - *large_count
+
+# ---- L-6: cancelling CREATE INDEX
+- id: limits.create_index_cancel.1
+  description: >
+    CREATE INDEX over the 1,000,002-row dictionary table under a 500 ms statement_timeout (prompt: canceled within
+    700 ms of it); rolled back either way.
+  corpus: lim_dict
+  capture:
+  - cancel: {sql: 'CREATE INDEX ON {table} USING {engine}(body)', timeout_ms: 500, within_ms: 700}

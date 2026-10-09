@@ -17,7 +17,11 @@ conformance/
   README.md
   run.py                       the runner
   cases/<area>.yaml            declarative cases, grouped by area
-  cases/catalog.*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9
+  cases/catalog.*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9,
+                               and catalog.promote.yaml, which asks catalog.S-07's
+                               question again
+  cases/limits.yaml            resource limits: expansion, regex size, large
+                               documents, cancellation
   expected/<engine>-<version>/<area>.json
                                recorded answers of one engine version
   divergences/<engine>.yaml    where an engine knowingly answers differently
@@ -77,6 +81,7 @@ compares against, runs the cases that have a recorded answer (the rest report SK
 | `SKIP` | no answer is recorded for the case (no expectation), or `--skip-crash` skipped it |
 | `IMPROVED` | a documented improvement: the recorded engine refused with an ERROR and the engine under test answered (see Divergences) |
 | `GAP` | a documented gap: the engine under test lacks what the case exercises (see Divergences) |
+| `LIMITED` | a documented limit: the recorded engine answered and the engine under test refused with a limit ERROR, 54000 or 54001 (see Divergences) |
 
 The run exits 1 if any case FAILs. Answers are compared exactly: id lists in
 order, counts, float4 bit patterns, highlight text.
@@ -91,11 +96,17 @@ e.g. `tin-1.0.3`), naming the captures that differ:
   capture and this engine answers. Reported as `IMPROVED`, with a
   `question` for the recorded engine's authors (why is this not supported?).
 - `kind: gap`: this engine lacks what the case exercises. Reported as `GAP`.
+- `kind: limit`: the recorded engine answered each listed capture (or, in a
+  `script`, the step), and this engine refuses it with SQLSTATE 54000
+  (program_limit_exceeded) or 54001 (statement_too_complex) by design.
+  Reported as `LIMITED`, with the recorded engine's behavior, this engine's
+  limit and a `question`. (Where the recorded engine crashed the server, no
+  entry is needed: any ERROR passes, see Crashes.)
 
 The entries cannot hide a regression: the case FAILs if a capture that is
 not listed differs, a listed capture matches the recorded answer again, a
-listed case matches entirely, or an improvement raises an ERROR where it
-should answer. Whether a divergence is an improvement is a judgment the
+listed case matches entirely, an improvement raises an ERROR where it
+should answer, or a limit answers or raises another ERROR. Whether a divergence is an improvement is a judgment the
 entry records; the runner only checks its mechanics.
 
 ### Crashes
@@ -118,8 +129,12 @@ the sentinel; if it died, the case's result is `server_crashed`, and the
 runner waits for crash recovery, reconnects and continues. A dropped working
 connection with a live sentinel is reported as a lost connection instead.
 
+A managed server may also end only the offending backend (PlanetScale's
+reads "terminating connection due to administrator command"), which records
+`{"captures": {"connection_lost": ...}}`; tag such a case too.
+
 If the recorded result of a case is `server_crashed` (the recorded engine
-crashed on it), the engine under test must not crash: an ERROR passes, and an
+crashed on it) or a lost connection, the engine under test must not crash: an ERROR passes, and an
 answer passes if it equals the case's `expect_if_answered` (when the case
 gives none, the answer is reported as unchecked and passes).
 
@@ -185,6 +200,12 @@ may restart.
   header (`imported_from`, `measured_by`): the live run skipped the three
   sizes that crash TIN's server, and their `server_crashed` records come
   from that first probe.
+- `expected/tin-1.0.3/catalog.promote.json` and `limits.json` were recorded
+  live by `run.py` (runner version 2) at `8592c98` on 2026-09-27 UTC
+  (2026-09-26 US Eastern) on the same server, the risky limits cases one at a
+  time and last. `limits.json`'s header reads `8592c98…-dirty` only because
+  the answer files being recorded were not yet committed (the runner now
+  ignores `expected/` in that check); the cases and runner were at `8592c98`.
 - A case without recorded answers for an engine is not a failure; it is
   reported as SKIP until someone records that engine.
 
@@ -283,6 +304,15 @@ Case fields:
     rows or ERRORs. Use it for mutations (DELETE, VACUUM, REINDEX, ALTER
     INDEX) and for multi-session visibility; give such a case its own corpus,
     since the changes are not rolled back.
+  - `cancel`: runs `sql` under `statement_timeout = timeout_ms` and records
+    whether it was canceled, not how long it took:
+    `{"canceled": true, "sqlstate": "57014", "prompt": true}`, where `prompt`
+    says the cancel came within `within_ms` (default 250) of the timeout;
+    `{"canceled": false, "answer": ...}` if the statement finished first; or
+    the ERROR. Choose the timeout well below the statement's uninterrupted
+    time and `within_ms` well below the difference, so the record does not
+    depend on the machine. `--timings` prints every capture's elapsed time
+    (never recorded).
 - `score`, `k`: defaults for the ranked and scores captures.
 - `settings`: GUCs set with `SET LOCAL` for every capture; names may use
   `{engine}`.
