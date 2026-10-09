@@ -504,6 +504,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; conformance cases encoded from docs/tin-behavior-catalog.md section 9, written for this repository on 2026-09-26. Moved from conformance/cases/catalog_topk.yaml."
     },
+    "conformance/cases/inventory.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
+    },
     "conformance/cases/limits.yaml": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
@@ -523,6 +527,18 @@
     "conformance/cases/spans.yaml": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-09-26."
+    },
+    "conformance/cases/stemming.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
+    },
+    "conformance/cases/tiebreak.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
+    },
+    "conformance/compare_recordings.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
     },
     "conformance/divergences/stannum.yaml": {
       "owner": "ben",

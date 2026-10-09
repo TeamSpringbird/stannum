@@ -1,0 +1,370 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: stemming
+description: >
+  Snowball stemming, new in TIN 1.0.4: the index option `stemmer` (a
+  language code), its effect on stored terms and on query terms, on
+  phrases, proximity and positions, on wildcard, fuzzy, regex and range
+  literals (documented to search the stored stems unchanged), on scores,
+  score_inspect and score_stop_words, on highlighting, and tokenize(...,
+  stemmer => code) for every documented language. Sources: PlanetScale's
+  index reference (reference/indexes#stemming), function reference
+  (tokenize) and the TIN v1.0.6 announcement, read 2026-10-08. stem_en and
+  stem_plain hold the same rows, with and without stemmer = 'en'.
+defaults:
+  settings: {enable_seqscan: 'off'}
+corpora:
+  stem_en: &stem_rows
+    rows:
+    - [1, I run every day]
+    - [2, she runs fast]
+    - [3, they were running fast]
+    - [4, the runner ran]
+    - [5, running shoes for runners]
+    - [6, Running FAST]
+    - [7, connection connected connecting]
+    - [8, the café cafés]
+    - [9, generous generously generosity]
+    pad: 30
+    index_options: {stemmer: "'en'"}
+  stem_plain:
+    rows:
+    - [1, I run every day]
+    - [2, she runs fast]
+    - [3, they were running fast]
+    - [4, the runner ran]
+    - [5, running shoes for runners]
+    - [6, Running FAST]
+    - [7, connection connected connecting]
+    - [8, the café cafés]
+    - [9, generous generously generosity]
+    pad: 30
+  stem_en_buffer:
+    # The same rows, inserted after the index is built: they sit in the
+    # index's write buffer when the cases run.
+    pad: 30
+    index_options: {stemmer: "'en'"}
+    after_index_sql:
+    - "INSERT INTO {table} VALUES (1, 'I run every day'), (2, 'she runs fast'), (3, 'they were running fast'), (4,
+      'the runner ran'), (5, 'running shoes for runners'), (6, 'Running FAST')"
+  stem_en_stop_run:
+    rows:
+    - [1, running fast]
+    - [2, runs slowly]
+    - [3, fast cars]
+    pad: 30
+    index_options: {stemmer: "'en'", score_stop_words: "'run'"}
+  stem_en_stop_running:
+    rows:
+    - [1, running fast]
+    - [2, runs slowly]
+    - [3, fast cars]
+    pad: 30
+    index_options: {stemmer: "'en'", score_stop_words: "'running'"}
+  stem_alter:
+    rows:
+    - [1, running fast]
+    - [2, runs slowly]
+    - [3, I run]
+    pad: 10
+  stem_fr:
+    rows:
+    - [1, je chante]
+    - [2, nous chantons]
+    - [3, elle a chanté]
+    - [4, le chanteur]
+    pad: 10
+    index_options: {stemmer: "'fr'"}
+  stem_de:
+    rows:
+    - [1, das Haus]
+    - [2, die Häuser]
+    - [3, in den Häusern]
+    - [4, er läuft]
+    - [5, wir laufen]
+    pad: 10
+    index_options: {stemmer: "'de'"}
+  stem_ru:
+    rows:
+    - [1, кошка спит]
+    - [2, две кошки]
+    - [3, с кошкой]
+    - [4, кот]
+    pad: 10
+    index_options: {stemmer: "'ru'"}
+cases:
+# ---- tokenize
+- id: stemming.tokenize.en
+  description: tokenize with stemmer => 'en', the reference's example plus irregular and derived forms.
+  source: reference/functions (tokenize); reference/indexes#stemming
+  capture:
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('runs running runner ran easily connection connected
+        generously ponies', stemmer => 'en') t"}
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('runs running runner ran easily connection connected
+        generously ponies') t", as: unstemmed}
+- id: stemming.tokenize.fold_order
+  description: Stemming runs after lowercasing and before accent folding; the same text with accent_folding preserve.
+  source: reference/indexes#stemming (pipeline order)
+  capture:
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('Running CAFÉS Naïvely résumés', stemmer => 'en') t"}
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('Running CAFÉS Naïvely résumés', stemmer => 'en',
+        accent_folding => 'preserve') t", as: accents_preserved}
+- id: stemming.tokenize.languages
+  description: tokenize with each of the 18 documented language codes on a few inflected words of that language.
+  source: reference/indexes#stemming (supported codes)
+  capture:
+  - value: {sql: "SELECT code, (SELECT array_agg(t) FROM {engine}.tokenize(txt, stemmer => code) t) FROM (VALUES
+        ('ar', 'المكتبات يكتبون'), ('da', 'løbende løber hestene'), ('de', 'Häuser laufen gelaufen Katzen'), ('el',
+        'ανθρώπους ανθρώπων'), ('en', 'running runs ponies'), ('es', 'hablando hablar gatos'), ('fi', 'taloissa taloja
+        kissat'), ('fr', 'chanter chantons chanté continuellement'), ('hu', 'házakban kertek'), ('it', 'parlare
+        parlando gatti'), ('nl', 'lopen loopt gelopen huizen'), ('no', 'hestene løpende bøker'), ('pt', 'falando falar
+        gatos'), ('ro', 'cântând pisicile'), ('ru', 'бегущий бегать кошки'), ('sv', 'springande hästarna'), ('ta',
+        'பள்ளிக்கூடங்கள்'), ('tr', 'kitaplar evlerden')) v(code, txt) ORDER BY code"}
+- id: stemming.tokenize.codes
+  description: >
+    Codes outside the documented list: Armenian (named by the v1.0.6 announcement, absent from the reference),
+    an unknown code, a language name, an upper-case code, the empty string and NULL.
+  source: reference/indexes#stemming; blog tin-v106
+  priority: edge
+  capture:
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('գրքեր գրքերը', stemmer => 'hy') t", as: hy}
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('running', stemmer => 'xx') t", as: unknown}
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('running', stemmer => 'english') t", as: name}
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('running', stemmer => 'EN') t", as: upper}
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('running', stemmer => '') t", as: empty}
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('running', stemmer => NULL) t", as: 'null'}
+- id: stemming.tokenize.case_preserve
+  description: A stemmer requires case_folding = fold; tokenize with case_folding => 'preserve' and a stemmer.
+  source: reference/indexes (stemmer requires case_folding = fold)
+  priority: edge
+  capture:
+  - value: {sql: "SELECT array_agg(t) FROM {engine}.tokenize('Running runs', case_folding => 'preserve', stemmer =>
+        'en') t"}
+
+# ---- DDL
+- id: stemming.ddl.errors
+  description: >
+    CREATE INDEX with an unknown stemmer code, with a stemmer and case_folding = preserve, and ALTER INDEX SET of an
+    unknown code: documented to fail at CREATE/ALTER.
+  source: reference/indexes#stemming (errors)
+  priority: edge
+  corpus: stem_plain
+  capture:
+  - error: {sql: "CREATE INDEX ON {table} USING {engine}(body) WITH (stemmer = 'xx')", as: unknown_code}
+  - error: {sql: "CREATE INDEX ON {table} USING {engine}(body) WITH (stemmer = 'en', case_folding = 'preserve')", as: case_preserve}
+  - error: {sql: "ALTER INDEX {index} SET (stemmer = 'xx')", as: alter_unknown}
+  - error: {sql: "ALTER INDEX {index} SET (case_folding = 'preserve', stemmer = 'en')", as: alter_case_preserve}
+- id: stemming.ddl.alter_reindex
+  description: >
+    ALTER INDEX SET (stemmer = 'en') on a populated index, queried before and after REINDEX, then RESET (stemmer),
+    queried before and after REINDEX. The reference says changing the stemmer needs a REINDEX.
+  source: reference/indexes#stemming (changing it)
+  corpus: stem_alter
+  capture:
+  - script:
+      steps:
+      - {sql: "SELECT coalesce(json_agg(id ORDER BY id), '[]') FROM {table} WHERE body ==> 'run'", capture: true}
+      - {sql: "ALTER INDEX {index} SET (stemmer = 'en')", capture: true}
+      - &alter_run {sql: "SELECT coalesce(json_agg(id ORDER BY id), '[]') FROM {table} WHERE body ==> 'run'"}
+      - &alter_running {sql: "SELECT coalesce(json_agg(id ORDER BY id), '[]') FROM {table} WHERE body ==> 'running'"}
+      - {sql: "REINDEX INDEX {index}"}
+      - *alter_run
+      - *alter_running
+      - {sql: "ALTER INDEX {index} RESET (stemmer)"}
+      - *alter_run
+      - *alter_running
+      - {sql: "REINDEX INDEX {index}"}
+      - *alter_run
+      - *alter_running
+
+# ---- matching
+- id: stemming.match.term
+  description: A base form, an inflected form, an agent noun and an irregular past, on the stemmed and the plain index.
+  source: reference/indexes#stemming (run, runs, running store as run; runner stays separate)
+  corpus: stem_en
+  capture:
+  - ids: {query: run, as: run}
+  - ids: {query: running, as: running}
+  - ids: {query: runners, as: runners}
+  - ids: {query: ran, as: ran}
+  - ids: {query: connections, as: connections}
+  - ids: {query: generosity, as: generosity}
+  - ids: {query: cafe, as: cafe}
+  - ids: {query: run, corpus: stem_plain, as: plain_run}
+  - ids: {query: running, corpus: stem_plain, as: plain_running}
+  - count: {query: run}
+- id: stemming.match.write_buffer
+  description: Rows inserted after the index is built (in the write buffer) are stemmed like built rows.
+  source: reference/indexes#stemming
+  corpus: stem_en_buffer
+  capture:
+  - ids: {query: run, as: run}
+  - ids: {query: running, as: running}
+  - ids: {query: '"runs fast"', as: phrase}
+  - count: {query: run}
+- id: stemming.match.boolean
+  description: Stemmed terms under AND, OR and NOT.
+  source: reference/indexes#stemming
+  corpus: stem_en
+  capture:
+  - ids: {query: runs AND fast, as: and}
+  - ids: {query: runner OR connects, as: or}
+  - ids: {query: running AND NOT fast, as: not}
+- id: stemming.match.custom_scan_off
+  description: A stemmed index queried with the custom scan off (TIN 1.0.3 refused non-default tokenization there).
+  source: catalog.K-12; reference/indexes#stemming
+  corpus: stem_en
+  capture:
+  - ids: {query: running, as: custom_scan_on}
+  - ids: {query: running, as: custom_scan_off, settings: {"{engine}.enable_custom_scan": "off"}}
+
+# ---- phrases, proximity, positions
+- id: stemming.phrase.1
+  description: Phrases are stemmed like the stored text, so "runs fast" matches running fast.
+  source: reference/indexes#stemming (ordinary terms and phrases use the same stemmer)
+  corpus: stem_en
+  capture:
+  - ids: {query: '"runs fast"', as: runs_fast}
+  - ids: {query: '"running shoe"', as: running_shoe}
+  - ids: {query: '"runs fast"', corpus: stem_plain, as: plain_runs_fast}
+- id: stemming.proximity.1
+  description: NEAR and THEN over stemmed terms.
+  source: reference/indexes#stemming
+  corpus: stem_en
+  capture:
+  - ids: {query: runs NEAR/1 fast, as: near}
+  - ids: {query: fast THEN/1 running, as: then_reversed}
+  - ids: {query: running THEN/2 runner, as: then_2}
+- id: stemming.positions.1
+  description: Positional filters on stemmed terms; stemming drops no token, so positions match the plain index.
+  source: reference/indexes#stemming
+  corpus: stem_en
+  capture:
+  - ids: {query: runs IN FIRST 1 WORDS, as: first_1}
+  - ids: {query: run IN LAST 1 WORDS, as: last_1}
+  - ids: {query: fasting IN LAST 1 WORDS, as: fasting_last}
+  - ids: {query: runner IN WORDS 1 TO 2, as: words_1_2}
+
+# ---- expansions
+- id: stemming.expansion.wildcard
+  description: Wildcards skip stemming and search the stored stems (runner and run are stored; running is not).
+  source: reference/indexes#stemming (wildcard, fuzzy and range literals)
+  corpus: stem_en
+  capture:
+  - ids: {query: 'runn*', as: runn}
+  - ids: {query: 'running*', as: running}
+  - ids: {query: 'run*', as: run}
+  - ids: {query: 'generos*', as: generos}
+  - ids: {query: 'runn*', corpus: stem_plain, as: plain_runn}
+- id: stemming.expansion.fuzzy
+  description: Fuzzy terms skip stemming and match stored stems within the edit distance.
+  source: reference/indexes#stemming
+  corpus: stem_en
+  capture:
+  - ids: {query: 'runs~0', as: runs_0}
+  - ids: {query: 'runs~1', as: runs_1}
+  - ids: {query: 'runnin~1', as: runnin_1}
+- id: stemming.expansion.regex
+  description: Regular expressions are unchanged and match stored stems.
+  source: reference/indexes#stemming (regular expressions are unchanged)
+  corpus: stem_en
+  capture:
+  - ids: {query: 'MATCHES runn.*', as: runn}
+  - ids: {query: 'MATCHES running', as: running}
+  - ids: {query: 'MATCHES connect.*', as: connect}
+- id: stemming.expansion.range
+  description: Range literals skip stemming and range over stored stems.
+  source: reference/indexes#stemming
+  corpus: stem_en
+  capture:
+  - ids: {query: run TO runz, as: run_runz}
+  - ids: {query: running TO runningz, as: running_runningz}
+
+# ---- scoring
+- id: stemming.score.1
+  description: full_score bits of run on the stemmed and the plain index (term frequency merges inflections).
+  source: reference/indexes#stemming
+  corpus: stem_en
+  score: '{engine}.full_score(ctid)'
+  capture:
+  - scores: {query: run, as: stemmed}
+  - scores: {query: running OR runs, as: stemmed_or}
+  - scores: {query: run, corpus: stem_plain, as: plain}
+  - ranked: {query: running}
+- id: stemming.score_inspect.1
+  description: score_inspect lists the stored stems of the query's terms.
+  source: reference/indexes#stemming; scoring (score_inspect)
+  corpus: stem_en
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), 'hex')) ORDER BY term),
+        '[]') FROM {engine}.score_inspect('{index}'::regclass, 'running OR runs OR runner OR fast')"}
+- id: stemming.stop_words.1
+  description: >
+    score_stop_words must be written in stemmed form: 'run' leaves running out of the score, 'running' (never a
+    stored stem) leaves nothing out. Matching is unaffected.
+  source: reference/indexes (score_stop_words; stop words on a stemmed index)
+  corpus: stem_en_stop_run
+  capture:
+  - value: {sql: "SELECT coalesce(json_agg(json_build_array(term, encode(float4send(weight), 'hex')) ORDER BY term),
+        '[]') FROM {engine}.score_inspect('{index}'::regclass, 'running OR fast')", as: stop_run}
+  - value: {corpus: stem_en_stop_running, sql: "SELECT coalesce(json_agg(json_build_array(term,
+        encode(float4send(weight), 'hex')) ORDER BY term), '[]') FROM {engine}.score_inspect('{index}'::regclass,
+        'running OR fast')", as: stop_running}
+  - ids: {query: running, as: ids}
+  - scores: {query: running OR fast, score: '{engine}.score(ctid)', as: stop_run_scores}
+
+# ---- highlighting
+- id: stemming.highlight.implicit
+  description: Implicit highlight() on a stemmed index (TIN 1.0.3 refused it on non-default tokenization).
+  source: catalog.H-14; reference/indexes#stemming
+  corpus: stem_en
+  capture:
+  - highlight: {query: run, as: run}
+  - highlight: {query: '"runs fast"', as: phrase}
+- id: stemming.highlight.explicit
+  description: >
+    highlight() with an explicit query on a stemmed index's rows, without and with stemmer => 'en' (1.0.4 added the
+    tokenizer options to highlight()).
+  source: pg_proc (tin.highlight signature in 1.0.4)
+  corpus: stem_en
+  capture:
+  - highlight: {query: run, sql: "SELECT id, {engine}.highlight(body, query => 'run') FROM {table} WHERE body ==>
+        {query} ORDER BY id", as: no_stemmer}
+  - highlight: {query: run, sql: "SELECT id, {engine}.highlight(body, query => 'run', stemmer => 'en') FROM {table}
+        WHERE body ==> {query} ORDER BY id", as: stemmer_en}
+- id: stemming.highlight.literal
+  description: highlight() and highlight_ansi() of a literal text with stemmer => 'en', no index involved.
+  source: pg_proc (tin.highlight, tin.highlight_ansi signatures in 1.0.4)
+  capture:
+  - value: {sql: "SELECT {engine}.highlight('Runners were running; she runs.', query => 'run', stemmer => 'en')", as: html}
+  - value: {sql: "SELECT {engine}.highlight('Runners were running; she runs.', query => '\"runs fast\" OR runner',
+        stemmer => 'en')", as: html_phrase}
+  - value: {sql: "SELECT encode(convert_to({engine}.highlight_ansi('she runs', query => 'running', stemmer => 'en'),
+        'UTF8'), 'hex')", as: ansi}
+
+# ---- other languages
+- id: stemming.language.fr
+  description: A French-stemmed index matches inflections of chanter.
+  source: reference/indexes#stemming (fr)
+  corpus: stem_fr
+  capture:
+  - ids: {query: chanter, as: chanter}
+  - ids: {query: chantez, as: chantez}
+  - ids: {query: chanteurs, as: chanteurs}
+- id: stemming.language.de
+  description: A German-stemmed index on Haus, Häuser and laufen, läuft.
+  source: reference/indexes#stemming (de)
+  corpus: stem_de
+  capture:
+  - ids: {query: häuser, as: haeuser}
+  - ids: {query: haus, as: haus}
+  - ids: {query: läuft, as: laeuft}
+- id: stemming.language.ru
+  description: A Russian-stemmed index on кошка and its cases.
+  source: reference/indexes#stemming (ru)
+  corpus: stem_ru
+  capture:
+  - ids: {query: кошку, as: koshku}
+  - ids: {query: кот, as: kot}

@@ -16,12 +16,19 @@ implements the interface.
 conformance/
   README.md
   run.py                       the runner
+  compare_recordings.py        lists the cases whose answers differ between two
+                               recorded directories (e.g. two engine versions)
   cases/<area>.yaml            declarative cases, grouped by area
   cases/catalog.*.yaml         the 140 cases of docs/tin-behavior-catalog.md §9,
                                and catalog.promote.yaml, which asks catalog.S-07's
                                question again
   cases/limits.yaml            resource limits: expansion, regex size, large
                                documents, cancellation
+  cases/stemming.yaml          the stemmer index option and tokenize(stemmer =>)
+                               (new in TIN 1.0.4)
+  cases/tiebreak.yaml          ORDER BY score DESC, other columns ... LIMIT k
+  cases/inventory.yaml         the engine's settings, functions, access method
+                               and operator as the catalogs list them
   expected/<engine>-<version>/<area>.json
                                recorded answers of one engine version
   divergences/<engine>.yaml    where an engine knowingly answers differently
@@ -213,6 +220,9 @@ may restart.
   time and last. `limits.json`'s header reads `8592c98…-dirty` only because
   the answer files being recorded were not yet committed (the runner now
   ignores `expected/` in that check); the cases and runner were at `8592c98`.
+- To see what a new version changed, compare its directory with the
+  previous one: `python3 conformance/compare_recordings.py
+  conformance/expected/tin-1.0.3 conformance/expected/tin-1.0.4`.
 - A case without recorded answers for an engine is not a failure; it is
   reported as SKIP until someone records that engine.
 
