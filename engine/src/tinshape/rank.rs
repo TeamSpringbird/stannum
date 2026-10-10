@@ -355,7 +355,7 @@ fn load<'a>(
 
 /// A term's positions read by posting index, forward from the last entry
 /// read where that is nearer than the entry its tables locate.
-struct PosCursor<'a> {
+pub(super) struct PosCursor<'a> {
     positions: Positions<'a>,
     at: usize,
     /// Entry `next` starts at byte `next_at`.
@@ -364,7 +364,7 @@ struct PosCursor<'a> {
 }
 
 impl<'a> PosCursor<'a> {
-    fn new(stream: (segment::tinshape::blob::Bytes<'a>, usize)) -> Result<Self> {
+    pub(super) fn new(stream: (segment::tinshape::blob::Bytes<'a>, usize)) -> Result<Self> {
         let positions = Positions::parse(stream.0)?;
         Ok(Self {
             next: 0,
@@ -375,7 +375,12 @@ impl<'a> PosCursor<'a> {
     }
 
     /// Reads entry `index` into `out`.
-    fn read(&mut self, index: u32, out: &mut Vec<u32>, touch: &mut impl Touch) -> Result<()> {
+    pub(super) fn read(
+        &mut self,
+        index: u32,
+        out: &mut Vec<u32>,
+        touch: &mut impl Touch,
+    ) -> Result<()> {
         let (entry, entry_at, reads) = self.positions.locate(index)?;
         if index < self.next || entry > self.next {
             for (at, len) in reads {

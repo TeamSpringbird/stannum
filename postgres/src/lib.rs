@@ -7600,6 +7600,13 @@ mod tests {
                 "common AND (red OR green)",
                 "absent OR needle OR green",
                 "absent AND common",
+                // Phrases fold too: the words' members ANDed per group,
+                // positions read only for those left.
+                "\"common red\"",
+                "\"needle red\"",
+                "\"red common\"",
+                "\"needle common green\"",
+                "\"common red\" OR needle",
             ] {
                 let sql = format!("SELECT count(*) FROM fold_counts WHERE body ==> '{query}'");
                 Spi::run("SET LOCAL stannum.count_fold=off").unwrap();
@@ -7616,14 +7623,10 @@ mod tests {
                 value("SELECT count(*) FROM fold_counts WHERE body ==> 'needle'"),
                 value("SELECT count(*) FROM fold_counts WHERE body LIKE '%needle%'")
             );
-            // Positional queries keep the existing strategies.
-            let plan = Spi::get_one::<Json>(
-                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM fold_counts WHERE body ==> '\"common red\"'",
-            )
-            .unwrap()
-            .unwrap()
-            .0;
-            assert_ne!(plan[0]["Plan"]["Count Strategy"], "ordinal fold");
+            assert_eq!(
+                value("SELECT count(*) FROM fold_counts WHERE body ==> '\"common red\"'"),
+                value("SELECT count(*) FROM fold_counts WHERE body LIKE '%common red%'")
+            );
         }
     }
 

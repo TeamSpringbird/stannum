@@ -177,7 +177,7 @@ struct G<'a> {
 /// A container's bytes, read for a path that cannot return an error: a
 /// failed load is reported as corruption.
 #[inline]
-fn container_bytes(bytes: Bytes<'_>) -> &[u8] {
+fn container_bytes(bytes: Bytes<'_>) -> &'_ [u8] {
     bytes
         .all()
         .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
@@ -205,7 +205,7 @@ pub struct TermSet<'a> {
     /// The target of the last seek: the cursor may move forward from it.
     sought: u32,
     gpos: usize,
-    loaded: Loaded,
+    loaded: Loaded<'a>,
     current: Option<u32>,
     index: u32,
     sparse: Option<EfCursor<'a>>,
@@ -215,11 +215,13 @@ pub struct TermSet<'a> {
 }
 
 #[derive(Default)]
-enum Loaded {
+enum Loaded<'a> {
     #[default]
     None,
-    /// A grid group, with `prefix` its members before each word.
-    Grid,
+    /// A grid group, its bytes read once (a grid across pages is stitched
+    /// once, not at every seek), with `prefix` its members before each
+    /// word.
+    Grid(&'a [u8]),
     /// A decoded group, its local slots in `list`, at `pos`.
     List,
 }
@@ -439,9 +441,9 @@ impl<'a> TermSet<'a> {
                 self.load(&g, &group, touch);
             }
             let first = self.first_of(&g);
-            let found = match (&self.loaded, g.src) {
-                (Loaded::Grid, Src::Container { bytes, .. }) => {
-                    let bytes = container_bytes(bytes);
+            let found = match &self.loaded {
+                Loaded::Grid(bytes) => {
+                    let bytes = *bytes;
                     let words = bytes.len() / 8;
                     let mut w = local_target as usize / 64;
                     let mut found = None;
@@ -465,7 +467,7 @@ impl<'a> TermSet<'a> {
                     }
                     found
                 }
-                (Loaded::List, _) => {
+                Loaded::List => {
                     let list = &self.list;
                     let mut pos = self.pos;
                     // Forward steps are short: look at the next few first.
@@ -480,7 +482,7 @@ impl<'a> TermSet<'a> {
                     self.pos = pos;
                     list.get(pos).map(|l| (*l, pos as u32))
                 }
-                _ => unreachable!("a loaded group"),
+                Loaded::None => unreachable!("a loaded group"),
             };
             if let Some((local, rank)) = found {
                 self.current = Some(base + local);
@@ -508,7 +510,7 @@ impl<'a> TermSet<'a> {
                 if entry.kind == KIND_GRID {
                     self.prefix.clear();
                     kernels::prefix_counts(bytes, &mut self.prefix);
-                    self.loaded = Loaded::Grid;
+                    self.loaded = Loaded::Grid(bytes);
                 } else {
                     let mut list = std::mem::take(&mut self.list);
                     list.clear();
@@ -639,6 +641,10 @@ struct Fold<'s, 'a, T: Touch> {
     /// Member lists of a probing AND.
     list: Vec<u32>,
     other: Vec<u32>,
+    /// Per term, a cursor over its positions, opened when a span first
+    /// reads them: documents are checked in slot order, so their entries
+    /// are read forward from the last one rather than located afresh.
+    cursors: Vec<Option<rank::PosCursor<'a>>>,
 }
 
 /// Keeps the members of `list` that are in `other`; both ascending.
@@ -993,7 +999,14 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     set.seek(geometry, slot, self.touch);
                     debug_assert_eq!(set.current(), Some(slot));
                     let index = set.index();
-                    read_positions(set.positions, index, &mut positions[i], self.touch)?;
+                    if self.cursors.len() <= *t {
+                        self.cursors.resize_with(*t + 1, || None);
+                    }
+                    let cursor = match &mut self.cursors[*t] {
+                        Some(cursor) => cursor,
+                        empty => empty.insert(rank::PosCursor::new(set.positions)?),
+                    };
+                    cursor.read(index, &mut positions[i], self.touch)?;
                 }
                 if solver.intervals(&positions).next().is_none() {
                     out[w] &= !(1u64 << bit);
@@ -1088,6 +1101,7 @@ pub fn count_terms<'a>(
         touch,
         list: Vec::new(),
         other: Vec::new(),
+        cursors: Vec::new(),
     };
     let mut total = 0u64;
     let mut out = Vec::new();
@@ -1143,6 +1157,7 @@ pub fn for_each_match<'a>(
         touch,
         list: Vec::new(),
         other: Vec::new(),
+        cursors: Vec::new(),
     };
     let mut out = Vec::new();
     for group in groups {
@@ -1269,6 +1284,7 @@ pub fn count_terms_visible<'a>(
         touch,
         list: Vec::new(),
         other: Vec::new(),
+        cursors: Vec::new(),
     };
     let mut total = 0u64;
     let mut out = Vec::new();
@@ -2381,6 +2397,75 @@ mod tests {
                 prop_assert_eq!(bits(top.into_rows()), bits(want.into_rows()), "top {} ties {} parts {:?} of {:?}", k, ties, order, node);
             }
         }
+    }
+
+    /// A phrase counted over a segment read in place checks positions for
+    /// each document holding its words, finding each one's posting index
+    /// in its words' grids: a grid spanning pages is stitched once per
+    /// group, not once per document (at 1M rows `"w1 w2"` stitched 238 MB
+    /// for 30,049 candidates).
+    #[test]
+    fn a_phrase_count_stitches_a_grid_once_per_group() {
+        let docs: Vec<Tid> = (0..4_000u32)
+            .map(|i| Tid {
+                block: i / 16,
+                offset: (i % 16) as u16 + 1,
+            })
+            .collect();
+        let lengths = vec![10u32; docs.len()];
+        let members = vec![
+            (0..docs.len()).map(|r| (r, 1)).collect::<Vec<_>>(),
+            (0..docs.len()).map(|r| (r, 2)).collect(),
+        ];
+        let all: Vec<usize> = (0..docs.len()).collect();
+        let options = Options {
+            grid_min_postings: 0,
+            grid_density: 4,
+            ..Options::default()
+        };
+        let blob = build_part(
+            &docs,
+            &lengths,
+            &members,
+            &all,
+            &vec![false; docs.len()],
+            options,
+        );
+        let parsed = Segment::parse(&blob).unwrap();
+        let pinned = LazyBlob::new(Box::new(segment::tinshape::blob::PinningSource::new(
+            blob.clone(),
+            509,
+        )));
+        let segment = assembled_in_place(&pinned, &parsed, &blob);
+        let names: Vec<String> = (0..2).map(|t| format!("t{t}")).collect();
+        // Term t holds positions 0..tf (see `build_part`): "t1 t0" is at 1, 2.
+        let node = Node::Span {
+            slots: vec![1, 0],
+            query: SpanQuery::phrase([0, 1]),
+        };
+        pinned.open_span();
+        let got = count(&segment, &node, &names, &mut NoTouch).unwrap();
+        let stitched = pinned.stitched();
+        segment.forget_borrowed();
+        // SAFETY: `count` returned an owned result.
+        unsafe { pinned.close_span() };
+        assert_eq!(got, 0, "t0 holds only position 0, t1 positions 0 and 1");
+        let phrase = Node::Span {
+            slots: vec![0, 1],
+            query: SpanQuery::phrase([0, 1]),
+        };
+        pinned.open_span();
+        let got = count(&segment, &phrase, &names, &mut NoTouch).unwrap();
+        let stitched = stitched.max(pinned.stitched());
+        segment.forget_borrowed();
+        // SAFETY: as above.
+        unsafe { pinned.close_span() };
+        assert_eq!(got, docs.len() as u64);
+        assert!(
+            stitched < blob.len(),
+            "stitched {stitched} bytes of a {}-byte blob",
+            blob.len()
+        );
     }
 
     /// A group's candidates are scored best bound first: its best rows come

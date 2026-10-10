@@ -2191,6 +2191,9 @@ unsafe fn fold_count(
                         exec.ctid_folds += 1;
                         Some(crate::storage::codec_in(result, label))
                     }
+                    // A positional query the source cannot fold natively is
+                    // counted through its candidates below.
+                    None if !crate::fold::supported(query) => None,
                     None => crate::storage::codec_in(
                         crate::fold::count_segment(
                             source.as_ref(),
@@ -2285,7 +2288,14 @@ unsafe extern "C-unwind" fn exec_count(
             let diagnostic = FORCE_COUNT_PAGES.get()
                 || COUNT_PAGE_THRESHOLD.get() > 0
                 || PROFILE_COUNT_SELECTION.get();
-            if COUNT_FOLD.get() && !diagnostic && !exec.recheck && crate::fold::supported(&query) {
+            // A Boolean query folds over any segment; a phrase (a span
+            // needing every word) over segments in TIN's shape, which AND
+            // its words a group at a time and read positions only for the
+            // documents left (any other source counts its candidates).
+            let foldable = crate::fold::supported(&query)
+                || COUNT_NATIVE.get()
+                    && engine::tinshape::lower(&query, &mut Vec::new()).is_some();
+            if COUNT_FOLD.get() && !diagnostic && !exec.recheck && foldable {
                 exec.count_fold = true;
                 count = fold_count(node, exec, &query, view, visibility);
             } else {
