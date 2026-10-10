@@ -809,7 +809,7 @@ fn parse_groups(
     let mut index: Option<u64> = None;
     let mut body = 0u64;
     let mut first = 0u64;
-    for g in 0..groups {
+    for slot in slots.iter_mut() {
         let gap = varint::get(payload, &mut at)?;
         let next = match index {
             None => gap,
@@ -832,7 +832,7 @@ fn parse_groups(
             KIND_PAGED => varint::get(payload, &mut at)?,
             _ => return Err(Error::Corrupt("postings group kind")),
         };
-        slots[g].write(GroupEntry {
+        slot.write(GroupEntry {
             index: next as u32,
             count: count as u32,
             kind,
