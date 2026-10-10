@@ -45,6 +45,25 @@ divergences:
       Why is this not supported? Is it because the scan computes one kind of
       score per relation, and would it be accepted if the scan computed both?
 
+  - id: prepared.generic_limit.1
+    against: tin-1.0.4
+    kind: improvement
+    captures: [limit_param, query_and_limit_params]
+    summary: Under a generic plan with LIMIT a parameter, TIN scores every match and a 40 ms statement_timeout cancels it; Stannum ranks the top k and answers.
+    tin: >
+      57014 (canceled by statement_timeout) for LIMIT $1, and for the query
+      text $1 with LIMIT $2; the control with a constant LIMIT answers. At
+      1M rows (stannum-lab/tin-probes round 3, C4) a generic plan with
+      LIMIT $n took about 380 ms against 5 ms with a constant LIMIT.
+    stannum: >
+      Binds LIMIT and OFFSET at execution, including a parameter declared
+      int or smallint (cast to bigint), and ranks only the top k: well
+      under a millisecond of scan time here.
+    question: >
+      Is the top k dropped because the planner sees LIMIT as a parameter
+      and the scan's strategy is fixed at plan time? Could the scan take
+      the bound from the Limit node at execution, as a sort does?
+
   - id: catalog.S-22
     against: [tin-1.0.3, tin-1.0.4]
     kind: improvement

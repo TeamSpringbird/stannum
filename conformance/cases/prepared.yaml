@@ -27,8 +27,10 @@ corpora:
 cases:
   - id: prepared.generic_limit.1
     description: >
-      Top 10 of 'needle OR common' by full_score under a generic plan: with a constant LIMIT (the control), with LIMIT a parameter declared int, then
-      with the query text a parameter too; each under a 40 ms statement_timeout.
+      Top 10 of 'needle OR common' by full_score under a generic plan: with a
+      constant LIMIT (the control), with LIMIT a parameter declared int, then
+      with the query text a parameter too; each under a 40 ms
+      statement_timeout.
     corpus: prep_topk
     settings:
       plan_cache_mode: force_generic_plan

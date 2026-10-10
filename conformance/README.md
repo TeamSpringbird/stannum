@@ -243,6 +243,12 @@ may restart.
   16 inside NEAR): `catalog.Q-20`, `limits.at_least_near.2`,
   `limits.large_doc.10mb`, `query_size.words.3000` and
   `query_size.or_chain.3000`.
+- `expected/tin-1.0.4/prepared.json` was recorded live by `run.py` (runner
+  version 3) at `90182b2` on 2026-10-10 UTC (2026-10-09 US Eastern) on the
+  same test database, in its `stannum_lab` database with
+  `--schema-prefix probe4_conformance`. The case is timed by
+  statement_timeout; an earlier run without the control capture canceled
+  the same two captures.
 - To see what a new version changed, compare its directory with the
   previous one: `python3 conformance/compare_recordings.py
   conformance/expected/tin-1.0.3 conformance/expected/tin-1.0.4`.
