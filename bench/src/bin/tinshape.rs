@@ -9,7 +9,8 @@
 //! ```text
 //! cargo run -p bench --release --bin tinshape -- --dump DIR --out DIR \
 //!     [--block 128] [--no-paged] [--no-ef-groups] [--no-sparse] [--fixed-tf] [--grid-density N] \
-//!     [--grid-min-postings N] [--inline-lengths MAXDF] [--subset ROWS [--rows-per-page R]] \
+//!     [--grid-min-postings N] [--inline-lengths MAXDF] [--group-frontiers off|exact|rounded] \
+//!     [--subset ROWS [--rows-per-page R]] \
 //!     [--no-verify] [--no-write] [--label NAME] \
 //!     [--trace trace.tsv --expect pg.tsv [--ranked] [--k 10] [--repeat 3] \
 //!      [--per-query FILE]]
@@ -59,7 +60,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tinshape --dump DIR --out DIR [--block N] [--no-paged] [--no-ef-groups] \
          [--no-sparse] [--fixed-tf] [--grid-density N] [--grid-min-postings N] \
-         [--subset ROWS [--rows-per-page R]] [--no-verify] [--no-write] [--label NAME] \
+         [--group-frontiers off|exact|rounded] [--subset ROWS [--rows-per-page R]] [--no-verify] [--no-write] [--label NAME] \
          [--trace FILE --expect FILE [--ranked] [--k N] [--repeat N] [--per-query FILE]]"
     );
     std::process::exit(2)
@@ -101,6 +102,14 @@ fn args() -> Args {
             }
             "--grid-density" => {
                 a.options.grid_density = value(&mut it).parse().unwrap_or_else(|_| usage())
+            }
+            "--group-frontiers" => {
+                a.options.group_frontiers = match value(&mut it).as_str() {
+                    "off" => segment::tinshape::postings::GroupFrontiers::Off,
+                    "exact" => segment::tinshape::postings::GroupFrontiers::Exact,
+                    "rounded" => segment::tinshape::postings::GroupFrontiers::Rounded,
+                    _ => usage(),
+                }
             }
             "--no-verify" => a.verify = false,
             "--no-write" => a.write = false,

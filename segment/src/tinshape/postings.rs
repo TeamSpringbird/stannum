@@ -466,8 +466,13 @@ pub fn encode_reusing<'r>(
         reuse,
         &mut grouped_stats,
     );
-    // A term with a group dense enough to be a grid stays grouped.
-    let use_sparse = options.sparse && grouped_stats.forced == 0 && sparse.len() <= grouped.len();
+    // A term with a group dense enough to be a grid stays grouped. The
+    // directory's frontiers do not count: they buy the walks their group
+    // bounds, and leaving them out keeps each term's form what it was
+    // without them.
+    let use_sparse = options.sparse
+        && grouped_stats.forced == 0
+        && sparse.len() <= grouped.len() - grouped_stats.frontier_bytes;
     let payload = if use_sparse { &sparse } else { &grouped };
     let mut inline_bytes = Vec::new();
     if inline {
