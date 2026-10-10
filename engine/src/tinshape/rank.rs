@@ -614,9 +614,18 @@ struct Walk<'s, 'a, T: Touch> {
 }
 
 impl<'a, T: Touch> Walk<'_, 'a, T> {
-    /// Adds what the walk used of its terms' footers and directories to
-    /// this thread's [`segment::tinshape::segment::MemoCounts`].
-    fn count_metadata(&self) {
+    /// Records the footer bytes the walk read, and adds what it used of
+    /// its terms' footers and directories to this thread's
+    /// [`segment::tinshape::segment::MemoCounts`].
+    fn count_metadata(&mut self) {
+        for s in &self.sc {
+            let read = s.footer.read();
+            if read > 0 {
+                let set = self.terms[s.term].as_ref().expect("scoring");
+                self.touch
+                    .touch(Part::Footer, set.at + set.postings.footer_at, read);
+            }
+        }
         let used: u64 = self
             .sc
             .iter()
@@ -1440,15 +1449,11 @@ pub(super) fn walk_into<'a>(
             continue;
         };
         let Some(set) = &terms[t] else { continue };
-        // Decoded per query, a block at a time as the walk reaches it.
+        // Decoded per query, a block at a time as the walk reaches it, and
+        // read as far (recorded as read when the walk ends).
         let footer =
             set.postings
                 .lazy_footer(segment.block_size, set.max_bucket, segment.adaptive_tf)?;
-        touch.touch(
-            Part::Footer,
-            set.at + set.postings.footer_at,
-            set.postings.footer.len(),
-        );
         sc.push(Sc::new(t, scorer.clone(), footer));
     }
     // Leaves only: a candidate holding every required term matches a flat

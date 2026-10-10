@@ -703,6 +703,24 @@ impl<'a> Bytes<'a> {
         self.get(from, from + max.min(len - from))
     }
 
+    /// Where the page holding byte `from` of the range ends, as an offset
+    /// in the range (its length at most): bytes `from..page_end(from)` are
+    /// read in place within a span, on one page, with nothing stitched. A
+    /// range in memory is one page.
+    #[inline]
+    pub fn page_end(&self, from: usize) -> usize {
+        match *self {
+            Self::Slice(bytes) => <[u8]>::len(bytes),
+            Self::Lazy { blob, at, len, .. } => {
+                let n = blob.page_len;
+                if n == 0 {
+                    return len;
+                }
+                ((at + from) / n * n + n - at).min(len)
+            }
+        }
+    }
+
     /// Every byte.
     pub fn all(&self) -> Result<&'a [u8]> {
         self.get(0, self.len())
@@ -899,6 +917,28 @@ mod tests {
         assert_eq!(bytes.get(205, 290).unwrap(), &state.bytes[205..290]);
         assert!(blob.loaded() > 0);
         assert_eq!(state.pins.get(), pins);
+    }
+
+    #[test]
+    fn page_end_bounds_reads_in_place() {
+        let (source, blob) = pinning(10 * 100 + 37, 100);
+        let range = blob.bytes().sub(150, 900).unwrap();
+        assert_eq!(range.page_end(0), 50);
+        assert_eq!(range.page_end(49), 50);
+        assert_eq!(range.page_end(50), 150);
+        assert_eq!(range.page_end(745), 750);
+        let all = blob.bytes();
+        assert_eq!(all.page_end(1000), 1037);
+        blob.open_span();
+        let stitched = blob.stitched();
+        assert_eq!(
+            range.get(50, range.page_end(50)).unwrap(),
+            &source.0.bytes[200..300]
+        );
+        assert_eq!(blob.stitched(), stitched, "read in place");
+        unsafe { blob.close_span() };
+        let memory = [1u8, 2, 3];
+        assert_eq!(Bytes::from(&memory).page_end(1), 3);
     }
 
     #[test]

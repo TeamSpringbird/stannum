@@ -2724,6 +2724,14 @@ unsafe extern "C-unwind" fn explain(
                 (c"Footers Decoded", memo.footers_decoded),
                 (c"Footers Kept", memo.footers_kept),
                 (c"Records Forgotten", memo.records_forgotten),
+                (c"Footer Blocks Decoded", memo.footer_blocks),
+                (c"Footer Bytes Parsed", memo.footer_bytes),
+                (c"Footer Blocks Used", memo.blocks_used),
+                (c"Directories Parsed", memo.directories),
+                (c"Directory Entries Decoded", memo.directory_entries),
+                (c"Directory Bytes Parsed", memo.directory_bytes),
+                (c"Directory Entries Reached", memo.entries_reached),
+                (c"Directory Entries Loaded", memo.entries_used),
             ] {
                 pg_sys::ExplainPropertyInteger(
                     label.as_ptr(),

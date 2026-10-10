@@ -1168,8 +1168,12 @@ impl Footer {
 /// length and largest bucket, and where its buckets start in the TF tail
 /// (structures of arrays, so a run of blocks' last slots is a run of
 /// words). A block's frontier pairs are decoded from the bytes when asked
-/// for ([`Self::frontier`]). Nothing is kept beyond the reader: a walk
-/// decodes per query what it reaches.
+/// for ([`Self::frontier`]).
+///
+/// The bytes are read as far as the blocks decoded, a page at a time and
+/// in place over a blob read within a span ([`Bytes::page_end`]): an entry
+/// across a page boundary is stitched alone. Nothing is kept beyond the
+/// reader: a walk decodes per query what it reaches.
 #[derive(Clone, Debug)]
 pub struct LazyFooter<'a> {
     block_size: u32,
@@ -1177,10 +1181,13 @@ pub struct LazyFooter<'a> {
     df: u32,
     blocks: usize,
     adaptive: bool,
-    /// The footer's bytes (the record's, or `own`, rebuilt for a record
-    /// whose footer is derived), and where the next block's entry starts.
-    bytes: &'a [u8],
+    /// The footer's bytes, and the windows of them read so far: each a
+    /// slice and where it starts in the footer. A derived footer (see
+    /// [`Self::new`]) is `own`, one window.
+    src: Bytes<'a>,
+    windows: Vec<(&'a [u8], usize)>,
     own: Vec<u8>,
+    /// Where the next block's entry starts in the footer.
     at: usize,
     /// The last slot and TF offset after the blocks decoded.
     next_last: u64,
@@ -1188,15 +1195,50 @@ pub struct LazyFooter<'a> {
     /// The TF tail's length, checked once every block is decoded; `None`
     /// for a single posting, which has none.
     tf_len: Option<u64>,
-    /// Per decoded block: its last slot; where its frontier's pairs start;
-    /// its frontier's length less one (high nibble) and its largest bucket
-    /// (low nibble); where its buckets start in the TF tail.
+    /// Per decoded block: its last slot; where its frontier's pairs start
+    /// in the footer, and the window holding them; its frontier's length
+    /// less one (high nibble) and its largest bucket (low nibble); where
+    /// its buckets start in the TF tail.
     last: Vec<u32>,
     pairs_at: Vec<u32>,
+    window: Vec<u32>,
     shape: Vec<u8>,
     tf_at: Vec<u32>,
     /// A single posting's bucket, which the dictionary keeps.
     single: Option<u8>,
+}
+
+/// Most bytes a footer block's entry takes: a slot gap, the frontier's
+/// length and sixteen pairs.
+const ENTRY_MAX: usize = 10 + 1 + 16 * (1 + 5);
+
+/// Bytes read first across a page boundary for the entry there: as a rule
+/// it is a few bytes, and the rest of the window is stitched for nothing.
+const BRIDGE: usize = 16;
+
+/// A footer block's entry: the gap to its last slot, where its pairs start,
+/// its frontier's length and largest bucket, and its length.
+#[inline]
+fn footer_entry(bytes: &[u8]) -> Result<(u64, usize, usize, u8, usize)> {
+    let mut at = 0;
+    let gap = varint::get(bytes, &mut at)?;
+    let k = *bytes.get(at).ok_or(Error::Truncated)? as usize;
+    at += 1;
+    if k == 0 || k > 16 {
+        return Err(Error::Corrupt("footer frontier"));
+    }
+    let pairs = at;
+    let mut max = 0u8;
+    for _ in 0..k {
+        let bucket = *bytes.get(at).ok_or(Error::Truncated)?;
+        at += 1;
+        if bucket > 15 {
+            return Err(Error::InvalidTfBucket);
+        }
+        varint::get_u32(bytes, &mut at)?;
+        max = max.max(bucket);
+    }
+    Ok((gap, pairs, k, max, at))
 }
 
 impl<'a> LazyFooter<'a> {
@@ -1213,7 +1255,8 @@ impl<'a> LazyFooter<'a> {
             df,
             blocks,
             adaptive,
-            bytes: &[],
+            src: postings.footer,
+            windows: Vec::new(),
             own: Vec::new(),
             at: 0,
             next_last: 0,
@@ -1221,6 +1264,7 @@ impl<'a> LazyFooter<'a> {
             tf_len: Some(postings.tf.len() as u64),
             last: Vec::new(),
             pairs_at: Vec::new(),
+            window: Vec::new(),
             shape: Vec::new(),
             tf_at: Vec::new(),
             single: None,
@@ -1241,31 +1285,63 @@ impl<'a> LazyFooter<'a> {
                     varint::put(&mut footer.own, u64::from(*length));
                 }
             }
+            footer.src = Bytes::default();
             footer.single = whole.single;
             if whole.single.is_some() {
                 footer.tf_len = None;
             }
-        } else {
-            footer.bytes = postings.footer.all()?;
-            // Room for a footer read through, so the vectors are not grown
-            // and copied as they fill (a block entry takes four bytes or
-            // more as a rule).
-            let likely = (footer.bytes.len() / 4).min(blocks);
-            footer.last.reserve(likely);
-            footer.pairs_at.reserve(likely);
-            footer.shape.reserve(likely);
-            footer.tf_at.reserve(likely);
         }
         Ok(footer)
     }
 
+    /// Window `w`: its bytes and where they start in the footer.
     #[inline]
-    fn data(&self) -> &[u8] {
+    fn window_at(&self, w: usize) -> (&[u8], usize) {
         if self.own.is_empty() {
-            self.bytes
+            self.windows[w]
         } else {
-            &self.own
+            (&self.own, 0)
         }
+    }
+
+    /// The footer's length.
+    #[inline]
+    fn len(&self) -> usize {
+        if self.own.is_empty() {
+            self.src.len()
+        } else {
+            self.own.len()
+        }
+    }
+
+    /// Reads a window from the next entry on: to the end of its page, or,
+    /// when the windows read reach that already (the entry crosses the
+    /// page boundary), `want` bytes past them, stitched.
+    #[cold]
+    fn read_window(&mut self, want: usize) -> Result<()> {
+        let (from, read, len) = (self.at, self.read(), self.src.len());
+        if read >= len && !self.windows.is_empty() {
+            return Err(Error::Truncated);
+        }
+        let end = self.src.page_end(from);
+        let to = if end > read || self.windows.is_empty() {
+            end
+        } else {
+            (read.max(from) + want).min(len)
+        };
+        let bytes = self.src.get(from, to)?;
+        if self.windows.is_empty() {
+            // Room for the blocks of the footer's first page, more as it
+            // goes (a block's entry takes four bytes or more as a rule).
+            let likely = ((to - from) / 4).min(self.blocks);
+            self.last.reserve(likely);
+            self.pairs_at.reserve(likely);
+            self.window.reserve(likely);
+            self.shape.reserve(likely);
+            self.tf_at.reserve(likely);
+        }
+        self.windows.push((bytes, from));
+        Ok(())
     }
 
     /// The record's blocks.
@@ -1278,6 +1354,18 @@ impl<'a> LazyFooter<'a> {
     #[inline]
     pub fn decoded(&self) -> usize {
         self.last.len()
+    }
+
+    /// Footer bytes parsed so far, and read so far.
+    pub fn parsed(&self) -> usize {
+        self.at
+    }
+
+    pub fn read(&self) -> usize {
+        match self.windows.last() {
+            Some((bytes, from)) => from + bytes.len(),
+            None => 0,
+        }
     }
 
     #[inline]
@@ -1298,25 +1386,33 @@ impl<'a> LazyFooter<'a> {
         if b >= self.blocks {
             return Ok(false);
         }
-        let (bytes, mut at) = (self.data(), self.at);
-        let next_last = self.next_last + varint::get(bytes, &mut at)?;
-        let last = u32::try_from(next_last).map_err(|_| Error::Corrupt("footer slot"))?;
-        let k = *bytes.get(at).ok_or(Error::Truncated)? as usize;
-        at += 1;
-        if k == 0 || k > 16 {
-            return Err(Error::Corrupt("footer frontier"));
-        }
-        let pairs_at = at;
-        let mut max = 0u8;
-        for _ in 0..k {
-            let bucket = *bytes.get(at).ok_or(Error::Truncated)?;
-            at += 1;
-            if bucket > 15 {
-                return Err(Error::InvalidTfBucket);
+        let mut want = BRIDGE;
+        let (entry, w) = loop {
+            let w = if self.own.is_empty() {
+                self.windows.len().wrapping_sub(1)
+            } else {
+                0
+            };
+            let parsed = match w {
+                usize::MAX => Err(Error::Truncated),
+                w => {
+                    let (bytes, from) = self.window_at(w);
+                    footer_entry(&bytes[self.at - from..])
+                }
+            };
+            match parsed {
+                Ok(entry) => break (entry, w),
+                Err(Error::Truncated) if self.own.is_empty() => {
+                    // The entry runs past the windows read: read on.
+                    self.read_window(want)?;
+                    want = (want * 2).min(ENTRY_MAX);
+                }
+                Err(error) => return Err(error),
             }
-            varint::get_u32(bytes, &mut at)?;
-            max = max.max(bucket);
-        }
+        };
+        let (gap, pairs, k, max, len) = entry;
+        let next_last = self.next_last + gap;
+        let last = u32::try_from(next_last).map_err(|_| Error::Corrupt("footer slot"))?;
         let n = if b + 1 == self.blocks {
             self.df - b as u32 * self.block_size
         } else {
@@ -1325,18 +1421,20 @@ impl<'a> LazyFooter<'a> {
         let width = tf_width(max, self.adaptive);
         let tf_at = self.next_tf;
         let next_tf = tf_at + bits::packed_len(n as usize, width) as u64;
+        let at = self.at + len;
         if b + 1 == self.blocks
-            && (at != bytes.len() || self.tf_len.is_some_and(|len| len != next_tf))
+            && (at != self.len() || self.tf_len.is_some_and(|len| len != next_tf))
         {
             return Err(Error::Corrupt("footer length"));
         }
+        self.last.push(last);
+        self.pairs_at.push((self.at + pairs) as u32);
+        self.window.push(w as u32);
+        self.shape.push(((k - 1) as u8) << 4 | max);
+        self.tf_at.push(tf_at as u32);
         self.next_last = next_last;
         self.next_tf = next_tf;
         self.at = at;
-        self.last.push(last);
-        self.pairs_at.push(pairs_at as u32);
-        self.shape.push(((k - 1) as u8) << 4 | max);
-        self.tf_at.push(tf_at as u32);
         Ok(true)
     }
 
@@ -1414,9 +1512,10 @@ impl<'a> LazyFooter<'a> {
     /// read from the footer's bytes.
     #[inline]
     pub fn frontier(&self, b: usize) -> Frontier<'_> {
+        let (bytes, from) = self.window_at(self.window[b] as usize);
         Frontier {
-            bytes: self.data(),
-            at: self.pairs_at[b] as usize,
+            bytes,
+            at: self.pairs_at[b] as usize - from,
             left: usize::from(self.shape[b] >> 4) + 1,
         }
     }
@@ -1852,5 +1951,80 @@ mod lazy_footer_tests {
             p.lazy_footer(2, 1, true).unwrap()
         };
         assert_eq!(l.seek(0, slots[0]).unwrap(), 0);
+    }
+
+    /// Over a blob read in place, a footer's pages are pinned only as far
+    /// as its blocks are decoded, an entry across a page boundary is
+    /// stitched alone, and every block agrees with the whole footer.
+    #[test]
+    fn lazy_footer_reads_in_place_as_far_as_reached() {
+        use super::super::blob::{self, LazyBlob, PinningSource};
+        let tids: Vec<Tid> = (0..4000u32)
+            .map(|i| Tid {
+                block: i / 3,
+                offset: (i % 3 + 1) as u16,
+            })
+            .collect();
+        let geometry = Geometry::of(&tids).unwrap();
+        let members: Vec<u32> = (0..4000)
+            .step_by(2)
+            .map(|i| geometry.slot_of(tids[i]).unwrap())
+            .collect();
+        let n = members.len();
+        let buckets: Vec<u8> = (0..n).map(|i| (i * 7 % 16) as u8).collect();
+        let lengths: Vec<u32> = (0..n).map(|i| (i as u32 * 7919) % 5000 + 1).collect();
+        let options = Options {
+            block_size: 4,
+            grid_min_postings: u32::MAX,
+            inline_lengths_max_df: 0,
+            ..Options::default()
+        };
+        let mut out = Vec::new();
+        encode(&geometry, &members, &buckets, &lengths, &options, &mut out);
+        let whole = Postings::parse(&out, n as u32, &geometry)
+            .unwrap()
+            .footer(4, 15, true)
+            .unwrap();
+        let footer_len = {
+            let p = Postings::parse(&out, n as u32, &geometry).unwrap();
+            p.footer.len()
+        };
+        assert!(footer_len > 20 * 64, "a footer of many pages");
+        let source = PinningSource::new(out.clone(), 64);
+        let blob = LazyBlob::new(Box::new(source.clone()));
+        blob.open_span();
+        let parsed = Postings::parse(blob.bytes(), n as u32, &geometry).unwrap();
+        blob::reset_stats();
+        let mut lazy = parsed.lazy_footer(4, 15, true).unwrap();
+        let pins = source.0.pins.get();
+        lazy.ensure(0).unwrap();
+        assert!(
+            source.0.pins.get() - pins <= 2,
+            "the first block's pages only"
+        );
+        let reached = whole.blocks() / 3;
+        lazy.ensure(reached).unwrap();
+        let pinned = source.0.pins.get() - pins;
+        assert!(
+            pinned * 64 < footer_len / 2,
+            "{pinned} pages pinned of a {footer_len}-byte footer"
+        );
+        for b in 0..whole.blocks() {
+            assert_eq!(lazy.seek(b, whole.last[b]).unwrap(), b);
+            assert_eq!(lazy.frontier(b).collect::<Vec<_>>(), whole.frontier_of(b));
+            assert_eq!(lazy.tf_at(b), whole.tf_at[b]);
+        }
+        for i in 0..n as u32 {
+            assert_eq!(lazy.bucket(parsed.tf, i).unwrap(), buckets[i as usize]);
+        }
+        // Stitched: only entries across page boundaries, a few bytes each.
+        let stitched = blob::stats()[Kind::Footer as usize].stitched as usize;
+        assert!(
+            stitched < footer_len / 2,
+            "stitched {stitched} of {footer_len}"
+        );
+        drop(lazy);
+        drop(parsed);
+        unsafe { blob.close_span() };
     }
 }
