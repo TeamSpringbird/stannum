@@ -1381,14 +1381,17 @@ impl<'a> LazyFooter<'a> {
         self.window_at = from;
         if !self.started {
             self.started = true;
-            // Room for the blocks of the footer's first page, more as it
-            // goes (a block's entry takes four bytes or more as a rule).
-            let likely = ((to - from) / 4).min(self.blocks);
-            self.last.reserve(likely);
-            self.ends.reserve(likely);
-            self.frontier.reserve(likely * 2);
-            self.tf_at.reserve(likely);
-            self.widths.reserve(likely);
+            // Room for every block, so the vectors are not grown and copied
+            // as they fill (a common word's footer holds tens of thousands);
+            // what is never decoded is never touched. A frontier pair takes
+            // two bytes or more.
+            let blocks = self.blocks;
+            self.last.reserve_exact(blocks);
+            self.ends.reserve_exact(blocks);
+            self.frontier
+                .reserve_exact((self.src.len().saturating_sub(2 * blocks) / 2).min(blocks * 16));
+            self.tf_at.reserve_exact(blocks);
+            self.widths.reserve_exact(blocks);
         }
         Ok(())
     }

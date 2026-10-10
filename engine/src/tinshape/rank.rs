@@ -142,6 +142,9 @@ impl<'a> Sc<'a> {
             .seek(from, slot)
             .unwrap_or_else(|e| corrupt_footer(e));
         if self.bounds.len() < self.footer.decoded() {
+            if self.bounds.capacity() == 0 {
+                self.bounds.reserve_exact(self.footer.blocks());
+            }
             self.bounds.resize(self.footer.decoded(), f32::NAN);
         }
         b
@@ -167,16 +170,21 @@ impl<'a> Sc<'a> {
     #[inline]
     fn range_bound(&mut self, from: u32, to: u32) -> f32 {
         // The blocks from the first ending at `from` or later through the
-        // first ending at `to` or later (or the last), decoded.
+        // first ending at `to` or later (or the last), in one pass,
+        // decoding as far as the last of them when it is not yet.
         self.wb = self.first_reaching(self.wb, from);
         let blocks = self.footer.blocks();
-        if self.wb >= blocks {
-            return 0.0;
-        }
-        let through = self.first_reaching(self.wb, to).min(blocks - 1);
         let mut best = 0.0_f32;
-        for b in self.wb..=through {
+        let mut b = self.wb;
+        while b < blocks {
+            if b >= self.footer.decoded() {
+                self.seek(b, to);
+            }
             best = best.max(self.bound(b));
+            if self.footer.last(b) >= to {
+                break;
+            }
+            b += 1;
         }
         best
     }
