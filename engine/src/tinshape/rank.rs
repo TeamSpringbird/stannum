@@ -57,10 +57,10 @@ pub(super) struct Sc {
     wb: usize,
     /// The block holding the last candidate asked about, moved forward only.
     cb: usize,
-    /// [`Self::bucket_bound`] per bucket in the block last asked about,
-    /// NaN until asked: a rare term's block spans many groups' candidates.
+    /// [`Self::floor`] per bucket in the block last asked about, `u32::MAX`
+    /// until asked: a rare term's block spans many groups' candidates.
     bb_block: usize,
-    bb: [f32; BUCKET_COUNT],
+    bb: [u32; BUCKET_COUNT],
 }
 
 impl Sc {
@@ -73,7 +73,7 @@ impl Sc {
             wb: 0,
             cb: 0,
             bb_block: usize::MAX,
-            bb: [f32::NAN; BUCKET_COUNT],
+            bb: [u32::MAX; BUCKET_COUNT],
         }
     }
 
@@ -128,37 +128,33 @@ impl Sc {
         (self.cb < last.len()).then_some(self.cb)
     }
 
-    /// What a posting of block `b` with bucket `bucket` scores at most: its
-    /// document is no shorter than the shortest the block holds with that
-    /// bucket or more, the shortest of the frontier's pairs at or above it
-    /// (every posting is dominated by a frontier pair).
+    /// How short a document holding a posting of block `b` with bucket
+    /// `bucket` can be: the shortest the block holds with that bucket or
+    /// more, the shortest of the frontier's pairs at or above it (every
+    /// posting is dominated by a frontier pair).
     #[inline]
-    fn bucket_bound(&self, b: usize, bucket: u8) -> f32 {
-        let length = self
-            .footer
+    fn floor(&self, b: usize, bucket: u8) -> u32 {
+        self.footer
             .frontier_of(b)
             .iter()
             .filter(|(at, _)| *at >= bucket)
             .map(|(_, length)| *length)
             .min()
-            .unwrap_or(0);
-        self.scorer
-            .bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
+            .unwrap_or(0)
     }
 
-    /// [`Self::bucket_bound`], kept per bucket for the block last asked
-    /// about.
+    /// [`Self::floor`], kept per bucket for the block last asked about.
     #[inline]
-    fn bucket_bound_kept(&mut self, b: usize, bucket: u8) -> f32 {
+    fn floor_kept(&mut self, b: usize, bucket: u8) -> u32 {
         if self.bb_block != b {
             self.bb_block = b;
-            self.bb = [f32::NAN; BUCKET_COUNT];
+            self.bb = [u32::MAX; BUCKET_COUNT];
         }
         let known = self.bb[usize::from(bucket)];
-        if !known.is_nan() {
+        if known != u32::MAX {
             return known;
         }
-        let v = self.bucket_bound(b, bucket);
+        let v = self.floor(b, bucket);
         self.bb[usize::from(bucket)] = v;
         v
     }
@@ -542,6 +538,13 @@ struct Walk<'s, 'a, T: Touch> {
     pending: Vec<(f32, u32)>,
     pending_index: Vec<u32>,
     span_index: Vec<u32>,
+    /// The group's staged candidates: (bound, local slot, length or
+    /// `u32::MAX`), and per one its buckets (one per scoring term) and, for
+    /// a span, its posting indexes; and the order they are finished in.
+    staged: Vec<(f32, u32, u32)>,
+    staged_buckets: Vec<u8>,
+    staged_span: Vec<u32>,
+    staged_order: Vec<u32>,
     cands: Vec<u32>,
     words: Vec<u64>,
     /// The node check's own cursors (the walk moves the terms' sparse
@@ -763,9 +766,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Bounds, scores and admits group `g`'s candidates `cands` (local
     /// slots, ascending), then checks its pending phrase candidates; false
-    /// once nothing later can enter the top k.
+    /// once nothing later can enter the top k. With terms to score, and a
+    /// check that does not walk cursors forward (a flat AND, a span), the
+    /// candidates are bounded by their buckets first and scored best first
+    /// (see [`Walk::finish_staged`]).
     fn walk_candidates(&mut self, g: u32, cands: &[u32]) -> Result<bool> {
         let base = self.geometry.groups[g as usize].slot_base;
+        let staging = !self.sc.is_empty() && !matches!(self.verify, Verify::Node);
         let mut more = true;
         let mut at = 0;
         while at < cands.len() {
@@ -781,10 +788,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     _ => break,
                 }
             }
-            if !self.process(g, local)? {
+            if staging {
+                self.stage_into(g, local)?;
+            } else if !self.process(g, local)? {
                 more = false;
                 break;
             }
+        }
+        if staging {
+            self.finish_staged(g)?;
         }
         if !self.pending.is_empty() {
             self.verify_pending(g)?;
@@ -905,18 +917,87 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// `g`, which every required term holds; false once nothing later can
     /// enter the top k.
     fn process(&mut self, g: u32, local: u32) -> Result<bool> {
-        let n = self.sc.len();
-        if n == 0 && self.unscored_done(self.geometry.tid_in(g as usize, local)) {
+        if self.sc.is_empty() && self.unscored_done(self.geometry.tid_in(g as usize, local)) {
             return Ok(false);
         }
+        if let Some((_, length)) = self.stage(g, local)? {
+            self.finish(g, local, length)?;
+        }
+        Ok(true)
+    }
+
+    /// Stages group `g`'s candidate at slot `local`: bounds it by its
+    /// buckets and keeps it, best bound first, for [`Walk::finish_staged`].
+    fn stage_into(&mut self, g: u32, local: u32) -> Result<()> {
+        let Some((reach, length)) = self.stage(g, local)? else {
+            return Ok(());
+        };
+        self.staged.push((reach, local, length));
+        self.staged_buckets.extend_from_slice(&self.buckets);
+        if matches!(self.verify, Verify::Span(_)) {
+            self.staged_span.extend_from_slice(&self.span_index);
+        }
+        Ok(())
+    }
+
+    /// Reads the lengths of the group's staged candidates and scores them,
+    /// best bound first, each against the threshold as it then stands: the
+    /// best of a group raise it over the rest, which its first candidates
+    /// in ctid order did not (on TIN's corpus, `w3 AND w17` read the DL
+    /// sidecar for six times the candidates the final threshold needs).
+    fn finish_staged(&mut self, g: u32) -> Result<()> {
+        let n = self.sc.len();
+        let width = self.span_index.len();
+        let mut staged = std::mem::take(&mut self.staged);
+        let mut order = std::mem::take(&mut self.staged_order);
+        order.clear();
+        order.extend(0..staged.len() as u32);
+        order.sort_unstable_by(|a, b| {
+            let (x, y) = (staged[*a as usize], staged[*b as usize]);
+            y.0.total_cmp(&x.0).then(x.1.cmp(&y.1))
+        });
+        let mut result = Ok(());
+        for &i in &order {
+            let i = i as usize;
+            let (reach, local, length) = staged[i];
+            let tid = self.geometry.tid_in(g as usize, local);
+            if self.cut(reach, || tid) {
+                continue;
+            }
+            self.buckets
+                .copy_from_slice(&self.staged_buckets[i * n..(i + 1) * n]);
+            if matches!(self.verify, Verify::Span(_)) {
+                self.span_index
+                    .copy_from_slice(&self.staged_span[i * width..(i + 1) * width]);
+            }
+            result = self.finish(g, local, length);
+            if result.is_err() {
+                break;
+            }
+        }
+        staged.clear();
+        self.staged = staged;
+        self.staged_order = order;
+        self.staged_buckets.clear();
+        self.staged_span.clear();
+        result
+    }
+
+    /// Bounds the candidate at slot `local` of group `g` by what can be
+    /// read before its length: `None` when it cannot be kept, else its
+    /// bound and its length when that is known (else `u32::MAX`), with its
+    /// buckets in [`Walk::buckets`] and, for a span, its posting indexes in
+    /// [`Walk::span_index`].
+    fn stage(&mut self, g: u32, local: u32) -> Result<Option<(f32, u32)>> {
+        let n = self.sc.len();
         if let Some(dead) = self.segment.liveness.groups[g as usize].as_deref()
             && dead[local as usize / 64] >> (local % 64) & 1 == 1
         {
-            return Ok(true);
+            return Ok(None);
         }
         self.answer.candidates += 1;
         let tid = self.geometry.tid_in(g as usize, local);
-        let length = match self.inline {
+        let staged = match self.inline {
             // The length alone, against the window's largest buckets, from
             // a rare required term's record that carries lengths.
             Some(t) => {
@@ -929,13 +1010,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     .touch(Part::Payload, set.at + inline.at_of(index), 4);
                 let length = inline.get(index)?;
                 if n > 0 && self.cut(self.length_bound(length), || tid) {
-                    return Ok(true);
+                    return Ok(None);
                 }
                 self.read_buckets(g, local)?;
                 if self.too_few() {
-                    return Ok(true);
+                    return Ok(None);
                 }
-                length
+                // The length known, its buckets bound it at that length.
+                (
+                    self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), length),
+                    length,
+                )
             }
             // The candidate's buckets first, each against the shortest
             // document of its block holding that bucket or more (the
@@ -945,22 +1030,37 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             None => {
                 let reach = self.read_buckets(g, local)?;
                 if self.cut(reach, || tid) || self.too_few() {
-                    return Ok(true);
+                    return Ok(None);
                 }
-                self.dl_length(g, local)?
+                (reach, u32::MAX)
             }
+        };
+        self.span_indexes(local);
+        Ok(Some(staged))
+    }
+
+    /// Scores and admits the candidate at slot `local` of group `g`, staged
+    /// with its buckets in [`Walk::buckets`] (and a span's posting indexes
+    /// in [`Walk::span_index`]); `length` is its length, or `u32::MAX` to
+    /// read it from the DL sidecar.
+    fn finish(&mut self, g: u32, local: u32, length: u32) -> Result<()> {
+        let n = self.sc.len();
+        let tid = self.geometry.tid_in(g as usize, local);
+        let length = if length == u32::MAX {
+            self.dl_length(g, local)?
+        } else {
+            length
         };
         // A span checks positions before scoring while the top k fill:
         // every match enters them.
         let span_first = matches!(self.verify, Verify::Span(_)) && self.top.bar().is_none();
         if span_first {
-            self.span_indexes(local);
             let Verify::Span(check) = &mut self.verify else {
                 unreachable!()
             };
             self.answer.position_checks += 1;
             if !check.holds(&self.span_index, self.touch)? {
-                return Ok(true);
+                return Ok(());
             }
         }
         // A walk with nothing to score (every term elided) scores nothing.
@@ -976,13 +1076,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 .score_bucket(TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?, length);
         }
         if !self.admits(total, tid) {
-            return Ok(true);
+            return Ok(());
         }
         match &self.verify {
             Verify::Flat => self.push(total, tid),
             Verify::Span(_) if span_first => self.push(total, tid),
             Verify::Span(_) => {
-                self.span_indexes(local);
                 self.pending.push((total, local));
                 self.pending_index.extend_from_slice(&self.span_index);
             }
@@ -1000,16 +1099,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Reads into [`Walk::buckets`] the bucket of each scoring term the
     /// candidate at slot `local` of group `g` holds ([`NO_BUCKET`] for the
     /// others), and returns what the candidate can score at most by them:
-    /// per term, its bucket at the shortest length its block holds for
-    /// that bucket or more.
+    /// see [`Walk::reach`].
     fn read_buckets(&mut self, g: u32, local: u32) -> Result<f32> {
-        let mut reach = 0.0_f32;
+        let mut floor = 0u32;
         for i in 0..self.sc.len() {
             let t = self.sc[i].term;
             if !self.sc_required[i] {
@@ -1030,10 +1128,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     1,
                 );
             }
-            reach += self.sc[i].bucket_bound_kept(block, bucket);
+            floor = floor.max(self.sc[i].floor_kept(block, bucket));
             self.buckets[i] = bucket;
         }
-        Ok(reach)
+        Ok(self.reach(
+            (0..self.sc.len()).filter(|i| self.buckets[*i] != NO_BUCKET),
+            floor,
+        ))
+    }
+
+    /// What a candidate holding the scoring terms `held` (in the scorer's
+    /// order), with the buckets in [`Walk::buckets`], scores at most when it
+    /// is at least `floor` long. A document has one length, and every term
+    /// it holds bounds that from below: by the shortest length its block
+    /// holds at the candidate's bucket or above. The longest of those
+    /// bounds every term's score (on TIN's corpus, where a word's count
+    /// grows with the length, it left a seventh of the candidates in reach
+    /// that each term's own bound did).
+    #[inline]
+    fn reach(&self, held: impl Iterator<Item = usize>, floor: u32) -> f32 {
+        let mut reach = 0.0_f32;
+        for i in held {
+            let bucket = TfBucket::new(self.buckets[i]).expect("a valid bucket");
+            reach += self.sc[i].scorer.bound_through(bucket, floor);
+        }
+        reach
     }
 
     /// Whether the candidate at hand, its buckets read, holds a word its
@@ -1246,6 +1365,10 @@ pub(super) fn walk_into<'a>(
         pending: Vec::new(),
         pending_index: Vec::new(),
         span_index: Vec::new(),
+        staged: Vec::new(),
+        staged_buckets: Vec::new(),
+        staged_span: Vec::new(),
+        staged_order: Vec::new(),
         cands: Vec::new(),
         words: Vec::new(),
         positions: Vec::new(),
@@ -1772,7 +1895,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // The candidate's buckets, each against the shortest document of
         // its block holding that bucket or more, before its length is read
         // (see `Walk::process`).
-        let mut reach = 0.0_f32;
+        let mut floor = 0u32;
         for h in 0..self.held_list.len() {
             let i = self.held_list[h];
             let index = self.row_index(i, words, local);
@@ -1787,9 +1910,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     1,
                 );
             }
-            reach += s.bucket_bound(self.blocks[i], bucket);
+            let block = self.blocks[i];
+            floor = floor.max(self.sc[i].floor_kept(block, bucket));
             self.buckets[i] = bucket;
         }
+        let reach = self.reach(self.held_list.iter().copied(), floor);
         if self.cut(reach, || tid) {
             return Ok(());
         }

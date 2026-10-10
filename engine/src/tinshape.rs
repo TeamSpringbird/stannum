@@ -2581,6 +2581,160 @@ mod tests {
         }
     }
 
+    /// A group's candidates are scored best bound first: its best rows come
+    /// last in ctid order here, each earlier one beating the one before, so
+    /// a walk in ctid order would read every length; best first, the best
+    /// rows set the threshold and the rest fall short on their buckets.
+    #[test]
+    fn a_group_is_scored_best_bound_first() {
+        let docs: Vec<Tid> = (0..300u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        let lengths: Vec<u32> = (0..300u32).map(|r| 400 - r).collect();
+        let members = vec![
+            (0..300usize)
+                .map(|r| (r, if r >= 280 { 10 } else { 1 }))
+                .collect::<Vec<_>>(),
+        ];
+        let all: Vec<usize> = (0..300).collect();
+        let options = Options {
+            block_size: 64,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &[false; 300], options);
+        let segment = Segment::parse(&blob).unwrap();
+        let names = vec!["t0".to_owned()];
+        let scorer =
+            TermScorer::from_statistics(10_000, 300, 1.0, Bm25Params::default(), 100.0).unwrap();
+        let scorers = vec![("t0".to_owned(), scorer)];
+        let got = top_k(&segment, &Node::Term(0), &names, &scorers, 3, &mut NoTouch).unwrap();
+        let tids: Vec<Tid> = got.rows.iter().map(|r| r.1).collect();
+        assert_eq!(tids, vec![docs[299], docs[298], docs[297]]);
+        assert!(got.scored <= 30, "scored {}", got.scored);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        /// A document has one length, so every term it holds bounds it from
+        /// below: by the shortest length its block holds at the candidate's
+        /// bucket or above. With the final rows kept from the start, the
+        /// walk scores (reads the length of) only a candidate whose buckets
+        /// at the longest of those lengths could reach the threshold. Term
+        /// counts grow with length here, as a document repeating a word
+        /// does.
+        #[test]
+        fn a_candidate_is_bounded_at_the_length_all_its_terms_imply(
+            n in 200usize..2500,
+            density in prop::collection::vec(5u32..60, 3),
+            seed in any::<u64>(),
+            k in 1usize..12,
+            block_size in prop::sample::select(vec![16u32, 64, 256]),
+        ) {
+            let docs: Vec<Tid> = (0..n as u32).map(|i| Tid { block: i / 7, offset: (i % 7) as u16 + 1 }).collect();
+            let mut state = seed | 1;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            // Eight words, then one word repeated: its count rises with the
+            // length.
+            let mut lengths = Vec::with_capacity(n);
+            let mut members: Vec<Vec<(usize, u32)>> = vec![Vec::new(); density.len()];
+            for r in 0..n {
+                let repeated = (next() % density.len() as u64) as usize;
+                let extra = ((next() % 30) * (next() % 30) / 30) as u32;
+                lengths.push(8 + extra);
+                for (t, d) in density.iter().enumerate() {
+                    let base = u32::from(next() % 100 < u64::from(*d));
+                    let tf = base + if t == repeated { extra } else { 0 };
+                    if tf > 0 {
+                        members[t].push((r, tf));
+                    }
+                }
+            }
+            let all: Vec<usize> = (0..n).collect();
+            let options = Options { block_size, grid_min_postings: 0, inline_lengths_min_documents: u32::MAX, ..Options::default() };
+            let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+            let segment = Segment::parse(&blob).unwrap();
+            let names: Vec<String> = (0..3).map(|t| format!("t{t}")).collect();
+            // Per term, per block of its postings, the shortest length at
+            // each bucket or above.
+            let floors: Vec<Vec<[u32; 16]>> = members
+                .iter()
+                .map(|m| {
+                    m.chunks(block_size as usize)
+                        .map(|block| {
+                            let mut best = [u32::MAX; 16];
+                            for (r, tf) in block {
+                                let b = usize::from(TfBucket::from_count(*tf).value());
+                                best[b] = best[b].min(lengths[*r]);
+                            }
+                            for b in (0..15).rev() {
+                                best[b] = best[b].min(best[b + 1]);
+                            }
+                            best
+                        })
+                        .collect()
+                })
+                .collect();
+            for node in [
+                Node::And(vec![Node::Term(0), Node::Term(1)]),
+                Node::And(vec![Node::Term(0), Node::Term(1), Node::Term(2)]),
+                Node::Or(vec![Node::Term(0), Node::Term(1), Node::Term(2)]),
+            ] {
+                let scorers: Vec<(String, TermScorer)> = leaf_terms(&node)
+                    .into_iter()
+                    .filter(|t| !members[*t].is_empty())
+                    .map(|t| {
+                        let df = members[t].len() as u64;
+                        (names[t].clone(), TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 14.0).unwrap())
+                    })
+                    .collect();
+                let terms: Vec<usize> = scorers.iter().map(|(name, _)| name[1..].parse().unwrap()).collect();
+                let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+                if got.rows.len() < k {
+                    continue;
+                }
+                let theta = got.rows[k - 1].0;
+                let mut seeded = crate::walk::TopRows::new(k, false);
+                for row in &got.rows {
+                    seeded.push(crate::walk::Ranked(row.0, row.1));
+                }
+                let walked = top_k_into(&segment, &node, &names, &scorers, &mut seeded, &mut AllVisible, &mut NoTouch).unwrap();
+                // The candidates whose bound at the shared length reaches
+                // the threshold.
+                let mut reach = 0u64;
+                for r in 0..n {
+                    if !eval(&node, &members, r) {
+                        continue;
+                    }
+                    let mut floor = 0u32;
+                    let mut held = Vec::new();
+                    for (s, t) in terms.iter().enumerate() {
+                        if let Some(p) = members[*t].iter().position(|(d, _)| *d == r) {
+                            let bucket = TfBucket::from_count(members[*t][p].1);
+                            floor = floor.max(floors[*t][p / block_size as usize][usize::from(bucket.value())]);
+                            held.push((s, bucket));
+                        }
+                    }
+                    let mut bound = 0.0_f32;
+                    for (s, bucket) in held {
+                        bound += scorers[s].1.bound_through(bucket, floor);
+                    }
+                    reach += u64::from(bound >= theta);
+                }
+                prop_assert!(walked.scored <= reach, "{:?}: scored {} with {} in reach", node, walked.scored, reach);
+            }
+        }
+    }
+
     struct AllVisible;
 
     impl crate::walk::Visibility for AllVisible {
