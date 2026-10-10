@@ -925,6 +925,22 @@ base twice as a control (`317a3b9`, two rounds; millions):
 | disjunction | 486.0 | 485.0 | 503.0 (+3.6%) |
 | phrase | 146.7 | 146.5 | 137.8 (-6.0%) |
 
+The same at `410cea3` (one round; `score`, then `full_score`):
+
+| | base | base again | lazy |
+| --- | ---: | ---: | ---: |
+| mixed | 244.4 | 242.3 | 239.2 (-1.7%; cycles -3.9%) |
+| conjunction | 102.3 | 102.3 | 94.8 (-7.3%) |
+| disjunction | 482.6 | 486.1 | 492.8 (+1.4%; cycles -0.9%) |
+| phrase | 146.9 | 146.8 | 137.0 (-6.7%) |
+| mixed, `full_score` | 747.9 | 748.4 | 701.0 (-6.3%) |
+| conjunction, `full_score` | 354.3 | 352.6 | 270.0 (-23.6%) |
+| disjunction, `full_score` | 1,493.8 | 1,504.2 | 1,547.4 (+3.2%) |
+| phrase, `full_score` | 396.9 | 396.9 | 305.1 (-23.1%) |
+
+A disjunction reaches and bounds every block, so it decodes as much as
+before and keeps the cost of decoding as it goes.
+
 Backend CPU per query (`schedstat`, 150 s warm and 90 s measured, two
 rounds; `0d7c3b0`):
 
