@@ -360,6 +360,10 @@ pub struct MemoCounts {
     /// to the last it read or stepped over.
     pub blocks_used: u64,
     pub blocks_reached: u64,
+    /// Blocks and bytes of the footers a walk's scoring terms hold: what
+    /// decoding them whole would decode.
+    pub footer_blocks_whole: u64,
+    pub footer_bytes_whole: u64,
     /// Group directories parsed, their entries decoded, and the directory
     /// bytes parsed for them.
     pub directories: u64,
@@ -382,6 +386,8 @@ impl MemoCounts {
         footer_bytes: 0,
         blocks_used: 0,
         blocks_reached: 0,
+        footer_blocks_whole: 0,
+        footer_bytes_whole: 0,
         directories: 0,
         directory_entries: 0,
         directory_bytes: 0,

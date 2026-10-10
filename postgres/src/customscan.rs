@@ -2727,6 +2727,8 @@ unsafe extern "C-unwind" fn explain(
                 (c"Footer Blocks Decoded", memo.footer_blocks),
                 (c"Footer Bytes Parsed", memo.footer_bytes),
                 (c"Footer Blocks Used", memo.blocks_used),
+                (c"Footer Blocks Whole", memo.footer_blocks_whole),
+                (c"Footer Bytes Whole", memo.footer_bytes_whole),
                 (c"Directories Parsed", memo.directories),
                 (c"Directory Entries Decoded", memo.directory_entries),
                 (c"Directory Bytes Parsed", memo.directory_bytes),

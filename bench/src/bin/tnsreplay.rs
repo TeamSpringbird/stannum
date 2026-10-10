@@ -924,7 +924,7 @@ fn run() -> Result<bool, String> {
     }
     println!(
         "\nterm metadata per query, mean (answer pass): records parsed / kept, footers decoded / kept, \
-         footer blocks decoded, reached, used, footer KB parsed; directories parsed, entries decoded, reached, \
+         footer blocks decoded, reached, used, in the whole footers, footer KB parsed, in the whole footers; directories parsed, entries decoded, reached, \
          loaded, directory KB parsed"
     );
     for style in &styles {
@@ -934,7 +934,7 @@ fn run() -> Result<bool, String> {
             of.iter().map(|r| f(&r.memo)).sum::<u64>() as f64 / n
         };
         println!(
-            "{:<12} records {:.1} / {:.1} footers {:.1} / {:.1} blocks {:.0} reached {:.0} used {:.0} footer KB {:.1}  \
+            "{:<12} records {:.1} / {:.1} footers {:.1} / {:.1} blocks {:.0} reached {:.0} used {:.0} whole {:.0} footer KB {:.1} whole {:.1}  \
              dirs {:.1} entries {:.0} reached {:.0} loaded {:.0} dir KB {:.1}",
             style,
             m(&|c| c.records_parsed),
@@ -944,7 +944,9 @@ fn run() -> Result<bool, String> {
             m(&|c| c.footer_blocks),
             m(&|c| c.blocks_reached),
             m(&|c| c.blocks_used),
+            m(&|c| c.footer_blocks_whole),
             m(&|c| c.footer_bytes) / 1024.0,
+            m(&|c| c.footer_bytes_whole) / 1024.0,
             m(&|c| c.directories),
             m(&|c| c.directory_entries),
             m(&|c| c.entries_reached),

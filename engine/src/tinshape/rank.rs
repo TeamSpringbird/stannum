@@ -659,6 +659,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .map(|s| s.bounds.iter().filter(|b| !b.is_nan()).count() as u64)
             .sum();
         let blocks_reached: u64 = self.sc.iter().map(|s| s.footer.decoded() as u64).sum();
+        let blocks_whole: u64 = self.sc.iter().map(|s| s.footer.blocks() as u64).sum();
+        let bytes_whole: u64 = self
+            .sc
+            .iter()
+            .filter_map(|s| self.terms[s.term].as_ref())
+            .map(|set| set.postings.footer.len() as u64)
+            .sum();
         let (mut reached, mut loaded) = (0u64, 0u64);
         for (set, mem) in self.terms.iter().zip(&self.mems) {
             if let Some(set) = set
@@ -671,6 +678,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         segment::tinshape::segment::count_memo(|c| {
             c.blocks_used += used;
             c.blocks_reached += blocks_reached;
+            c.footer_blocks_whole += blocks_whole;
+            c.footer_bytes_whole += bytes_whole;
             c.entries_reached += reached;
             c.entries_used += loaded;
         });
