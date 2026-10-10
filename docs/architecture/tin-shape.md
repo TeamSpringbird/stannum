@@ -906,13 +906,27 @@ CPU in the replay (2 rounds, 400 queries per style, instructions retired)
 against the base without its footer memo (the replay repeats each query five
 times, which the memo amortizes as the server's driver order does not):
 `full_score` conjunction 956 / 935 G -> 738 / 749 G (-21%), phrase 1,045 /
-1,042 G -> 835 / 837 G (-20%); `score` conjunction 399 / 396 G -> 398 /
-398 G, disjunction within noise of it at 150 queries (528 G both, one run
-of 545 G), 4% over it at 400. Against the base with its memo, the replay's
-repeats favour the base: `score` +1% to +6%, `full_score` +14% to +18%.
+1,042 G -> 835 / 837 G (-20%); `score` conjunction 400 / 388 G -> 370 /
+368 G (-6%), phrase 451 / 456 G -> 435 / 434 G (-4%), disjunction 1,068 /
+1,057 G -> 1,078 / 1,075 G (+1%: every block is reached, and a range of
+blocks was bounded in two passes until `410cea3`, +4% before it). Against
+the base with its memo, the replay's repeats favour the base: `score` +1%
+to +6%, `full_score` +14% to +18%.
 
-In the server (a copy of the saved 150M db, 8 clients in the driver's
-order, 150 s warm and 90 s measured, two rounds, backend CPU per query):
+In the server, the OrbStack VM's instructions per query, counted from the
+host (`proc_pid_rusage` of its helper; backend CPU from `schedstat` moves
+some 10% between identical images), 8 clients in the driver's order, the
+base twice as a control (`317a3b9`, two rounds; millions):
+
+| | base | base again | lazy |
+| --- | ---: | ---: | ---: |
+| mixed | 243.4 | 243.8 | 245.5 (+0.8%) |
+| conjunction | 103.0 | 102.6 | 95.4 (-7.2%) |
+| disjunction | 486.0 | 485.0 | 503.0 (+3.6%) |
+| phrase | 146.7 | 146.5 | 137.8 (-6.0%) |
+
+Backend CPU per query (`schedstat`, 150 s warm and 90 s measured, two
+rounds; `0d7c3b0`):
 
 | | base A1 / A2 | lazy B1 / B2 |
 | --- | --- | --- |
