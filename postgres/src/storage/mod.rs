@@ -1078,14 +1078,19 @@ unsafe fn shared_hints() -> Option<&'static [std::sync::atomic::AtomicU64]> {
         SharedHints::Unavailable => return None,
         SharedHints::Unknown => {}
     }
-    // Asked once: a failure below must not be retried per pin.
-    SHARED_HINTS.set(SharedHints::Unavailable);
     // SAFETY: plain reads of the backend's globals; the attach runs in a
     // subtransaction of its own, so an error creating the segment (no room
     // in /dev/shm, no free slot) rolls back what it took, such as the
     // registry's lock, and leaves the query to go on without the table.
     unsafe {
-        if !pg_sys::IsUnderPostmaster || pg_sys::IsInParallelMode() {
+        // No subtransaction may start during a parallel operation: a
+        // leader asks again after it, a parallel worker keeps its own table.
+        if pg_sys::ParallelWorkerNumber < 0 && pg_sys::IsInParallelMode() {
+            return None;
+        }
+        // Asked once: a failure below must not be retried per pin.
+        SHARED_HINTS.set(SharedHints::Unavailable);
+        if !pg_sys::IsUnderPostmaster || pg_sys::ParallelWorkerNumber >= 0 {
             return None;
         }
         let len = (pg_sys::NBuffers.max(1) as usize)
