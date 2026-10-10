@@ -530,6 +530,11 @@ struct Walk<'s, 'a, T: Touch> {
     /// Per scoring term, the candidate at hand's bucket ([`NO_BUCKET`]
     /// when it does not hold the term).
     buckets: Vec<u8>,
+    /// Per scoring term, the candidate at hand's posting index in it (read
+    /// with its bucket); and per term, its index into `sc` (`usize::MAX`
+    /// for a term that does not score).
+    held_index: Vec<u32>,
+    term_sc: Vec<usize>,
     /// The window: the last slot of every scoring term's footer block at
     /// the slot it was set at, and its bound; per scoring term, its block's
     /// largest bucket ([`NO_BUCKET`] when it holds nothing from the slot
@@ -1144,6 +1149,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             (floor, low) = (floor.max(f), low.min(f));
             own += bound;
             self.buckets[i] = bucket;
+            self.held_index[i] = index;
         }
         // Each term's own bound is at least the shared one: it prunes what
         // it can without a division per term, and is the shared one when
@@ -1207,9 +1213,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         };
         self.span_index.clear();
         for &t in &check.slots {
-            let index = self.mems[t]
-                .find(local)
-                .expect("a candidate holds every span term");
+            // A scoring term's index was found with its bucket.
+            let s = self.term_sc[t];
+            let index = if s != usize::MAX && self.buckets[s] != NO_BUCKET {
+                self.held_index[s]
+            } else {
+                self.mems[t]
+                    .find(local)
+                    .expect("a candidate holds every span term")
+            };
             self.span_index.push(index);
         }
     }
@@ -1374,6 +1386,8 @@ pub(super) fn walk_into<'a>(
         or_terms: Vec::new(),
         or_held: Vec::new(),
         buckets: vec![NO_BUCKET; n],
+        held_index: vec![0; n],
+        term_sc: Vec::new(),
         window_end: None,
         window_bound: 0.0,
         window_buckets: vec![NO_BUCKET; n],
@@ -1396,9 +1410,11 @@ pub(super) fn walk_into<'a>(
         touch,
         sc,
     };
+    walk.term_sc = vec![usize::MAX; walk.terms.len()];
     for i in 0..n {
         let r = required.contains(&walk.sc[i].term);
         walk.sc_required.push(r);
+        walk.term_sc[walk.sc[i].term] = i;
     }
     if let Verify::Span(check) = &walk.verify
         && let Some(plan) = &check.plan
