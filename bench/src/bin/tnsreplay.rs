@@ -52,6 +52,8 @@ struct Args {
     repeat: usize,
     limit: Option<usize>,
     keep: bool,
+    /// Rank as `stannum.full_score(ctid)` does: no dense term elided.
+    full: bool,
     memory: bool,
     seed: bool,
     pin_ns: u64,
@@ -64,7 +66,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
-         [--repeat N] [--limit N] [--memory [--keep]] [--pin-ns N] [--threads N --seconds S] [--per-query FILE] [--out FILE]"
+         [--repeat N] [--limit N] [--memory [--keep]] [--full] [--pin-ns N] [--threads N --seconds S] [--per-query FILE] [--out FILE]"
     );
     std::process::exit(2)
 }
@@ -80,6 +82,7 @@ fn args() -> Args {
         repeat: 3,
         limit: None,
         keep: false,
+        full: false,
         memory: false,
         seed: false,
         pin_ns: 0,
@@ -99,6 +102,7 @@ fn args() -> Args {
             "--repeat" => a.repeat = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--limit" => a.limit = Some(value(&mut it).parse().unwrap_or_else(|_| usage())),
             "--keep" => a.keep = true,
+            "--full" => a.full = true,
             "--memory" => a.memory = true,
             "--seed" => a.seed = true,
             "--pin-ns" => a.pin_ns = value(&mut it).parse().unwrap_or_else(|_| usage()),
@@ -337,6 +341,7 @@ struct Reader {
     tokenizer: tokenizer::CompiledTokenizerPipeline,
     params: engine::bm25::Bm25Params,
     stop: Option<String>,
+    full: bool,
     segs: Vec<Seg>,
 }
 
@@ -408,6 +413,7 @@ impl Reader {
             tokenizer,
             params: loaded.params,
             stop: loaded.stop_words.clone(),
+            full: args.full,
             segs,
         })
     }
@@ -420,7 +426,7 @@ impl Reader {
         let stop = self.stop.as_deref().and_then(ScoreStopWords::from_csv);
         let policy = ScoringPolicy {
             params: self.params,
-            full: false,
+            full: self.full,
             dense: DenseRatio::new(Some(DenseRatio::DEFAULT)),
             edit: &edit,
             stop: stop.as_ref(),
