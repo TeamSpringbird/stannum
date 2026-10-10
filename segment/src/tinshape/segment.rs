@@ -735,6 +735,21 @@ impl<'a> Segment<'a> {
         self.footers = cache;
     }
 
+    /// Whether the segment holds `term`, through the memo of earlier
+    /// lookups, its record left unparsed.
+    pub fn holds_memo(&self, term: &str) -> Result<bool> {
+        if let Some(entry) = self.memo.borrow().get(term) {
+            return Ok(entry.is_some());
+        }
+        let entry = self.dictionary().get(term)?;
+        let mut memo = self.memo.borrow_mut();
+        if memo.len() >= MEMO_LIMIT {
+            memo.clear();
+        }
+        memo.insert(term.to_owned(), entry);
+        Ok(entry.is_some())
+    }
+
     /// [`Self::term`] through the memo of earlier lookups.
     pub fn term_memo(&self, term: &str) -> Result<Option<Term<'a>>> {
         if let Some(entry) = self.memo.borrow().get(term) {

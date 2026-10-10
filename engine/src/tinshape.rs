@@ -2229,6 +2229,34 @@ mod tests {
     /// prunes it unread rather than scoring it (TIN's `t50` top 10 reads its
     /// first groups and stops).
     #[test]
+    fn a_walk_missing_a_required_term_parses_no_record() {
+        let docs: Vec<Tid> = (0..3_000u32)
+            .map(|i| Tid {
+                block: i / 10,
+                offset: (i % 10) as u16 + 1,
+            })
+            .collect();
+        let lengths = vec![12u32; docs.len()];
+        let members = vec![(0..docs.len()).map(|r| (r, 1)).collect::<Vec<_>>()];
+        let all: Vec<usize> = (0..docs.len()).collect();
+        let dead = vec![false; docs.len()];
+        let blob = build_part(&docs, &lengths, &members, &all, &dead, Options::default());
+        let segment = Segment::parse(&blob).unwrap();
+        let names = vec!["t0".to_owned(), "absent".to_owned()];
+        let scorer =
+            TermScorer::from_statistics(docs.len() as u64, 3_000, 1.0, Bm25Params::default(), 12.0)
+                .unwrap();
+        let scorers = vec![("t0".to_owned(), scorer)];
+        let node = Node::And(vec![Node::Term(0), Node::Term(1)]);
+        segment::tinshape::segment::reset_memo_counts();
+        let got = top_k(&segment, &node, &names, &scorers, 10, &mut NoTouch).unwrap();
+        assert!(got.rows.is_empty());
+        let memo = segment::tinshape::segment::memo_counts();
+        assert_eq!(memo.records_parsed, 0, "{memo:?}");
+        assert_eq!(memo.directories, 0, "{memo:?}");
+    }
+
+    #[test]
     fn a_tie_at_the_threshold_from_a_later_ctid_is_not_scored() {
         let docs: Vec<Tid> = (0..6_000u32)
             .map(|i| Tid {

@@ -227,9 +227,13 @@ ANDed into the fold, or probes into the terms' containers when it is small.
 **Ranked top k** (`engine/src/tinshape/rank.rs`). Exact BM25 from the TF
 tail and the DL sidecar, summed in the scorer's term order, ties broken by
 ctid, dense terms elided as today: the answers are bit-identical to
-scoring every match. A segment keeps the records it parses and the
-footers it decodes between queries (`Segment::resolve_memo`,
-`Segment::footer_memo`, 16 MiB), as `STN3`'s walk keeps decoded bounds.
+scoring every match. A segment keeps the records it parses between
+queries (`Segment::resolve_memo`, 16 MiB). A walk decodes its scoring
+terms' footers per query, a block at a time as it reaches them
+(`postings::LazyFooter`), and keeps nothing of them after it: a footer's
+entries are variable-length and in a row, so reaching a block decodes every
+entry before it, and nothing after. Its bytes are read in place a page at a
+time, as far as the blocks decoded (`Bytes::page_end`).
 
 - A query some terms of which every match holds (a conjunction, a phrase)
   walks the groups its rarest such term holds, taken from its directory. A
@@ -401,7 +405,8 @@ Stable for phase C; every signature below is as of `tinshape/phase-b`:
 
 - Reading: `Segment::parse(&[u8])`; `Segment::term_memo(&str)` and
   `Segment::resolve_memo`, `Segment::footer_memo` (memoized parses, keep the
-  `Segment` alive across queries to benefit); `Segment::positions`
+  `Segment` alive across queries to benefit; ranked walks decode footers
+  per query instead, `Postings::lazy_footer`); `Segment::positions`
   (a `positions::Positions` stream); `Segment::length_at(rank) -> (header,
   bits)` blob offsets; `Segment::lengths.get(rank)`.
 - Queries (`engine::tinshape`): `lower(&Query, &mut names) -> Option<Node>`;
@@ -787,9 +792,8 @@ Proposals (not built; layout only, the same structures):
 - Decode footers by the blocks a walk reaches instead of whole: a common
   word's footer at 150M is some 20,000 blocks per segment, decoded per
   query whenever its memo entry was dropped (5.7% of a looping
-  conjunction's samples in the server, `Postings::footer`). The walks read
-  `Footer::last` and the frontier by block, so this is an API change for
-  `engine/src/tinshape/rank.rs`.
+  conjunction's samples in the server, `Postings::footer`). Done on branch
+  `tinshape/lazy-meta` (see [lazy footers](#lazy-footers-at-150m-rows-branch-tinshapelazy-meta)).
 - `TermSet::open` cloned the term's group directory and built a cursor
   entry per group per segment per query: 9.2% of a conjunction replay's
   samples (2.4% with the built groups kept beside the parsed record, an

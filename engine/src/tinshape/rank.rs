@@ -1475,6 +1475,13 @@ pub(super) fn walk_into<'a>(
 ) -> Result<Option<Vec<Option<TermSet<'a>>>>> {
     let k = top.k();
     let required = required_terms(node);
+    // A segment lacking a required term matches nothing: its terms'
+    // records (their group directories) are not parsed.
+    for t in &required {
+        if !segment.holds_memo(&names[*t])? {
+            return Ok(None);
+        }
+    }
     let terms = open_terms(segment, names, touch)?;
     if k == 0 || required.iter().any(|t| terms[*t].is_none()) {
         return Ok(None);
