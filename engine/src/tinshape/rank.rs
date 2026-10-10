@@ -110,6 +110,12 @@ impl<'a> Sc<'a> {
         {
             return *v;
         }
+        self.bound_of(b)
+    }
+
+    /// [`Self::bound`], not known yet.
+    #[inline(never)]
+    fn bound_of(&mut self, b: usize) -> f32 {
         if b >= self.bounds.len() {
             self.bounds
                 .resize(self.footer.decoded().max(b + 1), f32::NAN);
@@ -118,8 +124,9 @@ impl<'a> Sc<'a> {
         let v = self
             .footer
             .frontier(b)
+            .iter()
             .map(|(bucket, length)| {
-                scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
+                scorer.bound_through(TfBucket::new(*bucket).expect("a valid bucket"), *length)
             })
             .fold(0.0_f32, f32::max);
         self.bounds[b] = v;
@@ -130,28 +137,46 @@ impl<'a> Sc<'a> {
     /// decoded; the footer's block count when there is none.
     #[inline]
     fn seek(&mut self, from: usize, slot: u32) -> usize {
-        self.footer
+        let b = self
+            .footer
             .seek(from, slot)
-            .unwrap_or_else(|e| corrupt_footer(e))
+            .unwrap_or_else(|e| corrupt_footer(e));
+        if self.bounds.len() < self.footer.decoded() {
+            self.bounds.resize(self.footer.decoded(), f32::NAN);
+        }
+        b
+    }
+
+    /// [`Self::seek`], looking among the blocks decoded first.
+    #[inline]
+    fn first_reaching(&mut self, from: usize, slot: u32) -> usize {
+        let last = self.footer.lasts();
+        let mut b = from;
+        while b < last.len() && last[b] < slot {
+            b += 1;
+        }
+        if b < last.len() {
+            b
+        } else {
+            self.seek(b, slot)
+        }
     }
 
     /// The best bound of the blocks overlapping slots `from..=to`; ranges
     /// must be asked in increasing order of `from`.
     #[inline]
     fn range_bound(&mut self, from: u32, to: u32) -> f32 {
-        self.wb = self.seek(self.wb, from);
+        // The blocks from the first ending at `from` or later through the
+        // first ending at `to` or later (or the last), decoded.
+        self.wb = self.first_reaching(self.wb, from);
         let blocks = self.footer.blocks();
+        if self.wb >= blocks {
+            return 0.0;
+        }
+        let through = self.first_reaching(self.wb, to).min(blocks - 1);
         let mut best = 0.0_f32;
-        let mut b = self.wb;
-        while b < blocks {
-            if b >= self.footer.decoded() {
-                self.footer.ensure(b).unwrap_or_else(|e| corrupt_footer(e));
-            }
+        for b in self.wb..=through {
             best = best.max(self.bound(b));
-            if self.footer.last(b) >= to {
-                break;
-            }
-            b += 1;
         }
         best
     }
@@ -160,7 +185,8 @@ impl<'a> Sc<'a> {
     /// slots must be asked in increasing order.
     #[inline]
     fn block_at(&mut self, slot: u32) -> Option<usize> {
-        self.cb = self.seek(self.cb, slot);
+        // As a rule a block decoded already: the candidate's, or one after.
+        self.cb = self.first_reaching(self.cb, slot);
         (self.cb < self.footer.blocks()).then_some(self.cb)
     }
 
@@ -172,8 +198,9 @@ impl<'a> Sc<'a> {
     fn floor(&self, b: usize, bucket: u8) -> u32 {
         self.footer
             .frontier(b)
+            .iter()
             .filter(|(at, _)| *at >= bucket)
-            .map(|(_, length)| length)
+            .map(|(_, length)| *length)
             .min()
             .unwrap_or(0)
     }
