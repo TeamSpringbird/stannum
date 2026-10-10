@@ -2293,8 +2293,7 @@ unsafe extern "C-unwind" fn exec_count(
             // its words a group at a time and read positions only for the
             // documents left (any other source counts its candidates).
             let foldable = crate::fold::supported(&query)
-                || COUNT_NATIVE.get()
-                    && engine::tinshape::lower(&query, &mut Vec::new()).is_some();
+                || COUNT_NATIVE.get() && engine::tinshape::lower(&query, &mut Vec::new()).is_some();
             if COUNT_FOLD.get() && !diagnostic && !exec.recheck && foldable {
                 exec.count_fold = true;
                 count = fold_count(node, exec, &query, view, visibility);
