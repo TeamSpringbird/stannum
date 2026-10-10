@@ -1602,6 +1602,9 @@ mod tests {
         let prefix = segment::dictionary::DictionaryIndex::prefix_len(term_map).unwrap();
         let index: &'static [u8] = Box::leak(term_map[..prefix].to_vec().into_boxed_slice());
         let index = segment::dictionary::DictionaryIndex::parse(index).unwrap();
+        // Walks release every page they are past, which the source then
+        // poisons: a walk reading a page it released reads garbage.
+        pinned.set_keep(0);
         pinned.open_span();
         let segment = Segment::assemble(
             pinned.bytes(),
@@ -1878,6 +1881,114 @@ mod tests {
                     prop_assert_eq!(bits(&rows), bits(&want), "in-place top {} of {:?}, round {}", k, node, round);
                     let alone: Vec<Option<u32>> = docs.iter().map(|tid| score_at(&segment, &scorers, *tid).unwrap().map(f32::to_bits)).collect();
                     prop_assert_eq!(scores, alone, "in-place scores, round {}", round);
+                }
+            }
+        }
+    }
+
+    /// Ranked walks over a segment read in place release the pages of the
+    /// groups they are past rather than holding every page until the span
+    /// closes, and never read a page they released: the source poisons it,
+    /// so a walk that did would rank garbage. Grids, Elias-Fano and listed
+    /// containers, a sparse term (its list kept pinned, the walk borrows
+    /// it) and phrases, over some 40 groups of small pages.
+    #[test]
+    fn ranked_walks_release_the_pages_of_groups_they_are_past() {
+        let docs: Vec<Tid> = (0..6_000u32)
+            .map(|i| Tid {
+                block: i / 3 * 5,
+                offset: (i % 3) as u16 + 1,
+            })
+            .collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let density = [70u64, 35, 12, 1];
+        let members: Vec<Vec<(usize, u32)>> = density
+            .iter()
+            .map(|d| {
+                let mut held = Vec::new();
+                for r in 0..docs.len() {
+                    if next() % 100 < *d {
+                        held.push((r, (next() % 5 + 1) as u32));
+                    }
+                }
+                held
+            })
+            .collect();
+        let options = Options {
+            block_size: 16,
+            grid_density: 32,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: 0,
+            ..Options::default()
+        };
+        let blob = build(&docs, &members, options);
+        let parsed = Segment::parse(&blob).unwrap();
+        assert!(parsed.docs.geometry.groups.len() >= 40);
+        let source = segment::tinshape::blob::PinningSource::new(blob.clone(), 211);
+        let pinned = LazyBlob::new(Box::new(source.clone()));
+        let in_place = assembled_in_place(&pinned, &parsed, &blob);
+        let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();
+        let scorers: Vec<(String, TermScorer)> = (0..4)
+            .map(|t| {
+                let scorer = TermScorer::from_statistics(
+                    docs.len() as u64,
+                    members[t].len() as u64,
+                    1.0,
+                    Bm25Params::default(),
+                    50.0,
+                )
+                .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        use Node::*;
+        let nodes = [
+            And(vec![Term(0), Term(1)]),
+            And(vec![Term(0), Term(1), Term(2)]),
+            And(vec![Term(3), Term(0)]),
+            Or(vec![Term(0), Term(1), Term(2), Term(3)]),
+            Or(vec![Term(1), Term(2)]),
+            Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
+        let state = &source.0;
+        for node in &nodes {
+            let used: Vec<(String, TermScorer)> = scorers
+                .iter()
+                .filter(|(n, _)| leaf_terms(node).iter().any(|t| names[*t] == *n))
+                .cloned()
+                .collect();
+            for k in [1, 10, 200] {
+                let want = top_k(&parsed, node, &names, &used, k, &mut NoTouch).unwrap();
+                let (pins, early) = (state.pins.get(), state.early.get());
+                state.peak.set(0);
+                pinned.open_span();
+                let got = top_k(&in_place, node, &names, &used, k, &mut NoTouch);
+                in_place.forget_borrowed();
+                // SAFETY: `got` is owned.
+                unsafe { pinned.close_span() };
+                let got = got.unwrap();
+                let bits = |rows: &[(f32, Tid)]| {
+                    rows.iter()
+                        .map(|(s, t)| (s.to_bits(), *t))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&got.rows), bits(&want.rows), "top {k} of {node:?}");
+                let (pins, early) = (state.pins.get() - pins, state.early.get() - early);
+                if k == 200 {
+                    assert!(
+                        early > 0 && state.peak.get() * 2 < pins,
+                        "{node:?}: {pins} pinned, {early} released early, {} at once",
+                        state.peak.get()
+                    );
                 }
             }
         }

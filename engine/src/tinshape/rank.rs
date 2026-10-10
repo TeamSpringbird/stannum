@@ -25,6 +25,7 @@ use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
+use segment::tinshape::blob::LazyBlob;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
@@ -646,6 +647,12 @@ struct Walk<'s, 'a, T: Touch> {
     /// cursors past each group), and its scratch.
     node_terms: Vec<Option<TermSet<'a>>>,
     positions: Vec<Vec<u32>>,
+    /// The blob the segment is read from in place, and the mark of the
+    /// pages pinned before the walk opened its terms (see
+    /// [`Walk::group_done`]); the ranges of the blob the terms' records keep
+    /// slices of.
+    frame: Option<(&'a LazyBlob, usize)>,
+    held: Vec<(usize, usize)>,
 }
 
 impl<'a, T: Touch> Walk<'_, 'a, T> {
@@ -795,8 +802,40 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if !more {
                 break;
             }
+            self.group_done();
         }
         Ok(())
+    }
+
+    /// Ends a group's reads: the pages pinned since the walk's mark are
+    /// released, all but those the terms' records borrow and the few read
+    /// last the blob keeps (see [`LazyBlob::release_since`]), once more
+    /// than those are held. A group's reads leave nothing behind that
+    /// borrows its pages: its candidates were scored, its phrase
+    /// candidates checked, and the terms' members (a grid or an
+    /// Elias-Fano list read in place) are forgotten here; positions, TF
+    /// tails and the DL sidecar are read a value at a time, and a
+    /// disjunction copies its terms' rows. What the walk keeps across
+    /// groups holds no slice (directories and footers, decoded; positions
+    /// streams, read when asked) or lies in [`Walk::held`] (a sparse
+    /// term's list, inline lengths).
+    #[inline]
+    fn group_done(&mut self) {
+        let Some((blob, mark)) = self.frame else {
+            return;
+        };
+        if !blob.over_keep(mark) {
+            return;
+        }
+        debug_assert!(self.pending.is_empty() && self.staged.is_empty());
+        for mem in &mut self.mems {
+            mem.loaded = 0;
+            mem.kind = Kind::List;
+        }
+        // SAFETY: nothing read in place since the mark is used after but
+        // what lies in `held` (see above): the members' slices were
+        // dropped just now.
+        unsafe { blob.release_since(mark, &self.held) };
     }
 
     /// Whether no match in slots `base..=end` of group `g` can be kept by
@@ -1490,6 +1529,10 @@ pub(super) fn walk_into<'a>(
             return Ok(None);
         }
     }
+    // Pages pinned from here on may be released a group at a time when
+    // nothing the walk keeps borrows them (see `Walk::group_done`).
+    let blob = segment.bytes.blob();
+    let opened = blob.map(LazyBlob::pin_mark);
     let terms = open_terms(segment, names, touch)?;
     if k == 0 || required.iter().any(|t| terms[*t].is_none()) {
         return Ok(None);
@@ -1575,6 +1618,8 @@ pub(super) fn walk_into<'a>(
         node_terms,
         touch,
         sc,
+        frame: None,
+        held: Vec::new(),
     };
     walk.term_sc = vec![usize::MAX; walk.terms.len()];
     for i in 0..n {
@@ -1603,6 +1648,22 @@ pub(super) fn walk_into<'a>(
             .as_ref()
             .is_some_and(|s| s.postings.lengths.is_some())
     });
+    // A node check's cursors keep a group's grid between seeks: its walk
+    // holds what it pins. Otherwise the pages read to open the terms
+    // (records, directories, footers, decoded) are released with the
+    // groups', but for the ranges the records keep slices of.
+    if let (Some(blob), Some(opened)) = (blob, opened)
+        && !matches!(walk.verify, Verify::Node)
+    {
+        for set in walk.terms.iter().flatten() {
+            for (from, to) in set.postings.borrowed().into_iter().flatten() {
+                walk.held.push((set.at + from, set.at + to));
+            }
+        }
+        // The pages those ranges lie on, read to open the terms, are held
+        // to the walk's end before the mark the groups release to.
+        walk.frame = Some((blob, blob.hold_since(opened, &walk.held)));
+    }
     if required.is_empty() {
         walk.run_or()?;
     } else {
@@ -1742,6 +1803,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
             self.or_group(g)?;
+            self.group_done();
             from = g + 1;
         }
         Ok(())

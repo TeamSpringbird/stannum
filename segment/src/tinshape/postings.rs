@@ -601,6 +601,21 @@ impl<'a> Postings<'a> {
             && self.tf.is_lazy()
     }
 
+    /// The ranges of the record (offsets from its start) the parsed record
+    /// keeps slices of: a single posting's record, a sparse term's list,
+    /// inline lengths. None for a detached record ([`Self::is_detached`]).
+    pub fn borrowed(&self) -> [Option<(usize, usize)>; 2] {
+        let lengths = self.lengths.as_ref().map(|l| (l.at, self.tf_at));
+        match self.form {
+            Form::Single(_) => [Some((0, self.tf_at)), None],
+            Form::Sparse(_) => [
+                Some((self.payload_at, self.payload_at + self.payload.len())),
+                lengths,
+            ],
+            Form::Grouped(_) => [lengths, None],
+        }
+    }
+
     /// Parses a record of a term with `df` postings in `geometry`: its
     /// header, footer, inline lengths and group directory (or sparse list)
     /// are read, its containers and TF tail only when asked for.

@@ -57,6 +57,9 @@ struct Args {
     memory: bool,
     seed: bool,
     pin_ns: u64,
+    /// Pages a walk keeps pinned between groups (`LazyBlob::set_keep`);
+    /// the blob's default when unset.
+    keep_pins: Option<usize>,
     threads: usize,
     seconds: f64,
     per_query: Option<PathBuf>,
@@ -66,7 +69,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
-         [--repeat N] [--limit N] [--memory [--keep]] [--full] [--pin-ns N] [--threads N --seconds S] [--per-query FILE] [--out FILE]"
+         [--repeat N] [--limit N] [--memory [--keep]] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--out FILE]"
     );
     std::process::exit(2)
 }
@@ -86,6 +89,7 @@ fn args() -> Args {
         memory: false,
         seed: false,
         pin_ns: 0,
+        keep_pins: None,
         threads: 0,
         seconds: 20.0,
         per_query: None,
@@ -106,6 +110,9 @@ fn args() -> Args {
             "--memory" => a.memory = true,
             "--seed" => a.seed = true,
             "--pin-ns" => a.pin_ns = value(&mut it).parse().unwrap_or_else(|_| usage()),
+            "--keep-pins" => {
+                a.keep_pins = Some(value(&mut it).parse().unwrap_or_else(|_| usage()));
+            }
             "--threads" => a.threads = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--seconds" => a.seconds = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--per-query" => a.per_query = Some(value(&mut it).into()),
@@ -191,6 +198,93 @@ const PINNED_LIMIT: usize = 8192;
 thread_local! {
     /// Pages pinned on this thread (a pin per page per span).
     static PINS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// PostgreSQL's private buffer refcounts as this thread's pins would
+    /// use them (see [`RefCounts`]).
+    static REFS: std::cell::RefCell<RefCounts> = std::cell::RefCell::new(RefCounts::default());
+}
+
+/// Entries of PostgreSQL's private refcount array (`bufmgr.c`,
+/// `REFCOUNT_ARRAY_ENTRIES`): a backend's pins past these go to a hash
+/// table.
+const REFCOUNT_ARRAY_ENTRIES: usize = 8;
+
+/// A model of `bufmgr.c`'s private refcount bookkeeping (PostgreSQL 17
+/// and 18): an array of eight entries, past it a hash table; a new pin
+/// takes a free array entry, or moves one (round robin) into the hash
+/// table; looking up a buffer not in the array searches the hash table
+/// once anything overflowed; releasing an entry held in the hash table
+/// removes it there. It counts the hash table operations the pins make,
+/// and the most pages held at once.
+#[derive(Default)]
+struct RefCounts {
+    array: [Option<u64>; REFCOUNT_ARRAY_ENTRIES],
+    reserved: Option<usize>,
+    clock: usize,
+    hash: FxHashSet<u64>,
+    held: u64,
+    peak: u64,
+    hash_ops: u64,
+}
+
+impl RefCounts {
+    /// `ReservePrivateRefCountEntry`.
+    fn reserve(&mut self) {
+        if self.reserved.is_some() {
+            return;
+        }
+        if let Some(free) = self.array.iter().position(Option::is_none) {
+            self.reserved = Some(free);
+            return;
+        }
+        let victim = self.clock % REFCOUNT_ARRAY_ENTRIES;
+        self.clock += 1;
+        let moved = self.array[victim].take().expect("a full array");
+        self.hash.insert(moved);
+        self.hash_ops += 1;
+        self.reserved = Some(victim);
+    }
+
+    /// `GetPrivateRefCountEntry` without moving: whether `page` is held.
+    fn lookup(&mut self, page: u64) -> bool {
+        if self.array.contains(&Some(page)) {
+            return true;
+        }
+        if self.hash.is_empty() {
+            return false;
+        }
+        self.hash_ops += 1;
+        self.hash.contains(&page)
+    }
+
+    /// A first pin of `page` (`PinBuffer` of a buffer not pinned).
+    fn pin(&mut self, page: u64) {
+        self.reserve();
+        let found = self.lookup(page);
+        debug_assert!(!found, "a page pinned once per span");
+        let slot = self.reserved.take().expect("reserved above");
+        self.array[slot] = Some(page);
+        self.held += 1;
+        self.peak = self.peak.max(self.held);
+    }
+
+    /// The release of `page`'s pin (`UnpinBuffer`, then
+    /// `ForgetPrivateRefCountEntry`).
+    fn unpin(&mut self, page: u64) {
+        self.lookup(page);
+        if let Some(slot) = self.array.iter().position(|e| *e == Some(page)) {
+            self.array[slot] = None;
+            self.reserved = Some(slot);
+        } else {
+            self.hash_ops += 1;
+            self.hash.remove(&page);
+        }
+        self.held -= 1;
+    }
+}
+
+/// Page `page` of the source at `source` as one key.
+fn ref_key(source: *const PinSource, page: usize) -> u64 {
+    ((source as u64) << 24) ^ page as u64
 }
 
 /// A blob in memory served as the extension's run source serves a
@@ -224,7 +318,12 @@ impl segment::source::Source for PinSource {
         } else {
             self.holding.set(depth.saturating_sub(1));
             if depth == 1 {
-                self.pinned.borrow_mut().clear();
+                let me = std::ptr::from_ref(self);
+                REFS.with_borrow_mut(|refs| {
+                    for (page, ()) in self.pinned.borrow_mut().drain() {
+                        refs.unpin(ref_key(me, page));
+                    }
+                });
             }
         }
     }
@@ -254,6 +353,8 @@ impl segment::source::Source for PinSource {
             }
             pinned.insert(page, ());
             PINS.set(PINS.get() + 1);
+            let me = std::ptr::from_ref(self);
+            REFS.with_borrow_mut(|refs| refs.pin(ref_key(me, page)));
             if self.pin_ns > 0 {
                 let until = Instant::now() + std::time::Duration::from_nanos(self.pin_ns);
                 while Instant::now() < until {
@@ -267,6 +368,14 @@ impl segment::source::Source for PinSource {
             len: PAGE.min(self.bytes.len() - start),
             pinned: fresh,
         }))
+    }
+
+    fn release_page(&self, offset: u64) {
+        let page = offset as usize / PAGE;
+        if self.pinned.borrow_mut().remove(&page).is_some() {
+            let me = std::ptr::from_ref(self);
+            REFS.with_borrow_mut(|refs| refs.unpin(ref_key(me, page)));
+        }
     }
 }
 
@@ -381,6 +490,9 @@ impl Reader {
                         pin_ns: args.pin_ns,
                     })),
                 ));
+                if let Some(keep) = args.keep_pins {
+                    lazy.set_keep(keep);
+                }
                 let mut segment = Segment::assemble(
                     lazy.bytes(),
                     segment::dictionary::DictionaryIndex::parse(NO_TERMS)
@@ -597,6 +709,10 @@ struct Row {
     pages: Pages,
     answer: tin::RankedAnswer,
     pins: u64,
+    /// The most pages held pinned at once in the instrumented pass, and
+    /// the private refcount hash table operations its pins made.
+    peak: u64,
+    hash_ops: u64,
     /// The instrumented pass's reads by kind of structure.
     kinds: [segment::tinshape::blob::KindStats; segment::tinshape::blob::KINDS],
     /// What the answer's pass parsed of the terms' metadata.
@@ -720,6 +836,10 @@ fn run() -> Result<bool, String> {
         }
         let mut pages = Pages::default();
         let pins0 = PINS.get();
+        let hash0 = REFS.with_borrow_mut(|refs| {
+            refs.peak = refs.held;
+            refs.hash_ops
+        });
         segment::tinshape::blob::reset_stats();
         let (direct, counters) = reader
             .instrumented(
@@ -741,6 +861,8 @@ fn run() -> Result<bool, String> {
             pages,
             answer: counters,
             pins: PINS.get() - pins0,
+            peak: REFS.with_borrow(|refs| refs.peak),
+            hash_ops: REFS.with_borrow(|refs| refs.hash_ops) - hash0,
             kinds: segment::tinshape::blob::stats(),
             memo,
         });
@@ -896,6 +1018,19 @@ fn run() -> Result<bool, String> {
         }
         println!("{line}");
     }
+    println!("\npinned per query by kind, mean");
+    for style in &styles {
+        let rs: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = rs.len().max(1) as f64;
+        let mut line = format!("{style:<12}");
+        for (k, name) in segment::tinshape::blob::KIND_NAMES.iter().enumerate() {
+            let pins = rs.iter().map(|r| r.kinds[k].pinned).sum::<u64>() as f64 / n;
+            if pins > 0.0 {
+                let _ = write!(line, "  {name}: {pins:.1}");
+            }
+        }
+        println!("{line}");
+    }
     println!("\npages pinned per query (in place), mean");
     for style in &styles {
         let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
@@ -903,6 +1038,23 @@ fn run() -> Result<bool, String> {
             "{:<12} {:>10.1}",
             style,
             of.iter().map(|r| r.pins).sum::<u64>() as f64 / of.len().max(1) as f64
+        );
+    }
+    println!(
+        "\npins held at once per query (mean, p50, max), and private refcount hash operations per query (mean)"
+    );
+    for style in &styles {
+        let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = of.len().max(1) as f64;
+        let mut peaks: Vec<u64> = of.iter().map(|r| r.peak).collect();
+        peaks.sort_unstable();
+        println!(
+            "{:<12} peak {:>8.1} {:>6} {:>6}  hash ops {:>10.1}",
+            style,
+            peaks.iter().sum::<u64>() as f64 / n,
+            peaks.get(peaks.len() / 2).copied().unwrap_or(0),
+            peaks.last().copied().unwrap_or(0),
+            of.iter().map(|r| r.hash_ops).sum::<u64>() as f64 / n,
         );
     }
     println!("\nwalk per query, mean: examined, scored, position checks, windows, pruned");

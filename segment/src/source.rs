@@ -260,6 +260,16 @@ pub trait Source {
         let _ = offset;
         None
     }
+
+    /// Releases, before its span ends, the page covering `offset` that
+    /// [`Source::pinned_page`] pinned in the open span; a page asked for
+    /// again is pinned afresh. A source may keep it pinned instead (the
+    /// default): releasing early only bounds the pins held at once.
+    ///
+    /// The caller must not read through the page's `data` after.
+    fn release_page(&self, offset: u64) {
+        let _ = offset;
+    }
 }
 
 fn check(total: u64, offset: u64, len: usize) -> Result<usize> {
@@ -356,6 +366,9 @@ impl Source for Box<dyn Source> {
     }
     fn pinned_page(&self, offset: u64) -> Option<Result<HeldSpan>> {
         (**self).pinned_page(offset)
+    }
+    fn release_page(&self, offset: u64) {
+        (**self).release_page(offset);
     }
 }
 
