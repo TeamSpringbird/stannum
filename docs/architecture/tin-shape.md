@@ -205,7 +205,7 @@ is folded a group at a time over the groups that can match (the
 intersection of an AND's children's groups, the union of an OR's):
 
 - AND of terms: grids are ANDed word by word (two grids: one fused
-  AND-popcount, NEON on Apple silicon); otherwise the rarest term's members
+  AND-popcount); otherwise the rarest term's members
   are listed and probed in the others, a bit test in a grid or a merge with
   a decoded list.
 - OR of terms: a group one term holds adds its stored count; otherwise
@@ -285,6 +285,62 @@ footers it decodes between queries (`Segment::resolve_memo`,
 - Candidates come in ctid order, so one that only ties the threshold ranks
   after the k-th row and is skipped like a lower one; every bound is
   compared with a relative margin (`1e-5`) far above `f32` rounding.
+
+### Word kernels and instruction sets
+
+The block loops (`engine/src/tinshape/kernels.rs`) have a body per
+instruction set: a grid loaded, ANDed, ORed or cleared into words, words
+combined and tested for any member, popcount, the fused AND-popcount, the
+masked count-and-clear of index-only counts and a grid's per-word prefix
+counts. The choice is made per call, never per word, and each loop runs
+whole inside one function compiled for its instruction set:
+
+- aarch64: NEON, part of the baseline; no runtime choice.
+- x86-64: chosen once at runtime, as PostgreSQL's `pg_popcount` chooses
+  and as PGDG's baseline packages need: AVX-512 (F, BW, VPOPCNTDQ) and
+  POPCNT, else AVX2 and POPCNT, else the portable bodies. AVX-512 works a
+  64-byte cache line per vector, with masked loads for tails; AVX2 two
+  32-byte vectors per line, counting by nibble lookup (`vpshufb`,
+  `vpsadbw`). `STANNUM_KERNELS=scalar|avx2|avx512` forces a level the CPU
+  has (tests, A/B runs); others are ignored.
+
+Not vectorized on either architecture: the OR walk's per-word and
+per-member weighing (a few terms' bounds a word; branch-free whole-group
+weighing measured slower), Elias-Fano decoding (serial over the highs' set
+bits), and TF-tail and DL reads (one packed value per candidate). Their
+scattered `count_ones` and `trailing_zeros` become POPCNT and TZCNT only
+in an `x86-64-v3` or `-v4` build (a baseline build runs bit tricks); that
+difference, not the kernels, is what those builds measure.
+
+x86-64 builds (set the per-target variable, not `RUSTFLAGS`, which would
+replace `.cargo/config.toml`'s link flags; `x86-64-v4` lacks VPOPCNTDQ, so
+its AVX-512 kernels are still chosen at runtime):
+
+```sh
+cargo pgrx install --package stannum --release ...           # runtime choice
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C target-cpu=x86-64-v3' \
+  cargo pgrx install --package stannum --release ...           # or x86-64-v4
+docker build --build-arg STANNUM_TARGET_CPU=x86-64-v4 -f benchmarks/Dockerfile .
+```
+
+Each level is tested against the portable bodies on random inputs
+(unaligned starts, odd lengths, every density). On an x86-64 host,
+`STANNUM_EXPECT_KERNELS` makes a level the CPU lacks a failure rather than
+a skip:
+
+```sh
+STANNUM_EXPECT_KERNELS=avx2,avx512 cargo test -p engine --lib tinshape::kernels -- --nocapture
+STANNUM_EXPECT_KERNELS=avx2,avx512 cargo test --release -p engine --lib tinshape::kernels
+for l in scalar avx2 avx512; do                  # whole suites at each level
+  STANNUM_KERNELS=$l STANNUM_EXPECT_KERNELS=$l cargo test -p engine -p segment; done
+for cpu in x86-64-v3 x86-64-v4; do
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=$cpu" \
+    cargo test -p engine -p segment --target-dir target/$cpu; done
+```
+
+On Apple silicon, an `x86_64-apple-darwin` build runs the scalar and AVX2
+levels under Rosetta with `ROSETTA_ADVERTISE_AVX=1`; nothing local runs
+AVX-512 (QEMU's TCG has none).
 
 ## Writing and maintaining it
 

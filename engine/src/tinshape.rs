@@ -83,180 +83,7 @@ impl Touch for NoTouch {
     fn touch(&mut self, _: Part, _: usize, _: usize) {}
 }
 
-/// Word kernels. NEON is part of every aarch64 target, so they need no
-/// runtime dispatch there; elsewhere the portable loops vectorize as the
-/// compiler can.
-pub mod kernels {
-    /// Set bits in `words`.
-    #[inline]
-    pub fn popcount(words: &[u64]) -> u64 {
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: NEON is baseline on aarch64; loads stay within `words`.
-        unsafe {
-            use core::arch::aarch64::*;
-            let mut acc = vdupq_n_u64(0);
-            let chunks = words.chunks_exact(4);
-            let rest = chunks.remainder();
-            for c in chunks {
-                let a = vcntq_u8(vreinterpretq_u8_u64(vld1q_u64(c.as_ptr())));
-                let b = vcntq_u8(vreinterpretq_u8_u64(vld1q_u64(c.as_ptr().add(2))));
-                acc = vaddq_u64(acc, vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(vaddq_u8(a, b)))));
-            }
-            vaddvq_u64(acc) + rest.iter().map(|w| u64::from(w.count_ones())).sum::<u64>()
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        words.iter().map(|w| u64::from(w.count_ones())).sum()
-    }
-
-    /// Set bits in a byte string (a grid's words, as stored).
-    #[inline]
-    pub fn popcount_bytes(bytes: &[u8]) -> u32 {
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: NEON is baseline on aarch64; every load is within `bytes`.
-        // Each 16-bit lane gains at most 32 per step, so it cannot overflow
-        // below 2,048 steps (64 KiB; a group's grid is at most 9.3 KiB).
-        unsafe {
-            use core::arch::aarch64::*;
-            let n = bytes.len();
-            let p = bytes.as_ptr();
-            let mut i = 0;
-            let mut total = 0u32;
-            while i + 32 <= n {
-                let mut acc = vdupq_n_u16(0);
-                let end = (i + 32 * 2048).min(n - n % 32);
-                while i < end {
-                    let a = vcntq_u8(vld1q_u8(p.add(i)));
-                    let b = vcntq_u8(vld1q_u8(p.add(i + 16)));
-                    acc = vpadalq_u8(acc, vaddq_u8(a, b));
-                    i += 32;
-                }
-                total += vaddlvq_u16(acc);
-            }
-            while i + 8 <= n {
-                total +=
-                    u64::from_le_bytes(bytes[i..i + 8].try_into().expect("eight")).count_ones();
-                i += 8;
-            }
-            while i < n {
-                total += bytes[i].count_ones();
-                i += 1;
-            }
-            total
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let mut chunks = bytes.chunks_exact(8);
-            let mut total: u32 = (&mut chunks)
-                .map(|c| u64::from_le_bytes(c.try_into().expect("eight")).count_ones())
-                .sum();
-            total += chunks
-                .remainder()
-                .iter()
-                .map(|b| b.count_ones())
-                .sum::<u32>();
-            total
-        }
-    }
-
-    /// `out = bytes` read as little-endian words.
-    #[inline]
-    pub fn load(out: &mut [u64], bytes: &[u8]) {
-        for (w, c) in out.iter_mut().zip(bytes.chunks_exact(8)) {
-            *w = u64::from_le_bytes(c.try_into().expect("eight bytes"));
-        }
-    }
-
-    /// `out &= bytes`.
-    #[inline]
-    pub fn and_bytes(out: &mut [u64], bytes: &[u8]) {
-        for (w, c) in out.iter_mut().zip(bytes.chunks_exact(8)) {
-            *w &= u64::from_le_bytes(c.try_into().expect("eight bytes"));
-        }
-    }
-
-    /// `out |= bytes`.
-    #[inline]
-    pub fn or_bytes(out: &mut [u64], bytes: &[u8]) {
-        for (w, c) in out.iter_mut().zip(bytes.chunks_exact(8)) {
-            *w |= u64::from_le_bytes(c.try_into().expect("eight bytes"));
-        }
-    }
-
-    /// Set bits of `a & b`, with `b` as little-endian bytes.
-    #[inline]
-    pub fn and_count_bytes(a: &[u64], bytes: &[u8]) -> u64 {
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: NEON is baseline on aarch64; every load is within its
-        // slice, the byte loads unaligned as `vld1q_u8` allows.
-        unsafe {
-            use core::arch::aarch64::*;
-            let n = a.len().min(bytes.len() / 8);
-            let mut acc = vdupq_n_u64(0);
-            let mut i = 0;
-            while i + 4 <= n {
-                let x0 = vandq_u8(
-                    vreinterpretq_u8_u64(vld1q_u64(a.as_ptr().add(i))),
-                    vld1q_u8(bytes.as_ptr().add(i * 8)),
-                );
-                let x1 = vandq_u8(
-                    vreinterpretq_u8_u64(vld1q_u64(a.as_ptr().add(i + 2))),
-                    vld1q_u8(bytes.as_ptr().add(i * 8 + 16)),
-                );
-                let s = vaddq_u8(vcntq_u8(x0), vcntq_u8(x1));
-                acc = vaddq_u64(acc, vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(s))));
-                i += 4;
-            }
-            let mut total = vaddvq_u64(acc);
-            while i < n {
-                let b = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("eight"));
-                total += u64::from((a[i] & b).count_ones());
-                i += 1;
-            }
-            total
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        a.iter()
-            .zip(bytes.chunks_exact(8))
-            .map(|(w, c)| {
-                u64::from((w & u64::from_le_bytes(c.try_into().expect("eight"))).count_ones())
-            })
-            .sum()
-    }
-
-    /// Set bits of the AND of two little-endian byte bitmaps.
-    #[inline]
-    pub fn and_count_two(x: &[u8], y: &[u8]) -> u64 {
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: as above.
-        unsafe {
-            use core::arch::aarch64::*;
-            let n = x.len().min(y.len());
-            let mut acc = vdupq_n_u64(0);
-            let mut i = 0;
-            while i + 32 <= n {
-                let a = vandq_u8(vld1q_u8(x.as_ptr().add(i)), vld1q_u8(y.as_ptr().add(i)));
-                let b = vandq_u8(
-                    vld1q_u8(x.as_ptr().add(i + 16)),
-                    vld1q_u8(y.as_ptr().add(i + 16)),
-                );
-                let s = vaddq_u8(vcntq_u8(a), vcntq_u8(b));
-                acc = vaddq_u64(acc, vpaddlq_u32(vpaddlq_u16(vpaddlq_u8(s))));
-                i += 32;
-            }
-            let mut total = vaddvq_u64(acc);
-            while i < n {
-                total += u64::from((x[i] & y[i]).count_ones());
-                i += 1;
-            }
-            total
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        x.iter()
-            .zip(y)
-            .map(|(a, b)| u64::from((a & b).count_ones()))
-            .sum()
-    }
-}
+pub mod kernels;
 
 /// A query lowered over a table of distinct terms.
 #[derive(Clone, Debug)]
@@ -679,13 +506,8 @@ impl<'a> TermSet<'a> {
                 touch.touch(Part::Payload, at, bytes.len());
                 let bytes = container_bytes(bytes);
                 if entry.kind == KIND_GRID {
-                    let words = bytes.len() / 8;
                     self.prefix.clear();
-                    let mut n = 0u32;
-                    for c in bytes.chunks_exact(8).take(words) {
-                        self.prefix.push(n);
-                        n += u64::from_le_bytes(c.try_into().expect("eight bytes")).count_ones();
-                    }
+                    kernels::prefix_counts(bytes, &mut self.prefix);
                     self.loaded = Loaded::Grid;
                 } else {
                     let mut list = std::mem::take(&mut self.list);
@@ -900,9 +722,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                         let mut other = self.scratch.level(depth, out.len());
                         let any = self.eval(&children[i], group, &mut other, depth + 1)?;
                         if any {
-                            for (o, x) in out.iter_mut().zip(&other) {
-                                *o &= x;
-                            }
+                            kernels::and_words(out, &other);
                         }
                         self.scratch.give(depth, other);
                         if !any {
@@ -919,14 +739,12 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     if let Node::Not(inner) = child {
                         let mut other = self.scratch.level(depth, out.len());
                         if self.eval(inner, group, &mut other, depth + 1)? {
-                            for (o, x) in out.iter_mut().zip(&other) {
-                                *o &= !x;
-                            }
+                            kernels::andnot_words(out, &other);
                         }
                         self.scratch.give(depth, other);
                     }
                 }
-                Ok(out.iter().any(|w| *w != 0))
+                Ok(kernels::any_set(out))
             }
             Node::Or(children) => {
                 let mut any = false;
@@ -938,9 +756,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     }
                     let mut other = self.scratch.level(depth, out.len());
                     if self.eval(child, group, &mut other, depth + 1)? {
-                        for (o, x) in out.iter_mut().zip(&other) {
-                            *o |= x;
-                        }
+                        kernels::or_words(out, &other);
                         any = true;
                     }
                     self.scratch.give(depth, other);
@@ -952,12 +768,10 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 out.copy_from_slice(words);
                 let mut other = self.scratch.level(depth, out.len());
                 if self.eval(inner, group, &mut other, depth + 1)? {
-                    for (o, x) in out.iter_mut().zip(&other) {
-                        *o &= !x;
-                    }
+                    kernels::andnot_words(out, &other);
                 }
                 self.scratch.give(depth, other);
-                Ok(out.iter().any(|w| *w != 0))
+                Ok(kernels::any_set(out))
             }
             Node::Span { slots, query } => {
                 let mut distinct = slots.clone();
@@ -968,7 +782,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     return Ok(false);
                 }
                 self.verify_span(slots, query, group, out)?;
-                Ok(out.iter().any(|w| *w != 0))
+                Ok(kernels::any_set(out))
             }
         }
     }
@@ -1108,9 +922,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
             match g.src {
                 Src::Container { entry, bytes, .. } if entry.kind == KIND_GRID => {
                     self.touch_src(&g.src);
-                    for (w, c) in out.iter_mut().zip(bytes.all()?.chunks_exact(8)) {
-                        *w &= !u64::from_le_bytes(c.try_into().expect("eight bytes"));
-                    }
+                    kernels::andnot_bytes(out, bytes.all()?);
                 }
                 _ => {
                     let mut other = std::mem::take(&mut self.other);
@@ -1123,7 +935,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 }
             }
         }
-        Ok(out.iter().any(|w| *w != 0))
+        Ok(kernels::any_set(out))
     }
 
     fn term_into(&mut self, t: usize, group: u32, out: &mut [u64]) -> Result<bool> {
@@ -1296,9 +1108,7 @@ pub fn count_terms<'a>(
             continue;
         }
         if let Some(dead) = dead {
-            for (o, d) in out.iter_mut().zip(dead) {
-                *o &= !d;
-            }
+            kernels::andnot_words(&mut out, dead);
         }
         total += kernels::popcount(&out);
     }
@@ -1344,11 +1154,9 @@ pub fn for_each_match<'a>(
             continue;
         }
         if let Some(dead) = live.groups[group as usize].as_deref() {
-            for (o, d) in out.iter_mut().zip(dead) {
-                *o &= !d;
-            }
+            kernels::andnot_words(&mut out, dead);
         }
-        if out.iter().any(|w| *w != 0) {
+        if kernels::any_set(&out) {
             emit(group as usize, &out);
         }
     }
@@ -1484,20 +1292,14 @@ pub fn count_terms_visible<'a>(
             continue;
         }
         if let Some(dead) = dead {
-            for (o, d) in out.iter_mut().zip(dead) {
-                *o &= !d;
-            }
+            kernels::andnot_words(&mut out, dead);
         }
         if whole {
             total += kernels::popcount(&out);
             continue;
         }
-        let mut any = false;
-        for (o, m) in out.iter_mut().zip(&mask) {
-            total += u64::from((*o & m).count_ones());
-            *o &= !m;
-            any |= *o != 0;
-        }
+        let (visible, any) = kernels::and_count_clear(&mut out, &mask);
+        total += visible;
         if any {
             hidden(group, &out);
         }
