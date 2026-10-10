@@ -120,6 +120,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the TIN vs Stannum comparison kit, written for this repository on 2026-10-09."
     },
+    "benchmarks/compare/h2h.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the head-to-head replay of the TIN probes' corpus and queries, written for this repository on 2026-10-09."
+    },
     "benchmarks/contention.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in e0fe96d06f4378ba3c88cf3a0633d3f2739cb6be."
@@ -609,6 +613,10 @@
     "conformance/cases/stemming.yaml": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
+    },
+    "conformance/cases/prepared.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-09."
     },
     "conformance/cases/tiebreak.yaml": {
       "owner": "ben",
