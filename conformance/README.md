@@ -70,7 +70,9 @@ For Stannum, `script/test-all conformance` runs the check against the
 installed build in a throwaway cluster of its own; CI runs it on
 PostgreSQL 18 after installing the release build (see `docs/testing.md`).
 
-Every run creates a scratch schema `conformance_<random>`, builds each corpus
+Every run creates a scratch schema `conformance_<random>` (`--schema-prefix`
+names another prefix, for a database whose owner reserves schema names),
+builds each corpus
 the selected cases use once (a table and an index in that schema), runs the
 cases and drops the schema at the end, also when the run fails. Each capture
 runs in its own transaction, which is rolled back, so cases cannot affect one

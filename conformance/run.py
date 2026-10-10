@@ -11,8 +11,8 @@
 
 The connection string is read from the environment variable named by
 --dsn-env (default CONFORMANCE_DSN), never from the command line. Every run
-works in a fresh scratch schema, conformance_<random>, which is dropped at
-the end, also when the run fails. See conformance/README.md.
+works in a fresh scratch schema, conformance_<random> (another prefix with
+--schema-prefix), which is dropped at the end, also when the run fails. See conformance/README.md.
 """
 
 import argparse
@@ -846,6 +846,8 @@ def main():
     parser.add_argument("--skip-crash", action="store_true",
                         help="skip cases tagged as crashing any version of the engine under test")
     parser.add_argument("--host-note", default="", help="free-text host description for the source header")
+    parser.add_argument("--schema-prefix", default="conformance",
+                        help="name the scratch schema <prefix>_<random> (default conformance)")
     parser.add_argument("--timings", action="store_true",
                         help="print each capture's elapsed time (never recorded)")
     parser.add_argument("--cases-dir", default=str(SUITE / "cases"), help=argparse.SUPPRESS)
@@ -873,7 +875,7 @@ def main():
             if expected_source.get(key):
                 print(f"  {key}: {expected_source[key]}")
 
-    schema = f"conformance_{secrets.token_hex(4)}"
+    schema = f"{args.schema_prefix}_{secrets.token_hex(4)}"
     session = Session(dsn, None)
     version, server = engine_facts(session, args.engine)
     print(f"Engine under test: {args.engine} {version}; {server}")
