@@ -27,12 +27,25 @@
 //! chunks unloaded, so the next query reads them again rather than taking
 //! zeros for the segment's bytes.
 //!
+//! A walk need not hold every page it read until its span closes: pages
+//! pinned since a mark ([`LazyBlob::pin_mark`]) are released by
+//! [`LazyBlob::release_since`] once nothing read from them is used, a group
+//! at a time, all but the few read last (the next group most often reads
+//! on from them). A page a stitched read pinned for itself and copied whole
+//! is released at once. A query pinned some thousands of pages at once at
+//! 150M rows, which overflowed PostgreSQL's per-backend array of pin counts
+//! (eight entries) into its hash table, so every pin and release looked up
+//! a hash table of thousands of entries.
+//!
 //! Soundness: a slice over loaded chunks lives as long as the blob: the
 //! blob's bytes are a raw allocation, a load writes only chunks not loaded
 //! yet, and loaded chunks stay loaded until the blob is dropped. A slice
 //! read within a span (a pinned page, or the span's stitch buffers) lives
 //! until the span closes: [`LazyBlob::close_span`] is `unsafe`, and its
-//! caller drops whatever borrowed the span's slices first.
+//! caller drops whatever borrowed the span's slices first. A slice of a
+//! page pinned since a mark lives until [`LazyBlob::release_since`] of that
+//! mark (also `unsafe`), unless the page is one of those it keeps; stitched
+//! slices live until the span closes.
 
 use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
@@ -151,6 +164,16 @@ const NO_PAGE: PageRef = PageRef {
     data: std::ptr::null(),
     len: 0,
 };
+
+/// Pages pinned since a mark that [`LazyBlob::release_since`] keeps by
+/// default, those read last: a walk's next group most often reads on from
+/// the pages each of its streams (a term's containers and TF tail, the DL
+/// sidecar, a term's positions) last touched, and a page released and read
+/// again is pinned again. At 150M rows (replay of the trace) keeping 4
+/// pinned 2.8 / 7.0 / 3.7 times as many pages as holding them all
+/// (conjunction / disjunction / phrase), 24 pinned 3% / 7% / 8% more, at
+/// some 30 / 35 / 55 held at once rather than 450 / 1,100 / 700.
+pub const KEEP_PINS: usize = 24;
 
 /// Bytes of a stitch buffer: a range across pages is copied into the
 /// current one, or into a buffer of its own when larger than a quarter.
@@ -271,6 +294,16 @@ pub struct LazyBlob {
     span: Cell<u64>,
     /// Pages the open span pinned, by page modulo [`PAGE_MEMO`].
     pages: Box<[Cell<PageRef>; PAGE_MEMO]>,
+    /// The pages the open span pinned and holds, in the order they were
+    /// pinned (see [`Self::pin_mark`]).
+    pinned: RefCell<Vec<usize>>,
+    /// Pages [`Self::release_since`] keeps.
+    keep: Cell<usize>,
+    /// Reads served from pinned pages so far, and per entry of
+    /// [`Self::pages`] the read that last used it: the pages kept are the
+    /// ones used last.
+    clock: Cell<u64>,
+    used: Box<[Cell<u64>; PAGE_MEMO]>,
     stitches: RefCell<Stitches>,
 }
 
@@ -314,6 +347,10 @@ impl LazyBlob {
             spans: Cell::new(0),
             span: Cell::new(0),
             pages: Box::new([const { Cell::new(NO_PAGE) }; PAGE_MEMO]),
+            pinned: RefCell::default(),
+            keep: Cell::new(KEEP_PINS),
+            clock: Cell::new(0),
+            used: Box::new([const { Cell::new(0) }; PAGE_MEMO]),
             stitches: RefCell::default(),
         }
     }
@@ -335,7 +372,8 @@ impl LazyBlob {
     /// the span's page memo and the stitch buffers it keeps.
     pub fn overhead(&self) -> usize {
         self.chunks.len() * 8
-            + self.pages.len() * std::mem::size_of::<PageRef>()
+            + self.pages.len() * (std::mem::size_of::<PageRef>() + 8)
+            + self.pinned.borrow().capacity() * std::mem::size_of::<usize>()
             + self.stitches.borrow().capacity()
     }
 
@@ -379,8 +417,107 @@ impl LazyBlob {
         if depth == 0 {
             // The page memo's entries name the span: none is served after.
             self.stitches.borrow_mut().clear();
+            self.pinned.borrow_mut().clear();
         }
         self.source.hold(false);
+    }
+
+    /// A mark of the pages the open span holds pinned: those it pins after
+    /// are released by [`Self::release_since`] of the mark.
+    #[inline]
+    pub fn pin_mark(&self) -> usize {
+        self.pinned.borrow().len()
+    }
+
+    /// Pages the open span pinned since `mark` and holds.
+    #[inline]
+    pub fn pinned_since(&self, mark: usize) -> usize {
+        self.pinned.borrow().len().saturating_sub(mark)
+    }
+
+    /// Pages [`Self::release_since`] keeps pinned.
+    #[inline]
+    pub fn keep(&self) -> usize {
+        self.keep.get()
+    }
+
+    /// Sets the pages [`Self::release_since`] keeps ([`KEEP_PINS`] by
+    /// default); tests release every one.
+    pub fn set_keep(&self, keep: usize) {
+        self.keep.set(keep);
+    }
+
+    /// Notes a read of page `page`, which the page memo holds.
+    #[inline(always)]
+    fn touch(&self, page: usize) {
+        let now = self.clock.get() + 1;
+        self.clock.set(now);
+        self.used[page % PAGE_MEMO].set(now);
+    }
+
+    /// When page `page`, pinned in the open span, was last read; zero once
+    /// another page took its memo entry.
+    fn last_used(&self, page: usize) -> u64 {
+        if self.pages[page % PAGE_MEMO].get().page == page {
+            self.used[page % PAGE_MEMO].get()
+        } else {
+            0
+        }
+    }
+
+    /// Releases the pages the open span pinned since `mark`, but for those
+    /// holding any byte of the ranges `held` (`(from, to)` offsets of the
+    /// blob) and the [`Self::keep`] of the others read last, which all
+    /// count as pinned since the mark still. A page read again is pinned
+    /// afresh.
+    ///
+    /// # Safety
+    ///
+    /// Nothing read in place from a page pinned since `mark` is used after,
+    /// unless it is read again or lies in `held`: the slices handed out
+    /// from those pages point into pages no longer pinned. Slices of
+    /// earlier pages, and stitched slices, stay valid until the span
+    /// closes.
+    pub unsafe fn release_since(&self, mark: usize, held: &[(usize, usize)]) {
+        let mut pinned = self.pinned.borrow_mut();
+        let keep = self.keep.get();
+        if pinned.len() <= mark.saturating_add(keep) {
+            return;
+        }
+        let n = self.page_len;
+        let is_held = |page: usize| {
+            held.iter()
+                .any(|&(from, to)| from < to && from / n <= page && page <= (to - 1) / n)
+        };
+        // Pages held first, then the rest by when they were last read: the
+        // ones read last stay, the others are released.
+        let since = &mut pinned[mark..];
+        since.sort_unstable_by_key(|page| {
+            if is_held(*page) {
+                (0, 0)
+            } else {
+                (1, self.last_used(*page))
+            }
+        });
+        let first = since.partition_point(|page| is_held(*page));
+        if since.len() - first <= keep {
+            return;
+        }
+        let until = since.len() - keep;
+        for &page in &since[first..until] {
+            self.release(page);
+        }
+        pinned.drain(mark + first..mark + until);
+    }
+
+    /// Releases page `page`, pinned in the open span, and forgets it.
+    fn release(&self, page: usize) {
+        let memo = &self.pages[page % PAGE_MEMO];
+        let known = memo.get();
+        if known.page == page && known.span == self.span.get() {
+            memo.set(NO_PAGE);
+        }
+        self.source.release_page((page * self.page_len) as u64);
     }
 
     fn is_loaded(&self, chunk: usize) -> bool {
@@ -476,6 +613,7 @@ impl LazyBlob {
             let page = from / n;
             let known = self.pages[page % PAGE_MEMO].get();
             if known.page == page && known.span == self.span.get() && to <= page * n + known.len {
+                self.touch(page);
                 // SAFETY: within a page the open span pinned, as in
                 // `in_place`; the caller of `close_span` drops this slice
                 // first.
@@ -516,6 +654,7 @@ impl LazyBlob {
         let memo = &self.pages[page % PAGE_MEMO];
         let known = memo.get();
         if known.page == page && known.span == self.span.get() {
+            self.touch(page);
             return Ok(Some((known.data, known.len)));
         }
         match self.source.pinned_page((page * self.page_len) as u64) {
@@ -524,6 +663,7 @@ impl LazyBlob {
             Some(Ok(span)) => {
                 if span.pinned {
                     count(kind, |s| s.pinned += 1);
+                    self.pinned.borrow_mut().push(page);
                 }
                 memo.set(PageRef {
                     page,
@@ -531,6 +671,7 @@ impl LazyBlob {
                     data: span.data,
                     len: span.len,
                 });
+                self.touch(page);
                 Ok(Some((span.data, span.len)))
             }
         }
@@ -559,6 +700,7 @@ impl LazyBlob {
         while at < to {
             let page = at / n;
             let take = ((page + 1) * n).min(to) - at;
+            let held = self.pinned.borrow().len();
             match self.page(page, kind)? {
                 Some((data, len)) => {
                     let within = at - page * n;
@@ -569,6 +711,13 @@ impl LazyBlob {
                     // buffer's `at - from..`, distinct allocations.
                     unsafe {
                         std::ptr::copy_nonoverlapping(data.add(within), out.add(at - from), take);
+                    }
+                    // A page pinned for this read alone and copied whole
+                    // (the middle of a footer or a directory read whole)
+                    // is released at once: nothing borrows it.
+                    if take == len && self.pinned.borrow().len() > held {
+                        self.pinned.borrow_mut().pop();
+                        self.release(page);
                     }
                 }
                 None => {
@@ -660,6 +809,14 @@ impl<'a> Bytes<'a> {
         matches!(self, Self::Lazy { .. })
     }
 
+    /// The blob a lazy range reads from.
+    pub fn blob(&self) -> Option<&'a LazyBlob> {
+        match self {
+            Self::Slice(_) => None,
+            Self::Lazy { blob, .. } => Some(blob),
+        }
+    }
+
     /// The range tagged as holding `kind`, for accounting.
     #[must_use]
     pub fn tag(self, kind: Kind) -> Self {
@@ -743,9 +900,13 @@ pub struct PinState {
     pub pinned: RefCell<std::collections::BTreeMap<usize, Box<[u8]>>>,
     /// Pages released and poisoned, kept so a stale slice stays readable.
     pub released: RefCell<Vec<Box<[u8]>>>,
-    /// Pages pinned in all, and copying reads made.
+    /// Pages pinned in all, copying reads made, and pages released before
+    /// their span closed ([`Source::release_page`]).
     pub pins: Cell<usize>,
     pub reads: Cell<usize>,
+    pub early: Cell<usize>,
+    /// The most pages pinned at once.
+    pub peak: Cell<usize>,
     /// Most pages a span pins; past it `pinned_page` is `None`.
     pub limit: Cell<usize>,
     /// While set, pins and reads fail (`false`) or panic (`true`).
@@ -763,6 +924,8 @@ impl PinningSource {
             released: RefCell::default(),
             pins: Cell::new(0),
             reads: Cell::new(0),
+            early: Cell::new(0),
+            peak: Cell::new(0),
             limit: Cell::new(usize::MAX),
             fail: Cell::new(None),
         }))
@@ -841,6 +1004,7 @@ impl Source for PinningSource {
             let end = (start + state.page_len).min(state.bytes.len());
             pinned.insert(page, state.bytes[start..end].into());
             state.pins.set(state.pins.get() + 1);
+            state.peak.set(state.peak.get().max(pinned.len()));
         }
         let data = &pinned[&page];
         Some(Ok(crate::source::HeldSpan {
@@ -849,6 +1013,16 @@ impl Source for PinningSource {
             len: data.len(),
             pinned: fresh,
         }))
+    }
+
+    fn release_page(&self, offset: u64) {
+        let state = &self.0;
+        let page = offset as usize / state.page_len;
+        let released = state.pinned.borrow_mut().remove(&page);
+        let mut page = released.expect("a page released was pinned in the open span");
+        page.fill(0xA5);
+        state.released.borrow_mut().push(page);
+        state.early.set(state.early.get() + 1);
     }
 }
 
@@ -977,6 +1151,91 @@ mod tests {
         }
         assert!(blob.overhead() >= 40_000, "kept buffers count as held");
         assert_eq!(blob.loaded(), 0);
+    }
+
+    /// Pages pinned since a mark are released but for those a range held
+    /// covers and those read last; earlier pages stay. A released page is
+    /// poisoned by the source: the blob must never serve it again, but pin
+    /// it afresh.
+    #[test]
+    fn release_since_keeps_held_and_recent_pages_and_never_serves_a_released_one() {
+        let (source, blob) = pinning(20 * 100, 100);
+        let state = &source.0;
+        let bytes = blob.bytes();
+        blob.open_span();
+        let before = bytes.get(5, 15).unwrap();
+        let mark = blob.pin_mark();
+        assert_eq!(mark, 1);
+        // Pages 2 to 9 in order, then page 3 again: read last are 3 and 9.
+        let mut stale = Vec::new();
+        for page in 2..10 {
+            stale.push(bytes.get(page * 100 + 10, page * 100 + 20).unwrap());
+        }
+        bytes.get(310, 320).unwrap();
+        assert_eq!(blob.pinned_since(mark), 8);
+        blob.set_keep(2);
+        // Page 6 is held: a slice of it is kept past the release.
+        let held = [(650, 655)];
+        unsafe { blob.release_since(mark, &held) };
+        let mut kept: Vec<usize> = state.pinned.borrow().keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![0, 3, 6, 9]);
+        assert_eq!(state.early.get(), 5);
+        assert_eq!(blob.pinned_since(mark), 3);
+        // Earlier pages and held ones stay readable through old slices.
+        assert_eq!(before, &state.bytes[5..15]);
+        assert_eq!(stale[4], &state.bytes[610..620]);
+        // A slice of a released page now reads the poison: such a read is
+        // what the walks must never make.
+        assert_eq!(stale[0], &[0xA5; 10]);
+        // Read again, a released page is pinned afresh and right.
+        let pins = state.pins.get();
+        for page in [2, 4, 5, 7, 8] {
+            assert_eq!(
+                bytes.get(page * 100 + 10, page * 100 + 20).unwrap(),
+                &state.bytes[page * 100 + 10..page * 100 + 20],
+                "page {page} read again"
+            );
+        }
+        assert_eq!(state.pins.get(), pins + 5);
+        // Kept pages are served without a pin.
+        bytes.get(320, 330).unwrap();
+        assert_eq!(state.pins.get(), pins + 5);
+        // Nothing past the bound: no release.
+        blob.set_keep(100);
+        unsafe { blob.release_since(mark, &[]) };
+        assert_eq!(state.pinned.borrow().len(), 9);
+        blob.set_keep(0);
+        unsafe { blob.release_since(mark, &[]) };
+        assert_eq!(
+            state.pinned.borrow().keys().copied().collect::<Vec<_>>(),
+            vec![0]
+        );
+        unsafe { blob.close_span() };
+        assert!(state.pinned.borrow().is_empty());
+        assert_eq!(blob.loaded(), 0);
+    }
+
+    /// A stitched read releases at once a page it pinned for itself and
+    /// copied whole, and keeps its partial first and last pages.
+    #[test]
+    fn a_stitch_releases_the_pages_it_copies_whole() {
+        let (source, blob) = pinning(20 * 100, 100);
+        let state = &source.0;
+        let bytes = blob.bytes();
+        blob.open_span();
+        bytes.get(310, 320).unwrap();
+        assert_eq!(bytes.get(250, 650).unwrap(), &state.bytes[250..650]);
+        let mut kept: Vec<usize> = state.pinned.borrow().keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            vec![2, 3, 6],
+            "pages 4 and 5 released, 3 pinned before"
+        );
+        assert_eq!(state.peak.get(), 3);
+        assert_eq!(blob.pin_mark(), 3);
+        unsafe { blob.close_span() };
     }
 
     #[test]
