@@ -1200,7 +1200,12 @@ pub struct LazyFooter<'a> {
 }
 
 impl<'a> LazyFooter<'a> {
-    fn new(postings: &Postings<'a>, block_size: u32, max_bucket: u8, adaptive: bool) -> Result<Self> {
+    fn new(
+        postings: &Postings<'a>,
+        block_size: u32,
+        max_bucket: u8,
+        adaptive: bool,
+    ) -> Result<Self> {
         let df = postings.df;
         let blocks = df.div_ceil(block_size.max(1)) as usize;
         let mut footer = Self {
@@ -1353,7 +1358,11 @@ impl<'a> LazyFooter<'a> {
     pub fn seek(&mut self, from: usize, slot: u32) -> Result<usize> {
         let mut b = from;
         loop {
-            if let Some(found) = self.last.get(b..).and_then(|rest| rest.iter().position(|l| *l >= slot)) {
+            if let Some(found) = self
+                .last
+                .get(b..)
+                .and_then(|rest| rest.iter().position(|l| *l >= slot))
+            {
                 return Ok(b + found);
             }
             b = b.max(self.last.len());
@@ -1793,7 +1802,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod lazy_footer_tests {
     use super::super::docs::Geometry;
@@ -1823,7 +1831,8 @@ mod lazy_footer_tests {
         let with = |footer: &[u8]| {
             let mut p = parsed.clone();
             p.footer = Bytes::Slice(footer);
-            p.lazy_footer(2, 1, true).and_then(|mut l| l.seek(0, u32::MAX))
+            p.lazy_footer(2, 1, true)
+                .and_then(|mut l| l.seek(0, u32::MAX))
         };
         assert_eq!(with(&bytes).unwrap(), 5);
         // Truncated, one byte too many, a frontier of no pairs.

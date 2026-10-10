@@ -28,7 +28,7 @@ use segment::tinshape::bits;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Footer, Form, KIND_EF, KIND_GRID, for_each_local};
+use segment::tinshape::postings::{Form, KIND_EF, KIND_GRID, LazyFooter, for_each_local};
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
@@ -53,11 +53,12 @@ const NO_BUCKET: u8 = u8::MAX;
 const STAGE_CHUNK: usize = 256;
 
 /// One scoring term of a walk.
-pub(super) struct Sc {
+pub(super) struct Sc<'a> {
     pub(super) term: usize,
     pub(super) scorer: TermScorer,
-    pub(super) footer: std::rc::Rc<Footer>,
-    /// Per footer block, its bound; NaN until asked.
+    /// The term's footer, decoded as far as the walk has reached.
+    pub(super) footer: LazyFooter<'a>,
+    /// Per footer block decoded, its bound; NaN until asked.
     bounds: Vec<f32>,
     /// The block a range bound starts from, moved forward only.
     wb: usize,
@@ -75,12 +76,19 @@ pub(super) struct Sc {
     bb: [(u32, f32); BUCKET_COUNT],
 }
 
-impl Sc {
-    pub(super) fn new(term: usize, scorer: TermScorer, footer: std::rc::Rc<Footer>) -> Self {
+/// A footer block past what a walk could reach was asked for, or a block
+/// it reached is corrupt.
+#[cold]
+fn corrupt_footer(error: Error) -> ! {
+    crate::corrupt(format!("Stannum postings footer: {error}"))
+}
+
+impl<'a> Sc<'a> {
+    pub(super) fn new(term: usize, scorer: TermScorer, footer: LazyFooter<'a>) -> Self {
         let (num, den, factor) = scorer.length_bound_parts();
         Self {
             term,
-            bounds: vec![f32::NAN; footer.blocks()],
+            bounds: Vec::new(),
             footer,
             scorer,
             wb: 0,
@@ -93,39 +101,54 @@ impl Sc {
         }
     }
 
-    /// Block `b`'s bound: the best score of its frontier.
+    /// Block `b`'s bound, which must be decoded: the best score of its
+    /// frontier.
     #[inline]
     fn bound(&mut self, b: usize) -> f32 {
-        let v = self.bounds[b];
-        if !v.is_nan() {
-            return v;
+        if let Some(v) = self.bounds.get(b)
+            && !v.is_nan()
+        {
+            return *v;
         }
+        if b >= self.bounds.len() {
+            self.bounds
+                .resize(self.footer.decoded().max(b + 1), f32::NAN);
+        }
+        let scorer = &self.scorer;
         let v = self
             .footer
-            .frontier_of(b)
-            .iter()
+            .frontier(b)
             .map(|(bucket, length)| {
-                self.scorer
-                    .bound_through(TfBucket::new(*bucket).expect("a valid bucket"), *length)
+                scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
             })
             .fold(0.0_f32, f32::max);
         self.bounds[b] = v;
         v
     }
 
+    /// The first block from `from` on whose last slot is `slot` or later,
+    /// decoded; the footer's block count when there is none.
+    #[inline]
+    fn seek(&mut self, from: usize, slot: u32) -> usize {
+        self.footer
+            .seek(from, slot)
+            .unwrap_or_else(|e| corrupt_footer(e))
+    }
+
     /// The best bound of the blocks overlapping slots `from..=to`; ranges
     /// must be asked in increasing order of `from`.
     #[inline]
     fn range_bound(&mut self, from: u32, to: u32) -> f32 {
-        let blocks = self.footer.last.len();
-        while self.wb < blocks && self.footer.last[self.wb] < from {
-            self.wb += 1;
-        }
+        self.wb = self.seek(self.wb, from);
+        let blocks = self.footer.blocks();
         let mut best = 0.0_f32;
         let mut b = self.wb;
         while b < blocks {
+            if b >= self.footer.decoded() {
+                self.footer.ensure(b).unwrap_or_else(|e| corrupt_footer(e));
+            }
             best = best.max(self.bound(b));
-            if self.footer.last[b] >= to {
+            if self.footer.last(b) >= to {
                 break;
             }
             b += 1;
@@ -137,11 +160,8 @@ impl Sc {
     /// slots must be asked in increasing order.
     #[inline]
     fn block_at(&mut self, slot: u32) -> Option<usize> {
-        let last = &self.footer.last;
-        while self.cb < last.len() && last[self.cb] < slot {
-            self.cb += 1;
-        }
-        (self.cb < last.len()).then_some(self.cb)
+        self.cb = self.seek(self.cb, slot);
+        (self.cb < self.footer.blocks()).then_some(self.cb)
     }
 
     /// How short a document holding a posting of block `b` with bucket
@@ -151,10 +171,9 @@ impl Sc {
     #[inline]
     fn floor(&self, b: usize, bucket: u8) -> u32 {
         self.footer
-            .frontier_of(b)
-            .iter()
+            .frontier(b)
             .filter(|(at, _)| *at >= bucket)
-            .map(|(_, length)| *length)
+            .map(|(_, length)| length)
             .min()
             .unwrap_or(0)
     }
@@ -185,7 +204,7 @@ impl Sc {
     /// Block `b`'s largest bucket: its frontier's last pair.
     #[inline]
     fn max_bucket(&self, b: usize) -> u8 {
-        self.footer.frontier_of(b).last().expect("a frontier").0
+        self.footer.max_bucket(b)
     }
 }
 
@@ -519,7 +538,7 @@ struct Walk<'s, 'a, T: Touch> {
     terms: Vec<Option<TermSet<'a>>>,
     /// Per term (by index into `terms`), its members in the group at hand.
     mems: Vec<Mem<'a>>,
-    sc: Vec<Sc>,
+    sc: Vec<Sc<'a>>,
     /// Required terms, rarest first.
     req: Vec<usize>,
     /// Per scoring term: whether it is required; whether it holds the group
@@ -603,14 +622,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .iter()
             .map(|s| s.bounds.iter().filter(|b| !b.is_nan()).count() as u64)
             .sum();
-        let blocks_reached: u64 = self
-            .sc
-            .iter()
-            .map(|s| {
-                let bounded = s.bounds.iter().rposition(|b| !b.is_nan()).map_or(0, |b| b + 1);
-                bounded.max(s.wb + 1).max(s.cb + 1).min(s.bounds.len()) as u64
-            })
-            .sum();
+        let blocks_reached: u64 = self.sc.iter().map(|s| s.footer.decoded() as u64).sum();
         let (mut reached, mut loaded) = (0u64, 0u64);
         for (set, mem) in self.terms.iter().zip(&self.mems) {
             if let Some(set) = set
@@ -948,7 +960,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     continue;
                 };
                 bound += s.bound(b);
-                e = e.min(s.footer.last[b]);
+                e = e.min(s.footer.last(b));
                 *mb = s.max_bucket(b);
                 let m = usize::from(*mb);
                 nsum += f64::from(s.num[m]);
@@ -1228,14 +1240,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.buckets[i] = NO_BUCKET;
                 continue;
             };
-            let s = &self.sc[i];
+            let s = &mut self.sc[i];
             let set = self.terms[t].as_ref().expect("scoring");
             let bucket = s.footer.bucket(set.postings.tf, index)?;
-            let block = (index / s.footer.block_size) as usize;
-            if s.footer.single.is_none() {
+            let block = (index / s.footer.block_size()) as usize;
+            if s.footer.single().is_none() {
                 self.touch.touch(
                     Part::TfTail,
-                    set.at + set.postings.tf_at + s.footer.tf_at[block] as usize,
+                    set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
                     1,
                 );
             }
@@ -1428,7 +1440,10 @@ pub(super) fn walk_into<'a>(
             continue;
         };
         let Some(set) = &terms[t] else { continue };
-        let footer = segment.footer_memo(set.at, &set.postings, set.max_bucket)?;
+        // Decoded per query, a block at a time as the walk reaches it.
+        let footer =
+            set.postings
+                .lazy_footer(segment.block_size, set.max_bucket, segment.adaptive_tf)?;
         touch.touch(
             Part::Footer,
             set.at + set.postings.footer_at,
@@ -2045,14 +2060,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for h in 0..self.held_list.len() {
             let i = self.held_list[h];
             let index = self.row_index(i, words, local);
-            let s = &self.sc[i];
+            let s = &mut self.sc[i];
             let set = self.terms[s.term].as_ref().expect("scoring");
             let bucket = s.footer.bucket(set.postings.tf, index)?;
-            if s.footer.single.is_none() {
-                let block = (index / s.footer.block_size) as usize;
+            if s.footer.single().is_none() {
+                let block = (index / s.footer.block_size()) as usize;
                 self.touch.touch(
                     Part::TfTail,
-                    set.at + set.postings.tf_at + s.footer.tf_at[block] as usize,
+                    set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
                     1,
                 );
             }
