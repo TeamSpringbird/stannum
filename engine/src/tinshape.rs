@@ -1571,13 +1571,6 @@ pub struct RankedAnswer {
     pub position_checks: u64,
 }
 
-/// A bound below the threshold by more than rounding can explain: partial
-/// sums are taken in another order than the score's.
-#[inline]
-fn below(bound: f64, theta: Option<f32>) -> bool {
-    theta.is_some_and(|theta| bound * (1.0 + 1e-5) + 1e-30 <= f64::from(theta))
-}
-
 /// The `k` best matches of `node` in `segment` by the summed scores of
 /// `scorers` (named by term, in the scorer's order), with block-max
 /// pruning; ties by ctid. Matches holding no scoring term score zero.
@@ -2366,6 +2359,233 @@ mod tests {
                 }
                 prop_assert_eq!(bits(top.into_rows()), bits(want.into_rows()), "unscored top {} ties {} of {:?}", k, ties, node);
             }
+        }
+    }
+
+    /// The segment of documents `local` (ranks into `docs`, ascending) of a
+    /// table whose term `t` holds `members[t]`, with the documents `dead`
+    /// marks deleted.
+    fn build_part(
+        docs: &[Tid],
+        lengths: &[u32],
+        members: &[Vec<(usize, u32)>],
+        local: &[usize],
+        dead: &[bool],
+        options: Options,
+    ) -> Vec<u8> {
+        let tids: Vec<Tid> = local.iter().map(|r| docs[*r]).collect();
+        let mut builder =
+            Builder::new(tids, local.iter().map(|r| lengths[*r]).collect(), options).unwrap();
+        for (t, m) in members.iter().enumerate() {
+            let held: Vec<(u32, u32)> = m
+                .iter()
+                .filter_map(|(r, tf)| local.binary_search(r).ok().map(|i| (i as u32, *tf)))
+                .collect();
+            if held.is_empty() {
+                continue;
+            }
+            let ranks: Vec<u32> = held.iter().map(|(i, _)| *i).collect();
+            let buckets: Vec<u8> = held
+                .iter()
+                .map(|(_, tf)| TfBucket::from_count(*tf).value())
+                .collect();
+            let mut payload = PayloadBuilder::default();
+            for (_, tf) in &held {
+                payload.push(&(0..*tf).collect::<Vec<u32>>()).unwrap();
+            }
+            builder
+                .add_term(&format!("t{t}"), &ranks, &buckets, &payload.finish())
+                .unwrap();
+        }
+        let gone: Vec<u32> = local
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| dead[**r])
+            .map(|(i, _)| i as u32)
+            .collect();
+        builder.finish(&gone).0
+    }
+
+    /// Every match scoring the same, once the top k fill each later one only
+    /// ties the threshold from a later ctid and cannot be kept: the walk
+    /// prunes it unread rather than scoring it (TIN's `t50` top 10 reads its
+    /// first groups and stops).
+    #[test]
+    fn a_tie_at_the_threshold_from_a_later_ctid_is_not_scored() {
+        let docs: Vec<Tid> = (0..6_000u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        let lengths = vec![12u32; docs.len()];
+        let members = vec![
+            (0..docs.len()).map(|r| (r, 1)).collect::<Vec<_>>(),
+            (0..docs.len()).step_by(2).map(|r| (r, 1)).collect(),
+        ];
+        let all: Vec<usize> = (0..docs.len()).collect();
+        let dead = vec![false; docs.len()];
+        let names: Vec<String> = (0..2).map(|t| format!("t{t}")).collect();
+        for inline in [u32::MAX, 0] {
+            let options = Options {
+                block_size: 64,
+                grid_min_postings: 0,
+                inline_lengths_min_documents: inline,
+                inline_lengths_max_df: u32::MAX,
+                ..Options::default()
+            };
+            let blob = build_part(&docs, &lengths, &members, &all, &dead, options);
+            let segment = Segment::parse(&blob).unwrap();
+            let shapes = [
+                (Node::Term(0), 1),
+                (Node::And(vec![Node::Term(0), Node::Term(1)]), 2),
+                (Node::Or(vec![Node::Term(0), Node::Term(1)]), 2),
+            ];
+            for (node, step) in shapes {
+                let scorers: Vec<(String, TermScorer)> = leaf_terms(&node)
+                    .into_iter()
+                    .map(|t| {
+                        let df = members[t].len() as u64;
+                        let scorer = TermScorer::from_statistics(
+                            docs.len() as u64,
+                            df,
+                            1.0,
+                            Bm25Params::default(),
+                            12.0,
+                        )
+                        .unwrap();
+                        (names[t].clone(), scorer)
+                    })
+                    .collect();
+                let got = top_k(&segment, &node, &names, &scorers, 10, &mut NoTouch).unwrap();
+                let tids: Vec<Tid> = got.rows.iter().map(|r| r.1).collect();
+                let want: Vec<Tid> = docs.iter().copied().step_by(step).take(10).collect();
+                assert_eq!(tids, want, "{node:?}");
+                assert!(
+                    got.scored <= 30,
+                    "{node:?} (inline {inline}) scored {} candidates",
+                    got.scored
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        /// Ties everywhere: few frequencies and lengths, several segments
+        /// interleaved or in ctid ranges, walked in any order into shared
+        /// rows, ties kept or not. The rows kept are a brute force's, bit
+        /// for bit, so a bound that only ties the threshold prunes exactly
+        /// what cannot win on ctid.
+        #[test]
+        fn ties_at_the_threshold_keep_the_exact_top_rows(
+            doc_set in prop::collection::btree_set((0u32..1200, 1u16..=20), 2..700),
+            density in prop::collection::vec(5u32..100, 4),
+            seed in any::<u64>(),
+            k in 1usize..16,
+            ties in any::<bool>(),
+            parts in 1usize..4,
+            ranges in any::<bool>(),
+            block_size in prop::sample::select(vec![4u32, 16, 128]),
+            lengths_of in prop::sample::select(vec![vec![9u32], vec![9, 9, 9, 30], vec![3, 7, 11, 50, 200]]),
+            inline in any::<bool>(),
+            avg in prop::sample::select(vec![1.0f32, 9.0, 33.3]),
+        ) {
+            let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
+            let mut state = seed | 1;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let lengths: Vec<u32> = (0..docs.len()).map(|_| lengths_of[(next() % lengths_of.len() as u64) as usize]).collect();
+            let mut members: Vec<Vec<(usize, u32)>> = vec![Vec::new(); density.len()];
+            for (t, d) in density.iter().enumerate() {
+                for r in 0..docs.len() {
+                    if next() % 100 < u64::from(*d) {
+                        let tf = if next() % 5 == 0 { 2 } else { 1 };
+                        members[t].push((r, tf));
+                    }
+                }
+            }
+            let side: Vec<usize> = (0..docs.len())
+                .map(|r| if ranges { r * parts / docs.len() } else { (next() % parts as u64) as usize })
+                .collect();
+            let dead: Vec<bool> = (0..docs.len()).map(|_| next() % 11 == 0).collect();
+            let options = Options {
+                block_size,
+                grid_min_postings: 0,
+                inline_lengths_min_documents: if inline { 0 } else { u32::MAX },
+                inline_lengths_max_df: u32::MAX,
+                ..Options::default()
+            };
+            let blobs: Vec<Vec<u8>> = (0..parts)
+                .map(|part| {
+                    let local: Vec<usize> = (0..docs.len()).filter(|r| side[*r] == part).collect();
+                    build_part(&docs, &lengths, &members, &local, &dead, options)
+                })
+                .collect();
+            let segments: Vec<Segment<'_>> = blobs.iter().map(|b| Segment::parse(b).unwrap()).collect();
+            let mut order: Vec<usize> = (0..parts).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();
+            let mut shapes = shapes();
+            shapes.push(Node::Or(vec![Node::Term(0), Node::Term(1), Node::Term(2), Node::Term(3)]));
+            shapes.push(Node::And(vec![Node::Term(3), Node::Term(1), Node::Term(0)]));
+            for node in shapes {
+                if matches!(node, Node::Not(_)) {
+                    continue;
+                }
+                // Scorers in lexical term order, as the extension builds them.
+                let mut leaves = leaf_terms(&node);
+                leaves.sort_unstable();
+                leaves.dedup();
+                let scorers: Vec<(String, TermScorer)> = leaves
+                    .into_iter()
+                    .filter(|t| !members[*t].is_empty())
+                    .map(|t| {
+                        let df = members[t].len() as u64;
+                        let scorer = TermScorer::from_statistics(docs.len() as u64, df, 1.0, Bm25Params::default(), avg).unwrap();
+                        (names[t].clone(), scorer)
+                    })
+                    .collect();
+                let mut want = crate::walk::TopRows::new(k, ties);
+                for r in 0..docs.len() {
+                    if dead[r] || !eval(&node, &members, r) {
+                        continue;
+                    }
+                    let mut total = 0.0_f32;
+                    for (name, scorer) in &scorers {
+                        let t: usize = name[1..].parse().unwrap();
+                        if let Some(tf) = holds(&members, t, r) {
+                            total += scorer.score_bucket(TfBucket::from_count(tf), lengths[r]);
+                        }
+                    }
+                    // A walk keeps only rows holding a scoring term (they
+                    // score above zero); a zero fill is the caller's.
+                    let row = crate::walk::Ranked(total, docs[r]);
+                    if total > 0.0 && want.admits(&row) {
+                        want.push(row);
+                    }
+                }
+                let mut top = crate::walk::TopRows::new(k, ties);
+                for &part in &order {
+                    top_k_into(&segments[part], &node, &names, &scorers, &mut top, &mut AllVisible, &mut NoTouch).unwrap();
+                }
+                let bits = |rows: Vec<(f32, Tid)>| rows.into_iter().map(|(s, t)| (s.to_bits(), t)).collect::<Vec<_>>();
+                prop_assert_eq!(bits(top.into_rows()), bits(want.into_rows()), "top {} ties {} parts {:?} of {:?}", k, ties, order, node);
+            }
+        }
+    }
+
+    struct AllVisible;
+
+    impl crate::walk::Visibility for AllVisible {
+        fn visible(&mut self, _: Tid) -> bool {
+            true
         }
     }
 }

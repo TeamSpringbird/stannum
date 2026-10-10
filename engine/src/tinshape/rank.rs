@@ -33,8 +33,7 @@ use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Node, Part, RankedAnswer, Src, TermSet, Touch, below, kernels, matches, open_terms,
-    required_terms,
+    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -58,10 +57,6 @@ pub(super) struct Sc {
     wb: usize,
     /// The block holding the last candidate asked about, moved forward only.
     cb: usize,
-    /// [`TermScorer::length_bound_parts`].
-    num: [f32; BUCKET_COUNT],
-    den: [f32; BUCKET_COUNT],
-    factor: f32,
     /// [`Self::bucket_bound`] per bucket in the block last asked about,
     /// NaN until asked: a rare term's block spans many groups' candidates.
     bb_block: usize,
@@ -70,7 +65,6 @@ pub(super) struct Sc {
 
 impl Sc {
     pub(super) fn new(term: usize, scorer: TermScorer, footer: std::rc::Rc<Footer>) -> Self {
-        let (num, den, factor) = scorer.length_bound_parts();
         Self {
             term,
             bounds: vec![f32::NAN; footer.blocks()],
@@ -78,9 +72,6 @@ impl Sc {
             scorer,
             wb: 0,
             cb: 0,
-            num,
-            den,
-            factor,
             bb_block: usize::MAX,
             bb: [f32::NAN; BUCKET_COUNT],
         }
@@ -174,8 +165,8 @@ impl Sc {
 
     /// Block `b`'s largest bucket: its frontier's last pair.
     #[inline]
-    fn max_bucket(&self, b: usize) -> usize {
-        usize::from(self.footer.frontier_of(b).last().expect("a frontier").0)
+    fn max_bucket(&self, b: usize) -> u8 {
+        self.footer.frontier_of(b).last().expect("a frontier").0
     }
 }
 
@@ -500,8 +491,6 @@ struct Walk<'s, 'a, T: Touch> {
     /// Per term (by index into `terms`), its members in the group at hand.
     mems: Vec<Mem<'a>>,
     sc: Vec<Sc>,
-    /// The scoring terms (indexes into `sc`), rarest first.
-    bound_order: Vec<usize>,
     /// Required terms, rarest first.
     req: Vec<usize>,
     /// Per scoring term: whether it is required; whether it holds the group
@@ -527,16 +516,18 @@ struct Walk<'s, 'a, T: Touch> {
     /// A disjunction's group at hand: per present term with a positive
     /// bound there, where its row starts in `rows`, that bound and its bound
     /// over the sub-range at hand; and its word at hand.
-    or_terms: Vec<(usize, f64, f64)>,
+    or_terms: Vec<(usize, f32, f32)>,
     or_held: Vec<u64>,
     /// Per scoring term, the candidate at hand's bucket ([`NO_BUCKET`]
     /// when it does not hold the term).
     buckets: Vec<u8>,
     /// The window: the last slot of every scoring term's footer block at
-    /// the slot it was set at, and its bound, and its length bound's
-    /// numerator, denominator and length factor.
+    /// the slot it was set at, and its bound; per scoring term, its block's
+    /// largest bucket ([`NO_BUCKET`] when it holds nothing from the slot
+    /// on).
     window_end: Option<u32>,
-    window_parts: (f64, f64, f64, f64),
+    window_bound: f32,
+    window_buckets: Vec<u8>,
     /// A required term whose record carries its documents' lengths, the
     /// led walk reads them from.
     inline: Option<usize>,
@@ -563,6 +554,28 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     #[inline]
     fn threshold(&self) -> Option<f32> {
         self.top.bar().map(|bar| bar.0)
+    }
+
+    /// Whether no match of ctid `from()` or later scoring at most `bound`
+    /// can be kept: it scores below the bar, or ties it from a later ctid
+    /// (rows rank by score, then ctid).
+    ///
+    /// Bounds are exact: each term's is an `f32` score of the scorer's
+    /// own at a bucket and length no worse than the match's, and they are
+    /// summed in `f32` in the scorer's order, the order [`Walk::process`]
+    /// sums the scores in. Correctly rounded addition is monotonic in both
+    /// operands, so the summed bound is at least the summed score, bit for
+    /// bit; a term a match lacks adds zero to its score.
+    #[inline]
+    fn cut(&self, bound: f32, from: impl FnOnce() -> Tid) -> bool {
+        match self.top.bar() {
+            None => false,
+            Some((score, tid)) => match bound.total_cmp(&score) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => from() >= tid,
+                std::cmp::Ordering::Greater => false,
+            },
+        }
     }
 
     /// Whether `(total, tid)` would be kept.
@@ -617,7 +630,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 break;
             }
             self.answer.windows += 1;
-            if self.group_below(base, end) {
+            if self.group_below(g, base, end) {
                 self.answer.windows_pruned += 1;
                 continue;
             }
@@ -644,24 +657,24 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
-    /// Whether the scoring terms' bounds over slots `base..=end` fall short
-    /// of the threshold. Bounds are not negative, so the sum stops once it
-    /// reaches the threshold; it is taken in [`Walk::bound_order`], rarest
-    /// term first, which most often gets there soonest.
+    /// Whether no match in slots `base..=end` of group `g` can be kept by
+    /// the scoring terms' bounds there (see [`Walk::cut`]). Bounds are not
+    /// negative, so the sum stops once it passes the threshold. With
+    /// nothing scoring every match scores zero.
     #[inline]
-    fn group_below(&mut self, base: u32, end: u32) -> bool {
+    fn group_below(&mut self, g: u32, base: u32, end: u32) -> bool {
         let Some(theta) = self.threshold() else {
             return false;
         };
-        let mut bound = 0.0_f64;
-        for o in 0..self.bound_order.len() {
-            bound += f64::from(self.sc[self.bound_order[o]].range_bound(base, end));
-            if !below(bound, Some(theta)) {
+        let mut bound = 0.0_f32;
+        for s in &mut self.sc {
+            bound += s.range_bound(base, end);
+            if bound > theta {
                 return false;
             }
         }
-        // Nothing scoring: every match scores zero, which ties a bar of zero.
-        below(bound, Some(theta))
+        let geometry = self.geometry;
+        self.cut(bound, || geometry.tid_in(g as usize, 0))
     }
 
     /// Whether every required term holds group `g` as a grid.
@@ -758,7 +771,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         while at < cands.len() {
             let local = cands[at];
             at += 1;
-            if self.window(base + local) {
+            if self.window(g, base, local) {
                 // Skip the rest of the window unread.
                 match self.window_end {
                     Some(e) if e < u32::MAX => {
@@ -827,29 +840,46 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(more)
     }
 
-    /// Moves the window to `slot` and says whether its bound falls short
-    /// of the threshold: slots up to [`Self::window_end`] share every
-    /// scoring term's footer block, so its bound and its length bound's
-    /// parts.
+    /// Moves the window to slot `local` of group `g` (whose first slot is
+    /// `base`) and says whether no match there can be kept by its bound:
+    /// slots up to [`Self::window_end`] share every scoring term's footer
+    /// block, so its bound and its largest buckets.
     #[inline]
-    fn window(&mut self, slot: u32) -> bool {
+    fn window(&mut self, g: u32, base: u32, local: u32) -> bool {
+        let slot = base + local;
         if self.window_end.is_none_or(|e| slot > e) {
             let mut e = u32::MAX;
-            let (mut bound, mut nsum, mut dmin, mut fmin) =
-                (0.0_f64, 0.0_f64, f64::INFINITY, f64::INFINITY);
-            for s in &mut self.sc {
-                let Some(b) = s.block_at(slot) else { continue };
-                bound += f64::from(s.bound(b));
+            let mut bound = 0.0_f32;
+            for (s, mb) in self.sc.iter_mut().zip(&mut self.window_buckets) {
+                let Some(b) = s.block_at(slot) else {
+                    *mb = NO_BUCKET;
+                    continue;
+                };
+                bound += s.bound(b);
                 e = e.min(s.footer.last[b]);
-                let mb = s.max_bucket(b);
-                nsum += f64::from(s.num[mb]);
-                dmin = dmin.min(f64::from(s.den[mb]));
-                fmin = fmin.min(f64::from(s.factor));
+                *mb = s.max_bucket(b);
             }
             self.window_end = Some(e);
-            self.window_parts = (bound, nsum, dmin, fmin);
+            self.window_bound = bound;
         }
-        below(self.window_parts.0, self.threshold())
+        let geometry = self.geometry;
+        self.cut(self.window_bound, || geometry.tid_in(g as usize, local))
+    }
+
+    /// What a document of `length` in the window scores at most: per
+    /// scoring term, the best score of a bucket up to its block's largest
+    /// at that length, summed in the scorer's order.
+    #[inline]
+    fn length_bound(&self, length: u32) -> f32 {
+        let mut bound = 0.0_f32;
+        for (s, mb) in self.sc.iter().zip(&self.window_buckets) {
+            if *mb != NO_BUCKET {
+                bound += s
+                    .scorer
+                    .bound_through(TfBucket::new(*mb).expect("a valid bucket"), length);
+            }
+        }
+        bound
     }
 
     /// Term `t`'s members in group `g`, loaded on first use (none when it
@@ -885,7 +915,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(true);
         }
         self.answer.candidates += 1;
-        let theta = self.threshold();
+        let tid = self.geometry.tid_in(g as usize, local);
         let length = match self.inline {
             // The length alone, against the window's largest buckets, from
             // a rare required term's record that carries lengths.
@@ -898,11 +928,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.touch
                     .touch(Part::Payload, set.at + inline.at_of(index), 4);
                 let length = inline.get(index)?;
-                if theta.is_some() && n > 0 {
-                    let (_, nsum, dmin, fmin) = self.window_parts;
-                    if below(nsum / (dmin + fmin * f64::from(length)), theta) {
-                        return Ok(true);
-                    }
+                if n > 0 && self.cut(self.length_bound(length), || tid) {
+                    return Ok(true);
                 }
                 self.read_buckets(g, local)?;
                 if self.too_few() {
@@ -917,7 +944,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // candidates fell short on their buckets alone.
             None => {
                 let reach = self.read_buckets(g, local)?;
-                if below(reach, theta) || self.too_few() {
+                if self.cut(reach, || tid) || self.too_few() {
                     return Ok(true);
                 }
                 self.dl_length(g, local)?
@@ -925,7 +952,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         };
         // A span checks positions before scoring while the top k fill:
         // every match enters them.
-        let tid = self.geometry.tid_in(g as usize, local);
         let span_first = matches!(self.verify, Verify::Span(_)) && self.top.bar().is_none();
         if span_first {
             self.span_indexes(local);
@@ -982,8 +1008,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// others), and returns what the candidate can score at most by them:
     /// per term, its bucket at the shortest length its block holds for
     /// that bucket or more.
-    fn read_buckets(&mut self, g: u32, local: u32) -> Result<f64> {
-        let mut reach = 0.0_f64;
+    fn read_buckets(&mut self, g: u32, local: u32) -> Result<f32> {
+        let mut reach = 0.0_f32;
         for i in 0..self.sc.len() {
             let t = self.sc[i].term;
             if !self.sc_required[i] {
@@ -1004,7 +1030,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     1,
                 );
             }
-            reach += f64::from(self.sc[i].bucket_bound_kept(block, bucket));
+            reach += self.sc[i].bucket_bound_kept(block, bucket);
             self.buckets[i] = bucket;
         }
         Ok(reach)
@@ -1210,7 +1236,8 @@ pub(super) fn walk_into<'a>(
         or_held: Vec::new(),
         buckets: vec![NO_BUCKET; n],
         window_end: None,
-        window_parts: (0.0, 0.0, 0.0, 0.0),
+        window_bound: 0.0,
+        window_buckets: vec![NO_BUCKET; n],
         inline: None,
         repeats: Vec::new(),
         req,
@@ -1220,7 +1247,6 @@ pub(super) fn walk_into<'a>(
         pending_index: Vec::new(),
         span_index: Vec::new(),
         cands: Vec::new(),
-        bound_order: Vec::new(),
         words: Vec::new(),
         positions: Vec::new(),
         node_terms,
@@ -1231,9 +1257,6 @@ pub(super) fn walk_into<'a>(
         let r = required.contains(&walk.sc[i].term);
         walk.sc_required.push(r);
     }
-    let mut bound_order: Vec<usize> = (0..n).collect();
-    bound_order.sort_by_key(|i| walk.terms[walk.sc[*i].term].as_ref().map_or(0, |s| s.df));
-    walk.bound_order = bound_order;
     if let Verify::Span(check) = &walk.verify
         && let Some(plan) = &check.plan
     {
@@ -1469,14 +1492,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut sb = std::mem::take(&mut self.sub_bounds);
         sb.clear();
         sb.resize(n, 0.0);
-        let mut total = 0.0_f64;
+        let mut total = 0.0_f32;
         for (i, bound) in sb.iter_mut().enumerate() {
             if self.present[i] {
                 *bound = self.sc[i].range_bound(base, end);
-                total += f64::from(*bound);
+                total += *bound;
             }
         }
-        if below(total, self.threshold()) {
+        let geometry = self.geometry;
+        let gi = g as usize;
+        if self.cut(total, || geometry.tid_in(gi, 0)) {
             self.answer.windows_pruned += 1;
             self.sub_bounds = sb;
             return Ok(());
@@ -1495,7 +1520,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // combined into the group's mask; a group whose mask is empty reads
         // nothing else, and a sub-range whose mask is empty is skipped
         // before its bounds are taken.
-        self.plan_group(&mut plan, self.threshold(), &sb, total);
+        let real: f64 = sb.iter().map(|b| f64::from(*b)).sum();
+        self.plan_group(&mut plan, self.threshold(), &sb, real);
         let mut loaded = std::mem::take(&mut self.row_loaded);
         loaded.clear();
         loaded.resize(n, false);
@@ -1580,11 +1606,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
             if sb[i] > 0.0 {
-                terms.push((i * words, f64::from(sb[i]), 0.0));
+                terms.push((i * words, sb[i], 0.0));
             }
         }
         held.clear();
         held.resize(terms.len(), 0);
+        // A word's members are bounded from its first slot's ctid (see
+        // `Walk::cut`), each member from its own.
+        let first = |w: usize| geometry.tid_in(gi, (w * 64) as u32);
         let mut w0 = 0;
         while w0 < words {
             let w1 = (w0 + SUB_WORDS).min(words);
@@ -1598,35 +1627,35 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let w = w0 + live.trailing_zeros() as usize;
                 live &= live - 1;
                 let mut word = mask[w];
-                let theta = self.threshold();
-                if theta.is_some() {
-                    let mut most = 0.0_f64;
+                if self.threshold().is_some() {
+                    let mut most = 0.0_f32;
                     for (h, &(at, bound, _)) in held.iter_mut().zip(&terms) {
                         *h = self.rows[at + w];
                         most += if *h & word != 0 { bound } else { 0.0 };
                     }
-                    if below(most, theta) {
+                    if self.cut(most, || first(w)) {
                         continue;
                     }
                     if !bounded {
                         bounded = true;
                         let from = base + (w0 * 64) as u32;
                         let to = (base + (w1 * 64) as u32 - 1).min(end);
-                        let mut total = 0.0_f64;
+                        let mut total = 0.0_f32;
                         for term in terms.iter_mut() {
-                            let bound = f64::from(self.sc[term.0 / words].range_bound(from, to));
+                            let bound = self.sc[term.0 / words].range_bound(from, to);
                             term.2 = bound;
                             total += bound;
                         }
-                        if below(total, theta) {
+                        // The sub-range's words left start at `w`.
+                        if self.cut(total, || first(w)) {
                             break;
                         }
                     }
-                    let mut most = 0.0_f64;
+                    let mut most = 0.0_f32;
                     for (h, &(_, _, bound)) in held.iter().zip(&terms) {
                         most += if *h & word != 0 { bound } else { 0.0 };
                     }
-                    if below(most, theta) {
+                    if self.cut(most, || first(w)) {
                         continue;
                     }
                     let mut keep = 0u64;
@@ -1634,11 +1663,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     while left != 0 {
                         let bit = left.trailing_zeros();
                         left &= left - 1;
-                        let mut sum = 0.0_f64;
+                        let mut sum = 0.0_f32;
                         for (h, &(_, _, bound)) in held.iter().zip(&terms) {
                             sum += if *h >> bit & 1 == 1 { bound } else { 0.0 };
                         }
-                        keep |= u64::from(!below(sum, theta)) << bit;
+                        let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
+                        keep |= u64::from(!self.cut(sum, tid)) << bit;
                     }
                     word = keep;
                 }
@@ -1723,8 +1753,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
         self.answer.candidates += 1;
-        let theta = self.threshold();
-        let mut bound = 0.0_f64;
+        let tid = self.geometry.tid_in(g as usize, local);
+        let mut bound = 0.0_f32;
         self.held_list.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
@@ -1733,16 +1763,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let s = &mut self.sc[i];
                 let b = s.block_at(slot).expect("a member's block");
                 self.blocks[i] = b;
-                bound += f64::from(s.bound(b));
+                bound += s.bound(b);
             }
         }
-        if below(bound, theta) {
+        if self.cut(bound, || tid) {
             return Ok(());
         }
         // The candidate's buckets, each against the shortest document of
         // its block holding that bucket or more, before its length is read
         // (see `Walk::process`).
-        let mut reach = 0.0_f64;
+        let mut reach = 0.0_f32;
         for h in 0..self.held_list.len() {
             let i = self.held_list[h];
             let index = self.row_index(i, words, local);
@@ -1757,10 +1787,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     1,
                 );
             }
-            reach += f64::from(s.bucket_bound(self.blocks[i], bucket));
+            reach += s.bucket_bound(self.blocks[i], bucket);
             self.buckets[i] = bucket;
         }
-        if below(reach, theta) {
+        if self.cut(reach, || tid) {
             return Ok(());
         }
         let carrier = self.held_list.iter().copied().find(|i| {
@@ -1789,7 +1819,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 length,
             );
         }
-        let tid = self.geometry.tid_in(g as usize, local);
         if !self.admits(total, tid) {
             return Ok(());
         }
