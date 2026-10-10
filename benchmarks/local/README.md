@@ -70,6 +70,42 @@ campaign`; see "Matching TIN v1.0.6's published setup" in
 Pages touched and candidates scored transfer to the full corpus directly; QPS is
 relative.
 
+## Comparing images in instructions (`vm_ab.py`)
+
+Inside the Docker VM on a Mac, the CPU time a backend reports per query
+moves by about 10% from one run to the next with the same binary, depending
+on which cores and clocks the VM's vCPUs get. Two images of the same
+`stannum.so` measured 9% apart over two rounds. A change worth a few percent
+cannot be seen that way. Instructions retired do not depend on the core: the
+host counts them for the whole VM process, and `vm_ab.py` divides them by the
+queries served.
+
+```sh
+cp -cR /path/to/saved/db /path/to/copy          # an APFS clone; the server writes to it
+/usr/bin/lockf -k /Users/uri/stannum-lab/pg150m.lock \
+  "$STANNUM_PYTHON" benchmarks/local/vm_ab.py --data /path/to/copy \
+    --queries queries.json --out /path/to/results --rounds 2 \
+    stannum-bench:base stannum-bench:base-again stannum-bench:candidate
+```
+
+Each round runs every image in turn (rotated, the server restarted for each),
+with 8 clients in the benchmark driver's order: the mixed trace (90 s warm, 60
+s measured), then each style alone (15 s warm, 45 s measured). Each window
+reports the median, over 15-second slices, of the VM's instructions and
+cycles per query, beside the backends' CPU milliseconds per query.
+`summary.txt` compares every image with the first, per phase.
+
+- Include the baseline twice, as two tags of one image, or two builds that
+  give a byte-identical `stannum.so`. Their difference is the noise floor.
+- The counters include everything else the VM runs: the other containers,
+  and image builds. The script lists every container above 2% CPU in each
+  window. Run it under the machine's 150M lock, and don't build images
+  meanwhile.
+- `--records N` keeps the first N records of `queries.json`, for example to
+  evaluate a profile on queries it was not trained on.
+- It finds an OrbStack or Docker Desktop VM by process name; `--vm-pid`
+  overrides that.
+
 ## A fresh 150M database in TIN's shape (`TNS1`)
 
 A database saved by an image of an earlier segment format does not load into

@@ -54,7 +54,8 @@ def answer(args):
     import psycopg
 
     trace = [line.split("\t", 2) for line in Path(args.trace).read_text().splitlines() if line]
-    ranked_sql = (f"SELECT {args.id_column}, stannum.score(ctid) AS score FROM {args.table} "
+    score = "stannum.full_score" if args.full else "stannum.score"
+    ranked_sql = (f"SELECT {args.id_column}, {score}(ctid) AS score FROM {args.table} "
                   f"WHERE {args.column} ==> %s ORDER BY score DESC LIMIT {args.k}")
     count_sql = f"SELECT count(*) FROM {args.table} WHERE {args.column} ==> %s"
     out = []
@@ -90,6 +91,8 @@ def main():
     pg.add_argument("--k", type=int, default=10)
     pg.add_argument("--ranked-only", action="store_true",
                     help="skip the counts (slow on a large table)")
+    pg.add_argument("--full", action="store_true",
+                    help="rank with stannum.full_score (no dense term elided) instead of stannum.score")
     args = parser.parse_args()
     if args.command == "trace":
         write_trace(args.queries, args.out)

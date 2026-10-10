@@ -216,6 +216,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Added on branch bench/long-run on 2026-09-27."
     },
+    "benchmarks/local/vm_ab.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: interleaved A/B of images on a saved database, counted in the VM's instructions retired."
+    },
     "benchmarks/local/workload.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6. Moved from benchmarks/local/mock-run.sh, merged with the duplicate runner in benchmarks/local/run150m.sh (now a wrapper)."
@@ -1007,6 +1011,14 @@
     "script/dump-segments.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
+    },
+    "script/pgo-build": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: trains the profile-guided optimization profiles (the extension in PostgreSQL, the offline replay)."
+    },
+    "script/pgo-check": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: checks a profile-guided build's hot functions against the built library and the compiler's warnings."
     },
     "script/pgrx-lock.py": {
       "owner": "ben",

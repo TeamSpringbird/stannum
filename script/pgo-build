@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+# Trains the profile-guided optimization (PGO) profiles described in
+# docs/benchmarks.md#profile-guided-builds.
+#
+#   script/pgo-build image --data DIR --trace FILE [--image TAG [--no-build]] [--out FILE]
+#   script/pgo-build replay --dump DIR --trace FILE [--expect FILE] [--out FILE]
+#
+# image: the extension's profile, the one benchmarks/Dockerfile's
+# STANNUM_PGO=1 reads. Builds the instrumented image (STANNUM_PGO=generate),
+# starts it on DIR, a PostgreSQL data directory holding the benchmark's
+# indexed `documents` table (mounted at /var/lib/postgresql, as the
+# benchmark's volume is; give it a COPY, the server writes to it), answers
+# the trace FILE (script/replay-oracle.py) with the benchmark's ranked
+# statement, once with stannum.score and once with stannum.full_score, stops
+# the server so that every backend writes its counts, and merges them into
+# FILE (default benchmarks/pgo/<arch>.profdata, <arch> as `uname -m` prints
+# it inside the image), with its 40 hottest functions beside it in
+# <arch>.hot.txt for script/pgo-check. Then rebuild the image with
+# STANNUM_PGO=1 and commit both files. --no-build uses TAG as already built
+# with `benchmarks/tin.py build-image --pgo generate`.
+#
+# replay: the offline replay's own profile (bench --bin tnsreplay; its
+# generic walk is instantiated over another page type, so the extension
+# cannot use it). Builds tnsreplay instrumented in target/pgo-generate,
+# replays every style of FILE over the dump DIR once ranked (checked against
+# --expect) and once --full, merges into FILE (default
+# target/pgo/tnsreplay.profdata) and builds the optimized tnsreplay in
+# target/pgo-use.
+#
+# Needs llvm-profdata from the pinned toolchain's llvm-tools
+# (`rustup component add llvm-tools`); `image` also needs Docker and
+# STANNUM_PYTHON (psycopg 3).
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+
+usage() {
+    sed -n '/^# Trains the profile/,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
+    exit "${1:-2}"
+}
+
+mode=${1:-}
+[ -n "$mode" ] || usage
+shift
+data='' dump='' trace='' expect='' out='' image=stannum-bench:pgo-generate build=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --data) data=$(cd "${2:?--data needs a directory}" && pwd); shift 2 ;;
+        --dump) dump=${2:?--dump needs a directory}; shift 2 ;;
+        --trace) trace=$(cd "$(dirname "${2:?--trace needs a file}")" && pwd)/$(basename "$2"); shift 2 ;;
+        --expect) expect=${2:?--expect needs a file}; shift 2 ;;
+        --out) out=${2:?--out needs a file}; shift 2 ;;
+        --image) image=${2:?--image needs a tag}; shift 2 ;;
+        --no-build) build=0; shift ;;
+        -h|--help) usage 0 ;;
+        *) usage ;;
+    esac
+done
+[ -n "$trace" ] || usage
+
+# The toolchain rust-toolchain.toml pins, when no rustup proxy is on PATH.
+channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+if ! command -v cargo >/dev/null 2>&1; then
+    for bin in "${RUSTUP_HOME:-$HOME/.rustup}"/toolchains/"$channel"-*/bin; do
+        [ -x "$bin/cargo" ] && PATH="$bin:$PATH" && break
+    done
+fi
+host=$(rustc -vV | sed -n 's/^host: //p')
+profdata="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+[ -x "$profdata" ] || { echo "no llvm-profdata: rustup component add llvm-tools --toolchain $channel" >&2; exit 2; }
+
+case "$mode" in
+image)
+    [ -n "$data" ] || usage
+    if [ "$build" = 1 ]; then
+        python3 benchmarks/tin.py build-image --image "$image" --base "${STANNUM_PGO_BASE:-postgres:18-trixie}" \
+            --pgo generate --output "$(mktemp -d)/image"
+    fi
+    arch=$(docker run --rm --entrypoint uname "$image" -m)
+    out=${out:-benchmarks/pgo/$arch.profdata}
+    raw="$data/pgo-raw"
+    rm -rf "$raw"
+    name=stannum-pgo-train
+    port=${STANNUM_PGO_PORT:-55497}
+    password=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+    docker rm -f "$name" >/dev/null 2>&1 || true
+    rm -f "$data"/*/docker/postmaster.pid
+    trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+    # The benchmark's container: 8 CPUs, 32 GB, 24 GB of shared buffers.
+    POSTGRES_PASSWORD=$password docker run -d --name "$name" --cpus 8 --memory 32g --memory-swap 32g \
+        --shm-size 1g -e POSTGRES_PASSWORD -p "127.0.0.1:$port:5432" -v "$data:/var/lib/postgresql" "$image" \
+        postgres -c shared_buffers=24GB -c work_mem=16MB -c jit=off -c autovacuum=off >/dev/null
+    until docker exec "$name" pg_isready -U postgres >/dev/null 2>&1; do sleep 2; done
+    printf "ALTER USER postgres PASSWORD '%s';\n" "$password" | docker exec -i "$name" psql -qU postgres -d benchmark
+    # The benchmark's ranked statement over the whole trace, with stannum.score
+    # and with stannum.full_score (counts and writes stay untrained: see the docs).
+    for full in '' --full; do
+        PGPASSWORD=$password PGHOST=127.0.0.1 PGPORT=$port PGUSER=postgres "${STANNUM_PYTHON:-python3}" \
+            script/replay-oracle.py postgres --dbname dbname=benchmark --trace "$trace" --ranked-only $full \
+            --out "$data/pgo-answers${full:+-full}.tsv"
+    done
+    # A fast shutdown: each backend exits through exit(3), which writes its counts.
+    docker stop -t 600 "$name" >/dev/null
+    mkdir -p "$(dirname "$out")"
+    "$profdata" merge --sparse -o "$out" "$raw"
+    # Local functions' names carry their module before a `;`; the symbol follows.
+    "$profdata" show --topn=40 "$out" | sed -n 's/^  \(.*\), max count = .*/\1/p' | sed 's/^.*;//' \
+        > "${out%.profdata}.hot.txt"
+    ;;
+replay)
+    [ -n "$dump" ] || usage
+    out=${out:-target/pgo/tnsreplay.profdata}
+    raw="$ROOT/target/pgo/raw"
+    rm -rf "$raw"
+    mkdir -p "$(dirname "$out")"
+    # Per-target flags: RUSTFLAGS would replace .cargo/config.toml's link flags.
+    flags_var=CARGO_TARGET_$(echo "$host" | tr 'a-z-' 'A-Z_')_RUSTFLAGS
+    env "$flags_var=-C profile-generate=$raw" \
+        cargo build --release -p bench --bin tnsreplay --target-dir target/pgo-generate
+    target/pgo-generate/release/tnsreplay --dump "$dump" --trace "$trace" ${expect:+--expect "$expect"} --repeat 1
+    target/pgo-generate/release/tnsreplay --dump "$dump" --trace "$trace" --full --repeat 1
+    "$profdata" merge --sparse -o "$out" "$raw"
+    env "$flags_var=-C profile-use=$(cd "$(dirname "$out")" && pwd)/$(basename "$out")" \
+        cargo build --release -p bench --bin tnsreplay --target-dir target/pgo-use
+    echo "target/pgo-use/release/tnsreplay"
+    ;;
+*) usage ;;
+esac
+echo "wrote $out"
