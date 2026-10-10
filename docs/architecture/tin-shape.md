@@ -205,7 +205,7 @@ is folded a group at a time over the groups that can match (the
 intersection of an AND's children's groups, the union of an OR's):
 
 - AND of terms: grids are ANDed word by word (two grids: one fused
-  AND-popcount, NEON on Apple silicon); otherwise the rarest term's members
+  AND-popcount); otherwise the rarest term's members
   are listed and probed in the others, a bit test in a grid or a merge with
   a decoded list.
 - OR of terms: a group one term holds adds its stored count; otherwise
@@ -285,6 +285,62 @@ footers it decodes between queries (`Segment::resolve_memo`,
 - Candidates come in ctid order, so one that only ties the threshold ranks
   after the k-th row and is skipped like a lower one; every bound is
   compared with a relative margin (`1e-5`) far above `f32` rounding.
+
+### Word kernels and instruction sets
+
+The block loops (`engine/src/tinshape/kernels.rs`) have a body per
+instruction set: a grid loaded, ANDed, ORed or cleared into words, words
+combined and tested for any member, popcount, the fused AND-popcount, the
+masked count-and-clear of index-only counts and a grid's per-word prefix
+counts. The choice is made per call, never per word, and each loop runs
+whole inside one function compiled for its instruction set:
+
+- aarch64: NEON, part of the baseline; no runtime choice.
+- x86-64: chosen once at runtime, as PostgreSQL's `pg_popcount` chooses
+  and as PGDG's baseline packages need: AVX-512 (F, BW, VPOPCNTDQ) and
+  POPCNT, else AVX2 and POPCNT, else the portable bodies. AVX-512 works a
+  64-byte cache line per vector, with masked loads for tails; AVX2 two
+  32-byte vectors per line, counting by nibble lookup (`vpshufb`,
+  `vpsadbw`). `STANNUM_KERNELS=scalar|avx2|avx512` forces a level the CPU
+  has (tests, A/B runs); others are ignored.
+
+Not vectorized on either architecture: the OR walk's per-word and
+per-member weighing (a few terms' bounds a word; branch-free whole-group
+weighing measured slower), Elias-Fano decoding (serial over the highs' set
+bits), and TF-tail and DL reads (one packed value per candidate). Their
+scattered `count_ones` and `trailing_zeros` become POPCNT and TZCNT only
+in an `x86-64-v3` or `-v4` build (a baseline build runs bit tricks); that
+difference, not the kernels, is what those builds measure.
+
+x86-64 builds (set the per-target variable, not `RUSTFLAGS`, which would
+replace `.cargo/config.toml`'s link flags; `x86-64-v4` lacks VPOPCNTDQ, so
+its AVX-512 kernels are still chosen at runtime):
+
+```sh
+cargo pgrx install --package stannum --release ...           # runtime choice
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C target-cpu=x86-64-v3' \
+  cargo pgrx install --package stannum --release ...           # or x86-64-v4
+docker build --build-arg STANNUM_TARGET_CPU=x86-64-v4 -f benchmarks/Dockerfile .
+```
+
+Each level is tested against the portable bodies on random inputs
+(unaligned starts, odd lengths, every density). On an x86-64 host,
+`STANNUM_EXPECT_KERNELS` makes a level the CPU lacks a failure rather than
+a skip:
+
+```sh
+STANNUM_EXPECT_KERNELS=avx2,avx512 cargo test -p engine --lib tinshape::kernels -- --nocapture
+STANNUM_EXPECT_KERNELS=avx2,avx512 cargo test --release -p engine --lib tinshape::kernels
+for l in scalar avx2 avx512; do                  # whole suites at each level
+  STANNUM_KERNELS=$l STANNUM_EXPECT_KERNELS=$l cargo test -p engine -p segment; done
+for cpu in x86-64-v3 x86-64-v4; do
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=$cpu" \
+    cargo test -p engine -p segment --target-dir target/$cpu; done
+```
+
+On Apple silicon, an `x86_64-apple-darwin` build runs the scalar and AVX2
+levels under Rosetta with `ROSETTA_ADVERTISE_AVX=1`; nothing local runs
+AVX-512 (QEMU's TCG has none).
 
 ## Writing and maintaining it
 
@@ -739,6 +795,64 @@ Proposals (not built; layout only, the same structures):
   samples (2.4% with the built groups kept beside the parsed record, an
   experiment since undone). The conjunction and phrase branch's lazy
   directory reads (`b7776bd`) cover it.
+
+## Per-query overhead in the server at 150M rows (branch `tinshape/perf-overhead`)
+
+Measured in PostgreSQL on a copy of the saved 150M database (24 GB of
+shared buffers, 8 CPUs), eight clients taking the benchmark driver's
+shuffled (query, style) entries from one counter, backend CPU per query
+read from `/proc/self/schedstat` after each query, `perf` across the eight
+backends. Log and outputs: `stannum-lab/tinshape/perf-overhead/`.
+
+- Buffer lookups. A backend found 38% / 59% / 78% (conjunction /
+  disjunction / phrase) of the pages it pinned through the buffer it had
+  last pinned them in: its table of 2^18 entries, direct-mapped, thrashed at
+  150M rows, and most pages of a query it had never pinned (other backends
+  had). The rest went through `ReadBuffer` (buffer mapping hash and
+  partition lock): 4.4% of the mixed workload's samples, 7.7% of a
+  conjunction's. Pin and release together, with the private refcount hash
+  thousands of held pins overflow into, were about 10%. `pin_block` now
+  finds the buffer through a table every backend shares (`shared_hints`, a
+  named dynamic shared memory segment of 8 bytes per shared buffer, 32 MB at
+  24 GB; no `shared_preload_libraries` needed), and raises the buffer's
+  usage count as `ReadBuffer` would (`ReadRecentBuffer` does not, so an
+  index pinned through hints would look unused to the clock sweep): 96% /
+  98% / 99% of pins found their buffer, backend CPU per query -10% / -5% /
+  -5%, 6% more queries per second. A hint is only a hint: the tag check in
+  `ReadRecentBuffer` refuses a buffer since given to another page, and an
+  error creating the segment (no room in `/dev/shm`) falls back to the
+  backend's own table. `stannum.share_buffer_hints = off` uses only the
+  backend's table, for comparison. Holding pins on hot pages across queries
+  was not tried: the segment's pages are distinct per segment, so within a
+  query nothing repeats, and across queries a pin outliving its statement
+  needs a resource owner of its own and blocks buffer eviction.
+- Term setup. In the driver's order a backend asks for some 7 MB of parsed
+  directories and footers a query (54,000 records and footers, 1.3 GB, over
+  the trace), and its memos (at most a quarter of `reader_cache_mb`, 96 MB)
+  kept 3 of a query's 56 to 61 footers and 29 of its 110 records: parsing
+  them again was 12% (directories) and 9% (footers) of a conjunction's
+  samples, 10% and 7% of a phrase's. A memo kept by use counts instead of
+  recency, with half of the reader cache, kept 8 footers and 49 records,
+  for 3% less conjunction CPU and 75 MB more per backend: not kept, as TIN
+  keeps nothing across executions either (round 3 of the TIN probes) and
+  the gain rests on the benchmark repeating each query some 27 times. What
+  was kept instead makes the parse cheaper: varints of one or two bytes
+  decode without a loop, a directory longer than the first 4 KiB window is
+  read in one window sized by its group count rather than re-parsed in
+  windows four times longer, the directory is built in its shared slice
+  (it was allocated and copied twice), and a footer's frontier is allocated
+  once at its upper bound: as many records and footers parsed per query,
+  backend CPU per query -9% / -2% / -7%.
+- A view counted every segment's liveness bytes per query by walking its
+  groups (0.3% to 0.5%); it is counted once when decoded.
+- Together, against a0f29d6 (two rounds, interleaved): backend CPU per
+  query 12.98 -> 10.80 ms (conjunction, -17%), 41.2 -> 37.8 ms
+  (disjunction, -8%), 17.0 -> 14.3 ms (phrase, -16%); 309 -> 345 queries
+  per second at eight clients; the same ranked answers to all 3,762 queries
+  of the trace. What remains outside the walks: decoding footers (7% of a
+  conjunction's samples, 6% of a phrase's), directories (4% and 3%), pin
+  and release (6% and 3%, mostly the private refcount hash), and planning
+  (2% to 3%).
 
 ## Open
 

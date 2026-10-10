@@ -834,9 +834,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             kernels::and_bytes(words, grid(&self.mems[t]));
         }
         if let Some(dead) = self.segment.liveness.groups[g as usize].as_deref() {
-            for (w, d) in words.iter_mut().zip(dead) {
-                *w &= !d;
-            }
+            kernels::andnot_words(words, dead);
         }
         let mut cands = std::mem::take(&mut self.cands);
         cands.clear();
@@ -1667,9 +1665,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             for &i in rest {
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
-                for (m, r) in mask.iter_mut().zip(&self.rows[i * words..(i + 1) * words]) {
-                    *m &= *r;
-                }
+                kernels::and_words(&mut mask, &self.rows[i * words..(i + 1) * words]);
             }
         }
         if plan.by_essential && !plan.essential.is_empty() {
@@ -1681,25 +1677,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let i = plan.essential[e];
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
-                for (a, r) in any.iter_mut().zip(&self.rows[i * words..(i + 1) * words]) {
-                    *a |= *r;
-                }
+                kernels::or_words(&mut any, &self.rows[i * words..(i + 1) * words]);
             }
             if required {
-                for (m, a) in mask.iter_mut().zip(&any) {
-                    *m &= *a;
-                }
+                kernels::and_words(&mut mask, &any);
             } else {
                 mask.copy_from_slice(&any);
             }
             self.any = any;
         }
         if let Some(dead) = dead {
-            for (m, d) in mask.iter_mut().zip(dead) {
-                *m &= !d;
-            }
+            kernels::andnot_words(&mut mask, dead);
         }
-        if mask.iter().all(|m| *m == 0) {
+        if !kernels::any_set(&mask) {
             self.answer.windows_pruned += 1;
             self.words = mask;
             self.row_loaded = loaded;

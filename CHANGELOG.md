@@ -13,6 +13,11 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Added
 
+- On x86-64, the word kernels of segments in TIN's shape (grid AND, OR and
+  AND NOT, popcount, AND-popcount, masked counts) run AVX-512 or AVX2 bodies
+  chosen once at runtime, as PostgreSQL's `pg_popcount` does, so baseline
+  x86-64 packages use the CPU's vectors; aarch64 keeps NEON.
+  `STANNUM_KERNELS` forces a level for tests and comparisons.
 - Queries read segments in TIN's shape in place from pinned shared buffers
   rather than copying what they read into per-backend chunks: at 150M rows
   the copies overflowed each backend's cache and every query copied some
@@ -151,6 +156,19 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   bounds, then at its 1,024-slot sub-range's) instead of planning and
   sieving every sub-range bit-parallel. At 150 million rows its replay takes
   a fifth less CPU (a quarter fewer instructions) for the same answers.
+- Index pages are pinned through a table every backend shares of the buffer
+  each page was last pinned in (a named dynamic shared memory segment, 8
+  bytes per shared buffer; no `shared_preload_libraries` needed) rather than
+  each backend's own: at 150 million rows 96 to 99% of a query's pins skip
+  the buffer mapping table, against 38 to 78%. A pin through a hint raises
+  the buffer's usage count as `ReadBuffer`'s does.
+  `stannum.share_buffer_hints` (on) switches back for comparison. Term
+  directories and footers parse with less work per query (short varints
+  without a loop, a long directory in one window, no copy of it), and
+  `EXPLAIN ANALYZE` counts records parsed, kept and forgotten and footers
+  decoded and kept. Together, at eight clients, backend CPU per query falls
+  17% (conjunction), 8% (disjunction) and 16% (phrase), for the same
+  answers.
 - TINQL query expressions are parsed by a recursive-descent parser; the pest
   expression grammar remains only as a test-only differential oracle, and
   phrase contents are still parsed with pest. AND and OR chains parse into

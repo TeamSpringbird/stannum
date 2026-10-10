@@ -41,15 +41,22 @@ COPY segment segment
 COPY engine engine
 # A workspace member: cargo reads its manifest; nothing here builds it.
 COPY bench bench
+# An x86-64 build for a CPU level (x86-64-v3, x86-64-v4); empty, the baseline
+# PGDG packages target (the kernels pick AVX2 or AVX-512 at runtime either
+# way). Set per target, not as RUSTFLAGS, which would replace
+# .cargo/config.toml's link flags.
+ARG STANNUM_TARGET_CPU=
 # Keep optimized code and line tables for the owned perf diagnostics.
-RUN CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none cargo pgrx install --package stannum --no-default-features --features pg18 --release
+RUN CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${STANNUM_TARGET_CPU:+-C target-cpu=$STANNUM_TARGET_CPU}" \
+    CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none cargo pgrx install --package stannum --no-default-features --features pg18 --release
 
 FROM runtime
 USER root
 ARG STANNUM_SOURCE_SHA256=unknown
 ARG STANNUM_COMMIT=unknown
 ARG RECIPE_SHA256=unknown
-LABEL benchmark.stannum_source_sha256=${STANNUM_SOURCE_SHA256} benchmark.stannum_commit=${STANNUM_COMMIT} benchmark.recipe_sha256=${RECIPE_SHA256}
+ARG STANNUM_TARGET_CPU=
+LABEL benchmark.stannum_source_sha256=${STANNUM_SOURCE_SHA256} benchmark.stannum_commit=${STANNUM_COMMIT} benchmark.recipe_sha256=${RECIPE_SHA256} benchmark.stannum_target_cpu=${STANNUM_TARGET_CPU}
 COPY --from=builder /usr/lib/postgresql/18/lib/stannum.so /usr/lib/postgresql/18/lib/
 COPY --from=builder /usr/share/postgresql/18/extension/stannum* /usr/share/postgresql/18/extension/
 COPY --from=builder /usr/lib/postgresql/18/lib/pg_textsearch.so /usr/lib/postgresql/18/lib/

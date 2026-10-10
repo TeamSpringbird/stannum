@@ -188,6 +188,14 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"stannum.share_buffer_hints",
+        c"Find the shared buffer an index page was last pinned in through a table every backend shares",
+        c"Off keeps a table per backend, for comparison.",
+        &crate::storage::SHARE_BUFFER_HINTS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"stannum.count_fold",
         c"Count Boolean term queries by folding document-ordinal streams",
         c"Off keeps the scalar and page-bitmap strategies; other query shapes always use those.",
@@ -2700,6 +2708,21 @@ unsafe extern "C-unwind" fn explain(
                 recent,
                 es,
             );
+            let memo = segment::tinshape::segment::memo_counts();
+            for (label, n) in [
+                (c"Records Parsed", memo.records_parsed),
+                (c"Records Kept", memo.records_kept),
+                (c"Footers Decoded", memo.footers_decoded),
+                (c"Footers Kept", memo.footers_kept),
+                (c"Records Forgotten", memo.records_forgotten),
+            ] {
+                pg_sys::ExplainPropertyInteger(
+                    label.as_ptr(),
+                    std::ptr::null(),
+                    i64::try_from(n).unwrap_or(i64::MAX),
+                    es,
+                );
+            }
             pg_sys::ExplainPropertyInteger(
                 c"Positions Checked".as_ptr(),
                 std::ptr::null(),
