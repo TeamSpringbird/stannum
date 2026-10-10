@@ -1732,6 +1732,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A word's members are bounded from its first slot's ctid (see
         // `Walk::cut`), each member from its own.
         let first = |w: usize| geometry.tid_in(gi, (w * 64) as u32);
+        // A flat disjunction's candidates are scored best bound first; a
+        // node's check walks its cursors forward, in slot order.
+        let staging = matches!(self.verify, Verify::Flat);
         let mut w0 = 0;
         while w0 < words {
             let w1 = (w0 + SUB_WORDS).min(words);
@@ -1793,10 +1796,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 while word != 0 {
                     let bit = word.trailing_zeros();
                     word &= word - 1;
-                    self.or_candidate(g, base, words, w, bit)?;
+                    if staging {
+                        self.or_stage_into(g, base, words, w, bit)?;
+                    } else {
+                        self.or_candidate(g, base, words, w, bit)?;
+                    }
                 }
             }
             w0 = w1;
+        }
+        if staging {
+            self.finish_staged(g)?;
         }
         self.or_terms = terms;
         self.or_held = held;
@@ -1869,6 +1879,36 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     #[inline(never)]
     fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
         let local = (w * 64) as u32 + bit;
+        if let Some((_, length)) = self.or_stage(g, base, words, w, bit)? {
+            self.finish(g, local, length)?;
+        }
+        Ok(())
+    }
+
+    /// [`Walk::or_candidate`] staged (see [`Walk::finish_staged`]).
+    #[inline(never)]
+    fn or_stage_into(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
+        if let Some((reach, length)) = self.or_stage(g, base, words, w, bit)? {
+            self.staged.push((reach, (w * 64) as u32 + bit, length));
+            self.staged_buckets.extend_from_slice(&self.buckets);
+        }
+        Ok(())
+    }
+
+    /// Bounds the candidate at bit `bit` of word `w` of group `g` by what
+    /// can be read before its length from the DL sidecar (see
+    /// [`Walk::stage`]): its terms' blocks, then its buckets, and a length
+    /// a term it holds carries inline. Its buckets are left in
+    /// [`Walk::buckets`] ([`NO_BUCKET`] for a term it lacks).
+    fn or_stage(
+        &mut self,
+        g: u32,
+        base: u32,
+        words: usize,
+        w: usize,
+        bit: u32,
+    ) -> Result<Option<(f32, u32)>> {
+        let local = (w * 64) as u32 + bit;
         let slot = base + local;
         self.answer.candidates += 1;
         let tid = self.geometry.tid_in(g as usize, local);
@@ -1885,11 +1925,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         if self.cut(bound, || tid) {
-            return Ok(());
+            return Ok(None);
         }
         // The candidate's buckets, each against the shortest document of
         // its block holding that bucket or more, before its length is read
-        // (see `Walk::process`).
+        // (see `Walk::stage`).
+        self.buckets.fill(NO_BUCKET);
         let mut floor = 0u32;
         for h in 0..self.held_list.len() {
             let i = self.held_list[h];
@@ -1911,52 +1952,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let reach = self.reach(self.held_list.iter().copied(), floor);
         if self.cut(reach, || tid) {
-            return Ok(());
+            return Ok(None);
         }
         let carrier = self.held_list.iter().copied().find(|i| {
             self.terms[self.sc[*i].term]
                 .as_ref()
                 .is_some_and(|s| s.postings.lengths.is_some())
         });
-        let length = match carrier {
+        Ok(Some(match carrier {
             Some(i) => {
                 let index = self.row_index(i, words, local);
                 let set = self.terms[self.sc[i].term].as_ref().expect("scoring");
                 let inline = set.postings.lengths.as_ref().expect("inline lengths");
                 self.touch
                     .touch(Part::Payload, set.at + inline.at_of(index), 4);
-                inline.get(index)?
+                let length = inline.get(index)?;
+                // The length known, its buckets bound it at that length.
+                (self.reach(self.held_list.iter().copied(), length), length)
             }
-            None => self.dl_length(g, local)?,
-        };
-        self.answer.scored += 1;
-        let mut total = 0.0_f32;
-        // The held terms are in the scorer's order: the sum is exact.
-        for h in 0..self.held_list.len() {
-            let i = self.held_list[h];
-            total += self.sc[i].scorer.score_bucket(
-                TfBucket::new(self.buckets[i]).ok_or(Error::InvalidTfBucket)?,
-                length,
-            );
-        }
-        if !self.admits(total, tid) {
-            return Ok(());
-        }
-        match &self.verify {
-            Verify::Flat => self.push(total, tid),
-            _ => {
-                if matches(
-                    self.segment,
-                    self.node,
-                    &mut self.node_terms,
-                    slot,
-                    &mut self.positions,
-                    self.touch,
-                )? {
-                    self.push(total, tid);
-                }
-            }
-        }
-        Ok(())
+            None => (reach, u32::MAX),
+        }))
     }
 }

@@ -2481,10 +2481,13 @@ mod tests {
             })
             .collect();
         let lengths: Vec<u32> = (0..300u32).map(|r| 400 - r).collect();
+        // A second term in the first document only, so `t0 OR t1` walks as a
+        // disjunction.
         let members = vec![
             (0..300usize)
                 .map(|r| (r, if r >= 280 { 10 } else { 1 }))
                 .collect::<Vec<_>>(),
+            vec![(0, 1)],
         ];
         let all: Vec<usize> = (0..300).collect();
         let options = Options {
@@ -2495,14 +2498,17 @@ mod tests {
         };
         let blob = build_part(&docs, &lengths, &members, &all, &[false; 300], options);
         let segment = Segment::parse(&blob).unwrap();
-        let names = vec!["t0".to_owned()];
-        let scorer =
-            TermScorer::from_statistics(10_000, 300, 1.0, Bm25Params::default(), 100.0).unwrap();
-        let scorers = vec![("t0".to_owned(), scorer)];
-        let got = top_k(&segment, &Node::Term(0), &names, &scorers, 3, &mut NoTouch).unwrap();
-        let tids: Vec<Tid> = got.rows.iter().map(|r| r.1).collect();
-        assert_eq!(tids, vec![docs[299], docs[298], docs[297]]);
-        assert!(got.scored <= 30, "scored {}", got.scored);
+        let names = vec!["t0".to_owned(), "t1".to_owned()];
+        let scorer = |df| {
+            TermScorer::from_statistics(10_000, df, 1.0, Bm25Params::default(), 100.0).unwrap()
+        };
+        let scorers = vec![("t0".to_owned(), scorer(300)), ("t1".to_owned(), scorer(1))];
+        for node in [Node::Term(0), Node::Or(vec![Node::Term(0), Node::Term(1)])] {
+            let got = top_k(&segment, &node, &names, &scorers, 3, &mut NoTouch).unwrap();
+            let tids: Vec<Tid> = got.rows.iter().map(|r| r.1).collect();
+            assert_eq!(tids, vec![docs[299], docs[298], docs[297]], "{node:?}");
+            assert!(got.scored <= 30, "{node:?} scored {}", got.scored);
+        }
     }
 
     proptest! {
