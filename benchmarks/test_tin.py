@@ -576,6 +576,23 @@ class ProfileAndServerCommandTests(unittest.TestCase):
         self.assertIsNone(tin.index_mib_per_query({'indexReadBytes': 1}, 2))
         self.assertIsNone(tin.index_mib_per_query({'indexReadBytes': 1, 'indexHitBytes': 1}, 0))
 
+    def test_a_saved_database_vouches_for_the_corpus_without_the_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'driver/datasets/stackexchange').mkdir(parents=True)
+            (root / 'driver/datasets/stackexchange/data-manifest.json').write_text(json.dumps({'csv': {'sha256': 'c'}}))
+            (root / 'db').mkdir()
+            (root / 'db/snapshot.json').write_text(json.dumps(dict(
+                published_corpus='stackexchange', input_sha256='i', source_run='build')))
+            corpus = tin.saved_corpus(root / 'driver', 'stackexchange', root / 'db')
+            self.assertEqual((corpus['rows'], corpus['csv'], corpus['verified_by']),
+                             (150000000, {'sha256': 'c'}, dict(saved_database='build', input_sha256='i')))
+            with self.assertRaisesRegex(ValueError, '--dataset is required'):
+                tin.saved_corpus(root / 'driver', 'stackexchange', None)
+            (root / 'db/snapshot.json').write_text(json.dumps(dict(published_corpus='wikipedia', input_sha256='i')))
+            with self.assertRaisesRegex(ValueError, 'no import'):
+                tin.saved_corpus(root / 'driver', 'stackexchange', root / 'db')
+
     def test_target_cpu_is_refused_off_x86(self):
         args = argparse.Namespace(target_cpu='x86-64-v4', output=Path('/nonexistent/never'), base=None)
         with patch.object(tin.platform, 'machine', return_value='aarch64'):

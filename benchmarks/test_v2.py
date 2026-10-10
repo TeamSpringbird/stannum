@@ -17,10 +17,20 @@ def save_run(root, layout, engine, score, scenario, qps, mib=10.0, status='compl
     path = v2.run_directory(root, layout, engine, score, scenario)
     path.mkdir(parents=True)
     (path / 'manifest.json').write_text(json.dumps(dict(
-        status=status, profile='v2', postgres_version='18.6', cpu_pinning=dict(server_cpuset='0-3,16-19'))))
+        status=status, profile='v2', postgres_version='18.6', host=dict(machine='arm64'),
+        cpu_pinning=dict(server_cpuset='0-7'))))
     (path / 'comparison.json').write_text(json.dumps([dict(
         engine=engine, status=status, qps=qps, p50_ms=5.0, p99_ms=50.0, seconds=600,
         index_bytes=1, index_mib_per_query=mib)]))
+
+
+def arguments(**overrides):
+    values = dict(driver=Path('/d'), dataset=None, rows=150000000, validation_queries=3,
+                  ranked_validation_queries=1, profile='v2', seconds=600, warmup=10, setup_timeout_seconds=1,
+                  port=1, image='img', paradedb_image='pdb', database=Path('/s'), paradedb_database=None,
+                  source_manifest=None, lscpu_file=None, extra=[])
+    values.update(overrides)
+    return argparse.Namespace(**values)
 
 
 class PublishedDataTests(unittest.TestCase):
@@ -46,59 +56,67 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(v2.layouts_to_run(i7i, ['siblings', 'distinct-cores']), ['siblings', 'distinct-cores'])
         self.assertEqual(v2.layouts_to_run(i8g, ['siblings', 'distinct-cores']), ['siblings'])
 
-    def test_plan_covers_every_scenario_and_variant_with_one_paradedb_run_each(self):
-        runs = v2.planned_runs(['siblings'], v2.SCENARIOS, ['stannum', 'paradedb'], ['score', 'full_score'])
-        self.assertEqual(len(runs), 12)
+    def test_paradedb_runs_only_when_its_database_is_given(self):
+        runs = v2.planned_runs(['siblings'], v2.SCENARIOS, ['score', 'full_score'])
+        self.assertEqual(len(runs), 8)
+        self.assertFalse(any(engine == 'paradedb' for _, engine, _, _ in runs))
+        runs = v2.planned_runs(['siblings'], v2.SCENARIOS, ['score', 'full_score'], paradedb=True)
         self.assertEqual(sum(engine == 'paradedb' for _, engine, _, _ in runs), 4)
-        self.assertEqual(len(v2.planned_runs(['siblings'], ['mixed'], ['stannum'], ['score'])), 1)
+        self.assertEqual(len(v2.planned_runs(['siblings'], ['mixed'], ['score'])), 1)
 
-    def test_tin_arguments_select_the_engines_database_and_the_reading(self):
-        args = argparse.Namespace(
-            driver=Path('/d'), dataset=Path('/ds'), rows=150000000, validation_queries=10,
-            ranked_validation_queries=2, profile='v2', seconds=600, warmup=10, setup_timeout_seconds=1,
-            port=1, image='img', paradedb_image='pdb', stannum_database=Path('/s'), paradedb_database=Path('/p'),
-            source_manifest=None, lscpu_file=None, extra=['--x'])
+    def test_tin_arguments_select_the_database_and_reading_and_need_no_corpus(self):
+        args = arguments(paradedb_database=Path('/p'), extra=['--x'])
         command = v2.tin_arguments(args, 'distinct-cores', 'paradedb', 'score', 'phrase', Path('/o'))
         self.assertEqual(command[command.index('--load-database') + 1], '/p')
+        self.assertEqual(command[command.index('--paradedb-image') + 1], 'pdb')
         self.assertEqual(command[command.index('--cpu-layout') + 1], 'distinct-cores')
-        self.assertEqual(command[command.index('--style') + 1], 'phrase')
         self.assertEqual(command[-1], '--x')
         command = v2.tin_arguments(args, 'siblings', 'stannum', 'full_score', 'mixed', Path('/o'))
         self.assertEqual(command[command.index('--load-database') + 1], '/s')
         self.assertEqual(command[command.index('--score-function') + 1], 'full_score')
+        self.assertNotIn('--dataset', command)
+        self.assertNotIn('--paradedb-image', command)
 
 
 class ReportTests(unittest.TestCase):
-    def test_hardware_factor_comes_from_paradedb_and_translates_stannum(self):
+    def test_without_paradedb_runs_the_published_numbers_stand_alone(self):
         published = json.loads(v2.PUBLISHED.read_text())
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            save_run(root, 'siblings', 'paradedb', 'score', 'mixed', qps=49.0)        # 0.5x i7i's 98
             save_run(root, 'siblings', 'stannum', 'score', 'mixed', qps=300.0, mib=27.5)
             save_run(root, 'siblings', 'stannum', 'full_score', 'mixed', qps=90.0, status='failed')
-            result = v2.comparison(root, published)['siblings']
-            mixed = result['mixed']
-            self.assertAlmostEqual(mixed['hardware_factor']['x86'], 0.5)
-            self.assertAlmostEqual(mixed['hardware_factor']['arm'], 49 / 79)
-            rows = {row['theirs']: row for row in mixed['rows']}
-            self.assertAlmostEqual(rows['TIN']['estimated_qps_on']['x86'], 600.0)
+            data = v2.comparison(root, published)['siblings']
+            rows = {row['theirs']: row for row in data['scenarios']['mixed']['rows']}
             self.assertEqual(rows['TIN']['published']['x86']['qps'], 413)
             self.assertEqual(rows['TIN_FULL']['measured']['status'], 'incomplete')
-            self.assertNotIn('estimated_qps_on', rows['TIN_FULL'])
-            self.assertIsNone(result['conjunction']['hardware_factor']['x86'])
+            self.assertEqual(rows['ParadeDB']['measured']['status'], 'missing')
+            self.assertNotIn('scaled_qps', rows['TIN'])
+            self.assertIsNone(data['factor_spread']['arm'])
             text = v2.render(v2.comparison(root, published), published)
-            self.assertIn('| Stannum | 300.0 | 50.0 | 27.5 | TIN | 413 / 119 / 27 | 265 / 218 / 27 | 600 |', text)
+            self.assertIn('| mixed | Stannum | 300.0 | 50.0 | 27.5 | TIN | 265 / 218 / 27 | 413 / 119 / 27 |', text)
+            self.assertIn('| mixed | (published only) |', text)
+            self.assertIn('no calibration', text)
 
-    def test_missing_paradedb_runs_come_from_the_anchor_campaign(self):
+    def test_paradedb_factor_scales_stannum_and_its_spread_is_reported(self):
         published = json.loads(v2.PUBLISHED.read_text())
         with tempfile.TemporaryDirectory() as tmp:
-            anchor, campaign = Path(tmp) / 'baseline', Path(tmp) / 'x86-64-v4'
-            save_run(anchor, 'siblings', 'paradedb', 'score', 'phrase', qps=83.0)
-            save_run(campaign, 'siblings', 'stannum', 'score', 'phrase', qps=400.0)
-            phrase = v2.comparison(campaign, published, anchor)['siblings']['phrase']
-            self.assertAlmostEqual(phrase['hardware_factor']['x86'], 0.5)
-            paradedb = [r for r in phrase['rows'] if r['theirs'] == 'ParadeDB'][0]
-            self.assertEqual(paradedb['measured']['from_campaign'], str(anchor))
+            root = Path(tmp)
+            # Twice the published i8g ParadeDB QPS in every scenario: a steady factor of 2.
+            for scenario, arm_qps in (('conjunction', 142), ('disjunction', 45), ('phrase', 122), ('mixed', 79)):
+                save_run(root, 'siblings', 'paradedb', 'score', scenario, qps=2 * arm_qps)
+                save_run(root, 'siblings', 'stannum', 'score', scenario, qps=1000.0)
+            data = v2.comparison(root, published)['siblings']
+            mixed = data['scenarios']['mixed']
+            self.assertAlmostEqual(mixed['factor']['arm'], 2.0)
+            self.assertAlmostEqual(mixed['factor']['x86'], 158 / 98)
+            tin = [r for r in mixed['rows'] if r['theirs'] == 'TIN'][0]
+            self.assertAlmostEqual(tin['scaled_qps']['arm'], 500.0)
+            self.assertAlmostEqual(data['factor_spread']['arm']['max_over_min'], 1.0)
+            self.assertGreater(data['factor_spread']['x86']['max_over_min'], 1.0)
+            text = v2.render(v2.comparison(root, published), published)
+            self.assertIn('rough approximation', text)
+            self.assertIn('Factor vs i8g across 4 scenarios: 2.00 to 2.00 (max/min 1.00, CV 0.00): steady.', text)
+            self.assertIn('| mixed | 2.00 | 1.61 | 500 (265) |', text)
 
 
 if __name__ == '__main__':

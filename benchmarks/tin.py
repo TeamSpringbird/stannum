@@ -720,6 +720,22 @@ class ResourceSampler:
         self.thread.join()
 
 
+def saved_corpus(driver, published, load_database):
+    """The corpus identity of a run that starts from a saved database and has no CSV: the
+    pinned dataset manifest, vouched for by the build that imported and checked it. A run
+    from a database needs the CSV only for this check, so an AWS session restoring a
+    database skips the corpus download (85 GB) and the CSV hash in every run."""
+    if not (published and load_database):
+        raise ValueError('--dataset is required unless --load-database supplies a published corpus')
+    saved = json.loads((Path(load_database) / 'snapshot.json').read_text())
+    if saved.get('published_corpus') != published or not saved.get('input_sha256'):
+        raise ValueError('the saved database records no import of this published corpus; pass --dataset')
+    manifest = json.loads((driver / 'datasets' / published / 'data-manifest.json').read_text())
+    return dict(format='planetscale-prepared-v1', revision=published_dataset.REVISION, corpus=published,
+                rows={'wikipedia': 5032104, 'stackexchange': 150000000}[published], csv=manifest['csv'],
+                verified_by=dict(saved_database=saved.get('source_run'), input_sha256=saved['input_sha256']))
+
+
 def run(args):
     apply_profile(args)
     if getattr(args, 'dry_run', False):
@@ -734,8 +750,11 @@ def run(args):
         raise ValueError('driver regression binary does not match recorded build')
     published = getattr(args, 'published_corpus', None)
     raw_text = published == 'stackexchange'
-    corpus = published_dataset.inspect(args.dataset, published, json.loads(
-        (driver / 'datasets' / published / 'data-manifest.json').read_text())) if published else dataset.verify(args.dataset)
+    if getattr(args, 'dataset', None) is None:
+        corpus = saved_corpus(driver, published, getattr(args, 'load_database', None))
+    else:
+        corpus = published_dataset.inspect(args.dataset, published, json.loads(
+            (driver / 'datasets' / published / 'data-manifest.json').read_text())) if published else dataset.verify(args.dataset)
     trace_path = Path(getattr(args, 'query_file', None) or driver / 'datasets' / (published or 'wikipedia') / 'queries.json').resolve()
     queries = trace_queries(driver, trace_path, raw_text=raw_text)
     if len(set(args.engines)) != len(args.engines) or not 0 <= args.updates <= 1000000000:
@@ -1400,7 +1419,9 @@ def parser():
     common = argparse.ArgumentParser(add_help=False)
     p = common
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--dataset', type=Path, required=True)
+    p.add_argument('--dataset', type=Path,
+                   help='The corpus; optional with --load-database and --published-corpus, whose saved '
+                        'database vouches for the import (no CSV needed)')
     p.add_argument('--published-corpus', choices=['wikipedia', 'stackexchange'])
     p.add_argument('--query-file', type=Path, help='Explicit trace; snapshotted and hashed for every run')
     p.add_argument('--rows', type=bench.positive, default=1000)
@@ -1456,7 +1477,8 @@ def parser():
     p.set_defaults(func=run)
     p.add_argument('--image', required=True)
     p.add_argument('--engines', nargs='+', choices=['stannum', 'postgres', 'paradedb'], default=['stannum', 'postgres'],
-                   help='paradedb is the calibration engine: the pinned ParadeDB 0.26.0 image, its |||/&&&/### operators')
+                   help='paradedb: an optional, local-only calibration anchor on the pinned ParadeDB 0.26.0 image, '
+                        'through its |||/&&&/### operators; never part of the AWS runs')
     p.add_argument('--paradedb-image', default=PARADEDB_IMAGE, help='default: the final 0.26.0 release, pinned by digest')
     p = commands.add_parser('compare', parents=[common])
     p.set_defaults(func=compare)

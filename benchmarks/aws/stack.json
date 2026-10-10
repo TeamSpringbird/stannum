@@ -25,9 +25,10 @@
     },
     "LifetimeHours": {
       "Type": "Number",
-      "Default": 8,
+      "Default": 6,
       "MinValue": 1,
-      "MaxValue": 24
+      "MaxValue": 24,
+      "Description": "Hours until the instance powers itself off (and terminates). Keep it short: a v2 session from a snapshot takes about 4 to 7 hours, a build on the instance about 10 (docs/benchmarks.md, cost table)."
     },
     "AvailabilityZone": {
       "Type": "AWS::EC2::AvailabilityZone::Name",

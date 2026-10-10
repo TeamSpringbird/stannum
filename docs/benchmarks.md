@@ -7,9 +7,10 @@ faster query that changes the result is not an improvement.
 ## Benchmarks v2
 
 From 2026-10-09 the reference setup is **benchmarks v2**: TIN v1.0.6's
-published setup (8 pinned vCPUs, 64 GB), with the four published scenarios,
-Stannum's default and full scoring, and ParadeDB 0.26.0 measured beside it as
-a calibration anchor. It is the default for every 150M run
+published setup (8 pinned vCPUs, 64 GB), with the four published scenarios and
+Stannum's default and full scoring, set beside PlanetScale's published TIN,
+TIN_FULL and ParadeDB 0.26.0 numbers. Locally, and optionally, ParadeDB 0.26.0
+can be measured as a one-off calibration anchor. It is the default for every 150M run
 (`tin.py --profile v2`, `benchmarks/local/workload.sh 150m`,
 `benchmarks/aws/v2-campaign.sh`). The setup of the results below, the launch
 post's 32 GB without pinning, stays selectable as `legacy`
@@ -183,7 +184,7 @@ third-party dataset, the figures from ParadeDB's
 | Ranking | `ORDER BY stannum.score(ctid) DESC LIMIT 10` | `ORDER BY tin.score(ctid) DESC LIMIT 10` | post |
 | Elision | `dense_ratio` 0.10: a term with `df >= 0.1 x N` (immutable segments, f64) is not scored, as Lead's `DenseRatio::elides` | terms in more than 10% of documents are not scored | post; `engine/src/bm25.rs` |
 | TIN_FULL | `--score-function full_score`: `stannum.full_score(ctid)` | `tin.full_score(ctid)` | post |
-| ParadeDB | `paradedb/paradedb:0.26.0-pg18@sha256:52fc9c95…` (multi-arch; PostgreSQL 18.6 inside); `body &&& $1`, `body ||| $1`, `body ### $1` on the query's plain text, `pdb.score(id)`; index `USING bm25 (id, body) WITH (key_field=id, target_segment_count=8)` | the final 0.26.0, `|||`, `&&&`, `###`; **image and index flags not stated** | post; the benchmarker's `post.sql` |
+| ParadeDB | published numbers only. Optional local calibration: `paradedb/paradedb:0.26.0-pg18@sha256:52fc9c95…` (official, multi-arch with a native arm64 image; PostgreSQL 18.6 inside); `body &&& $1`, `body ||| $1`, `body ### $1` on the query's plain text through the benchmarker's paradedb backend, `pdb.score(id)`; index `USING bm25 (id, body) WITH (key_field=id, target_segment_count=8)`. Never on AWS | the final 0.26.0, `|||`, `&&&`, `###`; **image and index flags not stated** | post; the benchmarker's `post.sql` |
 | Clients | 8 | not stated (launch post: at most 8) | |
 | Duration, warm-up | 600 s after 10 s | not stated (benchmarker default 60 s and 10 s) | |
 | Table state | static; built once, `VACUUM ANALYZE`, saved; every run restarts from a copy | static, one-shot build, clean VACUUM | post |
@@ -207,15 +208,15 @@ third-party dataset, the figures from ParadeDB's
 - **Server settings beyond the three named.** "Benchmarker defaults" are
   ParadeDB-shaped: the ParadeDB image tunes `work_mem` and
   `effective_cache_size` from the container's memory at first start, and
-  leaves JIT on. Our ParadeDB runs keep exactly that. Stannum keeps the
+  leaves JIT on. Our optional ParadeDB runs keep exactly that. Stannum keeps the
   harness's `work_mem=16MB` and `jit=off`, which every earlier run used: a
   ranked scan's plan cost can cross `jit_above_cost`, and TIN's own image and
   configuration are not public. Recorded in each manifest's `docker_run`.
-- **ParadeDB's index flags.** The post says neither. We use the
+- **ParadeDB's index flags** (for the optional local calibration). The post says neither. We use the
   benchmarker's `post.sql` verbatim (`key_field` is a no-op since 0.26.0;
   `bm25` is 0.26.0's alias of the `paradedb` access method and the name the
   pinned driver's I/O counters select).
-- **ParadeDB's build memory.** 64 GB for the build, as the benchmarker's
+- **ParadeDB's build memory** (local calibration). 64 GB for the build, as the benchmarker's
   `create` target. If a 150M build needs more, the run fails with the
   container's `memory.events` in `after-build-cgroup.json`; record it as a
   deviation rather than raising the limit silently.
@@ -252,27 +253,38 @@ forms or the Stannum and PostgreSQL I/O counters, and `ps-mods` lacks the
 Re-pinning would lose the trace and gain nothing measured.
 
 Our adapter patch adds two driver options beside the Stannum backend:
-`STANNUM_SCORE_FUNCTION` (`score` or `full_score`) and `PARADEDB_QUERY_FORM`
-(`operators` for `|||`, `&&&`, `###`; the upstream `parse` form,
-`@@@ pdb.parse`/`pdb.match`, stays the default). Drivers prepared before
-this change are refused; prepare a fresh one.
+`STANNUM_SCORE_FUNCTION` (`score` or `full_score`) and, for the optional
+local ParadeDB calibration, `PARADEDB_QUERY_FORM` (`operators` for `|||`,
+`&&&`, `###`; the upstream `parse` form, `@@@ pdb.parse`/`pdb.match`, stays
+the default). Drivers prepared before this change are refused; prepare a
+fresh one.
 
-### Calibration
+### Optional local calibration against ParadeDB 0.26.0
 
-ParadeDB 0.26.0 runs on our hardware under the same setup. For each
-scenario, our ParadeDB QPS / PlanetScale's published ParadeDB QPS is a
-hardware factor (separately against i7i and i8g), and Stannum's QPS / that
-factor estimates Stannum on their machine. `v2.py report CAMPAIGN` writes
-`v2-report.md` and `v2-report.json`: per scenario, Stannum (score and
-full_score) and our ParadeDB with QPS, p99 and MiB/query, beside the
-published TIN, TIN_FULL and ParadeDB on x86 and ARM, the factors and the
-estimates. The factor is only as good as the assumption that both engines
-scale alike from their machine to ours; compare the x86 and ARM factors for
-a sense of it.
+PlanetScale's published ParadeDB numbers are taken as published. Locally,
+and only there, `v2.py campaign --paradedb-database DIR` adds one ParadeDB
+0.26.0 run per scenario, under the same v2 setup, as a one-off calibration
+anchor: our ParadeDB QPS / their ParadeDB QPS is a per-scenario hardware
+factor against their i8g table (the closer architecture to this Mac) and
+their i7i table, and the report scales Stannum's QPS by it. That is a rough
+approximation: it holds only if both engines move alike from their machine
+to ours. The report shows how far the factor moves across the four
+scenarios (min, max, max/min, coefficient of variation): a factor that holds
+still is worth something, one that swings is not. AWS runs never include
+ParadeDB.
+
+The official image is multi-arch, with a native arm64 build, so nothing is
+built from source. It runs as the benchmarker starts it: the image's own
+bootstrap and auto-tuning, under the same overrides.
+
+`v2.py report CAMPAIGN` writes `v2-report.md` and `v2-report.json`: per
+scenario, Stannum (score and full_score) with QPS, p99 and MiB/query beside
+the published TIN, TIN_FULL and ParadeDB figures for i8g and i7i, then the
+calibration if ParadeDB ran.
 
 ### Local v2 campaign (this Mac, 150M)
 
-Both builds take hours; schedule them deliberately. The VM has 100 GiB, which
+The builds take hours; schedule them deliberately. The VM has 100 GiB, which
 holds a 64g container; nothing needs resizing.
 
 ```sh
@@ -291,79 +303,157 @@ python3 benchmarks/tin.py --driver "$LAB/driver" build
 python3 benchmarks/tin.py build-image --image "stannum-bench:v2-$SHA" --output "$LAB/image-$SHA"
 export STANNUM_DRIVER=$LAB/driver STANNUM_DATASET="$DATASET" STANNUM_SOURCE=$LAB/image-$SHA/source.json
 
-# Build and save each database (v2 sizing: 64g, 8 pinned CPUs, 8 maintenance workers).
+# Build and save the Stannum database (v2 sizing: 64g, 8 pinned CPUs, 8 maintenance workers).
 STANNUM_MOCK=$LAB/stannum bash benchmarks/local/mock-build.sh 150m "stannum-bench:v2-$SHA"
+# Optional: the ParadeDB 0.26.0 calibration database.
 STANNUM_MOCK=$LAB/paradedb STANNUM_ENGINE=paradedb bash benchmarks/local/mock-build.sh 150m "stannum-bench:v2-$SHA"
 rm -f "$LAB"/stannum/build/*/input.csv "$LAB"/paradedb/build/*/input.csv    # 79 GiB each
 
-# Every scenario x {Stannum score, Stannum full_score, ParadeDB}, NVMe read caps,
-# the VM page cache dropped as each measurement starts; then the report.
+# Every scenario x {score, full_score} (and ParadeDB, if built), NVMe read caps, the VM
+# page cache dropped as each measurement starts; then the report.
 STANNUM_DOCKER_RUN_ARGS="--device-read-iops /dev/vdb:20000 --device-read-bps /dev/vdb:400mb" \
-python3 benchmarks/v2.py campaign --driver "$LAB/driver" --dataset "$DATASET" \
+python3 benchmarks/v2.py campaign --driver "$LAB/driver" \
   --image "stannum-bench:v2-$SHA" --source-manifest "$LAB/image-$SHA/source.json" \
-  --stannum-database "$LAB/stannum/db" --paradedb-database "$LAB/paradedb/db" \
+  --database "$LAB/stannum/db" --paradedb-database "$LAB/paradedb/db" \
   --output "$LAB/campaign-$SHA" --drop-caches
 ```
 
 Add `--dry-run` to the campaign to print every server and driver command
-first. A single run: `STANNUM_ENGINE=paradedb` or
-`STANNUM_SCORE_FUNCTION=full_score` with `workload.sh 150m ...`.
+first; leave out `--paradedb-database` to skip the calibration. A single run:
+`STANNUM_SCORE_FUNCTION=full_score` (or `STANNUM_ENGINE=paradedb`) with
+`workload.sh 150m ...`.
 
-Estimates, from the local TNS1 build and a 1M-row ParadeDB build:
+Estimates, from the local TNS1 build and 1M-row builds of both engines:
 
-| | Stannum | ParadeDB 0.26.0 |
+| | Stannum | ParadeDB 0.26.0 (optional) |
 | --- | --- | --- |
 | Import | 12 min | 12 min |
-| Index build | about 2.5 h (TNS1 took 2 h 29 min) | about 0.5 to 2 h (1M rows: 3.8 s, 8 segments; merges grow with size) |
-| Saved database | 106 GiB (heap 69 GiB + index 35 GiB) | about 135 GiB (heap 69 GiB + index about 63 GiB) |
+| Index build | about 2.5 h (TNS1 took 2 h 29 min; 1M rows 34 s) | about 0.5 to 2 h (1M rows: 3.8 s into 8 segments; merges grow with size) |
+| VACUUM, checks, save | about 1 h | about 1 h |
+| Saved database | 106 GiB (heap 69 GiB + index 35 GiB) | about 135 GiB (heap 69 GiB + index about 63 GiB, the post's 67.3 GB) |
 | Peak disk during the build | about 300 GiB (CSV prefix 79 GiB + volume + saved copy) | about 360 GiB |
-| Campaign | 8 runs x about 30 min (copy, checks, 10 min measured) | 4 runs x about 30 min |
+| Campaign | 8 runs x about 25 min (copy, checks, 10 min measured) | 4 runs x about 25 min |
 
 Free space under /Users/uri/stannum-lab was 2.2 TiB on 2026-10-09. Run the
 builds one after the other; each campaign run copies its database into a
-fresh volume (up to 135 GiB more) and removes it afterwards.
+fresh volume (up to 135 GiB more) and removes it afterwards. If ParadeDB's
+build needs more than its 64 GB, it fails with the container's
+`memory.events` in `after-build-cgroup.json`; record that as a deviation
+rather than raising the limit.
 
-### AWS v2 campaign (not yet run)
+### AWS v2 session (not yet run)
 
-The stack and the host script are ready; launching is the owner's call. On
-both hosts `benchmarks/aws/v2-campaign.sh` prepares the driver, builds the
-image natively, builds (or restores, `STANNUM_SNAPSHOT` / `PARADEDB_SNAPSHOT`)
-both databases, runs the campaign and writes the report. `DRY_RUN=1` prints
-the sequence. Launch the host script with `setsid nohup ... < /dev/null &`
-and a long SSM `executionTimeout`, as in the r5 to r8 runbook.
+One short, decisive session, to confirm that the local results hold on the
+published hardware. It never runs ParadeDB. `benchmarks/aws/v2-campaign.sh`
+does the whole session on the host: driver, native image, database, every
+scenario and scoring back to back, the optional x86-64-v3 and v4 builds
+(built while the database is restored, measured last, `score` on one CPU
+reading by default), evidence uploaded to the stack's artifact bucket after
+each campaign. It is rerunnable, and `DRY_RUN=1` prints the sequence.
 
-x86, i7i.8xlarge (runtime-dispatch build, then x86-64-v3 and v4):
+**The database: restore a short-lived snapshot of the local build.** Building
+on the instance costs about 5 instance-hours (corpus download, import, a 2.5
+to 3.5 hour index build, VACUUM and checks): about $15. Uploading the local
+v2 database (106 GiB, about 114 GB) to S3 just before the session and deleting
+it right after costs cents: S3 Standard is $0.023 per GB-month, about $2.60 a
+month for this archive, so about $0.30 for a few days (transfer into S3 and
+from S3 to an instance in the same region is free; the upload's requests cost
+under a cent). A restore takes about 6 to 15 minutes, and with a restored
+database the runs need no corpus (`tin.py` takes the corpus identity from the
+saved database), which also skips the 85 GB download. Earlier sessions (r6 to
+r8) restored a database built on this Mac onto the i7i: PostgreSQL's files
+moved between little-endian 64-bit Linux hosts without trouble, though that
+is not a supported guarantee. If the restore is refused, the fallback is the
+build on the instance's NVMe (leave `STANNUM_SNAPSHOT` unset). The bucket's
+30-day expiry rule bounds a forgotten snapshot at about $2.60.
+
+Cost estimate, i7i.8xlarge at about $3.02 an hour (us-east-1, on demand):
+
+| Phase | Snapshot (recommended) | Build on the instance |
+| --- | ---: | ---: |
+| Provision and bootstrap (stack, packages, NVMe) | 0.2 h | 0.2 h |
+| Driver and baseline image (restore runs alongside) | 0.4 h | 0.4 h |
+| Corpus download and verification | none | 0.6 h |
+| Import | none | 0.2 h |
+| Index build | none | 2.5 to 3.5 h |
+| VACUUM ANALYZE, checks, save | none | 1.0 to 1.5 h |
+| Scenario runs, 4 scenarios x 2 scorings, about 0.33 h each (copy, checks, 10 s + 600 s), one CPU reading | 2.7 h | 2.7 h |
+| Second CPU reading (distinct cores), 8 more runs | 2.7 h | 2.7 h |
+| Export and teardown | 0.2 h | 0.2 h |
+| **x86 session, one reading** | **3.5 h, about $11** | **8 to 9 h, about $25** |
+| **x86 session, both readings** | **6.2 h, about $19** | **11 to 12 h, about $35** |
+| Optional x86-64-v3 and v4 (images built during the restore; 4 runs each, `score`, one reading) | +2.7 h, about $8 | +2.7 h, about $8 |
+| S3 | snapshot, about $0.30 if deleted within days | none |
+
+`V2_SECONDS=300` halves the measured time and saves about 0.7 h per reading.
+ARM is an optional extra: an i8g.8xlarge session from the same snapshot runs
+one reading only (Graviton4 has no SMT), about 3.5 h; at about $2.7 an hour
+(check current pricing) that is about $10. Set `LifetimeHours` (default 6)
+to the session's estimate plus an hour: 5 for one reading, 8 for both, 10
+with v3 and v4, 13 for a build on the instance.
+
+x86, i7i.8xlarge:
 
 ```sh
+SHA=<full commit SHA>; CORPUS=springbird-dev-stannum-corpus-cache-860510875764
+SNAP=postgres-snapshots/stackexchange-150m-v2-${SHA:0:7}
+# 1. From this Mac, just before: upload the local v2 database (about 40 minutes).
+tar -C /Users/uri/stannum-lab/v2-150m/stannum/db -cf - . | \
+  aws --profile springbird-development s3 cp - "s3://$CORPUS/$SNAP.tar" --expected-size 120000000000
+# 2. The stack, with a short lifetime.
 aws --profile springbird-development --region us-east-1 cloudformation create-stack \
   --stack-name stannum-v2-x86-$(date +%Y%m%d) --template-body file://benchmarks/aws/stack.json \
   --capabilities CAPABILITY_IAM --parameters \
   ParameterKey=InstanceType,ParameterValue=i7i.8xlarge \
   ParameterKey=Ami,ParameterValue=/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id \
-  ParameterKey=AvailabilityZone,ParameterValue=us-east-1a ParameterKey=LifetimeHours,ParameterValue=24 \
-  ParameterKey=DiskGiB,ParameterValue=80 ParameterKey=CorpusBucket,ParameterValue=<corpus bucket>
-# On the host (SSM), once /opt/stannum-benchmark/bootstrap-ready exists:
+  ParameterKey=AvailabilityZone,ParameterValue=us-east-1a ParameterKey=LifetimeHours,ParameterValue=8 \
+  ParameterKey=DiskGiB,ParameterValue=80 ParameterKey=CorpusBucket,ParameterValue=$CORPUS
+# 3. On the host (SSM; setsid nohup ... < /dev/null & with a long executionTimeout, as
+#    in the r5 to r8 runbook), once /opt/stannum-benchmark/bootstrap-ready exists:
 git clone https://github.com/TeamSpringbird/stannum.git /opt/stannum-benchmark/repo
-cd /opt/stannum-benchmark/repo && git checkout --detach <full SHA>
+cd /opt/stannum-benchmark/repo && git checkout --detach "$SHA"
 python3 -m venv --system-site-packages /opt/stannum-benchmark/venv
 /opt/stannum-benchmark/venv/bin/pip install 'psycopg[binary]==3.3.6'
 export PATH=/opt/stannum-benchmark/venv/bin:$PATH
-bash benchmarks/aws/v2-campaign.sh                                   # baseline: runtime SIMD dispatch
-STANNUM_TARGET_CPUS="x86-64-v3 x86-64-v4" bash benchmarks/aws/v2-campaign.sh   # adds v3 and v4 (Stannum only)
+BENCH_BUCKET=<ArtifactBucket output> STANNUM_SNAPSHOT="s3://$CORPUS/$SNAP.tar" \
+  STANNUM_TARGET_CPUS="x86-64-v3 x86-64-v4" bash benchmarks/aws/v2-campaign.sh
+# 4. From this Mac: fetch the evidence, then clean up (below).
+aws --profile springbird-development s3 sync s3://<ArtifactBucket output> ./aws-v2-export
 ```
 
 ARM, i8g.8xlarge: the same with
 `ParameterKey=InstanceType,ParameterValue=i8g.8xlarge`, the default (arm64)
-`Ami`, and no `STANNUM_TARGET_CPUS`. Graviton4 has no SMT, so the two CPU
-readings coincide and run once. The image builds on `postgres:18-trixie`
-(the Dockerfile's ParadeDB base is amd64-only), with the same pinned
-PostgreSQL 18.6 packages. Check that the zone offers i8g.8xlarge first
-(`aws ec2 describe-instance-type-offerings --location-type availability-zone
---filters Name=instance-type,Values=i8g.8xlarge`).
+`Ami`, `LifetimeHours` 5 and no `STANNUM_TARGET_CPUS`. The image builds on
+`postgres:18-trixie` (the Dockerfile's ParadeDB base image is amd64-only)
+with the same pinned PostgreSQL 18.6 packages. Check that the zone offers
+i8g.8xlarge first (`aws ec2 describe-instance-type-offerings
+--location-type availability-zone --filters
+Name=instance-type,Values=i8g.8xlarge`).
 
-Time: building both databases on the host adds about 4 to 7 hours; 24 runs
-(two readings) at about 25 minutes each take about 10 hours, so a single
-24-hour stack fits either the builds and one reading or both readings from
-snapshots. Earlier runs restored a database built on this Mac onto the i7i
-(r6 to r8): PostgreSQL's files are portable between little-endian 64-bit
-Linux hosts in practice, though not a supported guarantee.
+**Cleanup**, right after the evidence is safe:
+
+```sh
+aws --profile springbird-development s3 rm --recursive s3://<ArtifactBucket output>
+aws --profile springbird-development --region us-east-1 cloudformation delete-stack --stack-name <stack>
+aws --profile springbird-development s3 rm "s3://$CORPUS/$SNAP.tar"
+# Confirm: the instance terminated and its volumes gone, no stack left, and only what
+# is still wanted under s3://$CORPUS.
+aws --profile springbird-development s3 ls "s3://$CORPUS" --recursive --summarize
+```
+
+**What is in S3 now** (listed read-only on 2026-10-09; nothing deleted).
+The corpus-cache bucket `springbird-dev-stannum-corpus-cache-860510875764`
+holds 557.6 GiB in 16 objects, about $13.80 a month, under a 30-day expiry
+rule, and no Stannum stack is running:
+
+| Object | Size | Uploaded | Use now |
+| --- | ---: | --- | --- |
+| `postgres-snapshots/stackexchange-150m-lsg5-7372fc6.tar` (+ .json) | 300.1 GiB | 2026-09-23 | none: LSG5 format, unreadable by current builds |
+| `postgres-snapshots/stackexchange-150m-stn3-b961ded.tar` (+ .json) | 117.1 GiB | 2026-09-24 | none: STN3, pre-36355bc meta layout |
+| `postgres-snapshots/stackexchange-150m-stn3-f099667.tar` (+ .json) | 117.1 GiB | 2026-09-25 | none: STN3, unreadable by TNS1 builds |
+| `postgres-snapshots/wikipedia-bba903d-20260921-r4/` | 13.2 GiB | 2026-09-20 | none for v2 (an old Wikipedia COUNT database) |
+| `f487fba…/wikipedia/` (corpus cache) | 10.0 GiB | 2026-09-20 | the Wikipedia COUNT crossover only |
+
+All of it expires on its own by 2026-10-25 (about $6 more if left). Deleting
+the three Stack Exchange snapshots now saves most of that; that is the
+owner's call.

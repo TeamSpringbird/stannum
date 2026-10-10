@@ -37,7 +37,8 @@ naming any that is missing. Install the Python packages from
   (default the 15M prefix) once and saves it to `$STANNUM_MOCK/db`. A saved
   database is only valid for the segment format its image wrote. It waits up
   to `STANNUM_IMAGE_WAIT_SECONDS` (3600) for the image. `STANNUM_ENGINE=paradedb`
-  builds ParadeDB 0.26.0's database instead.
+  builds ParadeDB 0.26.0's database instead, for the optional, local-only
+  calibration.
 - `workload.sh PROFILE IMAGE LABEL STYLE UPDATES [SECONDS]` runs a workload from
   that copy and prints one line: QPS, latency, index MiB per query (TIN's
   MB/query), disk read per query and CPU. `run150m.sh IMAGE LABEL STYLE UPDATES
@@ -55,8 +56,9 @@ Profiles:
 | `mock15m` | 15M | 5g (12g build), 2GB shared buffers, 8 CPUs by quota |
 | `smoke1m` | 1M | v2's pinning and settings, memory scaled down (2g, 512MB shared buffers) |
 
-The full v2 campaign (every scenario, Stannum's two scorings and ParadeDB,
-then the comparison with the published numbers) is `benchmarks/v2.py
+The full v2 campaign (every scenario with Stannum's two scorings, optionally
+ParadeDB as a calibration anchor, then the comparison with the published
+numbers) is `benchmarks/v2.py
 campaign`; see "Matching TIN v1.0.6's published setup" in
 [docs/benchmarks.md](../../docs/benchmarks.md) for its commands.
 - `mock-probe.py IMAGE LABEL [N]` reports pages touched, candidates scored, disk
