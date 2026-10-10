@@ -58,9 +58,10 @@ pub(super) struct Sc {
     /// The block holding the last candidate asked about, moved forward only.
     cb: usize,
     /// [`Self::floor`] per bucket in the block last asked about, `u32::MAX`
-    /// until asked: a rare term's block spans many groups' candidates.
+    /// until asked (a rare term's block spans many groups' candidates), and
+    /// the bucket's score at that length.
     bb_block: usize,
-    bb: [u32; BUCKET_COUNT],
+    bb: [(u32, f32); BUCKET_COUNT],
 }
 
 impl Sc {
@@ -73,7 +74,7 @@ impl Sc {
             wb: 0,
             cb: 0,
             bb_block: usize::MAX,
-            bb: [u32::MAX; BUCKET_COUNT],
+            bb: [(u32::MAX, 0.0); BUCKET_COUNT],
         }
     }
 
@@ -143,18 +144,25 @@ impl Sc {
             .unwrap_or(0)
     }
 
-    /// [`Self::floor`], kept per bucket for the block last asked about.
+    /// [`Self::floor`] and what bucket `bucket` scores at most there (the
+    /// term's own bound, before the other terms raise the length), kept per
+    /// bucket for the block last asked about.
     #[inline]
-    fn floor_kept(&mut self, b: usize, bucket: u8) -> u32 {
+    fn floor_kept(&mut self, b: usize, bucket: u8) -> (u32, f32) {
         if self.bb_block != b {
             self.bb_block = b;
-            self.bb = [u32::MAX; BUCKET_COUNT];
+            self.bb = [(u32::MAX, 0.0); BUCKET_COUNT];
         }
         let known = self.bb[usize::from(bucket)];
-        if known != u32::MAX {
+        if known.0 != u32::MAX {
             return known;
         }
-        let v = self.floor(b, bucket);
+        let floor = self.floor(b, bucket);
+        let v = (
+            floor,
+            self.scorer
+                .bound_through(TfBucket::new(bucket).expect("a valid bucket"), floor),
+        );
         self.bb[usize::from(bucket)] = v;
         v
     }
@@ -1015,7 +1023,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 if n > 0 && self.cut(self.length_bound(length), || tid) {
                     return Ok(None);
                 }
-                self.read_buckets(g, local)?;
+                self.read_buckets(g, local, tid)?;
                 if self.too_few() {
                     return Ok(None);
                 }
@@ -1031,7 +1039,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // they leave in reach: at 150 million rows two in three scored
             // candidates fell short on their buckets alone.
             None => {
-                let reach = self.read_buckets(g, local)?;
+                let reach = self.read_buckets(g, local, tid)?;
                 if self.cut(reach, || tid) || self.too_few() {
                     return Ok(None);
                 }
@@ -1108,9 +1116,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Reads into [`Walk::buckets`] the bucket of each scoring term the
     /// candidate at slot `local` of group `g` holds ([`NO_BUCKET`] for the
     /// others), and returns what the candidate can score at most by them:
-    /// see [`Walk::reach`].
-    fn read_buckets(&mut self, g: u32, local: u32) -> Result<f32> {
-        let mut floor = 0u32;
+    /// see [`Walk::reach`], taken only when each term's own bound (kept per
+    /// block and bucket) leaves the candidate, of ctid `tid`, in reach.
+    fn read_buckets(&mut self, g: u32, local: u32, tid: Tid) -> Result<f32> {
+        let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
         for i in 0..self.sc.len() {
             let t = self.sc[i].term;
             if !self.sc_required[i] {
@@ -1131,8 +1140,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     1,
                 );
             }
-            floor = floor.max(self.sc[i].floor_kept(block, bucket));
+            let (f, bound) = self.sc[i].floor_kept(block, bucket);
+            (floor, low) = (floor.max(f), low.min(f));
+            own += bound;
             self.buckets[i] = bucket;
+        }
+        // Each term's own bound is at least the shared one: it prunes what
+        // it can without a division per term, and is the shared one when
+        // the terms' lengths agree.
+        if low >= floor || self.cut(own, || tid) {
+            return Ok(own);
         }
         Ok(self.reach(
             (0..self.sc.len()).filter(|i| self.buckets[*i] != NO_BUCKET),
@@ -1931,7 +1948,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // its block holding that bucket or more, before its length is read
         // (see `Walk::stage`).
         self.buckets.fill(NO_BUCKET);
-        let mut floor = 0u32;
+        let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
         for h in 0..self.held_list.len() {
             let i = self.held_list[h];
             let index = self.row_index(i, words, local);
@@ -1947,10 +1964,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 );
             }
             let block = self.blocks[i];
-            floor = floor.max(self.sc[i].floor_kept(block, bucket));
+            let (f, bound) = self.sc[i].floor_kept(block, bucket);
+            (floor, low) = (floor.max(f), low.min(f));
+            own += bound;
             self.buckets[i] = bucket;
         }
-        let reach = self.reach(self.held_list.iter().copied(), floor);
+        // Each term's own bound first, as `Walk::read_buckets` does.
+        if self.cut(own, || tid) {
+            return Ok(None);
+        }
+        let reach = if low >= floor {
+            own
+        } else {
+            self.reach(self.held_list.iter().copied(), floor)
+        };
         if self.cut(reach, || tid) {
             return Ok(None);
         }
