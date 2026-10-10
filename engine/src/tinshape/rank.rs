@@ -721,7 +721,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let Some((blob, mark)) = self.frame else {
             return;
         };
-        if blob.pinned_since(mark) <= blob.keep() {
+        if !blob.over_keep(mark) {
             return;
         }
         debug_assert!(self.pending.is_empty() && self.staged.is_empty());
@@ -1546,12 +1546,14 @@ pub(super) fn walk_into<'a>(
     if let (Some(blob), Some(opened)) = (blob, opened)
         && !matches!(walk.verify, Verify::Node)
     {
-        walk.frame = Some((blob, opened));
         for set in walk.terms.iter().flatten() {
             for (from, to) in set.postings.borrowed().into_iter().flatten() {
                 walk.held.push((set.at + from, set.at + to));
             }
         }
+        // The pages those ranges lie on, read to open the terms, are held
+        // to the walk's end before the mark the groups release to.
+        walk.frame = Some((blob, blob.hold_since(opened, &walk.held)));
     }
     if required.is_empty() {
         walk.run_or()?;

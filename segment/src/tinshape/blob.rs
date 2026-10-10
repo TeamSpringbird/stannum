@@ -441,6 +441,16 @@ impl LazyBlob {
         self.keep.get()
     }
 
+    /// Whether [`Self::release_since`] of `mark` would release anything:
+    /// more than half as many again as it keeps are pinned since, so a
+    /// release has some pages to release, rather than one per group read
+    /// at the cost of choosing it among those kept.
+    #[inline]
+    pub fn over_keep(&self, mark: usize) -> bool {
+        let keep = self.keep.get();
+        self.pinned_since(mark) > keep + keep / 2
+    }
+
     /// Sets the pages [`Self::release_since`] keeps ([`KEEP_PINS`] by
     /// default); tests release every one.
     pub fn set_keep(&self, keep: usize) {
@@ -468,8 +478,8 @@ impl LazyBlob {
     /// Releases the pages the open span pinned since `mark`, but for those
     /// holding any byte of the ranges `held` (`(from, to)` offsets of the
     /// blob) and the [`Self::keep`] of the others read last, which all
-    /// count as pinned since the mark still. A page read again is pinned
-    /// afresh.
+    /// count as pinned since the mark still; nothing unless
+    /// [`Self::over_keep`]. A page read again is pinned afresh.
     ///
     /// # Safety
     ///
@@ -479,35 +489,55 @@ impl LazyBlob {
     /// earlier pages, and stitched slices, stay valid until the span
     /// closes.
     pub unsafe fn release_since(&self, mark: usize, held: &[(usize, usize)]) {
+        if !self.over_keep(mark) {
+            return;
+        }
         let mut pinned = self.pinned.borrow_mut();
         let keep = self.keep.get();
-        if pinned.len() <= mark.saturating_add(keep) {
-            return;
-        }
-        let n = self.page_len;
-        let is_held = |page: usize| {
-            held.iter()
-                .any(|&(from, to)| from < to && from / n <= page && page <= (to - 1) / n)
-        };
-        // Pages held first, then the rest by when they were last read: the
-        // ones read last stay, the others are released.
+        // The pages read last to the end, unordered; the others before them
+        // are released, but for those held.
         let since = &mut pinned[mark..];
-        since.sort_unstable_by_key(|page| {
-            if is_held(*page) {
-                (0, 0)
+        let cut = since.len() - keep;
+        if keep > 0 {
+            since.select_nth_unstable_by_key(cut, |page| self.last_used(*page));
+        }
+        let mut kept = 0;
+        for i in 0..cut {
+            let page = since[i];
+            if self.holds(held, page) {
+                since.swap(kept, i);
+                kept += 1;
             } else {
-                (1, self.last_used(*page))
+                self.release(page);
             }
-        });
-        let first = since.partition_point(|page| is_held(*page));
-        if since.len() - first <= keep {
-            return;
         }
-        let until = since.len() - keep;
-        for &page in &since[first..until] {
-            self.release(page);
+        pinned.drain(mark + kept..mark + cut);
+    }
+
+    /// Whether page `page` holds any byte of the ranges `held`.
+    fn holds(&self, held: &[(usize, usize)], page: usize) -> bool {
+        let n = self.page_len;
+        held.iter()
+            .any(|&(from, to)| from < to && from / n <= page && page <= (to - 1) / n)
+    }
+
+    /// Moves the pages pinned since `mark` that hold any byte of the ranges
+    /// `held` before the others, and returns the mark past them: a walk
+    /// holds them to its end, and [`Self::release_since`] of the mark
+    /// returned need not weigh them again.
+    pub fn hold_since(&self, mark: usize, held: &[(usize, usize)]) -> usize {
+        let mut pinned = self.pinned.borrow_mut();
+        let Some(since) = pinned.get_mut(mark..) else {
+            return mark;
+        };
+        let mut kept = 0;
+        for i in 0..since.len() {
+            if self.holds(held, since[i]) {
+                since.swap(kept, i);
+                kept += 1;
+            }
         }
-        pinned.drain(mark + first..mark + until);
+        mark + kept
     }
 
     /// Releases page `page`, pinned in the open span, and forgets it.
@@ -1214,6 +1244,35 @@ mod tests {
         unsafe { blob.close_span() };
         assert!(state.pinned.borrow().is_empty());
         assert_eq!(blob.loaded(), 0);
+    }
+
+    /// Pages holding a held range move before the mark `hold_since`
+    /// returns: releases to that mark leave them pinned.
+    #[test]
+    fn hold_since_keeps_held_pages_out_of_later_releases() {
+        let (source, blob) = pinning(20 * 100, 100);
+        let state = &source.0;
+        let bytes = blob.bytes();
+        blob.open_span();
+        let mark = blob.pin_mark();
+        for page in [4, 7, 2, 9] {
+            bytes.get(page * 100, page * 100 + 10).unwrap();
+        }
+        let held = bytes.get(705, 710).unwrap();
+        let after = blob.hold_since(mark, &[(705, 710), (950, 960)]);
+        assert_eq!(after, mark + 2);
+        blob.set_keep(0);
+        for page in [11, 12] {
+            bytes.get(page * 100, page * 100 + 10).unwrap();
+        }
+        unsafe { blob.release_since(after, &[]) };
+        let mut kept: Vec<usize> = state.pinned.borrow().keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![7, 9]);
+        assert_eq!(held, &state.bytes[705..710]);
+        unsafe { blob.release_since(mark, &[]) };
+        assert!(state.pinned.borrow().is_empty());
+        unsafe { blob.close_span() };
     }
 
     /// A stitched read releases at once a page it pinned for itself and
