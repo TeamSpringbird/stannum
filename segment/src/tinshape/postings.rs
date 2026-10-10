@@ -776,6 +776,17 @@ impl<'a> Postings<'a> {
     pub fn footer(&self, block_size: u32, max_bucket: u8, adaptive_tf: bool) -> Result<Footer> {
         Footer::parse(self, block_size, max_bucket, adaptive_tf)
     }
+
+    /// The footer, to be decoded a block at a time as a reader reaches its
+    /// blocks ([`LazyFooter`]); its bytes are read now.
+    pub fn lazy_footer(
+        &self,
+        block_size: u32,
+        max_bucket: u8,
+        adaptive_tf: bool,
+    ) -> Result<LazyFooter<'a>> {
+        LazyFooter::new(self, block_size, max_bucket, adaptive_tf)
+    }
 }
 
 /// Bytes of a grouped payload read first for its directory: a few groups'
@@ -846,6 +857,11 @@ fn parse_groups(
     if first != u64::from(df) || at as u64 + body != payload_len as u64 {
         return Err(Error::Corrupt("postings payload length"));
     }
+    super::segment::count_memo(|c| {
+        c.directories += 1;
+        c.directory_entries += groups as u64;
+        c.directory_bytes += at as u64;
+    });
     // SAFETY: the loop wrote every one of the `groups` entries (an error
     // returns before this, dropping the slice as uninitialized memory,
     // which `GroupEntry`, plain data, permits).
@@ -1104,6 +1120,10 @@ impl Footer {
             tf += bits::packed_len(n as usize, width) as u64;
         }
         footer.starts.push(footer.frontier.len() as u32);
+        super::segment::count_memo(|c| {
+            c.footer_blocks += blocks as u64;
+            c.footer_bytes += at as u64;
+        });
         if at != bytes.len() || tf != postings.tf.len() as u64 {
             return Err(Error::Corrupt("footer length"));
         }
@@ -1141,6 +1161,326 @@ impl Footer {
     }
 }
 
+/// A record's footer decoded a block at a time, as far as a reader has
+/// reached: its blocks' entries are variable-length and in a row, so
+/// reaching block `b` parses every entry before it, but an entry passed
+/// over keeps only its last slot, where its frontier starts, its frontier's
+/// length and largest bucket, and where its buckets start in the TF tail
+/// (structures of arrays, so a run of blocks' last slots is a run of
+/// words). A block's frontier pairs are decoded from the bytes when asked
+/// for ([`Self::frontier`]). Nothing is kept beyond the reader: a walk
+/// decodes per query what it reaches.
+#[derive(Clone, Debug)]
+pub struct LazyFooter<'a> {
+    block_size: u32,
+    /// The record's postings and its blocks.
+    df: u32,
+    blocks: usize,
+    adaptive: bool,
+    /// The footer's bytes (the record's, or `own`, rebuilt for a record
+    /// whose footer is derived), and where the next block's entry starts.
+    bytes: &'a [u8],
+    own: Vec<u8>,
+    at: usize,
+    /// The last slot and TF offset after the blocks decoded.
+    next_last: u64,
+    next_tf: u64,
+    /// The TF tail's length, checked once every block is decoded; `None`
+    /// for a single posting, which has none.
+    tf_len: Option<u64>,
+    /// Per decoded block: its last slot; where its frontier's pairs start;
+    /// its frontier's length less one (high nibble) and its largest bucket
+    /// (low nibble); where its buckets start in the TF tail.
+    last: Vec<u32>,
+    pairs_at: Vec<u32>,
+    shape: Vec<u8>,
+    tf_at: Vec<u32>,
+    /// A single posting's bucket, which the dictionary keeps.
+    single: Option<u8>,
+}
+
+impl<'a> LazyFooter<'a> {
+    fn new(postings: &Postings<'a>, block_size: u32, max_bucket: u8, adaptive: bool) -> Result<Self> {
+        let df = postings.df;
+        let blocks = df.div_ceil(block_size.max(1)) as usize;
+        let mut footer = Self {
+            block_size,
+            df,
+            blocks,
+            adaptive,
+            bytes: &[],
+            own: Vec::new(),
+            at: 0,
+            next_last: 0,
+            next_tf: 0,
+            tf_len: Some(postings.tf.len() as u64),
+            last: Vec::new(),
+            pairs_at: Vec::new(),
+            shape: Vec::new(),
+            tf_at: Vec::new(),
+            single: None,
+        };
+        let derived = matches!(postings.form, Form::Single(_)) || postings.compact;
+        if derived {
+            // Derived from the record (a block at most): decoded whole as
+            // ever, then written back in the footer's own encoding.
+            let whole = Footer::parse(postings, block_size, max_bucket, adaptive)?;
+            let mut previous = 0;
+            for b in 0..whole.blocks() {
+                varint::put(&mut footer.own, u64::from(whole.last[b] - previous));
+                previous = whole.last[b];
+                let front = whole.frontier_of(b);
+                footer.own.push(front.len() as u8);
+                for (bucket, length) in front {
+                    footer.own.push(*bucket);
+                    varint::put(&mut footer.own, u64::from(*length));
+                }
+            }
+            footer.single = whole.single;
+            if whole.single.is_some() {
+                footer.tf_len = None;
+            }
+        } else {
+            footer.bytes = postings.footer.all()?;
+            // Room for a footer read through, so the vectors are not grown
+            // and copied as they fill (a block entry takes four bytes or
+            // more as a rule).
+            let likely = (footer.bytes.len() / 4).min(blocks);
+            footer.last.reserve(likely);
+            footer.pairs_at.reserve(likely);
+            footer.shape.reserve(likely);
+            footer.tf_at.reserve(likely);
+        }
+        Ok(footer)
+    }
+
+    #[inline]
+    fn data(&self) -> &[u8] {
+        if self.own.is_empty() {
+            self.bytes
+        } else {
+            &self.own
+        }
+    }
+
+    /// The record's blocks.
+    #[inline]
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    /// Blocks decoded so far.
+    #[inline]
+    pub fn decoded(&self) -> usize {
+        self.last.len()
+    }
+
+    #[inline]
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// A single posting's bucket, which the dictionary keeps.
+    #[inline]
+    pub fn single(&self) -> Option<u8> {
+        self.single
+    }
+
+    /// Decodes the next block's entry; false when every block is.
+    #[inline]
+    fn decode_next(&mut self) -> Result<bool> {
+        let b = self.last.len();
+        if b >= self.blocks {
+            return Ok(false);
+        }
+        let (bytes, mut at) = (self.data(), self.at);
+        let next_last = self.next_last + varint::get(bytes, &mut at)?;
+        let last = u32::try_from(next_last).map_err(|_| Error::Corrupt("footer slot"))?;
+        let k = *bytes.get(at).ok_or(Error::Truncated)? as usize;
+        at += 1;
+        if k == 0 || k > 16 {
+            return Err(Error::Corrupt("footer frontier"));
+        }
+        let pairs_at = at;
+        let mut max = 0u8;
+        for _ in 0..k {
+            let bucket = *bytes.get(at).ok_or(Error::Truncated)?;
+            at += 1;
+            if bucket > 15 {
+                return Err(Error::InvalidTfBucket);
+            }
+            varint::get_u32(bytes, &mut at)?;
+            max = max.max(bucket);
+        }
+        let n = if b + 1 == self.blocks {
+            self.df - b as u32 * self.block_size
+        } else {
+            self.block_size
+        };
+        let width = tf_width(max, self.adaptive);
+        let tf_at = self.next_tf;
+        let next_tf = tf_at + bits::packed_len(n as usize, width) as u64;
+        if b + 1 == self.blocks
+            && (at != bytes.len() || self.tf_len.is_some_and(|len| len != next_tf))
+        {
+            return Err(Error::Corrupt("footer length"));
+        }
+        self.next_last = next_last;
+        self.next_tf = next_tf;
+        self.at = at;
+        self.last.push(last);
+        self.pairs_at.push(pairs_at as u32);
+        self.shape.push(((k - 1) as u8) << 4 | max);
+        self.tf_at.push(tf_at as u32);
+        Ok(true)
+    }
+
+    /// Decodes blocks through `b` (which must be below [`Self::blocks`]).
+    #[inline]
+    pub fn ensure(&mut self, b: usize) -> Result<()> {
+        while self.last.len() <= b {
+            if !self.decode_next()? {
+                return Err(Error::Corrupt("footer block"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The first block from `from` on whose last slot is `slot` or later,
+    /// decoding as far as it; [`Self::blocks`] when there is none. Blocks
+    /// are decoded only up to the one returned.
+    #[inline]
+    pub fn seek(&mut self, from: usize, slot: u32) -> Result<usize> {
+        let mut b = from;
+        loop {
+            if let Some(found) = self.last.get(b..).and_then(|rest| rest.iter().position(|l| *l >= slot)) {
+                return Ok(b + found);
+            }
+            b = b.max(self.last.len());
+            loop {
+                if !self.decode_next()? {
+                    return Ok(self.blocks);
+                }
+                if *self.last.last().expect("just decoded") >= slot && self.last.len() > b {
+                    return Ok(self.last.len() - 1);
+                }
+            }
+        }
+    }
+
+    /// Block `b`'s last slot (decoded).
+    #[inline]
+    pub fn last(&self, b: usize) -> u32 {
+        self.last[b]
+    }
+
+    /// The last slots of the blocks decoded.
+    #[inline]
+    pub fn lasts(&self) -> &[u32] {
+        &self.last
+    }
+
+    /// Block `b`'s largest bucket (decoded).
+    #[inline]
+    pub fn max_bucket(&self, b: usize) -> u8 {
+        self.shape[b] & 15
+    }
+
+    /// Where block `b`'s buckets start in the TF tail (decoded).
+    #[inline]
+    pub fn tf_at(&self, b: usize) -> u32 {
+        self.tf_at[b]
+    }
+
+    /// The width of block `b`'s buckets in the TF tail (decoded).
+    #[inline]
+    pub fn width(&self, b: usize) -> u32 {
+        if self.single.is_some() {
+            return 0;
+        }
+        tf_width(self.max_bucket(b), self.adaptive)
+    }
+
+    /// Block `b`'s frontier (decoded): its (bucket, shortest length) pairs,
+    /// read from the footer's bytes.
+    #[inline]
+    pub fn frontier(&self, b: usize) -> Frontier<'_> {
+        Frontier {
+            bytes: self.data(),
+            at: self.pairs_at[b] as usize,
+            left: usize::from(self.shape[b] >> 4) + 1,
+        }
+    }
+
+    /// The bucket of posting `index`, from its record's TF tail, decoding
+    /// the footer through its block.
+    #[inline]
+    pub fn bucket(&mut self, tf: Bytes<'_>, index: u32) -> Result<u8> {
+        if let Some(bucket) = self.single {
+            return Ok(bucket);
+        }
+        let block = (index / self.block_size) as usize;
+        if block >= self.blocks {
+            return Err(Error::Corrupt("posting index"));
+        }
+        self.ensure(block)?;
+        let width = self.width(block);
+        if width == 0 {
+            return Ok(0);
+        }
+        let bit = (index % self.block_size) as usize * width as usize;
+        let bytes = tf.window(self.tf_at[block] as usize + bit / 8, 8)?;
+        Ok(bits::get_at(bytes, bit % 8, width)? as u8)
+    }
+}
+
+impl Drop for LazyFooter<'_> {
+    /// Counts what was decoded ([`super::segment::MemoCounts`]); a derived
+    /// footer was counted as it was decoded whole.
+    fn drop(&mut self) {
+        if self.own.is_empty() && !self.last.is_empty() {
+            let (blocks, bytes) = (self.last.len() as u64, self.at as u64);
+            super::segment::count_memo(|c| {
+                c.footers_decoded += 1;
+                c.footer_blocks += blocks;
+                c.footer_bytes += bytes;
+            });
+        }
+    }
+}
+
+/// A footer block's frontier pairs, decoded as they are read
+/// ([`LazyFooter::frontier`]); the block's entry was checked when decoded.
+#[derive(Clone, Debug)]
+pub struct Frontier<'b> {
+    bytes: &'b [u8],
+    at: usize,
+    left: usize,
+}
+
+impl Iterator for Frontier<'_> {
+    type Item = (u8, u32);
+
+    #[inline]
+    fn next(&mut self) -> Option<(u8, u32)> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let bucket = self.bytes[self.at];
+        self.at += 1;
+        let length = varint::get_u32(self.bytes, &mut self.at).unwrap_or(0);
+        Some((bucket, length))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for Frontier<'_> {}
+
 #[cfg(test)]
 mod tests {
     use super::super::docs::Geometry;
@@ -1175,6 +1515,7 @@ mod tests {
                 "posting {i}"
             );
         }
+        check_lazy(&parsed, &footer, options, max);
         // Every posting is covered by its block's frontier, and the last
         // slot of each block is right.
         for b in 0..footer.blocks() {
@@ -1198,6 +1539,56 @@ mod tests {
             }
         }
         stats
+    }
+
+    /// The footer decoded a block at a time agrees with the whole one:
+    /// sought block by block, asked for a bucket first, and sought past
+    /// its end.
+    fn check_lazy(parsed: &Postings<'_>, footer: &Footer, options: &Options, max: u8) {
+        let lazy = || {
+            parsed
+                .lazy_footer(options.block_size, max, options.adaptive_tf)
+                .unwrap()
+        };
+        let mut l = lazy();
+        assert_eq!(l.blocks(), footer.blocks());
+        assert_eq!(l.decoded(), 0);
+        for b in 0..footer.blocks() {
+            assert_eq!(l.seek(b, footer.last[b]).unwrap(), b, "block {b}");
+            assert_eq!(l.last(b), footer.last[b]);
+            let front: Vec<(u8, u32)> = l.frontier(b).collect();
+            assert_eq!(front, footer.frontier_of(b), "frontier of {b}");
+            assert_eq!(l.max_bucket(b), footer.frontier_of(b).last().unwrap().0);
+            assert_eq!(l.tf_at(b), footer.tf_at[b]);
+            assert_eq!(l.width(b), u32::from(footer.widths[b]));
+            // A block is decoded only once the walk reaches it.
+            assert_eq!(l.decoded(), b + 1);
+        }
+        assert_eq!(l.seek(0, u32::MAX).unwrap(), footer.blocks());
+        assert_eq!(l.seek(0, 0).unwrap(), 0);
+        // A bucket asked for first decodes its block's prefix only.
+        let df = parsed.df;
+        let mut l = lazy();
+        let i = df - 1;
+        assert_eq!(
+            l.bucket(parsed.tf, i).unwrap(),
+            footer.bucket(parsed.tf, i).unwrap()
+        );
+        for i in 0..df {
+            assert_eq!(
+                l.bucket(parsed.tf, i).unwrap(),
+                footer.bucket(parsed.tf, i).unwrap(),
+                "posting {i}"
+            );
+        }
+        // Sought from the start for each block's first slot.
+        let mut l = lazy();
+        let mut from = 0;
+        for b in 0..footer.blocks() {
+            let first = if b == 0 { 0 } else { footer.last[b - 1] + 1 };
+            from = l.seek(from, first).unwrap();
+            assert_eq!(from, b);
+        }
     }
 
     fn all_options() -> Vec<Options> {
@@ -1399,5 +1790,58 @@ mod tests {
             let buckets: Vec<u8> = buckets[..members.len()].iter().map(|b| if b % 3 == 0 { *b } else { 0 }).collect();
             check_all(&tids, &members, &buckets);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod lazy_footer_tests {
+    use super::super::docs::Geometry;
+    use super::*;
+    use crate::Tid;
+
+    #[test]
+    fn lazy_footer_rejects_corruption() {
+        let tids: Vec<Tid> = (0..10u32)
+            .map(|b| Tid {
+                block: b * 3,
+                offset: 1,
+            })
+            .collect();
+        let geometry = Geometry::of(&tids).unwrap();
+        let slots: Vec<u32> = tids.iter().map(|t| geometry.slot_of(*t).unwrap()).collect();
+        let options = Options {
+            block_size: 2,
+            grid_min_postings: u32::MAX,
+            inline_lengths_max_df: 0,
+            ..Options::default()
+        };
+        let mut out = Vec::new();
+        encode(&geometry, &slots, &[1; 10], &[5; 10], &options, &mut out);
+        let parsed = Postings::parse(&out, 10, &geometry).unwrap();
+        let bytes = parsed.footer.all().unwrap().to_vec();
+        let with = |footer: &[u8]| {
+            let mut p = parsed.clone();
+            p.footer = Bytes::Slice(footer);
+            p.lazy_footer(2, 1, true).and_then(|mut l| l.seek(0, u32::MAX))
+        };
+        assert_eq!(with(&bytes).unwrap(), 5);
+        // Truncated, one byte too many, a frontier of no pairs.
+        assert!(with(&bytes[..bytes.len() - 1]).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(with(&longer).is_err());
+        let mut empty = bytes.clone();
+        let mut k = 0;
+        varint::get(&bytes, &mut k).unwrap();
+        empty[k] = 0;
+        assert!(with(&empty).is_err());
+        // A prefix decodes before the corruption past it shows.
+        let mut l = {
+            let mut p = parsed.clone();
+            p.footer = Bytes::Slice(&bytes[..bytes.len() - 1]);
+            p.lazy_footer(2, 1, true).unwrap()
+        };
+        assert_eq!(l.seek(0, slots[0]).unwrap(), 0);
     }
 }
