@@ -365,6 +365,7 @@ def build_image(args):
                  '--build-arg', 'RECIPE_SHA256=' + recipe] +
                 (['--build-arg', 'BASE=' + args.base] if getattr(args, 'base', None) else []) +
                 (['--build-arg', 'STANNUM_TARGET_CPU=' + args.target_cpu] if getattr(args, 'target_cpu', None) else []) +
+                (['--build-arg', 'STANNUM_PGO=' + args.pgo] if getattr(args, 'pgo', None) else []) +
                 ['-t', args.image, '.'],
                 cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     bench.save(args.output / 'image.json', json.loads(output(['docker', 'image', 'inspect', args.image])))
@@ -1416,6 +1417,9 @@ def parser():
     p.add_argument('--base', help='Base image for a rehearsal on another architecture; the published runs use the pinned ParadeDB image')
     p.add_argument('--target-cpu', help='x86-64 only: STANNUM_TARGET_CPU build argument (x86-64-v3, x86-64-v4); '
                                         'unset builds the baseline with runtime SIMD dispatch')
+    p.add_argument('--pgo', choices=('1', 'generate'),
+                   help='STANNUM_PGO build argument: 1 optimizes with benchmarks/pgo/<arch>.profdata, '
+                        'generate builds the instrumented library script/pgo-build trains')
     common = argparse.ArgumentParser(add_help=False)
     p = common
     p.add_argument('--output', type=Path, required=True)

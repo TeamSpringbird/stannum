@@ -150,6 +150,50 @@ settings), the correctness outputs, per-query and per-family latency, and
 resource counters to its output directory. Keep results and connection
 credentials out of Git.
 
+## Profile-guided builds
+
+`build-image --pgo 1` (the Dockerfile's `STANNUM_PGO=1`) compiles the
+extension with `-C profile-use` and the committed profile for the image's
+architecture, `benchmarks/pgo/<arch>.profdata` (`uname -m`: `aarch64`
+today). Without it, builds are as before. A profile changes code layout,
+inlining and branch weights only; answers and formats do not change.
+
+The profile has to be trained by the extension itself, in PostgreSQL. The
+offline replay (`bench --bin tnsreplay`) cannot stand in: its hot walk is
+`Walk<T>` instantiated over the replay's page type, its `engine` is built
+with other features, and so every function the extension compiles has
+another symbol and no profile. A replay profile does speed the replay up,
+which is what `script/pgo-build replay` is for.
+
+To retrain, on a host of that architecture with a copy of a saved 150M
+database (`--save-database`; the server writes to it):
+
+```sh
+STANNUM_PYTHON=/path/to/python-with-psycopg \
+  script/pgo-build image --data COPY_OF_DB --trace trace.tsv
+python3 benchmarks/tin.py build-image --pgo 1 --image TAG --output DIR ...
+```
+
+`trace.tsv` is `script/replay-oracle.py trace` over the published queries.
+`pgo-build image` builds the instrumented image (`--pgo generate`), runs
+every query of the trace through the benchmark's ranked statement once with
+`stannum.score` and once with `stannum.full_score`, stops the server so
+that each backend writes its counts, and merges them with the toolchain's
+`llvm-profdata` (`rustup component add llvm-tools`) into
+`benchmarks/pgo/<arch>.profdata`. The run takes about 15 minutes. Commit
+the new profile with the change that made it stale.
+
+**Staleness.** Each function's counts are keyed by its symbol name and a
+hash of its control flow. A function whose code changes, or whose symbol
+changes (a new crate hash after a dependency, feature or toolchain change),
+loses its profile silently: the build stays correct and that function is
+optimized as without PGO. The merge is `--sparse`, so code the training
+never ran (counts, writes, VACUUM) also has no profile, rather than a
+profile that marks it cold. Retrain after a change to the walk, the
+decoders or the toolchain, and after anything that moves the hot path; an
+A/B of the old and new profile shows whether it was needed. An x86-64
+profile has to be trained on x86-64.
+
 ## Matching TIN v1.0.6's published setup
 
 Benchmarks v2 reproduces the setup of PlanetScale's

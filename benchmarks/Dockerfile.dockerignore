@@ -12,4 +12,5 @@
 !segment/**
 !engine/**
 !bench/**
+!benchmarks/pgo/**
 **/target/**

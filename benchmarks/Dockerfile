@@ -46,8 +46,22 @@ COPY bench bench
 # way). Set per target, not as RUSTFLAGS, which would replace
 # .cargo/config.toml's link flags.
 ARG STANNUM_TARGET_CPU=
+# Profile-guided optimization (docs/architecture/pgo.md). Empty: none. 1: use
+# the committed profile for this architecture, benchmarks/pgo/<arch>.profdata.
+# generate: an instrumented build whose backends write raw profiles under
+# /var/lib/postgresql/pgo-raw (script/pgo-build trains one).
+ARG STANNUM_PGO=
+COPY benchmarks/pgo benchmarks/pgo
 # Keep optimized code and line tables for the owned perf diagnostics.
-RUN CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${STANNUM_TARGET_CPU:+-C target-cpu=$STANNUM_TARGET_CPU}" \
+RUN case "$STANNUM_PGO" in \
+      "") pgo= ;; \
+      generate) pgo="-C profile-generate=/var/lib/postgresql/pgo-raw" ;; \
+      1) pgo="-C profile-use=/src/benchmarks/pgo/$(uname -m).profdata -C llvm-args=-no-pgo-warn-mismatch" \
+         && test -s "benchmarks/pgo/$(uname -m).profdata" ;; \
+      *) echo "STANNUM_PGO is empty, 1 or generate" >&2; exit 2 ;; \
+    esac \
+    && CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${STANNUM_TARGET_CPU:+-C target-cpu=$STANNUM_TARGET_CPU} $pgo" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="$pgo" \
     CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none cargo pgrx install --package stannum --no-default-features --features pg18 --release
 
 FROM runtime
@@ -56,7 +70,8 @@ ARG STANNUM_SOURCE_SHA256=unknown
 ARG STANNUM_COMMIT=unknown
 ARG RECIPE_SHA256=unknown
 ARG STANNUM_TARGET_CPU=
-LABEL benchmark.stannum_source_sha256=${STANNUM_SOURCE_SHA256} benchmark.stannum_commit=${STANNUM_COMMIT} benchmark.recipe_sha256=${RECIPE_SHA256} benchmark.stannum_target_cpu=${STANNUM_TARGET_CPU}
+ARG STANNUM_PGO=
+LABEL benchmark.stannum_source_sha256=${STANNUM_SOURCE_SHA256} benchmark.stannum_commit=${STANNUM_COMMIT} benchmark.recipe_sha256=${RECIPE_SHA256} benchmark.stannum_target_cpu=${STANNUM_TARGET_CPU} benchmark.stannum_pgo=${STANNUM_PGO}
 COPY --from=builder /usr/lib/postgresql/18/lib/stannum.so /usr/lib/postgresql/18/lib/
 COPY --from=builder /usr/share/postgresql/18/extension/stannum* /usr/share/postgresql/18/extension/
 COPY --from=builder /usr/lib/postgresql/18/lib/pg_textsearch.so /usr/lib/postgresql/18/lib/
