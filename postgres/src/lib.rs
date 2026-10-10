@@ -8218,6 +8218,47 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_backend_that_cannot_attach_the_shared_hints_answers_through_its_own() {
+        // The table lives in dynamic shared memory created on first use; a
+        // failure there (no room in /dev/shm, no free segment slot) raises
+        // an error with the registry's locks held. The attach runs in a
+        // subtransaction of its own, so the error is rolled back with what
+        // it took, and the backend goes on with its own table.
+        use crate::storage::testing::{
+            HINTS_SIZE_SKEW, clear_reader_caches, forget_recent_buffers, reattach_shared_hints,
+        };
+        let ranked = buffer_hint_fixture();
+        let first = ranked();
+        assert!(reattach_shared_hints(), "the shared table was not attached");
+        // A size other than the existing segment's: the attach fails.
+        HINTS_SIZE_SKEW.set(1);
+        forget_recent_buffers();
+        clear_reader_caches();
+        let failed = ranked();
+        HINTS_SIZE_SKEW.set(0);
+        assert_eq!(failed, first);
+        assert!(
+            !reattach_shared_hints(),
+            "a failed attach left the table attached"
+        );
+        // A transaction-level statement after the rolled-back attach.
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM hints").unwrap(),
+            Some(20000)
+        );
+        assert_eq!(ranked(), first);
+        assert!(
+            reattach_shared_hints(),
+            "the attach failed again with the right size"
+        );
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(
+            recent * 10 >= pins * 9,
+            "{recent} of {pins} pinned through hints"
+        );
+    }
+
+    #[pg_test]
     fn a_page_pinned_through_its_buffer_counts_as_used() {
         // `ReadRecentBuffer` pins without raising the buffer's usage count,
         // which `ReadBuffer` raises (up to 5) on every pin: with nearly all

@@ -1101,6 +1101,8 @@ unsafe fn shared_hints() -> Option<&'static [std::sync::atomic::AtomicU64]> {
         pg_sys::BeginInternalSubTransaction(std::ptr::null());
         let attached = pgrx::PgTryBuilder::new(|| {
             let mut found = false;
+            #[cfg(feature = "pg_test")]
+            let len = len + testing::HINTS_SIZE_SKEW.get();
             let at = pg_sys::GetNamedDSMSegment(
                 SHARED_HINTS_NAME.as_ptr(),
                 len * 8,
@@ -5349,6 +5351,9 @@ pub mod testing {
         /// Raise an error at the end of every native read, with what it
         /// read still pinned.
         pub static NATIVE_READ_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Entries added to the shared hint table's size when attaching: a
+        /// size other than the existing segment's makes the attach fail.
+        pub static HINTS_SIZE_SKEW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// Bytes the cached segments' blobs copied in and keep.
@@ -5395,6 +5400,14 @@ pub mod testing {
                     .count()
             }),
         }
+    }
+
+    /// Has this backend attach the shared hint table again on its next
+    /// pin; whether it is attached now.
+    pub fn reattach_shared_hints() -> bool {
+        let attached = matches!(SHARED_HINTS.get(), SharedHints::Attached { .. });
+        SHARED_HINTS.set(SharedHints::Unknown);
+        attached
     }
 
     /// Forgets the buffers this backend pinned pages in, in its own hint
