@@ -33,16 +33,32 @@ naming any that is missing. Install the Python packages from
 
 ## Scripts
 
-- `mock-build.sh [mock15m|150m] IMAGE` builds the database of that profile
+- `mock-build.sh [PROFILE] IMAGE` builds the database of that profile
   (default the 15M prefix) once and saves it to `$STANNUM_MOCK/db`. A saved
   database is only valid for the segment format its image wrote. It waits up
-  to `STANNUM_IMAGE_WAIT_SECONDS` (3600) for the image.
+  to `STANNUM_IMAGE_WAIT_SECONDS` (3600) for the image. `STANNUM_ENGINE=paradedb`
+  builds ParadeDB 0.26.0's database instead.
 - `workload.sh PROFILE IMAGE LABEL STYLE UPDATES [SECONDS]` runs a workload from
-  that copy and prints one line: QPS, latency, disk read per query and CPU.
-  `PROFILE` is `mock15m` or `150m`; the latter sizes the container like the
-  instance for a full-corpus database. `run150m.sh IMAGE LABEL STYLE UPDATES
+  that copy and prints one line: QPS, latency, index MiB per query (TIN's
+  MB/query), disk read per query and CPU. `run150m.sh IMAGE LABEL STYLE UPDATES
   [SECONDS]` is shorthand for the `150m` profile. `report.py` prints the line and
-  can be rerun on an existing run directory.
+  can be rerun on an existing run directory. `STANNUM_ENGINE`,
+  `STANNUM_SCORE_FUNCTION` and `STANNUM_CPU_LAYOUT` select ParadeDB, full
+  scoring and the CPU reading.
+
+Profiles:
+
+| Profile | Rows | Server |
+| --- | ---: | --- |
+| `150m` | 150M | benchmarks v2, TIN v1.0.6's setup: 64g, 24GB shared buffers, 8 pinned CPUs (`tin.py --profile v2`) |
+| `150m-legacy` | 150M | AWS r5 to r8: 64g build, 32g queries, 8 CPUs by quota (`--profile legacy`) |
+| `mock15m` | 15M | 5g (12g build), 2GB shared buffers, 8 CPUs by quota |
+| `smoke1m` | 1M | v2's pinning and settings, memory scaled down (2g, 512MB shared buffers) |
+
+The full v2 campaign (every scenario, Stannum's two scorings and ParadeDB,
+then the comparison with the published numbers) is `benchmarks/v2.py
+campaign`; see "Matching TIN v1.0.6's published setup" in
+[docs/benchmarks.md](../../docs/benchmarks.md) for its commands.
 - `mock-probe.py IMAGE LABEL [N]` reports pages touched, candidates scored, disk
   read and time per query, with the cache dropped before each.
 - `attrib.py IMAGE [WARM] [STEADY]` reconciles read counters per query style.
@@ -58,7 +74,9 @@ A database saved by an image of an earlier segment format does not load into
 a `TNS1` build (page layout version 6); build one afresh. The build takes
 hours (`STN3`'s took five at 150M rows on AWS) and its container gets 64 GB,
 so raise the OrbStack VM first (that restarts the VM and bounces its other
-containers) and lower it again before measuring.
+containers) and lower it again before measuring. These commands are the
+legacy setup's (TNS1 was measured that way); for v2 the queries get 64 GB
+too, so keep the VM at its 100 GiB and use the `150m` profile.
 
 ```sh
 # The branch's commit in a checkout of its own, so the working tree may move
@@ -85,13 +103,13 @@ export STANNUM_SOURCE=$STANNUM_MOCK/image-$SHA/source.json
 # Build and save: import, CREATE INDEX, VACUUM ANALYZE and validation, then
 # the data volume copied to $STANNUM_MOCK/db.
 orb config set memory_mib 81920 && orb stop && orb start
-(cd "$SRC" && bash benchmarks/local/mock-build.sh 150m "$IMAGE")
+(cd "$SRC" && bash benchmarks/local/mock-build.sh 150m-legacy "$IMAGE")
 
 # Measure from the saved database, the VM back near the instance's size.
 orb config set memory_mib 40960 && orb stop && orb start
-(cd "$SRC" && bash benchmarks/local/run150m.sh "$IMAGE" tns1 mixed 0 600)
-(cd "$SRC" && bash benchmarks/local/run150m.sh "$IMAGE" tns1 conjunction-phrase 0 600)
-(cd "$SRC" && bash benchmarks/local/run150m.sh "$IMAGE" tns1 disjunction 100 600)
+(cd "$SRC" && bash benchmarks/local/workload.sh 150m-legacy "$IMAGE" tns1 mixed 0 600)
+(cd "$SRC" && bash benchmarks/local/workload.sh 150m-legacy "$IMAGE" tns1 conjunction-phrase 0 600)
+(cd "$SRC" && bash benchmarks/local/workload.sh 150m-legacy "$IMAGE" tns1 disjunction 100 600)
 ```
 
 Each run prints its line and keeps its results under

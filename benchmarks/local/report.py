@@ -65,7 +65,7 @@ def workload_line(run_dir, label, style, updates, seconds):
         return f'{head} (no comparison; see {run_dir}.log) {(job.get("error") or "")[:200]}'
     c = comparison[0]
     try:
-        with (run_dir / 'stannum' / 'resources.jsonl').open() as stream:
+        with (run_dir / job.get('engine', 'stannum') / 'resources.jsonl').open() as stream:
             window = measurement_window(json.loads(line) for line in stream)
     except OSError:
         window = []
@@ -76,9 +76,13 @@ def workload_line(run_dir, label, style, updates, seconds):
     else:
         gb = cores = math.nan
     per_query = gb * 1024 / c['completed'] if c['completed'] else math.nan
+    # TIN's MB/query is the benchmarker's PER QUERY: index blocks read + hit, not disk reads.
+    index_per_query = c.get('index_mib_per_query')
+    index_per_query = math.nan if index_per_query is None else index_per_query
     families = ' '.join(f"{f} p50 {v['p50_ms']:.0f}" for f, v in c['families'].items())
     return (f"{head} {c['completed'] / seconds:.1f} QPS p50 {c['p50_ms']:.0f} p95 {c['p95_ms']:.0f} "
-            f"p99 {c['p99_ms']:.0f} ms | disk read {gb:.1f} GB ({per_query:.1f} MB/query) "
+            f"p99 {c['p99_ms']:.0f} ms | index {index_per_query:.1f} MiB/query (TIN's MB/query) | "
+            f"disk read {gb:.1f} GB ({per_query:.1f} MB/query) "
             f"cpu {cores:.2f} cores | {families}")
 
 
@@ -88,7 +92,7 @@ def build_lines(run_dir, seconds):
     job = (manifest.get('jobs') or [{}])[0]
     lines = [f"status {manifest.get('status', 'missing')} {job.get('status')} {(job.get('error') or '')[:200]}",
              f"import {round(job.get('import_seconds', 0))} build {round(job.get('index_build_seconds', 0))} "
-             f"segments {len(job.get('segments_after_build', []))} sizes {job.get('sizes')}"]
+             f"segments {(lambda s: s if isinstance(s, int) else len(s))(job.get('segments_after_build', []))} sizes {job.get('sizes')}"]
     comparison = load(run_dir / 'comparison.json')
     if comparison:
         c = comparison[0]

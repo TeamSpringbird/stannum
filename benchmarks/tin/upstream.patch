@@ -48,7 +48,7 @@ index 9535787..c419175 100644
  
  // CaptureConfig captures database configuration and registers it with metrics.
 diff --git a/benchmarks/queries.js b/benchmarks/queries.js
-index 8f40f68..bf511ec 100644
+index 8f40f68..804c4d2 100644
 --- a/benchmarks/queries.js
 +++ b/benchmarks/queries.js
 @@ -1,4 +1,5 @@
@@ -85,12 +85,45 @@ index 8f40f68..bf511ec 100644
    const entries = contents.queries.flatMap((record) =>
      styles.map((queryStyle) => ({ record, style: queryStyle })),
    );
-@@ -115,6 +116,13 @@ export function buildRequest(backend, workload, entry, topK) {
+@@ -82,9 +83,17 @@ function argument(entry, backend, form = entry.style) {
+   return value;
+ }
+ 
+-export function buildRequest(backend, workload, entry, topK) {
++// Native ParadeDB match operators by query family (TIN v1.0.6 post: "|||, &&&, ###").
++const paradedbOperators = { conjunction: "&&&", disjunction: "|||", phrase: "###" };
++
++export function buildRequest(backend, workload, entry, topK, options = {}) {
+   if (!Number.isInteger(topK) || topK < 1)
+     throw new Error("TOP_K must be a positive integer");
++  const { scoreFunction = "score", paradedbForm = "parse" } = options;
++  if (!["score", "full_score"].includes(scoreFunction))
++    throw new Error("STANNUM_SCORE_FUNCTION must be score or full_score");
++  if (!["parse", "operators"].includes(paradedbForm))
++    throw new Error("PARADEDB_QUERY_FORM must be parse or operators");
+   selectBackends(backend, workload, entry.style);
+   const count = workload === "count";
+   if (backend === "elasticsearch") {
+@@ -104,6 +113,13 @@ export function buildRequest(backend, workload, entry, topK) {
+       },
+     ];
+   }
++  if (backend === "paradedb" && paradedbForm === "operators") {
++    const fields = count ? "count(*)" : "id, body, pdb.score(id) AS score";
++    return [
++      `SELECT ${fields} FROM documents WHERE body ${paradedbOperators[entry.style]} $1${count ? "" : ` ORDER BY score DESC LIMIT ${topK}`}`,
++      argument(entry, backend, "match"),
++    ];
++  }
+   if (backend === "paradedb") {
+     const match = !count && entry.style === "disjunction";
+     const predicate = match
+@@ -115,6 +131,13 @@ export function buildRequest(backend, workload, entry, topK) {
        argument(entry, backend, match ? "match" : entry.style),
      ];
    }
 +  if (backend === "stannum") {
-+    const fields = count ? "count(*)" : "id, body, stannum.score(ctid) AS score";
++    const fields = count ? "count(*)" : `id, body, stannum.${scoreFunction}(ctid) AS score`;
 +    return [
 +      `SELECT ${fields} FROM documents WHERE body ==> $1${count ? "" : ` ORDER BY score DESC LIMIT ${topK}`}`,
 +      argument(entry, "tin"),
@@ -100,10 +133,18 @@ index 8f40f68..bf511ec 100644
      const fields = count
        ? "count(*)"
 diff --git a/benchmarks/search.js b/benchmarks/search.js
-index d901e5a..ecb07c3 100644
+index d901e5a..803c575 100644
 --- a/benchmarks/search.js
 +++ b/benchmarks/search.js
-@@ -34,6 +34,7 @@ const requests = Object.fromEntries(
+@@ -30,10 +30,14 @@ const entries = selectQueries(
+ const requests = Object.fromEntries(
+   names.map((name) => [
+     name,
+-    entries.map((entry) => buildRequest(name, workload, entry, topK)),
++    entries.map((entry) => buildRequest(name, workload, entry, topK, {
++      scoreFunction: __ENV.STANNUM_SCORE_FUNCTION || "score",
++      paradedbForm: __ENV.PARADEDB_QUERY_FORM || "parse",
++    })),
    ]),
  );
  const connections = {
@@ -111,7 +152,7 @@ index d901e5a..ecb07c3 100644
    paradedb: `postgres://postgres:postgres@127.0.0.1:${__ENV.PARADEDB_PORT}/benchmark`,
    pg_textsearch: `postgres://postgres:postgres@127.0.0.1:${__ENV.PG_TEXTSEARCH_PORT}/benchmark`,
    postgres: `postgres://postgres:postgres@127.0.0.1:${__ENV.POSTGRES_PORT}/benchmark`,
-@@ -44,7 +45,7 @@ const backends = db.backends({
+@@ -44,7 +48,7 @@ const backends = db.backends({
    backends: names.map((type) => ({
      type,
      connection: connections[type],
@@ -120,7 +161,7 @@ index d901e5a..ecb07c3 100644
    })),
  });
  const phases = db.phases({
-@@ -111,7 +112,7 @@ export function queryPhase() {
+@@ -111,7 +115,7 @@ export function queryPhase() {
    const name = __ENV.ACTIVE_BACKEND;
    const client = backends.get(name);
    const relation =

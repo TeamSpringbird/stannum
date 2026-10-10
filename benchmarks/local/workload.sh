@@ -7,31 +7,47 @@
 #
 #   workload.sh PROFILE IMAGE LABEL STYLE UPDATES [SECONDS]
 #
-# PROFILE is mock15m (the 15M-row prefix: 5g container, 2GB shared buffers) or
-# 150m (the full corpus: 32g container, 24GB shared buffers). SECONDS defaults
-# to 180. Required environment:
+# PROFILE sets the corpus size and the server's sizing:
+#   150m         the full corpus, benchmarks v2: TIN v1.0.6's setup (tin.py --profile v2:
+#                64g, 24GB shared buffers, 8 CPUs pinned, the default; see docs/benchmarks.md)
+#   150m-legacy  the full corpus as AWS r5-r8 ran it (32g, 8 CPUs by quota, unpinned)
+#   mock15m      the 15M-row prefix: 5g container, 2GB shared buffers
+#   smoke1m      a 1M-row prefix in the v2 shape with memory scaled down (2g, 512MB buffers)
+# SECONDS defaults to 180. Required environment:
 #   STANNUM_MOCK     directory holding the saved database in db/; runs go to runs/
 #   STANNUM_DRIVER   prepared benchmark driver (tin.py --driver)
 #   STANNUM_DATASET  the published StackExchange dataset directory
-# Optional: STANNUM_EXTRA_ARGS (more tin.py run arguments, split on spaces, e.g.
-#   "--before-measure-sql delete.sql"), STANNUM_SOURCE (a source.json to pin the image's provenance) and
-# STANNUM_DOCKER_RUN_ARGS (defaults to the NVMe read caps below).
+# Optional: STANNUM_ENGINE (stannum, the default, or paradedb: ParadeDB 0.26.0, the
+#   calibration engine; its saved database is a ParadeDB one), STANNUM_SCORE_FUNCTION
+#   (score or full_score: TIN or TIN_FULL), STANNUM_CPU_LAYOUT (siblings, distinct-cores or
+#   none; overrides the profile's), STANNUM_EXTRA_ARGS (more tin.py run arguments, split on
+#   spaces, e.g. "--before-measure-sql delete.sql"), STANNUM_SOURCE (a source.json to pin the
+#   image's provenance) and STANNUM_DOCKER_RUN_ARGS (defaults to the NVMe read caps below).
 set -euo pipefail
 usage() {
-  echo "usage: $0 mock15m|150m IMAGE LABEL STYLE UPDATES [SECONDS]" >&2
+  echo "usage: $0 150m|150m-legacy|mock15m|smoke1m IMAGE LABEL STYLE UPDATES [SECONDS]" >&2
   echo "  needs STANNUM_MOCK, STANNUM_DRIVER and STANNUM_DATASET; see the script's header" >&2
   exit 2
 }
 [ $# -ge 5 ] && [ $# -le 6 ] || usage
 PROFILE=$1; IMG=$2; LABEL=$3; STYLE=$4; UPDATES=$5; SECONDS_=${6:-180}
 case $PROFILE in
-  mock15m) ROWS=15000000; CHECKS=(--validation-queries 2 --ranked-validation-queries 1)
-           SIZES=(--memory 5g --build-memory 12g --shared-buffers 2GB --maintenance-work-mem 4GB) ;;
-  150m)    ROWS=150000000; CHECKS=(--validation-queries 10 --ranked-validation-queries 2)
-           SIZES=(--memory 32g --build-memory 64g --shared-buffers 24GB --maintenance-work-mem 24GB) ;;
-  *) echo "unknown profile '$PROFILE' (mock15m or 150m)" >&2; usage ;;
+  150m)        ROWS=150000000; CHECKS=(--validation-queries 10 --ranked-validation-queries 2)
+               SIZES=(--profile v2) ;;
+  150m-legacy) ROWS=150000000; CHECKS=(--validation-queries 10 --ranked-validation-queries 2)
+               SIZES=(--profile legacy) ;;
+  mock15m)     ROWS=15000000; CHECKS=(--validation-queries 2 --ranked-validation-queries 1)
+               SIZES=(--clients 8 --cpus 8 --memory 5g --build-memory 12g --shared-buffers 2GB --maintenance-work-mem 4GB) ;;
+  smoke1m)     ROWS=1000000; CHECKS=(--validation-queries 6 --ranked-validation-queries 2)
+               SIZES=(--profile v2 --memory 2g --build-memory 4g --shared-buffers 512MB --maintenance-work-mem 1GB --shm-size 1g) ;;
+  *) echo "unknown profile '$PROFILE'" >&2; usage ;;
 esac
 [[ $UPDATES =~ ^[0-9]+$ ]] || { echo "UPDATES must be a whole number, not '$UPDATES'" >&2; usage; }
+ENGINE=${STANNUM_ENGINE:-stannum}
+case $ENGINE in stannum|paradedb) ;; *) echo "STANNUM_ENGINE must be stannum or paradedb" >&2; usage ;; esac
+SCORE=${STANNUM_SCORE_FUNCTION:-score}
+LAYOUT=()
+[ -z "${STANNUM_CPU_LAYOUT:-}" ] || LAYOUT=(--cpu-layout "$STANNUM_CPU_LAYOUT")
 : "${STANNUM_MOCK:?set STANNUM_MOCK to the directory holding the saved database (db/)}"
 : "${STANNUM_DRIVER:?set STANNUM_DRIVER to the prepared benchmark driver directory}"
 : "${STANNUM_DATASET:?set STANNUM_DATASET to the published StackExchange dataset directory}"
@@ -42,6 +58,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 # i7i.8xlarge NVMe delivered inside the container (13.8M reads and 241 GB in 688 s).
 export STANNUM_DOCKER_RUN_ARGS="${STANNUM_DOCKER_RUN_ARGS:---device-read-iops /dev/vdb:20000 --device-read-bps /dev/vdb:400mb}"
 R=$STANNUM_MOCK/runs/$LABEL-$STYLE-u$UPDATES
+[ "$ENGINE" = stannum ] || R=$R-$ENGINE
+[ "$SCORE" = score ] || R=$R-$SCORE
 rm -rf "$R" "$R.log"; mkdir -p "$(dirname "$R")"
 
 # Validation warms the VM's global page cache with pages that stay cached, uncharged, after
@@ -49,7 +67,7 @@ rm -rf "$R" "$R.log"; mkdir -p "$(dirname "$R")"
 # so the run reads the index cold except for its own shared buffers, as on AWS.
 (
   for _ in $(seq 1 3000); do
-    if [ -f "$R/stannum/resources.jsonl" ] && tail -n 1 "$R/stannum/resources.jsonl" | grep -q driver-warmup-and-measurement; then
+    if [ -f "$R/$ENGINE/resources.jsonl" ] && tail -n 1 "$R/$ENGINE/resources.jsonl" | grep -q driver-warmup-and-measurement; then
       docker run --rm --privileged alpine sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
       echo "dropped caches at measurement start $(date)" >> "$R.log"
       exit 0
@@ -61,10 +79,11 @@ WATCHER=$!
 trap 'kill "$WATCHER" 2>/dev/null || true' EXIT
 
 status=0
+# shellcheck disable=SC2086 # STANNUM_EXTRA_ARGS is split on spaces by design
 python3 benchmarks/tin.py --driver "$STANNUM_DRIVER" run ${STANNUM_SOURCE:+--source-manifest "$STANNUM_SOURCE"} \
   --published-corpus stackexchange --dataset "$STANNUM_DATASET" --rows "$ROWS" \
-  --validation-rows 1000 "${CHECKS[@]}" --engines stannum --workload topk --style "$STYLE" --updates "$UPDATES" \
-  --warmup 10 --seconds "$SECONDS_" --clients 8 --cpus 8 "${SIZES[@]}" \
+  --validation-rows 1000 "${CHECKS[@]}" --engines "$ENGINE" --workload topk --style "$STYLE" --updates "$UPDATES" \
+  --score-function "$SCORE" --warmup 10 --seconds "$SECONDS_" "${SIZES[@]}" ${LAYOUT[@]+"${LAYOUT[@]}"} \
   --setup-timeout-seconds 14400 --load-database "$STANNUM_MOCK/db" --image "$IMG" --output "$R" \
   ${STANNUM_EXTRA_ARGS:-} >> "$R.log" 2>&1 || status=$?
 python3 benchmarks/local/report.py workload "$R" "$LABEL" "$STYLE" "$UPDATES" "$SECONDS_"
