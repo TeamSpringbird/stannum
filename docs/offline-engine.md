@@ -76,7 +76,9 @@ PGHOST=127.0.0.1 PGPORT=55432 PGUSER=postgres PGPASSWORD=postgres \
     --data-directory /tmp/db-copy/18/docker --out DIR
 ```
 
-The script reads page layout version 6; it prints each blob's signature.
+The script reads page layout versions 6 and 7 (7's directories carry group
+frontiers; `tnsreencode` adds them to a version 6 dump, below); it prints
+each blob's signature.
 The `replay` binary reads `STN3` segments; an index of the current format
 (`TNS1`) is replayed by `tnsreplay` (below). A saved database can be
 copied without using disk space with `cp -c -R` (APFS clones) and served

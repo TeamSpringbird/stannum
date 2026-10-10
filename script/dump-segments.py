@@ -35,13 +35,16 @@ PAGE_SIZE = 8192
 PAGE_HEADER = 24
 SPECIAL_SIZE = 8
 MAGIC = 0x4C445032
-VERSION = 6
+# Page layout versions 6 and 7 lay out pages alike; 7's segments carry
+# group frontiers in their directories (bench's tnsreencode adds them to a
+# version 6 dump).
+VERSIONS = (6, 7)
 KIND_META = 1
 KIND_RUN = 3
 SPEC_BYTES = 8
 NONE = 0xFFFFFFFF
 FILE_BLOCKS = (1 << 30) // PAGE_SIZE
-# storage/layout.rs (page version 6): a run is first, blocks, bytes and last
+# storage/layout.rs (page versions 6 and 7): a run is first, blocks, bytes and last
 # page; an entry is the segment's run, its page table's run, its dead list's
 # run, the dead list's stamp, documents, total length, generation and origin
 # (a byte padded to four).
@@ -80,7 +83,7 @@ class Relation:
         lower, = struct.unpack_from("<H", page, 12)
         special = PAGE_SIZE - SPECIAL_SIZE
         magic, kind, version = struct.unpack_from("<IBB", page, special)
-        if magic != MAGIC or version != VERSION:
+        if magic != MAGIC or version not in VERSIONS:
             raise SystemExit(f"block {block}: not an LDP2 page")
         return kind, page[PAGE_HEADER:lower]
 

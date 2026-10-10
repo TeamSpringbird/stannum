@@ -36,9 +36,11 @@ pub const MAGIC: u32 = 0x4c44_5032;
 /// record their origin, sealed write segments and retired sources on the
 /// meta page. Version 6: `TNS1` positions streams with single-position
 /// masks, rare terms' lengths inline in their records and records without
-/// a footer (phase B, round 2). An index of an
-/// earlier version must be rebuilt.
-pub const VERSION: u8 = 6;
+/// a footer (phase B, round 2). Version 7: each entry of a grouped record's
+/// directory ends with its group's impact frontier, which ranked walks
+/// bound the group by before reading it. An index of an earlier version
+/// must be rebuilt.
+pub const VERSION: u8 = 7;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();
