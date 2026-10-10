@@ -1008,6 +1008,14 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
     },
+    "script/pgo-build": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: trains the profile-guided optimization profiles (the extension in PostgreSQL, the offline replay)."
+    },
+    "script/pgo-check": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: checks a profile-guided build's hot functions against the built library and the compiler's warnings."
+    },
     "script/pgrx-lock.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in d3f5c9833304d4d8a2fa05edf7931f64aaf0d764."

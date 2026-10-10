@@ -1,0 +1,44 @@
+#!/bin/sh
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+# Checks that a profile-guided build used its profile where it matters
+# (docs/benchmarks.md#profile-guided-builds).
+#
+#   script/pgo-check HOT LIBRARY BUILD_LOG [strict]
+#
+# HOT lists the profile's hottest functions by symbol (benchmarks/pgo/
+# <arch>.hot.txt, written with the profile by script/pgo-build). Each one
+# counts as matched when LIBRARY (built with debug info, which keeps every
+# function's linkage name, inlined or not) still has that exact symbol and
+# BUILD_LOG (the compiler's output) has no hash mismatch for it. A function
+# whose code changed has a mismatch: LLVM drops its counts. A function whose
+# symbol is gone (renamed, moved, or a new crate hash after a dependency,
+# feature or toolchain change) is not in LIBRARY: nothing could use its
+# counts. Either way the build is correct but that function is optimized as
+# without PGO. Prints the tally and the stale functions; with `strict`, exits
+# 1 when any is stale.
+set -eu
+
+[ $# -ge 3 ] || { sed -n '/^# Checks that/,/^set -eu/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 2; }
+hot=$1 library=$2 log=$3 strict=${4:-}
+
+total=0 stale=0 report=''
+while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    total=$((total + 1))
+    if grep -F "$name" "$log" | grep -q 'hash mismatch'; then
+        stale=$((stale + 1)); report="$report
+  changed: $name"
+    elif ! grep -qaF "$name" "$library"; then
+        stale=$((stale + 1)); report="$report
+  gone:    $name"
+    fi
+done < "$hot"
+
+echo "PGO profile: $((total - stale)) of $total hot functions matched$report"
+if [ "$stale" -gt 0 ]; then
+    echo "PGO profile is stale: retrain it (script/pgo-build image)" >&2
+    [ "$strict" != strict ] || exit 1
+fi

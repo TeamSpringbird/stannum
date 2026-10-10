@@ -46,23 +46,35 @@ COPY bench bench
 # way). Set per target, not as RUSTFLAGS, which would replace
 # .cargo/config.toml's link flags.
 ARG STANNUM_TARGET_CPU=
-# Profile-guided optimization (docs/architecture/pgo.md). Empty: none. 1: use
-# the committed profile for this architecture, benchmarks/pgo/<arch>.profdata.
-# generate: an instrumented build whose backends write raw profiles under
-# /var/lib/postgresql/pgo-raw (script/pgo-build trains one).
+# Profile-guided optimization (docs/benchmarks.md#profile-guided-builds).
+# Empty: none. 1: use the committed profile for this architecture,
+# benchmarks/pgo/<arch>.profdata, or build without one if there is none;
+# then script/pgo-check reports whether the profile's hot functions still
+# match the code. strict: as 1, but a missing or stale profile fails the
+# build. generate: an instrumented build whose backends write raw profiles
+# under /var/lib/postgresql/pgo-raw (script/pgo-build trains one).
 ARG STANNUM_PGO=
 COPY benchmarks/pgo benchmarks/pgo
-# Keep optimized code and line tables for the owned perf diagnostics.
-RUN case "$STANNUM_PGO" in \
-      "") pgo= ;; \
+COPY script/pgo-check script/pgo-check
+# Keep optimized code and line tables for the owned perf diagnostics (the
+# line tables also keep the symbols script/pgo-check looks for).
+RUN profile="benchmarks/pgo/$(uname -m).profdata" pgo= \
+    && case "$STANNUM_PGO" in \
+      "") ;; \
       generate) pgo="-C profile-generate=/var/lib/postgresql/pgo-raw" ;; \
-      1) pgo="-C profile-use=/src/benchmarks/pgo/$(uname -m).profdata -C llvm-args=-no-pgo-warn-mismatch" \
-         && test -s "benchmarks/pgo/$(uname -m).profdata" ;; \
-      *) echo "STANNUM_PGO is empty, 1 or generate" >&2; exit 2 ;; \
+      1|strict) if [ -s "$profile" ]; then pgo="-C profile-use=/src/$profile"; \
+        elif [ "$STANNUM_PGO" = strict ]; then echo "STANNUM_PGO=strict: no $profile" >&2; exit 2; \
+        else echo "warning: no $profile; building without PGO" >&2; fi ;; \
+      *) echo "STANNUM_PGO is empty, 1, strict or generate" >&2; exit 2 ;; \
     esac \
-    && CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${STANNUM_TARGET_CPU:+-C target-cpu=$STANNUM_TARGET_CPU} $pgo" \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="$pgo" \
-    CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none cargo pgrx install --package stannum --no-default-features --features pg18 --release
+    && { CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${STANNUM_TARGET_CPU:+-C target-cpu=$STANNUM_TARGET_CPU} $pgo" \
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="$pgo" \
+      CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none \
+      cargo pgrx install --package stannum --no-default-features --features pg18 --release > /tmp/build.log 2>&1 \
+      || { tail -n 100 /tmp/build.log; exit 1; }; } \
+    && grep -v 'hash mismatch' /tmp/build.log | tail -n 20 \
+    && case "$pgo" in *profile-use*) script/pgo-check "${profile%.profdata}.hot.txt" \
+      /usr/lib/postgresql/18/lib/stannum.so /tmp/build.log "$STANNUM_PGO" ;; esac
 
 FROM runtime
 USER root

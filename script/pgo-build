@@ -17,10 +17,11 @@
 # the trace FILE (script/replay-oracle.py) with the benchmark's ranked
 # statement, once with stannum.score and once with stannum.full_score, stops
 # the server so that every backend writes its counts, and merges them into
-# FILE (default benchmarks/pgo/<arch>.profdata,
-# <arch> as `uname -m` prints it inside the image). Then rebuild the image
-# with STANNUM_PGO=1 and commit the profile. --no-build uses TAG as already
-# built with `benchmarks/tin.py build-image --pgo generate`.
+# FILE (default benchmarks/pgo/<arch>.profdata, <arch> as `uname -m` prints
+# it inside the image), with its 40 hottest functions beside it in
+# <arch>.hot.txt for script/pgo-check. Then rebuild the image with
+# STANNUM_PGO=1 and commit both files. --no-build uses TAG as already built
+# with `benchmarks/tin.py build-image --pgo generate`.
 #
 # replay: the offline replay's own profile (bench --bin tnsreplay; its
 # generic walk is instantiated over another page type, so the extension
@@ -107,6 +108,9 @@ image)
     docker stop -t 600 "$name" >/dev/null
     mkdir -p "$(dirname "$out")"
     "$profdata" merge --sparse -o "$out" "$raw"
+    # Local functions' names carry their module before a `;`; the symbol follows.
+    "$profdata" show --topn=40 "$out" | sed -n 's/^  \(.*\), max count = .*/\1/p' | sed 's/^.*;//' \
+        > "${out%.profdata}.hot.txt"
     ;;
 replay)
     [ -n "$dump" ] || usage

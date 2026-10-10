@@ -1417,8 +1417,9 @@ def parser():
     p.add_argument('--base', help='Base image for a rehearsal on another architecture; the published runs use the pinned ParadeDB image')
     p.add_argument('--target-cpu', help='x86-64 only: STANNUM_TARGET_CPU build argument (x86-64-v3, x86-64-v4); '
                                         'unset builds the baseline with runtime SIMD dispatch')
-    p.add_argument('--pgo', choices=('1', 'generate'),
-                   help='STANNUM_PGO build argument: 1 optimizes with benchmarks/pgo/<arch>.profdata, '
+    p.add_argument('--pgo', choices=('1', 'strict', 'generate'),
+                   help='STANNUM_PGO build argument: 1 optimizes with benchmarks/pgo/<arch>.profdata if there is one, '
+                        'strict also fails when it is missing or stale, '
                         'generate builds the instrumented library script/pgo-build trains')
     common = argparse.ArgumentParser(add_help=False)
     p = common
