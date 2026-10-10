@@ -1669,6 +1669,11 @@ pub(super) fn walk_into<'a>(
         // The pages those ranges lie on, read to open the terms, are held
         // to the walk's end before the mark the groups release to.
         walk.frame = Some((blob, blob.hold_since(opened, &walk.held)));
+        // A footer's pages hold only its bytes: each is released once the
+        // footer has read past it, not left pinned to the group's end.
+        for s in &mut walk.sc {
+            s.footer.release_passed();
+        }
     }
     if required.is_empty() {
         walk.run_or()?;

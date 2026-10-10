@@ -541,6 +541,37 @@ impl LazyBlob {
         mark + kept
     }
 
+    /// The source's bytes per page, zero when it pins none.
+    #[inline]
+    pub fn page_len(&self) -> usize {
+        self.page_len
+    }
+
+    /// The page pinned `i`th of those the open span holds (see
+    /// [`Self::pin_mark`]).
+    #[inline]
+    pub fn pinned_page(&self, i: usize) -> Option<usize> {
+        self.pinned.borrow().get(i).copied()
+    }
+
+    /// Releases page `page` at once if the open span holds it pinned: a
+    /// reader that pinned a page for bytes only it reads, and has read
+    /// past them, need not wait for [`Self::release_since`]. Searches
+    /// from the pages pinned last, and moves no page before another, so
+    /// no mark of a page pinned before `page` moves.
+    ///
+    /// # Safety
+    ///
+    /// Nothing read in place from the page is used after.
+    pub unsafe fn release_pinned(&self, page: usize) {
+        let mut pinned = self.pinned.borrow_mut();
+        if let Some(i) = pinned.iter().rposition(|p| *p == page) {
+            pinned.remove(i);
+            drop(pinned);
+            self.release(page);
+        }
+    }
+
     /// Releases page `page`, pinned in the open span, and forgets it.
     fn release(&self, page: usize) {
         let memo = &self.pages[page % PAGE_MEMO];
@@ -1237,6 +1268,38 @@ mod tests {
     /// covers and those read last; earlier pages stay. A released page is
     /// poisoned by the source: the blob must never serve it again, but pin
     /// it afresh.
+    #[test]
+    fn release_pinned_releases_one_page_at_once_and_moves_no_mark() {
+        let (source, blob) = pinning(10 * 100, 100);
+        let state = &source.0;
+        let bytes = blob.bytes();
+        blob.open_span();
+        bytes.get(5, 15).unwrap();
+        let mark = blob.pin_mark();
+        let stale: Vec<&[u8]> = (2..6)
+            .map(|page| bytes.get(page * 100, page * 100 + 10).unwrap())
+            .collect();
+        assert_eq!(blob.pinned_since(mark), 4);
+        assert_eq!(blob.pinned_page(mark + 1), Some(3));
+        unsafe { blob.release_pinned(3) };
+        assert_eq!(state.early.get(), 1);
+        assert_eq!(blob.pinned_since(mark), 3);
+        assert_eq!(
+            blob.pinned_page(0),
+            Some(0),
+            "the page before the mark stays"
+        );
+        assert_eq!(stale[1], &[0xA5; 10]);
+        assert_eq!(stale[2], &state.bytes[400..410]);
+        // A page not pinned: nothing.
+        unsafe { blob.release_pinned(3) };
+        unsafe { blob.release_pinned(8) };
+        assert_eq!(state.early.get(), 1);
+        // Read again, it is pinned afresh and right.
+        assert_eq!(bytes.get(300, 310).unwrap(), &state.bytes[300..310]);
+        unsafe { blob.close_span() };
+    }
+
     #[test]
     fn release_since_keeps_held_and_recent_pages_and_never_serves_a_released_one() {
         let (source, blob) = pinning(20 * 100, 100);

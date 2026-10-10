@@ -1189,7 +1189,9 @@ impl Footer {
 /// reader: a walk decodes per query what it reaches. The window read in
 /// place is a slice of its page, which a walk releasing pages as it goes
 /// must hold while the footer has bytes on it to decode
-/// ([`LazyFooter::borrowed`]).
+/// ([`LazyFooter::borrowed`]); a page holding only footer bytes is
+/// released once the footer has read past it
+/// ([`LazyFooter::release_passed`]).
 #[derive(Clone, Debug)]
 pub struct LazyFooter<'a> {
     block_size: u32,
@@ -1221,6 +1223,11 @@ pub struct LazyFooter<'a> {
     widths: Vec<u8>,
     /// A single posting's bucket, which the dictionary keeps.
     single: Option<u8>,
+    /// Whether pages the footer's reads pinned for bytes only it reads are
+    /// released once it has read past them ([`Self::release_passed`]), and
+    /// those pages, still pinned.
+    release: bool,
+    owned: Vec<usize>,
 }
 
 /// Most bytes a footer block's entry takes: a slot gap, the frontier's
@@ -1362,6 +1369,8 @@ impl<'a> LazyFooter<'a> {
             tf_at: Vec::new(),
             widths: Vec::new(),
             single: None,
+            release: false,
+            owned: Vec::new(),
         };
         if matches!(postings.form, Form::Single(_)) || postings.compact {
             // Derived from the record (a block at most): decoded whole as
@@ -1395,8 +1404,13 @@ impl<'a> LazyFooter<'a> {
         } else {
             (read.max(from) + want).min(len)
         };
+        let blob = self.src.blob().filter(|_| self.release);
+        let mark = blob.map_or(0, |b| b.pin_mark());
         self.window = self.src.get(from, to)?;
         self.window_at = from;
+        if let Some(blob) = blob {
+            self.pass(blob, mark);
+        }
         if !self.started {
             self.started = true;
             // Room for every block, so the vectors are not grown and copied
@@ -1412,6 +1426,50 @@ impl<'a> LazyFooter<'a> {
             self.widths.reserve_exact(blocks);
         }
         Ok(())
+    }
+
+    /// Has the footer release each page its reads pinned that holds
+    /// nothing but its bytes once it has read past it, rather than leave
+    /// it to the walk's next [`super::blob::LazyBlob::release_since`]: a
+    /// walk whose first bound lies far into a common term's footer reads
+    /// hundreds of its pages within one group. For a walk that releases
+    /// pages as it goes (nothing else reads a footer's pages).
+    pub fn release_passed(&mut self) {
+        self.release = true;
+    }
+
+    /// After a read: notes the pages it pinned (since `mark`) that hold
+    /// footer bytes only, and releases those noted before the window.
+    #[inline(never)]
+    fn pass(&mut self, blob: &super::blob::LazyBlob, mark: usize) {
+        let (n, Some(base)) = (blob.page_len(), self.src.offset()) else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        let end = base + self.src.len();
+        let mut i = mark;
+        while let Some(page) = blob.pinned_page(i) {
+            if page * n >= base && (page + 1) * n <= end {
+                self.owned.push(page);
+            }
+            i += 1;
+        }
+        let window = base + self.window_at;
+        let mut k = 0;
+        while k < self.owned.len() {
+            let page = self.owned[k];
+            if (page + 1) * n <= window {
+                // SAFETY: the page holds only footer bytes, which only this
+                // footer reads, and the window, its one slice of a page,
+                // starts past it.
+                unsafe { blob.release_pinned(page) };
+                self.owned.swap_remove(k);
+            } else {
+                k += 1;
+            }
+        }
     }
 
     /// The record's blocks.

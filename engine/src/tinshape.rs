@@ -2186,6 +2186,64 @@ mod tests {
         assert!(released_walks_match(&docs, &members, &blob, 72, &nodes) > 0);
     }
 
+    /// A walk whose first bound lies far into a common term's footer reads
+    /// the footer up to it within one group: each page it reads past is
+    /// released at once, not held to the group's end (a `full_score`
+    /// conjunction at 150M rows held 97 pages at once, 426 at most, rather
+    /// than some 40). A rare lead whose members all lie late, and a term in
+    /// every document, its footer of small blocks over many small pages.
+    #[test]
+    fn a_far_bound_releases_the_footer_pages_it_reads_past() {
+        let (docs, _) = drawn(9_000, &[], 1);
+        let members: Vec<Vec<(usize, u32)>> = vec![
+            (8_000..docs.len()).step_by(50).map(|r| (r, 2)).collect(),
+            (0..docs.len()).map(|r| (r, (r % 3 + 1) as u32)).collect(),
+        ];
+        let options = Options {
+            block_size: 4,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: 0,
+            ..Options::default()
+        };
+        let blob = build(&docs, &members, options);
+        let parsed = Segment::parse(&blob).unwrap();
+        let page_len = 97;
+        let footer_pages = parsed.term("t1").unwrap().unwrap().postings.footer.len() / page_len;
+        assert!(footer_pages >= 60, "{footer_pages} pages");
+        let source = segment::tinshape::blob::PinningSource::new(blob.clone(), page_len);
+        let pinned = LazyBlob::new(Box::new(source.clone()));
+        let in_place = assembled_in_place(&pinned, &parsed, &blob);
+        let names: Vec<String> = vec!["t0".into(), "t1".into()];
+        let scorers: Vec<(String, TermScorer)> = (0..2)
+            .map(|t| {
+                let scorer = TermScorer::from_statistics(
+                    docs.len() as u64,
+                    members[t].len() as u64,
+                    1.0,
+                    Bm25Params::default(),
+                    50.0,
+                )
+                .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let node = Node::And(vec![Node::Term(0), Node::Term(1)]);
+        let want = top_k(&parsed, &node, &names, &scorers, 10, &mut NoTouch).unwrap();
+        source.0.peak.set(0);
+        pinned.open_span();
+        let got = top_k(&in_place, &node, &names, &scorers, 10, &mut NoTouch);
+        in_place.forget_borrowed();
+        // SAFETY: `got` is owned.
+        unsafe { pinned.close_span() };
+        let got = got.unwrap();
+        assert_eq!(got.rows, want.rows);
+        let peak = source.0.peak.get();
+        assert!(
+            peak < 12,
+            "{peak} pages held at once, of a {footer_pages}-page footer"
+        );
+    }
+
     /// A rare term's sparse list and inline lengths are borrowed by its
     /// record for the whole walk: held, not released, while a common
     /// term's pages are.
