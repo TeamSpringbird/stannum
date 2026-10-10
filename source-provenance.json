@@ -216,6 +216,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Added on branch bench/long-run on 2026-09-27."
     },
+    "benchmarks/local/vm_ab.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: interleaved A/B of images on a saved database, counted in the VM's instructions retired."
+    },
     "benchmarks/local/workload.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in c261512fee1222b5cdc2e60d8d4ec63c08f8b4b6. Moved from benchmarks/local/mock-run.sh, merged with the duplicate runner in benchmarks/local/run150m.sh (now a wrapper)."

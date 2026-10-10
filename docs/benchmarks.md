@@ -161,6 +161,16 @@ profile (below). Without `--pgo`, builds are as before. A profile changes
 code layout, inlining and branch weights only; answers and formats do not
 change.
 
+Measured at 43d99b1 on the local 150M database (8 clients, the first 400
+records), with `benchmarks/local/vm_ab.py`, a profile trained on the other
+854 records cut the VM's instructions per query by 13% for conjunctions, 4
+to 5% for disjunctions and 11 to 12% for phrases. Cycles per query fell 3
+to 8%, and on the mixed trace 6%. Two runs of one binary differ by up to 2%
+in instructions and 3% in cycles. The committed profile, trained on the
+whole trace, gains the same. Offline, the replay's own profile gains more
+(11 to 20% of instructions), because the replay spends less of its time in
+PostgreSQL's buffer manager.
+
 The profile has to be trained by the extension itself, in PostgreSQL. The
 offline replay (`bench --bin tnsreplay`) cannot stand in: its hot walk is
 `Walk<T>` instantiated over the replay's page type, and its `engine` is
