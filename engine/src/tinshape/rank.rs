@@ -1046,7 +1046,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.staged_order = order;
         self.staged_buckets.clear();
         self.staged_span.clear();
-        result
+        result?;
+        // A span's candidates that scored into the top k are checked now,
+        // so the threshold their matches raise prunes the next chunk.
+        if !self.pending.is_empty() {
+            self.verify_pending(g)?;
+        }
+        Ok(())
     }
 
     /// Bounds the candidate at slot `local` of group `g` by what can be
