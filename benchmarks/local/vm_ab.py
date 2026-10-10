@@ -24,9 +24,13 @@ CPU milliseconds per query (from /proc/self/schedstat) are reported beside
 them.
 
 The VM's counters include everything else the VM runs. Every other
-container using more than 2% CPU during a window is listed with it. Keep the
-VM otherwise quiet; a 150M server should hold the machine's 150M lock (see
-README). Use an identical binary as one of the arms to see the noise floor.
+container using more than 2% CPU during a window is listed with it (its
+peak, sampled every few seconds). Before each window the script waits
+until no other container is above BUSY_LIMIT percent (default 50), giving
+up after BUSY_WAIT seconds; a window in which one went above it is
+discarded and repeated. Keep the VM otherwise quiet; a 150M server should
+hold the machine's 150M lock (see README). Use an identical binary as one
+of the arms to see the noise floor. --full ranks with stannum.full_score.
 
 --data is mounted at /var/lib/postgresql as the benchmark's volume is; give
 it a COPY of a saved database (`tin.py run --save-database`), since the
@@ -122,15 +126,39 @@ def start_server(args, image, password):
                    input=f"ALTER USER postgres PASSWORD '{password}';\n", text=True, check=True)
 
 
-def busy_containers():
+def other_cpu():
+    """CPU percent of every other container in the VM, right now."""
     out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{.Name}} {{.CPUPerc}}"],
                          capture_output=True, text=True).stdout
-    busy = []
+    cpu = {}
     for line in out.splitlines():
-        name, _, cpu = line.rpartition(" ")
-        if name != CONTAINER and float(cpu.rstrip("%") or 0) > 2:
-            busy.append(f"{name} {cpu}")
-    return busy
+        name, _, pct = line.rpartition(" ")
+        if name and name != CONTAINER:
+            cpu[name] = float(pct.rstrip("%") or 0)
+    return cpu
+
+
+def wait_quiet(args):
+    """Wait until no other container is above --busy-limit; give up after --busy-wait."""
+    start = time.time()
+    while True:
+        busy = {n: c for n, c in other_cpu().items() if c > args.busy_limit}
+        if not busy:
+            return
+        if time.time() - start > args.busy_wait:
+            sys.exit(f"other containers stayed busy for {args.busy_wait:.0f} s: "
+                     + ", ".join(f"{n} {c:.0f}%" for n, c in busy.items()))
+        print(f"   waiting for a quiet VM: " + ", ".join(f"{n} {c:.0f}%" for n, c in busy.items()), flush=True)
+        time.sleep(15)
+
+
+def watch_others(t_start, t_end, peaks):
+    """Each other container's peak CPU percent over [t_start, t_end)."""
+    time.sleep(max(0.0, t_start - time.time()))
+    while time.time() < t_end:
+        for name, cpu in other_cpu().items():
+            peaks[name] = max(peaks.get(name, 0.0), cpu)
+        time.sleep(3)
 
 
 def window(args, order, password, warm, measure, pid):
@@ -167,9 +195,12 @@ def window(args, order, password, warm, measure, pid):
         with lock:
             rows.extend(mine)
 
+    peaks = {}
+    watcher = threading.Thread(target=watch_others, args=(t_measure, t_end, peaks), daemon=True)
     threads = [threading.Thread(target=client) for _ in range(args.clients)]
     for t in threads:
         t.start()
+    watcher.start()
     time.sleep(max(0.0, t_measure - time.time()))
     samples = [vm_counters(pid)]
     while samples[-1][0] < t_end - 0.5:
@@ -177,6 +208,7 @@ def window(args, order, password, warm, measure, pid):
         samples.append(vm_counters(pid))
     for t in threads:
         t.join()
+    watcher.join()
     slices = []
     for (t0, i0, c0), (t1, i1, c1) in zip(samples, samples[1:]):
         n = sum(1 for r in rows if t0 <= r[0] < t1)
@@ -188,7 +220,8 @@ def window(args, order, password, warm, measure, pid):
                 cyc_per_q=statistics.median(s["cyc"] for s in slices) if slices else None,
                 cpu_ms=sum(r[2] for r in rows) / max(len(rows), 1),
                 cpu_ms_by_style={s: sum(v) / len(v) for s, v in styles.items() if v},
-                busy=busy_containers())
+                busy=[f"{n} {c:.2f}%" for n, c in sorted(peaks.items()) if c > 2],
+                contaminated=sorted(n for n, c in peaks.items() if c > args.busy_limit))
 
 
 def summarize(results, names):
@@ -236,7 +269,16 @@ def main():
     parser.add_argument("--memory", default="32g")
     parser.add_argument("--shared-buffers", default="24GB")
     parser.add_argument("--vm-pid", type=int)
+    parser.add_argument("--full", action="store_true", help="rank with stannum.full_score")
+    parser.add_argument("--busy-limit", type=float, default=50,
+                        help="another container's CPU percent that voids a window (default 50)")
+    parser.add_argument("--busy-wait", type=float, default=1800,
+                        help="seconds to wait for a quiet VM before giving up (default 1800)")
+    parser.add_argument("--retries", type=int, default=5, help="repeats of a voided window")
     args = parser.parse_args()
+    global SQL
+    if args.full:
+        SQL = SQL.replace("stannum.score(", "stannum.full_score(")
     args.data = args.data.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
     pid = args.vm_pid or vm_pid()
@@ -254,7 +296,14 @@ def main():
                     order = mixed if phase == "mixed" else [e for e in mixed if e[1] == phase]
                     warm, measure = ((args.warm, args.measure) if phase == "mixed"
                                      else (args.style_warm, args.style_measure))
-                    result = window(args, order, password, warm, measure, pid)
+                    for attempt in range(args.retries + 1):
+                        wait_quiet(args)
+                        result = window(args, order, password, warm, measure, pid)
+                        if not result["contaminated"]:
+                            break
+                        print(f"   {phase:<12} discarded: {', '.join(result['busy'])}", flush=True)
+                    else:
+                        sys.exit(f"{phase} contaminated {args.retries + 1} times in a row")
                     results[(arm, rnd, phase)] = result
                     (args.out / f"arm{arm}-r{rnd}-{phase}.json").write_text(json.dumps(
                         dict(image=args.images[arm], round=rnd, phase=phase, **result), indent=1))

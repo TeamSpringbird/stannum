@@ -98,9 +98,12 @@ cycles per query, beside the backends' CPU milliseconds per query.
 - Include the baseline twice, as two tags of one image, or two builds that
   give a byte-identical `stannum.so`. Their difference is the noise floor.
 - The counters include everything else the VM runs: the other containers,
-  and image builds. The script lists every container above 2% CPU in each
-  window. Run it under the machine's 150M lock, and don't build images
-  meanwhile.
+  CI runners, and image builds. The script lists every container above 2%
+  CPU in each window. Before each window it waits until no other container
+  is above `--busy-limit` percent (50), for at most `--busy-wait` seconds
+  (1800), and it discards and repeats a window in which one went above it.
+  Run it under the machine's 150M lock, and don't build images meanwhile.
+- `--full` ranks with `stannum.full_score` instead of `stannum.score`.
 - `--records N` keeps the first N records of `queries.json`, for example to
   evaluate a profile on queries it was not trained on.
 - It finds an OrbStack or Docker Desktop VM by process name; `--vm-pid`
