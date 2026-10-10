@@ -142,6 +142,17 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- Ranked walks over `TNS1` sum their bounds in `f32` in the scorer's order,
+  as the scores are summed, so a bound is at least the score bit for bit;
+  a bound that only ties the threshold prunes when its matches cannot win
+  on ctid. A candidate is bounded at the length all its terms imply (a
+  document has one length), and a phrase's candidates are scored best bound
+  first, 256 at a time. Counts of a phrase fold over `TNS1` (its words ANDed
+  a group at a time, positions read in place only for the documents left).
+  On TIN's probe corpus a dense term's top 10 reads 10 pages instead of 121
+  (0.06 ms instead of 10), a two-word top 10 reads 51 DL pages instead of
+  83, and a phrase count takes 16 to 20 ms instead of 36 to 45;
+  `tnsreplay --full` replays `full_score`.
 - Ranked walks over `TNS1` bound a candidate by its buckets, each at the
   shortest length its footer block holds for that bucket or more, before
   reading its length from the DL sidecar; a disjunction plans each group at
