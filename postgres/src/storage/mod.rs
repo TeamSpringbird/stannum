@@ -3991,6 +3991,10 @@ pub(crate) struct Native {
     blob: std::cell::OnceCell<Box<LazyBlob>>,
     /// The published liveness in slot space, with the dead run it is of.
     liveness: RefCell<Option<PublishedLiveness>>,
+    /// The bytes the liveness holds, counted once when it is decoded: a
+    /// view counts every segment's bytes per query, and counting them
+    /// walks the liveness's groups (tens of thousands a segment at 150M).
+    liveness_bytes: Cell<usize>,
     /// Footers the ranked walks decoded, kept across the segments
     /// [`with_native`] assembles.
     footers: Rc<RefCell<segment::tinshape::segment::FooterCache>>,
@@ -4019,11 +4023,7 @@ impl Native {
             .blob
             .get()
             .map_or(0, |blob| blob.loaded() + blob.overhead());
-        let liveness = self
-            .liveness
-            .borrow()
-            .as_ref()
-            .map_or(0, |(_, l)| l.heap_bytes());
+        let liveness = self.liveness_bytes.get();
         let parsed = self.segment.borrow().as_ref().map_or(0, |s| s.memo_bytes());
         let terms = self.terms.borrow().len() * 64;
         blob + liveness + parsed + terms + self.footers.borrow().bytes()
@@ -4200,6 +4200,7 @@ fn native_segment<R>(
                 &segment::tinshape::docs::encode_liveness(header.documents, &ranks),
                 &docs,
             )?;
+            native.liveness_bytes.set(found.heap_bytes());
             *liveness = Some((dead, Rc::new(found)));
         }
         let live = liveness.as_ref().expect("decoded above").1.clone();
