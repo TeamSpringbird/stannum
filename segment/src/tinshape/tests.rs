@@ -13,7 +13,7 @@ use proptest::prelude::*;
 
 use super::index::Reader as TnsReader;
 use super::merge::{Input, merge};
-use super::postings::Options;
+use super::postings::{Form, GroupFrontiers, Options, group_frontier, rounded_length};
 use super::verify::verify_segment;
 use crate::dead::DeadDocs;
 use crate::index::{Expanded, Index, Window};
@@ -224,6 +224,177 @@ proptest! {
     }
 }
 
+/// Per (term, heap group number), per bucket, the shortest length of the
+/// term's live postings there, from a segment's postings, buckets and
+/// lengths (not its frontiers).
+fn group_minima(blob: &[u8], dead: &DeadDocs) -> BTreeMap<(String, u32), [u32; 16]> {
+    let segment = super::segment::Segment::parse(blob).unwrap();
+    let geometry = &segment.docs.geometry;
+    let mut out = BTreeMap::new();
+    for item in segment.dictionary().iter() {
+        let (term, entry) = item.unwrap();
+        let found = segment.resolve(entry).unwrap();
+        let footer = found
+            .postings
+            .footer(segment.block_size, entry.max_tf_bucket, segment.adaptive_tf)
+            .unwrap();
+        for (i, slot) in found.postings.slots(geometry).unwrap().iter().enumerate() {
+            let rank = segment.docs.rank(*slot).unwrap();
+            if dead.contains(rank) {
+                continue;
+            }
+            let group = geometry.groups[geometry.group_of_slot(*slot)].id;
+            let bucket = footer.bucket(found.postings.tf, i as u32).unwrap();
+            let length = segment.lengths.get(rank).unwrap();
+            let least: &mut [u32; 16] = out
+                .entry((term.clone(), group))
+                .or_insert([u32::MAX; 16]);
+            least[usize::from(bucket)] = least[usize::from(bucket)].min(length);
+        }
+    }
+    out
+}
+
+/// Per (term, heap group number), the frontier a segment's group
+/// directories hold, for its grouped terms.
+fn stored_frontiers(blob: &[u8]) -> BTreeMap<(String, u32), Vec<(u8, u32)>> {
+    let segment = super::segment::Segment::parse(blob).unwrap();
+    let geometry = &segment.docs.geometry;
+    let mut out = BTreeMap::new();
+    for item in segment.dictionary().iter() {
+        let (term, entry) = item.unwrap();
+        let found = segment.resolve(entry).unwrap();
+        if let Form::Grouped(entries) = &found.postings.form {
+            for e in entries.iter() {
+                let front = found.postings.group_frontier(e).expect("frontiers").collect();
+                out.insert((term.clone(), geometry.groups[e.index as usize].id), front);
+            }
+        }
+    }
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+    #[test]
+    fn a_merge_keeps_the_least_length_per_bucket_of_its_inputs(
+        docs in documents(500),
+        parts in 2usize..5,
+        dead in prop::collection::btree_set(0usize..500, 0..80),
+        any_dead in any::<bool>(),
+        rounded in any::<bool>(),
+        small in any::<bool>(),
+    ) {
+        let dead = if any_dead { dead } else { Default::default() };
+        // Inputs interleaved by ctid share groups: a group's frontier in
+        // the merge comes from several inputs' postings, less the dead.
+        let options = Options {
+            block_size: if small { 3 } else { 256 },
+            grid_min_postings: 0,
+            sparse: false,
+            group_frontiers: if rounded {
+                GroupFrontiers::Rounded
+            } else {
+                GroupFrontiers::Exact
+            },
+            ..Options::default()
+        };
+        let mut inputs: Vec<Vec<Doc>> = vec![Vec::new(); parts];
+        for (i, doc) in docs.iter().enumerate() {
+            inputs[i % parts].push(doc.clone());
+        }
+        inputs.retain(|input| !input.is_empty());
+        let blobs: Vec<Vec<u8>> = inputs.iter().map(|input| tns(input, options)).collect();
+        let mut deads = Vec::new();
+        let mut global = 0usize;
+        for input in &inputs {
+            let ranks: Vec<u32> = (0..input.len())
+                .filter(|r| dead.contains(&(global + r)))
+                .map(|r| r as u32)
+                .collect();
+            global += input.len();
+            deads.push(DeadDocs::decode(&crate::ordinals::encode(&ranks), input.len() as u32).unwrap());
+        }
+        // The least length per bucket over the inputs' live postings.
+        let mut want: BTreeMap<(String, u32), [u32; 16]> = BTreeMap::new();
+        for (blob, dead) in blobs.iter().zip(&deads) {
+            for (key, least) in group_minima(blob, dead) {
+                let into = want.entry(key).or_insert([u32::MAX; 16]);
+                for b in 0..16 {
+                    into[b] = into[b].min(least[b]);
+                }
+            }
+        }
+        let merged = merge(
+            &blobs
+                .iter()
+                .zip(&deads)
+                .map(|(bytes, dead)| Input { bytes, dead })
+                .collect::<Vec<_>>(),
+            options,
+            || Ok(()),
+        )
+        .unwrap();
+        let Some(merged) = merged else {
+            prop_assert!(want.is_empty());
+            return Ok(());
+        };
+        // A term of one posting has no directory.
+        let stored = stored_frontiers(&merged.blob);
+        let grouped: std::collections::BTreeSet<&String> = stored.keys().map(|k| &k.0).collect();
+        want.retain(|key, _| grouped.contains(&key.0));
+        prop_assert_eq!(stored.len(), want.len());
+        for (key, least) in &want {
+            let pairs = least
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| **l != u32::MAX)
+                .map(|(b, l)| (b as u8, *l));
+            let expected: Vec<(u8, u32)> = group_frontier(pairs, options.group_frontiers)
+                .into_iter()
+                .map(|(b, v)| (b, if rounded { rounded_length(v) } else { v }))
+                .collect();
+            prop_assert_eq!(stored.get(key), Some(&expected), "{:?}", key);
+        }
+        // With nothing dead, that is the least per bucket over the inputs'
+        // stored frontiers.
+        if dead.is_empty() {
+            let mut union: BTreeMap<(String, u32), Vec<(u8, u32)>> = BTreeMap::new();
+            for (blob, none) in blobs.iter().zip(&deads) {
+                let fronts = stored_frontiers(blob);
+                // An input's term of one posting holds no directory: its
+                // posting stands for its frontier.
+                for (key, least) in group_minima(blob, none) {
+                    if !grouped.contains(&key.0) {
+                        continue;
+                    }
+                    let into = union.entry(key.clone()).or_default();
+                    match fronts.get(&key) {
+                        Some(front) => into.extend(front),
+                        None => into.extend(
+                            least
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, l)| **l != u32::MAX)
+                                .map(|(b, l)| (b as u8, *l)),
+                        ),
+                    }
+                }
+            }
+            for (key, pairs) in union {
+                // Stored lengths are rounded already: rounding again keeps them.
+                let expected: Vec<(u8, u32)> =
+                    group_frontier(pairs.into_iter(), options.group_frontiers)
+                        .into_iter()
+                        .map(|(b, v)| (b, if rounded { rounded_length(v) } else { v }))
+                        .collect();
+                prop_assert_eq!(stored.get(&key), Some(&expected), "{:?}", key);
+            }
+        }
+    }
+}
+
 #[test]
 fn a_merge_keeps_the_containers_of_groups_one_input_holds() {
     // Two inputs over two 256-page groups each, every page full to the same
@@ -302,4 +473,40 @@ fn a_corrupted_length_is_found() {
     let mut broken = blob.clone();
     broken[segment.length_at(2).0] = 3;
     assert!(!verify_segment(&broken).is_clean());
+}
+
+#[test]
+fn a_corrupted_frontier_is_found() {
+    // A word in every document of two groups: grouped, two directory
+    // entries, each with its frontier.
+    let docs: Vec<Doc> = (0..2u32)
+        .flat_map(|g| {
+            (1..=5u16).map(move |o| {
+                (
+                    Tid::new(g * 256, o).unwrap(),
+                    (0..u32::from(o)).map(|p| ("w".to_owned(), p)).collect(),
+                )
+            })
+        })
+        .collect();
+    let options = Options {
+        sparse: false,
+        ..Options::default()
+    };
+    let blob = tns(&docs, options);
+    assert!(verify_segment(&blob).is_clean());
+    let segment = super::segment::Segment::parse(&blob).unwrap();
+    let term = segment.term("w").unwrap().unwrap();
+    let Form::Grouped(entries) = &term.postings.form else {
+        panic!("a grouped term");
+    };
+    // The first frontier's first length (after its head byte): the group's
+    // shortest document, 1 token, made 2.
+    let at = term.at + term.postings.payload_at + entries[0].frontier as usize + 1;
+    assert_eq!(blob[at], 1);
+    let mut broken = blob.clone();
+    broken[at] = 2;
+    let report = verify_segment(&broken);
+    assert!(!report.is_clean());
+    assert!(format!("{:?}", report.findings).contains("frontier"));
 }

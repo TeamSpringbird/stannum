@@ -20,8 +20,15 @@
 //! payload := sparse:  ef(df slots below the grid's slot count)
 //!          | grouped: groups varint,
 //!                     (index_gap varint, (count - 1) << 2 | kind varint,
-//!                      [len varint, paged groups only])*,
+//!                      [len varint, paged groups only],
+//!                      group frontier)*,
 //!                     container*
+//! group frontier := head u8 = (n - 1) << 4 | first bucket,
+//!            first length varint,
+//!            ((length - previous length - 1) << 4
+//!             | bucket - previous bucket - 1) varint, for each later pair:
+//!            the group's impact frontier, its lengths rounded down to six
+//!            significant bits when the form says so
 //! container := grid:  32 * width bytes, bit `local` set for each member
 //!            | ef:    ef(count local slots below 256 * width)
 //!            | paged: (pages - 1) u8, the pages (a byte each when fewer
@@ -59,6 +66,14 @@ pub const FORM_LENGTHS: u8 = 0x80;
 /// footer a reader derives (its last slot from the list, its frontier from
 /// its buckets and lengths, its TF width from its largest bucket).
 pub const FORM_COMPACT: u8 = 0x40;
+
+/// Set in a grouped record's form when each directory entry ends with its
+/// group's impact frontier ([`GroupFrontier`]), which a reader bounds the
+/// group by before it reads the group's container.
+pub const FORM_FRONTIERS: u8 = 0x20;
+/// Set with [`FORM_FRONTIERS`] when the frontiers' lengths are rounded down
+/// to six significant bits ([`round_length`]).
+pub const FORM_ROUNDED: u8 = 0x10;
 
 /// Postings a footer-less record holds at most.
 pub const COMPACT_MAX: u32 = 8;
@@ -100,6 +115,21 @@ pub struct Options {
     /// ... in a segment of at least this many documents: a smaller one's DL
     /// sidecar is a few pages.
     pub inline_lengths_min_documents: u32,
+    /// What a grouped record's directory holds of each group's postings
+    /// beyond their count: their impact frontier, exact or rounded.
+    pub group_frontiers: GroupFrontiers,
+}
+
+/// [`Options::group_frontiers`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupFrontiers {
+    /// None (the directory of page layout version 6).
+    Off,
+    /// The frontier's exact lengths.
+    Exact,
+    /// Its lengths rounded down to six significant bits, as TIN stores its
+    /// per-group frontiers.
+    Rounded,
 }
 
 impl Default for Options {
@@ -114,6 +144,7 @@ impl Default for Options {
             grid_min_postings: 4096,
             inline_lengths_max_df: 64,
             inline_lengths_min_documents: 1 << 16,
+            group_frontiers: GroupFrontiers::Exact,
         }
     }
 }
@@ -135,6 +166,10 @@ pub struct Stats {
     pub forced: usize,
     /// Bytes of inline lengths ([`InlineLengths`]).
     pub lengths: usize,
+    /// Bytes of the directory's group frontiers (part of `payload`), and
+    /// how many it holds.
+    pub frontier_bytes: usize,
+    pub frontiers: usize,
 }
 
 impl Stats {
@@ -176,6 +211,150 @@ pub fn frontier(postings: impl Iterator<Item = (u8, u32)>) -> Vec<(u8, u32)> {
     }
     out.reverse();
     out
+}
+
+/// `length` rounded down to six significant bits, as a code that orders
+/// as lengths do: a length below 64 is its own code; a longer one, `m << s`
+/// with `m` its six leading bits (32 to 63) and `s` at least 1, is
+/// `64 + 32 * (s - 1) + m - 32`. A bound at the rounded length is a bound
+/// at the length (a score falls as the length grows).
+#[inline]
+pub const fn round_length(length: u32) -> u32 {
+    let bits = 32 - length.leading_zeros();
+    if bits <= 6 {
+        return length;
+    }
+    let s = bits - 6;
+    64 + 32 * (s - 1) + (length >> s) - 32
+}
+
+/// The length [`round_length`]'s `code` stands for: the longest it rounds
+/// down to, never above a length that gives the code.
+#[inline]
+pub const fn rounded_length(code: u32) -> u32 {
+    if code < 64 {
+        return code;
+    }
+    let s = (code - 64) / 32 + 1;
+    let m = 32 + (code - 64) % 32;
+    if s >= 27 { u32::MAX } else { m << s }
+}
+
+/// The impact frontier of a group's postings `(bucket, length)` as its
+/// directory entry stores it: [`frontier`] of the lengths, or of their
+/// [`round_length`] codes.
+pub fn group_frontier(
+    postings: impl Iterator<Item = (u8, u32)>,
+    mode: GroupFrontiers,
+) -> Vec<(u8, u32)> {
+    match mode {
+        GroupFrontiers::Rounded => frontier(postings.map(|(b, l)| (b, round_length(l)))),
+        _ => frontier(postings),
+    }
+}
+
+/// Appends a group frontier's encoding (see the module's grammar): pairs
+/// ascending in bucket and strictly in length (or code), 1 to 16 of them.
+pub fn put_group_frontier(out: &mut Vec<u8>, pairs: &[(u8, u32)]) {
+    debug_assert!((1..=16).contains(&pairs.len()));
+    let (b0, l0) = pairs[0];
+    out.push(((pairs.len() as u8 - 1) << 4) | (b0 & 15));
+    varint::put(out, u64::from(l0));
+    for w in pairs.windows(2) {
+        let ((pb, pl), (b, l)) = (w[0], w[1]);
+        debug_assert!(b > pb && l > pl);
+        varint::put(out, (u64::from(l - pl - 1) << 4) | u64::from(b - pb - 1));
+    }
+}
+
+/// Checks and steps over a group frontier at `at`.
+#[inline]
+fn skip_group_frontier(bytes: &[u8], at: &mut usize) -> Result<()> {
+    let head = *bytes.get(*at).ok_or(Error::Truncated)?;
+    *at += 1;
+    let mut bucket = u32::from(head & 15);
+    let mut length = varint::get(bytes, at)?;
+    for _ in 0..head >> 4 {
+        let d = varint::get(bytes, at)?;
+        bucket += 1 + (d & 15) as u32;
+        length += 1 + (d >> 4);
+    }
+    if bucket > 15 || length > u64::from(u32::MAX) {
+        return Err(Error::Corrupt("group frontier"));
+    }
+    Ok(())
+}
+
+/// A group's impact frontier, from its directory entry: (bucket, shortest
+/// length) pairs ascending in both, every posting of the group dominated
+/// by one (a bucket at least as high, a length at most as long). A length
+/// rounded when stored is the rounded one, at most the true one.
+#[derive(Clone, Debug)]
+pub struct GroupFrontier<'b> {
+    bytes: &'b [u8],
+    at: usize,
+    /// Pairs left to give; the head is read with the first.
+    left: u8,
+    started: bool,
+    bucket: u8,
+    code: u32,
+    rounded: bool,
+}
+
+impl<'b> GroupFrontier<'b> {
+    /// The frontier at `at` of a directory's bytes, checked when parsed.
+    fn new(bytes: &'b [u8], at: usize, rounded: bool) -> Self {
+        Self {
+            bytes,
+            at,
+            left: 1,
+            started: false,
+            bucket: 0,
+            code: 0,
+            rounded,
+        }
+    }
+}
+
+impl Iterator for GroupFrontier<'_> {
+    type Item = (u8, u32);
+
+    #[inline]
+    fn next(&mut self) -> Option<(u8, u32)> {
+        if self.left == 0 {
+            return None;
+        }
+        if self.started {
+            let d = get_checked(self.bytes, &mut self.at);
+            self.bucket += 1 + (d & 15) as u8;
+            self.code += 1 + (d >> 4) as u32;
+        } else {
+            let head = self.bytes[self.at];
+            self.at += 1;
+            self.started = true;
+            self.left = (head >> 4) + 1;
+            self.bucket = head & 15;
+            self.code = get_checked(self.bytes, &mut self.at) as u32;
+        }
+        self.left -= 1;
+        let length = if self.rounded {
+            rounded_length(self.code)
+        } else {
+            self.code
+        };
+        Some((self.bucket, length))
+    }
+}
+
+/// A varint of a directory checked when it was parsed.
+#[inline]
+fn get_checked(bytes: &[u8], at: &mut usize) -> u64 {
+    let b = bytes[*at];
+    if b < 0x80 {
+        *at += 1;
+        return u64::from(b);
+    }
+    varint::get(bytes, at).expect("a frontier checked when parsed")
 }
 
 /// A group container an input segment holds that a merge may copy: its
@@ -278,7 +457,15 @@ pub fn encode_reusing<'r>(
         ef::encode(slots, geometry.slots, &mut sparse);
     }
     let mut grouped_stats = Stats::default();
-    let grouped = encode_groups(geometry, slots, options, reuse, &mut grouped_stats);
+    let grouped = encode_groups(
+        geometry,
+        slots,
+        buckets,
+        lengths,
+        options,
+        reuse,
+        &mut grouped_stats,
+    );
     // A term with a group dense enough to be a grid stays grouped.
     let use_sparse = options.sparse && grouped_stats.forced == 0 && sparse.len() <= grouped.len();
     let payload = if use_sparse { &sparse } else { &grouped };
@@ -296,7 +483,12 @@ pub fn encode_reusing<'r>(
         } else {
             FORM_GROUPED
         } | if inline { FORM_LENGTHS } else { 0 }
-            | if compact { FORM_COMPACT } else { 0 },
+            | if compact { FORM_COMPACT } else { 0 }
+            | if use_sparse {
+                0
+            } else {
+                frontier_form(options.group_frontiers)
+            },
     );
     if compact {
         footer.clear();
@@ -321,8 +513,19 @@ pub fn encode_reusing<'r>(
         stats.kinds = grouped_stats.kinds;
         stats.kind_bytes = grouped_stats.kind_bytes;
         stats.forced = grouped_stats.forced;
+        stats.frontier_bytes = grouped_stats.frontier_bytes;
+        stats.frontiers = grouped_stats.frontiers;
     }
     stats
+}
+
+/// The form bits of a grouped record's directory frontiers.
+const fn frontier_form(mode: GroupFrontiers) -> u8 {
+    match mode {
+        GroupFrontiers::Off => 0,
+        GroupFrontiers::Exact => FORM_FRONTIERS,
+        GroupFrontiers::Rounded => FORM_FRONTIERS | FORM_ROUNDED,
+    }
 }
 
 /// Encodes one group's members, `locals` its slots within the group.
@@ -384,6 +587,8 @@ fn encode_paged(locals: &[u32], width: u32, out: &mut Vec<u8>) {
 fn encode_groups<'r>(
     geometry: &Geometry,
     slots: &[u32],
+    buckets: &[u8],
+    lengths: &[u32],
     options: &Options,
     reuse: &mut dyn FnMut(usize) -> Option<Reused<'r>>,
     stats: &mut Stats,
@@ -402,6 +607,7 @@ fn encode_groups<'r>(
         }
         let group = geometry.groups[index];
         locals.clear();
+        let from = at;
         while at < slots.len() && slots[at] < group.slot_base + group.slots() {
             locals.push(slots[at] - group.slot_base);
             at += 1;
@@ -470,6 +676,22 @@ fn encode_groups<'r>(
                 }
             }
         }
+        if options.group_frontiers != GroupFrontiers::Off {
+            // Computed from the group's postings, a copied container's
+            // included: a merge's is the least length per bucket over the
+            // inputs' live postings there.
+            let pairs = group_frontier(
+                buckets[from..at]
+                    .iter()
+                    .copied()
+                    .zip(lengths[from..at].iter().copied()),
+                options.group_frontiers,
+            );
+            let before = directory.len();
+            put_group_frontier(&mut directory, &pairs);
+            stats.frontier_bytes += directory.len() - before;
+            stats.frontiers += 1;
+        }
         debug_assert_eq!(bodies.len() - before, best);
         stats.kinds[kind as usize] += 1;
         stats.kind_bytes[kind as usize] += best;
@@ -494,7 +716,13 @@ pub struct GroupEntry {
     pub len: u32,
     /// Postings in earlier groups.
     pub first: u32,
+    /// Where the group's frontier lies in [`Postings::frontiers`]
+    /// ([`NO_FRONTIER`] in a record without them).
+    pub frontier: u32,
 }
+
+/// [`GroupEntry::frontier`] of a record whose directory holds none.
+pub const NO_FRONTIER: u32 = u32::MAX;
 
 /// A term's membership.
 #[derive(Clone, Debug)]
@@ -529,6 +757,11 @@ pub struct Postings<'a> {
     pub lengths: Option<InlineLengths<'a>>,
     /// Whether the record has no footer ([`FORM_COMPACT`]).
     pub compact: bool,
+    /// A grouped record's directory bytes when its entries carry their
+    /// groups' frontiers ([`FORM_FRONTIERS`]), copied once when parsed so
+    /// the parsed record borrows nothing; whether their lengths are rounded.
+    pub frontiers: Option<std::rc::Rc<[u8]>>,
+    pub frontiers_rounded: bool,
 }
 
 /// A rare term's documents' lengths, in posting order: a base, a width
@@ -645,6 +878,8 @@ impl<'a> Postings<'a> {
             }
             return Ok(Self {
                 compact: false,
+                frontiers: None,
+                frontiers_rounded: false,
                 lengths,
                 df,
                 form: Form::Single(slot),
@@ -676,7 +911,12 @@ impl<'a> Postings<'a> {
             0
         };
         let compact = form & FORM_COMPACT != 0;
-        let form = form & !(FORM_LENGTHS | FORM_COMPACT);
+        let with_frontiers = form & FORM_FRONTIERS != 0;
+        let frontiers_rounded = form & FORM_ROUNDED != 0;
+        if (with_frontiers && form & 3 != FORM_GROUPED) || (frontiers_rounded && !with_frontiers) {
+            return Err(Error::Corrupt("postings frontiers"));
+        }
+        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_FRONTIERS | FORM_ROUNDED);
         let footer_at = at;
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
@@ -696,6 +936,7 @@ impl<'a> Postings<'a> {
             None
         };
         let mut containers_at = 0;
+        let mut frontiers = None;
         let form = match form {
             FORM_SPARSE => {
                 if payload.len() != ef::encoded_len(df as usize, geometry.slots) {
@@ -712,21 +953,32 @@ impl<'a> Postings<'a> {
                 // read a prefix of the payload, at least as long as its
                 // group count says it must be, longer until it holds it.
                 let mut want = DIRECTORY_PREFIX.min(payload.len());
+                let typical = if with_frontiers {
+                    DIRECTORY_ENTRY_TYPICAL + FRONTIER_TYPICAL
+                } else {
+                    DIRECTORY_ENTRY_TYPICAL
+                };
                 let (entries, at) = loop {
                     let directory = payload.window(0, want)?;
                     let mut at = 0;
                     let groups = (varint::get(directory, &mut at).unwrap_or(0) as usize)
                         .min(geometry.groups.len());
-                    let least = at.saturating_add(groups.saturating_mul(DIRECTORY_ENTRY_TYPICAL));
+                    let least = at.saturating_add(groups.saturating_mul(typical));
                     if least > want && want < payload.len() {
                         want = least.min(payload.len());
                         continue;
                     }
-                    match parse_groups(directory, payload.len(), df, geometry) {
+                    match parse_groups(directory, payload.len(), df, geometry, with_frontiers) {
                         Err(Error::Truncated) if want < payload.len() => {
                             want = want.saturating_mul(2).min(payload.len());
                         }
-                        parsed => break parsed?,
+                        Ok((entries, at)) => {
+                            if with_frontiers {
+                                frontiers = Some(std::rc::Rc::from(&directory[..at]));
+                            }
+                            break (entries, at);
+                        }
+                        Err(error) => return Err(error),
                     }
                 };
                 containers_at = at;
@@ -746,6 +998,18 @@ impl<'a> Postings<'a> {
             tf_at,
             lengths,
             compact,
+            frontiers,
+            frontiers_rounded,
+        })
+    }
+
+    /// The impact frontier the directory holds for a group, if it holds
+    /// frontiers ([`FORM_FRONTIERS`]).
+    #[inline]
+    pub fn group_frontier(&self, entry: &GroupEntry) -> Option<GroupFrontier<'_>> {
+        let bytes = self.frontiers.as_deref()?;
+        (entry.frontier != NO_FRONTIER).then(|| {
+            GroupFrontier::new(bytes, entry.frontier as usize, self.frontiers_rounded)
         })
     }
 
@@ -815,6 +1079,9 @@ const DIRECTORY_PREFIX: usize = 4096;
 /// longer each.
 const DIRECTORY_ENTRY_TYPICAL: usize = 3;
 
+/// ... and a group frontier, as a rule (a head, a length, a later pair).
+const FRONTIER_TYPICAL: usize = 3;
+
 /// A grouped payload's directory, from a prefix of the payload holding it
 /// (`Truncated` when it does not), `payload_len` the whole payload's length.
 fn parse_groups(
@@ -822,6 +1089,7 @@ fn parse_groups(
     payload_len: usize,
     df: u32,
     geometry: &Geometry,
+    frontiers: bool,
 ) -> Result<(std::rc::Rc<[GroupEntry]>, usize)> {
     let mut at = 0;
     let groups = varint::get_u32(payload, &mut at)? as usize;
@@ -858,6 +1126,13 @@ fn parse_groups(
             KIND_PAGED => varint::get(payload, &mut at)?,
             _ => return Err(Error::Corrupt("postings group kind")),
         };
+        let frontier = if frontiers {
+            let from = at as u32;
+            skip_group_frontier(payload, &mut at)?;
+            from
+        } else {
+            NO_FRONTIER
+        };
         slot.write(GroupEntry {
             index: next as u32,
             count: count as u32,
@@ -865,6 +1140,7 @@ fn parse_groups(
             at: body as u32,
             len: len as u32,
             first: first as u32,
+            frontier,
         });
         body += len;
         first += count;
@@ -1784,6 +2060,7 @@ mod tests {
             );
         }
         check_lazy(&parsed, &footer, options, max);
+        check_group_frontiers(&parsed, geometry, slots, buckets, lengths, options);
         // Every posting is covered by its block's frontier, and the last
         // slot of each block is right.
         for b in 0..footer.blocks() {
@@ -1807,6 +2084,134 @@ mod tests {
             }
         }
         stats
+    }
+
+    /// A grouped record's directory holds, per group, the frontier of the
+    /// group's postings (of their rounded lengths when rounded): every
+    /// posting is dominated by one of its pairs, and every pair is a
+    /// posting's.
+    fn check_group_frontiers(
+        parsed: &Postings<'_>,
+        geometry: &Geometry,
+        slots: &[u32],
+        buckets: &[u8],
+        lengths: &[u32],
+        options: &Options,
+    ) {
+        let Form::Grouped(entries) = &parsed.form else {
+            assert!(parsed.frontiers.is_none());
+            return;
+        };
+        let rounded = options.group_frontiers == GroupFrontiers::Rounded;
+        assert_eq!(parsed.frontiers_rounded, rounded);
+        for entry in entries.iter() {
+            let Some(front) = parsed.group_frontier(entry) else {
+                assert_eq!(options.group_frontiers, GroupFrontiers::Off);
+                assert_eq!(entry.frontier, NO_FRONTIER);
+                continue;
+            };
+            assert_ne!(options.group_frontiers, GroupFrontiers::Off);
+            let front: Vec<(u8, u32)> = front.collect();
+            let group = geometry.groups[entry.index as usize];
+            let members: Vec<usize> = (0..slots.len())
+                .filter(|i| {
+                    slots[*i] >= group.slot_base && slots[*i] < group.slot_base + group.slots()
+                })
+                .collect();
+            assert_eq!(members.len(), entry.count as usize);
+            let stored = |l: u32| {
+                if rounded {
+                    rounded_length(round_length(l))
+                } else {
+                    l
+                }
+            };
+            let expected: Vec<(u8, u32)> = group_frontier(
+                members.iter().map(|i| (buckets[*i], lengths[*i])),
+                options.group_frontiers,
+            )
+            .into_iter()
+            .map(|(b, v)| (b, if rounded { rounded_length(v) } else { v }))
+            .collect();
+            assert_eq!(front, expected, "group {}", entry.index);
+            for i in &members {
+                assert!(
+                    front
+                        .iter()
+                        .any(|(fb, fl)| *fb >= buckets[*i] && *fl <= lengths[*i]),
+                    "posting {i} uncovered by {front:?}"
+                );
+            }
+            for (fb, fl) in &front {
+                assert!(
+                    members
+                        .iter()
+                        .any(|i| buckets[*i] == *fb && stored(lengths[*i]) == *fl)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_lengths_keep_six_significant_bits() {
+        let mut previous = 0;
+        for length in (1..100_000u32).chain([u32::MAX - 1, u32::MAX]) {
+            let code = round_length(length);
+            assert!(code >= previous, "codes order as lengths do");
+            previous = code;
+            let back = rounded_length(code);
+            assert!(back <= length, "{length} rounds up to {back}");
+            let bits = 32 - length.leading_zeros();
+            assert!(u64::from(length - back) < 1u64 << bits.saturating_sub(6));
+            assert_eq!(round_length(back), code);
+        }
+        for exact in [1u32, 63, 64, 65, 126, 128, 256, 4032] {
+            if exact < 64 || exact.count_ones() == 1 || exact == 4032 {
+                assert_eq!(rounded_length(round_length(exact)), exact);
+            }
+        }
+        assert_eq!(rounded_length(round_length(65)), 64);
+        assert_eq!(rounded_length(round_length(300)), 296);
+    }
+
+    #[test]
+    fn group_frontiers_round_trip() {
+        // Pairs of every shape through the codec: deltas of one and of
+        // several bytes, all sixteen buckets.
+        let cases: Vec<Vec<(u8, u32)>> = vec![
+            vec![(0, 1)],
+            vec![(15, u32::MAX)],
+            vec![(0, 1), (1, 2), (2, 3)],
+            vec![(3, 100), (9, 100_000), (15, 4_000_000_000)],
+            (0..16).map(|b| (b, u32::from(b) * 1000 + 7)).collect(),
+        ];
+        for pairs in cases {
+            for rounded in [false, true] {
+                let mut bytes = vec![0xaa];
+                put_group_frontier(&mut bytes, &pairs);
+                let mut at = 1;
+                skip_group_frontier(&bytes, &mut at).unwrap();
+                assert_eq!(at, bytes.len());
+                let back: Vec<(u8, u32)> = GroupFrontier::new(&bytes, 1, rounded).collect();
+                let want: Vec<(u8, u32)> = pairs
+                    .iter()
+                    .map(|(b, v)| (*b, if rounded { rounded_length(*v) } else { *v }))
+                    .collect();
+                assert_eq!(back, want);
+                // Truncated anywhere, it fails to parse.
+                for cut in 1..bytes.len() {
+                    let mut at = 1;
+                    assert!(skip_group_frontier(&bytes[..cut], &mut at).is_err());
+                }
+            }
+        }
+        // A bucket past 15 is refused.
+        let mut bytes = Vec::new();
+        bytes.push((1 << 4) | 15);
+        varint::put(&mut bytes, 5);
+        varint::put(&mut bytes, 0);
+        let mut at = 0;
+        assert!(skip_group_frontier(&bytes, &mut at).is_err());
     }
 
     /// The footer decoded a block at a time agrees with the whole one:
@@ -1885,6 +2290,11 @@ mod tests {
                             grid_min_postings: 0,
                             inline_lengths_max_df: if adaptive_tf { 8 } else { 0 },
                             inline_lengths_min_documents: 0,
+                            group_frontiers: [
+                                GroupFrontiers::Off,
+                                GroupFrontiers::Exact,
+                                GroupFrontiers::Rounded,
+                            ][(block_size + grid_density) as usize % 3],
                         });
                     }
                 }
@@ -1997,8 +2407,10 @@ mod tests {
         let stats = round_trip(&geometry, &slots, &buckets, &lengths, &grids);
         assert!(!stats.sparse);
         assert_eq!(stats.kinds, [2, 0, 0]);
-        // A bit per slot, a bit per bucket.
-        assert_eq!(stats.payload, 2 * 32 * 40 + 1 + 2 * (1 + 3));
+        // A bit per slot, a bit per bucket; per group a directory entry and
+        // a frontier of one pair, (1, 50), of two bytes.
+        assert_eq!(stats.payload, 2 * 32 * 40 + 1 + 2 * (1 + 3) + 2 * 2);
+        assert_eq!((stats.frontiers, stats.frontier_bytes), (2, 4));
         assert_eq!(stats.tf, tids.len() / 8);
         // Whole pages are runs, smaller still, when size alone decides; the
         // default keeps groups this dense as grids.

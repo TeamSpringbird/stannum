@@ -4,9 +4,10 @@
 
 //! Checking a segment blob in this shape completely: its header and areas,
 //! the document set and DL sidecar, every term's slots, buckets and
-//! positions, and that each document's positions across all terms add up
-//! to its length.
+//! positions, each group frontier a directory holds, and that each
+//! document's positions across all terms add up to its length.
 
+use super::postings::{Form, GroupFrontiers, group_frontier, rounded_length};
 use super::segment::Segment;
 use crate::payload::Payload;
 use crate::tf_bucket::TfBucket;
@@ -136,12 +137,14 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             }
             let mut cursor = payload.cursor();
             let mut largest = 0u8;
+            let mut buckets = Vec::with_capacity(slots.len());
             for (i, slot) in slots.iter().enumerate() {
                 let rank = segment
                     .docs
                     .rank(*slot)
                     .ok_or(Error::Corrupt("posting outside the document set"))?;
                 let bucket = footer.bucket(found.postings.tf, i as u32)?;
+                buckets.push((bucket, lengths[rank as usize]));
                 largest = largest.max(bucket);
                 scratch.clear();
                 cursor.next_into(&mut scratch)?;
@@ -153,6 +156,34 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     ));
                 }
                 positions_of[rank as usize] += scratch.len() as u64;
+            }
+            if let Form::Grouped(entries) = &found.postings.form
+                && found.postings.frontiers.is_some()
+            {
+                let rounded = found.postings.frontiers_rounded;
+                let mode = if rounded {
+                    GroupFrontiers::Rounded
+                } else {
+                    GroupFrontiers::Exact
+                };
+                for e in entries.iter() {
+                    let from = e.first as usize;
+                    let Some(postings) = buckets.get(from..from + e.count as usize) else {
+                        break;
+                    };
+                    let want: Vec<(u8, u32)> = group_frontier(postings.iter().copied(), mode)
+                        .into_iter()
+                        .map(|(b, v)| (b, if rounded { rounded_length(v) } else { v }))
+                        .collect();
+                    let stored: Option<Vec<(u8, u32)>> =
+                        found.postings.group_frontier(e).map(Iterator::collect);
+                    if stored.as_ref() != Some(&want) {
+                        problems.push(format!(
+                            "group {} holds frontier {stored:?} but its postings {want:?}",
+                            e.index
+                        ));
+                    }
+                }
             }
             if largest != entry.max_tf_bucket {
                 problems.push(format!(
