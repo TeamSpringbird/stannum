@@ -27,6 +27,8 @@ conformance/
   cases/stemming.yaml          the stemmer index option and tokenize(stemmer =>)
                                (new in TIN 1.0.4)
   cases/tiebreak.yaml          ORDER BY score DESC, other columns ... LIMIT k
+  cases/prepared.yaml          top k under generic plans (LIMIT and query text
+                               as parameters), timed by statement_timeout
   cases/inventory.yaml         the engine's settings, functions, access method
                                and operator as the catalogs list them
   expected/<engine>-<version>/<area>.json
@@ -70,7 +72,9 @@ For Stannum, `script/test-all conformance` runs the check against the
 installed build in a throwaway cluster of its own; CI runs it on
 PostgreSQL 18 after installing the release build (see `docs/testing.md`).
 
-Every run creates a scratch schema `conformance_<random>`, builds each corpus
+Every run creates a scratch schema `conformance_<random>` (`--schema-prefix`
+names another prefix, for a database whose owner reserves schema names),
+builds each corpus
 the selected cases use once (a table and an index in that schema), runs the
 cases and drops the schema at the end, also when the run fails. Each capture
 runs in its own transaction, which is rolled back, so cases cannot affect one
@@ -241,6 +245,12 @@ may restart.
   16 inside NEAR): `catalog.Q-20`, `limits.at_least_near.2`,
   `limits.large_doc.10mb`, `query_size.words.3000` and
   `query_size.or_chain.3000`.
+- `expected/tin-1.0.4/prepared.json` was recorded live by `run.py` (runner
+  version 3) at `90182b2` on 2026-10-10 UTC (2026-10-09 US Eastern) on the
+  same test database, in its `stannum_lab` database with
+  `--schema-prefix probe4_conformance`. The case is timed by
+  statement_timeout; an earlier run without the control capture canceled
+  the same two captures.
 - To see what a new version changed, compare its directory with the
   previous one: `python3 conformance/compare_recordings.py
   conformance/expected/tin-1.0.3 conformance/expected/tin-1.0.4`.

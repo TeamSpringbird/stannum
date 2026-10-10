@@ -1,0 +1,44 @@
+{
+ "source": {
+  "engine": "tin",
+  "extension_version": "1.0.4",
+  "server_version": "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+2) on aarch64-unknown-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "host": "PlanetScale Postgres 18 test database (stannum_lab)",
+  "date": "2026-10-10T00:37:25Z",
+  "suite_commit": "90182b2b24526183373e3a67017a5fb23a6c012d",
+  "runner_version": "3"
+ },
+ "cases": [
+  {
+   "id": "prepared.generic_limit.1",
+   "captures": {
+    "limit_constant": {
+     "canceled": false,
+     "answer": null
+    },
+    "limit_param": {
+     "canceled": true,
+     "sqlstate": "57014",
+     "prompt": true
+    },
+    "query_and_limit_params": {
+     "canceled": true,
+     "sqlstate": "57014",
+     "prompt": true
+    },
+    "ranked": [
+     280000,
+     160000,
+     40000,
+     320000,
+     200000,
+     80000,
+     360000,
+     240000,
+     120000,
+     400000
+    ]
+   }
+  }
+ ]
+}
