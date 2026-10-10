@@ -27,6 +27,8 @@ conformance/
   cases/stemming.yaml          the stemmer index option and tokenize(stemmer =>)
                                (new in TIN 1.0.4)
   cases/tiebreak.yaml          ORDER BY score DESC, other columns ... LIMIT k
+  cases/prepared.yaml          top k under generic plans (LIMIT and query text
+                               as parameters), timed by statement_timeout
   cases/inventory.yaml         the engine's settings, functions, access method
                                and operator as the catalogs list them
   expected/<engine>-<version>/<area>.json

@@ -224,6 +224,11 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Fixed
 
+- A generic plan with LIMIT or OFFSET a parameter declared `int` or
+  `smallint` ranks only the top k: the parameter's cast to `bigint` kept the
+  bound from the scan, which scored every match (68 ms against 0.4 ms for
+  `w3 OR w17 OR t1` at 1M rows). TIN 1.0.4 scores every match there
+  (conformance case `prepared.generic_limit.1`).
 - A backend decodes a segment's dead list into a bitmap over its ordinals, at
   most a bit per document, instead of a set of heap locations plus a vector of
   ordinals, 16 to 24 bytes per dead document. After VACUUM published 45
