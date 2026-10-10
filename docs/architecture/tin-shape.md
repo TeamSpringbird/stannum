@@ -858,6 +858,75 @@ backends. Log and outputs: `stannum-lab/tinshape/perf-overhead/`.
   and release (6% and 3%, mostly the private refcount hash), and planning
   (2% to 3%).
 
+## Lazy footers at 150M rows (branch `tinshape/lazy-meta`)
+
+A ranked walk decodes its scoring terms' footers per query, a block at a
+time as it reaches them (`postings::LazyFooter`), instead of whole through
+`Segment::footer_memo`, which kept 3 of a query's 56 to 61 footers in the
+server; TIN keeps nothing across executions either. Reaching block `b`
+decodes every entry before it (they are variable-length and in a row) and
+nothing after it. A decoded block keeps what `Footer` keeps (last slot,
+frontier pairs, TF offset and width, structures of arrays); keeping only
+where its pairs start and decoding them again for each bound cost more, as
+a walk bounds most blocks it reaches (all of them in a disjunction). Blocks
+whose entries lie well within the window read are decoded in one loop
+without a bounds check per byte. The bytes are read in place a page at a
+time as far as the blocks decoded (`Bytes::page_end`); an entry across a
+page boundary is stitched alone (16 bytes, more as needed). A walk records
+as read only the footer bytes it read. `score()` of single rows still uses
+the memo. Log and outputs: `stannum-lab/lazy-meta/`.
+
+Replay (`tnsreplay`, first 900 queries of the trace, the answer's pass, per
+query; "whole" is what decoding the walk's footers whole decodes):
+
+| | blocks decoded / whole | blocks bounded | footer KB parsed / whole |
+| --- | ---: | ---: | ---: |
+| conjunction | 26,056 / 59,673 (44%) | 13,563 | 300 / 678 |
+| disjunction | 64,776 / 64,777 | 64,777 | 741 / 741 |
+| phrase | 24,898 / 60,816 (41%) | 7,014 | 287 / 693 |
+| conjunction, `full_score` | 303,775 / 690,688 (44%) | 145,512 | 3,903 / 8,819 |
+| disjunction, `full_score` | 726,833 / 726,834 | 726,834 | 9,292 / 9,292 |
+| phrase, `full_score` | 293,799 / 695,940 (42%) | 73,853 | 3,784 / 8,889 |
+
+A conjunction or phrase walk stops reaching a term's blocks at its lead's
+last group, and a group's bound sum stops at the threshold, so later terms
+are asked less; of a `full_score` conjunction's 84 footers, 36 are never
+read at all. A disjunction's MaxScore bounds every block of every term.
+
+Group directories are not decoded by group. A walk steps through nearly
+every entry of its terms' directories (94,000 of 94,000 entries asked for,
+a conjunction), and a container's offset counts from the directory's end,
+so no container is found before the directory is parsed through: parsing
+it lazily would parse as much, later. What is skipped is a record the walk
+never needs: a walk checks its required terms first (`Segment::holds_memo`,
+a term-map lookup) and parses nothing in a segment lacking one, 8% of a
+conjunction's directory entries in the replay.
+
+CPU in the replay (2 rounds, 400 queries per style, instructions retired)
+against the base without its footer memo (the replay repeats each query five
+times, which the memo amortizes as the server's driver order does not):
+`full_score` conjunction 956 / 935 G -> 738 / 749 G (-21%), phrase 1,045 /
+1,042 G -> 835 / 837 G (-20%); `score` conjunction 399 / 396 G -> 398 /
+398 G, disjunction within noise of it at 150 queries (528 G both, one run
+of 545 G), 4% over it at 400. Against the base with its memo, the replay's
+repeats favour the base: `score` +1% to +6%, `full_score` +14% to +18%.
+
+In the server (a copy of the saved 150M db, 8 clients in the driver's
+order, 150 s warm and 90 s measured, two rounds, backend CPU per query):
+
+| | base A1 / A2 | lazy B1 / B2 |
+| --- | --- | --- |
+| conjunction, ms | 14.21 / 11.51 | 10.64 / 10.80 |
+| disjunction, ms | 47.33 / 40.83 | 39.93 / 40.48 |
+| phrase, ms | 20.32 / 16.23 | 15.02 / 15.35 |
+| queries per second | 259 / 306 | 323 / 319 |
+
+A1 ran beside another lane's replay (the host's load at 11 to 17). The
+reader cache no longer holds footers, so it keeps more records: 41 of a
+query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
+to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
+trace.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
