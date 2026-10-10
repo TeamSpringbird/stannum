@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Per-query buffer accesses from the EXPLAIN-sampled runs beside pg_statio.
 
     explain_table.py RUN_PREFIX   (reads runs/RUN_PREFIX-{score,full_score}-{style}.json)

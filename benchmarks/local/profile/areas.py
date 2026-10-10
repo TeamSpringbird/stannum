@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Area breakdown and folded stacks from `perf script -F ip,sym` output.
 
     areas.py table PROFILE_PREFIX...        area shares + top functions per area (markdown)

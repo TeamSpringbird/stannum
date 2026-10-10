@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
 """Folds `perf script` output and answers questions about it.
 
     stacks.py SCRIPT.txt incl REGEX...        inclusive share of frames matching each regex

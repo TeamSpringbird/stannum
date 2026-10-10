@@ -204,6 +204,18 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 7ee73ff00e2643ecb2142a819e86ae24fb274c85."
     },
+    "benchmarks/local/profile/areas.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: area shares and folded stacks from perf script output. Added on branch tinshape/profile-v2."
+    },
+    "benchmarks/local/profile/explain_table.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: per-query buffer accesses from EXPLAIN-sampled runs beside pg_statio. Added on branch tinshape/profile-v2."
+    },
+    "benchmarks/local/profile/stacks.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: folds perf script output and answers queries over the stacks. Added on branch tinshape/profile-v2."
+    },
     "benchmarks/local/report.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 7ee73ff00e2643ecb2142a819e86ae24fb274c85."
