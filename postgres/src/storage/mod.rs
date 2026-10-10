@@ -1531,6 +1531,18 @@ impl segment::source::Source for RunSource {
         }))
     }
 
+    /// A walk releases a group's pages once it is past them (see
+    /// `LazyBlob::release_since`), so it holds tens of pages rather than
+    /// the thousands a query touches: PostgreSQL counts a backend's first
+    /// eight pins in an array and the rest in a hash table, and its
+    /// resource owner remembers 32 in an array and the rest in a hash.
+    fn release_page(&self, offset: u64) {
+        let page = (offset / CHAIN_CAPACITY as u64) as usize;
+        if let Some(held) = self.pinned.borrow_mut().remove(&page) {
+            unpin(held);
+        }
+    }
+
     fn held_slot(&self) -> Option<usize> {
         if self.holding.get() == 0 {
             return None;
@@ -3979,6 +3991,10 @@ impl segment::source::Source for ReaderSource {
 
     fn pinned_page(&self, offset: u64) -> Option<segment::Result<segment::source::HeldSpan>> {
         self.0.source().pinned_page(offset)
+    }
+
+    fn release_page(&self, offset: u64) {
+        self.0.source().release_page(offset);
     }
 }
 
