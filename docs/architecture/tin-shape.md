@@ -920,6 +920,10 @@ order, 150 s warm and 90 s measured, two rounds, backend CPU per query):
 | disjunction, ms | 47.33 / 40.83 | 39.93 / 40.48 |
 | phrase, ms | 20.32 / 16.23 | 15.02 / 15.35 |
 | queries per second | 259 / 306 | 323 / 319 |
+| conjunction, `full_score`, ms | 28.36 / 28.79 | 23.80 / 22.50 |
+| disjunction, `full_score`, ms | 147.92 / 137.63 | 142.79 / 133.41 |
+| phrase, `full_score`, ms | 32.40 / 33.35 | 28.64 / 26.40 |
+| queries per second, `full_score` | 105 / 109 | 112 / 122 |
 
 A1 ran beside another lane's replay (the host's load at 11 to 17). The
 reader cache no longer holds footers, so it keeps more records: 41 of a
