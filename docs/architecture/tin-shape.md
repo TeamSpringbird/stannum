@@ -740,6 +740,55 @@ Proposals (not built; layout only, the same structures):
   experiment since undone). The conjunction and phrase branch's lazy
   directory reads (`b7776bd`) cover it.
 
+## Per-query overhead in the server at 150M rows (branch `tinshape/perf-overhead`)
+
+Measured in PostgreSQL on a copy of the saved 150M database (24 GB of
+shared buffers, 8 CPUs), eight clients taking the benchmark driver's
+shuffled (query, style) entries from one counter, backend CPU per query
+read from `/proc/self/schedstat` after each query, `perf` across the eight
+backends. Log and outputs: `stannum-lab/tinshape/perf-overhead/`.
+
+- Buffer lookups. A backend found 38% / 59% / 78% (conjunction /
+  disjunction / phrase) of the pages it pinned through the buffer it had
+  last pinned them in: its table of 2^18 entries, direct-mapped, thrashed at
+  150M rows, and most pages of a query it had never pinned (other backends
+  had). The rest went through `ReadBuffer` (buffer mapping hash and
+  partition lock): 4.4% of the mixed workload's samples, 7.7% of a
+  conjunction's. Pin and release together, with the private refcount hash
+  thousands of held pins overflow into, were about 10%. `pin_block` now
+  finds the buffer through a table every backend shares (`shared_hints`, a
+  named dynamic shared memory segment of 8 bytes per shared buffer, 32 MB at
+  24 GB; no `shared_preload_libraries` needed), and raises the buffer's
+  usage count as `ReadBuffer` would (`ReadRecentBuffer` does not, so an
+  index pinned through hints would look unused to the clock sweep): 96% /
+  98% / 99% of pins found their buffer, backend CPU per query -10% / -5% /
+  -5%, 6% more queries per second. A hint is only a hint: the tag check in
+  `ReadRecentBuffer` refuses a buffer since given to another page, and an
+  error creating the segment (no room in `/dev/shm`) falls back to the
+  backend's own table. `stannum.share_buffer_hints = off` uses only the
+  backend's table, for comparison. Holding pins on hot pages across queries
+  was not tried: the segment's pages are distinct per segment, so within a
+  query nothing repeats, and across queries a pin outliving its statement
+  needs a resource owner of its own and blocks buffer eviction.
+- Term setup. In the driver's order a backend asks for some 7 MB of parsed
+  directories and footers a query (54,000 records and footers, 1.3 GB, over
+  the trace), and its memos (at most a quarter of `reader_cache_mb`, 96 MB)
+  kept 3 of a query's 56 to 61 footers and 29 of its 110 records: parsing
+  them again was 12% (directories) and 9% (footers) of a conjunction's
+  samples, 10% and 7% of a phrase's. A memo kept by use counts instead of
+  recency, with half of the reader cache, kept 8 footers and 49 records,
+  for 3% less conjunction CPU and 75 MB more per backend: not kept, as TIN
+  keeps nothing across executions either (round 3 of the TIN probes) and
+  the gain rests on the benchmark repeating each query some 27 times. What
+  was kept instead makes the parse cheaper: varints of one or two bytes
+  decode without a loop, a directory longer than the first 4 KiB window is
+  read in one window sized by its group count rather than re-parsed in
+  windows four times longer, the directory is built in its shared slice
+  (it was allocated and copied twice), and a footer's frontier is allocated
+  once at its upper bound.
+- A view counted every segment's liveness bytes per query by walking its
+  groups (0.3% to 0.5%); it is counted once when decoded.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
