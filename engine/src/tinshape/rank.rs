@@ -224,6 +224,10 @@ struct Mem<'a> {
     pos: usize,
     /// The term's group directory position, moved forward only.
     hint: usize,
+    /// Containers loaded from the directory, for [`MemoCounts`].
+    ///
+    /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
+    used: u32,
 }
 
 impl Mem<'_> {
@@ -353,6 +357,7 @@ fn load<'a>(
         } => {
             touch.touch(Part::Payload, at, bytes.len());
             let bytes = bytes.all()?;
+            mem.used += 1;
             mem.first = e.first;
             if e.kind == KIND_GRID {
                 mem.kind = Kind::Grid(bytes);
@@ -590,6 +595,39 @@ struct Walk<'s, 'a, T: Touch> {
 }
 
 impl<'a, T: Touch> Walk<'_, 'a, T> {
+    /// Adds what the walk used of its terms' footers and directories to
+    /// this thread's [`segment::tinshape::segment::MemoCounts`].
+    fn count_metadata(&self) {
+        let used: u64 = self
+            .sc
+            .iter()
+            .map(|s| s.bounds.iter().filter(|b| !b.is_nan()).count() as u64)
+            .sum();
+        let blocks_reached: u64 = self
+            .sc
+            .iter()
+            .map(|s| {
+                let bounded = s.bounds.iter().rposition(|b| !b.is_nan()).map_or(0, |b| b + 1);
+                bounded.max(s.wb + 1).max(s.cb + 1).min(s.bounds.len()) as u64
+            })
+            .sum();
+        let (mut reached, mut loaded) = (0u64, 0u64);
+        for (set, mem) in self.terms.iter().zip(&self.mems) {
+            if let Some(set) = set
+                && matches!(set.postings.form, Form::Grouped(_))
+            {
+                reached += (mem.hint + 1).min(set.group_count()) as u64;
+                loaded += u64::from(mem.used);
+            }
+        }
+        segment::tinshape::segment::count_memo(|c| {
+            c.blocks_used += used;
+            c.blocks_reached += blocks_reached;
+            c.entries_reached += reached;
+            c.entries_used += loaded;
+        });
+    }
+
     #[inline]
     fn threshold(&self) -> Option<f32> {
         self.top.bar().map(|bar| bar.0)
@@ -1499,6 +1537,7 @@ pub(super) fn walk_into<'a>(
     } else {
         walk.run()?;
     }
+    walk.count_metadata();
     let done = walk.answer;
     answer.scored += done.scored;
     answer.windows += done.windows;
@@ -1676,6 +1715,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             } => {
                 self.touch.touch(Part::Payload, at, bytes.len());
                 let bytes = bytes.all()?;
+                self.mems[t].used += 1;
                 r.first = e.first;
                 if e.kind == KIND_GRID {
                     kernels::load(row, bytes);

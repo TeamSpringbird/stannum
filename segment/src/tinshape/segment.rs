@@ -340,29 +340,59 @@ thread_local! {
     static TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Memo outcomes since [`reset_memo_counts`], for `EXPLAIN ANALYZE`.
+/// Memo outcomes since [`reset_memo_counts`], for `EXPLAIN ANALYZE`, and
+/// what parsing per-term metadata decoded and a walk used of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoCounts {
     /// Records found parsed in a memo, and records parsed.
     pub records_kept: u64,
     pub records_parsed: u64,
-    /// Footers found decoded in a memo, and footers decoded.
+    /// Footers found decoded in a memo, and footers decoded (wholly or a
+    /// prefix of their blocks).
     pub footers_kept: u64,
     pub footers_decoded: u64,
     /// Records forgotten when their span closed (they borrowed its pages).
     pub records_forgotten: u64,
+    /// Footer blocks decoded, and the footer bytes parsed for them.
+    pub footer_blocks: u64,
+    pub footer_bytes: u64,
+    /// Footer blocks a walk read the frontier of (bounded), and blocks up
+    /// to the last it read or stepped over.
+    pub blocks_used: u64,
+    pub blocks_reached: u64,
+    /// Group directories parsed, their entries decoded, and the directory
+    /// bytes parsed for them.
+    pub directories: u64,
+    pub directory_entries: u64,
+    pub directory_bytes: u64,
+    /// Directory entries a walk stepped over or read, and entries whose
+    /// container it loaded.
+    pub entries_reached: u64,
+    pub entries_used: u64,
+}
+
+impl MemoCounts {
+    const ZERO: Self = Self {
+        records_kept: 0,
+        records_parsed: 0,
+        footers_kept: 0,
+        footers_decoded: 0,
+        records_forgotten: 0,
+        footer_blocks: 0,
+        footer_bytes: 0,
+        blocks_used: 0,
+        blocks_reached: 0,
+        directories: 0,
+        directory_entries: 0,
+        directory_bytes: 0,
+        entries_reached: 0,
+        entries_used: 0,
+    };
 }
 
 thread_local! {
-    static MEMO_COUNTS: std::cell::Cell<MemoCounts> = const {
-        std::cell::Cell::new(MemoCounts {
-            records_kept: 0,
-            records_parsed: 0,
-            footers_kept: 0,
-            footers_decoded: 0,
-            records_forgotten: 0,
-        })
-    };
+    static MEMO_COUNTS: std::cell::Cell<MemoCounts> =
+        const { std::cell::Cell::new(MemoCounts::ZERO) };
 }
 
 /// This thread's memo outcomes since the last [`reset_memo_counts`].
@@ -374,7 +404,9 @@ pub fn reset_memo_counts() {
     MEMO_COUNTS.set(MemoCounts::default());
 }
 
-fn count_memo(add: impl FnOnce(&mut MemoCounts)) {
+/// Adds to this thread's [`MemoCounts`].
+#[inline]
+pub fn count_memo(add: impl FnOnce(&mut MemoCounts)) {
     let mut counts = MEMO_COUNTS.get();
     add(&mut counts);
     MEMO_COUNTS.set(counts);

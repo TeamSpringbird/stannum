@@ -599,6 +599,8 @@ struct Row {
     pins: u64,
     /// The instrumented pass's reads by kind of structure.
     kinds: [segment::tinshape::blob::KindStats; segment::tinshape::blob::KINDS],
+    /// What the answer's pass parsed of the terms' metadata.
+    memo: segment::tinshape::segment::MemoCounts,
 }
 
 fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Result<(), String> {
@@ -701,11 +703,14 @@ fn run() -> Result<bool, String> {
     let mut mismatched = 0usize;
     for (n, q) in trace.iter().enumerate() {
         let scorer = reader.scorer(&q.text)?;
-        // Warm pass (also the answer), then timed passes.
+        // Warm pass (also the answer, and what it decoded of the terms'
+        // metadata), then timed passes.
+        segment::tinshape::segment::reset_memo_counts();
         let Some(answer) = reader.ranked(&scorer, args.k) else {
             unsupported += 1;
             continue;
         };
+        let memo = segment::tinshape::segment::memo_counts();
         let mut times = Vec::with_capacity(args.repeat);
         for _ in 0..args.repeat {
             let at = Instant::now();
@@ -737,6 +742,7 @@ fn run() -> Result<bool, String> {
             answer: counters,
             pins: PINS.get() - pins0,
             kinds: segment::tinshape::blob::stats(),
+            memo,
         });
         if (n + 1) % 500 == 0 {
             eprintln!("{} of {}", n + 1, trace.len());
@@ -914,6 +920,36 @@ fn run() -> Result<bool, String> {
             m(&|a| a.position_checks),
             m(&|a| a.windows),
             m(&|a| a.windows_pruned),
+        );
+    }
+    println!(
+        "\nterm metadata per query, mean (answer pass): records parsed / kept, footers decoded / kept, \
+         footer blocks decoded, reached, used, footer KB parsed; directories parsed, entries decoded, reached, \
+         loaded, directory KB parsed"
+    );
+    for style in &styles {
+        let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = of.len().max(1) as f64;
+        let m = |f: &dyn Fn(&segment::tinshape::segment::MemoCounts) -> u64| {
+            of.iter().map(|r| f(&r.memo)).sum::<u64>() as f64 / n
+        };
+        println!(
+            "{:<12} records {:.1} / {:.1} footers {:.1} / {:.1} blocks {:.0} reached {:.0} used {:.0} footer KB {:.1}  \
+             dirs {:.1} entries {:.0} reached {:.0} loaded {:.0} dir KB {:.1}",
+            style,
+            m(&|c| c.records_parsed),
+            m(&|c| c.records_kept),
+            m(&|c| c.footers_decoded),
+            m(&|c| c.footers_kept),
+            m(&|c| c.footer_blocks),
+            m(&|c| c.blocks_reached),
+            m(&|c| c.blocks_used),
+            m(&|c| c.footer_bytes) / 1024.0,
+            m(&|c| c.directories),
+            m(&|c| c.directory_entries),
+            m(&|c| c.entries_reached),
+            m(&|c| c.entries_used),
+            m(&|c| c.directory_bytes) / 1024.0,
         );
     }
     if let Some(path) = &args.per_query {
