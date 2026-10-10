@@ -785,9 +785,18 @@ backends. Log and outputs: `stannum-lab/tinshape/perf-overhead/`.
   read in one window sized by its group count rather than re-parsed in
   windows four times longer, the directory is built in its shared slice
   (it was allocated and copied twice), and a footer's frontier is allocated
-  once at its upper bound.
+  once at its upper bound: as many records and footers parsed per query,
+  backend CPU per query -9% / -2% / -7%.
 - A view counted every segment's liveness bytes per query by walking its
   groups (0.3% to 0.5%); it is counted once when decoded.
+- Together, against a0f29d6 (two rounds, interleaved): backend CPU per
+  query 12.98 -> 10.80 ms (conjunction, -17%), 41.2 -> 37.8 ms
+  (disjunction, -8%), 17.0 -> 14.3 ms (phrase, -16%); 309 -> 345 queries
+  per second at eight clients; the same ranked answers to all 3,762 queries
+  of the trace. What remains outside the walks: decoding footers (7% of a
+  conjunction's samples, 6% of a phrase's), directories (4% and 3%), pin
+  and release (6% and 3%, mostly the private refcount hash), and planning
+  (2% to 3%).
 
 ## Open
 
