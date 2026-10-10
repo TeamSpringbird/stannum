@@ -1994,6 +1994,225 @@ mod tests {
         }
     }
 
+    /// Ranks each of `nodes` (top 1, 10 and 200) over `blob` read in place
+    /// in pages of `page_len`, every page a walk is past released (none
+    /// kept) and poisoned, and over `blob` in memory, and asserts they
+    /// agree. Returns the pages released early.
+    fn released_walks_match(
+        docs: &[Tid],
+        members: &[Vec<(usize, u32)>],
+        blob: &[u8],
+        page_len: usize,
+        nodes: &[Node],
+    ) -> usize {
+        let parsed = Segment::parse(blob).unwrap();
+        let source = segment::tinshape::blob::PinningSource::new(blob.to_vec(), page_len);
+        let pinned = LazyBlob::new(Box::new(source.clone()));
+        let in_place = assembled_in_place(&pinned, &parsed, blob);
+        assert_eq!(pinned.keep(), 0);
+        let names: Vec<String> = (0..members.len()).map(|t| format!("t{t}")).collect();
+        let scorers: Vec<(String, TermScorer)> = (0..members.len())
+            .filter(|t| !members[*t].is_empty())
+            .map(|t| {
+                let scorer = TermScorer::from_statistics(
+                    docs.len() as u64,
+                    members[t].len() as u64,
+                    1.0,
+                    Bm25Params::default(),
+                    50.0,
+                )
+                .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let early = source.0.early.get();
+        for node in nodes {
+            let used: Vec<(String, TermScorer)> = scorers
+                .iter()
+                .filter(|(n, _)| leaf_terms(node).iter().any(|t| names[*t] == *n))
+                .cloned()
+                .collect();
+            for k in [1, 10, 200] {
+                let want = top_k(&parsed, node, &names, &used, k, &mut NoTouch).unwrap();
+                pinned.open_span();
+                let got = top_k(&in_place, node, &names, &used, k, &mut NoTouch);
+                in_place.forget_borrowed();
+                // SAFETY: `got` is owned.
+                unsafe { pinned.close_span() };
+                let got = got.unwrap();
+                let bits = |rows: &[(f32, Tid)]| {
+                    rows.iter()
+                        .map(|(s, t)| (s.to_bits(), *t))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&got.rows), bits(&want.rows), "top {k} of {node:?}");
+            }
+        }
+        source.0.early.get() - early
+    }
+
+    /// Documents `0..n` in small heap blocks, and per entry of `density`
+    /// (percent) a term holding about that share of them, its counts
+    /// `1..=max_tf`, drawn from a fixed seed.
+    fn drawn(n: u32, density: &[u64], max_tf: u64) -> (Vec<Tid>, Vec<Vec<(usize, u32)>>) {
+        let docs: Vec<Tid> = (0..n)
+            .map(|i| Tid {
+                block: i / 3 * 5,
+                offset: (i % 3) as u16 + 1,
+            })
+            .collect();
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let members = density
+            .iter()
+            .map(|d| {
+                let mut held = Vec::new();
+                for r in 0..docs.len() {
+                    if next() % 100 < *d {
+                        held.push((r, (next() % max_tf + 1) as u32));
+                    }
+                }
+                held
+            })
+            .collect();
+        (docs, members)
+    }
+
+    /// A scoring term's footer decoded lazily reads on, block by block,
+    /// from the page it read last: a walk releasing the pages of each group
+    /// it is past must not release that page while the footer has bytes on
+    /// it left to decode (the footer would decode the poison: "varint
+    /// exceeds 64 bits"). Footers of small blocks, over many small pages.
+    #[test]
+    fn lazy_footers_read_on_after_their_groups_pages_are_released() {
+        let (docs, members) = drawn(6_000, &[60, 45], 9);
+        let options = Options {
+            block_size: 4,
+            grid_density: 32,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: 0,
+            ..Options::default()
+        };
+        let blob = build(&docs, &members, options);
+        let parsed = Segment::parse(&blob).unwrap();
+        let page_len = 97;
+        for t in ["t0", "t1"] {
+            let term = parsed.term(t).unwrap().unwrap();
+            assert!(term.postings.footer.len() > 20 * page_len);
+        }
+        use Node::*;
+        let nodes = [
+            And(vec![Term(0), Term(1)]),
+            Or(vec![Term(0), Term(1)]),
+            Term(0),
+        ];
+        assert!(released_walks_match(&docs, &members, &blob, page_len, &nodes) > 0);
+    }
+
+    /// Group directories are decoded when a term is opened, so a walk
+    /// keeps nothing of their pages: every page holding one is released
+    /// with the groups'. Many groups, over pages smaller than a directory.
+    #[test]
+    fn directories_hold_no_pages_a_walk_releases() {
+        let (docs, members) = drawn(12_000, &[30, 20, 8], 3);
+        let options = Options {
+            grid_density: 16,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: 0,
+            ..Options::default()
+        };
+        let blob = build(&docs, &members, options);
+        let parsed = Segment::parse(&blob).unwrap();
+        assert!(parsed.docs.geometry.groups.len() >= 60);
+        use Node::*;
+        let nodes = [
+            And(vec![Term(0), Term(1), Term(2)]),
+            Or(vec![Term(0), Term(1), Term(2)]),
+        ];
+        assert!(released_walks_match(&docs, &members, &blob, 64, &nodes) > 0);
+    }
+
+    /// TF tails and the DL sidecar are read a value at a time, never
+    /// through a slice kept across groups: wide buckets (counts up to 60)
+    /// and a sidecar of many pages, each released once a walk is past it.
+    #[test]
+    fn tf_tails_and_lengths_are_read_again_after_release() {
+        let (docs, members) = drawn(8_000, &[50, 25], 60);
+        let options = Options {
+            block_size: 32,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build(&docs, &members, options);
+        use Node::*;
+        let nodes = [
+            And(vec![Term(0), Term(1)]),
+            Or(vec![Term(0), Term(1)]),
+            Term(1),
+        ];
+        assert!(released_walks_match(&docs, &members, &blob, 80, &nodes) > 0);
+    }
+
+    /// Phrase checks read positions through cursors that keep offsets, not
+    /// slices, across groups: a phrase, and one repeating a word, over
+    /// positions spanning many released pages.
+    #[test]
+    fn positions_cursors_read_again_after_release() {
+        let (docs, members) = drawn(6_000, &[55, 40], 6);
+        let options = Options {
+            block_size: 16,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: 0,
+            ..Options::default()
+        };
+        let blob = build(&docs, &members, options);
+        use Node::*;
+        let nodes = [
+            Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+            Span {
+                slots: vec![0, 0],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
+        assert!(released_walks_match(&docs, &members, &blob, 72, &nodes) > 0);
+    }
+
+    /// A rare term's sparse list and inline lengths are borrowed by its
+    /// record for the whole walk: held, not released, while a common
+    /// term's pages are.
+    #[test]
+    fn sparse_lists_and_inline_lengths_stay_held() {
+        let (docs, members) = drawn(70_000, &[1, 40], 4);
+        let options = Options {
+            block_size: 8,
+            grid_min_postings: 0,
+            inline_lengths_max_df: 1_000,
+            inline_lengths_min_documents: 0,
+            ..Options::default()
+        };
+        let blob = build(&docs, &members, options);
+        let parsed = Segment::parse(&blob).unwrap();
+        let rare = parsed.term("t0").unwrap().unwrap();
+        assert!(matches!(rare.postings.form, Form::Sparse(_)));
+        assert!(rare.postings.lengths.is_some());
+        use Node::*;
+        let nodes = [
+            And(vec![Term(0), Term(1)]),
+            Or(vec![Term(0), Term(1)]),
+            Term(0),
+        ];
+        assert!(released_walks_match(&docs, &members, &blob, 128, &nodes) > 0);
+    }
+
     /// A phrase of two words in every document, ranked over a segment that
     /// loads what it reads, reads a few of their positions' pages and a few
     /// of the DL sidecar's, not their areas: a backend's memory must not

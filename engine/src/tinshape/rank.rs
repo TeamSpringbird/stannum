@@ -816,9 +816,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Elias-Fano list read in place) are forgotten here; positions, TF
     /// tails and the DL sidecar are read a value at a time, and a
     /// disjunction copies its terms' rows. What the walk keeps across
-    /// groups holds no slice (directories and footers, decoded; positions
-    /// streams, read when asked) or lies in [`Walk::held`] (a sparse
-    /// term's list, inline lengths).
+    /// groups holds no slice (directories, decoded; positions streams,
+    /// read when asked), lies in [`Walk::held`] (a sparse term's list,
+    /// inline lengths) or is held for this release: a scoring term's
+    /// footer, decoded lazily, reads on from the page it read last
+    /// ([`LazyFooter::borrowed`]), one page per term at most.
     #[inline]
     fn group_done(&mut self) {
         let Some((blob, mark)) = self.frame else {
@@ -832,10 +834,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             mem.loaded = 0;
             mem.kind = Kind::List;
         }
+        let held = self.held.len();
+        self.held
+            .extend(self.sc.iter().filter_map(|s| s.footer.borrowed()));
         // SAFETY: nothing read in place since the mark is used after but
         // what lies in `held` (see above): the members' slices were
-        // dropped just now.
+        // dropped just now, and the footers' windows are held.
         unsafe { blob.release_since(mark, &self.held) };
+        self.held.truncate(held);
     }
 
     /// Whether no match in slots `base..=end` of group `g` can be kept by
@@ -1650,7 +1656,7 @@ pub(super) fn walk_into<'a>(
     });
     // A node check's cursors keep a group's grid between seeks: its walk
     // holds what it pins. Otherwise the pages read to open the terms
-    // (records, directories, footers, decoded) are released with the
+    // (records, directories, decoded) are released with the
     // groups', but for the ranges the records keep slices of.
     if let (Some(blob), Some(opened)) = (blob, opened)
         && !matches!(walk.verify, Verify::Node)

@@ -1186,7 +1186,10 @@ impl Footer {
 /// The bytes are read as far as the blocks decoded, a page at a time and
 /// in place over a blob read within a span ([`Bytes::page_end`]): an entry
 /// across a page boundary is stitched alone. Nothing is kept beyond the
-/// reader: a walk decodes per query what it reaches.
+/// reader: a walk decodes per query what it reaches. The window read in
+/// place is a slice of its page, which a walk releasing pages as it goes
+/// must hold while the footer has bytes on it to decode
+/// ([`LazyFooter::borrowed`]).
 #[derive(Clone, Debug)]
 pub struct LazyFooter<'a> {
     block_size: u32,
@@ -1431,6 +1434,23 @@ impl<'a> LazyFooter<'a> {
     /// Footer bytes read so far.
     pub fn read(&self) -> usize {
         self.window_at + self.window.len()
+    }
+
+    /// The bytes of the blob the footer keeps a slice of and has yet to
+    /// decode, as `(from, to)` offsets of the blob: those of the window
+    /// read last past the entries decoded, when the window was read in
+    /// place (one page) from a lazy blob. Decoding reads on from that
+    /// slice, so its page must stay pinned until the footer is past it
+    /// ([`super::blob::LazyBlob::release_since`]'s `held`); a stitched
+    /// window lives until its span closes.
+    #[inline]
+    pub fn borrowed(&self) -> Option<(usize, usize)> {
+        let (from, to) = (self.at, self.read());
+        if from >= to || to > self.src.page_end(self.window_at) {
+            return None;
+        }
+        let base = self.src.offset()?;
+        Some((base + from, base + to))
     }
 
     #[inline]
@@ -2109,6 +2129,69 @@ mod lazy_footer_tests {
             stitched < footer_len / 2,
             "stitched {stitched} of {footer_len}"
         );
+        drop(lazy);
+        drop(parsed);
+        unsafe { blob.close_span() };
+    }
+    /// A lazy footer read on a block at a time, every page pinned since a
+    /// mark released (none kept, poisoned) between blocks but for the
+    /// window it reports borrowed, decodes the same blocks as whole.
+    #[test]
+    fn lazy_footer_reads_on_with_only_its_borrowed_window_held() {
+        use super::super::blob::{LazyBlob, PinningSource};
+        let tids: Vec<Tid> = (0..4000u32)
+            .map(|i| Tid {
+                block: i / 3,
+                offset: (i % 3 + 1) as u16,
+            })
+            .collect();
+        let geometry = Geometry::of(&tids).unwrap();
+        let members: Vec<u32> = (0..4000)
+            .step_by(3)
+            .map(|i| geometry.slot_of(tids[i]).unwrap())
+            .collect();
+        let n = members.len();
+        let buckets: Vec<u8> = (0..n).map(|i| (i * 5 % 16) as u8).collect();
+        let lengths: Vec<u32> = (0..n).map(|i| (i as u32 * 7919) % 5000 + 1).collect();
+        let options = Options {
+            block_size: 4,
+            grid_min_postings: u32::MAX,
+            inline_lengths_max_df: 0,
+            ..Options::default()
+        };
+        let mut out = Vec::new();
+        encode(&geometry, &members, &buckets, &lengths, &options, &mut out);
+        let whole = Postings::parse(&out, n as u32, &geometry)
+            .unwrap()
+            .footer(4, 15, true)
+            .unwrap();
+        let source = PinningSource::new(out.clone(), 64);
+        let blob = LazyBlob::new(Box::new(source.clone()));
+        blob.set_keep(0);
+        blob.open_span();
+        let parsed = Postings::parse(blob.bytes(), n as u32, &geometry).unwrap();
+        let mark = blob.pin_mark();
+        let mut lazy = parsed.lazy_footer(4, 15, true).unwrap();
+        let mut held_at_most = 0;
+        for b in 0..whole.blocks() {
+            assert_eq!(lazy.seek(b, whole.last[b]).unwrap(), b);
+            assert_eq!(lazy.frontier(b), whole.frontier_of(b));
+            assert_eq!(lazy.tf_at(b), whole.tf_at[b]);
+            let held: Vec<(usize, usize)> = lazy.borrowed().into_iter().collect();
+            if let Some((from, to)) = held.first() {
+                assert!(from < to && (to - 1) / 64 == from / 64, "one page");
+            }
+            // Keep 0: anything pinned since is released, but the window.
+            if blob.over_keep(mark) {
+                unsafe { blob.release_since(mark, &held) };
+                held_at_most = held_at_most.max(blob.pinned_since(mark));
+            }
+        }
+        assert!(
+            source.0.early.get() > 10,
+            "pages released as the footer read on"
+        );
+        assert!(held_at_most <= 1, "{held_at_most} pages held");
         drop(lazy);
         drop(parsed);
         unsafe { blob.close_span() };

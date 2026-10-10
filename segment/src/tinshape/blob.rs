@@ -848,6 +848,15 @@ impl<'a> Bytes<'a> {
         }
     }
 
+    /// Where a lazy range starts in its blob.
+    #[inline]
+    pub fn offset(&self) -> Option<usize> {
+        match self {
+            Self::Slice(_) => None,
+            Self::Lazy { at, .. } => Some(*at),
+        }
+    }
+
     /// The range tagged as holding `kind`, for accounting.
     #[must_use]
     pub fn tag(self, kind: Kind) -> Self {
