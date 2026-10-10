@@ -694,19 +694,27 @@ impl<'a> Postings<'a> {
             }
             FORM_GROUPED => {
                 // The directory's length is known only once it is parsed:
-                // read a prefix of the payload, longer until it holds it.
+                // read a prefix of the payload, at least as long as its
+                // group count says it must be, longer until it holds it.
                 let mut want = DIRECTORY_PREFIX.min(payload.len());
                 let (entries, at) = loop {
                     let directory = payload.window(0, want)?;
+                    let mut at = 0;
+                    let groups = varint::get(directory, &mut at).unwrap_or(0) as usize;
+                    let least = at.saturating_add(groups.saturating_mul(DIRECTORY_ENTRY_TYPICAL));
+                    if least > want && want < payload.len() {
+                        want = least.min(payload.len());
+                        continue;
+                    }
                     match parse_groups(directory, payload.len(), df, geometry) {
                         Err(Error::Truncated) if want < payload.len() => {
-                            want = want.saturating_mul(4).min(payload.len());
+                            want = want.saturating_mul(2).min(payload.len());
                         }
                         parsed => break parsed?,
                     }
                 };
                 containers_at = at;
-                Form::Grouped(entries.into())
+                Form::Grouped(entries)
             }
             _ => return Err(Error::Corrupt("postings form")),
         };
@@ -773,6 +781,13 @@ impl<'a> Postings<'a> {
 /// entries take a few bytes each.
 const DIRECTORY_PREFIX: usize = 4096;
 
+/// Bytes a directory entry takes as a rule (a one-byte gap, a count and
+/// kind of one or two bytes, a paged container's length): a directory of
+/// more groups than a prefix holds is read in one window this long per
+/// group, rather than parsed from the start again in windows four times
+/// longer each.
+const DIRECTORY_ENTRY_TYPICAL: usize = 3;
+
 /// A grouped payload's directory, from a prefix of the payload holding it
 /// (`Truncated` when it does not), `payload_len` the whole payload's length.
 fn parse_groups(
@@ -780,17 +795,20 @@ fn parse_groups(
     payload_len: usize,
     df: u32,
     geometry: &Geometry,
-) -> Result<(Vec<GroupEntry>, usize)> {
+) -> Result<(std::rc::Rc<[GroupEntry]>, usize)> {
     let mut at = 0;
     let groups = varint::get_u32(payload, &mut at)? as usize;
     if groups > geometry.groups.len() {
         return Err(Error::Corrupt("postings groups"));
     }
-    let mut entries = Vec::with_capacity(groups);
+    // Filled in place: the directory is kept shared, and a vector copied
+    // into it allocated and copied it twice per parse.
+    let mut entries = std::rc::Rc::<[GroupEntry]>::new_uninit_slice(groups);
+    let slots = std::rc::Rc::get_mut(&mut entries).expect("just allocated");
     let mut index: Option<u64> = None;
     let mut body = 0u64;
     let mut first = 0u64;
-    for _ in 0..groups {
+    for g in 0..groups {
         let gap = varint::get(payload, &mut at)?;
         let next = match index {
             None => gap,
@@ -813,7 +831,7 @@ fn parse_groups(
             KIND_PAGED => varint::get(payload, &mut at)?,
             _ => return Err(Error::Corrupt("postings group kind")),
         };
-        entries.push(GroupEntry {
+        slots[g].write(GroupEntry {
             index: next as u32,
             count: count as u32,
             kind,
@@ -827,7 +845,10 @@ fn parse_groups(
     if first != u64::from(df) || at as u64 + body != payload_len as u64 {
         return Err(Error::Corrupt("postings payload length"));
     }
-    Ok((entries, at))
+    // SAFETY: the loop wrote every one of the `groups` entries (an error
+    // returns before this, dropping the slice as uninitialized memory,
+    // which `GroupEntry`, plain data, permits).
+    Ok((unsafe { entries.assume_init() }, at))
 }
 
 /// Calls `visit` with every member of a group container, as local slots in
@@ -1029,17 +1050,22 @@ impl Footer {
             });
         }
         let blocks = df.div_ceil(block_size) as usize;
+        let bytes = postings.footer.all()?;
+        // A block's entry takes at least two bytes (its last slot and its
+        // frontier's length), a frontier pair at least two (bucket, length):
+        // room for that many pairs, so the vector is not grown and copied
+        // as it fills (a common word's footer holds some 50,000 pairs).
+        let pairs = (bytes.len().saturating_sub(2 * blocks) / 2).min(blocks * 16);
         let mut footer = Self {
             block_size,
             last: Vec::with_capacity(blocks),
             starts: Vec::with_capacity(blocks + 1),
-            frontier: Vec::with_capacity(blocks * 2),
+            frontier: Vec::with_capacity(pairs),
             tf_at: Vec::with_capacity(blocks),
             widths: Vec::with_capacity(blocks),
             entry_at: Vec::with_capacity(blocks),
             single: None,
         };
-        let bytes = postings.footer.all()?;
         let mut at = 0usize;
         let mut last = 0u64;
         let mut tf = 0u64;
@@ -1261,6 +1287,28 @@ mod tests {
         check_all(&tids, &tids[3..4], &[15]);
         check_all(&tids, &tids, &[0, 1, 2, 15, 4]);
         check_all(&tids, &[tids[0], tids[1]], &[0, 0]);
+    }
+
+    #[test]
+    fn directories_longer_than_the_first_window() {
+        // A document in each of 3,000 groups: a directory of some 6 KB, past
+        // the 4 KiB read first, is read in one window sized by its count.
+        let tids: Vec<Tid> = (0..3000u32)
+            .map(|g| Tid {
+                block: g * 256,
+                offset: 1,
+            })
+            .collect();
+        let geometry = geometry(&tids);
+        let slots: Vec<u32> = tids.iter().map(|t| geometry.slot_of(*t).unwrap()).collect();
+        let buckets = vec![1u8; slots.len()];
+        let lengths: Vec<u32> = (0..slots.len() as u32).map(|i| i % 50 + 1).collect();
+        let options = Options {
+            sparse: false,
+            grid_min_postings: 0,
+            ..Options::default()
+        };
+        round_trip(&geometry, &slots, &buckets, &lengths, &options);
     }
 
     #[test]
