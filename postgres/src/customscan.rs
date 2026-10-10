@@ -896,13 +896,37 @@ unsafe fn safe_bound_expr(expr: *mut pg_sys::Node) -> bool {
             pg_sys::NodeTag::T_Const => {
                 (*expr.cast::<pg_sys::Const>()).consttype == pg_sys::INT8OID
             }
-            pg_sys::NodeTag::T_Param => {
-                let param = &*expr.cast::<pg_sys::Param>();
-                param.paramkind == pg_sys::ParamKind::PARAM_EXTERN
-                    && param.paramtype == pg_sys::INT8OID
+            pg_sys::NodeTag::T_Param => extern_param(expr, pg_sys::INT8OID),
+            // A parameter declared `int` or `smallint` reaches LIMIT and
+            // OFFSET through its implicit cast to `bigint`, which cannot
+            // fail and has no side effects.
+            pg_sys::NodeTag::T_FuncExpr => {
+                let cast = &*expr.cast::<pg_sys::FuncExpr>();
+                cast.funcresulttype == pg_sys::INT8OID
+                    && cast.funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+                    && pg_sys::list_length(cast.args) == 1
+                    && {
+                        let arg = pg_sys::list_nth(cast.args, 0).cast::<pg_sys::Node>();
+                        (cast.funcid == INT4_TO_INT8 && extern_param(arg, pg_sys::INT4OID))
+                            || (cast.funcid == INT2_TO_INT8 && extern_param(arg, pg_sys::INT2OID))
+                    }
             }
             _ => false,
         }
+    }
+}
+
+/// `int8(integer)` and `int8(smallint)`: pg_proc's casts to `bigint`.
+const INT4_TO_INT8: pg_sys::Oid = pg_sys::Oid::from_u32(pg_sys::F_INT8_INT4);
+const INT2_TO_INT8: pg_sys::Oid = pg_sys::Oid::from_u32(pg_sys::F_INT8_INT2);
+
+/// `expr` is an external parameter (of a prepared statement) of type `ty`.
+unsafe fn extern_param(expr: *mut pg_sys::Node, ty: pg_sys::Oid) -> bool {
+    unsafe {
+        !expr.is_null()
+            && (*expr).type_ == pg_sys::NodeTag::T_Param
+            && (*expr.cast::<pg_sys::Param>()).paramkind == pg_sys::ParamKind::PARAM_EXTERN
+            && (*expr.cast::<pg_sys::Param>()).paramtype == ty
     }
 }
 
@@ -942,9 +966,9 @@ unsafe extern "C-unwind" fn plan_search_path(
             && runtime_bound_shape(root, rel)
             && safe_bound_expr(parse.limitCount)
             && (parse.limitOffset.is_null() || safe_bound_expr(parse.limitOffset))
-            && ((*parse.limitCount).type_ == pg_sys::NodeTag::T_Param
+            && ((*parse.limitCount).type_ != pg_sys::NodeTag::T_Const
                 || (!parse.limitOffset.is_null()
-                    && (*parse.limitOffset).type_ == pg_sys::NodeTag::T_Param))
+                    && (*parse.limitOffset).type_ != pg_sys::NodeTag::T_Const))
         {
             expressions.push(pg_sys::copyObjectImpl(parse.limitCount.cast()).cast());
             if !parse.limitOffset.is_null() {

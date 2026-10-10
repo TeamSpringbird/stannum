@@ -1481,6 +1481,107 @@ mod tests {
         }
     }
 
+    /// A LIMIT or OFFSET parameter declared `int` or `smallint` reaches the
+    /// plan through a cast to `bigint`; a generic plan still ranks only the
+    /// top k (TIN 1.0.4 scores every match there).
+    #[pg_test]
+    fn generic_ranked_runtime_bounds_accept_integer_parameters() {
+        Spi::run(
+            "CREATE TABLE runtime_int(id int, body text);
+             INSERT INTO runtime_int SELECT n, repeat('common ', n % 7 + 1) ||
+                 CASE WHEN n % 2 = 0 THEN 'blue' ELSE 'red' END FROM generate_series(1,1000) n;
+             CREATE INDEX runtime_int_idx ON runtime_int USING stannum(body);
+             ANALYZE runtime_int;
+             SET LOCAL plan_cache_mode = force_generic_plan;
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;
+             SET LOCAL enable_indexscan = off;",
+        )
+        .unwrap();
+        let ranked = |sql: &str| -> Vec<(i32, u32)> {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        };
+        for (types, bounds, args, literal, top_k) in [
+            (
+                "text, int",
+                "LIMIT $2",
+                "'common OR blue', 10",
+                "LIMIT 10",
+                10,
+            ),
+            (
+                "text, smallint",
+                "LIMIT $2",
+                "'common OR blue', 7",
+                "LIMIT 7",
+                7,
+            ),
+            (
+                "text, int, int",
+                "LIMIT $2 OFFSET $3",
+                "'common OR blue', 7, 12",
+                "LIMIT 7 OFFSET 12",
+                19,
+            ),
+            (
+                "text, bigint, int",
+                "LIMIT $2 OFFSET $3",
+                "'blue', 5, 3",
+                "LIMIT 5 OFFSET 3",
+                8,
+            ),
+        ] {
+            Spi::run(&format!(
+                "PREPARE runtime_int_bound({types}) AS
+                 SELECT id, stannum.full_score(ctid) AS score FROM runtime_int
+                 WHERE body ==> $1 ORDER BY score DESC {bounds}"
+            ))
+            .unwrap();
+            let sql = format!("EXECUTE runtime_int_bound({args})");
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0
+                .to_string();
+            assert!(
+                plan.contains(&format!("\"Top K\":{top_k}")),
+                "{types}: {plan}"
+            );
+            let query = args.split(',').next().unwrap();
+            // Ties may be taken in either order: compare the scores, and
+            // each returned row's score with the row's own.
+            let scores =
+                |rows: Vec<(i32, u32)>| rows.into_iter().map(|(_, s)| s).collect::<Vec<_>>();
+            let expected = ranked(&format!(
+                "SELECT id, score FROM (SELECT id, stannum.full_score(ctid) AS score
+                 FROM runtime_int WHERE body ==> {query}) s ORDER BY score DESC {literal}"
+            ));
+            let actual = ranked(&sql);
+            let own: std::collections::HashMap<i32, u32> = ranked(&format!(
+                "SELECT id, stannum.full_score(ctid) FROM runtime_int WHERE body ==> {query}"
+            ))
+            .into_iter()
+            .collect();
+            assert!(
+                actual.iter().all(|(id, s)| own.get(id) == Some(s)),
+                "{types}"
+            );
+            assert_eq!(scores(actual), scores(expected), "{types}");
+            Spi::run("DEALLOCATE runtime_int_bound").unwrap();
+        }
+    }
+
     #[pg_test]
     fn generic_ranked_scan_rescans_and_preserves_remaining_filters() {
         Spi::run(
