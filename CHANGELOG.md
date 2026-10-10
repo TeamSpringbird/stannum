@@ -180,6 +180,14 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   decoded and kept. Together, at eight clients, backend CPU per query falls
   17% (conjunction), 8% (disjunction) and 16% (phrase), for the same
   answers.
+- A ranked walk over `TNS1` releases the index pages of each group it is
+  past, but for those its terms' records still borrow and the 24 it read
+  last, rather than holding every page it read until the segment's read
+  ends: at 150 million rows a query held some 560 / 1,140 / 820 pages at
+  once (conjunction / disjunction / phrase, replay), which overflowed
+  PostgreSQL's per-backend array of private pin counts into a hash table of
+  as many entries, and now holds some 40 / 45 / 60. `EXPLAIN ANALYZE`'s
+  `Pages Held Peak` reports it.
 - TINQL query expressions are parsed by a recursive-descent parser; the pest
   expression grammar remains only as a test-only differential oracle, and
   phrase contents are still parsed with pest. AND and OR chains parse into

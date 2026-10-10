@@ -169,10 +169,11 @@ const NO_PAGE: PageRef = PageRef {
 /// default, those read last: a walk's next group most often reads on from
 /// the pages each of its streams (a term's containers and TF tail, the DL
 /// sidecar, a term's positions) last touched, and a page released and read
-/// again is pinned again. At 150M rows (replay of the trace) keeping 4
-/// pinned 2.8 / 7.0 / 3.7 times as many pages as holding them all
-/// (conjunction / disjunction / phrase), 24 pinned 3% / 7% / 8% more, at
-/// some 30 / 35 / 55 held at once rather than 450 / 1,100 / 700.
+/// again is pinned again. At 150M rows (replay of 300 queries) keeping 4,
+/// released each group, pinned 2.8 / 7.0 / 3.7 times as many pages as
+/// holding them all (conjunction / disjunction / phrase); 24, released
+/// once 12 more are pinned ([`LazyBlob::over_keep`]), 1% / 2% / 3% more,
+/// at some 40 / 45 / 60 held at once rather than 560 / 1,140 / 820.
 pub const KEEP_PINS: usize = 24;
 
 /// Bytes of a stitch buffer: a range across pages is copied into the

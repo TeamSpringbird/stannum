@@ -634,7 +634,26 @@ A term's record header and group directory are read when it is resolved, a
 group's container
 when a walk reaches the group, a posting's TF bits, the entries of a
 positions stream a phrase checks and the DL sidecar words of the documents
-scored; nothing is kept but what is parsed from them. The span ends when
+scored; nothing is kept but what is parsed from them. A ranked walk does
+not hold what it read until the span ends: after each group it walks it
+releases the pages pinned since it began opening its terms
+(`LazyBlob::release_since`), but for the record ranges its terms keep
+slices of (`Postings::borrowed`: a sparse list, inline lengths, held
+from then on) and the 24 pages read last, from which the next group most
+often reads on, once 12 more than those are pinned; a stitched read
+releases at once a page it pinned for itself and copied whole (the middle
+of a footer). Over the trace at 150M rows (replay) a query held 560 /
+1,140 / 820 pages at once (conjunction / disjunction / phrase, mean of
+the most per query; 740 / 3,230 / 1,000 by `full_score`, whose
+disjunctions reached the 8,192 a span may pin), which overflowed
+PostgreSQL's per-backend array of eight private pin counts into a hash
+table of as many entries, so every pin and release searched it (3% of a
+conjunction's backend CPU, 1.8% of a disjunction's), and its resource
+owner's array of 32 likewise; now some 37 / 45 / 58 (41 / 49 / 62), at
+1% / 2% / 4% more pins (1% / 9% / 7%), pages released and read again.
+Holding fewer, 4 say, pinned 3 to 7 times as many pages. A walk whose
+candidates are checked against a node (cursors that keep a group's grid
+between seeks) holds its pages as before. The span ends when
 the read returns or unwinds (an error, a cancel): it forgets the parsed
 records that borrow its pages, then releases them; a backend exiting
 mid-read leaves the pins to PostgreSQL, as held pages are. At 150M rows the
