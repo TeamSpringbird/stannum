@@ -700,7 +700,8 @@ impl<'a> Postings<'a> {
                 let (entries, at) = loop {
                     let directory = payload.window(0, want)?;
                     let mut at = 0;
-                    let groups = varint::get(directory, &mut at).unwrap_or(0) as usize;
+                    let groups = (varint::get(directory, &mut at).unwrap_or(0) as usize)
+                        .min(geometry.groups.len());
                     let least = at.saturating_add(groups.saturating_mul(DIRECTORY_ENTRY_TYPICAL));
                     if least > want && want < payload.len() {
                         want = least.min(payload.len());
@@ -1054,7 +1055,7 @@ impl Footer {
         // A block's entry takes at least two bytes (its last slot and its
         // frontier's length), a frontier pair at least two (bucket, length):
         // room for that many pairs, so the vector is not grown and copied
-        // as it fills (a common word's footer holds some 50,000 pairs).
+        // as it fills (a common word's footer holds tens of thousands).
         let pairs = (bytes.len().saturating_sub(2 * blocks) / 2).min(blocks * 16);
         let mut footer = Self {
             block_size,
