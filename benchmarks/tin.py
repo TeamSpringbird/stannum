@@ -33,9 +33,229 @@ ASSETS = ROOT / 'benchmarks/tin'
 REVISION = 'f487fbaaf5039a7b92e1de4efb40e0f7c6fcdb86'
 REPOSITORY = 'https://github.com/planetscale/paradedb-benchmarker.git'
 DEFAULT_DRIVER = ROOT / 'benchmarks/results/tin-driver'
+# The final ParadeDB 0.26.0 release on PostgreSQL 18 (18.6-1.pgdg13+2 inside), the version
+# TIN v1.0.6's post measured; one multi-arch index, native on amd64 and arm64.
+PARADEDB_IMAGE = 'paradedb/paradedb:0.26.0-pg18@sha256:52fc9c95fdfd462201168d1d82334ed61f85cbd921957cab083ec39800a217ac'
+# The benchmarker's index (datasets' benchmarks/paradedb/post.sql at the pinned revision);
+# key_field is a no-op since 0.26.0, kept verbatim. `bm25` is 0.26.0's alias of the
+# `paradedb` access method, and the name the pinned driver's index I/O counters select.
+PARADEDB_INDEX_SQL = ('CREATE INDEX documents_body_bm25_idx ON documents USING bm25 (id, body) '
+                      'WITH (key_field=id, target_segment_count=8);')
+# The native match operators the v1.0.6 post used for ParadeDB, by query family.
+PARADEDB_OPERATORS = dict(conjunction='&&&', disjunction='|||', phrase='###')
+# The base for arm64 builds: the Dockerfile's ParadeDB base is published for amd64 only.
+ARM64_BASE = 'postgres:18-trixie'
+INDEXES = dict(stannum='documents_body_stannum_idx', postgres='documents_body_gin_idx',
+               paradedb='documents_body_bm25_idx')
 LOADED_SOURCES = {str(p): dataset.sha256(p) for p in
                   [Path(__file__), Path(bench.__file__), Path(dataset.__file__), Path(published_dataset.__file__), Path(resources.__file__), *ASSETS.iterdir()]
                   if p.is_file()}
+
+
+# Server sizing for the published Stack Exchange comparisons. A profile only
+# fills options left unset, so any explicit flag still wins; the resolved
+# values are what the manifest records. See "Matching TIN v1.0.6's published
+# setup" in docs/benchmarks.md for the source of every value.
+PROFILES = {
+    # Benchmarks v2, TIN v1.0.6's published setup (planetscale.com/blog/tin-v106):
+    # 8 vCPUs pinned, 64 GB; the benchmarker's defaults otherwise (shm 16g, 8
+    # parallel maintenance workers). The default for every 150M run.
+    'v2': dict(cpus=8, memory='64g', build_memory='64g', shared_buffers='24GB',
+               maintenance_work_mem='24GB', shm_size='16g', cpu_layout='siblings',
+               max_parallel_maintenance_workers=8, clients=8),
+    # The launch post (TIN 1.0.2) and our AWS runs r5 to r8: 8 CPUs by CFS
+    # quota, unpinned, 32 GB for queries and 64 GB for the build.
+    'legacy': dict(cpus=8, memory='32g', build_memory='64g', shared_buffers='24GB',
+                   maintenance_work_mem='24GB', shm_size='1g', cpu_layout='none',
+                   max_parallel_maintenance_workers=None, clients=8),
+}
+# What run used before profiles existed; an unprofiled run is unchanged.
+RUN_DEFAULTS = dict(cpus=4, memory='4g', build_memory=None, shared_buffers='1GB',
+                    maintenance_work_mem='512MB', shm_size='1g', cpu_layout='none',
+                    max_parallel_maintenance_workers=None, clients=2)
+CPU_LAYOUTS = ('none', 'siblings', 'distinct-cores')
+
+
+def apply_profile(args):
+    """Fills every sizing option left unset from --profile, then the defaults."""
+    for key, default in dict(profile=None, score_function='score', cpuset_cpus=None, lscpu_file=None,
+                             paradedb_image=PARADEDB_IMAGE).items():
+        if not hasattr(args, key):
+            setattr(args, key, default)
+    profile = PROFILES[args.profile] if args.profile else {}
+    for key, default in RUN_DEFAULTS.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, profile.get(key, default))
+    return args
+
+
+def parse_cpuset(text):
+    """'0-3,16-19' -> [0, 1, 2, 3, 16, 17, 18, 19], as docker --cpuset-cpus reads it."""
+    cpus = []
+    for part in text.split(','):
+        if not re.fullmatch(r'\d+(-\d+)?', part.strip()):
+            raise ValueError(f'invalid cpuset {text!r}')
+        low, _, high = part.strip().partition('-')
+        low, high = int(low), int(high or low)
+        if high < low:
+            raise ValueError(f'invalid cpuset range {part!r}')
+        cpus.extend(range(low, high + 1))
+    if len(set(cpus)) != len(cpus):
+        raise ValueError(f'cpuset {text!r} repeats a CPU')
+    return sorted(cpus)
+
+
+def format_cpuset(cpus):
+    ranges, cpus = [], sorted(cpus)
+    for cpu in cpus:
+        if ranges and cpu == ranges[-1][1] + 1:
+            ranges[-1][1] = cpu
+        else:
+            ranges.append([cpu, cpu])
+    return ','.join(str(a) if a == b else f'{a}-{b}' for a, b in ranges)
+
+
+def parse_lscpu(text):
+    """Rows of `lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE`; a '-' NODE (no NUMA) reads as 0."""
+    lines = [line.split() for line in text.strip().splitlines() if line.strip()]
+    if not lines or lines[0][:3] != ['CPU', 'CORE', 'SOCKET']:
+        raise ValueError('expected lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE output')
+    header, rows = lines[0], []
+    for fields in lines[1:]:
+        row = dict(zip(header, fields))
+        rows.append(dict(cpu=int(row['CPU']), core=int(row['CORE']), socket=int(row['SOCKET']),
+                         node=int(row['NODE']) if row.get('NODE', '-').isdigit() else 0,
+                         online=row.get('ONLINE', 'yes') == 'yes'))
+    return rows
+
+
+def cpu_topology(image):
+    """The CPUs a container can be pinned to, as the Docker host's kernel numbers them
+    (the Linux VM's on Docker Desktop or OrbStack, not macOS's)."""
+    text = output(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'lscpu', image,
+                   '-e=CPU,CORE,SOCKET,NODE,ONLINE'])
+    return dict(lscpu=text, source='docker run ' + image)
+
+
+def plan_cpus(lscpu_text, count, layout, cpuset=None):
+    """The server's CPUs and the client's, from the host's real topology.
+
+    `siblings` gives the server count/threads-per-core whole cores, every
+    hyperthread of each: "8 vCPUs" as AWS sells them (4 cores x 2 threads on
+    an i7i). `distinct-cores` gives it one thread on each of `count` cores and
+    leaves their siblings idle. On a host without SMT (Graviton) the two are
+    the same. The client gets every CPU on the remaining cores, so it never
+    shares a core with the server. Cores are taken in (socket, node, core)
+    order from the lowest, so the server stays on one socket while it fits.
+    """
+    rows = [r for r in parse_lscpu(lscpu_text) if r['online']]
+    cores = {}
+    for row in rows:
+        cores.setdefault((row['socket'], row['node'], row['core']), []).append(row['cpu'])
+    ordered = [sorted(cores[key]) for key in sorted(cores)]
+    threads = max(len(c) for c in ordered)
+    if cpuset:
+        server = parse_cpuset(cpuset)
+        unknown = set(server) - {r['cpu'] for r in rows}
+        if unknown:
+            raise ValueError(f'--cpuset-cpus names CPUs the host does not have online: {format_cpuset(unknown)}')
+        layout = 'explicit'
+    elif layout == 'siblings':
+        if count % threads:
+            raise ValueError(f'{count} CPUs is not a whole number of {threads}-thread cores; use distinct-cores')
+        chosen = ordered[:count // threads]
+        if len(chosen) < count // threads or any(len(c) != threads for c in chosen):
+            raise ValueError(f'host has too few complete cores for {count} sibling CPUs')
+        server = [cpu for core in chosen for cpu in core]
+    elif layout == 'distinct-cores':
+        if len(ordered) < count:
+            raise ValueError(f'host has {len(ordered)} cores, fewer than {count}')
+        server = [core[0] for core in ordered[:count]]
+    else:
+        raise ValueError(f'unknown CPU layout {layout!r}')
+    if len(server) != count:
+        raise ValueError(f'the server cpuset has {len(server)} CPUs but --cpus is {count}')
+    used = [core for core in ordered if set(core) & set(server)]
+    client = sorted(cpu for core in ordered if core not in used for cpu in core)
+    return dict(layout=layout, server_cpuset=format_cpuset(server), server_cpus=len(server),
+                server_physical_cores=len(used), threads_per_core=threads, smt=threads > 1,
+                idle_siblings=format_cpuset(sorted(set(cpu for core in used for cpu in core) - set(server))),
+                client_cpuset=format_cpuset(client) if client else None,
+                host_cpus=len(rows), host_cores=len(ordered))
+
+
+def client_pinning(plan, system=None):
+    """The prefix that pins the driver (k6) to the client CPUs, and why it is empty when it is.
+    k6 runs on the Docker host: on Linux that kernel numbers the CPUs the cpuset names; on
+    macOS it runs outside the Docker VM and cannot be pinned to the VM's CPUs. `system`
+    overrides the running host's, for printing another host's commands."""
+    if not plan or not plan.get('client_cpuset'):
+        return [], 'unpinned: no server cpuset, or no CPUs left over for the client'
+    system = system or platform.system()
+    if system != 'Linux':
+        return [], (f'unpinned: the driver runs on the {system} host, outside the Docker VM '
+                    f'(on Linux it would get CPUs {plan["client_cpuset"]})')
+    if not shutil.which('taskset') and system == platform.system():
+        return [], 'unpinned: taskset is not installed'
+    return ['taskset', '-c', plan['client_cpuset']], 'taskset -c ' + plan['client_cpuset']
+
+
+def server_command(args, name, image, volume, path, engine, plan, extra):
+    """The `docker run` that starts the measured server."""
+    pinning = ['--cpuset-cpus', plan['server_cpuset']] if plan else []
+    settings = ['shared_buffers=' + args.shared_buffers,
+                'maintenance_work_mem=' + args.maintenance_work_mem]
+    if engine == 'paradedb':
+        # As the benchmarker starts it: the image's own bootstrap and auto-tuning
+        # (work_mem, effective_cache_size, ...) stay, under these overrides.
+        settings += [f'max_parallel_workers={args.cpus}', 'max_parallel_workers_per_gather=2']
+    else:
+        settings += ['work_mem=16MB', f'max_parallel_workers={args.cpus}', 'jit=off']
+    settings += ['track_io_timing=on', f'plan_cache_mode={args.plan_cache_mode}']
+    if args.max_parallel_maintenance_workers is not None:
+        settings.append(f'max_parallel_maintenance_workers={args.max_parallel_maintenance_workers}')
+    if engine == 'stannum' and getattr(args, 'build_segment_docs', None) is not None:
+        settings.append(f'stannum.build_segment_docs={args.build_segment_docs}')
+    # Local experiments only, recorded in the manifest: extra server
+    # settings such as STANNUM_POSTGRES_SETTINGS="stannum.read_cache_mb=256".
+    settings += shlex.split(os.environ.get('STANNUM_POSTGRES_SETTINGS', ''))
+    memory = args.build_memory or args.memory
+    return (['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus), *pinning, *extra,
+             '--memory', memory, '--memory-swap', memory, '--shm-size', args.shm_size,
+             '-p', f'127.0.0.1:{args.port}:5432',
+             '-v', f'{volume}:/var/lib/postgresql',
+             # The server reads the prepared CSV itself: see the import below.
+             '-v', f'{path}:/import:ro',
+             '-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_DB=benchmark',
+             image, 'postgres'] + [a for setting in settings for a in ('-c', setting)])
+
+
+def dry_run(args):
+    """Prints what a run would start, without Docker state, the driver or the dataset."""
+    apply_profile(args)
+    plan = None
+    if args.cpu_layout != 'none' or args.cpuset_cpus:
+        text = Path(args.lscpu_file).read_text() if args.lscpu_file else cpu_topology(args.image)['lscpu']
+        plan = plan_cpus(text, args.cpus, args.cpu_layout, args.cpuset_cpus)
+    extra = shlex.split(os.environ.get('STANNUM_DOCKER_RUN_ARGS', ''))
+    for engine in args.engines:
+        print(f'# {engine}: profile {args.profile or "none"}, style {args.style}, '
+              f'score {args.score_function}, layout {plan["layout"] if plan else "none"}')
+        image = args.paradedb_image if engine == 'paradedb' else args.image
+        print(shlex.join(server_command(args, 'stannum-trace-DRYRUN', image, 'stannum-trace-DRYRUN-data',
+                                        args.output.resolve() / engine, engine, plan, extra)))
+        if args.build_memory and args.build_memory != args.memory:
+            print(shlex.join(['docker', 'update', '--memory', args.memory, '--memory-swap', args.memory,
+                              'stannum-trace-DRYRUN']))
+        # A saved topology is another (Linux) host's: print the commands that host would run.
+        prefix, why = client_pinning(plan, 'Linux' if args.lscpu_file else None)
+        env = dict(BACKENDS=engine, WORKLOAD=args.workload, QUERY_STYLE=args.style, VUS=args.clients,
+                   DURATION=f'{args.seconds}s', PREWARM=f'{args.warmup}s', UPDATES_PER_SECOND=args.updates,
+                   TOP_K=10, STANNUM_SCORE_FUNCTION=args.score_function, PARADEDB_QUERY_FORM='operators')
+        print(' '.join(f'{k}={v}' for k, v in env.items()) + ' ' +
+              shlex.join(prefix + [str(args.driver / 'k6'), 'run', str(args.driver / 'benchmarks/search.js')]) +
+              f'   # client: {why}')
+    return plan
 
 
 def verify_sources(expected):
@@ -126,6 +346,13 @@ def build(args):
 
 
 def build_image(args):
+    if getattr(args, 'target_cpu', None) and platform.machine() != 'x86_64':
+        # The Dockerfile applies it to the x86-64 target only; elsewhere the label would lie.
+        raise ValueError('--target-cpu is an x86-64 build argument; this host is ' + platform.machine())
+    if not getattr(args, 'base', None) and platform.machine() in ('arm64', 'aarch64'):
+        # The Dockerfile's pinned ParadeDB base is amd64-only; an arm64 host (a Mac, i8g)
+        # would build it under emulation, which run() then refuses to time.
+        args.base = ARM64_BASE
     args.output.mkdir(parents=True, exist_ok=False)
     source = bench.provenance(args.output)
     bench.save(args.output / 'source.json', source)
@@ -137,6 +364,7 @@ def build_image(args):
                  '--build-arg', 'STANNUM_COMMIT=' + source['commit'],
                  '--build-arg', 'RECIPE_SHA256=' + recipe] +
                 (['--build-arg', 'BASE=' + args.base] if getattr(args, 'base', None) else []) +
+                (['--build-arg', 'STANNUM_TARGET_CPU=' + args.target_cpu] if getattr(args, 'target_cpu', None) else []) +
                 ['-t', args.image, '.'],
                 cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
     bench.save(args.output / 'image.json', json.loads(output(['docker', 'image', 'inspect', args.image])))
@@ -215,12 +443,12 @@ def copy_volume(image, source, target):
              '-a', '/from/.', '/to/'], stdout=subprocess.DEVNULL)
 
 
-def ranked_check_sql(queries, engine):
+def ranked_check_sql(queries, engine, score_function='score'):
     statements = []
     for name, tin, postgres, text in queries:
         tsquery = f"to_tsquery('simple', {literal(postgres)})"
         predicate = f'body ==> {literal(tin)}' if engine == 'stannum' else f'body_tsv @@ {tsquery}'
-        score = 'stannum.score(ctid)' if engine == 'stannum' else f'ts_rank_cd(body_tsv,{tsquery})'
+        score = f'stannum.{score_function}(ctid)' if engine == 'stannum' else f'ts_rank_cd(body_tsv,{tsquery})'
         # Compare score multisets, allowing arbitrary document order within ties.
         # MATERIALIZED forces exhaustive scoring before the reference sort/limit.
         select = f'SELECT id, {score} AS score FROM documents WHERE {predicate}'
@@ -236,12 +464,15 @@ def ranked_check_sql(queries, engine):
     return '\n'.join(statements)
 
 
-def prepared_plan_sql(query, engine, workload, mode):
+def prepared_plan_sql(query, engine, workload, mode, score_function='score'):
     if mode not in ('force_custom_plan', 'force_generic_plan'):
         raise ValueError('unsupported diagnostic plan mode')
-    _, tin, postgres, _ = query
-    if engine == 'stannum':
-        fields = 'count(*)' if workload == 'count' else 'id, body, stannum.score(ctid) AS score'
+    name, tin, postgres, text = query
+    if engine == 'paradedb':
+        fields = 'count(*)' if workload == 'count' else 'id, body, pdb.score(id) AS score'
+        predicate, argument = f"body {PARADEDB_OPERATORS[name.split(':')[1]]} $1", text
+    elif engine == 'stannum':
+        fields = 'count(*)' if workload == 'count' else f'id, body, stannum.{score_function}(ctid) AS score'
         predicate, argument = 'body ==> $1', tin
     else:
         fields = ('count(*)' if workload == 'count' else
@@ -256,6 +487,14 @@ def prepared_plan_sql(query, engine, workload, mode):
             'EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT JSON) '
             f'EXECUTE stannum_bench_plan({literal(argument)});\n'
             'DEALLOCATE stannum_bench_plan;\nRESET plan_cache_mode;')
+
+
+def paradedb_count_sql(queries):
+    """Full-corpus match counts through ParadeDB's index, with the operators the driver uses."""
+    return '\n'.join(
+        f"SELECT {literal(name)}, count(*) FROM documents WHERE body "
+        f"{PARADEDB_OPERATORS[name.split(':')[1]]} {literal(text)};"
+        for name, _, _, text in queries)
 
 
 def semantics_sql(queries, raw_text=False):
@@ -314,6 +553,13 @@ def workload_state_contract(job, updates):
                 table_options=state['before_driver']['table_options'])
 
 
+def index_mib_per_query(metrics, completed):
+    read, hit = metrics.get('indexReadBytes'), metrics.get('indexHitBytes')
+    if read is None or hit is None or not completed:
+        return None
+    return (read + hit) / completed / 2**20
+
+
 def report(root):
     manifest = json.loads((root / 'manifest.json').read_text())
     rows = []
@@ -368,6 +614,10 @@ def report(root):
                          index_bytes=job['sizes']['index'], total_bytes=job['sizes']['total'],
                          index_read_bytes=metrics.get('indexReadBytes'),
                          index_hit_bytes=metrics.get('indexHitBytes'),
+                         # The benchmarker's "per query" (TIN's MB/query): logical index
+                         # block accesses, read + hit, over completed queries. Its counters
+                         # are reset before warm-up, so warm-up traffic is in the numerator.
+                         index_mib_per_query=index_mib_per_query(metrics, len(samples)),
                          updates_completed=updates['update_docs'], updates_attempted=updates['attempted'],
                          update_errors=updates['update_errors'],
                          cross_engine_membership_differences=job['cross_engine_membership_differences']))
@@ -376,18 +626,20 @@ def report(root):
              'Diagnostic measurements, not a capacity claim. Each engine uses its native query semantics.',
              'GIN ranks with ts_rank_cd; Stannum ranks with BM25. Phrase membership can also differ.',
              'Percentiles use nearest rank; p99 is omitted below 1,000 samples. No speedup ratio is inferred.', '',
-             '| Engine | QPS | p95 ms | p99 ms | Measured query forms | Index MiB | Total relation MiB |',
-             '| --- | ---: | ---: | ---: | ---: | ---: | ---: |']
+             '| Engine | QPS | p95 ms | p99 ms | Index MiB/query | Measured query forms | Index MiB | Total relation MiB |',
+             '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
     for row in rows:
         if row['status'] != 'complete':
-            lines.append(f"| {row['engine']} | incomplete | | | | | |")
+            lines.append(f"| {row['engine']} | incomplete | | | | | | |")
         else:
             p99 = f"{row['p99_ms']:.3f}" if row['p99_ms'] is not None else '—'
-            lines.append(f"| {row['engine']} | {row['qps']:.1f} | {row['p95_ms']:.3f} | {p99} | "
+            per_query = f"{row['index_mib_per_query']:.1f}" if row['index_mib_per_query'] is not None else '—'
+            lines.append(f"| {row['engine']} | {row['qps']:.1f} | {row['p95_ms']:.3f} | {p99} | {per_query} | "
                          f"{row['measured_query_forms']} | {row['index_bytes']/2**20:.2f} | {row['total_bytes']/2**20:.2f} |")
     lines += ['', 'See comparison.json for query-family and individual-query distributions,',
               'semantic differences on the validation sample, and completed updates.',
-              'Index read/hit bytes are block accesses, not physical disk traffic.',
+              'Index read/hit bytes are block accesses, not physical disk traffic. Index MiB/query is',
+              "(read + hit) / completed queries: the benchmarker's PER QUERY, which TIN reports as MB/query.",
               'Resource summaries in comparison.json and resource-summary.json use samples wholly inside the measured window; boundary gaps are reported.',
               'The full pinned trace may not be traversed during short or slow runs.']
     for job in manifest['jobs']:
@@ -468,7 +720,27 @@ class ResourceSampler:
         self.thread.join()
 
 
+def saved_corpus(driver, published, load_database):
+    """The corpus identity of a run that starts from a saved database and has no CSV: the
+    pinned dataset manifest, vouched for by the build that imported and checked it. A run
+    from a database needs the CSV only for this check, so an AWS session restoring a
+    database skips the corpus download (85 GB) and the CSV hash in every run."""
+    if not (published and load_database):
+        raise ValueError('--dataset is required unless --load-database supplies a published corpus')
+    saved = json.loads((Path(load_database) / 'snapshot.json').read_text())
+    if saved.get('published_corpus') != published or not saved.get('input_sha256'):
+        raise ValueError('the saved database records no import of this published corpus; pass --dataset')
+    manifest = json.loads((driver / 'datasets' / published / 'data-manifest.json').read_text())
+    return dict(format='planetscale-prepared-v1', revision=published_dataset.REVISION, corpus=published,
+                rows={'wikipedia': 5032104, 'stackexchange': 150000000}[published], csv=manifest['csv'],
+                verified_by=dict(saved_database=saved.get('source_run'), input_sha256=saved['input_sha256']))
+
+
 def run(args):
+    apply_profile(args)
+    if getattr(args, 'dry_run', False):
+        dry_run(args)
+        return
     verify_sources(LOADED_SOURCES)
     driver = args.driver.resolve()
     adapter = verify_driver(driver)
@@ -478,8 +750,11 @@ def run(args):
         raise ValueError('driver regression binary does not match recorded build')
     published = getattr(args, 'published_corpus', None)
     raw_text = published == 'stackexchange'
-    corpus = published_dataset.inspect(args.dataset, published, json.loads(
-        (driver / 'datasets' / published / 'data-manifest.json').read_text())) if published else dataset.verify(args.dataset)
+    if getattr(args, 'dataset', None) is None:
+        corpus = saved_corpus(driver, published, getattr(args, 'load_database', None))
+    else:
+        corpus = published_dataset.inspect(args.dataset, published, json.loads(
+            (driver / 'datasets' / published / 'data-manifest.json').read_text())) if published else dataset.verify(args.dataset)
     trace_path = Path(getattr(args, 'query_file', None) or driver / 'datasets' / (published or 'wikipedia') / 'queries.json').resolve()
     queries = trace_queries(driver, trace_path, raw_text=raw_text)
     if len(set(args.engines)) != len(args.engines) or not 0 <= args.updates <= 1000000000:
@@ -490,9 +765,19 @@ def run(args):
     root.mkdir(parents=True, exist_ok=False)
     source_path = getattr(args, 'source_manifest', None)
     source = recorded_source(source_path) if source_path else bench.provenance(root)
+    if 'paradedb' in args.engines and args.updates:
+        raise ValueError('ParadeDB runs are read-only calibration runs; its post-update checks are not implemented')
+    native = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'amd64'}[platform.machine()]
     image = json.loads(output(['docker', 'image', 'inspect', args.image]))[0]
-    if image['Architecture'] != {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'amd64'}[platform.machine()]:
+    if image['Architecture'] != native:
         raise ValueError('image must run natively; emulated timings are not supported')
+    images = dict(stannum=image, postgres=image)
+    if 'paradedb' in args.engines:
+        if subprocess.run(['docker', 'image', 'inspect', args.paradedb_image], capture_output=True).returncode:
+            command(['docker', 'pull', args.paradedb_image], stdout=subprocess.DEVNULL)
+        images['paradedb'] = json.loads(output(['docker', 'image', 'inspect', args.paradedb_image]))[0]
+        if images['paradedb']['Architecture'] != native:
+            raise ValueError('ParadeDB image must run natively; emulated timings are not supported')
     if image['Config'].get('Labels', {}).get('benchmark.stannum_source_sha256') != source['source_sha256']:
         raise ValueError('image does not match extension source provenance')
     recipe = bench.digest((ROOT / 'benchmarks/Dockerfile').read_bytes() +
@@ -517,6 +802,23 @@ def run(args):
     shutil.copytree(ASSETS, protocol / 'tin')
     manifest['host'] = dict(system=platform.platform(), machine=platform.machine(),
                             docker=json.loads(output(['docker', 'info', '--format', '{{json .}}'])))
+    # The server's CPUs from the Docker host's topology, recorded with the
+    # topology itself so a reader can tell "8 vCPUs" readings apart.
+    plan = None
+    if args.cpu_layout != 'none' or getattr(args, 'cpuset_cpus', None):
+        topology = (dict(lscpu=Path(args.lscpu_file).read_text(), source=str(args.lscpu_file))
+                    if getattr(args, 'lscpu_file', None) else cpu_topology(image['Id']))
+        plan = plan_cpus(topology['lscpu'], args.cpus, args.cpu_layout, getattr(args, 'cpuset_cpus', None))
+        manifest['host']['lscpu'] = topology
+    client_prefix, client_note = client_pinning(plan)
+    manifest['cpu_pinning'] = dict(plan or dict(layout='none', server_cpuset=None),
+                                   method='docker --cpuset-cpus' if plan else 'docker --cpus quota only',
+                                   cpus_quota=args.cpus, client=client_note)
+    manifest['profile'] = getattr(args, 'profile', None)
+    manifest['score_function'] = getattr(args, 'score_function', 'score')
+    manifest['engine_images'] = {engine: dict(id=images[engine]['Id'], repo_digests=images[engine].get('RepoDigests'))
+                                 for engine in args.engines}
+    bench.save(root / 'manifest.json', manifest)
     env = dict(os.environ, PGHOST='127.0.0.1', PGPORT=str(args.port), PGUSER='postgres',
                PGPASSWORD='postgres', PGDATABASE='benchmark',
                PGOPTIONS='-c statement_timeout=120000 -c jit=off')
@@ -540,7 +842,9 @@ def run(args):
             path.mkdir()
             job = dict(engine=engine, status='running', container=name, volume=volume,
                        resource_limits=dict(build_memory=getattr(args, 'build_memory', None) or args.memory,
-                                            query_memory=args.memory))
+                                            query_memory=args.memory, cpus=args.cpus,
+                                            cpuset=plan['server_cpuset'] if plan else None,
+                                            shm_size=args.shm_size))
             manifest['jobs'].append(job)
             bench.save(root / 'manifest.json', manifest)
             command(['docker', 'volume', 'create', volume], stdout=subprocess.DEVNULL)
@@ -557,30 +861,14 @@ def run(args):
                 # A database built by another image is usable as long as this
                 # image reads its segment format, which the directory check
                 # after startup proves; the origin is recorded either way.
-                copy_volume(image['Id'], f'{args.load_database.resolve()}:/from:ro', f'{volume}:/to')
+                copy_volume(images[engine]['Id'], f'{args.load_database.resolve()}:/from:ro', f'{volume}:/to')
             try:
                 # Extra `docker run` flags for local rehearsals, such as read throttling that
                 # stands in for a slower disk: STANNUM_DOCKER_RUN_ARGS="--device-read-iops /dev/vdb:20000".
                 extra = shlex.split(os.environ.get('STANNUM_DOCKER_RUN_ARGS', ''))
-                command(['docker', 'run', '-d', '--name', name, '--cpus', str(args.cpus), *extra,
-                         '--memory', job['resource_limits']['build_memory'],
-                         '--memory-swap', job['resource_limits']['build_memory'], '--shm-size', '1g',
-                         '-p', f'127.0.0.1:{args.port}:5432',
-                         '-v', f'{volume}:/var/lib/postgresql',
-                         # The server reads the prepared CSV itself: see the import below.
-                         '-v', f'{path.resolve()}:/import:ro',
-                         '-e', 'POSTGRES_PASSWORD=postgres', '-e', 'POSTGRES_DB=benchmark',
-                         image['Id'], 'postgres', '-c', f'shared_buffers={args.shared_buffers}',
-                         '-c', 'maintenance_work_mem=' + getattr(args, 'maintenance_work_mem', '512MB'), '-c', 'work_mem=16MB',
-                         '-c', f'max_parallel_workers={args.cpus}', '-c', 'jit=off',
-                         '-c', 'track_io_timing=on', '-c', f'plan_cache_mode={args.plan_cache_mode}'] +
-                        (['-c', f'stannum.build_segment_docs={args.build_segment_docs}']
-                         if engine == 'stannum' and getattr(args, 'build_segment_docs', None) is not None else []) +
-                        # Local experiments only, recorded in the manifest: extra server
-                        # settings such as STANNUM_POSTGRES_SETTINGS="stannum.read_cache_mb=256".
-                        [a for setting in shlex.split(os.environ.get('STANNUM_POSTGRES_SETTINGS', ''))
-                         for a in ('-c', setting)],
-                        stdout=subprocess.DEVNULL)
+                start = server_command(args, name, images[engine]['Id'], volume, path.resolve(), engine, plan, extra)
+                job['docker_run'] = start
+                command(start, stdout=subprocess.DEVNULL)
                 deadline = time.monotonic() + 90
                 while subprocess.run(['pg_isready'], env=env, capture_output=True).returncode:
                     if time.monotonic() > deadline:
@@ -588,14 +876,22 @@ def run(args):
                     time.sleep(.5)
                 sampler = ResourceSampler(name, path / 'resources.jsonl')
                 sampler.thread.start()
+                job['postgres'] = dict(server_version=sql('SHOW server_version;'), version=sql('SELECT version();'))
+                manifest['postgres_version'] = job['postgres']['server_version']
                 if loaded is None:
-                    sql('CREATE EXTENSION pg_prewarm; CREATE EXTENSION pg_visibility; CREATE EXTENSION stannum;')
-                with (path / 'driver-regressions.txt').open('w') as log:
-                    command([driver / 'pg-driver-test', '-test.v'],
-                            env=dict(env, STANNUM_BENCH_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark',
-                                     BENCHMARKER_POSTGRES_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark'),
-                            stdout=log, stderr=subprocess.STDOUT)
-                index = 'documents_body_gin_idx' if engine == 'postgres' else 'documents_body_stannum_idx'
+                    sql('CREATE EXTENSION pg_prewarm; CREATE EXTENSION pg_visibility; ' +
+                        # The ParadeDB image's bootstrap has already created pg_search.
+                        ('CREATE EXTENSION IF NOT EXISTS pg_search;' if engine == 'paradedb' else 'CREATE EXTENSION stannum;'))
+                if engine == 'paradedb':
+                    job['extension_version'] = sql("SELECT extversion FROM pg_extension WHERE extname = 'pg_search';")
+                    (path / 'driver-regressions.txt').write_text('skipped: the regressions exercise the Stannum adapter\n')
+                else:
+                    with (path / 'driver-regressions.txt').open('w') as log:
+                        command([driver / 'pg-driver-test', '-test.v'],
+                                env=dict(env, STANNUM_BENCH_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark',
+                                         BENCHMARKER_POSTGRES_TEST_URL=f'postgres://postgres:postgres@127.0.0.1:{args.port}/benchmark'),
+                                stdout=log, stderr=subprocess.STDOUT)
+                index = INDEXES[engine]
                 if loaded is not None:
                     for key in ('input_sha256', 'import_seconds', 'index_build_seconds',
                                 'build_segment_docs', 'segments_after_build'):
@@ -611,7 +907,8 @@ def run(args):
                         job['database_from']['image'] = loaded.get('image')
                         job['database_from']['commit'] = loaded.get('commit')
                 if loaded is None:
-                    sql((ASSETS / 'position-limit.sql').read_text())
+                    if engine != 'paradedb':
+                        sql((ASSETS / 'position-limit.sql').read_text())
                     sql('CREATE TABLE documents(id text NOT NULL, body text NOT NULL);' if published else
                         'CREATE TABLE documents(id bigint PRIMARY KEY, body text NOT NULL);')
                 if loaded is None:
@@ -646,7 +943,9 @@ def run(args):
                     expression = 'gin(body_tsv)' if engine == 'postgres' else 'stannum(body)'
                     sampler.phase = 'index-build'
                     bench.save(path / 'before-build-cgroup.json', resource_snapshot(name))
-                    build_sql = f'CREATE INDEX {index} ON documents USING {expression};'
+                    build_sql = (PARADEDB_INDEX_SQL if engine == 'paradedb' else
+                                 f'CREATE INDEX {index} ON documents USING {expression};')
+                    job['index_sql'] = build_sql
                     if engine == 'stannum':
                         build_sql += " SELECT current_setting('stannum.build_segment_docs');"
                     build_result = sql(build_sql, setup=True)
@@ -660,6 +959,8 @@ def run(args):
                     if engine == 'stannum':
                         job['segments_after_build'] = json.loads(sql(
                             f"SELECT coalesce(json_agg(s ORDER BY ordinal), '[]'::json) FROM stannum.segment_info('{index}') s;"))
+                if engine == 'paradedb':
+                    job['segments_after_build'] = int(sql(f"SELECT count(*) FROM paradedb.index_info('{index}');"))
                 if job['resource_limits']['build_memory'] != args.memory:
                     sampler.phase = 'query-memory-transition'
                     command(['docker', 'update', '--memory', args.memory, '--memory-swap', args.memory, name],
@@ -684,43 +985,58 @@ def run(args):
                 job['workload_state'] = dict(protocol='postvacuum-observed-v1',
                                              after_vacuum=workload_state(sql))
                 job['sizes'] = json.loads(sql(f"SELECT json_build_object('index',pg_relation_size('{index}'),'table',pg_table_size('documents'),'total',pg_total_relation_size('documents'),'rows',(SELECT count(*) FROM documents));", setup=True))
-                sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};", setup=True)
-                oracle = 'SET enable_seqscan=off;\n' + check_sql(queries, engine, raw_text=raw_text)
-                (path / 'correctness.sql').write_text(oracle)
-                started = time.monotonic()
-                text = sql(oracle)
-                (path / 'correctness.txt').write_text(text + '\n')
-                validate_result(text, [q[0] for q in queries])
-                job['full_counts_before'] = {name: int(count) for name, _, count in
-                                            (line.split('|') for line in text.splitlines())}
-                job['correctness'] = dict(queries=len(queries), mismatches=0,
-                                          reference='same-engine-unindexed-tokenizer' if raw_text else 'normalized-lexical-or-gin',
-                                          sampled_rows=min(args.rows, args.validation_rows),
-                                          seconds=time.monotonic() - started)
-                semantics = sql(semantics_sql(queries, raw_text=raw_text))
-                (path / 'semantics.txt').write_text(semantics + '\n')
-                differences = {name: int(count) for name, count in
-                               (line.split('|') for line in semantics.splitlines()) if int(count)}
-                job['cross_engine_membership_differences'] = differences
-                sql('DROP TABLE reference;')
-                if args.workload == 'topk':
-                    ranked_queries = validation_queries(queries, getattr(args, 'ranked_validation_queries', 0))
-                    # Like the count check: the references go through the index,
-                    # not a sequential scan that tokenizes every body.
-                    ranked_sql = 'SET enable_seqscan=off;\n' + ranked_check_sql(ranked_queries, engine)
-                    (path / 'ranked-correctness.sql').write_text(ranked_sql)
-                    # Exhaustive references over the full table are setup work: one
-                    # stopword-heavy disjunction over 15 million rows outlasts the
-                    # timeout measured queries run under.
-                    ranked = sql(ranked_sql, setup=True)
-                    (path / 'ranked-correctness.txt').write_text(ranked + '\n')
-                    validate_result(ranked, [q[0] for q in ranked_queries])
-                    job['ranked_correctness'] = dict(queries=len(ranked_queries), mismatches=0,
-                                                     reference='exhaustive same-engine score multiset; ties unordered')
+                if engine == 'paradedb':
+                    # A calibration engine with its own tokenizer: no oracle, only the
+                    # full-corpus match counts of the validation sample, as a record.
+                    counts_sql = paradedb_count_sql(queries)
+                    (path / 'correctness.sql').write_text(counts_sql)
+                    started = time.monotonic()
+                    text = sql(counts_sql)
+                    (path / 'correctness.txt').write_text(text + '\n')
+                    job['full_counts_before'] = {name: int(count) for name, count in
+                                                (line.split('|') for line in text.splitlines())}
+                    job['correctness'] = dict(queries=len(queries), mismatches=None,
+                                              reference='none: calibration engine; full-corpus counts recorded',
+                                              seconds=time.monotonic() - started)
+                    job['cross_engine_membership_differences'] = {}
+                else:
+                    sql(f"CREATE TABLE reference AS SELECT id, body, to_tsvector('simple',body) AS body_tsv FROM documents ORDER BY id LIMIT {args.validation_rows};", setup=True)
+                    oracle = 'SET enable_seqscan=off;\n' + check_sql(queries, engine, raw_text=raw_text)
+                    (path / 'correctness.sql').write_text(oracle)
+                    started = time.monotonic()
+                    text = sql(oracle)
+                    (path / 'correctness.txt').write_text(text + '\n')
+                    validate_result(text, [q[0] for q in queries])
+                    job['full_counts_before'] = {name: int(count) for name, _, count in
+                                                (line.split('|') for line in text.splitlines())}
+                    job['correctness'] = dict(queries=len(queries), mismatches=0,
+                                              reference='same-engine-unindexed-tokenizer' if raw_text else 'normalized-lexical-or-gin',
+                                              sampled_rows=min(args.rows, args.validation_rows),
+                                              seconds=time.monotonic() - started)
+                    semantics = sql(semantics_sql(queries, raw_text=raw_text))
+                    (path / 'semantics.txt').write_text(semantics + '\n')
+                    differences = {name: int(count) for name, count in
+                                   (line.split('|') for line in semantics.splitlines()) if int(count)}
+                    job['cross_engine_membership_differences'] = differences
+                    sql('DROP TABLE reference;')
+                    if args.workload == 'topk':
+                        ranked_queries = validation_queries(queries, getattr(args, 'ranked_validation_queries', 0))
+                        # Like the count check: the references go through the index,
+                        # not a sequential scan that tokenizes every body.
+                        ranked_sql = 'SET enable_seqscan=off;\n' + ranked_check_sql(ranked_queries, engine, args.score_function)
+                        (path / 'ranked-correctness.sql').write_text(ranked_sql)
+                        # Exhaustive references over the full table are setup work: one
+                        # stopword-heavy disjunction over 15 million rows outlasts the
+                        # timeout measured queries run under.
+                        ranked = sql(ranked_sql, setup=True)
+                        (path / 'ranked-correctness.txt').write_text(ranked + '\n')
+                        validate_result(ranked, [q[0] for q in ranked_queries])
+                        job['ranked_correctness'] = dict(queries=len(ranked_queries), mismatches=0,
+                                                         reference='exhaustive same-engine score multiset; ties unordered')
                 plan_queries = [q for q in queries if selected_style(q[0], args.style)]
                 for query in plan_queries[:6]:
                     for mode in ('force_custom_plan', 'force_generic_plan'):
-                        statement = prepared_plan_sql(query, engine, args.workload, mode)
+                        statement = prepared_plan_sql(query, engine, args.workload, mode, args.score_function)
                         filename = 'plan-' + query[0].replace(':', '-') + '-' + mode
                         (path / (filename + '.sql')).write_text(statement + '\n')
                         # Diagnostics, not measurements: a forced generic plan may scan the heap.
@@ -760,14 +1076,19 @@ def run(args):
                                QUERY_STYLE=args.style, QUERIES=str(root / 'queries.json'),
                                CONFIG_DIR=str(driver / 'datasets/wikipedia'),
                                STANNUM_PORT=str(args.port), POSTGRES_PORT=str(args.port),
+                               PARADEDB_PORT=str(args.port), PARADEDB_CONTAINER=name,
+                               # ParadeDB through |||, &&& and ### (the v1.0.6 post), not @@@.
+                               PARADEDB_QUERY_FORM='operators',
                                STANNUM_CONTAINER=name, POSTGRES_CONTAINER=name,
                                VUS=str(args.clients), DURATION=f'{args.seconds}s',
                                PREWARM=f'{args.warmup}s', UPDATES_PER_SECOND=str(args.updates),
                                SEED=str(args.seed), COOLDOWN='0s', TOP_K='10',
-                               DASHBOARD_EXPORT_DIR=str(path), DASHBOARD_EXPORT_PREFIX='result')
+                               DASHBOARD_EXPORT_DIR=str(path), DASHBOARD_EXPORT_PREFIX='result',
+                               STANNUM_SCORE_FUNCTION=args.score_function)
                 sampler.phase = 'driver-warmup-and-measurement'
                 with (path / 'driver.log').open('w') as log:
-                    command([driver / 'k6', 'run', '--out', 'dashboard=json',
+                    # Pinned to the CPUs the server does not use, where the host allows it.
+                    command([*client_prefix, driver / 'k6', 'run', '--out', 'dashboard=json',
                              '--out', 'json=' + str(path / 'samples.json.gz'),
                              '--summary-export', path / 'summary.json',
                              driver / 'benchmarks/search.js'], env=run_env, stdout=log, stderr=subprocess.STDOUT)
@@ -864,6 +1185,9 @@ def recorded_source(path):
 COMPARISON_SETTINGS = ('rows', 'validation_rows', 'workload', 'style', 'clients',
                        'seconds', 'warmup', 'updates', 'seed', 'cpus', 'memory',
                        'shared_buffers', 'engines', 'plan_cache_mode')
+# Recorded since the TIN v1.0.6 alignment; absent (None) in older manifests.
+LATER_COMPARISON_SETTINGS = ('profile', 'score_function', 'cpu_layout', 'cpuset_cpus', 'shm_size',
+                             'max_parallel_maintenance_workers')
 
 
 def comparison_contract(manifest):
@@ -891,7 +1215,9 @@ def comparison_contract(manifest):
                 validation_query_ids=manifest.get('validation_query_ids'), trace=manifest.get('trace'), adapter=manifest['adapter'], corpus=manifest['corpus'],
                 harness_sources=manifest['harness_sources'],
                 runner_sha256=manifest['runner_sha256'],
-                config={k: (manifest['config'].get(k, 'auto') if k == 'plan_cache_mode' else manifest['config'][k]) for k in COMPARISON_SETTINGS},
+                config={**{k: (manifest['config'].get(k, 'auto') if k == 'plan_cache_mode' else manifest['config'][k]) for k in COMPARISON_SETTINGS},
+                        **{k: manifest['config'].get(k) for k in LATER_COMPARISON_SETTINGS}},
+                cpu_pinning=manifest.get('cpu_pinning'),
                 host={k: manifest['host'][k] for k in ('system', 'machine')},
                 docker={k: docker.get(k) for k in
                         ('NCPU', 'MemTotal', 'Architecture', 'OperatingSystem', 'ServerVersion', 'KernelVersion')},
@@ -1056,7 +1382,7 @@ def experiment_command(args):
     tin_experiments.run(args)
 
 
-def main():
+def parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--driver', type=Path, default=DEFAULT_DRIVER)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -1088,10 +1414,14 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--image', required=True)
     p.add_argument('--base', help='Base image for a rehearsal on another architecture; the published runs use the pinned ParadeDB image')
+    p.add_argument('--target-cpu', help='x86-64 only: STANNUM_TARGET_CPU build argument (x86-64-v3, x86-64-v4); '
+                                        'unset builds the baseline with runtime SIMD dispatch')
     common = argparse.ArgumentParser(add_help=False)
     p = common
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--dataset', type=Path, required=True)
+    p.add_argument('--dataset', type=Path,
+                   help='The corpus; optional with --load-database and --published-corpus, whose saved '
+                        'database vouches for the import (no CSV needed)')
     p.add_argument('--published-corpus', choices=['wikipedia', 'stackexchange'])
     p.add_argument('--query-file', type=Path, help='Explicit trace; snapshotted and hashed for every run')
     p.add_argument('--rows', type=bench.positive, default=1000)
@@ -1107,16 +1437,35 @@ def main():
                    help='SQL run on the database after load or build and before validation and measurement')
     p.add_argument('--workload', choices=['count', 'topk'], default='count')
     p.add_argument('--style', choices=['mixed', 'conjunction', 'disjunction', 'phrase', 'conjunction-phrase', 'conjunction-disjunction'], default='mixed')
-    p.add_argument('--clients', type=bench.positive, default=2)
+    p.add_argument('--profile', choices=sorted(PROFILES),
+                   help='Server sizing of a published setup (v2 = TIN v1.0.6: 8 pinned CPUs, 64g; legacy = the launch '
+                        'post and AWS r5-r8: 8 CPUs by quota, 32g); '
+                        'it fills only the sizing options left unset')
+    p.add_argument('--clients', type=bench.positive, default=None, help='Driver clients (default 2; 8 under a profile)')
     p.add_argument('--seconds', type=bench.positive, default=60)
     p.add_argument('--warmup', type=bench.positive, default=10)
     p.add_argument('--updates', type=int, default=0)
     p.add_argument('--seed', type=int, default=1592614637)
-    p.add_argument('--cpus', type=bench.positive, default=4)
-    p.add_argument('--memory', default='4g')
-    p.add_argument('--build-memory', help='Optional separate build cap; switch to --memory before validation and queries')
-    p.add_argument('--shared-buffers', default='1GB')
-    p.add_argument('--maintenance-work-mem', default='512MB')
+    p.add_argument('--cpus', type=bench.positive, default=None, help='CPU quota and max_parallel_workers (default 4)')
+    p.add_argument('--cpu-layout', choices=CPU_LAYOUTS, default=None,
+                   help='Pin the server with --cpuset-cpus chosen from the host topology (lscpu): siblings = '
+                        'cpus/threads-per-core whole cores, both hyperthreads of each (8 vCPUs as AWS sells them); '
+                        'distinct-cores = one thread on each of cpus cores; none = CFS quota only (the default)')
+    p.add_argument('--cpuset-cpus', help='Pin the server to exactly these CPUs (e.g. 0-3,16-19); overrides --cpu-layout')
+    p.add_argument('--lscpu-file', type=Path,
+                   help='Topology from saved `lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE` output instead of the Docker host')
+    p.add_argument('--memory', default=None, help='Container memory for validation and queries (default 4g)')
+    p.add_argument('--build-memory', default=None, help='Optional separate build cap; switch to --memory before validation and queries')
+    p.add_argument('--shared-buffers', default=None, help='default 1GB')
+    p.add_argument('--maintenance-work-mem', default=None, help='default 512MB')
+    p.add_argument('--max-parallel-maintenance-workers', type=int, default=None,
+                   help='Server setting; unset keeps PostgreSQL\'s default (2), v2 uses the benchmarker\'s 8')
+    p.add_argument('--shm-size', default=None, help='Container /dev/shm (default 1g; the benchmarker uses 16g)')
+    p.add_argument('--score-function', choices=['score', 'full_score'], default='score',
+                   help='Ranking: stannum.score (dense terms elided at 10%%, as tin.score: "TIN") or '
+                        'stannum.full_score (every term, as tin.full_score: "TIN_FULL")')
+    p.add_argument('--dry-run', action='store_true',
+                   help='Print the server and driver commands this run would start, and exit')
     p.add_argument('--build-segment-docs', type=bench.positive,
                    help='Override Stannum construction batch size; default uses the extension setting')
     p.add_argument('--plan-cache-mode', choices=['auto', 'force_custom_plan', 'force_generic_plan'], default='auto')
@@ -1127,14 +1476,21 @@ def main():
                    help='the source.json build-image wrote for --image, so a run matches the image rather than the working tree')
     p.set_defaults(func=run)
     p.add_argument('--image', required=True)
-    p.add_argument('--engines', nargs='+', choices=['stannum', 'postgres'], default=['stannum', 'postgres'])
+    p.add_argument('--engines', nargs='+', choices=['stannum', 'postgres', 'paradedb'], default=['stannum', 'postgres'],
+                   help='paradedb: an optional, local-only calibration anchor on the pinned ParadeDB 0.26.0 image, '
+                        'through its |||/&&&/### operators; never part of the AWS runs')
+    p.add_argument('--paradedb-image', default=PARADEDB_IMAGE, help='default: the final 0.26.0 release, pinned by digest')
     p = commands.add_parser('compare', parents=[common])
     p.set_defaults(func=compare)
     p.add_argument('--repetitions', type=bench.positive, default=5)
     for variant in ('baseline', 'candidate'):
         p.add_argument('--' + variant + '-image', required=True)
         p.add_argument('--' + variant + '-source', type=Path, required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = parser().parse_args()
     # No global lock here: a run or an image build works inside Docker and
     # touches no native pgrx build or install, and a full-scale run holding
     # the pgrx lock for hours blocked every test and image build meanwhile.

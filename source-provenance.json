@@ -108,6 +108,10 @@
       "owner": "ben",
       "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
     },
+    "benchmarks/aws/v2-campaign.sh": {
+      "owner": "ben",
+      "evidence": "New Stannum AWS orchestration for benchmarks v2 (TIN v1.0.6 setup); not copied from Lead."
+    },
     "benchmarks/baselines.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -368,6 +372,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
     },
+    "benchmarks/test_v2.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum tests for the benchmarks v2 campaign and report."
+    },
     "benchmarks/test_vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
@@ -391,6 +399,10 @@
     "benchmarks/tin_experiments.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
+    },
+    "benchmarks/v2.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmarks v2 campaign and report over the pinned PlanetScale/ParadeDB benchmark driver."
     },
     "benchmarks/vacuum_cleanup.py": {
       "owner": "ben",

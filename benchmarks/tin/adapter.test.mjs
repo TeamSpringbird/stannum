@@ -40,3 +40,30 @@ test('conjunction-phrase retains both families and excludes disjunctions', () =>
     assert.equal(buildRequest('postgres', 'topk', entry, 10)[1], entry.record.engines.postgres[entry.style]);
   }
 });
+
+test('the full-score variant (TIN_FULL) changes only the ranking function', () => {
+  const entries = selectQueries(trace, 'mixed', 1592614637);
+  for (const entry of entries) {
+    const [score, argument] = buildRequest('stannum', 'topk', entry, 10);
+    const [full, fullArgument] = buildRequest('stannum', 'topk', entry, 10, {scoreFunction: 'full_score'});
+    assert.equal(full, score.replace('stannum.score(ctid)', 'stannum.full_score(ctid)'));
+    assert.equal(fullArgument, argument);
+    assert.equal(buildRequest('stannum', 'count', entry, 10, {scoreFunction: 'full_score'})[0],
+                 'SELECT count(*) FROM documents WHERE body ==> $1');
+  }
+  assert.throws(() => buildRequest('stannum', 'topk', entries[0], 10, {scoreFunction: 'max_score'}), /score or full_score/);
+});
+
+test('ParadeDB native operators (TIN v1.0.6 post) bind the plain text; the upstream form is unchanged', () => {
+  const entries = selectQueries(trace, 'mixed', 1592614637);
+  const operators = {conjunction: '&&&', disjunction: '|||', phrase: '###'};
+  for (const entry of entries) {
+    const [ranked, argument] = buildRequest('paradedb', 'topk', entry, 10, {paradedbForm: 'operators'});
+    assert.equal(ranked, `SELECT id, body, pdb.score(id) AS score FROM documents WHERE body ${operators[entry.style]} $1 ORDER BY score DESC LIMIT 10`);
+    assert.equal(argument, entry.record.engines.paradedb.match);
+    assert.equal(buildRequest('paradedb', 'count', entry, 10, {paradedbForm: 'operators'})[0],
+                 `SELECT count(*) FROM documents WHERE body ${operators[entry.style]} $1`);
+    assert.match(buildRequest('paradedb', 'topk', entry, 10)[0], /body @@@ pdb\.(parse|match)\(\$1/);
+  }
+  assert.throws(() => buildRequest('paradedb', 'topk', entries[0], 10, {paradedbForm: 'sql'}), /parse or operators/);
+});
