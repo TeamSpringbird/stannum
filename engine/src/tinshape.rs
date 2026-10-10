@@ -2468,47 +2468,59 @@ mod tests {
         );
     }
 
-    /// A group's candidates are scored best bound first: its best rows come
-    /// last in ctid order here, each earlier one beating the one before, so
-    /// a walk in ctid order would read every length; best first, the best
-    /// rows set the threshold and the rest fall short on their buckets.
+    /// A phrase's candidates in a group are scored best bound first: its
+    /// best rows come last in ctid order here, each earlier one beating the
+    /// one before, so a walk in ctid order would check the positions and
+    /// read the length of every one; best first, the best rows set the
+    /// threshold and the rest fall short on their buckets.
     #[test]
-    fn a_group_is_scored_best_bound_first() {
-        let docs: Vec<Tid> = (0..300u32)
+    fn a_phrase_group_is_scored_best_bound_first() {
+        let n = 200usize;
+        let docs: Vec<Tid> = (0..n as u32)
             .map(|i| Tid {
                 block: i / 20,
                 offset: (i % 20) as u16 + 1,
             })
             .collect();
-        let lengths: Vec<u32> = (0..300u32).map(|r| 400 - r).collect();
-        // A second term in the first document only, so `t0 OR t1` walks as a
-        // disjunction.
+        let lengths: Vec<u32> = (0..n as u32).map(|r| 400 - r).collect();
+        // Term t holds positions 0..tf (see `build_part`): "t0 t1" is at 0, 1
+        // in every document.
         let members = vec![
-            (0..300usize)
-                .map(|r| (r, if r >= 280 { 10 } else { 1 }))
+            (0..n)
+                .map(|r| (r, if r >= n - 20 { 10 } else { 1 }))
                 .collect::<Vec<_>>(),
-            vec![(0, 1)],
+            (0..n).map(|r| (r, 2)).collect(),
         ];
-        let all: Vec<usize> = (0..300).collect();
+        let all: Vec<usize> = (0..n).collect();
         let options = Options {
             block_size: 64,
             grid_min_postings: 0,
             inline_lengths_min_documents: u32::MAX,
             ..Options::default()
         };
-        let blob = build_part(&docs, &lengths, &members, &all, &[false; 300], options);
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
         let segment = Segment::parse(&blob).unwrap();
         let names = vec!["t0".to_owned(), "t1".to_owned()];
         let scorer = |df| {
             TermScorer::from_statistics(10_000, df, 1.0, Bm25Params::default(), 100.0).unwrap()
         };
-        let scorers = vec![("t0".to_owned(), scorer(300)), ("t1".to_owned(), scorer(1))];
-        for node in [Node::Term(0), Node::Or(vec![Node::Term(0), Node::Term(1)])] {
-            let got = top_k(&segment, &node, &names, &scorers, 3, &mut NoTouch).unwrap();
-            let tids: Vec<Tid> = got.rows.iter().map(|r| r.1).collect();
-            assert_eq!(tids, vec![docs[299], docs[298], docs[297]], "{node:?}");
-            assert!(got.scored <= 30, "{node:?} scored {}", got.scored);
-        }
+        let scorers = vec![
+            ("t0".to_owned(), scorer(200)),
+            ("t1".to_owned(), scorer(200)),
+        ];
+        let node = Node::Span {
+            slots: vec![0, 1],
+            query: SpanQuery::phrase([0, 1]),
+        };
+        let got = top_k(&segment, &node, &names, &scorers, 3, &mut NoTouch).unwrap();
+        let tids: Vec<Tid> = got.rows.iter().map(|r| r.1).collect();
+        assert_eq!(tids, vec![docs[n - 1], docs[n - 2], docs[n - 3]]);
+        assert!(got.scored <= 30, "scored {}", got.scored);
+        assert!(
+            got.position_checks <= 30,
+            "{} positions checks",
+            got.position_checks
+        );
     }
 
     proptest! {

@@ -46,6 +46,12 @@ const SEEK_RATIO: usize = 4;
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
 
+/// Candidates staged before they are finished best first: a group's
+/// candidates are staged and finished this many at a time, so a threshold
+/// that is still low early in a walk rises between chunks rather than
+/// letting a whole group's candidates be bounded and sorted against it.
+const STAGE_CHUNK: usize = 256;
+
 /// One scoring term of a walk.
 pub(super) struct Sc {
     pub(super) term: usize,
@@ -796,13 +802,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Bounds, scores and admits group `g`'s candidates `cands` (local
     /// slots, ascending), then checks its pending phrase candidates; false
-    /// once nothing later can enter the top k. With terms to score, and a
-    /// check that does not walk cursors forward (a flat AND, a span), the
-    /// candidates are bounded by their buckets first and scored best first
-    /// (see [`Walk::finish_staged`]).
+    /// once nothing later can enter the top k. A span's candidates, with
+    /// terms to score, are bounded by their buckets first and scored best
+    /// first (see [`Walk::finish_staged`]): its top k fill only with
+    /// confirmed matches, which its best-bounded candidates find soonest,
+    /// and each one scored may mean a positions check. Any other walk scores
+    /// in ctid order: on TIN's corpus staging its candidates scored fewer
+    /// of them but read no fewer DL pages (the sidecar holds about a
+    /// group's lengths per page), and took longer.
     fn walk_candidates(&mut self, g: u32, cands: &[u32]) -> Result<bool> {
         let base = self.geometry.groups[g as usize].slot_base;
-        let staging = !self.sc.is_empty() && !matches!(self.verify, Verify::Node);
+        let staging = !self.sc.is_empty() && matches!(self.verify, Verify::Span(_));
         let mut more = true;
         let mut at = 0;
         while at < cands.len() {
@@ -820,6 +830,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             if staging {
                 self.stage_into(g, local)?;
+                if self.staged.len() >= STAGE_CHUNK {
+                    self.finish_staged(g)?;
+                }
             } else if !self.process(g, local)? {
                 more = false;
                 break;
@@ -1012,8 +1025,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let i = i as usize;
             let (reach, local, length) = staged[i];
             let tid = self.geometry.tid_in(g as usize, local);
+            // In this order (bound down, then ctid up) and with a bar that
+            // only rises, every candidate after one cut is cut too.
             if self.cut(reach, || tid) {
-                continue;
+                break;
             }
             self.buckets
                 .copy_from_slice(&self.staged_buckets[i * n..(i + 1) * n]);
@@ -1801,9 +1816,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A word's members are bounded from its first slot's ctid (see
         // `Walk::cut`), each member from its own.
         let first = |w: usize| geometry.tid_in(gi, (w * 64) as u32);
-        // A flat disjunction's candidates are scored best bound first; a
-        // node's check walks its cursors forward, in slot order.
-        let staging = matches!(self.verify, Verify::Flat);
         let mut w0 = 0;
         while w0 < words {
             let w1 = (w0 + SUB_WORDS).min(words);
@@ -1865,17 +1877,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 while word != 0 {
                     let bit = word.trailing_zeros();
                     word &= word - 1;
-                    if staging {
-                        self.or_stage_into(g, base, words, w, bit)?;
-                    } else {
-                        self.or_candidate(g, base, words, w, bit)?;
-                    }
+                    self.or_candidate(g, base, words, w, bit)?;
                 }
             }
             w0 = w1;
-        }
-        if staging {
-            self.finish_staged(g)?;
         }
         self.or_terms = terms;
         self.or_held = held;
@@ -1950,16 +1955,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let local = (w * 64) as u32 + bit;
         if let Some((_, length)) = self.or_stage(g, base, words, w, bit)? {
             self.finish(g, local, length)?;
-        }
-        Ok(())
-    }
-
-    /// [`Walk::or_candidate`] staged (see [`Walk::finish_staged`]).
-    #[inline(never)]
-    fn or_stage_into(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
-        if let Some((reach, length)) = self.or_stage(g, base, words, w, bit)? {
-            self.staged.push((reach, (w * 64) as u32 + bit, length));
-            self.staged_buckets.extend_from_slice(&self.buckets);
         }
         Ok(())
     }
