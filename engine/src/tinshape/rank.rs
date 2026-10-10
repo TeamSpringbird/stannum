@@ -854,14 +854,35 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return false;
         };
         let mut bound = 0.0_f32;
-        for s in &mut self.sc {
-            bound += s.range_bound(base, end);
+        for i in 0..self.sc.len() {
+            bound += self.group_term_bound(i, g, base, end);
             if bound > theta {
                 return false;
             }
         }
         let geometry = self.geometry;
         self.cut(bound, || geometry.tid_in(g as usize, 0))
+    }
+
+    /// The group-skip hook of both walks: scoring term `i`'s bound over
+    /// group `g` (slots `base..=end`) before any of the group is read. It
+    /// is the term's footer blocks' bound over the slots, capped by the
+    /// group's frontier where the term's directory holds one
+    /// ([`TermSet::group_bound`]): zero, with no block bounded, where the
+    /// term does not hold the group. Either is at least the term's score
+    /// of each of its postings there, bit for bit, so their sum in the
+    /// scorer's order bounds a match as [`Walk::cut`] requires.
+    #[inline]
+    fn group_term_bound(&mut self, i: usize, g: u32, base: u32, end: u32) -> f32 {
+        let t = self.sc[i].term;
+        let cap = self.terms[t]
+            .as_ref()
+            .and_then(|set| set.group_bound(g, &mut self.mems[t].hint, &self.sc[i].scorer));
+        match cap {
+            Some(0.0) => 0.0,
+            Some(cap) => self.sc[i].range_bound(base, end).min(cap),
+            None => self.sc[i].range_bound(base, end),
+        }
     }
 
     /// Whether every required term holds group `g` as a grid.
@@ -1893,10 +1914,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         sb.clear();
         sb.resize(n, 0.0);
         let mut total = 0.0_f32;
-        for (i, bound) in sb.iter_mut().enumerate() {
+        for i in 0..n {
             if self.present[i] {
-                *bound = self.sc[i].range_bound(base, end);
-                total += *bound;
+                sb[i] = self.group_term_bound(i, g, base, end);
+                total += sb[i];
             }
         }
         let geometry = self.geometry;

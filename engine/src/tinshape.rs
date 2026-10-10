@@ -14,6 +14,7 @@
 
 use boldi_vigna::{SpanQuery, SpanSolver};
 use segment::Tid;
+use segment::tf_bucket::TfBucket;
 use segment::tinshape::bits;
 use segment::tinshape::blob::Bytes;
 use segment::tinshape::docs::{Geometry, Group};
@@ -371,6 +372,37 @@ impl<'a> TermSet<'a> {
                 at: self.containers + entry.at as usize,
             },
         }
+    }
+
+    /// The most `scorer` can give a posting of the term in group `group`,
+    /// by the group's frontier in the term's directory, looked for from
+    /// `hint` forward as [`Self::find`] looks: zero when the term does not
+    /// hold the group, `None` when the directory holds no frontiers (a
+    /// sparse term, a single posting, a record written without them). Like
+    /// a footer block's bound, an `f32` score of the scorer's own at a
+    /// bucket at least the posting's and a length at most its document's
+    /// (rounded down where the frontier is), so at least its score, bit for
+    /// bit. Read from the directory, which is parsed already: nothing more
+    /// of the record is read.
+    #[inline]
+    pub(crate) fn group_bound(
+        &self,
+        group: u32,
+        hint: &mut usize,
+        scorer: &TermScorer,
+    ) -> Option<f32> {
+        self.postings.frontiers.as_ref()?;
+        let count = self.dir.len();
+        while *hint < count && self.dir[*hint].index < group {
+            *hint += 1;
+        }
+        if *hint >= count || self.dir[*hint].index != group {
+            return Some(0.0);
+        }
+        let frontier = self.postings.group_frontier(&self.dir[*hint])?;
+        Some(frontier.fold(0.0_f32, |best, (bucket, length)| {
+            best.max(scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length))
+        }))
     }
 
     /// The term's group `group`, if it holds it, looked for from `hint`
@@ -1568,7 +1600,7 @@ mod tests {
     use segment::payload::PayloadBuilder;
     use segment::tf_bucket::TfBucket;
     use segment::tinshape::blob::LazyBlob;
-    use segment::tinshape::postings::Options;
+    use segment::tinshape::postings::{GroupFrontiers, Options};
     use segment::tinshape::segment::Builder;
 
     /// `parsed`'s blob assembled over `lazy`, which loads what is read, as
@@ -1740,6 +1772,7 @@ mod tests {
             block_size in prop::sample::select(vec![2u32, 16, 128]),
             k in 1usize..12,
             page_len in prop::sample::select(vec![37usize, 509, 8160]),
+            group_frontiers in prop::sample::select(vec![GroupFrontiers::Off, GroupFrontiers::Exact, GroupFrontiers::Rounded]),
         ) {
             let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
             // Term t holds a document with probability density[t] percent.
@@ -1759,7 +1792,7 @@ mod tests {
                     }
                 }
             }
-            let options = Options { block_size, grid_density, grid_min_postings: 0, inline_lengths_min_documents: 0, ..Options::default() };
+            let options = Options { block_size, grid_density, grid_min_postings: 0, inline_lengths_min_documents: 0, group_frontiers, ..Options::default() };
             let blob = build(&docs, &members, options);
             let segment = Segment::parse(&blob).unwrap();
             let lazy_blob = LazyBlob::new(Box::new(blob.clone()));
@@ -1882,6 +1915,163 @@ mod tests {
                     let alone: Vec<Option<u32>> = docs.iter().map(|tid| score_at(&segment, &scorers, *tid).unwrap().map(f32::to_bits)).collect();
                     prop_assert_eq!(scores, alone, "in-place scores, round {}", round);
                 }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        /// A group's bound from its directory frontier is at least the
+        /// score of every posting of the term in the group, bit for bit, as
+        /// the walks score it (the scorer's `score_bucket` at the posting's
+        /// bucket and its document's exact length), under any `k1`, `b`,
+        /// boost and average length, rounded frontiers included; and zero
+        /// for a group the term does not hold.
+        #[test]
+        fn a_group_bound_is_never_below_a_score_in_the_group(
+            doc_set in prop::collection::btree_set((0u32..2400, 1u16..=60), 1..600),
+            tfs in prop::collection::vec(1u32..40, 600),
+            lengths in prop::collection::vec(1u32..5000, 600),
+            k1 in prop::sample::select(vec![0.0f32, 1e-6, 0.3, 1.2, 3.0, 1e4]),
+            b in prop::sample::select(vec![0.0f32, 0.25, 0.75, 1.0]),
+            boost in prop::sample::select(vec![0.0f32, 0.5, 1.0, 7.25]),
+            average in prop::sample::select(vec![0.5f32, 13.0, 300.0, 4999.0]),
+            rounded in any::<bool>(),
+            every in 1usize..4,
+        ) {
+            let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
+            let lengths: Vec<u32> = (0..docs.len()).map(|i| lengths[i % lengths.len()]).collect();
+            let members: Vec<(usize, u32)> = (0..docs.len())
+                .filter(|r| r % every == 0)
+                .map(|r| (r, tfs[r % tfs.len()]))
+                .collect();
+            let options = Options {
+                sparse: false,
+                grid_min_postings: 0,
+                group_frontiers: if rounded { GroupFrontiers::Rounded } else { GroupFrontiers::Exact },
+                ..Options::default()
+            };
+            let mut builder = Builder::new(docs.clone(), lengths.clone(), options).unwrap();
+            let ranks: Vec<u32> = members.iter().map(|(r, _)| *r as u32).collect();
+            let buckets: Vec<u8> = members.iter().map(|(_, tf)| TfBucket::from_count(*tf).value()).collect();
+            let mut payload = PayloadBuilder::default();
+            for (_, tf) in &members {
+                payload.push(&(0..*tf).collect::<Vec<u32>>()).unwrap();
+            }
+            builder.add_term("t", &ranks, &buckets, &payload.finish()).unwrap();
+            let blob = builder.finish(&[]).0;
+            let segment = Segment::parse(&blob).unwrap();
+            let scorer = TermScorer::from_statistics(
+                docs.len() as u64,
+                members.len() as u64,
+                boost,
+                Bm25Params { k1, b },
+                average,
+            )
+            .unwrap();
+            let set = TermSet::open(&segment, "t", &mut NoTouch).unwrap().unwrap();
+            let geometry = &segment.docs.geometry;
+            if members.len() == 1 {
+                // A single posting has no directory.
+                prop_assert_eq!(set.group_bound(0, &mut 0, &scorer), None);
+                return Ok(());
+            }
+            let mut hint = 0;
+            let mut held = 0;
+            for g in 0..geometry.groups.len() as u32 {
+                let bound = set.group_bound(g, &mut hint, &scorer).expect("frontiers");
+                let group = geometry.groups[g as usize];
+                let mut any = false;
+                for (r, tf) in &members {
+                    let slot = geometry.slot_of(docs[*r]).unwrap();
+                    if slot < group.slot_base || slot >= group.slot_base + group.slots() {
+                        continue;
+                    }
+                    any = true;
+                    let score = scorer.score_bucket(TfBucket::from_count(*tf), lengths[*r]);
+                    prop_assert!(
+                        bound.total_cmp(&score).is_ge(),
+                        "group {} bound {} below score {} (tf {}, length {})",
+                        g, bound, score, tf, lengths[*r]
+                    );
+                }
+                if any {
+                    held += 1;
+                } else {
+                    prop_assert_eq!(bound.to_bits(), 0.0f32.to_bits(), "group {} the term lacks", g);
+                }
+            }
+            prop_assert_eq!(held, set.group_count());
+        }
+    }
+
+    /// With frontiers in the directory, a disjunction's and a conjunction's
+    /// walks skip groups their blocks' bounds would have read (a term's
+    /// blocks span groups of short and long documents alike), and rank as
+    /// without them.
+    #[test]
+    fn group_frontiers_skip_groups_and_keep_the_answer() {
+        // 40 groups of 64 pages of 4 documents; documents are short in
+        // every fifth group, long elsewhere. "c" is in every document, "r"
+        // in every third, "x" in every seventh.
+        let docs: Vec<Tid> = (0..40u32)
+            .flat_map(|g| (0..64u32).flat_map(move |p| (1..=4u16).map(move |o| Tid { block: g * 256 + p, offset: o })))
+            .collect();
+        let lengths: Vec<u32> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| if (t.block / 256) % 5 == 0 { 8 + (i as u32 % 5) } else { 400 + (i as u32 % 97) })
+            .collect();
+        let pick = |every: usize| -> Vec<(usize, u32)> {
+            (0..docs.len()).filter(|r| r % every == 0).map(|r| (r, 1 + (r as u32 % 3))).collect()
+        };
+        let members = [pick(1), pick(3), pick(7)];
+        let names: Vec<String> = ["c", "r", "x"].iter().map(|s| (*s).to_owned()).collect();
+        let run = |mode: GroupFrontiers, node: &Node| {
+            // Grouped: a sparse term's list has no directory to hold
+            // frontiers.
+            let options = Options {
+                block_size: 4096,
+                sparse: false,
+                group_frontiers: mode,
+                ..Options::default()
+            };
+            let mut builder = Builder::new(docs.clone(), lengths.clone(), options).unwrap();
+            for (t, m) in members.iter().enumerate() {
+                let ranks: Vec<u32> = m.iter().map(|(r, _)| *r as u32).collect();
+                let buckets: Vec<u8> = m.iter().map(|(_, tf)| TfBucket::from_count(*tf).value()).collect();
+                let mut payload = PayloadBuilder::default();
+                for (_, tf) in m {
+                    payload.push(&(0..*tf).collect::<Vec<u32>>()).unwrap();
+                }
+                builder.add_term(&names[t], &ranks, &buckets, &payload.finish()).unwrap();
+            }
+            let blob = builder.finish(&[]).0;
+            let segment = Segment::parse(&blob).unwrap();
+            let average = lengths.iter().map(|l| f64::from(*l)).sum::<f64>() / lengths.len() as f64;
+            let scorers: Vec<(String, TermScorer)> = members
+                .iter()
+                .enumerate()
+                .map(|(t, m)| {
+                    let scorer = TermScorer::from_statistics(docs.len() as u64, m.len() as u64, 1.0, Bm25Params::default(), average as f32).unwrap();
+                    (names[t].clone(), scorer)
+                })
+                .collect();
+            let answer = top_k(&segment, node, &names, &scorers, 10, &mut NoTouch).unwrap();
+            let rows: Vec<(u32, Tid)> = answer.rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect();
+            (rows, answer.windows_pruned, answer.scored)
+        };
+        for node in [
+            Node::Or(vec![Node::Term(0), Node::Term(1), Node::Term(2)]),
+            Node::And(vec![Node::Term(1), Node::Term(0)]),
+            Node::And(vec![Node::Term(2), Node::Or(vec![Node::Term(0), Node::Term(1)])]),
+        ] {
+            let (off, off_pruned, off_scored) = run(GroupFrontiers::Off, &node);
+            for mode in [GroupFrontiers::Exact, GroupFrontiers::Rounded] {
+                let (on, pruned, scored) = run(mode, &node);
+                assert_eq!(on, off, "{node:?} {mode:?}");
+                assert!(pruned > off_pruned, "{node:?} {mode:?}: pruned {pruned} against {off_pruned}");
+                assert!(scored <= off_scored, "{node:?} {mode:?}: scored {scored} against {off_scored}");
             }
         }
     }
