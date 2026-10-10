@@ -57,6 +57,11 @@ pub(super) struct Sc {
     wb: usize,
     /// The block holding the last candidate asked about, moved forward only.
     cb: usize,
+    /// [`TermScorer::length_bound_parts`], for [`Walk::length_bound`]'s
+    /// cheap first test.
+    num: [f32; BUCKET_COUNT],
+    den: [f32; BUCKET_COUNT],
+    factor: f32,
     /// [`Self::floor`] per bucket in the block last asked about, `u32::MAX`
     /// until asked (a rare term's block spans many groups' candidates), and
     /// the bucket's score at that length.
@@ -66,6 +71,7 @@ pub(super) struct Sc {
 
 impl Sc {
     pub(super) fn new(term: usize, scorer: TermScorer, footer: std::rc::Rc<Footer>) -> Self {
+        let (num, den, factor) = scorer.length_bound_parts();
         Self {
             term,
             bounds: vec![f32::NAN; footer.blocks()],
@@ -73,6 +79,9 @@ impl Sc {
             scorer,
             wb: 0,
             cb: 0,
+            num,
+            den,
+            factor,
             bb_block: usize::MAX,
             bb: [(u32::MAX, 0.0); BUCKET_COUNT],
         }
@@ -542,6 +551,9 @@ struct Walk<'s, 'a, T: Touch> {
     window_end: Option<u32>,
     window_bound: f32,
     window_buckets: Vec<u8>,
+    /// The window's length bound parts: its terms' numerators summed, and
+    /// the least of their denominators and length factors.
+    window_parts: (f64, f64, f64),
     /// A required term whose record carries its documents' lengths, the
     /// led walk reads them from.
     inline: Option<usize>,
@@ -878,6 +890,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if self.window_end.is_none_or(|e| slot > e) {
             let mut e = u32::MAX;
             let mut bound = 0.0_f32;
+            let (mut nsum, mut dmin, mut fmin) = (0.0_f64, f64::INFINITY, f64::INFINITY);
             for (s, mb) in self.sc.iter_mut().zip(&mut self.window_buckets) {
                 let Some(b) = s.block_at(slot) else {
                     *mb = NO_BUCKET;
@@ -886,12 +899,34 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 bound += s.bound(b);
                 e = e.min(s.footer.last[b]);
                 *mb = s.max_bucket(b);
+                let m = usize::from(*mb);
+                nsum += f64::from(s.num[m]);
+                dmin = dmin.min(f64::from(s.den[m]));
+                fmin = fmin.min(f64::from(s.factor));
             }
             self.window_end = Some(e);
             self.window_bound = bound;
+            self.window_parts = (nsum, dmin, fmin);
         }
         let geometry = self.geometry;
         self.cut(self.window_bound, || geometry.tid_in(g as usize, local))
+    }
+
+    /// Whether no document of `length` and ctid `tid` in the window can be
+    /// kept: first by the terms' numerators over the least of their
+    /// denominators, one division, pruning only a bound below the
+    /// threshold by far more than `f32` rounding can explain; then exactly,
+    /// by [`Self::length_bound`].
+    #[inline]
+    fn length_cut(&self, length: u32, tid: Tid) -> bool {
+        let Some(theta) = self.threshold() else {
+            return false;
+        };
+        let (nsum, dmin, fmin) = self.window_parts;
+        if nsum / (dmin + fmin * f64::from(length)) * (1.0 + 1e-5) < f64::from(theta) {
+            return true;
+        }
+        self.cut(self.length_bound(length), || tid)
     }
 
     /// What a document of `length` in the window scores at most: per
@@ -1025,7 +1060,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.touch
                     .touch(Part::Payload, set.at + inline.at_of(index), 4);
                 let length = inline.get(index)?;
-                if n > 0 && self.cut(self.length_bound(length), || tid) {
+                if n > 0 && self.length_cut(length, tid) {
                     return Ok(None);
                 }
                 self.read_buckets(g, local, tid)?;
@@ -1390,6 +1425,7 @@ pub(super) fn walk_into<'a>(
         term_sc: Vec::new(),
         window_end: None,
         window_bound: 0.0,
+        window_parts: (0.0, f64::INFINITY, f64::INFINITY),
         window_buckets: vec![NO_BUCKET; n],
         inline: None,
         repeats: Vec::new(),
