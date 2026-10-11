@@ -154,8 +154,8 @@ credentials out of Git.
 
 `build-image --pgo 1` (the Dockerfile's `STANNUM_PGO=1`) compiles the
 extension with `-C profile-use` and the committed profile for the image's
-architecture, `benchmarks/pgo/<arch>.profdata` (`uname -m`; only `aarch64`
-has one so far). An architecture without a profile builds as without PGO,
+architecture, `benchmarks/pgo/<arch>.profdata` (`uname -m`: `aarch64` and
+`x86_64`). An architecture without a profile builds as without PGO,
 with a warning. `--pgo strict` fails instead, and also fails on a stale
 profile (below). Without `--pgo`, builds are as before. A profile changes
 code layout, inlining and branch weights only; answers and formats do not
@@ -201,7 +201,9 @@ profile's 40 hottest functions. The run takes about 15 minutes. Commit both
 files with the change that made the old ones stale.
 
 An x86-64 profile is trained the same way on an x86-64 host: the AWS
-benchmark instance, with the saved database. An emulated run (an amd64
+benchmark instance, with the saved database. The committed `x86_64` profile
+was trained on an i7i.8xlarge (Xeon Platinum 8559C) with a restored copy of
+the local 150M database; the training took about 10 minutes there. An emulated run (an amd64
 image under Rosetta) records the same branch counts, since counts do not
 depend on speed, except in the AVX-512 kernels, which Rosetta does not
 run. Such a profile is good for checking function coverage, but not as the
