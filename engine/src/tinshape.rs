@@ -3200,6 +3200,81 @@ mod tests {
         );
     }
 
+    /// A conjunction reads a common word's bucket last, and only for a
+    /// candidate the rarer word's bucket leaves in reach: a rare word's
+    /// bucket of 1 in a block that also holds a 6 rules the candidate out
+    /// at the common word's block bound, without its bucket.
+    #[test]
+    fn a_conjunction_reads_a_common_words_bucket_only_for_candidates_in_reach() {
+        let n = 4_000usize;
+        let docs: Vec<Tid> = (0..n as u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        let lengths = vec![10u32; n];
+        // The rare word in every 16th document (fewer than one in ten), six
+        // times in one in 256 (one per block of its postings: the first ten
+        // are the winners); the common word in all, twice in every third.
+        let rare: Vec<(usize, u32)> = (0..n)
+            .step_by(16)
+            .map(|r| (r, if r % 256 == 0 { 6 } else { 1 }))
+            .collect();
+        let common: Vec<(usize, u32)> = (0..n)
+            .map(|r| (r, if r % 3 == 1 && r % 256 != 0 { 2 } else { 1 }))
+            .collect();
+        let members = vec![rare, common];
+        let all: Vec<usize> = (0..n).collect();
+        let options = Options {
+            block_size: 16,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+        let segment = Segment::parse(&blob).unwrap();
+        let names: Vec<String> = (0..2).map(|t| format!("t{t}")).collect();
+        let node = Node::And(vec![Node::Term(0), Node::Term(1)]);
+        let scorers: Vec<(String, TermScorer)> = (0..2)
+            .map(|t| {
+                let df = members[t].len() as u64;
+                let scorer =
+                    TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 10.0)
+                        .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let k = 10;
+        let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+        let want: Vec<Tid> = (0..n).step_by(256).take(k).map(|r| docs[r]).collect();
+        assert_eq!(got.rows.iter().map(|r| r.1).collect::<Vec<_>>(), want);
+        // With the final rows kept from the start, every candidate holding
+        // the rare word once is ruled out by its bucket there.
+        let mut seeded = crate::walk::TopRows::new(k, false);
+        for row in &got.rows {
+            seeded.push(crate::walk::Ranked(row.0, row.1));
+        }
+        let mut reads = TfReads::default();
+        let walked = top_k_into(
+            &segment,
+            &node,
+            &names,
+            &scorers,
+            &mut seeded,
+            &mut AllVisible,
+            &mut reads,
+        )
+        .unwrap();
+        assert!(walked.candidates > 20, "{} candidates", walked.candidates);
+        assert!(
+            reads.0 * 10 <= walked.candidates * 12,
+            "{} TF reads for {} candidates",
+            reads.0,
+            walked.candidates
+        );
+    }
+
     struct AllVisible;
 
     impl crate::walk::Visibility for AllVisible {

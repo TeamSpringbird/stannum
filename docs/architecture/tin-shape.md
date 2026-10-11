@@ -271,6 +271,25 @@ again (2.5% fewer cycles in the full_score replay).
   the length bound let through, and 11% (conjunction), 20% (disjunction)
   and 3 to 5% (phrase) of the pages a query pins; CPU is unchanged where a
   page touch is a memory read.
+- Such a walk scoring a common term (in at least one document in ten of
+  the segment, as `full_score` scores them) beside a rarer one treats it
+  apart (`Sc::make_common`). Its footer holds a dozen blocks or more per
+  group, each with a short document holding it often: bounding a group by
+  them decoded and bounded every one, for a group check that skipped one
+  group in eight at 150M rows. So the group check bounds a common term by
+  its record (its largest bucket at the least length), the rarer terms'
+  blocks summed first; a candidate's window still bounds it by its block,
+  and its bucket is read last, only for a candidate the rarer terms'
+  buckets leave in reach at its block's bound. Its footer is skimmed
+  (`LazyFooter::skim`): a block is decoded for its last slot, TF offset,
+  width and largest bucket, its entry's bytes kept for the frontier a
+  window or a bucket asks for later. The answers are those of the blocks'
+  bounds (a looser bound only lets more through to an exact check). At
+  150M rows `full_score` conjunctions retire 14% fewer instructions in the
+  server (11% less backend CPU), phrases 4.6% fewer; what is left of a
+  common term's cost is mostly its footer's decode up to the candidates'
+  blocks (a fifth of a `full_score` phrase's CPU in the replay), which a
+  footer addressed per group, as TIN's is, would remove.
 - A phrase reads positions only for a candidate that would enter the top
   k. Until the top k fill every match does, so its positions are checked
   first; after, a group's candidates that score into the top k wait and

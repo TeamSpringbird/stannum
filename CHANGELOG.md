@@ -180,6 +180,15 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   entries' bytes instead of their pairs, reading a block's frontier again
   only for a candidate in it (`full_score` disjunction replay at 150 million
   rows: 2.5% less CPU).
+- A ranked conjunction or phrase over `TNS1` scoring a common term (in at
+  least one document in ten of the segment, as `full_score` scores them)
+  beside a rarer one bounds the common term's groups by its record rather
+  than its footer blocks, sums the rarer terms' bounds first, and reads its
+  bucket after theirs, only for a candidate they leave in reach; its footer
+  is skimmed for TF offsets, a block's frontier read only when a window or
+  a bucket asks for it. At 150 million rows `full_score` conjunctions
+  retire 14% fewer instructions in the server (11% less backend CPU) and
+  phrases 4.6% fewer (`benchmarks/local/vm_ab.py`), with the same answers.
 - Benchmark manifests' `source_sha256` covers every crate the extension
   builds from (read from the manifests, so `engine/` too) and the PGO
   profiles; builds that differed only in `engine/` shared a fingerprint.
