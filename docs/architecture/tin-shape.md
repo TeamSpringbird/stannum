@@ -1070,12 +1070,27 @@ containers decoded. On TIN's probe corpus (`benchmarks/compare/h2h.py`,
 times TIN's and every other area within 1%: its uniform documents give a
 group's frontier little over its blocks'.
 
+CPU (`tnsreplay`, the first 400 queries of each style, `--repeat 3`, base
+and branch interleaved, two rounds; instructions and cycles of the whole
+process, which vary some 3% between identical runs): `score` +1.3% /
++0.6% / +0.1% instructions and +1.0% / +2.6% / -0.4% cycles (conjunction /
+disjunction / phrase); with `--pin-ns 1000` +0.1% / +0.9% / -0.9% and
++1.7% / +1.0% / -0.4%, the walk's mean time -2.3% / -3.0% / -2.4%;
+`full_score` +1.7% / +2.0% / -0.6% and +1.8% / +2.4% / +0.1%, with
+`--pin-ns 1000` +2.1% / +1.9% / -0.5% and +0.7% / +1.4% / -1.3%. Sampled,
+`TermSet::group_bound` is 4.4% of a conjunction's time and parsing the
+larger directories 0.9% more; the work it saves (lookups, TF reads,
+containers) is about as much.
+
 Not built:
 
 - Frontiers for sparse terms, which have no directory: the 150M dump holds
-  40.2M sparse lists against 60.8M group containers (`tnsunits`); an
-  in-memory experiment supplying them is in lab
-  `group-bounds/runs/exp-sparse.txt`.
+  40.2M sparse lists against 60.8M group containers (`tnsunits`). Supplied
+  in memory to the same hook (an experiment, lab
+  `group-bounds/runs/exp-sparse.txt`), they would take pins to -8.0% /
+  -5.7% / -3.4%, candidates examined to -30% / -29% / -16%, DL pages to
+  -15% / -15% / -7% and distinct pages to -3.1% / -3.2% / -0.2% of the
+  base: about as much again as the directories' frontiers give.
 - A group's payload and TF tail stored together (TIN's page touches
   suggest it; not proven). At 150M rows a query reads 155 / 593 / 165 TF
   pages (conjunction / disjunction / phrase), at most what it could save,
