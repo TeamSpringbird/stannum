@@ -69,6 +69,9 @@ class ProvenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'segment').mkdir()
+            (root / 'postgres').mkdir()
+            (root / 'postgres/Cargo.toml').write_text('[dependencies]\nsegment = { path = "../segment" }\n')
+            (root / 'segment/Cargo.toml').write_text('[package]\nname = "segment"\n')
             source = root / 'segment/lib.rs'
             source.write_text('first version')
             out = root / 'metadata'
@@ -85,6 +88,37 @@ class ProvenanceTests(unittest.TestCase):
                 second = run.provenance(out)
             self.assertIn('segment/lib.rs', first['source_files'])
             self.assertNotEqual(first['source_sha256'], second['source_sha256'])
+
+    def test_engine_changes_change_build_identity(self):
+        # d4b6885 and 9bb6781 differed only in engine/ and shared a fingerprint.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for crate, deps in (('postgres', 'engine = { path = "../engine" }\n'), ('engine', ''), ('bench', '')):
+                (root / crate / 'src').mkdir(parents=True)
+                (root / crate / 'Cargo.toml').write_text(f'[package]\nname = "{crate}"\n[dependencies]\n{deps}')
+            (root / 'Cargo.toml').write_text('[workspace]\nmembers = ["bench", "engine", "postgres"]\n')
+            source = root / 'engine/src/rank.rs'
+            source.write_text('first version')
+            (root / 'bench/src/main.rs').write_text('bench only')
+            out = root / 'metadata'
+            out.mkdir()
+            def git(command, **kwargs):
+                if command[1] == 'ls-files':
+                    return 'engine/src/rank.rs\nbench/src/main.rs'
+                if command[1] == 'rev-parse':
+                    return 'test-commit'
+                return ''
+            with patch.object(run, 'ROOT', root), patch.object(run, 'command', side_effect=git):
+                first = run.provenance(out)
+                source.write_text('second version')
+                second = run.provenance(out)
+            self.assertIn('engine/src/rank.rs', first['source_files'])
+            self.assertNotIn('bench/src/main.rs', first['source_files'])
+            self.assertNotEqual(first['source_sha256'], second['source_sha256'])
+
+    def test_every_crate_the_extension_builds_from_is_fingerprinted(self):
+        crates = run.extension_crates(run.ROOT)
+        self.assertEqual(crates, ['boldi-vigna', 'engine', 'postgres', 'segment', 'tinql', 'tokenizer'])
 
 
 def plan(actual_node, expected_node):

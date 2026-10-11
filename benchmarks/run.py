@@ -19,6 +19,7 @@ import platform
 import subprocess
 import sys
 import time
+import tomllib
 
 ROOT = Path(os.environ.get("STANNUM_BENCH_ROOT", Path(__file__).resolve().parents[1]))
 # "tin" targets PlanetScale TIN; "stannum" targets this extension under its own schema.
@@ -241,9 +242,46 @@ def container_counters(name):
     return result
 
 
+def extension_crates(root, start="postgres"):
+    """Directories of the crates the extension builds from: the extension crate and,
+    transitively, its path dependencies (not dev-dependencies). Read from the
+    manifests, so a crate added later is fingerprinted too."""
+    root_manifest = root / "Cargo.toml"
+    workspace = (tomllib.loads(root_manifest.read_text()).get("workspace", {}).get("dependencies", {})
+                 if root_manifest.is_file() else {})
+
+    def path_deps(crate, manifest):
+        tables = [manifest.get(key, {}) for key in ("dependencies", "build-dependencies")]
+        for target in manifest.get("target", {}).values():
+            tables += [target.get(key, {}) for key in ("dependencies", "build-dependencies")]
+        for table in tables:
+            for name, spec in table.items():
+                base = root / crate
+                if isinstance(spec, dict) and spec.get("workspace"):
+                    # workspace.dependencies paths are relative to the root.
+                    spec, base = workspace.get(spec.get("package", name)), root
+                if isinstance(spec, dict) and "path" in spec:
+                    yield (base / spec["path"]).resolve().relative_to(root.resolve()).as_posix()
+
+    found, pending = set(), [start]
+    while pending:
+        crate = pending.pop()
+        manifest = root / crate / "Cargo.toml"
+        if crate in found or not manifest.is_file():
+            continue
+        found.add(crate)
+        pending += path_deps(crate, tomllib.loads(manifest.read_text()))
+    return sorted(found)
+
+
+# Build inputs outside the crates: cargo configuration and the PGO profiles.
+BUILD_DIRS = (".cargo/", "benchmarks/pgo/")
+
+
 def provenance(out):
     paths = command(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=ROOT).splitlines()
-    selected = [p for p in paths if p.startswith(("postgres/", "tinql/", "tokenizer/", "boldi-vigna/", "segment/", ".cargo/"))
+    prefixes = tuple(crate + "/" for crate in extension_crates(ROOT)) + BUILD_DIRS
+    selected = [p for p in paths if p.startswith(prefixes)
                 or p in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")]
     hashes = {p: digest((ROOT / p).read_bytes()) for p in selected if (ROOT / p).is_file()}
     patch = command(["git", "diff", "HEAD", "--binary", "--", *selected], cwd=ROOT)
