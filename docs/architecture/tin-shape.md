@@ -998,6 +998,34 @@ query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
 to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
 
+## Containers at 150M rows (branch `tinshape/containers`)
+
+`tnscensus` prices every (term, group) of a dump under each container form,
+and `tnsregrid` re-encodes a dump's records under other
+`grid_density` / `grid_min_postings` (it reproduces the dump byte for byte
+under the defaults). On the 150M dump, payload is 12.63 GB (1.88 B per
+posting). Forced grids hold 8.20 GB of it: 56% of postings, 140 of 256 pages
+present, 2.4 members on a present page, and one member on half of those
+pages. A mask shared by every page, or full pages, never occur (213
+containers in 11.4M). So TIN's free shared mask saves nothing here.
+Elias-Fano is 6.2x smaller than the grid below 1 member in 32 slots, and
+1.13x smaller at 1 in 8 or more.
+
+| grids forced at | payload + directory | OR payload pages (replay) | pins | instructions | cycles (pin 1 µs) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1/64 (default) | 12.77 GB | 5,164 | 7,772 | | |
+| 1/32 | 9.26 GB (-27%) | 3,352 (-35%) | -24% | +19% | +9% (+2.3%) |
+| never | 6.99 GB (-45%) | 1,749 (-66%) | -31% | +89% | +51% (+30%) |
+
+That is score disjunctions, 400 queries x 3, with exact answers. For
+conjunctions at 1/32, pins are -14%, instructions +7.5% and mean latency
++22%. A disjunction expands every present term's container into a row in
+every group it visits. Elias-Fano costs about 1.1 ns a member there, and a
+grid copy costs about 15 ns a container. So the smaller containers cost more
+CPU than they save in pins. The default stays. TIN's per-page bitmaps would
+do no better: they also need work per present page. Log and data:
+`stannum-lab/containers/`.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
