@@ -1014,9 +1014,8 @@ impl<'a> Postings<'a> {
     #[inline]
     pub fn group_frontier(&self, entry: &GroupEntry) -> Option<GroupFrontier<'_>> {
         let bytes = self.frontiers.as_deref()?;
-        (entry.frontier != NO_FRONTIER).then(|| {
-            GroupFrontier::new(bytes, entry.frontier as usize, self.frontiers_rounded)
-        })
+        (entry.frontier != NO_FRONTIER)
+            .then(|| GroupFrontier::new(bytes, entry.frontier as usize, self.frontiers_rounded))
     }
 
     /// The container of a grouped record's entry, not read yet (see

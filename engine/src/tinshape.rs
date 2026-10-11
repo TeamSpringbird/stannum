@@ -2015,15 +2015,31 @@ mod tests {
         // every fifth group, long elsewhere. "c" is in every document, "r"
         // in every third, "x" in every seventh.
         let docs: Vec<Tid> = (0..40u32)
-            .flat_map(|g| (0..64u32).flat_map(move |p| (1..=4u16).map(move |o| Tid { block: g * 256 + p, offset: o })))
+            .flat_map(|g| {
+                (0..64u32).flat_map(move |p| {
+                    (1..=4u16).map(move |o| Tid {
+                        block: g * 256 + p,
+                        offset: o,
+                    })
+                })
+            })
             .collect();
         let lengths: Vec<u32> = docs
             .iter()
             .enumerate()
-            .map(|(i, t)| if (t.block / 256) % 5 == 0 { 8 + (i as u32 % 5) } else { 400 + (i as u32 % 97) })
+            .map(|(i, t)| {
+                if (t.block / 256) % 5 == 0 {
+                    8 + (i as u32 % 5)
+                } else {
+                    400 + (i as u32 % 97)
+                }
+            })
             .collect();
         let pick = |every: usize| -> Vec<(usize, u32)> {
-            (0..docs.len()).filter(|r| r % every == 0).map(|r| (r, 1 + (r as u32 % 3))).collect()
+            (0..docs.len())
+                .filter(|r| r % every == 0)
+                .map(|r| (r, 1 + (r as u32 % 3)))
+                .collect()
         };
         let members = [pick(1), pick(3), pick(7)];
         let names: Vec<String> = ["c", "r", "x"].iter().map(|s| (*s).to_owned()).collect();
@@ -2039,12 +2055,17 @@ mod tests {
             let mut builder = Builder::new(docs.clone(), lengths.clone(), options).unwrap();
             for (t, m) in members.iter().enumerate() {
                 let ranks: Vec<u32> = m.iter().map(|(r, _)| *r as u32).collect();
-                let buckets: Vec<u8> = m.iter().map(|(_, tf)| TfBucket::from_count(*tf).value()).collect();
+                let buckets: Vec<u8> = m
+                    .iter()
+                    .map(|(_, tf)| TfBucket::from_count(*tf).value())
+                    .collect();
                 let mut payload = PayloadBuilder::default();
                 for (_, tf) in m {
                     payload.push(&(0..*tf).collect::<Vec<u32>>()).unwrap();
                 }
-                builder.add_term(&names[t], &ranks, &buckets, &payload.finish()).unwrap();
+                builder
+                    .add_term(&names[t], &ranks, &buckets, &payload.finish())
+                    .unwrap();
             }
             let blob = builder.finish(&[]).0;
             let segment = Segment::parse(&blob).unwrap();
@@ -2053,25 +2074,42 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(t, m)| {
-                    let scorer = TermScorer::from_statistics(docs.len() as u64, m.len() as u64, 1.0, Bm25Params::default(), average as f32).unwrap();
+                    let scorer = TermScorer::from_statistics(
+                        docs.len() as u64,
+                        m.len() as u64,
+                        1.0,
+                        Bm25Params::default(),
+                        average as f32,
+                    )
+                    .unwrap();
                     (names[t].clone(), scorer)
                 })
                 .collect();
             let answer = top_k(&segment, node, &names, &scorers, 10, &mut NoTouch).unwrap();
-            let rows: Vec<(u32, Tid)> = answer.rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect();
+            let rows: Vec<(u32, Tid)> =
+                answer.rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect();
             (rows, answer.windows_pruned, answer.scored)
         };
         for node in [
             Node::Or(vec![Node::Term(0), Node::Term(1), Node::Term(2)]),
             Node::And(vec![Node::Term(1), Node::Term(0)]),
-            Node::And(vec![Node::Term(2), Node::Or(vec![Node::Term(0), Node::Term(1)])]),
+            Node::And(vec![
+                Node::Term(2),
+                Node::Or(vec![Node::Term(0), Node::Term(1)]),
+            ]),
         ] {
             let (off, off_pruned, off_scored) = run(GroupFrontiers::Off, &node);
             for mode in [GroupFrontiers::Exact, GroupFrontiers::Rounded] {
                 let (on, pruned, scored) = run(mode, &node);
                 assert_eq!(on, off, "{node:?} {mode:?}");
-                assert!(pruned > off_pruned, "{node:?} {mode:?}: pruned {pruned} against {off_pruned}");
-                assert!(scored <= off_scored, "{node:?} {mode:?}: scored {scored} against {off_scored}");
+                assert!(
+                    pruned > off_pruned,
+                    "{node:?} {mode:?}: pruned {pruned} against {off_pruned}"
+                );
+                assert!(
+                    scored <= off_scored,
+                    "{node:?} {mode:?}: scored {scored} against {off_scored}"
+                );
             }
         }
     }

@@ -1914,10 +1914,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         sb.clear();
         sb.resize(n, 0.0);
         let mut total = 0.0_f32;
-        for i in 0..n {
+        for (i, bound) in sb.iter_mut().enumerate() {
             if self.present[i] {
-                sb[i] = self.group_term_bound(i, g, base, end);
-                total += sb[i];
+                *bound = self.group_term_bound(i, g, base, end);
+                total += *bound;
             }
         }
         let geometry = self.geometry;

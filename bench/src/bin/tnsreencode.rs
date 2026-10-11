@@ -194,7 +194,12 @@ fn group_postings(
             return Err(x.to_string());
         }
         if held.len() != e.count as usize {
-            return Err(format!("group {} holds {} not {}", e.index, held.len(), e.count));
+            return Err(format!(
+                "group {} holds {} not {}",
+                e.index,
+                held.len(),
+                e.count
+            ));
         }
     }
     Ok(())
@@ -265,7 +270,8 @@ fn reencode(blob: &[u8], outs: &mut [Out]) -> Result<Vec<Vec<u8>>, String> {
     let mut groups: Vec<Vec<(u8, u32)>> = Vec::new();
     for out in outs.iter_mut() {
         out.postings.clear();
-        out.postings.reserve(fields[5] as usize + fields[5] as usize / 20);
+        out.postings
+            .reserve(fields[5] as usize + fields[5] as usize / 20);
         out.dictionary = DictionaryBuilder::default();
     }
     for item in segment.dictionary().iter() {
@@ -306,7 +312,9 @@ fn reencode(blob: &[u8], outs: &mut [Out]) -> Result<Vec<Vec<u8>>, String> {
                 },
                 ..entry
             };
-            out.dictionary.push(&term, moved).map_err(|e| e.to_string())?;
+            out.dictionary
+                .push(&term, moved)
+                .map_err(|e| e.to_string())?;
         }
     }
     let rest = &blob[segment.area_at(Area::Positions)..segment.bounds[7]];

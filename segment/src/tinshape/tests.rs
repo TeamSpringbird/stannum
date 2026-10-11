@@ -246,9 +246,7 @@ fn group_minima(blob: &[u8], dead: &DeadDocs) -> BTreeMap<(String, u32), [u32; 1
             let group = geometry.groups[geometry.group_of_slot(*slot)].id;
             let bucket = footer.bucket(found.postings.tf, i as u32).unwrap();
             let length = segment.lengths.get(rank).unwrap();
-            let least: &mut [u32; 16] = out
-                .entry((term.clone(), group))
-                .or_insert([u32::MAX; 16]);
+            let least: &mut [u32; 16] = out.entry((term.clone(), group)).or_insert([u32::MAX; 16]);
             least[usize::from(bucket)] = least[usize::from(bucket)].min(length);
         }
     }
@@ -266,7 +264,11 @@ fn stored_frontiers(blob: &[u8]) -> BTreeMap<(String, u32), Vec<(u8, u32)>> {
         let found = segment.resolve(entry).unwrap();
         if let Form::Grouped(entries) = &found.postings.form {
             for e in entries.iter() {
-                let front = found.postings.group_frontier(e).expect("frontiers").collect();
+                let front = found
+                    .postings
+                    .group_frontier(e)
+                    .expect("frontiers")
+                    .collect();
                 out.insert((term.clone(), geometry.groups[e.index as usize].id), front);
             }
         }
