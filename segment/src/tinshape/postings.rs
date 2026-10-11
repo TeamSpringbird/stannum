@@ -1223,6 +1223,13 @@ pub struct LazyFooter<'a> {
     widths: Vec<u8>,
     /// A single posting's bucket, which the dictionary keeps.
     single: Option<u8>,
+    /// Whether the decoded blocks' frontiers are kept in `frontier`
+    /// (`ends`); else (decoded for their bounds, [`Self::decode_bounds`])
+    /// their entries' bytes are, in `raw`, each block's starting at
+    /// `entries[b]`.
+    kept: bool,
+    raw: Vec<u8>,
+    entries: Vec<u32>,
     /// Whether pages the footer's reads pinned for bytes only it reads are
     /// released once it has read past them ([`Self::release_passed`]), and
     /// those pages, still pinned.
@@ -1341,6 +1348,83 @@ fn footer_entry_fast(bytes: &[u8], pairs: &mut Vec<(u8, u32)>) -> Option<(u64, u
     Some((gap, at))
 }
 
+/// A block's bound from its frontier: the best of `bound` over its pairs,
+/// and 0 at least.
+#[inline(always)]
+fn fold_bound(pairs: &[(u8, u32)], bound: &mut impl FnMut(u8, u32) -> f32) -> f32 {
+    pairs
+        .iter()
+        .map(|(bucket, length)| bound(*bucket, *length))
+        .fold(0.0_f32, f32::max)
+}
+
+/// [`footer_entry_fast`] taking each pair's `bound` as it is read, rather
+/// than keeping the pairs: the gap, the entry's length, its largest
+/// bucket (its last pair's) and [`fold_bound`] of its pairs.
+#[inline(always)]
+fn footer_entry_bound(
+    bytes: &[u8],
+    bound: &mut impl FnMut(u8, u32) -> f32,
+) -> Option<(u64, usize, u8, f32)> {
+    let b: &[u8; ENTRY_MAX] = bytes.get(..ENTRY_MAX)?.try_into().ok()?;
+    let mut at = 0;
+    let mut gap = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = b[at];
+        at += 1;
+        gap |= u64::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            break;
+        }
+        shift += 7;
+        if shift >= 35 {
+            return None;
+        }
+    }
+    let k = usize::from(b[at]);
+    at += 1;
+    if k.wrapping_sub(1) >= 16 {
+        return None;
+    }
+    let (mut best, mut last) = (0.0_f32, 0u8);
+    for _ in 0..k {
+        let bucket = b[at];
+        if bucket > 15 {
+            return None;
+        }
+        let (b0, b1) = (b[at + 1], b[at + 2]);
+        // A length: one or two bytes as a rule, five at most.
+        let length = if b0 < 0x80 {
+            at += 2;
+            u32::from(b0)
+        } else if b1 < 0x80 {
+            at += 3;
+            u32::from(b0 & 0x7f) | u32::from(b1) << 7
+        } else {
+            at += 1;
+            let mut value = 0u64;
+            let mut n = 0;
+            loop {
+                let byte = b[at + n];
+                value |= u64::from(byte & 0x7f) << (7 * n);
+                n += 1;
+                if byte < 0x80 {
+                    break;
+                }
+                if n == 5 {
+                    return None;
+                }
+            }
+            at += n;
+            u32::try_from(value).ok()?
+        };
+        best = best.max(bound(bucket, length));
+        last = bucket;
+    }
+    Some((gap, at, last, best))
+}
+
 impl<'a> LazyFooter<'a> {
     fn new(
         postings: &Postings<'a>,
@@ -1369,6 +1453,9 @@ impl<'a> LazyFooter<'a> {
             tf_at: Vec::new(),
             widths: Vec::new(),
             single: None,
+            kept: true,
+            raw: Vec::new(),
+            entries: Vec::new(),
             release: false,
             owned: Vec::new(),
         };
@@ -1419,9 +1506,15 @@ impl<'a> LazyFooter<'a> {
             // two bytes or more.
             let blocks = self.blocks;
             self.last.reserve_exact(blocks);
-            self.ends.reserve_exact(blocks);
-            self.frontier
-                .reserve_exact((self.src.len().saturating_sub(2 * blocks) / 2).min(blocks * 16));
+            if self.kept {
+                self.ends.reserve_exact(blocks);
+                self.frontier.reserve_exact(
+                    (self.src.len().saturating_sub(2 * blocks) / 2).min(blocks * 16),
+                );
+            } else {
+                self.entries.reserve_exact(blocks);
+                self.raw.reserve_exact(self.src.len());
+            }
             self.tf_at.reserve_exact(blocks);
             self.widths.reserve_exact(blocks);
         }
@@ -1587,8 +1680,16 @@ impl<'a> LazyFooter<'a> {
         if self.last.len() >= self.blocks {
             return Ok(false);
         }
+        let entry = self.next_entry()?;
+        self.push_block(entry)
+    }
+
+    /// Parses the next block's entry (its pairs appended to the frontier),
+    /// reading windows as needed: its bytes are the window's from
+    /// [`Self::at`] on.
+    fn next_entry(&mut self) -> Result<(u64, usize)> {
         let mut want = BRIDGE;
-        let entry = loop {
+        Ok(loop {
             let parsed = match self.window.get(self.at - self.window_at..) {
                 Some(bytes) if self.started => footer_entry(bytes, &mut self.frontier),
                 _ => Err(Error::Truncated),
@@ -1602,8 +1703,7 @@ impl<'a> LazyFooter<'a> {
                 }
                 Err(error) => return Err(error),
             }
-        };
-        self.push_block(entry)
+        })
     }
 
     /// Records the block whose entry, at the next block's place, was just
@@ -1628,7 +1728,9 @@ impl<'a> LazyFooter<'a> {
             return Err(Error::Corrupt("footer length"));
         }
         self.last.push(last);
-        self.ends.push(end as u32);
+        if self.kept {
+            self.ends.push(end as u32);
+        }
         self.tf_at.push(tf_at as u32);
         self.widths.push(width as u8);
         self.next_last = next_last;
@@ -1647,6 +1749,176 @@ impl<'a> LazyFooter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Decodes every block in one pass, for a reader that bounds every
+    /// block (a disjunction bounds each group its terms hold), and pushes
+    /// onto `bounds` each block's bound: the best `bound` of its frontier's
+    /// pairs (0 at least), taken as each pair is read. The frontiers are
+    /// not kept as pairs: their entries' bytes are (a few bytes a pair,
+    /// where a pair kept takes eight), and a block's frontier is read from
+    /// them only when asked ([`Self::floor`], [`Self::floors`],
+    /// [`Self::max_bucket`]); most blocks' never are.
+    /// The footer's pages are read and released as [`Self::ensure`] reads
+    /// them. Blocks decoded already (a footer derived from its record)
+    /// are bounded from their frontiers.
+    #[inline(never)]
+    pub fn decode_bounds(
+        &mut self,
+        mut bound: impl FnMut(u8, u32) -> f32,
+        bounds: &mut Vec<f32>,
+    ) -> Result<()> {
+        bounds.reserve_exact(self.blocks);
+        if !self.last.is_empty() || self.blocks == 0 {
+            if self.blocks > 0 {
+                self.ensure(self.blocks - 1)?;
+            }
+            for b in 0..self.blocks {
+                bounds.push(fold_bound(self.frontier(b), &mut bound));
+            }
+            return Ok(());
+        }
+        self.kept = false;
+        let full = bits::packed_len(self.block_size as usize, 1) as u64;
+        loop {
+            // The entries well within the window, in one loop: each one's
+            // pairs taken and dropped, its bytes copied with the rest after.
+            let (window, window_at) = (self.window, self.window_at);
+            let start = self.at;
+            let (mut at, mut next_last, mut next_tf) = (self.at, self.next_last, self.next_tf);
+            let mut b = self.last.len();
+            let raw = self.raw.len();
+            while b + 1 < self.blocks {
+                let Some((gap, len, max, v)) = window
+                    .get(at - window_at..)
+                    .and_then(|bytes| footer_entry_bound(bytes, &mut bound))
+                else {
+                    break;
+                };
+                let Ok(last) = u32::try_from(next_last + gap) else {
+                    // Reported by the block's slow decode.
+                    break;
+                };
+                next_last += gap;
+                let width = tf_width(max, self.adaptive);
+                bounds.push(v);
+                self.last.push(last);
+                self.entries.push((raw + (at - start)) as u32);
+                self.tf_at.push(next_tf as u32);
+                self.widths.push(width as u8);
+                next_tf += if width == 1 {
+                    full
+                } else {
+                    bits::packed_len(self.block_size as usize, width) as u64
+                };
+                at += len;
+                b += 1;
+            }
+            if at > start {
+                self.raw
+                    .extend_from_slice(&window[start - window_at..at - window_at]);
+            }
+            self.at = at;
+            self.next_last = next_last;
+            self.next_tf = next_tf;
+            if self.last.len() >= self.blocks {
+                return Ok(());
+            }
+            // The next entry alone: across a window's end, or the last.
+            let (gap, len) = self.next_entry()?;
+            let from = self.at - self.window_at;
+            let entry = self.raw.len() as u32;
+            self.raw.extend_from_slice(&self.window[from..from + len]);
+            self.push_block((gap, len))?;
+            self.entries.push(entry);
+            bounds.push(fold_bound(&self.frontier, &mut bound));
+            self.frontier.clear();
+        }
+    }
+
+    /// Block `b`'s frontier pairs, in order, read from its entry's bytes
+    /// (a footer decoded for its bounds), which were checked as decoded.
+    fn raw_pairs(&self, b: usize) -> impl Iterator<Item = (u8, u32)> + '_ {
+        let raw = &self.raw[self.entries[b] as usize..];
+        // The slot gap's bytes, then the pair count.
+        let mut at = raw
+            .iter()
+            .position(|byte| *byte < 0x80)
+            .map_or(0, |i| i + 1);
+        let k = usize::from(raw[at]);
+        at += 1;
+        (0..k).map(move |_| {
+            let bucket = raw[at];
+            at += 1;
+            let mut length = 0u32;
+            let mut shift = 0;
+            loop {
+                let byte = raw[at];
+                at += 1;
+                length |= u32::from(byte & 0x7f) << shift;
+                if byte < 0x80 {
+                    break;
+                }
+                shift += 7;
+            }
+            (bucket, length)
+        })
+    }
+
+    /// How short a document holding a posting of (decoded) block `b` with
+    /// bucket `bucket` or more can be: the shortest length of the
+    /// frontier's pairs at or above it (every posting is dominated by a
+    /// frontier pair); 0 when none is.
+    #[inline]
+    pub fn floor(&self, b: usize, bucket: u8) -> u32 {
+        if self.kept {
+            self.frontier(b)
+                .iter()
+                .filter(|(at, _)| *at >= bucket)
+                .map(|(_, length)| *length)
+                .min()
+                .unwrap_or(0)
+        } else {
+            self.raw_floor(b, bucket)
+        }
+    }
+
+    #[inline(never)]
+    fn raw_floor(&self, b: usize, bucket: u8) -> u32 {
+        self.raw_pairs(b)
+            .filter(|(at, _)| *at >= bucket)
+            .map(|(_, length)| length)
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// [`Self::floor`] of (decoded) block `b` at every bucket, from one
+    /// read of its frontier.
+    #[inline(never)]
+    pub fn floors(&self, b: usize) -> [u32; 16] {
+        let mut out = [u32::MAX; 16];
+        let mut put = |(bucket, length): (u8, u32)| {
+            let at = usize::from(bucket) % 16;
+            out[at] = out[at].min(length);
+        };
+        if self.kept {
+            self.frontier(b).iter().copied().for_each(&mut put);
+        } else {
+            self.raw_pairs(b).for_each(&mut put);
+        }
+        let mut least = u32::MAX;
+        for floor in out.iter_mut().rev() {
+            least = least.min(*floor);
+            *floor = if least == u32::MAX { 0 } else { least };
+        }
+        out
+    }
+
+    /// Whether the decoded blocks' frontiers are kept as pairs (not a
+    /// footer decoded for its bounds), so [`Self::frontier`] reads them.
+    #[inline]
+    pub fn keeps_pairs(&self) -> bool {
+        self.kept
     }
 
     /// The first block from `from` on whose last slot is `slot` or later,
@@ -1684,7 +1956,10 @@ impl<'a> LazyFooter<'a> {
 
     /// Block `b`'s frontier (decoded): its (bucket, shortest length) pairs.
     #[inline]
+    /// Not for a footer decoded for its bounds ([`Self::decode_bounds`]),
+    /// which keeps no pairs: see [`Self::floor`].
     pub fn frontier(&self, b: usize) -> &[(u8, u32)] {
+        debug_assert!(self.kept, "a frontier kept as pairs");
         let from = if b == 0 { 0 } else { self.ends[b - 1] as usize };
         &self.frontier[from..self.ends[b] as usize]
     }
@@ -1692,7 +1967,11 @@ impl<'a> LazyFooter<'a> {
     /// Block `b`'s largest bucket (decoded): its frontier's last pair's.
     #[inline]
     pub fn max_bucket(&self, b: usize) -> u8 {
-        self.frontier[self.ends[b] as usize - 1].0
+        if self.kept {
+            self.frontier[self.ends[b] as usize - 1].0
+        } else {
+            self.raw_pairs(b).last().map_or(0, |(bucket, _)| bucket)
+        }
     }
 
     /// Where block `b`'s buckets start in the TF tail (decoded).
@@ -1861,6 +2140,57 @@ mod tests {
             from = l.seek(from, first).unwrap();
             assert_eq!(from, b);
         }
+        // Decoded whole for its blocks' bounds, as a disjunction does.
+        check_bounds(lazy(), parsed, footer);
+    }
+
+    /// A stand-in for a pair's bound: rising with the bucket, falling with
+    /// the length.
+    pub(super) fn pair_bound(bucket: u8, length: u32) -> f32 {
+        f32::from(bucket) * 1000.0 + 1e6 / (length as f32 + 1.0)
+    }
+
+    /// The bound [`LazyFooter::decode_bounds`] gives a block of `pairs`.
+    pub(super) fn test_bound(pairs: &[(u8, u32)]) -> f32 {
+        pairs
+            .iter()
+            .map(|(bucket, length)| pair_bound(*bucket, *length))
+            .fold(0.0, f32::max)
+    }
+
+    /// [`LazyFooter::decode_bounds`] decodes every block, bounds each from
+    /// its frontier, and still answers each block's floors, largest bucket
+    /// and buckets as the whole footer does.
+    fn check_bounds(mut l: LazyFooter<'_>, parsed: &Postings<'_>, footer: &Footer) {
+        let mut bounds = Vec::new();
+        l.decode_bounds(pair_bound, &mut bounds).unwrap();
+        assert_eq!(l.decoded(), footer.blocks());
+        assert_eq!(bounds.len(), footer.blocks());
+        for (b, bound) in bounds.iter().enumerate() {
+            let front = footer.frontier_of(b);
+            assert_eq!(*bound, test_bound(front), "bound of {b}");
+            assert_eq!(l.last(b), footer.last[b]);
+            assert_eq!(l.tf_at(b), footer.tf_at[b]);
+            assert_eq!(l.width(b), u32::from(footer.widths[b]));
+            assert_eq!(l.max_bucket(b), front.last().unwrap().0);
+            for bucket in 0..16u8 {
+                let want = front
+                    .iter()
+                    .filter(|(at, _)| *at >= bucket)
+                    .map(|(_, length)| *length)
+                    .min()
+                    .unwrap_or(0);
+                assert_eq!(l.floor(b, bucket), want, "floor of {b} at {bucket}");
+                assert_eq!(l.floors(b)[usize::from(bucket)], want);
+            }
+        }
+        for i in 0..parsed.df {
+            assert_eq!(
+                l.bucket(parsed.tf, i).unwrap(),
+                footer.bucket(parsed.tf, i).unwrap()
+            );
+        }
+        assert_eq!(l.seek(0, u32::MAX).unwrap(), footer.blocks());
     }
 
     fn all_options() -> Vec<Options> {
@@ -2250,6 +2580,74 @@ mod lazy_footer_tests {
             "pages released as the footer read on"
         );
         assert!(held_at_most <= 1, "{held_at_most} pages held");
+        drop(lazy);
+        drop(parsed);
+        unsafe { blob.close_span() };
+    }
+
+    /// Decoded whole for its bounds over a blob read in place, a footer
+    /// releases each page of its own bytes as it reads past it, as
+    /// decoding a block at a time does, and its blocks' frontiers stay
+    /// readable after: they are not read from the released (poisoned)
+    /// pages.
+    #[test]
+    fn lazy_footer_decoded_for_bounds_releases_its_pages_and_keeps_its_frontiers() {
+        use super::super::blob::{LazyBlob, PinningSource};
+        let tids: Vec<Tid> = (0..6000u32)
+            .map(|i| Tid {
+                block: i / 3,
+                offset: (i % 3 + 1) as u16,
+            })
+            .collect();
+        let geometry = Geometry::of(&tids).unwrap();
+        let members: Vec<u32> = (0..6000)
+            .step_by(2)
+            .map(|i| geometry.slot_of(tids[i]).unwrap())
+            .collect();
+        let n = members.len();
+        let buckets: Vec<u8> = (0..n).map(|i| (i * 7 % 16) as u8).collect();
+        let lengths: Vec<u32> = (0..n).map(|i| (i as u32 * 7919) % 5000 + 1).collect();
+        let options = Options {
+            block_size: 4,
+            grid_min_postings: u32::MAX,
+            inline_lengths_max_df: 0,
+            ..Options::default()
+        };
+        let mut out = Vec::new();
+        encode(&geometry, &members, &buckets, &lengths, &options, &mut out);
+        let whole = Postings::parse(&out, n as u32, &geometry)
+            .unwrap()
+            .footer(4, 15, true)
+            .unwrap();
+        let source = PinningSource::new(out.clone(), 64);
+        let blob = LazyBlob::new(Box::new(source.clone()));
+        blob.open_span();
+        let parsed = Postings::parse(blob.bytes(), n as u32, &geometry).unwrap();
+        let mut lazy = parsed.lazy_footer(4, 15, true).unwrap();
+        lazy.release_passed();
+        let mut bounds = Vec::new();
+        lazy.decode_bounds(super::tests::pair_bound, &mut bounds)
+            .unwrap();
+        assert!(
+            source.0.early.get() > 10,
+            "pages released as the footer read on"
+        );
+        assert_eq!(bounds.len(), whole.blocks());
+        for (b, bound) in bounds.iter().enumerate() {
+            let front = whole.frontier_of(b);
+            assert_eq!(*bound, super::tests::test_bound(front));
+            assert_eq!(lazy.max_bucket(b), front.last().unwrap().0);
+            for bucket in 0..16u8 {
+                let want = front
+                    .iter()
+                    .filter(|(at, _)| *at >= bucket)
+                    .map(|(_, length)| *length)
+                    .min()
+                    .unwrap_or(0);
+                assert_eq!(lazy.floor(b, bucket), want, "floor of {b} at {bucket}");
+                assert_eq!(lazy.floors(b)[usize::from(bucket)], want);
+            }
+        }
         drop(lazy);
         drop(parsed);
         unsafe { blob.close_span() };

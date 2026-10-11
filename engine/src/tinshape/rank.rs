@@ -76,6 +76,10 @@ pub(super) struct Sc<'a> {
     /// to a new block clears nothing.
     bb: [(u32, f32); BUCKET_COUNT],
     bb_block: [u32; BUCKET_COUNT],
+    /// A footer decoded for its bounds: the floors of block `floors_block`
+    /// at every bucket.
+    floors: [u32; BUCKET_COUNT],
+    floors_block: u32,
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -100,6 +104,8 @@ impl<'a> Sc<'a> {
             factor,
             bb: [(0, 0.0); BUCKET_COUNT],
             bb_block: [u32::MAX; BUCKET_COUNT],
+            floors: [0; BUCKET_COUNT],
+            floors_block: u32::MAX,
         }
     }
 
@@ -139,28 +145,20 @@ impl<'a> Sc<'a> {
     /// bounds every block anyway (a disjunction bounds each group its terms
     /// hold), so decoding a block at a time as it is reached saves nothing,
     /// and reading the footer's pages between a group's leaves them pinned
-    /// among the group's (see [`Walk::group_done`]).
+    /// among the group's (see [`Walk::group_done`]). Each block is bounded
+    /// as it is decoded, and its frontier is not kept as pairs
+    /// ([`LazyFooter::decode_bounds`]): most blocks' are never read again.
     fn decode_all(&mut self) {
-        let blocks = self.footer.blocks();
-        if blocks == 0 {
-            return;
-        }
-        self.footer
-            .ensure(blocks - 1)
-            .unwrap_or_else(|e| corrupt_footer(e));
         let scorer = &self.scorer;
-        let footer = &self.footer;
         self.bounds.clear();
-        self.bounds.reserve_exact(blocks);
-        self.bounds.extend((0..blocks).map(|b| {
-            footer
-                .frontier(b)
-                .iter()
-                .map(|(bucket, length)| {
-                    scorer.bound_through(TfBucket::new(*bucket).expect("a valid bucket"), *length)
-                })
-                .fold(0.0_f32, f32::max)
-        }));
+        self.footer
+            .decode_bounds(
+                |bucket, length| {
+                    scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
+                },
+                &mut self.bounds,
+            )
+            .unwrap_or_else(|e| corrupt_footer(e));
     }
 
     /// The first block from `from` on whose last slot is `slot` or later,
@@ -234,13 +232,7 @@ impl<'a> Sc<'a> {
     /// posting is dominated by a frontier pair).
     #[inline]
     fn floor(&self, b: usize, bucket: u8) -> u32 {
-        self.footer
-            .frontier(b)
-            .iter()
-            .filter(|(at, _)| *at >= bucket)
-            .map(|(_, length)| *length)
-            .min()
-            .unwrap_or(0)
+        self.footer.floor(b, bucket)
     }
 
     /// [`Self::floor`] and what bucket `bucket` scores at most there (the
@@ -255,7 +247,17 @@ impl<'a> Sc<'a> {
             return self.bb[at];
         }
         self.bb_block[at] = tag;
-        let floor = self.floor(b, bucket);
+        let floor = if self.footer.keeps_pairs() {
+            self.floor(b, bucket)
+        } else {
+            // A footer decoded for its bounds keeps its frontiers as their
+            // entries' bytes: a block's floors are read at once.
+            if self.floors_block != tag {
+                self.floors_block = tag;
+                self.floors = self.footer.floors(b);
+            }
+            self.floors[at]
+        };
         let v = (
             floor,
             self.scorer
