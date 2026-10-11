@@ -1278,6 +1278,20 @@ fn footer_entry(bytes: &[u8], pairs: &mut Vec<(u8, u32)>) -> Result<(u64, usize)
     entry
 }
 
+/// A pair's length whose varint starts with bytes `b0`, `b1`, when it takes
+/// one byte or two (a length below 16,384, as a rule): its value and its
+/// bytes, chosen by a [`bits::mask`], not a branch (one length takes one
+/// byte, the next two, as the documents come); `None` for a longer one.
+#[inline(always)]
+fn short_length(b0: u8, b1: u8) -> Option<(u32, usize)> {
+    if (b0 & b1) >= 0x80 {
+        return None;
+    }
+    let two = b0 >> 7;
+    let high = (u32::from(b1) << 7) & bits::mask(two == 1) as u32;
+    Some((u32::from(b0 & 0x7f) | high, 1 + usize::from(two)))
+}
+
 /// [`footer_entry`] of an entry that starts at least [`ENTRY_MAX`] bytes
 /// before the end of `bytes`, so it lies wholly within them: `None`, with
 /// nothing appended, for anything a corrupt entry could hold (decoded again
@@ -1313,12 +1327,9 @@ fn footer_entry_fast(bytes: &[u8], pairs: &mut Vec<(u8, u32)>) -> Option<(u64, u
         any |= bucket;
         let (b0, b1) = (b[at + 1], b[at + 2]);
         // A length: one or two bytes as a rule, five at most.
-        let length = if b0 < 0x80 {
-            at += 2;
-            u32::from(b0)
-        } else if b1 < 0x80 {
-            at += 3;
-            u32::from(b0 & 0x7f) | u32::from(b1) << 7
+        let length = if let Some((length, n)) = short_length(b0, b1) {
+            at += 1 + n;
+            length
         } else {
             at += 1;
             let mut value = 0u64;
@@ -1400,12 +1411,9 @@ fn footer_entry_bound(
         }
         let (b0, b1) = (b[at + 1], b[at + 2]);
         // A length: one or two bytes as a rule, five at most.
-        let length = if b0 < 0x80 {
-            at += 2;
-            u32::from(b0)
-        } else if b1 < 0x80 {
-            at += 3;
-            u32::from(b0 & 0x7f) | u32::from(b1) << 7
+        let length = if let Some((length, n)) = short_length(b0, b1) {
+            at += 1 + n;
+            length
         } else {
             at += 1;
             let mut value = 0u64;
@@ -1462,6 +1470,10 @@ fn footer_entry_skim(bytes: &[u8]) -> Option<(u64, usize, u8)> {
         any |= bucket;
         last = bucket;
         at += 1;
+        if let Some((_, n)) = short_length(b[at], b[at + 1]) {
+            at += n;
+            continue;
+        }
         // A length: five bytes at most, the last below 0x80.
         let mut n = 0;
         while b[at + n] >= 0x80 {
@@ -2370,6 +2382,57 @@ mod tests {
             .iter()
             .map(|(bucket, length)| pair_bound(*bucket, *length))
             .fold(0.0, f32::max)
+    }
+
+    /// The fast footer readers read an entry as [`footer_entry`] does, for
+    /// pair lengths of one to five bytes and any mix of them.
+    #[test]
+    fn fast_entry_readers_agree_with_the_checked_one() {
+        let lengths = [
+            0u32,
+            1,
+            127,
+            128,
+            200,
+            16_383,
+            16_384,
+            (1 << 21) - 1,
+            1 << 21,
+            1 << 28,
+            u32::MAX,
+        ];
+        for (gap, k, from) in [
+            (0u64, 1usize, 0usize),
+            (300, 3, 4),
+            (1 << 20, 16, 2),
+            (5, 11, 7),
+        ] {
+            let mut bytes = Vec::new();
+            crate::varint::put(&mut bytes, gap);
+            bytes.push(k as u8);
+            let mut want = Vec::new();
+            for i in 0..k {
+                let pair = (i as u8 % 16, lengths[(from + i) % lengths.len()]);
+                bytes.push(pair.0);
+                crate::varint::put(&mut bytes, u64::from(pair.1));
+                want.push(pair);
+            }
+            let end = bytes.len();
+            bytes.resize(end + ENTRY_MAX, 0xff);
+            let mut pairs = Vec::new();
+            assert_eq!(footer_entry(&bytes, &mut pairs).unwrap(), (gap, end));
+            assert_eq!(pairs, want);
+            let mut fast = Vec::new();
+            assert_eq!(footer_entry_fast(&bytes, &mut fast), Some((gap, end)));
+            assert_eq!(fast, want);
+            let last = want.last().unwrap().0;
+            let mut bound = pair_bound;
+            assert_eq!(
+                footer_entry_bound(&bytes, &mut bound),
+                Some((gap, end, last, test_bound(&want)))
+            );
+            assert_eq!(footer_entry_skim(&bytes), Some((gap, end, last)));
+        }
     }
 
     /// [`LazyFooter::decode_bounds`] decodes every block, bounds each from
