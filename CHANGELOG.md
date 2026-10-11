@@ -167,6 +167,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   bounds, then at its 1,024-slot sub-range's) instead of planning and
   sieving every sub-range bit-parallel. At 150 million rows its replay takes
   a fifth less CPU (a quarter fewer instructions) for the same answers.
+- A ranked disjunction over `TNS1` decodes its terms' footers whole before
+  its first group (it bounds every block anyway) rather than a block at a
+  time between a group's reads, reads a candidate's buckets starting with
+  the term its block bounds highest (most candidates read no other TF, as
+  TIN reads a term's TF only for a candidate that still needs it), and
+  scores a group's candidates best bound first. At 150 million rows
+  disjunctions retire 12% (`score`) and 16.5% (`full_score`) fewer
+  instructions in the server (`benchmarks/local/vm_ab.py`; the mixed trace
+  9% and 12%), and `full_score` ones read 17% fewer buffers, with the same
+  answers.
 - Index pages are pinned through a table every backend shares of the buffer
   each page was last pinned in (a named dynamic shared memory segment, 8
   bytes per shared buffer; no `shared_preload_libraries` needed) rather than
