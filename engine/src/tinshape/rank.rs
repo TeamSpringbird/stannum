@@ -233,9 +233,6 @@ impl<'a> Sc<'a> {
     /// must be asked in increasing order of `from`.
     #[inline]
     fn range_bound(&mut self, from: u32, to: u32) -> f32 {
-        if let Some(bound) = self.common {
-            return bound;
-        }
         // The blocks from the first ending at `from` or later through the
         // first ending at `to` or later (or the last), in one pass,
         // decoding as far as the last of them when it is not yet.
@@ -988,7 +985,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut partial = 0.0_f32;
         for k in 0..self.sc_order.len() {
             let i = self.sc_order[k];
-            let v = self.sc[i].range_bound(base, end);
+            let s = &mut self.sc[i];
+            let v = match s.common {
+                Some(bound) => bound,
+                None => s.range_bound(base, end),
+            };
             self.sub_bounds[i] = v;
             partial += v;
             if partial > theta {
