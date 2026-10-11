@@ -792,6 +792,8 @@ struct Row {
     /// then walking it.
     scorer_allocs: Allocs,
     walk_allocs: Allocs,
+    /// Instructions and cycles of the timed passes, all of them.
+    timed: (u64, u64),
 }
 
 fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Result<(), String> {
@@ -904,6 +906,7 @@ fn run() -> Result<bool, String> {
         let memo = segment::tinshape::segment::memo_counts();
         let mut times = Vec::with_capacity(args.repeat);
         let (mut scorer_allocs, mut walk_allocs) = (Allocs::default(), Allocs::default());
+        let counters0 = process_counters();
         for _ in 0..args.repeat {
             let at = Instant::now();
             let a0 = Allocs::now();
@@ -914,6 +917,8 @@ fn run() -> Result<bool, String> {
             times.push(at.elapsed().as_nanos() as u64);
             (scorer_allocs, walk_allocs) = (a1.since(a0), a2.since(a1));
         }
+        let counters1 = process_counters();
+        let timed = (counters1.0 - counters0.0, counters1.1 - counters0.1);
         let mut pages = Pages::default();
         let pins0 = PINS.get();
         let hash0 = REFS.with_borrow_mut(|refs| {
@@ -947,6 +952,7 @@ fn run() -> Result<bool, String> {
             memo,
             scorer_allocs,
             walk_allocs,
+            timed,
         });
         if (n + 1) % 500 == 0 {
             eprintln!("{} of {}", n + 1, trace.len());
@@ -1158,6 +1164,18 @@ fn run() -> Result<bool, String> {
             m(&|r| r.walk_allocs.bytes) / 1024.0,
         );
     }
+    println!(
+        "\ninstructions and cycles of the timed passes, all queries (where the OS counts them)"
+    );
+    for style in &styles {
+        let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        println!(
+            "{:<12} timed instructions {:.3}G cycles {:.3}G",
+            style,
+            of.iter().map(|r| r.timed.0).sum::<u64>() as f64 / 1e9,
+            of.iter().map(|r| r.timed.1).sum::<u64>() as f64 / 1e9,
+        );
+    }
     println!("\nwalk per query, mean: examined, scored, position checks, windows, pruned");
     for style in &styles {
         let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
@@ -1246,6 +1264,28 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// The process's instructions retired and cycles so far, where the OS
+/// counts them (macOS: `proc_pid_rusage`, as `time -l` reports them);
+/// zero elsewhere. Taken around the timed passes only, they leave out
+/// loading the dump and the instrumented pass.
+fn process_counters() -> (u64, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+            fn getpid() -> i32;
+        }
+        // `struct rusage_info_v4`: a 16-byte UUID, then 64-bit fields, of
+        // which `ri_instructions` and `ri_cycles` are the 30th and 31st.
+        let mut info = [0u64; 2 + 40];
+        // SAFETY: RUSAGE_INFO_V4 (4) into a buffer larger than the struct.
+        if unsafe { proc_pid_rusage(getpid(), 4, info.as_mut_ptr()) } == 0 {
+            return (info[2 + 29], info[2 + 30]);
+        }
+    }
+    (0, 0)
 }
 
 /// The process's user and system CPU seconds so far (`getrusage`).
