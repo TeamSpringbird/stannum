@@ -48,6 +48,7 @@ use super::bits::{self, BitWriter};
 use super::blob::{Bytes, Kind};
 use super::docs::{Geometry, Group};
 use super::ef::{self, Ef};
+use super::isa;
 use crate::{Error, Result, varint};
 
 pub const FORM_SPARSE: u8 = 1;
@@ -886,6 +887,7 @@ fn parse_groups(
 /// Calls `visit` with every member of a group container, as local slots in
 /// order.
 #[inline]
+#[isa::hot]
 pub fn for_each_local(
     entry: &GroupEntry,
     bytes: &[u8],
@@ -927,6 +929,7 @@ pub fn or_into(entry: &GroupEntry, bytes: &[u8], group: &Group, words: &mut [u64
     })
 }
 
+#[isa::hot]
 fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Result<()> {
     let ob = bits::width_below(width);
     let pages = *bytes.first().ok_or(Error::Truncated)? as usize + 1;
@@ -1247,6 +1250,7 @@ const BRIDGE: usize = 16;
 
 /// A footer block's entry at the start of `bytes`, its pairs appended to
 /// `pairs`: the gap to its last slot, and its length.
+#[isa::hot]
 fn footer_entry(bytes: &[u8], pairs: &mut Vec<(u8, u32)>) -> Result<(u64, usize)> {
     let from = pairs.len();
     let entry = (|| {
@@ -1620,6 +1624,7 @@ impl<'a> LazyFooter<'a> {
     /// window read in one loop, the others (and the last block, whose
     /// lengths are checked) one at a time.
     #[inline(never)]
+    #[isa::hot]
     fn decode_until(&mut self, from: usize, slot: u32) -> Result<()> {
         loop {
             let (window, window_at) = (self.window, self.window_at);
@@ -1676,6 +1681,7 @@ impl<'a> LazyFooter<'a> {
     /// Decodes the next block's entry, reading windows as needed; false
     /// when every block is.
     #[inline(never)]
+    #[isa::hot]
     fn decode_next(&mut self) -> Result<bool> {
         if self.last.len() >= self.blocks {
             return Ok(false);
@@ -1687,6 +1693,7 @@ impl<'a> LazyFooter<'a> {
     /// Parses the next block's entry (its pairs appended to the frontier),
     /// reading windows as needed: its bytes are the window's from
     /// [`Self::at`] on.
+    #[isa::hot]
     fn next_entry(&mut self) -> Result<(u64, usize)> {
         let mut want = BRIDGE;
         Ok(loop {
@@ -1763,6 +1770,7 @@ impl<'a> LazyFooter<'a> {
     /// them. Blocks decoded already (a footer derived from its record)
     /// are bounded from their frontiers.
     #[inline(never)]
+    #[isa::hot]
     pub fn decode_bounds(
         &mut self,
         mut bound: impl FnMut(u8, u32) -> f32,
@@ -1870,6 +1878,7 @@ impl<'a> LazyFooter<'a> {
     /// frontier's pairs at or above it (every posting is dominated by a
     /// frontier pair); 0 when none is.
     #[inline]
+    #[isa::hot]
     pub fn floor(&self, b: usize, bucket: u8) -> u32 {
         if self.kept {
             self.frontier(b)
@@ -1884,6 +1893,7 @@ impl<'a> LazyFooter<'a> {
     }
 
     #[inline(never)]
+    #[isa::hot]
     fn raw_floor(&self, b: usize, bucket: u8) -> u32 {
         self.raw_pairs(b)
             .filter(|(at, _)| *at >= bucket)
@@ -1895,6 +1905,7 @@ impl<'a> LazyFooter<'a> {
     /// [`Self::floor`] of (decoded) block `b` at every bucket, from one
     /// read of its frontier.
     #[inline(never)]
+    #[isa::hot]
     pub fn floors(&self, b: usize) -> [u32; 16] {
         let mut out = [u32::MAX; 16];
         let mut put = |(bucket, length): (u8, u32)| {
@@ -1966,6 +1977,7 @@ impl<'a> LazyFooter<'a> {
 
     /// Block `b`'s largest bucket (decoded): its frontier's last pair's.
     #[inline]
+    #[isa::hot]
     pub fn max_bucket(&self, b: usize) -> u8 {
         if self.kept {
             self.frontier[self.ends[b] as usize - 1].0
@@ -1989,6 +2001,7 @@ impl<'a> LazyFooter<'a> {
     /// The bucket of posting `index`, from its record's TF tail, decoding
     /// the footer through its block.
     #[inline]
+    #[isa::hot]
     pub fn bucket(&mut self, tf: Bytes<'_>, index: u32) -> Result<u8> {
         if let Some(bucket) = self.single {
             return Ok(bucket);

@@ -28,6 +28,7 @@ use segment::tinshape::bits;
 use segment::tinshape::blob::LazyBlob;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
+use segment::tinshape::isa;
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{Form, KIND_EF, KIND_GRID, LazyFooter, for_each_local};
 use segment::tinshape::segment::Segment;
@@ -123,6 +124,7 @@ impl<'a> Sc<'a> {
 
     /// [`Self::bound`], not known yet.
     #[inline(never)]
+    #[isa::hot]
     fn bound_of(&mut self, b: usize) -> f32 {
         if b >= self.bounds.len() {
             self.bounds
@@ -164,6 +166,7 @@ impl<'a> Sc<'a> {
     /// The first block from `from` on whose last slot is `slot` or later,
     /// decoded; the footer's block count when there is none.
     #[inline]
+    #[isa::hot]
     fn seek(&mut self, from: usize, slot: u32) -> usize {
         let b = self
             .footer
@@ -239,6 +242,7 @@ impl<'a> Sc<'a> {
     /// term's own bound, before the other terms raise the length), kept per
     /// bucket for the block it was last asked about in.
     #[inline]
+    #[isa::hot]
     fn floor_kept(&mut self, b: usize, bucket: u8) -> (u32, f32) {
         let at = usize::from(bucket) % BUCKET_COUNT;
         // Blocks are numbered below `u32::MAX` (a record has fewer postings).
@@ -319,6 +323,7 @@ impl Mem<'_> {
     /// The posting index of `local` if the term holds it; slots must be
     /// asked in increasing order (asking one again is allowed).
     #[inline]
+    #[isa::hot]
     fn find(&mut self, local: u32) -> Option<u32> {
         match &mut self.kind {
             Kind::Grid(bytes) => {
@@ -384,6 +389,7 @@ fn group_from(geometry: &Geometry, from: usize, slot: u32) -> usize {
 }
 
 /// The first group at or after `from` holding a member of `set`.
+#[isa::hot]
 fn next_group(
     set: &mut TermSet<'_>,
     geometry: &Geometry,
@@ -419,6 +425,7 @@ fn next_group(
 /// postings by slots stands for its count there). False, with nothing
 /// loaded, when a grouped term does not hold the group: the directory is
 /// looked up once.
+#[isa::hot]
 fn load<'a>(
     set: &mut TermSet<'a>,
     geometry: &Geometry,
@@ -520,6 +527,7 @@ impl<'a> PosCursor<'a> {
     }
 
     /// Reads entry `index` into `out`.
+    #[isa::hot]
     pub(super) fn read(
         &mut self,
         index: u32,
@@ -567,6 +575,7 @@ struct SpanCheck<'a> {
 impl SpanCheck<'_> {
     /// Reads slot `slot`'s positions unless read: its term's first slot's,
     /// copied, when an earlier slot holds the same term.
+    #[isa::hot]
     fn read_slot(&mut self, slot: usize, index: &[u32], touch: &mut impl Touch) -> Result<()> {
         if std::mem::replace(&mut self.read[slot], true) {
             return Ok(());
@@ -583,6 +592,7 @@ impl SpanCheck<'_> {
 
     /// Whether the candidate whose posting index in each slot's term is
     /// `index[slot]` holds the span.
+    #[isa::hot]
     fn holds(&mut self, index: &[u32], touch: &mut impl Touch) -> Result<bool> {
         self.read.fill(false);
         if let Some(plan) = self.plan.take() {
@@ -825,6 +835,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// in any other the required terms' members are intersected whole (word
     /// by word where every one is a grid, else term by term from the fewest)
     /// and the candidates left are bounded, scored and admitted in order.
+    #[isa::hot]
     fn run(&mut self) -> Result<()> {
         let lead = self.req[0];
         let n = self.sc.len();
@@ -921,6 +932,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// negative, so the sum stops once it passes the threshold. With
     /// nothing scoring every match scores zero.
     #[inline]
+    #[isa::hot]
     fn group_below(&mut self, g: u32, base: u32, end: u32) -> bool {
         let Some(theta) = self.threshold() else {
             return false;
@@ -937,6 +949,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// Whether every required term holds group `g` as a grid.
+    #[isa::hot]
     fn all_grids(&mut self, g: u32) -> bool {
         for r in 0..self.req.len() {
             let t = self.req[r];
@@ -961,6 +974,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// filters them by bit, an Elias-Fano list much longer than they are by
     /// probing its high bits in place, any other list by a merge. Then walks
     /// the candidates left.
+    #[isa::hot]
     fn group_and(&mut self, g: u32) -> Result<bool> {
         let mut cands = std::mem::take(&mut self.cands);
         cands.clear();
@@ -1030,6 +1044,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// in ctid order: on TIN's corpus staging its candidates scored fewer
     /// of them but read no fewer DL pages (the sidecar holds about a
     /// group's lengths per page), and took longer.
+    #[isa::hot]
     fn walk_candidates(&mut self, g: u32, cands: &[u32]) -> Result<bool> {
         let base = self.geometry.groups[g as usize].slot_base;
         let staging = !self.sc.is_empty() && matches!(self.verify, Verify::Span(_));
@@ -1069,6 +1084,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Sieves group `g`, every required term of which is a grid there, by
     /// the AND of their words, and walks its candidates.
+    #[isa::hot]
     fn dense_group(&mut self, g: u32) -> Result<bool> {
         let group = self.geometry.groups[g as usize];
         for r in 0..self.req.len() {
@@ -1118,6 +1134,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// slots up to [`Self::window_end`] share every scoring term's footer
     /// block, so its bound and its largest buckets.
     #[inline]
+    #[isa::hot]
     fn window(&mut self, g: u32, base: u32, local: u32) -> bool {
         let slot = base + local;
         if self.window_end.is_none_or(|e| slot > e) {
@@ -1180,6 +1197,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Term `t`'s members in group `g`, loaded on first use (none when it
     /// holds no member there).
+    #[isa::hot]
     fn ensure(&mut self, t: usize, g: u32) -> Result<()> {
         if self.mems[t].loaded == g + 1 {
             return Ok(());
@@ -1200,6 +1218,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Bounds, scores and admits the candidate at slot `local` of group
     /// `g`, which every required term holds; false once nothing later can
     /// enter the top k.
+    #[isa::hot]
     fn process(&mut self, g: u32, local: u32) -> Result<bool> {
         if self.sc.is_empty() && self.unscored_done(self.geometry.tid_in(g as usize, local)) {
             return Ok(false);
@@ -1212,6 +1231,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Stages group `g`'s candidate at slot `local`: bounds it by its
     /// buckets and keeps it, best bound first, for [`Walk::finish_staged`].
+    #[isa::hot]
     fn stage_into(&mut self, g: u32, local: u32) -> Result<()> {
         let Some((reach, length)) = self.stage(g, local)? else {
             return Ok(());
@@ -1229,6 +1249,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// best of a group raise it over the rest, which its first candidates
     /// in ctid order did not (on TIN's corpus, `w3 AND w17` read the DL
     /// sidecar for six times the candidates the final threshold needs).
+    #[isa::hot]
     fn finish_staged(&mut self, g: u32) -> Result<()> {
         let n = self.sc.len();
         let width = self.span_index.len();
@@ -1280,6 +1301,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// bound and its length when that is known (else `u32::MAX`), with its
     /// buckets in [`Walk::buckets`] and, for a span, its posting indexes in
     /// [`Walk::span_index`].
+    #[isa::hot]
     fn stage(&mut self, g: u32, local: u32) -> Result<Option<(f32, u32)>> {
         let n = self.sc.len();
         if let Some(dead) = self.segment.liveness.groups[g as usize].as_deref()
@@ -1335,6 +1357,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// with its buckets in [`Walk::buckets`] (and a span's posting indexes
     /// in [`Walk::span_index`]); `length` is its length, or `u32::MAX` to
     /// read it from the DL sidecar.
+    #[isa::hot]
     fn finish(&mut self, g: u32, local: u32, length: u32) -> Result<()> {
         let n = self.sc.len();
         let tid = self.geometry.tid_in(g as usize, local);
@@ -1399,6 +1422,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// others), and returns what the candidate can score at most by them:
     /// see [`Walk::reach`], taken only when each term's own bound (kept per
     /// block and bucket) leaves the candidate, of ctid `tid`, in reach.
+    #[isa::hot]
     fn read_buckets(&mut self, g: u32, local: u32, tid: Tid) -> Result<f32> {
         let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
         for i in 0..self.sc.len() {
@@ -1448,6 +1472,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// grows with the length, it left a seventh of the candidates in reach
     /// that each term's own bound did).
     #[inline]
+    #[isa::hot]
     fn reach(&self, held: impl Iterator<Item = usize>, floor: u32) -> f32 {
         let mut reach = 0.0_f32;
         for i in held {
@@ -1470,6 +1495,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// The length of the document at slot `local` of group `g`, from the DL
     /// sidecar.
     #[inline]
+    #[isa::hot]
     fn dl_length(&mut self, g: u32, local: u32) -> Result<u32> {
         let rank = self
             .segment
@@ -1483,6 +1509,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// The candidate's posting index in each span slot's term.
+    #[isa::hot]
     fn span_indexes(&mut self, local: u32) {
         let Verify::Span(check) = &self.verify else {
             return;
@@ -1504,6 +1531,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Checks the group's pending phrase candidates, best first, each
     /// against the threshold as it then stands.
+    #[isa::hot]
     fn verify_pending(&mut self, g: u32) -> Result<()> {
         let width = match &self.verify {
             Verify::Span(check) => check.slots.len(),
@@ -1857,6 +1885,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// bounds over its sub-range of the terms it holds; each one left is
     /// bounded by its terms' blocks, then by its buckets and length, then
     /// scored.
+    #[isa::hot]
     fn run_or(&mut self) -> Result<()> {
         let n = self.sc.len();
         if n == 0 {
@@ -1904,6 +1933,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Scoring term `i`'s members in group `g`, which it holds, into its row
     /// of `words` words.
     #[inline(never)]
+    #[isa::hot]
     fn or_load(&mut self, i: usize, g: u32, words: usize) -> Result<()> {
         let t = self.sc[i].term;
         let group = self.geometry.groups[g as usize];
@@ -1963,6 +1993,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     #[inline(never)]
+    #[isa::hot]
     fn or_group(&mut self, g: u32) -> Result<()> {
         let n = self.sc.len();
         let group = self.geometry.groups[g as usize];
@@ -2167,6 +2198,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Plans a group whose present terms' bounds are `sb` (summing to
     /// `total`) at threshold `theta`.
     #[inline(never)]
+    #[isa::hot]
     fn plan_group(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
         plan.required.clear();
         plan.essential.clear();
@@ -2208,6 +2240,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// The posting index of member `local` of scoring term `i`'s row;
     /// members must be asked in increasing order.
     #[inline]
+    #[isa::hot]
     fn row_index(&mut self, i: usize, words: usize, local: u32) -> u32 {
         let row = &self.rows[i * words..(i + 1) * words];
         let r = &mut self.row_state[i];
@@ -2233,6 +2266,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Kept out of line, as the group and plan steps are: inlined into the
     /// word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
+    #[isa::hot]
     fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
         let local = (w * 64) as u32 + bit;
         if let Some((reach, length)) = self.or_stage(g, base, words, w, bit)? {
@@ -2253,6 +2287,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// [`Walk::stage`]): its terms' blocks, then its buckets, and a length
     /// a term it holds carries inline. Its buckets are left in
     /// [`Walk::buckets`] ([`NO_BUCKET`] for a term it lacks).
+    #[isa::hot]
     fn or_stage(
         &mut self,
         g: u32,

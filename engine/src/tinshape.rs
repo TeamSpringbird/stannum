@@ -18,6 +18,7 @@ use segment::tinshape::bits;
 use segment::tinshape::blob::Bytes;
 use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::EfCursor;
+use segment::tinshape::isa;
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings, for_each_local};
 use segment::tinshape::segment::{Area, Segment};
@@ -375,6 +376,7 @@ impl<'a> TermSet<'a> {
 
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
+    #[isa::hot]
     fn find(&self, group: u32, hint: &mut usize) -> Option<G<'a>> {
         let count = self.group_count();
         while *hint < count && self.group_index(*hint) < group {
@@ -387,6 +389,7 @@ impl<'a> TermSet<'a> {
 
     /// Moves to the first slot at or after `target`; the slot, if any.
     #[inline]
+    #[isa::hot]
     pub fn seek(
         &mut self,
         geometry: &Geometry,
@@ -501,6 +504,7 @@ impl<'a> TermSet<'a> {
         }
     }
 
+    #[isa::hot]
     fn load(&mut self, g: &G<'a>, group: &Group, touch: &mut impl Touch) {
         self.pos = 0;
         match g.src {
@@ -661,6 +665,7 @@ fn intersect_sorted(list: &mut Vec<u32>, other: &[u32]) {
 impl<'a, T: Touch> Fold<'_, 'a, T> {
     /// Writes the members of `node` in group `group` into `out` (zeroed by
     /// the caller); false when there are none.
+    #[isa::hot]
     fn eval(&mut self, node: &Node, group: u32, out: &mut [u64], depth: usize) -> Result<bool> {
         match node {
             Node::Term(t) => self.term_into(*t, group, out),
@@ -1020,6 +1025,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
 
 /// Reads entry `index` of a positions stream (a
 /// [`segment::tinshape::positions`] stream) into `out`.
+#[isa::hot]
 pub fn read_positions(
     stream: (segment::tinshape::blob::Bytes<'_>, usize),
     index: u32,
@@ -1071,6 +1077,7 @@ pub fn count(
 }
 
 /// [`count`] over terms opened already.
+#[isa::hot]
 pub fn count_terms<'a>(
     segment: &Segment<'a>,
     node: &Node,
@@ -1133,6 +1140,7 @@ pub fn count_terms<'a>(
 /// `emit` is called with each group holding any, ascending, and the
 /// group's words over its slots (bit `local` for slot `local`; see
 /// [`Geometry::tid_in`]). Ctid order is group order, then slot order.
+#[isa::hot]
 pub fn for_each_match<'a>(
     segment: &Segment<'a>,
     node: &Node,
@@ -1198,6 +1206,7 @@ pub fn score_at(
 /// of `scorers[i]`: a caller scoring row after row keeps them, so a row in
 /// the group of the last reads no container again. Their cursors are moved
 /// back when a row comes before the last.
+#[isa::hot]
 pub fn score_at_in<'a>(
     segment: &Segment<'a>,
     scorers: &[(String, TermScorer)],
@@ -1259,6 +1268,7 @@ pub fn tids_in(geometry: &Geometry, group: usize, words: &[u64], mut visit: impl
 /// whether it covers every document of the group; members on other slots
 /// are not counted but handed to `hidden` (the group and its words of
 /// hidden members), for the caller to check against the heap.
+#[isa::hot]
 pub fn count_terms_visible<'a>(
     segment: &Segment<'a>,
     node: &Node,
@@ -1460,6 +1470,7 @@ fn required_terms(node: &Node) -> Vec<usize> {
 
 /// Whether the document at `slot` matches `node`; cursors only move
 /// forward, so slots must be asked in increasing order.
+#[isa::hot]
 fn matches<'a>(
     segment: &Segment<'a>,
     node: &Node,
@@ -3194,6 +3205,136 @@ mod tests {
     impl crate::walk::Visibility for AllVisible {
         fn visible(&mut self, _: Tid) -> bool {
             true
+        }
+    }
+    /// Everything a query reads of a segment at one instruction set: per
+    /// shape its count, its index-only count, its matches, its top k and
+    /// every document's score, floats as bits.
+    type Answers = Vec<(u64, u64, Vec<Tid>, Vec<(u32, Tid)>, Vec<Option<u32>>)>;
+
+    fn answers(
+        segment: &Segment<'_>,
+        nodes: &[Node],
+        scorers: &[(String, TermScorer)],
+        k: usize,
+    ) -> Answers {
+        let names: Vec<String> = (0..6).map(|t| format!("t{t}")).collect();
+        let docs = segment.docs.tids();
+        nodes
+            .iter()
+            .map(|node| {
+                let total = count(segment, node, &names, &mut NoTouch).unwrap();
+                let mut terms = open_terms(segment, &names, &mut NoTouch).unwrap();
+                // Slots on even words visible, the rest hidden.
+                let visible = count_terms_visible(
+                    segment,
+                    node,
+                    &mut terms,
+                    &mut NoTouch,
+                    &mut |_, mask| {
+                        for (w, word) in mask.iter_mut().enumerate() {
+                            *word = if w % 2 == 0 { !0 } else { 0 };
+                        }
+                        false
+                    },
+                    &mut |_, _| {},
+                )
+                .unwrap();
+                let mut terms = open_terms(segment, &names, &mut NoTouch).unwrap();
+                let mut listed = Vec::new();
+                for_each_match(
+                    segment,
+                    node,
+                    &mut terms,
+                    &mut NoTouch,
+                    &mut |group, words| {
+                        tids_in(&segment.docs.geometry, group, words, |tid| listed.push(tid));
+                    },
+                )
+                .unwrap();
+                let rows = top_k(segment, node, &names, scorers, k, &mut NoTouch)
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .map(|(s, t)| (s.to_bits(), *t))
+                    .collect();
+                let scores = docs
+                    .iter()
+                    .map(|tid| score_at(segment, scorers, *tid).unwrap().map(f32::to_bits))
+                    .collect();
+                (total, visible, listed, rows, scores)
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+        /// The walks, the count fold and the decoders under them answer
+        /// alike, bit for bit, at every instruction set this CPU runs their
+        /// hot bodies at (`segment::tinshape::isa`): over many groups, every
+        /// container kind, footers of several blocks, and phrases.
+        #[test]
+        fn every_instruction_set_answers_alike(
+            doc_set in prop::collection::btree_set((0u32..4000, 1u16..=24), 1..4000),
+            density in prop::collection::vec(prop_oneof![1u64..4, 4u64..40, 40u64..100], 6),
+            max_tf in 1u64..40,
+            seed in any::<u64>(),
+            grid_density in prop::sample::select(vec![0u32, 4, 64]),
+            block_size in prop::sample::select(vec![16u32, 128, 256]),
+            adaptive_tf in any::<bool>(),
+            k in prop::sample::select(vec![1usize, 10, 100]),
+        ) {
+            let have = segment::tinshape::isa::Isa::supported();
+            if let Ok(want) = std::env::var("STANNUM_EXPECT_KERNELS") {
+                let wants_v3 = want.split(',').any(|w| matches!(w.trim(), "avx2" | "avx512" | "v3"));
+                prop_assert!(!wants_v3 || have.len() > 1, "v3 not supported here");
+            }
+            let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
+            let mut state = seed | 1;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let members: Vec<Vec<(usize, u32)>> = density
+                .iter()
+                .map(|d| {
+                    let mut held = Vec::new();
+                    for r in 0..docs.len() {
+                        if next() % 100 < *d {
+                            held.push((r, (next() % max_tf + 1) as u32));
+                        }
+                    }
+                    held
+                })
+                .collect();
+            let options = Options { block_size, grid_density, adaptive_tf, grid_min_postings: 0, inline_lengths_min_documents: 0, ..Options::default() };
+            let blob = build(&docs, &members, options);
+            let segment = Segment::parse(&blob).unwrap();
+            let mut scorers = Vec::new();
+            for (t, m) in members.iter().enumerate() {
+                if !m.is_empty() {
+                    let scorer = TermScorer::from_statistics(docs.len() as u64, m.len() as u64, 1.0, Bm25Params::default(), 50.0).unwrap();
+                    scorers.push((format!("t{t}"), scorer));
+                }
+            }
+            use Node::*;
+            let mut nodes = shapes();
+            nodes.extend([
+                Or((0..6).map(Term).collect()),
+                And(vec![Term(4), Term(5)]),
+                And(vec![Term(1), Term(4), Term(5)]),
+                Or(vec![Term(5), And(vec![Term(3), Term(4)])]),
+                Span { slots: vec![4, 5, 4], query: SpanQuery::phrase([0, 1, 2]) },
+            ]);
+            let want = segment::tinshape::isa::with(segment::tinshape::isa::Isa::GENERIC, || answers(&segment, &nodes, &scorers, k));
+            for isa in have {
+                let got = segment::tinshape::isa::with(isa, || answers(&segment, &nodes, &scorers, k));
+                for ((node, got), want) in nodes.iter().zip(&got).zip(&want) {
+                    prop_assert_eq!(got, want, "{:?} at {}", node, isa.name());
+                }
+            }
         }
     }
 }

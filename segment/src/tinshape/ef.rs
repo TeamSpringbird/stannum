@@ -15,6 +15,7 @@
 //! no header: it costs about `2 + log2(u / n)` bits per value.
 
 use super::bits::{self, BitWriter};
+use super::isa;
 use crate::{Error, Result};
 
 /// The low-bit width for `n` values below `universe`.
@@ -103,6 +104,7 @@ impl<'a> Ef<'a> {
 
     /// Calls `visit` with every value in order.
     #[inline]
+    #[isa::hot]
     pub fn for_each(&self, mut visit: impl FnMut(u32)) {
         let mut i = 0usize;
         let words = self.highs.len().div_ceil(8);
@@ -168,6 +170,7 @@ impl<'a> Ef<'a> {
     /// (its high part is the number of zeros before it), and only the lows
     /// of that bucket's members are read: for a few values against a long
     /// list, a small part of what decoding the list reads.
+    #[isa::hot]
     pub fn retain_members(&self, values: &mut Vec<u32>) {
         let (highs, lows, low, n) = (self.highs, self.lows, self.low, self.n);
         let total = highs.len() * 8;
@@ -262,6 +265,7 @@ pub struct EfCursor<'a> {
 }
 
 impl<'a> EfCursor<'a> {
+    #[isa::hot]
     fn load(&mut self) {
         if self.index >= self.ef.n {
             self.current = None;
@@ -306,6 +310,7 @@ impl<'a> EfCursor<'a> {
     /// the highs a word at a time (the word at hand kept, its passed bits
     /// cleared) and the lows read in place.
     #[inline]
+    #[isa::hot]
     pub fn drain_below(&mut self, end: u32, mut visit: impl FnMut(u32)) {
         let Some(mut value) = self.current else {
             return;
@@ -367,6 +372,7 @@ impl<'a> EfCursor<'a> {
     /// their high bits alone (a word of them at a time where every one of a
     /// word does), and only values in the target's high bucket have their
     /// low bits read.
+    #[isa::hot]
     pub fn seek(&mut self, target: u32) {
         match self.current {
             Some(current) if current < target => {}

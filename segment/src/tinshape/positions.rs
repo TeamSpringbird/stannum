@@ -32,6 +32,7 @@
 //! most postings, at a bit each.
 
 use super::blob::Bytes;
+use super::isa;
 use crate::payload::{PayloadBuilder, SKIP_INTERVAL};
 use crate::{Error, Result, varint};
 
@@ -210,6 +211,7 @@ impl<'a> Positions<'a> {
     /// it starts in [`Self::bytes`]; with the table bytes read, as
     /// `(offset, length)` pairs, for page accounting.
     #[inline]
+    #[isa::hot]
     pub fn locate(&self, index: u32) -> Result<Located> {
         if index >= self.count {
             return Err(Error::Corrupt("positions index"));
@@ -248,6 +250,7 @@ impl<'a> Positions<'a> {
     /// The count of positions of entry `index`, starting at byte `p`, and
     /// where its positions start.
     #[inline]
+    #[isa::hot]
     fn head(&self, index: u32, p: usize) -> Result<(u32, usize)> {
         if let Some(m) = self.masks_at {
             let at = m + (index / SKIP_INTERVAL) as usize * 4;
@@ -272,6 +275,7 @@ impl<'a> Positions<'a> {
 
     /// Skips entry `index`, starting at byte `p`; where the next starts.
     #[inline]
+    #[isa::hot]
     pub fn skip(&self, index: u32, p: usize) -> Result<usize> {
         let (n, p) = self.head(index, p)?;
         Ok(p + skip_varints(self.varints(p, n)?, 0, n)?)
@@ -282,6 +286,7 @@ impl<'a> Positions<'a> {
     /// names (a position each, no count) is skipped as one run of varints,
     /// and another entry's count and positions are read from one window
     /// where they fit in it.
+    #[isa::hot]
     pub fn skip_entries(&self, from: u32, at: usize, to: u32) -> Result<usize> {
         let mut p = at;
         let mut i = from;
@@ -318,6 +323,7 @@ impl<'a> Positions<'a> {
     /// Decodes entry `index`, starting at byte `at`, into `out`; where the
     /// next starts.
     #[inline]
+    #[isa::hot]
     pub fn read_entry(&self, index: u32, at: usize, out: &mut Vec<u32>) -> Result<usize> {
         let (n, p) = self.head(index, at)?;
         let bytes = self.varints(p, n)?;

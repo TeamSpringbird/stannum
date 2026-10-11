@@ -37,6 +37,7 @@ COPY postgres postgres
 COPY tinql tinql
 COPY tokenizer tokenizer
 COPY boldi-vigna boldi-vigna
+COPY isa-macro isa-macro
 COPY segment segment
 COPY engine engine
 # A workspace member: cargo reads its manifest; nothing here builds it.

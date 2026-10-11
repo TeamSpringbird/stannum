@@ -15,6 +15,7 @@
 //!   frequent terms.
 //! * [`segment`]: the blob that holds them with the term map and positions.
 //! * [`ef`], [`bits`]: the Elias-Fano and bit-packing codecs underneath.
+//! * [`isa`]: the instruction set the query path's hot bodies run.
 //! * [`index`]: a segment read through a [`crate::source::Source`] behind
 //!   the query interface every source offers, for the query shapes the
 //!   ctid-native paths do not take.
@@ -28,6 +29,7 @@ pub mod blob;
 pub mod docs;
 pub mod ef;
 pub mod index;
+pub mod isa;
 pub mod merge;
 pub mod positions;
 pub mod postings;

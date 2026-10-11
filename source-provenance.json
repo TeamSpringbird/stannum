@@ -1491,6 +1491,18 @@
     "tokenizer/tests/tin_stemming.rs": {
       "owner": "ben",
       "evidence": "Original Stannum tests of stemmed tokenization against TIN 1.0.4's recorded answers."
+    },
+    "isa-macro/Cargo.toml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the manifest of the #[hot] attribute macro crate."
+    },
+    "isa-macro/src/lib.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: #[hot], which compiles a hot function twice on x86-64 (portable and x86-64-v3) and dispatches at runtime."
+    },
+    "segment/src/tinshape/isa.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the instruction set the query path's hot copies run, chosen once per process."
     }
   }
 }

@@ -39,6 +39,7 @@
 
 use super::bits;
 use super::blob::Bytes;
+use super::isa;
 use crate::{Error, Result, Tid, varint};
 
 /// Heap blocks per group.
@@ -473,6 +474,7 @@ impl<'a> Lengths<'a> {
 
     /// Block `b`'s header: where its bits start, its base and its width.
     #[inline]
+    #[isa::hot]
     fn header(&self, b: usize) -> Result<(usize, u32, u32)> {
         let h = self
             .headers
@@ -485,6 +487,7 @@ impl<'a> Lengths<'a> {
 
     /// The length of the document at `rank`.
     #[inline]
+    #[isa::hot]
     pub fn get(&self, rank: u32) -> Result<u32> {
         if rank >= self.documents {
             return Err(Error::Corrupt("length rank"));

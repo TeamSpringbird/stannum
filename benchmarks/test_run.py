@@ -118,7 +118,7 @@ class ProvenanceTests(unittest.TestCase):
 
     def test_every_crate_the_extension_builds_from_is_fingerprinted(self):
         crates = run.extension_crates(run.ROOT)
-        self.assertEqual(crates, ['boldi-vigna', 'engine', 'postgres', 'segment', 'tinql', 'tokenizer'])
+        self.assertEqual(crates, ['boldi-vigna', 'engine', 'isa-macro', 'postgres', 'segment', 'tinql', 'tokenizer'])
 
 
 def plan(actual_node, expected_node):

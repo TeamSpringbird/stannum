@@ -11,6 +11,7 @@ license.workspace = true
 description = "Byte codecs for immutable search-index segments: dictionary, document-ordinal streams, document table, positions, forward records"
 
 [dependencies]
+isa-macro = { path = "../isa-macro" }
 rustc-hash.workspace = true
 thiserror.workspace = true
 
