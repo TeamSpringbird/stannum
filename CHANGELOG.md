@@ -142,6 +142,10 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- A ranked disjunction over `TNS1` sums a group's term bounds per word and
+  per member without a branch on x86-64: LLVM turned the select of a
+  bound or zero into a jump the CPU mispredicted (AVX-512 and aarch64 were
+  branch-free already). Scores are unchanged bit for bit.
 - Ranked walks over `TNS1` sum their bounds in `f32` in the scorer's order,
   as the scores are summed, so a bound is at least the score bit for bit;
   a bound that only ties the threshold prunes when its matches cannot win
