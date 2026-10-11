@@ -142,6 +142,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- Ranked walks over `TNS1` branch less where the branch follows the data,
+  for x86-64, whose predictors miss such branches far more often than the
+  Apple cores do. A conjunction intersects its candidates with each
+  required term's list eight values at a time in vector registers, and
+  keeps or drops each one (against a list, a grid or a probed Elias-Fano
+  container) without a branch on its fate.
+  Footer readers take a pair's one- or two-byte length without a branch.
+  A query also allocates less: a dictionary lookup reuses its term
+  buffers, and a walk sizes its vectors once (at 150 million rows, a
+  conjunction's 4,500 allocations or so became about 860).
 - Ranked walks over `TNS1` sum their bounds in `f32` in the scorer's order,
   as the scores are summed, so a bound is at least the score bit for bit;
   a bound that only ties the threshold prunes when its matches cannot win
