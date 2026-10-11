@@ -666,6 +666,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// over the sub-range at hand; and its word at hand.
     or_terms: Vec<(usize, f32, f32)>,
     or_held: Vec<u64>,
+    /// A disjunction's candidate at hand: per scoring term it holds, the
+    /// bound of the block or, once its bucket is read, of the bucket (see
+    /// [`Walk::or_stage`]).
+    held_bound: Vec<f32>,
     /// Per scoring term, the candidate at hand's bucket ([`NO_BUCKET`]
     /// when it does not hold the term).
     buckets: Vec<u8>,
@@ -1667,6 +1671,7 @@ pub(super) fn walk_into<'a>(
         any: Vec::new(),
         or_terms: Vec::new(),
         or_held: Vec::new(),
+        held_bound: vec![0.0; n],
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
         term_sc: Vec::new(),
@@ -2241,6 +2246,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.answer.candidates += 1;
         let tid = self.geometry.tid_in(g as usize, local);
         let mut bound = 0.0_f32;
+        // The held term its block bounds highest.
+        let (mut best, mut top) = (-1.0_f32, usize::MAX);
         self.held_list.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
@@ -2255,7 +2262,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let b = (index / s.footer.block_size()) as usize;
                 debug_assert_eq!(Some(b), s.block_at(slot));
                 self.blocks[i] = b;
-                bound += s.bound(b);
+                let v = s.bound(b);
+                self.held_bound[i] = v;
+                bound += v;
+                if v > best {
+                    (best, top) = (v, i);
+                }
             }
         }
         if self.cut(bound, || tid) {
@@ -2263,27 +2275,37 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         // The candidate's buckets, each against the shortest document of
         // its block holding that bucket or more, before its length is read
-        // (see `Walk::stage`).
+        // (see `Walk::stage`). The term its block bounds highest is read
+        // first, alone: its bucket replacing its block's bound rules out
+        // most candidates the others' blocks left in reach, before their
+        // TF is read (as TIN reads a term's TF only for a candidate that
+        // still needs it). The bounds are summed in the scorer's order,
+        // each no lower than its term's score, so the partial sum bounds
+        // the candidate.
         self.buckets.fill(NO_BUCKET);
-        let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
+        let (mut floor, mut low) = (0u32, u32::MAX);
+        let first = if self.held_list.len() > 1 {
+            let f = self.or_bucket_of(top)?;
+            (floor, low) = (f, f);
+            let mut partial = 0.0_f32;
+            for &h in &self.held_list {
+                partial += self.held_bound[h];
+            }
+            if self.cut(partial, || tid) {
+                return Ok(None);
+            }
+            top
+        } else {
+            usize::MAX
+        };
+        let mut own = 0.0_f32;
         for h in 0..self.held_list.len() {
             let i = self.held_list[h];
-            let index = self.held_index[i];
-            let s = &mut self.sc[i];
-            let set = self.terms[s.term].as_ref().expect("scoring");
-            let bucket = s.footer.bucket(set.postings.tf, index)?;
-            let block = self.blocks[i];
-            if s.footer.single().is_none() {
-                self.touch.touch(
-                    Part::TfTail,
-                    set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
-                    1,
-                );
+            if i != first {
+                let f = self.or_bucket_of(i)?;
+                (floor, low) = (floor.max(f), low.min(f));
             }
-            let (f, bound) = self.sc[i].floor_kept(block, bucket);
-            (floor, low) = (floor.max(f), low.min(f));
-            own += bound;
-            self.buckets[i] = bucket;
+            own += self.held_bound[i];
         }
         // Each term's own bound first, as `Walk::read_buckets` does.
         if self.cut(own, || tid) {
@@ -2315,6 +2337,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             None => (reach, u32::MAX),
         }))
+    }
+
+    /// Reads into [`Walk::buckets`] the bucket of held scoring term `i`
+    /// for the candidate at hand (its posting index in
+    /// [`Walk::held_index`], its block in [`Walk::blocks`]), and into
+    /// [`Walk::held_bound`] what the bucket scores at most there; returns
+    /// the shortest length the block holds at that bucket or above.
+    #[inline(always)]
+    fn or_bucket_of(&mut self, i: usize) -> Result<u32> {
+        let index = self.held_index[i];
+        let block = self.blocks[i];
+        let s = &mut self.sc[i];
+        let set = self.terms[s.term].as_ref().expect("scoring");
+        let bucket = s.footer.bucket(set.postings.tf, index)?;
+        if s.footer.single().is_none() {
+            self.touch.touch(
+                Part::TfTail,
+                set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
+                1,
+            );
+        }
+        let (floor, bound) = s.floor_kept(block, bucket);
+        self.held_bound[i] = bound;
+        self.buckets[i] = bucket;
+        Ok(floor)
     }
 }
 
