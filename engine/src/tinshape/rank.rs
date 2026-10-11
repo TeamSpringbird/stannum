@@ -545,6 +545,7 @@ fn load<'a>(
                 };
             } else {
                 let list = &mut mem.list;
+                list.reserve(e.count as usize);
                 for_each_local(&e, bytes, &group, |l| list.push(l))?;
             }
         }
@@ -1812,7 +1813,8 @@ pub(super) fn walk_into<'a>(
     if k == 0 || required.iter().any(|t| terms[*t].is_none()) {
         return Ok(None);
     }
-    let mut sc: Vec<Sc> = Vec::new();
+    // Sized once: an `Sc` is large, and a growing vector copies them.
+    let mut sc: Vec<Sc> = Vec::with_capacity(scorers.len());
     for (name, scorer) in scorers {
         let Some(t) = names.iter().position(|n| n == name) else {
             continue;

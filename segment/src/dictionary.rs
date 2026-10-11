@@ -387,6 +387,7 @@ impl<'a> Dictionary<'a> {
             reader: Reader::new(self.blocks.block(range)?),
             remaining_in_block: self.index.block_terms(block),
             term: Vec::new(),
+            previous: Vec::new(),
             payload_end: 0,
             ordinals_end: 0,
         })
@@ -491,6 +492,10 @@ struct Walker<'a> {
     reader: Reader<'a>,
     remaining_in_block: usize,
     term: Vec<u8>,
+    /// The term before `term`: its buffer swapped with `term`'s each step,
+    /// so a walk over a block reuses two buffers rather than allocating one
+    /// per entry.
+    previous: Vec<u8>,
     /// Where the previous entry's extents ended, for the gaps.
     payload_end: u64,
     ordinals_end: u64,
@@ -504,10 +509,12 @@ impl<'a> Walker<'a> {
         }
         let suffix_len = self.reader.varint_u32()? as usize;
         let suffix = self.reader.take(suffix_len)?;
-        let previous = std::mem::take(&mut self.term);
-        self.term.extend_from_slice(&previous[..shared]);
+        std::mem::swap(&mut self.term, &mut self.previous);
+        self.term.clear();
+        self.term.extend_from_slice(&self.previous[..shared]);
         self.term.extend_from_slice(suffix);
-        if self.term.is_empty() || (!previous.is_empty() && previous >= self.term) {
+        let previous = &self.previous;
+        if self.term.is_empty() || (!previous.is_empty() && *previous >= self.term) {
             return Err(Error::Corrupt("dictionary term order"));
         }
         let df_bucket = self.reader.varint()?;

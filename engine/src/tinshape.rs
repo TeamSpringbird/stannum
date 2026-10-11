@@ -239,7 +239,9 @@ impl<'a> TermSet<'a> {
         let record_at = term.at;
         let mut groups = Vec::new();
         let mut locals = Vec::new();
-        let mut dir: std::rc::Rc<[GroupEntry]> = std::rc::Rc::new([]);
+        // A grouped term's directory, shared with its record; set only
+        // there (an empty one is an allocation of its own).
+        let mut dir: Option<std::rc::Rc<[GroupEntry]>> = None;
         let mut containers = 0;
         match &postings.form {
             Form::Single(slot) => {
@@ -266,9 +268,10 @@ impl<'a> TermSet<'a> {
                     postings.containers_at,
                 );
                 containers = record_at + postings.payload_at + postings.containers_at;
-                dir = entries.clone();
+                dir = Some(entries.clone());
             }
         }
+        let dir = dir.unwrap_or_else(|| std::rc::Rc::new([]));
         Ok(Some(Self {
             df: term.entry.df,
             max_bucket: term.entry.max_tf_bucket,
@@ -1042,10 +1045,13 @@ pub fn open_terms<'a>(
     names: &[String],
     touch: &mut impl Touch,
 ) -> Result<Vec<Option<TermSet<'a>>>> {
-    names
-        .iter()
-        .map(|n| TermSet::open(segment, n, touch))
-        .collect()
+    // Sized once: collected through a `Result`, the vector would grow (and
+    // copy its terms) as it filled.
+    let mut terms = Vec::with_capacity(names.len());
+    for name in names {
+        terms.push(TermSet::open(segment, name, touch)?);
+    }
+    Ok(terms)
 }
 
 /// Counts the live documents of `segment` matching `node`.
@@ -1427,24 +1433,23 @@ pub fn top_k_into(
     Ok(answer)
 }
 
-/// Terms every match holds.
+/// Terms every match holds, ascending.
 fn required_terms(node: &Node) -> Vec<usize> {
-    match node {
-        Node::Term(t) => vec![*t],
-        Node::And(children) => {
-            let mut out: Vec<usize> = children.iter().flat_map(required_terms).collect();
-            out.sort_unstable();
-            out.dedup();
-            out
+    /// Appends the terms every match of `node` holds: those of each child
+    /// of an AND, in one list rather than one per child.
+    fn add(node: &Node, out: &mut Vec<usize>) {
+        match node {
+            Node::Term(t) => out.push(*t),
+            Node::And(children) => children.iter().for_each(|c| add(c, out)),
+            Node::Span { slots, .. } => out.extend_from_slice(slots),
+            _ => {}
         }
-        Node::Span { slots, .. } => {
-            let mut out = slots.clone();
-            out.sort_unstable();
-            out.dedup();
-            out
-        }
-        _ => Vec::new(),
     }
+    let mut out = Vec::new();
+    add(node, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// Whether the document at `slot` matches `node`; cursors only move
