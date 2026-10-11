@@ -1230,6 +1230,11 @@ pub struct LazyFooter<'a> {
     kept: bool,
     raw: Vec<u8>,
     entries: Vec<u32>,
+    /// Whether the footer is skimmed ([`Self::skim`]): its blocks' last
+    /// slots, TF offsets and widths are kept, their frontiers not at all.
+    skim: bool,
+    /// A skimmed footer's blocks' largest buckets.
+    maxb: Vec<u8>,
     /// Whether pages the footer's reads pinned for bytes only it reads are
     /// released once it has read past them ([`Self::release_passed`]), and
     /// those pages, still pinned.
@@ -1425,6 +1430,57 @@ fn footer_entry_bound(
     Some((gap, at, last, best))
 }
 
+/// [`footer_entry_fast`] keeping nothing of the pairs: the gap, the
+/// entry's length and its largest bucket (its last pair's).
+#[inline(always)]
+fn footer_entry_skim(bytes: &[u8]) -> Option<(u64, usize, u8)> {
+    let b: &[u8; ENTRY_MAX] = bytes.get(..ENTRY_MAX)?.try_into().ok()?;
+    let mut at = 0;
+    let mut gap = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = b[at];
+        at += 1;
+        gap |= u64::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            break;
+        }
+        shift += 7;
+        if shift >= 35 {
+            return None;
+        }
+    }
+    let k = usize::from(b[at]);
+    at += 1;
+    if k.wrapping_sub(1) >= 16 {
+        return None;
+    }
+    let mut any = 0u8;
+    let mut last = 0u8;
+    for _ in 0..k {
+        let bucket = b[at];
+        any |= bucket;
+        last = bucket;
+        at += 1;
+        // A length: five bytes at most, the last below 0x80.
+        let mut n = 0;
+        while b[at + n] >= 0x80 {
+            n += 1;
+            if n == 5 {
+                return None;
+            }
+        }
+        if n == 4 && b[at + 4] > 0x0f {
+            return None;
+        }
+        at += n + 1;
+    }
+    if any > 15 {
+        return None;
+    }
+    Some((gap, at, last))
+}
+
 impl<'a> LazyFooter<'a> {
     fn new(
         postings: &Postings<'a>,
@@ -1456,6 +1512,8 @@ impl<'a> LazyFooter<'a> {
             kept: true,
             raw: Vec::new(),
             entries: Vec::new(),
+            skim: false,
+            maxb: Vec::new(),
             release: false,
             owned: Vec::new(),
         };
@@ -1514,6 +1572,9 @@ impl<'a> LazyFooter<'a> {
             } else {
                 self.entries.reserve_exact(blocks);
                 self.raw.reserve_exact(self.src.len());
+                if self.skim {
+                    self.maxb.reserve_exact(blocks);
+                }
             }
             self.tf_at.reserve_exact(blocks);
             self.widths.reserve_exact(blocks);
@@ -1621,6 +1682,9 @@ impl<'a> LazyFooter<'a> {
     /// lengths are checked) one at a time.
     #[inline(never)]
     fn decode_until(&mut self, from: usize, slot: u32) -> Result<()> {
+        if self.skim {
+            return self.skim_until(from, slot);
+        }
         loop {
             let (window, window_at) = (self.window, self.window_at);
             let (mut at, mut next_last, mut next_tf) = (self.at, self.next_last, self.next_tf);
@@ -1671,6 +1735,91 @@ impl<'a> LazyFooter<'a> {
                 return Ok(());
             }
         }
+    }
+
+    /// [`Self::decode_until`] of a skimmed footer: no pairs kept.
+    fn skim_until(&mut self, from: usize, slot: u32) -> Result<()> {
+        loop {
+            let (window, window_at) = (self.window, self.window_at);
+            let (mut at, mut next_last, mut next_tf) = (self.at, self.next_last, self.next_tf);
+            let mut b = self.last.len();
+            let full = bits::packed_len(self.block_size as usize, 1) as u64;
+            let mut found = false;
+            let start = at;
+            let raw = self.raw.len();
+            while b + 1 < self.blocks {
+                let Some((gap, len, max)) =
+                    window.get(at - window_at..).and_then(footer_entry_skim)
+                else {
+                    break;
+                };
+                let Ok(last) = u32::try_from(next_last + gap) else {
+                    // Reported by the block's slow decode.
+                    break;
+                };
+                next_last += gap;
+                let width = tf_width(max, self.adaptive);
+                self.last.push(last);
+                self.entries.push((raw + (at - start)) as u32);
+                self.maxb.push(max);
+                self.tf_at.push(next_tf as u32);
+                self.widths.push(width as u8);
+                next_tf += if width == 1 {
+                    full
+                } else {
+                    bits::packed_len(self.block_size as usize, width) as u64
+                };
+                at += len;
+                b += 1;
+                if b > from && last >= slot {
+                    found = true;
+                    break;
+                }
+            }
+            if at > start {
+                self.raw
+                    .extend_from_slice(&window[start - window_at..at - window_at]);
+            }
+            self.at = at;
+            self.next_last = next_last;
+            self.next_tf = next_tf;
+            if found || self.last.len() >= self.blocks {
+                return Ok(());
+            }
+            // The next entry alone: across a window's end, or the last.
+            let (gap, len) = self.next_entry()?;
+            let within = self.at - self.window_at;
+            let entry = self.raw.len() as u32;
+            self.raw
+                .extend_from_slice(&self.window[within..within + len]);
+            let max = self.frontier.last().map_or(0, |pair| pair.0);
+            self.push_block((gap, len))?;
+            self.entries.push(entry);
+            self.maxb.push(max);
+            self.frontier.clear();
+            let b = self.last.len() - 1;
+            if b >= from && self.last[b] >= slot {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Skims the footer from here on: its blocks are decoded for their last
+    /// slots, TF offsets and widths, and their entries' bytes kept, as
+    /// [`Self::decode_bounds`] keeps them: a block's frontier is read from
+    /// them only when asked ([`Self::floor`], [`Self::floors`],
+    /// [`Self::max_bucket`]). Before any block is decoded.
+    pub fn skim(&mut self) {
+        if self.last.is_empty() && self.frontier.is_empty() {
+            self.skim = true;
+            self.kept = false;
+        }
+    }
+
+    /// Whether the footer is skimmed ([`Self::skim`]).
+    #[inline]
+    pub fn skimmed(&self) -> bool {
+        self.skim
     }
 
     /// Decodes the next block's entry, reading windows as needed; false
@@ -1914,6 +2063,21 @@ impl<'a> LazyFooter<'a> {
         out
     }
 
+    /// Block `b`'s frontier pairs (decoded), each given to `visit`, kept as
+    /// pairs or read from the block's entry.
+    #[inline]
+    pub fn each_pair(&self, b: usize, mut visit: impl FnMut(u8, u32)) {
+        if self.kept {
+            for (bucket, length) in self.frontier(b) {
+                visit(*bucket, *length);
+            }
+        } else {
+            for (bucket, length) in self.raw_pairs(b) {
+                visit(bucket, length);
+            }
+        }
+    }
+
     /// Whether the decoded blocks' frontiers are kept as pairs (not a
     /// footer decoded for its bounds), so [`Self::frontier`] reads them.
     #[inline]
@@ -1967,7 +2131,9 @@ impl<'a> LazyFooter<'a> {
     /// Block `b`'s largest bucket (decoded): its frontier's last pair's.
     #[inline]
     pub fn max_bucket(&self, b: usize) -> u8 {
-        if self.kept {
+        if self.skim {
+            self.maxb[b]
+        } else if self.kept {
             self.frontier[self.ends[b] as usize - 1].0
         } else {
             self.raw_pairs(b).last().map_or(0, |(bucket, _)| bucket)
@@ -2142,6 +2308,54 @@ mod tests {
         }
         // Decoded whole for its blocks' bounds, as a disjunction does.
         check_bounds(lazy(), parsed, footer);
+        check_skim(lazy, parsed, footer);
+    }
+
+    /// A skimmed footer answers each block's last slot, TF offset, width,
+    /// floors and largest bucket, and every bucket, as the whole footer
+    /// does: asked for buckets first (decoding a block's prefix only), and
+    /// sought block by block.
+    fn check_skim<'p>(lazy: impl Fn() -> LazyFooter<'p>, parsed: &Postings<'_>, footer: &Footer) {
+        let derived = matches!(parsed.form, Form::Single(_)) || parsed.compact;
+        let mut l = lazy();
+        l.skim();
+        assert_eq!(l.skimmed(), !derived);
+        for i in 0..parsed.df {
+            assert_eq!(
+                l.bucket(parsed.tf, i).unwrap(),
+                footer.bucket(parsed.tf, i).unwrap(),
+                "posting {i}"
+            );
+            let b = (i / footer.block_size) as usize;
+            assert_eq!(
+                l.decoded(),
+                if derived { footer.blocks() } else { b + 1 },
+                "posting {i} block {b} of {} bs {}",
+                footer.blocks(),
+                footer.block_size
+            );
+        }
+        let mut l = lazy();
+        l.skim();
+        for b in 0..footer.blocks() {
+            assert_eq!(l.seek(b, footer.last[b]).unwrap(), b, "block {b}");
+            let front = footer.frontier_of(b);
+            assert_eq!(l.last(b), footer.last[b]);
+            assert_eq!(l.tf_at(b), footer.tf_at[b]);
+            assert_eq!(l.width(b), u32::from(footer.widths[b]));
+            assert_eq!(l.max_bucket(b), front.last().unwrap().0);
+            for bucket in 0..16u8 {
+                let want = front
+                    .iter()
+                    .filter(|(at, _)| *at >= bucket)
+                    .map(|(_, length)| *length)
+                    .min()
+                    .unwrap_or(0);
+                assert_eq!(l.floor(b, bucket), want, "floor of {b} at {bucket}");
+                assert_eq!(l.floors(b)[usize::from(bucket)], want);
+            }
+        }
+        assert_eq!(l.seek(0, u32::MAX).unwrap(), footer.blocks());
     }
 
     /// A stand-in for a pair's bound: rising with the bucket, falling with

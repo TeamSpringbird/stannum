@@ -47,6 +47,14 @@ const SEEK_RATIO: usize = 4;
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
 
+/// [`Walk::buckets`] of a common term (see [`Sc::make_common`]) the
+/// candidate holds, its bucket not read yet.
+const LATER: u8 = u8::MAX - 1;
+
+/// A scoring term of a led walk in at least one document in this many is
+/// common ([`Sc::make_common`]), when the walk scores a rarer term too.
+const COMMON_RATIO: u64 = 10;
+
 /// Candidates staged before they are finished best first: a group's
 /// candidates are staged and finished this many at a time, so a threshold
 /// that is still low early in a walk rises between chunks rather than
@@ -80,6 +88,8 @@ pub(super) struct Sc<'a> {
     /// at every bucket.
     floors: [u32; BUCKET_COUNT],
     floors_block: u32,
+    /// A common term's bound over a group (see [`Sc::make_common`]).
+    common: Option<f32>,
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -106,7 +116,25 @@ impl<'a> Sc<'a> {
             bb_block: [u32::MAX; BUCKET_COUNT],
             floors: [0; BUCKET_COUNT],
             floors_block: u32::MAX,
+            common: None,
         }
+    }
+
+    /// Makes the term common, for a led walk that scores a rarer term too.
+    /// A group is bounded by its record (what its largest bucket
+    /// `max_bucket` scores at the least length, which no block's frontier
+    /// exceeds), not its blocks there: a common term's footer holds a
+    /// dozen blocks or more per group, each with a short document holding
+    /// it often, and the group check, which seldom skips a group these
+    /// blocks would leave in reach, decoded and bounded every one of them.
+    /// A candidate's window still bounds it by its block, but its bucket is
+    /// read last, only for a candidate the rarer terms' buckets leave in
+    /// reach. Its footer is skimmed ([`LazyFooter::skim`]): most of its
+    /// blocks are decoded only for their TF offsets.
+    fn make_common(&mut self, max_bucket: u8) {
+        let bucket = TfBucket::new(max_bucket).expect("a valid bucket");
+        self.common = Some(self.scorer.bound_through(bucket, 0));
+        self.footer.skim();
     }
 
     /// Block `b`'s bound, which must be decoded: the best score of its
@@ -129,14 +157,22 @@ impl<'a> Sc<'a> {
                 .resize(self.footer.decoded().max(b + 1), f32::NAN);
         }
         let scorer = &self.scorer;
-        let v = self
-            .footer
-            .frontier(b)
-            .iter()
-            .map(|(bucket, length)| {
-                scorer.bound_through(TfBucket::new(*bucket).expect("a valid bucket"), *length)
-            })
-            .fold(0.0_f32, f32::max);
+        let bound = |bucket: u8, length: u32| {
+            scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
+        };
+        let v = if self.footer.keeps_pairs() {
+            self.footer
+                .frontier(b)
+                .iter()
+                .map(|(bucket, length)| bound(*bucket, *length))
+                .fold(0.0_f32, f32::max)
+        } else {
+            // A skimmed footer's (see `Sc::make_common`).
+            let mut v = 0.0_f32;
+            self.footer
+                .each_pair(b, |bucket, length| v = v.max(bound(bucket, length)));
+            v
+        };
         self.bounds[b] = v;
         v
     }
@@ -197,6 +233,9 @@ impl<'a> Sc<'a> {
     /// must be asked in increasing order of `from`.
     #[inline]
     fn range_bound(&mut self, from: u32, to: u32) -> f32 {
+        if let Some(bound) = self.common {
+            return bound;
+        }
         // The blocks from the first ending at `from` or later through the
         // first ending at `to` or later (or the last), in one pass,
         // decoding as far as the last of them when it is not yet.
@@ -643,6 +682,10 @@ struct Walk<'s, 'a, T: Touch> {
     sc: Vec<Sc<'a>>,
     /// Required terms, rarest first.
     req: Vec<usize>,
+    /// Scoring terms (indexes into `sc`), rarest first.
+    sc_order: Vec<usize>,
+    /// Whether a scoring term is common ([`Sc::make_common`]).
+    common_terms: bool,
     /// Per scoring term: whether it is required; whether it holds the group
     /// at hand, and the candidate at hand, and that candidate's block; its
     /// bound over the sub-range at hand.
@@ -687,6 +730,8 @@ struct Walk<'s, 'a, T: Touch> {
     window_end: Option<u32>,
     window_bound: f32,
     window_buckets: Vec<u8>,
+    /// Per scoring term, its bound over the window.
+    window_terms: Vec<f32>,
     /// The window's length bound parts: its terms' numerators summed, and
     /// the least of their denominators and length factors.
     window_parts: (f64, f64, f64),
@@ -925,12 +970,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let Some(theta) = self.threshold() else {
             return false;
         };
-        let mut bound = 0.0_f32;
-        for s in &mut self.sc {
-            bound += s.range_bound(base, end);
-            if bound > theta {
+        // Rarest first: a sum past the threshold says no, in any order; one
+        // that is not is summed again in the scorer's order.
+        let mut partial = 0.0_f32;
+        for k in 0..self.sc_order.len() {
+            let i = self.sc_order[k];
+            let v = self.sc[i].range_bound(base, end);
+            self.sub_bounds[i] = v;
+            partial += v;
+            if partial > theta {
                 return false;
             }
+        }
+        let mut bound = 0.0_f32;
+        for v in &self.sub_bounds {
+            bound += *v;
         }
         let geometry = self.geometry;
         self.cut(bound, || geometry.tid_in(g as usize, 0))
@@ -1124,12 +1178,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let mut e = u32::MAX;
             let mut bound = 0.0_f32;
             let (mut nsum, mut dmin, mut fmin) = (0.0_f64, f64::INFINITY, f64::INFINITY);
-            for (s, mb) in self.sc.iter_mut().zip(&mut self.window_buckets) {
+            for ((s, mb), wt) in self
+                .sc
+                .iter_mut()
+                .zip(&mut self.window_buckets)
+                .zip(&mut self.window_terms)
+            {
                 let Some(b) = s.block_at(slot) else {
                     *mb = NO_BUCKET;
+                    *wt = 0.0;
                     continue;
                 };
-                bound += s.bound(b);
+                *wt = s.bound(b);
+                bound += *wt;
                 e = e.min(s.footer.last(b));
                 *mb = s.max_bucket(b);
                 let m = usize::from(*mb);
@@ -1304,8 +1365,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 if n > 0 && self.length_cut(length, tid) {
                     return Ok(None);
                 }
-                self.read_buckets(g, local, tid)?;
-                if self.too_few() {
+                let reach = self.read_buckets(g, local, tid)?;
+                if self.cut(reach, || tid) || self.too_few() {
                     return Ok(None);
                 }
                 // The length known, its buckets bound it at that length.
@@ -1400,6 +1461,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// see [`Walk::reach`], taken only when each term's own bound (kept per
     /// block and bucket) leaves the candidate, of ctid `tid`, in reach.
     fn read_buckets(&mut self, g: u32, local: u32, tid: Tid) -> Result<f32> {
+        if self.common_terms {
+            return self.read_buckets_common(g, local, tid);
+        }
         let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
         for i in 0..self.sc.len() {
             let t = self.sc[i].term;
@@ -1437,6 +1501,102 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             (0..self.sc.len()).filter(|i| self.buckets[*i] != NO_BUCKET),
             floor,
         ))
+    }
+
+    /// [`Walk::read_buckets`] in a walk with common terms
+    /// ([`Sc::make_common`]): their buckets last, only for a candidate the
+    /// others' buckets leave in reach.
+    #[inline(never)]
+    fn read_buckets_common(&mut self, g: u32, local: u32, tid: Tid) -> Result<f32> {
+        let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
+        // Whether the candidate holds a common term, and whether a bucket
+        // was read before its (else the common terms' window bounds are the
+        // window's, which the candidate passed).
+        let mut common = false;
+        let mut read = false;
+        for i in 0..self.sc.len() {
+            let t = self.sc[i].term;
+            if !self.sc_required[i] {
+                self.ensure(t, g)?;
+            }
+            let Some(index) = self.mems[t].find(local) else {
+                self.buckets[i] = NO_BUCKET;
+                continue;
+            };
+            self.held_index[i] = index;
+            if self.sc[i].common.is_some() {
+                // Its bucket only for a candidate the others leave in reach:
+                // until then, its block's bound.
+                common = true;
+                self.buckets[i] = LATER;
+                own += self.window_terms[i];
+                continue;
+            }
+            let bucket = self.read_bucket(i, index)?;
+            let block = (index / self.sc[i].footer.block_size()) as usize;
+            let (f, bound) = self.sc[i].floor_kept(block, bucket);
+            (floor, low) = (floor.max(f), low.min(f));
+            self.held_bound[i] = bound;
+            own += bound;
+            read = true;
+        }
+        if !common {
+            // Each term's own bound is at least the shared one: it prunes
+            // what it can without a division per term, and is the shared one
+            // when the terms' lengths agree.
+            if low >= floor || self.cut(own, || tid) {
+                return Ok(own);
+            }
+        } else {
+            // The common terms at their blocks' bounds, the others at their
+            // buckets'.
+            if read && self.cut(own, || tid) {
+                return Ok(own);
+            }
+            // Then their buckets, each bounded at its block's frontier as
+            // the others' are.
+            own = 0.0;
+            for i in 0..self.sc.len() {
+                match self.buckets[i] {
+                    NO_BUCKET => {}
+                    LATER => {
+                        let index = self.held_index[i];
+                        let bucket = self.read_bucket(i, index)?;
+                        let block = (index / self.sc[i].footer.block_size()) as usize;
+                        let (f, bound) = self.sc[i].floor_kept(block, bucket);
+                        (floor, low) = (floor.max(f), low.min(f));
+                        own += bound;
+                    }
+                    _ => own += self.held_bound[i],
+                }
+            }
+            if low >= floor || self.cut(own, || tid) {
+                return Ok(own);
+            }
+        }
+        Ok(self.reach(
+            (0..self.sc.len()).filter(|i| self.buckets[*i] != NO_BUCKET),
+            floor,
+        ))
+    }
+
+    /// Reads into [`Walk::buckets`] scoring term `i`'s bucket for its
+    /// posting `index`.
+    #[inline]
+    fn read_bucket(&mut self, i: usize, index: u32) -> Result<u8> {
+        let s = &mut self.sc[i];
+        let set = self.terms[s.term].as_ref().expect("scoring");
+        let bucket = s.footer.bucket(set.postings.tf, index)?;
+        if s.footer.single().is_none() {
+            let block = (index / s.footer.block_size()) as usize;
+            self.touch.touch(
+                Part::TfTail,
+                set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
+                1,
+            );
+        }
+        self.buckets[i] = bucket;
+        Ok(bucket)
     }
 
     /// What a candidate holding the scoring terms `held` (in the scorer's
@@ -1681,9 +1841,12 @@ pub(super) fn walk_into<'a>(
         window_bound: 0.0,
         window_parts: (0.0, f64::INFINITY, f64::INFINITY),
         window_buckets: vec![NO_BUCKET; n],
+        window_terms: vec![0.0; n],
         inline: None,
         repeats: Vec::new(),
         req,
+        sc_order: Vec::new(),
+        common_terms: false,
         answer: RankedAnswer::default(),
         verify,
         pending: Vec::new(),
@@ -1724,6 +1887,29 @@ pub(super) fn walk_into<'a>(
             }
         }
     }
+    if !required.is_empty() {
+        let common = |s: &Sc, set: &TermSet| {
+            u64::from(set.df) * COMMON_RATIO >= u64::from(segment.documents)
+                && s.footer.single().is_none()
+        };
+        let rarer = walk.sc.iter().any(|s| {
+            let set = walk.terms[s.term].as_ref().expect("scoring");
+            !common(s, set)
+        });
+        if rarer {
+            for s in &mut walk.sc {
+                let set = walk.terms[s.term].as_ref().expect("scoring");
+                if common(s, set) {
+                    s.make_common(set.max_bucket);
+                    walk.common_terms = true;
+                }
+            }
+        }
+    }
+    walk.sc_order = (0..walk.sc.len()).collect();
+    walk.sc_order
+        .sort_by_key(|i| walk.terms[walk.sc[*i].term].as_ref().expect("scoring").df);
+    walk.sub_bounds = vec![0.0; walk.sc.len()];
     walk.inline = walk.req.iter().copied().find(|t| {
         walk.terms[*t]
             .as_ref()
