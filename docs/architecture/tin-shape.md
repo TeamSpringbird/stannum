@@ -233,7 +233,14 @@ terms' footers per query, a block at a time as it reaches them
 (`postings::LazyFooter`), and keeps nothing of them after it: a footer's
 entries are variable-length and in a row, so reaching a block decodes every
 entry before it, and nothing after. Its bytes are read in place a page at a
-time, as far as the blocks decoded (`Bytes::page_end`).
+time, as far as the blocks decoded (`Bytes::page_end`). A disjunction
+bounds every block of every scoring term (each group a term holds is
+bounded by its blocks there), so its walk decodes each footer whole, with
+every block's bound, before its first group (`Sc::decode_all`): decoding
+as it went saved nothing there, and read footer pages among a group's,
+where they made the group's release drop pages the next group read again
+(full_score disjunctions at 150M rows: 18% fewer pins, 11% fewer
+instructions in the walk).
 
 - A query some terms of which every match holds (a conjunction, a phrase)
   walks the groups its rarest such term holds, taken from its directory. A
@@ -284,11 +291,22 @@ time, as far as the blocks decoded (`Bytes::page_end`).
   third of its words, and this costs less than planning each sub-range
   as `STN3` planned a sub-block and sieving all its words bit-parallel
   (`LaneSums`), and lets fewer through.
-  A candidate is then bounded by its terms' blocks, then by its buckets as
-  above, and scored exactly once its length is read.
+  A candidate is then bounded by its terms' blocks (a member's block is its
+  posting index over the block size), then by its buckets as above, the
+  bucket of the term its block bounds highest read first and alone: most
+  candidates that bucket leaves below the threshold read no other TF (as
+  TIN reads a term's TF only for a candidate that still needs it; at 150M
+  rows a fifth to a quarter fewer TF reads). A flat disjunction's
+  candidates left in reach are scored best bound first at the group's end,
+  as a phrase's are, so the best of a group raise the threshold over the
+  rest before their lengths are read (on TIN's corpus, 15 ORed terms read
+  the DL sidecar for 40% fewer candidates); a node's own check reads
+  cursors that only move forward, so a non-flat one scores in ctid order.
 - Candidates come in ctid order, so one that only ties the threshold ranks
   after the k-th row and is skipped like a lower one; every bound is
-  compared with a relative margin (`1e-5`) far above `f32` rounding.
+  compared with a relative margin (`1e-5`) far above `f32` rounding. A
+  group's candidates scored best bound first are cut by their own ctid
+  against the k-th row's, so the order within a group is free.
 
 ### Word kernels and instruction sets
 
