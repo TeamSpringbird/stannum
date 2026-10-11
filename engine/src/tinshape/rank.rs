@@ -853,36 +853,53 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let Some(theta) = self.threshold() else {
             return false;
         };
+        let geometry = self.geometry;
+        let from = || geometry.tid_in(g as usize, 0);
+        // The footer blocks' bounds first; the frontiers only for a group
+        // they leave in reach. Each capped bound is at most its blocks', so
+        // the group is skipped exactly when the capped sum alone would skip
+        // it.
+        let mut bound = 0.0_f32;
+        let mut reached = false;
+        for s in &mut self.sc {
+            bound += s.range_bound(base, end);
+            if bound > theta {
+                reached = true;
+                break;
+            }
+        }
+        if !reached && self.cut(bound, from) {
+            return true;
+        }
         let mut bound = 0.0_f32;
         for i in 0..self.sc.len() {
-            bound += self.group_term_bound(i, g, base, end);
+            bound += match self.group_cap(i, g) {
+                Some(0.0) => 0.0,
+                Some(cap) => self.sc[i].range_bound(base, end).min(cap),
+                None => self.sc[i].range_bound(base, end),
+            };
             if bound > theta {
                 return false;
             }
         }
-        let geometry = self.geometry;
-        self.cut(bound, || geometry.tid_in(g as usize, 0))
+        self.cut(bound, from)
     }
 
     /// The group-skip hook of both walks: scoring term `i`'s bound over
-    /// group `g` (slots `base..=end`) before any of the group is read. It
-    /// is the term's footer blocks' bound over the slots, capped by the
-    /// group's frontier where the term's directory holds one
-    /// ([`TermSet::group_bound`]): zero, with no block bounded, where the
-    /// term does not hold the group. Either is at least the term's score
-    /// of each of its postings there, bit for bit, so their sum in the
-    /// scorer's order bounds a match as [`Walk::cut`] requires.
+    /// group `g` by the group's frontier in its directory
+    /// ([`TermSet::group_bound`]), before any of the group is read; zero
+    /// where the directory says the term lacks the group, `None` where it
+    /// holds no frontiers (a sparse term). A walk caps the term's footer
+    /// blocks' bound over the group by it: either is at least the term's
+    /// score of each of its postings there, bit for bit, so their sum in
+    /// the scorer's order bounds a match as [`Walk::cut`] requires. Taken
+    /// only for a group the blocks' bounds leave in reach.
     #[inline]
-    fn group_term_bound(&mut self, i: usize, g: u32, base: u32, end: u32) -> f32 {
+    fn group_cap(&mut self, i: usize, g: u32) -> Option<f32> {
         let t = self.sc[i].term;
-        let cap = self.terms[t]
-            .as_ref()
-            .and_then(|set| set.group_bound(g, &mut self.mems[t].hint, &self.sc[i].scorer));
-        match cap {
-            Some(0.0) => 0.0,
-            Some(cap) => self.sc[i].range_bound(base, end).min(cap),
-            None => self.sc[i].range_bound(base, end),
-        }
+        self.terms[t]
+            .as_ref()?
+            .group_bound(g, &mut self.mems[t].hint, &self.sc[i].scorer)
     }
 
     /// Whether every required term holds group `g` as a grid.
@@ -1916,12 +1933,26 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut total = 0.0_f32;
         for (i, bound) in sb.iter_mut().enumerate() {
             if self.present[i] {
-                *bound = self.group_term_bound(i, g, base, end);
+                *bound = self.sc[i].range_bound(base, end);
                 total += *bound;
             }
         }
         let geometry = self.geometry;
         let gi = g as usize;
+        // Where the blocks' bounds leave the group in reach of a threshold,
+        // each present term's is capped by the group's frontier (see
+        // `Walk::group_cap`), for the skip and the plan below.
+        if self.threshold().is_some() && !self.cut(total, || geometry.tid_in(gi, 0)) {
+            total = 0.0;
+            for (i, bound) in sb.iter_mut().enumerate() {
+                if self.present[i] {
+                    if let Some(cap) = self.group_cap(i, g) {
+                        *bound = bound.min(cap);
+                    }
+                    total += *bound;
+                }
+            }
+        }
         if self.cut(total, || geometry.tid_in(gi, 0)) {
             self.answer.windows_pruned += 1;
             self.sub_bounds = sb;
