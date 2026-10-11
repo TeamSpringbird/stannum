@@ -1743,6 +1743,7 @@ impl<'a> LazyFooter<'a> {
     }
 
     /// [`Self::decode_until`] of a skimmed footer: no pairs kept.
+    #[isa::hot]
     fn skim_until(&mut self, from: usize, slot: u32) -> Result<()> {
         loop {
             let (window, window_at) = (self.window, self.window_at);

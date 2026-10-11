@@ -1545,6 +1545,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// ([`Sc::make_common`]): their buckets last, only for a candidate the
     /// others' buckets leave in reach.
     #[inline(never)]
+    #[isa::hot]
     fn read_buckets_common(&mut self, g: u32, local: u32, tid: Tid) -> Result<f32> {
         let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
         // Whether the candidate holds a common term, and whether a bucket
@@ -1621,6 +1622,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Reads into [`Walk::buckets`] scoring term `i`'s bucket for its
     /// posting `index`.
     #[inline]
+    #[isa::hot]
     fn read_bucket(&mut self, i: usize, index: u32) -> Result<u8> {
         let s = &mut self.sc[i];
         let set = self.terms[s.term].as_ref().expect("scoring");
