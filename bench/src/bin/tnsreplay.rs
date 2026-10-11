@@ -126,6 +126,77 @@ fn args() -> Args {
     a
 }
 
+/// The system allocator, counting on this thread the calls that ask it
+/// for memory (an allocation, a growth) and the bytes asked: what a query
+/// costs in `malloc`, `realloc` and the copies a growth makes.
+struct Counting;
+
+#[derive(Clone, Copy, Default)]
+struct Allocs {
+    allocs: u64,
+    reallocs: u64,
+    bytes: u64,
+}
+
+thread_local! {
+    static ALLOCS: std::cell::Cell<Allocs> = const {
+        std::cell::Cell::new(Allocs { allocs: 0, reallocs: 0, bytes: 0 })
+    };
+}
+
+impl Allocs {
+    fn now() -> Self {
+        ALLOCS.with(std::cell::Cell::get)
+    }
+
+    fn since(self, from: Self) -> Self {
+        Self {
+            allocs: self.allocs - from.allocs,
+            reallocs: self.reallocs - from.reallocs,
+            bytes: self.bytes - from.bytes,
+        }
+    }
+
+    fn count(realloc: bool, size: usize) {
+        // `try_with`: a thread's own teardown frees after its locals are gone.
+        let _ = ALLOCS.try_with(|c| {
+            let mut a = c.get();
+            if realloc {
+                a.reallocs += 1;
+            } else {
+                a.allocs += 1;
+            }
+            a.bytes += size as u64;
+            c.set(a);
+        });
+    }
+}
+
+// SAFETY: every call is the system allocator's, with its arguments.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Allocs::count(false, layout.size());
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Allocs::count(false, layout.size());
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
+        Allocs::count(true, new);
+        unsafe { std::alloc::System.realloc(ptr, layout, new) }
+    }
+}
+
+#[global_allocator]
+static COUNTING: Counting = Counting;
+
 /// A dumped segment: its generation, its blob and its dead list.
 type Dumped = (u32, &'static [u8], Option<Vec<u8>>);
 
@@ -717,6 +788,10 @@ struct Row {
     kinds: [segment::tinshape::blob::KindStats; segment::tinshape::blob::KINDS],
     /// What the answer's pass parsed of the terms' metadata.
     memo: segment::tinshape::segment::MemoCounts,
+    /// The last timed pass's allocations: building the query's scorer,
+    /// then walking it.
+    scorer_allocs: Allocs,
+    walk_allocs: Allocs,
 }
 
 fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Result<(), String> {
@@ -828,11 +903,16 @@ fn run() -> Result<bool, String> {
         };
         let memo = segment::tinshape::segment::memo_counts();
         let mut times = Vec::with_capacity(args.repeat);
+        let (mut scorer_allocs, mut walk_allocs) = (Allocs::default(), Allocs::default());
         for _ in 0..args.repeat {
             let at = Instant::now();
+            let a0 = Allocs::now();
             let scorer = reader.scorer(&q.text)?;
+            let a1 = Allocs::now();
             std::hint::black_box(reader.ranked(&scorer, args.k));
+            let a2 = Allocs::now();
             times.push(at.elapsed().as_nanos() as u64);
+            (scorer_allocs, walk_allocs) = (a1.since(a0), a2.since(a1));
         }
         let mut pages = Pages::default();
         let pins0 = PINS.get();
@@ -865,6 +945,8 @@ fn run() -> Result<bool, String> {
             hash_ops: REFS.with_borrow(|refs| refs.hash_ops) - hash0,
             kinds: segment::tinshape::blob::stats(),
             memo,
+            scorer_allocs,
+            walk_allocs,
         });
         if (n + 1) % 500 == 0 {
             eprintln!("{} of {}", n + 1, trace.len());
@@ -1057,6 +1139,25 @@ fn run() -> Result<bool, String> {
             of.iter().map(|r| r.hash_ops).sum::<u64>() as f64 / n,
         );
     }
+    println!(
+        "\nallocations per query (a timed pass), mean: building the scorer, then the walk: \
+         allocations, growths (realloc), KB asked"
+    );
+    for style in &styles {
+        let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = of.len().max(1) as f64;
+        let m = |f: &dyn Fn(&Row) -> u64| of.iter().map(|r| f(r)).sum::<u64>() as f64 / n;
+        println!(
+            "{:<12} scorer {:>8.1} {:>7.1} {:>8.1} KB  walk {:>9.1} {:>8.1} {:>9.1} KB",
+            style,
+            m(&|r| r.scorer_allocs.allocs),
+            m(&|r| r.scorer_allocs.reallocs),
+            m(&|r| r.scorer_allocs.bytes) / 1024.0,
+            m(&|r| r.walk_allocs.allocs),
+            m(&|r| r.walk_allocs.reallocs),
+            m(&|r| r.walk_allocs.bytes) / 1024.0,
+        );
+    }
     println!("\nwalk per query, mean: examined, scored, position checks, windows, pruned");
     for style in &styles {
         let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
@@ -1108,12 +1209,12 @@ fn run() -> Result<bool, String> {
     }
     if let Some(path) = &args.per_query {
         let mut text = String::from(
-            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\n",
+            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\n",
         );
         for r in &rows {
             let _ = writeln!(
                 text,
-                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 r.name,
                 r.style,
                 r.ns as f64 / 1e3,
@@ -1127,6 +1228,8 @@ fn run() -> Result<bool, String> {
                 r.pages.distinct(Part::TfTail),
                 r.pages.distinct(Part::Positions),
                 r.pins,
+                r.walk_allocs.allocs,
+                r.walk_allocs.reallocs,
             );
         }
         std::fs::write(path, text).map_err(|e| e.to_string())?;
