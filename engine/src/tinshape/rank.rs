@@ -387,6 +387,29 @@ impl Mem<'_> {
     }
 }
 
+/// `x` where `keep` holds, else `+0.0`, without a branch: `x`'s bits under
+/// an all-ones or all-zeros mask. Added to a sum, it adds exactly what
+/// `if keep { x } else { 0.0 }` would, for every `x` (NaN, infinities and
+/// -0.0 included). LLVM lowers that select of a float on an integer
+/// condition to a test and a jump on x86-64 below AVX-512, which the walks'
+/// per-word bound sums mispredict.
+///
+/// LLVM folds the mask back into that select, so on x86-64 the mask passes
+/// through an empty `asm!` first, which it cannot see through: it stays an
+/// `and`. With AVX-512 (a masked move) and on aarch64 (`fcsel`) the select
+/// has no branch already, and is left to LLVM.
+#[inline(always)]
+fn or_zero(x: f32, keep: bool) -> f32 {
+    #[allow(unused_mut)]
+    let mut mask = u32::from(keep).wrapping_neg();
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    // SAFETY: a template of a comment only: `mask` is left as it is.
+    unsafe {
+        core::arch::asm!("/* {0:e} */", inout(reg) mask, options(pure, nomem, nostack, preserves_flags));
+    }
+    f32::from_bits(x.to_bits() & mask)
+}
+
 /// The group holding `slot`, which is group `from`'s first slot or later:
 /// searched forward from `from`, doubling the step, so a walk's next
 /// group (as a rule `from` or one soon after) costs a probe or two rather
@@ -2306,7 +2329,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     let mut most = 0.0_f32;
                     for (h, &(at, bound, _)) in held.iter_mut().zip(&terms) {
                         *h = self.rows[at + w];
-                        most += if *h & word != 0 { bound } else { 0.0 };
+                        most += or_zero(bound, *h & word != 0);
                     }
                     if self.cut(most, || first(w)) {
                         continue;
@@ -2328,7 +2351,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     }
                     let mut most = 0.0_f32;
                     for (h, &(_, _, bound)) in held.iter().zip(&terms) {
-                        most += if *h & word != 0 { bound } else { 0.0 };
+                        most += or_zero(bound, *h & word != 0);
                     }
                     if self.cut(most, || first(w)) {
                         continue;
@@ -2340,7 +2363,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         left &= left - 1;
                         let mut sum = 0.0_f32;
                         for (h, &(_, _, bound)) in held.iter().zip(&terms) {
-                            sum += if *h >> bit & 1 == 1 { bound } else { 0.0 };
+                            sum += or_zero(bound, *h >> bit & 1 == 1);
                         }
                         let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
                         keep |= u64::from(!self.cut(sum, tid)) << bit;
@@ -2590,6 +2613,46 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn or_zero_adds_what_the_branchy_select_adds() {
+        let xs = [
+            0.0_f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            f32::from_bits(0x007f_ffff),
+            -f32::from_bits(0x007f_ffff),
+            1.0,
+            -1.5,
+            f32::MAX,
+            f32::MIN,
+            f32::EPSILON,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7f80_0001),
+            f32::from_bits(0x7fbf_ffff),
+            f32::from_bits(0xffc0_1234),
+            f32::from_bits(0xff80_0001),
+        ];
+        for &x in &xs {
+            for keep in [false, true] {
+                let branchy = if keep { x } else { 0.0 };
+                assert_eq!(or_zero(x, keep).to_bits(), branchy.to_bits(), "{x:?} {keep}");
+                for &acc in &xs {
+                    let want = acc + branchy;
+                    let got = acc + or_zero(x, keep);
+                    assert!(
+                        got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                        "{acc:?} + {x:?} {keep}: {got:?} vs {want:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn group_from_finds_the_group_holding_a_slot_from_any_earlier_group() {
