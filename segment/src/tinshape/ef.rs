@@ -167,7 +167,8 @@ impl<'a> Ef<'a> {
     /// The highs are passed a word at a time to each value's high bucket
     /// (its high part is the number of zeros before it), and only the lows
     /// of that bucket's members are read: for a few values against a long
-    /// list, a small part of what decoding the list reads.
+    /// list, a small part of what decoding the list reads. Each value is
+    /// kept as [`bits::retain`] keeps it, without a branch on its fate.
     pub fn retain_members(&self, values: &mut Vec<u32>) {
         let (highs, lows, low, n) = (self.highs, self.lows, self.low, self.n);
         let total = highs.len() * 8;
@@ -176,7 +177,7 @@ impl<'a> Ef<'a> {
         // rank of the next member); the zeros before it are the difference.
         let mut bit = 0usize;
         let mut index = 0usize;
-        values.retain(|&v| {
+        bits::retain(values, |v| {
             let h = (v >> low) as usize;
             // Move to bucket `h`'s first bit, `h` zeros in.
             while bit - index < h {
