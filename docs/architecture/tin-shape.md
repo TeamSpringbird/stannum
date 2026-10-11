@@ -996,6 +996,94 @@ query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
 to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
 
+## Group frontiers (branch `tinshape/group-bounds`)
+
+TIN keeps one footer entry per (term, aligned 256-page group) holding the
+group's counts and a parameter-free frontier, for each TF bucket the
+shortest length rounded to six significant bits, and checks it before it
+reads a group's payload or TF tail (TIN probes round 2, H1, H2 and H8;
+round 4 for disjunctions: a group is skipped when the bounds of the terms
+present in it sum to at most the threshold, absent terms adding nothing).
+Page layout version 7 stores the same in `TNS1`'s group directory: each
+entry of a grouped record ends with the group's impact frontier (see the
+[postings record](#postings-record)), computed by the encoder from the
+group's postings, and by a merge from the group's live postings (a copied
+container's included), so a merged frontier is the least length per
+bucket over its inputs' live postings there. A sparse record (a
+whole-term Elias-Fano list) has no directory and keeps its footer blocks'
+bounds; frontiers do not count toward a term's choice between the sparse
+and grouped forms, so every term keeps the form it had without them.
+
+Rounded or exact: at 150M rows rounded frontiers take 282.4 MB against
+291.5 MB exact, read 1% fewer footer pages and examine 0.1% more
+candidates; pins and answers are the same. Rounding, as TIN does, is the
+default (`postings::GroupFrontiers::Rounded`; `Exact` remains an option).
+
+**Reading them.** `TermSet::group_bound(g, hint, scorer)` is the term's
+best score in group `g` by its frontier: the scorer's own `f32` score at a
+bucket and a length no worse than a posting's (rounded lengths are rounded
+down), so at least every posting's score there, bit for bit; zero where
+the directory says the term lacks the group. Both walks call it through
+one hook, `Walk::group_cap` in `engine/src/tinshape/rank.rs`, and only
+for a group their footer blocks' bounds leave in reach of a threshold:
+the conjunction's `group_below` and the disjunction's `or_group`, where
+it caps each present term's bound before the group is skipped or planned.
+Each term's bound is the lesser of its blocks' and its cap, summed in the
+scorer's order and compared as `Walk::cut` compares (below the bar, or
+equal to it from a later ctid). An OR walk reworked elsewhere
+keeps this by calling `group_cap` for each present term where it takes the
+group's bounds. Taking the frontiers for every group a walk reaches,
+rather than only where the blocks leave it in reach, made the
+conjunction's replay retire 7% to 9% more instructions than the base.
+
+**Measured.** Size: 150M rows +291.5 MB exact, +282.4 MB rounded
+(+0.754%; 60.8M frontiers, 2.37 pairs and 4.64 bytes each; a directory
+entry grows from about 3 to about 7.8 bytes); 1M Stack Exchange rows
++0.646%; TIN's probe corpus +0.079% (every length below 64). The 150M
+dump was re-encoded offline (`tnsreencode`, which equals a merge of each
+segment alone byte for byte on the probe corpus) and replayed against the
+base (`9bb6781`) on the version 6 dump, the whole trace (`tnsreplay`,
+answers' pass, per query; lab `group-bounds/runs/`):
+
+| per query | conjunction | disjunction | phrase |
+| --- | ---: | ---: | ---: |
+| candidates examined | 9,311 -> 7,231 (-22%) | 22,918 -> 18,660 (-19%) | 27,892 -> 24,340 (-13%) |
+| containers decoded | 26,336 -> 23,697 (-10%) | 78,372 -> 73,177 (-6.6%) | 29,799 -> 28,358 (-4.8%) |
+| pins | 3,808 -> 3,694 (-3.0%) | 7,700 -> 7,601 (-1.3%) | 5,940 -> 5,851 (-1.5%) |
+| footer pages (record headers, directories, blocks) | 269 -> 452 | 320 -> 517 | 274 -> 461 |
+| payload / TF / DL pages | -2.6% / -1.0% / -5.5% | -0.8% / -2.2% / -3.0% | -1.1% / -0.4% / -3.1% |
+| distinct pages | +1.7% | +1.2% | +1.7% |
+| `full_score`: examined, containers, pins | -9.2%, -8.0%, -1.8% | -8.0%, -3.9%, -1.0% | -6.5%, -4.5%, -0.9% |
+| `full_score`: distinct pages | +1.3% | -0.3% | +1.4% |
+
+Every ranked answer equals PostgreSQL's (3,733) and the `--full` answers
+equal the base's (3,761). The directories cost what the skipped groups
+save in pages: a walk parses every scoring term's directory whole (a
+container's offset counts from the directory's end), so a common term's
+frontiers are read whether or not its groups are skipped; frontiers in a
+section of their own, read by group, would not help much, as a
+conjunction's lead groups touch nearly every page of a common term's
+frontiers (some 17 pages per segment). Most skipped groups' containers
+share pages with groups that are read, so payload pages fall far less than
+containers decoded. On TIN's probe corpus (`benchmarks/compare/h2h.py`,
+134 one-segment cases, pages against TIN's) footer pages are 1.45 -> 1.58
+times TIN's and every other area within 1%: its uniform documents give a
+group's frontier little over its blocks'.
+
+Not built:
+
+- Frontiers for sparse terms, which have no directory: the 150M dump holds
+  40.2M sparse lists against 60.8M group containers (`tnsunits`); an
+  in-memory experiment supplying them is in lab
+  `group-bounds/runs/exp-sparse.txt`.
+- A group's payload and TF tail stored together (TIN's page touches
+  suggest it; not proven). At 150M rows a query reads 155 / 593 / 165 TF
+  pages (conjunction / disjunction / phrase), at most what it could save,
+  while TF tails are 2.22 GB against 9.58 GB of containers: interleaving
+  them would spread a term's containers over some 23% more pages wherever
+  a walk reads them in a run, about +640 / +1,160 / +700 payload pages, a
+  net loss.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
