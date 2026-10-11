@@ -102,11 +102,14 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
                                                  dictionary's largest bucket)
          | form u8, [footer_len], payload_len, [lengths_len],
            [footer], payload, [lengths], tf
-form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
+form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer,
+           | 0x20 when the directory holds frontiers, | 0x10 when rounded
 lengths := base varint, width u8, (length - base) packed at width, by posting
 payload := sparse:  Elias-Fano over the term's slots, universe = all slots
-         | grouped: groups, (index gap, (count - 1) << 2 | kind, [len])*,
-                    one container per group the term occupies
+         | grouped: groups, (index gap, (count - 1) << 2 | kind, [len],
+                    frontier)*, one container per group the term occupies
+frontier := (n - 1) << 4 | first bucket u8, first length varint,
+            (length gap - 1) << 4 | (bucket gap - 1) varint per later pair
 container := grid:  the group's slots as a bitmap of whole words
            | ef:    Elias-Fano over the group's local slots (universe p * w)
            | paged: a page mask (or page list) and per page a bitmap, a
@@ -141,6 +144,12 @@ from the dictionary's largest bucket.
 The group directory holds each group's posting count and where its
 container starts: a single-term count is `df`, and an OR of terms in a
 group only one of them holds is that term's count, without the payload.
+Each entry ends with the group's **impact frontier** (page layout version
+7): the (bucket, shortest length) pairs of the group's postings no other
+dominates, as a footer block's, its lengths rounded down to six
+significant bits as TIN's per-(term, group) footer entries are (64, 128
+and 256 exact; [group frontiers](#group-frontiers-branch-tinshapegroup-bounds)).
+A walk bounds a group by it before reading the group's container.
 
 ### Footer
 
@@ -237,9 +246,10 @@ time, as far as the blocks decoded (`Bytes::page_end`).
 
 - A query some terms of which every match holds (a conjunction, a phrase)
   walks the groups its rarest such term holds, taken from its directory. A
-  group whose scoring terms' footer blocks cannot reach the threshold is
-  skipped unread (the sum stops once it reaches the threshold, rarest term
-  first); otherwise the required terms' members are intersected: word by
+  group whose scoring terms' bounds there cannot reach the threshold is
+  skipped unread (each term's footer blocks' bound capped by the group's
+  frontier, zero for a term the directory says lacks the group; the sum
+  stops once it reaches the threshold, rarest term first); otherwise the required terms' members are intersected: word by
   word where every one is a grid, else the rarest term's members filtered
   by each other required term in order of `df`, each looked up only while
   candidates are left (at 150M rows nothing is left after one or two terms
@@ -271,7 +281,10 @@ time, as far as the blocks decoded (`Bytes::page_end`).
 - Any other query is block-max MaxScore over its scoring terms, a group at
   a time. Each term present in the group becomes a row of words (a grid
   copied, a list decoded into bits; a posting's index is a popcount over
-  its row). The group is first planned at its own bounds: its required
+  its row). The group's bound per present term is its blocks' capped by
+  its frontier (absent terms add nothing); a group whose bounds cannot
+  reach the threshold reads nothing. The group is first planned at its own
+  bounds: its required
   and essential terms' rows are read and combined into a mask (a document
   holding none of the essential terms cannot reach the threshold anywhere
   in the group), and a group whose mask is empty reads no other row. Each
@@ -365,7 +378,9 @@ re-encoded at the larger width, which moves each page's offsets. A term's
 footer blocks and TF tail are rebuilt, since its posting indexes change
 when two inputs' postings interleave, and its positions streams are
 interleaved in slot order with their skip tables rebuilt; entries are
-copied, not re-encoded.
+copied, not re-encoded. A group's frontier is computed from its live
+postings, a copied container's included: the least length per bucket
+over the inputs' live postings in the group.
 
 **Copying containers** (`Builder::add_term_reusing`,
 `postings::encode_reusing`). A merge passes, per group of the output's
@@ -596,9 +611,10 @@ of 3.9 MB.
 
 ## Integration (phase C)
 
-The extension writes and reads only `TNS1`; the page layout is version 6
-(phase B's positions masks, inline lengths and footer-less records) and an
-older index must be rebuilt. What the segment crate gained for it, beside
+The extension writes and reads only `TNS1`; the page layout is version 7
+(phase B's positions masks, inline lengths and footer-less records; group
+frontiers in the directories since `tinshape/group-bounds`) and an older
+index must be rebuilt. What the segment crate gained for it, beside
 the phase A and B codecs, under `segment/src/tinshape/`:
 
 - `index::Reader<S: Source>`: a segment read a range at a time from the

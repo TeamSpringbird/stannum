@@ -106,6 +106,21 @@ million rows, time A/B comparisons by the process's user CPU over
 interleaved runs: wall time on a shared machine and counters read around
 short sections (`isb; mrs cntvct_el0`) both misled.
 
+A dump of page layout version 6 (no group frontiers) is brought to version
+7 without rebuilding the index:
+
+```sh
+cargo run -p bench --release --bin tnsreencode -- --in DIR \
+    [--rounded OUT] [--exact OUT] [--segment FILE] [--check-merge]
+```
+
+Only grouped records' directories change (each entry gains its group's
+frontier, computed from the TF tail and the DL sidecar); every other byte
+is copied, the manifest too, and `ids.tsv` is linked. `--check-merge`
+requires each re-encoded blob to equal this build's merge of the segment
+alone and to verify (small dumps: it holds several copies). The 150M dump's
+14 segments take 5 to 11 seconds each.
+
 ## Replaying a trace
 
 ```sh
