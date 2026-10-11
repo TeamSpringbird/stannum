@@ -18,6 +18,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   chosen once at runtime, as PostgreSQL's `pg_popcount` does, so baseline
   x86-64 packages use the CPU's vectors; aarch64 keeps NEON.
   `STANNUM_KERNELS` forces a level for tests and comparisons.
+- On x86-64, the query path's scalar code (the ranked walks, the count
+  fold, Elias-Fano, footer, TF-tail, DL-sidecar and positions decoding) is
+  compiled twice in one package, portable and for x86-64-v3 (POPCNT, BMI1,
+  BMI2, LZCNT, AVX2; no FMA, so scores are unchanged), and the v3 copies
+  run when the CPU has them. `STANNUM_KERNELS=scalar` forces the portable
+  copies. aarch64 code is unchanged.
 - Queries read segments in TIN's shape in place from pinned shared buffers
   rather than copying what they read into per-backend chunks: at 150M rows
   the copies overflowed each backend's cache and every query copied some

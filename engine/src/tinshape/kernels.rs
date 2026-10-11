@@ -21,9 +21,10 @@
 //!
 //! On x86-64, `STANNUM_KERNELS` (`scalar`, `avx2` or `avx512`), read when
 //! the choice is made, forces a level the CPU supports, for tests and A/B
-//! runs; an unsupported or unknown name is ignored. The `*_at` functions run one
-//! level on purpose, for tests that compare every level with the portable
-//! one.
+//! runs; an unsupported or unknown name is ignored. `scalar` also forces
+//! the portable copies of the walks' scalar code (`segment::tinshape::isa`).
+//! The `*_at` functions run one level on purpose, for tests that compare
+//! every level with the portable one.
 //!
 //! Blocks are 64 bytes, a cache line on every x86-64 and most aarch64
 //! parts; nothing here assumes the alignment of its inputs.

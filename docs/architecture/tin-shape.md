@@ -355,13 +355,79 @@ Not vectorized on either architecture: the OR walk's per-word and
 per-member weighing (a few terms' bounds a word; branch-free whole-group
 weighing measured slower), Elias-Fano decoding (serial over the highs' set
 bits), and TF-tail and DL reads (one packed value per candidate). Their
-scattered `count_ones` and `trailing_zeros` become POPCNT and TZCNT only
-in an `x86-64-v3` or `-v4` build (a baseline build runs bit tricks); that
-difference, not the kernels, is what those builds measure.
+scattered `count_ones`, `trailing_zeros`, `leading_zeros`, `x & (x - 1)`
+and variable shifts are what the hot copies below are for.
+
+### Hot copies (x86-64 multiversioning)
+
+A baseline x86-64 build (as PGDG packages are) compiles the walks' scalar
+bit code to SSE2-era sequences: a popcount is a dozen instructions, a
+variable shift needs `cl`, a bit extract is shift-and-mask. An
+`x86-64-v4` build of the same code measured mixed +13.5% and full_score
++24% on an i7i.8xlarge (2026-10-11). So on x86-64 the query path's hot
+functions are compiled twice, in one package:
+
+- `#[isa::hot]` (crate `isa-macro`, re-exported as
+  `segment::tinshape::isa::hot`) on a function emits, on x86-64 only,
+  `name` (the original signature, docs and attributes such as
+  `#[inline(never)]`) which calls `name_v3` or `name_portable` by
+  `isa::is_v3()`; `name_portable` (`#[inline(always)]`) holds the body as
+  written, and `name_v3` the same body compiled with
+  `#[target_feature(enable = "popcnt,bmi1,bmi2,lzcnt,avx2")]`. On aarch64
+  (and anything else) the function is left as written: the aarch64 code is
+  instruction for instruction what it was.
+- The body is compiled twice rather than inlined into one
+  `#[target_feature]` entry: LLVM refuses to inline code into a function
+  with more features when that code calls anything out of line with an
+  aggregate argument or result (a `Result<Option<u32>>`, an `(f32, u32)`),
+  which most walk bodies do, so a single v3 entry left nearly everything
+  baseline. A v3 copy calls what it does not inline through that
+  function's own dispatch; a dispatcher it does inline brings the callee's
+  v3 copy along (their features match).
+- The level is chosen once per process (`isa::current`, an atomic read on
+  each dispatch, as the kernels' level is): v3 when the CPU has POPCNT,
+  BMI1, BMI2, LZCNT and AVX2, else portable. `STANNUM_KERNELS=scalar` (or
+  `generic`) forces the portable copies along with the portable kernels;
+  `avx2` and `avx512` leave v3 on. FMA is not enabled (Rust never
+  contracts float operations anyway), so scores are bit-identical; the
+  only packed float instructions in the v3 copies are lane-wise adds, as
+  exact as the scalar ones.
+- Marked: the walks' entries and group steps (`Walk::run`, `run_or`,
+  `or_group`, `or_load`, `or_stage`, `or_candidate`, `plan_group`,
+  `row_index`, `dense_group`, `group_and`, `walk_candidates`, `stage`,
+  `finish`, `finish_staged`, `read_buckets`, `read_bucket`,
+  `read_buckets_common`, `window`, `verify_pending`, phrase checks,
+  `Mem::find`, `Sc::seek`/`bound_of`/`floor_kept`, `next_group`, `load`),
+  the count fold (`count_terms`, `count_terms_visible`, `for_each_match`,
+  `Fold::eval`, `matches`, `score_at_in`, `TermSet::seek`/`load`/`find`),
+  and the decoders: Elias-Fano (`Ef::for_each`, `retain_members`, the
+  cursor's `load`, `seek`, `drain_below`), `for_each_local` and the paged
+  containers, the footer (`LazyFooter::decode_until`, `skim_until`,
+  `decode_bounds`, `bucket`, `floor`, `floors`, entries), the DL sidecar
+  (`Lengths::get`) and positions (`locate`, `skip`, `skip_entries`,
+  `read_entry`). Left portable: setup (term opening, parsing), cold paths,
+  and the float-only `TermScorer` bounds and `TopRows`.
+- Checking it: disassemble a release build for x86-64 and look at the
+  `*_v3` symbols (POPCNT, TZCNT, BLSR, BZHI, SHLX, ANDN where the portable
+  copy has the `0x5555…` popcount and shift-by-`cl` sequences), and at the
+  engine/segment functions a `_v3` copy calls that are neither copies nor
+  dispatchers (only setup, cold paths and the float bounds remain). The test
+  `tinshape::tests::every_instruction_set_answers_alike` runs counts,
+  index-only counts, matches, top k and every score at each level the CPU
+  has and compares them bit for bit; `isa::with` switches the level for a
+  call (tests and comparisons only).
+
+Note for work on the walks (e.g. `tinshape/full-score`): rewriting a
+marked function's body needs nothing; the attribute takes the body as it
+is. A new function that runs out of line on the query path
+(`#[inline(never)]`, or one LLVM declines to inline) runs baseline code on
+x86-64 until it gets `#[isa::hot]` (with `isa` in scope; a function
+without a receiver must be a free function, not an associated one).
 
 x86-64 builds (set the per-target variable, not `RUSTFLAGS`, which would
 replace `.cargo/config.toml`'s link flags; `x86-64-v4` lacks VPOPCNTDQ, so
-its AVX-512 kernels are still chosen at runtime):
+its AVX-512 kernels are still chosen at runtime; a `-v3` or `-v4` build
+still dispatches its hot copies, both compiled for that CPU):
 
 ```sh
 cargo pgrx install --package stannum --release ...           # runtime choice
@@ -386,8 +452,10 @@ for cpu in x86-64-v3 x86-64-v4; do
 ```
 
 On Apple silicon, an `x86_64-apple-darwin` build runs the scalar and AVX2
-levels under Rosetta with `ROSETTA_ADVERTISE_AVX=1`; nothing local runs
-AVX-512 (QEMU's TCG has none).
+levels under Rosetta with `ROSETTA_ADVERTISE_AVX=1` (which also reports
+BMI1, BMI2 and LZCNT, so the v3 copies run); nothing local runs AVX-512
+(QEMU's TCG has none). `STANNUM_EXPECT_KERNELS=avx2` also fails the hot
+copies' tests on a CPU without v3.
 
 ## Writing and maintaining it
 
