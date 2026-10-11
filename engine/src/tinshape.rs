@@ -2939,6 +2939,50 @@ mod tests {
         );
     }
 
+    /// A disjunction's candidates in a group are scored best bound first,
+    /// as a phrase's are: the best of the group raise the threshold over the
+    /// rest before their lengths are read, where in ctid order each later
+    /// (shorter, better) document beat the one before.
+    #[test]
+    fn a_disjunction_group_is_scored_best_bound_first() {
+        let n = 200usize;
+        let docs: Vec<Tid> = (0..n as u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        let lengths: Vec<u32> = (0..n as u32).map(|r| 400 - r).collect();
+        let members = vec![
+            (0..n)
+                .map(|r| (r, if r >= n - 20 { 10 } else { 1 }))
+                .collect::<Vec<_>>(),
+            (0..n).step_by(2).map(|r| (r, 2)).collect(),
+        ];
+        let all: Vec<usize> = (0..n).collect();
+        let options = Options {
+            block_size: 64,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+        let segment = Segment::parse(&blob).unwrap();
+        let names = vec!["t0".to_owned(), "t1".to_owned()];
+        let scorer = |df| {
+            TermScorer::from_statistics(10_000, df, 1.0, Bm25Params::default(), 100.0).unwrap()
+        };
+        let scorers = vec![
+            ("t0".to_owned(), scorer(200)),
+            ("t1".to_owned(), scorer(100)),
+        ];
+        let node = Node::Or(vec![Node::Term(0), Node::Term(1)]);
+        let got = top_k(&segment, &node, &names, &scorers, 3, &mut NoTouch).unwrap();
+        let tids: Vec<Tid> = got.rows.iter().map(|r| r.1).collect();
+        assert_eq!(tids, vec![docs[n - 2], docs[n - 4], docs[n - 6]]);
+        assert!(got.scored <= 30, "scored {}", got.scored);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
         /// A document has one length, so every term it holds bounds it from

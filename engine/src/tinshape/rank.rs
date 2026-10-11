@@ -2151,6 +2151,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             w0 = w1;
         }
+        if !self.staged.is_empty() {
+            self.finish_staged(g)?;
+        }
         self.or_terms = terms;
         self.or_held = held;
         self.words = mask;
@@ -2214,16 +2217,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         r.first + r.run + (row[w] & ((1u64 << (local % 64)) - 1)).count_ones()
     }
 
-    /// Bounds, scores and admits the candidate at bit `bit` of word `w` of
-    /// group `g`.
+    /// Bounds the candidate at bit `bit` of word `w` of group `g` and, if
+    /// it is left in reach, stages it: the group's staged candidates are
+    /// scored best bound first ([`Walk::finish_staged`]), at the group's end
+    /// or every [`STAGE_CHUNK`], so the best of a group raise the threshold
+    /// over the rest before their lengths are read (TIN reads the DL
+    /// sidecar of a disjunction for about as many documents with 15 terms
+    /// as with 2; scored in ctid order, each later, better document of a
+    /// group read its length). A node's own check ([`Verify::Node`]) reads
+    /// cursors that only move forward, so its candidates are scored in
+    /// ctid order as they come.
     ///
     /// Kept out of line, as the group and plan steps are: inlined into the
     /// word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
     fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
         let local = (w * 64) as u32 + bit;
-        if let Some((_, length)) = self.or_stage(g, base, words, w, bit)? {
-            self.finish(g, local, length)?;
+        if let Some((reach, length)) = self.or_stage(g, base, words, w, bit)? {
+            if !matches!(self.verify, Verify::Flat) {
+                return self.finish(g, local, length);
+            }
+            self.staged.push((reach, local, length));
+            self.staged_buckets.extend_from_slice(&self.buckets);
+            if self.staged.len() >= STAGE_CHUNK {
+                self.finish_staged(g)?;
+            }
         }
         Ok(())
     }
