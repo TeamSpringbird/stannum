@@ -1096,14 +1096,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let mem = &self.mems[t];
             match &mem.kind {
                 Kind::Grid(bytes) => {
-                    cands.retain(|l| bytes[*l as usize / 8] >> (l % 8) & 1 == 1);
+                    bits::retain(&mut cands, |l| bytes[l as usize / 8] >> (l % 8) & 1 == 1);
                 }
                 Kind::Cursor { cursor, offset: 0 } => cursor.list().retain_members(&mut cands),
                 Kind::Cursor { .. } => {
                     let mem = &mut self.mems[t];
                     cands.retain(|l| mem.find(*l).is_some());
                 }
-                Kind::List => super::intersect_sorted(&mut cands, &mem.list),
+                Kind::List => bits::intersect_sorted(&mut cands, &mem.list),
             }
         }
         let more = self.walk_candidates(g, &cands)?;

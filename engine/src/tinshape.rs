@@ -647,17 +647,6 @@ struct Fold<'s, 'a, T: Touch> {
     cursors: Vec<Option<rank::PosCursor<'a>>>,
 }
 
-/// Keeps the members of `list` that are in `other`; both ascending.
-fn intersect_sorted(list: &mut Vec<u32>, other: &[u32]) {
-    let mut j = 0;
-    list.retain(|l| {
-        while j < other.len() && other[j] < *l {
-            j += 1;
-        }
-        j < other.len() && other[j] == *l
-    });
-}
-
 impl<'a, T: Touch> Fold<'_, 'a, T> {
     /// Writes the members of `node` in group `group` into `out` (zeroed by
     /// the caller); false when there are none.
@@ -911,7 +900,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     _ => {
                         other.clear();
                         self.decode(*t, g, &mut other)?;
-                        intersect_sorted(&mut list, &other);
+                        bits::intersect_sorted(&mut list, &other);
                     }
                 }
             }
@@ -1723,7 +1712,7 @@ mod tests {
         ) {
             let mut list: Vec<u32> = a.iter().copied().collect();
             let other: Vec<u32> = b.iter().copied().collect();
-            intersect_sorted(&mut list, &other);
+            bits::intersect_sorted(&mut list, &other);
             let want: Vec<u32> = a.intersection(&b).copied().collect();
             prop_assert_eq!(list, want);
         }

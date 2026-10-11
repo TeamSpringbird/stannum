@@ -113,6 +113,129 @@ pub fn word(bytes: &[u8], i: usize) -> u64 {
     }
 }
 
+/// All ones where `keep` holds, else zero: for choosing between values
+/// without a branch, where the choice follows data a branch predictor
+/// cannot guess.
+///
+/// On x86-64 the mask passes through an empty `asm!`, which LLVM cannot
+/// see through. A mask it can see it folds into a select, and a select in
+/// a loop whose condition comes from memory it lowers to a test and a
+/// jump on x86-64 (`x86-cmov-conversion`), which mispredicts about every
+/// other time on such data. Elsewhere (aarch64's `csel`) it is left to
+/// LLVM.
+#[inline(always)]
+pub fn mask(keep: bool) -> u64 {
+    #[allow(unused_mut)]
+    let mut mask = u64::from(keep).wrapping_neg();
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a template of a comment only: `mask` is left as it is.
+    unsafe {
+        core::arch::asm!("/* {0} */", inout(reg) mask, options(pure, nomem, nostack, preserves_flags));
+    }
+    mask
+}
+
+/// Keeps the values `keep` holds, in order, as [`Vec::retain`] does but
+/// without a branch on each value's fate: every value is written after
+/// those kept so far, which count it only if it is kept.
+#[inline]
+pub fn retain(values: &mut Vec<u32>, mut keep: impl FnMut(u32) -> bool) {
+    let mut kept = 0;
+    for read in 0..values.len() {
+        let value = values[read];
+        let k = keep(value);
+        values[kept] = value;
+        kept += usize::from(k);
+    }
+    values.truncate(kept);
+}
+
+/// Values of `other` a step of [`intersect_sorted`] compares at once.
+const STRIDE: usize = 8;
+
+/// Keeps the members of `list` that are in `other`; both ascending and
+/// without repeats.
+///
+/// A merge, but with `other` passed by counting how many of its next
+/// [`STRIDE`] values lie below the member at hand (a compare the compiler
+/// does in vector registers) rather than one value at a time, and the
+/// member kept as [`retain`] keeps: neither how far `other` runs past a
+/// member nor whether it holds it is a branch. A one-at-a-time merge
+/// branches on both, and on x86-64 mispredicts about once a member. The
+/// one branch left, another stride when all of one lies below, is rare:
+/// `other` holds a few times as many values as `list` at most, as a rule
+/// (the walk probes a longer one in place). Near its end, fewer than a
+/// stride of values are counted masked.
+#[inline]
+pub fn intersect_sorted(list: &mut Vec<u32>, other: &[u32]) {
+    let m = other.len();
+    if m == 0 {
+        list.clear();
+        return;
+    }
+    /// How many of `window` (ascending) lie below `value`.
+    #[inline(always)]
+    fn below(window: &[u32; STRIDE], value: u32) -> usize {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: SSE2 is part of x86-64; the loads read the window's
+        // eight values.
+        unsafe {
+            // Those below are a prefix: the trailing ones of the lanes'
+            // mask (two bits a lane after the pack), a bit scan, where a
+            // sum is a population count, which baseline x86-64 lacks (a
+            // multiply sequence, longer on the path from one member to the
+            // next). Unsigned order by signed compares of biased values.
+            use core::arch::x86_64::{
+                _mm_cmpgt_epi32, _mm_loadu_si128, _mm_movemask_epi8, _mm_packs_epi32,
+                _mm_set1_epi32, _mm_xor_si128,
+            };
+            let bias = _mm_set1_epi32(i32::MIN);
+            let v = _mm_xor_si128(_mm_set1_epi32(value as i32), bias);
+            let p = window.as_ptr();
+            let lo = _mm_xor_si128(_mm_loadu_si128(p.cast()), bias);
+            let hi = _mm_xor_si128(_mm_loadu_si128(p.add(4).cast()), bias);
+            let lt = _mm_packs_epi32(_mm_cmpgt_epi32(v, lo), _mm_cmpgt_epi32(v, hi));
+            let mask = _mm_movemask_epi8(lt) as u32;
+            ((!mask).trailing_zeros() / 2) as usize
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            window.iter().map(|&o| u32::from(o < value)).sum::<u32>() as usize
+        }
+    }
+    // `other[..j]` lies below the member at hand.
+    let mut j = 0;
+    let mut kept = 0;
+    for read in 0..list.len() {
+        let value = list[read];
+        while let Some(window) = other.get(j..j + STRIDE) {
+            let n = below(window.try_into().expect("a stride"), value);
+            j += n;
+            if n < STRIDE {
+                break;
+            }
+        }
+        if j + STRIDE > m {
+            // Less than a stride left: the last stride counted (what lies
+            // before `j` in it is below `value` already), or with fewer
+            // values than a stride, each where it lies before the end
+            // (read clamped to it, so no lane branches).
+            if let Some(last) = m.checked_sub(STRIDE) {
+                j = last + below(other[last..].try_into().expect("a stride"), value);
+            } else {
+                j = 0;
+                for t in 0..STRIDE - 1 {
+                    j += usize::from((t < m) & (other[t.min(m - 1)] < value));
+                }
+            }
+        }
+        list[kept] = value;
+        // Past the end, `other`'s last value lies below `value`.
+        kept += usize::from(other[j.min(m - 1)] == value);
+    }
+    list.truncate(kept);
+}
+
 /// Bits needed to hold values below `bound` (at least one).
 pub const fn width_below(bound: u32) -> u32 {
     if bound <= 2 {
@@ -137,7 +260,72 @@ mod tests {
         assert_eq!(width_below(291), 9);
     }
 
+    #[test]
+    fn masks() {
+        assert_eq!(mask(true), u64::MAX);
+        assert_eq!(mask(false), 0);
+    }
+
+    /// What [`intersect_sorted`] keeps: the members of `list` in `other`.
+    fn common(list: &[u32], other: &[u32]) -> Vec<u32> {
+        list.iter()
+            .copied()
+            .filter(|v| other.binary_search(v).is_ok())
+            .collect()
+    }
+
+    #[test]
+    fn intersects_edges() {
+        for (list, other) in [
+            (vec![], vec![]),
+            (vec![], vec![1, 2]),
+            (vec![1, 2], vec![]),
+            (vec![0], vec![0]),
+            (vec![0, u32::MAX], vec![0, u32::MAX]),
+            (vec![u32::MAX], vec![0, 7, u32::MAX - 1]),
+            (vec![3, 4, 5], vec![5]),
+            (vec![5], vec![3, 4, 5]),
+            (vec![1, 3, 5, 7], vec![0, 2, 4, 6, 8]),
+            ((0..100).collect(), (50..300).collect()),
+            (
+                (0..1000).step_by(3).collect(),
+                (0..1000).step_by(5).collect(),
+            ),
+            (vec![2, 999_999], (0..100_000).map(|v| v * 10 + 9).collect()),
+        ] {
+            let mut kept = list.clone();
+            intersect_sorted(&mut kept, &other);
+            assert_eq!(kept, common(&list, &other), "{list:?} {other:?}");
+        }
+    }
+
     proptest! {
+        #[test]
+        fn retains_what_vec_retain_keeps(values in prop::collection::vec(any::<u32>(), 0..300), m in 1u32..9, r in 0u32..9) {
+            let mut kept = values.clone();
+            retain(&mut kept, |v| v % m == r % m);
+            let mut want = values;
+            want.retain(|v| v % m == r % m);
+            prop_assert_eq!(kept, want);
+        }
+
+        #[test]
+        fn intersects(list in prop::collection::btree_set(0u32..5_000, 0..300), other in prop::collection::btree_set(0u32..5_000, 0..1200), pick in prop::collection::vec(any::<prop::sample::Index>(), 0..60)) {
+            let other: Vec<u32> = other.into_iter().collect();
+            let mut list = list;
+            if !other.is_empty() {
+                list.extend(pick.iter().map(|i| other[i.index(other.len())]));
+            }
+            let list: Vec<u32> = list.into_iter().collect();
+            let mut kept = list.clone();
+            intersect_sorted(&mut kept, &other);
+            prop_assert_eq!(&kept, &common(&list, &other));
+            // The other way round: a long list against a short one.
+            let mut kept = other.clone();
+            intersect_sorted(&mut kept, &list);
+            prop_assert_eq!(kept, common(&other, &list));
+        }
+
         #[test]
         fn round_trips(width in 0u32..=32, values in prop::collection::vec(any::<u32>(), 0..200)) {
             let mask = if width == 32 { u32::MAX } else { (1u32 << width) - 1 };
