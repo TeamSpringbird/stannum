@@ -176,7 +176,13 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   disjunctions retire 12% (`score`) and 16.5% (`full_score`) fewer
   instructions in the server (`benchmarks/local/vm_ab.py`; the mixed trace
   9% and 12%), and `full_score` ones read 17% fewer buffers, with the same
-  answers.
+  answers. It bounds each footer block as it parses it and keeps the
+  entries' bytes instead of their pairs, reading a block's frontier again
+  only for a candidate in it (`full_score` disjunction replay at 150 million
+  rows: 2.5% less CPU).
+- Benchmark manifests' `source_sha256` covers every crate the extension
+  builds from (read from the manifests, so `engine/` too) and the PGO
+  profiles; builds that differed only in `engine/` shared a fingerprint.
 - Index pages are pinned through a table every backend shares of the buffer
   each page was last pinned in (a named dynamic shared memory segment, 8
   bytes per shared buffer; no `shared_preload_libraries` needed) rather than

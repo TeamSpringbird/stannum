@@ -240,7 +240,13 @@ every block's bound, before its first group (`Sc::decode_all`): decoding
 as it went saved nothing there, and read footer pages among a group's,
 where they made the group's release drop pages the next group read again
 (full_score disjunctions at 150M rows: 18% fewer pins, 11% fewer
-instructions in the walk).
+instructions in the walk). It bounds each block as it parses the block's
+pairs and keeps their entries' bytes rather than the pairs
+(`LazyFooter::decode_bounds`): at 150M rows a full_score disjunction
+decodes about 1.1M blocks and reads the frontier of at most a sixth of
+them again (a candidate's floors, all sixteen at once), so keeping eight
+bytes a pair for every block cost more than reading one block's bytes
+again (2.5% fewer cycles in the full_score replay).
 
 - A query some terms of which every match holds (a conjunction, a phrase)
   walks the groups its rarest such term holds, taken from its directory. A
