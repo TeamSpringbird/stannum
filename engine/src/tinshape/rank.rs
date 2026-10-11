@@ -70,11 +70,12 @@ pub(super) struct Sc<'a> {
     num: [f32; BUCKET_COUNT],
     den: [f32; BUCKET_COUNT],
     factor: f32,
-    /// [`Self::floor`] per bucket in the block last asked about, `u32::MAX`
-    /// until asked (a rare term's block spans many groups' candidates), and
-    /// the bucket's score at that length.
-    bb_block: usize,
+    /// [`Self::floor`] per bucket, with the bucket's score at that length,
+    /// and the block it was taken in (a rare term's block spans many
+    /// groups' candidates): an entry of another block is stale, so moving
+    /// to a new block clears nothing.
     bb: [(u32, f32); BUCKET_COUNT],
+    bb_block: [u32; BUCKET_COUNT],
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -97,8 +98,8 @@ impl<'a> Sc<'a> {
             num,
             den,
             factor,
-            bb_block: usize::MAX,
-            bb: [(u32::MAX, 0.0); BUCKET_COUNT],
+            bb: [(0, 0.0); BUCKET_COUNT],
+            bb_block: [u32::MAX; BUCKET_COUNT],
         }
     }
 
@@ -132,6 +133,34 @@ impl<'a> Sc<'a> {
             .fold(0.0_f32, f32::max);
         self.bounds[b] = v;
         v
+    }
+
+    /// Decodes every block and its bound now, in one pass: for a walk that
+    /// bounds every block anyway (a disjunction bounds each group its terms
+    /// hold), so decoding a block at a time as it is reached saves nothing,
+    /// and reading the footer's pages between a group's leaves them pinned
+    /// among the group's (see [`Walk::group_done`]).
+    fn decode_all(&mut self) {
+        let blocks = self.footer.blocks();
+        if blocks == 0 {
+            return;
+        }
+        self.footer
+            .ensure(blocks - 1)
+            .unwrap_or_else(|e| corrupt_footer(e));
+        let scorer = &self.scorer;
+        let footer = &self.footer;
+        self.bounds.clear();
+        self.bounds.reserve_exact(blocks);
+        self.bounds.extend((0..blocks).map(|b| {
+            footer
+                .frontier(b)
+                .iter()
+                .map(|(bucket, length)| {
+                    scorer.bound_through(TfBucket::new(*bucket).expect("a valid bucket"), *length)
+                })
+                .fold(0.0_f32, f32::max)
+        }));
     }
 
     /// The first block from `from` on whose last slot is `slot` or later,
@@ -216,24 +245,23 @@ impl<'a> Sc<'a> {
 
     /// [`Self::floor`] and what bucket `bucket` scores at most there (the
     /// term's own bound, before the other terms raise the length), kept per
-    /// bucket for the block last asked about.
+    /// bucket for the block it was last asked about in.
     #[inline]
     fn floor_kept(&mut self, b: usize, bucket: u8) -> (u32, f32) {
-        if self.bb_block != b {
-            self.bb_block = b;
-            self.bb = [(u32::MAX, 0.0); BUCKET_COUNT];
+        let at = usize::from(bucket) % BUCKET_COUNT;
+        // Blocks are numbered below `u32::MAX` (a record has fewer postings).
+        let tag = b as u32;
+        if self.bb_block[at] == tag {
+            return self.bb[at];
         }
-        let known = self.bb[usize::from(bucket)];
-        if known.0 != u32::MAX {
-            return known;
-        }
+        self.bb_block[at] = tag;
         let floor = self.floor(b, bucket);
         let v = (
             floor,
             self.scorer
                 .bound_through(TfBucket::new(bucket).expect("a valid bucket"), floor),
         );
-        self.bb[usize::from(bucket)] = v;
+        self.bb[at] = v;
         v
     }
 
@@ -321,6 +349,38 @@ impl Mem<'_> {
     }
 }
 
+/// The group holding `slot`, which is group `from`'s first slot or later:
+/// searched forward from `from`, doubling the step, so a walk's next
+/// group (as a rule `from` or one soon after) costs a probe or two rather
+/// than a binary search of every group.
+#[inline]
+fn group_from(geometry: &Geometry, from: usize, slot: u32) -> usize {
+    let groups = &geometry.groups;
+    debug_assert!(groups[from].slot_base <= slot);
+    // `lo` holds `slot` or comes before the group that does; `hi` is past it.
+    let (mut lo, mut step) = (from, 1);
+    let mut hi = loop {
+        let at = lo + step;
+        if at >= groups.len() {
+            break groups.len();
+        }
+        if groups[at].slot_base > slot {
+            break at;
+        }
+        lo = at;
+        step *= 2;
+    };
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if groups[mid].slot_base <= slot {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// The first group at or after `from` holding a member of `set`.
 fn next_group(
     set: &mut TermSet<'_>,
@@ -342,7 +402,7 @@ fn next_group(
         cursor.seek(group.slot_base);
         return cursor
             .current()
-            .map(|slot| geometry.group_of_slot(slot) as u32);
+            .map(|slot| group_from(geometry, from as usize, slot) as u32);
     }
     let count = set.group_count();
     while *hint < count && set.group_index(*hint) < from {
@@ -569,6 +629,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// the check a row passes as it is kept (heap visibility, the scan's
     /// other restrictions).
     top: &'s mut TopRows,
+    /// [`TopRows::bar`], kept as the walk pushes: the walk is the only
+    /// writer of `top` while it runs, and the bar is read per word and
+    /// per candidate.
+    bar: Option<(f32, Tid)>,
     visibility: &'s mut dyn Visibility,
     touch: &'s mut T,
     terms: Vec<Option<TermSet<'a>>>,
@@ -702,7 +766,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     #[inline]
     fn threshold(&self) -> Option<f32> {
-        self.top.bar().map(|bar| bar.0)
+        self.bar.map(|bar| bar.0)
     }
 
     /// Whether no match of ctid `from()` or later scoring at most `bound`
@@ -717,7 +781,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// bit; a term a match lacks adds zero to its score.
     #[inline]
     fn cut(&self, bound: f32, from: impl FnOnce() -> Tid) -> bool {
-        match self.top.bar() {
+        match self.bar {
             None => false,
             Some((score, tid)) => match bound.total_cmp(&score) {
                 std::cmp::Ordering::Less => true,
@@ -730,14 +794,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Whether `(total, tid)` would be kept.
     #[inline]
     fn admits(&self, total: f32, tid: Tid) -> bool {
-        self.top.admits(&Ranked(total, tid))
+        self.bar
+            .is_none_or(|(score, at)| Ranked(total, tid) < Ranked(score, at))
     }
 
     /// Keeps `(total, tid)` if it ranks above the bar and passes the check.
     fn push(&mut self, total: f32, tid: Tid) {
         let row = Ranked(total, tid);
-        if self.top.admits(&row) && self.visibility.visible(tid) {
+        if self.admits(total, tid) && self.visibility.visible(tid) {
             self.top.push(row);
+            self.bar = self.top.bar();
         }
     }
 
@@ -1273,7 +1339,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         };
         // A span checks positions before scoring while the top k fill:
         // every match enters them.
-        let span_first = matches!(self.verify, Verify::Span(_)) && self.top.bar().is_none();
+        let span_first = matches!(self.verify, Verify::Span(_)) && self.bar.is_none();
         if span_first {
             let Verify::Span(check) = &mut self.verify else {
                 unreachable!()
@@ -1578,11 +1644,13 @@ pub(super) fn walk_into<'a>(
     let mut req: Vec<usize> = required.clone();
     req.sort_by_key(|t| terms[*t].as_ref().expect("checked").df);
     let n = sc.len();
+    let bar = top.bar();
     let mut walk = Walk {
         segment,
         geometry: &segment.docs.geometry,
         node,
         top,
+        bar,
         visibility,
         mems: (0..terms.len()).map(|_| Mem::default()).collect(),
         terms,
@@ -1786,6 +1854,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let n = self.sc.len();
         if n == 0 {
             return Ok(());
+        }
+        // Every group a term holds is bounded by its blocks there, so every
+        // block is: decoded whole first, its pages released as it reads
+        // past them, rather than a block at a time between a group's reads.
+        for s in &mut self.sc {
+            s.decode_all();
         }
         let mut next = vec![0u32; n];
         let mut from = 0u32;
@@ -2172,8 +2246,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let i = self.present_list[p];
             if self.rows[i * words + w] >> bit & 1 == 1 {
                 self.held_list.push(i);
+                // A member's block is its posting index's: the footer is
+                // decoded whole (`Sc::decode_all`), and its blocks hold
+                // `block_size` postings each.
+                let index = self.row_index(i, words, local);
+                self.held_index[i] = index;
                 let s = &mut self.sc[i];
-                let b = s.block_at(slot).expect("a member's block");
+                let b = (index / s.footer.block_size()) as usize;
+                debug_assert_eq!(Some(b), s.block_at(slot));
                 self.blocks[i] = b;
                 bound += s.bound(b);
             }
@@ -2188,19 +2268,18 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
         for h in 0..self.held_list.len() {
             let i = self.held_list[h];
-            let index = self.row_index(i, words, local);
+            let index = self.held_index[i];
             let s = &mut self.sc[i];
             let set = self.terms[s.term].as_ref().expect("scoring");
             let bucket = s.footer.bucket(set.postings.tf, index)?;
+            let block = self.blocks[i];
             if s.footer.single().is_none() {
-                let block = (index / s.footer.block_size()) as usize;
                 self.touch.touch(
                     Part::TfTail,
                     set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
                     1,
                 );
             }
-            let block = self.blocks[i];
             let (f, bound) = self.sc[i].floor_kept(block, bucket);
             (floor, low) = (floor.max(f), low.min(f));
             own += bound;
@@ -2225,7 +2304,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         });
         Ok(Some(match carrier {
             Some(i) => {
-                let index = self.row_index(i, words, local);
+                let index = self.held_index[i];
                 let set = self.terms[self.sc[i].term].as_ref().expect("scoring");
                 let inline = set.postings.lengths.as_ref().expect("inline lengths");
                 self.touch
@@ -2236,5 +2315,40 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             None => (reach, u32::MAX),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_from_finds_the_group_holding_a_slot_from_any_earlier_group() {
+        // Groups of uneven widths, some heap groups skipped.
+        let mut tids = Vec::new();
+        for group in [0u32, 1, 2, 5, 6, 9, 10, 11, 12, 30, 31, 40] {
+            let width = 1 + (group % 4) as u16;
+            for page in (0..256).step_by(1 + group as usize % 7) {
+                for offset in 1..=width {
+                    tids.push(Tid {
+                        block: group * 256 + page,
+                        offset,
+                    });
+                }
+            }
+        }
+        let geometry = Geometry::of(&tids).unwrap();
+        let last = geometry.groups[geometry.groups.len() - 1];
+        let slots = last.slot_base + last.slots();
+        for slot in (0..slots).step_by(37).chain([0, slots - 1]) {
+            let holding = geometry.group_of_slot(slot);
+            for from in 0..=holding {
+                assert_eq!(
+                    group_from(&geometry, from, slot),
+                    holding,
+                    "slot {slot} from {from}"
+                );
+            }
+        }
     }
 }
