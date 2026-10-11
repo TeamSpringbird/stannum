@@ -2641,7 +2641,11 @@ mod tests {
         for &x in &xs {
             for keep in [false, true] {
                 let branchy = if keep { x } else { 0.0 };
-                assert_eq!(or_zero(x, keep).to_bits(), branchy.to_bits(), "{x:?} {keep}");
+                assert_eq!(
+                    or_zero(x, keep).to_bits(),
+                    branchy.to_bits(),
+                    "{x:?} {keep}"
+                );
                 for &acc in &xs {
                     let want = acc + branchy;
                     let got = acc + or_zero(x, keep);
