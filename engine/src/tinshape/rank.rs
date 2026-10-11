@@ -682,7 +682,8 @@ struct Walk<'s, 'a, T: Touch> {
     sc: Vec<Sc<'a>>,
     /// Required terms, rarest first.
     req: Vec<usize>,
-    /// Scoring terms (indexes into `sc`), rarest first.
+    /// With common terms, the scoring terms (indexes into `sc`), rarest
+    /// first.
     sc_order: Vec<usize>,
     /// Whether a scoring term is common ([`Sc::make_common`]).
     common_terms: bool,
@@ -970,8 +971,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let Some(theta) = self.threshold() else {
             return false;
         };
-        // Rarest first: a sum past the threshold says no, in any order; one
-        // that is not is summed again in the scorer's order.
+        if !self.common_terms {
+            let mut bound = 0.0_f32;
+            for s in &mut self.sc {
+                bound += s.range_bound(base, end);
+                if bound > theta {
+                    return false;
+                }
+            }
+            let geometry = self.geometry;
+            return self.cut(bound, || geometry.tid_in(g as usize, 0));
+        }
+        // With common terms, rarest first (theirs last, by their records):
+        // a sum past the threshold says no, in any order; one that is not
+        // is summed again in the scorer's order.
         let mut partial = 0.0_f32;
         for k in 0..self.sc_order.len() {
             let i = self.sc_order[k];
@@ -1906,10 +1919,12 @@ pub(super) fn walk_into<'a>(
             }
         }
     }
-    walk.sc_order = (0..walk.sc.len()).collect();
-    walk.sc_order
-        .sort_by_key(|i| walk.terms[walk.sc[*i].term].as_ref().expect("scoring").df);
-    walk.sub_bounds = vec![0.0; walk.sc.len()];
+    if walk.common_terms {
+        walk.sc_order = (0..walk.sc.len()).collect();
+        walk.sc_order
+            .sort_by_key(|i| walk.terms[walk.sc[*i].term].as_ref().expect("scoring").df);
+        walk.sub_bounds = vec![0.0; walk.sc.len()];
+    }
     walk.inline = walk.req.iter().copied().find(|t| {
         walk.terms[*t]
             .as_ref()
