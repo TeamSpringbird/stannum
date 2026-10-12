@@ -2377,7 +2377,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // bounds.
             let weighed = live != 0 && self.threshold().is_some();
             if weighed {
-                kernels::word_sums(&mask[w0..w1], w0, &rows, &bounds, &mut sums[..w1 - w0]);
+                kernels::word_sums(&mask[w0..w1], live, w0, &rows, &bounds, &mut sums[..w1 - w0]);
             }
             let mut bounded = false;
             while live != 0 {

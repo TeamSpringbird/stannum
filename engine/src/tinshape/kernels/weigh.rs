@@ -96,29 +96,37 @@ impl Row {
     }
 }
 
-/// Sets `sums[j]`, for each word `j` of `mask` with a member, to the sum
-/// from `+0.0` of each term's bound where `mask[j]` and word `at + j` of
-/// the term's row share a bit; `bounds[t]` is row `t`'s bound. A word
-/// without members is left as it is. Each row holds words through
-/// `at + mask.len()`.
+/// Sets `sums[j]`, for each word `j` of `mask` with a member (bit `j` of
+/// `live`, which the caller has), to the sum from `+0.0` of each term's
+/// bound where `mask[j]` and word `at + j` of the term's row share a bit;
+/// `bounds[t]` is row `t`'s bound. A word without members is left as it
+/// is. Each row holds words through `at + mask.len()`.
 #[inline]
-pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
-    check_words(mask, at, rows, bounds, sums);
-    run!(level(), word_sums(mask, at, rows, bounds, sums))
+pub fn word_sums(
+    mask: &[u64],
+    live: u32,
+    at: usize,
+    rows: &[Row],
+    bounds: &[f32],
+    sums: &mut [f32],
+) {
+    check_words(mask, live, at, rows, bounds, sums);
+    run!(level(), word_sums(mask, live, at, rows, bounds, sums))
 }
 
 /// [`word_sums`] at `level`; panics if the CPU lacks it.
 pub fn word_sums_at(
     level: Level,
     mask: &[u64],
+    live: u32,
     at: usize,
     rows: &[Row],
     bounds: &[f32],
     sums: &mut [f32],
 ) {
     assert!(level.supported(), "kernel level {} unsupported here", level.name());
-    check_words(mask, at, rows, bounds, sums);
-    run!(level, word_sums(mask, at, rows, bounds, sums))
+    check_words(mask, live, at, rows, bounds, sums);
+    run!(level, word_sums(mask, live, at, rows, bounds, sums))
 }
 
 /// Adds to `sums[j]`, for each bit position `bits[j]` (below 64), each
@@ -159,10 +167,15 @@ fn chunks<const N: usize>(live: u32) -> u32 {
 }
 
 #[inline(always)]
-fn check_words(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
+fn check_words(mask: &[u64], live: u32, at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
     assert_eq!(rows.len(), bounds.len(), "a bound per row");
     assert_eq!(mask.len(), sums.len(), "a sum per word");
     assert!(mask.len() <= WORDS, "a sub-range of words");
+    assert_eq!(
+        live.checked_shr(mask.len() as u32).unwrap_or(0),
+        0,
+        "live bits of the mask's words"
+    );
     for row in rows {
         assert!(row.len >= (at + mask.len()) * 8, "a row of the mask's words");
     }
@@ -229,8 +242,15 @@ mod scalar {
     }
 
     #[inline(always)]
-    pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
-        word_tail(mask, at, rows, bounds, sums, live(mask), 0)
+    pub fn word_sums(
+        mask: &[u64],
+        live: u32,
+        at: usize,
+        rows: &[Row],
+        bounds: &[f32],
+        sums: &mut [f32],
+    ) {
+        word_tail(mask, at, rows, bounds, sums, live, 0)
     }
 
     #[inline(always)]
@@ -253,10 +273,16 @@ mod neon {
     }
 
     #[inline]
-    pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
+    pub fn word_sums(
+        mask: &[u64],
+        live: u32,
+        at: usize,
+        rows: &[Row],
+        bounds: &[f32],
+        sums: &mut [f32],
+    ) {
         let n = mask.len();
         let full = n - n % 4;
-        let live = scalar::live(mask);
         // The vectors of four words holding a live word, walked by their bits.
         let mut chunks = super::chunks::<4>(live) & ((1u32 << (full / 4)) - 1);
         // SAFETY: NEON is baseline on aarch64; every load is of four words
@@ -340,11 +366,17 @@ mod avx2 {
     }
 
     #[target_feature(enable = "avx2")]
-    pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
+    pub fn word_sums(
+        mask: &[u64],
+        live: u32,
+        at: usize,
+        rows: &[Row],
+        bounds: &[f32],
+        sums: &mut [f32],
+    ) {
         let n = mask.len();
         let full = n - n % 8;
         let zero = _mm256_setzero_si256();
-        let live = scalar::live(mask);
         // The vectors of eight words holding a live word, walked by their bits.
         let mut chunks = super::chunks::<8>(live) & ((1u32 << (full / 8)) - 1);
         // SAFETY: every load is of eight words (64 bytes) at most `at + full`
@@ -488,14 +520,15 @@ mod tests {
             let rows: Vec<Row> = buffers.iter().map(|b| Row::new(&b[shift..])).collect();
             let mut want: Vec<f32> = (0..words).map(|j| start.get(j).copied().unwrap_or(0.0)).collect();
             let init = want.clone();
-            scalar::word_sums(&mask, at, &rows, bounds, &mut want);
+            let live = scalar::live(&mask);
+            scalar::word_sums(&mask, live, at, &rows, bounds, &mut want);
             // A word without members is left as it is.
             for (j, &m) in mask.iter().enumerate() {
                 if m == 0 { prop_assert_eq!(want[j].to_bits(), init[j].to_bits()); }
             }
             for level in Level::supported_levels() {
                 let mut have = init.clone();
-                word_sums_at(level, &mask, at, &rows, bounds, &mut have);
+                word_sums_at(level, &mask, live, at, &rows, bounds, &mut have);
                 prop_assert!(same(&have, &want), "{:?}: {:?} vs {:?}", level, have, want);
             }
         }
