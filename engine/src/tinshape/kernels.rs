@@ -224,9 +224,6 @@ pub use ef::{
 };
 mod weigh;
 pub use weigh::{Row, member_sums, member_sums_at, or_zero, word_sums, word_sums_at};
-mod score;
-pub use score::{score_pairs, score_pairs_at};
-
 #[inline(always)]
 fn le(c: &[u8]) -> u64 {
     u64::from_le_bytes(c.try_into().expect("eight bytes"))

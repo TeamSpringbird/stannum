@@ -794,10 +794,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a disjunction's words and members weighed by their terms' bounds in lanes (words, or a word's members), per instruction set (NEON, AVX2) with a portable reference."
     },
-    "engine/src/tinshape/kernels/score.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation: BM25 scores of (bucket, length) pairs in lanes, the footer's block bounds, per instruction set (NEON, AVX2) with a portable reference."
-    },
     "engine/src/tinshape/rank.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: ranked top-k over the ctid-addressed segment format, a 256-page group at a time."
