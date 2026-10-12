@@ -25,7 +25,7 @@ use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
-use segment::tinshape::blob::LazyBlob;
+use segment::tinshape::blob::{Bytes, LazyBlob};
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
@@ -720,8 +720,9 @@ struct Walk<'s, 'a, T: Touch> {
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
     plan: Plan,
-    /// A disjunction's group at hand: per scoring term a row of the
-    /// group's words holding its members, and its index cursor.
+    /// A disjunction's group at hand: per scoring term room for a row of
+    /// the group's words holding its members (unless read in place, see
+    /// [`RowAt`]), and its row and index cursor.
     rows: Vec<u64>,
     row_state: Vec<Row>,
     /// Per scoring term, whether its row holds the group at hand; and the
@@ -729,9 +730,9 @@ struct Walk<'s, 'a, T: Touch> {
     row_loaded: Vec<bool>,
     any: Vec<u64>,
     /// A disjunction's group at hand: per present term with a positive
-    /// bound there, where its row starts in `rows`, that bound and its bound
-    /// over the sub-range at hand; and its word at hand.
-    or_terms: Vec<(usize, f32, f32)>,
+    /// bound there, the term, its row, that bound and its bound over the
+    /// sub-range at hand; and its word at hand.
+    or_terms: Vec<(usize, RowAt, f32, f32)>,
     or_held: Vec<u64>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
@@ -954,7 +955,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// candidates checked, and the terms' members (a grid or an
     /// Elias-Fano list read in place) are forgotten here; positions, TF
     /// tails and the DL sidecar are read a value at a time, and a
-    /// disjunction copies its terms' rows. What the walk keeps across
+    /// disjunction's rows (a grid read in place) are loaded afresh in the
+    /// next group they are read in. What the walk keeps across
     /// groups holds no slice (directories, decoded; positions streams,
     /// read when asked), lies in [`Walk::held`] (a sparse term's list,
     /// inline lengths) or is held for this release: a scoring term's
@@ -2061,12 +2063,12 @@ impl<'r> RowBits<'r> {
         let kept = if w == self.w { self.bits } else { 0 };
         self.bits = kept | 1 << (local % 64);
         self.w = w;
-        self.row[w] = self.bits;
+        self.row[w] = self.bits.to_le();
     }
 }
 
-/// A disjunction term's members in the group at hand, as a row of words in
-/// [`Walk::rows`], and a forward cursor over their posting indexes.
+/// A disjunction term's members in the group at hand, as a row of words
+/// (see [`RowAt`]), and a forward cursor over their posting indexes.
 #[derive(Clone, Copy, Default)]
 struct Row {
     /// Postings in earlier groups.
@@ -2074,6 +2076,89 @@ struct Row {
     /// Members in words `..w` are `run`.
     w: usize,
     run: u32,
+    at: RowAt,
+}
+
+/// Where a disjunction term's row lies in the group at hand: the group's
+/// words, little-endian. A grid on one page is read in place there; other
+/// members (decoded, or a grid across pages copied a page's part at a
+/// time) lie in the term's part of [`Walk::rows`]. A word is the same load
+/// from either, so the walk never asks which.
+///
+/// Copying every grid into its row cost 31 MB of copies per disjunction at
+/// 150M rows (106 MB scoring every term), libc `memcpy` on x86-64.
+///
+/// A pointer, not a slice, as it borrows a page or `rows` across the walk's
+/// `&mut self` calls. Sound as the walk uses it: a group's rows are loaded
+/// after `rows` is sized for the group, and read only within that group,
+/// before [`Walk::group_done`] releases its pages.
+#[derive(Clone, Copy)]
+struct RowAt {
+    at: *const u8,
+    len: usize,
+}
+
+impl Default for RowAt {
+    fn default() -> Self {
+        Self::new(&[])
+    }
+}
+
+impl RowAt {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            at: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    /// A row of `rows`, its words stored little-endian.
+    fn of(row: &[u64]) -> Self {
+        Self {
+            at: row.as_ptr().cast(),
+            len: size_of_val(row),
+        }
+    }
+
+    #[inline(always)]
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `len` bytes from `at` were a slice when the row was
+        // loaded, and are still (see the type).
+        unsafe { std::slice::from_raw_parts(self.at, self.len) }
+    }
+
+    /// Word `w`.
+    #[inline(always)]
+    fn word(&self, w: usize) -> u64 {
+        debug_assert!(w * 8 + 8 <= self.len);
+        // SAFETY: as in `bytes`; the walk asks only for its group's words,
+        // which a row holds (see `grid_row`).
+        u64::from_le_bytes(unsafe { self.at.add(w * 8).cast::<[u8; 8]>().read_unaligned() })
+    }
+}
+
+/// A grid container's row (`row`, of its group's words, holding it only if
+/// need be): in place where the grid lies on one page, else copied into
+/// `row` a page's part at a time rather than stitched into the span's
+/// buffers first.
+#[inline]
+fn grid_row(grid: Bytes<'_>, row: &mut [u64]) -> Result<RowAt> {
+    let len = grid.len();
+    if len != size_of_val(row) {
+        return Err(Error::Corrupt("a grid of its group's words"));
+    }
+    if grid.page_end(0) == len {
+        return Ok(RowAt::new(grid.all()?));
+    }
+    // SAFETY: a `u64` slice's bytes, any value valid.
+    let out = unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), len) };
+    let mut at = 0;
+    while at < len {
+        let end = grid.page_end(at);
+        out[at..end].copy_from_slice(grid.get(at, end)?);
+        at = end;
+    }
+    Ok(RowAt::of(row))
 }
 
 impl<'a, T: Touch> Walk<'_, 'a, T> {
@@ -2128,8 +2213,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
-    /// Scoring term `i`'s members in group `g`, which it holds, into its row
-    /// of `words` words.
+    /// Scoring term `i`'s members in group `g`, which it holds, as its row
+    /// of `words` words ([`Row::at`]).
     #[inline(never)]
     fn or_load(&mut self, i: usize, g: u32, words: usize) -> Result<()> {
         let t = self.sc[i].term;
@@ -2139,6 +2224,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let r = &mut self.row_state[i];
         r.w = 0;
         r.run = 0;
+        r.at = RowAt::of(row);
         if let Form::Sparse(list) = &set.postings.form {
             row.fill(0);
             let cursor = set.sparse.get_or_insert_with(|| {
@@ -2166,15 +2252,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 at,
             } => {
                 self.touch.touch(Part::Payload, at, bytes.len());
-                let bytes = bytes.all()?;
                 self.mems[t].used += 1;
                 r.first = e.first;
                 if e.kind == KIND_GRID {
-                    kernels::load(row, bytes);
+                    r.at = grid_row(bytes, row)?;
                 } else {
                     row.fill(0);
                     let mut out = RowBits::new(row);
-                    for_each_local(&e, bytes, &group, |l| out.set(l))?;
+                    for_each_local(&e, bytes.all()?, &group, |l| out.set(l))?;
                 }
             }
             Src::Locals { from, to } => {
@@ -2248,28 +2333,33 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if let Some((&first, rest)) = plan.required.split_first() {
             self.or_load(first, g, words)?;
             loaded[first] = true;
-            mask.copy_from_slice(&self.rows[first * words..(first + 1) * words]);
+            kernels::load(&mut mask, self.row_state[first].at.bytes());
             for &i in rest {
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
-                kernels::and_words(&mut mask, &self.rows[i * words..(i + 1) * words]);
+                kernels::and_bytes(&mut mask, self.row_state[i].at.bytes());
             }
         }
         if plan.by_essential && !plan.essential.is_empty() {
+            // Into the mask itself, cleared above, without required terms.
             let required = !plan.required.is_empty();
             let mut any = std::mem::take(&mut self.any);
-            any.clear();
-            any.resize(words, 0);
+            if required {
+                any.clear();
+                any.resize(words, 0);
+            } else {
+                std::mem::swap(&mut any, &mut mask);
+            }
             for e in 0..plan.essential.len() {
                 let i = plan.essential[e];
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
-                kernels::or_words(&mut any, &self.rows[i * words..(i + 1) * words]);
+                kernels::or_bytes(&mut any, self.row_state[i].at.bytes());
             }
             if required {
                 kernels::and_words(&mut mask, &any);
             } else {
-                mask.copy_from_slice(&any);
+                std::mem::swap(&mut any, &mut mask);
             }
             self.any = any;
         }
@@ -2306,7 +2396,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
             if sb[i] > 0.0 {
-                terms.push((i * words, sb[i], 0.0));
+                terms.push((i, self.row_state[i].at, sb[i], 0.0));
             }
         }
         held.clear();
@@ -2329,8 +2419,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let mut word = mask[w];
                 if self.threshold().is_some() {
                     let mut most = 0.0_f32;
-                    for (h, &(at, bound, _)) in held.iter_mut().zip(&terms) {
-                        *h = self.rows[at + w];
+                    for (h, &(_, at, bound, _)) in held.iter_mut().zip(&terms) {
+                        *h = at.word(w);
                         most += or_zero(bound, *h & word != 0);
                     }
                     if self.cut(most, || first(w)) {
@@ -2342,8 +2432,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         let to = (base + (w1 * 64) as u32 - 1).min(end);
                         let mut total = 0.0_f32;
                         for term in terms.iter_mut() {
-                            let bound = self.sc[term.0 / words].range_bound(from, to);
-                            term.2 = bound;
+                            let bound = self.sc[term.0].range_bound(from, to);
+                            term.3 = bound;
                             total += bound;
                         }
                         // The sub-range's words left start at `w`.
@@ -2352,7 +2442,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         }
                     }
                     let mut most = 0.0_f32;
-                    for (h, &(_, _, bound)) in held.iter().zip(&terms) {
+                    for (h, &(_, _, _, bound)) in held.iter().zip(&terms) {
                         most += or_zero(bound, *h & word != 0);
                     }
                     if self.cut(most, || first(w)) {
@@ -2364,7 +2454,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         let bit = left.trailing_zeros();
                         left &= left - 1;
                         let mut sum = 0.0_f32;
-                        for (h, &(_, _, bound)) in held.iter().zip(&terms) {
+                        for (h, &(_, _, _, bound)) in held.iter().zip(&terms) {
                             sum += or_zero(bound, *h >> bit & 1 == 1);
                         }
                         let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
@@ -2375,7 +2465,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 while word != 0 {
                     let bit = word.trailing_zeros();
                     word &= word - 1;
-                    self.or_candidate(g, base, words, w, bit)?;
+                    self.or_candidate(g, base, w, bit)?;
                 }
             }
             w0 = w1;
@@ -2435,15 +2525,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// The posting index of member `local` of scoring term `i`'s row;
     /// members must be asked in increasing order.
     #[inline]
-    fn row_index(&mut self, i: usize, words: usize, local: u32) -> u32 {
-        let row = &self.rows[i * words..(i + 1) * words];
+    fn row_index(&mut self, i: usize, local: u32) -> u32 {
         let r = &mut self.row_state[i];
         let w = local as usize / 64;
         if w > r.w {
-            r.run += kernels::popcount(&row[r.w..w]) as u32;
+            r.run += kernels::popcount_bytes(&r.at.bytes()[r.w * 8..w * 8]);
             r.w = w;
         }
-        r.first + r.run + (row[w] & ((1u64 << (local % 64)) - 1)).count_ones()
+        r.first + r.run + (r.at.word(w) & ((1u64 << (local % 64)) - 1)).count_ones()
     }
 
     /// Bounds the candidate at bit `bit` of word `w` of group `g` and, if
@@ -2460,9 +2549,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Kept out of line, as the group and plan steps are: inlined into the
     /// word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
-    fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
+    fn or_candidate(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<()> {
         let local = (w * 64) as u32 + bit;
-        if let Some((reach, length)) = self.or_stage(g, base, words, w, bit)? {
+        if let Some((reach, length)) = self.or_stage(g, base, w, bit)? {
             if !matches!(self.verify, Verify::Flat) {
                 return self.finish(g, local, length);
             }
@@ -2484,7 +2573,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         &mut self,
         g: u32,
         base: u32,
-        words: usize,
         w: usize,
         bit: u32,
     ) -> Result<Option<(f32, u32)>> {
@@ -2498,12 +2586,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.held_list.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
-            if self.rows[i * words + w] >> bit & 1 == 1 {
+            if self.row_state[i].at.word(w) >> bit & 1 == 1 {
                 self.held_list.push(i);
                 // A member's block is its posting index's: the footer is
                 // decoded whole (`Sc::decode_all`), and its blocks hold
                 // `block_size` postings each.
-                let index = self.row_index(i, words, local);
+                let index = self.row_index(i, local);
                 self.held_index[i] = index;
                 let s = &mut self.sc[i];
                 let b = (index / s.footer.block_size()) as usize;
