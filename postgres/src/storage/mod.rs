@@ -1743,7 +1743,17 @@ unsafe fn pending_removable(index: pg_sys::Relation, xid: u32) -> bool {
     if testing::PENDING_REMOVABLE.with(Cell::get) {
         return true;
     }
-    unsafe { pg_sys::GlobalVisCheckRemovableXid(index, pg_sys::TransactionId::from(xid)) }
+    // The horizon is the table's: PostgreSQL computes it for the relation
+    // holding the rows (and asserts as much), the index only points at them.
+    unsafe {
+        let heap = pg_sys::table_open(
+            (*(*index).rd_index).indrelid,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        );
+        let removable = pg_sys::GlobalVisCheckRemovableXid(heap, pg_sys::TransactionId::from(xid));
+        pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        removable
+    }
 }
 
 /// Removes from the list what pending runs no snapshot can still read, at
