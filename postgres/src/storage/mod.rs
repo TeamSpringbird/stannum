@@ -5797,6 +5797,78 @@ pub mod testing {
         }
     }
 
+    /// The shared buffer holding `block` of index `oid`, read in if need be
+    /// and left unpinned, with its index relation open.
+    ///
+    /// # Safety
+    /// `oid` is an index.
+    unsafe fn buffer_of(oid: pg_sys::Oid, block: u32) -> (pg_sys::Relation, pg_sys::Buffer) {
+        unsafe {
+            let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let buffer = pg_sys::ReadBuffer(index, block);
+            pg_sys::ReleaseBuffer(buffer);
+            (index, buffer)
+        }
+    }
+
+    /// The shared reference count of the buffer holding `block` of index
+    /// `oid`: every backend's pins, PostgreSQL's and own.
+    ///
+    /// # Safety
+    /// `oid` is an index.
+    pub unsafe fn shared_refcount(oid: pg_sys::Oid, block: u32) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let count = state_of(descriptor(buffer)).load(std::sync::atomic::Ordering::Acquire)
+                & pg_sys::BUF_REFCOUNT_MASK;
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            count
+        }
+    }
+
+    /// Pins `block` of index `oid` as [`own_pin`] does, holds the pin for
+    /// `hold_ms`, releases it as [`own_unpin`] does, and returns the
+    /// buffer's shared reference count right after the release. Another
+    /// session locking the buffer's header meanwhile (see
+    /// [`header_locked`]) is what the bgwriter, a checkpoint, a clock sweep
+    /// or `pg_buffercache` do under a running query.
+    ///
+    /// # Safety
+    /// `oid` is an index with a page `block`.
+    pub unsafe fn own_pin_held(oid: pg_sys::Oid, block: u32, hold_ms: u64) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let locator = (*index).rd_locator;
+            assert!(own_pin(buffer, &locator, block), "the page's buffer was replaced");
+            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+            own_unpin(buffer);
+            let count = state_of(descriptor(buffer)).load(std::sync::atomic::Ordering::Acquire)
+                & pg_sys::BUF_REFCOUNT_MASK;
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            count
+        }
+    }
+
+    /// Locks the header of the buffer holding `block` of index `oid` for
+    /// `hold_ms`, then unlocks it as `UnlockBufHdr` does, writing back the
+    /// state read under the lock; returns the reference count read. A pin
+    /// released by a plain atomic decrement meanwhile is undone by the
+    /// write-back: PostgreSQL's `UnpinBuffer` waits for the lock instead.
+    ///
+    /// # Safety
+    /// `oid` is an index with a page `block`.
+    pub unsafe fn header_locked(oid: pg_sys::Oid, block: u32, hold_ms: u64) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let desc = descriptor(buffer);
+            let locked = pg_sys::LockBufHdr(desc);
+            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+            state_of(desc).store(locked & !pg_sys::BM_LOCKED, std::sync::atomic::Ordering::Release);
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            locked & pg_sys::BUF_REFCOUNT_MASK
+        }
+    }
+
     /// Empties this backend's segment readers with their dead lists, and
     /// its page tables, as exceeding `stannum.reader_cache_mb` does.
     pub fn clear_reader_caches() {

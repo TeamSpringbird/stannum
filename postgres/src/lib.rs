@@ -8766,4 +8766,30 @@ mod tests {
             status & pg_sys::VISIBILITYMAP_ALL_VISIBLE as u8 != 0
         }
     }
+
+    /// The shared reference count of the buffer holding `block` of `index`
+    /// (used by postgres/tests/own_pins.py).
+    #[pg_extern]
+    fn buffer_refcount(index: pg_sys::Oid, block: i64) -> i64 {
+        i64::from(unsafe { crate::storage::testing::shared_refcount(index, block as u32) })
+    }
+
+    /// Holds an own pin on `block` of `index` for `hold_ms`; the buffer's
+    /// reference count right after the release.
+    #[pg_extern]
+    fn own_pin_held(index: pg_sys::Oid, block: i64, hold_ms: i64) -> i64 {
+        i64::from(unsafe {
+            crate::storage::testing::own_pin_held(index, block as u32, hold_ms as u64)
+        })
+    }
+
+    /// Holds the header lock of the buffer holding `block` of `index` for
+    /// `hold_ms`, as the bgwriter, a checkpoint or `pg_buffercache` hold it
+    /// for a moment; the reference count read under the lock.
+    #[pg_extern]
+    fn buffer_header_locked(index: pg_sys::Oid, block: i64, hold_ms: i64) -> i64 {
+        i64::from(unsafe {
+            crate::storage::testing::header_locked(index, block as u32, hold_ms as u64)
+        })
+    }
 }
