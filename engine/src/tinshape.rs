@@ -2878,6 +2878,73 @@ mod tests {
         );
     }
 
+    /// Counts reads per area.
+    #[derive(Default)]
+    struct AreaReads([u64; Part::ALL.len()]);
+
+    impl Touch for AreaReads {
+        fn touch(&mut self, part: Part, _: usize, _: usize) {
+            self.0[part as usize] += 1;
+        }
+    }
+
+    /// While the top k fill, a phrase's candidate is confirmed by its
+    /// positions before its length is read: one that holds both words but
+    /// not the phrase reads no DL (TIN reads lengths for phrase matches
+    /// only). Here every document holds both words, one in 100 as the
+    /// phrase, and all score the same, so the walk ends once 10 are found.
+    #[test]
+    fn a_phrase_reads_lengths_only_for_matches_while_filling() {
+        let n = 2_000usize;
+        let docs: Vec<Tid> = (0..n as u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        let lengths = vec![10u32; n];
+        // Term t holds positions 0..tf: "t0 t1" needs t1 at 1, so tf 2.
+        let members = vec![
+            (0..n).map(|r| (r, 1)).collect::<Vec<_>>(),
+            (0..n)
+                .map(|r| (r, if r % 100 == 0 { 2 } else { 1 }))
+                .collect(),
+        ];
+        let all: Vec<usize> = (0..n).collect();
+        let options = Options {
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+        let segment = Segment::parse(&blob).unwrap();
+        let names = vec!["t0".to_owned(), "t1".to_owned()];
+        // Scores ignore tf here (k1 0): every match scores the same.
+        let params = Bm25Params { k1: 0.0, b: 0.75 };
+        let scorer = TermScorer::from_statistics(10_000, 2_000, 1.0, params, 10.0).unwrap();
+        let scorers = vec![("t0".to_owned(), scorer.clone()), ("t1".to_owned(), scorer)];
+        let node = Node::Span {
+            slots: vec![0, 1],
+            query: SpanQuery::phrase([0, 1]),
+        };
+        let mut reads = AreaReads::default();
+        let got = top_k(&segment, &node, &names, &scorers, 10, &mut reads).unwrap();
+        let want: Vec<Tid> = (0..n).step_by(100).take(10).map(|r| docs[r]).collect();
+        assert_eq!(got.rows.iter().map(|r| r.1).collect::<Vec<_>>(), want);
+        assert!(got.position_checks >= 900, "{} checks", got.position_checks);
+        // A length is two reads (its block's header and its bits).
+        let lengths_read = reads.0[Part::DlSidecar as usize] / 2;
+        assert!(
+            lengths_read <= 10,
+            "{lengths_read} lengths read for 10 matches"
+        );
+        // With nothing to score (both words elided), no length is read.
+        let mut reads = AreaReads::default();
+        let got = top_k(&segment, &node, &names, &[], 10, &mut reads).unwrap();
+        assert_eq!(got.rows.iter().map(|r| r.1).collect::<Vec<_>>(), want);
+        assert_eq!(reads.0[Part::DlSidecar as usize], 0);
+    }
+
     /// A phrase's candidates in a group are scored best bound first: its
     /// best rows come last in ctid order here, each earlier one beating the
     /// one before, so a walk in ctid order would check the positions and

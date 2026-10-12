@@ -1437,13 +1437,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn finish(&mut self, g: u32, local: u32, length: u32) -> Result<()> {
         let n = self.sc.len();
         let tid = self.geometry.tid_in(g as usize, local);
-        let length = if length == u32::MAX {
-            self.dl_length(g, local)?
-        } else {
-            length
-        };
         // A span checks positions before scoring while the top k fill:
-        // every match enters them.
+        // every match enters them, and only a match reads its length (at
+        // 150M rows four in ten of a phrase's lengths were read for
+        // candidates its positions then ruled out).
         let span_first = matches!(self.verify, Verify::Span(_)) && self.bar.is_none();
         if span_first {
             let Verify::Span(check) = &mut self.verify else {
@@ -1454,7 +1451,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 return Ok(());
             }
         }
-        // A walk with nothing to score (every term elided) scores nothing.
+        // A walk with nothing to score (every term elided) scores nothing,
+        // and needs no length.
+        let length = if length == u32::MAX && n > 0 {
+            self.dl_length(g, local)?
+        } else {
+            length
+        };
         self.answer.scored += u64::from(n > 0);
         let mut total = 0.0_f32;
         for i in 0..n {
