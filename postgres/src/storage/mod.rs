@@ -1454,9 +1454,19 @@ unsafe fn wait_header_unlocked(state: &std::sync::atomic::AtomicU32) -> u32 {
 
 /// Pins shared buffer `buffer` as `PinBuffer` does, one compare-and-swap of
 /// its state (a reference and, up to the most, a use), and keeps the pin if
-/// the buffer holds `block` of the relation at `locator`, valid; otherwise
+/// the buffer holds `block` of the relation at `locator`; otherwise
 /// releases it again and returns false. The tag is read once pinned: a
-/// pinned buffer cannot be given to another page.
+/// pinned valid buffer cannot be given to another page.
+///
+/// Only a valid buffer is pinned: the compare-and-swap takes the pin only
+/// if the state it read, `BM_VALID` set, is still the state. A buffer
+/// without `BM_VALID` may be a victim between its eviction and its new
+/// tag, pinned once by the backend replacing it, which asserts that single
+/// pin (`BufferAlloc`, `GetVictimBuffer`, `ExtendBufferedRelShared`): a
+/// stale hint names such a buffer, and a pin on it, however brief, trips
+/// the assertion in a cassert build and makes the replacement start over
+/// in any build. `ReadRecentBuffer` checks under the header lock before
+/// pinning for the same reason.
 ///
 /// # Safety
 ///
@@ -1476,6 +1486,9 @@ unsafe fn own_pin(buffer: pg_sys::Buffer, locator: &pg_sys::RelFileLocator, bloc
                 // does, a header lock is held for a few instructions.
                 old = wait_header_unlocked(state);
                 continue;
+            }
+            if old & pg_sys::BM_VALID == 0 {
+                return false;
             }
             let mut new = old + pg_sys::BUF_REFCOUNT_ONE;
             if (old & pg_sys::BUF_USAGECOUNT_MASK) >> pg_sys::BUF_USAGECOUNT_SHIFT

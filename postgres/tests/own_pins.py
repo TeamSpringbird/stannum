@@ -84,8 +84,10 @@ def main():
         command(['initdb', '-D', str(data), '-U', 'pin_probe', '-A', 'trust', '--no-locale',
                  '--encoding=UTF8'])
         with (data / 'postgresql.conf').open('a') as config:
+            # Few shared buffers: the walks' pages are evicted and replaced
+            # under them, so hints go stale and name buffers being replaced.
             config.write(f"\nlisten_addresses=''\nport={PORT}\nunix_socket_directories='{root}'\n"
-                         "shared_buffers=64MB\nlog_min_messages=warning\n")
+                         "shared_buffers=4MB\nlog_min_messages=warning\n")
         command(['pg_ctl', '-D', str(data), '-l', str(log), '-w', 'start'])
         sql("""CREATE EXTENSION stannum;
 CREATE EXTENSION pg_buffercache;
