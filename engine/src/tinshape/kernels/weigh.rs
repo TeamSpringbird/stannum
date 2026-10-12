@@ -263,15 +263,16 @@ mod avx2 {
         unsafe {
             let mut j = 0;
             while j < full {
+                // Each member's bit as a one-bit mask: `1 << bits[j]`.
                 let b = _mm_loadl_epi64(bits.as_ptr().add(j).cast());
-                let s0 = _mm256_cvtepu8_epi64(b);
-                let s1 = _mm256_cvtepu8_epi64(_mm_srli_si128::<4>(b));
+                let b0 = _mm256_sllv_epi64(one, _mm256_cvtepu8_epi64(b));
+                let b1 = _mm256_sllv_epi64(one, _mm256_cvtepu8_epi64(_mm_srli_si128::<4>(b)));
                 let mut acc =
                     _mm256_permutevar8x32_ps(_mm256_loadu_ps(sums.as_ptr().add(j)), order());
                 for (&h, &bound) in held.iter().zip(bounds) {
                     let hv = _mm256_set1_epi64x(h as i64);
-                    let z0 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_srlv_epi64(hv, s0), one), zero);
-                    let z1 = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_srlv_epi64(hv, s1), one), zero);
+                    let z0 = _mm256_cmpeq_epi64(_mm256_and_si256(hv, b0), zero);
+                    let z1 = _mm256_cmpeq_epi64(_mm256_and_si256(hv, b1), zero);
                     let v = _mm256_andnot_ps(narrow(z0, z1), _mm256_set1_ps(bound));
                     acc = _mm256_add_ps(acc, v);
                 }
