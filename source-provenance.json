@@ -1491,6 +1491,26 @@
     "tokenizer/tests/tin_stemming.rs": {
       "owner": "ben",
       "evidence": "Original Stannum tests of stemmed tokenization against TIN 1.0.4's recorded answers."
+    },
+    "benchmarks/aws/devbox.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: runs one command on a spot x86 AWS box through SSM and copies the results home."
+    },
+    "benchmarks/aws/devbox-box.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the devbox's side of devbox.sh (toolchain, sources, dump, command, results)."
+    },
+    "benchmarks/aws/devbox-replay-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of two trees under perf stat."
+    },
+    "benchmarks/aws/devbox-bolt-variants.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file measuring PGO, CPU-level and BOLT builds of the replay."
+    },
+    "script/bolt-build": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: optimizes a built ELF's code layout with LLVM BOLT from a training run."
     }
   }
 }

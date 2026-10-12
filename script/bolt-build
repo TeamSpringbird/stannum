@@ -95,9 +95,9 @@ esac
 
 # Layout: hot blocks in a straight line (ext-tsp), callers near callees
 # (cdsort), cold blocks split out of hot functions, identical code folded.
-# (BOLT 20 turned -icf into a level: all or safe.)
+# (BOLT 20 turned -icf into a level, all or safe, and deprecated -icf=1.)
 icf=-icf=1
-"$bolt" --help 2>&1 | grep -A3 -- '-icf' | grep -q safe && icf=-icf=all
+[ "$("$bolt" --version | sed -n 's/.*LLVM version \([0-9]*\).*/\1/p')" -ge 20 ] 2>/dev/null && icf=-icf=all
 read -r -a flags <<< "${BOLT_FLAGS:--reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh $icf -dyno-stats}"
 "$bolt" "$elf" -o "$out" -data "$fdata" "${flags[@]}"
 echo "wrote $out (profile $fdata)"
