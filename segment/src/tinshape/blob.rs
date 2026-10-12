@@ -165,6 +165,43 @@ const NO_PAGE: PageRef = PageRef {
     len: 0,
 };
 
+/// Blob offsets divided by the page length, by a multiply: the length is a
+/// run page's capacity, not a power of two, and the division sat on the
+/// path of every read in place to its page (a TF bucket, a length, a
+/// container: some 150,000 reads a disjunction at 150M rows).
+///
+/// `magic` is `ceil(2^64 / len)`, so `at * magic >> 64` is `at / len`
+/// exactly while `at * (magic * len - 2^64) < 2^64`, which holds for every
+/// offset below `2^64 / len`: a segment is far smaller.
+#[derive(Clone, Copy, Debug)]
+struct PageDiv {
+    len: usize,
+    magic: u64,
+}
+
+impl PageDiv {
+    /// Division by `len` (one, or a source that pins no pages, divides by
+    /// nothing).
+    fn new(len: usize) -> Self {
+        let magic = match len {
+            0 | 1 => 0,
+            len => (1u128 << 64).div_ceil(len as u128) as u64,
+        };
+        Self { len, magic }
+    }
+
+    /// `at / len`.
+    #[inline(always)]
+    fn page(self, at: usize) -> usize {
+        if self.magic == 0 {
+            return at;
+        }
+        let page = ((at as u128 * u128::from(self.magic)) >> 64) as usize;
+        debug_assert_eq!(page, at / self.len);
+        page
+    }
+}
+
 /// Pages pinned since a mark that [`LazyBlob::release_since`] keeps by
 /// default, those read last: a walk's next group most often reads on from
 /// the pages each of its streams (a term's containers and TF tail, the DL
@@ -289,6 +326,8 @@ pub struct LazyBlob {
     source: Box<dyn Source>,
     /// The source's bytes per page, zero when it pins none.
     page_len: usize,
+    /// Offsets divided by `page_len`.
+    page_div: PageDiv,
     /// Open [`Self::open_span`]s.
     spans: Cell<u32>,
     /// The outermost span open or last opened, numbering them from 1.
@@ -345,6 +384,7 @@ impl LazyBlob {
             loaded: Cell::new(0),
             source,
             page_len,
+            page_div: PageDiv::new(page_len),
             spans: Cell::new(0),
             span: Cell::new(0),
             pages: Box::new([const { Cell::new(NO_PAGE) }; PAGE_MEMO]),
@@ -672,7 +712,7 @@ impl LazyBlob {
     fn get_kind(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if self.spans.get() > 0 && from < to && self.page_len > 0 {
             let n = self.page_len;
-            let page = from / n;
+            let page = self.page_div.page(from);
             let known = self.pages[page % PAGE_MEMO].get();
             if known.page == page && known.span == self.span.get() && to <= page * n + known.len {
                 self.touch(page);
@@ -743,8 +783,8 @@ impl LazyBlob {
     /// place on its page, else stitched.
     fn in_place(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         let n = self.page_len;
-        let first = from / n;
-        if (to - 1) / n == first
+        let first = self.page_div.page(from);
+        if self.page_div.page(to - 1) == first
             && let Some((data, len)) = self.page(first, kind)?
         {
             let within = from - first * n;
@@ -760,7 +800,7 @@ impl LazyBlob {
         let out = self.stitches.borrow_mut().alloc(to - from);
         let mut at = from;
         while at < to {
-            let page = at / n;
+            let page = self.page_div.page(at);
             let take = ((page + 1) * n).min(to) - at;
             let held = self.pinned.borrow().len();
             match self.page(page, kind)? {
@@ -944,7 +984,7 @@ impl<'a> Bytes<'a> {
                 if n == 0 {
                     return len;
                 }
-                ((at + from) / n * n + n - at).min(len)
+                (blob.page_div.page(at + from) * n + n - at).min(len)
             }
         }
     }
@@ -1125,6 +1165,21 @@ mod tests {
         let source = PinningSource::new(bytes, page_len);
         let blob = LazyBlob::new(Box::new(source.clone()));
         (source, blob)
+    }
+
+    #[test]
+    fn page_division_by_a_multiply_is_exact() {
+        // Run pages, the tests' pages, small odd ones, powers of two.
+        for len in [8192 - 24 - 8 - 4, 8192, 100, 7, 3, 2, 1, 1000, 4096, 65_521] {
+            let div = PageDiv::new(len);
+            let mut at = 0usize;
+            while at < 1 << 42 {
+                for near in [at.saturating_sub(1), at, at + 1, at + len - 1, at + len] {
+                    assert_eq!(div.page(near), near / len, "{near} / {len}");
+                }
+                at = at * 3 + 7;
+            }
+        }
     }
 
     #[test]
