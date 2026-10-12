@@ -539,8 +539,13 @@ fn load<'a>(
             mem.used += 1;
             mem.first = e.first;
             if e.kind == KIND_GRID {
-                mem.grid.resize(group.words(), 0);
-                mem.kind = Kind::Grid(grid_row(bytes, &mut mem.grid)?);
+                let words = group.words();
+                let grid = &mut mem.grid;
+                let at = grid_row(bytes, words, || {
+                    grid.resize(words, 0);
+                    grid
+                })?;
+                mem.kind = Kind::Grid(at);
             } else if e.kind == KIND_EF && e.count as usize > probe_over {
                 let ef = Ef::parse(bytes.all()?, e.count as usize, group.slots())?;
                 mem.kind = Kind::Cursor {
@@ -2146,19 +2151,24 @@ impl RowAt {
     }
 }
 
-/// A grid container's row (`row`, of its group's words, holding it only if
-/// need be): in place where the grid lies on one page, else copied into
-/// `row` a page's part at a time rather than stitched into the span's
-/// buffers first.
+/// A grid container's row of `words` words: in place where the grid lies
+/// on one page, else copied into `row()` (that many words) a page's part
+/// at a time rather than stitched into the span's buffers first.
 #[inline]
-fn grid_row(grid: Bytes<'_>, row: &mut [u64]) -> Result<RowAt> {
+fn grid_row<'r>(
+    grid: Bytes<'_>,
+    words: usize,
+    row: impl FnOnce() -> &'r mut [u64],
+) -> Result<RowAt> {
     let len = grid.len();
-    if len != size_of_val(row) {
+    if len != words * 8 {
         return Err(Error::Corrupt("a grid of its group's words"));
     }
     if grid.page_end(0) == len {
         return Ok(RowAt::new(grid.all()?));
     }
+    let row = row();
+    assert_eq!(row.len(), words);
     // SAFETY: a `u64` slice's bytes, any value valid.
     let out = unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), len) };
     let mut at = 0;
@@ -2264,7 +2274,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.mems[t].used += 1;
                 r.first = e.first;
                 if e.kind == KIND_GRID {
-                    r.at = grid_row(bytes, row)?;
+                    r.at = grid_row(bytes, words, || row)?;
                 } else {
                     row.fill(0);
                     let mut out = RowBits::new(row);
