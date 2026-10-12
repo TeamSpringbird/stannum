@@ -1743,7 +1743,17 @@ unsafe fn pending_removable(index: pg_sys::Relation, xid: u32) -> bool {
     if testing::PENDING_REMOVABLE.with(Cell::get) {
         return true;
     }
-    unsafe { pg_sys::GlobalVisCheckRemovableXid(index, pg_sys::TransactionId::from(xid)) }
+    // The horizon is the table's: PostgreSQL computes it for the relation
+    // holding the rows (and asserts as much), the index only points at them.
+    unsafe {
+        let heap = pg_sys::table_open(
+            (*(*index).rd_index).indrelid,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        );
+        let removable = pg_sys::GlobalVisCheckRemovableXid(heap, pg_sys::TransactionId::from(xid));
+        pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        removable
+    }
 }
 
 /// Removes from the list what pending runs no snapshot can still read, at
@@ -4437,6 +4447,18 @@ pub mod testing {
     /// `index` is a live LDP2 index.
     pub unsafe fn pending_entries(index: pg_sys::Relation) -> usize {
         unsafe { read_meta(index, false) }.1.pending.len()
+    }
+
+    /// Whether [`pending_removable`] finds a run released at `xid` removable,
+    /// asking PostgreSQL's horizon even when [`PENDING_REMOVABLE`] is set.
+    ///
+    /// # Safety
+    /// `index` is a live index relation.
+    pub unsafe fn horizon_removable(index: pg_sys::Relation, xid: u32) -> bool {
+        let forced = PENDING_REMOVABLE.replace(false);
+        let removable = unsafe { pending_removable(index, xid) };
+        PENDING_REMOVABLE.set(forced);
+        removable
     }
 
     /// Forgets `pages` in the free space map, as a crash or a promoted

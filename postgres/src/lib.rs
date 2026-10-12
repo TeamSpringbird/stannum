@@ -6667,6 +6667,26 @@ mod tests {
     }
 
     #[pg_test]
+    fn pending_removal_asks_the_horizon_of_the_table() {
+        // PostgreSQL computes the removal horizon for the relation holding
+        // the rows and asserts it is a table (procarray.c,
+        // GlobalVisHorizonKindForRel): asked of the index, a cassert build
+        // aborts here.
+        Spi::run(
+            "CREATE TABLE horizon_kind (id int, body text);
+             CREATE INDEX horizon_kind_idx ON horizon_kind USING stannum(body);",
+        )
+        .unwrap();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'horizon_kind_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index = unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::AccessShareLock as _) };
+        // This transaction is still running: what it released stays readable.
+        let xid = unsafe { pg_sys::GetCurrentTransactionId() }.into_inner();
+        assert!(!unsafe { crate::storage::testing::horizon_removable(index.as_ptr(), xid) });
+    }
+
+    #[pg_test]
     fn failure_after_a_chain_join_before_publication_leaves_published_runs_whole() {
         direct_merge_fixture();
         // The third insert folds and merges both singletons; retiring their
