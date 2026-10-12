@@ -734,10 +734,8 @@ struct Walk<'s, 'a, T: Touch> {
     /// [`RowAt`]), and its row and index cursor.
     rows: Vec<u64>,
     row_state: Vec<Row>,
-    /// Per scoring term, whether its row holds the group at hand; and the
-    /// essential terms' union there.
+    /// Per scoring term, whether its row holds the group at hand.
     row_loaded: Vec<bool>,
-    any: Vec<u64>,
     /// A disjunction's group at hand: per present term with a positive
     /// bound there, the term, its row, that bound and its bound over the
     /// sub-range at hand; and its word at hand.
@@ -1884,7 +1882,6 @@ pub(super) fn walk_into<'a>(
         rows: Vec::new(),
         row_state: vec![Row::default(); n],
         row_loaded: Vec::new(),
-        any: Vec::new(),
         or_terms: Vec::new(),
         or_held: Vec::new(),
         held_bound: vec![0.0; n],
@@ -2349,38 +2346,26 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if filters == 0 {
             mask.fill(!0);
         }
-        if let Some((&first, rest)) = plan.required.split_first() {
-            self.or_load(first, g, words)?;
-            loaded[first] = true;
-            kernels::load(&mut mask, self.row_state[first].at.bytes());
-            for &i in rest {
-                self.or_load(i, g, words)?;
-                loaded[i] = true;
-                kernels::and_bytes(&mut mask, self.row_state[i].at.bytes());
-            }
-        }
+        // The essential terms ORed into the mask, cleared above, then the
+        // required terms ANDed in; without essential terms the first
+        // required one is the mask to start from.
+        let mut required = plan.required.iter();
         if plan.by_essential && !plan.essential.is_empty() {
-            // Into the mask itself, cleared above, without required terms.
-            let required = !plan.required.is_empty();
-            let mut any = std::mem::take(&mut self.any);
-            if required {
-                any.clear();
-                any.resize(words, 0);
-            } else {
-                std::mem::swap(&mut any, &mut mask);
-            }
             for e in 0..plan.essential.len() {
                 let i = plan.essential[e];
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
-                kernels::or_bytes(&mut any, self.row_state[i].at.bytes());
+                kernels::or_bytes(&mut mask, self.row_state[i].at.bytes());
             }
-            if required {
-                kernels::and_words(&mut mask, &any);
-            } else {
-                std::mem::swap(&mut any, &mut mask);
-            }
-            self.any = any;
+        } else if let Some(&first) = required.next() {
+            self.or_load(first, g, words)?;
+            loaded[first] = true;
+            kernels::load(&mut mask, self.row_state[first].at.bytes());
+        }
+        for &i in required {
+            self.or_load(i, g, words)?;
+            loaded[i] = true;
+            kernels::and_bytes(&mut mask, self.row_state[i].at.bytes());
         }
         if let Some(dead) = dead {
             kernels::andnot_words(&mut mask, dead);
