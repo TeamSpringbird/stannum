@@ -793,6 +793,9 @@ struct Walk<'s, 'a, T: Touch> {
     staged_order: Vec<u32>,
     cands: Vec<u32>,
     words: Vec<u64>,
+    /// A bitmap over a group's slots, all clear between uses: a list's
+    /// members marked to filter candidates by ([`bits::intersect_marked`]).
+    marks: Vec<u64>,
     /// The node check's own cursors (the walk moves the terms' sparse
     /// cursors past each group), and its scratch.
     node_terms: Vec<Option<TermSet<'a>>>,
@@ -1118,7 +1121,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     let mem = &mut self.mems[t];
                     cands.retain(|l| mem.find(*l).is_some());
                 }
-                Kind::List => bits::intersect_sorted(&mut cands, &mem.list),
+                Kind::List => {
+                    let words = self.geometry.groups[g as usize].words();
+                    if self.marks.len() < words {
+                        self.marks.resize(words, 0);
+                    }
+                    bits::intersect_marked(&mut cands, &mem.list, &mut self.marks);
+                }
             }
         }
         let more = self.walk_candidates(g, &cands)?;
@@ -1910,6 +1919,7 @@ pub(super) fn walk_into<'a>(
         staged_order: Vec::new(),
         cands: Vec::new(),
         words: Vec::new(),
+        marks: Vec::new(),
         positions: Vec::new(),
         node_terms,
         touch,

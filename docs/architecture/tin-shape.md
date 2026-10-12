@@ -517,6 +517,13 @@ in a cleared row: the walks' container decodes now go through them).
 Callers of `postings::for_each_local` for a walk's lists would rather use
 `container_locals`.
 
+Added for conjunction overhead (branch `tinshape/conj-overhead`):
+`bits::intersect_marked(&mut list, &other, &mut marks)`, the members of
+`list` in `other` through a bitmap the caller keeps clear (`other` marked,
+`list` kept by its marks, the marks cleared); the led walk's group
+intersection uses it where it used `bits::intersect_sorted`, which the
+counts keep.
+
 Changed in phase B (callers of phase A's API): `Group` has `first` and
 `pages` (`slots()` is `pages * width`, `grid_bytes()` new);
 `postings::for_each_local` and `or_into` take `&Group` instead of a width;
@@ -1221,6 +1228,101 @@ the group check needs. For the lanes on the same walk: `or_stage` reads
 `Walk::held_bound` as each held term's current bound (block, then bucket
 at the shared floor) and computes a member's posting index as before
 (`row_index`); `or_bucket_of` no longer writes a bound.
+
+## A conjunction's instructions at 150M rows (branch `tinshape/conj-overhead`)
+
+Where a ranked conjunction's CPU goes, at `1e01d81`. Log, tools and
+outputs: `stannum-lab/conj-overhead/`.
+
+**By phase**, from the process's instruction counter read at each phase's
+ends in the replay (lab-only; the whole conjunction trace, 1,253 queries,
+timed passes, aarch64, millions per query):
+
+| part | instructions | share |
+| --- | ---: | ---: |
+| scorer build (TinQL, term lookups, BM25 constants) | 2.72 | 3.5% |
+| `Scorer::top_k` outside the segments | 0.46 | 0.6% |
+| per segment (14): terms opened (records, directories) | 0.44 | 0.6% |
+| per segment: walk setup (footers, scorer tables) | 0.23 | 0.3% |
+| per segment: the walk | 73.29 | 94.6% |
+| per segment: counts and drops after it | 0.37 | 0.5% |
+
+The replay keeps no term memo, so its scorer build walks a dictionary block
+per term and segment; the server memoizes those lookups. In the server
+(perf over 8 backends running conjunctions) planning is 1.7% of the
+backends' cycles, the executor 1.5%, the rest of PostgreSQL 0.7%, pins and
+the buffer manager 9.4%. Setup, scorer construction and term resolution
+are a few percent; the walk is the rest.
+
+**Within the walk**, each instruction counted to the innermost function of
+its source line, inlined code included (callgrind on aarch64 Linux over 4
+of the 14 segments, 98 queries):
+
+| part | share |
+| --- | ---: |
+| members decoded (the lead's, other terms' lists) | 34.4% |
+| intersection and filters (grids, merges, Elias-Fano probes) | 16.5% |
+| footers decoded as the walk reaches their blocks | 11.0% |
+| reads in place (page lookups, pins) | 7.6% |
+| directory lookups (a term's group, the next group) | 5.3% |
+| candidates: window, buckets, floors | 4.6% |
+| records and directories parsed | 3.0% |
+| scorer build | 1.7% |
+| group bounds | 1.2% |
+| the walk's loop and group releases | 1.2% |
+| candidates: length, score, top k | 1.1% |
+| allocation | 0.7% |
+| library code inlined in the walk's functions | 11.8% |
+
+Per query over the whole trace: 18,864 groups visited (2,703 skipped by
+their bound), 9,311 candidates examined, 1,237 scored, about 3,620 pages
+pinned; 4.1 K instructions a visited group, 21 K a page, 8.3 K an examined
+candidate. A visited group decodes its lead's members (about 22) and the
+next required term's (about 27, or probes them in place), and nine groups
+in ten end empty after one or two terms. What is not decoding is spread
+thin: no part outside decoding and intersecting is a tenth of the walk.
+
+Tried and not kept (instructions of the timed passes, 300 conjunctions):
+the required terms ordered per group by cost (grids, which test a bit per
+candidate, before lists, which decode, would have left nothing to decode
+in 6.6 of 9.0 thousand list steps a query) +14.6%, as looking every term
+up in every group costs more than the decodes saved; every scoring footer
+skimmed +0.4%; buckets read best bound first, stopping once the candidate
+falls short with the others at their window's bounds +1.0% (at the shared
+length floor, +2.2%; TF pages unchanged: candidates fall short only with
+every bucket read); containers decoded in place rather than pushed +0.1%;
+the sparse lead drained in chunks +1.9%; the Elias-Fano probe ratio at 8
++0.1%. The required term holding the fewest groups is the df-rarest one in
+all but 2 of 13 walks a query (22.3 K groups against 21.9 K). The final
+threshold known from the start (the replay's `--seed`) bounds what any
+early threshold could save: 6.1% of the instructions (examined 10,209 ->
+6,459, scored 1,192 -> 569, pages 3,620 -> 3,253).
+
+**Kept: the group's intersection through a bitmap.** A list's members are
+intersected with the candidates by marking the list in a bitmap over the
+group's slots, keeping the candidates whose bits are set, and clearing the
+marks (`bits::intersect_marked`), where `intersect_sorted` counted, per
+candidate, the list's values below it a stride at a time: a chain of
+dependent steps per candidate (count, then the stride's position, then
+the next count), 13% of a conjunction's cycles in the replay's sampled
+profile. Marking does more work but nothing waits on the step before.
+In the replay (aarch64, timed passes, 300 queries, base and change
+interleaved): conjunctions retire 2.1% more instructions (69.2 to 70.7 G)
+in 4% to 12% fewer cycles (seven pairs, median 7%), phrases 1.3% more in
+8% fewer. The same answers: the whole trace against `pg-ranked.tsv`, and
+`--full` byte-identical to `1e01d81`'s. On x86-64 `intersect_sorted`'s
+chain per candidate is a load, two compares, a pack, a move of the mask,
+a count and an add; marking is a few independent operations per value.
+Looking a member's posting index up by binary search rather than a scan
+changed nothing (conjunctions -0.2% instructions, phrases +0.1%).
+
+In the server (`vm_ab`, plain images, one round; host load near 28 on 16
+cores) the VM retired 1.7% more instructions per conjunction (96.8 to
+98.5 M), as in the replay, but its cycles did not resolve the change: the
+identical-binary control differed from the base by 5.7% in conjunction
+cycles and by 13% (conjunction) and 42% (disjunction, whose code did not
+change) in backend CPU. The server comparison is to be repeated on a quiet
+host.
 
 ## Open
 
