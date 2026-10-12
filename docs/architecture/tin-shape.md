@@ -351,10 +351,20 @@ whole inside one function compiled for its instruction set:
   `vpsadbw`). `STANNUM_KERNELS=scalar|avx2|avx512` forces a level the CPU
   has (tests, A/B runs); others are ignored.
 
+Elias-Fano lists are decoded a block at a time
+(`engine/src/tinshape/kernels/ef.rs`, the same per-call choice): the high
+parts a highs byte at a time (a table row per byte value, eight lanes
+stored at once, a word's byte ranks by one multiply), then the low parts
+eight at a time (eight values are `l` whole bytes: a shuffle, a shift per
+lane and a mask, per width up to 25 bits), into a list or straight into a
+cleared row; lists of fewer than 16 members by clamped eight-byte loads
+before the level is chosen. A sparse list drained a group at a time by its
+cursor stays scalar (a group holds a member or two of it).
+
 Not vectorized on either architecture: the OR walk's per-word and
 per-member weighing (a few terms' bounds a word; branch-free whole-group
-weighing measured slower), Elias-Fano decoding (serial over the highs' set
-bits), and TF-tail and DL reads (one packed value per candidate). Their
+weighing measured slower), and TF-tail and DL reads (one packed value per
+candidate). Their
 scattered `count_ones` and `trailing_zeros` become POPCNT and TZCNT only
 in an `x86-64-v3` or `-v4` build (a baseline build runs bit tricks); that
 difference, not the kernels, is what those builds measure.
@@ -492,6 +502,14 @@ the values a list holds, its highs passed a word at a time and only the
 lows of the values' buckets read) and `ef::EfCursor::list`;
 `positions::Positions::skip_entries(from, at, to)`;
 `boldi_vigna::PhrasePlan::leaves`.
+
+Added for Elias-Fano decoding (branch `tinshape/ef-simd`):
+`ef::Ef::{lows, highs, low_width}`; `engine::tinshape::kernels::{ef_decode,
+ef_into_row}` (and `_at` per level), `container_locals` and
+`container_row` (a group container's members appended to a list, or set
+in a cleared row: the walks' container decodes now go through them).
+Callers of `postings::for_each_local` for a walk's lists would rather use
+`container_locals`.
 
 Changed in phase B (callers of phase A's API): `Group` has `first` and
 `pages` (`slots()` is `pages * width`, `grid_bytes()` new);
@@ -1022,6 +1040,58 @@ reader cache no longer holds footers, so it keeps more records: 41 of a
 query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
 to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
+
+## Elias-Fano decoding a block at a time (branch `tinshape/ef-simd`)
+
+A walk decoded its Elias-Fano containers a member at a time
+(`Ef::for_each`: next set bit, low part from a bit stream, some 24
+instructions and a branch on the data). The block kernels
+(`kernels/ef.rs`, see "Word kernels and instruction sets") cut a
+container's decode, measured by `bench tnsef` on two segments' containers
+(instructions per member, aarch64; `for_each` -> NEON, into a list | into
+a cleared row):
+
+| members | list | row |
+| --- | ---: | ---: |
+| 1-7 | 101 -> 52 | 100 -> 58 |
+| 8-15 | 50 -> 31 | 53 -> 40 |
+| 32-63 | 35 -> 12 | 39 -> 22 |
+| 64-127 | 32 -> 8.3 | 36 -> 17 |
+| 128-511 | 31 -> 6.8 | 35 -> 15 |
+| all, density 64 | 42 -> 18 | 46 -> 28 |
+| all, density 32 | 37 -> 13 | 41 -> 23 |
+
+Timed, 64-127 members: 3.9x (list), 1.9x (row); 128-511: 4.7x, 1.5x.
+On a Sapphire Rapids devbox AVX2 is 1.7x the portable body overall, up
+to 5x on dense lists; AVX-512 machines run the same AVX2 bodies.
+
+Replay of the 150M trace (first 400 queries per style, 3 passes, timed
+instructions | cycles against `1e01d81`; aarch64, `--pin-ns 1000`, quiet
+machine): disjunction -5.7% | -3.0%, conjunction -4.9% | -2.1%; without
+pin costs, phrase -5.2% instructions. Answers: the whole trace equal to
+`pg-ranked.tsv`, `--full` byte-identical to `1e01d81`'s. x86-64 (Sapphire
+Rapids devbox, AVX2 bodies, perf user counts, 2 rounds, answers exact):
+conjunction -9.0% instructions | -5.3% cycles, disjunction -8.4% | -6.0%,
+phrase -6.9% | -4.2%. In PostgreSQL (vm_ab, aarch64): instructions per
+query -5% to -7% per style; its cycles were not resolved at this host's
+noise.
+
+Not kept: decoding a sparse term's per-group drains in bulk (a span found
+from the highs, then the block kernels). Those drains are many and long
+(258M members in 400 conjunctions, 640M in 400 disjunctions, two thirds
+in drains of 16 or more), but a span's setup cost about what its decode
+saved: disjunction instructions +0.8%, cycles +1.6% against the block
+kernels alone.
+
+Grid density 32 (`tnsregrid --grid-density 32`) still loses with the
+block kernels: fewer groups force grids, so more terms are sparse lists
+(2.3 to 2.9 times the drained members) and Elias-Fano containers grow.
+With pin costs, density 32 against 64, both with the kernels:
+disjunction instructions +13%, cycles +0.8%; conjunction +11%, +6%
+(without the kernels, +4% and +6.5% cycles). On x86-64 with the kernels:
+disjunction +17% instructions, +4.4% cycles; conjunction +21%, +9.8%.
+Keep 64. Log and tools:
+`stannum-lab/ef-simd/`.
 
 ## Open
 

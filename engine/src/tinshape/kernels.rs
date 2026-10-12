@@ -218,6 +218,11 @@ kernels! {
     fn prefix_counts / prefix_counts_at(bytes: &[u8], out: &mut Vec<u32>);
 }
 
+mod ef;
+pub use ef::{
+    container_locals, container_row, ef_decode, ef_decode_at, ef_into_row, ef_into_row_at,
+};
+
 #[inline(always)]
 fn le(c: &[u8]) -> u64 {
     u64::from_le_bytes(c.try_into().expect("eight bytes"))

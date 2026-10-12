@@ -101,6 +101,21 @@ impl<'a> Ef<'a> {
         self.n == 0
     }
 
+    /// The packed low parts: value `i`'s at bits `i * l .. (i + 1) * l`.
+    pub const fn lows(&self) -> &'a [u8] {
+        self.lows
+    }
+
+    /// The high parts in unary: value `i`'s high part `h` as bit `h + i`.
+    pub const fn highs(&self) -> &'a [u8] {
+        self.highs
+    }
+
+    /// `l`, the width of the low parts.
+    pub const fn low_width(&self) -> u32 {
+        self.low
+    }
+
     /// Calls `visit` with every value in order.
     #[inline]
     pub fn for_each(&self, mut visit: impl FnMut(u32)) {
