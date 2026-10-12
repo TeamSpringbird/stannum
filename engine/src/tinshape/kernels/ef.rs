@@ -229,6 +229,30 @@ fn lows_padded<'a>(ef: &Ef<'a>) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts(lows.as_ptr(), lows.len() + highs.len()) }
 }
 
+/// Word `w` of the highs, the last `highs_len` bytes of `padded` (see
+/// [`lows_padded`]): their last part-word by a load ending at their end,
+/// the bytes before it shifted out, where `padded` has eight bytes.
+#[inline(always)]
+fn highs_word(padded: &[u8], highs_len: usize, w: usize) -> u64 {
+    let at = padded.len() - highs_len + 8 * w;
+    if let Some(eight) = padded.get(at..at + 8) {
+        return u64::from_le_bytes(eight.try_into().expect("eight bytes"));
+    }
+    match padded.len().checked_sub(8) {
+        Some(last) => {
+            u64::from_le_bytes(padded[last..].try_into().expect("eight bytes")) >> (8 * (at - last))
+        }
+        None => part_word(&padded[at..]),
+    }
+}
+
+/// A part-word of fewer than eight bytes, assembled a byte at a time.
+#[cold]
+#[inline(never)]
+fn part_word(bytes: &[u8]) -> u64 {
+    segment::tinshape::bits::word(bytes, 0)
+}
+
 /// Values `i` with `i % 8 == 0` below the result have their eight low parts
 /// (from byte `i / 8 * l`) and the vector loads' reach (`half + 16` bytes
 /// from there) within `len` bytes.
@@ -394,10 +418,10 @@ mod scalar {
 /// attribute, if any.
 macro_rules! passes {
     ($(#[$tf:meta])*) => {
-        /// The high parts of the members whose set bits are in words
-        /// `w0..w1` of the highs, from member `idx`, stored from `dst`
-        /// (member `origin`'s place); stops after the word in which the
-        /// `n`-th member is found. The members found, counted from 0.
+        /// The high parts of `ef`'s members whose set bits are in words
+        /// `w0..w1` of its highs, from member `idx`, stored from `dst`
+        /// (member `origin`'s place); stops after the word in which its
+        /// last member is found. The members found, counted from 0.
         ///
         /// # Safety
         /// `dst` has room for members `origin..min(n, found) + SLACK`, and
@@ -405,21 +429,21 @@ macro_rules! passes {
         $(#[$tf])*
         #[inline]
         unsafe fn highs(
-            highs: &[u8],
+            ef: &Ef<'_>,
             w0: usize,
             w1: usize,
             mut idx: usize,
-            n: usize,
             dst: *mut u32,
             origin: usize,
         ) -> usize {
+            let (n, padded, highs_len) = (ef.len(), super::lows_padded(ef), ef.highs().len());
             for w in w0..w1 {
                 if idx >= n {
                     break;
                 }
                 // The last word may be part of one: its missing bytes are
                 // zero, so store lanes past its members, within the slack.
-                let word = segment::tinshape::bits::word(highs, w);
+                let word = super::highs_word(padded, highs_len, w);
                 // Byte k's rank in the word: the set bits of bytes 0..k.
                 let inclusive = super::byte_counts(word).wrapping_mul(0x0101_0101_0101_0101);
                 let s = ((w * 64) as u32).wrapping_sub(idx as u32);
@@ -478,7 +502,7 @@ macro_rules! passes {
             unsafe {
                 let dst = out.as_mut_ptr().add(start);
                 let words = highs_bytes.len().div_ceil(8);
-                let found = highs(highs_bytes, 0, words, 0, n, dst, 0).min(n);
+                let found = highs(&ef, 0, words, 0, dst, 0).min(n);
                 // The last eight `combine` may take: initialized.
                 dst.add(found).write_bytes(0, 8);
                 combine(lows, ef.low_width(), 0, found, dst);
@@ -514,7 +538,7 @@ macro_rules! passes {
                     let from = idx;
                     let origin = from & !7;
                     dst.write_bytes(0, from - origin);
-                    idx = highs(highs_bytes, w, w1, idx, n, dst, origin);
+                    idx = highs(&ef, w, w1, idx, dst, origin);
                     let to = idx.min(n);
                     w = w1;
                     if to == from {
