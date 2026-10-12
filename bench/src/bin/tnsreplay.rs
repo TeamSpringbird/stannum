@@ -10,7 +10,8 @@
 //! ```text
 //! cargo run -p bench --release --bin tnsreplay -- --dump DIR --trace trace.tsv \
 //!     [--expect pg.tsv] [--style S] [--k 10] [--repeat 3] [--limit N] \
-//!     [--keep] [--threads N] [--seconds S] [--per-query FILE] [--out FILE]
+//!     [--keep] [--threads N] [--seconds S] [--per-query FILE] [--out FILE] \
+//!     [--per-segment FILE] [--order O] [--seed] [--timed-walk]
 //! ```
 //!
 //! Each segment is read from memory and kept across queries with its
@@ -22,6 +23,14 @@
 //! segment at a time into shared rows, which must give the same rows.
 //! `--threads N --seconds S` runs N threads, each with its own segments,
 //! over the trace for S seconds and reports queries per second.
+//!
+//! The second pass measures what the threshold costs across segments:
+//! `--per-segment FILE` writes, per query and segment in the order walked,
+//! the threshold the segment started from, the final one and the walk's
+//! counters there; `--order` walks the segments in another order than the
+//! engine's (largest first); `--seed` starts it from the final rows (found
+//! again, they are not kept twice); `--timed-walk` times that pass, without
+//! pages, instead of the extension's path.
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -63,13 +72,40 @@ struct Args {
     threads: usize,
     seconds: f64,
     per_query: Option<PathBuf>,
+    /// Per query and segment, what the instrumented pass did there and the
+    /// threshold it started from.
+    per_segment: Option<PathBuf>,
+    /// The order the instrumented pass walks the segments in (see
+    /// [`SegmentOrder`]).
+    order: SegmentOrder,
+    /// Time the instrumented pass's walk (a segment at a time in `order`,
+    /// seeded with `--seed`) rather than the extension's path.
+    timed_walk: bool,
     out: Option<PathBuf>,
+}
+
+/// Orders of the instrumented pass's segments, to measure what an order
+/// costs: the engine's own (`engine`), by generation (`gen`, `gen-desc`),
+/// smallest first (`docs-asc`), or by how many of the final rows each
+/// segment holds, most first (`final`, a ceiling no walk can know).
+#[derive(Clone, Copy, PartialEq)]
+enum SegmentOrder {
+    Engine,
+    Generation,
+    GenerationDesc,
+    DocsAscending,
+    /// The smallest segment, then the engine's order.
+    SmallFirst,
+    /// By the scoring terms' summed record bounds in the segment.
+    Bound,
+    Final,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
-         [--repeat N] [--limit N] [--memory [--keep]] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--out FILE]"
+         [--repeat N] [--limit N] [--memory [--keep]] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--timed-walk] [--out FILE]"
     );
     std::process::exit(2)
 }
@@ -93,6 +129,9 @@ fn args() -> Args {
         threads: 0,
         seconds: 20.0,
         per_query: None,
+        per_segment: None,
+        order: SegmentOrder::Engine,
+        timed_walk: false,
         out: None,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
@@ -116,6 +155,20 @@ fn args() -> Args {
             "--threads" => a.threads = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--seconds" => a.seconds = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--per-query" => a.per_query = Some(value(&mut it).into()),
+            "--timed-walk" => a.timed_walk = true,
+            "--per-segment" => a.per_segment = Some(value(&mut it).into()),
+            "--order" => {
+                a.order = match value(&mut it).as_str() {
+                    "engine" => SegmentOrder::Engine,
+                    "gen" => SegmentOrder::Generation,
+                    "gen-desc" => SegmentOrder::GenerationDesc,
+                    "docs-asc" => SegmentOrder::DocsAscending,
+                    "small-first" => SegmentOrder::SmallFirst,
+                    "bound" => SegmentOrder::Bound,
+                    "final" => SegmentOrder::Final,
+                    _ => usage(),
+                }
+            }
             "--out" => a.out = Some(value(&mut it).into()),
             _ => usage(),
         }
@@ -646,27 +699,34 @@ impl Reader {
         Some(top.rows)
     }
 
-    /// The same walk, a segment at a time, with pages and counters.
+    /// The same walk, a segment at a time in `order`, with pages and
+    /// counters, and per segment what the walk did there.
     fn instrumented(
         &self,
         scorer: &Scorer,
         k: usize,
         pages: &mut Pages,
         seed: Option<&[(f32, Tid)]>,
-    ) -> Option<(Vec<(f32, Tid)>, tin::RankedAnswer)> {
+        order: SegmentOrder,
+        answer: &[(f32, Tid)],
+    ) -> Option<Instrumented> {
         let mut names = Vec::new();
         let node = tin::lower(&scorer.query, &mut names)?;
-        let mut order: Vec<usize> = (0..self.segs.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(self.segs[i].segment.documents));
+        let visit = self.visit(&names, scorer, order, answer);
         let mut top = TopRows::new(k, false);
         // A measurement aid: the final rows kept from the start, so the
-        // walk prunes against the final threshold throughout.
+        // walk prunes against the final threshold throughout. A walk finding
+        // one of them again must not keep it twice (the bar would rise past
+        // the final threshold): they are not visible to it.
         for row in seed.unwrap_or(&[]) {
             top.push(engine::walk::Ranked(row.0, row.1));
         }
+        let mut visibility = Unseeded(seed.unwrap_or(&[]).iter().map(|row| row.1).collect());
         let mut total = tin::RankedAnswer::default();
-        for i in order {
+        let mut work = Vec::with_capacity(visit.len());
+        for i in visit {
             let seg = &self.segs[i];
+            let (bar, pages0, pins0) = (top.bar(), pages.total(), PINS.get());
             pages.touch_meta(i);
             let a = seg
                 .with(&names, |segment| {
@@ -676,7 +736,7 @@ impl Reader {
                         &names,
                         &scorer.terms,
                         &mut top,
-                        &mut AllVisible,
+                        &mut visibility,
                         &mut Offset {
                             pages: &mut *pages,
                             base: i << 40,
@@ -684,14 +744,144 @@ impl Reader {
                     )
                 })
                 .ok()?;
+            work.push(SegmentWork {
+                generation: seg.generation,
+                documents: seg.segment.documents,
+                theta: bar.map(|b| b.0),
+                groups: a.windows,
+                pruned: a.windows_pruned,
+                examined: a.candidates,
+                scored: a.scored,
+                pages: (pages.total() - pages0) as u64,
+                pins: PINS.get() - pins0,
+            });
             total.scored += a.scored;
             total.candidates += a.candidates;
             total.position_checks += a.position_checks;
             total.windows += a.windows;
             total.windows_pruned += a.windows_pruned;
         }
-        Some((top.into_rows(), total))
+        Some((top.into_rows(), total, work))
     }
+
+    /// The instrumented pass's walk without pages or counters, to time it
+    /// (`--timed-walk`): seeded or not, in `order`.
+    fn walked(
+        &self,
+        scorer: &Scorer,
+        k: usize,
+        seed: Option<&[(f32, Tid)]>,
+        order: SegmentOrder,
+        answer: &[(f32, Tid)],
+    ) -> Option<Vec<(f32, Tid)>> {
+        let mut names = Vec::new();
+        let node = tin::lower(&scorer.query, &mut names)?;
+        let visit = self.visit(&names, scorer, order, answer);
+        let mut top = TopRows::new(k, false);
+        for row in seed.unwrap_or(&[]) {
+            top.push(engine::walk::Ranked(row.0, row.1));
+        }
+        let mut visibility = Unseeded(seed.unwrap_or(&[]).iter().map(|row| row.1).collect());
+        for i in visit {
+            self.segs[i]
+                .with(&names, |segment| {
+                    tin::top_k_into(
+                        segment,
+                        &node,
+                        &names,
+                        &scorer.terms,
+                        &mut top,
+                        &mut visibility,
+                        &mut NoTouch,
+                    )
+                })
+                .ok()?;
+        }
+        Some(top.into_rows())
+    }
+
+    /// The segments in `order`.
+    fn visit(
+        &self,
+        names: &[String],
+        scorer: &Scorer,
+        order: SegmentOrder,
+        answer: &[(f32, Tid)],
+    ) -> Vec<usize> {
+        let mut visit: Vec<usize> = (0..self.segs.len()).collect();
+        visit.sort_by_key(|&i| std::cmp::Reverse(self.segs[i].segment.documents));
+        match order {
+            SegmentOrder::SmallFirst => {
+                if let Some(smallest) = visit.pop() {
+                    visit.insert(0, smallest);
+                }
+            }
+            SegmentOrder::Bound => {
+                let bound: Vec<f32> = self
+                    .segs
+                    .iter()
+                    .map(|seg| {
+                        let mut sum = 0.0_f32;
+                        for (name, term) in &scorer.terms {
+                            if let Ok(Some(entry)) = seg.reader.term_entry(name)
+                                && let Some(bucket) =
+                                    segment::tf_bucket::TfBucket::new(entry.max_tf_bucket)
+                            {
+                                sum += term.bound_through(bucket, 0);
+                            }
+                        }
+                        sum
+                    })
+                    .collect();
+                visit.sort_by(|a, b| bound[*b].total_cmp(&bound[*a]));
+            }
+            SegmentOrder::Engine => {}
+            SegmentOrder::Generation => visit.sort_by_key(|&i| self.segs[i].generation),
+            SegmentOrder::GenerationDesc => {
+                visit.sort_by_key(|&i| std::cmp::Reverse(self.segs[i].generation));
+            }
+            SegmentOrder::DocsAscending => visit.reverse(),
+            SegmentOrder::Final => {
+                let held: Vec<usize> = (0..self.segs.len())
+                    .map(|i| {
+                        self.segs[i]
+                            .with(names, |segment| {
+                                let mut held = 0;
+                                for row in answer {
+                                    held += usize::from(
+                                        tin::score_at(segment, &scorer.terms, row.1)?.is_some(),
+                                    );
+                                }
+                                Ok(held)
+                            })
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                // Stable: segments holding as many rows keep the engine's order.
+                visit.sort_by_key(|&i| std::cmp::Reverse(held[i]));
+            }
+        }
+        visit
+    }
+}
+
+/// The instrumented pass's rows, its counters, and per segment what it did.
+type Instrumented = (Vec<(f32, Tid)>, tin::RankedAnswer, Vec<SegmentWork>);
+
+/// What the instrumented pass did in one segment: the threshold it
+/// started from (`None` before `k` rows were kept), the groups it visited
+/// and of those skipped by their bounds, the candidates it examined and
+/// scored, the distinct pages it touched and the pages it pinned.
+struct SegmentWork {
+    generation: u32,
+    documents: u32,
+    theta: Option<f32>,
+    groups: u64,
+    pruned: u64,
+    examined: u64,
+    scored: u64,
+    pages: u64,
+    pins: u64,
 }
 
 /// Pages of segment `i` counted apart from another segment's.
@@ -722,6 +912,15 @@ struct AllVisible;
 impl Visibility for AllVisible {
     fn visible(&mut self, _: Tid) -> bool {
         true
+    }
+}
+
+/// Every row but the seeded ones (see [`Reader::instrumented`]).
+struct Unseeded(FxHashSet<Tid>);
+
+impl Visibility for Unseeded {
+    fn visible(&mut self, tid: Tid) -> bool {
+        !self.0.contains(&tid)
     }
 }
 
@@ -794,6 +993,8 @@ struct Row {
     walk_allocs: Allocs,
     /// Instructions and cycles of the timed passes, all of them.
     timed: (u64, u64),
+    /// The instrumented pass, per segment in the order walked.
+    segments: Vec<SegmentWork>,
 }
 
 fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Result<(), String> {
@@ -912,7 +1113,17 @@ fn run() -> Result<bool, String> {
             let a0 = Allocs::now();
             let scorer = reader.scorer(&q.text)?;
             let a1 = Allocs::now();
-            std::hint::black_box(reader.ranked(&scorer, args.k));
+            if args.timed_walk {
+                std::hint::black_box(reader.walked(
+                    &scorer,
+                    args.k,
+                    args.seed.then_some(answer.as_slice()),
+                    args.order,
+                    &answer,
+                ));
+            } else {
+                std::hint::black_box(reader.ranked(&scorer, args.k));
+            }
             let a2 = Allocs::now();
             times.push(at.elapsed().as_nanos() as u64);
             (scorer_allocs, walk_allocs) = (a1.since(a0), a2.since(a1));
@@ -926,12 +1137,14 @@ fn run() -> Result<bool, String> {
             refs.hash_ops
         });
         segment::tinshape::blob::reset_stats();
-        let (direct, counters) = reader
+        let (direct, counters, segments) = reader
             .instrumented(
                 &scorer,
                 args.k,
                 &mut pages,
                 args.seed.then_some(answer.as_slice()),
+                args.order,
+                &answer,
             )
             .ok_or("an instrumented walk failed")?;
         if direct != answer && !args.seed {
@@ -953,6 +1166,7 @@ fn run() -> Result<bool, String> {
             scorer_allocs,
             walk_allocs,
             timed,
+            segments,
         });
         if (n + 1) % 500 == 0 {
             eprintln!("{} of {}", n + 1, trace.len());
@@ -1249,6 +1463,35 @@ fn run() -> Result<bool, String> {
                 r.walk_allocs.allocs,
                 r.walk_allocs.reallocs,
             );
+        }
+        std::fs::write(path, text).map_err(|e| e.to_string())?;
+    }
+    if let Some(path) = &args.per_segment {
+        let mut text = String::from(
+            "name\tstyle\tstep\tgeneration\tdocuments\ttheta\tfinal\tgroups\tpruned\texamined\tscored\tpages\tpins\n",
+        );
+        for r in &rows {
+            // The final threshold: the k-th row's score (none with fewer).
+            let last = (r.rows.len() == args.k).then(|| r.rows[args.k - 1].0);
+            let show = |t: Option<f32>| t.map_or_else(|| "-".to_owned(), |t| t.to_string());
+            for (step, w) in r.segments.iter().enumerate() {
+                let _ = writeln!(
+                    text,
+                    "{}\t{}\t{step}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    r.name,
+                    r.style,
+                    w.generation,
+                    w.documents,
+                    show(w.theta),
+                    show(last),
+                    w.groups,
+                    w.pruned,
+                    w.examined,
+                    w.scored,
+                    w.pages,
+                    w.pins,
+                );
+            }
         }
         std::fs::write(path, text).map_err(|e| e.to_string())?;
     }
