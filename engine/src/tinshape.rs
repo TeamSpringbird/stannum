@@ -3183,6 +3183,121 @@ mod tests {
         );
     }
 
+    /// A disjunction's term names, the scorers its walk is given, and its
+    /// exact top `k`.
+    type BruteForce = (Vec<String>, Vec<(String, TermScorer)>, Vec<(f32, Tid)>);
+
+    /// The exact top `k` of a disjunction of `members` over live `docs`,
+    /// by brute force.
+    fn disjunction_by_brute_force(
+        docs: &[Tid],
+        lengths: &[u32],
+        members: &[Vec<(usize, u32)>],
+        dead: &[bool],
+        k: usize,
+    ) -> BruteForce {
+        let names: Vec<String> = (0..members.len()).map(|t| format!("t{t}")).collect();
+        let scorers: Vec<(String, TermScorer)> = (0..members.len())
+            .filter(|t| !members[*t].is_empty())
+            .map(|t| {
+                let df = members[t].len() as u64;
+                let scorer = TermScorer::from_statistics(
+                    docs.len() as u64,
+                    df,
+                    1.0,
+                    Bm25Params::default(),
+                    20.0,
+                )
+                .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let mut want: Vec<(f32, Tid)> = (0..docs.len())
+            .filter(|r| !dead[*r])
+            .filter_map(|r| {
+                let mut total = None::<f32>;
+                for (name, scorer) in &scorers {
+                    let t: usize = name[1..].parse().unwrap();
+                    if let Some(tf) = holds(members, t, r) {
+                        total = Some(
+                            total.unwrap_or(0.0)
+                                + scorer.score_bucket(TfBucket::from_count(tf), lengths[r]),
+                        );
+                    }
+                }
+                total.map(|s| (s, docs[r]))
+            })
+            .collect();
+        want.sort_by(crate::walk::rank);
+        want.truncate(k);
+        (names, scorers, want)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+        /// Disjunctions of terms of any density over groups of many words,
+        /// some documents dead, match brute force, from no threshold and
+        /// from the final one.
+        #[test]
+        fn dense_disjunctions_match_brute_force(
+            per_page in 5u32..60,
+            pages in 300u32..700,
+            density in prop::collection::vec(prop::sample::select(vec![1u32, 7, 40, 150, 600, 3_000, 9_000]), 2..6),
+            grid_density in prop::sample::select(vec![0u32, 16, 64]),
+            paged in any::<bool>(),
+            block_size in prop::sample::select(vec![16u32, 128]),
+            k in 1usize..25,
+            seed in any::<u64>(),
+        ) {
+            let n = (per_page * pages) as usize;
+            let docs: Vec<Tid> = (0..n as u32)
+                .map(|i| Tid { block: i / per_page, offset: (i % per_page) as u16 + 1 })
+                .collect();
+            let mut state = seed | 1;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let lengths: Vec<u32> = (0..n).map(|_| (next() % 40) as u32 + 3).collect();
+            // Term t holds a document with probability density[t] in 10,000.
+            let mut members: Vec<Vec<(usize, u32)>> = vec![Vec::new(); density.len()];
+            for (t, d) in density.iter().enumerate() {
+                for r in 0..n {
+                    if next() % 10_000 < u64::from(*d) {
+                        let tf = (next() % 5) as u32 + 1;
+                        members[t].push((r, tf));
+                    }
+                }
+            }
+            let dead: Vec<bool> = (0..n).map(|_| next() % 50 == 0).collect();
+            let all: Vec<usize> = (0..n).collect();
+            let options = Options { block_size, grid_density, paged, grid_min_postings: 0, inline_lengths_min_documents: 0, ..Options::default() };
+            let blob = build_part(&docs, &lengths, &members, &all, &dead, options);
+            let segment = Segment::parse(&blob).unwrap();
+            let (names, scorers, want) = disjunction_by_brute_force(&docs, &lengths, &members, &dead, k);
+            let node = Node::Or((0..members.len()).map(Node::Term).collect());
+            let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
+            let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+            prop_assert_eq!(bits(&got.rows), bits(&want));
+            // From the final threshold: rows of another source, each ranking
+            // just after the k-th, so the walk must find every row of
+            // `want` and no other.
+            let mut seeded = crate::walk::TopRows::new(k, false);
+            if want.len() == k {
+                for i in 0..k {
+                    let tid = Tid { block: u32::MAX - i as u32, offset: 1 };
+                    seeded.push(crate::walk::Ranked(want[k - 1].0, tid));
+                }
+            }
+            top_k_into(&segment, &node, &names, &scorers, &mut seeded, &mut AllVisible, &mut NoTouch).unwrap();
+            let mut rows = seeded.into_rows();
+            rows.sort_by(crate::walk::rank);
+            prop_assert_eq!(bits(&rows), bits(&want));
+        }
+    }
+
     /// A conjunction reads a common word's bucket last, and only for a
     /// candidate the rarer word's bucket leaves in reach: a rare word's
     /// bucket of 1 in a block that also holds a 6 rules the candidate out

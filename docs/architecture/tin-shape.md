@@ -1023,6 +1023,39 @@ query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
 to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
 
+## Disjunction rows in place at 150M rows (branch `tinshape/or-rows`)
+
+The disjunction walk decodes every present term's container into a row
+of the group. Lower grid densities shrink the payload (grid_density 32 /
+16: payload pages per score disjunction 5,164 -> 3,352 / 2,086, pins
+7,772 -> 5,873 / 4,592) but cost instructions (1,033-1,054 -> 1,238-1,246
+/ 1,581-1,591 G per 400 disjunctions x 4 passes), because more
+containers are Elias-Fano rather than grids.
+
+- Ceiling: decoding the rows of terms the mask is not built from
+  (Elias-Fano containers, sparse lists, locals) a second time costs 5.6%
+  of the walk's instructions at density 64 and 11.8% at 32. Those rows
+  hold 41% / 46% of their members in the mask's live words (about 40 of a
+  group's ~113). The mask's own terms (required, essential) are decoded
+  in full by any walk. Their decoding grows with lower densities too (18%
+  of g32 samples, against 19.5% for the other rows, and sparse lists
+  11%).
+- Measured (exact, not kept; branch `tinshape/or-rows-inplace`): the
+  other rows filled a word at a time where a mask word is weighed, highest
+  bound first, stopping once the word is cut (a safe f64 margin), and
+  passing the values between by their high bits. Every row in place:
+  +5-10% instructions at 64, +8-11% at 32. Only rows holding more than 3x
+  the mask's live words: +2.7% at 64, flat at 32, -6% at 16. Only sparse
+  rows: worse. The cursor steps are data-dependent branches (44% of g32
+  samples went to word_at, pass_to, the early cut and the fill), while
+  the row decode is a predictable stream of about 24 instructions a
+  member. Decoding on demand would skip only the ~10% of rows no word asks
+  for.
+- So the row expansion is not what blocks lower densities. It is the
+  Elias-Fano decode per member, for every term. Keep grid_density 64. A
+  lower one needs a cheaper decode (SIMD lows and positions) or a
+  container whose word test costs no member steps.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
