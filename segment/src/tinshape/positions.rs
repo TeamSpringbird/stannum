@@ -429,6 +429,50 @@ mod tests {
         }
     }
 
+    /// Read in place from pages far smaller than its entries' runs, every
+    /// entry is located, skipped to and decoded as from memory (windows
+    /// across a page's end are stitched).
+    #[test]
+    fn reads_in_place_across_page_ends() {
+        use super::super::blob::{LazyBlob, PinningSource};
+        let count = SUB_MIN + 100;
+        let entries: Vec<Vec<u32>> = (0..count)
+            .map(|i| {
+                let n = match i % 9 {
+                    0 => 40,
+                    1 | 2 => 3,
+                    _ => 1,
+                };
+                (0..n).map(|p| p * (i % 500 + 1) + i % 3).collect()
+            })
+            .collect();
+        let encoded = encode(&stream(&entries), SUB_SHARE * SUB_MIN).unwrap();
+        let memory = Positions::parse(&encoded[..]).unwrap();
+        let mut starts = vec![memory.data_at];
+        for index in 0..count {
+            starts.push(memory.skip(index, *starts.last().unwrap()).unwrap());
+        }
+        for page_len in [7, 64, 1000] {
+            let blob = LazyBlob::new(Box::new(PinningSource::new(encoded.clone(), page_len)));
+            blob.open_span();
+            let positions = Positions::parse(blob.bytes()).unwrap();
+            let mut out = Vec::new();
+            for index in 0..count {
+                let (entry, at, _) = positions.locate(index).unwrap();
+                let at = positions.skip_entries(entry, at, index).unwrap();
+                assert_eq!(at, starts[index as usize], "{index} in pages of {page_len}");
+                let next = positions.read_entry(index, at, &mut out).unwrap();
+                assert_eq!(next, starts[index as usize + 1]);
+                assert_eq!(
+                    out, entries[index as usize],
+                    "{index} in pages of {page_len}"
+                );
+            }
+            // SAFETY: no slice of the span is used past here.
+            unsafe { blob.close_span() };
+        }
+    }
+
     #[test]
     fn long_blocks_fall_back_to_skips() {
         // Entries of 3,000 two-byte positions: a block of 32 is far over
