@@ -1377,7 +1377,10 @@ fn fold_bound(pairs: &[(u8, u32)], bound: &mut impl FnMut(u8, u32) -> f32) -> f3
 
 /// [`footer_entry_fast`] taking each pair's `bound` as it is read, rather
 /// than keeping the pairs: the gap, the entry's length, its largest
-/// bucket (its last pair's) and [`fold_bound`] of its pairs.
+/// bucket (its last pair's) and [`fold_bound`] of its pairs. (The readers'
+/// reference in the tests; [`LazyFooter::decode_bounds`] bounds a window's
+/// pairs at once.)
+#[cfg(test)]
 #[inline(always)]
 fn footer_entry_bound(
     bytes: &[u8],
@@ -1929,6 +1932,7 @@ impl<'a> LazyFooter<'a> {
     pub fn decode_bounds(
         &mut self,
         mut bound: impl FnMut(u8, u32) -> f32,
+        mut bound_pairs: impl FnMut(&[(u8, u32)], &mut [f32]),
         bounds: &mut Vec<f32>,
     ) -> Result<()> {
         bounds.reserve_exact(self.blocks);
@@ -1944,28 +1948,37 @@ impl<'a> LazyFooter<'a> {
         self.kept = false;
         self.maxb.reserve_exact(self.blocks);
         let full = bits::packed_len(self.block_size as usize, 1) as u64;
+        let mut values = Vec::new();
         loop {
             // The entries well within the window, in one loop: each one's
-            // pairs taken and dropped, its bytes copied with the rest after.
+            // pairs parsed into the frontier (with where each block's end,
+            // in `ends`, both scratch here) and bounded all at once after,
+            // the best per block; its bytes copied with the rest after.
             let (window, window_at) = (self.window, self.window_at);
             let start = self.at;
             let (mut at, mut next_last, mut next_tf) = (self.at, self.next_last, self.next_tf);
             let mut b = self.last.len();
             let raw = self.raw.len();
+            self.frontier.clear();
+            self.ends.clear();
             while b + 1 < self.blocks {
-                let Some((gap, len, max, v)) = window
+                let Some((gap, len)) = window
                     .get(at - window_at..)
-                    .and_then(|bytes| footer_entry_bound(bytes, &mut bound))
+                    .and_then(|bytes| footer_entry_fast(bytes, &mut self.frontier))
                 else {
                     break;
                 };
                 let Ok(last) = u32::try_from(next_last + gap) else {
                     // Reported by the block's slow decode.
+                    let end = self.ends.last().map_or(0, |e| *e as usize);
+                    self.frontier.truncate(end);
                     break;
                 };
                 next_last += gap;
+                let end = self.frontier.len();
+                let max = self.frontier[end - 1].0;
                 let width = tf_width(max, self.adaptive);
-                bounds.push(v);
+                self.ends.push(end as u32);
                 self.maxb.push(max);
                 self.last.push(last);
                 self.entries.push((raw + (at - start)) as u32);
@@ -1979,6 +1992,16 @@ impl<'a> LazyFooter<'a> {
                 at += len;
                 b += 1;
             }
+            values.resize(self.frontier.len(), 0.0);
+            bound_pairs(&self.frontier, &mut values);
+            let mut from = 0;
+            for &end in &self.ends {
+                let end = end as usize;
+                bounds.push(values[from..end].iter().copied().fold(0.0_f32, f32::max));
+                from = end;
+            }
+            self.frontier.clear();
+            self.ends.clear();
             if at > start {
                 self.raw
                     .extend_from_slice(&window[start - window_at..at - window_at]);
@@ -2383,6 +2406,11 @@ mod tests {
     }
 
     /// The bound [`LazyFooter::decode_bounds`] gives a block of `pairs`.
+    pub(super) fn pairs_bound(pairs: &[(u8, u32)], out: &mut [f32]) {
+        for (v, (bucket, length)) in out.iter_mut().zip(pairs) {
+            *v = pair_bound(*bucket, *length);
+        }
+    }
     pub(super) fn test_bound(pairs: &[(u8, u32)]) -> f32 {
         pairs
             .iter()
@@ -2446,7 +2474,7 @@ mod tests {
     /// and buckets as the whole footer does.
     fn check_bounds(mut l: LazyFooter<'_>, parsed: &Postings<'_>, footer: &Footer) {
         let mut bounds = Vec::new();
-        l.decode_bounds(pair_bound, &mut bounds).unwrap();
+        l.decode_bounds(pair_bound, pairs_bound, &mut bounds).unwrap();
         assert_eq!(l.decoded(), footer.blocks());
         assert_eq!(bounds.len(), footer.blocks());
         for (b, bound) in bounds.iter().enumerate() {
@@ -2909,7 +2937,7 @@ mod lazy_footer_tests {
         let mut lazy = parsed.lazy_footer(4, 15, true).unwrap();
         lazy.release_passed();
         let mut bounds = Vec::new();
-        lazy.decode_bounds(super::tests::pair_bound, &mut bounds)
+        lazy.decode_bounds(super::tests::pair_bound, super::tests::pairs_bound, &mut bounds)
             .unwrap();
         assert!(
             source.0.early.get() > 10,

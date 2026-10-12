@@ -415,6 +415,39 @@ impl TermScorer {
             .fold(0.0_f32, f32::max)
     }
 
+    /// [`Self::bound_through`] of each `(bucket, length)` pair into `out`:
+    /// lanes at a time where the scorer rises with the bucket (the common
+    /// case: one division per pair), else one at a time.
+    pub fn bound_pairs(&self, pairs: &[(u8, u32)], out: &mut [f32]) {
+        assert_eq!(pairs.len(), out.len(), "a bound per pair");
+        if !self.rises {
+            for (v, &(bucket, length)) in out.iter_mut().zip(pairs) {
+                let bucket = TfBucket::new(bucket).expect("a valid bucket");
+                *v = self.bound_through(bucket, length);
+            }
+            return;
+        }
+        // The pairs split into their lanes' inputs, a stack of them at a time.
+        const BATCH: usize = 64;
+        let mut buckets = [0u8; BATCH];
+        let mut lengths = [0u32; BATCH];
+        for (chunk, out) in pairs.chunks(BATCH).zip(out.chunks_mut(BATCH)) {
+            for (i, &(bucket, length)) in chunk.iter().enumerate() {
+                buckets[i] = bucket;
+                lengths[i] = length;
+            }
+            let n = chunk.len();
+            crate::tinshape::kernels::score_pairs(
+                &self.numerator,
+                &self.denominator_constant,
+                self.document_length_factor,
+                &buckets[..n],
+                &lengths[..n],
+                out,
+            );
+        }
+    }
+
     /// What bounds a score from its bucket and length alone: per bucket
     /// `b`, the largest numerator and the smallest denominator constant
     /// over the buckets up to `b`, and the length factor. Every bucket up to

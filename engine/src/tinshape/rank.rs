@@ -193,6 +193,7 @@ impl<'a> Sc<'a> {
                 |bucket, length| {
                     scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
                 },
+                |pairs, out| scorer.bound_pairs(pairs, out),
                 &mut self.bounds,
             )
             .unwrap_or_else(|e| corrupt_footer(e));
