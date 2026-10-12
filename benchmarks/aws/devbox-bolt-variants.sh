@@ -4,7 +4,7 @@
 
 # A devbox.sh --cmd-file: build-only options for the 150M replay on one x86
 # box, measured against each other (docs/benchmarks.md#bolt-and-cpu-levels).
-#   devbox.sh --branch bench/bolt-variants --dump --hours 3 --cmd-file benchmarks/aws/devbox-bolt-variants.sh
+#   devbox.sh --branch bench/bolt-variants --dump --on-demand --cmd-file benchmarks/aws/devbox-bolt-variants.sh
 # Builds tnsreplay five ways from one source: plain; PGO; x86-64-v3 + PGO;
 # x86-64-v4 + PGO (each level trains its own replay profile, as
 # script/pgo-build replay does); and PGO + BOLT (script/bolt-build: LBR if

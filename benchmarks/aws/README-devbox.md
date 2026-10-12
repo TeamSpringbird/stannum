@@ -17,6 +17,8 @@ benchmarks/aws/devbox.sh --branch my-branch --dump --cmd 'cargo build --release 
   --dump $DATA/dump150m --trace $DATA/trace.tsv --expect $DATA/pg-ranked.tsv --style conjunction --limit 400 --repeat 3 > $OUT/replay.txt'
 # A/B: two trees on one box, SRC1 and SRC2, CMD in a file
 benchmarks/aws/devbox.sh --branch base --branch candidate --dump --cmd-file benchmarks/aws/devbox-replay-ab.sh
+# build options of one tree: plain, PGO, x86-64-v3/v4 + PGO, PGO + BOLT (an hour: on-demand)
+benchmarks/aws/devbox.sh --branch my-branch --dump --on-demand --cmd-file benchmarks/aws/devbox-bolt-variants.sh
 benchmarks/aws/devbox.sh --list                # live devboxes
 benchmarks/aws/devbox.sh --terminate ID|all    # kill one, or every devbox
 benchmarks/aws/devbox.sh --ledger              # instance-hours and cost so far
@@ -27,6 +29,10 @@ Options: `--type c7i.2xlarge` (default; 8 vCPU, 16 GiB), `c7i.xlarge`
 because `tnsreplay` reads all 37.5 GB of segments into memory). `--hours N`
 (1 to 3, default 2) is a hard limit: the box runs `shutdown -h +N*60` with
 instance-initiated shutdown = terminate. `--env K=V` sets variables for CMD.
+`--on-demand` skips spot: on 2026-10-12 two r7i.2xlarge spot boxes in a
+row were reclaimed 15 and 55 minutes in, so take on-demand for sessions
+that cannot be lost (a command file can also upload `$OUT` as it goes, as
+`devbox-bolt-variants.sh` does, so a reclaim keeps what was done).
 
 ## What a call does
 
@@ -58,7 +64,9 @@ c7i.xlarge and $0.16 to $0.22/h for r7i.2xlarge in October 2026 (on-demand
 $0.357, $0.179, $0.529). Measured: engine + segment tests at four kernel
 settings took 3 minutes of box time ($0.01); the dump sync takes 75 s and a
 two-tree replay A/B (`devbox-replay-ab.sh`: builds, tnsef, 10 replays) 23
-minutes ($0.07 with the volume).
+minutes ($0.07 with the volume). `devbox-bolt-variants.sh` (five builds,
+three PGO trainings, a BOLT training, 15 replays) took 62 minutes ($0.59
+on-demand with the volume).
 
 On these VM sizes perf sees the core events (instructions, cycles,
 branches, branch-misses, L1 cache events); `machine.txt` records which

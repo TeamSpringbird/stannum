@@ -5,7 +5,7 @@
 
 # Optimizes the code layout of a built ELF file (an executable or a shared
 # library such as the extension's stannum.so) with LLVM BOLT, from a profile
-# of a training command. See docs/benchmarks.md#bolt.
+# of a training command. See docs/benchmarks.md#bolt-and-cpu-levels.
 #
 #   script/bolt-build ELF [--out FILE] [--mode instrument|lbr|sample] [--profile DIR] -- CMD...
 #
