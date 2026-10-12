@@ -681,15 +681,21 @@ mod avx2 {
         // SAFETY: table rows are 16 bytes; each store is at `d + before_k`,
         // below `d + 64`, and eight lanes long.
         unsafe {
+            // Byte k's base, s + 8k - before_k, for the eight together; each
+            // byte's taken by a lane permute.
+            let bases = _mm256_sub_epi32(
+                _mm256_add_epi32(
+                    _mm256_set1_epi32(s as i32),
+                    _mm256_setr_epi32(0, 8, 16, 24, 32, 40, 48, 56),
+                ),
+                _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(before as i64)),
+            );
             for k in 0..8 {
-                let e = ((before >> (8 * k)) & 0xff) as u32;
+                let e = ((before >> (8 * k)) & 0xff) as usize;
                 let row = super::ZEROS[(word >> (8 * k)) as u8 as usize].as_ptr();
-                let base = s.wrapping_add(8 * k).wrapping_sub(e);
-                let v = _mm256_add_epi32(
-                    _mm256_cvtepu16_epi32(_mm_loadu_si128(row.cast())),
-                    _mm256_set1_epi32(base as i32),
-                );
-                _mm256_storeu_si256(d.add(e as usize).cast(), v);
+                let base = _mm256_permutevar8x32_epi32(bases, _mm256_set1_epi32(k));
+                let v = _mm256_add_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128(row.cast())), base);
+                _mm256_storeu_si256(d.add(e).cast(), v);
             }
         }
     }
