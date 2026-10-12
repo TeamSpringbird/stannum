@@ -62,29 +62,39 @@ blob := "TNS1", documents, total_length, block_size, flags (bit 0: adaptive TF),
 ### The ctid grid
 
 Heap blocks are taken in groups of 256, as TIN's page masks are. A group
-the segment holds documents in has a width `w`, the largest line pointer
-offset among them, a first page `f` and a span of `p` pages to its last
-(256 but at a heap's or a segment's edges), and `p * w` **slots**: tuple
-`(block, offset)` is slot `(block % 256 - f) * w + offset - 1` of group
-`block / 256`, and the groups' slots are numbered in a row. The span keeps
-a table of a few dozen pages from paying, in every bitmap, for pages it
-does not have. A slot names a ctid with one table of groups
-and a multiply, slots sort as ctids, and every term's members in a group
-form a bitmap of the same shape, so two terms combine word by word.
+the segment holds documents in has a first page `f`, a span of `p` pages
+to its last (256 but at a heap's or a segment's edges), and per page of the
+span a **width** `w[i]`, the largest line pointer offset among the page's
+documents (0 for a page without one). Page `i` owns the group's slots
+`start[i] .. start[i] + w[i]`, `start[i]` the sum of the widths before it:
+tuple `(block, offset)` is slot `start[block % 256 - f] + offset - 1` of
+group `block / 256`, and the groups' slots are numbered in a row. Slots sort
+as ctids, and every term's members in a group form a bitmap of the same
+shape, so two terms combine word by word.
 
-A slot per possible offset up to 291 would cost a bit per line pointer of
-every page; the group width cuts that to what the group uses. On the
-Stack Exchange heap (20.5 rows per page on average, 4 to 70) a group has
-1.61 slots per document; groups of 16, 64 or 1,024 pages would have 1.29,
-1.43 or 1.91. The exact per-page widths would give one slot per document,
-which is the ordinal numbering again, with a page table to reach the ctid.
+A heap only inserted into holds each page's rows at offsets `1..=n`, so a
+page costs `n` slots and a group's bitmap one bit per document: TIN sizes
+its page masks the same way, to each page's rows (round 2, H5). Page layout
+8 and earlier gave a group one width, its largest offset over all its
+pages: 1.53 slots per document at 150M rows (17.9 rows a page), 1.61 on
+the Stack Exchange heap (20.5, 4 to 70). A page that lost rows to pruning
+keeps its holes as empty slots, as before.
+
+A slot's ctid is a short search: `Geometry` keeps per group its page starts
+(`starts(i)`, `p + 1` of them, the slot count last) and per 64-slot word the
+page its first slot is on, and `page_of` steps from there over the page
+starts in the word (three or four at 18 rows a page). Only a candidate's
+ctid (and a native cursor's position) needs it; word operations, counts,
+containers and ranks never do: a document's rank is a popcount of the
+document set's words, as before.
 
 ### Document set and rank directory
 
-The segment's documents in slot space: per group a 13-byte directory entry
-(group, width, first page, span, documents before it, kind) and either the
-group's slots as a bitmap of whole words or, when every page holds offsets
-`1..n`, a byte of `n` per page (0.06 MB per million documents here). A reader decodes it once into a
+The segment's documents in slot space: per group an 11-byte directory entry
+(group, first page, span, documents before it, kind) and either, when every
+page holds offsets `1..n` with `n` below 256, a byte of `n` per page (its
+width; 0.06 MB per million documents here), or each page's width (two
+bytes) and the group's slots as a bitmap of whole words. A reader decodes it once into a
 bitmap with the rank of each word's first slot, so a document's **rank**
 (its position in ctid order) is a popcount away. Ranks address the DL
 sidecar and the liveness bitmap; nothing addresses a posting by rank.
@@ -456,13 +466,14 @@ records is TIN's mutable write segment: sealed in place when full, then
 promoted into a `TNS1` segment (see [segmented
 storage](segmented-storage.md#writing-an-index)).
 
-**Merges.** Nothing is renumbered. A merge's grid is the union of its
-inputs' groups, each group's width the largest of the inputs' and its
-span the union of theirs. Containers
-hold slots local to their group, so a group only one input holds keeps its
-width and its containers are copied as they are, counts included; a group
-two inputs share (rows updated into pages another segment covers) is
-re-encoded at the larger width, which moves each page's offsets. A term's
+**Merges.** Nothing is renumbered. A merge's grid is the grid of its live
+documents: each page's width the largest offset of the documents kept
+there, each group's span the union of its pages. Containers
+hold slots local to their group, so a group only one input holds, on the
+same pages at the same widths, keeps its containers as they are, counts
+included; a group two inputs share (rows updated into pages another segment
+covers), or whose pages a dead document narrows, is re-encoded over the
+merged widths, which moves the later pages' slots. A term's
 footer blocks and TF tail are rebuilt, since its posting indexes change
 when two inputs' postings interleave, and its positions streams are
 interleaved in slot order with their skip tables rebuilt; entries are
@@ -476,7 +487,8 @@ of encoding the group. The output is byte for byte a fresh build's
 (`segment::tinshape::segment` tests merge two inputs sharing a group both
 ways and compare) when:
 
-1. the output group has the input group's width, first page and span;
+1. the output group lies on the input group's pages at the same widths
+   (`Geometry::same_slots`);
 2. its members are exactly the input's there: no dead document of the
    input in the group, and no other input holding the group;
 3. both segments are built with the same `Options`;
@@ -565,6 +577,16 @@ Added for conjunction overhead (branch `tinshape/conj-overhead`):
 `list` kept by its marks, the marks cleared); the led walk's group
 intersection uses it where it used `bits::intersect_sorted`, which the
 counts keep.
+
+Changed in page layout 9 (per-page widths, branch `fable/pgrid`): `Group`
+has no `width`; a group's page widths are `Geometry::starts(index)` (each
+page's first local slot, then the slot count), `Geometry::width(index,
+page)`, `local(index, page, offset)` and `page_of(index, local)`;
+`Geometry::push_group` builds a grid from widths; `same_slots` compares two
+groups' slots. `postings::for_each_local` and `or_into` and
+`kernels::container_locals` and `container_row` take the group's page
+starts instead of `&Group` (a paged container needs them; the slot count is
+their last). `tnsreencode` re-encodes a version-8 (or 6) dump to 9.
 
 Changed in phase B (callers of phase A's API): `Group` has `first` and
 `pages` (`slots()` is `pages * width`, `grid_bytes()` new);

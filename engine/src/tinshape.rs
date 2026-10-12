@@ -16,7 +16,7 @@ use boldi_vigna::{SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tinshape::bits;
 use segment::tinshape::blob::Bytes;
-use segment::tinshape::docs::{Geometry, Group};
+use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::EfCursor;
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings};
@@ -438,10 +438,9 @@ impl<'a> TermSet<'a> {
                 self.loaded = Loaded::None;
                 continue;
             }
-            let group = *group;
             let local_target = target.saturating_sub(base);
             if matches!(self.loaded, Loaded::None) {
-                self.load(&g, &group, touch);
+                self.load(&g, geometry.starts(g.index as usize), touch);
             }
             let first = self.first_of(&g);
             let found = match &self.loaded {
@@ -504,7 +503,7 @@ impl<'a> TermSet<'a> {
         }
     }
 
-    fn load(&mut self, g: &G<'a>, group: &Group, touch: &mut impl Touch) {
+    fn load(&mut self, g: &G<'a>, starts: &[u32], touch: &mut impl Touch) {
         self.pos = 0;
         match g.src {
             Src::Container { entry, bytes, at } => {
@@ -517,7 +516,7 @@ impl<'a> TermSet<'a> {
                 } else {
                     let mut list = std::mem::take(&mut self.list);
                     list.clear();
-                    kernels::container_locals(&entry, bytes, group, &mut list)
+                    kernels::container_locals(&entry, bytes, starts, &mut list)
                         .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")));
                     self.list = list;
                     self.loaded = Loaded::List;
@@ -836,10 +835,11 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
     /// The members of term `t`'s group `g`, appended to `list` in order.
     fn decode(&mut self, t: usize, g: &G<'a>, list: &mut Vec<u32>) -> Result<()> {
         self.touch_src(&g.src);
-        let group = self.segment.docs.geometry.groups[g.index as usize];
+        let segment = self.segment;
+        let starts = segment.docs.geometry.starts(g.index as usize);
         match g.src {
             Src::Container { entry, bytes, .. } => {
-                kernels::container_locals(&entry, bytes.all()?, &group, list)?;
+                kernels::container_locals(&entry, bytes.all()?, starts, list)?;
             }
             Src::Locals { from, to } => {
                 let set = self.terms[t].as_ref().expect("a term with a group");
@@ -941,7 +941,8 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
             return Ok(false);
         };
         self.touch_src(&g.src);
-        let geometry_group = self.segment.docs.geometry.groups[group as usize];
+        let segment = self.segment;
+        let starts = segment.docs.geometry.starts(group as usize);
         let set = self.terms[t].as_ref().expect("found above");
         match g.src {
             Src::Container { entry, bytes, .. } => {
@@ -952,7 +953,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     // ORed in: a disjunction's term_or adds to a filled row.
                     let mut list = std::mem::take(&mut self.other);
                     list.clear();
-                    kernels::container_locals(&entry, bytes, &geometry_group, &mut list)?;
+                    kernels::container_locals(&entry, bytes, starts, &mut list)?;
                     for l in &list {
                         out[*l as usize / 64] |= 1 << (l % 64);
                     }
@@ -1243,14 +1244,8 @@ pub fn score_at_in<'a>(
 }
 
 /// The documents set in `words`, group `group`'s matches, in ctid order.
-pub fn tids_in(geometry: &Geometry, group: usize, words: &[u64], mut visit: impl FnMut(Tid)) {
-    for (w, word) in words.iter().enumerate() {
-        let mut word = *word;
-        while word != 0 {
-            visit(geometry.tid_in(group, (w * 64) as u32 + word.trailing_zeros()));
-            word &= word - 1;
-        }
-    }
+pub fn tids_in(geometry: &Geometry, group: usize, words: &[u64], visit: impl FnMut(Tid)) {
+    geometry.each_tid(group, words, visit);
 }
 
 /// [`count_terms`] trusting only the slots on all-visible heap pages, as an
@@ -1620,6 +1615,34 @@ mod tests {
 
     /// A segment of `docs` (ctids ascending) where term `t` holds the
     /// documents `members[t]` with `tfs`, and its brute-force view.
+    /// Fewer than `max` ctids on blocks below `blocks`, ascending: random
+    /// line pointers up to `offsets`, or heap pages each holding rows
+    /// `1..=n` for its own `n` up to `offsets`, some with a hole, as a heap
+    /// only inserted into is laid out (each page's width its row count).
+    fn doc_tids(blocks: u32, offsets: u16, max: usize) -> impl Strategy<Value = Vec<Tid>> {
+        let random =
+            prop::collection::btree_set((0..blocks, 1..=offsets), 1..max).prop_map(|set| {
+                set.into_iter()
+                    .map(|(block, offset)| Tid { block, offset })
+                    .collect()
+            });
+        let heap = prop::collection::btree_map(0..blocks, (1..=offsets, any::<u8>()), 1..max / 4)
+            .prop_map(move |pages| {
+                let mut tids: Vec<Tid> = Vec::new();
+                for (block, (rows, shape)) in pages {
+                    let hole = (shape % 4 == 0 && rows > 1).then_some(u16::from(shape) % rows + 1);
+                    tids.extend(
+                        (1..=rows)
+                            .filter(|o| Some(*o) != hole)
+                            .map(|offset| Tid { block, offset }),
+                    );
+                }
+                tids.truncate(max - 1);
+                tids
+            });
+        prop_oneof![random, heap]
+    }
+
     fn build(docs: &[Tid], members: &[Vec<(usize, u32)>], options: Options) -> Vec<u8> {
         let lengths: Vec<u32> = (0..docs.len()).map(|i| (i as u32 * 37) % 90 + 5).collect();
         let mut builder = Builder::new(docs.to_vec(), lengths, options).unwrap();
@@ -1732,7 +1755,7 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(48))]
         #[test]
         fn counts_and_top_k_match_brute_force(
-            doc_set in prop::collection::btree_set((0u32..1500, 1u16..=40), 1..700),
+            docs in doc_tids(1500, 40, 700),
             density in prop::collection::vec(1u32..100, 4),
             seed in any::<u64>(),
             grid_density in prop::sample::select(vec![0u32, 4, 64]),
@@ -1740,7 +1763,6 @@ mod tests {
             k in 1usize..12,
             page_len in prop::sample::select(vec![37usize, 509, 8160]),
         ) {
-            let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
             // Term t holds a document with probability density[t] percent.
             let mut state = seed | 1;
             let mut next = || {
@@ -2264,9 +2286,10 @@ mod tests {
     #[test]
     fn sparse_lists_and_inline_lengths_stay_held() {
         let (docs, members) = drawn(70_000, &[1, 40], 4);
+        // The rare term (about 700 postings) is never forced into grids.
         let options = Options {
             block_size: 8,
-            grid_min_postings: 0,
+            grid_min_postings: 2_000,
             inline_lengths_max_df: 1_000,
             inline_lengths_min_documents: 0,
             ..Options::default()
@@ -2452,13 +2475,12 @@ mod tests {
         /// over the eligible matches keeps.
         #[test]
         fn shared_walks_keep_the_eligible_top_rows(
-            doc_set in prop::collection::btree_set((0u32..900, 1u16..=30), 2..500),
+            docs in doc_tids(900, 30, 500).prop_filter("two documents", |d| d.len() >= 2),
             density in prop::collection::vec(1u32..100, 4),
             seed in any::<u64>(),
             k in 1usize..12,
             ties in any::<bool>(),
         ) {
-            let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
             let mut state = seed | 1;
             let mut next = || {
                 state ^= state << 13;
@@ -2727,7 +2749,7 @@ mod tests {
         /// what cannot win on ctid.
         #[test]
         fn ties_at_the_threshold_keep_the_exact_top_rows(
-            doc_set in prop::collection::btree_set((0u32..1200, 1u16..=20), 2..700),
+            docs in doc_tids(1200, 20, 700).prop_filter("two documents", |d| d.len() >= 2),
             density in prop::collection::vec(5u32..100, 4),
             seed in any::<u64>(),
             k in 1usize..16,
@@ -2739,7 +2761,6 @@ mod tests {
             inline in any::<bool>(),
             avg in prop::sample::select(vec![1.0f32, 9.0, 33.3]),
         ) {
-            let docs: Vec<Tid> = doc_set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
             let mut state = seed | 1;
             let mut next = || {
                 state ^= state << 13;

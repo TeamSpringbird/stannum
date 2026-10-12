@@ -33,7 +33,9 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   `score_inspect`), highlighting (`stannum.highlight`, `highlight_ansi`),
   segmented indexes and exact counts under concurrent writes.
 - Segment format `TNS1`, in TIN's shape: a term's postings are a set of heap
-  ctids over a grid of 256-page groups (Elias-Fano lists, grid bitmaps or
+  ctids over a grid of 256-page groups in which each heap page is as wide as
+  its largest line pointer, so a page of `n` rows costs `n` slots, one per
+  document, as TIN sizes its page masks (Elias-Fano lists, grid bitmaps or
   per-page containers, the smallest), with its score metadata per (term,
   group) as TIN keeps it: each group's directory entry carries the group's
   impact frontier (lengths rounded down to six significant bits) and its
@@ -42,7 +44,7 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   term kept as one list keeps a footer of per-block frontiers. Positions are
   in their own stream, with a document set and a DL sidecar of exact
   lengths; see [the TIN-shape guide](docs/architecture/tin-shape.md). Index
-  pages are layout version 8; an index written earlier must be rebuilt
+  pages are layout version 9; an index written earlier must be rebuilt
   (`REINDEX`).
   Ranked scans (every style, tiebreak keys and filtered walks included),
   bitmap and plain index scans, counts and `score()` of single rows read

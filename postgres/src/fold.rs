@@ -61,15 +61,15 @@ pub(crate) fn count_native(
                 if covers(&bits, first, first + pages) {
                     return true;
                 }
-                // Each all-visible page's slots, a run of `width` bits.
-                let width = usize::from(g.width);
+                // Each all-visible page's slots, a run of its width's bits.
+                let starts = geometry.starts(group as usize);
                 for (w, word) in bits.iter().enumerate() {
                     let mut word = *word;
                     while word != 0 {
                         let page = w * 64 + word.trailing_zeros() as usize;
                         if page >= first && page < first + pages {
                             let local = page - first;
-                            set_range(mask, local * width, (local + 1) * width);
+                            set_range(mask, starts[local] as usize, starts[local + 1] as usize);
                         }
                         word &= word - 1;
                     }
@@ -83,14 +83,7 @@ pub(crate) fn count_native(
                     .all(|(docs, visible)| docs & !visible == 0)
             },
             &mut |group, words| {
-                for (w, word) in words.iter().enumerate() {
-                    let mut word = *word;
-                    while word != 0 {
-                        let local = w as u32 * 64 + word.trailing_zeros();
-                        hidden.push(geometry.tid_in(group as usize, local));
-                        word &= word - 1;
-                    }
-                }
+                geometry.each_tid(group as usize, words, |tid| hidden.push(tid));
             },
         )?;
         let mut offsets = Vec::new();

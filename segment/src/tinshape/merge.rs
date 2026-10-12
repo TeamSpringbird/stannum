@@ -100,25 +100,23 @@ pub fn merge(
     let mut builder = Builder::new(tids, lengths, options)?;
     // Per group of the output, the input (and its group) whose containers
     // it may keep: the only input with a live document there, with the
-    // same width, first page and span, and no dead document there.
+    // same pages at the same widths, and no dead document there.
     let owners: Vec<Option<(usize, u32)>> = builder
         .geometry()
         .groups
         .iter()
-        .map(|out| {
+        .enumerate()
+        .map(|(o, out)| {
             let mut owner = None;
             for (i, segment) in segments.iter().enumerate() {
-                let groups = &segment.docs.geometry.groups;
-                let Ok(g) = groups.binary_search_by_key(&out.id, |g| g.id) else {
+                let geometry = &segment.docs.geometry;
+                let Ok(g) = geometry.groups.binary_search_by_key(&out.id, |g| g.id) else {
                     continue;
                 };
                 if owner.is_some() {
                     return None;
                 }
-                let held = &groups[g];
-                if dead_in[i][g]
-                    || (held.width, held.first, held.pages) != (out.width, out.first, out.pages)
-                {
+                if dead_in[i][g] || !geometry.same_slots(g, builder.geometry(), o) {
                     return None;
                 }
                 owner = Some((i, g as u32));

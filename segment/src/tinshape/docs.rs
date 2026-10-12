@@ -9,23 +9,30 @@
 //! # The ctid grid
 //!
 //! Heap blocks are taken in groups of [`GROUP_PAGES`]. A group the segment
-//! holds documents in has a width `w`, the largest line pointer offset of
-//! those documents, a first page `f` and a span of `p` pages to its last
-//! (all 256 but at a heap's or a segment's edges), and `p * w` slots: tuple
-//! `(block, offset)` is slot `(block % 256 - f) * w + offset - 1` of group
-//! `block / 256`. The groups'
-//! slots are numbered in a row, so a slot names a ctid and back with one
-//! table of groups and a multiply, and slots sort as ctids do. A term's
-//! postings are a set of slots ([`super::postings`]), so two terms' sets in a
-//! group are bitmaps of the same shape and combine word by word.
+//! holds documents in has a first page `f`, a span of `p` pages to its last
+//! (all 256 but at a heap's or a segment's edges), and per page a width
+//! `w[i]`, the largest line pointer offset of the page's documents (0 for a
+//! page without one). Page `i` of the span owns slots `start[i] ..
+//! start[i] + w[i]`, `start[i]` the sum of the widths before it, so tuple
+//! `(block, offset)` is slot `start[block % 256 - f] + offset - 1` of group
+//! `block / 256`. A page holding its rows at offsets `1..=n` (every page of
+//! a heap that was only inserted into) costs `n` slots, one per document,
+//! as TIN sizes its page masks to each page's rows. The groups' slots are
+//! numbered in a row, so slots sort as ctids do; a slot's ctid is a short
+//! search in its group's page starts, which only a candidate's ctid needs.
+//! A term's postings are a set of slots ([`super::postings`]), so two
+//! terms' sets in a group are bitmaps of the same shape and combine word by
+//! word.
 //!
 //! ```text
 //! docset   := groups varint,
-//!             (group u32le, width u16le, first u8, pages - 1 u8,
-//!              rank_base u32le, kind u8)*,
+//!             (group u32le, first u8, pages - 1 u8, rank_base u32le,
+//!              kind u8)*,
 //!             body* (per group, in order)
-//! body     := grid:   the group's slots as a bitmap of whole u64le words
-//!           | counts: a byte per page, page p holding offsets 1..=count[p]
+//! body     := counts: a byte per page, page i holding offsets 1..=count[i]
+//!                     (its width count[i])
+//!           | grid:   a u16le width per page, then the group's slots as a
+//!                     bitmap of whole u64le words
 //! dl       := block varint (documents per block), blocks varint,
 //!             (bits_at u32le, base u24le, width u8)* per block,
 //!             per block its lengths less its base, packed at its width
@@ -46,17 +53,16 @@ pub const GROUP_PAGES: u32 = 256;
 /// The largest line pointer offset an 8 KiB heap page can hold.
 pub const MAX_OFFSET: u16 = 291;
 /// Bytes of one directory entry of the document set.
-const ENTRY: usize = 13;
+const ENTRY: usize = 11;
 const KIND_GRID: u8 = 0;
 const KIND_COUNTS: u8 = 1;
 
-/// One group of heap blocks the segment holds documents in.
+/// One group of heap blocks the segment holds documents in. Its pages'
+/// widths are the [`Geometry`]'s ([`Geometry::starts`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Group {
     /// `block / 256` of its blocks.
     pub id: u32,
-    /// Its largest offset: slots per page.
-    pub width: u16,
     /// Its first page (`block % 256`), and the pages from there to its last.
     pub first: u8,
     pub pages: u16,
@@ -64,28 +70,30 @@ pub struct Group {
     pub slot_base: u32,
     /// Documents in earlier groups.
     pub rank_base: u32,
+    /// Its slots: the sum of its pages' widths.
+    slot_count: u32,
+    /// Where its page starts (`pages + 1` of them) and its word hints begin
+    /// in the geometry's tables.
+    starts_at: u32,
+    hints_at: u32,
 }
 
 impl Group {
     /// Slots in the group.
+    #[inline]
     pub const fn slots(&self) -> u32 {
-        self.pages as u32 * self.width as u32
+        self.slot_count
     }
 
     /// 64-bit words of a bitmap over its slots.
+    #[inline]
     pub const fn words(&self) -> usize {
-        (self.pages as usize * self.width as usize).div_ceil(64)
+        (self.slot_count as usize).div_ceil(64)
     }
 
     /// Bytes of a grid over its slots: whole words.
     pub const fn grid_bytes(&self) -> usize {
         self.words() * 8
-    }
-
-    /// The local slot of `(page, offset)`, `page` being `block % 256`.
-    #[inline]
-    pub const fn local(&self, page: u32, offset: u16) -> u32 {
-        (page - self.first as u32) * self.width as u32 + offset as u32 - 1
     }
 }
 
@@ -96,13 +104,24 @@ pub struct Geometry {
     /// Slots in every group together.
     pub slots: u32,
     pub documents: u32,
+    /// Per group, the local slot each page of its span starts at, then its
+    /// slot count: `pages + 1` entries, ascending.
+    starts: Vec<u32>,
+    /// Per group, per 64-slot word of a bitmap over it, the page (of its
+    /// span) the word's first slot is on: where a slot's page search starts.
+    hints: Vec<u8>,
 }
 
 impl Geometry {
-    /// The grid of `tids`, which must be strictly increasing.
+    /// The grid of `tids`, which must be strictly increasing: each page's
+    /// width is its largest offset.
     pub fn of(tids: &[Tid]) -> Result<Self> {
-        let mut groups: Vec<Group> = Vec::new();
+        let mut geometry = Self::default();
         let mut previous: Option<Tid> = None;
+        // The group at hand: its id, first page and first rank, and its
+        // pages' widths so far.
+        let mut open: Option<(u32, u8, u32)> = None;
+        let mut widths: Vec<u16> = Vec::with_capacity(GROUP_PAGES as usize);
         for (rank, tid) in tids.iter().enumerate() {
             if tid.offset == 0 || tid.offset > MAX_OFFSET {
                 return Err(Error::InvalidTid);
@@ -113,33 +132,127 @@ impl Geometry {
             previous = Some(*tid);
             let id = tid.block / GROUP_PAGES;
             let page = tid.block % GROUP_PAGES;
-            match groups.last_mut() {
-                Some(group) if group.id == id => {
-                    group.width = group.width.max(tid.offset);
-                    group.pages = (page - u32::from(group.first) + 1) as u16;
+            let first = match open {
+                Some((open_id, first, _)) if open_id == id => first,
+                _ => {
+                    if let Some((id, first, rank_base)) = open {
+                        geometry.push_group(id, first, &widths, rank_base)?;
+                    }
+                    open = Some((id, page as u8, rank as u32));
+                    widths.clear();
+                    page as u8
                 }
-                _ => groups.push(Group {
-                    id,
-                    width: tid.offset,
-                    first: page as u8,
-                    pages: 1,
-                    slot_base: 0,
-                    rank_base: rank as u32,
-                }),
+            };
+            let at = (page - u32::from(first)) as usize;
+            if widths.len() <= at {
+                widths.resize(at + 1, 0);
             }
+            widths[at] = widths[at].max(tid.offset);
         }
+        if let Some((id, first, rank_base)) = open {
+            geometry.push_group(id, first, &widths, rank_base)?;
+        }
+        geometry.documents = tids.len() as u32;
+        Ok(geometry)
+    }
+
+    /// Appends group `id` holding `rank_base` documents before it, its span
+    /// starting at page `first` with a page per width. Groups come in
+    /// ascending order; `documents` is the caller's to set.
+    pub fn push_group(&mut self, id: u32, first: u8, widths: &[u16], rank_base: u32) -> Result<()> {
+        if widths.is_empty()
+            || u32::from(first) + widths.len() as u32 > GROUP_PAGES
+            || widths.iter().any(|w| *w > MAX_OFFSET)
+        {
+            return Err(Error::Corrupt("group geometry"));
+        }
+        if self.groups.last().is_some_and(|g| g.id >= id) {
+            return Err(Error::Corrupt("group order"));
+        }
+        let starts_at = self.starts.len();
         let mut slots = 0u32;
-        for group in &mut groups {
-            group.slot_base = slots;
-            slots = slots
-                .checked_add(group.slots())
-                .ok_or(Error::Corrupt("grid exceeds 32 bits"))?;
+        for width in widths {
+            self.starts.push(slots);
+            slots += u32::from(*width);
         }
-        Ok(Self {
-            groups,
-            slots,
-            documents: tids.len() as u32,
-        })
+        self.starts.push(slots);
+        let hints_at = self.hints.len();
+        let starts = &self.starts[starts_at..];
+        let mut page = 0usize;
+        for word in 0..slots.div_ceil(64) {
+            while starts[page + 1] <= word * 64 {
+                page += 1;
+            }
+            self.hints.push(page as u8);
+        }
+        let slot_base = self.slots;
+        self.slots = slot_base
+            .checked_add(slots)
+            .ok_or(Error::Corrupt("grid exceeds 32 bits"))?;
+        self.groups.push(Group {
+            id,
+            first,
+            pages: widths.len() as u16,
+            slot_base,
+            rank_base,
+            slot_count: slots,
+            starts_at: starts_at as u32,
+            hints_at: hints_at as u32,
+        });
+        Ok(())
+    }
+
+    /// Group `index`'s page starts: the local slot of each page of its span,
+    /// then its slot count.
+    #[inline]
+    pub fn starts(&self, index: usize) -> &[u32] {
+        let group = &self.groups[index];
+        &self.starts[group.starts_at as usize..][..usize::from(group.pages) + 1]
+    }
+
+    /// The width of page `page` (of its span) of group `index`.
+    #[inline]
+    pub fn width(&self, index: usize, page: usize) -> u32 {
+        let starts = self.starts(index);
+        starts[page + 1] - starts[page]
+    }
+
+    /// Whether group `index` here and group `other_index` of `other` lie on
+    /// the same pages at the same widths, so their slots are the same.
+    pub fn same_slots(&self, index: usize, other: &Geometry, other_index: usize) -> bool {
+        let (a, b) = (&self.groups[index], &other.groups[other_index]);
+        (a.id, a.first) == (b.id, b.first) && self.starts(index) == other.starts(other_index)
+    }
+
+    /// The local slot of `(page, offset)` in group `index`, `page` being
+    /// `block % 256` and `offset` within the page's width.
+    #[inline]
+    pub fn local(&self, index: usize, page: u32, offset: u16) -> u32 {
+        let first = u32::from(self.groups[index].first);
+        self.starts(index)[(page - first) as usize] + u32::from(offset) - 1
+    }
+
+    /// The page (of its span) holding local slot `local` of group `index`:
+    /// from the page its word starts on, a step per page start in the word
+    /// (pages are a few dozen slots wide). A slot past the group's (a
+    /// corrupt container's) falls on its last page.
+    #[inline]
+    pub fn page_of(&self, index: usize, local: u32) -> usize {
+        let group = &self.groups[index];
+        let starts = self.starts(index);
+        let last = starts.len() - 2;
+        let hint = self
+            .hints
+            .get(group.hints_at as usize + local as usize / 64)
+            .filter(|_| local < group.slot_count);
+        let Some(&hint) = hint else {
+            return last;
+        };
+        let mut page = usize::from(hint);
+        while starts[page + 1] <= local {
+            page += 1;
+        }
+        page
     }
 
     /// The index of the group holding heap block `block`, if any.
@@ -149,18 +262,18 @@ impl Geometry {
     }
 
     /// The slot of `tid`, `None` when its group is not in the segment or its
-    /// offset is beyond the group's width.
+    /// offset is beyond its page's width.
     pub fn slot_of(&self, tid: Tid) -> Option<u32> {
-        let group = &self.groups[self.group_index(tid.block)?];
-        let page = tid.block % GROUP_PAGES;
+        let index = self.group_index(tid.block)?;
+        let group = &self.groups[index];
+        let page = (tid.block % GROUP_PAGES).checked_sub(u32::from(group.first))?;
         if tid.offset == 0
-            || tid.offset > group.width
-            || page < u32::from(group.first)
-            || page - u32::from(group.first) >= u32::from(group.pages)
+            || page >= u32::from(group.pages)
+            || u32::from(tid.offset) > self.width(index, page as usize)
         {
             return None;
         }
-        Some(group.slot_base + group.local(page, tid.offset))
+        Some(group.slot_base + self.starts(index)[page as usize] + u32::from(tid.offset) - 1)
     }
 
     /// The group holding `slot`.
@@ -172,10 +285,35 @@ impl Geometry {
     #[inline]
     pub fn tid_in(&self, index: usize, local: u32) -> Tid {
         let group = &self.groups[index];
-        let width = u32::from(group.width);
+        let page = self.page_of(index, local);
         Tid {
-            block: group.id * GROUP_PAGES + u32::from(group.first) + local / width,
-            offset: (local % width) as u16 + 1,
+            block: group.id * GROUP_PAGES + u32::from(group.first) + page as u32,
+            offset: (local - self.starts(index)[page]) as u16 + 1,
+        }
+    }
+
+    /// Calls `visit` with the ctid of every slot set in `words`, a bitmap
+    /// over group `index`'s slots, in order: the pages are stepped through
+    /// with the members, not searched per member.
+    pub fn each_tid(&self, index: usize, words: &[u64], mut visit: impl FnMut(Tid)) {
+        let group = &self.groups[index];
+        let starts = self.starts(index);
+        let block = group.id * GROUP_PAGES + u32::from(group.first);
+        let last = starts.len() - 2;
+        let mut page = 0usize;
+        for (w, word) in words.iter().enumerate() {
+            let mut word = *word;
+            while word != 0 {
+                let local = (w * 64) as u32 + word.trailing_zeros();
+                while page < last && starts[page + 1] <= local {
+                    page += 1;
+                }
+                visit(Tid {
+                    block: block + page as u32,
+                    offset: (local - starts[page]) as u16 + 1,
+                });
+                word &= word - 1;
+            }
         }
     }
 
@@ -184,47 +322,58 @@ impl Geometry {
         let index = self.group_of_slot(slot);
         self.tid_in(index, slot - self.groups[index].slot_base)
     }
+
+    /// Bytes its tables hold on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.groups.capacity() * std::mem::size_of::<Group>()
+            + self.starts.capacity() * 4
+            + self.hints.capacity()
+    }
 }
 
-/// Builds the document set of `tids` (strictly increasing).
+/// Builds the document set of `tids` (strictly increasing) over
+/// `geometry`, which holds each of them.
 pub fn encode_docset(geometry: &Geometry, tids: &[Tid]) -> Vec<u8> {
     let mut out = Vec::new();
     varint::put(&mut out, geometry.groups.len() as u64);
     let mut bodies = Vec::new();
     let mut at = 0usize;
-    for group in &geometry.groups {
+    for (index, group) in geometry.groups.iter().enumerate() {
         let start = at;
         while at < tids.len() && tids[at].block / GROUP_PAGES == group.id {
             at += 1;
         }
         let members = &tids[start..at];
-        // Pages that hold exactly offsets 1..=n need only n.
-        let mut counts = vec![0u16; usize::from(group.pages)];
+        let widths: Vec<u32> = (0..usize::from(group.pages))
+            .map(|page| geometry.width(index, page))
+            .collect();
+        // Pages that hold exactly offsets 1..=width need only their width.
+        let mut counts = vec![0u32; widths.len()];
         let mut prefix = true;
         for tid in members {
             let page = (tid.block % GROUP_PAGES - u32::from(group.first)) as usize;
-            if tid.offset != counts[page] + 1 {
+            if u32::from(tid.offset) != counts[page] + 1 {
                 prefix = false;
             }
             counts[page] += 1;
         }
-        let kind = if prefix && group.width <= 255 && counts.len() < group.grid_bytes() {
+        let kind = if prefix && counts == widths && widths.iter().all(|w| *w <= 255) {
             KIND_COUNTS
         } else {
             KIND_GRID
         };
         out.extend_from_slice(&group.id.to_le_bytes());
-        out.extend_from_slice(&group.width.to_le_bytes());
         out.push(group.first);
         out.push((group.pages - 1) as u8);
         out.extend_from_slice(&group.rank_base.to_le_bytes());
         out.push(kind);
         if kind == KIND_COUNTS {
-            bodies.extend(counts.iter().map(|c| *c as u8));
+            bodies.extend(widths.iter().map(|w| *w as u8));
         } else {
+            bodies.extend(widths.iter().flat_map(|w| (*w as u16).to_le_bytes()));
             let mut grid = vec![0u8; group.grid_bytes()];
             for tid in members {
-                let local = group.local(tid.block % GROUP_PAGES, tid.offset);
+                let local = geometry.local(index, tid.block % GROUP_PAGES, tid.offset);
                 grid[local as usize / 8] |= 1 << (local % 8);
             }
             bodies.extend_from_slice(&grid);
@@ -262,80 +411,65 @@ impl DocSet {
         let mut word_base = Vec::with_capacity(count);
         let mut word_rank = Vec::new();
         let mut rank = 0u32;
+        let mut widths: Vec<u16> = Vec::with_capacity(GROUP_PAGES as usize);
         for entry in directory.chunks_exact(ENTRY) {
             let id = u32::from_le_bytes(entry[0..4].try_into().expect("four bytes"));
-            let width = u16::from_le_bytes(entry[4..6].try_into().expect("two bytes"));
-            let first = entry[6];
-            let pages = u16::from(entry[7]) + 1;
-            let rank_base = u32::from_le_bytes(entry[8..12].try_into().expect("four bytes"));
-            let kind = entry[12];
-            if width == 0
-                || width > MAX_OFFSET
-                || rank_base != rank
-                || u32::from(first) + u32::from(pages) > GROUP_PAGES
-            {
+            let first = entry[4];
+            let pages = usize::from(entry[5]) + 1;
+            let rank_base = u32::from_le_bytes(entry[6..10].try_into().expect("four bytes"));
+            let kind = entry[10];
+            if rank_base != rank {
                 return Err(Error::Corrupt("document set directory"));
             }
-            if geometry.groups.last().is_some_and(|g| g.id >= id) {
-                return Err(Error::Corrupt("document set order"));
+            widths.clear();
+            match kind {
+                KIND_COUNTS => {
+                    let body = bytes.get(at..at + pages).ok_or(Error::Truncated)?;
+                    at += pages;
+                    widths.extend(body.iter().map(|n| u16::from(*n)));
+                }
+                KIND_GRID => {
+                    let body = bytes.get(at..at + pages * 2).ok_or(Error::Truncated)?;
+                    at += pages * 2;
+                    widths.extend(
+                        body.chunks_exact(2)
+                            .map(|w| u16::from_le_bytes([w[0], w[1]])),
+                    );
+                }
+                _ => return Err(Error::Corrupt("document set kind")),
             }
-            let group = Group {
-                id,
-                width,
-                first,
-                pages,
-                slot_base: geometry.slots,
-                rank_base,
-            };
-            geometry.slots = geometry
-                .slots
-                .checked_add(group.slots())
-                .ok_or(Error::Corrupt("grid exceeds 32 bits"))?;
+            geometry.push_group(id, first, &widths, rank_base)?;
+            let index = geometry.groups.len() - 1;
+            let group = geometry.groups[index];
             let base = words.len();
             word_base.push(base);
             words.resize(base + group.words(), 0u64);
             let grid = &mut words[base..];
-            match kind {
-                KIND_GRID => {
-                    let body = bytes
-                        .get(at..at + group.grid_bytes())
-                        .ok_or(Error::Truncated)?;
-                    at += body.len();
-                    for (i, word) in grid.iter_mut().enumerate() {
-                        *word = bits::word(body, i);
-                    }
+            if kind == KIND_GRID {
+                let body = bytes
+                    .get(at..at + group.grid_bytes())
+                    .ok_or(Error::Truncated)?;
+                at += body.len();
+                for (i, word) in grid.iter_mut().enumerate() {
+                    *word = bits::word(body, i);
                 }
-                KIND_COUNTS => {
-                    let body = bytes
-                        .get(at..at + usize::from(pages))
-                        .ok_or(Error::Truncated)?;
-                    at += body.len();
-                    for (page, &n) in body.iter().enumerate() {
-                        if u16::from(n) > width {
-                            return Err(Error::Corrupt("document set page count"));
-                        }
-                        // Offsets 1..n: a run of n slots, set a word at a time.
-                        let mut local = page * width as usize;
-                        let end = local + n as usize;
-                        while local < end {
-                            let bit = local % 64;
-                            let take = (64 - bit).min(end - local);
-                            grid[local / 64] |= if take == 64 {
-                                u64::MAX
-                            } else {
-                                ((1u64 << take) - 1) << bit
-                            };
-                            local += take;
-                        }
-                    }
+                if !group.slots().is_multiple_of(64)
+                    && grid.last().is_some_and(|w| w >> (group.slots() % 64) != 0)
+                {
+                    return Err(Error::Corrupt("document set past its slots"));
                 }
-                _ => return Err(Error::Corrupt("document set kind")),
+            } else {
+                // Every page holds offsets 1..=width: every slot is a document.
+                let slots = group.slots() as usize;
+                grid[..slots / 64].fill(u64::MAX);
+                if !slots.is_multiple_of(64) {
+                    grid[slots / 64] = (1u64 << (slots % 64)) - 1;
+                }
             }
             for word in grid.iter() {
                 word_rank.push(rank);
                 rank += word.count_ones();
             }
-            geometry.groups.push(group);
         }
         if at != bytes.len() {
             return Err(Error::Corrupt("document set length"));
@@ -354,7 +488,7 @@ impl DocSet {
         self.words.capacity() * 8
             + self.word_base.capacity() * std::mem::size_of::<usize>()
             + self.word_rank.capacity() * 4
-            + self.geometry.groups.capacity() * std::mem::size_of::<Group>()
+            + self.geometry.heap_bytes()
     }
 
     /// The rank of the document at slot `local` of group `index`, `None`
@@ -379,16 +513,9 @@ impl DocSet {
     /// Every document's ctid, in order.
     pub fn tids(&self) -> Vec<Tid> {
         let mut out = Vec::with_capacity(self.geometry.documents as usize);
-        for (index, group) in self.geometry.groups.iter().enumerate() {
-            let base = self.word_base[index];
-            for w in 0..group.words() {
-                let mut word = self.words[base + w];
-                while word != 0 {
-                    let local = (w * 64) as u32 + word.trailing_zeros();
-                    out.push(self.geometry.tid_in(index, local));
-                    word &= word - 1;
-                }
-            }
+        for index in 0..self.geometry.groups.len() {
+            self.geometry
+                .each_tid(index, self.group_words(index), |tid| out.push(tid));
         }
         out
     }
@@ -667,6 +794,100 @@ mod tests {
         assert!(Geometry::of(&tids(&[(0, 2), (0, 1)])).is_err());
     }
 
+    /// Pages of `rows` rows each at offsets `1..=rows` (0: an empty page),
+    /// from block `first`.
+    fn heap(first: u32, rows: &[u16]) -> Vec<Tid> {
+        rows.iter()
+            .enumerate()
+            .flat_map(|(page, &n)| {
+                (1..=n).map(move |offset| Tid {
+                    block: first + page as u32,
+                    offset,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_page_has_its_own_width() {
+        // A slot per document where pages hold rows 1..=n, whatever n.
+        let rows = [3u16, 0, 1, 64, 0, 0, 291, 2, 63, 65, 1];
+        let tids = heap(250, &rows);
+        let geometry = Geometry::of(&tids).unwrap();
+        assert_eq!(geometry.groups.len(), 2);
+        assert_eq!(geometry.slots, tids.len() as u32);
+        let g = &geometry.groups[0];
+        assert_eq!((g.first, g.pages, g.slots()), (250, 4, 68));
+        assert_eq!(geometry.starts(0), &[0, 3, 3, 4, 68]);
+        assert_eq!(geometry.width(0, 1), 0);
+        assert_eq!(
+            geometry.slot_of(Tid {
+                block: 251,
+                offset: 1
+            }),
+            None
+        );
+        assert_eq!(
+            geometry.slot_of(Tid {
+                block: 252,
+                offset: 2
+            }),
+            None
+        );
+        assert_eq!(
+            geometry.slot_of(Tid {
+                block: 252,
+                offset: 1
+            }),
+            Some(3)
+        );
+        assert_eq!(
+            geometry.slot_of(Tid {
+                block: 249,
+                offset: 1
+            }),
+            None
+        );
+        let g = &geometry.groups[1];
+        assert_eq!((g.first, g.pages, g.slot_base), (0, 5, 68));
+        // The first group as counts (a byte per page); the second has a
+        // page of 291 rows, which no byte holds, so it is a grid: a u16
+        // width per page and 422 slots in 7 words.
+        assert_eq!(
+            encode_docset(&geometry, &tids).len(),
+            1 + 2 * ENTRY + 4 + 5 * 2 + 7 * 8
+        );
+        check(&tids);
+        // Pages with holes, and a page wider than its rows.
+        let mut holes = heap(512, &[5, 0, 7, 2]);
+        holes.retain(|t| t.offset != 3);
+        holes.push(Tid {
+            block: 516,
+            offset: 40,
+        });
+        let geometry = Geometry::of(&holes).unwrap();
+        assert_eq!(geometry.starts(0), &[0, 5, 5, 12, 14, 54]);
+        check(&holes);
+        // Spans whose slots end on, before and past a word's end.
+        for n in [63u16, 64, 65, 127, 128, 129] {
+            check(&heap(7, &[n]));
+            check(&heap(7, &[1, n, 0, n]));
+        }
+    }
+
+    #[test]
+    fn page_search_from_every_slot() {
+        let rows: Vec<u16> = (0..256u32).map(|p| ((p * 37) % 23) as u16).collect();
+        let tids = heap(1024, &rows);
+        let geometry = Geometry::of(&tids).unwrap();
+        for local in 0..geometry.groups[0].slots() {
+            let page = geometry.page_of(0, local);
+            let starts = geometry.starts(0);
+            assert!(starts[page] <= local && local < starts[page + 1]);
+        }
+        check(&tids);
+    }
+
     #[test]
     fn lengths_round_trip() {
         let mut lengths = vec![1, 65_534, 65_535, 70_000, 3, u32::MAX, 0, (1 << 24) + 5];
@@ -708,6 +929,21 @@ mod tests {
         #[test]
         fn random_document_sets(set in prop::collection::btree_set((0u32..2000, 1u16..=291), 1..500)) {
             let tids: Vec<Tid> = set.into_iter().map(|(block, offset)| Tid { block, offset }).collect();
+            check(&tids);
+        }
+
+        /// Heap pages holding rows `1..=n`, `n` random per page, some with
+        /// holes (a row deleted and pruned).
+        #[test]
+        fn random_heaps(pages in prop::collection::btree_map(0u32..1200, (1u16..=291, any::<u64>()), 1..60)) {
+            let mut tids = Vec::new();
+            for (block, (n, holes)) in pages {
+                let n = if holes % 5 == 0 { n } else { n % 40 + 1 };
+                tids.extend((1..=n).filter(|o| holes % 3 != 0 || (holes >> (o % 64)) & 1 == 0).map(|offset| Tid { block, offset }));
+            }
+            prop_assume!(!tids.is_empty());
+            let geometry = Geometry::of(&tids).unwrap();
+            prop_assert!(geometry.slots as usize >= tids.len());
             check(&tids);
         }
     }

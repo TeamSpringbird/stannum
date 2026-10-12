@@ -2,37 +2,52 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments whose grouped records keep a footer
-//! of blocks (page layout version 6) to grouped records whose directory
-//! entries carry their group's frontier and whose TF tail is packed per
-//! group (page layout version 8), and reports what that costs.
+//! Re-encodes dumped `TNS1` segments of page layout version 8 (or 6) to
+//! version 9, whose ctid grid gives each heap page its own width, and
+//! reports what that costs.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--exact] [--segment FILE] [--check-merge]
+//!     [--from 8|6] [--exact] [--segment FILE] [--grid-density N] [--jobs N] [--check]
+//!     [--check-merge]
 //! ```
 //!
-//! Only grouped records change: their footer goes, their directory gains
-//! a frontier per entry, their TF tail is re-packed per group, and the
-//! term map's extents move with them. Containers, inline lengths, sparse
-//! and single records, positions, the document set, the DL sidecar and
-//! the liveness area are copied byte for byte. Each frontier is computed
-//! from the group's postings: buckets from the old TF tail (through the
-//! old footer), lengths from the DL sidecar.
+//! Three steps per segment:
 //!
-//! `--check-merge` also merges each re-encoded segment alone with this build's
-//! `merge::merge` (a fresh encoding of every record) and requires the
-//! re-encoded blob to equal it byte for byte, and checks it with
-//! `verify_segment`: for small dumps (it holds several copies in memory).
+//! 1. **The document set.** Versions 6 and 8 gave a group one width `w`,
+//!    its largest offset, and slot `page * w + offset - 1`. The old set is
+//!    rewritten as a version-9 set whose every page has the width `w`: the
+//!    same slots, so every record, the DL sidecar and the liveness area
+//!    stay valid as they are.
+//! 2. With `--from 6`, grouped records lose their footer of blocks: their
+//!    directory entries gain their group's frontier and their TF tail is
+//!    packed per group (version 8). Each frontier is computed from the
+//!    group's postings: buckets from the old TF tail (through the old
+//!    footer), lengths from the DL sidecar. Everything else is copied.
+//! 3. **Renumbering.** The segment is merged alone with this build's
+//!    `merge::merge`, which derives the grid from its documents (each
+//!    page's width its largest offset) and encodes every record afresh, as
+//!    a build of the same documents does.
+//!
+//! `--grid-density N` encodes with `Options::grid_density` N (a writer
+//! option: a group of a big term holding one slot in N is a grid) to
+//! weigh other thresholds. `--check` verifies each output with
+//! `verify_segment`; `--check-merge`
+//! also merges the output alone again and requires the same bytes. Each
+//! segment holds a few copies of itself in memory; `--jobs` re-encodes
+//! that many at once (default 1).
 //!
 //! The output gets the source's manifest and a symlink to its `ids.tsv`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
+use segment::Tid;
 use segment::dead::DeadDocs;
 use segment::dictionary::{DictionaryBuilder, Extent, TermEntry};
 use segment::tinshape::bits::BitWriter;
+use segment::tinshape::docs::{GROUP_PAGES, Geometry, encode_docset};
 use segment::tinshape::ef;
 use segment::tinshape::merge::{Input, merge};
 use segment::tinshape::postings::{
@@ -75,13 +90,20 @@ mod varint {
 struct Args {
     input: PathBuf,
     output: PathBuf,
+    from: u8,
     mode: GroupFrontiers,
+    grid_density: u32,
     only: Option<String>,
+    jobs: usize,
+    check: bool,
     check_merge: bool,
 }
 
 fn usage() -> ! {
-    eprintln!("usage: tnsreencode --in DIR --out DIR [--exact] [--segment FILE] [--check-merge]");
+    eprintln!(
+        "usage: tnsreencode --in DIR --out DIR [--from 8|6] [--exact] [--segment FILE] \
+         [--grid-density N] [--jobs N] [--check] [--check-merge]"
+    );
     std::process::exit(2)
 }
 
@@ -90,8 +112,12 @@ fn args() -> Args {
     let mut a = Args {
         input: PathBuf::new(),
         output: PathBuf::new(),
+        from: 8,
         mode: GroupFrontiers::Rounded,
+        grid_density: Options::default().grid_density,
         only: None,
+        jobs: 1,
+        check: false,
         check_merge: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
@@ -99,13 +125,21 @@ fn args() -> Args {
         match arg.as_str() {
             "--in" => a.input = value(&mut it).into(),
             "--out" => a.output = value(&mut it).into(),
+            "--from" => a.from = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--exact" => a.mode = GroupFrontiers::Exact,
+            "--grid-density" => a.grid_density = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--segment" => a.only = Some(value(&mut it)),
+            "--jobs" => a.jobs = value(&mut it).parse().unwrap_or_else(|_| usage()),
+            "--check" => a.check = true,
             "--check-merge" => a.check_merge = true,
             _ => usage(),
         }
     }
-    if a.input.as_os_str().is_empty() || a.output.as_os_str().is_empty() {
+    if a.input.as_os_str().is_empty()
+        || a.output.as_os_str().is_empty()
+        || !matches!(a.from, 6 | 8)
+        || a.jobs == 0
+    {
         usage();
     }
     a
@@ -302,11 +336,11 @@ fn group_postings(
     for (e, held) in old.entries.iter().zip(out.iter_mut()) {
         held.clear();
         let index = e.index as usize;
-        let group = &geometry.groups[index];
+        let starts = geometry.starts(index);
         let bytes = &old.containers[e.at as usize..(e.at + e.len) as usize];
         let mut failed = None;
         let mut i = e.first;
-        for_each_local(e, bytes, group, |local| {
+        for_each_local(e, bytes, starts, |local| {
             if failed.is_some() {
                 return;
             }
@@ -410,8 +444,8 @@ fn reencode_record(
     out.extend_from_slice(&tf);
 }
 
-/// Re-encodes one blob.
-fn reencode(blob: &[u8], mode: GroupFrontiers, cost: &mut Cost) -> Result<Vec<u8>, String> {
+/// Step 2: re-encodes one blob's grouped records from version 6 to 8.
+fn reencode_v6(blob: &[u8], mode: GroupFrontiers, cost: &mut Cost) -> Result<Vec<u8>, String> {
     let segment = Segment::parse(blob).map_err(|e| e.to_string())?;
     let (fields, _) = header_fields(blob)?;
     let postings_at = segment.area_at(Area::Postings);
@@ -535,6 +569,205 @@ fn copy_manifest(input: &Path, output: &Path) -> Result<(), String> {
     Ok(())
 }
 
+impl Cost {
+    fn add(&mut self, other: &Cost) {
+        self.blob += other.blob;
+        self.grouped_terms += other.grouped_terms;
+        self.footer_removed += other.footer_removed;
+        self.directory_before += other.directory_before;
+        self.directory_after += other.directory_after;
+        self.frontier_bytes += other.frontier_bytes;
+        self.frontiers += other.frontiers;
+        self.pairs += other.pairs;
+        self.tf_before += other.tf_before;
+        self.tf_after += other.tf_after;
+        for (a, b) in self.by_pairs.iter_mut().zip(other.by_pairs) {
+            *a += b;
+        }
+    }
+}
+
+/// Area names, in the blob's order after its header.
+const AREAS: [&str; 6] = [
+    "term map",
+    "postings",
+    "positions",
+    "document set",
+    "lengths",
+    "liveness",
+];
+
+/// The bytes of each area of `blob`, in [`AREAS`] order.
+fn area_sizes(blob: &[u8]) -> Result<[u64; 6], String> {
+    let (fields, _) = header_fields(blob)?;
+    Ok(std::array::from_fn(|i| fields[4 + i]))
+}
+
+/// The ctids and the grid of a version-6 or -8 document set:
+///
+/// ```text
+/// docset := groups varint, (group u32le, width u16le, first u8, pages - 1 u8,
+///            rank_base u32le, kind u8)*, body* (per group, in order)
+/// body   := grid:   pages * width slots as whole u64le words, slot
+///                   page * width + offset - 1
+///         | counts: a byte per page, page p holding offsets 1..=count[p]
+/// ```
+///
+/// Every page of the returned grid has its group's old width, so its slots
+/// are the old slots.
+fn legacy_docset(bytes: &[u8]) -> Result<(Geometry, Vec<Tid>), String> {
+    const ENTRY: usize = 13;
+    let mut at = 0usize;
+    let count = varint::get(bytes, &mut at)? as usize;
+    let directory = bytes
+        .get(at..at + count * ENTRY)
+        .ok_or("truncated document set")?;
+    at += count * ENTRY;
+    let mut geometry = Geometry::default();
+    let mut tids = Vec::new();
+    for entry in directory.chunks_exact(ENTRY) {
+        let id = u32::from_le_bytes(entry[0..4].try_into().expect("four bytes"));
+        let width = u16::from_le_bytes([entry[4], entry[5]]);
+        let first = entry[6];
+        let pages = usize::from(entry[7]) + 1;
+        let rank_base = u32::from_le_bytes(entry[8..12].try_into().expect("four bytes"));
+        if rank_base as usize != tids.len() || width == 0 {
+            return Err("document set directory".into());
+        }
+        let block = |page: usize| id * GROUP_PAGES + u32::from(first) + page as u32;
+        match entry[12] {
+            0 => {
+                let slots = pages * usize::from(width);
+                let len = slots.div_ceil(64) * 8;
+                let body = bytes.get(at..at + len).ok_or("truncated document set")?;
+                at += len;
+                for local in 0..slots {
+                    if body[local / 8] >> (local % 8) & 1 == 1 {
+                        let (page, offset) =
+                            (local / usize::from(width), local % usize::from(width));
+                        tids.push(Tid {
+                            block: block(page),
+                            offset: offset as u16 + 1,
+                        });
+                    }
+                }
+            }
+            1 => {
+                let body = bytes.get(at..at + pages).ok_or("truncated document set")?;
+                at += pages;
+                for (page, n) in body.iter().enumerate() {
+                    tids.extend((1..=u16::from(*n)).map(|offset| Tid {
+                        block: block(page),
+                        offset,
+                    }));
+                }
+            }
+            _ => return Err("document set kind".into()),
+        }
+        geometry
+            .push_group(id, first, &vec![width; pages], rank_base)
+            .map_err(|e| e.to_string())?;
+    }
+    if at != bytes.len() {
+        return Err("document set length".into());
+    }
+    geometry.documents = tids.len() as u32;
+    Ok((geometry, tids))
+}
+
+/// Step 1: `blob` with its version-6 or -8 document set rewritten as a
+/// version-9 set of the same slots.
+fn regrid(blob: &[u8]) -> Result<Vec<u8>, String> {
+    let (mut fields, header) = header_fields(blob)?;
+    let mut bounds = [header; 7];
+    for i in 0..6 {
+        bounds[i + 1] = bounds[i] + fields[4 + i] as usize;
+    }
+    if bounds[6] != blob.len() {
+        return Err("areas against the blob's length".into());
+    }
+    let (geometry, tids) = legacy_docset(&blob[bounds[3]..bounds[4]])?;
+    if tids.len() as u64 != fields[0] {
+        return Err("document set against the header's documents".into());
+    }
+    let docset = encode_docset(&geometry, &tids);
+    fields[7] = docset.len() as u64;
+    let mut out = Vec::with_capacity(blob.len());
+    out.extend_from_slice(b"TNS1");
+    for f in &fields {
+        varint::put(&mut out, *f);
+    }
+    out.extend_from_slice(&blob[header..bounds[3]]);
+    out.extend_from_slice(&docset);
+    out.extend_from_slice(&blob[bounds[4]..]);
+    Ok(out)
+}
+
+/// Step 3: `blob` merged alone, every record encoded afresh over the grid
+/// of its documents.
+fn renumber(blob: &[u8], args: &Args) -> Result<Vec<u8>, String> {
+    let (fields, _) = header_fields(blob)?;
+    let none = DeadDocs::decode(&segment::ordinals::encode(&[]), fields[0] as u32)
+        .map_err(|e| e.to_string())?;
+    let merged = merge(
+        &[Input {
+            bytes: blob,
+            dead: &none,
+        }],
+        Options {
+            group_frontiers: args.mode,
+            grid_density: args.grid_density,
+            ..Options::default()
+        },
+        || Ok(()),
+    )
+    .map_err(|e| e.to_string())?
+    .ok_or("no live document")?;
+    Ok(merged.blob)
+}
+
+/// One segment, re-encoded: its line of the report, its version-6 costs,
+/// and whether its checks passed.
+fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), String> {
+    let start = Instant::now();
+    let blob = std::fs::read(args.input.join(name)).map_err(|e| e.to_string())?;
+    let before = area_sizes(&blob)?;
+    let mut new = regrid(&blob)?;
+    let source = blob.len();
+    drop(blob);
+    if args.from == 6 {
+        new = reencode_v6(&new, args.mode, cost)?;
+    }
+    let new = renumber(&new, args)?;
+    let after = area_sizes(&new)?;
+    let mut line = format!(
+        "{name}: {source} -> {} bytes ({:+.3}%)",
+        new.len(),
+        100.0 * (new.len() as f64 / source as f64 - 1.0)
+    );
+    for (i, area) in AREAS.iter().enumerate() {
+        line += &format!("; {area} {} -> {}", before[i], after[i]);
+    }
+    let mut ok = true;
+    if args.check || args.check_merge {
+        let clean = verify_segment(&new).is_clean();
+        line += &format!("; verifies {clean}");
+        ok &= clean;
+    }
+    if args.check_merge {
+        let again = renumber(&new, args)?;
+        let same = again == new;
+        line += &format!("; equal to its own merge {same}");
+        if !same {
+            explain_difference(&new, &again);
+        }
+        ok &= same;
+    }
+    std::fs::write(args.output.join(name), &new).map_err(|e| e.to_string())?;
+    line += &format!("; {:.1} s", start.elapsed().as_secs_f64());
+    Ok((line, ok))
+}
+
 fn main() {
     let args = args();
     let manifest = std::fs::read_to_string(args.input.join("manifest.tsv")).unwrap_or_else(|e| {
@@ -545,9 +778,7 @@ fn main() {
         eprintln!("{}: {e}", args.output.display());
         std::process::exit(1)
     });
-    let mut cost = Cost::default();
-    let mut source = 0u64;
-    let mut ok = true;
+    let mut names = Vec::new();
     for line in manifest.lines() {
         let f: Vec<&str> = line.split('\t').collect();
         let ["segment", _, _, name, dead] = f.as_slice() else {
@@ -560,74 +791,82 @@ fn main() {
             eprintln!("{name}: has a dead list, which is copied as is");
             let _ = std::fs::copy(args.input.join(dead), args.output.join(dead));
         }
-        let start = Instant::now();
-        let blob = std::fs::read(args.input.join(name)).unwrap_or_else(|e| {
-            eprintln!("{name}: {e}");
-            std::process::exit(1)
-        });
-        source += blob.len() as u64;
-        let new = match reencode(&blob, args.mode, &mut cost) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("{name}: {e}");
-                std::process::exit(1)
-            }
-        };
-        println!(
-            "{name}: {} -> {} bytes ({:+.3}%)",
-            blob.len(),
-            new.len(),
-            100.0 * (new.len() as f64 / blob.len() as f64 - 1.0)
-        );
-        if args.check_merge {
-            let documents = header_fields(&blob).map(|(f, _)| f[0] as u32).unwrap_or(0);
-            let none = DeadDocs::decode(&segment::ordinals::encode(&[]), documents).ok();
-            let merged = none.as_ref().and_then(|dead| {
-                merge(
-                    &[Input { bytes: &new, dead }],
-                    Options {
-                        group_frontiers: args.mode,
-                        ..Options::default()
-                    },
-                    || Ok(()),
-                )
-                .ok()
-                .flatten()
-            });
-            let same = merged.as_ref().is_some_and(|m| m.blob == new);
-            let clean = verify_segment(&new).is_clean();
-            println!("{name}: equal to a merge's {same}, verifies {clean}");
-            if let (false, Some(m)) = (same, merged.as_ref()) {
-                explain_difference(&new, &m.blob);
-            }
-            ok &= same && clean;
-        }
-        std::fs::write(args.output.join(name), new).unwrap_or_else(|e| {
-            eprintln!("{name}: {e}");
-            std::process::exit(1)
-        });
-        eprintln!("{name}: {:.1} s", start.elapsed().as_secs_f64());
+        names.push(name.to_string());
     }
-    let c = &cost;
-    println!("source {source} bytes");
+    let queue = Mutex::new(names.into_iter());
+    let totals = Mutex::new((Cost::default(), [[0u64; 6]; 2], true));
+    std::thread::scope(|scope| {
+        for _ in 0..args.jobs {
+            scope.spawn(|| {
+                loop {
+                    let Some(name) = queue.lock().expect("queue").next() else {
+                        return;
+                    };
+                    let mut cost = Cost::default();
+                    match one(&args, &name, &mut cost) {
+                        Ok((line, ok)) => {
+                            println!("{line}");
+                            let mut t = totals.lock().expect("totals");
+                            t.0.add(&cost);
+                            t.2 &= ok;
+                            let blob = std::fs::read(args.input.join(&name)).ok();
+                            let new = std::fs::read(args.output.join(&name)).ok();
+                            if let (Some(b), Some(n)) = (blob, new)
+                                && let (Ok(b), Ok(n)) = (area_sizes(&b), area_sizes(&n))
+                            {
+                                for i in 0..6 {
+                                    t.1[0][i] += b[i];
+                                    t.1[1][i] += n[i];
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{name}: {e}");
+                            std::process::exit(1)
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let (cost, areas, ok) = totals.into_inner().expect("totals");
+    let (before, after): (u64, u64) = (areas[0].iter().sum(), areas[1].iter().sum());
     println!(
-        "{:?}: blobs {} bytes ({:+} = {:+.3}%); grouped terms {}: footer -{} B, directory {} -> {} B (frontiers {} in {} B, {:.2} B each, {:.2} pairs), TF {} -> {} B; by pairs {:?}",
-        args.mode,
-        c.blob,
-        c.blob as i64 - source as i64,
-        100.0 * (c.blob as f64 / source as f64 - 1.0),
-        c.grouped_terms,
-        c.footer_removed,
-        c.directory_before,
-        c.directory_after,
-        c.frontiers,
-        c.frontier_bytes,
-        c.frontier_bytes as f64 / c.frontiers.max(1) as f64,
-        c.pairs as f64 / c.frontiers.max(1) as f64,
-        c.tf_before,
-        c.tf_after,
-        &c.by_pairs[1..],
+        "areas, source -> output: {}",
+        AREAS
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!(
+                "{a} {} -> {} ({:+.2}%)",
+                areas[0][i],
+                areas[1][i],
+                100.0 * (areas[1][i] as f64 / areas[0][i].max(1) as f64 - 1.0)
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
     );
+    println!(
+        "areas together {before} -> {after} ({:+.3}%)",
+        100.0 * (after as f64 / before.max(1) as f64 - 1.0)
+    );
+    if args.from == 6 {
+        let c = &cost;
+        println!(
+            "{:?}, version 6 to 8: grouped terms {}: footer -{} B, directory {} -> {} B (frontiers {} in {} B, {:.2} B each, {:.2} pairs), TF {} -> {} B; by pairs {:?}",
+            args.mode,
+            c.grouped_terms,
+            c.footer_removed,
+            c.directory_before,
+            c.directory_after,
+            c.frontiers,
+            c.frontier_bytes,
+            c.frontier_bytes as f64 / c.frontiers.max(1) as f64,
+            c.pairs as f64 / c.frontiers.max(1) as f64,
+            c.tf_before,
+            c.tf_after,
+            &c.by_pairs[1..],
+        );
+    }
     if !ok {
         std::process::exit(1);
     }

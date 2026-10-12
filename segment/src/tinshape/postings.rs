@@ -30,13 +30,14 @@
 //!             | bucket - previous bucket - 1) varint, for each later pair:
 //!            the group's impact frontier, its lengths rounded down to six
 //!            significant bits when the form says so
-//! container := grid:  32 * width bytes, bit `local` set for each member
-//!            | ef:    ef(count local slots below 256 * width)
-//!            | paged: (pages - 1) u8, the pages (a byte each when fewer
-//!                     than 32, else a 256-bit mask), then per page
-//!                     head u8 = kind << 6 | value and its offsets:
+//! container := grid:  the group's slots in whole u64le words, bit `local`
+//!                     set for each member
+//!            | ef:    ef(count local slots below the group's slot count)
+//!            | paged: (pages - 1) u8, the pages of the group's span (a byte
+//!                     each when fewer than 32, else a 256-bit mask), then
+//!                     per page head u8 = kind << 6 | value and its offsets:
 //!                     list   (value + 1 offsets, `offset - 1` packed at
-//!                             the bits the width needs),
+//!                             the bits the page's width needs),
 //!                     bitmap (value + 1 bytes, bit `offset - 1`),
 //!                     run    (first and count, less one, packed so)
 //! tf      := sparse: per block, its buckets packed at the block's width,
@@ -66,7 +67,7 @@
 
 use super::bits::{self, BitWriter};
 use super::blob::{Bytes, Kind};
-use super::docs::{Geometry, Group};
+use super::docs::Geometry;
 use super::ef::{self, Ef};
 use crate::{Error, Result, varint};
 
@@ -538,15 +539,20 @@ pub fn encode_reusing<'r>(
     stats
 }
 
-/// Encodes one group's members, `locals` its slots within the group.
-fn encode_paged(locals: &[u32], width: u32, out: &mut Vec<u8>) {
-    let ob = bits::width_below(width);
+/// Encodes one group's members, `locals` its slots within the group and
+/// `starts` its page starts; each page's offsets are packed at the bits its
+/// own width needs.
+fn encode_paged(locals: &[u32], starts: &[u32], out: &mut Vec<u8>) {
     let mut pages: Vec<(u32, Vec<u32>)> = Vec::new();
+    let mut page = 0usize;
     for local in locals {
-        let (page, offset) = (local / width, local % width);
+        while starts[page + 1] <= *local {
+            page += 1;
+        }
+        let offset = local - starts[page];
         match pages.last_mut() {
-            Some((p, offsets)) if *p == page => offsets.push(offset),
-            _ => pages.push((page, vec![offset])),
+            Some((p, offsets)) if *p == page as u32 => offsets.push(offset),
+            _ => pages.push((page as u32, vec![offset])),
         }
     }
     out.push((pages.len() - 1) as u8);
@@ -559,7 +565,9 @@ fn encode_paged(locals: &[u32], width: u32, out: &mut Vec<u8>) {
         }
         out.extend_from_slice(&mask);
     }
-    for (_, offsets) in &pages {
+    for (page, offsets) in &pages {
+        let page = *page as usize;
+        let ob = bits::width_below(starts[page + 1] - starts[page]);
         let n = offsets.len();
         let list = (n <= LIST_MAX).then(|| bits::packed_len(n, ob));
         let bitmap = (*offsets.last().expect("a member") as usize) / 8 + 1;
@@ -628,7 +636,7 @@ fn encode_groups<'r>(
             locals.push(slots[at] - group.slot_base);
             at += 1;
         }
-        let width = u32::from(group.width);
+        let starts = geometry.starts(index);
         let mut kind = KIND_GRID;
         let mut best = group.grid_bytes();
         let dense = options.grid_density > 0
@@ -654,7 +662,7 @@ fn encode_groups<'r>(
         }
         if options.paged && !forced && reused.is_none() {
             candidate.clear();
-            encode_paged(&locals, width, &mut candidate);
+            encode_paged(&locals, starts, &mut candidate);
             if candidate.len() < best {
                 best = candidate.len();
                 kind = KIND_PAGED;
@@ -1090,9 +1098,10 @@ impl<'a> Postings<'a> {
             Form::Sparse(list) => list.for_each(visit),
             Form::Grouped(entries) => {
                 for entry in entries.iter() {
-                    let group = &geometry.groups[entry.index as usize];
-                    let base = group.slot_base;
-                    for_each_local(entry, self.container(entry).all()?, group, |local| {
+                    let index = entry.index as usize;
+                    let base = geometry.groups[index].slot_base;
+                    let starts = geometry.starts(index);
+                    for_each_local(entry, self.container(entry).all()?, starts, |local| {
                         visit(base + local);
                     })?;
                 }
@@ -1225,12 +1234,13 @@ fn parse_groups(
 }
 
 /// Calls `visit` with every member of a group container, as local slots in
-/// order.
+/// order; `starts` is the group's page starts ([`Geometry::starts`]: its
+/// slot count last).
 #[inline]
 pub fn for_each_local(
     entry: &GroupEntry,
     bytes: &[u8],
-    group: &Group,
+    starts: &[u32],
     mut visit: impl FnMut(u32),
 ) -> Result<()> {
     match entry.kind {
@@ -1246,30 +1256,38 @@ pub fn for_each_local(
             Ok(())
         }
         KIND_EF => {
-            Ef::parse(bytes, entry.count as usize, group.slots())?.for_each(visit);
+            Ef::parse(bytes, entry.count as usize, group_slots(starts))?.for_each(visit);
             Ok(())
         }
-        _ => paged_for_each(bytes, u32::from(group.width), visit),
+        _ => paged_for_each(bytes, starts, visit),
     }
+}
+
+/// A group's slot count, from its page starts.
+#[inline]
+pub fn group_slots(starts: &[u32]) -> u32 {
+    starts[starts.len() - 1]
 }
 
 /// Sets every member of a group container in `words`, a bitmap over the
 /// group's slots.
 #[inline]
-pub fn or_into(entry: &GroupEntry, bytes: &[u8], group: &Group, words: &mut [u64]) -> Result<()> {
+pub fn or_into(entry: &GroupEntry, bytes: &[u8], starts: &[u32], words: &mut [u64]) -> Result<()> {
     if entry.kind == KIND_GRID {
         for (i, word) in words.iter_mut().enumerate() {
             *word |= bits::word(bytes, i);
         }
         return Ok(());
     }
-    for_each_local(entry, bytes, group, |local| {
+    for_each_local(entry, bytes, starts, |local| {
         words[local as usize / 64] |= 1 << (local % 64);
     })
 }
 
-fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Result<()> {
-    let ob = bits::width_below(width);
+/// A paged container's members; each page's offsets are at the bits the
+/// page's own width needs.
+fn paged_for_each(bytes: &[u8], starts: &[u32], mut visit: impl FnMut(u32)) -> Result<()> {
+    let span = starts.len() - 1;
     let pages = *bytes.first().ok_or(Error::Truncated)? as usize + 1;
     let mut at = 1;
     let mut list = [0u8; 256];
@@ -1294,7 +1312,13 @@ fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Resul
     };
     let page_list: Vec<u8> = page_list.to_vec();
     for page in page_list {
-        let base = u32::from(page) * width;
+        let page = usize::from(page);
+        if page >= span {
+            return Err(Error::Corrupt("paged page"));
+        }
+        let base = starts[page];
+        let width = starts[page + 1] - base;
+        let ob = bits::width_below(width);
         let head = *bytes.get(at).ok_or(Error::Truncated)?;
         at += 1;
         let value = (head & 63) as usize;

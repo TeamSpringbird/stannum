@@ -44,31 +44,76 @@ type Doc = (Tid, Vec<(String, u32)>);
 /// Documents with clustered ctids over several 256-page groups and terms
 /// of every frequency: `w` in most, `k<n>` in few, `t<i>` in between.
 fn documents(max: usize) -> impl Strategy<Value = Vec<Doc>> {
-    prop::collection::btree_map(
-        (0u32..1400, 1u16..=MAX_OFFSET).prop_map(|(raw, offset)| {
-            let block = if raw % 3 == 0 { raw / 64 } else { raw };
+    ctids(max)
+        .prop_flat_map(|tids| {
+            let n = tids.len();
+            (
+                Just(tids),
+                prop::collection::vec((0u32..1000, 1usize..12), n),
+            )
+        })
+        .prop_map(|(tids, seeds)| tids.into_iter().zip(seeds).collect::<BTreeMap<_, _>>())
+        .prop_map(|docs: BTreeMap<Tid, (u32, usize)>| {
+            docs.into_iter()
+                .map(|(tid, (seed, len))| {
+                    let tokens = (0..len)
+                        .map(|p| {
+                            let name = match (seed + p as u32 * 7) % 9 {
+                                0..=2 => "w".to_owned(),
+                                3 => format!("k{}", seed % 40),
+                                n => format!("t{}", (seed + n) % 6),
+                            };
+                            (name, p as u32)
+                        })
+                        .collect();
+                    (tid, tokens)
+                })
+                .collect()
+        })
+}
+
+/// Fewer than `max` ctids, ascending: random line pointers (pages with
+/// holes, wide at the first blocks), or heap pages each holding rows
+/// `1..=n` for its own `n`, some with a hole, as a heap only inserted into
+/// is laid out (each page's width its row count). Blocks cluster into few
+/// 256-page groups either way.
+pub(crate) fn ctids(max: usize) -> impl Strategy<Value = Vec<Tid>> {
+    let block = |raw: u32| if raw.is_multiple_of(3) { raw / 64 } else { raw };
+    let random = prop::collection::btree_set(
+        (0u32..1400, 1u16..=MAX_OFFSET).prop_map(move |(raw, offset)| {
+            let block = block(raw);
             Tid::new(block, if block < 4 { offset } else { 1 + offset % 30 }).unwrap()
         }),
-        (0u32..1000, 1usize..12),
         1..max,
     )
-    .prop_map(|docs: BTreeMap<Tid, (u32, usize)>| {
-        docs.into_iter()
-            .map(|(tid, (seed, len))| {
-                let tokens = (0..len)
-                    .map(|p| {
-                        let name = match (seed + p as u32 * 7) % 9 {
-                            0..=2 => "w".to_owned(),
-                            3 => format!("k{}", seed % 40),
-                            n => format!("t{}", (seed + n) % 6),
-                        };
-                        (name, p as u32)
-                    })
-                    .collect();
-                (tid, tokens)
-            })
-            .collect()
-    })
+    .prop_map(|set| set.into_iter().collect::<Vec<_>>());
+    let pages = (max / 8).max(2);
+    let heap = prop::collection::btree_map(0u32..1400, (1u16..=40, any::<u8>()), 1..pages)
+        .prop_map(move |pages| {
+            let mut tids: Vec<Tid> = Vec::new();
+            for (raw, (rows, shape)) in pages {
+                let block = block(raw);
+                let rows = if shape % 13 == 0 {
+                    MAX_OFFSET - u16::from(shape % 7)
+                } else {
+                    rows
+                };
+                let hole = (shape % 4 == 0).then_some(u16::from(shape) % rows + 1);
+                tids.extend(
+                    (1..=rows)
+                        .filter(|o| Some(*o) != hole)
+                        .map(|o| Tid::new(block, o).unwrap()),
+                );
+            }
+            tids.sort_unstable();
+            tids.dedup();
+            tids.truncate(max - 1);
+            if tids.is_empty() {
+                tids.push(Tid::new(0, 1).unwrap());
+            }
+            tids
+        });
+    prop_oneof![random, heap]
 }
 
 fn builder(docs: &[Doc]) -> SegmentBuilder {
@@ -282,6 +327,88 @@ fn a_merge_keeps_the_containers_of_groups_one_input_holds() {
             .map(|(_, d)| d.clone()),
     );
     assert!(merged.reused >= 6, "{}", merged.reused);
+    assert!(verify_segment(&merged.blob).is_clean());
+    assert_eq!(merged.blob, tns(&live, options));
+}
+
+#[test]
+fn a_merge_renumbers_groups_whose_pages_change_width() {
+    // Pages of 1 to 9 rows. In groups 0 and 1 input `a` holds the even
+    // pages and the first rows of the odd ones, `b` the odd pages' last
+    // rows, so each input's odd pages are narrower than the merge's (`a`)
+    // or start later (`b`); some of `b`'s last rows are dead, so those
+    // pages are narrower in the merge than in `b`. Group 2 is `a`'s alone,
+    // its widths unchanged: its containers are kept.
+    let doc = |block: u32, offset: u16| -> Doc {
+        let n = block * 16 + u32::from(offset);
+        let mut tokens = vec![("w".to_owned(), 0)];
+        if n.is_multiple_of(3) {
+            tokens.push(("c".to_owned(), 1));
+        }
+        if n.is_multiple_of(29) {
+            tokens.push(("r".to_owned(), 2));
+        }
+        (Tid::new(block, offset).unwrap(), tokens)
+    };
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for group in 0..3u32 {
+        for page in 0..60u32 {
+            let rows = 1 + (page % 9) as u16;
+            for offset in 1..=rows {
+                let d = doc(group * 256 + page, offset);
+                if group == 2 || page % 2 == 0 || offset <= rows / 2 {
+                    a.push(d);
+                } else {
+                    b.push(d);
+                }
+            }
+        }
+    }
+    a.sort_by_key(|d| d.0);
+    let options = Options {
+        block_size: 16,
+        grid_min_postings: 0,
+        ..Options::default()
+    };
+    let blobs = [tns(&a, options), tns(&b, options)];
+    // b's dead: every third page's last row.
+    let dead: Vec<u32> = b
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| {
+            let next = b.get(i + 1).map(|n: &Doc| n.0.block);
+            next != Some(d.0.block) && d.0.block % 3 == 0
+        })
+        .map(|(i, _)| i as u32)
+        .collect();
+    assert!(!dead.is_empty());
+    let none = DeadDocs::decode(&crate::ordinals::encode(&[]), a.len() as u32).unwrap();
+    let some = DeadDocs::decode(&crate::ordinals::encode(&dead), b.len() as u32).unwrap();
+    let merged = merge(
+        &[
+            Input {
+                bytes: &blobs[0],
+                dead: &none,
+            },
+            Input {
+                bytes: &blobs[1],
+                dead: &some,
+            },
+        ],
+        options,
+        || Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    let mut live = a.clone();
+    live.extend(
+        b.iter()
+            .enumerate()
+            .filter(|(i, _)| !dead.contains(&(*i as u32)))
+            .map(|(_, d)| d.clone()),
+    );
+    live.sort_by_key(|d| d.0);
+    assert!(merged.reused >= 2, "{}", merged.reused);
     assert!(verify_segment(&merged.blob).is_clean());
     assert_eq!(merged.blob, tns(&live, options));
 }

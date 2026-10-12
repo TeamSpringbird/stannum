@@ -186,14 +186,27 @@ impl Matches {
 
     /// The bit of `tid` in group `group`'s words, or where it would be.
     fn bit_of(&self, group: usize, tid: Tid) -> usize {
-        let g = &self.docs.geometry.groups[group];
+        let geometry = &self.docs.geometry;
+        let g = &geometry.groups[group];
         let first = g.id * 256 + u32::from(g.first);
         if tid.block < first {
             return 0;
         }
         let page = (tid.block - first) as usize;
-        let width = usize::from(g.width);
-        page * width + usize::from(tid.offset.saturating_sub(1)).min(width)
+        let starts = geometry.starts(group);
+        if page >= usize::from(g.pages) {
+            return g.slots() as usize;
+        }
+        let width = (starts[page + 1] - starts[page]) as usize;
+        starts[page] as usize + usize::from(tid.offset.saturating_sub(1)).min(width)
+    }
+
+    /// The bits of the page holding bit `bit` of group `group`.
+    fn page_bits(&self, group: usize, bit: usize) -> std::ops::Range<usize> {
+        let geometry = &self.docs.geometry;
+        let page = geometry.page_of(group, bit as u32);
+        let starts = geometry.starts(group);
+        starts[page] as usize..starts[page + 1] as usize
     }
 }
 
@@ -216,8 +229,9 @@ impl set::Cursor for Matches {
             if current >= target {
                 break;
             }
-            let (group, words) = &self.groups[self.group];
-            let last = self.tid(*group, words.len() * 64 - 1);
+            let (group, _) = &self.groups[self.group];
+            let slots = self.docs.geometry.groups[*group].slots() as usize;
+            let last = self.tid(*group, slots - 1);
             if target > last {
                 self.group += 1;
                 self.bit = 0;
@@ -233,13 +247,12 @@ impl set::Cursor for Matches {
 impl pages::Cursor for Matches {
     fn current(&self) -> Option<Page> {
         let (group, words) = self.groups.get(self.group)?;
-        let width = usize::from(self.docs.geometry.groups[*group].width);
         let block = self.tid(*group, self.bit).block;
-        let page_start = self.bit / width * width;
+        let page = self.page_bits(*group, self.bit);
         let mut offsets = Offsets::default();
-        for bit in self.bit..page_start + width {
+        for bit in self.bit..page.end {
             if words[bit / 64] >> (bit % 64) & 1 == 1 {
-                offsets.insert((bit - page_start + 1) as u16);
+                offsets.insert((bit - page.start + 1) as u16);
             }
         }
         Some(Page { block, offsets })
@@ -247,8 +260,7 @@ impl pages::Cursor for Matches {
 
     fn advance(&mut self) -> segment::Result<()> {
         if let Some((group, _)) = self.groups.get(self.group) {
-            let width = usize::from(self.docs.geometry.groups[*group].width);
-            self.bit = (self.bit / width + 1) * width;
+            self.bit = self.page_bits(*group, self.bit).end;
             self.settle();
         }
         Ok(())

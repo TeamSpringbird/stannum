@@ -893,15 +893,12 @@ mod tests {
                 let Some(i) = geometry_in.group_index(group.id * 256) else {
                     continue;
                 };
-                let held = geometry_in.groups[i];
                 let input_docs: Vec<Tid> = input
                     .iter()
                     .filter(|tid| tid.block / 256 == group.id)
                     .copied()
                     .collect();
-                if (held.width, held.first, held.pages) != (group.width, group.first, group.pages)
-                    || input_docs != docs
-                {
+                if !geometry_in.same_slots(i, &geometry, g) || input_docs != docs {
                     return None;
                 }
                 let term = segment.term(&format!("t{t:02}")).unwrap()?;

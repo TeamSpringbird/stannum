@@ -37,9 +37,9 @@
 
 use super::{Level, level};
 use segment::Result;
-use segment::tinshape::docs::Group;
+
 use segment::tinshape::ef::Ef;
-use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local};
+use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local, group_slots};
 
 /// Appends the list's values, in order.
 #[inline]
@@ -85,20 +85,24 @@ pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
 
 /// Appends a group container's members (local slots, in order), as
 /// [`for_each_local`] visits them: an Elias-Fano container's by
-/// [`ef_decode`].
+/// [`ef_decode`]. `starts` is the group's page starts
+/// ([`segment::tinshape::docs::Geometry::starts`]).
 #[inline]
 pub fn container_locals(
     entry: &GroupEntry,
     bytes: &[u8],
-    group: &Group,
+    starts: &[u32],
     out: &mut Vec<u32>,
 ) -> Result<()> {
     if entry.kind == KIND_EF {
-        ef_decode(Ef::parse(bytes, entry.count as usize, group.slots())?, out);
+        ef_decode(
+            Ef::parse(bytes, entry.count as usize, group_slots(starts))?,
+            out,
+        );
         return Ok(());
     }
     out.reserve(entry.count as usize);
-    for_each_local(entry, bytes, group, |l| out.push(l))
+    for_each_local(entry, bytes, starts, |l| out.push(l))
 }
 
 /// Sets a group container's members in `row`, which is cleared where they
@@ -107,15 +111,18 @@ pub fn container_locals(
 pub fn container_row(
     entry: &GroupEntry,
     bytes: &[u8],
-    group: &Group,
+    starts: &[u32],
     row: &mut [u64],
 ) -> Result<()> {
     if entry.kind == KIND_EF {
-        ef_into_row(Ef::parse(bytes, entry.count as usize, group.slots())?, row);
+        ef_into_row(
+            Ef::parse(bytes, entry.count as usize, group_slots(starts))?,
+            row,
+        );
         return Ok(());
     }
     let mut put = RowPut::new();
-    for_each_local(entry, bytes, group, |l| put.put(row, l))
+    for_each_local(entry, bytes, starts, |l| put.put(row, l))
 }
 
 /// Lists shorter than this are decoded by [`short`] at every level.

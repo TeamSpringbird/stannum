@@ -871,7 +871,7 @@ fn load<'a>(
                     offset: 0,
                 };
             } else {
-                kernels::container_locals(&e, bytes, &group, &mut mem.list)?;
+                kernels::container_locals(&e, bytes, geometry.starts(g as usize), &mut mem.list)?;
             }
         }
         Src::Locals { from, to } => {
@@ -2546,7 +2546,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     #[inline(never)]
     fn or_load(&mut self, i: usize, g: u32, words: usize) -> Result<()> {
         let t = self.sc[i].term;
-        let group = self.geometry.groups[g as usize];
+        let geometry = self.geometry;
+        let group = geometry.groups[g as usize];
         let row = &mut self.rows[i * words..(i + 1) * words];
         let set = self.terms[t].as_mut().expect("scoring");
         let r = &mut self.row_state[i];
@@ -2588,7 +2589,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     r.at = grid_row(bytes, row)?;
                 } else {
                     row.fill(0);
-                    kernels::container_row(&e, bytes.all()?, &group, row)?;
+                    kernels::container_row(&e, bytes.all()?, geometry.starts(g as usize), row)?;
                 }
             }
             Src::Locals { from, to } => {
