@@ -550,7 +550,14 @@ macro_rules! passes {
                     let last = u64::from(*dst.add(to - origin - 1)) | mask;
                     if ((last / 64) as usize) < row.len() {
                         let values = core::slice::from_raw_parts(dst.add(from - origin), to - from);
-                        for &v in values {
+                        let mut fours = values.chunks_exact(4);
+                        for four in &mut fours {
+                            put.put_unchecked(row, four[0]);
+                            put.put_unchecked(row, four[1]);
+                            put.put_unchecked(row, four[2]);
+                            put.put_unchecked(row, four[3]);
+                        }
+                        for &v in fours.remainder() {
                             put.put_unchecked(row, v);
                         }
                     } else {
