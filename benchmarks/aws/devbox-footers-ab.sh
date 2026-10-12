@@ -5,8 +5,8 @@
 # A devbox.sh --cmd-file: the 150M replay A/B of a format change. SRC1 (base)
 # replays the dump in S3 (page layout version 6); SRC2 (candidate) re-encodes
 # it on the box with its own `tnsreencode` into /data/dump150m-v8 and replays
-# that. Interleaved, 2 rounds, score and full_score, three styles, under perf
-# stat.
+# that. Interleaved (A B for score, B A for full_score), one round, three
+# styles, under perf stat: about 50 minutes of box time.
 #   devbox.sh --branch BASE --branch CANDIDATE --dump --cmd-file benchmarks/aws/devbox-footers-ab.sh
 set -u
 D=$DATA/dump150m
@@ -23,11 +23,11 @@ A=$SRC1/target/release/tnsreplay; B=$SRC2/target/release/tnsreplay
 for x in A B; do bin=$(eval echo \$$x); dump=$D; [ $x = B ] && dump=$D2
   perf stat -x, -e $EV -o $OUT/perf-load-$x.csv -- $bin --dump $dump --trace $DATA/trace.tsv --style conjunction --limit 1 --repeat 1 > $OUT/replay-load-$x.txt 2> $OUT/replay-load-$x.err
 done
-for r in 1 2; do
+for r in 1; do
   for mode in score full; do
     for st in conjunction disjunction phrase; do
-      order="A B"; [ $r = 2 ] && order="B A"
-      extra=""; limit=400; [ $mode = full ] && { extra="--full"; limit=300; }
+      order="A B"; [ $mode = full ] && order="B A"
+      extra=""; limit=300; [ $mode = full ] && { extra="--full"; limit=150; }
       for x in $order; do bin=$(eval echo \$$x); dump=$D; [ $x = B ] && dump=$D2
         tag=r$r-$x-$mode-$st
         perf stat -x, -e $EV -o $OUT/perf-$tag.csv -- $bin --dump $dump --trace $DATA/trace.tsv --expect $DATA/pg-ranked.tsv \
