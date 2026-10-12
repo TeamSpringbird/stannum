@@ -94,6 +94,13 @@ pub struct Options {
     /// smaller term whole costs microseconds, and a small table, every
     /// term of which is small, would pay for grids it never needs.
     pub grid_min_postings: u32,
+    /// A group holding at least one slot in this many (but fewer than
+    /// [`Self::grid_density`] asks) of a term of at least
+    /// [`Self::grid_min_postings`] is a paged container whatever else would
+    /// be smaller: TIN's two-level bitmap, a page mask and per present page
+    /// a short offset list or bitmap, read a page at a time rather than a
+    /// member at a time. 0 chooses by size alone.
+    pub paged_density: u32,
     /// A term of at most this many postings carries its documents' lengths
     /// in its record ([`InlineLengths`]): its top k reads no DL sidecar.
     pub inline_lengths_max_df: u32,
@@ -112,6 +119,7 @@ impl Default for Options {
             adaptive_tf: true,
             grid_density: 64,
             grid_min_postings: 4096,
+            paged_density: 0,
             inline_lengths_max_df: 64,
             inline_lengths_min_documents: 1 << 16,
         }
@@ -131,7 +139,8 @@ pub struct Stats {
     pub kinds: [usize; 3],
     /// Bytes per container kind.
     pub kind_bytes: [usize; 3],
-    /// Groups made grids by [`Options::grid_density`].
+    /// Groups made grids by [`Options::grid_density`], or paged containers
+    /// by [`Options::paged_density`] (either keeps the term grouped).
     pub forced: usize,
     /// Bytes of inline lengths ([`InlineLengths`]).
     pub lengths: usize,
@@ -325,8 +334,9 @@ pub fn encode_reusing<'r>(
     stats
 }
 
-/// Encodes one group's members, `locals` its slots within the group.
-fn encode_paged(locals: &[u32], width: u32, out: &mut Vec<u8>) {
+/// Encodes one group's members, `locals` its slots within the group, as a
+/// paged container.
+pub fn encode_paged(locals: &[u32], width: u32, out: &mut Vec<u8>) {
     let ob = bits::width_below(width);
     let mut pages: Vec<(u32, Vec<u32>)> = Vec::new();
     for local in locals {
@@ -411,29 +421,35 @@ fn encode_groups<'r>(
         let mut best = group.grid_bytes();
         let dense = options.grid_density > 0
             && locals.len() as u64 * u64::from(options.grid_density) >= u64::from(group.slots());
-        let forced = dense && slots.len() as u64 >= u64::from(options.grid_min_postings);
-        if forced {
+        let big = slots.len() as u64 >= u64::from(options.grid_min_postings);
+        let forced = dense && big;
+        let forced_paged = !forced
+            && big
+            && options.paged_density > 0
+            && locals.len() as u64 * u64::from(options.paged_density) >= u64::from(group.slots());
+        if forced || forced_paged {
             stats.forced += 1;
         }
         // An input's container, where its term was forced as this one is.
         let reused = reuse(index).filter(|r| {
-            !dense || (u64::from(r.input_df) >= u64::from(options.grid_min_postings)) == forced
+            let input_big = u64::from(r.input_df) >= u64::from(options.grid_min_postings);
+            (!dense || input_big == forced) && (!forced_paged || input_big)
         });
         if let Some(r) = reused {
             kind = r.kind;
             best = r.bytes.len();
         }
-        if options.ef_groups && !forced && reused.is_none() {
+        if options.ef_groups && !forced && !forced_paged && reused.is_none() {
             let len = ef::encoded_len(locals.len(), group.slots());
             if len < best {
                 best = len;
                 kind = KIND_EF;
             }
         }
-        if options.paged && !forced && reused.is_none() {
+        if (options.paged || forced_paged) && !forced && reused.is_none() {
             candidate.clear();
             encode_paged(&locals, width, &mut candidate);
-            if candidate.len() < best {
+            if forced_paged || candidate.len() < best {
                 best = candidate.len();
                 kind = KIND_PAGED;
             }
@@ -913,57 +929,86 @@ pub fn for_each_local(
 }
 
 /// Sets every member of a group container in `words`, a bitmap over the
-/// group's slots.
+/// group's slots (ORed in: a page's members at once for a paged
+/// container).
 #[inline]
 pub fn or_into(entry: &GroupEntry, bytes: &[u8], group: &Group, words: &mut [u64]) -> Result<()> {
-    if entry.kind == KIND_GRID {
-        for (i, word) in words.iter_mut().enumerate() {
-            *word |= bits::word(bytes, i);
+    match entry.kind {
+        KIND_GRID => {
+            for (i, word) in words.iter_mut().enumerate() {
+                *word |= bits::word(bytes, i);
+            }
+            Ok(())
         }
-        return Ok(());
+        KIND_PAGED => paged_or_into(bytes, u32::from(group.width), words),
+        _ => for_each_local(entry, bytes, group, |local| {
+            words[local as usize / 64] |= 1 << (local % 64);
+        }),
     }
-    for_each_local(entry, bytes, group, |local| {
-        words[local as usize / 64] |= 1 << (local % 64);
-    })
 }
 
-fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Result<()> {
+/// Calls `page` with each present page of a paged container, its head
+/// byte and its body, in page order.
+#[inline]
+fn paged_pages(
+    bytes: &[u8],
+    width: u32,
+    mut page: impl FnMut(u32, u8, &[u8]) -> Result<()>,
+) -> Result<()> {
     let ob = bits::width_below(width);
     let pages = *bytes.first().ok_or(Error::Truncated)? as usize + 1;
     let mut at = 1;
-    let mut list = [0u8; 256];
-    let page_list: &[u8] = if pages < 32 {
-        let l = bytes.get(at..at + pages).ok_or(Error::Truncated)?;
+    let mut body_of = |p: u32, at: &mut usize| -> Result<()> {
+        let head = *bytes.get(*at).ok_or(Error::Truncated)?;
+        *at += 1;
+        let value = (head & 63) as usize;
+        let len = match head >> 6 {
+            PAGE_LIST => bits::packed_len(value + 1, ob),
+            PAGE_BITMAP => value + 1,
+            PAGE_RUN => bits::packed_len(2, ob),
+            _ => return Err(Error::Corrupt("paged page kind")),
+        };
+        let body = bytes.get(*at..*at + len).ok_or(Error::Truncated)?;
+        *at += len;
+        page(p, head, body)
+    };
+    if pages < 32 {
+        let list = bytes.get(at..at + pages).ok_or(Error::Truncated)?;
         at += pages;
-        l
+        for p in list {
+            body_of(u32::from(*p), &mut at)?;
+        }
     } else {
         let mask = bytes.get(at..at + 32).ok_or(Error::Truncated)?;
         at += 32;
-        let mut n = 0;
-        for p in 0..256 {
-            if mask[p / 8] >> (p % 8) & 1 == 1 {
-                list[n] = p as u8;
+        let mut n = 0usize;
+        for w in 0..4 {
+            let mut word = bits::word(mask, w);
+            while word != 0 {
+                let p = (w * 64) as u32 + word.trailing_zeros();
+                word &= word - 1;
                 n += 1;
+                body_of(p, &mut at)?;
             }
         }
         if n != pages {
             return Err(Error::Corrupt("paged mask count"));
         }
-        &list[..n]
-    };
-    let page_list: Vec<u8> = page_list.to_vec();
-    for page in page_list {
-        let base = u32::from(page) * width;
-        let head = *bytes.get(at).ok_or(Error::Truncated)?;
-        at += 1;
+    }
+    if at != bytes.len() {
+        return Err(Error::Corrupt("paged length"));
+    }
+    Ok(())
+}
+
+fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Result<()> {
+    let ob = bits::width_below(width);
+    paged_pages(bytes, width, |page, head, body| {
+        let base = page * width;
         let value = (head & 63) as usize;
         match head >> 6 {
             PAGE_LIST => {
-                let n = value + 1;
-                let len = bits::packed_len(n, ob);
-                let body = bytes.get(at..at + len).ok_or(Error::Truncated)?;
-                at += len;
-                for i in 0..n {
+                for i in 0..value + 1 {
                     let offset = bits::get(body, i, ob)?;
                     if offset >= width {
                         return Err(Error::Corrupt("paged offset"));
@@ -972,9 +1017,6 @@ fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Resul
                 }
             }
             PAGE_BITMAP => {
-                let len = value + 1;
-                let body = bytes.get(at..at + len).ok_or(Error::Truncated)?;
-                at += len;
                 for (i, byte) in body.iter().enumerate() {
                     let mut byte = *byte;
                     while byte != 0 {
@@ -987,10 +1029,7 @@ fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Resul
                     }
                 }
             }
-            PAGE_RUN => {
-                let len = bits::packed_len(2, ob);
-                let body = bytes.get(at..at + len).ok_or(Error::Truncated)?;
-                at += len;
+            _ => {
                 let first = bits::get(body, 0, ob)?;
                 let n = bits::get(body, 1, ob)? + 1;
                 if first + n > width {
@@ -1000,13 +1039,88 @@ fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Resul
                     visit(base + offset);
                 }
             }
-            _ => return Err(Error::Corrupt("paged page kind")),
+        }
+        Ok(())
+    })
+}
+
+/// ORs the low `count` bits of `value` into `words` at bit `at`.
+#[inline(always)]
+fn or_bits(words: &mut [u64], at: usize, value: u64, count: usize) -> Result<()> {
+    let (w, s) = (at / 64, at % 64);
+    *words.get_mut(w).ok_or(Error::Corrupt("paged offset"))? |= value << s;
+    if s + count > 64 {
+        // Only set bits spill into the next word (the last page's mask
+        // may end past the row).
+        let spill = value >> (64 - s);
+        if spill != 0 {
+            *words.get_mut(w + 1).ok_or(Error::Corrupt("paged offset"))? |= spill;
         }
     }
-    if at != bytes.len() {
-        return Err(Error::Corrupt("paged length"));
-    }
     Ok(())
+}
+
+/// [`or_into`] for a paged container: a page's bitmap or run is shifted
+/// into place as a whole, a list's offsets set one by one.
+fn paged_or_into(bytes: &[u8], width: u32, words: &mut [u64]) -> Result<()> {
+    let ob = bits::width_below(width);
+    paged_pages(bytes, width, |page, head, body| {
+        let base = (page * width) as usize;
+        let value = (head & 63) as usize;
+        match head >> 6 {
+            PAGE_LIST => {
+                for i in 0..value + 1 {
+                    let offset = bits::get(body, i, ob)?;
+                    if offset >= width {
+                        return Err(Error::Corrupt("paged offset"));
+                    }
+                    let local = base + offset as usize;
+                    *words
+                        .get_mut(local / 64)
+                        .ok_or(Error::Corrupt("paged offset"))? |= 1 << (local % 64);
+                }
+            }
+            PAGE_BITMAP => {
+                if body.len() * 8 > width as usize + 7 {
+                    return Err(Error::Corrupt("paged offset"));
+                }
+                for (c, chunk) in body.chunks(8).enumerate() {
+                    let mut v = 0u64;
+                    for (i, b) in chunk.iter().enumerate() {
+                        v |= u64::from(*b) << (8 * i);
+                    }
+                    // Bits past the width would spill into the next page.
+                    let bits = chunk.len() * 8;
+                    let limit = width as usize - c * 64;
+                    if bits > limit && v >> limit != 0 {
+                        return Err(Error::Corrupt("paged offset"));
+                    }
+                    or_bits(words, base + c * 64, v, bits)?;
+                }
+            }
+            _ => {
+                let first = bits::get(body, 0, ob)? as usize;
+                let n = bits::get(body, 1, ob)? as usize + 1;
+                if first + n > width as usize {
+                    return Err(Error::Corrupt("paged run"));
+                }
+                let mut at = base + first;
+                let mut left = n;
+                while left > 0 {
+                    let take = left.min(64);
+                    let v = if take == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << take) - 1
+                    };
+                    or_bits(words, at, v, take)?;
+                    at += take;
+                    left -= take;
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 /// A record's footer decoded: per block, its last slot, its frontier and
@@ -2487,7 +2601,7 @@ mod tests {
                 (false, false, true),
             ] {
                 for adaptive_tf in [true, false] {
-                    for grid_density in [0, 4] {
+                    for (grid_density, paged_density) in [(0, 0), (4, 0), (4, 16), (0, 8)] {
                         out.push(Options {
                             block_size,
                             paged,
@@ -2496,6 +2610,7 @@ mod tests {
                             adaptive_tf,
                             grid_density,
                             grid_min_postings: 0,
+                            paged_density,
                             inline_lengths_max_df: if adaptive_tf { 8 } else { 0 },
                             inline_lengths_min_documents: 0,
                         });
@@ -2629,6 +2744,69 @@ mod tests {
         check_all(&tids, &tenth, &vec![2; tenth.len()]);
         let runs: Vec<Tid> = tids.iter().filter(|t| t.block % 3 == 0).copied().collect();
         check_all(&tids, &runs, &vec![0; runs.len()]);
+    }
+
+    #[test]
+    fn paged_density_forces_paged_containers() {
+        // 512 full pages of 40 tuples, two groups; one document per page is
+        // 1 slot in 40: below a grid at 1 in 16, above a paged container
+        // at 1 in 64.
+        let all: Vec<Tid> = (0..512u32)
+            .flat_map(|b| {
+                (1..=40u16).map(move |o| Tid {
+                    block: b,
+                    offset: o,
+                })
+            })
+            .collect();
+        let geometry = geometry(&all);
+        let tids: Vec<Tid> = all
+            .iter()
+            .filter(|t| t.offset == 1 + (t.block * 7 % 40) as u16)
+            .copied()
+            .collect();
+        let slots: Vec<u32> = tids.iter().map(|t| geometry.slot_of(*t).unwrap()).collect();
+        let buckets = vec![1u8; tids.len()];
+        let lengths = vec![30; tids.len()];
+        let options = Options {
+            grid_density: 16,
+            paged_density: 64,
+            grid_min_postings: 256,
+            ..Options::default()
+        };
+        let stats = round_trip(&geometry, &slots, &buckets, &lengths, &options);
+        assert!(!stats.sparse);
+        assert_eq!((stats.kinds, stats.forced), ([0, 0, 2], 2));
+        // Without the option, one list over the grid is smaller.
+        let by_size = Options {
+            grid_density: 16,
+            grid_min_postings: 256,
+            ..Options::default()
+        };
+        assert!(round_trip(&geometry, &slots, &buckets, &lengths, &by_size).sparse);
+        // The row expansion agrees with the members, group by group.
+        let mut out = Vec::new();
+        encode(&geometry, &slots, &buckets, &lengths, &options, &mut out);
+        let parsed = Postings::parse(&out, slots.len() as u32, &geometry).unwrap();
+        let Form::Grouped(entries) = &parsed.form else {
+            panic!("grouped");
+        };
+        for entry in entries.iter() {
+            let group = &geometry.groups[entry.index as usize];
+            let bytes = parsed.container(entry).all().unwrap();
+            let mut row = vec![0u64; group.words()];
+            or_into(entry, bytes, group, &mut row).unwrap();
+            let mut want = vec![0u64; group.words()];
+            let mut listed = Vec::new();
+            for_each_local(entry, bytes, group, |l| {
+                want[l as usize / 64] |= 1 << (l % 64);
+                listed.push(l + group.slot_base);
+            })
+            .unwrap();
+            assert_eq!(row, want);
+            let from = entry.first as usize;
+            assert_eq!(listed, slots[from..from + entry.count as usize]);
+        }
     }
 
     #[test]

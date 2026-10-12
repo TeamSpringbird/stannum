@@ -43,7 +43,7 @@ const GRID_DENSITY: u64 = 64;
 const GRID_MIN_POSTINGS: u64 = 4096;
 const LIST_MAX: usize = 64;
 
-const SCHEMES: [&str; 14] = [
+const SCHEMES: [&str; 19] = [
     "actual",
     "cur",
     "noforce",
@@ -58,7 +58,17 @@ const SCHEMES: [&str; 14] = [
     "force8+x",
     "best",
     "tin",
+    "tin2",
+    "pm16",
+    "pm32",
+    "pg16",
+    "pg32",
 ];
+/// Schemes whose per-group container bytes are kept for the trace's
+/// conjunctions and phrases (the lead's groups only).
+const PAGE_SCHEMES: [usize; 8] = [1, 2, 9, 14, 15, 16, 17, 18];
+const NPS: usize = PAGE_SCHEMES.len();
+const STYLES: [&str; 3] = ["conjunction", "disjunction", "phrase"];
 const S_ACTUAL: usize = 0;
 const NS: usize = SCHEMES.len();
 
@@ -86,12 +96,16 @@ fn df_class(df: u32) -> usize {
     }
 }
 
-const FORMS: [&str; 7] = ["single", "sparse", "grid", "ef", "paged", "shared", "pgrid"];
+const FORMS: [&str; 8] = [
+    "single", "sparse", "grid", "ef", "paged", "shared", "pgrid", "pmask",
+];
+const NF: usize = FORMS.len();
 const F_GRID: usize = 2;
 const F_EF: usize = 3;
 const F_PAGED: usize = 4;
 const F_SHARED: usize = 5;
 const F_PGRID: usize = 6;
+const F_PMASK: usize = 7;
 
 struct Args {
     dump: PathBuf,
@@ -190,6 +204,14 @@ struct Costs {
     pagedx: usize,
     shared: Option<usize>,
     tin: usize,
+    /// A page bitmap (or list) and per present page a bitmap at the
+    /// group's width (a fixed stride, so a page's mask is found by its
+    /// rank): TIN's two-level bitmap without head bytes.
+    pmask: usize,
+    /// TIN 1.0.4 as probed on an 18-rows-per-page heap (probe6 S1):
+    /// about 20 B per (term, group) and per present page about 2.8 B for
+    /// one member, 0.2 B per further member, at most a bitmap.
+    tin2: usize,
 }
 
 /// Per-page shape counts.
@@ -259,6 +281,8 @@ fn price(
     let mut paged_pages = 0usize;
     let mut pagedx_pages = 0usize;
     let mut tin_pages = 0usize;
+    let mut pmask_pages = 0usize;
+    let mut tin2_pages = 0.0f64;
     let mut identical = true;
     let mut all_full = true;
     let mut first_page: (usize, usize) = (0, 0);
@@ -294,6 +318,13 @@ fn price(
         } else {
             (w as usize).div_ceil(8)
         };
+        pmask_pages += (w as usize).div_ceil(8);
+        {
+            let docs = gp.docs[base + page as usize] as f64;
+            let list = 2.8 + 0.2 * (k as f64 - 1.0);
+            let bitmap = 0.9 + (docs / 8.0).ceil();
+            tin2_pages += list.min(bitmap);
+        }
         if np == 0 {
             first_page = (start, i);
         } else if identical {
@@ -310,6 +341,8 @@ fn price(
     let page_set = 1 + if np < 32 { np } else { 32 };
     c.paged = page_set + paged_pages;
     c.pagedx = page_set + pagedx_pages;
+    c.pmask = page_set + pmask_pages;
+    c.tin2 = (20.0 + tin2_pages).round() as usize;
     if np >= 2 && identical {
         c.shared = Some(page_set + 1 + max_offset as usize / 8 + 1);
     } else if np >= 2 && all_full {
@@ -440,6 +473,31 @@ fn choose(scheme: usize, c: &Costs, df: u32, slots: u32) -> (usize, usize) {
             (F_SHARED, shared),
         ]),
         "tin" => (F_PAGED, c.tin),
+        // Terms under about 250 postings live in TIN's footer at about
+        // 6.5 B per posting (probe6 S1: 5.6 to 9.9).
+        "tin2" => (
+            F_PAGED,
+            if df < 256 {
+                (f64::from(c.n) * 6.5).round() as usize
+            } else {
+                c.tin2
+            },
+        ),
+        "pm16" | "pm32" | "pg16" | "pg32" => {
+            let (d, form, bytes) = match SCHEMES[scheme] {
+                "pm16" => (16, F_PMASK, c.pmask),
+                "pm32" => (32, F_PMASK, c.pmask),
+                "pg16" => (16, F_PAGED, c.paged),
+                _ => (32, F_PAGED, c.paged),
+            };
+            if forced(d) {
+                (F_GRID, c.grid)
+            } else if forced(GRID_DENSITY) {
+                (form, bytes)
+            } else {
+                min(&[all[0], all[1], all[2], (F_PMASK, c.pmask)])
+            }
+        }
         _ => unreachable!(),
     }
 }
@@ -452,7 +510,8 @@ fn forced_in(scheme: usize, c: &Costs, df: u32, slots: u32) -> bool {
         "force16" => 16,
         "force8" | "force8+x" => 8,
         "force4" => 4,
-        "tin" => return true,
+        "tin" | "tin2" => return true,
+        "pm16" | "pm32" | "pg16" | "pg32" => GRID_DENSITY,
         _ => return false,
     };
     big && u64::from(c.n) * d >= u64::from(slots)
@@ -464,8 +523,8 @@ struct Total {
     payload: u64,
     directory: u64,
     by_class: [u64; 8],
-    by_form: [u64; 7],
-    forms: [u64; 7],
+    by_form: [u64; NF],
+    forms: [u64; NF],
 }
 
 /// Where a trace term's payload lies under each scheme, per segment.
@@ -481,6 +540,18 @@ struct TermAt {
     at: Vec<[Extent; NS]>,
 }
 
+/// A trace term in the segment at hand: its groups and, per page scheme,
+/// where each group's container starts within its payload (a prefix sum,
+/// one more entry than groups).
+#[derive(Default, Clone)]
+struct SegTerm {
+    present: bool,
+    df: u32,
+    groups: Vec<u32>,
+    at: [Vec<u32>; NPS],
+    sparse: [bool; NPS],
+}
+
 /// Times loading a forced grid's members into a row as the OR walk does
 /// (`kernels::load` of the grid, or clearing the row and setting each
 /// member of the group's Elias-Fano list), the same followed by a visit of
@@ -494,8 +565,9 @@ fn decode_bench(dump: &std::path::Path, name: &str) {
     let blob = std::fs::read(dump.join(name)).expect("segment");
     let segment = Segment::parse(&blob).expect("parse");
     let geometry = &segment.docs.geometry;
-    // (density band, group words, grid bytes, ef bytes, members, slots)
-    type Sample = (usize, usize, Vec<u8>, Vec<u8>, u32, u32);
+    // (density band, group words, grid bytes, ef bytes, members, slots,
+    // paged bytes, group index)
+    type Sample = (usize, usize, Vec<u8>, Vec<u8>, u32, u32, Vec<u8>, usize);
     let mut samples: Vec<Sample> = Vec::new();
     let mut per_band = [0usize; 4];
     let mut seen = 0u64;
@@ -552,7 +624,18 @@ fn decode_bench(dump: &std::path::Path, name: &str) {
             }
             let mut efb = Vec::new();
             ef::encode(&locals, group.slots(), &mut efb);
-            samples.push((band, group.words(), bytes, efb, n, group.slots()));
+            let mut paged = Vec::new();
+            segment::tinshape::postings::encode_paged(&locals, u32::from(group.width), &mut paged);
+            samples.push((
+                band,
+                group.words(),
+                bytes,
+                efb,
+                n,
+                group.slots(),
+                paged,
+                e.index as usize,
+            ));
         }
         if per_band.iter().all(|c| *c >= 5000) {
             break;
@@ -572,6 +655,15 @@ fn decode_bench(dump: &std::path::Path, name: &str) {
         let members: u64 = set.iter().map(|s| u64::from(s.4)).sum();
         let grid_bytes: u64 = set.iter().map(|s| s.2.len() as u64).sum();
         let ef_bytes: u64 = set.iter().map(|s| s.3.len() as u64).sum();
+        let paged_bytes: u64 = set.iter().map(|s| s.6.len() as u64).sum();
+        let entry_of = |s: &Sample, kind: u8| segment::tinshape::postings::GroupEntry {
+            index: s.7 as u32,
+            count: s.4,
+            kind,
+            at: 0,
+            len: 0,
+            first: 0,
+        };
         let reps = 20;
         let time = |f: &mut dyn FnMut() -> u64| {
             let mut best = f64::MAX;
@@ -610,6 +702,50 @@ fn decode_bench(dump: &std::path::Path, name: &str) {
                     r[w] = bits;
                 });
                 x = x.wrapping_add(std::hint::black_box(r[0]));
+            }
+            x
+        });
+        let mut list: Vec<u32> = Vec::with_capacity(1 << 16);
+        let ef_row_kernel = time(&mut || {
+            let mut x = 0u64;
+            for s in &set {
+                let r = &mut row[..s.1];
+                r.fill(0);
+                let e = entry_of(s, KIND_EF);
+                kernels::container_row(&e, &s.3, &geometry.groups[s.7], r).expect("ef");
+                x = x.wrapping_add(std::hint::black_box(r[0]));
+            }
+            x
+        });
+        let paged_row = time(&mut || {
+            let mut x = 0u64;
+            for s in &set {
+                let r = &mut row[..s.1];
+                r.fill(0);
+                let e = entry_of(s, KIND_PAGED);
+                kernels::container_row(&e, &s.6, &geometry.groups[s.7], r).expect("paged");
+                x = x.wrapping_add(std::hint::black_box(r[0]));
+            }
+            x
+        });
+        let ef_list = time(&mut || {
+            let mut x = 0u64;
+            for s in &set {
+                list.clear();
+                let e = entry_of(s, KIND_EF);
+                kernels::container_locals(&e, &s.3, &geometry.groups[s.7], &mut list).expect("ef");
+                x = x.wrapping_add(std::hint::black_box(list.len() as u64));
+            }
+            x
+        });
+        let paged_list = time(&mut || {
+            let mut x = 0u64;
+            for s in &set {
+                list.clear();
+                let e = entry_of(s, KIND_PAGED);
+                kernels::container_locals(&e, &s.6, &geometry.groups[s.7], &mut list)
+                    .expect("paged");
+                x = x.wrapping_add(std::hint::black_box(list.len() as u64));
             }
             x
         });
@@ -668,14 +804,19 @@ fn decode_bench(dump: &std::path::Path, name: &str) {
         });
         let m = members as f64 / set.len() as f64;
         println!(
-            "  band {band}: {} containers, {:.0} members, grid {:.0} B ef {:.0} B ({:.2}x) | ns/container: load grid {:.0} ef {:.0} | load+visit grid {:.0} ef {:.0} | count grid {:.0} ef {:.0} | ef ns/member load {:.2} visit-delta {:.2}",
+            "  band {band}: {} containers, {:.0} members, grid {:.0} B ef {:.0} B ({:.2}x) paged {:.0} B | ns/container: load grid {:.0} ef-scalar {:.0} ef-kernel {:.0} paged {:.0} | list ef-kernel {:.0} paged {:.0} | load+visit grid {:.0} ef {:.0} | count grid {:.0} ef {:.0} | ef ns/member load {:.2} visit-delta {:.2}",
             set.len(),
             m,
             grid_bytes as f64 / set.len() as f64,
             ef_bytes as f64 / set.len() as f64,
             grid_bytes as f64 / ef_bytes as f64,
+            paged_bytes as f64 / set.len() as f64,
             grid_load,
             ef_load,
+            ef_row_kernel,
+            paged_row,
+            ef_list,
+            paged_list,
             grid_visit,
             ef_visit,
             grid_count,
@@ -710,8 +851,8 @@ fn main() {
             _ => {}
         }
     }
-    // Trace terms, per disjunction.
-    let mut queries: Vec<Vec<usize>> = Vec::new();
+    // Trace terms, per query: (style, terms).
+    let mut queries: Vec<(usize, Vec<usize>)> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     let mut name_at: FxHashMap<String, usize> = FxHashMap::default();
     if let Some(trace) = &args.trace {
@@ -726,9 +867,9 @@ fn main() {
             .compile()
             .expect("tokenizer");
         for q in bench::read_trace(trace).expect("trace") {
-            if q.style != "disjunction" {
+            let Some(style) = STYLES.iter().position(|s| *s == q.style) else {
                 continue;
-            }
+            };
             let query = tinql::runtime::parse_tinql_to_query(&q.text, &tokenizer).expect("query");
             let mut terms = Vec::new();
             if engine::tinshape::lower(&query, &mut terms).is_none() {
@@ -743,10 +884,17 @@ fn main() {
                     })
                 })
                 .collect();
-            queries.push(ids);
+            queries.push((style, ids));
         }
-        eprintln!("{} disjunctions, {} terms", queries.len(), names.len());
+        eprintln!("{} queries, {} terms", queries.len(), names.len());
     }
+    // Per style, per term, per page scheme: the pages read over the trace
+    // (conjunctions and phrases: the lead whole, the others in the lead's
+    // groups; disjunctions are counted at the end from the extents).
+    let mut style_pages: Vec<Vec<[u64; NPS]>> =
+        (0..3).map(|_| vec![[0u64; NPS]; names.len()]).collect();
+    // Per term, per page scheme, bytes by form (for attributing pages).
+    let mut term_form: Vec<[[u64; NF]; NPS]> = vec![[[0u64; NF]; NPS]; names.len()];
     let mut term_at: Vec<TermAt> = names
         .iter()
         .map(|_| TermAt {
@@ -805,6 +953,10 @@ fn main() {
         let postings_at = segment.area_at(Area::Postings) as u64;
         // Each scheme's running record offset in the postings area.
         let mut offset = [0u64; NS];
+        let mut seg_terms: Vec<SegTerm> = (0..names.len()).map(|_| SegTerm::default()).collect();
+        let mut group_idx: Vec<u32> = Vec::new();
+        let mut group_bytes: Vec<Vec<u32>> = (0..NPS).map(|_| Vec::new()).collect();
+        let mut sparse_chosen: [bool; NPS];
         for item in segment.dictionary().iter() {
             let (term, entry) = item.expect("term map");
             let found = segment.resolve(entry).expect("record");
@@ -827,6 +979,11 @@ fn main() {
             };
             let trace = name_at.get(&term).copied();
             let mut chosen = [(0u64, 0u64); NS];
+            group_idx.clear();
+            for g in group_bytes.iter_mut() {
+                g.clear();
+            }
+            sparse_chosen = [false; NPS];
             match &p.form {
                 Form::Single(_) => {
                     totals[S_ACTUAL].forms[0] += 1;
@@ -917,11 +1074,20 @@ fn main() {
                         let mut directory = varint_len(costs.len() as u64) as u64;
                         let mut any_forced = false;
                         let mut previous: Option<usize> = None;
-                        let mut by_form = [0u64; 7];
-                        let mut forms = [0u64; 7];
+                        let mut by_form = [0u64; NF];
+                        let mut forms = [0u64; NF];
+                        let ps = PAGE_SCHEMES.iter().position(|&x| x == s);
                         for (index, c) in &costs {
                             let gslots = geometry.groups[*index].slots();
                             let (form, bytes) = choose(s, c, df, gslots);
+                            if trace.is_some() {
+                                if let Some(ps) = ps {
+                                    group_bytes[ps].push(bytes as u32);
+                                }
+                                if s == 1 {
+                                    group_idx.push(*index as u32);
+                                }
+                            }
                             any_forced |= forced_in(s, c, df, gslots);
                             payload += bytes as u64;
                             by_form[form] += bytes as u64;
@@ -944,9 +1110,18 @@ fn main() {
                             chosen[s] = (sparse_len, 0);
                             t.by_form[1] += sparse_len;
                             t.forms[1] += 1;
+                            if let (Some(tr), Some(ps)) = (trace, ps) {
+                                sparse_chosen[ps] = true;
+                                term_form[tr][ps][1] += sparse_len;
+                            }
                         } else {
+                            if let (Some(tr), Some(ps)) = (trace, ps) {
+                                for f in 0..NF {
+                                    term_form[tr][ps][f] += by_form[f];
+                                }
+                            }
                             chosen[s] = (payload, directory);
-                            for f in 0..7 {
+                            for f in 0..NF {
                                 t.by_form[f] += by_form[f];
                                 t.forms[f] += forms[f];
                             }
@@ -1014,8 +1189,68 @@ fn main() {
             }
             if let Some(t) = trace {
                 term_at[t].df += u64::from(df);
+                let st = &mut seg_terms[t];
+                st.present = true;
+                st.df = df;
+                st.groups = group_idx.clone();
+                st.sparse = sparse_chosen;
+                for ps in 0..NPS {
+                    let mut at = Vec::with_capacity(group_bytes[ps].len() + 1);
+                    let mut sum = 0u32;
+                    at.push(0);
+                    for b in &group_bytes[ps] {
+                        sum += b;
+                        at.push(sum);
+                    }
+                    st.at[ps] = at;
+                }
             }
         }
+        // Conjunctions and phrases over this segment: the lead (fewest
+        // postings here) is read whole; every other term's containers are
+        // read in the groups the lead holds (a sparse list whole).
+        for (style, q) in &queries {
+            if *style == 1 || q.iter().any(|&t| !seg_terms[t].present) {
+                continue;
+            }
+            let lead = *q.iter().min_by_key(|&&t| seg_terms[t].df).expect("terms");
+            for (ps, &s) in PAGE_SCHEMES.iter().enumerate() {
+                for &t in q {
+                    let st = &seg_terms[t];
+                    let ext = term_at[t].at[si][s];
+                    let mut set: FxHashSet<u64> = FxHashSet::default();
+                    if ext.len == 0 {
+                        continue;
+                    }
+                    if t == lead || st.sparse[ps] || st.groups.is_empty() {
+                        let first = ext.at / PAGE_DATA as u64;
+                        let last = (ext.at + ext.len - 1) / PAGE_DATA as u64;
+                        set.extend(first..=last);
+                    } else {
+                        let lg = &seg_terms[lead].groups;
+                        let (mut i, mut j) = (0usize, 0usize);
+                        while i < lg.len() && j < st.groups.len() {
+                            if lg[i] < st.groups[j] {
+                                i += 1;
+                            } else if lg[i] > st.groups[j] {
+                                j += 1;
+                            } else {
+                                let (a, b) = (st.at[ps][j], st.at[ps][j + 1]);
+                                if b > a {
+                                    let first = (ext.at + u64::from(a)) / PAGE_DATA as u64;
+                                    let last = (ext.at + u64::from(b) - 1) / PAGE_DATA as u64;
+                                    set.extend(first..=last);
+                                }
+                                i += 1;
+                                j += 1;
+                            }
+                        }
+                    }
+                    style_pages[*style][t][ps] += set.len() as u64;
+                }
+            }
+        }
+        drop(seg_terms);
         eprintln!(
             "{name}: {:.1} s, {} groups",
             start.elapsed().as_secs_f64(),
@@ -1141,15 +1376,100 @@ fn main() {
         let _ = writeln!(
             out,
             "\ndisjunction payload pages per query (distinct; every group of each present term), {} queries, {} of {} terms absent",
-            queries.len(),
+            queries.iter().filter(|(st, _)| *st == 1).count(),
             missing,
             names.len()
         );
+        let nq: Vec<usize> = (0..3)
+            .map(|st| queries.iter().filter(|(s, _)| *s == st).count())
+            .collect();
+        let class_of = |t: usize| df_class(term_at[t].df.min(u64::from(u32::MAX)) as u32);
+        // Pages per query by df class and by form, per style and page scheme.
+        let mut by_class: Vec<Vec<[f64; 9]>> = (0..3).map(|_| vec![[0f64; 9]; NPS]).collect();
+        let mut by_form_pages: Vec<Vec<[f64; NF]>> =
+            (0..3).map(|_| vec![[0f64; NF]; NPS]).collect();
+        for style in [0usize, 2] {
+            for ps in 0..NPS {
+                for t in 0..names.len() {
+                    let pages = style_pages[style][t][ps] as f64 / nq[style].max(1) as f64;
+                    by_class[style][ps][class_of(t)] += pages;
+                    by_class[style][ps][8] += pages;
+                    let tf = &term_form[t][ps];
+                    let total: u64 = tf.iter().sum();
+                    if total > 0 {
+                        for f in 0..NF {
+                            by_form_pages[style][ps][f] += pages * tf[f] as f64 / total as f64;
+                        }
+                    }
+                }
+            }
+        }
+        for (ps, &s) in PAGE_SCHEMES.iter().enumerate() {
+            for (_, q) in queries.iter().filter(|(st, _)| *st == 1) {
+                for &t in q {
+                    let ta = &term_at[t];
+                    if ta.df as f64 >= 0.10 * docs_total as f64 {
+                        continue;
+                    }
+                    let mut pages = 0u64;
+                    for per in ta.at.iter() {
+                        let e = per[s];
+                        if e.len == 0 {
+                            continue;
+                        }
+                        pages +=
+                            (e.at + e.len - 1) / PAGE_DATA as u64 - e.at / PAGE_DATA as u64 + 1;
+                    }
+                    let pages = pages as f64 / nq[1].max(1) as f64;
+                    by_class[1][ps][class_of(t)] += pages;
+                    by_class[1][ps][8] += pages;
+                    let tf = &term_form[t][ps];
+                    let total: u64 = tf.iter().sum();
+                    if total > 0 {
+                        for f in 0..NF {
+                            by_form_pages[1][ps][f] += pages * tf[f] as f64 / total as f64;
+                        }
+                    }
+                }
+            }
+        }
+        for style in 0..3 {
+            let _ = writeln!(
+                out,
+                "\n{} payload pages per query by the term's df class ({} queries; score: terms of 10% of the documents elided; AND/phrase: lead whole, others in the lead's groups)",
+                STYLES[style], nq[style]
+            );
+            let _ = write!(out, "  {:>11}", "");
+            for c in DF_CLASSES {
+                let _ = write!(out, " {c:>13}");
+            }
+            let _ = writeln!(out, " {:>13}", "total");
+            for (ps, &s) in PAGE_SCHEMES.iter().enumerate() {
+                let _ = write!(out, "  {:>11}", SCHEMES[s]);
+                for c in 0..9 {
+                    let _ = write!(out, " {:>13.1}", by_class[style][ps][c]);
+                }
+                let _ = writeln!(out);
+            }
+            let _ = writeln!(
+                out,
+                "  by form (pages attributed by the term's bytes per form):"
+            );
+            for (ps, &s) in PAGE_SCHEMES.iter().enumerate() {
+                let mut line = format!("  {:>11}", SCHEMES[s]);
+                for f in 0..NF {
+                    if by_form_pages[style][ps][f] > 0.05 {
+                        let _ = write!(line, " {} {:.1}", FORMS[f], by_form_pages[style][ps][f]);
+                    }
+                }
+                let _ = writeln!(out, "{line}");
+            }
+        }
         for (label, elide) in [("score", true), ("full_score", false)] {
             let mut line = format!("  {label:>10}");
             for s in 0..NS {
                 let mut sum = 0u64;
-                for q in &queries {
+                for (_, q) in queries.iter().filter(|(st, _)| *st == 1) {
                     let mut set: FxHashSet<(usize, u64)> = FxHashSet::default();
                     for &t in q {
                         let ta = &term_at[t];
@@ -1174,7 +1494,7 @@ fn main() {
                     line,
                     " {}={:.0}",
                     SCHEMES[s],
-                    sum as f64 / queries.len() as f64
+                    sum as f64 / nq[1].max(1) as f64
                 );
             }
             let _ = writeln!(out, "{line}");

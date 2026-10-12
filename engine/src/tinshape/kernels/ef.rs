@@ -39,7 +39,7 @@ use super::{Level, level};
 use segment::Result;
 use segment::tinshape::docs::Group;
 use segment::tinshape::ef::Ef;
-use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local};
+use segment::tinshape::postings::{GroupEntry, KIND_EF, KIND_PAGED, for_each_local, or_into};
 
 /// Appends the list's values, in order.
 #[inline]
@@ -113,6 +113,10 @@ pub fn container_row(
     if entry.kind == KIND_EF {
         ef_into_row(Ef::parse(bytes, entry.count as usize, group.slots())?, row);
         return Ok(());
+    }
+    if entry.kind == KIND_PAGED {
+        // A page at a time, ORed into the cleared words.
+        return or_into(entry, bytes, group, row);
     }
     let mut put = RowPut::new();
     for_each_local(entry, bytes, group, |l| put.put(row, l))

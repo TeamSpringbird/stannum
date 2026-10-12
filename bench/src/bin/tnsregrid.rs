@@ -60,6 +60,7 @@ struct Args {
     only: Option<String>,
     grid_density: u32,
     grid_min_postings: u32,
+    paged_density: u32,
     min_df: u32,
     check: bool,
 }
@@ -67,7 +68,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: tnsregrid --in DIR [--out DIR] [--grid-density D] [--grid-min-postings N] \
-         [--min-df N] [--segment FILE] [--check]"
+         [--paged-density D] [--min-df N] [--segment FILE] [--check]"
     );
     std::process::exit(2)
 }
@@ -81,6 +82,7 @@ fn args() -> Args {
         only: None,
         grid_density: defaults.grid_density,
         grid_min_postings: defaults.grid_min_postings,
+        paged_density: defaults.paged_density,
         min_df: defaults.grid_min_postings,
         check: false,
     };
@@ -93,6 +95,9 @@ fn args() -> Args {
             "--grid-density" => a.grid_density = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--grid-min-postings" => {
                 a.grid_min_postings = value(&mut it).parse().unwrap_or_else(|_| usage());
+            }
+            "--paged-density" => {
+                a.paged_density = value(&mut it).parse().unwrap_or_else(|_| usage());
             }
             "--min-df" => a.min_df = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--check" => a.check = true,
@@ -238,6 +243,7 @@ fn main() {
         Options {
             grid_density: args.grid_density,
             grid_min_postings: args.grid_min_postings,
+            paged_density: args.paged_density,
             ..Options::default()
         }
     };
