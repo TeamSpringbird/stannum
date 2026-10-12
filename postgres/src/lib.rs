@@ -2022,20 +2022,43 @@ mod tests {
         let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'exiting_idx'::regclass::oid")
             .unwrap()
             .unwrap();
+        let refcount = |buffer: pg_sys::Buffer| unsafe {
+            let desc = pg_sys::BufferDescriptors.add(buffer as usize - 1);
+            std::ptr::read_volatile(std::ptr::addr_of!((*desc).bufferdesc.state.value))
+                & pg_sys::BUF_REFCOUNT_MASK
+        };
         let before = crate::storage::held_pages().0;
         // Otherwise the drop releases the span's page and relation.
-        unsafe { crate::storage::drop_holding_source(oid, false) };
+        let (buffers, _) = unsafe { crate::storage::drop_holding_source(oid, false) };
         assert_eq!(crate::storage::held_pages().0, before);
+        for (buffer, _) in buffers {
+            assert_eq!(refcount(buffer), 0, "a pin outlived its span");
+        }
         // At exit it leaves both to the resource owner, so releasing them
         // here, as exit processing would, releases each once: a second
-        // release raises "not owned by resource owner".
+        // release raises "not owned by resource owner". A page pinned
+        // through its hint is the span's own pin, released through the
+        // span's ledger the owner remembers.
         let (buffers, relation) = unsafe { crate::storage::drop_holding_source(oid, true) };
         assert_eq!(crate::storage::held_pages().0, before);
+        assert!(
+            buffers.iter().any(|(_, owned)| *owned),
+            "the page pinned again, through its hint, was not the span's own pin"
+        );
+        for (buffer, _) in buffers {
+            assert!(refcount(buffer) > 0, "the drop at exit released a pin");
+        }
         unsafe {
-            for buffer in buffers {
-                pg_sys::ReleaseBuffer(buffer);
+            for (buffer, owned) in buffers {
+                if !owned {
+                    pg_sys::ReleaseBuffer(buffer);
+                }
             }
+            crate::storage::release_spans_of_owner();
             pg_sys::RelationClose(relation);
+        }
+        for (buffer, _) in buffers {
+            assert_eq!(refcount(buffer), 0, "the owner's release left a pin");
         }
     }
 
