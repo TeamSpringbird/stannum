@@ -2578,13 +2578,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// [`Walk::stage`]): its terms' blocks, then its buckets, and a length
     /// a term it holds carries inline. Its buckets are left in
     /// [`Walk::buckets`] ([`NO_BUCKET`] for a term it lacks).
-    fn or_stage(
-        &mut self,
-        g: u32,
-        base: u32,
-        w: usize,
-        bit: u32,
-    ) -> Result<Option<(f32, u32)>> {
+    fn or_stage(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<Option<(f32, u32)>> {
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
         self.answer.candidates += 1;

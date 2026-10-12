@@ -3033,7 +3033,11 @@ mod tests {
                 query: SpanQuery::phrase([0, 1]),
             },
         ];
-        let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
+        let bits = |rows: &[(f32, Tid)]| {
+            rows.iter()
+                .map(|(s, t)| (s.to_bits(), *t))
+                .collect::<Vec<_>>()
+        };
         for node in &nodes {
             let want = top_k(&parsed, node, &names, &scorers, 10, &mut NoTouch).unwrap();
             assert!(!want.rows.is_empty(), "{node:?} matches");
