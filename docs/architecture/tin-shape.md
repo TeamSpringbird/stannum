@@ -292,10 +292,12 @@ again (2.5% fewer cycles in the full_score replay).
   footer addressed per group, as TIN's is, would remove.
 - A phrase reads positions only for a candidate that would enter the top
   k. Until the top k fill every match does, so its positions are checked
-  first, and its length is read only once they hold (as TIN reads lengths
-  for phrase matches only: at 150M rows this halves a phrase's DL pages and
-  saves 13% of its pins, 12% with `full_score`); after, a group's candidates that score into the top k wait and
-  are checked best first, so a confirmed one raises the threshold over the
+  first, in ctid order (each word's read forward from the entry read last),
+  and its length is read only once they hold (as TIN reads lengths for
+  phrase matches only: at 150M rows this halves a phrase's DL pages and
+  saves 13% of its pins, 12% with `full_score`). After, a group's
+  candidates are scored best bound first, and one that scores into the top
+  k is checked at once, so a confirmed one raises the threshold over the
   rest (admission compares score and ctid, so the order is free). The
   rarest slot is read first and each pair of leaves tested as it is read
   (`PhrasePlan`); a word repeated in the phrase is read once, and a

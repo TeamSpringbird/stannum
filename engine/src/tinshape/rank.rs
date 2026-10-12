@@ -14,8 +14,9 @@
 //! window's largest buckets, and only then scored exactly from the TF tail.
 //! A phrase reads positions only for a candidate that would enter the top
 //! k: before the top k fill, every match does, so its positions are
-//! checked first; after, a group's candidates that score into the top k
-//! wait and are checked best first, so a confirmed one raises the
+//! checked first, in ctid order, and only a match reads its length; after,
+//! a group's candidates are scored best bound first and one that scores
+//! into the top k is checked at once, so a confirmed one raises the
 //! threshold over the rest.
 //!
 //! Any other query is block-max MaxScore over its scoring terms, a group at
@@ -765,11 +766,8 @@ struct Walk<'s, 'a, T: Touch> {
     repeats: Vec<(usize, u8)>,
     answer: RankedAnswer,
     verify: Verify<'a>,
-    /// Phrase candidates of the group that scored into the top k, awaiting
-    /// their positions check: (score, local slot), and per one its posting
-    /// index in each span slot's term, `span` apiece.
-    pending: Vec<(f32, u32)>,
-    pending_index: Vec<u32>,
+    /// A span's candidate at hand: its posting index in each span slot's
+    /// term.
     span_index: Vec<u32>,
     /// The group's staged candidates: (bound, local slot, length or
     /// `u32::MAX`), and per one its buckets (one per scoring term) and, for
@@ -968,7 +966,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if !blob.over_keep(mark) {
             return;
         }
-        debug_assert!(self.pending.is_empty() && self.staged.is_empty());
+        debug_assert!(self.staged.is_empty());
         for mem in &mut self.mems {
             mem.loaded = 0;
             mem.kind = Kind::List;
@@ -1113,8 +1111,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// Bounds, scores and admits group `g`'s candidates `cands` (local
-    /// slots, ascending), then checks its pending phrase candidates; false
-    /// once nothing later can enter the top k. A span's candidates, with
+    /// slots, ascending); false once nothing later can enter the top k. A span's candidates, with
     /// terms to score, are bounded by their buckets first and scored best
     /// first (see [`Walk::finish_staged`]): its top k fill only with
     /// confirmed matches, which its best-bounded candidates find soonest,
@@ -1152,9 +1149,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         if staging {
             self.finish_staged(g)?;
-        }
-        if !self.pending.is_empty() {
-            self.verify_pending(g)?;
         }
         Ok(more)
     }
@@ -1328,50 +1322,64 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// best of a group raise it over the rest, which its first candidates
     /// in ctid order did not (on TIN's corpus, `w3 AND w17` read the DL
     /// sidecar for six times the candidates the final threshold needs).
+    ///
+    /// While the top k fill, a span's candidates are finished in ctid order
+    /// instead: each is checked whatever its bound, and in that order each
+    /// term's positions are read forward from the entry read last, where
+    /// best first went back to the start of the entry's block (a phrase of
+    /// common words that never fills its top k checks every candidate).
     fn finish_staged(&mut self, g: u32) -> Result<()> {
-        let n = self.sc.len();
-        let width = self.span_index.len();
-        let mut staged = std::mem::take(&mut self.staged);
+        let staged = std::mem::take(&mut self.staged);
         let mut order = std::mem::take(&mut self.staged_order);
+        let mut result = Ok(());
+        let mut filled = 0;
+        if matches!(self.verify, Verify::Span(_)) {
+            while filled < staged.len() && self.bar.is_none() && result.is_ok() {
+                result = self.finish_one(g, &staged, filled);
+                filled += 1;
+            }
+        }
         order.clear();
-        order.extend(0..staged.len() as u32);
+        order.extend(filled as u32..staged.len() as u32);
         order.sort_unstable_by(|a, b| {
             let (x, y) = (staged[*a as usize], staged[*b as usize]);
             y.0.total_cmp(&x.0).then(x.1.cmp(&y.1))
         });
-        let mut result = Ok(());
         for &i in &order {
-            let i = i as usize;
-            let (reach, local, length) = staged[i];
+            if result.is_err() {
+                break;
+            }
+            let (reach, local, _) = staged[i as usize];
             let tid = self.geometry.tid_in(g as usize, local);
             // In this order (bound down, then ctid up) and with a bar that
             // only rises, every candidate after one cut is cut too.
             if self.cut(reach, || tid) {
                 break;
             }
-            self.buckets
-                .copy_from_slice(&self.staged_buckets[i * n..(i + 1) * n]);
-            if matches!(self.verify, Verify::Span(_)) {
-                self.span_index
-                    .copy_from_slice(&self.staged_span[i * width..(i + 1) * width]);
-            }
-            result = self.finish(g, local, length);
-            if result.is_err() {
-                break;
-            }
+            result = self.finish_one(g, &staged, i as usize);
         }
+        let mut staged = staged;
         staged.clear();
         self.staged = staged;
         self.staged_order = order;
         self.staged_buckets.clear();
         self.staged_span.clear();
-        result?;
-        // A span's candidates that scored into the top k are checked now,
-        // so the threshold their matches raise prunes the next chunk.
-        if !self.pending.is_empty() {
-            self.verify_pending(g)?;
+        result
+    }
+
+    /// Finishes staged candidate `i` of `staged` (group `g`'s), its buckets
+    /// and a span's posting indexes restored from where they were staged.
+    fn finish_one(&mut self, g: u32, staged: &[(f32, u32, u32)], i: usize) -> Result<()> {
+        let n = self.sc.len();
+        let (_, local, length) = staged[i];
+        self.buckets
+            .copy_from_slice(&self.staged_buckets[i * n..(i + 1) * n]);
+        if matches!(self.verify, Verify::Span(_)) {
+            let width = self.span_index.len();
+            self.span_index
+                .copy_from_slice(&self.staged_span[i * width..(i + 1) * width]);
         }
-        Ok(())
+        self.finish(g, local, length)
     }
 
     /// Bounds the candidate at slot `local` of group `g` by what can be
@@ -1475,9 +1483,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         match &self.verify {
             Verify::Flat => self.push(total, tid),
             Verify::Span(_) if span_first => self.push(total, tid),
+            // Once they fill, only a candidate that would enter them is
+            // checked, as it is scored (best bound first in its group, so a
+            // confirmed one raises the bar over the rest).
             Verify::Span(_) => {
-                self.pending.push((total, local));
-                self.pending_index.extend_from_slice(&self.span_index);
+                let Verify::Span(check) = &mut self.verify else {
+                    unreachable!()
+                };
+                self.answer.position_checks += 1;
+                if check.holds(&self.span_index, self.touch)? {
+                    self.push(total, tid);
+                }
             }
             Verify::Node => {
                 let slot = self.geometry.groups[g as usize].slot_base + local;
@@ -1702,37 +1718,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.span_index.push(index);
         }
     }
-
-    /// Checks the group's pending phrase candidates, best first, each
-    /// against the threshold as it then stands.
-    fn verify_pending(&mut self, g: u32) -> Result<()> {
-        let width = match &self.verify {
-            Verify::Span(check) => check.slots.len(),
-            _ => 0,
-        };
-        let mut order: Vec<usize> = (0..self.pending.len()).collect();
-        order.sort_by(|a, b| {
-            let (x, y) = (self.pending[*a], self.pending[*b]);
-            y.0.total_cmp(&x.0).then(x.1.cmp(&y.1))
-        });
-        for i in order {
-            let (total, local) = self.pending[i];
-            let tid = self.geometry.tid_in(g as usize, local);
-            if !self.admits(total, tid) {
-                continue;
-            }
-            let Verify::Span(check) = &mut self.verify else {
-                unreachable!()
-            };
-            self.answer.position_checks += 1;
-            if check.holds(&self.pending_index[i * width..(i + 1) * width], self.touch)? {
-                self.push(total, tid);
-            }
-        }
-        self.pending.clear();
-        self.pending_index.clear();
-        Ok(())
-    }
 }
 
 /// Every row is visible.
@@ -1891,8 +1876,6 @@ pub(super) fn walk_into<'a>(
         common_terms: false,
         answer: RankedAnswer::default(),
         verify,
-        pending: Vec::new(),
-        pending_index: Vec::new(),
         span_index: Vec::new(),
         staged: Vec::new(),
         staged_buckets: Vec::new(),
