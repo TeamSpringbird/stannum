@@ -38,14 +38,24 @@
 use super::{Level, level};
 use segment::Result;
 use segment::tinshape::docs::Group;
-use segment::tinshape::ef::Ef;
+use segment::tinshape::ef::{Ef, EfCursor, Span};
 use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local};
+
+/// The whole of a list, as a span.
+#[inline(always)]
+fn whole(ef: &Ef<'_>) -> Span {
+    Span {
+        index: 0,
+        bit: 0,
+        count: ef.len(),
+    }
+}
 
 /// Appends the list's values, in order.
 #[inline]
 pub fn ef_decode(ef: Ef<'_>, out: &mut Vec<u32>) {
     if !short_decode(&ef, out) {
-        run!(level(), ef_decode(ef, out));
+        run!(level(), ef_decode_span(ef, whole(&ef), 0, out));
     }
 }
 
@@ -57,7 +67,7 @@ pub fn ef_decode_at(level: Level, ef: Ef<'_>, out: &mut Vec<u32>) {
         level.name()
     );
     if !short_decode(&ef, out) {
-        run!(level, ef_decode(ef, out));
+        run!(level, ef_decode_span(ef, whole(&ef), 0, out));
     }
 }
 
@@ -67,7 +77,7 @@ pub fn ef_decode_at(level: Level, ef: Ef<'_>, out: &mut Vec<u32>) {
 #[inline]
 pub fn ef_into_row(ef: Ef<'_>, row: &mut [u64]) {
     if !short_row(&ef, row) {
-        run!(level(), ef_into_row(ef, row));
+        run!(level(), ef_span_into_row(ef, whole(&ef), 0, row));
     }
 }
 
@@ -79,7 +89,62 @@ pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
         level.name()
     );
     if !short_row(&ef, row) {
-        run!(level, ef_into_row(ef, row));
+        run!(level, ef_span_into_row(ef, whole(&ef), 0, row));
+    }
+}
+
+/// Appends the cursor's current value and those after it below `end`, less
+/// `offset`, and moves past them, as [`EfCursor::drain_below`] with a push
+/// would: the span found from the highs ([`EfCursor::skip_below`]), then
+/// decoded a block at a time if it holds [`SHORT`] values or more.
+#[inline]
+pub fn drain_below(cursor: &mut EfCursor<'_>, end: u32, offset: u32, out: &mut Vec<u32>) {
+    drain_below_at(level(), cursor, end, offset, out);
+}
+
+/// [`drain_below`] at `level`, which the CPU must support.
+#[inline]
+pub fn drain_below_at(
+    level: Level,
+    cursor: &mut EfCursor<'_>,
+    end: u32,
+    offset: u32,
+    out: &mut Vec<u32>,
+) {
+    let span = cursor.skip_below(end);
+    let ef = cursor.list();
+    if span.count < SHORT {
+        out.reserve(span.count);
+        ef.for_each_in(span, |v| out.push(v.wrapping_sub(offset)));
+    } else {
+        run!(level, ef_decode_span(ef, span, offset, out));
+    }
+}
+
+/// Sets the cursor's current value and those after it below `end`, less
+/// `offset`, in `row` (as [`ef_into_row`] sets a list's), and moves past
+/// them (see [`drain_below`]).
+#[inline]
+pub fn drain_into_row(cursor: &mut EfCursor<'_>, end: u32, offset: u32, row: &mut [u64]) {
+    drain_into_row_at(level(), cursor, end, offset, row);
+}
+
+/// [`drain_into_row`] at `level`, which the CPU must support.
+#[inline]
+pub fn drain_into_row_at(
+    level: Level,
+    cursor: &mut EfCursor<'_>,
+    end: u32,
+    offset: u32,
+    row: &mut [u64],
+) {
+    let span = cursor.skip_below(end);
+    let ef = cursor.list();
+    if span.count < SHORT {
+        let mut put = RowPut::new();
+        ef.for_each_in(span, |v| put.put(row, v.wrapping_sub(offset)));
+    } else {
+        run!(level, ef_span_into_row(ef, span, offset, row));
     }
 }
 
@@ -395,18 +460,18 @@ fn short_row(ef: &Ef<'_>, row: &mut [u64]) -> bool {
 
 /// The portable bodies: the format's own decoder.
 mod scalar {
-    use segment::tinshape::ef::Ef;
+    use segment::tinshape::ef::{Ef, Span};
 
     #[inline(never)]
-    pub fn ef_decode(ef: Ef<'_>, out: &mut Vec<u32>) {
-        out.reserve(ef.len());
-        ef.for_each(|v| out.push(v));
+    pub fn ef_decode_span(ef: Ef<'_>, span: Span, offset: u32, out: &mut Vec<u32>) {
+        out.reserve(span.count);
+        ef.for_each_in(span, |v| out.push(v.wrapping_sub(offset)));
     }
 
     #[inline(never)]
-    pub fn ef_into_row(ef: Ef<'_>, row: &mut [u64]) {
+    pub fn ef_span_into_row(ef: Ef<'_>, span: Span, offset: u32, row: &mut [u64]) {
         let mut put = super::RowPut::new();
-        ef.for_each(|v| put.put(row, v));
+        ef.for_each_in(span, |v| put.put(row, v.wrapping_sub(offset)));
     }
 }
 
@@ -418,36 +483,40 @@ mod scalar {
 /// attribute, if any.
 macro_rules! passes {
     ($(#[$tf:meta])*) => {
-        /// The high parts of `ef`'s members whose set bits are in words
-        /// `w0..w1` of its highs, from member `idx`, stored from `dst`
-        /// (member `origin`'s place); stops after the word in which its
-        /// last member is found. The members found, counted from 0.
+        /// The high parts of `ef`'s members whose set bits are at or after
+        /// highs bit `bit0` and in words before `w1`, from member `idx` (the
+        /// first at or after `bit0`), stored from `dst` (member `origin`'s
+        /// place); stops after the word in which member `stop` is found.
+        /// The members found, counted from 0.
         ///
         /// # Safety
-        /// `dst` has room for members `origin..min(n, found) + SLACK`, and
-        /// `idx >= origin`.
+        /// `dst` has room for members `origin..min(stop, found) + SLACK`,
+        /// and `idx >= origin`.
         $(#[$tf])*
         #[inline]
         unsafe fn highs(
             ef: &Ef<'_>,
-            w0: usize,
+            bit0: usize,
             w1: usize,
             mut idx: usize,
+            stop: usize,
             dst: *mut u32,
             origin: usize,
         ) -> usize {
-            let (n, padded, highs_len) = (ef.len(), super::lows_padded(ef), ef.highs().len());
-            for w in w0..w1 {
-                if idx >= n {
+            let (padded, highs_len) = (super::lows_padded(ef), ef.highs().len());
+            let mut keep = u64::MAX << (bit0 % 64);
+            for w in bit0 / 64..w1 {
+                if idx >= stop {
                     break;
                 }
                 // The last word may be part of one: its missing bytes are
                 // zero, so store lanes past its members, within the slack.
-                let word = super::highs_word(padded, highs_len, w);
+                let word = super::highs_word(padded, highs_len, w) & keep;
+                keep = u64::MAX;
                 // Byte k's rank in the word: the set bits of bytes 0..k.
                 let inclusive = super::byte_counts(word).wrapping_mul(0x0101_0101_0101_0101);
                 let s = ((w * 64) as u32).wrapping_sub(idx as u32);
-                // SAFETY: the word's members start at `idx < n`, and it
+                // SAFETY: the word's members start at `idx < stop`, and it
                 // stores at most 64 + 8 lanes from there.
                 unsafe { highs_word(dst.add(idx - origin), s, word, inclusive << 8) };
                 idx += (inclusive >> 56) as usize;
@@ -490,31 +559,43 @@ macro_rules! passes {
 
         $(#[$tf])*
         #[inline(never)]
-        pub fn ef_decode(ef: Ef<'_>, out: &mut Vec<u32>) {
-            let n = ef.len();
-            let highs_bytes = ef.highs();
-            let lows = super::lows_padded(&ef);
+        pub fn ef_decode_span(ef: Ef<'_>, span: Span, offset: u32, out: &mut Vec<u32>) {
+            let stop = (span.index + span.count).min(ef.len());
+            if span.index >= stop {
+                return;
+            }
+            // Decoded from the multiple of 8 at or before the span's first
+            // member (those before it zeros), then moved down.
+            let origin = span.index & !7;
+            let lead = span.index - origin;
             let start = out.len();
-            out.reserve(n + super::SLACK);
-            // SAFETY: the room is reserved for `n + SLACK` values from
-            // `start`; `highs` writes within it, `combine` reads and writes
-            // the `found` it wrote, and those are then the vector's.
+            out.reserve(stop - origin + super::SLACK + 8);
+            // SAFETY: the room is reserved for `stop - origin + SLACK + 8`
+            // values from `start`; `highs` writes within it, `combine`
+            // reads and writes the members it found (initialized, the 8
+            // after them zeroed), and the `got` moved down are then the
+            // vector's.
             unsafe {
                 let dst = out.as_mut_ptr().add(start);
-                let words = highs_bytes.len().div_ceil(8);
-                let found = highs(&ef, 0, words, 0, dst, 0).min(n);
-                // The last eight `combine` may take: initialized.
-                dst.add(found).write_bytes(0, 8);
-                combine(lows, ef.low_width(), 0, found, dst);
-                out.set_len(start + found);
+                dst.write_bytes(0, lead);
+                let words = ef.highs().len().div_ceil(8);
+                let found = highs(&ef, span.bit, words, span.index, stop, dst, origin).min(stop);
+                dst.add(found - origin).write_bytes(0, 8);
+                combine(super::lows_padded(&ef), ef.low_width(), origin, found, dst);
+                let got = found - span.index;
+                if lead > 0 || offset > 0 {
+                    for k in 0..got {
+                        *dst.add(k) = (*dst.add(lead + k)).wrapping_sub(offset);
+                    }
+                }
+                out.set_len(start + got);
             }
         }
 
         $(#[$tf])*
         #[inline(never)]
-        pub fn ef_into_row(ef: Ef<'_>, row: &mut [u64]) {
-            let n = ef.len();
-            let highs_bytes = ef.highs();
+        pub fn ef_span_into_row(ef: Ef<'_>, span: Span, offset: u32, row: &mut [u64]) {
+            let stop = (span.index + span.count).min(ef.len());
             let lows = super::lows_padded(&ef);
             let l = ef.low_width();
             // A chunk's members from the multiple of 8 at or before its
@@ -522,14 +603,14 @@ macro_rules! passes {
             let mut buf = [core::mem::MaybeUninit::<u32>::uninit();
                 8 + super::CHUNK_WORDS * 64 + super::SLACK];
             let dst = buf.as_mut_ptr().cast::<u32>();
-            let total = highs_bytes.len().div_ceil(8);
+            let total = ef.highs().len().div_ceil(8);
             let mut put = super::RowPut::new();
             // Whether a chunk's values fit the row, by its last: the value
             // with the largest high part, and low bits at most `mask`.
             let mask = if l == 0 { 0 } else { (1u64 << l) - 1 };
-            let (mut idx, mut w) = (0, 0);
-            while w < total && idx < n {
-                let w1 = (w + super::CHUNK_WORDS).min(total);
+            let (mut idx, mut bit) = (span.index, span.bit);
+            while bit / 64 < total && idx < stop {
+                let w1 = (bit / 64 + super::CHUNK_WORDS).min(total);
                 // SAFETY: a chunk finds at most 64 members a word, so its
                 // members from `origin` and their slack fit in `buf`, the
                 // ones `combine` reads initialized; the reads below stay
@@ -538,31 +619,31 @@ macro_rules! passes {
                     let from = idx;
                     let origin = from & !7;
                     dst.write_bytes(0, from - origin);
-                    idx = highs(&ef, w, w1, idx, dst, origin);
-                    let to = idx.min(n);
-                    w = w1;
+                    idx = highs(&ef, bit, w1, idx, stop, dst, origin);
+                    let to = idx.min(stop);
+                    bit = w1 * 64;
                     if to == from {
                         // A chunk of empty buckets.
                         continue;
                     }
                     dst.add(to - origin).write_bytes(0, 8);
                     combine(lows, l, origin, to, dst);
-                    let last = u64::from(*dst.add(to - origin - 1)) | mask;
+                    let last = (u64::from(*dst.add(to - origin - 1)) | mask).wrapping_sub(u64::from(offset));
+                    let values = core::slice::from_raw_parts(dst.add(from - origin), to - from);
                     if ((last / 64) as usize) < row.len() {
-                        let values = core::slice::from_raw_parts(dst.add(from - origin), to - from);
                         let mut fours = values.chunks_exact(4);
                         for four in &mut fours {
-                            put.put_unchecked(row, four[0]);
-                            put.put_unchecked(row, four[1]);
-                            put.put_unchecked(row, four[2]);
-                            put.put_unchecked(row, four[3]);
+                            put.put_unchecked(row, four[0].wrapping_sub(offset));
+                            put.put_unchecked(row, four[1].wrapping_sub(offset));
+                            put.put_unchecked(row, four[2].wrapping_sub(offset));
+                            put.put_unchecked(row, four[3].wrapping_sub(offset));
                         }
                         for &v in fours.remainder() {
-                            put.put_unchecked(row, v);
+                            put.put_unchecked(row, v.wrapping_sub(offset));
                         }
                     } else {
-                        for k in from - origin..to - origin {
-                            put.put(row, *dst.add(k));
+                        for &v in values {
+                            put.put(row, v.wrapping_sub(offset));
                         }
                     }
                 }
@@ -577,7 +658,7 @@ macro_rules! passes {
 #[cfg(target_arch = "aarch64")]
 mod neon {
     use core::arch::aarch64::*;
-    use segment::tinshape::ef::Ef;
+    use segment::tinshape::ef::{Ef, Span};
 
     /// # Safety
     /// `d` is valid for 64 + 8 values.
@@ -671,7 +752,7 @@ mod neon {
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
     use core::arch::x86_64::*;
-    use segment::tinshape::ef::Ef;
+    use segment::tinshape::ef::{Ef, Span};
 
     /// # Safety
     /// `d` is valid for 64 + 8 values.
@@ -756,7 +837,7 @@ mod avx2 {
 /// passes' loads and stores ahead of the members.
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
-    pub use super::avx2::{ef_decode, ef_into_row};
+    pub use super::avx2::{ef_decode_span, ef_span_into_row};
 }
 
 #[cfg(test)]
@@ -915,11 +996,56 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
         #[test]
+        fn drains_agree(
+            (values, universe) in list(),
+            seek in any::<prop::sample::Index>(),
+            cuts in prop::collection::vec(any::<prop::sample::Index>(), 1..12),
+            offset in any::<prop::sample::Index>(),
+        ) {
+            prop_assume!(!values.is_empty());
+            let mut bytes = Vec::new();
+            ef::encode(&values, universe, &mut bytes);
+            let list = Ef::parse(&bytes, values.len(), universe).unwrap();
+            // Ends between and at values, ascending; an offset at or below
+            // the first value drained, as a group's slot base is.
+            let mut ends: Vec<u32> = cuts
+                .iter()
+                .map(|c| values[c.index(values.len())] + (c.index(3) as u32 % 2))
+                .collect();
+            ends.sort_unstable();
+            let start = values[seek.index(values.len())];
+            for level in levels() {
+                let mut want = list.cursor();
+                want.seek(start);
+                let (mut have_list, mut have_row) = (want.clone(), want.clone());
+                for &end in &ends {
+                    let offset = want.current().map_or(0, |c| offset.index(c as usize + 1) as u32);
+                    let mut expected = Vec::new();
+                    want.drain_below(end, |v| expected.push(v - offset));
+                    let mut got = vec![7];
+                    drain_below_at(level, &mut have_list, end, offset, &mut got);
+                    prop_assert_eq!(&got[1..], &expected[..], "{:?} end {}", level, end);
+                    prop_assert_eq!(have_list.current(), want.current());
+                    prop_assert_eq!(have_list.rank(), want.rank());
+                    let words = expected.last().map_or(1, |v| *v as usize / 64 + 1);
+                    let mut bits_want = vec![0u64; words];
+                    for v in &expected {
+                        bits_want[*v as usize / 64] |= 1 << (v % 64);
+                    }
+                    let mut bits_have = vec![0u64; words];
+                    drain_into_row_at(level, &mut have_row, end, offset, &mut bits_have);
+                    prop_assert_eq!(&bits_have, &bits_want, "{:?} row end {}", level, end);
+                    prop_assert_eq!(have_row.current(), want.current());
+                }
+            }
+        }
+
+        #[test]
         fn decodes_agree((values, universe) in list(), at in 0usize..16, after in 0usize..20) {
             let bytes = encoded(&values, universe, at, after);
             let list = Ef::parse(&bytes[at..], values.len(), universe).unwrap();
             let mut want = Vec::new();
-            super::scalar::ef_decode(list, &mut want);
+            list.for_each(|v| want.push(v));
             prop_assert_eq!(&want, &values);
             let words = (universe as usize).div_ceil(64).min(1 << 20);
             let mut bits_want = vec![0u64; words];
@@ -935,14 +1061,14 @@ mod tests {
                 prop_assert_eq!(&have, &want, "{:?}", level);
                 // The level's own body, which short lists skip.
                 let mut have = vec![9];
-                run!(level, ef_decode(list, &mut have));
+                run!(level, ef_decode_span(list, whole(&list), 0, &mut have));
                 prop_assert_eq!(&have[1..], &want[..], "body {:?}", level);
                 if rows {
                     let mut bits_have = vec![0u64; words];
                     ef_into_row_at(level, list, &mut bits_have);
                     prop_assert_eq!(&bits_have, &bits_want, "{:?}", level);
                     let mut bits_have = vec![0u64; words];
-                    run!(level, ef_into_row(list, &mut bits_have));
+                    run!(level, ef_span_into_row(list, whole(&list), 0, &mut bits_have));
                     prop_assert_eq!(&bits_have, &bits_want, "body {:?}", level);
                 }
             }

@@ -170,6 +170,27 @@ impl<'a> Ef<'a> {
         }
     }
 
+    /// Calls `visit` with the values of `span` (as [`EfCursor::skip_below`]
+    /// gives it) in order; fewer if the highs end first.
+    #[inline]
+    pub fn for_each_in(&self, span: Span, mut visit: impl FnMut(u32)) {
+        let words = self.highs.len().div_ceil(8);
+        let mut w = span.bit / 64;
+        let mut word = bits::word(self.highs, w) & (u64::MAX << (span.bit % 64));
+        for i in span.index..(span.index + span.count).min(self.n) {
+            while word == 0 {
+                w += 1;
+                if w >= words {
+                    return;
+                }
+                word = bits::word(self.highs, w);
+            }
+            let high = (w * 64 + word.trailing_zeros() as usize - i) as u32;
+            word &= word - 1;
+            visit(high << self.low | bits::get(self.lows, i, self.low).unwrap_or(0));
+        }
+    }
+
     /// The values, decoded.
     pub fn to_vec(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(self.n);
@@ -264,6 +285,15 @@ fn select(x: u64, k: usize) -> u32 {
         b &= b - 1;
     }
     8 * byte + b.trailing_zeros()
+}
+
+/// A run of a list's members: `count` from rank `index`, the first's set
+/// bit at highs bit `bit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub index: usize,
+    pub bit: usize,
+    pub count: usize,
 }
 
 /// Reads an [`Ef`] list forward, with its rank.
@@ -366,6 +396,67 @@ impl<'a> EfCursor<'a> {
         self.index = index;
         self.bit = bit;
         self.current = Some(value);
+    }
+
+    /// The current value and those after it below `end`, as a span, the
+    /// cursor moved past them as [`Self::drain_below`] moves it (the next
+    /// value read): for a caller that decodes the span in bulk.
+    ///
+    /// Only the highs are read for the members of buckets below `end`'s
+    /// (they end at that bucket's opening zero, found a word at a time),
+    /// then the lows of `end`'s bucket's members until one is not below.
+    pub fn skip_below(&mut self, end: u32) -> Span {
+        let start = Span {
+            index: self.index,
+            bit: self.bit,
+            count: 0,
+        };
+        match self.current {
+            Some(current) if current < end => {}
+            _ => return start,
+        }
+        let (highs, lows, low, n) = (self.ef.highs, self.ef.lows, self.ef.low, self.ef.n);
+        let words = highs.len().div_ceil(8);
+        // Members passed, and the highs bit the scan stands at.
+        let (mut ones, mut at) = (0usize, self.bit);
+        // Zeros to pass before `end`'s bucket: the current value's high
+        // part is the zeros before it.
+        let mut need = (end >> low) as usize - (self.bit - self.index);
+        while need > 0 {
+            let w = at / 64;
+            if w >= words {
+                // Past the highs: every member left is below `end`.
+                ones = n - self.index;
+                break;
+            }
+            let word = bits::word(highs, w) >> (at % 64);
+            let (avail, set) = (64 - at % 64, word.count_ones() as usize);
+            if avail - set < need {
+                need -= avail - set;
+                ones += set;
+                at = (w + 1) * 64;
+                continue;
+            }
+            let q = select(!word, need - 1) as usize;
+            ones += (word & ((1u64 << q) - 1)).count_ones() as usize;
+            at += q + 1;
+            need = 0;
+        }
+        // `end`'s bucket: its members whose lows are below `end`'s.
+        let mask = if low == 0 { 0 } else { (1u32 << low) - 1 };
+        let total = highs.len() * 8;
+        while self.index + ones < n && at < total && highs[at / 8] >> (at % 8) & 1 == 1 {
+            if bits::get(lows, self.index + ones, low).unwrap_or(0) >= end & mask {
+                break;
+            }
+            ones += 1;
+            at += 1;
+        }
+        let count = ones.min(n - self.index);
+        self.index += count;
+        self.bit = at;
+        self.load();
+        Span { count, ..start }
     }
 
     pub fn advance(&mut self) {
@@ -562,6 +653,39 @@ mod tests {
             let values: Vec<u32> = std::mem::take(&mut values).into_iter().collect();
             let universe = values.last().map_or(1, |v| v + extra);
             round_trip(&values, universe);
+        }
+
+        #[test]
+        fn skips_as_drains(values in prop::collection::btree_set(0u32..100_000, 1..600), shift in 0u32..12, ends in prop::collection::vec(0u32..110_000, 1..30), seek in 0u32..100_000) {
+            // Lists from dense to sparse: values scaled down by `shift`.
+            let values: Vec<u32> = values.into_iter().map(|v| v >> shift).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            let universe = values.last().unwrap() + 1 + (seek >> 10);
+            let mut out = Vec::new();
+            encode(&values, universe, &mut out);
+            let ef = Ef::parse(&out, values.len(), universe).unwrap();
+            let mut drained = ef.cursor();
+            drained.seek(seek >> shift);
+            let mut skipped = drained.clone();
+            let mut ends = ends;
+            ends.sort_unstable();
+            for end in ends {
+                let end = end >> shift;
+                let (rank, bit) = (drained.rank(), drained.bit);
+                let mut seen = Vec::new();
+                drained.drain_below(end, |v| seen.push(v));
+                let span = skipped.skip_below(end);
+                prop_assert_eq!((span.index, span.count), (rank, seen.len()));
+                // (An exhausted cursor's highs bit is not used.)
+                if !seen.is_empty() {
+                    prop_assert_eq!(span.bit, bit);
+                }
+                prop_assert_eq!(&values[rank..rank + seen.len()], &seen[..]);
+                let mut decoded = Vec::new();
+                ef.for_each_in(span, |v| decoded.push(v));
+                prop_assert_eq!(&decoded, &seen);
+                prop_assert_eq!(skipped.current(), drained.current());
+                prop_assert_eq!(skipped.rank(), drained.rank());
+            }
         }
 
         #[test]
