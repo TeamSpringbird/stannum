@@ -20,6 +20,12 @@ step() {
   echo "$(date -u +%H:%M:%S) $*" >> /work/progress.txt
   /usr/local/bin/aws s3 cp --only-show-errors /work/progress.txt "s3://$BUCKET/$PREFIX/progress.txt" || true
 }
+# A spot box can be reclaimed mid-run: after each step, $OUT so far goes up
+# as the results devbox.sh fetches (the final upload replaces it).
+save() {
+  tar -C /work -czf /work/partial.tar.gz out &&
+    /usr/local/bin/aws s3 cp --only-show-errors /work/partial.tar.gz "s3://$BUCKET/$PREFIX/results.tar.gz" || true
+}
 D=$DATA/dump150m T=$DATA/trace.tsv E=$DATA/pg-ranked.tsv
 LIMIT=${LIMIT:-1200} TRAIN_LIMIT=${TRAIN_LIMIT:-1200}
 FV=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS
@@ -59,6 +65,7 @@ build() { # name flags
     { step "build $1 failed"; tail -20 $OUT/build-$1.log; return 1; }
   cp /work/t-$1/release/tnsreplay $B/$1
   step "built $1 ($(grep -ci 'mismatch\|out of date\|no profile' $OUT/build-$1.log) profile warnings)"
+  save
 }
 train() { # binary log
   local bin=$1 log=$2
@@ -96,7 +103,7 @@ step "measuring: $builds"
 for b in $builds; do
   perf stat -x, -e $EV -o $OUT/perf-load-$b.csv -- $B/$b --dump $D --trace $T --limit 1 --repeat 1 > $OUT/replay-load-$b.txt 2> $OUT/replay-load-$b.err
 done
-step "load-only runs done"
+step "load-only runs done"; save
 for r in 1 2; do
   order=$builds; [ $r = 2 ] && order=$rev
   for b in $order; do
@@ -104,5 +111,6 @@ for r in 1 2; do
     perf stat -x, -e $EV -o $OUT/perf-$tag.csv -- $B/$b --dump $D --trace $T --expect $E \
       --limit $LIMIT --repeat 3 > $OUT/replay-$tag.txt 2> $OUT/replay-$tag.err
     step "$tag exit $? $(grep expect: $OUT/replay-$tag.txt) | $(grep -E '^(conjunction|disjunction|phrase) +[0-9]+ +[0-9.]+ +[0-9.]+ +[0-9.]+$' $OUT/replay-$tag.txt | awk '{printf "%s %s ", substr($1,1,4), $5}')"
+    save
   done
 done
