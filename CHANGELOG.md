@@ -142,6 +142,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- A ranked disjunction over `TNS1` reads its terms' grids where they lie on
+  their pages rather than copying each into a row, and copies a grid across
+  two pages straight into its row rather than stitching it first: at 150
+  million rows a query copies 12 MB instead of 44 MB (21 MB instead of 130
+  MB scoring every term), for 5% to 6% fewer instructions and 5% to 8%
+  fewer cycles on aarch64 and x86-64 alike.
 - Ranked walks over `TNS1` branch less where the branch follows the data,
   for x86-64, whose predictors miss such branches far more often than the
   Apple cores do. A conjunction intersects its candidates with each

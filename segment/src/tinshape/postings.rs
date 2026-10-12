@@ -1997,7 +1997,8 @@ impl<'a> LazyFooter<'a> {
             self.push_block((gap, len))?;
             self.entries.push(entry);
             bounds.push(fold_bound(&self.frontier, &mut bound));
-            self.maxb.push(self.frontier.last().map_or(0, |pair| pair.0));
+            self.maxb
+                .push(self.frontier.last().map_or(0, |pair| pair.0));
             self.frontier.clear();
         }
     }

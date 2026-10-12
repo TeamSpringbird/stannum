@@ -2977,6 +2977,86 @@ mod tests {
         assert!(got.scored <= 30, "scored {}", got.scored);
     }
 
+    /// A ranked disjunction over a segment read in place reads its terms'
+    /// grids where they lie: one on a page in place, one across pages
+    /// copied into the term's row, neither stitched into the span's buffers
+    /// (at 150M rows those were 4 MB per query, 14 MB scoring every term).
+    /// Conjunctions and phrases over the same grids (a grid across pages
+    /// stitched) rank as in memory. The pages are released as the walk
+    /// passes them and poisoned, so a grid read after its page was released
+    /// would rank garbage.
+    #[test]
+    fn ranked_walks_read_grids_in_place() {
+        use segment::tinshape::blob::{self, Kind};
+        let n = 6_000usize;
+        let docs: Vec<Tid> = (0..n as u32)
+            .map(|i| Tid {
+                block: i / 16,
+                offset: (i % 16) as u16 + 1,
+            })
+            .collect();
+        let lengths: Vec<u32> = (0..n as u32).map(|r| r % 50 + 5).collect();
+        let members: Vec<Vec<(usize, u32)>> = (0..3)
+            .map(|t| {
+                (0..n)
+                    .filter(|r| (r * 7 + t * 3) % (t + 2) != 0)
+                    .map(|r| (r, (r % 5 + t) as u32 + 1))
+                    .collect()
+            })
+            .collect();
+        let all: Vec<usize> = (0..n).collect();
+        let options = Options {
+            grid_min_postings: 0,
+            grid_density: 4,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+        let parsed = Segment::parse(&blob).unwrap();
+        let pinned = LazyBlob::new(Box::new(segment::tinshape::blob::PinningSource::new(
+            blob.clone(),
+            509,
+        )));
+        let segment = assembled_in_place(&pinned, &parsed, &blob);
+        let names: Vec<String> = (0..3).map(|t| format!("t{t}")).collect();
+        let scorers: Vec<(String, TermScorer)> = (0..3)
+            .map(|t| {
+                let df = members[t].len() as u64;
+                let s = TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 30.0);
+                (names[t].clone(), s.unwrap())
+            })
+            .collect();
+        let nodes = [
+            Node::Or((0..3).map(Node::Term).collect()),
+            Node::And((0..3).map(Node::Term).collect()),
+            Node::And(vec![Node::Term(0), Node::Term(2)]),
+            // Term t holds positions 0..tf (see `build_part`).
+            Node::Span {
+                slots: vec![2, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
+        let bits = |rows: &[(f32, Tid)]| {
+            rows.iter()
+                .map(|(s, t)| (s.to_bits(), *t))
+                .collect::<Vec<_>>()
+        };
+        for node in &nodes {
+            let want = top_k(&parsed, node, &names, &scorers, 10, &mut NoTouch).unwrap();
+            assert!(!want.rows.is_empty(), "{node:?} matches");
+            pinned.open_span();
+            blob::reset_stats();
+            let got = top_k(&segment, node, &names, &scorers, 10, &mut NoTouch).unwrap();
+            let stitched = blob::stats()[Kind::Container as usize].stitched;
+            segment.forget_borrowed();
+            // SAFETY: `top_k` returned owned results.
+            unsafe { pinned.close_span() };
+            assert_eq!(bits(&got.rows), bits(&want.rows), "{node:?}");
+            if matches!(node, Node::Or(_)) {
+                assert_eq!(stitched, 0, "container bytes stitched for {node:?}");
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
         /// A document has one length, so every term it holds bounds it from
@@ -3229,9 +3309,7 @@ mod tests {
             })
             .collect();
         let at = |t: usize, tf: u32, length: u32| {
-            scorers[t]
-                .1
-                .bound_through(TfBucket::from_count(tf), length)
+            scorers[t].1.bound_through(TfBucket::from_count(tf), length)
         };
         // The threshold (a winner's score) lies above what a rare word's
         // candidate scores at its length, and below its blocks' bounds.
