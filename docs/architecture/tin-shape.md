@@ -1328,6 +1328,75 @@ cycles and by 13% (conjunction) and 42% (disjunction, whose code did not
 change) in backend CPU. The server comparison is to be repeated on a quiet
 host.
 
+## The server path and concurrency at 150M rows (branch `fable/server`)
+
+Measured in PostgreSQL on a copy of the saved 150M database (24 GB of
+shared buffers, 8 vCPUs of the Mac's VM, the driver's shuffled order,
+backend CPU from `/proc/self/schedstat`, `perf` across the backends, VM
+instructions per query from `benchmarks/local/vm_ab.py`), beside the i7i
+counters of 2026-10-12 and the r7i replay of the same commit. Log and
+outputs: `stannum-lab/fable/server/`.
+
+- Outside the walk. The server's own code is a tenth of a query's cycles
+  or less: pins and the buffer manager 6.8% of the mixed workload on the
+  Mac (7.5% of an x86 conjunction, 3.3% of a disjunction, plus 2-3% of
+  first touches of the hint, descriptor and page-header lines), the planner
+  0.9%, the executor 0.8%, the kernel 0.4%. Planning a query takes 0.04 to
+  0.08 ms over 15 buffers once a connection is warm (its first query costs
+  33 ms and 8,700 buffers of catalog and reader caches, once); TIN plans
+  in about 0.55 ms over 39 buffers and resolves its terms there. Against
+  the replay at the same commit the server retires 24% more instructions
+  per conjunction, 7% per disjunction and 28% per phrase, and costs 1.5 to
+  1.8 times the cycles: the walk itself runs slower inside the server
+  (shared buffers a page at a time on 4 KB kernel pages, a loaded module's
+  code) and, on x86, on a hyperthread.
+- Concurrency. From one client to eight, CPU per query is flat (conjunction
+  8.4 to 7.9 ms, disjunction 33.8 to 32.4, phrase 12.7 to 10.9 on a loaded
+  host) and queries per second linear; the profiles at one and at eight
+  clients are the same to a tenth of a percent per area. Nothing in the
+  buffer mapping partitions, the shared hint table (read on every pin,
+  written on the 4% that miss), the private reference-count hash or the
+  allocator contends; the one shared line visible is the buffer header's
+  spinlock in `ReadRecentBuffer` (1.2 to 1.9% on x86). On the i7i (four
+  cores, eight hyperthreads, 8 clients) each hyperthread retires 1.45
+  (conjunction) to 1.68 (disjunction) instructions per cycle, where the
+  same code alone on an r7i core retires 2.6 and on the Mac 3.7 to 4.1: the
+  walk is 44 to 51% retiring with few cache misses, so a sibling thread
+  finds little idle issue bandwidth and SMT adds 10 to 20% of core
+  throughput rather than the 30% or more a memory-bound workload gets.
+  Fewer instructions in the walk are the lever there, not the server.
+- Pins. A `ReadRecentBuffer` pin and its release cost about 1,400 cycles
+  of bookkeeping on x86 (`GetPrivateRefCount` and `NewPrivateRefCountEntry`
+  in the hash a walk's 40 to 60 held pins overflow into, `LockBufHdr`, the
+  resource owner's remember and forget, the release's hash lookup and
+  delete, and a second atomic to raise the usage count) and about 600 of
+  cache misses (the hint bucket, the descriptor, the page header), 3,600 to
+  7,700 times a query. `own_pin` pins a hinted buffer as `PinBuffer` does,
+  one compare-and-swap of the header's state (reference and usage counts
+  together) and then the tag check, and `own_unpin` releases it as
+  `UnpinBuffer` does (the atomic decrement, and under the header lock the
+  wake-up of a waiter for the sole pin). The span's own pins are entered in
+  a ledger remembered with the statement's resource owner as one resource
+  (`ResourceOwnerDesc`, released with the buffer pins), so a `FATAL` exit
+  mid-walk, which unwinds nothing, releases them as PostgreSQL releases its
+  own; an error that unwinds the walk releases them through the span's
+  close as before. The pin counters are backend statics: a `thread_local!`
+  in a loaded module costs a dynamic lookup per access, several per pin.
+  Together (`vm_ab`, two rounds, an identical-binary control within 0.7%
+  in instructions): instructions per query -6.1% (conjunction), -3.9%
+  (disjunction), -6.2% (phrase), -4.0% (mixed); cycles -5 to -7%; backend
+  CPU -4 to -7%; the same ranked answers to the whole trace.
+- Not changed: batching pins of consecutive blocks (a group's pages are not
+  consecutive); holding at most eight pins (fewer-pins: pins x2.8 to 7);
+  pins kept across queries (eviction, a resource owner of their own, and
+  TIN keeps nothing). The page-header read per pin could go (the data
+  length follows from the run's geometry) for one line per pin, about 1 to
+  2% of an x86 conjunction, at the price of the per-pin corruption check.
+  Shared buffers sit on 4 KB kernel pages in these containers (no hugetlb
+  pages): the i7i counts one dTLB miss per page pinned and 2.6 to 3.9% of
+  cycles in page walks, for TIN as for us; a benchmark-setup question, not
+  a change here.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every

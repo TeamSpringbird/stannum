@@ -233,6 +233,23 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   decoded and kept. Together, at eight clients, backend CPU per query falls
   17% (conjunction), 8% (disjunction) and 16% (phrase), for the same
   answers.
+- A page found through its hint is pinned by one compare-and-swap of its
+  buffer header, as `PinBuffer` pins, then its tag checked, and released by
+  `UnpinBuffer`'s atomic decrement (with its wake-up of a waiter for the
+  sole pin), outside PostgreSQL's per-pin bookkeeping: a walk holds tens of
+  pages at once, past the eight its private reference counts keep in an
+  array, so each of a query's thousands of pins cost two or three hash
+  lookups, the header spinlock and a second atomic for the usage count. A
+  span's own pins are remembered with the statement's resource owner as one
+  resource, released with the buffer pins should the statement end without
+  closing the span (a `FATAL` exit). `stannum.own_pins` (on) switches back
+  to `ReadRecentBuffer` for comparison. The pin counters are backend
+  statics rather than thread-locals, which a loaded module reaches through
+  a dynamic lookup per access. At 150 million rows and eight clients (VM
+  instructions per query, an identical-binary control within 0.7%): 6.1%
+  fewer instructions per conjunction, 3.9% per disjunction, 6.2% per
+  phrase, 4.0% on the mixed workload, and 4 to 7% less backend CPU, for
+  the same answers.
 - A ranked walk over `TNS1` releases the index pages of each group it is
   past, but for those its terms' records still borrow and the 24 it read
   last, rather than holding every page it read until the segment's read
