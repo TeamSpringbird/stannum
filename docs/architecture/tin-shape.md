@@ -1117,6 +1117,14 @@ a count and an add; marking is a few independent operations per value.
 Looking a member's posting index up by binary search rather than a scan
 changed nothing (conjunctions -0.2% instructions, phrases +0.1%).
 
+In the server (`vm_ab`, plain images, one round; host load near 28 on 16
+cores) the VM retired 1.7% more instructions per conjunction (96.8 to
+98.5 M), as in the replay, but its cycles did not resolve the change: the
+identical-binary control differed from the base by 5.7% in conjunction
+cycles and by 13% (conjunction) and 42% (disjunction, whose code did not
+change) in backend CPU. The server comparison is to be repeated on a quiet
+host.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
