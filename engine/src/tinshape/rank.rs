@@ -2307,11 +2307,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         self.row_loaded = loaded;
         // Each member of the mask weighed alone: the bounds of the terms it
-        // holds, summed, must reach the threshold (a word's members first
-        // all at once, by the terms holding any of them). A word is weighed
-        // by the group's bounds first, and only a word they leave in reach by
-        // its sub-range's (1,024 slots), taken once per sub-range: tighter,
-        // but a range bound per term. A member's blocks bound it no higher,
+        // holds, summed, must reach the threshold. A word's members are
+        // weighed first all at once, by the group's bounds of the terms
+        // holding any of them; each member of a word they leave in reach then
+        // by its sub-range's (1,024 slots), taken once per sub-range: tighter,
+        // but a range bound per term. (A word check at the sub-range's bounds
+        // too cut 3% of the words it saw, for 2% of a `full_score`
+        // disjunction's instructions.) A member's blocks bound it no higher,
         // so one this leaves below the threshold would fail its candidate
         // check. At 150 million rows a group's mask holds ~85 members in a
         // third of its words; weighing them alone, without a plan per
@@ -2366,13 +2368,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         if self.cut(total, || first(w)) {
                             break;
                         }
-                    }
-                    let mut most = 0.0_f32;
-                    for (h, &(_, _, bound)) in held.iter().zip(&terms) {
-                        most += or_zero(bound, *h & word != 0);
-                    }
-                    if self.cut(most, || first(w)) {
-                        continue;
                     }
                     let mut keep = 0u64;
                     let mut left = word;
