@@ -25,7 +25,7 @@ use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
-use segment::tinshape::blob::LazyBlob;
+use segment::tinshape::blob::{Bytes, LazyBlob};
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
@@ -301,6 +301,22 @@ impl<'a> Sc<'a> {
         );
         self.bb[at] = v;
         v
+    }
+
+    /// [`Self::floor`], a footer decoded for its bounds reading a block's
+    /// floors at once and keeping them for the block.
+    #[inline]
+    fn floor_at(&mut self, b: usize, bucket: u8) -> u32 {
+        if self.footer.keeps_pairs() {
+            return self.floor(b, bucket);
+        }
+        // Blocks are numbered below `u32::MAX` (a record has fewer postings).
+        let tag = b as u32;
+        if self.floors_block != tag {
+            self.floors_block = tag;
+            self.floors = self.footer.floors(b);
+        }
+        self.floors[usize::from(bucket) % BUCKET_COUNT]
     }
 
     /// Block `b`'s largest bucket: its frontier's last pair.
@@ -718,18 +734,17 @@ struct Walk<'s, 'a, T: Touch> {
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
     plan: Plan,
-    /// A disjunction's group at hand: per scoring term a row of the
-    /// group's words holding its members, and its index cursor.
+    /// A disjunction's group at hand: per scoring term room for a row of
+    /// the group's words holding its members (unless read in place, see
+    /// [`RowAt`]), and its row and index cursor.
     rows: Vec<u64>,
     row_state: Vec<Row>,
-    /// Per scoring term, whether its row holds the group at hand; and the
-    /// essential terms' union there.
+    /// Per scoring term, whether its row holds the group at hand.
     row_loaded: Vec<bool>,
-    any: Vec<u64>,
     /// A disjunction's group at hand: per present term with a positive
-    /// bound there, where its row starts in `rows`, that bound and its bound
-    /// over the sub-range at hand; and its word at hand.
-    or_terms: Vec<(usize, f32, f32)>,
+    /// bound there, the term, its row, that bound and its bound over the
+    /// sub-range at hand; and its word at hand.
+    or_terms: Vec<(usize, RowAt, f32, f32)>,
     or_held: Vec<u64>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
@@ -952,7 +967,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// candidates checked, and the terms' members (a grid or an
     /// Elias-Fano list read in place) are forgotten here; positions, TF
     /// tails and the DL sidecar are read a value at a time, and a
-    /// disjunction copies its terms' rows. What the walk keeps across
+    /// disjunction's rows (a grid read in place) are loaded afresh in the
+    /// next group they are read in. What the walk keeps across
     /// groups holds no slice (directories, decoded; positions streams,
     /// read when asked), lies in [`Walk::held`] (a sparse term's list,
     /// inline lengths) or is held for this release: a scoring term's
@@ -1867,7 +1883,6 @@ pub(super) fn walk_into<'a>(
         rows: Vec::new(),
         row_state: vec![Row::default(); n],
         row_loaded: Vec::new(),
-        any: Vec::new(),
         or_terms: Vec::new(),
         or_held: Vec::new(),
         held_bound: vec![0.0; n],
@@ -2059,12 +2074,12 @@ impl<'r> RowBits<'r> {
         let kept = if w == self.w { self.bits } else { 0 };
         self.bits = kept | 1 << (local % 64);
         self.w = w;
-        self.row[w] = self.bits;
+        self.row[w] = self.bits.to_le();
     }
 }
 
-/// A disjunction term's members in the group at hand, as a row of words in
-/// [`Walk::rows`], and a forward cursor over their posting indexes.
+/// A disjunction term's members in the group at hand, as a row of words
+/// (see [`RowAt`]), and a forward cursor over their posting indexes.
 #[derive(Clone, Copy, Default)]
 struct Row {
     /// Postings in earlier groups.
@@ -2072,6 +2087,93 @@ struct Row {
     /// Members in words `..w` are `run`.
     w: usize,
     run: u32,
+    at: RowAt,
+}
+
+/// Where a disjunction term's row lies in the group at hand: the group's
+/// words, little-endian. A grid on one page is read in place there; other
+/// members (decoded, or a grid across pages copied a page's part at a
+/// time) lie in the term's part of [`Walk::rows`]. A word is the same load
+/// from either, so the walk never asks which.
+///
+/// Copying every grid into its row cost 31 MB of copies per disjunction at
+/// 150M rows (106 MB scoring every term), libc `memcpy` on x86-64.
+///
+/// A pointer, not a slice, as it borrows a page or `rows` across the walk's
+/// `&mut self` calls. Sound as the walk uses it: a group's rows are loaded
+/// after `rows` is sized for the group, and read only within that group,
+/// before [`Walk::group_done`] releases its pages.
+///
+/// A conjunction's grids stay slices (`Kind::Grid`): copying a grid across
+/// pages into the term's own words rather than stitching it copied as many
+/// bytes, and checking for it per grid cost 1.3% more instructions.
+#[derive(Clone, Copy)]
+struct RowAt {
+    at: *const u8,
+    len: usize,
+}
+
+impl Default for RowAt {
+    fn default() -> Self {
+        Self::new(&[])
+    }
+}
+
+impl RowAt {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            at: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    /// A row of `rows`, its words stored little-endian.
+    fn of(row: &[u64]) -> Self {
+        Self {
+            at: row.as_ptr().cast(),
+            len: size_of_val(row),
+        }
+    }
+
+    #[inline(always)]
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `len` bytes from `at` were a slice when the row was
+        // loaded, and are still (see the type).
+        unsafe { std::slice::from_raw_parts(self.at, self.len) }
+    }
+
+    /// Word `w`.
+    #[inline(always)]
+    fn word(&self, w: usize) -> u64 {
+        debug_assert!(w * 8 + 8 <= self.len);
+        // SAFETY: as in `bytes`; the walk asks only for its group's words,
+        // which a row holds (see `grid_row`).
+        u64::from_le_bytes(unsafe { self.at.add(w * 8).cast::<[u8; 8]>().read_unaligned() })
+    }
+}
+
+/// A grid container's row (`row`, of its group's words, holding it only if
+/// need be): in place where the grid lies on one page, else copied into
+/// `row` a page's part at a time rather than stitched into the span's
+/// buffers first.
+#[inline]
+fn grid_row(grid: Bytes<'_>, row: &mut [u64]) -> Result<RowAt> {
+    let len = grid.len();
+    if len != size_of_val(row) {
+        return Err(Error::Corrupt("a grid of its group's words"));
+    }
+    if grid.page_end(0) == len {
+        return Ok(RowAt::new(grid.all()?));
+    }
+    // SAFETY: a `u64` slice's bytes, any value valid.
+    let out = unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), len) };
+    let mut at = 0;
+    while at < len {
+        let end = grid.page_end(at);
+        out[at..end].copy_from_slice(grid.get(at, end)?);
+        at = end;
+    }
+    Ok(RowAt::of(row))
 }
 
 impl<'a, T: Touch> Walk<'_, 'a, T> {
@@ -2126,8 +2228,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
-    /// Scoring term `i`'s members in group `g`, which it holds, into its row
-    /// of `words` words.
+    /// Scoring term `i`'s members in group `g`, which it holds, as its row
+    /// of `words` words ([`Row::at`]).
     #[inline(never)]
     fn or_load(&mut self, i: usize, g: u32, words: usize) -> Result<()> {
         let t = self.sc[i].term;
@@ -2137,6 +2239,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let r = &mut self.row_state[i];
         r.w = 0;
         r.run = 0;
+        r.at = RowAt::of(row);
         if let Form::Sparse(list) = &set.postings.form {
             row.fill(0);
             let cursor = set.sparse.get_or_insert_with(|| {
@@ -2164,14 +2267,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 at,
             } => {
                 self.touch.touch(Part::Payload, at, bytes.len());
-                let bytes = bytes.all()?;
                 self.mems[t].used += 1;
                 r.first = e.first;
                 if e.kind == KIND_GRID {
-                    kernels::load(row, bytes);
+                    r.at = grid_row(bytes, row)?;
                 } else {
                     row.fill(0);
-                    kernels::container_row(&e, bytes, &group, row)?;
+                    kernels::container_row(&e, bytes.all()?, &group, row)?;
                 }
             }
             Src::Locals { from, to } => {
@@ -2242,33 +2344,26 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if filters == 0 {
             mask.fill(!0);
         }
-        if let Some((&first, rest)) = plan.required.split_first() {
-            self.or_load(first, g, words)?;
-            loaded[first] = true;
-            mask.copy_from_slice(&self.rows[first * words..(first + 1) * words]);
-            for &i in rest {
-                self.or_load(i, g, words)?;
-                loaded[i] = true;
-                kernels::and_words(&mut mask, &self.rows[i * words..(i + 1) * words]);
-            }
-        }
+        // The essential terms ORed into the mask, cleared above, then the
+        // required terms ANDed in; without essential terms the first
+        // required one is the mask to start from.
+        let mut required = plan.required.iter();
         if plan.by_essential && !plan.essential.is_empty() {
-            let required = !plan.required.is_empty();
-            let mut any = std::mem::take(&mut self.any);
-            any.clear();
-            any.resize(words, 0);
             for e in 0..plan.essential.len() {
                 let i = plan.essential[e];
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
-                kernels::or_words(&mut any, &self.rows[i * words..(i + 1) * words]);
+                kernels::or_bytes(&mut mask, self.row_state[i].at.bytes());
             }
-            if required {
-                kernels::and_words(&mut mask, &any);
-            } else {
-                mask.copy_from_slice(&any);
-            }
-            self.any = any;
+        } else if let Some(&first) = required.next() {
+            self.or_load(first, g, words)?;
+            loaded[first] = true;
+            kernels::load(&mut mask, self.row_state[first].at.bytes());
+        }
+        for &i in required {
+            self.or_load(i, g, words)?;
+            loaded[i] = true;
+            kernels::and_bytes(&mut mask, self.row_state[i].at.bytes());
         }
         if let Some(dead) = dead {
             kernels::andnot_words(&mut mask, dead);
@@ -2288,11 +2383,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         self.row_loaded = loaded;
         // Each member of the mask weighed alone: the bounds of the terms it
-        // holds, summed, must reach the threshold (a word's members first
-        // all at once, by the terms holding any of them). A word is weighed
-        // by the group's bounds first, and only a word they leave in reach by
-        // its sub-range's (1,024 slots), taken once per sub-range: tighter,
-        // but a range bound per term. A member's blocks bound it no higher,
+        // holds, summed, must reach the threshold. A word's members are
+        // weighed first all at once, by the group's bounds of the terms
+        // holding any of them; each member of a word they leave in reach then
+        // by its sub-range's (1,024 slots), taken once per sub-range: tighter,
+        // but a range bound per term. (A word check at the sub-range's bounds
+        // too cut 3% of the words it saw, for 2% of a `full_score`
+        // disjunction's instructions.) A member's blocks bound it no higher,
         // so one this leaves below the threshold would fail its candidate
         // check. At 150 million rows a group's mask holds ~85 members in a
         // third of its words; weighing them alone, without a plan per
@@ -2303,7 +2400,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
             if sb[i] > 0.0 {
-                terms.push((i * words, sb[i], 0.0));
+                terms.push((i, self.row_state[i].at, sb[i], 0.0));
             }
         }
         held.clear();
@@ -2326,8 +2423,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let mut word = mask[w];
                 if self.threshold().is_some() {
                     let mut most = 0.0_f32;
-                    for (h, &(at, bound, _)) in held.iter_mut().zip(&terms) {
-                        *h = self.rows[at + w];
+                    for (h, &(_, at, bound, _)) in held.iter_mut().zip(&terms) {
+                        *h = at.word(w);
                         most += or_zero(bound, *h & word != 0);
                     }
                     if self.cut(most, || first(w)) {
@@ -2339,8 +2436,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         let to = (base + (w1 * 64) as u32 - 1).min(end);
                         let mut total = 0.0_f32;
                         for term in terms.iter_mut() {
-                            let bound = self.sc[term.0 / words].range_bound(from, to);
-                            term.2 = bound;
+                            let bound = self.sc[term.0].range_bound(from, to);
+                            term.3 = bound;
                             total += bound;
                         }
                         // The sub-range's words left start at `w`.
@@ -2348,20 +2445,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             break;
                         }
                     }
-                    let mut most = 0.0_f32;
-                    for (h, &(_, _, bound)) in held.iter().zip(&terms) {
-                        most += or_zero(bound, *h & word != 0);
-                    }
-                    if self.cut(most, || first(w)) {
-                        continue;
-                    }
                     let mut keep = 0u64;
                     let mut left = word;
                     while left != 0 {
                         let bit = left.trailing_zeros();
                         left &= left - 1;
                         let mut sum = 0.0_f32;
-                        for (h, &(_, _, bound)) in held.iter().zip(&terms) {
+                        for (h, &(_, _, _, bound)) in held.iter().zip(&terms) {
                             sum += or_zero(bound, *h >> bit & 1 == 1);
                         }
                         let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
@@ -2372,7 +2462,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 while word != 0 {
                     let bit = word.trailing_zeros();
                     word &= word - 1;
-                    self.or_candidate(g, base, words, w, bit)?;
+                    self.or_candidate(g, base, w, bit)?;
                 }
             }
             w0 = w1;
@@ -2432,15 +2522,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// The posting index of member `local` of scoring term `i`'s row;
     /// members must be asked in increasing order.
     #[inline]
-    fn row_index(&mut self, i: usize, words: usize, local: u32) -> u32 {
-        let row = &self.rows[i * words..(i + 1) * words];
+    fn row_index(&mut self, i: usize, local: u32) -> u32 {
         let r = &mut self.row_state[i];
         let w = local as usize / 64;
         if w > r.w {
-            r.run += kernels::popcount(&row[r.w..w]) as u32;
+            r.run += kernels::popcount_bytes(&r.at.bytes()[r.w * 8..w * 8]);
             r.w = w;
         }
-        r.first + r.run + (row[w] & ((1u64 << (local % 64)) - 1)).count_ones()
+        r.first + r.run + (r.at.word(w) & ((1u64 << (local % 64)) - 1)).count_ones()
     }
 
     /// Bounds the candidate at bit `bit` of word `w` of group `g` and, if
@@ -2457,9 +2546,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Kept out of line, as the group and plan steps are: inlined into the
     /// word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
-    fn or_candidate(&mut self, g: u32, base: u32, words: usize, w: usize, bit: u32) -> Result<()> {
+    fn or_candidate(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<()> {
         let local = (w * 64) as u32 + bit;
-        if let Some((reach, length)) = self.or_stage(g, base, words, w, bit)? {
+        if let Some((reach, length)) = self.or_stage(g, base, w, bit)? {
             if !matches!(self.verify, Verify::Flat) {
                 return self.finish(g, local, length);
             }
@@ -2477,30 +2566,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// [`Walk::stage`]): its terms' blocks, then its buckets, and a length
     /// a term it holds carries inline. Its buckets are left in
     /// [`Walk::buckets`] ([`NO_BUCKET`] for a term it lacks).
-    fn or_stage(
-        &mut self,
-        g: u32,
-        base: u32,
-        words: usize,
-        w: usize,
-        bit: u32,
-    ) -> Result<Option<(f32, u32)>> {
+    fn or_stage(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<Option<(f32, u32)>> {
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
         self.answer.candidates += 1;
         let tid = self.geometry.tid_in(g as usize, local);
         let mut bound = 0.0_f32;
-        // The held term its block bounds highest.
-        let (mut best, mut top) = (-1.0_f32, usize::MAX);
         self.held_list.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
-            if self.rows[i * words + w] >> bit & 1 == 1 {
+            if self.row_state[i].at.word(w) >> bit & 1 == 1 {
                 self.held_list.push(i);
                 // A member's block is its posting index's: the footer is
                 // decoded whole (`Sc::decode_all`), and its blocks hold
                 // `block_size` postings each.
-                let index = self.row_index(i, words, local);
+                let index = self.row_index(i, local);
                 self.held_index[i] = index;
                 let s = &mut self.sc[i];
                 let b = (index / s.footer.block_size()) as usize;
@@ -2509,59 +2589,55 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let v = s.bound(b);
                 self.held_bound[i] = v;
                 bound += v;
-                if v > best {
-                    (best, top) = (v, i);
-                }
             }
         }
         if self.cut(bound, || tid) {
             return Ok(None);
         }
-        // The candidate's buckets, each against the shortest document of
-        // its block holding that bucket or more, before its length is read
-        // (see `Walk::stage`). The term its block bounds highest is read
-        // first, alone: its bucket replacing its block's bound rules out
-        // most candidates the others' blocks left in reach, before their
-        // TF is read (as TIN reads a term's TF only for a candidate that
-        // still needs it). The bounds are summed in the scorer's order,
-        // each no lower than its term's score, so the partial sum bounds
-        // the candidate.
+        // The candidate's buckets, before its length is read (see
+        // `Walk::stage`), a term at a time while the candidate is left in
+        // reach, the term bounding it highest first (as TIN reads a term's
+        // TF only for a candidate that still needs it). A bucket read bounds
+        // the document's length from below: by the shortest document its
+        // block holds at that bucket or above. A document has one length, so
+        // the longest of those floors bounds every term it holds (TIN bounds
+        // a document at one shared length): a term read by its bucket there,
+        // any other by its block's largest bucket there (and its block's
+        // bound). A rare word's bucket in a long document leaves the common
+        // words' blocks, bounded by their short documents, far below the
+        // threshold, before their TF is read. The bounds are summed in the
+        // scorer's order, each no lower than its term's score, so the sum
+        // bounds the candidate.
         self.buckets.fill(NO_BUCKET);
-        let (mut floor, mut low) = (0u32, u32::MAX);
-        let first = if self.held_list.len() > 1 {
-            let f = self.or_bucket_of(top)?;
-            (floor, low) = (f, f);
-            let mut partial = 0.0_f32;
+        let mut floor = 0u32;
+        let mut reach = bound;
+        loop {
+            let mut top = usize::MAX;
+            let mut best = f32::NEG_INFINITY;
             for &h in &self.held_list {
-                partial += self.held_bound[h];
+                if self.buckets[h] == NO_BUCKET && self.held_bound[h] > best {
+                    (best, top) = (self.held_bound[h], h);
+                }
             }
-            if self.cut(partial, || tid) {
+            if top == usize::MAX {
+                break;
+            }
+            let f = self.or_bucket_of(top)?;
+            if f > floor {
+                floor = f;
+                reach = self.or_rebound(floor);
+            } else {
+                let s = &self.sc[top];
+                let bucket = TfBucket::new(self.buckets[top]).expect("a bucket read");
+                self.held_bound[top] = s.scorer.bound_through(bucket, floor);
+                reach = 0.0;
+                for &h in &self.held_list {
+                    reach += self.held_bound[h];
+                }
+            }
+            if self.cut(reach, || tid) {
                 return Ok(None);
             }
-            top
-        } else {
-            usize::MAX
-        };
-        let mut own = 0.0_f32;
-        for h in 0..self.held_list.len() {
-            let i = self.held_list[h];
-            if i != first {
-                let f = self.or_bucket_of(i)?;
-                (floor, low) = (floor.max(f), low.min(f));
-            }
-            own += self.held_bound[i];
-        }
-        // Each term's own bound first, as `Walk::read_buckets` does.
-        if self.cut(own, || tid) {
-            return Ok(None);
-        }
-        let reach = if low >= floor {
-            own
-        } else {
-            self.reach(self.held_list.iter().copied(), floor)
-        };
-        if self.cut(reach, || tid) {
-            return Ok(None);
         }
         let carrier = self.held_list.iter().copied().find(|i| {
             self.terms[self.sc[*i].term]
@@ -2583,11 +2659,34 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }))
     }
 
+    /// Bounds each scoring term the candidate at hand holds at length
+    /// `floor`, which its length is no shorter than, into
+    /// [`Walk::held_bound`]: a term whose bucket is read by that bucket, any
+    /// other by its block's largest bucket (and no higher than it was).
+    /// Returns their sum, in the scorer's order.
+    #[inline]
+    fn or_rebound(&mut self, floor: u32) -> f32 {
+        let mut sum = 0.0_f32;
+        for &h in &self.held_list {
+            let s = &self.sc[h];
+            let read = self.buckets[h];
+            let v = if read == NO_BUCKET {
+                let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
+                s.scorer.bound_through(most, floor).min(self.held_bound[h])
+            } else {
+                s.scorer
+                    .bound_through(TfBucket::new(read).expect("a valid bucket"), floor)
+            };
+            self.held_bound[h] = v;
+            sum += v;
+        }
+        sum
+    }
+
     /// Reads into [`Walk::buckets`] the bucket of held scoring term `i`
     /// for the candidate at hand (its posting index in
-    /// [`Walk::held_index`], its block in [`Walk::blocks`]), and into
-    /// [`Walk::held_bound`] what the bucket scores at most there; returns
-    /// the shortest length the block holds at that bucket or above.
+    /// [`Walk::held_index`], its block in [`Walk::blocks`]); returns the
+    /// shortest length the block holds at that bucket or above.
     #[inline(always)]
     fn or_bucket_of(&mut self, i: usize) -> Result<u32> {
         let index = self.held_index[i];
@@ -2602,8 +2701,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 1,
             );
         }
-        let (floor, bound) = s.floor_kept(block, bucket);
-        self.held_bound[i] = bound;
+        let floor = s.floor_at(block, bucket);
         self.buckets[i] = bucket;
         Ok(floor)
     }

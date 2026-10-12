@@ -317,11 +317,17 @@ again (2.5% fewer cycles in the full_score replay).
   as `STN3` planned a sub-block and sieving all its words bit-parallel
   (`LaneSums`), and lets fewer through.
   A candidate is then bounded by its terms' blocks (a member's block is its
-  posting index over the block size), then by its buckets as above, the
-  bucket of the term its block bounds highest read first and alone: most
-  candidates that bucket leaves below the threshold read no other TF (as
-  TIN reads a term's TF only for a candidate that still needs it; at 150M
-  rows a fifth to a quarter fewer TF reads). A flat disjunction's
+  posting index over the block size), then by its buckets, a term at a
+  time while it is left in reach, the term bounding it highest first (as
+  TIN reads a term's TF only for a candidate that still needs it). Each
+  bucket read bounds the document's length from below (the shortest its
+  block holds at that bucket or above), and the longest of those floors
+  bounds every term it holds, read or not (TIN's shared length): an unread
+  term by its block's largest bucket there. A rare word's bucket in a long
+  document so rules out the common words' blocks, bounded by their short
+  documents, before their TF is read: at 150M rows, scoring every term
+  (`full_score`), a candidate past its blocks reads 60% fewer buckets and
+  a disjunction 38% fewer TF pages. A flat disjunction's
   candidates left in reach are scored best bound first at the group's end,
   as a phrase's are, so the best of a group raise the threshold over the
   rest before their lengths are read (on TIN's corpus, 15 ORed terms read
@@ -862,9 +868,10 @@ Proposals (not built; layout only, the same structures):
   them for 462 MB (1.2%; with the rest about 1.6%). The copies cost little
   (1.3 to 4.2 MB a query, well under a millisecond); the second pin is the
   larger part. Without padding, a walk could read a container across two
-  pages in place, a run of words per page (a grid's rows are copied into
-  a row anyway in the disjunction walk), which needs the walks to take a
-  container as up to two slices. Units could also start on a 64-byte line
+  pages in place, a run of words per page, which needs the walks to take a
+  container as up to two slices. (The disjunction walk now copies a grid
+  across pages straight into its row, unstitched: see
+  [grids read in place](#grids-read-in-place-branch-tinshapegrids-inplace).) Units could also start on a 64-byte line
   of the page (page offsets that are multiples of 64: data offsets of
   36 + 64k on a page): 507 MB for containers, 730 MB for TF blocks,
   2.9 GB for positions blocks (`tnsunits`, "line pad"), which only pays
@@ -1092,6 +1099,128 @@ disjunction instructions +13%, cycles +0.8%; conjunction +11%, +6%
 disjunction +17% instructions, +4.4% cycles; conjunction +21%, +9.8%.
 Keep 64. Log and tools:
 `stannum-lab/ef-simd/`.
+
+## Grids read in place (branch `tinshape/grids-inplace`)
+
+A disjunction copied every present term's grid into its row of
+`Walk::rows` (`kernels::load`, a libc `memcpy` call on x86-64, where
+`memcpy` was 11% to 14% of cycles), and a grid across two pages was
+stitched first, so copied twice, into a fresh stitch block. Counted at
+150M rows (replay, 200 queries per style, per query):
+
+| | grids into rows | mask starts | stitched containers | all copies |
+| --- | --- | --- | --- | --- |
+| disjunction, before | 40.7K (31.2 MB) | 9.7K (8.5 MB) | 4.1K (3.9 MB) | 44.4 MB, 59K `memcpy` |
+| disjunction, after | 7.8K parts across pages (3.9 MB) | 7.9K (7.1 MB) | 0.2K (21 KB) | 11.8 MB, 17K |
+| disjunction `--full`, before | 127.6K (106 MB) | 10.1K (8.8 MB) | 13.5K (14.4 MB) | 130 MB, 168K |
+| disjunction `--full`, after | 26.5K parts across pages (14.3 MB) | 6.0K (5.5 MB) | 0.2K (23 KB) | 20.7 MB, 36K |
+| conjunction / phrase | 0.6K / 0.9K `dense_group` starts | | 1.1K / 1.3K (1.0 / 1.2 MB) | unchanged |
+
+(A copy across pages is a `memcpy` per page's part; "all" counts other
+stitches too, 0.8 MB a query.)
+
+Now a row is a `RowAt` (a pointer and a length to the group's words,
+little-endian): a grid on one page is read where it lies, and a grid
+across pages, or members decoded from another container, lie in the
+term's part of `rows`. Every reader (the mask, the sieve's word per term,
+`row_index`'s popcounts, `or_stage`'s bit tests) loads a word the same way
+from either, with no choice per read. The mask starts from the essential
+terms' union ORed into it, then ANDs the required terms, so a required
+row is copied only when no essential term filters. An earlier attempt
+(`tinshape/perf-disj`, S2) read only the non-essential grids in place,
+beside the others' rows, and measured 10% slower, most of it in the
+sieve's row reads.
+
+A conjunction's grids were already read in place (`Kind::Grid`); copying
+one across pages into the term's own words instead of stitching it
+copies as many bytes, and measured 1.3% more instructions on aarch64 (a
+page check per grid load; a first version, sizing that buffer at every
+load, 5% more cycles on x86-64), so it stays stitched.
+
+Measured against `1e01d81` (`--expect` 0 different on the whole trace,
+every style; `--full` answers byte-identical), two rounds A B / B A:
+
+| | aarch64 (M4, timed passes): instructions, cycles | x86-64 (r7i.2xlarge, `perf stat`): instructions, cycles, mean |
+| --- | --- | --- |
+| disjunction | -6.3%, -6.6% (196 queries) | -6.1%, -4.9%, -4.5% (292 queries) |
+| disjunction `--full` | -5.1%, -8.5% (100 queries) | -4.9%, -5.0%, -4.9% (150) |
+| conjunction | 0.0%, within ±2% noise (300) | 0.0%, +0.7%, +0.9% (299) |
+| phrase | 0.0%, +0.6% (300) | 0.0%, -0.2%, -0.5% (298) |
+
+On x86-64 the disjunction's L1 data misses fell by 16% (23% with
+`--full`), but the cycles saved are about the instructions saved, not
+more, as if the copies' cost was mostly the first touch of the grids'
+lines, which the in-place reads now pay for the words they read.
+
+For the lanes changing the same walk (`tinshape/full-or`,
+`tinshape/ef-simd`): `Walk::rows` holds little-endian words, read only
+through `Row::at`; a path that fills a row sets `Row::at` (`RowAt::of`
+for `rows`, `grid_row` for a grid) and writes words with `to_le`
+(`RowBits` does). The kernels are the existing byte-slice ones
+(`load`, `and_bytes`, `or_bytes`, `popcount_bytes`); nothing in `ef.rs`
+changed.
+
+## `full_score` disjunctions (branch `tinshape/full-or`)
+
+A `full_score` disjunction scores the dense words `score` elides (in at
+least one document in ten). At 150M rows (replay, 400 disjunctions) it
+read 25,282 pages a query against `score`'s 7,895, and its profile on
+aarch64 was the word loop 29%, grid copies 20% (now read in place, above),
+the candidates' path 23% (11.7% reading buckets), footer decoding 12% and
+range bounds 8.5%. Counted over two passes:
+
+- Dense words already behave as MaxScore's non-essential terms: of 39.0M
+  groups, 13.4M are cut before a dense row is read (7.2M by the summed
+  bounds, 6.2M by an empty essential mask); 0.34M passing groups hold
+  dense words alone. A dense word is essential in 4.9M of the 25.5M
+  passing groups, where the threshold is still below the dense words'
+  summed bounds.
+- 1.32G live words: 930M cut at the group's bounds, 1.79G members of the
+  rest weighed (10.4 terms each) into 177M candidates (`score`: 27M), 69M
+  of them holding dense words alone. 40M fall to their blocks' bounds; the
+  rest read 511M buckets (313M of dense words), 2.8M are scored.
+
+Kept:
+
+- A candidate's buckets are read a term at a time while it is left in
+  reach, the term bounding it highest first, every held term bounded at
+  the longest length floor its read buckets imply (an unread term by its
+  block's largest bucket there; `LazyFooter::decode_bounds` keeps each
+  block's largest bucket, a byte a block). Buckets read past the blocks'
+  bounds fell from 375M to 148M (simulated: dense words first at their
+  blocks' bounds would have saved 39M; plain incremental reads 81M). TF
+  pages a query 6,820 to 4,257 (`score`: 601 to 565).
+- No word check at the sub-range's bounds before the members are weighed
+  there (it cut 13M of 383M words).
+
+On top of `tinshape/grids-inplace` (`0bd6e15`), 400 disjunctions x 3
+passes, aarch64 (M4, shared host, two rounds): `--full` instructions
+-2.4% / -2.2%, cycles -5.5% / -4.9%; with `--pin-ns 1000` -3.7% and
+-7.3%; `score` -1.0% / -0.9% and -1.1% / -1.6%. x86-64 (r7i.2xlarge,
+`perf stat`, user, less a load-only run, one round): `--full`
+instructions -3.7%, cycles -5.1%, mean latency -4.6%; `score` -1.6%,
+-2.2%, -2.3%. Answers: `--expect` 0 different on the whole trace,
+`--full` byte-identical.
+
+Measured and not kept (exact, all): sub-ranges of 512 or 256 slots
+(closer to a dense word's ~365-slot blocks: +1.6% / +3.8% instructions);
+dense words' group bounds by their record, so their footers could be
+skimmed (passing groups +8.5%, members weighed +50%; the group check
+needs the blocks); blocks found by slot with posting indexes only for
+buckets read (+5% cycles); the length read first for a candidate whose
+best term is dense (more DL pages, +1.6% instructions); a MaxScore plan
+per sub-range (members weighed -7% only); a word's members weighed term
+by term, or only by the terms holding any of them (+7% / +2%); the held
+terms found without a branch (+0.5% instructions, -1.3% cycles alone,
+nothing on top of the above).
+
+What is left is mostly not dense-specific: the word loop (each member of
+a live word weighed by every present term), `range_bound` per term per
+sub-range, and decoding every dense footer block's bound up front, which
+the group check needs. For the lanes on the same walk: `or_stage` reads
+`Walk::held_bound` as each held term's current bound (block, then bucket
+at the shared floor) and computes a member's posting index as before
+(`row_index`); `or_bucket_of` no longer writes a bound.
 
 ## Open
 
