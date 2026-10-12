@@ -19,7 +19,7 @@ use segment::tinshape::blob::Bytes;
 use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::EfCursor;
 use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings, for_each_local};
+use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings};
 use segment::tinshape::segment::{Area, Segment};
 use segment::{Error, Result};
 use tinql::runtime::{Query, SpanTermSlot};
@@ -308,7 +308,7 @@ impl<'a> TermSet<'a> {
             self.postings.payload.len(),
         );
         let mut slots = Vec::with_capacity(self.df as usize);
-        list.for_each(|s| slots.push(s));
+        kernels::ef_decode(*list, &mut slots);
         let mut index = 0usize;
         let mut from = 0u32;
         for (i, slot) in slots.iter().enumerate() {
@@ -517,7 +517,7 @@ impl<'a> TermSet<'a> {
                 } else {
                     let mut list = std::mem::take(&mut self.list);
                     list.clear();
-                    for_each_local(&entry, bytes, group, |l| list.push(l))
+                    kernels::container_locals(&entry, bytes, group, &mut list)
                         .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")));
                     self.list = list;
                     self.loaded = Loaded::List;
@@ -839,7 +839,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
         let group = self.segment.docs.geometry.groups[g.index as usize];
         match g.src {
             Src::Container { entry, bytes, .. } => {
-                for_each_local(&entry, bytes.all()?, &group, |l| list.push(l))?;
+                kernels::container_locals(&entry, bytes.all()?, &group, list)?;
             }
             Src::Locals { from, to } => {
                 let set = self.terms[t].as_ref().expect("a term with a group");
@@ -949,9 +949,14 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 if entry.kind == KIND_GRID {
                     kernels::load(out, bytes);
                 } else {
-                    for_each_local(&entry, bytes, &geometry_group, |l| {
-                        out[l as usize / 64] |= 1 << (l % 64)
-                    })?;
+                    // ORed in: a disjunction's term_or adds to a filled row.
+                    let mut list = std::mem::take(&mut self.other);
+                    list.clear();
+                    kernels::container_locals(&entry, bytes, &geometry_group, &mut list)?;
+                    for l in &list {
+                        out[*l as usize / 64] |= 1 << (l % 64);
+                    }
+                    self.other = list;
                 }
             }
             Src::Locals { from, to } => {

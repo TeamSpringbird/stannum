@@ -29,7 +29,7 @@ use segment::tinshape::blob::LazyBlob;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Form, KIND_EF, KIND_GRID, LazyFooter, for_each_local};
+use segment::tinshape::postings::{Form, KIND_EF, KIND_GRID, LazyFooter};
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
@@ -544,9 +544,7 @@ fn load<'a>(
                     offset: 0,
                 };
             } else {
-                let list = &mut mem.list;
-                list.reserve(e.count as usize);
-                for_each_local(&e, bytes, &group, |l| list.push(l))?;
+                kernels::container_locals(&e, bytes, &group, &mut mem.list)?;
             }
         }
         Src::Locals { from, to } => {
@@ -2173,8 +2171,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     kernels::load(row, bytes);
                 } else {
                     row.fill(0);
-                    let mut out = RowBits::new(row);
-                    for_each_local(&e, bytes, &group, |l| out.set(l))?;
+                    kernels::container_row(&e, bytes, &group, row)?;
                 }
             }
             Src::Locals { from, to } => {
