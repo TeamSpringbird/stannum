@@ -351,10 +351,20 @@ whole inside one function compiled for its instruction set:
   `vpsadbw`). `STANNUM_KERNELS=scalar|avx2|avx512` forces a level the CPU
   has (tests, A/B runs); others are ignored.
 
+Elias-Fano lists are decoded a block at a time
+(`engine/src/tinshape/kernels/ef.rs`, the same per-call choice): the high
+parts a highs byte at a time (a table row per byte value, eight lanes
+stored at once, a word's byte ranks by one multiply), then the low parts
+eight at a time (eight values are `l` whole bytes: a shuffle, a shift per
+lane and a mask, per width up to 25 bits), into a list or straight into a
+cleared row; lists of fewer than 16 members by clamped eight-byte loads
+before the level is chosen. A sparse list drained a group at a time by its
+cursor stays scalar (a group holds a member or two of it).
+
 Not vectorized on either architecture: the OR walk's per-word and
 per-member weighing (a few terms' bounds a word; branch-free whole-group
-weighing measured slower), Elias-Fano decoding (serial over the highs' set
-bits), and TF-tail and DL reads (one packed value per candidate). Their
+weighing measured slower), and TF-tail and DL reads (one packed value per
+candidate). Their
 scattered `count_ones` and `trailing_zeros` become POPCNT and TZCNT only
 in an `x86-64-v3` or `-v4` build (a baseline build runs bit tricks); that
 difference, not the kernels, is what those builds measure.
@@ -492,6 +502,14 @@ the values a list holds, its highs passed a word at a time and only the
 lows of the values' buckets read) and `ef::EfCursor::list`;
 `positions::Positions::skip_entries(from, at, to)`;
 `boldi_vigna::PhrasePlan::leaves`.
+
+Added for Elias-Fano decoding (branch `tinshape/ef-simd`):
+`ef::Ef::{lows, highs, low_width}`; `engine::tinshape::kernels::{ef_decode,
+ef_into_row}` (and `_at` per level), `container_locals` and
+`container_row` (a group container's members appended to a list, or set
+in a cleared row: the walks' container decodes now go through them).
+Callers of `postings::for_each_local` for a walk's lists would rather use
+`container_locals`.
 
 Changed in phase B (callers of phase A's API): `Group` has `first` and
 `pages` (`slots()` is `pages * width`, `grid_bytes()` new);
