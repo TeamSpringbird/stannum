@@ -136,10 +136,33 @@ pub fn member_sums_at(level: Level, held: &[u64], bits: &[u8], bounds: &[f32], s
     run!(level, member_sums(held, bits, bounds, sums))
 }
 
+/// Most words [`word_sums`] takes at once (a sub-range's).
+pub const WORDS: usize = 32;
+
+/// The chunks of `N` words (bit `c` for words `c * N..`) holding a live
+/// word of `live` (a bit per word, as `scalar::live` gives them).
+#[inline(always)]
+fn chunks<const N: usize>(live: u32) -> u32 {
+    let mut folded = live;
+    let mut step = 1;
+    while step < N {
+        folded |= folded >> step;
+        step *= 2;
+    }
+    // Chunk `c`'s first bit now holds the OR of its words (`N` a power of
+    // two): gathered, one bit per chunk.
+    let mut chunks = 0u32;
+    for c in 0..32 / N {
+        chunks |= (folded >> (c * N) & 1) << c;
+    }
+    chunks
+}
+
 #[inline(always)]
 fn check_words(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
     assert_eq!(rows.len(), bounds.len(), "a bound per row");
     assert_eq!(mask.len(), sums.len(), "a sum per word");
+    assert!(mask.len() <= WORDS, "a sub-range of words");
     for row in rows {
         assert!(row.len >= (at + mask.len()) * 8, "a row of the mask's words");
     }
@@ -157,7 +180,21 @@ fn check_members(held: &[u64], bits: &[u8], bounds: &[f32], sums: &mut [f32]) {
 mod scalar {
     use super::{Row, or_zero};
 
-    /// Words `from..` of the inputs, one at a time.
+    /// The words of `mask` with a member, as bits (a sub-range has at most
+    /// [`super::WORDS`]), without a branch per word: a branch on each word's
+    /// having members mispredicts about once a live word, where walking the
+    /// bits mispredicts once at the end.
+    #[inline(always)]
+    pub fn live(mask: &[u64]) -> u32 {
+        let mut live = 0u32;
+        for (j, m) in mask.iter().enumerate() {
+            live |= u32::from(*m != 0) << j;
+        }
+        live
+    }
+
+    /// The live words of `live` (the bits of [`live`]) at `from` and after,
+    /// one at a time.
     #[inline(always)]
     pub fn word_tail(
         mask: &[u64],
@@ -165,13 +202,14 @@ mod scalar {
         rows: &[Row],
         bounds: &[f32],
         sums: &mut [f32],
+        live: u32,
         from: usize,
     ) {
-        for j in from..mask.len() {
+        let mut left = live & u32::MAX.checked_shl(from as u32).unwrap_or(0);
+        while left != 0 {
+            let j = left.trailing_zeros() as usize;
+            left &= left - 1;
             let m = mask[j];
-            if m == 0 {
-                continue;
-            }
             let mut sum = 0.0_f32;
             for (row, &bound) in rows.iter().zip(bounds) {
                 sum += or_zero(bound, row.word(at + j) & m != 0);
@@ -192,7 +230,7 @@ mod scalar {
 
     #[inline(always)]
     pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
-        word_tail(mask, at, rows, bounds, sums, 0)
+        word_tail(mask, at, rows, bounds, sums, live(mask), 0)
     }
 
     #[inline(always)]
@@ -218,18 +256,18 @@ mod neon {
     pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
         let n = mask.len();
         let full = n - n % 4;
+        let live = scalar::live(mask);
+        // The vectors of four words holding a live word, walked by their bits.
+        let mut chunks = super::chunks::<4>(live) & ((1u32 << (full / 4)) - 1);
         // SAFETY: NEON is baseline on aarch64; every load is of four words
         // (32 bytes) at most `at + full` words into a row, which every row
         // holds (checked by the caller), and every store of four sums.
         unsafe {
-            let mut j = 0;
-            while j < full {
+            while chunks != 0 {
+                let j = chunks.trailing_zeros() as usize * 4;
+                chunks &= chunks - 1;
                 let m0 = vld1q_u64(mask.as_ptr().add(j));
                 let m1 = vld1q_u64(mask.as_ptr().add(j + 2));
-                if vmaxvq_u32(vreinterpretq_u32_u64(vorrq_u64(m0, m1))) == 0 {
-                    j += 4;
-                    continue;
-                }
                 let mut acc = vdupq_n_f32(0.0);
                 for (row, &bound) in rows.iter().zip(bounds) {
                     let p = row.at.add((at + j) * 8);
@@ -240,13 +278,12 @@ mod neon {
                     acc = vaddq_f32(acc, vreinterpretq_f32_u32(v));
                 }
                 // A word without members keeps its sum.
-                let live = narrow(vtstq_u64(m0, m0), vtstq_u64(m1, m1));
+                let has = narrow(vtstq_u64(m0, m0), vtstq_u64(m1, m1));
                 let old = vld1q_f32(sums.as_ptr().add(j));
-                vst1q_f32(sums.as_mut_ptr().add(j), vbslq_f32(live, acc, old));
-                j += 4;
+                vst1q_f32(sums.as_mut_ptr().add(j), vbslq_f32(has, acc, old));
             }
         }
-        scalar::word_tail(mask, at, rows, bounds, sums, full);
+        scalar::word_tail(mask, at, rows, bounds, sums, live, full);
     }
 
     #[inline]
@@ -307,19 +344,18 @@ mod avx2 {
         let n = mask.len();
         let full = n - n % 8;
         let zero = _mm256_setzero_si256();
+        let live = scalar::live(mask);
+        // The vectors of eight words holding a live word, walked by their bits.
+        let mut chunks = super::chunks::<8>(live) & ((1u32 << (full / 8)) - 1);
         // SAFETY: every load is of eight words (64 bytes) at most `at + full`
         // words into a row, which every row holds (checked by the caller),
         // and every load and store of sums of eight lanes.
         unsafe {
-            let mut j = 0;
-            while j < full {
+            while chunks != 0 {
+                let j = chunks.trailing_zeros() as usize * 8;
+                chunks &= chunks - 1;
                 let m0 = _mm256_loadu_si256(mask.as_ptr().add(j).cast());
                 let m1 = _mm256_loadu_si256(mask.as_ptr().add(j + 4).cast());
-                let any = _mm256_or_si256(m0, m1);
-                if _mm256_testz_si256(any, any) != 0 {
-                    j += 8;
-                    continue;
-                }
                 let mut acc = _mm256_setzero_ps();
                 for (row, &bound) in rows.iter().zip(bounds) {
                     let p = row.at.add((at + j) * 8);
@@ -336,10 +372,9 @@ mod avx2 {
                     _mm256_permutevar8x32_ps(_mm256_loadu_ps(sums.as_ptr().add(j)), order());
                 let v = _mm256_blendv_ps(acc, old, dead);
                 _mm256_storeu_ps(sums.as_mut_ptr().add(j), _mm256_permutevar8x32_ps(v, order()));
-                j += 8;
             }
         }
-        scalar::word_tail(mask, at, rows, bounds, sums, full);
+        scalar::word_tail(mask, at, rows, bounds, sums, live, full);
     }
 
     #[target_feature(enable = "avx2")]
