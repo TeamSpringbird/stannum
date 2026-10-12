@@ -174,13 +174,13 @@ VACUUM ANALYZE docs;""", timeout=300)
                     walker.communicate()
                     active[i] = session(walk, f'walker-{i}')
                     processes.append(active[i])
-        for process in active + hammers:
-            if process.poll() is None:
-                process.terminate()
-            process.communicate(timeout=30)
+        # A backend in a DO loop notices its client's exit only at its end:
+        # end every other session from the server's side.
         maintainer.stdin.close()
-        maintainer.terminate()
-        maintainer.communicate(timeout=60)
+        sql("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+            "WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()")
+        for process in active + hammers + [maintainer]:
+            process.communicate(timeout=60)
         # Every session but this one has gone: nothing may stay pinned.
         for _ in range(50):
             others = sql("SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' "

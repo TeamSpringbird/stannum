@@ -1319,7 +1319,9 @@ unsafe fn pin_block(
         // Pins `buffer` if it still holds the block: owned, else through
         // `ReadRecentBuffer`.
         let recent = |buffer: pg_sys::Buffer| {
-            if buffer <= 0 {
+            // A shared buffer's number; a hint names one, but the tables
+            // are read without a lock and the descriptor is indexed by it.
+            if buffer <= 0 || buffer > pg_sys::NBuffers {
                 return false;
             }
             if own {
@@ -1421,6 +1423,35 @@ unsafe fn state_of<'a>(desc: *mut pg_sys::BufferDesc) -> &'a std::sync::atomic::
     unsafe { &*std::ptr::addr_of!((*desc).state.value).cast::<std::sync::atomic::AtomicU32>() }
 }
 
+/// Waits for the buffer header whose state is `state` to be unlocked, as
+/// `WaitBufHdrUnlocked` does (PostgreSQL's spin delay: a few spins, then
+/// sleeps that lengthen, so a holder descheduled while holding the lock
+/// gets to run), and returns the state read unlocked.
+///
+/// # Safety
+///
+/// `state` is a shared buffer descriptor's state word.
+#[cold]
+unsafe fn wait_header_unlocked(state: &std::sync::atomic::AtomicU32) -> u32 {
+    use std::sync::atomic::Ordering;
+    // SAFETY: the delay status is this call's own, initialized as
+    // `init_local_spin_delay` does, and named for the stuck-spinlock report.
+    unsafe {
+        let mut delay = pg_sys::SpinDelayStatus {
+            file: c"stannum/storage".as_ptr(),
+            func: c"wait_header_unlocked".as_ptr(),
+            ..Default::default()
+        };
+        let mut now = state.load(Ordering::Relaxed);
+        while now & pg_sys::BM_LOCKED != 0 {
+            pg_sys::perform_spin_delay(&raw mut delay);
+            now = state.load(Ordering::Relaxed);
+        }
+        pg_sys::finish_spin_delay(&raw mut delay);
+        now
+    }
+}
+
 /// Pins shared buffer `buffer` as `PinBuffer` does, one compare-and-swap of
 /// its state (a reference and, up to the most, a use), and keeps the pin if
 /// the buffer holds `block` of the relation at `locator`, valid; otherwise
@@ -1443,8 +1474,7 @@ unsafe fn own_pin(buffer: pg_sys::Buffer, locator: &pg_sys::RelFileLocator, bloc
             if old & pg_sys::BM_LOCKED != 0 {
                 // Someone changes the header: wait for it as `PinBuffer`
                 // does, a header lock is held for a few instructions.
-                std::hint::spin_loop();
-                old = state.load(Ordering::Relaxed);
+                old = wait_header_unlocked(state);
                 continue;
             }
             let mut new = old + pg_sys::BUF_REFCOUNT_ONE;
@@ -1474,9 +1504,17 @@ unsafe fn own_pin(buffer: pg_sys::Buffer, locator: &pg_sys::RelFileLocator, bloc
     }
 }
 
-/// Releases a pin [`own_pin`] took, as `UnpinBuffer` does: an atomic
-/// decrement; then, if a backend waits for the buffer's sole pin, under
-/// the header lock, the wait is ended and the waiter signalled.
+/// Releases a pin [`own_pin`] took, as `UnpinBuffer` does: one
+/// compare-and-swap of the state while the header is not locked; then, if
+/// a backend waits for the buffer's sole pin, under the header lock, the
+/// wait is ended and the waiter signalled.
+///
+/// Not an atomic decrement: whoever holds the header lock (the bgwriter's
+/// and a checkpoint's scans, the clock sweep, `pg_buffercache`) writes the
+/// state it read back at the unlock, a plain store, so a decrement that
+/// lands under the lock is undone, and the pin outlives everyone (the
+/// buffer is never evicted; dropping the relation spins in
+/// `InvalidateBuffer`). `UnpinBuffer` waits for the lock for this reason.
 ///
 /// # Safety
 ///
@@ -1488,8 +1526,19 @@ unsafe fn own_unpin(buffer: pg_sys::Buffer) {
     unsafe {
         let desc = descriptor(buffer);
         let state = state_of(desc);
-        let old = state.fetch_sub(pg_sys::BUF_REFCOUNT_ONE, Ordering::AcqRel);
-        if old & pg_sys::BM_PIN_COUNT_WAITER != 0 {
+        let mut old = state.load(Ordering::Relaxed);
+        let now = loop {
+            if old & pg_sys::BM_LOCKED != 0 {
+                old = wait_header_unlocked(state);
+                continue;
+            }
+            let new = old - pg_sys::BUF_REFCOUNT_ONE;
+            match state.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break new,
+                Err(current) => old = current,
+            }
+        };
+        if now & pg_sys::BM_PIN_COUNT_WAITER != 0 {
             let locked = pg_sys::LockBufHdr(desc);
             if locked & pg_sys::BM_PIN_COUNT_WAITER != 0 && locked & pg_sys::BUF_REFCOUNT_MASK == 1
             {
@@ -5839,7 +5888,10 @@ pub mod testing {
         unsafe {
             let (index, buffer) = buffer_of(oid, block);
             let locator = (*index).rd_locator;
-            assert!(own_pin(buffer, &locator, block), "the page's buffer was replaced");
+            assert!(
+                own_pin(buffer, &locator, block),
+                "the page's buffer was replaced"
+            );
             std::thread::sleep(std::time::Duration::from_millis(hold_ms));
             own_unpin(buffer);
             let count = state_of(descriptor(buffer)).load(std::sync::atomic::Ordering::Acquire)
@@ -5863,7 +5915,10 @@ pub mod testing {
             let desc = descriptor(buffer);
             let locked = pg_sys::LockBufHdr(desc);
             std::thread::sleep(std::time::Duration::from_millis(hold_ms));
-            state_of(desc).store(locked & !pg_sys::BM_LOCKED, std::sync::atomic::Ordering::Release);
+            state_of(desc).store(
+                locked & !pg_sys::BM_LOCKED,
+                std::sync::atomic::Ordering::Release,
+            );
             pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
             locked & pg_sys::BUF_REFCOUNT_MASK
         }

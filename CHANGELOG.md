@@ -234,9 +234,13 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   17% (conjunction), 8% (disjunction) and 16% (phrase), for the same
   answers.
 - A page found through its hint is pinned by one compare-and-swap of its
-  buffer header, as `PinBuffer` pins, then its tag checked, and released by
-  `UnpinBuffer`'s atomic decrement (with its wake-up of a waiter for the
-  sole pin), outside PostgreSQL's per-pin bookkeeping: a walk holds tens of
+  buffer header, as `PinBuffer` pins, then its tag checked, and released as
+  `UnpinBuffer` releases, one compare-and-swap while the header is not
+  locked (a plain decrement landing under another backend's header lock is
+  undone by the state that backend writes back at the unlock, which left
+  pins nobody held; `postgres/tests/own_pins.py` holds the lock across a
+  release), with its wake-up of a waiter for the sole pin, outside
+  PostgreSQL's per-pin bookkeeping: a walk holds tens of
   pages at once, past the eight its private reference counts keep in an
   array, so each of a query's thousands of pins cost two or three hash
   lookups, the header spinlock and a second atomic for the usage count. A

@@ -1374,8 +1374,17 @@ outputs: `stannum-lab/fable/server/`.
   7,700 times a query. `own_pin` pins a hinted buffer as `PinBuffer` does,
   one compare-and-swap of the header's state (reference and usage counts
   together) and then the tag check, and `own_unpin` releases it as
-  `UnpinBuffer` does (the atomic decrement, and under the header lock the
-  wake-up of a waiter for the sole pin). The span's own pins are entered in
+  `UnpinBuffer` does: one compare-and-swap while the header is not locked,
+  waiting with PostgreSQL's spin delay while it is, and under the header
+  lock the wake-up of a waiter for the sole pin. Not a plain atomic
+  decrement: a holder of the header lock (the bgwriter's and a checkpoint's
+  scans, the clock sweep, `pg_buffercache`) writes the state it read back
+  at the unlock, so a decrement landing under the lock is undone and the
+  pin outlives everyone, which keeps the buffer from eviction and makes a
+  `DROP` of the relation spin in `InvalidateBuffer`
+  (`postgres/tests/own_pins.py` holds the lock across a release). The
+  hint's buffer number is checked against `NBuffers` before the descriptor
+  is read. The span's own pins are entered in
   a ledger remembered with the statement's resource owner as one resource
   (`ResourceOwnerDesc`, released with the buffer pins), so a `FATAL` exit
   mid-walk, which unwinds nothing, releases them as PostgreSQL releases its
