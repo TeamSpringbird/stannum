@@ -2977,14 +2977,14 @@ mod tests {
         assert!(got.scored <= 30, "scored {}", got.scored);
     }
 
-    /// A ranked disjunction over a segment read in place reads its terms'
-    /// grids where they lie: one on a page in place, one across pages
-    /// copied into the term's row, neither stitched into the span's buffers
-    /// (at 150M rows those were 4 MB per query, 14 MB scoring every term).
-    /// The pages are released as the walk passes them and poisoned, so a
-    /// row read after its page was released would rank garbage.
+    /// A ranked walk over a segment read in place reads its terms' grids
+    /// where they lie: one on a page in place, one across pages copied into
+    /// the term's own words, neither stitched into the span's buffers (at
+    /// 150M rows a disjunction stitched 4 MB per query, 14 MB scoring every
+    /// term). The pages are released as the walk passes them and poisoned,
+    /// so a grid read after its page was released would rank garbage.
     #[test]
-    fn a_disjunction_reads_grids_in_place_or_copies_them_into_rows() {
+    fn ranked_walks_read_grids_in_place_or_copy_them_unstitched() {
         use segment::tinshape::blob::{self, Kind};
         let n = 6_000usize;
         let docs: Vec<Tid> = (0..n as u32)
@@ -3023,18 +3023,30 @@ mod tests {
                 (names[t].clone(), s.unwrap())
             })
             .collect();
-        let node = Node::Or((0..3).map(Node::Term).collect());
-        let want = top_k(&parsed, &node, &names, &scorers, 10, &mut NoTouch).unwrap();
-        pinned.open_span();
-        blob::reset_stats();
-        let got = top_k(&segment, &node, &names, &scorers, 10, &mut NoTouch).unwrap();
-        let stitched = blob::stats()[Kind::Container as usize].stitched;
-        segment.forget_borrowed();
-        // SAFETY: `top_k` returned owned results.
-        unsafe { pinned.close_span() };
+        let nodes = [
+            Node::Or((0..3).map(Node::Term).collect()),
+            Node::And((0..3).map(Node::Term).collect()),
+            Node::And(vec![Node::Term(0), Node::Term(2)]),
+            // Term t holds positions 0..tf (see `build_part`).
+            Node::Span {
+                slots: vec![2, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
         let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
-        assert_eq!(bits(&got.rows), bits(&want.rows));
-        assert_eq!(stitched, 0, "container bytes stitched");
+        for node in &nodes {
+            let want = top_k(&parsed, node, &names, &scorers, 10, &mut NoTouch).unwrap();
+            assert!(!want.rows.is_empty(), "{node:?} matches");
+            pinned.open_span();
+            blob::reset_stats();
+            let got = top_k(&segment, node, &names, &scorers, 10, &mut NoTouch).unwrap();
+            let stitched = blob::stats()[Kind::Container as usize].stitched;
+            segment.forget_borrowed();
+            // SAFETY: `top_k` returned owned results.
+            unsafe { pinned.close_span() };
+            assert_eq!(bits(&got.rows), bits(&want.rows), "{node:?}");
+            assert_eq!(stitched, 0, "container bytes stitched for {node:?}");
+        }
     }
 
     proptest! {
