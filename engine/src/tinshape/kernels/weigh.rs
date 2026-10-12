@@ -194,10 +194,10 @@ mod scalar {
     use super::{Row, or_zero};
 
     /// The words of `mask` with a member, as bits (a sub-range has at most
-    /// [`super::WORDS`]), without a branch per word: a branch on each word's
-    /// having members mispredicts about once a live word, where walking the
-    /// bits mispredicts once at the end.
-    #[inline(always)]
+    /// [`super::WORDS`]), as the walk computes them before it asks: a
+    /// branch on each word's having members mispredicts about once a live
+    /// word, where walking the bits mispredicts once at the end.
+    #[cfg(test)]
     pub fn live(mask: &[u64]) -> u32 {
         let mut live = 0u32;
         for (j, m) in mask.iter().enumerate() {
