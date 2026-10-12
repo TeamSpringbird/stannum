@@ -222,6 +222,80 @@ retrain when it fails. The merge is `--sparse`, so code the training never
 ran (counts, writes, VACUUM) has no profile at all, rather than one that
 marks it cold.
 
+## BOLT and CPU levels
+
+Two more build-only options were measured on x86-64, both without source
+changes, on the 150M offline replay: post-link layout with LLVM BOLT
+(`script/bolt-build`), and builds for the x86-64-v3 and x86-64-v4 CPU levels
+(which would ship as one source and a small loader choosing the library).
+**Neither is worth adopting:** BOLT gains nothing beyond PGO, and v3 and v4
+gain 1.4% and 2.9% beyond PGO, below the 5% that a loader and three libraries
+would need to pay for.
+
+Measured on 2026-10-12 at 1e01d81 on one r7i.2xlarge (Xeon 8488C, Sapphire Rapids), with
+`benchmarks/aws/devbox-bolt-variants.sh` (`devbox.sh --dump --on-demand`;
+the box costs about $0.60 for its hour). Each build is tnsreplay over the
+first 400 records of each style, three timed passes each, two rounds with
+the order reversed in round 2. The counters are user-space `perf stat`
+minus a load-only run of the same build. Every replay answered all 1188
+queries exactly (`--expect`). The two rounds agree within 0.8% in cycles
+for every build and within 0.4% in time for all but v3 (up to 1.5%).
+
+| build | instructions | cycles | IPC | branch misses | L1i misses | iTLB misses | conj ms | disj ms | phrase ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| plain | 1428.8 G | 470.5 G | 3.04 | 3452 M | 1219 M | 3.1 M | 9.02 | 40.48 | 13.18 |
+| PGO | 1331.2 G | 440.6 G | 3.02 | 3457 M | 549 M | 4.0 M | 8.49 | 37.84 | 12.43 |
+| v3 + PGO | 1251.6 G | 433.5 G | 2.89 | 3465 M | 565 M | 4.0 M | 8.37 | 37.40 | 12.17 |
+| v4 + PGO | 1225.2 G | 427.8 G | 2.86 | 3406 M | 561 M | 2.7 M | 8.44 | 36.30 | 12.29 |
+| PGO + BOLT | 1325.5 G | 440.3 G | 3.01 | 3529 M | 378 M | 9.0 M | 8.52 | 37.87 | 12.34 |
+
+PGO is the replay's own profile (`script/pgo-build replay` does the same).
+The committed `benchmarks/pgo/x86_64.profdata` is the extension's, and its
+records do not apply to the replay (see above). Each CPU level trained its
+own profile, because a target CPU changes which code `cfg(target_feature)`
+compiles, on the same 1200 records the replay then measured (BOLT too). Against plain, PGO cuts 6.3% of cycles and 6 to 6.5% of each
+style's time, as on the i7i.
+
+**BOLT** (22.1.8, matching rustc 1.96's LLVM 22; `-reorder-blocks=ext-tsp
+-reorder-functions=cdsort -split-functions -split-all-cold -split-eh
+-icf=all`, applied to the PGO build linked with `--emit-relocs`). The VM
+exposes no LBR, so the profile came from BOLT's instrumentation, which also
+works in containers. BOLT laid 298 functions out again, moved 436 KB of hot
+code together and 314 KB of cold code out, and cut taken branches by 22%
+and L1i misses by 31%. Cycles moved by 0.1% and times by -0.7 to +0.4%:
+the replay is not bound by its instruction cache. With PGO it misses 0.4
+times per thousand instructions. On the i7i, the extension inside
+PostgreSQL misses 2 to 4 times per thousand, but instruction cache stalls
+there take only about 1% of cycles. Most of its 22% frontend share is
+elsewhere, and BOLT on `stannum.so` would not touch PostgreSQL's own code.
+So BOLT was not tried on the extension. If it ever is, nothing changes for a
+pgrx cdylib: link with `-C link-arg=-Wl,--emit-relocs`, then
+`script/bolt-build stannum.so -- <training>`. The image build would need two
+passes, as for PGO: an instrumented image whose backends each write a
+profile, a training run on the saved database, then `llvm-bolt` with the
+merged profile. Unlike a PGO profile, a BOLT profile belongs to one exact
+binary, so it would have to be trained and applied in the same build rather
+than committed.
+
+**CPU levels.** v4 + PGO cuts 2.9% of cycles beyond PGO (disjunctions 4.1%,
+conjunctions 0.6%, phrases 1.1%), and v3 + PGO cuts 1.6% (1.2 to 2.1%). They
+run 6 to 8% fewer instructions at a lower IPC. The +13.5% that v4 once
+showed was the branchy f32 select that `or_zero` has since fixed for every
+level. In the server, a quarter to a third of the cycles are PostgreSQL's
+and the kernel's, which these builds do not change, so v4 would gain about
+2% there. A loader would make that portable: `stannum.so` as a small C library
+that, in `_PG_init`, reads CPUID, `dlopen`s `stannum_v1.so`, `stannum_v3.so`
+or `stannum_v4.so` (the same crate built three times), and calls that
+library's `_PG_init`. It would export `Pg_magic_func` and a trampoline for
+each symbol PostgreSQL resolves by name: every `#[pg_extern]` function
+(the access method handler among them) with its `pg_finfo_*`, and the
+background workers' entry points (their `bgw_library_name` is `stannum`, so they load
+the loader too). The trampolines can be generated from the variant's
+`nm -D` list. pgrx itself would not change, but packaging would: three
+builds and three PGO trainings per architecture and PostgreSQL version,
+three times the library size, and a symbol list to keep in step. That is
+not worth 2%.
+
 ## Matching TIN v1.0.6's published setup
 
 Benchmarks v2 reproduces the setup of PlanetScale's

@@ -1,0 +1,83 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Stannum x86 devboxes (benchmarks/aws/devbox.sh): an instance role reachable only through SSM, with S3 access limited to replay-dumps/ (read) and devbox-runs/ (read/write) of the corpus bucket, and a security group with no inbound rules. Holds no instances; it costs nothing while idle. Delete with: aws cloudformation delete-stack --stack-name stannum-devbox",
+  "Parameters": {
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id",
+      "Description": "The account's default VPC: its subnets give public IPs, so SSM and S3 need no endpoints."
+    },
+    "CorpusBucket": {
+      "Type": "String",
+      "Default": "springbird-dev-stannum-corpus-cache-860510875764",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
+    }
+  },
+  "Resources": {
+    "SecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Stannum devbox: SSM only, no inbound ports",
+        "VpcId": { "Ref": "VpcId" },
+        "SecurityGroupEgress": [{ "IpProtocol": "-1", "CidrIp": "0.0.0.0/0" }],
+        "Tags": [{ "Key": "stannum-devbox", "Value": "stack" }]
+      }
+    },
+    "Role": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": ["ec2.amazonaws.com"] },
+              "Action": ["sts:AssumeRole"]
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          { "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore" }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "DevboxObjects",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:ListBucket"],
+                  "Resource": { "Fn::Sub": "arn:${AWS::Partition}:s3:::${CorpusBucket}" },
+                  "Condition": {
+                    "StringLike": { "s3:prefix": ["replay-dumps/*", "devbox-runs/*"] }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:GetObject"],
+                  "Resource": [
+                    { "Fn::Sub": "arn:${AWS::Partition}:s3:::${CorpusBucket}/replay-dumps/*" },
+                    { "Fn::Sub": "arn:${AWS::Partition}:s3:::${CorpusBucket}/devbox-runs/*" }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:PutObject"],
+                  "Resource": { "Fn::Sub": "arn:${AWS::Partition}:s3:::${CorpusBucket}/devbox-runs/*" }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "InstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "Properties": { "Roles": [{ "Ref": "Role" }] }
+    }
+  },
+  "Outputs": {
+    "InstanceProfileArn": { "Value": { "Fn::GetAtt": ["InstanceProfile", "Arn"] } },
+    "SecurityGroupId": { "Value": { "Ref": "SecurityGroup" } }
+  }
+}
