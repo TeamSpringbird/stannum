@@ -33,6 +33,8 @@ instance-initiated shutdown = terminate. `--env K=V` sets variables for CMD.
 row were reclaimed 15 and 55 minutes in, so take on-demand for sessions
 that cannot be lost (a command file can also upload `$OUT` as it goes, as
 `devbox-bolt-variants.sh` does, so a reclaim keeps what was done).
+`--spot-only` refuses the on-demand fallback instead (the call fails when
+no AZ has spot capacity), for a session with a small budget.
 
 ## What a call does
 

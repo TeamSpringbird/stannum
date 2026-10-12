@@ -8,7 +8,7 @@
 # under perf stat. One box per call; several calls can run at once.
 #
 #   devbox.sh --branch B [--branch B2 ...] --cmd 'CMD' | --cmd-file F
-#             [--type c7i.2xlarge] [--dump] [--hours 2] [--env K=V ...] [--on-demand]
+#             [--type c7i.2xlarge] [--dump] [--hours 2] [--env K=V ...] [--on-demand | --spot-only]
 #   devbox.sh --list | --terminate ID|all | --ledger
 #   devbox.sh --cleanup-dump | --delete-stack
 #
@@ -54,7 +54,7 @@ TYPES="c7i.xlarge c7i.2xlarge r7i.2xlarge"
 die() { echo "devbox: $*" >&2; exit 1; }
 log() { echo "devbox $(date +%H:%M:%S) $*" >&2; }
 
-branches=() envs=() cmd= cmd_file= type= dump=0 hours=2 action=run target= spot=1
+branches=() envs=() cmd= cmd_file= type= dump=0 hours=2 action=run target= spot=1 spot_only=0
 while [ $# -gt 0 ]; do
   case $1 in
     --branch) branches+=("$2"); shift 2 ;;
@@ -65,6 +65,7 @@ while [ $# -gt 0 ]; do
     --hours) hours=$2; shift 2 ;;
     --env) envs+=("$2"); shift 2 ;;
     --on-demand) spot=0; shift ;;
+    --spot-only) spot_only=1; shift ;;
     --list) action=list; shift ;;
     --terminate) action=terminate; target=$2; shift 2 ;;
     --ledger) action=ledger; shift ;;
@@ -200,6 +201,7 @@ while [ $spot = 1 ] && read -r z subnet price_z; do
   instance=
 done <<< "$zones"
 if [ -z "$instance" ]; then
+  [ $spot_only = 1 ] && { aws s3 rm --only-show-errors --recursive "s3://$BUCKET/$prefix/"; die "no spot capacity for $type; not falling back to on-demand (--spot-only)"; }
   read -r z subnet _ <<< "$zones"
   instance=$(launch on-demand "$z" "$subnet") || die "on-demand launch failed: $(cat "$dir/launch.err")"
   market=on-demand az=$z price=$(on_demand "$type")
