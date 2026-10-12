@@ -353,6 +353,125 @@ impl<'a> EfCursor<'a> {
         self.current = Some(value);
     }
 
+    /// The values in `lo..end` (`end` at most `lo + 64`) as the bits of a
+    /// word (value `lo + i` at bit `i`), and the rank of the first value at
+    /// or after `lo`; the cursor is left at the first value at or past
+    /// `end`. Asked for windows in ascending order, none overlapping the
+    /// one before, it reads the lows of a list's members in those windows
+    /// only (and of a few in the window's first bucket): the values between
+    /// are passed by their high bits alone ([`Self::pass_to`]).
+    #[inline]
+    pub fn word_at(&mut self, lo: u32, end: u32) -> (usize, u64) {
+        debug_assert!(end >= lo && end - lo <= 64);
+        let Some(mut value) = self.current else {
+            return (self.index, 0);
+        };
+        if value >= end {
+            return (self.index, 0);
+        }
+        if value < lo {
+            self.pass_to(lo);
+            match self.current {
+                Some(v) if v < end => value = v,
+                _ => return (self.index, 0),
+            }
+        }
+        let rank = self.index;
+        let (highs, lows, low, n) = (self.ef.highs, self.ef.lows, self.ef.low, self.ef.n);
+        let words = highs.len().div_ceil(8);
+        let mut index = self.index;
+        let mut bit = self.bit;
+        let mut w = bit / 64;
+        // The current value's word, without its bit and those below.
+        let mut word = bits::word(highs, w) & ((u64::MAX << (bit % 64)) << 1);
+        let mut out = 0u64;
+        loop {
+            out |= 1 << (value - lo);
+            index += 1;
+            if index >= n {
+                self.index = n;
+                self.bit = bit + 1;
+                self.current = None;
+                return (rank, out);
+            }
+            while word == 0 {
+                w += 1;
+                if w >= words {
+                    self.index = index;
+                    self.bit = w * 64;
+                    self.current = None;
+                    return (rank, out);
+                }
+                word = bits::word(highs, w);
+            }
+            bit = w * 64 + word.trailing_zeros() as usize;
+            word &= word - 1;
+            let high = (bit - index) as u32;
+            value = high << low | bits::get(lows, index, low).unwrap_or(0);
+            if value >= end {
+                break;
+            }
+        }
+        self.index = index;
+        self.bit = bit;
+        self.current = Some(value);
+        (rank, out)
+    }
+
+    /// Moves to the first value at or after `target`, as [`Self::seek`]
+    /// does, but passing the high bits to the target's bucket without a
+    /// step per value: whole words of them by their zeros (a value's high
+    /// part is the number of zeros before its bit), then a select within the
+    /// word holding the zero that opens the bucket. Only the bucket's
+    /// values have their lows read.
+    fn pass_to(&mut self, target: u32) {
+        let Some(current) = self.current else {
+            return;
+        };
+        if current >= target {
+            return;
+        }
+        let (highs, low, n) = (self.ef.highs, self.ef.low, self.ef.n);
+        let bucket = (target >> low) as usize;
+        let high = self.bit - self.index;
+        if high < bucket {
+            // Zeros left to pass after the current value's bit.
+            let mut need = bucket - high;
+            let mut at = self.bit + 1;
+            let total = highs.len() * 8;
+            loop {
+                if at >= total {
+                    self.index = n;
+                    self.bit = total;
+                    self.current = None;
+                    return;
+                }
+                let off = at % 64;
+                let valid = if off == 0 { u64::MAX } else { u64::MAX >> off };
+                let zeros = !(bits::word(highs, at / 64) >> off) & valid;
+                let count = zeros.count_ones() as usize;
+                if count < need {
+                    need -= count;
+                    at += 64 - off;
+                    continue;
+                }
+                at += select(zeros, need - 1) as usize + 1;
+                break;
+            }
+            // `bucket` zeros before `at`: the rest of its bits are ones.
+            self.index = at - bucket;
+            self.bit = at;
+            self.load();
+        }
+        // The bucket's values with lower lows.
+        while let Some(current) = self.current {
+            if current >= target {
+                return;
+            }
+            self.advance();
+        }
+    }
+
     pub fn advance(&mut self) {
         if self.current.is_none() {
             return;
@@ -547,6 +666,35 @@ mod tests {
             let values: Vec<u32> = std::mem::take(&mut values).into_iter().collect();
             let universe = values.last().map_or(1, |v| v + extra);
             round_trip(&values, universe);
+        }
+
+        #[test]
+        fn reads_words(values in prop::collection::btree_set(0u32..20_000, 1..900), skips in prop::collection::vec(0usize..40, 1..60)) {
+            let values: Vec<u32> = values.into_iter().collect();
+            let universe = values.last().unwrap() + 1;
+            let mut out = Vec::new();
+            encode(&values, universe, &mut out);
+            let ef = Ef::parse(&out, values.len(), universe).unwrap();
+            let mut cursor = ef.cursor();
+            // Windows of up to 64 at ascending starts, some not 64 apart.
+            let mut lo = 0u32;
+            for skip in skips {
+                lo += 64 + skip as u32 * 13;
+                let end = lo + 64 - (skip as u32 % 7) * 9;
+                let (rank, word) = cursor.word_at(lo, end);
+                let mut want = 0u64;
+                for v in values.iter().filter(|v| (lo..end).contains(*v)) {
+                    want |= 1 << (v - lo);
+                }
+                prop_assert_eq!(word, want, "window at {}", lo);
+                let first = values.partition_point(|v| *v < lo);
+                if want != 0 {
+                    prop_assert_eq!(rank, first);
+                }
+                let next = values.partition_point(|v| *v < end);
+                prop_assert_eq!(cursor.current(), values.get(next).copied());
+                lo = end - 64;
+            }
         }
 
         #[test]

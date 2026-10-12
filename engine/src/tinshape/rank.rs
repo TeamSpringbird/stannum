@@ -55,6 +55,12 @@ const LATER: u8 = u8::MAX - 1;
 /// common ([`Sc::make_common`]), when the walk scores a rarer term too.
 const COMMON_RATIO: u64 = 10;
 
+/// A disjunction term's row in a group is read in place (see
+/// [`Walk::or_open`]) only where it holds more than this many times as many
+/// members as the group's mask has live words: a sparser one is decoded
+/// into its row whole, which costs less than a cursor's steps.
+const IN_PLACE_RATIO: usize = 3;
+
 /// Candidates staged before they are finished best first: a group's
 /// candidates are staged and finished this many at a time, so a threshold
 /// that is still low early in a walk rises between chunks rather than
@@ -728,6 +734,13 @@ struct Walk<'s, 'a, T: Touch> {
     /// essential terms' union there.
     row_loaded: Vec<bool>,
     any: Vec<u64>,
+    /// A disjunction's group at hand: its rows filled a word at a time;
+    /// per present term with a positive bound there, held in full, where its
+    /// row starts in `rows` and that bound, and read in place, that bound
+    /// and its index into `in_place`, highest bound first.
+    in_place: Vec<InPlace<'a>>,
+    or_fixed: Vec<(usize, f32)>,
+    or_lazy: Vec<(f32, usize)>,
     /// A disjunction's group at hand: per present term with a positive
     /// bound there, where its row starts in `rows`, that bound and its bound
     /// over the sub-range at hand; and its word at hand.
@@ -1870,6 +1883,9 @@ pub(super) fn walk_into<'a>(
         row_state: vec![Row::default(); n],
         row_loaded: Vec::new(),
         any: Vec::new(),
+        in_place: Vec::new(),
+        or_fixed: Vec::new(),
+        or_lazy: Vec::new(),
         or_terms: Vec::new(),
         or_held: Vec::new(),
         held_bound: vec![0.0; n],
@@ -1989,6 +2005,7 @@ pub(super) fn walk_into<'a>(
     answer.windows_pruned += done.windows_pruned;
     answer.candidates += done.candidates;
     answer.position_checks += done.position_checks;
+    answer.rows_in_place += done.rows_in_place;
     Ok(Some(walk.terms))
 }
 
@@ -2074,6 +2091,27 @@ struct Row {
     /// Members in words `..w` are `run`.
     w: usize,
     run: u32,
+}
+
+/// A disjunction term's row in the group at hand filled a word at a time,
+/// at the words the walk weighs ([`Walk::or_fetch`]): its next member's
+/// local slot (`u32::MAX` past its last), and where its members are read.
+struct InPlace<'a> {
+    i: usize,
+    next: u32,
+    /// The word last filled (`usize::MAX` before any).
+    w: usize,
+    src: InPlaceSrc<'a>,
+}
+
+enum InPlaceSrc<'a> {
+    /// An Elias-Fano container, over local slots.
+    Ef(EfCursor<'a>),
+    /// A sparse term's list, by the term's own cursor, over the group's
+    /// slots `base..end`.
+    Sparse { base: u32, end: u32 },
+    /// The term's local slots from `at` to `to`.
+    Locals { at: u32, to: u32 },
 }
 
 impl<'a, T: Touch> Walk<'_, 'a, T> {
@@ -2189,6 +2227,192 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
+    /// Opens scoring term `i`'s members in group `g`, which it holds, to be
+    /// read a word at a time ([`Walk::or_fetch`]) where the walk weighs a
+    /// word of the mask, rather than decoded into a row: an Elias-Fano
+    /// container, a sparse term's list or a term's local slots, of at
+    /// least `min` members. False, with nothing opened, for a grid (a row
+    /// is a copy of it), a paged container or a smaller one.
+    fn or_open(&mut self, i: usize, g: u32, min: usize) -> Result<bool> {
+        let t = self.sc[i].term;
+        let group = self.geometry.groups[g as usize];
+        let set = self.terms[t].as_mut().expect("scoring");
+        let r = &mut self.row_state[i];
+        let (next, src) = if let Form::Sparse(list) = &set.postings.form {
+            let cursor = set.sparse.get_or_insert_with(|| {
+                self.touch.touch(
+                    Part::Payload,
+                    set.at + set.postings.payload_at,
+                    set.postings.payload.len(),
+                );
+                list.cursor()
+            });
+            // Its share of the term's postings by slots stands for its count.
+            let share = u64::from(set.df) * u64::from(group.slots())
+                / u64::from(self.geometry.slots).max(1);
+            if share < min as u64 {
+                return Ok(false);
+            }
+            cursor.seek(group.slot_base);
+            r.first = 0;
+            let (base, end) = (group.slot_base, group.slot_base + group.slots());
+            let next = cursor.current().map_or(u32::MAX, |slot| slot - base);
+            (next, InPlaceSrc::Sparse { base, end })
+        } else {
+            let entry = set
+                .find(g, &mut self.mems[t].hint)
+                .ok_or(Error::Corrupt("a group the term holds"))?;
+            match entry.src {
+                Src::Container {
+                    entry: e,
+                    bytes,
+                    at,
+                } => {
+                    if e.kind != KIND_EF || (e.count as usize) < min {
+                        return Ok(false);
+                    }
+                    self.touch.touch(Part::Payload, at, bytes.len());
+                    let bytes = bytes.all()?;
+                    self.mems[t].used += 1;
+                    r.first = e.first;
+                    let cursor = Ef::parse(bytes, e.count as usize, group.slots())?.cursor();
+                    (cursor.current().unwrap_or(u32::MAX), InPlaceSrc::Ef(cursor))
+                }
+                Src::Locals { from, to } => {
+                    if ((to - from) as usize) < min {
+                        return Ok(false);
+                    }
+                    r.first = 0;
+                    (
+                        set.locals[from as usize],
+                        InPlaceSrc::Locals { at: from, to },
+                    )
+                }
+            }
+        };
+        self.in_place.push(InPlace {
+            i,
+            next,
+            w: usize::MAX,
+            src,
+        });
+        Ok(true)
+    }
+
+    /// Fills word `w` of every row read in place ([`Walk::or_open`]).
+    #[inline]
+    fn or_fetch(&mut self, w: usize, words: usize) {
+        for j in 0..self.in_place.len() {
+            self.or_fetch_one(j, w, words);
+        }
+    }
+
+    /// Word `w` of row `j` read in place, filled once: a row's words are
+    /// asked in ascending order, and a word the walk does not ask for is
+    /// never read. A row whose next member is past the word reads nothing.
+    #[inline]
+    fn or_fetch_one(&mut self, j: usize, w: usize, words: usize) -> u64 {
+        let InPlace { i, next, w: at, .. } = self.in_place[j];
+        let cell = i * words + w;
+        if at == w {
+            return self.rows[cell];
+        }
+        let word = if next < ((w + 1) * 64) as u32 {
+            self.or_fill(j, w)
+        } else {
+            0
+        };
+        self.in_place[j].w = w;
+        self.rows[cell] = word;
+        word
+    }
+
+    /// Whether mask word `word` (word `w`) is out of reach before every row
+    /// read in place is filled there: the rows held in full (`fixed`, at
+    /// their offsets in `rows`) holding a member of it count their group
+    /// bounds, and the rows read in place (`lazy`, highest bound first,
+    /// summing to `total`) count theirs until filled, each filled until
+    /// those left cannot bring the word into reach. Summed in another order
+    /// than the walk's own check, in f64 and with a margin over the
+    /// threshold, so a word cut here is one that check would cut (the
+    /// margin is plan_group's).
+    #[inline]
+    fn or_out_of_reach(
+        &mut self,
+        w: usize,
+        words: usize,
+        word: u64,
+        fixed: &[(usize, f32)],
+        lazy: &[(f32, usize)],
+        total: f64,
+    ) -> bool {
+        let Some(theta) = self.threshold() else {
+            return false;
+        };
+        let t = f64::from(theta) / (1.0 + f64::from(f32::EPSILON) * 256.0);
+        let mut reach = total;
+        for &(at, bound) in fixed {
+            reach += f64::from(or_zero(bound, self.rows[at + w] & word != 0));
+        }
+        if reach < t {
+            return true;
+        }
+        for &(bound, j) in lazy {
+            let held = self.or_fetch_one(j, w, words) & word != 0;
+            reach -= f64::from(or_zero(bound, !held));
+            if reach < t {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Row `j` read in place's members in word `w` (and those before it
+    /// passed), with its posting index cursor left at the word.
+    #[inline(never)]
+    fn or_fill(&mut self, j: usize, w: usize) -> u64 {
+        let lo = (w * 64) as u32;
+        let p = &mut self.in_place[j];
+        let r = &mut self.row_state[p.i];
+        r.w = w;
+        match &mut p.src {
+            InPlaceSrc::Ef(cursor) => {
+                let (rank, word) = cursor.word_at(lo, lo + 64);
+                r.run = rank as u32;
+                p.next = cursor.current().unwrap_or(u32::MAX);
+                word
+            }
+            InPlaceSrc::Sparse { base, end } => {
+                let (base, end) = (*base, *end);
+                let set = self.terms[self.sc[p.i].term].as_mut().expect("scoring");
+                let cursor = set.sparse.as_mut().expect("opened");
+                // The list goes on past the group: its next group's members
+                // are left to it.
+                let (rank, word) = cursor.word_at(base + lo, end.min(base + lo + 64));
+                r.run = rank as u32;
+                p.next = cursor.current().map_or(u32::MAX, |slot| slot - base);
+                word
+            }
+            InPlaceSrc::Locals { at, to } => {
+                let set = self.terms[self.sc[p.i].term].as_ref().expect("scoring");
+                let locals = &set.locals[..*to as usize];
+                let mut k = *at as usize;
+                while k < locals.len() && locals[k] < lo {
+                    k += 1;
+                }
+                r.run = k as u32;
+                let mut word = 0u64;
+                while k < locals.len() && locals[k] < lo + 64 {
+                    word |= 1 << (locals[k] - lo);
+                    k += 1;
+                }
+                *at = k as u32;
+                p.next = locals.get(k).copied().unwrap_or(u32::MAX);
+                word
+            }
+        }
+    }
+
     #[inline(never)]
     fn or_group(&mut self, g: u32) -> Result<()> {
         let n = self.sc.len();
@@ -2284,11 +2508,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.plan = plan;
             return Ok(());
         }
+        // The other present terms' rows: a grid's copied, a dense enough
+        // other one read where a word of the mask is weighed (most of a
+        // group's words hold no member of the mask), the rest decoded.
+        self.in_place.clear();
+        let min = IN_PLACE_RATIO * mask.iter().filter(|w| **w != 0).count();
         for (i, done) in loaded.iter().enumerate() {
-            if self.present[i] && !done {
+            if self.present[i] && !done && !self.or_open(i, g, min)? {
                 self.or_load(i, g, words)?;
             }
         }
+        self.answer.rows_in_place += self.in_place.len() as u64;
         self.row_loaded = loaded;
         // Each member of the mask weighed alone: the bounds of the terms it
         // holds, summed, must reach the threshold (a word's members first
@@ -2309,6 +2539,26 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 terms.push((i * words, sb[i], 0.0));
             }
         }
+        // With rows read in place, a word is first weighed filling them
+        // only as far as it takes (see `Walk::or_out_of_reach`).
+        let mut fixed = std::mem::take(&mut self.or_fixed);
+        let mut lazy = std::mem::take(&mut self.or_lazy);
+        fixed.clear();
+        lazy.clear();
+        if !self.in_place.is_empty() {
+            for (j, p) in self.in_place.iter().enumerate() {
+                if sb[p.i] > 0.0 {
+                    lazy.push((sb[p.i], j));
+                }
+            }
+            lazy.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            for &(at, bound, _) in &terms {
+                if !self.in_place.iter().any(|p| p.i * words == at) {
+                    fixed.push((at, bound));
+                }
+            }
+        }
+        let lazy_total: f64 = lazy.iter().map(|l| f64::from(l.0)).sum();
         held.clear();
         held.resize(terms.len(), 0);
         // A word's members are bounded from its first slot's ctid (see
@@ -2327,6 +2577,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let w = w0 + live.trailing_zeros() as usize;
                 live &= live - 1;
                 let mut word = mask[w];
+                if !lazy.is_empty()
+                    && self.or_out_of_reach(w, words, word, &fixed, &lazy, lazy_total)
+                {
+                    continue;
+                }
+                self.or_fetch(w, words);
                 if self.threshold().is_some() {
                     let mut most = 0.0_f32;
                     for (h, &(at, bound, _)) in held.iter_mut().zip(&terms) {
@@ -2383,6 +2639,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if !self.staged.is_empty() {
             self.finish_staged(g)?;
         }
+        // The cursors borrow the group's containers, released past it.
+        self.in_place.clear();
+        self.or_fixed = fixed;
+        self.or_lazy = lazy;
         self.or_terms = terms;
         self.or_held = held;
         self.words = mask;
