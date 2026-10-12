@@ -8,7 +8,7 @@
 # under perf stat. One box per call; several calls can run at once.
 #
 #   devbox.sh --branch B [--branch B2 ...] --cmd 'CMD' | --cmd-file F
-#             [--type c7i.2xlarge] [--dump] [--hours 2] [--env K=V ...]
+#             [--type c7i.2xlarge] [--dump] [--hours 2] [--env K=V ...] [--on-demand]
 #   devbox.sh --list | --terminate ID|all | --ledger
 #   devbox.sh --cleanup-dump | --delete-stack
 #
@@ -21,7 +21,8 @@
 # segment into memory (37.5 GB), so --dump defaults to r7i.2xlarge (64 GiB).
 #
 # The box is a one-time spot instance in the AZ with the lowest spot price
-# (on-demand if no AZ has spot capacity), tagged stannum-devbox=<id>, with
+# (on-demand if no AZ has spot capacity, or with --on-demand, for sessions
+# too long to lose to a spot reclaim), tagged stannum-devbox=<id>, with
 # shutdown -h +<hours> and instance-initiated shutdown = terminate, so it
 # dies on its own even if this script does. The script terminates it when
 # the command ends (or on Ctrl-C), checks its volumes are gone, deletes the
@@ -53,7 +54,7 @@ TYPES="c7i.xlarge c7i.2xlarge r7i.2xlarge"
 die() { echo "devbox: $*" >&2; exit 1; }
 log() { echo "devbox $(date +%H:%M:%S) $*" >&2; }
 
-branches=() envs=() cmd= cmd_file= type= dump=0 hours=2 action=run target=
+branches=() envs=() cmd= cmd_file= type= dump=0 hours=2 action=run target= spot=1
 while [ $# -gt 0 ]; do
   case $1 in
     --branch) branches+=("$2"); shift 2 ;;
@@ -63,6 +64,7 @@ while [ $# -gt 0 ]; do
     --dump) dump=1; shift ;;
     --hours) hours=$2; shift 2 ;;
     --env) envs+=("$2"); shift 2 ;;
+    --on-demand) spot=0; shift ;;
     --list) action=list; shift ;;
     --terminate) action=terminate; target=$2; shift 2 ;;
     --ledger) action=ledger; shift ;;
@@ -192,8 +194,8 @@ launch() { # market az subnet -> instance id
     --query 'Instances[0].InstanceId' --output text 2> "$dir/launch.err" < /dev/null
 }
 instance= market= az= price=
-while read -r z subnet spot; do
-  instance=$(launch spot "$z" "$subnet") && { market=spot az=$z price=$spot; break; }
+while [ $spot = 1 ] && read -r z subnet price_z; do
+  instance=$(launch spot "$z" "$subnet") && { market=spot az=$z price=$price_z; break; }
   log "spot in $z failed: $(grep -o -E '\(([A-Za-z.]+)\)' "$dir/launch.err" | head -1)"
   instance=
 done <<< "$zones"
