@@ -150,6 +150,24 @@ pub fn retain(values: &mut Vec<u32>, mut keep: impl FnMut(u32) -> bool) {
     values.truncate(kept);
 }
 
+/// Keeps the members of `list` that are in `other`, as [`intersect_sorted`]
+/// does, through `marks`, a bitmap over the values (all clear on entry, and
+/// left clear): `other`'s values are marked, `list` is kept by its marks
+/// ([`retain`]), and the marks are cleared again. A bit set, a bit tested
+/// and a word cleared per value, none a branch, where a merge (even
+/// [`intersect_sorted`]'s) compares each member with a stretch of `other`.
+/// Values must lie below `marks.len() * 64`.
+#[inline]
+pub fn intersect_marked(list: &mut Vec<u32>, other: &[u32], marks: &mut [u64]) {
+    for &v in other {
+        marks[v as usize / 64] |= 1 << (v % 64);
+    }
+    retain(list, |v| marks[v as usize / 64] >> (v % 64) & 1 == 1);
+    for &v in other {
+        marks[v as usize / 64] = 0;
+    }
+}
+
 /// Values of `other` a step of [`intersect_sorted`] compares at once.
 const STRIDE: usize = 8;
 
@@ -324,6 +342,25 @@ mod tests {
             let mut kept = other.clone();
             intersect_sorted(&mut kept, &list);
             prop_assert_eq!(kept, common(&other, &list));
+        }
+
+        #[test]
+        fn intersects_through_marks(list in prop::collection::btree_set(0u32..5_000, 0..300), other in prop::collection::btree_set(0u32..5_000, 0..1200), pick in prop::collection::vec(any::<prop::sample::Index>(), 0..60)) {
+            let other: Vec<u32> = other.into_iter().collect();
+            let mut list = list;
+            if !other.is_empty() {
+                list.extend(pick.iter().map(|i| other[i.index(other.len())]));
+            }
+            let list: Vec<u32> = list.into_iter().collect();
+            let mut marks = vec![0u64; 5_000usize.div_ceil(64)];
+            let mut kept = list.clone();
+            intersect_marked(&mut kept, &other, &mut marks);
+            prop_assert_eq!(&kept, &common(&list, &other));
+            prop_assert!(marks.iter().all(|w| *w == 0), "marks left set");
+            let mut kept = other.clone();
+            intersect_marked(&mut kept, &list, &mut marks);
+            prop_assert_eq!(kept, common(&other, &list));
+            prop_assert!(marks.iter().all(|w| *w == 0), "marks left set");
         }
 
         #[test]

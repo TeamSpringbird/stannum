@@ -144,10 +144,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 - Ranked walks over `TNS1` branch less where the branch follows the data,
   for x86-64, whose predictors miss such branches far more often than the
-  Apple cores do. A conjunction intersects its candidates with each
-  required term's list eight values at a time in vector registers, and
-  keeps or drops each one (against a list, a grid or a probed Elias-Fano
-  container) without a branch on its fate.
+  Apple cores do. A conjunction or phrase intersects its candidates with
+  each required term's list through a bitmap of the list's members (a
+  bit set, tested and cleared per value, no step waiting on the one
+  before; 7% fewer cycles than a merge eight values at a time on Apple
+  cores), and keeps or drops each one (against a list, a grid or a
+  probed Elias-Fano container) without a branch on its fate.
   Footer readers take a pair's one- or two-byte length without a branch.
   A query also allocates less: a dictionary lookup reuses its term
   buffers, and a walk sizes its vectors once (at 150 million rows, a
