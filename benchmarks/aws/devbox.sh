@@ -8,7 +8,8 @@
 # under perf stat. One box per call; several calls can run at once.
 #
 #   devbox.sh --branch B [--branch B2 ...] --cmd 'CMD' | --cmd-file F
-#             [--type c7i.2xlarge] [--dump] [--hours 2] [--env K=V ...] [--on-demand]
+#             [--type c7i.2xlarge] [--dump] [--disk GIB] [--hours 2] [--env K=V ...]
+#             [--on-demand]
 #   devbox.sh --list | --terminate ID|all | --ledger
 #   devbox.sh --cleanup-dump | --delete-stack
 #
@@ -19,6 +20,8 @@
 # s3://<bucket>/replay-dumps/dump150m-v6/ to /data (dump150m/, trace.tsv,
 # pg-ranked.tsv) on a gp3 root volume sized for it; tnsreplay reads every
 # segment into memory (37.5 GB), so --dump defaults to r7i.2xlarge (64 GiB).
+# --disk sizes the root volume (default 30 GiB, 90 with --dump): a command
+# that re-encodes the dump into two more formats on the box needs about 150.
 #
 # The box is a one-time spot instance in the AZ with the lowest spot price
 # (on-demand if no AZ has spot capacity, or with --on-demand, for sessions
@@ -54,7 +57,7 @@ TYPES="c7i.xlarge c7i.2xlarge r7i.2xlarge"
 die() { echo "devbox: $*" >&2; exit 1; }
 log() { echo "devbox $(date +%H:%M:%S) $*" >&2; }
 
-branches=() envs=() cmd= cmd_file= type= dump=0 hours=2 action=run target= spot=1
+branches=() envs=() cmd= cmd_file= type= dump=0 hours=2 action=run target= spot=1 disk=
 while [ $# -gt 0 ]; do
   case $1 in
     --branch) branches+=("$2"); shift 2 ;;
@@ -63,6 +66,7 @@ while [ $# -gt 0 ]; do
     --type) type=$2; shift 2 ;;
     --dump) dump=1; shift ;;
     --hours) hours=$2; shift 2 ;;
+    --disk) disk=$2; shift 2 ;;
     --env) envs+=("$2"); shift 2 ;;
     --on-demand) spot=0; shift ;;
     --list) action=list; shift ;;
@@ -70,7 +74,7 @@ while [ $# -gt 0 ]; do
     --ledger) action=ledger; shift ;;
     --cleanup-dump) action=cleanup-dump; shift ;;
     --delete-stack) action=delete-stack; shift ;;
-    -h|--help) sed -n '5,36p' "$0"; exit 0 ;;
+    -h|--help) sed -n '5,39p' "$0"; exit 0 ;;
     *) die "unknown argument $1 (--help)" ;;
   esac
 done
@@ -105,6 +109,7 @@ esac
 [ -n "$type" ] || { [ $dump = 1 ] && type=r7i.2xlarge || type=c7i.2xlarge; }
 [ -n "$(on_demand "$type")" ] || die "--type must be one of: $TYPES"
 case $hours in 1|2|3) ;; *) die "--hours must be 1, 2 or 3" ;; esac
+case $disk in "" | [3-9][0-9] | 1[0-9][0-9] | 200) ;; *) die "--disk must be 30 to 200 (GiB)" ;; esac
 
 # --- the stack: role, instance profile, security group --------------------
 stack_output() {
@@ -159,8 +164,10 @@ b64() { base64 | tr -d '\n'; }
 } > "$dir/box.sh"
 
 # --- launch: the cheapest AZ's spot, else on-demand ------------------------
-disk=30
-[ $dump = 1 ] && disk=90
+if [ -z "$disk" ]; then
+  disk=30
+  [ $dump = 1 ] && disk=90
+fi
 volume="{\"VolumeSize\":$disk,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true"
 [ $dump = 1 ] && volume="$volume,\"Throughput\":500,\"Iops\":4000"
 volume="$volume}"

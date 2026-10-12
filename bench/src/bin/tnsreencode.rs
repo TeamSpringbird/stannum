@@ -9,7 +9,7 @@
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
 //!     [--from 8|6] [--exact] [--segment FILE] [--grid-density N] [--jobs N] [--check]
-//!     [--check-merge]
+//!     [--check-merge] [--census]
 //! ```
 //!
 //! Three steps per segment:
@@ -36,6 +36,10 @@
 //! also merges the output alone again and requires the same bytes. Each
 //! segment holds a few copies of itself in memory; `--jobs` re-encodes
 //! that many at once (default 1).
+//!
+//! `--census` re-encodes nothing: per segment it reports the source at its
+//! old slots (step 1, in memory) and the output already in `--out`: slots a
+//! document, words a group, and group containers by kind.
 //!
 //! The output gets the source's manifest and a symlink to its `ids.tsv`.
 
@@ -97,12 +101,13 @@ struct Args {
     jobs: usize,
     check: bool,
     check_merge: bool,
+    census: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: tnsreencode --in DIR --out DIR [--from 8|6] [--exact] [--segment FILE] \
-         [--grid-density N] [--jobs N] [--check] [--check-merge]"
+         [--grid-density N] [--jobs N] [--check] [--check-merge] [--census]"
     );
     std::process::exit(2)
 }
@@ -119,6 +124,7 @@ fn args() -> Args {
         jobs: 1,
         check: false,
         check_merge: false,
+        census: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -132,6 +138,7 @@ fn args() -> Args {
             "--jobs" => a.jobs = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--check" => a.check = true,
             "--check-merge" => a.check_merge = true,
+            "--census" => a.census = true,
             _ => usage(),
         }
     }
@@ -768,6 +775,119 @@ fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), Strin
     Ok((line, ok))
 }
 
+/// A segment's grid and containers, for `--census`.
+#[derive(Default, Clone, Copy)]
+struct Census {
+    documents: u64,
+    groups: u64,
+    slots: u64,
+    /// 64-bit words of a bitmap over each group, summed.
+    words: u64,
+    /// Group containers by kind (grid, Elias-Fano, paged): how many, their
+    /// members and their bytes; grids of groups a term was forced into.
+    kinds: [(u64, u64, u64); 3],
+    sparse_terms: u64,
+    sparse_bytes: u64,
+}
+
+impl Census {
+    fn of(blob: &[u8]) -> Result<Self, String> {
+        let segment = Segment::parse(blob).map_err(|e| e.to_string())?;
+        let geometry = &segment.docs.geometry;
+        let mut c = Census {
+            documents: u64::from(segment.documents),
+            groups: geometry.groups.len() as u64,
+            slots: u64::from(geometry.slots),
+            words: geometry.groups.iter().map(|g| g.words() as u64).sum(),
+            ..Census::default()
+        };
+        for item in segment.dictionary().iter() {
+            let (term, entry) = item.map_err(|e| e.to_string())?;
+            let found = segment.resolve(entry).map_err(|e| format!("{term}: {e}"))?;
+            match &found.postings.form {
+                segment::tinshape::postings::Form::Grouped(entries) => {
+                    for e in entries.iter() {
+                        let k = &mut c.kinds[usize::from(e.kind.min(2))];
+                        k.0 += 1;
+                        k.1 += u64::from(e.count);
+                        k.2 += u64::from(e.len);
+                    }
+                }
+                _ => {
+                    c.sparse_terms += 1;
+                    c.sparse_bytes += found.postings.payload.len() as u64;
+                }
+            }
+        }
+        Ok(c)
+    }
+
+    fn add(&mut self, o: &Census) {
+        self.documents += o.documents;
+        self.groups += o.groups;
+        self.slots += o.slots;
+        self.words += o.words;
+        for (a, b) in self.kinds.iter_mut().zip(o.kinds) {
+            a.0 += b.0;
+            a.1 += b.1;
+            a.2 += b.2;
+        }
+        self.sparse_terms += o.sparse_terms;
+        self.sparse_bytes += o.sparse_bytes;
+    }
+
+    fn line(&self) -> String {
+        let kinds = ["grid", "ef", "paged"]
+            .iter()
+            .zip(self.kinds)
+            .map(|(name, (n, members, bytes))| format!("{name} {n} ({members} members, {bytes} B)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "documents {} groups {} slots {} ({:.3} a document) words {} ({:.1} a group); containers: {kinds}; sparse terms {} ({} B)",
+            self.documents,
+            self.groups,
+            self.slots,
+            self.slots as f64 / self.documents.max(1) as f64,
+            self.words,
+            self.words as f64 / self.groups.max(1) as f64,
+            self.sparse_terms,
+            self.sparse_bytes,
+        )
+    }
+}
+
+/// `--census`: each segment of the source at its old slots (step 1 only, in
+/// memory, when it is of version 6 or 8) and as re-encoded in the output.
+fn census(args: &Args, names: &[String]) {
+    let mut totals = [Census::default(); 2];
+    for name in names {
+        let blob = std::fs::read(args.input.join(name)).unwrap_or_else(|e| {
+            eprintln!("{name}: {e}");
+            std::process::exit(1)
+        });
+        let old = regrid(&blob).and_then(|b| Census::of(&b));
+        drop(blob);
+        let new = std::fs::read(args.output.join(name))
+            .map_err(|e| e.to_string())
+            .and_then(|b| Census::of(&b));
+        match (old, new) {
+            (Ok(old), Ok(new)) => {
+                println!("{name} source: {}", old.line());
+                println!("{name} output: {}", new.line());
+                totals[0].add(&old);
+                totals[1].add(&new);
+            }
+            (old, new) => {
+                eprintln!("{name}: {:?} / {:?}", old.err(), new.err());
+                std::process::exit(1)
+            }
+        }
+    }
+    println!("source: {}", totals[0].line());
+    println!("output: {}", totals[1].line());
+}
+
 fn main() {
     let args = args();
     let manifest = std::fs::read_to_string(args.input.join("manifest.tsv")).unwrap_or_else(|e| {
@@ -792,6 +912,10 @@ fn main() {
             let _ = std::fs::copy(args.input.join(dead), args.output.join(dead));
         }
         names.push(name.to_string());
+    }
+    if args.census {
+        census(&args, &names);
+        return;
     }
     let queue = Mutex::new(names.into_iter());
     let totals = Mutex::new((Cost::default(), [[0u64; 6]; 2], true));
