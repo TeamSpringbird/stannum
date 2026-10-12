@@ -2089,11 +2089,14 @@ mod tests {
     /// exceeds 64 bits"). Footers of small blocks, over many small pages.
     #[test]
     fn lazy_footers_read_on_after_their_groups_pages_are_released() {
-        let (docs, members) = drawn(6_000, &[60, 45], 9);
+        // Sparse records (one list each, footers of blocks): grouped
+        // records keep their metadata in their directories instead.
+        let (docs, members) = drawn(6_000, &[25, 20], 9);
         let options = Options {
-            block_size: 4,
-            grid_density: 32,
-            grid_min_postings: 0,
+            block_size: 2,
+            grid_density: 0,
+            ef_groups: false,
+            paged: false,
             inline_lengths_min_documents: 0,
             ..Options::default()
         };
@@ -2102,7 +2105,16 @@ mod tests {
         let page_len = 97;
         for t in ["t0", "t1"] {
             let term = parsed.term(t).unwrap().unwrap();
-            assert!(term.postings.footer.len() > 20 * page_len);
+            assert!(
+                matches!(term.postings.form, Form::Sparse(_)),
+                "a sparse record"
+            );
+            assert!(
+                term.postings.footer.len() > 20 * page_len,
+                "{t}: a footer of {} bytes, df {}",
+                term.postings.footer.len(),
+                term.postings.df
+            );
         }
         use Node::*;
         let nodes = [
@@ -2190,7 +2202,9 @@ mod tests {
     /// released at once, not held to the group's end (a `full_score`
     /// conjunction at 150M rows held 97 pages at once, 426 at most, rather
     /// than some 40). A rare lead whose members all lie late, and a term in
-    /// every document, its footer of small blocks over many small pages.
+    /// every document: a grouped record, whose score metadata is its
+    /// directory, parsed when the term is opened and copied, so a far
+    /// bound holds no metadata pages at all.
     #[test]
     fn a_far_bound_releases_the_footer_pages_it_reads_past() {
         let (docs, _) = drawn(9_000, &[], 1);
@@ -2207,8 +2221,9 @@ mod tests {
         let blob = build(&docs, &members, options);
         let parsed = Segment::parse(&blob).unwrap();
         let page_len = 97;
-        let footer_pages = parsed.term("t1").unwrap().unwrap().postings.footer.len() / page_len;
-        assert!(footer_pages >= 60, "{footer_pages} pages");
+        let dense = parsed.term("t1").unwrap().unwrap().postings;
+        assert!(matches!(dense.form, Form::Grouped(_)) && dense.footer.is_empty());
+        let footer_pages = dense.directory.len() / page_len;
         let source = segment::tinshape::blob::PinningSource::new(blob.clone(), page_len);
         let pinned = LazyBlob::new(Box::new(source.clone()));
         let in_place = assembled_in_place(&pinned, &parsed, &blob);
@@ -3232,24 +3247,38 @@ mod tests {
             let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
             let segment = Segment::parse(&blob).unwrap();
             let names: Vec<String> = (0..3).map(|t| format!("t{t}")).collect();
+            // Per term, whether its record is grouped: then its blocks are
+            // its groups and its frontiers' lengths are rounded down.
+            let grouped: Vec<bool> = names
+                .iter()
+                .map(|name| {
+                    segment.term(name).unwrap().is_some_and(|t| matches!(t.postings.form, Form::Grouped(_)))
+                })
+                .collect();
+            let block_of = |t: usize, p: usize| -> usize {
+                if grouped[t] { (docs[members[t][p].0].block / 256) as usize } else { p / block_size as usize }
+            };
+            let stored = |t: usize, length: u32| -> u32 {
+                use segment::tinshape::postings::{round_length, rounded_length};
+                if grouped[t] { rounded_length(round_length(length)) } else { length }
+            };
             // Per term, per block of its postings, the shortest length at
             // each bucket or above.
-            let floors: Vec<Vec<[u32; 16]>> = members
-                .iter()
-                .map(|m| {
-                    m.chunks(block_size as usize)
-                        .map(|block| {
-                            let mut best = [u32::MAX; 16];
-                            for (r, tf) in block {
-                                let b = usize::from(TfBucket::from_count(*tf).value());
-                                best[b] = best[b].min(lengths[*r]);
-                            }
-                            for b in (0..15).rev() {
-                                best[b] = best[b].min(best[b + 1]);
-                            }
-                            best
-                        })
-                        .collect()
+            let floors: Vec<Vec<[u32; 16]>> = (0..members.len())
+                .map(|t| {
+                    let blocks = members[t].len().max(1);
+                    let mut out: Vec<[u32; 16]> = vec![[u32::MAX; 16]; blocks];
+                    for (p, (r, tf)) in members[t].iter().enumerate() {
+                        let b = usize::from(TfBucket::from_count(*tf).value());
+                        let best = &mut out[block_of(t, p)];
+                        best[b] = best[b].min(stored(t, lengths[*r]));
+                    }
+                    for best in &mut out {
+                        for b in (0..15).rev() {
+                            best[b] = best[b].min(best[b + 1]);
+                        }
+                    }
+                    out
                 })
                 .collect();
             for node in [
@@ -3288,7 +3317,7 @@ mod tests {
                     for (s, t) in terms.iter().enumerate() {
                         if let Some(p) = members[*t].iter().position(|(d, _)| *d == r) {
                             let bucket = TfBucket::from_count(members[*t][p].1);
-                            floor = floor.max(floors[*t][p / block_size as usize][usize::from(bucket.value())]);
+                            floor = floor.max(floors[*t][block_of(*t, p)][usize::from(bucket.value())]);
                             held.push((s, bucket));
                         }
                     }

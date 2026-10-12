@@ -136,6 +136,14 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             }
             let mut cursor = payload.cursor();
             let mut largest = 0u8;
+            // A grouped record: each group's frontier must dominate the
+            // group's postings (a bucket at least as high, a length at
+            // most as long), and its count must be its container's.
+            let entries = match &found.postings.form {
+                super::postings::Form::Grouped(entries) => entries.as_ref(),
+                _ => &[],
+            };
+            let mut at_entry = 0usize;
             for (i, slot) in slots.iter().enumerate() {
                 let rank = segment
                     .docs
@@ -153,6 +161,31 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     ));
                 }
                 positions_of[rank as usize] += scratch.len() as u64;
+                if !entries.is_empty() {
+                    while at_entry + 1 < entries.len() && entries[at_entry + 1].first <= i as u32 {
+                        at_entry += 1;
+                    }
+                    let entry = &entries[at_entry];
+                    let group = &segment.docs.geometry.groups[entry.index as usize];
+                    if *slot < group.slot_base || *slot >= group.slot_base + group.slots() {
+                        problems.push(format!(
+                            "posting {i} lies outside its directory entry's group {}",
+                            entry.index
+                        ));
+                        continue;
+                    }
+                    let length = lengths[rank as usize];
+                    let covered = found
+                        .postings
+                        .group_frontier(entry)
+                        .any(|(fb, fl)| fb >= bucket && fl <= length);
+                    if !covered {
+                        problems.push(format!(
+                            "posting {i} (bucket {bucket}, length {length}) is not covered by group {}'s frontier",
+                            entry.index
+                        ));
+                    }
+                }
             }
             if largest != entry.max_tf_bucket {
                 problems.push(format!(

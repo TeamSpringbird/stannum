@@ -27,10 +27,12 @@ use segment::Tid;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
 use segment::tinshape::blob::{Bytes, LazyBlob};
-use segment::tinshape::docs::Geometry;
+use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Form, KIND_EF, KIND_GRID, LazyFooter};
+use segment::tinshape::postings::{
+    Form, GroupEntry, GroupFrontier, KIND_EF, KIND_GRID, LazyFooter,
+};
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
@@ -62,14 +64,281 @@ const COMMON_RATIO: u64 = 10;
 /// letting a whole group's candidates be bounded and sorted against it.
 const STAGE_CHUNK: usize = 256;
 
+/// A scoring term's score metadata as a walk bounds by it: a sparse
+/// record's footer blocks, decoded a block at a time as the walk reaches
+/// them ([`LazyFooter`]); a grouped record's directory entries, one per
+/// group the term holds, each bounded from its frontier when the walk
+/// visits the group (as TIN reads one footer entry per term and group). A
+/// "block" of either is numbered from zero: a footer block, or a position
+/// in the directory.
+enum Bounds<'s, 'a> {
+    /// Boxed: a lazy footer is several vectors, a group's bounds a few
+    /// words.
+    Blocks(Box<LazyFooter<'a>>),
+    Groups(GroupBounds<'s>),
+}
+
+/// A grouped record's entries as a walk's blocks: the directory (shared
+/// with the parsed record), its bytes (the frontiers), and the segment's
+/// groups, which turn an entry's group index into the group's last slot.
+struct GroupBounds<'s> {
+    dir: std::rc::Rc<[GroupEntry]>,
+    directory: std::rc::Rc<[u8]>,
+    rounded: bool,
+    groups: &'s [Group],
+}
+
+impl GroupBounds<'_> {
+    /// Entry `b`'s group's first slot.
+    #[inline]
+    fn start(&self, b: usize) -> u32 {
+        self.groups[self.dir[b].index as usize].slot_base
+    }
+
+    /// Entry `b`'s group's last slot.
+    #[inline]
+    fn end(&self, b: usize) -> u32 {
+        let group = &self.groups[self.dir[b].index as usize];
+        group.slot_base + group.slots() - 1
+    }
+
+    /// The frontier of entry `b`.
+    #[inline]
+    fn frontier(&self, b: usize) -> GroupFrontier<'_> {
+        GroupFrontier::new(&self.directory, self.dir[b].frontier as usize, self.rounded)
+    }
+
+    /// The first entry from `from` on whose group ends at `slot` or later:
+    /// a step or two forward as a rule (the walk's next group), else a
+    /// gallop and a binary search; the entry count when there is none.
+    #[inline]
+    fn first_reaching(&self, from: usize, slot: u32) -> usize {
+        let n = self.dir.len();
+        if from >= n || self.end(from) >= slot {
+            return from;
+        }
+        let (mut lo, mut step) = (from, 1);
+        let mut hi = loop {
+            let at = lo + step;
+            if at >= n {
+                break n;
+            }
+            if self.end(at) >= slot {
+                break at;
+            }
+            lo = at;
+            step *= 2;
+        };
+        // `lo` ends before `slot`; `hi` ends at or after it, or is `n`.
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if self.end(mid) >= slot {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+}
+
+impl<'a> Bounds<'_, 'a> {
+    /// Blocks the record has.
+    #[inline]
+    fn blocks(&self) -> usize {
+        match self {
+            Self::Blocks(f) => f.blocks(),
+            Self::Groups(g) => g.dir.len(),
+        }
+    }
+
+    /// Blocks decoded so far (every one of a grouped record's).
+    #[inline]
+    fn decoded(&self) -> usize {
+        match self {
+            Self::Blocks(f) => f.decoded(),
+            Self::Groups(g) => g.dir.len(),
+        }
+    }
+
+    /// A single posting's bucket, which the dictionary keeps.
+    #[inline]
+    fn single(&self) -> Option<u8> {
+        match self {
+            Self::Blocks(f) => f.single(),
+            Self::Groups(_) => None,
+        }
+    }
+
+    /// Block `b`'s last slot (decoded): a footer block's last posting's, a
+    /// group entry's group's last.
+    #[inline]
+    fn last(&self, b: usize) -> u32 {
+        match self {
+            Self::Blocks(f) => f.last(b),
+            Self::Groups(g) => g.end(b),
+        }
+    }
+
+    /// Whether block `b`'s postings all lie past `slot`: a group entry
+    /// whose group starts after it (a footer block may start anywhere).
+    #[inline]
+    fn starts_after(&self, b: usize, slot: u32) -> bool {
+        match self {
+            Self::Blocks(_) => false,
+            Self::Groups(g) => g.start(b) > slot,
+        }
+    }
+
+    /// The first block from `from` on whose last slot is `slot` or later,
+    /// decoded (a footer's decoded as far as it); the block count when
+    /// there is none. Looks among the blocks decoded first.
+    #[inline]
+    fn first_reaching(&mut self, from: usize, slot: u32) -> Result<usize> {
+        match self {
+            Self::Blocks(f) => {
+                let last = f.lasts();
+                let mut b = from;
+                while b < last.len() && last[b] < slot {
+                    b += 1;
+                }
+                if b < last.len() {
+                    Ok(b)
+                } else {
+                    f.seek(b, slot)
+                }
+            }
+            Self::Groups(g) => Ok(g.first_reaching(from, slot)),
+        }
+    }
+
+    /// Block `b`'s largest bucket (decoded).
+    #[inline]
+    fn max_bucket(&self, b: usize) -> u8 {
+        match self {
+            Self::Blocks(f) => f.max_bucket(b),
+            Self::Groups(g) => g.dir[b].max_bucket,
+        }
+    }
+
+    /// Where block `b`'s buckets start in the TF tail, in bytes (for page
+    /// accounting).
+    #[inline]
+    fn tf_byte(&self, b: usize) -> usize {
+        match self {
+            Self::Blocks(f) => f.tf_at(b) as usize,
+            Self::Groups(g) => g.dir[b].tf_bit as usize / 8,
+        }
+    }
+
+    /// The bucket of posting `index`, which block `b` holds, from the
+    /// record's TF tail.
+    #[inline]
+    fn bucket_in(&mut self, b: usize, tf: Bytes<'_>, index: u32) -> Result<u8> {
+        match self {
+            Self::Blocks(f) => f.bucket(tf, index),
+            Self::Groups(g) => {
+                let e = &g.dir[b];
+                debug_assert!(e.first <= index && index < e.first + e.count);
+                if e.width == 0 {
+                    return Ok(0);
+                }
+                let bit = e.bucket_bit(index);
+                let bytes = tf.window(bit / 8, 8)?;
+                Ok(bits::get_at(bytes, bit % 8, u32::from(e.width))? as u8)
+            }
+        }
+    }
+
+    /// [`Self::floor`] of block `b` at every bucket, from one read of its
+    /// frontier.
+    #[inline]
+    fn floors(&self, b: usize) -> [u32; BUCKET_COUNT] {
+        match self {
+            Self::Blocks(f) => f.floors(b),
+            Self::Groups(g) => {
+                let mut out = [u32::MAX; BUCKET_COUNT];
+                for (bucket, length) in g.frontier(b) {
+                    let at = usize::from(bucket) % BUCKET_COUNT;
+                    out[at] = out[at].min(length);
+                }
+                let mut least = u32::MAX;
+                for floor in out.iter_mut().rev() {
+                    least = least.min(*floor);
+                    *floor = if least == u32::MAX { 0 } else { least };
+                }
+                out
+            }
+        }
+    }
+
+    /// The best of `bound` over block `b`'s frontier pairs (0 at least).
+    #[inline]
+    fn fold_bound(&self, b: usize, mut bound: impl FnMut(u8, u32) -> f32) -> f32 {
+        match self {
+            Self::Blocks(f) => {
+                if f.keeps_pairs() {
+                    f.frontier(b)
+                        .iter()
+                        .map(|(bucket, length)| bound(*bucket, *length))
+                        .fold(0.0_f32, f32::max)
+                } else {
+                    // A skimmed footer's, or one decoded for its bounds.
+                    let mut v = 0.0_f32;
+                    f.each_pair(b, |bucket, length| v = v.max(bound(bucket, length)));
+                    v
+                }
+            }
+            Self::Groups(g) => g
+                .frontier(b)
+                .map(|(bucket, length)| bound(bucket, length))
+                .fold(0.0_f32, f32::max),
+        }
+    }
+
+    /// Footer bytes read so far (a sparse record's).
+    #[inline]
+    fn read(&self) -> usize {
+        match self {
+            Self::Blocks(f) => f.read(),
+            Self::Groups(_) => 0,
+        }
+    }
+
+    /// See [`LazyFooter::borrowed`]: nothing for a grouped record, whose
+    /// directory is copied when parsed.
+    #[inline]
+    fn borrowed(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Blocks(f) => f.borrowed(),
+            Self::Groups(_) => None,
+        }
+    }
+
+    /// See [`LazyFooter::release_passed`].
+    fn release_passed(&mut self) {
+        if let Self::Blocks(f) = self {
+            f.release_passed();
+        }
+    }
+}
+
 /// One scoring term of a walk.
-pub(super) struct Sc<'a> {
+pub(super) struct Sc<'s, 'a> {
     pub(super) term: usize,
     pub(super) scorer: TermScorer,
-    /// The term's footer, decoded as far as the walk has reached.
-    pub(super) footer: LazyFooter<'a>,
-    /// Per footer block decoded, its bound; NaN until asked.
+    /// The term's blocks: its footer, decoded as far as the walk has
+    /// reached, or its group entries.
+    footer: Bounds<'s, 'a>,
+    /// A footer's blocks' bounds, per block decoded; NaN until asked.
     bounds: Vec<f32>,
+    /// A grouped record's entry bounded last, and its bound: a walk asks
+    /// for a group's bound a few times (the group, its sub-ranges, each
+    /// candidate's window) and moves on, so one is kept.
+    gb: usize,
+    gv: f32,
+    /// Group entries bounded, for the memo counts.
+    computed: u64,
     /// The block a range bound starts from, moved forward only.
     wb: usize,
     /// The block holding the last candidate asked about, moved forward only.
@@ -85,8 +354,7 @@ pub(super) struct Sc<'a> {
     /// to a new block clears nothing.
     bb: [(u32, f32); BUCKET_COUNT],
     bb_block: [u32; BUCKET_COUNT],
-    /// A footer decoded for its bounds: the floors of block `floors_block`
-    /// at every bucket.
+    /// The floors of block `floors_block` at every bucket, read at once.
     floors: [u32; BUCKET_COUNT],
     floors_block: u32,
     /// A common term's bound over a group (see [`Sc::make_common`]).
@@ -100,12 +368,36 @@ fn corrupt_footer(error: Error) -> ! {
     crate::corrupt(format!("Stannum postings footer: {error}"))
 }
 
-impl<'a> Sc<'a> {
-    pub(super) fn new(term: usize, scorer: TermScorer, footer: LazyFooter<'a>) -> Self {
+impl<'s, 'a> Sc<'s, 'a> {
+    /// The scoring term `term` of `set`, whose blocks are its directory's
+    /// entries (a grouped record) or its footer's blocks (decoded per
+    /// query, a block at a time as the walk reaches it, and read as far).
+    pub(super) fn new(
+        term: usize,
+        scorer: TermScorer,
+        set: &TermSet<'a>,
+        segment: &'s Segment<'a>,
+    ) -> Result<Self> {
+        let footer = match &set.postings.form {
+            Form::Grouped(entries) => Bounds::Groups(GroupBounds {
+                dir: entries.clone(),
+                directory: set.postings.directory.clone(),
+                rounded: set.postings.rounded,
+                groups: &segment.docs.geometry.groups,
+            }),
+            _ => Bounds::Blocks(Box::new(set.postings.lazy_footer(
+                segment.block_size,
+                set.max_bucket,
+                segment.adaptive_tf,
+            )?)),
+        };
         let (num, den, factor) = scorer.length_bound_parts();
-        Self {
+        Ok(Self {
             term,
             bounds: Vec::new(),
+            gb: usize::MAX,
+            gv: 0.0,
+            computed: 0,
             footer,
             scorer,
             wb: 0,
@@ -118,31 +410,49 @@ impl<'a> Sc<'a> {
             floors: [0; BUCKET_COUNT],
             floors_block: u32::MAX,
             common: None,
-        }
+        })
+    }
+
+    /// Whether the term's blocks are its group entries.
+    #[inline]
+    fn grouped(&self) -> bool {
+        matches!(self.footer, Bounds::Groups(_))
     }
 
     /// Makes the term common, for a led walk that scores a rarer term too.
-    /// A group is bounded by its record (what its largest bucket
-    /// `max_bucket` scores at the least length, which no block's frontier
-    /// exceeds), not its blocks there: a common term's footer holds a
-    /// dozen blocks or more per group, each with a short document holding
-    /// it often, and the group check, which seldom skips a group these
-    /// blocks would leave in reach, decoded and bounded every one of them.
-    /// A candidate's window still bounds it by its block, but its bucket is
-    /// read last, only for a candidate the rarer terms' buckets leave in
-    /// reach. Its footer is skimmed ([`LazyFooter::skim`]): most of its
-    /// blocks are decoded only for their TF offsets.
+    /// A sparse record's group is bounded by its record (what its largest
+    /// bucket `max_bucket` scores at the least length, which no block's
+    /// frontier exceeds), not its blocks there, and its footer is skimmed
+    /// ([`LazyFooter::skim`]): most of its blocks are decoded only for
+    /// their TF offsets. A grouped record's group is bounded by its entry,
+    /// one frontier per group. Either way a candidate's window still bounds
+    /// it by its block, but its bucket is read last, only for a candidate
+    /// the rarer terms' buckets leave in reach.
     fn make_common(&mut self, max_bucket: u8) {
         let bucket = TfBucket::new(max_bucket).expect("a valid bucket");
         self.common = Some(self.scorer.bound_through(bucket, 0));
-        self.footer.skim();
+        if let Bounds::Blocks(f) = &mut self.footer {
+            f.skim();
+        }
+    }
+
+    /// A common term's bound over a group before its blocks are asked:
+    /// its record's, for a sparse record; `None` for a grouped one, whose
+    /// entry bounds the group as cheaply.
+    #[inline]
+    fn common_bound(&self) -> Option<f32> {
+        if self.grouped() { None } else { self.common }
     }
 
     /// Block `b`'s bound, which must be decoded: the best score of its
     /// frontier.
     #[inline]
     fn bound(&mut self, b: usize) -> f32 {
-        if let Some(v) = self.bounds.get(b)
+        if self.grouped() {
+            if self.gb == b {
+                return self.gv;
+            }
+        } else if let Some(v) = self.bounds.get(b)
             && !v.is_nan()
         {
             return *v;
@@ -153,60 +463,57 @@ impl<'a> Sc<'a> {
     /// [`Self::bound`], not known yet.
     #[inline(never)]
     fn bound_of(&mut self, b: usize) -> f32 {
-        if b >= self.bounds.len() {
-            self.bounds
-                .resize(self.footer.decoded().max(b + 1), f32::NAN);
-        }
         let scorer = &self.scorer;
-        let bound = |bucket: u8, length: u32| {
+        let v = self.footer.fold_bound(b, |bucket, length| {
             scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
-        };
-        let v = if self.footer.keeps_pairs() {
-            self.footer
-                .frontier(b)
-                .iter()
-                .map(|(bucket, length)| bound(*bucket, *length))
-                .fold(0.0_f32, f32::max)
+        });
+        if self.grouped() {
+            self.gb = b;
+            self.gv = v;
+            self.computed += 1;
         } else {
-            // A skimmed footer's (see `Sc::make_common`).
-            let mut v = 0.0_f32;
-            self.footer
-                .each_pair(b, |bucket, length| v = v.max(bound(bucket, length)));
-            v
-        };
-        self.bounds[b] = v;
+            if b >= self.bounds.len() {
+                self.bounds
+                    .resize(self.footer.decoded().max(b + 1), f32::NAN);
+            }
+            self.bounds[b] = v;
+        }
         v
     }
 
-    /// Decodes every block and its bound now, in one pass: for a walk that
-    /// bounds every block anyway (a disjunction bounds each group its terms
-    /// hold), so decoding a block at a time as it is reached saves nothing,
-    /// and reading the footer's pages between a group's leaves them pinned
-    /// among the group's (see [`Walk::group_done`]). Each block is bounded
-    /// as it is decoded, and its frontier is not kept as pairs
-    /// ([`LazyFooter::decode_bounds`]): most blocks' are never read again.
+    /// Decodes every block of a footer and its bound now, in one pass: for
+    /// a walk that bounds every block anyway (a disjunction bounds each
+    /// group its terms hold), so decoding a block at a time as it is
+    /// reached saves nothing, and reading the footer's pages between a
+    /// group's leaves them pinned among the group's (see
+    /// [`Walk::group_done`]). Each block is bounded as it is decoded, and
+    /// its frontier is not kept as pairs ([`LazyFooter::decode_bounds`]):
+    /// most blocks' are never read again. A grouped record's entries are
+    /// bounded as its groups are visited.
     fn decode_all(&mut self) {
+        let Bounds::Blocks(f) = &mut self.footer else {
+            return;
+        };
         let scorer = &self.scorer;
         self.bounds.clear();
-        self.footer
-            .decode_bounds(
-                |bucket, length| {
-                    scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
-                },
-                &mut self.bounds,
-            )
-            .unwrap_or_else(|e| corrupt_footer(e));
+        f.decode_bounds(
+            |bucket, length| {
+                scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
+            },
+            &mut self.bounds,
+        )
+        .unwrap_or_else(|e| corrupt_footer(e));
     }
 
     /// The first block from `from` on whose last slot is `slot` or later,
-    /// decoded; the footer's block count when there is none.
+    /// decoded; the block count when there is none.
     #[inline]
-    fn seek(&mut self, from: usize, slot: u32) -> usize {
+    fn first_reaching(&mut self, from: usize, slot: u32) -> usize {
         let b = self
             .footer
-            .seek(from, slot)
+            .first_reaching(from, slot)
             .unwrap_or_else(|e| corrupt_footer(e));
-        if self.bounds.len() < self.footer.decoded() {
+        if !self.grouped() && self.bounds.len() < self.footer.decoded() {
             if self.bounds.capacity() == 0 {
                 self.bounds.reserve_exact(self.footer.blocks());
             }
@@ -215,23 +522,9 @@ impl<'a> Sc<'a> {
         b
     }
 
-    /// [`Self::seek`], looking among the blocks decoded first.
-    #[inline]
-    fn first_reaching(&mut self, from: usize, slot: u32) -> usize {
-        let last = self.footer.lasts();
-        let mut b = from;
-        while b < last.len() && last[b] < slot {
-            b += 1;
-        }
-        if b < last.len() {
-            b
-        } else {
-            self.seek(b, slot)
-        }
-    }
-
     /// The best bound of the blocks overlapping slots `from..=to`; ranges
-    /// must be asked in increasing order of `from`.
+    /// must be asked in increasing order of `from`. Zero where a grouped
+    /// record's next entry lies past the range: the term has nothing there.
     #[inline]
     fn range_bound(&mut self, from: u32, to: u32) -> f32 {
         // The blocks from the first ending at `from` or later through the
@@ -241,9 +534,12 @@ impl<'a> Sc<'a> {
         let blocks = self.footer.blocks();
         let mut best = 0.0_f32;
         let mut b = self.wb;
+        if b < blocks && self.footer.starts_after(b, to) {
+            return 0.0;
+        }
         while b < blocks {
             if b >= self.footer.decoded() {
-                self.seek(b, to);
+                self.first_reaching(b, to);
             }
             best = best.max(self.bound(b));
             if self.footer.last(b) >= to {
@@ -263,16 +559,31 @@ impl<'a> Sc<'a> {
         (self.cb < self.footer.blocks()).then_some(self.cb)
     }
 
-    /// How short a document holding a posting of block `b` with bucket
-    /// `bucket` can be: the shortest the block holds with that bucket or
-    /// more, the shortest of the frontier's pairs at or above it (every
-    /// posting is dominated by a frontier pair).
+    /// The block holding posting `index`: a footer's by the block size, a
+    /// grouped record's the entry `entry` the term's members were loaded
+    /// from for the group at hand.
     #[inline]
-    fn floor(&self, b: usize, bucket: u8) -> u32 {
-        self.footer.floor(b, bucket)
+    fn block_of(&self, index: u32, entry: usize) -> usize {
+        match &self.footer {
+            Bounds::Blocks(f) => (index / f.block_size()) as usize,
+            Bounds::Groups(g) => {
+                debug_assert!(
+                    entry < g.dir.len()
+                        && g.dir[entry].first <= index
+                        && index < g.dir[entry].first + g.dir[entry].count
+                );
+                entry
+            }
+        }
     }
 
-    /// [`Self::floor`] and what bucket `bucket` scores at most there (the
+    /// The bucket of posting `index`, which block `b` holds.
+    #[inline]
+    fn bucket_in(&mut self, b: usize, tf: Bytes<'_>, index: u32) -> Result<u8> {
+        self.footer.bucket_in(b, tf, index)
+    }
+
+    /// A block's floor at a bucket (see [`Bounds::floors`]) and what bucket `bucket` scores at most there (the
     /// term's own bound, before the other terms raise the length), kept per
     /// bucket for the block it was last asked about in.
     #[inline]
@@ -284,17 +595,7 @@ impl<'a> Sc<'a> {
             return self.bb[at];
         }
         self.bb_block[at] = tag;
-        let floor = if self.footer.keeps_pairs() {
-            self.floor(b, bucket)
-        } else {
-            // A footer decoded for its bounds keeps its frontiers as their
-            // entries' bytes: a block's floors are read at once.
-            if self.floors_block != tag {
-                self.floors_block = tag;
-                self.floors = self.footer.floors(b);
-            }
-            self.floors[at]
-        };
+        let floor = self.floor_at(b, bucket);
         let v = (
             floor,
             self.scorer
@@ -304,12 +605,16 @@ impl<'a> Sc<'a> {
         v
     }
 
-    /// [`Self::floor`], a footer decoded for its bounds reading a block's
-    /// floors at once and keeping them for the block.
+    /// A block's floor at a bucket, its floors read at once and kept for the
+    /// block (a footer decoded for its bounds keeps its frontiers as their
+    /// entries' bytes; a group entry's frontier is read from the
+    /// directory).
     #[inline]
     fn floor_at(&mut self, b: usize, bucket: u8) -> u32 {
-        if self.footer.keeps_pairs() {
-            return self.floor(b, bucket);
+        if let Bounds::Blocks(f) = &self.footer
+            && f.keeps_pairs()
+        {
+            return f.floor(b, bucket);
         }
         // Blocks are numbered below `u32::MAX` (a record has fewer postings).
         let tag = b as u32;
@@ -360,8 +665,11 @@ struct Mem<'a> {
     w: usize,
     run: u32,
     pos: usize,
-    /// The term's group directory position, moved forward only.
+    /// The term's group directory position, moved forward only; and the
+    /// entry the members at hand were loaded from (a grouped term's block
+    /// for the group at hand), `usize::MAX` for none.
     hint: usize,
+    entry: usize,
     /// Containers loaded from the directory, for [`MemoCounts`].
     ///
     /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
@@ -509,6 +817,7 @@ fn load<'a>(
     mem.w = 0;
     mem.run = 0;
     mem.pos = 0;
+    mem.entry = usize::MAX;
     let group = geometry.groups[g as usize];
     if let Form::Sparse(list) = &set.postings.form {
         let cursor = set.sparse.get_or_insert_with(|| {
@@ -542,6 +851,7 @@ fn load<'a>(
         return Ok(false);
     };
     mem.count = entry.count;
+    mem.entry = mem.hint;
     match entry.src {
         Src::Container {
             entry: e,
@@ -715,7 +1025,7 @@ struct Walk<'s, 'a, T: Touch> {
     terms: Vec<Option<TermSet<'a>>>,
     /// Per term (by index into `terms`), its members in the group at hand.
     mems: Vec<Mem<'a>>,
-    sc: Vec<Sc<'a>>,
+    sc: Vec<Sc<'s, 'a>>,
     /// Required terms, rarest first.
     req: Vec<usize>,
     /// With common terms, the scoring terms (indexes into `sc`), rarest
@@ -822,7 +1132,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let used: u64 = self
             .sc
             .iter()
-            .map(|s| s.bounds.iter().filter(|b| !b.is_nan()).count() as u64)
+            .map(|s| s.computed + s.bounds.iter().filter(|b| !b.is_nan()).count() as u64)
             .sum();
         let blocks_reached: u64 = self.sc.iter().map(|s| s.footer.decoded() as u64).sum();
         let blocks_whole: u64 = self.sc.iter().map(|s| s.footer.blocks() as u64).sum();
@@ -830,7 +1140,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .sc
             .iter()
             .filter_map(|s| self.terms[s.term].as_ref())
-            .map(|set| set.postings.footer.len() as u64)
+            .map(|set| (set.postings.footer.len() + set.postings.directory.len()) as u64)
             .sum();
         let (mut reached, mut loaded) = (0u64, 0u64);
         for (set, mem) in self.terms.iter().zip(&self.mems) {
@@ -1025,7 +1335,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for k in 0..self.sc_order.len() {
             let i = self.sc_order[k];
             let s = &mut self.sc[i];
-            let v = match s.common {
+            let v = match s.common_bound() {
                 Some(bound) => bound,
                 None => s.range_bound(base, end),
             };
@@ -1230,6 +1540,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn window(&mut self, g: u32, base: u32, local: u32) -> bool {
         let slot = base + local;
         if self.window_end.is_none_or(|e| slot > e) {
+            let group = &self.geometry.groups[g as usize];
+            let group_end = base + group.slots() - 1;
             let mut e = u32::MAX;
             let mut bound = 0.0_f32;
             let (mut nsum, mut dmin, mut fmin) = (0.0_f64, f64::INFINITY, f64::INFINITY);
@@ -1244,6 +1556,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     *wt = 0.0;
                     continue;
                 };
+                // A grouped term whose next entry lies past this group
+                // holds nothing in it: the window ends with the group.
+                if s.footer.starts_after(b, group_end) {
+                    *mb = NO_BUCKET;
+                    *wt = 0.0;
+                    e = e.min(group_end);
+                    continue;
+                }
                 *wt = s.bound(b);
                 bound += *wt;
                 e = e.min(s.footer.last(b));
@@ -1556,12 +1876,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             };
             let s = &mut self.sc[i];
             let set = self.terms[t].as_ref().expect("scoring");
-            let bucket = s.footer.bucket(set.postings.tf, index)?;
-            let block = (index / s.footer.block_size()) as usize;
+            let block = s.block_of(index, self.mems[t].entry);
+            let bucket = s.bucket_in(block, set.postings.tf, index)?;
             if s.footer.single().is_none() {
                 self.touch.touch(
                     Part::TfTail,
-                    set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
+                    set.at + set.postings.tf_at + s.footer.tf_byte(block),
                     1,
                 );
             }
@@ -1612,8 +1932,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 own += self.window_terms[i];
                 continue;
             }
-            let bucket = self.read_bucket(i, index)?;
-            let block = (index / self.sc[i].footer.block_size()) as usize;
+            let block = self.sc[i].block_of(index, self.mems[t].entry);
+            let bucket = self.read_bucket(i, block, index)?;
             let (f, bound) = self.sc[i].floor_kept(block, bucket);
             (floor, low) = (floor.max(f), low.min(f));
             self.held_bound[i] = bound;
@@ -1641,8 +1961,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     NO_BUCKET => {}
                     LATER => {
                         let index = self.held_index[i];
-                        let bucket = self.read_bucket(i, index)?;
-                        let block = (index / self.sc[i].footer.block_size()) as usize;
+                        let t = self.sc[i].term;
+                        let block = self.sc[i].block_of(index, self.mems[t].entry);
+                        let bucket = self.read_bucket(i, block, index)?;
                         let (f, bound) = self.sc[i].floor_kept(block, bucket);
                         (floor, low) = (floor.max(f), low.min(f));
                         own += bound;
@@ -1661,17 +1982,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// Reads into [`Walk::buckets`] scoring term `i`'s bucket for its
-    /// posting `index`.
+    /// posting `index`, which its block `block` holds.
     #[inline]
-    fn read_bucket(&mut self, i: usize, index: u32) -> Result<u8> {
+    fn read_bucket(&mut self, i: usize, block: usize, index: u32) -> Result<u8> {
         let s = &mut self.sc[i];
         let set = self.terms[s.term].as_ref().expect("scoring");
-        let bucket = s.footer.bucket(set.postings.tf, index)?;
+        let bucket = s.bucket_in(block, set.postings.tf, index)?;
         if s.footer.single().is_none() {
-            let block = (index / s.footer.block_size()) as usize;
             self.touch.touch(
                 Part::TfTail,
-                set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
+                set.at + set.postings.tf_at + s.footer.tf_byte(block),
                 1,
             );
         }
@@ -1797,8 +2117,8 @@ pub(super) fn top_k(
     clippy::too_many_arguments,
     reason = "the walk's inputs and its two outputs"
 )]
-pub(super) fn walk_into<'a>(
-    segment: &Segment<'a>,
+pub(super) fn walk_into<'s, 'a>(
+    segment: &'s Segment<'a>,
     node: &Node,
     names: &[String],
     scorers: &[(String, TermScorer)],
@@ -1825,18 +2145,13 @@ pub(super) fn walk_into<'a>(
         return Ok(None);
     }
     // Sized once: an `Sc` is large, and a growing vector copies them.
-    let mut sc: Vec<Sc> = Vec::with_capacity(scorers.len());
+    let mut sc: Vec<Sc<'s, 'a>> = Vec::with_capacity(scorers.len());
     for (name, scorer) in scorers {
         let Some(t) = names.iter().position(|n| n == name) else {
             continue;
         };
         let Some(set) = &terms[t] else { continue };
-        // Decoded per query, a block at a time as the walk reaches it, and
-        // read as far (recorded as read when the walk ends).
-        let footer =
-            set.postings
-                .lazy_footer(segment.block_size, set.max_bucket, segment.adaptive_tf)?;
-        sc.push(Sc::new(t, scorer.clone(), footer));
+        sc.push(Sc::new(t, scorer.clone(), set, segment)?);
     }
     // Leaves only: a candidate holding every required term matches a flat
     // AND, and one holding a scoring term a flat OR.
@@ -2078,8 +2393,10 @@ impl<'r> RowBits<'r> {
 /// (see [`RowAt`]), and a forward cursor over their posting indexes.
 #[derive(Clone, Copy, Default)]
 struct Row {
-    /// Postings in earlier groups.
+    /// Postings in earlier groups; the term's directory entry for the
+    /// group at hand (`usize::MAX` for a sparse term).
     first: u32,
+    entry: usize,
     /// Members in words `..w` are `run`.
     w: usize,
     run: u32,
@@ -2235,6 +2552,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let r = &mut self.row_state[i];
         r.w = 0;
         r.run = 0;
+        r.entry = usize::MAX;
         r.at = RowAt::of(row);
         if let Form::Sparse(list) = &set.postings.form {
             row.fill(0);
@@ -2256,6 +2574,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let entry = set
             .find(g, &mut self.mems[t].hint)
             .ok_or(Error::Corrupt("a group the term holds"))?;
+        r.entry = self.mems[t].hint;
         match entry.src {
             Src::Container {
                 entry: e,
@@ -2578,8 +2897,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // `block_size` postings each.
                 let index = self.row_index(i, local);
                 self.held_index[i] = index;
+                let entry = self.row_state[i].entry;
                 let s = &mut self.sc[i];
-                let b = (index / s.footer.block_size()) as usize;
+                let b = s.block_of(index, entry);
                 debug_assert_eq!(Some(b), s.block_at(slot));
                 self.blocks[i] = b;
                 let v = s.bound(b);
@@ -2689,11 +3009,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let block = self.blocks[i];
         let s = &mut self.sc[i];
         let set = self.terms[s.term].as_ref().expect("scoring");
-        let bucket = s.footer.bucket(set.postings.tf, index)?;
+        let bucket = s.bucket_in(block, set.postings.tf, index)?;
         if s.footer.single().is_none() {
             self.touch.touch(
                 Part::TfTail,
-                set.at + set.postings.tf_at + s.footer.tf_at(block) as usize,
+                set.at + set.postings.tf_at + s.footer.tf_byte(block),
                 1,
             );
         }
@@ -2748,6 +3068,166 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A grouped scoring term's bound over a group, from its directory
+    /// entry's frontier, is at least the score of each of its postings
+    /// there, bit for bit, as the walk scores them (the scorer's
+    /// `score_bucket` at the posting's bucket and its document's exact
+    /// length), under any `k1`, `b`, boost and average length, rounded
+    /// frontiers included; zero for a group the term lacks; and its floor
+    /// at a bucket is at most the shortest document in the group holding
+    /// that bucket or more.
+    #[test]
+    fn a_group_entrys_bound_covers_its_postings() {
+        use crate::bm25::Bm25Params;
+        use segment::payload::PayloadBuilder;
+        use segment::tinshape::postings::{GroupFrontiers, Options};
+        use segment::tinshape::segment::Builder;
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..24 {
+            // 40 groups of 64 pages of 1 to 4 documents, a term in one
+            // document in three (or in every one of a group, or none).
+            let mut docs: Vec<Tid> = Vec::new();
+            for g in 0..40u32 {
+                for p in 0..64u32 {
+                    let n = 1 + (next() % 4) as u16;
+                    for o in 1..=n {
+                        docs.push(Tid {
+                            block: g * 256 + p,
+                            offset: o,
+                        });
+                    }
+                }
+            }
+            let lengths: Vec<u32> = (0..docs.len())
+                .map(|_| 1 + (next() % 3000) as u32)
+                .collect();
+            let mut members: Vec<(usize, u32)> = Vec::new();
+            for (r, doc) in docs.iter().enumerate() {
+                let g = doc.block / 256;
+                let held = match g % 5 {
+                    0 => true,
+                    1 => false,
+                    _ => next() % 3 == 0,
+                };
+                if held {
+                    members.push((r, 1 + (next() % 40) as u32));
+                }
+            }
+            let rounded = round % 2 == 0;
+            let options = Options {
+                sparse: false,
+                grid_min_postings: 0,
+                inline_lengths_min_documents: u32::MAX,
+                group_frontiers: if rounded {
+                    GroupFrontiers::Rounded
+                } else {
+                    GroupFrontiers::Exact
+                },
+                ..Options::default()
+            };
+            let mut builder = Builder::new(docs.clone(), lengths.clone(), options).unwrap();
+            let ranks: Vec<u32> = members.iter().map(|(r, _)| *r as u32).collect();
+            let buckets: Vec<u8> = members
+                .iter()
+                .map(|(_, tf)| TfBucket::from_count(*tf).value())
+                .collect();
+            let mut payload = PayloadBuilder::default();
+            for (_, tf) in &members {
+                payload.push(&(0..*tf).collect::<Vec<u32>>()).unwrap();
+            }
+            builder
+                .add_term("t", &ranks, &buckets, &payload.finish())
+                .unwrap();
+            let blob = builder.finish(&[]).0;
+            let segment = Segment::parse(&blob).unwrap();
+            let (k1, b, boost, average) = [
+                (1.2f32, 0.75f32, 1.0f32, 300.0f32),
+                (0.0, 0.0, 0.5, 13.0),
+                (3.0, 1.0, 7.25, 4999.0),
+                (1e-6, 0.25, 1.0, 0.5),
+            ][round % 4];
+            let scorer = TermScorer::from_statistics(
+                docs.len() as u64,
+                members.len() as u64,
+                boost,
+                Bm25Params { k1, b },
+                average,
+            )
+            .unwrap();
+            let set = TermSet::open(&segment, "t", &mut crate::tinshape::NoTouch)
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(set.postings.form, Form::Grouped(_)),
+                "a grouped record"
+            );
+            let mut sc = Sc::new(0, scorer.clone(), &set, &segment).unwrap();
+            let geometry = &segment.docs.geometry;
+            let mut held = 0;
+            for g in 0..geometry.groups.len() {
+                let group = geometry.groups[g];
+                let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
+                let bound = sc.range_bound(base, end);
+                let mut any = false;
+                let mut shortest = [u32::MAX; 16];
+                for (r, tf) in &members {
+                    let slot = geometry.slot_of(docs[*r]).unwrap();
+                    if slot < base || slot > end {
+                        continue;
+                    }
+                    any = true;
+                    let score = scorer.score_bucket(TfBucket::from_count(*tf), lengths[*r]);
+                    assert!(
+                        bound.total_cmp(&score).is_ge(),
+                        "round {round} group {g}: bound {bound} below score {score} (tf {tf}, length {})",
+                        lengths[*r]
+                    );
+                    let bucket = usize::from(TfBucket::from_count(*tf).value());
+                    shortest[bucket] = shortest[bucket].min(lengths[*r]);
+                }
+                if any {
+                    held += 1;
+                    // The window: the entry holding the group, ending with it.
+                    let b = sc.block_at(base).unwrap();
+                    assert_eq!(sc.footer.last(b), end);
+                    assert!(!sc.footer.starts_after(b, end));
+                    assert_eq!(sc.bound(b).to_bits(), bound.to_bits());
+                    let mut least = u32::MAX;
+                    for bucket in (0..16).rev() {
+                        least = least.min(shortest[bucket]);
+                        let (floor, v) = sc.floor_kept(b, bucket as u8);
+                        if least != u32::MAX {
+                            assert!(
+                                floor <= least,
+                                "group {g} bucket {bucket}: floor {floor} over {least}"
+                            );
+                            assert!(
+                                v.total_cmp(
+                                    &scorer
+                                        .bound_through(TfBucket::new(bucket as u8).unwrap(), least)
+                                )
+                                .is_ge()
+                            );
+                        }
+                    }
+                } else {
+                    assert_eq!(
+                        bound.to_bits(),
+                        0.0f32.to_bits(),
+                        "round {round} group {g} the term lacks"
+                    );
+                }
+            }
+            assert_eq!(held, sc.footer.blocks());
         }
     }
 

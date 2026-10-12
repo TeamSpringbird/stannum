@@ -480,7 +480,7 @@ impl Parsed<'_> {
 fn record_bytes(postings: &Postings<'_>) -> usize {
     64 + match &postings.form {
         postings::Form::Grouped(entries) => {
-            entries.len() * std::mem::size_of::<postings::GroupEntry>()
+            entries.len() * std::mem::size_of::<postings::GroupEntry>() + postings.directory.len()
         }
         _ => 0,
     }

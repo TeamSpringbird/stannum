@@ -100,13 +100,20 @@ the term's postings record and positions stream.
 ```text
 record  := slot varint [length varint]           when df = 1 (the bucket is the
                                                  dictionary's largest bucket)
-         | form u8, [footer_len], payload_len, [lengths_len],
-           [footer], payload, [lengths], tf
+         | sparse:  form u8, [footer_len], payload_len, [lengths_len],
+                    [footer], list, [lengths], tf
+         | grouped: form u8, payload_len, [lengths_len],
+                    directory, container*, [lengths], tf
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
+           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped)
 lengths := base varint, width u8, (length - base) packed at width, by posting
-payload := sparse:  Elias-Fano over the term's slots, universe = all slots
-         | grouped: groups, (index gap, (count - 1) << 2 | kind, [len])*,
-                    one container per group the term occupies
+list    := Elias-Fano over the term's slots, universe = all slots
+directory := groups, (index gap, (count - 1) << 2 | kind, [len],
+                      group frontier)*: one entry per group the term occupies
+group frontier := head u8 = (pairs - 1) << 4 | first bucket, first length
+                  varint, then per pair ((length gap - 1) << 4 | bucket gap - 1)
+                  varint: the group's impact frontier, its lengths rounded
+                  down to six significant bits when the form says so
 container := grid:  the group's slots as a bitmap of whole words
            | ef:    Elias-Fano over the group's local slots (universe p * w)
            | paged: a page mask (or page list) and per page a bitmap, a
@@ -142,25 +149,50 @@ The group directory holds each group's posting count and where its
 container starts: a single-term count is `df`, and an OR of terms in a
 group only one of them holds is that term's count, without the payload.
 
-### Footer
+### Score metadata: per (term, group), or a footer of blocks
 
-One entry per block of `block_size` postings (256 by default) in posting
-order: the gap from the previous block's last slot to this one's, and the
-block's **impact frontier**, the (bucket, shortest length) pairs no other
-posting of the block dominates (1 to 16, usually 1 to 3). The block's best
-score under any `k1` and `b` is the score of one of them, as Lucene's
-competitive impacts are; a reader computes the bound for the query's
-parameters (`bound_through`, so rounding never puts a bound below a score
-it covers). The frontier's first pair is the block's shortest document,
-which bounds a candidate by its bucket before its length is read.
+A grouped record's score metadata is per (term, group), as TIN keeps one
+footer entry per term and aligned 256-page group (its probes, rounds 2 and
+7): each directory entry ends with its group's **impact frontier**, the
+(bucket, shortest length) pairs no other posting of the group dominates (1
+to 16; 2.4 on average at 150M rows), and the group's buckets follow the
+groups before it in the TF tail, at the width the group's largest bucket
+needs. A walk reaches group `g`'s entry by its position in the directory
+(parsed once when the term is opened) and decodes nothing of the groups
+before it; a group's bound is its frontier's best score, its floors per
+bucket come from the same pairs, and a group the term lacks bounds at
+zero. The frontier's lengths are rounded down to six significant bits
+(`round_length`, as TIN quantizes its lengths): a bound at the rounded
+length is a bound at the length, the frontier costs 3% less, and 0.1% more
+candidates pass (`Options::group_frontiers`, `Exact` keeps them whole).
+The best score under any `k1` and `b` is the score of one of the pairs, as
+Lucene's competitive impacts are; a reader computes the bound for the
+query's parameters (`bound_through`, so rounding never puts a bound below
+a score it covers).
+
+A sparse record (one Elias-Fano list over the segment: a rare term) keeps
+the footer of blocks: one entry per block of `block_size` postings (256 by
+default) in posting order, the gap from the previous block's last slot to
+this one's and the block's impact frontier. Such a block spans many groups
+of a rare term, so its bound is near the term's own; per-group entries for
+sparse terms would cost about 4 bytes per posting-group (11% of the index
+at 150M rows, where 17.5% of postings are in sparse records), and
+computing them per query from the list, the TF tail and inline lengths
+costs about 12 ns a member, more than a conjunction's lead can pay. TIN
+keeps a per-(term, group) entry and a container for every posting of a
+rare term (about 120 bytes per posting-group, round 7); a sparse record
+here costs 3.5 bytes a posting.
 
 ### TF tail
 
-Each block's buckets packed at the block's width: 0 bits when its largest
-bucket is 0 (every posting has tf 1), 1, 2, else 4. Posting `i`'s bucket is
-in block `i / block_size` at bit `(i % block_size) * width`; block offsets
-follow from the footer. 2.3 bits per posting here against 4 at a fixed
-width (13.1 MB against 22.8 MB).
+A grouped record: each group's buckets packed at the group's width, in a
+row (no padding between groups); its entry records where they start in
+bits. A sparse record: each block's buckets packed at the block's width,
+each block starting on a byte. A width is 0 bits when the largest bucket
+is 0 (every posting has tf 1), 1, 2, else 4. 2.3 bits per posting here
+against 4 at a fixed width (13.1 MB against 22.8 MB at 1M rows; packing
+per group rather than per byte-aligned block saved 46 MB of 1.7 GB at
+150M).
 
 ### Positions
 
@@ -228,8 +260,14 @@ ANDed into the fold, or probes into the terms' containers when it is small.
 tail and the DL sidecar, summed in the scorer's term order, ties broken by
 ctid, dense terms elided as today: the answers are bit-identical to
 scoring every match. A segment keeps the records it parses between
-queries (`Segment::resolve_memo`, 16 MiB). A walk decodes its scoring
-terms' footers per query, a block at a time as it reaches them
+queries (`Segment::resolve_memo`, 16 MiB). A grouped scoring term's
+"blocks" are its directory entries (`rank::Bounds::Groups`): a group's
+bound is computed from its entry's frontier when the walk first asks for
+it and kept while the walk is in the group, a group the term lacks bounds
+at zero, a candidate's window ends with its group, and its bucket lies at
+its entry's TF bits. What follows about footers applies to sparse scoring
+terms (`rank::Bounds::Blocks`). A walk decodes those terms' footers per
+query, a block at a time as it reaches them
 (`postings::LazyFooter`), and keeps nothing of them after it: a footer's
 entries are variable-length and in a row, so reaching a block decodes every
 entry before it, and nothing after. Its bytes are read in place a page at a

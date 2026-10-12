@@ -38,7 +38,7 @@ pub const MAGIC: u32 = 0x4c44_5032;
 /// masks, rare terms' lengths inline in their records and records without
 /// a footer (phase B, round 2). An index of an
 /// earlier version must be rebuilt.
-pub const VERSION: u8 = 6;
+pub const VERSION: u8 = 8;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();

@@ -6,22 +6,30 @@
 //! [`super::docs`]), a footer of per-block score metadata, and the TF tail.
 //!
 //! ```text
-//! record  := single | full
+//! record  := single | sparse | grouped
 //! single  := slot varint                    (df = 1; the bucket is the
 //!                                            dictionary's max_tf_bucket)
-//! full    := form u8 (1 sparse, 2 grouped), footer_len varint,
-//!            payload_len varint, footer, payload, tf
+//! sparse  := form u8 (1), footer_len varint, payload_len varint,
+//!            footer, ef(df slots below the grid's slot count), tf
 //! footer  := block*, one per `block_size` postings in posting order:
 //!            last_gap varint (its last slot less the previous block's,
 //!                             the first block's from zero),
 //!            frontier_len u8 (1..=16),
 //!            (bucket u8, min_length varint)* ascending in both: the
 //!            block's impact frontier
-//! payload := sparse:  ef(df slots below the grid's slot count)
-//!          | grouped: groups varint,
-//!                     (index_gap varint, (count - 1) << 2 | kind varint,
-//!                      [len varint, paged groups only])*,
-//!                     container*
+//! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded),
+//!            payload_len varint,
+//!            groups varint,
+//!            (index_gap varint, (count - 1) << 2 | kind varint,
+//!             [len varint, paged groups only],
+//!             group frontier)*,                   the group directory
+//!            container*, tf
+//! group frontier := head u8 = (n - 1) << 4 | first bucket,
+//!            first length varint,
+//!            ((length - previous length - 1) << 4
+//!             | bucket - previous bucket - 1) varint, for each later pair:
+//!            the group's impact frontier, its lengths rounded down to six
+//!            significant bits when the form says so
 //! container := grid:  32 * width bytes, bit `local` set for each member
 //!            | ef:    ef(count local slots below 256 * width)
 //!            | paged: (pages - 1) u8, the pages (a byte each when fewer
@@ -31,15 +39,27 @@
 //!                             the bits the width needs),
 //!                     bitmap (value + 1 bytes, bit `offset - 1`),
 //!                     run    (first and count, less one, packed so)
-//! tf      := per block, its buckets packed at the block's width: 0 bits
-//!            when its largest bucket is 0, 1 when 1, 2 when at most 3,
-//!            else 4
+//! tf      := sparse: per block, its buckets packed at the block's width,
+//!            each block's starting on a byte;
+//!            grouped: per group in directory order, its buckets packed at
+//!            the group's width, in a row (no padding between groups);
+//!            a width is 0 bits when the largest bucket is 0, 1 when 1,
+//!            2 when at most 3, else 4
 //! ```
 //!
 //! The impact frontier is the set of (bucket, length) pairs no other
-//! posting of the block dominates (a bucket at least as high with a length
-//! at most as long): the block's best score under any `k1` and `b` is the
-//! score of one of them, as Lucene's competitive impacts are.
+//! posting of the block (or group) dominates (a bucket at least as high
+//! with a length at most as long): its best score under any `k1` and `b`
+//! is the score of one of them, as Lucene's competitive impacts are.
+//!
+//! A grouped record's score metadata is per (term, group), as TIN keeps
+//! one footer entry per term and aligned 256-page group (its probes, rounds
+//! 2 and 7): the directory entry of a group holds its count, its
+//! container's kind and its frontier, and its buckets follow the groups
+//! before it in the TF tail; a reader reaches a group's entry by its
+//! position in the directory, decoding nothing of the groups before it.
+//! A sparse record (one Elias-Fano list over the segment) keeps the footer
+//! of blocks of `block_size` postings.
 //!
 //! A posting's index (its rank in slot order) addresses its bucket in the
 //! TF tail and its positions in the positions area.
@@ -59,6 +79,9 @@ pub const FORM_LENGTHS: u8 = 0x80;
 /// footer a reader derives (its last slot from the list, its frontier from
 /// its buckets and lengths, its TF width from its largest bucket).
 pub const FORM_COMPACT: u8 = 0x40;
+/// Set in a grouped record's form when its frontiers' lengths are rounded
+/// down to six significant bits ([`round_length`]).
+pub const FORM_ROUNDED: u8 = 0x10;
 
 /// Postings a footer-less record holds at most.
 pub const COMPACT_MAX: u32 = 8;
@@ -100,6 +123,20 @@ pub struct Options {
     /// ... in a segment of at least this many documents: a smaller one's DL
     /// sidecar is a few pages.
     pub inline_lengths_min_documents: u32,
+    /// Whether a grouped record's frontiers hold exact lengths or lengths
+    /// rounded down to six significant bits.
+    pub group_frontiers: GroupFrontiers,
+}
+
+/// [`Options::group_frontiers`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupFrontiers {
+    /// The frontier's exact lengths: at 150M rows 3% more frontier bytes
+    /// than rounded and 0.1% fewer candidates examined.
+    Exact,
+    /// Its lengths rounded down to six significant bits, as TIN stores its
+    /// per-group frontiers (the default).
+    Rounded,
 }
 
 impl Default for Options {
@@ -114,6 +151,7 @@ impl Default for Options {
             grid_min_postings: 4096,
             inline_lengths_max_df: 64,
             inline_lengths_min_documents: 1 << 16,
+            group_frontiers: GroupFrontiers::Rounded,
         }
     }
 }
@@ -135,6 +173,10 @@ pub struct Stats {
     pub forced: usize,
     /// Bytes of inline lengths ([`InlineLengths`]).
     pub lengths: usize,
+    /// Bytes of the directory's group frontiers (part of `payload`), and
+    /// how many it holds.
+    pub frontier_bytes: usize,
+    pub frontiers: usize,
 }
 
 impl Stats {
@@ -176,6 +218,151 @@ pub fn frontier(postings: impl Iterator<Item = (u8, u32)>) -> Vec<(u8, u32)> {
     }
     out.reverse();
     out
+}
+
+/// `length` rounded down to six significant bits, as a code that orders
+/// as lengths do: a length below 64 is its own code; a longer one, `m << s`
+/// with `m` its six leading bits (32 to 63) and `s` at least 1, is
+/// `64 + 32 * (s - 1) + m - 32`. A bound at the rounded length is a bound
+/// at the length (a score falls as the length grows).
+#[inline]
+pub const fn round_length(length: u32) -> u32 {
+    let bits = 32 - length.leading_zeros();
+    if bits <= 6 {
+        return length;
+    }
+    let s = bits - 6;
+    64 + 32 * (s - 1) + (length >> s) - 32
+}
+
+/// The length [`round_length`]'s `code` stands for: the longest it rounds
+/// down to, never above a length that gives the code.
+#[inline]
+pub const fn rounded_length(code: u32) -> u32 {
+    if code < 64 {
+        return code;
+    }
+    let s = (code - 64) / 32 + 1;
+    let m = 32 + (code - 64) % 32;
+    if s >= 27 { u32::MAX } else { m << s }
+}
+
+/// The impact frontier of a group's postings `(bucket, length)` as its
+/// directory entry stores it: [`frontier`] of the lengths, or of their
+/// [`round_length`] codes.
+pub fn group_frontier(
+    postings: impl Iterator<Item = (u8, u32)>,
+    mode: GroupFrontiers,
+) -> Vec<(u8, u32)> {
+    match mode {
+        GroupFrontiers::Rounded => frontier(postings.map(|(b, l)| (b, round_length(l)))),
+        GroupFrontiers::Exact => frontier(postings),
+    }
+}
+
+/// Appends a group frontier's encoding (see the module's grammar): pairs
+/// ascending in bucket and strictly in length (or code), 1 to 16 of them.
+pub fn put_group_frontier(out: &mut Vec<u8>, pairs: &[(u8, u32)]) {
+    debug_assert!((1..=16).contains(&pairs.len()));
+    let (b0, l0) = pairs[0];
+    out.push(((pairs.len() as u8 - 1) << 4) | (b0 & 15));
+    varint::put(out, u64::from(l0));
+    for w in pairs.windows(2) {
+        let ((pb, pl), (b, l)) = (w[0], w[1]);
+        debug_assert!(b > pb && l > pl);
+        varint::put(out, (u64::from(l - pl - 1) << 4) | u64::from(b - pb - 1));
+    }
+}
+
+/// Checks and steps over a group frontier at `at`; its largest bucket (the
+/// last pair's).
+#[inline]
+fn skip_group_frontier(bytes: &[u8], at: &mut usize) -> Result<u8> {
+    let head = *bytes.get(*at).ok_or(Error::Truncated)?;
+    *at += 1;
+    let mut bucket = u32::from(head & 15);
+    let mut length = varint::get(bytes, at)?;
+    for _ in 0..head >> 4 {
+        let d = varint::get(bytes, at)?;
+        bucket += 1 + (d & 15) as u32;
+        length += 1 + (d >> 4);
+    }
+    if bucket > 15 || length > u64::from(u32::MAX) {
+        return Err(Error::Corrupt("group frontier"));
+    }
+    Ok(bucket as u8)
+}
+
+/// A group's impact frontier, from its directory entry: (bucket, shortest
+/// length) pairs ascending in both, every posting of the group dominated
+/// by one (a bucket at least as high, a length at most as long). A length
+/// rounded when stored is the rounded one, at most the true one.
+#[derive(Clone, Debug)]
+pub struct GroupFrontier<'b> {
+    bytes: &'b [u8],
+    at: usize,
+    /// Pairs left to give; the head is read with the first.
+    left: u8,
+    started: bool,
+    bucket: u8,
+    code: u32,
+    rounded: bool,
+}
+
+impl<'b> GroupFrontier<'b> {
+    /// The frontier at `at` of a directory's bytes, checked when parsed.
+    pub fn new(bytes: &'b [u8], at: usize, rounded: bool) -> Self {
+        Self {
+            bytes,
+            at,
+            left: 1,
+            started: false,
+            bucket: 0,
+            code: 0,
+            rounded,
+        }
+    }
+}
+
+impl Iterator for GroupFrontier<'_> {
+    type Item = (u8, u32);
+
+    #[inline]
+    fn next(&mut self) -> Option<(u8, u32)> {
+        if self.left == 0 {
+            return None;
+        }
+        if self.started {
+            let d = get_checked(self.bytes, &mut self.at);
+            self.bucket += 1 + (d & 15) as u8;
+            self.code += 1 + (d >> 4) as u32;
+        } else {
+            let head = self.bytes[self.at];
+            self.at += 1;
+            self.started = true;
+            self.left = (head >> 4) + 1;
+            self.bucket = head & 15;
+            self.code = get_checked(self.bytes, &mut self.at) as u32;
+        }
+        self.left -= 1;
+        let length = if self.rounded {
+            rounded_length(self.code)
+        } else {
+            self.code
+        };
+        Some((self.bucket, length))
+    }
+}
+
+/// A varint of a directory checked when it was parsed.
+#[inline]
+fn get_checked(bytes: &[u8], at: &mut usize) -> u64 {
+    let b = bytes[*at];
+    if b < 0x80 {
+        *at += 1;
+        return u64::from(b);
+    }
+    varint::get(bytes, at).expect("a frontier checked when parsed")
 }
 
 /// A group container an input segment holds that a merge may copy: its
@@ -240,47 +427,65 @@ pub fn encode_reusing<'r>(
         return stats;
     }
     let block = options.block_size as usize;
-    // Footer.
-    let mut footer = Vec::new();
-    let mut tf = BitWriter::new();
-    let mut tf_bytes = Vec::new();
-    let mut previous = 0u32;
-    for (b, chunk) in slots.chunks(block).enumerate() {
-        let from = b * block;
-        let last = *chunk.last().expect("a nonempty chunk");
-        varint::put(&mut footer, u64::from(last - previous));
-        previous = last;
-        let range = from..from + chunk.len();
-        let front = frontier(
-            buckets[range.clone()]
-                .iter()
-                .copied()
-                .zip(lengths[range.clone()].iter().copied()),
-        );
-        footer.push(front.len() as u8);
-        for (bucket, length) in &front {
-            footer.push(*bucket);
-            varint::put(&mut footer, u64::from(*length));
-        }
-        let max = front.last().expect("a nonempty frontier").0;
-        let width = tf_width(max, options.adaptive_tf);
-        for bucket in &buckets[range] {
-            tf.put(u32::from(*bucket), width);
-        }
-        // Each block's buckets start on a byte.
-        tf_bytes.extend_from_slice(&std::mem::take(&mut tf).finish());
-        stats.blocks += 1;
-    }
     // Payload: the smaller of one list over the grid and per-group
-    // containers.
+    // containers (with their directory's frontiers and their TF tail).
     let mut sparse = Vec::new();
     if options.sparse {
         ef::encode(slots, geometry.slots, &mut sparse);
     }
     let mut grouped_stats = Stats::default();
-    let grouped = encode_groups(geometry, slots, options, reuse, &mut grouped_stats);
-    // A term with a group dense enough to be a grid stays grouped.
-    let use_sparse = options.sparse && grouped_stats.forced == 0 && sparse.len() <= grouped.len();
+    let mut grouped_tf = Vec::new();
+    let grouped = encode_groups(
+        geometry,
+        slots,
+        buckets,
+        lengths,
+        options,
+        reuse,
+        &mut grouped_stats,
+        &mut grouped_tf,
+    );
+    // A sparse record's footer and TF tail, per block.
+    let mut footer = Vec::new();
+    let mut tf_bytes = Vec::new();
+    let mut blocks = 0usize;
+    if options.sparse && grouped_stats.forced == 0 {
+        let mut tf = BitWriter::new();
+        let mut previous = 0u32;
+        for (b, chunk) in slots.chunks(block).enumerate() {
+            let from = b * block;
+            let last = *chunk.last().expect("a nonempty chunk");
+            varint::put(&mut footer, u64::from(last - previous));
+            previous = last;
+            let range = from..from + chunk.len();
+            let front = frontier(
+                buckets[range.clone()]
+                    .iter()
+                    .copied()
+                    .zip(lengths[range.clone()].iter().copied()),
+            );
+            footer.push(front.len() as u8);
+            for (bucket, length) in &front {
+                footer.push(*bucket);
+                varint::put(&mut footer, u64::from(*length));
+            }
+            let max = front.last().expect("a nonempty frontier").0;
+            let width = tf_width(max, options.adaptive_tf);
+            for bucket in &buckets[range] {
+                tf.put(u32::from(*bucket), width);
+            }
+            // Each block's buckets start on a byte.
+            tf_bytes.extend_from_slice(&std::mem::take(&mut tf).finish());
+            blocks += 1;
+        }
+    }
+    // A term with a group dense enough to be a grid stays grouped. The
+    // directory's frontiers and the footer do not count: they buy the
+    // walks their bounds, and leaving them out keeps each term's form
+    // what it was without them.
+    let use_sparse = options.sparse
+        && grouped_stats.forced == 0
+        && sparse.len() <= grouped.len() - grouped_stats.frontier_bytes;
     let payload = if use_sparse { &sparse } else { &grouped };
     let mut inline_bytes = Vec::new();
     if inline {
@@ -290,15 +495,18 @@ pub fn encode_reusing<'r>(
         && inline
         && slots.len() as u64 <= u64::from(COMPACT_MAX)
         && slots.len() <= block;
-    out.push(
-        if use_sparse {
-            FORM_SPARSE
-        } else {
-            FORM_GROUPED
-        } | if inline { FORM_LENGTHS } else { 0 }
-            | if compact { FORM_COMPACT } else { 0 },
-    );
-    if compact {
+    out.push(if use_sparse {
+        FORM_SPARSE | if inline { FORM_LENGTHS } else { 0 } | if compact { FORM_COMPACT } else { 0 }
+    } else {
+        FORM_GROUPED
+            | if inline { FORM_LENGTHS } else { 0 }
+            | if options.group_frontiers == GroupFrontiers::Rounded {
+                FORM_ROUNDED
+            } else {
+                0
+            }
+    });
+    if !use_sparse || compact {
         footer.clear();
     } else {
         varint::put(out, footer.len() as u64);
@@ -312,15 +520,20 @@ pub fn encode_reusing<'r>(
     out.extend_from_slice(payload);
     out.extend_from_slice(&inline_bytes);
     stats.lengths = inline_bytes.len();
-    out.extend_from_slice(&tf_bytes);
+    let tf_bytes = if use_sparse { &tf_bytes } else { &grouped_tf };
+    out.extend_from_slice(tf_bytes);
     stats.footer = footer.len();
     stats.payload = payload.len();
     stats.tf = tf_bytes.len();
     stats.sparse = use_sparse;
-    if !use_sparse {
+    if use_sparse {
+        stats.blocks = blocks;
+    } else {
         stats.kinds = grouped_stats.kinds;
         stats.kind_bytes = grouped_stats.kind_bytes;
         stats.forced = grouped_stats.forced;
+        stats.frontier_bytes = grouped_stats.frontier_bytes;
+        stats.frontiers = grouped_stats.frontiers;
     }
     stats
 }
@@ -381,12 +594,19 @@ fn encode_paged(locals: &[u32], width: u32, out: &mut Vec<u8>) {
     }
 }
 
+/// A grouped payload (its directory with each group's frontier, then its
+/// containers), and in `tf` the record's TF tail: each group's buckets at
+/// the group's width, in a row.
+#[expect(clippy::too_many_arguments, reason = "the postings and the outputs")]
 fn encode_groups<'r>(
     geometry: &Geometry,
     slots: &[u32],
+    buckets: &[u8],
+    lengths: &[u32],
     options: &Options,
     reuse: &mut dyn FnMut(usize) -> Option<Reused<'r>>,
     stats: &mut Stats,
+    tf: &mut Vec<u8>,
 ) -> Vec<u8> {
     let mut directory = Vec::new();
     let mut bodies = Vec::new();
@@ -396,12 +616,14 @@ fn encode_groups<'r>(
     let mut index = geometry.group_of_slot(slots[0]);
     let mut locals = Vec::new();
     let mut candidate = Vec::new();
+    let mut tf_bits = BitWriter::new();
     while at < slots.len() {
         while geometry.groups[index].slot_base + geometry.groups[index].slots() <= slots[at] {
             index += 1;
         }
         let group = geometry.groups[index];
         locals.clear();
+        let from = at;
         while at < slots.len() && slots[at] < group.slot_base + group.slots() {
             locals.push(slots[at] - group.slot_base);
             at += 1;
@@ -471,10 +693,30 @@ fn encode_groups<'r>(
             }
         }
         debug_assert_eq!(bodies.len() - before, best);
+        // The group's frontier, from its postings (a copied container's
+        // included: a merge's is the least length per bucket over the
+        // inputs' live postings there), and its buckets at its width.
+        let pairs = group_frontier(
+            buckets[from..at]
+                .iter()
+                .copied()
+                .zip(lengths[from..at].iter().copied()),
+            options.group_frontiers,
+        );
+        let before = directory.len();
+        put_group_frontier(&mut directory, &pairs);
+        stats.frontier_bytes += directory.len() - before;
+        stats.frontiers += 1;
+        // A group's buckets are always packed at the group's own width.
+        let width = tf_width(pairs.last().expect("a pair").0, true);
+        for bucket in &buckets[from..at] {
+            tf_bits.put(u32::from(*bucket), width);
+        }
         stats.kinds[kind as usize] += 1;
         stats.kind_bytes[kind as usize] += best;
         groups += 1;
     }
+    *tf = tf_bits.finish();
     let mut out = Vec::with_capacity(directory.len() + bodies.len() + 4);
     varint::put(&mut out, groups as u64);
     out.extend_from_slice(&directory);
@@ -494,6 +736,23 @@ pub struct GroupEntry {
     pub len: u32,
     /// Postings in earlier groups.
     pub first: u32,
+    /// Where the group's frontier lies in the directory's bytes
+    /// ([`Postings::directory`]).
+    pub frontier: u32,
+    /// Where the group's buckets start in the TF tail, in bits, and their
+    /// width; the frontier's largest bucket.
+    pub tf_bit: u32,
+    pub width: u8,
+    pub max_bucket: u8,
+}
+
+impl GroupEntry {
+    /// Where posting `index` of the group (its `first` or later) has its
+    /// bucket in the TF tail, in bits.
+    #[inline]
+    pub fn bucket_bit(&self, index: u32) -> usize {
+        self.tf_bit as usize + (index - self.first) as usize * usize::from(self.width)
+    }
 }
 
 /// A term's membership.
@@ -529,6 +788,11 @@ pub struct Postings<'a> {
     pub lengths: Option<InlineLengths<'a>>,
     /// Whether the record has no footer ([`FORM_COMPACT`]).
     pub compact: bool,
+    /// A grouped record's directory bytes (its entries carry their groups'
+    /// frontiers), copied once when parsed so the parsed record borrows
+    /// nothing; whether their lengths are rounded ([`FORM_ROUNDED`]).
+    pub directory: std::rc::Rc<[u8]>,
+    pub rounded: bool,
 }
 
 /// A rare term's documents' lengths, in posting order: a base, a width
@@ -655,16 +919,25 @@ impl<'a> Postings<'a> {
                 containers_at: 0,
                 tf: Bytes::default(),
                 tf_at: at,
+                directory: std::rc::Rc::from([]),
+                rounded: false,
             });
         }
         // The form and three varints.
         let record = bytes.window(0, 1 + 3 * 10)?;
         let form = *record.first().ok_or(Error::Truncated)?;
         let mut at = 1;
+        let grouped = form & 3 == FORM_GROUPED;
+        let rounded = form & FORM_ROUNDED != 0;
+        if rounded && !grouped {
+            return Err(Error::Corrupt("postings form"));
+        }
         let footer_len = if form & FORM_COMPACT != 0 {
             if form & FORM_LENGTHS == 0 || form & 3 != FORM_SPARSE || df > COMPACT_MAX {
                 return Err(Error::Corrupt("compact postings"));
             }
+            0
+        } else if grouped {
             0
         } else {
             varint::get_u32(record, &mut at)? as usize
@@ -676,7 +949,7 @@ impl<'a> Postings<'a> {
             0
         };
         let compact = form & FORM_COMPACT != 0;
-        let form = form & !(FORM_LENGTHS | FORM_COMPACT);
+        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED);
         let footer_at = at;
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
@@ -696,6 +969,8 @@ impl<'a> Postings<'a> {
             None
         };
         let mut containers_at = 0;
+        let mut directory: std::rc::Rc<[u8]> = std::rc::Rc::from([]);
+        let tf_len = bytes.len() - tf_at;
         let form = match form {
             FORM_SPARSE => {
                 if payload.len() != ef::encoded_len(df as usize, geometry.slots) {
@@ -713,20 +988,24 @@ impl<'a> Postings<'a> {
                 // group count says it must be, longer until it holds it.
                 let mut want = DIRECTORY_PREFIX.min(payload.len());
                 let (entries, at) = loop {
-                    let directory = payload.window(0, want)?;
+                    let bytes = payload.window(0, want)?;
                     let mut at = 0;
-                    let groups = (varint::get(directory, &mut at).unwrap_or(0) as usize)
+                    let groups = (varint::get(bytes, &mut at).unwrap_or(0) as usize)
                         .min(geometry.groups.len());
                     let least = at.saturating_add(groups.saturating_mul(DIRECTORY_ENTRY_TYPICAL));
                     if least > want && want < payload.len() {
                         want = least.min(payload.len());
                         continue;
                     }
-                    match parse_groups(directory, payload.len(), df, geometry) {
+                    match parse_groups(bytes, payload.len(), df, tf_len, geometry) {
                         Err(Error::Truncated) if want < payload.len() => {
                             want = want.saturating_mul(2).min(payload.len());
                         }
-                        parsed => break parsed?,
+                        Ok((entries, at)) => {
+                            directory = std::rc::Rc::from(&bytes[..at]);
+                            break (entries, at);
+                        }
+                        Err(error) => return Err(error),
                     }
                 };
                 containers_at = at;
@@ -746,7 +1025,52 @@ impl<'a> Postings<'a> {
             tf_at,
             lengths,
             compact,
+            directory,
+            rounded,
         })
+    }
+
+    /// The impact frontier a grouped record's directory holds for a group.
+    #[inline]
+    pub fn group_frontier(&self, entry: &GroupEntry) -> GroupFrontier<'_> {
+        GroupFrontier::new(&self.directory, entry.frontier as usize, self.rounded)
+    }
+
+    /// The bucket of posting `index` of a grouped record (its group's
+    /// entry found by the index), a single posting's (`max_bucket`, the
+    /// dictionary's), or a sparse record's through its footer, decoded
+    /// whole: for a reader of one posting, not a walk.
+    pub fn bucket_at(
+        &self,
+        index: u32,
+        block_size: u32,
+        max_bucket: u8,
+        adaptive_tf: bool,
+    ) -> Result<u8> {
+        match &self.form {
+            Form::Single(_) => Ok(max_bucket),
+            Form::Grouped(entries) => {
+                let b = entries.partition_point(|e| e.first <= index);
+                if b == 0 {
+                    return Err(Error::Corrupt("posting index"));
+                }
+                self.bucket_in(&entries[b - 1], index)
+            }
+            Form::Sparse(_) => {
+                Footer::parse(self, block_size, max_bucket, adaptive_tf)?.bucket(self.tf, index)
+            }
+        }
+    }
+
+    /// The bucket of posting `index` of a grouped record's group `entry`.
+    #[inline]
+    pub fn bucket_in(&self, entry: &GroupEntry, index: u32) -> Result<u8> {
+        if entry.width == 0 {
+            return Ok(0);
+        }
+        let bit = entry.bucket_bit(index);
+        let bytes = self.tf.window(bit / 8, 8)?;
+        Ok(bits::get_at(bytes, bit % 8, u32::from(entry.width))? as u8)
     }
 
     /// The container of a grouped record's entry, not read yet (see
@@ -809,18 +1133,20 @@ impl<'a> Postings<'a> {
 const DIRECTORY_PREFIX: usize = 4096;
 
 /// Bytes a directory entry takes as a rule (a one-byte gap, a count and
-/// kind of one or two bytes, a paged container's length): a directory of
-/// more groups than a prefix holds is read in one window this long per
-/// group, rather than parsed from the start again in windows four times
-/// longer each.
-const DIRECTORY_ENTRY_TYPICAL: usize = 3;
+/// kind of one or two bytes, a paged container's length, a frontier of a
+/// head, a length and a later pair): a directory of more groups than a
+/// prefix holds is read in one window this long per group, rather than
+/// parsed from the start again in windows four times longer each.
+const DIRECTORY_ENTRY_TYPICAL: usize = 6;
 
 /// A grouped payload's directory, from a prefix of the payload holding it
-/// (`Truncated` when it does not), `payload_len` the whole payload's length.
+/// (`Truncated` when it does not), `payload_len` the whole payload's length
+/// and `tf_len` the TF tail's.
 fn parse_groups(
     payload: &[u8],
     payload_len: usize,
     df: u32,
+    tf_len: usize,
     geometry: &Geometry,
 ) -> Result<(std::rc::Rc<[GroupEntry]>, usize)> {
     let mut at = 0;
@@ -835,6 +1161,7 @@ fn parse_groups(
     let mut index: Option<u64> = None;
     let mut body = 0u64;
     let mut first = 0u64;
+    let mut tf_bit = 0u64;
     for slot in slots.iter_mut() {
         let gap = varint::get(payload, &mut at)?;
         let next = match index {
@@ -858,6 +1185,12 @@ fn parse_groups(
             KIND_PAGED => varint::get(payload, &mut at)?,
             _ => return Err(Error::Corrupt("postings group kind")),
         };
+        let frontier = at as u32;
+        let max_bucket = skip_group_frontier(payload, &mut at)?;
+        let width = tf_width(max_bucket, true);
+        if tf_bit > u64::from(u32::MAX) {
+            return Err(Error::Corrupt("postings TF tail length"));
+        }
         slot.write(GroupEntry {
             index: next as u32,
             count: count as u32,
@@ -865,12 +1198,20 @@ fn parse_groups(
             at: body as u32,
             len: len as u32,
             first: first as u32,
+            frontier,
+            tf_bit: tf_bit as u32,
+            width: width as u8,
+            max_bucket,
         });
         body += len;
         first += count;
+        tf_bit += count * u64::from(width);
     }
     if first != u64::from(df) || at as u64 + body != payload_len as u64 {
         return Err(Error::Corrupt("postings payload length"));
+    }
+    if tf_bit.div_ceil(8) != tf_len as u64 {
+        return Err(Error::Corrupt("postings TF tail length"));
     }
     super::segment::count_memo(|c| {
         c.directories += 1;
@@ -1009,8 +1350,10 @@ fn paged_for_each(bytes: &[u8], width: u32, mut visit: impl FnMut(u32)) -> Resul
     Ok(())
 }
 
-/// A record's footer decoded: per block, its last slot, its frontier and
-/// where its buckets start in the TF tail.
+/// A record's score metadata decoded whole: per block (a sparse record's
+/// footer blocks; a grouped record's groups, one block per directory
+/// entry), its last slot, its frontier and where its buckets start in the
+/// TF tail.
 #[derive(Clone, Debug, Default)]
 pub struct Footer {
     pub block_size: u32,
@@ -1018,13 +1361,16 @@ pub struct Footer {
     /// Block `b`'s frontier is `frontier[starts[b]..starts[b + 1]]`.
     pub starts: Vec<u32>,
     pub frontier: Vec<(u8, u32)>,
-    /// Block `b`'s buckets start at byte `tf_at[b]` of the TF tail, packed
+    /// Block `b`'s buckets start at bit `tf_at[b]` of the TF tail, packed
     /// at `widths[b]` bits.
     pub tf_at: Vec<u32>,
     pub widths: Vec<u8>,
-    /// Where each block's footer entry starts within the footer, for page
-    /// accounting.
+    /// Where each block's footer entry starts within the footer (a sparse
+    /// record), for page accounting.
     pub entry_at: Vec<u32>,
+    /// A grouped record's blocks' first posting indexes (empty for blocks
+    /// of `block_size` postings).
+    pub firsts: Vec<u32>,
     /// A single posting's bucket, which the dictionary keeps.
     pub single: Option<u8>,
 }
@@ -1037,6 +1383,44 @@ impl Footer {
         adaptive: bool,
     ) -> Result<Self> {
         let df = postings.df;
+        if let Form::Grouped(entries) = &postings.form {
+            // Each group's entry, decoded whole. `last` holds each block's
+            // group index (the geometry turns it into the group's last
+            // slot): the walks bound grouped records from their directory
+            // entries, not through this.
+            let mut footer = Self {
+                block_size,
+                last: Vec::with_capacity(entries.len()),
+                starts: Vec::with_capacity(entries.len() + 1),
+                frontier: Vec::with_capacity(entries.len() * 2),
+                tf_at: Vec::with_capacity(entries.len()),
+                widths: Vec::with_capacity(entries.len()),
+                entry_at: Vec::new(),
+                firsts: Vec::with_capacity(entries.len()),
+                single: None,
+            };
+            let mut largest = 0u8;
+            for e in entries.iter() {
+                footer.starts.push(footer.frontier.len() as u32);
+                footer.frontier.extend(postings.group_frontier(e));
+                footer.tf_at.push(e.tf_bit);
+                footer.widths.push(e.width);
+                footer.firsts.push(e.first);
+                // The group's index: a reader with the geometry turns it
+                // into the group's last slot ([`Self::group_ends`]).
+                footer.last.push(e.index);
+                largest = largest.max(e.max_bucket);
+            }
+            footer.starts.push(footer.frontier.len() as u32);
+            if largest != max_bucket {
+                return Err(Error::Corrupt("postings largest bucket"));
+            }
+            super::segment::count_memo(|c| {
+                c.footer_blocks += entries.len() as u64;
+                c.footer_bytes += postings.directory.len() as u64;
+            });
+            return Ok(footer);
+        }
         if postings.compact
             && let (Form::Sparse(list), Some(lengths)) = (&postings.form, &postings.lengths)
         {
@@ -1066,6 +1450,7 @@ impl Footer {
                 tf_at: vec![0],
                 widths: vec![width as u8],
                 entry_at: vec![0],
+                firsts: Vec::new(),
                 single: None,
             });
         }
@@ -1078,6 +1463,7 @@ impl Footer {
                 tf_at: vec![0],
                 widths: vec![0],
                 entry_at: vec![0],
+                firsts: Vec::new(),
                 single: Some(max_bucket),
             });
         }
@@ -1096,6 +1482,7 @@ impl Footer {
             tf_at: Vec::with_capacity(blocks),
             widths: Vec::with_capacity(blocks),
             entry_at: Vec::with_capacity(blocks),
+            firsts: Vec::new(),
             single: None,
         };
         let mut at = 0usize;
@@ -1130,7 +1517,7 @@ impl Footer {
             } else {
                 block_size
             };
-            footer.tf_at.push(tf as u32);
+            footer.tf_at.push((tf * 8) as u32);
             footer.widths.push(width as u8);
             tf += bits::packed_len(n as usize, width) as u64;
         }
@@ -1153,14 +1540,29 @@ impl Footer {
         &self.frontier[self.starts[block] as usize..self.starts[block + 1] as usize]
     }
 
+    /// The block holding posting `index`, and the posting's place in it.
+    #[inline]
+    fn block_of(&self, index: u32) -> Result<(usize, usize)> {
+        if self.firsts.is_empty() {
+            return Ok((
+                (index / self.block_size) as usize,
+                (index % self.block_size) as usize,
+            ));
+        }
+        let b = self.firsts.partition_point(|f| *f <= index);
+        if b == 0 {
+            return Err(Error::Corrupt("posting index"));
+        }
+        Ok((b - 1, (index - self.firsts[b - 1]) as usize))
+    }
+
     /// The bucket of posting `index`, from its record's TF tail.
     #[inline]
     pub fn bucket(&self, tf: Bytes<'_>, index: u32) -> Result<u8> {
         if let Some(bucket) = self.single {
             return Ok(bucket);
         }
-        let block = (index / self.block_size) as usize;
-        let within = (index % self.block_size) as usize;
+        let (block, within) = self.block_of(index)?;
         let width = u32::from(
             *self
                 .widths
@@ -1170,8 +1572,8 @@ impl Footer {
         if width == 0 {
             return Ok(0);
         }
-        let bit = within * width as usize;
-        let bytes = tf.window(self.tf_at[block] as usize + bit / 8, 8)?;
+        let bit = self.tf_at[block] as usize + within * width as usize;
+        let bytes = tf.window(bit / 8, 8)?;
         Ok(bits::get_at(bytes, bit % 8, width)? as u8)
     }
 }
@@ -1501,6 +1903,11 @@ impl<'a> LazyFooter<'a> {
         max_bucket: u8,
         adaptive: bool,
     ) -> Result<Self> {
+        if matches!(postings.form, Form::Grouped(_)) {
+            // A grouped record's metadata is per group in its directory
+            // (see the module's grammar): nothing to decode lazily.
+            return Err(Error::Corrupt("a lazy footer of a grouped record"));
+        }
         let df = postings.df;
         let blocks = df.div_ceil(block_size.max(1)) as usize;
         let mut footer = Self {
@@ -2245,6 +2652,19 @@ mod tests {
                 *bucket,
                 "posting {i}"
             );
+            assert_eq!(
+                parsed
+                    .bucket_at(i as u32, options.block_size, max, options.adaptive_tf)
+                    .unwrap(),
+                *bucket,
+                "posting {i}"
+            );
+        }
+        if let Form::Grouped(entries) = &parsed.form {
+            check_group_frontiers(&parsed, entries, geometry, slots, buckets, lengths, options);
+            assert_eq!(footer.blocks(), entries.len());
+            assert!(stats.footer == 0 && stats.blocks == 0);
+            return stats;
         }
         check_lazy(&parsed, &footer, options, max);
         // Every posting is covered by its block's frontier, and the last
@@ -2272,6 +2692,129 @@ mod tests {
         stats
     }
 
+    /// A grouped record's directory holds, per group, the frontier of the
+    /// group's postings (of their rounded lengths when rounded): every
+    /// posting is dominated by one of its pairs, every pair is a posting's,
+    /// and the group's buckets lie at its entry's TF bits.
+    fn check_group_frontiers(
+        parsed: &Postings<'_>,
+        entries: &[GroupEntry],
+        geometry: &Geometry,
+        slots: &[u32],
+        buckets: &[u8],
+        lengths: &[u32],
+        options: &Options,
+    ) {
+        let rounded = options.group_frontiers == GroupFrontiers::Rounded;
+        assert_eq!(parsed.rounded, rounded);
+        for entry in entries {
+            let front: Vec<(u8, u32)> = parsed.group_frontier(entry).collect();
+            let group = geometry.groups[entry.index as usize];
+            let members: Vec<usize> = (0..slots.len())
+                .filter(|i| {
+                    slots[*i] >= group.slot_base && slots[*i] < group.slot_base + group.slots()
+                })
+                .collect();
+            assert_eq!(members.len(), entry.count as usize);
+            assert_eq!(members[0], entry.first as usize);
+            let stored = |l: u32| {
+                if rounded {
+                    rounded_length(round_length(l))
+                } else {
+                    l
+                }
+            };
+            let expected: Vec<(u8, u32)> = group_frontier(
+                members.iter().map(|i| (buckets[*i], lengths[*i])),
+                options.group_frontiers,
+            )
+            .into_iter()
+            .map(|(b, v)| (b, if rounded { rounded_length(v) } else { v }))
+            .collect();
+            assert_eq!(front, expected, "group {}", entry.index);
+            assert_eq!(entry.max_bucket, front.last().unwrap().0);
+            assert_eq!(u32::from(entry.width), tf_width(entry.max_bucket, true));
+            for i in &members {
+                assert!(
+                    front
+                        .iter()
+                        .any(|(fb, fl)| *fb >= buckets[*i] && *fl <= lengths[*i]),
+                    "posting {i} uncovered by {front:?}"
+                );
+                assert_eq!(parsed.bucket_in(entry, *i as u32).unwrap(), buckets[*i]);
+            }
+            for (fb, fl) in &front {
+                assert!(
+                    members
+                        .iter()
+                        .any(|i| buckets[*i] == *fb && stored(lengths[*i]) == *fl)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_lengths_keep_six_significant_bits() {
+        let mut previous = 0;
+        for length in (1..100_000u32).chain([u32::MAX - 1, u32::MAX]) {
+            let code = round_length(length);
+            assert!(code >= previous, "codes order as lengths do");
+            previous = code;
+            let back = rounded_length(code);
+            assert!(back <= length, "{length} rounds up to {back}");
+            let bits = 32 - length.leading_zeros();
+            assert!(u64::from(length - back) < 1u64 << bits.saturating_sub(6));
+            assert_eq!(round_length(back), code);
+        }
+        assert_eq!(rounded_length(round_length(65)), 64);
+        assert_eq!(rounded_length(round_length(300)), 296);
+        for exact in [1u32, 63, 64, 128, 256, 4032] {
+            assert_eq!(rounded_length(round_length(exact)), exact);
+        }
+    }
+
+    #[test]
+    fn group_frontiers_round_trip() {
+        // Pairs of every shape through the codec: deltas of one and of
+        // several bytes, all sixteen buckets.
+        let cases: Vec<Vec<(u8, u32)>> = vec![
+            vec![(0, 1)],
+            vec![(15, u32::MAX)],
+            vec![(0, 1), (1, 2), (2, 3)],
+            vec![(3, 100), (9, 100_000), (15, 4_000_000_000)],
+            (0..16).map(|b| (b, u32::from(b) * 1000 + 7)).collect(),
+        ];
+        for pairs in cases {
+            for rounded in [false, true] {
+                let mut bytes = vec![0xaa];
+                put_group_frontier(&mut bytes, &pairs);
+                let mut at = 1;
+                assert_eq!(
+                    skip_group_frontier(&bytes, &mut at).unwrap(),
+                    pairs.last().unwrap().0
+                );
+                assert_eq!(at, bytes.len());
+                let back: Vec<(u8, u32)> = GroupFrontier::new(&bytes, 1, rounded).collect();
+                let want: Vec<(u8, u32)> = pairs
+                    .iter()
+                    .map(|(b, v)| (*b, if rounded { rounded_length(*v) } else { *v }))
+                    .collect();
+                assert_eq!(back, want);
+                // Truncated anywhere, it fails to parse.
+                for cut in 1..bytes.len() {
+                    let mut at = 1;
+                    assert!(skip_group_frontier(&bytes[..cut], &mut at).is_err());
+                }
+            }
+        }
+        // A bucket past 15 is refused.
+        let mut bytes = vec![(1 << 4) | 15];
+        varint::put(&mut bytes, 5);
+        varint::put(&mut bytes, 0);
+        let mut at = 0;
+        assert!(skip_group_frontier(&bytes, &mut at).is_err());
+    }
+
     /// The footer decoded a block at a time agrees with the whole one:
     /// sought block by block, asked for a bucket first, and sought past
     /// its end.
@@ -2294,7 +2837,7 @@ mod tests {
             let front = l.frontier(b).to_vec();
             assert_eq!(front, footer.frontier_of(b), "frontier of {b}");
             assert_eq!(l.max_bucket(b), footer.frontier_of(b).last().unwrap().0);
-            assert_eq!(l.tf_at(b), footer.tf_at[b]);
+            assert_eq!(l.tf_at(b) * 8, footer.tf_at[b]);
             assert_eq!(l.width(b), u32::from(footer.widths[b]));
             // A block is decoded only once the walk reaches it.
             assert_eq!(l.decoded(), start.max(b + 1));
@@ -2359,7 +2902,7 @@ mod tests {
             assert_eq!(l.seek(b, footer.last[b]).unwrap(), b, "block {b}");
             let front = footer.frontier_of(b);
             assert_eq!(l.last(b), footer.last[b]);
-            assert_eq!(l.tf_at(b), footer.tf_at[b]);
+            assert_eq!(l.tf_at(b) * 8, footer.tf_at[b]);
             assert_eq!(l.width(b), u32::from(footer.widths[b]));
             assert_eq!(l.max_bucket(b), front.last().unwrap().0);
             for bucket in 0..16u8 {
@@ -2453,7 +2996,7 @@ mod tests {
             let front = footer.frontier_of(b);
             assert_eq!(*bound, test_bound(front), "bound of {b}");
             assert_eq!(l.last(b), footer.last[b]);
-            assert_eq!(l.tf_at(b), footer.tf_at[b]);
+            assert_eq!(l.tf_at(b) * 8, footer.tf_at[b]);
             assert_eq!(l.width(b), u32::from(footer.widths[b]));
             assert_eq!(l.max_bucket(b), front.last().unwrap().0);
             for bucket in 0..16u8 {
@@ -2498,6 +3041,11 @@ mod tests {
                             grid_min_postings: 0,
                             inline_lengths_max_df: if adaptive_tf { 8 } else { 0 },
                             inline_lengths_min_documents: 0,
+                            group_frontiers: if (block_size + grid_density) % 2 == 0 {
+                                GroupFrontiers::Rounded
+                            } else {
+                                GroupFrontiers::Exact
+                            },
                         });
                     }
                 }
@@ -2610,8 +3158,10 @@ mod tests {
         let stats = round_trip(&geometry, &slots, &buckets, &lengths, &grids);
         assert!(!stats.sparse);
         assert_eq!(stats.kinds, [2, 0, 0]);
-        // A bit per slot, a bit per bucket.
-        assert_eq!(stats.payload, 2 * 32 * 40 + 1 + 2 * (1 + 3));
+        // A bit per slot, a bit per bucket; per group a directory entry and
+        // a frontier of one pair, (1, 50), of two bytes.
+        assert_eq!(stats.payload, 2 * 32 * 40 + 1 + 2 * (1 + 3) + 2 * 2);
+        assert_eq!((stats.frontiers, stats.frontier_bytes), (2, 4));
         assert_eq!(stats.tf, tids.len() / 8);
         // Whole pages are runs, smaller still, when size alone decides; the
         // default keeps groups this dense as grids.
@@ -2744,12 +3294,14 @@ mod lazy_footer_tests {
             .collect();
         let geometry = Geometry::of(&tids).unwrap();
         let members: Vec<u32> = (0..4000)
-            .step_by(2)
+            .step_by(5)
             .map(|i| geometry.slot_of(tids[i]).unwrap())
             .collect();
         let n = members.len();
         let buckets: Vec<u8> = (0..n).map(|i| (i * 7 % 16) as u8).collect();
         let lengths: Vec<u32> = (0..n).map(|i| (i as u32 * 7919) % 5000 + 1).collect();
+        // A sparse record (one list, footer blocks): the members are few
+        // enough for one list to beat group containers.
         let options = Options {
             block_size: 4,
             grid_min_postings: u32::MAX,
@@ -2758,10 +3310,9 @@ mod lazy_footer_tests {
         };
         let mut out = Vec::new();
         encode(&geometry, &members, &buckets, &lengths, &options, &mut out);
-        let whole = Postings::parse(&out, n as u32, &geometry)
-            .unwrap()
-            .footer(4, 15, true)
-            .unwrap();
+        let parsed = Postings::parse(&out, n as u32, &geometry).unwrap();
+        assert!(matches!(parsed.form, Form::Sparse(_)), "a sparse record");
+        let whole = parsed.footer(4, 15, true).unwrap();
         let footer_len = {
             let p = Postings::parse(&out, n as u32, &geometry).unwrap();
             p.footer.len()
@@ -2789,7 +3340,7 @@ mod lazy_footer_tests {
         for b in 0..whole.blocks() {
             assert_eq!(lazy.seek(b, whole.last[b]).unwrap(), b);
             assert_eq!(lazy.frontier(b), whole.frontier_of(b));
-            assert_eq!(lazy.tf_at(b), whole.tf_at[b]);
+            assert_eq!(lazy.tf_at(b) * 8, whole.tf_at[b]);
         }
         for i in 0..n as u32 {
             assert_eq!(lazy.bucket(parsed.tf, i).unwrap(), buckets[i as usize]);
@@ -2818,12 +3369,14 @@ mod lazy_footer_tests {
             .collect();
         let geometry = Geometry::of(&tids).unwrap();
         let members: Vec<u32> = (0..4000)
-            .step_by(3)
+            .step_by(5)
             .map(|i| geometry.slot_of(tids[i]).unwrap())
             .collect();
         let n = members.len();
         let buckets: Vec<u8> = (0..n).map(|i| (i * 5 % 16) as u8).collect();
         let lengths: Vec<u32> = (0..n).map(|i| (i as u32 * 7919) % 5000 + 1).collect();
+        // A sparse record (one list, footer blocks): the members are few
+        // enough for one list to beat group containers.
         let options = Options {
             block_size: 4,
             grid_min_postings: u32::MAX,
@@ -2832,10 +3385,9 @@ mod lazy_footer_tests {
         };
         let mut out = Vec::new();
         encode(&geometry, &members, &buckets, &lengths, &options, &mut out);
-        let whole = Postings::parse(&out, n as u32, &geometry)
-            .unwrap()
-            .footer(4, 15, true)
-            .unwrap();
+        let parsed = Postings::parse(&out, n as u32, &geometry).unwrap();
+        assert!(matches!(parsed.form, Form::Sparse(_)), "a sparse record");
+        let whole = parsed.footer(4, 15, true).unwrap();
         let source = PinningSource::new(out.clone(), 64);
         let blob = LazyBlob::new(Box::new(source.clone()));
         blob.set_keep(0);
@@ -2847,7 +3399,7 @@ mod lazy_footer_tests {
         for b in 0..whole.blocks() {
             assert_eq!(lazy.seek(b, whole.last[b]).unwrap(), b);
             assert_eq!(lazy.frontier(b), whole.frontier_of(b));
-            assert_eq!(lazy.tf_at(b), whole.tf_at[b]);
+            assert_eq!(lazy.tf_at(b) * 8, whole.tf_at[b]);
             let held: Vec<(usize, usize)> = lazy.borrowed().into_iter().collect();
             if let Some((from, to)) = held.first() {
                 assert!(from < to && (to - 1) / 64 == from / 64, "one page");
@@ -2884,12 +3436,14 @@ mod lazy_footer_tests {
             .collect();
         let geometry = Geometry::of(&tids).unwrap();
         let members: Vec<u32> = (0..6000)
-            .step_by(2)
+            .step_by(7)
             .map(|i| geometry.slot_of(tids[i]).unwrap())
             .collect();
         let n = members.len();
         let buckets: Vec<u8> = (0..n).map(|i| (i * 7 % 16) as u8).collect();
         let lengths: Vec<u32> = (0..n).map(|i| (i as u32 * 7919) % 5000 + 1).collect();
+        // A sparse record (one list, footer blocks): the members are few
+        // enough for one list to beat group containers.
         let options = Options {
             block_size: 4,
             grid_min_postings: u32::MAX,
@@ -2898,10 +3452,9 @@ mod lazy_footer_tests {
         };
         let mut out = Vec::new();
         encode(&geometry, &members, &buckets, &lengths, &options, &mut out);
-        let whole = Postings::parse(&out, n as u32, &geometry)
-            .unwrap()
-            .footer(4, 15, true)
-            .unwrap();
+        let parsed = Postings::parse(&out, n as u32, &geometry).unwrap();
+        assert!(matches!(parsed.form, Form::Sparse(_)), "a sparse record");
+        let whole = parsed.footer(4, 15, true).unwrap();
         let source = PinningSource::new(out.clone(), 64);
         let blob = LazyBlob::new(Box::new(source.clone()));
         blob.open_span();

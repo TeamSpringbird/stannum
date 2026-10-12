@@ -34,11 +34,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   segmented indexes and exact counts under concurrent writes.
 - Segment format `TNS1`, in TIN's shape: a term's postings are a set of heap
   ctids over a grid of 256-page groups (Elias-Fano lists, grid bitmaps or
-  per-page containers, the smallest), with a footer of per-block impact
-  frontiers, a TF tail of bucket nibbles at each block's width, positions in
-  their own stream, a document set and a DL sidecar of exact lengths; see
-  [the TIN-shape guide](docs/architecture/tin-shape.md). Index pages are
-  layout version 6; an index written earlier must be rebuilt (`REINDEX`).
+  per-page containers, the smallest), with its score metadata per (term,
+  group) as TIN keeps it: each group's directory entry carries the group's
+  impact frontier (lengths rounded down to six significant bits) and its
+  buckets follow in a TF tail packed per group, so a ranked walk bounds a
+  group from its entry and decodes nothing of the groups before it; a rare
+  term kept as one list keeps a footer of per-block frontiers. Positions are
+  in their own stream, with a document set and a DL sidecar of exact
+  lengths; see [the TIN-shape guide](docs/architecture/tin-shape.md). Index
+  pages are layout version 8; an index written earlier must be rebuilt
+  (`REINDEX`).
   Ranked scans (every style, tiebreak keys and filtered walks included),
   bitmap and plain index scans, counts and `score()` of single rows read
   segments natively, a 256-page group at a time, with VACUUM's dead list as
