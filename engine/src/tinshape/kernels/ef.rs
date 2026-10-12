@@ -41,13 +41,46 @@ use segment::tinshape::docs::Group;
 use segment::tinshape::ef::Ef;
 use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local};
 
-kernels! {
-    /// Appends the list's values, in order.
-    fn ef_decode / ef_decode_at(ef: Ef<'_>, out: &mut Vec<u32>);
-    /// Sets bit `v` of `row` for each value `v` of the list, the words they
-    /// fall in being zero (as a cleared row's are): each such word is
-    /// written, not read. Panics if a value is past the row.
-    fn ef_into_row / ef_into_row_at(ef: Ef<'_>, row: &mut [u64]);
+/// Appends the list's values, in order.
+#[inline]
+pub fn ef_decode(ef: Ef<'_>, out: &mut Vec<u32>) {
+    if !short_decode(&ef, out) {
+        run!(level(), ef_decode(ef, out));
+    }
+}
+
+/// [`ef_decode`] at `level`; panics if the CPU lacks it.
+pub fn ef_decode_at(level: Level, ef: Ef<'_>, out: &mut Vec<u32>) {
+    assert!(
+        level.supported(),
+        "kernel level {} unsupported here",
+        level.name()
+    );
+    if !short_decode(&ef, out) {
+        run!(level, ef_decode(ef, out));
+    }
+}
+
+/// Sets bit `v` of `row` for each value `v` of the list, the words they
+/// fall in being zero (as a cleared row's are): each such word is written,
+/// not read. Panics if a value is past the row.
+#[inline]
+pub fn ef_into_row(ef: Ef<'_>, row: &mut [u64]) {
+    if !short_row(&ef, row) {
+        run!(level(), ef_into_row(ef, row));
+    }
+}
+
+/// [`ef_into_row`] at `level`; panics if the CPU lacks it.
+pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
+    assert!(
+        level.supported(),
+        "kernel level {} unsupported here",
+        level.name()
+    );
+    if !short_row(&ef, row) {
+        run!(level, ef_into_row(ef, row));
+    }
 }
 
 /// Appends a group container's members (local slots, in order), as
@@ -85,7 +118,7 @@ pub fn container_row(
     for_each_local(entry, bytes, group, |l| put.put(row, l))
 }
 
-/// Lists shorter than this take the portable body.
+/// Lists shorter than this are decoded by [`short`] at every level.
 pub const SHORT: usize = 16;
 
 /// Values the first pass may store past the last member it finds: a word's
@@ -259,17 +292,94 @@ impl RowPut {
     }
 }
 
+/// Visits the values of a list shorter than [`SHORT`] whose highs fit a
+/// word, as a valid one's do (fewer than `3n` bits); false, visiting
+/// nothing, for any other.
+///
+/// Short lists are a few bytes, so every read is one eight-byte load
+/// clamped to end at the list's end (its bytes past the end shifted out):
+/// the highs word and each low part (the highs follow the lows). A list
+/// shorter than eight bytes is read into one word first.
+#[inline(always)]
+fn short(ef: &Ef<'_>, mut visit: impl FnMut(u32)) -> bool {
+    let (n, l, highs) = (ef.len(), ef.low_width(), ef.highs());
+    if n >= SHORT || highs.len() > 8 {
+        return false;
+    }
+    let bytes = lows_padded(ef);
+    let whole = if bytes.len() < 8 {
+        let mut whole = 0u64;
+        for (k, b) in bytes.iter().enumerate() {
+            whole |= u64::from(*b) << (8 * k);
+        }
+        whole
+    } else {
+        0
+    };
+    // The eight bytes from `byte`, those past the end zero.
+    let load = |byte: usize| match bytes.len().checked_sub(8) {
+        Some(last) => {
+            let at = byte.min(last);
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
+                >> (8 * (byte - at))
+        }
+        None => whole >> (8 * byte),
+    };
+    let mut word = load(ef.lows().len());
+    let mask = if l == 0 { 0 } else { (1u64 << l) - 1 };
+    let mut bit = 0usize;
+    for i in 0..n as u32 {
+        if word == 0 {
+            break;
+        }
+        let low = (load(bit / 8) >> (bit % 8) & mask) as u32;
+        visit((word.trailing_zeros() - i) << l | low);
+        word &= word - 1;
+        bit += l as usize;
+    }
+    true
+}
+
+/// [`ef_decode`] of a short list (see [`short`]); false for another.
+#[inline(always)]
+fn short_decode(ef: &Ef<'_>, out: &mut Vec<u32>) -> bool {
+    if ef.len() >= SHORT {
+        return false;
+    }
+    out.reserve(ef.len());
+    let (start, mut k) = (out.len(), 0);
+    let dst = out.as_mut_ptr();
+    let done = short(ef, |v| {
+        // SAFETY: `short` visits at most `n` values, the room reserved.
+        unsafe { dst.add(start + k).write(v) };
+        k += 1;
+    });
+    // SAFETY: the `k` values from `start` are written.
+    unsafe { out.set_len(start + k) };
+    done
+}
+
+/// [`ef_into_row`] of a short list (see [`short`]); false for another.
+#[inline(always)]
+fn short_row(ef: &Ef<'_>, row: &mut [u64]) -> bool {
+    if ef.len() >= SHORT {
+        return false;
+    }
+    let mut put = RowPut::new();
+    short(ef, |v| put.put(row, v))
+}
+
 /// The portable bodies: the format's own decoder.
 mod scalar {
     use segment::tinshape::ef::Ef;
 
-    #[inline(always)]
+    #[inline(never)]
     pub fn ef_decode(ef: Ef<'_>, out: &mut Vec<u32>) {
         out.reserve(ef.len());
         ef.for_each(|v| out.push(v));
     }
 
-    #[inline(always)]
+    #[inline(never)]
     pub fn ef_into_row(ef: Ef<'_>, row: &mut [u64]) {
         let mut put = super::RowPut::new();
         ef.for_each(|v| put.put(row, v));
@@ -355,11 +465,9 @@ macro_rules! passes {
         }
 
         $(#[$tf])*
+        #[inline(never)]
         pub fn ef_decode(ef: Ef<'_>, out: &mut Vec<u32>) {
             let n = ef.len();
-            if n < super::SHORT {
-                return super::scalar::ef_decode(ef, out);
-            }
             let highs_bytes = ef.highs();
             let lows = super::lows_padded(&ef);
             let start = out.len();
@@ -379,11 +487,9 @@ macro_rules! passes {
         }
 
         $(#[$tf])*
+        #[inline(never)]
         pub fn ef_into_row(ef: Ef<'_>, row: &mut [u64]) {
             let n = ef.len();
-            if n < super::SHORT {
-                return super::scalar::ef_into_row(ef, row);
-            }
             let highs_bytes = ef.highs();
             let lows = super::lows_padded(&ef);
             let l = ef.low_width();
@@ -619,7 +725,11 @@ mod avx512 {
 #[cfg(test)]
 mod tests {
     use super::super::Level;
+    #[cfg(target_arch = "aarch64")]
+    use super::neon;
     use super::*;
+    #[cfg(target_arch = "x86_64")]
+    use super::{avx2, avx512};
     use proptest::prelude::*;
     use segment::tinshape::ef;
 
@@ -741,7 +851,7 @@ mod tests {
     }
 
     fn list() -> impl Strategy<Value = (Vec<u32>, u32)> {
-        (0u32..31, 0usize..1500).prop_flat_map(|(shift, n)| {
+        (0u32..31, prop_oneof![0usize..40, 0usize..1500]).prop_flat_map(|(shift, n)| {
             (
                 prop::collection::vec(1u64..=(2u64 << shift), n),
                 0u64..(1u64 << shift).max(2),
@@ -775,18 +885,28 @@ mod tests {
             super::scalar::ef_decode(list, &mut want);
             prop_assert_eq!(&want, &values);
             let words = (universe as usize).div_ceil(64).min(1 << 20);
+            let mut bits_want = vec![0u64; words];
+            let rows = (universe as usize) <= words * 64;
+            if rows {
+                for v in &values {
+                    bits_want[*v as usize / 64] |= 1 << (v % 64);
+                }
+            }
             for level in levels() {
                 let mut have = Vec::new();
                 ef_decode_at(level, list, &mut have);
                 prop_assert_eq!(&have, &want, "{:?}", level);
-                if (universe as usize) <= words * 64 {
-                    let mut bits_want = vec![0u64; words];
-                    for v in &values {
-                        bits_want[*v as usize / 64] |= 1 << (v % 64);
-                    }
+                // The level's own body, which short lists skip.
+                let mut have = vec![9];
+                run!(level, ef_decode(list, &mut have));
+                prop_assert_eq!(&have[1..], &want[..], "body {:?}", level);
+                if rows {
                     let mut bits_have = vec![0u64; words];
                     ef_into_row_at(level, list, &mut bits_have);
-                    prop_assert_eq!(bits_have, bits_want, "{:?}", level);
+                    prop_assert_eq!(&bits_have, &bits_want, "{:?}", level);
+                    let mut bits_have = vec![0u64; words];
+                    run!(level, ef_into_row(list, &mut bits_have));
+                    prop_assert_eq!(&bits_have, &bits_want, "body {:?}", level);
                 }
             }
         }

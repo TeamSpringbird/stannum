@@ -14,9 +14,12 @@
 //! lists are) and into a cleared row (as a disjunction's are): per member,
 //! the median of seven batches of at least 20 ms. `count` decodes one group
 //! at one level `--passes` times, for `time -l`'s instructions retired (run
-//! it with 0 passes too and take the difference).
+//! it with 0 passes too and take the difference). `time` and `count` take a
+//! dump instead of a sample file (`--dump DIR [--segments N]`), sampling it
+//! first (about a minute a segment at 150M rows).
 //!
 //! ```text
+//! cargo run --release -p bench --bin tnsef -- time --dump DIR [--segments 1]
 //! tnsef sample --dump DIR --out FILE [--segments 1]
 //! tnsef time --sample FILE [--group PREFIX]
 //! tnsef count --sample FILE --group NAME --level L --mode vector|row --passes P
@@ -67,6 +70,12 @@ fn sample(args: &[String]) {
             _ => panic!("usage: tnsef sample --dump DIR --out FILE [--segments N]"),
         }
     }
+    std::fs::write(&out, sampled(&dump, segments)).expect("the sample written");
+    eprintln!("sample written to {out}");
+}
+
+/// A sample file's bytes: the groups of the first `segments` of `dump`.
+fn sampled(dump: &str, segments: usize) -> Vec<u8> {
     let dump = std::path::PathBuf::from(dump);
     let manifest = std::fs::read_to_string(dump.join("manifest.tsv")).expect("a manifest");
     let mut all: Vec<Sampled> = Vec::new();
@@ -168,18 +177,23 @@ fn sample(args: &[String]) {
             file.extend_from_slice(&s.bytes);
         }
     }
-    std::fs::write(&out, file).expect("the sample written");
     eprintln!(
-        "{containers} containers, {total} members; {} groups to {out}",
+        "{containers} containers, {total} members; {} groups",
         groups.len()
     );
+    file
 }
 
 type Lists = Vec<(Ef<'static>, u32)>;
 
-/// The groups of a sample file: name, share of members, lists.
-fn load(path: &str) -> Vec<(String, f64, Lists)> {
-    let file: &'static [u8] = Box::leak(std::fs::read(path).expect("a sample").into_boxed_slice());
+/// The groups of a sample file, or of a dump sampled first: name, share of
+/// members, lists.
+fn load(path: &str, dump: Option<(&str, usize)>) -> Vec<(String, f64, Lists)> {
+    let file = match dump {
+        Some((dump, segments)) => sampled(dump, segments),
+        None => std::fs::read(path).expect("a sample"),
+    };
+    let file: &'static [u8] = Box::leak(file.into_boxed_slice());
     let mut at = 0;
     let mut groups = Vec::new();
     let u32_at = |at: &mut usize| {
@@ -235,11 +249,16 @@ fn median_ns(mut f: impl FnMut() -> u64) -> f64 {
     times[3]
 }
 
-/// One pass over `lists` at `level`, into a vector or into the row.
+/// One pass over `lists` at `level`, into a vector or into the row (or,
+/// with `HARNESS` set, neither: the harness's own cost).
 fn pass(level: Level, into_row: bool, lists: &Lists, out: &mut Vec<u32>, row: &mut [u64]) -> u64 {
     let mut sum = 0u64;
+    let harness = std::env::var_os("HARNESS").is_some();
     for (ef, w) in lists {
-        if into_row {
+        if harness {
+            out.clear();
+            sum += black_box(ef).len() as u64 + u64::from(*w);
+        } else if into_row {
             let row = &mut row[..*w as usize];
             kernels::ef_into_row_at(level, *ef, row);
             sum += row[0];
@@ -262,15 +281,20 @@ fn widest(groups: &[(String, f64, Lists)]) -> usize {
 
 fn time(args: &[String]) {
     let (mut path, mut prefix) = (String::new(), String::new());
+    let (mut dump, mut segments) = (None, 1usize);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--sample" => path = it.next().expect("a file").clone(),
+            "--dump" => dump = Some(it.next().expect("a directory").clone()),
+            "--segments" => segments = it.next().expect("a count").parse().expect("a count"),
             "--group" => prefix = it.next().expect("a prefix").clone(),
-            _ => panic!("usage: tnsef time --sample FILE [--group PREFIX]"),
+            _ => panic!(
+                "usage: tnsef time --sample FILE | --dump DIR [--segments N] [--group PREFIX]"
+            ),
         }
     }
-    let groups = load(&path);
+    let groups = load(&path, dump.as_deref().map(|d| (d, segments)));
     let levels = Level::supported_levels();
     let mut row = vec![0u64; widest(&groups)];
     let mut out = Vec::with_capacity(1 << 16);
@@ -313,10 +337,13 @@ fn time(args: &[String]) {
 fn count(args: &[String]) {
     let (mut path, mut group, mut level, mut into_row, mut passes) =
         (String::new(), String::new(), Level::Scalar, false, 1u64);
+    let (mut dump, mut segments) = (None::<String>, 1usize);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--sample" => path = it.next().expect("a file").clone(),
+            "--dump" => dump = Some(it.next().expect("a directory").clone()),
+            "--segments" => segments = it.next().expect("a count").parse().expect("a count"),
             "--group" => group = it.next().expect("a name").clone(),
             "--level" => level = Level::parse(it.next().expect("a level")).expect("a level"),
             "--mode" => into_row = it.next().expect("a mode") == "row",
@@ -326,7 +353,7 @@ fn count(args: &[String]) {
             ),
         }
     }
-    let groups = load(&path);
+    let groups = load(&path, dump.as_deref().map(|d| (d, segments)));
     let (_, _, lists) = groups.iter().find(|g| g.0 == group).expect("the group");
     let members: u64 = lists.iter().map(|(e, _)| e.len() as u64).sum();
     let mut row = vec![0u64; widest(&groups)];
