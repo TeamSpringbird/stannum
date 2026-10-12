@@ -1233,7 +1233,8 @@ pub struct LazyFooter<'a> {
     /// Whether the footer is skimmed ([`Self::skim`]): its blocks' last
     /// slots, TF offsets and widths are kept, their frontiers not at all.
     skim: bool,
-    /// A skimmed footer's blocks' largest buckets.
+    /// A skimmed footer's blocks' largest buckets, or a footer's decoded
+    /// for its bounds ([`Self::decode_bounds`]).
     maxb: Vec<u8>,
     /// Whether pages the footer's reads pinned for bytes only it reads are
     /// released once it has read past them ([`Self::release_passed`]), and
@@ -1918,8 +1919,9 @@ impl<'a> LazyFooter<'a> {
     /// pairs (0 at least), taken as each pair is read. The frontiers are
     /// not kept as pairs: their entries' bytes are (a few bytes a pair,
     /// where a pair kept takes eight), and a block's frontier is read from
-    /// them only when asked ([`Self::floor`], [`Self::floors`],
-    /// [`Self::max_bucket`]); most blocks' never are.
+    /// them only when asked ([`Self::floor`], [`Self::floors`]); most
+    /// blocks' never are. Each block's largest bucket is kept
+    /// ([`Self::max_bucket`]), a byte a block.
     /// The footer's pages are read and released as [`Self::ensure`] reads
     /// them. Blocks decoded already (a footer derived from its record)
     /// are bounded from their frontiers.
@@ -1940,6 +1942,7 @@ impl<'a> LazyFooter<'a> {
             return Ok(());
         }
         self.kept = false;
+        self.maxb.reserve_exact(self.blocks);
         let full = bits::packed_len(self.block_size as usize, 1) as u64;
         loop {
             // The entries well within the window, in one loop: each one's
@@ -1963,6 +1966,7 @@ impl<'a> LazyFooter<'a> {
                 next_last += gap;
                 let width = tf_width(max, self.adaptive);
                 bounds.push(v);
+                self.maxb.push(max);
                 self.last.push(last);
                 self.entries.push((raw + (at - start)) as u32);
                 self.tf_at.push(next_tf as u32);
@@ -1993,6 +1997,7 @@ impl<'a> LazyFooter<'a> {
             self.push_block((gap, len))?;
             self.entries.push(entry);
             bounds.push(fold_bound(&self.frontier, &mut bound));
+            self.maxb.push(self.frontier.last().map_or(0, |pair| pair.0));
             self.frontier.clear();
         }
     }
@@ -2143,7 +2148,7 @@ impl<'a> LazyFooter<'a> {
     /// Block `b`'s largest bucket (decoded): its frontier's last pair's.
     #[inline]
     pub fn max_bucket(&self, b: usize) -> u8 {
-        if self.skim {
+        if self.skim || !self.kept && b < self.maxb.len() {
             self.maxb[b]
         } else if self.kept {
             self.frontier[self.ends[b] as usize - 1].0

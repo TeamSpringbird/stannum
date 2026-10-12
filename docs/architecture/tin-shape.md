@@ -317,11 +317,17 @@ again (2.5% fewer cycles in the full_score replay).
   as `STN3` planned a sub-block and sieving all its words bit-parallel
   (`LaneSums`), and lets fewer through.
   A candidate is then bounded by its terms' blocks (a member's block is its
-  posting index over the block size), then by its buckets as above, the
-  bucket of the term its block bounds highest read first and alone: most
-  candidates that bucket leaves below the threshold read no other TF (as
-  TIN reads a term's TF only for a candidate that still needs it; at 150M
-  rows a fifth to a quarter fewer TF reads). A flat disjunction's
+  posting index over the block size), then by its buckets, a term at a
+  time while it is left in reach, the term bounding it highest first (as
+  TIN reads a term's TF only for a candidate that still needs it). Each
+  bucket read bounds the document's length from below (the shortest its
+  block holds at that bucket or above), and the longest of those floors
+  bounds every term it holds, read or not (TIN's shared length): an unread
+  term by its block's largest bucket there. A rare word's bucket in a long
+  document so rules out the common words' blocks, bounded by their short
+  documents, before their TF is read: at 150M rows, scoring every term
+  (`full_score`), a candidate past its blocks reads 60% fewer buckets and
+  a disjunction 38% fewer TF pages. A flat disjunction's
   candidates left in reach are scored best bound first at the group's end,
   as a phrase's are, so the best of a group raise the threshold over the
   rest before their lengths are read (on TIN's corpus, 15 ORed terms read

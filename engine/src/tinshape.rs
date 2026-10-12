@@ -3183,6 +3183,89 @@ mod tests {
         );
     }
 
+    /// A disjunction bounds a candidate's unread terms at the length its
+    /// read buckets imply (TIN's shared length): a rare word held only by
+    /// long documents, read first, puts the candidate at their length, where
+    /// the common words' largest buckets fall short, though their blocks'
+    /// short documents left it in reach. Their TF is not read.
+    #[test]
+    fn a_disjunction_bounds_unread_terms_at_the_length_read_buckets_imply() {
+        let n = 4_000usize;
+        let docs: Vec<Tid> = (0..n as u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        let lengths: Vec<u32> = (0..n).map(|r| if r % 10 == 0 { 5 } else { 200 }).collect();
+        // The rare word eight times in long documents only; two common words
+        // once in every odd (long) document and every short one; the winners'
+        // word in twenty long documents (the first ten win the ties).
+        let rare: Vec<(usize, u32)> = (0..n).filter(|r| r % 8 == 1).map(|r| (r, 8)).collect();
+        let common: Vec<(usize, u32)> = (0..n)
+            .filter(|r| r % 2 == 1 || r % 10 == 0)
+            .map(|r| (r, 1))
+            .collect();
+        let winners: Vec<(usize, u32)> = (0..n).filter(|r| r % 200 == 3).map(|r| (r, 1)).collect();
+        let members = vec![rare, common.clone(), common, winners];
+        let all: Vec<usize> = (0..n).collect();
+        let options = Options {
+            block_size: 16,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+        let segment = Segment::parse(&blob).unwrap();
+        let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();
+        let node = Node::Or((0..4).map(Node::Term).collect());
+        let scorers: Vec<(String, TermScorer)> = (0..4)
+            .map(|t| {
+                let df = members[t].len() as u64;
+                let scorer =
+                    TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 100.0)
+                        .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let at = |t: usize, tf: u32, length: u32| {
+            scorers[t]
+                .1
+                .bound_through(TfBucket::from_count(tf), length)
+        };
+        // The threshold (a winner's score) lies above what a rare word's
+        // candidate scores at its length, and below its blocks' bounds.
+        let theta = at(3, 1, 200) + at(1, 1, 200) + at(2, 1, 200);
+        assert!(theta > at(0, 8, 200) + at(1, 1, 200) + at(2, 1, 200));
+        assert!(theta < at(0, 8, 200) + at(1, 1, 5) + at(2, 1, 5));
+        let k = 10;
+        let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+        let want: Vec<Tid> = members[3].iter().take(10).map(|(r, _)| docs[*r]).collect();
+        assert_eq!(got.rows.iter().map(|r| r.1).collect::<Vec<_>>(), want);
+        let mut seeded = crate::walk::TopRows::new(k, false);
+        for row in &got.rows {
+            seeded.push(crate::walk::Ranked(row.0, row.1));
+        }
+        let mut reads = TfReads::default();
+        let walked = top_k_into(
+            &segment,
+            &node,
+            &names,
+            &scorers,
+            &mut seeded,
+            &mut AllVisible,
+            &mut reads,
+        )
+        .unwrap();
+        assert!(walked.candidates >= 400, "{} candidates", walked.candidates);
+        assert!(
+            reads.0 * 10 <= walked.candidates * 12,
+            "{} TF reads for {} candidates",
+            reads.0,
+            walked.candidates
+        );
+    }
+
     /// A conjunction reads a common word's bucket last, and only for a
     /// candidate the rarer word's bucket leaves in reach: a rare word's
     /// bucket of 1 in a block that also holds a 6 rules the candidate out
