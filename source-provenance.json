@@ -48,6 +48,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ctid-addressed format's converter, size report and trace replay."
     },
+    "bench/src/bin/tnsef.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Elias-Fano decoding measured on a dump's own containers, by width and length, at each kernel level."
+    },
     "bench/src/bin/tnsreplay.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ranked trace replay over dumped TNS1 segments, read in place as the extension reads them."
@@ -781,6 +785,10 @@
     "engine/src/tinshape/kernels.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the word kernels of the ctid-addressed segment format, per instruction set (NEON, AVX2, AVX-512) with a portable reference, moved out of engine/src/tinshape.rs."
+    },
+    "engine/src/tinshape/kernels/ef.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Elias-Fano lists decoded a block at a time (a table per highs byte, a shuffle per eight low parts), per instruction set (NEON, AVX2) with a portable reference."
     },
     "engine/src/tinshape/rank.rs": {
       "owner": "ben",
