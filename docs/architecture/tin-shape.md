@@ -844,9 +844,10 @@ Proposals (not built; layout only, the same structures):
   them for 462 MB (1.2%; with the rest about 1.6%). The copies cost little
   (1.3 to 4.2 MB a query, well under a millisecond); the second pin is the
   larger part. Without padding, a walk could read a container across two
-  pages in place, a run of words per page (a grid's rows are copied into
-  a row anyway in the disjunction walk), which needs the walks to take a
-  container as up to two slices. Units could also start on a 64-byte line
+  pages in place, a run of words per page, which needs the walks to take a
+  container as up to two slices. (The disjunction walk now copies a grid
+  across pages straight into its row, unstitched: see
+  [grids read in place](#grids-read-in-place-branch-tinshapegrids-inplace).) Units could also start on a 64-byte line
   of the page (page offsets that are multiples of 64: data offsets of
   36 + 64k on a page): 507 MB for containers, 730 MB for TF blocks,
   2.9 GB for positions blocks (`tnsunits`, "line pad"), which only pays
@@ -1022,6 +1023,66 @@ reader cache no longer holds footers, so it keeps more records: 41 of a
 query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
 to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
+
+## Grids read in place (branch `tinshape/grids-inplace`)
+
+A disjunction copied every present term's grid into its row of
+`Walk::rows` (`kernels::load`, a libc `memcpy` call on x86-64, where
+`memcpy` was 11% to 14% of cycles), and a grid across two pages was
+stitched first, so copied twice, into a fresh stitch block. Counted at
+150M rows (replay, 200 queries per style, per query):
+
+| | grids into rows | mask starts | stitched containers | all copies |
+| --- | --- | --- | --- | --- |
+| disjunction, before | 40.7K (31.2 MB) | 9.7K (8.5 MB) | 4.1K (3.9 MB) | 44.4 MB, 59K `memcpy` |
+| disjunction, after | 7.8K parts across pages (3.9 MB) | 7.9K (7.1 MB) | 0.2K (21 KB) | 11.8 MB, 17K |
+| disjunction `--full`, before | 127.6K (106 MB) | 10.1K (8.8 MB) | 13.5K (14.4 MB) | 130 MB, 168K |
+| disjunction `--full`, after | 26.5K parts across pages (14.3 MB) | 6.0K (5.5 MB) | 0.2K (23 KB) | 20.7 MB, 36K |
+| conjunction / phrase | 0.6K / 0.9K `dense_group` starts | | 1.1K / 1.3K (1.0 / 1.2 MB) | unchanged |
+
+(A copy across pages is a `memcpy` per page's part; "all" counts other
+stitches too, 0.8 MB a query.)
+
+Now a row is a `RowAt` (a pointer and a length to the group's words,
+little-endian): a grid on one page is read where it lies, and a grid
+across pages, or members decoded from another container, lie in the
+term's part of `rows`. Every reader (the mask, the sieve's word per term,
+`row_index`'s popcounts, `or_stage`'s bit tests) loads a word the same way
+from either, with no choice per read. The mask starts from the essential
+terms' union ORed into it, then ANDs the required terms, so a required
+row is copied only when no essential term filters. An earlier attempt
+(`tinshape/perf-disj`, S2) read only the non-essential grids in place,
+beside the others' rows, and measured 10% slower, most of it in the
+sieve's row reads.
+
+A conjunction's grids were already read in place (`Kind::Grid`); copying
+one across pages into the term's own words instead of stitching it
+copies as many bytes, and measured 1.3% more instructions on aarch64 (a
+page check per grid load; a first version, sizing that buffer at every
+load, 5% more cycles on x86-64), so it stays stitched.
+
+Measured against `1e01d81` (`--expect` 0 different on the whole trace,
+every style; `--full` answers byte-identical), two rounds A B / B A:
+
+| | aarch64 (M4, timed passes): instructions, cycles | x86-64 (r7i.2xlarge, `perf stat`): instructions, cycles, mean |
+| --- | --- | --- |
+| disjunction | -6.3%, -6.6% (196 queries) | -6.1%, -4.9%, -4.5% (292 queries) |
+| disjunction `--full` | -5.1%, -8.5% (100 queries) | -4.9%, -5.0%, -4.9% (150) |
+| conjunction | 0.0%, within ±2% noise (300) | 0.0%, +0.7%, +0.9% (299) |
+| phrase | 0.0%, +0.6% (300) | 0.0%, -0.2%, -0.5% (298) |
+
+On x86-64 the disjunction's L1 data misses fell by 16% (23% with
+`--full`), but the cycles saved are about the instructions saved, not
+more, as if the copies' cost was mostly the first touch of the grids'
+lines, which the in-place reads now pay for the words they read.
+
+For the lanes changing the same walk (`tinshape/full-or`,
+`tinshape/ef-simd`): `Walk::rows` holds little-endian words, read only
+through `Row::at`; a path that fills a row sets `Row::at` (`RowAt::of`
+for `rows`, `grid_row` for a grid) and writes words with `to_le`
+(`RowBits` does). The kernels are the existing byte-slice ones
+(`load`, `and_bytes`, `or_bytes`, `popcount_bytes`); nothing in `ef.rs`
+changed.
 
 ## Open
 
