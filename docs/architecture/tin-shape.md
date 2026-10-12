@@ -1041,6 +1041,51 @@ query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
 to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
 
+## Elias-Fano decoding a block at a time (branch `tinshape/ef-simd`)
+
+A walk decoded its Elias-Fano containers a member at a time
+(`Ef::for_each`: next set bit, low part from a bit stream, some 24
+instructions and a branch on the data). The block kernels
+(`kernels/ef.rs`, see "Word kernels and instruction sets") cut a
+container's decode, measured by `bench tnsef` on two segments' containers
+(instructions per member, aarch64; `for_each` -> NEON, into a list | into
+a cleared row):
+
+| members | list | row |
+| --- | ---: | ---: |
+| 1-7 | 101 -> 52 | 100 -> 58 |
+| 8-15 | 50 -> 31 | 53 -> 40 |
+| 32-63 | 35 -> 12 | 39 -> 22 |
+| 64-127 | 32 -> 8.3 | 36 -> 17 |
+| 128-511 | 31 -> 6.8 | 35 -> 15 |
+| all, density 64 | 42 -> 18 | 46 -> 28 |
+| all, density 32 | 37 -> 13 | 41 -> 23 |
+
+Timed, 64-127 members: 3.9x (list), 1.9x (row); 128-511: 4.7x, 1.5x.
+On a Sapphire Rapids devbox AVX2 is 1.7x the portable body overall, up
+to 5x on dense lists; AVX-512 machines run the same AVX2 bodies.
+
+Replay of the 150M trace (first 400 queries per style, 3 passes, timed
+instructions | cycles against `1e01d81`; aarch64, `--pin-ns 1000`, quiet
+machine): disjunction -5.7% | -3.0%, conjunction -4.9% | -2.1%; without
+pin costs, phrase -5.2% instructions. Answers: the whole trace equal to
+`pg-ranked.tsv`, `--full` byte-identical to `1e01d81`'s.
+
+Not kept: decoding a sparse term's per-group drains in bulk (a span found
+from the highs, then the block kernels). Those drains are many and long
+(258M members in 400 conjunctions, 640M in 400 disjunctions, two thirds
+in drains of 16 or more), but a span's setup cost about what its decode
+saved: disjunction instructions +0.8%, cycles +1.6% against the block
+kernels alone.
+
+Grid density 32 (`tnsregrid --grid-density 32`) still loses with the
+block kernels: fewer groups force grids, so more terms are sparse lists
+(2.3 to 2.9 times the drained members) and Elias-Fano containers grow.
+With pin costs, density 32 against 64, both with the kernels:
+disjunction instructions +13%, cycles +0.8%; conjunction +11%, +6%
+(without the kernels, +4% and +6.5% cycles). Keep 64. Log and tools:
+`stannum-lab/ef-simd/`.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
