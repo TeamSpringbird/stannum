@@ -220,8 +220,7 @@ kernels! {
 
 mod ef;
 pub use ef::{
-    container_locals, container_row, drain_below, drain_below_at, drain_into_row,
-    drain_into_row_at, ef_decode, ef_decode_at, ef_into_row, ef_into_row_at,
+    container_locals, container_row, ef_decode, ef_decode_at, ef_into_row, ef_into_row_at,
 };
 
 #[inline(always)]
