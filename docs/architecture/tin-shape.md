@@ -1328,6 +1328,30 @@ cycles and by 13% (conjunction) and 42% (disjunction, whose code did not
 change) in backend CPU. The server comparison is to be repeated on a quiet
 host.
 
+## Units against TIN at 150M rows (branch `fable/algo`, report only)
+
+On TIN's machine type (i7i.8xlarge, EXPLAIN pages) a `score` disjunction or
+phrase costs the same CPU per page touched as TIN 1.0.6 (27 K and 14 K
+cycles a page, 0.97x and 1.00x of TIN's); the gap (1.8x, 1.5x) is pages:
+1.9x and 1.5x TIN's. A conjunction is 1.33x the pages at 1.28x per page.
+`full_score` is 1.3-1.6x the pages at 1.33-1.73x per page (the dense
+terms' footers, decoded whole or to the candidates' blocks). Counted at
+`f0962a8` over 400 disjunctions: 31.8 K groups a query, 26% pruned by the
+summed bounds, 22% by an empty essential mask, 16.3 K worked (58% of them
+examining no candidate); 646 K live words weighed at the group bounds,
+86% cut there, 341 K members weighed one by one, 23 K kept; of the words
+passing the prefilter 1.4% hold one term and 1.4% have every member pass,
+so no per-word fast path pays. Over 400 conjunctions: 19.4 K groups, 15%
+pruned, 91% of the intersected groups empty; another required term is
+absent by its directory in 1.4% of groups; the next two required terms'
+grids would empty 30% of the second term's list decodes, but filtering by
+them first (looked up by hint before the list) measured -0.1%
+instructions and +28% pins (their pages), so the intersection stays in
+`df` order. The remaining levers are per unit on x86 (the word loop and
+the Elias-Fano decode) and the format (per-(term, group) footer entries
+and frontiers; container bytes of mid-frequency terms). Log:
+`stannum-lab/fable/algo/report.md`.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
