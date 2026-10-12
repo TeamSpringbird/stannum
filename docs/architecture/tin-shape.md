@@ -1069,7 +1069,12 @@ Replay of the 150M trace (first 400 queries per style, 3 passes, timed
 instructions | cycles against `1e01d81`; aarch64, `--pin-ns 1000`, quiet
 machine): disjunction -5.7% | -3.0%, conjunction -4.9% | -2.1%; without
 pin costs, phrase -5.2% instructions. Answers: the whole trace equal to
-`pg-ranked.tsv`, `--full` byte-identical to `1e01d81`'s.
+`pg-ranked.tsv`, `--full` byte-identical to `1e01d81`'s. x86-64 (Sapphire
+Rapids devbox, AVX2 bodies, perf user counts, 2 rounds, answers exact):
+conjunction -9.0% instructions | -5.3% cycles, disjunction -8.4% | -6.0%,
+phrase -6.9% | -4.2%. In PostgreSQL (vm_ab, aarch64): instructions per
+query -5% to -7% per style; its cycles were not resolved at this host's
+noise.
 
 Not kept: decoding a sparse term's per-group drains in bulk (a span found
 from the highs, then the block kernels). Those drains are many and long
@@ -1083,7 +1088,9 @@ block kernels: fewer groups force grids, so more terms are sparse lists
 (2.3 to 2.9 times the drained members) and Elias-Fano containers grow.
 With pin costs, density 32 against 64, both with the kernels:
 disjunction instructions +13%, cycles +0.8%; conjunction +11%, +6%
-(without the kernels, +4% and +6.5% cycles). Keep 64. Log and tools:
+(without the kernels, +4% and +6.5% cycles). On x86-64 with the kernels:
+disjunction +17% instructions, +4.4% cycles; conjunction +21%, +9.8%.
+Keep 64. Log and tools:
 `stannum-lab/ef-simd/`.
 
 ## Open
