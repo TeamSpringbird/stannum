@@ -16,7 +16,7 @@ benchmarks/aws/devbox.sh --branch my-branch --dump --cmd 'cargo build --release 
   perf stat -e instructions:u,cycles:u,branch-misses:u -o $OUT/perf.txt -- target/release/tnsreplay \
   --dump $DATA/dump150m --trace $DATA/trace.tsv --expect $DATA/pg-ranked.tsv --style conjunction --limit 400 --repeat 3 > $OUT/replay.txt'
 # A/B: two trees on one box, SRC1 and SRC2, CMD in a file
-benchmarks/aws/devbox.sh --branch base --branch candidate --dump --cmd-file ab.sh
+benchmarks/aws/devbox.sh --branch base --branch candidate --dump --cmd-file benchmarks/aws/devbox-replay-ab.sh
 benchmarks/aws/devbox.sh --list                # live devboxes
 benchmarks/aws/devbox.sh --terminate ID|all    # kill one, or every devbox
 benchmarks/aws/devbox.sh --ledger              # instance-hours and cost so far
@@ -55,8 +55,10 @@ instance-initiated shutdown = terminate. `--env K=V` sets variables for CMD.
 
 Cost: spot in us-east-1 was about $0.18/h for c7i.2xlarge, $0.07/h for
 c7i.xlarge and $0.16 to $0.22/h for r7i.2xlarge in October 2026 (on-demand
-$0.357, $0.179, $0.529). A test run takes about 15 to 25 minutes, so a few
-cents; a replay A/B with the dump about half an hour on r7i.2xlarge.
+$0.357, $0.179, $0.529). Measured: engine + segment tests at four kernel
+settings took 3 minutes of box time ($0.01); the dump sync takes 75 s and a
+two-tree replay A/B (`devbox-replay-ab.sh`: builds, tnsef, 10 replays) 23
+minutes ($0.07 with the volume).
 
 On these VM sizes perf sees the core events (instructions, cycles,
 branches, branch-misses, L1 cache events); `machine.txt` records which
@@ -68,9 +70,9 @@ subtract the setup.
 
 `s3://springbird-dev-stannum-corpus-cache-860510875764/replay-dumps/dump150m-v6/`
 holds the 150M TNS1 replay dump (`dump150m/`: 14 segments, ids.tsv,
-manifest.tsv), `trace.tsv` and `pg-ranked.tsv`, about 40 GB. It was uploaded
+manifest.tsv), `trace.tsv` and `pg-ranked.tsv`, 40.4 GB. It was uploaded
 once from `~/stannum-lab/tinshape/phase-c-perf/` and **stays there until
-deleted, at about $0.90 a month**. Delete it with
+deleted, at about $0.93 a month**. Delete it with
 `benchmarks/aws/devbox.sh --cleanup-dump`. A dump of a newer format needs a
 new prefix (and the `DUMP_PREFIX` in devbox.sh).
 
