@@ -2977,14 +2977,16 @@ mod tests {
         assert!(got.scored <= 30, "scored {}", got.scored);
     }
 
-    /// A ranked walk over a segment read in place reads its terms' grids
-    /// where they lie: one on a page in place, one across pages copied into
-    /// the term's own words, neither stitched into the span's buffers (at
-    /// 150M rows a disjunction stitched 4 MB per query, 14 MB scoring every
-    /// term). The pages are released as the walk passes them and poisoned,
-    /// so a grid read after its page was released would rank garbage.
+    /// A ranked disjunction over a segment read in place reads its terms'
+    /// grids where they lie: one on a page in place, one across pages
+    /// copied into the term's row, neither stitched into the span's buffers
+    /// (at 150M rows those were 4 MB per query, 14 MB scoring every term).
+    /// Conjunctions and phrases over the same grids (a grid across pages
+    /// stitched) rank as in memory. The pages are released as the walk
+    /// passes them and poisoned, so a grid read after its page was released
+    /// would rank garbage.
     #[test]
-    fn ranked_walks_read_grids_in_place_or_copy_them_unstitched() {
+    fn ranked_walks_read_grids_in_place() {
         use segment::tinshape::blob::{self, Kind};
         let n = 6_000usize;
         let docs: Vec<Tid> = (0..n as u32)
@@ -3049,7 +3051,9 @@ mod tests {
             // SAFETY: `top_k` returned owned results.
             unsafe { pinned.close_span() };
             assert_eq!(bits(&got.rows), bits(&want.rows), "{node:?}");
-            assert_eq!(stitched, 0, "container bytes stitched for {node:?}");
+            if matches!(node, Node::Or(_)) {
+                assert_eq!(stitched, 0, "container bytes stitched for {node:?}");
+            }
         }
     }
 

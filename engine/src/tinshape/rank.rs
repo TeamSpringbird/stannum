@@ -316,9 +316,8 @@ enum Kind<'a> {
     /// Decoded into [`Mem::list`].
     #[default]
     List,
-    /// A grid container, read in place on its page, or copied into
-    /// [`Mem::grid`] across pages.
-    Grid(RowAt),
+    /// A grid container, read in place.
+    Grid(&'a [u8]),
     /// An Elias-Fano list read by seeking: a group container (`offset` 0)
     /// or a sparse term's whole list (`offset` the group's first slot).
     Cursor { cursor: EfCursor<'a>, offset: u32 },
@@ -333,8 +332,6 @@ struct Mem<'a> {
     kind: Kind<'a>,
     /// The members' local slots, ascending, for [`Kind::List`].
     list: Vec<u32>,
-    /// A grid across pages, for [`Kind::Grid`].
-    grid: Vec<u64>,
     /// Postings in earlier groups (zero for a sparse term's cursor, whose
     /// rank is the index).
     first: u32,
@@ -360,8 +357,7 @@ impl Mem<'_> {
     #[inline]
     fn find(&mut self, local: u32) -> Option<u32> {
         match &mut self.kind {
-            Kind::Grid(at) => {
-                let bytes = at.bytes();
+            Kind::Grid(bytes) => {
                 if bytes[local as usize / 8] >> (local % 8) & 1 == 0 {
                     return None;
                 }
@@ -536,18 +532,13 @@ fn load<'a>(
             at,
         } => {
             touch.touch(Part::Payload, at, bytes.len());
+            let bytes = bytes.all()?;
             mem.used += 1;
             mem.first = e.first;
             if e.kind == KIND_GRID {
-                let words = group.words();
-                let grid = &mut mem.grid;
-                let at = grid_row(bytes, words, || {
-                    grid.resize(words, 0);
-                    grid
-                })?;
-                mem.kind = Kind::Grid(at);
+                mem.kind = Kind::Grid(bytes);
             } else if e.kind == KIND_EF && e.count as usize > probe_over {
-                let ef = Ef::parse(bytes.all()?, e.count as usize, group.slots())?;
+                let ef = Ef::parse(bytes, e.count as usize, group.slots())?;
                 mem.kind = Kind::Cursor {
                     cursor: ef.cursor(),
                     offset: 0,
@@ -555,7 +546,7 @@ fn load<'a>(
             } else {
                 let list = &mut mem.list;
                 list.reserve(e.count as usize);
-                for_each_local(&e, bytes.all()?, &group, |l| list.push(l))?;
+                for_each_local(&e, bytes, &group, |l| list.push(l))?;
             }
         }
         Src::Locals { from, to } => {
@@ -1067,8 +1058,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         cands.clear();
         let lead = &self.mems[self.req[0]];
         match &lead.kind {
-            Kind::Grid(at) => {
-                let bytes = at.bytes();
+            Kind::Grid(bytes) => {
                 for w in 0..bytes.len() / 8 {
                     let mut word = bits::word(bytes, w);
                     while word != 0 {
@@ -1106,8 +1096,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             let mem = &self.mems[t];
             match &mem.kind {
-                Kind::Grid(at) => {
-                    let bytes = at.bytes();
+                Kind::Grid(bytes) => {
                     bits::retain(&mut cands, |l| bytes[l as usize / 8] >> (l % 8) & 1 == 1);
                 }
                 Kind::Cursor { cursor, offset: 0 } => cursor.list().retain_members(&mut cands),
@@ -1188,12 +1177,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 )?;
             }
         }
-        fn grid<'m>(m: &'m Mem<'_>) -> &'m [u8] {
-            match &m.kind {
-                Kind::Grid(at) => at.bytes(),
-                _ => unreachable!("a grid"),
-            }
-        }
+        let grid = |m: &Mem<'a>| match m.kind {
+            Kind::Grid(bytes) => bytes,
+            _ => unreachable!("a grid"),
+        };
         let words = &mut self.words;
         words.clear();
         words.resize(group.words(), 0);
@@ -2089,20 +2076,23 @@ struct Row {
     at: RowAt,
 }
 
-/// Where a term's members in the group at hand lie as the group's words,
-/// little-endian: a grid on one page in place there; a grid across pages
-/// copied a page's part at a time, and a disjunction's other members
-/// decoded, into the term's own words ([`Walk::rows`], [`Mem::grid`]). A
-/// word is the same load from either, so the walk never asks which.
+/// Where a disjunction term's row lies in the group at hand: the group's
+/// words, little-endian. A grid on one page is read in place there; other
+/// members (decoded, or a grid across pages copied a page's part at a
+/// time) lie in the term's part of [`Walk::rows`]. A word is the same load
+/// from either, so the walk never asks which.
 ///
 /// Copying every grid into its row cost 31 MB of copies per disjunction at
 /// 150M rows (106 MB scoring every term), libc `memcpy` on x86-64.
 ///
-/// A pointer, not a slice, as it borrows a page or the walk's own words
-/// across its `&mut self` calls. Sound as the walk uses it: a group's rows
-/// are loaded after `rows` is sized for the group, a term's grid is
-/// replaced only by its next load, and either is read only within its
-/// group, before [`Walk::group_done`] releases the group's pages.
+/// A pointer, not a slice, as it borrows a page or `rows` across the walk's
+/// `&mut self` calls. Sound as the walk uses it: a group's rows are loaded
+/// after `rows` is sized for the group, and read only within that group,
+/// before [`Walk::group_done`] releases its pages.
+///
+/// A conjunction's grids stay slices (`Kind::Grid`): copying a grid across
+/// pages into the term's own words rather than stitching it copied as many
+/// bytes, and checking for it per grid cost 1.3% more instructions.
 #[derive(Clone, Copy)]
 struct RowAt {
     at: *const u8,
@@ -2148,24 +2138,19 @@ impl RowAt {
     }
 }
 
-/// A grid container's row of `words` words: in place where the grid lies
-/// on one page, else copied into `row()` (that many words) a page's part
-/// at a time rather than stitched into the span's buffers first.
+/// A grid container's row (`row`, of its group's words, holding it only if
+/// need be): in place where the grid lies on one page, else copied into
+/// `row` a page's part at a time rather than stitched into the span's
+/// buffers first.
 #[inline]
-fn grid_row<'r>(
-    grid: Bytes<'_>,
-    words: usize,
-    row: impl FnOnce() -> &'r mut [u64],
-) -> Result<RowAt> {
+fn grid_row(grid: Bytes<'_>, row: &mut [u64]) -> Result<RowAt> {
     let len = grid.len();
-    if len != words * 8 {
+    if len != size_of_val(row) {
         return Err(Error::Corrupt("a grid of its group's words"));
     }
     if grid.page_end(0) == len {
         return Ok(RowAt::new(grid.all()?));
     }
-    let row = row();
-    assert_eq!(row.len(), words);
     // SAFETY: a `u64` slice's bytes, any value valid.
     let out = unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr().cast::<u8>(), len) };
     let mut at = 0;
@@ -2271,7 +2256,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.mems[t].used += 1;
                 r.first = e.first;
                 if e.kind == KIND_GRID {
-                    r.at = grid_row(bytes, words, || row)?;
+                    r.at = grid_row(bytes, row)?;
                 } else {
                     row.fill(0);
                     let mut out = RowBits::new(row);
