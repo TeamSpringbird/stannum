@@ -15,16 +15,21 @@ crash the backend, and the postmaster would restart every backend.
 
 Runs against a server in a Docker container built from the tree under test
 (see benchmarks/local/exit-test.sh), reading the server log with
-`docker logs`. The connection comes from libpq's environment (PGHOST,
-PGPORT, PGUSER, PGPASSWORD, PGDATABASE), never from the command line:
+`docker logs`, or against a local server whose log file is readable
+(`--log`, with `--pgdata` for the shutdown through `pg_ctl`). The
+connection comes from libpq's environment (PGHOST, PGPORT, PGUSER,
+PGPASSWORD, PGDATABASE), never from the command line:
 
     PGHOST=127.0.0.1 PGPORT=28963 PGUSER=postgres PGPASSWORD=... \
         exit_during_walk.py --container stannum-exit
+    PGHOST=/tmp/exit PGPORT=28997 PGUSER=postgres \
+        exit_during_walk.py --log /tmp/exit/server.log --pgdata /tmp/exit/data
 
-The container must be dedicated to the test: its log is checked for crashes
+The server must be dedicated to the test: its log is checked for crashes
 and the last check shuts the server down.
 """
 import argparse
+from pathlib import Path
 import random
 import re
 import subprocess
@@ -65,8 +70,11 @@ def queries(words, seed):
     return out
 
 
-def log_lines(container):
-    return subprocess.run(['docker', 'logs', container], check=True, text=True,
+def log_lines(source):
+    """The server log's lines: of the log file, or of the container named."""
+    if isinstance(source, Path):
+        return source.read_text(errors='replace').splitlines()
+    return subprocess.run(['docker', 'logs', source], check=True, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.splitlines()
 
 
@@ -152,13 +160,20 @@ def assert_walks_hold_pages(control, texts):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
-    parser.add_argument('--container', required=True)
+    parser.add_argument('--container', help='the Docker container running the server')
+    parser.add_argument('--log', type=Path, help="a local server's log file")
+    parser.add_argument('--pgdata', help="the local server's data directory, for the shutdown")
     parser.add_argument('--rounds', type=int, default=40)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--rows', type=int, default=ROWS,
                         help='documents; a table already holding this many is reused')
     parser.add_argument('--no-shutdown', action='store_true', help='skip the final fast shutdown')
     args = parser.parse_args()
+    if (args.container is None) == (args.log is None):
+        parser.error('one of --container or --log')
+    if args.log is not None and args.pgdata is None and not args.no_shutdown:
+        parser.error('--log needs --pgdata for the shutdown, or --no-shutdown')
+    source = args.container or args.log
     dsn = ''  # libpq reads PGHOST, PGPORT, PGUSER, PGPASSWORD and PGDATABASE
     rng = random.Random(args.seed)
 
@@ -168,7 +183,7 @@ def main():
     assert_walks_hold_pages(control, texts)
     block = walker_block(texts)
     started = control.execute('SELECT pg_postmaster_start_time()').fetchone()[0]
-    before = len(log_lines(args.container))
+    before = len(log_lines(source))
 
     terminated = 0
     for round in range(args.rounds):
@@ -185,7 +200,7 @@ def main():
         terminated += 1
         # A crash restart terminates this connection too.
         assert control.execute('SELECT pg_postmaster_start_time()').fetchone()[0] == started, round
-        found = crashes(log_lines(args.container)[before:])
+        found = crashes(log_lines(source)[before:])
         assert not found, f'round {round}: server crashed after pg_terminate_backend:\n' + '\n'.join(found)
     print(f'pg_terminate_backend during a walk: {terminated} rounds, no crash')
 
@@ -195,16 +210,20 @@ def main():
         assert all(control.execute('SELECT state FROM pg_stat_activity WHERE pid = %s', (w.pid,)).fetchone()
                    == ('active',) for w in walkers)
         control.close()
-        # SIGINT to the postmaster, the container's PID 1, is a fast shutdown.
-        subprocess.run(['docker', 'kill', '--signal', 'INT', args.container], check=True,
-                       stdout=subprocess.DEVNULL)
-        subprocess.run(['docker', 'wait', args.container], check=True, timeout=120,
-                       stdout=subprocess.DEVNULL)
+        if args.container:
+            # SIGINT to the postmaster, the container's PID 1, is a fast shutdown.
+            subprocess.run(['docker', 'kill', '--signal', 'INT', args.container], check=True,
+                           stdout=subprocess.DEVNULL)
+            subprocess.run(['docker', 'wait', args.container], check=True, timeout=120,
+                           stdout=subprocess.DEVNULL)
+        else:
+            subprocess.run(['pg_ctl', '-D', args.pgdata, '-m', 'fast', '-w', 'stop'], check=True,
+                           timeout=120, stdout=subprocess.DEVNULL)
         for walker in walkers:
             walker.join()
         deadline = time.time() + 60
         while True:
-            lines = log_lines(args.container)[before:]
+            lines = log_lines(source)[before:]
             if any('database system is shut down' in line for line in lines) or time.time() > deadline:
                 break
             time.sleep(0.5)

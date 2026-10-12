@@ -234,6 +234,11 @@ STANNUM_PYTHON=.venv/bin/python benchmarks/local/exit-test.sh
 # STANNUM_EXIT_IMAGE=... reuses an image built earlier
 ```
 
+It also runs against a local server dedicated to it (a cassert build, say)
+whose log file it can read, `--log FILE --pgdata DIR` instead of
+`--container`, the shutdown through `pg_ctl`; on macOS the thread-local
+destructors do not run at exit, so only the exit itself is tested there.
+
 The table has 4.6 million documents because a walk checks for interrupts
 only every 64 chunks of 65,536 rows. Below that, every termination lands
 between walks. At this size most of them land with 7 to 17 pages held. The
