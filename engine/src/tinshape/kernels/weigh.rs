@@ -124,7 +124,11 @@ pub fn word_sums_at(
     bounds: &[f32],
     sums: &mut [f32],
 ) {
-    assert!(level.supported(), "kernel level {} unsupported here", level.name());
+    assert!(
+        level.supported(),
+        "kernel level {} unsupported here",
+        level.name()
+    );
     check_words(mask, live, at, rows, bounds, sums);
     run!(level, word_sums(mask, live, at, rows, bounds, sums))
 }
@@ -139,7 +143,11 @@ pub fn member_sums(held: &[u64], bits: &[u8], bounds: &[f32], sums: &mut [f32]) 
 
 /// [`member_sums`] at `level`; panics if the CPU lacks it.
 pub fn member_sums_at(level: Level, held: &[u64], bits: &[u8], bounds: &[f32], sums: &mut [f32]) {
-    assert!(level.supported(), "kernel level {} unsupported here", level.name());
+    assert!(
+        level.supported(),
+        "kernel level {} unsupported here",
+        level.name()
+    );
     check_members(held, bits, bounds, sums);
     run!(level, member_sums(held, bits, bounds, sums))
 }
@@ -177,7 +185,10 @@ fn check_words(mask: &[u64], live: u32, at: usize, rows: &[Row], bounds: &[f32],
         "live bits of the mask's words"
     );
     for row in rows {
-        assert!(row.len >= (at + mask.len()) * 8, "a row of the mask's words");
+        assert!(
+            row.len >= (at + mask.len()) * 8,
+            "a row of the mask's words"
+        );
     }
 }
 
@@ -400,10 +411,12 @@ mod avx2 {
                 }
                 // A word without members keeps its sum.
                 let dead = narrow(_mm256_cmpeq_epi64(m0, zero), _mm256_cmpeq_epi64(m1, zero));
-                let old =
-                    _mm256_permutevar8x32_ps(_mm256_loadu_ps(sums.as_ptr().add(j)), order());
+                let old = _mm256_permutevar8x32_ps(_mm256_loadu_ps(sums.as_ptr().add(j)), order());
                 let v = _mm256_blendv_ps(acc, old, dead);
-                _mm256_storeu_ps(sums.as_mut_ptr().add(j), _mm256_permutevar8x32_ps(v, order()));
+                _mm256_storeu_ps(
+                    sums.as_mut_ptr().add(j),
+                    _mm256_permutevar8x32_ps(v, order()),
+                );
             }
         }
         scalar::word_tail(mask, at, rows, bounds, sums, live, full);
@@ -433,7 +446,10 @@ mod avx2 {
                     let v = _mm256_andnot_ps(narrow(z0, z1), _mm256_set1_ps(bound));
                     acc = _mm256_add_ps(acc, v);
                 }
-                _mm256_storeu_ps(sums.as_mut_ptr().add(j), _mm256_permutevar8x32_ps(acc, order()));
+                _mm256_storeu_ps(
+                    sums.as_mut_ptr().add(j),
+                    _mm256_permutevar8x32_ps(acc, order()),
+                );
                 j += 8;
             }
         }
@@ -583,7 +599,11 @@ mod tests {
         for &x in &xs {
             for keep in [false, true] {
                 let branchy = if keep { x } else { 0.0 };
-                assert_eq!(or_zero(x, keep).to_bits(), branchy.to_bits(), "{x:?} {keep}");
+                assert_eq!(
+                    or_zero(x, keep).to_bits(),
+                    branchy.to_bits(),
+                    "{x:?} {keep}"
+                );
                 for &acc in &xs {
                     let want = acc + branchy;
                     let got = acc + or_zero(x, keep);

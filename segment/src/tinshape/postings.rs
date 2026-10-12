@@ -2474,7 +2474,8 @@ mod tests {
     /// and buckets as the whole footer does.
     fn check_bounds(mut l: LazyFooter<'_>, parsed: &Postings<'_>, footer: &Footer) {
         let mut bounds = Vec::new();
-        l.decode_bounds(pair_bound, pairs_bound, &mut bounds).unwrap();
+        l.decode_bounds(pair_bound, pairs_bound, &mut bounds)
+            .unwrap();
         assert_eq!(l.decoded(), footer.blocks());
         assert_eq!(bounds.len(), footer.blocks());
         for (b, bound) in bounds.iter().enumerate() {
@@ -2937,8 +2938,12 @@ mod lazy_footer_tests {
         let mut lazy = parsed.lazy_footer(4, 15, true).unwrap();
         lazy.release_passed();
         let mut bounds = Vec::new();
-        lazy.decode_bounds(super::tests::pair_bound, super::tests::pairs_bound, &mut bounds)
-            .unwrap();
+        lazy.decode_bounds(
+            super::tests::pair_bound,
+            super::tests::pairs_bound,
+            &mut bounds,
+        )
+        .unwrap();
         assert!(
             source.0.early.get() > 10,
             "pages released as the footer read on"

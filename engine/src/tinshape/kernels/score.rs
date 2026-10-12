@@ -26,7 +26,10 @@ pub fn score_pairs(
     out: &mut [f32],
 ) {
     check(buckets, lengths, out);
-    run!(level(), score_pairs(num, den, factor, buckets, lengths, out))
+    run!(
+        level(),
+        score_pairs(num, den, factor, buckets, lengths, out)
+    )
 }
 
 /// [`score_pairs`] at `level`; panics if the CPU lacks it.
@@ -39,7 +42,11 @@ pub fn score_pairs_at(
     lengths: &[u32],
     out: &mut [f32],
 ) {
-    assert!(level.supported(), "kernel level {} unsupported here", level.name());
+    assert!(
+        level.supported(),
+        "kernel level {} unsupported here",
+        level.name()
+    );
     check(buckets, lengths, out);
     run!(level, score_pairs(num, den, factor, buckets, lengths, out))
 }
@@ -114,7 +121,12 @@ mod neon {
             let mut i = 0;
             while i < full {
                 let b = &buckets[i..i + 4];
-                let (b0, b1, b2, b3) = (usize::from(b[0]), usize::from(b[1]), usize::from(b[2]), usize::from(b[3]));
+                let (b0, b1, b2, b3) = (
+                    usize::from(b[0]),
+                    usize::from(b[1]),
+                    usize::from(b[2]),
+                    usize::from(b[3]),
+                );
                 let nv = vld1q_f32([num[b0], num[b1], num[b2], num[b3]].as_ptr());
                 let dv = vld1q_f32([den[b0], den[b1], den[b2], den[b3]].as_ptr());
                 let l = vcvtq_f32_u32(vld1q_u32(lengths.as_ptr().add(i)));
