@@ -7,6 +7,26 @@
 
 use crate::{Error, Result};
 
+/// Asks the CPU to bring the cache line holding `at` toward L1 ahead of a
+/// read: a hint, which neither reads the byte nor faults on an address
+/// nothing maps. Nothing where the target has no such hint.
+#[inline(always)]
+pub fn prefetch(at: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch hint reads nothing and cannot fault.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(at.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a prefetch hint reads nothing, cannot fault and changes no
+    // register or flag.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) at, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = at;
+}
+
 /// Appends fixed-width values to a byte string.
 #[derive(Default)]
 pub struct BitWriter {

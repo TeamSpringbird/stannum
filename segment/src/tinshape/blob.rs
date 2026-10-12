@@ -51,6 +51,7 @@ use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
+use super::bits;
 use crate::source::Source;
 use crate::{Error, Result};
 
@@ -727,6 +728,35 @@ impl LazyBlob {
         self.get_slow(from, to, kind)
     }
 
+    /// `[from, to)` only if it lies on a page the open span holds pinned:
+    /// nothing is pinned, loaded or stitched for it. For a read a reader
+    /// may not make at all (see [`Self::prefetch`]).
+    #[inline]
+    pub fn peek(&self, from: usize, to: usize) -> Option<&[u8]> {
+        if self.spans.get() == 0 || from >= to || self.page_len == 0 {
+            return None;
+        }
+        let n = self.page_len;
+        let page = self.page_div.page(from);
+        let known = self.pages[page % PAGE_MEMO].get();
+        if known.page != page || known.span != self.span.get() || to > page * n + known.len {
+            return None;
+        }
+        // SAFETY: within a page the open span pinned, as in `get_kind`.
+        Some(unsafe { std::slice::from_raw_parts(known.data.add(from - page * n), to - from) })
+    }
+
+    /// Prefetches the line holding byte `at`, if its page is pinned in the
+    /// open span (else nothing: a pin is the cost to avoid). A reader whose
+    /// next reads are known ahead (a staged candidate's length) hides their
+    /// latency behind the work in between.
+    #[inline]
+    pub fn prefetch(&self, at: usize) {
+        if let Some(bytes) = self.peek(at, at + 1) {
+            bits::prefetch(bytes.as_ptr());
+        }
+    }
+
     #[inline(never)]
     fn get_slow(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if from > to {
@@ -994,6 +1024,39 @@ impl<'a> Bytes<'a> {
         self.get(0, self.len())
     }
 
+    /// Bytes `[from, to)` if they can be read without pinning, loading or
+    /// stitching anything ([`LazyBlob::peek`]); a range in memory always.
+    #[inline]
+    pub fn peek(&self, from: usize, to: usize) -> Option<&'a [u8]> {
+        match *self {
+            Self::Slice(bytes) => bytes.get(from..to),
+            Self::Lazy { blob, at, len, .. } => {
+                if from > to || to > len {
+                    return None;
+                }
+                blob.peek(at + from, at + to)
+            }
+        }
+    }
+
+    /// Prefetches the line holding byte `from`, if it can be reached without
+    /// pinning anything ([`LazyBlob::prefetch`]).
+    #[inline]
+    pub fn prefetch(&self, from: usize) {
+        match *self {
+            Self::Slice(bytes) => {
+                if let Some(byte) = bytes.get(from) {
+                    bits::prefetch(byte);
+                }
+            }
+            Self::Lazy { blob, at, len, .. } => {
+                if from < len {
+                    blob.prefetch(at + from);
+                }
+            }
+        }
+    }
+
     /// Bytes `[from, to)` as a range of their own, nothing loaded.
     pub fn sub(&self, from: usize, to: usize) -> Result<Bytes<'a>> {
         if from > to || to > self.len() {
@@ -1180,6 +1243,36 @@ mod tests {
                 at = at * 3 + 7;
             }
         }
+    }
+
+    #[test]
+    fn a_peek_reads_only_pages_the_span_pinned_and_pins_nothing() {
+        let (source, blob) = pinning(10 * 100 + 37, 100);
+        let state = &source.0;
+        let bytes = blob.bytes();
+        assert!(bytes.peek(205, 290).is_none(), "outside a span");
+        blob.open_span();
+        assert!(bytes.peek(205, 290).is_none(), "a page not pinned");
+        bytes.prefetch(205);
+        assert_eq!(state.pins.get(), 0, "a prefetch pins nothing");
+        bytes.get(210, 220).unwrap();
+        let pins = state.pins.get();
+        assert_eq!(bytes.peek(205, 290).unwrap(), &state.bytes[205..290]);
+        assert!(bytes.peek(290, 310).is_none(), "across pages");
+        assert!(
+            bytes.peek(1030, 1040).is_none(),
+            "past the end of the last page"
+        );
+        bytes.prefetch(250);
+        assert_eq!(state.pins.get(), pins);
+        assert_eq!(blob.loaded(), 0);
+        unsafe { blob.close_span() };
+        assert!(bytes.peek(205, 290).is_none(), "the span closed");
+        assert_eq!(
+            Bytes::from(&state.bytes).peek(205, 290).unwrap(),
+            &state.bytes[205..290],
+            "in memory, always"
+        );
     }
 
     #[test]

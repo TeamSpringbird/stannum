@@ -504,6 +504,30 @@ impl<'a> Lengths<'a> {
         Ok(base + bits::get_at(bytes, bit % 8, width)?)
     }
 
+    /// Prefetches the line holding `rank`'s packed length, when its block's
+    /// header can be read without pinning anything: a walk that knows
+    /// which documents it will score before it scores them (a staged
+    /// candidate) hides the sidecar's random read behind the work between.
+    /// Nothing is pinned, loaded or stitched; a length a walk never reads
+    /// costs one line fetched.
+    #[inline]
+    pub fn prefetch(&self, rank: u32) {
+        if rank >= self.documents {
+            return;
+        }
+        let b = (rank / self.block) as usize;
+        let Some(h) = self.headers.peek(b * 8, b * 8 + 8) else {
+            return;
+        };
+        let at = u32::from_le_bytes(h[0..4].try_into().expect("four bytes")) as usize;
+        let width = u32::from_le_bytes(h[4..8].try_into().expect("four bytes")) >> 24;
+        if width == 0 {
+            return;
+        }
+        let bit = (rank % self.block) as usize * width as usize;
+        self.data.prefetch(at + bit / 8);
+    }
+
     /// Where `rank`'s block header and its packed length lie within the
     /// sidecar's bytes, for page accounting.
     pub fn at(&self, rank: u32) -> (usize, usize) {

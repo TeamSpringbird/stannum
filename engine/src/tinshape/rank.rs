@@ -1332,12 +1332,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let Some((reach, length)) = self.stage(g, local)? else {
             return Ok(());
         };
+        if length == u32::MAX {
+            self.prefetch_length(g, local);
+        }
         self.staged.push((reach, local, length));
         self.staged_buckets.extend_from_slice(&self.buckets);
         if matches!(self.verify, Verify::Span(_)) {
             self.staged_span.extend_from_slice(&self.span_index);
         }
         Ok(())
+    }
+
+    /// Prefetches the DL sidecar line holding the length of the candidate
+    /// at slot `local` of group `g`, staged to be scored later: the line is
+    /// on its way while the group's other candidates are staged and sorted
+    /// (and a phrase's positions checked), where reading it then missed
+    /// the caches on most candidates (the sidecar is read by rank, a few
+    /// documents per page). Nothing is pinned for it.
+    #[inline]
+    fn prefetch_length(&self, g: u32, local: u32) {
+        if self.sc.is_empty() {
+            return;
+        }
+        if let Some(rank) = self.segment.docs.rank_in(g as usize, local) {
+            self.segment.lengths.prefetch(rank);
+        }
     }
 
     /// Reads the lengths of the group's staged candidates and scores them,
@@ -2547,6 +2566,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if let Some((reach, length)) = self.or_stage(g, base, w, bit)? {
             if !matches!(self.verify, Verify::Flat) {
                 return self.finish(g, local, length);
+            }
+            if length == u32::MAX {
+                self.prefetch_length(g, local);
             }
             self.staged.push((reach, local, length));
             self.staged_buckets.extend_from_slice(&self.buckets);
