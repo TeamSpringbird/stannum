@@ -1090,6 +1090,68 @@ for `rows`, `grid_row` for a grid) and writes words with `to_le`
 (`load`, `and_bytes`, `or_bytes`, `popcount_bytes`); nothing in `ef.rs`
 changed.
 
+## `full_score` disjunctions (branch `tinshape/full-or`)
+
+A `full_score` disjunction scores the dense words `score` elides (in at
+least one document in ten). At 150M rows (replay, 400 disjunctions) it
+read 25,282 pages a query against `score`'s 7,895, and its profile on
+aarch64 was the word loop 29%, grid copies 20% (now read in place, above),
+the candidates' path 23% (11.7% reading buckets), footer decoding 12% and
+range bounds 8.5%. Counted over two passes:
+
+- Dense words already behave as MaxScore's non-essential terms: of 39.0M
+  groups, 13.4M are cut before a dense row is read (7.2M by the summed
+  bounds, 6.2M by an empty essential mask); 0.34M passing groups hold
+  dense words alone. A dense word is essential in 4.9M of the 25.5M
+  passing groups, where the threshold is still below the dense words'
+  summed bounds.
+- 1.32G live words: 930M cut at the group's bounds, 1.79G members of the
+  rest weighed (10.4 terms each) into 177M candidates (`score`: 27M), 69M
+  of them holding dense words alone. 40M fall to their blocks' bounds; the
+  rest read 511M buckets (313M of dense words), 2.8M are scored.
+
+Kept:
+
+- A candidate's buckets are read a term at a time while it is left in
+  reach, the term bounding it highest first, every held term bounded at
+  the longest length floor its read buckets imply (an unread term by its
+  block's largest bucket there; `LazyFooter::decode_bounds` keeps each
+  block's largest bucket, a byte a block). Buckets read past the blocks'
+  bounds fell from 375M to 148M (simulated: dense words first at their
+  blocks' bounds would have saved 39M; plain incremental reads 81M). TF
+  pages a query 6,820 to 4,257 (`score`: 601 to 565).
+- No word check at the sub-range's bounds before the members are weighed
+  there (it cut 13M of 383M words).
+
+On top of `tinshape/grids-inplace` (`0bd6e15`), 400 disjunctions x 3
+passes, aarch64 (M4, shared host, two rounds): `--full` instructions
+-2.4% / -2.2%, cycles -5.5% / -4.9%; with `--pin-ns 1000` -3.7% and
+-7.3%; `score` -1.0% / -0.9% and -1.1% / -1.6%. x86-64 (r7i.2xlarge,
+`perf stat`, user, less a load-only run, one round): `--full`
+instructions -3.7%, cycles -5.1%, mean latency -4.6%; `score` -1.6%,
+-2.2%, -2.3%. Answers: `--expect` 0 different on the whole trace,
+`--full` byte-identical.
+
+Measured and not kept (exact, all): sub-ranges of 512 or 256 slots
+(closer to a dense word's ~365-slot blocks: +1.6% / +3.8% instructions);
+dense words' group bounds by their record, so their footers could be
+skimmed (passing groups +8.5%, members weighed +50%; the group check
+needs the blocks); blocks found by slot with posting indexes only for
+buckets read (+5% cycles); the length read first for a candidate whose
+best term is dense (more DL pages, +1.6% instructions); a MaxScore plan
+per sub-range (members weighed -7% only); a word's members weighed term
+by term, or only by the terms holding any of them (+7% / +2%); the held
+terms found without a branch (+0.5% instructions, -1.3% cycles alone,
+nothing on top of the above).
+
+What is left is mostly not dense-specific: the word loop (each member of
+a live word weighed by every present term), `range_bound` per term per
+sub-range, and decoding every dense footer block's bound up front, which
+the group check needs. For the lanes on the same walk: `or_stage` reads
+`Walk::held_bound` as each held term's current bound (block, then bucket
+at the shared floor) and computes a member's posting index as before
+(`row_index`); `or_bucket_of` no longer writes a bound.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every

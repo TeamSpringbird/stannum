@@ -148,6 +148,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   million rows a query copies 12 MB instead of 44 MB (21 MB instead of 130
   MB scoring every term), for 5% to 6% fewer instructions and 5% to 8%
   fewer cycles on aarch64 and x86-64 alike.
+- A ranked disjunction over `TNS1` reads a candidate's buckets a term at a
+  time while it is left in reach, and bounds every term it holds at the
+  longest length its read buckets imply, an unread term by its footer
+  block's largest bucket there (TIN's shared length): a rare word's bucket
+  in a long document rules out the common words before their TF is read.
+  It weighs a word's members at their sub-range's bounds without first
+  weighing the word there. At 150 million rows `full_score` disjunctions
+  read 38% fewer TF pages (10% fewer pages in all) and take 5% fewer
+  cycles on aarch64 and x86-64 (7% on aarch64 with slow pins); `score`
+  ones 1% to 2% fewer, with the same answers.
 - Ranked walks over `TNS1` branch less where the branch follows the data,
   for x86-64, whose predictors miss such branches far more often than the
   Apple cores do. A conjunction intersects its candidates with each
