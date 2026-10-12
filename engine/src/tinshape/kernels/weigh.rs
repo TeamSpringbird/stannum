@@ -11,11 +11,13 @@
 //! same order as the one-at-a-time loop's, so the sums are bit for bit its.
 //!
 //! The portable bodies are those loops. The vector bodies test a vector of
-//! words (or a term's word shifted by a vector of bit positions) against the
+//! words (or a term's word against a vector of one-bit masks) against the
 //! mask, widen each 64-bit lane's verdict to a 32-bit one (two vectors of
 //! words make one of `f32` lanes), keep the term's bound under it and add.
 //! The per-word sum of the one-at-a-time loop ran a chain of dependent
-//! `f32` additions per term; here a chain runs across lanes at once.
+//! `f32` additions per term; here a chain runs across lanes at once. A
+//! vector of words none of which has a member is skipped: nothing is added
+//! to a word without members, whose sum is left as it is.
 
 use super::{Level, level};
 
@@ -42,21 +44,81 @@ pub fn or_zero(x: f32, keep: bool) -> f32 {
     f32::from_bits(x.to_bits() & mask)
 }
 
-/// Adds to `sums[j]`, for each word `j` of `mask`, each term's bound where
-/// `mask[j]` and word `j` of the term's row share a bit: `rows[t]` is term
-/// `t`'s row as little-endian bytes (at least `mask.len() * 8` of them),
-/// `bounds[t]` its bound.
+/// A term's row in the group at hand: its words, little-endian, as bytes
+/// (a grid read in place on its page, or words decoded into a buffer).
+///
+/// A pointer, not a slice, as a walk borrows it from a page or its own
+/// buffer across its `&mut self` calls. Sound as the walk uses it: a
+/// group's rows are made after its buffer is sized for the group, and read
+/// only within that group, before the group's pages are released.
+#[derive(Clone, Copy)]
+pub struct Row {
+    at: *const u8,
+    len: usize,
+}
+
+impl Default for Row {
+    fn default() -> Self {
+        Self::new(&[])
+    }
+}
+
+impl Row {
+    pub fn new(bytes: &[u8]) -> Self {
+        Self {
+            at: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    /// Words stored little-endian.
+    pub fn of(words: &[u64]) -> Self {
+        Self {
+            at: words.as_ptr().cast(),
+            len: size_of_val(words),
+        }
+    }
+
+    #[inline(always)]
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: `len` bytes from `at` were a slice when the row was made,
+        // and are still (see the type).
+        unsafe { std::slice::from_raw_parts(self.at, self.len) }
+    }
+
+    /// Word `w`.
+    #[inline(always)]
+    pub fn word(&self, w: usize) -> u64 {
+        debug_assert!(w * 8 + 8 <= self.len);
+        // SAFETY: as in `bytes`; a walk asks only for its group's words,
+        // which a row holds.
+        u64::from_le_bytes(unsafe { self.at.add(w * 8).cast::<[u8; 8]>().read_unaligned() })
+    }
+}
+
+/// Sets `sums[j]`, for each word `j` of `mask` with a member, to the sum
+/// from `+0.0` of each term's bound where `mask[j]` and word `at + j` of
+/// the term's row share a bit; `bounds[t]` is row `t`'s bound. A word
+/// without members is left as it is. Each row holds words through
+/// `at + mask.len()`.
 #[inline]
-pub fn word_sums(mask: &[u64], rows: &[&[u8]], bounds: &[f32], sums: &mut [f32]) {
-    check_words(mask, rows, bounds, sums);
-    run!(level(), word_sums(mask, rows, bounds, sums))
+pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
+    check_words(mask, at, rows, bounds, sums);
+    run!(level(), word_sums(mask, at, rows, bounds, sums))
 }
 
 /// [`word_sums`] at `level`; panics if the CPU lacks it.
-pub fn word_sums_at(level: Level, mask: &[u64], rows: &[&[u8]], bounds: &[f32], sums: &mut [f32]) {
+pub fn word_sums_at(
+    level: Level,
+    mask: &[u64],
+    at: usize,
+    rows: &[Row],
+    bounds: &[f32],
+    sums: &mut [f32],
+) {
     assert!(level.supported(), "kernel level {} unsupported here", level.name());
-    check_words(mask, rows, bounds, sums);
-    run!(level, word_sums(mask, rows, bounds, sums))
+    check_words(mask, at, rows, bounds, sums);
+    run!(level, word_sums(mask, at, rows, bounds, sums))
 }
 
 /// Adds to `sums[j]`, for each bit position `bits[j]` (below 64), each
@@ -75,11 +137,11 @@ pub fn member_sums_at(level: Level, held: &[u64], bits: &[u8], bounds: &[f32], s
 }
 
 #[inline(always)]
-fn check_words(mask: &[u64], rows: &[&[u8]], bounds: &[f32], sums: &mut [f32]) {
+fn check_words(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
     assert_eq!(rows.len(), bounds.len(), "a bound per row");
     assert_eq!(mask.len(), sums.len(), "a sum per word");
     for row in rows {
-        assert!(row.len() >= mask.len() * 8, "a row of the mask's words");
+        assert!(row.len >= (at + mask.len()) * 8, "a row of the mask's words");
     }
 }
 
@@ -93,32 +155,44 @@ fn check_members(held: &[u64], bits: &[u8], bounds: &[f32], sums: &mut [f32]) {
 /// The portable bodies: the one-at-a-time loops, the reference every level
 /// is tested against.
 mod scalar {
-    use super::or_zero;
+    use super::{Row, or_zero};
 
     /// Words `from..` of the inputs, one at a time.
     #[inline(always)]
-    pub fn word_tail(mask: &[u64], rows: &[&[u8]], bounds: &[f32], sums: &mut [f32], from: usize) {
-        for (row, &bound) in rows.iter().zip(bounds) {
-            for j in from..mask.len() {
-                let w = u64::from_le_bytes(row[j * 8..j * 8 + 8].try_into().expect("eight bytes"));
-                sums[j] += or_zero(bound, w & mask[j] != 0);
+    pub fn word_tail(
+        mask: &[u64],
+        at: usize,
+        rows: &[Row],
+        bounds: &[f32],
+        sums: &mut [f32],
+        from: usize,
+    ) {
+        for j in from..mask.len() {
+            let m = mask[j];
+            if m == 0 {
+                continue;
             }
+            let mut sum = 0.0_f32;
+            for (row, &bound) in rows.iter().zip(bounds) {
+                sum += or_zero(bound, row.word(at + j) & m != 0);
+            }
+            sums[j] = sum;
         }
     }
 
     /// Members `from..` of the inputs, one at a time.
     #[inline(always)]
     pub fn member_tail(held: &[u64], bits: &[u8], bounds: &[f32], sums: &mut [f32], from: usize) {
-        for (&h, &bound) in held.iter().zip(bounds) {
-            for j in from..bits.len() {
+        for j in from..bits.len() {
+            for (&h, &bound) in held.iter().zip(bounds) {
                 sums[j] += or_zero(bound, h >> bits[j] & 1 == 1);
             }
         }
     }
 
     #[inline(always)]
-    pub fn word_sums(mask: &[u64], rows: &[&[u8]], bounds: &[f32], sums: &mut [f32]) {
-        word_tail(mask, rows, bounds, sums, 0)
+    pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
+        word_tail(mask, at, rows, bounds, sums, 0)
     }
 
     #[inline(always)]
@@ -130,7 +204,7 @@ mod scalar {
 /// NEON bodies: four lanes of `f32` from two vectors of two words.
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::scalar;
+    use super::{Row, scalar};
     use core::arch::aarch64::*;
 
     /// The low halves of two vectors of 64-bit verdicts as four 32-bit ones.
@@ -141,31 +215,38 @@ mod neon {
     }
 
     #[inline]
-    pub fn word_sums(mask: &[u64], rows: &[&[u8]], bounds: &[f32], sums: &mut [f32]) {
+    pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
         let n = mask.len();
         let full = n - n % 4;
         // SAFETY: NEON is baseline on aarch64; every load is of four words
-        // (32 bytes) at most `full` words in, which every row holds (checked
-        // by the caller), and every store of four sums.
+        // (32 bytes) at most `at + full` words into a row, which every row
+        // holds (checked by the caller), and every store of four sums.
         unsafe {
             let mut j = 0;
             while j < full {
                 let m0 = vld1q_u64(mask.as_ptr().add(j));
                 let m1 = vld1q_u64(mask.as_ptr().add(j + 2));
-                let mut acc = vld1q_f32(sums.as_ptr().add(j));
+                if vmaxvq_u32(vreinterpretq_u32_u64(vorrq_u64(m0, m1))) == 0 {
+                    j += 4;
+                    continue;
+                }
+                let mut acc = vdupq_n_f32(0.0);
                 for (row, &bound) in rows.iter().zip(bounds) {
-                    let p = row.as_ptr().add(j * 8);
+                    let p = row.at.add((at + j) * 8);
                     let r0 = vreinterpretq_u64_u8(vld1q_u8(p));
                     let r1 = vreinterpretq_u64_u8(vld1q_u8(p.add(16)));
                     let held = narrow(vtstq_u64(r0, m0), vtstq_u64(r1, m1));
                     let v = vandq_u32(held, vdupq_n_u32(bound.to_bits()));
                     acc = vaddq_f32(acc, vreinterpretq_f32_u32(v));
                 }
-                vst1q_f32(sums.as_mut_ptr().add(j), acc);
+                // A word without members keeps its sum.
+                let live = narrow(vtstq_u64(m0, m0), vtstq_u64(m1, m1));
+                let old = vld1q_f32(sums.as_ptr().add(j));
+                vst1q_f32(sums.as_mut_ptr().add(j), vbslq_f32(live, acc, old));
                 j += 4;
             }
         }
-        scalar::word_tail(mask, rows, bounds, sums, full);
+        scalar::word_tail(mask, at, rows, bounds, sums, full);
     }
 
     #[inline]
@@ -204,7 +285,7 @@ mod neon {
 /// permuted into that order on load and back on store.
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::scalar;
+    use super::{Row, scalar};
     use core::arch::x86_64::*;
 
     #[target_feature(enable = "avx2")]
@@ -222,22 +303,26 @@ mod avx2 {
     }
 
     #[target_feature(enable = "avx2")]
-    pub fn word_sums(mask: &[u64], rows: &[&[u8]], bounds: &[f32], sums: &mut [f32]) {
+    pub fn word_sums(mask: &[u64], at: usize, rows: &[Row], bounds: &[f32], sums: &mut [f32]) {
         let n = mask.len();
         let full = n - n % 8;
         let zero = _mm256_setzero_si256();
-        // SAFETY: every load is of eight words (64 bytes) at most `full`
-        // words in, which every row holds (checked by the caller), and
-        // every load and store of sums of eight lanes.
+        // SAFETY: every load is of eight words (64 bytes) at most `at + full`
+        // words into a row, which every row holds (checked by the caller),
+        // and every load and store of sums of eight lanes.
         unsafe {
             let mut j = 0;
             while j < full {
                 let m0 = _mm256_loadu_si256(mask.as_ptr().add(j).cast());
                 let m1 = _mm256_loadu_si256(mask.as_ptr().add(j + 4).cast());
-                let mut acc =
-                    _mm256_permutevar8x32_ps(_mm256_loadu_ps(sums.as_ptr().add(j)), order());
+                let any = _mm256_or_si256(m0, m1);
+                if _mm256_testz_si256(any, any) != 0 {
+                    j += 8;
+                    continue;
+                }
+                let mut acc = _mm256_setzero_ps();
                 for (row, &bound) in rows.iter().zip(bounds) {
-                    let p = row.as_ptr().add(j * 8);
+                    let p = row.at.add((at + j) * 8);
                     let r0 = _mm256_loadu_si256(p.cast());
                     let r1 = _mm256_loadu_si256(p.add(32).cast());
                     let z0 = _mm256_cmpeq_epi64(_mm256_and_si256(r0, m0), zero);
@@ -245,11 +330,16 @@ mod avx2 {
                     let v = _mm256_andnot_ps(narrow(z0, z1), _mm256_set1_ps(bound));
                     acc = _mm256_add_ps(acc, v);
                 }
-                _mm256_storeu_ps(sums.as_mut_ptr().add(j), _mm256_permutevar8x32_ps(acc, order()));
+                // A word without members keeps its sum.
+                let dead = narrow(_mm256_cmpeq_epi64(m0, zero), _mm256_cmpeq_epi64(m1, zero));
+                let old =
+                    _mm256_permutevar8x32_ps(_mm256_loadu_ps(sums.as_ptr().add(j)), order());
+                let v = _mm256_blendv_ps(acc, old, dead);
+                _mm256_storeu_ps(sums.as_mut_ptr().add(j), _mm256_permutevar8x32_ps(v, order()));
                 j += 8;
             }
         }
-        scalar::word_tail(mask, rows, bounds, sums, full);
+        scalar::word_tail(mask, at, rows, bounds, sums, full);
     }
 
     #[target_feature(enable = "avx2")]
@@ -333,34 +423,44 @@ mod tests {
         #[test]
         fn word_sums_agree(
             words in 0usize..21,
+            at in 0usize..5,
             terms in 0usize..9,
             density in 0u32..4,
             seed in any::<u64>(),
             bounds in prop::collection::vec(bound(), 0..9),
             start in prop::collection::vec(bound(), 0..21),
-            at in 0usize..8,
+            shift in 0usize..8,
         ) {
             let terms = terms.min(bounds.len());
             let bounds = &bounds[..terms];
             let mut s = seed | 1;
             let mut next = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
             let dense = |x: u64| match density { 0 => 0, 1 => x & x.rotate_left(17) & x.rotate_left(31), 2 => x & x.rotate_left(7), _ => x };
-            let mask: Vec<u64> = (0..words).map(|_| dense(next())).collect();
-            // Rows as bytes, each starting `at` bytes into its buffer (unaligned).
+            // A run of dead words in the mask, sometimes.
+            let dead = (next() % 3 == 0).then(|| (next() as usize % (words + 1), next() as usize % 9));
+            let mask: Vec<u64> = (0..words)
+                .map(|j| if dead.is_some_and(|(from, n)| j >= from && j < from + n) { 0 } else { dense(next()) })
+                .collect();
+            // Rows as bytes, `at` words then the mask's, each starting
+            // `shift` bytes into its buffer (unaligned).
             let buffers: Vec<Vec<u8>> = (0..terms)
                 .map(|_| {
-                    let mut b = vec![0u8; at];
-                    for _ in 0..words { b.extend_from_slice(&dense(next()).to_le_bytes()); }
+                    let mut b = vec![0u8; shift];
+                    for _ in 0..at + words { b.extend_from_slice(&dense(next()).to_le_bytes()); }
                     b
                 })
                 .collect();
-            let rows: Vec<&[u8]> = buffers.iter().map(|b| &b[at..]).collect();
+            let rows: Vec<Row> = buffers.iter().map(|b| Row::new(&b[shift..])).collect();
             let mut want: Vec<f32> = (0..words).map(|j| start.get(j).copied().unwrap_or(0.0)).collect();
             let init = want.clone();
-            scalar::word_sums(&mask, &rows, bounds, &mut want);
+            scalar::word_sums(&mask, at, &rows, bounds, &mut want);
+            // A word without members is left as it is.
+            for (j, &m) in mask.iter().enumerate() {
+                if m == 0 { prop_assert_eq!(want[j].to_bits(), init[j].to_bits()); }
+            }
             for level in Level::supported_levels() {
                 let mut have = init.clone();
-                word_sums_at(level, &mask, &rows, bounds, &mut have);
+                word_sums_at(level, &mask, at, &rows, bounds, &mut have);
                 prop_assert!(same(&have, &want), "{:?}: {:?} vs {:?}", level, have, want);
             }
         }

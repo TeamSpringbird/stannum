@@ -223,7 +223,7 @@ pub use ef::{
     container_locals, container_row, ef_decode, ef_decode_at, ef_into_row, ef_into_row_at,
 };
 mod weigh;
-pub use weigh::{member_sums, member_sums_at, or_zero, word_sums, word_sums_at};
+pub use weigh::{Row, member_sums, member_sums_at, or_zero, word_sums, word_sums_at};
 mod score;
 pub use score::{score_pairs, score_pairs_at};
 
