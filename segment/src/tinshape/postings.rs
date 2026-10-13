@@ -195,6 +195,9 @@ pub struct Stats {
     /// how many it holds.
     pub frontier_bytes: usize,
     pub frontiers: usize,
+    /// Bytes the array containers take less what their members would take
+    /// as Elias-Fano lists (negative for a few lists of one to four).
+    pub array_excess: isize,
 }
 
 impl Stats {
@@ -508,10 +511,12 @@ pub fn encode_reusing<'r>(
     // A term with a group dense enough to be a grid stays grouped. The
     // directory's frontiers and the footer do not count: they buy the
     // walks their bounds, and leaving them out keeps each term's form
-    // what it was without them.
-    let use_sparse = options.sparse
-        && grouped_stats.forced == 0
-        && sparse.len() <= grouped.len() - grouped_stats.frontier_bytes;
+    // what it was without them. Arrays count as the Elias-Fano lists they
+    // replace, for the same reason: they buy decoding.
+    let grouped_len =
+        grouped.len() as isize - grouped_stats.frontier_bytes as isize - grouped_stats.array_excess;
+    let use_sparse =
+        options.sparse && grouped_stats.forced == 0 && sparse.len() as isize <= grouped_len;
     let payload = if use_sparse { &sparse } else { &grouped };
     let mut inline_bytes = Vec::new();
     if inline {
@@ -563,6 +568,7 @@ pub fn encode_reusing<'r>(
         stats.forced = grouped_stats.forced;
         stats.frontier_bytes = grouped_stats.frontier_bytes;
         stats.frontiers = grouped_stats.frontiers;
+        stats.array_excess = grouped_stats.array_excess;
     }
     stats
 }
@@ -710,6 +716,10 @@ fn encode_groups<'r>(
         if kind == KIND_EF && array {
             kind = KIND_ARRAY;
             best = 2 * locals.len();
+        }
+        if kind == KIND_ARRAY {
+            stats.array_excess +=
+                best as isize - ef::encoded_len(locals.len(), group.slots()) as isize;
         }
         let gap = match previous {
             None => index,
@@ -3949,7 +3959,16 @@ mod tests {
             .map(|i| (i as u32 * 7919) % 300 + 1)
             .collect();
         for options in all_options() {
-            round_trip(&geometry, &slots, buckets, &lengths, &options);
+            let stats = round_trip(&geometry, &slots, buckets, &lengths, &options);
+            // Arrays weigh as the lists they replace in the choice of a
+            // term's form: it is the same without them.
+            let lists = Options {
+                array_max: 0,
+                ..options
+            };
+            let without = round_trip(&geometry, &slots, buckets, &lengths, &lists);
+            assert_eq!(stats.sparse, without.sparse);
+            assert_eq!(without.array_excess, 0);
         }
     }
 
@@ -4174,6 +4193,11 @@ mod tests {
         }
         assert_eq!(locals, slots);
         check_all(&tids, &members, &buckets);
+        // What the arrays take beyond the lists, which the choice of the
+        // term's form leaves out.
+        let second = ef::encoded_len(109, geometry.groups[1].slots());
+        assert_eq!(all.array_excess, (2 * 178 - first - second) as isize);
+        assert_eq!(ef.array_excess, 0);
     }
 
     #[test]
