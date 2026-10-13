@@ -196,6 +196,14 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"stannum.own_pins",
+        c"Pin index pages found through their hints with one atomic operation, outside PostgreSQL's per-pin bookkeeping",
+        c"Off pins them through ReadRecentBuffer, for comparison.",
+        &crate::storage::OWN_PINS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"stannum.count_fold",
         c"Count Boolean term queries by folding document-ordinal streams",
         c"Off keeps the scalar and page-bitmap strategies; other query shapes always use those.",

@@ -2022,20 +2022,43 @@ mod tests {
         let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'exiting_idx'::regclass::oid")
             .unwrap()
             .unwrap();
+        let refcount = |buffer: pg_sys::Buffer| unsafe {
+            let desc = pg_sys::BufferDescriptors.add(buffer as usize - 1);
+            std::ptr::read_volatile(std::ptr::addr_of!((*desc).bufferdesc.state.value))
+                & pg_sys::BUF_REFCOUNT_MASK
+        };
         let before = crate::storage::held_pages().0;
         // Otherwise the drop releases the span's page and relation.
-        unsafe { crate::storage::drop_holding_source(oid, false) };
+        let (buffers, _) = unsafe { crate::storage::drop_holding_source(oid, false) };
         assert_eq!(crate::storage::held_pages().0, before);
+        for (buffer, _) in buffers {
+            assert_eq!(refcount(buffer), 0, "a pin outlived its span");
+        }
         // At exit it leaves both to the resource owner, so releasing them
         // here, as exit processing would, releases each once: a second
-        // release raises "not owned by resource owner".
+        // release raises "not owned by resource owner". A page pinned
+        // through its hint is the span's own pin, released through the
+        // span's ledger the owner remembers.
         let (buffers, relation) = unsafe { crate::storage::drop_holding_source(oid, true) };
         assert_eq!(crate::storage::held_pages().0, before);
+        assert!(
+            buffers.iter().any(|(_, owned)| *owned),
+            "the page pinned again, through its hint, was not the span's own pin"
+        );
+        for (buffer, _) in buffers {
+            assert!(refcount(buffer) > 0, "the drop at exit released a pin");
+        }
         unsafe {
-            for buffer in buffers {
-                pg_sys::ReleaseBuffer(buffer);
+            for (buffer, owned) in buffers {
+                if !owned {
+                    pg_sys::ReleaseBuffer(buffer);
+                }
             }
+            crate::storage::release_spans_of_owner();
             pg_sys::RelationClose(relation);
+        }
+        for (buffer, _) in buffers {
+            assert_eq!(refcount(buffer), 0, "the owner's release left a pin");
         }
     }
 
@@ -8741,5 +8764,31 @@ mod tests {
             pg_sys::table_close(relation, pg_sys::AccessShareLock as _);
             status & pg_sys::VISIBILITYMAP_ALL_VISIBLE as u8 != 0
         }
+    }
+
+    /// The shared reference count of the buffer holding `block` of `index`
+    /// (used by postgres/tests/own_pins.py).
+    #[pg_extern]
+    fn buffer_refcount(index: pg_sys::Oid, block: i64) -> i64 {
+        i64::from(unsafe { crate::storage::testing::shared_refcount(index, block as u32) })
+    }
+
+    /// Holds an own pin on `block` of `index` for `hold_ms`; the buffer's
+    /// reference count right after the release.
+    #[pg_extern]
+    fn own_pin_held(index: pg_sys::Oid, block: i64, hold_ms: i64) -> i64 {
+        i64::from(unsafe {
+            crate::storage::testing::own_pin_held(index, block as u32, hold_ms as u64)
+        })
+    }
+
+    /// Holds the header lock of the buffer holding `block` of `index` for
+    /// `hold_ms`, as the bgwriter, a checkpoint or `pg_buffercache` hold it
+    /// for a moment; the reference count read under the lock.
+    #[pg_extern]
+    fn buffer_header_locked(index: pg_sys::Oid, block: i64, hold_ms: i64) -> i64 {
+        i64::from(unsafe {
+            crate::storage::testing::header_locked(index, block as u32, hold_ms as u64)
+        })
     }
 }

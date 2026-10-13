@@ -1022,6 +1022,10 @@
       "owner": "ben",
       "evidence": "Original Stannum wide-query fuzzer generation regression tests. Moved from benchmarks/test_wide_cursor.py."
     },
+    "postgres/tests/own_pins.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum regression: an own pin released under another session's buffer header lock, and walks with own pins under pg_buffercache readers, VACUUM, REINDEX, cancellation and termination."
+    },
     "postgres/tests/vacuum_cleanup_pins.py": {
       "owner": "ben",
       "evidence": "Original Stannum regression reproducing reader-pinned heap cleanup and validating benchmark accounting. Moved from benchmarks/vacuum_cleanup_pins.py."

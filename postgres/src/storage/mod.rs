@@ -855,17 +855,30 @@ pub struct RunSource {
     /// The index, opened at the first page a span pins and closed when it
     /// ends, rather than looked up per page: a walk pins a page per chunk.
     relation: Cell<pg_sys::Relation>,
+    /// The open span's ledger of own pins (see [`SpanLedger`]), remembered
+    /// with `owner` as one resource (see [`RUN_PAGES`]); null outside a
+    /// span.
+    ledger: Cell<*mut SpanLedger>,
+    owner: Cell<pg_sys::ResourceOwner>,
+}
+
+/// The buffers a span holds pinned by [`own_pin`], outside PostgreSQL's
+/// per-pin bookkeeping: what its resource owner releases should the span
+/// never close (a `FATAL` exit mid-walk, see [`release_run_pages`]). Boxed
+/// apart from the source, which an exiting backend drops after its owners
+/// are released: the owner frees the box then, else the span's close does.
+#[derive(Default)]
+struct SpanLedger {
+    owned: Vec<pg_sys::Buffer>,
 }
 
 /// Most pages a span of one run source keeps pinned for in-place reads
 /// (64 MiB of shared buffers); past it the reader copies what it reads.
 const PINNED_LIMIT: usize = 8192;
 
-thread_local! {
-    /// Outermost hold spans opened by the backend's run sources, numbering
-    /// each span uniquely across sources.
-    static HOLD_SPANS: Cell<u64> = const { Cell::new(0) };
-}
+/// Outermost hold spans opened by the backend's run sources, numbering
+/// each span uniquely across sources.
+static HOLD_SPANS: BackendCell<u64> = BackendCell::new(0);
 
 /// The pages one slot holds pinned.
 type HeldSlot = [Option<HeldPage>; segment::source::HELD_PIECES];
@@ -894,6 +907,9 @@ struct HeldPage {
     /// The page's run data, valid while pinned.
     data: *const u8,
     len: usize,
+    /// Pinned by [`own_pin`], outside PostgreSQL's per-pin bookkeeping (see
+    /// [`OWN_PINS`]); else by `ReadBuffer`, released by `ReleaseBuffer`.
+    owned: bool,
 }
 
 impl RunSource {
@@ -908,6 +924,8 @@ impl RunSource {
             slots: RefCell::new(vec![Default::default(); segment::source::HELD_SLOTS]),
             pinned: RefCell::default(),
             relation: Cell::new(std::ptr::null_mut()),
+            ledger: Cell::new(std::ptr::null_mut()),
+            owner: Cell::new(std::ptr::null_mut()),
         }
     }
 
@@ -919,19 +937,78 @@ impl RunSource {
         for slot in slots.iter_mut() {
             for page in slot.iter_mut() {
                 if let Some(held) = page.take() {
-                    unpin(held);
+                    self.unpin(held);
                 }
             }
         }
         slots.truncate(segment::source::HELD_SLOTS);
         for (_, held) in self.pinned.borrow_mut().drain() {
-            unpin(held);
+            self.unpin(held);
         }
         let relation = self.relation.replace(std::ptr::null_mut());
         if !relation.is_null() && !exiting() {
             // SAFETY: opened by `pin` within the span now ending.
             unsafe { pg_sys::RelationClose(relation) };
         }
+        let ledger = self.ledger.replace(std::ptr::null_mut());
+        let owner = self.owner.replace(std::ptr::null_mut());
+        if !ledger.is_null() && !exiting() {
+            // SAFETY: remembered by `remember_span` with this owner, which
+            // the statement keeps until it ends. In an exiting backend the
+            // owner has released the ledger already, or will: it is left
+            // to the owner (see `release_run_pages`).
+            unsafe {
+                if !owner.is_null() {
+                    pg_sys::ResourceOwnerForget(owner, ledger_datum(ledger), &RUN_PAGES.0);
+                }
+                drop(Box::from_raw(ledger));
+            }
+        }
+    }
+
+    /// Opens the span's ledger of own pins and remembers it with the
+    /// current resource owner as one resource: an error that ends the
+    /// statement without unwinding the walk (a `FATAL` exit) releases the
+    /// span's own pins through it (see [`release_run_pages`]). PostgreSQL's
+    /// own pins (`ReadBuffer`) are remembered by `ReadBuffer` itself.
+    fn remember_span(&self) {
+        let ledger = Box::into_raw(Box::<SpanLedger>::default());
+        self.ledger.set(ledger);
+        // SAFETY: called within a statement, whose resource owner outlives
+        // the span.
+        unsafe {
+            let owner = pg_sys::CurrentResourceOwner;
+            if owner.is_null() {
+                return;
+            }
+            pg_sys::ResourceOwnerEnlarge(owner);
+            pg_sys::ResourceOwnerRemember(owner, ledger_datum(ledger), &RUN_PAGES.0);
+            self.owner.set(owner);
+        }
+    }
+
+    /// Releases a page [`Self::pin`] pinned; in an exiting backend only
+    /// forgets it (see [`exiting`]).
+    fn unpin(&self, held: HeldPage) {
+        if !exiting() {
+            // SAFETY: the pin was taken by `pin` and is released once: the
+            // slot holding it was emptied before this call. An own pin is
+            // struck from the ledger it was entered in.
+            unsafe {
+                if held.owned {
+                    let ledger = self.ledger.get();
+                    if !ledger.is_null() {
+                        let owned = &mut (*ledger).owned;
+                        if let Some(at) = owned.iter().rposition(|&b| b == held.buffer) {
+                            owned.swap_remove(at);
+                        }
+                    }
+                }
+                release_pin(held.buffer, held.owned);
+            }
+        }
+        let (now, total, peak) = HELD_PAGES.get();
+        HELD_PAGES.set((now - 1, total, peak));
     }
 
     /// Pins page `page` of the run, checked as a run page, and releases
@@ -961,10 +1038,14 @@ impl RunSource {
                 // Pinned only: a run page is never written while published
                 // (see `HeldPage`), so its content lock guards nothing, and
                 // a walk pins a page or two per chunk it loads.
-                let buffer = if charge {
-                    crate::score::charging("buffer read", || pin_block(index, block))
+                // An own pin needs the span's ledger (see `SpanLedger`):
+                // outside a span the page is pinned PostgreSQL's way.
+                let ledger = self.ledger.get();
+                let own = OWN_PINS.get() && !ledger.is_null();
+                let (buffer, owned) = if charge {
+                    crate::score::charging("buffer read", || pin_block(index, block, own))
                 } else {
-                    pin_block(index, block)
+                    pin_block(index, block, own)
                 };
                 let contents = std::slice::from_raw_parts(page_of(buffer), PAGE_SIZE);
                 let checked = match layout::kind(contents) {
@@ -977,7 +1058,7 @@ impl RunSource {
                 let data = match checked {
                     Ok(data) => data,
                     Err(message) => {
-                        pg_sys::ReleaseBuffer(buffer);
+                        release_pin(buffer, owned);
                         corrupt(format!("Stannum {}: page {block}: {message}", self.label))
                     }
                 };
@@ -986,7 +1067,11 @@ impl RunSource {
                     buffer,
                     data: data.as_ptr(),
                     len: data.len(),
+                    owned,
                 };
+                if owned {
+                    (*ledger).owned.push(buffer);
+                }
                 let (now, total, peak) = HELD_PAGES.get();
                 HELD_PAGES.set((now + 1, total + 1, peak.max(now + 1)));
                 SCAN_PINS.set(SCAN_PINS.get() + 1);
@@ -996,22 +1081,47 @@ impl RunSource {
     }
 }
 
+/// A cell of the backend's, read and written on its one thread: the
+/// extension runs no thread of its own, and a backend is a process. Where
+/// a `thread_local!` would do, this spares the dynamic thread-local lookup
+/// a loaded module pays per access (`__tls_get_addr` or its descriptor,
+/// several per pin on the hot path).
+struct BackendCell<T>(Cell<T>);
+
+// SAFETY: see the type: only the backend's thread touches it.
+unsafe impl<T> Sync for BackendCell<T> {}
+
+impl<T: Copy> BackendCell<T> {
+    const fn new(value: T) -> Self {
+        Self(Cell::new(value))
+    }
+
+    fn get(&self) -> T {
+        self.0.get()
+    }
+
+    fn set(&self, value: T) {
+        self.0.set(value);
+    }
+}
+
+/// Run pages held pinned now, pinned so in all, and the most held at once
+/// since the peak was reset: a held page must never outlive the walk that
+/// pinned it.
+static HELD_PAGES: BackendCell<(i64, u64, i64)> = BackendCell::new((0, 0, 0));
+/// Run pages pinned to be held since the peak was reset, and of those the
+/// ones [`pin_block`] pinned through their recent buffer.
+static SCAN_PINS: BackendCell<i64> = BackendCell::new(0);
+static SCAN_RECENT: BackendCell<i64> = BackendCell::new(0);
+/// This backend's mapping of the shared hint table, once attached.
+static SHARED_HINTS: BackendCell<SharedHints> = BackendCell::new(SharedHints::Unknown);
+
 thread_local! {
-    /// Run pages held pinned now, pinned so in all, and the most held at
-    /// once since the peak was reset: a held page must never outlive the
-    /// walk that pinned it.
-    static HELD_PAGES: Cell<(i64, u64, i64)> = const { Cell::new((0, 0, 0)) };
-    /// Run pages pinned to be held since the peak was reset, and of those
-    /// the ones [`pin_block`] pinned through their recent buffer.
-    static SCAN_PINS: Cell<i64> = const { Cell::new(0) };
-    static SCAN_RECENT: Cell<i64> = const { Cell::new(0) };
     /// Per backend, the buffer a block was last pinned in (see
     /// [`pin_block`]), direct-mapped by block and relation: used where the
     /// shared table ([`shared_hints`]) is off or could not be had.
     static RECENT_BUFFERS: RefCell<Box<[RecentBuffer]>> =
         RefCell::new(vec![RecentBuffer::default(); RECENT_BUFFERS_LEN].into_boxed_slice());
-    /// This backend's mapping of the shared hint table, once attached.
-    static SHARED_HINTS: Cell<SharedHints> = const { Cell::new(SharedHints::Unknown) };
 }
 
 /// Entries of [`RECENT_BUFFERS`], 2 MiB per backend. A pass over the 60
@@ -1193,22 +1303,35 @@ unsafe fn count_use(buffer: pg_sys::Buffer) {
 /// # Safety
 ///
 /// `index` is a live index relation held open by the caller.
-unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_sys::Buffer {
+unsafe fn pin_block(
+    index: pg_sys::Relation,
+    block: pg_sys::BlockNumber,
+    own: bool,
+) -> (pg_sys::Buffer, bool) {
     use std::sync::atomic::Ordering;
     // SAFETY: per the contract. `ReadRecentBuffer` checks the buffer's tag
     // under its header lock before pinning it, so a remembered buffer since
-    // given to another page is refused rather than pinned.
+    // given to another page is refused rather than pinned; `own_pin` checks
+    // it once pinned.
     unsafe {
         let locator = (*index).rd_locator;
         let slot = hint_slot(locator.relNumber.to_u32(), block);
+        // Pins `buffer` if it still holds the block: owned, else through
+        // `ReadRecentBuffer`.
         let recent = |buffer: pg_sys::Buffer| {
-            buffer > 0
-                && pg_sys::ReadRecentBuffer(
-                    locator,
-                    pg_sys::ForkNumber::MAIN_FORKNUM,
-                    block,
-                    buffer,
-                )
+            // A shared buffer's number; a hint names one, but the tables
+            // are read without a lock and the descriptor is indexed by it.
+            if buffer <= 0 || buffer > pg_sys::NBuffers {
+                return false;
+            }
+            if own {
+                return own_pin(buffer, &locator, block);
+            }
+            if pg_sys::ReadRecentBuffer(locator, pg_sys::ForkNumber::MAIN_FORKNUM, block, buffer) {
+                count_use(buffer);
+                return true;
+            }
+            false
         };
         if SHARE_BUFFER_HINTS.get()
             && let Some(table) = shared_hints()
@@ -1220,9 +1343,8 @@ unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_s
                 if (entry >> 32) as u32 == block {
                     let buffer = entry as u32 as pg_sys::Buffer;
                     if recent(buffer) {
-                        count_use(buffer);
                         SCAN_RECENT.set(SCAN_RECENT.get() + 1);
-                        return buffer;
+                        return (buffer, own);
                     }
                     break;
                 }
@@ -1240,21 +1362,263 @@ unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_s
                     Ordering::Relaxed,
                 );
             }
-            return buffer;
+            return (buffer, false);
         }
         let at = slot & (RECENT_BUFFERS_LEN - 1);
         let hint = RECENT_BUFFERS.with_borrow(|recent| recent[at]);
         if hint.block == block && recent(hint.buffer) {
-            count_use(hint.buffer);
             SCAN_RECENT.set(SCAN_RECENT.get() + 1);
-            return hint.buffer;
+            return (hint.buffer, own);
         }
         let buffer = pg_sys::ReadBuffer(index, block);
         if buffer > 0 {
             RECENT_BUFFERS.with_borrow_mut(|recent| recent[at] = RecentBuffer { block, buffer });
         }
-        buffer
+        (buffer, false)
     }
+}
+
+/// `stannum.own_pins`: whether a run page found through its hint is pinned
+/// by [`own_pin`], outside PostgreSQL's per-pin bookkeeping, or through
+/// `ReadRecentBuffer`.
+///
+/// A walk pins thousands of pages a query and holds tens at once, past the
+/// eight PostgreSQL's private reference counts keep in an array: every pin
+/// and release then looks a hash up two or three times (the private count,
+/// the resource owner), takes the buffer header's spinlock and raises its
+/// usage count in a second atomic operation, a tenth of a conjunction's
+/// backend CPU at 150M rows. An own pin is what `PinBuffer` does, one
+/// compare-and-swap of the header's state (reference and usage counts
+/// together), then the tag check `ReadRecentBuffer` makes; an own release
+/// is `UnpinBuffer`'s atomic decrement and, for a buffer with a waiter for
+/// its sole pin (a vacuum's cleanup lock), the waiter's wake-up under the
+/// header lock. The span's pins are remembered with the resource owner as
+/// one resource ([`RUN_PAGES`]), so an abort or exit that does not unwind
+/// the walk releases them as it would the rest.
+pub static OWN_PINS: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+
+/// The buffer descriptor of shared buffer `buffer`.
+///
+/// # Safety
+///
+/// `buffer` is a shared buffer (positive).
+#[inline]
+unsafe fn descriptor(buffer: pg_sys::Buffer) -> *mut pg_sys::BufferDesc {
+    // SAFETY: a shared buffer's descriptor lies at its index in the array.
+    unsafe {
+        std::ptr::addr_of_mut!((*pg_sys::BufferDescriptors.add(buffer as usize - 1)).bufferdesc)
+    }
+}
+
+/// The descriptor's state word, an atomic PostgreSQL updates by
+/// compare-and-swap whenever the header is not locked.
+///
+/// # Safety
+///
+/// `desc` is a shared buffer's descriptor.
+#[inline]
+unsafe fn state_of<'a>(desc: *mut pg_sys::BufferDesc) -> &'a std::sync::atomic::AtomicU32 {
+    // SAFETY: `pg_atomic_uint32` is a 32-bit word PostgreSQL accesses with
+    // the platform's atomics.
+    unsafe { &*std::ptr::addr_of!((*desc).state.value).cast::<std::sync::atomic::AtomicU32>() }
+}
+
+/// Waits for the buffer header whose state is `state` to be unlocked, as
+/// `WaitBufHdrUnlocked` does (PostgreSQL's spin delay: a few spins, then
+/// sleeps that lengthen, so a holder descheduled while holding the lock
+/// gets to run), and returns the state read unlocked.
+///
+/// # Safety
+///
+/// `state` is a shared buffer descriptor's state word.
+#[cold]
+unsafe fn wait_header_unlocked(state: &std::sync::atomic::AtomicU32) -> u32 {
+    use std::sync::atomic::Ordering;
+    // SAFETY: the delay status is this call's own, initialized as
+    // `init_local_spin_delay` does, and named for the stuck-spinlock report.
+    unsafe {
+        let mut delay = pg_sys::SpinDelayStatus {
+            file: c"stannum/storage".as_ptr(),
+            func: c"wait_header_unlocked".as_ptr(),
+            ..Default::default()
+        };
+        let mut now = state.load(Ordering::Relaxed);
+        while now & pg_sys::BM_LOCKED != 0 {
+            pg_sys::perform_spin_delay(&raw mut delay);
+            now = state.load(Ordering::Relaxed);
+        }
+        pg_sys::finish_spin_delay(&raw mut delay);
+        now
+    }
+}
+
+/// Pins shared buffer `buffer` as `PinBuffer` does, one compare-and-swap of
+/// its state (a reference and, up to the most, a use), and keeps the pin if
+/// the buffer holds `block` of the relation at `locator`; otherwise
+/// releases it again and returns false. The tag is read once pinned: a
+/// pinned valid buffer cannot be given to another page.
+///
+/// Only a valid buffer is pinned: the compare-and-swap takes the pin only
+/// if the state it read, `BM_VALID` set, is still the state. A buffer
+/// without `BM_VALID` may be a victim between its eviction and its new
+/// tag, pinned once by the backend replacing it, which asserts that single
+/// pin (`BufferAlloc`, `GetVictimBuffer`, `ExtendBufferedRelShared`): a
+/// stale hint names such a buffer, and a pin on it, however brief, trips
+/// the assertion in a cassert build and makes the replacement start over
+/// in any build. `ReadRecentBuffer` checks under the header lock before
+/// pinning for the same reason.
+///
+/// # Safety
+///
+/// `buffer` is a shared buffer number this backend may pin (positive and
+/// within `NBuffers`, as a hint read from the tables is).
+unsafe fn own_pin(buffer: pg_sys::Buffer, locator: &pg_sys::RelFileLocator, block: u32) -> bool {
+    use std::sync::atomic::Ordering;
+    // SAFETY: per the contract; the descriptor's fields are read as
+    // PostgreSQL reads them.
+    unsafe {
+        let desc = descriptor(buffer);
+        let state = state_of(desc);
+        let mut old = state.load(Ordering::Relaxed);
+        let now = loop {
+            if old & pg_sys::BM_LOCKED != 0 {
+                // Someone changes the header: wait for it as `PinBuffer`
+                // does, a header lock is held for a few instructions.
+                old = wait_header_unlocked(state);
+                continue;
+            }
+            if old & pg_sys::BM_VALID == 0 {
+                return false;
+            }
+            let mut new = old + pg_sys::BUF_REFCOUNT_ONE;
+            if (old & pg_sys::BUF_USAGECOUNT_MASK) >> pg_sys::BUF_USAGECOUNT_SHIFT
+                < pg_sys::BM_MAX_USAGE_COUNT
+            {
+                new += pg_sys::BUF_USAGECOUNT_ONE;
+            }
+            match state.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break new,
+                Err(current) => old = current,
+            }
+        };
+        let tag = std::ptr::read(std::ptr::addr_of!((*desc).tag));
+        if now & pg_sys::BM_VALID != 0
+            && tag.blockNum == block
+            && tag.forkNum == pg_sys::ForkNumber::MAIN_FORKNUM
+            && tag.relNumber == locator.relNumber
+            && tag.dbOid == locator.dbOid
+            && tag.spcOid == locator.spcOid
+        {
+            (*std::ptr::addr_of_mut!(pg_sys::pgBufferUsage)).shared_blks_hit += 1;
+            return true;
+        }
+        own_unpin(buffer);
+        false
+    }
+}
+
+/// Releases a pin [`own_pin`] took, as `UnpinBuffer` does: one
+/// compare-and-swap of the state while the header is not locked; then, if
+/// a backend waits for the buffer's sole pin, under the header lock, the
+/// wait is ended and the waiter signalled.
+///
+/// Not an atomic decrement: whoever holds the header lock (the bgwriter's
+/// and a checkpoint's scans, the clock sweep, `pg_buffercache`) writes the
+/// state it read back at the unlock, a plain store, so a decrement that
+/// lands under the lock is undone, and the pin outlives everyone (the
+/// buffer is never evicted; dropping the relation spins in
+/// `InvalidateBuffer`). `UnpinBuffer` waits for the lock for this reason.
+///
+/// # Safety
+///
+/// `buffer` is pinned by [`own_pin`] and released once.
+unsafe fn own_unpin(buffer: pg_sys::Buffer) {
+    use std::sync::atomic::Ordering;
+    // SAFETY: per the contract; `LockBufHdr` and `ProcSendSignal` are
+    // PostgreSQL's own, and the unlock is `UnlockBufHdr`'s release store.
+    unsafe {
+        let desc = descriptor(buffer);
+        let state = state_of(desc);
+        let mut old = state.load(Ordering::Relaxed);
+        let now = loop {
+            if old & pg_sys::BM_LOCKED != 0 {
+                old = wait_header_unlocked(state);
+                continue;
+            }
+            let new = old - pg_sys::BUF_REFCOUNT_ONE;
+            match state.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break new,
+                Err(current) => old = current,
+            }
+        };
+        if now & pg_sys::BM_PIN_COUNT_WAITER != 0 {
+            let locked = pg_sys::LockBufHdr(desc);
+            if locked & pg_sys::BM_PIN_COUNT_WAITER != 0 && locked & pg_sys::BUF_REFCOUNT_MASK == 1
+            {
+                let waiter = (*desc).wait_backend_pgprocno;
+                state.store(
+                    locked & !pg_sys::BM_PIN_COUNT_WAITER & !pg_sys::BM_LOCKED,
+                    Ordering::Release,
+                );
+                pg_sys::ProcSendSignal(waiter);
+            } else {
+                state.store(locked & !pg_sys::BM_LOCKED, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Releases a pin [`pin_block`] took: an own one, or PostgreSQL's.
+///
+/// # Safety
+///
+/// `buffer` was returned by [`pin_block`] with `owned`, and is released once.
+#[inline]
+unsafe fn release_pin(buffer: pg_sys::Buffer, owned: bool) {
+    // SAFETY: per the contract.
+    unsafe {
+        if owned {
+            own_unpin(buffer);
+        } else {
+            pg_sys::ReleaseBuffer(buffer);
+        }
+    }
+}
+
+/// A `ResourceOwnerDesc`, shared across the backend's spans.
+struct ResourceKind(pg_sys::ResourceOwnerDesc);
+
+// SAFETY: a constant: PostgreSQL reads it and never writes it.
+unsafe impl Sync for ResourceKind {}
+
+/// The resource kind a span's pages are remembered as, one resource per
+/// span (see [`RunSource::remember_span`]), released with the buffer pins.
+static RUN_PAGES: ResourceKind = ResourceKind(pg_sys::ResourceOwnerDesc {
+    name: c"Stannum run pages".as_ptr(),
+    release_phase: pg_sys::ResourceReleasePhase::RESOURCE_RELEASE_BEFORE_LOCKS,
+    release_priority: pg_sys::RELEASE_PRIO_BUFFER_PINS,
+    ReleaseResource: Some(release_run_pages),
+    DebugPrint: None,
+});
+
+/// Releases a span's own pins for its resource owner (see [`RUN_PAGES`]):
+/// an owner is released with the span still open when a `FATAL` error
+/// exits the backend mid-walk. The owner then releases PostgreSQL's own
+/// pins and the relation reference itself, and this the ledger's.
+unsafe extern "C-unwind" fn release_run_pages(datum: pg_sys::Datum) {
+    // SAFETY: the datum is a ledger's address, remembered by
+    // `remember_span`; a span that closes forgets it first, so the ledger
+    // is the owner's to free (see `SpanLedger`).
+    unsafe {
+        let ledger = Box::from_raw(datum.value() as *mut SpanLedger);
+        for buffer in ledger.owned {
+            own_unpin(buffer);
+        }
+    }
+}
+
+fn ledger_datum(ledger: *mut SpanLedger) -> pg_sys::Datum {
+    pg_sys::Datum::from(ledger as usize)
 }
 
 /// The page of pinned buffer `buffer`: for a shared buffer computed as
@@ -1306,18 +1670,6 @@ pub(crate) fn reset_held_peak() {
     SCAN_RECENT.set(0);
 }
 
-/// Releases a page `RunSource::pin` pinned; in an exiting backend only
-/// forgets it (see [`exiting`]).
-fn unpin(held: HeldPage) {
-    if !exiting() {
-        // SAFETY: the pin was taken by `pin` and is released once: the slot
-        // holding it was emptied before this call.
-        unsafe { pg_sys::ReleaseBuffer(held.buffer) };
-    }
-    let (now, total, peak) = HELD_PAGES.get();
-    HELD_PAGES.set((now - 1, total, peak));
-}
-
 /// Whether the backend is exiting, from `proc_exit` on: a FATAL error
 /// (`pg_terminate_backend`, a shutdown, postmaster death) exits without
 /// unwinding the walk it interrupts, so a hold span stays open, and
@@ -1359,7 +1711,7 @@ impl Drop for RunSource {
 pub(crate) unsafe fn drop_holding_source(
     index_oid: pg_sys::Oid,
     exiting: bool,
-) -> ([pg_sys::Buffer; 2], pg_sys::Relation) {
+) -> ([(pg_sys::Buffer, bool); 2], pg_sys::Relation) {
     use segment::source::Source as _;
     // SAFETY: per the contract; the flag is set only while the source
     // drops.
@@ -1383,15 +1735,30 @@ pub(crate) unsafe fn drop_holding_source(
                 .expect("pinned")
                 .pinned
         );
-        let buffer = source.slots.borrow()[0][0].expect("the pinned page").buffer;
-        let in_place = source.pinned.borrow()[&0].buffer;
+        let slot = source.slots.borrow()[0][0].expect("the pinned page");
+        let in_place = source.pinned.borrow()[&0];
         let held = source.relation.get();
         assert!(!held.is_null());
         pg_sys::proc_exit_inprogress = exiting;
         drop(source);
         pg_sys::proc_exit_inprogress = false;
-        ([buffer, in_place], held)
+        (
+            [(slot.buffer, slot.owned), (in_place.buffer, in_place.owned)],
+            held,
+        )
     }
+}
+
+/// Releases the own pins of every span the current resource owner
+/// remembers, as its release at exit would (see [`release_run_pages`]).
+///
+/// # Safety
+///
+/// Within a transaction.
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) unsafe fn release_spans_of_owner() {
+    // SAFETY: per the contract.
+    unsafe { pg_sys::ResourceOwnerReleaseAllOfKind(pg_sys::CurrentResourceOwner, &RUN_PAGES.0) };
 }
 
 impl segment::source::Source for RunSource {
@@ -1442,6 +1809,7 @@ impl segment::source::Source for RunSource {
                 let generation = HOLD_SPANS.get() + 1;
                 HOLD_SPANS.set(generation);
                 self.generation.set(generation);
+                self.remember_span();
             }
             self.holding.set(self.holding.get() + 1);
         } else {
@@ -1461,22 +1829,33 @@ impl segment::source::Source for RunSource {
         if self.holding.get() == 0 {
             return None;
         }
-        let mut slots = self.slots.borrow_mut();
-        let pages = slots.get_mut(slot)?;
         let page = (offset / CHAIN_CAPACITY as u64) as usize;
-        let (held, pinned) = match pages.iter().flatten().find(|held| held.page == page) {
-            Some(held) => (*held, false),
-            None => {
-                for previous in pages.iter_mut() {
-                    if let Some(previous) = previous.take() {
-                        unpin(previous);
+        // The slot's pages are released and forgotten before the pin, which
+        // calls into PostgreSQL: no map stays borrowed across that call
+        // (see `release_for_owner`).
+        let found = {
+            let mut slots = self.slots.borrow_mut();
+            let pages = slots.get_mut(slot)?;
+            match pages.iter().flatten().find(|held| held.page == page) {
+                Some(held) => Some(*held),
+                None => {
+                    for previous in pages.iter_mut() {
+                        if let Some(previous) = previous.take() {
+                            self.unpin(previous);
+                        }
                     }
+                    None
                 }
+            }
+        };
+        let (held, pinned) = match found {
+            Some(held) => (held, false),
+            None => {
                 let held = match self.pin(page) {
                     Ok(held) => held,
                     Err(error) => return Some(Err(error)),
                 };
-                pages[0] = Some(held);
+                self.slots.borrow_mut()[slot][0] = Some(held);
                 (held, true)
             }
         };
@@ -1508,18 +1887,24 @@ impl segment::source::Source for RunSource {
             return Some(Err(segment::Error::Truncated));
         }
         let page = (offset / CHAIN_CAPACITY as u64) as usize;
-        let mut pinned = self.pinned.borrow_mut();
-        let (held, fresh) = match pinned.get(&page) {
-            Some(held) => (*held, false),
+        // The map is not borrowed across the pin, a call into PostgreSQL
+        // (see `release_for_owner`).
+        let found = {
+            let pinned = self.pinned.borrow();
+            match pinned.get(&page) {
+                Some(held) => Some(*held),
+                None if pinned.len() >= PINNED_LIMIT => return None,
+                None => None,
+            }
+        };
+        let (held, fresh) = match found {
+            Some(held) => (held, false),
             None => {
-                if pinned.len() >= PINNED_LIMIT {
-                    return None;
-                }
                 let held = match self.pin_page(page, false) {
                     Ok(held) => held,
                     Err(error) => return Some(Err(error)),
                 };
-                pinned.insert(page, held);
+                self.pinned.borrow_mut().insert(page, held);
                 (held, true)
             }
         };
@@ -1539,7 +1924,7 @@ impl segment::source::Source for RunSource {
     fn release_page(&self, offset: u64) {
         let page = (offset / CHAIN_CAPACITY as u64) as usize;
         if let Some(held) = self.pinned.borrow_mut().remove(&page) {
-            unpin(held);
+            self.unpin(held);
         }
     }
 
@@ -1584,7 +1969,7 @@ impl segment::source::Source for RunSource {
         // follows its last one in the stream, often on the same page.
         for page in pages.iter_mut() {
             if page.is_some_and(|held| held.page < first || held.page > last) {
-                unpin(page.take().expect("checked above"));
+                self.unpin(page.take().expect("checked above"));
             }
         }
         let mut range = segment::source::HeldRange::default();
@@ -2114,7 +2499,17 @@ unsafe fn pending_removable(index: pg_sys::Relation, xid: u32) -> bool {
     if testing::PENDING_REMOVABLE.with(Cell::get) {
         return true;
     }
-    unsafe { pg_sys::GlobalVisCheckRemovableXid(index, pg_sys::TransactionId::from(xid)) }
+    // The horizon is the table's: PostgreSQL computes it for the relation
+    // holding the rows (and asserts as much), the index only points at them.
+    unsafe {
+        let heap = pg_sys::table_open(
+            (*(*index).rd_index).indrelid,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        );
+        let removable = pg_sys::GlobalVisCheckRemovableXid(heap, pg_sys::TransactionId::from(xid));
+        pg_sys::table_close(heap, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        removable
+    }
 }
 
 /// Removes from the list what pending runs no snapshot can still read, at
@@ -5450,23 +5845,105 @@ pub mod testing {
             let blocks =
                 pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
             let mut found = (pg_sys::BM_MAX_USAGE_COUNT, pg_sys::BM_MAX_USAGE_COUNT);
+            // Outside a span, with no ledger, an own pin is released within
+            // the call, as here.
+            let own = OWN_PINS.get();
             for block in 1..blocks {
-                let buffer = pin_block(index, block);
+                let (buffer, owned) = pin_block(index, block, own);
                 let before = usage(buffer);
-                pg_sys::ReleaseBuffer(buffer);
+                release_pin(buffer, owned);
                 if before >= pg_sys::BM_MAX_USAGE_COUNT {
                     continue;
                 }
                 let mut last = buffer;
                 for _ in 0..pins {
-                    last = pin_block(index, block);
-                    pg_sys::ReleaseBuffer(last);
+                    let (buffer, owned) = pin_block(index, block, own);
+                    last = buffer;
+                    release_pin(buffer, owned);
                 }
                 found = (before, usage(last));
                 break;
             }
             pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
             found
+        }
+    }
+
+    /// The shared buffer holding `block` of index `oid`, read in if need be
+    /// and left unpinned, with its index relation open.
+    ///
+    /// # Safety
+    /// `oid` is an index.
+    unsafe fn buffer_of(oid: pg_sys::Oid, block: u32) -> (pg_sys::Relation, pg_sys::Buffer) {
+        unsafe {
+            let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let buffer = pg_sys::ReadBuffer(index, block);
+            pg_sys::ReleaseBuffer(buffer);
+            (index, buffer)
+        }
+    }
+
+    /// The shared reference count of the buffer holding `block` of index
+    /// `oid`: every backend's pins, PostgreSQL's and own.
+    ///
+    /// # Safety
+    /// `oid` is an index.
+    pub unsafe fn shared_refcount(oid: pg_sys::Oid, block: u32) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let count = state_of(descriptor(buffer)).load(std::sync::atomic::Ordering::Acquire)
+                & pg_sys::BUF_REFCOUNT_MASK;
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            count
+        }
+    }
+
+    /// Pins `block` of index `oid` as [`own_pin`] does, holds the pin for
+    /// `hold_ms`, releases it as [`own_unpin`] does, and returns the
+    /// buffer's shared reference count right after the release. Another
+    /// session locking the buffer's header meanwhile (see
+    /// [`header_locked`]) is what the bgwriter, a checkpoint, a clock sweep
+    /// or `pg_buffercache` do under a running query.
+    ///
+    /// # Safety
+    /// `oid` is an index with a page `block`.
+    pub unsafe fn own_pin_held(oid: pg_sys::Oid, block: u32, hold_ms: u64) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let locator = (*index).rd_locator;
+            assert!(
+                own_pin(buffer, &locator, block),
+                "the page's buffer was replaced"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+            own_unpin(buffer);
+            let count = state_of(descriptor(buffer)).load(std::sync::atomic::Ordering::Acquire)
+                & pg_sys::BUF_REFCOUNT_MASK;
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            count
+        }
+    }
+
+    /// Locks the header of the buffer holding `block` of index `oid` for
+    /// `hold_ms`, then unlocks it as `UnlockBufHdr` does, writing back the
+    /// state read under the lock; returns the reference count read. A pin
+    /// released by a plain atomic decrement meanwhile is undone by the
+    /// write-back: PostgreSQL's `UnpinBuffer` waits for the lock instead.
+    ///
+    /// # Safety
+    /// `oid` is an index with a page `block`.
+    pub unsafe fn header_locked(oid: pg_sys::Oid, block: u32, hold_ms: u64) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let desc = descriptor(buffer);
+            let locked = pg_sys::LockBufHdr(desc);
+            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+            state_of(desc).store(
+                locked & !pg_sys::BM_LOCKED,
+                std::sync::atomic::Ordering::Release,
+            );
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            locked & pg_sys::BUF_REFCOUNT_MASK
         }
     }
 
