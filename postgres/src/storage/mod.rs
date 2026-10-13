@@ -5979,6 +5979,18 @@ pub mod testing {
         unsafe { read_meta(index, false) }.1.pending.len()
     }
 
+    /// Whether [`pending_removable`] finds a run released at `xid` removable,
+    /// asking PostgreSQL's horizon even when [`PENDING_REMOVABLE`] is set.
+    ///
+    /// # Safety
+    /// `index` is a live index relation.
+    pub unsafe fn horizon_removable(index: pg_sys::Relation, xid: u32) -> bool {
+        let forced = PENDING_REMOVABLE.replace(false);
+        let removable = unsafe { pending_removable(index, xid) };
+        PENDING_REMOVABLE.set(forced);
+        removable
+    }
+
     /// Forgets `pages` in the free space map, as a crash or a promoted
     /// standby does for pages freed since the map was last written.
     ///
