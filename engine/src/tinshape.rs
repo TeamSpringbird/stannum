@@ -16,10 +16,11 @@ use boldi_vigna::{SpanQuery, SpanSolver};
 use segment::Tid;
 use segment::tinshape::bits;
 use segment::tinshape::blob::Bytes;
+use segment::tinshape::docs::DocSet;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::EfCursor;
 use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Form, GroupEntry, KIND_GRID, Postings};
+use segment::tinshape::postings::{Directory, Form, GroupEntry, KIND_GRID, Postings};
 use segment::tinshape::segment::{Area, Segment};
 use segment::{Error, Result};
 use tinql::runtime::{Query, SpanTermSlot};
@@ -192,10 +193,12 @@ pub struct TermSet<'a> {
     pub at: usize,
     /// The positions stream and its blob offset.
     pub positions: (segment::tinshape::blob::Bytes<'a>, usize),
-    /// A grouped record's directory, shared with the parsed record (each
-    /// group's [`G`] is made when it is asked for), and where its
-    /// containers start in the blob.
-    dir: std::rc::Rc<[GroupEntry]>,
+    /// A grouped record's directory, shared with the parsed record and
+    /// decoded as far as asked for (each group's [`G`] is made when it is
+    /// asked for), the segment's groups it is decoded against, and where
+    /// its containers start in the blob.
+    dir: Option<std::rc::Rc<Directory>>,
+    docs: std::rc::Rc<DocSet>,
     containers: usize,
     /// Groups of a single or sparse term, over [`Self::locals`].
     groups: Vec<G<'a>>,
@@ -239,9 +242,8 @@ impl<'a> TermSet<'a> {
         let record_at = term.at;
         let mut groups = Vec::new();
         let mut locals = Vec::new();
-        // A grouped term's directory, shared with its record; set only
-        // there (an empty one is an allocation of its own).
-        let mut dir: Option<std::rc::Rc<[GroupEntry]>> = None;
+        // A grouped term's directory, shared with its record.
+        let mut dir: Option<std::rc::Rc<Directory>> = None;
         let mut containers = 0;
         match &postings.form {
             Form::Single(slot) => {
@@ -258,7 +260,7 @@ impl<'a> TermSet<'a> {
                 // The header only; the list is read where it is decoded.
                 touch.touch(Part::Footer, record_at, postings.footer_at);
             }
-            Form::Grouped(entries) => {
+            Form::Grouped(directory) => {
                 // The header and the group directory: per-term metadata,
                 // which TIN would count as the postings footer.
                 touch.touch(Part::Footer, record_at, postings.footer_at);
@@ -268,10 +270,9 @@ impl<'a> TermSet<'a> {
                     postings.containers_at,
                 );
                 containers = record_at + postings.payload_at + postings.containers_at;
-                dir = Some(entries.clone());
+                dir = Some(directory.clone());
             }
         }
-        let dir = dir.unwrap_or_else(|| std::rc::Rc::new([]));
         Ok(Some(Self {
             df: term.entry.df,
             max_bucket: term.entry.max_tf_bucket,
@@ -279,6 +280,7 @@ impl<'a> TermSet<'a> {
             postings,
             at: record_at,
             dir,
+            docs: segment.docs.clone(),
             containers,
             groups,
             locals,
@@ -341,30 +343,35 @@ impl<'a> TermSet<'a> {
     /// [`Self::ensure_groups`] has listed them).
     #[inline]
     fn group_count(&self) -> usize {
-        if self.dir.is_empty() {
-            self.groups.len()
-        } else {
-            self.dir.len()
+        match &self.dir {
+            Some(dir) => dir.len(),
+            None => self.groups.len(),
         }
+    }
+
+    /// A grouped term's directory entry `i` (decoded if it was not yet).
+    #[inline]
+    fn entry(dir: &Directory, docs: &DocSet, i: usize) -> GroupEntry {
+        *dir.get(i, &docs.geometry.groups)
+            .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
     }
 
     /// The geometry index of the term's `i`th group.
     #[inline]
     fn group_index(&self, i: usize) -> u32 {
-        if self.dir.is_empty() {
-            self.groups[i].index
-        } else {
-            self.dir[i].index
+        match &self.dir {
+            Some(dir) => Self::entry(dir, &self.docs, i).index,
+            None => self.groups[i].index,
         }
     }
 
     /// The term's `i`th group.
     #[inline]
     fn group_at(&self, i: usize) -> G<'a> {
-        if self.dir.is_empty() {
+        let Some(dir) = &self.dir else {
             return self.groups[i];
-        }
-        let entry = self.dir[i];
+        };
+        let entry = Self::entry(dir, &self.docs, i);
         G {
             index: entry.index,
             count: entry.count,
@@ -380,6 +387,19 @@ impl<'a> TermSet<'a> {
     /// forward (the hint is left at the first group at or after it).
     fn find(&self, group: u32, hint: &mut usize) -> Option<G<'a>> {
         let count = self.group_count();
+        if let Some(dir) = &self.dir {
+            // Through the entries decoded, then a block at a time.
+            loop {
+                let decoded = dir.decoded_entries();
+                while *hint < decoded.len() && decoded[*hint].index < group {
+                    *hint += 1;
+                }
+                if *hint < decoded.len() || *hint >= count {
+                    break;
+                }
+                Self::entry(dir, &self.docs, *hint);
+            }
+        }
         while *hint < count && self.group_index(*hint) < group {
             *hint += 1;
         }
@@ -423,8 +443,26 @@ impl<'a> TermSet<'a> {
             let group = &geometry.groups[g.index as usize];
             let base = group.slot_base;
             if base + group.slots() <= target {
-                // Skip the groups wholly before the target.
-                let (mut lo, mut hi) = (self.gpos, self.group_count());
+                // Skip the groups wholly before the target: a gallop from
+                // the group at hand, then a binary search, so that a lazy
+                // directory decodes about as far as the target.
+                let count = self.group_count();
+                let ends_before = |i: usize| {
+                    let group = &geometry.groups[self.group_index(i) as usize];
+                    group.slot_base + group.slots() <= target
+                };
+                let (mut lo, mut step) = (self.gpos, 1);
+                let mut hi = loop {
+                    let at = lo + step;
+                    if at >= count {
+                        break count;
+                    }
+                    if !ends_before(at) {
+                        break at;
+                    }
+                    lo = at + 1;
+                    step *= 2;
+                };
                 while lo < hi {
                     let mid = lo + (hi - lo) / 2;
                     let group = &geometry.groups[self.group_index(mid) as usize];
@@ -2245,7 +2283,7 @@ mod tests {
         let page_len = 97;
         let dense = parsed.term("t1").unwrap().unwrap().postings;
         assert!(matches!(dense.form, Form::Grouped(_)) && dense.footer.is_empty());
-        let footer_pages = dense.directory.len() / page_len;
+        let footer_pages = dense.directory_bytes().len() / page_len;
         let source = segment::tinshape::blob::PinningSource::new(blob.clone(), page_len);
         let pinned = LazyBlob::new(Box::new(source.clone()));
         let in_place = assembled_in_place(&pinned, &parsed, &blob);

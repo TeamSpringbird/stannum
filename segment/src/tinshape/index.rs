@@ -345,6 +345,7 @@ impl<S: Source> Reader<S> {
         let record = self.record(entry)?;
         let postings = Postings::parse(&*record, entry.df, &docs.geometry)?;
         let footer = postings.footer(
+            &docs.geometry,
             self.header.block_size,
             entry.max_tf_bucket,
             self.header.adaptive_tf,

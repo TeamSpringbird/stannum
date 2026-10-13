@@ -80,7 +80,10 @@ fn main() {
                 b.lengths += (p.tf_at - l.at) as u64;
             }
             match &p.form {
-                Form::Grouped(entries) => {
+                Form::Grouped(dir) => {
+                    let entries = dir
+                        .entries(&segment.docs.geometry.groups)
+                        .expect("a directory");
                     b.groups += entries.len() as u64;
                     b.directory += p.containers_at as u64;
                     b.containers += (p.payload.len() - p.containers_at) as u64;

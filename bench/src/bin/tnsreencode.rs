@@ -805,7 +805,10 @@ impl Census {
             let (term, entry) = item.map_err(|e| e.to_string())?;
             let found = segment.resolve(entry).map_err(|e| format!("{term}: {e}"))?;
             match &found.postings.form {
-                segment::tinshape::postings::Form::Grouped(entries) => {
+                segment::tinshape::postings::Form::Grouped(dir) => {
+                    let entries = dir
+                        .entries(&segment.docs.geometry.groups)
+                        .map_err(|e| format!("{term}: {e}"))?;
                     for e in entries.iter() {
                         let k = &mut c.kinds[usize::from(e.kind.min(2))];
                         k.0 += 1;

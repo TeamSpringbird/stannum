@@ -30,6 +30,21 @@ pub fn low_width(n: usize, universe: u32) -> u32 {
     }
 }
 
+/// [`encoded_len`] for `n` of at least one, without a division or a branch
+/// on the quotient (a group directory's parse takes one per entry, its
+/// groups dense and sparse in turn): with `d` the difference of the two's
+/// bit lengths, the low width is `d` or `d - 1`, the latter when `n << d`
+/// exceeds `universe`, and 0 when the quotient is below 2.
+#[inline]
+pub fn encoded_len_branchless(n: u32, universe: u32) -> usize {
+    debug_assert!(n > 0);
+    let (n64, universe64) = (u64::from(n), u64::from(universe));
+    let d = n64.leading_zeros().wrapping_sub(universe64.leading_zeros()) & 63;
+    let width = d.wrapping_sub(u32::from(n64 << d > universe64));
+    let low = if universe64 < 2 * n64 { 0 } else { width };
+    bits::packed_len(n as usize, low) + high_bits(n as usize, universe, low).div_ceil(8)
+}
+
 fn high_bits(n: usize, universe: u32, low: u32) -> usize {
     if n == 0 {
         return 0;

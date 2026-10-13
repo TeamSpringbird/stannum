@@ -436,9 +436,20 @@ const PARSED_BUDGET: usize = 16 << 20;
 
 #[derive(Default)]
 struct Parsed<'a> {
+    /// The bytes the records were counted at, together.
     bytes: usize,
-    /// Records by offset, with their last use.
-    records: rustc_hash::FxHashMap<usize, (Postings<'a>, std::cell::Cell<u64>)>,
+    /// Records by offset, with their last use and the bytes they were
+    /// counted at: a grouped record's directory decodes its entries as a
+    /// walk reaches them, after it is kept, so what it holds grows; it is
+    /// counted again when used again and before records are dropped.
+    records: rustc_hash::FxHashMap<usize, Kept<'a>>,
+}
+
+/// A record a memo keeps: its last use and the bytes it was counted at.
+struct Kept<'a> {
+    postings: Postings<'a>,
+    used: std::cell::Cell<u64>,
+    counted: std::cell::Cell<usize>,
 }
 
 impl Parsed<'_> {
@@ -453,24 +464,34 @@ impl Parsed<'_> {
         self.bytes += bytes;
     }
 
-    /// Drops the least recently used records until at
-    /// most `keep` bytes remain.
+    /// Counts `kept` at what it holds now.
+    fn recount(bytes: &mut usize, kept: &Kept<'_>) {
+        let now = record_bytes(&kept.postings);
+        *bytes = bytes.saturating_sub(kept.counted.get()) + now;
+        kept.counted.set(now);
+    }
+
+    /// Drops the least recently used records until at most `keep` bytes
+    /// remain, every record counted again first.
     fn shed(&mut self, keep: usize) {
-        if self.bytes <= keep {
+        let Parsed { bytes, records } = self;
+        for kept in records.values() {
+            Self::recount(bytes, kept);
+        }
+        if *bytes <= keep {
             return;
         }
-        let mut by_use: Vec<(u64, usize)> = self
-            .records
+        let mut by_use: Vec<(u64, usize)> = records
             .iter()
-            .map(|(at, (_, used))| (used.get(), *at))
+            .map(|(at, kept)| (kept.used.get(), *at))
             .collect();
         by_use.sort_unstable();
         for (_, at) in by_use {
-            if self.bytes <= keep {
+            if *bytes <= keep {
                 break;
             }
-            if let Some((postings, _)) = self.records.remove(&at) {
-                self.bytes = self.bytes.saturating_sub(record_bytes(&postings));
+            if let Some(kept) = records.remove(&at) {
+                *bytes = bytes.saturating_sub(kept.counted.get());
             }
         }
     }
@@ -479,9 +500,7 @@ impl Parsed<'_> {
 /// Bytes a kept record of `postings` costs.
 fn record_bytes(postings: &Postings<'_>) -> usize {
     64 + match &postings.form {
-        postings::Form::Grouped(entries) => {
-            entries.len() * std::mem::size_of::<postings::GroupEntry>() + postings.directory.len()
-        }
+        postings::Form::Grouped(dir) => dir.held(),
         _ => 0,
     }
 }
@@ -646,20 +665,23 @@ impl<'a> Segment<'a> {
     /// only those past it.
     pub fn forget_borrowed(&self) {
         let mut parsed = self.parsed.borrow_mut();
-        if parsed.records.values().all(|(p, _)| p.is_detached()) {
+        if parsed
+            .records
+            .values()
+            .all(|kept| kept.postings.is_detached())
+        {
             return;
         }
         let before = parsed.records.len();
-        parsed
-            .records
-            .retain(|_, (postings, _)| postings.is_detached());
+        parsed.records.retain(|_, kept| kept.postings.is_detached());
         let gone = (before - parsed.records.len()) as u64;
         count_memo(|c| c.records_forgotten += gone);
         let Parsed { records, bytes } = &mut *parsed;
-        *bytes = records
-            .values()
-            .map(|(postings, _)| record_bytes(postings))
-            .sum();
+        *bytes = 0;
+        for kept in records.values() {
+            kept.counted.set(record_bytes(&kept.postings));
+            *bytes += kept.counted.get();
+        }
     }
 
     /// Records `term`'s term-map entry (or its absence) in the memo, found
@@ -680,22 +702,34 @@ impl<'a> Segment<'a> {
     pub fn resolve_memo(&self, entry: TermEntry) -> Result<Term<'a>> {
         let from = usize::try_from(entry.ordinals.offset).map_err(|_| Error::Truncated)?;
         let at = self.area_at(Area::Postings) + from;
-        if let Some((postings, used)) = self.parsed.borrow().records.get(&at) {
-            used.set(tick());
-            count_memo(|c| c.records_kept += 1);
-            return Ok(Term {
-                entry,
-                at,
-                postings: postings.clone(),
-            });
+        {
+            let mut parsed = self.parsed.borrow_mut();
+            let Parsed { bytes, records } = &mut *parsed;
+            if let Some(kept) = records.get(&at) {
+                kept.used.set(tick());
+                // What its directory decoded since it was last counted.
+                Parsed::recount(bytes, kept);
+                count_memo(|c| c.records_kept += 1);
+                return Ok(Term {
+                    entry,
+                    at,
+                    postings: kept.postings.clone(),
+                });
+            }
         }
         let term = self.resolve(entry)?;
         count_memo(|c| c.records_parsed += 1);
         let mut parsed = self.parsed.borrow_mut();
-        parsed.room(record_bytes(&term.postings));
-        parsed
-            .records
-            .insert(at, (term.postings.clone(), std::cell::Cell::new(tick())));
+        let counted = record_bytes(&term.postings);
+        parsed.room(counted);
+        parsed.records.insert(
+            at,
+            Kept {
+                postings: term.postings.clone(),
+                used: std::cell::Cell::new(tick()),
+                counted: std::cell::Cell::new(counted),
+            },
+        );
         Ok(term)
     }
 
@@ -714,8 +748,12 @@ impl<'a> Segment<'a> {
             return Ok(footer.clone());
         }
         count_memo(|c| c.footers_decoded += 1);
-        let footer =
-            std::rc::Rc::new(postings.footer(self.block_size, max_bucket, self.adaptive_tf)?);
+        let footer = std::rc::Rc::new(postings.footer(
+            &self.docs.geometry,
+            self.block_size,
+            max_bucket,
+            self.adaptive_tf,
+        )?);
         let bytes = footer_bytes(&footer);
         let mut cache = self.footers.borrow_mut();
         if cache.bytes + bytes > PARSED_BUDGET {
@@ -902,9 +940,10 @@ mod tests {
                     return None;
                 }
                 let term = segment.term(&format!("t{t:02}")).unwrap()?;
-                let postings::Form::Grouped(entries) = &term.postings.form else {
+                let postings::Form::Grouped(dir) = &term.postings.form else {
                     return None;
                 };
+                let entries = dir.entries(&geometry_in.groups).unwrap();
                 let entry = entries.iter().find(|e| e.index as usize == i)?;
                 copied += 1;
                 return Some(postings::Reused {
@@ -1052,6 +1091,7 @@ mod tests {
                 let footer = found
                     .postings
                     .footer(
+                        &segment.docs.geometry,
                         segment.block_size,
                         found.entry.max_tf_bucket,
                         segment.adaptive_tf,

@@ -239,10 +239,13 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   the buffer's usage count as `ReadBuffer`'s does.
   `stannum.share_buffer_hints` (on) switches back for comparison. Term
   directories and footers parse with less work per query (short varints
-  without a loop; a long directory decoded once, read in windows that
-  resume where its whole entries end, each sized by the bytes its entries
-  took so far, where a frontier per group made entries twice the guessed
-  length and the directory was parsed from the start two or three times), and
+  without a loop; a grouped record's directory, read in windows that resume
+  where its whole entries end, is skimmed when parsed and its entries
+  decoded 128 at a time as a walk reaches them, from a scan of where its
+  varints start, without a branch on their lengths: at 150M rows a cheap
+  conjunction decodes 33,000 entries where it decoded 119,000, and one
+  backend's median conjunction takes 1.20 times the layout 6 build's CPU
+  where it took 1.36), and
   `EXPLAIN ANALYZE` counts records parsed, kept and forgotten and footers
   decoded and kept. Together, at eight clients, backend CPU per query falls
   17% (conjunction), 8% (disjunction) and 16% (phrase), for the same
