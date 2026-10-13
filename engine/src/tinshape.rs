@@ -3577,6 +3577,161 @@ mod tests {
         );
     }
 
+    /// Documents, their lengths, and per word its (document, count) pairs.
+    type Corpus = (Vec<Tid>, Vec<u32>, Vec<Vec<(usize, u32)>>);
+
+    /// Dense words: `n` documents, seven a page (some 1,800 a group), word
+    /// `t` in `density[t]` percent of them, counts mostly one and lengths
+    /// from a short list (ties at a threshold are common).
+    fn dense_words(n: usize, density: &[u32], seed: u64) -> Corpus {
+        let docs: Vec<Tid> = (0..n as u32)
+            .map(|i| Tid {
+                block: i / 7,
+                offset: (i % 7) as u16 + 1,
+            })
+            .collect();
+        let mut state = seed | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let lengths: Vec<u32> = (0..n)
+            .map(|_| [4u32, 9, 9, 20, 33, 60][(next() % 6) as usize])
+            .collect();
+        let mut members: Vec<Vec<(usize, u32)>> = vec![Vec::new(); density.len()];
+        for r in 0..n {
+            for (t, d) in density.iter().enumerate() {
+                if next() % 100 < u64::from(*d) {
+                    let tf = match next() % 16 {
+                        0 => 2 + (next() % 9) as u32,
+                        1..=3 => 2,
+                        _ => 1,
+                    };
+                    members[t].push((r, tf));
+                }
+            }
+        }
+        (docs, lengths, members)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+        /// A group's candidates of dense words are sieved by their buckets
+        /// before each is bounded alone (`rank::Walk::sieve`): the rows
+        /// kept are a brute force's, bit for bit, for conjunctions,
+        /// disjunctions and a conjunction with a disjunction under it (its
+        /// scoring terms not all required).
+        #[test]
+        fn dense_words_sieved_by_their_buckets_keep_the_exact_top_rows(
+            n in 2000usize..6000,
+            density in prop::collection::vec(40u32..100, 3),
+            seed in any::<u64>(),
+            k in 1usize..12,
+        ) {
+            let (docs, lengths, members) = dense_words(n, &density, seed);
+            let all: Vec<usize> = (0..n).collect();
+            let options = Options { grid_min_postings: 0, inline_lengths_min_documents: u32::MAX, ..Options::default() };
+            let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+            let segment = Segment::parse(&blob).unwrap();
+            let names: Vec<String> = (0..3).map(|t| format!("t{t}")).collect();
+            for node in [
+                Node::And(vec![Node::Term(0), Node::Term(1)]),
+                Node::And(vec![Node::Term(0), Node::Term(1), Node::Term(2)]),
+                Node::Or(vec![Node::Term(0), Node::Term(1)]),
+                Node::Or(vec![Node::Term(0), Node::Term(1), Node::Term(2)]),
+                Node::And(vec![Node::Term(0), Node::Or(vec![Node::Term(1), Node::Term(2)])]),
+            ] {
+                let scorers: Vec<(String, TermScorer)> = leaf_terms(&node)
+                    .into_iter()
+                    .map(|t| {
+                        let df = members[t].len() as u64;
+                        (names[t].clone(), TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 20.0).unwrap())
+                    })
+                    .collect();
+                let mut want: Vec<(f32, Tid)> = (0..n)
+                    .filter(|r| eval(&node, &members, *r))
+                    .map(|r| {
+                        let mut total = 0.0_f32;
+                        for (name, scorer) in &scorers {
+                            let t: usize = name[1..].parse().unwrap();
+                            if let Some(tf) = holds(&members, t, r) {
+                                total += scorer.score_bucket(TfBucket::from_count(tf), lengths[r]);
+                            }
+                        }
+                        (total, docs[r])
+                    })
+                    .collect();
+                want.sort_by(crate::walk::rank);
+                want.truncate(k);
+                let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+                let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
+                prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
+            }
+        }
+    }
+
+    /// Two dense words, with the final rows kept from the start: a group's
+    /// candidates are sieved by their buckets, read a chunk at a time from
+    /// the TF tail, so far fewer TF reads are made than candidates bounded.
+    #[test]
+    fn dense_words_read_their_buckets_a_chunk_at_a_time() {
+        let n = 6_000;
+        let (docs, lengths, members) = dense_words(n, &[90, 80], 7);
+        let all: Vec<usize> = (0..n).collect();
+        let options = Options {
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+        let segment = Segment::parse(&blob).unwrap();
+        let names: Vec<String> = (0..2).map(|t| format!("t{t}")).collect();
+        for node in [
+            Node::And(vec![Node::Term(0), Node::Term(1)]),
+            Node::Or(vec![Node::Term(0), Node::Term(1)]),
+        ] {
+            let scorers: Vec<(String, TermScorer)> = (0..2)
+                .map(|t| {
+                    let df = members[t].len() as u64;
+                    let scorer =
+                        TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 20.0)
+                            .unwrap();
+                    (names[t].clone(), scorer)
+                })
+                .collect();
+            let k = 10;
+            let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+            let mut seeded = crate::walk::TopRows::new(k, false);
+            for row in &got.rows {
+                seeded.push(crate::walk::Ranked(row.0, row.1));
+            }
+            let mut reads = TfReads::default();
+            let walked = top_k_into(
+                &segment,
+                &node,
+                &names,
+                &scorers,
+                &mut seeded,
+                &mut AllVisible,
+                &mut reads,
+            )
+            .unwrap();
+            assert!(
+                walked.candidates > 1_000,
+                "{node:?}: {} candidates",
+                walked.candidates
+            );
+            assert!(
+                reads.0 * 4 < walked.candidates,
+                "{node:?}: {} TF reads for {} candidates",
+                reads.0,
+                walked.candidates
+            );
+        }
+    }
+
     struct AllVisible;
 
     impl crate::walk::Visibility for AllVisible {
