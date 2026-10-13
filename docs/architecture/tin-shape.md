@@ -1174,6 +1174,19 @@ reaches every entry, against `perf-integrate8` (eager directories): cycles
 -1.3%, instructions +1.5% (the branch-free decode), where lazy directories
 alone were +3.1% cycles.
 
+On x86-64 (Sapphire Rapids, `m7i.4xlarge`; replay with `--forget`, 300
+queries per style and 150 under `full_score`, 2 rounds, `perf stat` user
+counters; all outputs the same), the SSSE3 scan's first measurement on
+hardware: lazy directories (`perf-integrate9`) against eager ones
+(`perf-integrate8`) cut branch misses 30-40% and cycles 2.5-2.8%
+(conjunction, disjunction, phrase; median conjunction -21%) for 1.4-1.7%
+more instructions, and cost a `full_score` disjunction +1.2% cycles. With
+the header's length (layout 10) against lazy directories: cycles -10.9% /
+-3.9% / -7.0%, instructions -6.4% / -3.8% / -5.6%, median query -16% / -6%
+/ -7%; under `full_score` cycles -6.7% / -1.2% / -5.9%. Against eager
+directories: cycles -13.1% / -6.6% / -9.6%, and a `full_score` disjunction
+level (0.0%, instructions +1.9%).
+
 CPU in the replay (2 rounds, 400 queries per style, instructions retired)
 against the base without its footer memo (the replay repeats each query five
 times, which the memo amortizes as the server's driver order does not):
