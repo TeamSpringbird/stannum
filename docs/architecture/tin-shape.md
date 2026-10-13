@@ -135,6 +135,9 @@ container := grid:  the group's slots as a bitmap of whole words
            | ef:    Elias-Fano over the group's local slots (universe p * w)
            | paged: a page mask (or page list) and per page a bitmap, a
                     packed sorted list of offsets or a run, the smallest
+           | array: the group's local slots as sorted little-endian u16s
+                    (count * 2 bytes; layout 11)
+kind    := 0 grid | 1 ef | 2 paged | 3 array
 ```
 
 The encoder takes the smallest form, with one exception: a group holding
@@ -152,6 +155,17 @@ that span many groups. The paged container is TIN's two-level bitmap
 proper; on this corpus it is almost never the smallest (402 of 331,137
 group containers), because pages hold few rows and a term rarely has two
 on one page.
+
+A group the encoder would store as Elias-Fano, of at most 64 members
+(`Options::array_max`) and at most 65,536 slots, is an **array** of its
+local slots as `u16`s instead (page layout 11; see
+[measurements](#short-lists-as-u16-arrays-at-150m-rows-branch-loopr8)):
+two bytes a member where Elias-Fano takes 1.2 to 1.8 at these lengths,
+but nothing to decode. A walk widens an array into its list eight values
+a step (NEON, AVX2), sets it in a row a value at a time, and probes one
+much longer than its candidates in place by galloping. Roaring's array
+container is the precedent; TIN's sparse lists measure 3 to 4 bytes a
+posting (round 2, H5), so it likely stores short lists byte-wise too.
 
 A term of at most 64 postings in a segment of at least 65,536 documents
 (`Options::inline_lengths_max_df`, `inline_lengths_min_documents`)

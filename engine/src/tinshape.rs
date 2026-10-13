@@ -1823,6 +1823,7 @@ mod tests {
             block_size in prop::sample::select(vec![2u32, 16, 128]),
             k in 1usize..12,
             page_len in prop::sample::select(vec![37usize, 509, 8160]),
+            array_max in prop::sample::select(vec![0u32, 64, u32::MAX]),
         ) {
             // Term t holds a document with probability density[t] percent.
             let mut state = seed | 1;
@@ -1841,7 +1842,7 @@ mod tests {
                     }
                 }
             }
-            let options = Options { block_size, grid_density, grid_min_postings: 0, inline_lengths_min_documents: 0, ..Options::default() };
+            let options = Options { block_size, grid_density, grid_min_postings: 0, array_max, inline_lengths_min_documents: 0, ..Options::default() };
             let blob = build(&docs, &members, options);
             let segment = Segment::parse(&blob).unwrap();
             let lazy_blob = LazyBlob::new(Box::new(blob.clone()));

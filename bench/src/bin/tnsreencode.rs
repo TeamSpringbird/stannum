@@ -2,14 +2,14 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments of page layout version 9, 8 or 6 to
-//! version 10, whose grouped records' headers give their directory's length,
-//! and reports what that costs.
+//! Re-encodes dumped `TNS1` segments of page layout version 10, 9, 8 or 6
+//! to version 11 (or, with `--keep-records`, 10, whose grouped records'
+//! headers give their directory's length), and reports what that costs.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 9|8|6] [--exact] [--segment FILE] [--grid-density N] [--jobs N] [--check]
-//!     [--check-merge] [--census] [--keep-records]
+//!     [--from 10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
+//!     [--jobs N] [--check] [--check-merge] [--census] [--keep-records]
 //! ```
 //!
 //! Up to four steps per segment:
@@ -32,14 +32,17 @@
 //! 4. **Renumbering.** The segment is merged alone with this build's
 //!    `merge::merge`, which derives the grid from its documents (each
 //!    page's width its largest offset) and encodes every record afresh, as
-//!    a build of the same documents does.
+//!    a build of the same documents does: from 10, the only step, which
+//!    makes the Elias-Fano lists of at most `--arrays` members (default
+//!    `Options::array_max`) array containers (version 11).
 //!
 //! `--keep-records` skips step 4: each record keeps its encoding but for
 //! the header (with `--check-merge`, the merge must give the same bytes).
 //!
 //! `--grid-density N` encodes with `Options::grid_density` N (a writer
 //! option: a group of a big term holding one slot in N is a grid) to
-//! weigh other thresholds. `--check` verifies each output with
+//! weigh other thresholds, and `--arrays N` with `Options::array_max` N
+//! (0: no array containers). `--check` verifies each output with
 //! `verify_segment`; `--check-merge`
 //! also merges the output alone again and requires the same bytes. Each
 //! segment holds a few copies of itself in memory; `--jobs` re-encodes
@@ -105,6 +108,7 @@ struct Args {
     from: u8,
     mode: GroupFrontiers,
     grid_density: u32,
+    array_max: u32,
     only: Option<String>,
     jobs: usize,
     check: bool,
@@ -115,8 +119,9 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 9|8|6] [--exact] [--segment FILE] \
-         [--grid-density N] [--jobs N] [--check] [--check-merge] [--census] [--keep-records]"
+        "usage: tnsreencode --in DIR --out DIR [--from 10|9|8|6] [--exact] [--segment FILE] \
+         [--grid-density N] [--arrays N] [--jobs N] [--check] [--check-merge] [--census] \
+         [--keep-records]"
     );
     std::process::exit(2)
 }
@@ -129,6 +134,7 @@ fn args() -> Args {
         from: 8,
         mode: GroupFrontiers::Rounded,
         grid_density: Options::default().grid_density,
+        array_max: Options::default().array_max,
         only: None,
         jobs: 1,
         check: false,
@@ -144,6 +150,7 @@ fn args() -> Args {
             "--from" => a.from = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--exact" => a.mode = GroupFrontiers::Exact,
             "--grid-density" => a.grid_density = value(&mut it).parse().unwrap_or_else(|_| usage()),
+            "--arrays" => a.array_max = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--segment" => a.only = Some(value(&mut it)),
             "--jobs" => a.jobs = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--check" => a.check = true,
@@ -155,7 +162,8 @@ fn args() -> Args {
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9)
+        || !matches!(a.from, 6 | 8 | 9 | 10)
+        || (a.keep_records && a.from == 10)
         || (a.keep_records && a.from == 6)
         || a.jobs == 0
     {
@@ -827,6 +835,7 @@ fn renumber(blob: &[u8], args: &Args) -> Result<Vec<u8>, String> {
         Options {
             group_frontiers: args.mode,
             grid_density: args.grid_density,
+            array_max: args.array_max,
             ..Options::default()
         },
         || Ok(()),
@@ -843,10 +852,10 @@ fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), Strin
     let blob = std::fs::read(args.input.join(name)).map_err(|e| e.to_string())?;
     let before = area_sizes(&blob)?;
     let source = blob.len();
-    let mut new = if args.from == 9 { blob } else { regrid(&blob)? };
+    let mut new = if args.from >= 9 { blob } else { regrid(&blob)? };
     if args.from == 6 {
         new = reencode_v6(&new, args.mode, cost)?;
-    } else {
+    } else if args.from < 10 {
         new = add_directory_lengths(&new, cost)?;
     }
     let new = if args.keep_records {
@@ -893,7 +902,7 @@ struct Census {
     words: u64,
     /// Group containers by kind (grid, Elias-Fano, paged): how many, their
     /// members and their bytes; grids of groups a term was forced into.
-    kinds: [(u64, u64, u64); 3],
+    kinds: [(u64, u64, u64); 4],
     sparse_terms: u64,
     sparse_bytes: u64,
 }
@@ -918,7 +927,7 @@ impl Census {
                         .entries(&segment.docs.geometry.groups)
                         .map_err(|e| format!("{term}: {e}"))?;
                     for e in entries.iter() {
-                        let k = &mut c.kinds[usize::from(e.kind.min(2))];
+                        let k = &mut c.kinds[usize::from(e.kind & 3)];
                         k.0 += 1;
                         k.1 += u64::from(e.count);
                         k.2 += u64::from(e.len);
@@ -948,7 +957,7 @@ impl Census {
     }
 
     fn line(&self) -> String {
-        let kinds = ["grid", "ef", "paged"]
+        let kinds = ["grid", "ef", "paged", "array"]
             .iter()
             .zip(self.kinds)
             .map(|(name, (n, members, bytes))| format!("{name} {n} ({members} members, {bytes} B)"))

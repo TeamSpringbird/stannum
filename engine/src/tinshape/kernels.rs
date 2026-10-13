@@ -286,6 +286,8 @@ pub fn set_bits_bytes_at(level: Level, bytes: &[u8], out: &mut Vec<u32>) {
     }
 }
 
+mod array;
+pub use array::{array_decode, array_decode_at, array_into_row, array_retain, array_seek};
 mod ef;
 pub use ef::{
     container_locals, container_row, ef_decode, ef_decode_at, ef_into_row, ef_into_row_at,
