@@ -5,8 +5,11 @@
 
 name: CI
 
+# Pushes to main and pull requests only: experiment branches get CI by opening
+# a pull request or through workflow_dispatch.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
