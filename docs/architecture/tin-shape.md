@@ -1393,6 +1393,49 @@ cycles and by 13% (conjunction) and 42% (disjunction, whose code did not
 change) in backend CPU. The server comparison is to be repeated on a quiet
 host.
 
+## Per-page widths at 150M rows (branch `fable/pgrid`, page layout 9)
+
+The 150M dump re-encoded from layout 8 (`tnsreencode --from 8`, 10 to 12
+minutes at four jobs): 1.529 slots a document become 1.000 (32,696 groups,
+109.6 words a group become 72.2). With `Options::grid_density` at 64 a group
+is now forced into a grid at one document in 64 where it was one slot in 64
+(one document in 98 at 1.53 slots a document), so 60% more groups are grids
+(11.4M to 18.3M) and the postings area shrinks only 5.7% (16.59 to 15.65 GB;
+the dump 37.47 to 36.53 GB, -2.5%). At density 42, about the old forced set,
+grids rise 10% and their bytes fall 35% (8.20 to 5.36 GB): postings -18.8%
+(-3.12 GB, the containers lane's model), the dump -8.3% (34.35 GB). Both
+answer the whole trace as PostgreSQL does, and `--full` outputs are byte for
+byte f0962a8's; a fresh PostgreSQL build at 9 equals the re-encoded 8 build
+byte for byte.
+
+Replays against layout 8 (`fable/footers`), score on 400 queries and
+`full_score` on 200, `--repeat 3`, two rounds on the M4 (instructions agree to
+0.1% between rounds; cycles moved by up to 3% on a loaded machine), one round
+on a dedicated Sapphire Rapids (perf, the process less a load-only run, 300
+and 150 queries):
+
+| v9 against v8 | M4 instr / cycles (64) | M4 instr / cycles (42) | x86 instr / cycles / latency (64) | pins (64 / 42) | pages (64 / 42) |
+| --- | --- | --- | --- | --- | --- |
+| score conjunction | -10.8 / +1.0% | -2.9 / +7.0% | -9.0 / +4.6 / -11.1% | -16 / -23% | -14 / -20% |
+| score disjunction | -10.9 / -3.1% | -4.8 / +2.8% | -9.1 / -8.4 / -9.3% | -16 / -25% | -15 / -23% |
+| score phrase | -8.8 / +3.3% | -2.8 / +5.2% | -6.9 / -5.2 / -7.0% | -13 / -19% | -12 / -18% |
+| full conjunction | -4.7 / +3.8% | -2.6 / +0.7% | -5.7 / -5.5 / -7.1% | -13 / -18% | -11 / -16% |
+| full disjunction | -5.9 / -5.8% | -3.6 / -3.5% | -4.9 / -7.2 / -7.7% | -21 / -24% | -21 / -23% |
+| full phrase | -4.2 / -3.8% | -2.4 / -3.4% | -5.4 / -6.4 / -8.4% | -10 / -15% | -10 / -14% |
+
+Payload pages fall 18 to 20% at density 64 (29% for a `full_score`
+disjunction) and 28 to 33% at 42, as modelled (-33% for a disjunction);
+footer pages rise 2 to 3% (more directory entries of forced groups), TF
+pages fall up to 3% and DL pages 3 to 9%. Pages per query, score, density 64
+(42): conjunction 3,191 (2,965), disjunction 6,318 (5,721), phrase 4,264
+(4,005), against TIN's 2,688, 3,968 and 3,584. Branch misses fall 13% on x86
+in every style. A row is a third shorter, so every word loop, union, AND and
+popcount does a third fewer word operations; the Elias-Fano lists a forced
+grid replaces at density 42 cost more to expand than their pages save in the
+replay, where a pin costs nothing; at about 1,300 cycles a pin in the
+server, density 42's further pins close a fifth (disjunction) to two thirds
+(phrase) of that gap. Density 64 is the default.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
