@@ -14,8 +14,9 @@
 #      every source's --full outputs into OUT (compare them at home);
 #   4. the A/B: one round, three styles, score (300 queries) and
 #      full_score (150), interleaved (A B C, then C B A), under perf stat.
+# EXACT names the variants step 3 checks (default all; A's --full only).
 # Progress and results so far are uploaded after each step. Box time:
-# about 90 minutes.
+# about two hours with three sources, 75 minutes with two and EXACT=B.
 #   devbox.sh --branch BASE --branch CAND [--branch CAND2] --dump --disk 120 --hours 3 \
 #     --spot-only --cmd-file benchmarks/aws/devbox-kernels-ab.sh
 set -u
@@ -34,6 +35,7 @@ V9=/data/dump150m-v9
 EV=instructions:u,cycles:u,branch-misses:u,L1-icache-load-misses:u,task-clock
 names="A B"; [ -n "${SRC3:-}" ] && names="A B C"
 last=$(echo $names | awk '{print $NF}')
+EXACT=${EXACT:-$names}
 i=0
 for x in $names; do
   i=$((i + 1)); src=$(eval echo \$SRC$i); bins="--bin tnsreplay"
@@ -56,7 +58,7 @@ step "tnsef exit $? $(head -3 $OUT/tnsef-time.txt | tr '\n' ' ')"
 save
 # 3. exactness
 for st in conjunction disjunction phrase; do
-  for x in $names; do bin=$(eval echo \$bin_$x)
+  for x in $EXACT; do bin=$(eval echo \$bin_$x)
     if [ $x != A ]; then
       $bin --dump $V9 --trace $DATA/trace.tsv --expect $DATA/pg-ranked.tsv --style $st --repeat 1 > $OUT/expect-$x-$st.txt 2>&1
       step "expect $x $st exit $? $(grep -E '^expect' $OUT/expect-$x-$st.txt | head -1)"
