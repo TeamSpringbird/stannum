@@ -38,9 +38,10 @@ pub const MAGIC: u32 = 0x4c44_5032;
 /// masks, rare terms' lengths inline in their records and records without
 /// a footer (phase B, round 2). Version 8: grouped records' score metadata
 /// per (term, group). Version 9: a ctid grid with a width per heap page
-/// (one slot per document on pages holding rows `1..=n`). An index of an
+/// (one slot per document on pages holding rows `1..=n`). Version 10:
+/// grouped records' headers give their directory's length. An index of an
 /// earlier version must be rebuilt.
-pub const VERSION: u8 = 9;
+pub const VERSION: u8 = 10;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();
