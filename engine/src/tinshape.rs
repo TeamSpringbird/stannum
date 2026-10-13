@@ -352,7 +352,7 @@ impl<'a> TermSet<'a> {
     /// A grouped term's directory entry `i` (decoded if it was not yet).
     #[inline]
     fn entry(dir: &Directory, docs: &DocSet, i: usize) -> GroupEntry {
-        *dir.get(i, &docs.geometry.groups)
+        dir.get(i, &docs.geometry.groups)
             .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
     }
 
@@ -424,7 +424,7 @@ impl<'a> TermSet<'a> {
         }
         Some(match &self.dir {
             // Decoded: the seek reached it.
-            Some(dir) => self.group_of_entry(dir.decoded_entries()[*hint]),
+            Some(dir) => self.group_of_entry(Self::entry(dir, &self.docs, *hint)),
             None => self.groups[*hint],
         })
     }

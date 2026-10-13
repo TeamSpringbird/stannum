@@ -101,7 +101,7 @@ struct GroupBounds<'s> {
 impl GroupBounds<'_> {
     /// Entry `b` (decoded if it was not yet).
     #[inline]
-    fn entry(&self, b: usize) -> &GroupEntry {
+    fn entry(&self, b: usize) -> GroupEntry {
         self.dir
             .get(b, self.groups)
             .unwrap_or_else(|e| corrupt_footer(e))
@@ -663,7 +663,7 @@ impl<'s, 'a> Sc<'s, 'a> {
     #[inline]
     fn group_entry(&self, b: usize) -> Option<GroupEntry> {
         match &self.footer {
-            Bounds::Groups(g) => (b < g.dir.len()).then(|| *g.entry(b)),
+            Bounds::Groups(g) => (b < g.dir.len()).then(|| g.entry(b)),
             Bounds::Blocks(_) => None,
         }
     }

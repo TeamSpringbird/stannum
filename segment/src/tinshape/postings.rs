@@ -778,6 +778,45 @@ impl GroupEntry {
     }
 }
 
+/// A [`GroupEntry`] as a [`Directory`] keeps it decoded: 24 bytes, not 32.
+/// It holds where its container, its postings and its buckets end; where
+/// they start is where the entry before it ends them (the directory keeps a
+/// zero entry before its first), so its count, its container's length and
+/// its width (by its largest bucket) are not kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirEntry {
+    /// Index of the group in the segment's geometry.
+    pub index: u32,
+    frontier: u32,
+    /// Container bytes, postings and TF bits up to the group's end.
+    at_end: u32,
+    first_end: u32,
+    tf_end: u32,
+    kind: u8,
+    max_bucket: u8,
+}
+
+const _: () = assert!(std::mem::size_of::<DirEntry>() == 24);
+
+impl DirEntry {
+    /// The entry this one and the one before it give.
+    #[inline(always)]
+    fn view(&self, before: &DirEntry) -> GroupEntry {
+        GroupEntry {
+            index: self.index,
+            count: self.first_end - before.first_end,
+            kind: self.kind,
+            at: before.at_end,
+            len: self.at_end - before.at_end,
+            first: before.first_end,
+            frontier: self.frontier,
+            tf_bit: before.tf_end,
+            width: TF_WIDTH[usize::from(self.max_bucket & 15)],
+            max_bucket: self.max_bucket,
+        }
+    }
+}
+
 /// A term's membership.
 #[derive(Clone, Debug)]
 pub enum Form<'a> {
@@ -1111,7 +1150,7 @@ impl<'a> Postings<'a> {
                 if lo == 0 {
                     return Err(Error::Corrupt("posting index"));
                 }
-                self.bucket_in(dir.get(lo - 1, groups)?, index)
+                self.bucket_in(&dir.get(lo - 1, groups)?, index)
             }
             Form::Sparse(_) => Footer::parse(self, geometry, block_size, max_bucket, adaptive_tf)?
                 .bucket(self.tf, index),
@@ -1146,7 +1185,7 @@ impl<'a> Postings<'a> {
             Form::Sparse(list) => list.for_each(visit),
             Form::Grouped(dir) => {
                 for b in 0..dir.len() {
-                    let entry = dir.get(b, &geometry.groups)?;
+                    let entry = &dir.get(b, &geometry.groups)?;
                     let index = entry.index as usize;
                     let base = geometry.groups[index].slot_base;
                     let starts = geometry.starts(index);
@@ -1223,12 +1262,13 @@ pub struct Directory {
     /// The directory's bytes, from its group count on: entries' frontier
     /// offsets index them.
     bytes: Box<[u8]>,
-    /// A slot per entry, reserved when parsed and never moved: those below
+    /// A slot per entry and one before the first (a zero entry: where the
+    /// first starts), reserved when parsed and never moved: those up to
     /// `decoded` are written, once, and read through shared references a
     /// walk holds while later ones are written. A walk asks for an entry
     /// several times per group (its group's bounds, frontier, buckets), so
-    /// one decoded is a comparison and a load away.
-    entries: Box<[std::cell::UnsafeCell<std::mem::MaybeUninit<GroupEntry>>]>,
+    /// one decoded is a comparison and two adjacent loads away.
+    entries: Box<[std::cell::UnsafeCell<std::mem::MaybeUninit<DirEntry>>]>,
     decoded: std::cell::Cell<usize>,
     /// Where decoding stands after the entries decoded.
     resume: std::cell::Cell<Resume>,
@@ -1264,8 +1304,14 @@ struct Resume {
 impl Directory {
     fn new(bytes: Box<[u8]>, len: usize, df: u32, containers: u64, tf_len: u64) -> Self {
         Self {
-            entries: (0..len)
-                .map(|_| std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()))
+            entries: (0..=len)
+                .map(|i| {
+                    std::cell::UnsafeCell::new(if i == 0 {
+                        std::mem::MaybeUninit::new(DirEntry::default())
+                    } else {
+                        std::mem::MaybeUninit::uninit()
+                    })
+                })
                 .collect(),
             decoded: std::cell::Cell::new(0),
             resume: std::cell::Cell::new(Resume {
@@ -1283,12 +1329,12 @@ impl Directory {
     /// Entries (groups the record holds).
     #[inline]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() - 1
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
     /// The directory's bytes, from its group count on.
@@ -1300,17 +1346,22 @@ impl Directory {
     /// Entry `b`, its block decoded first if it was not (with every block
     /// before it); `groups` is the segment's ([`Geometry::groups`]).
     #[inline]
-    pub fn get(&self, b: usize, groups: &[Group]) -> Result<&GroupEntry> {
+    pub fn get(&self, b: usize, groups: &[Group]) -> Result<GroupEntry> {
         if b < self.decoded.get() {
-            // SAFETY: `b` is below `decoded`, at most the slots: written
-            // once, never again (decoding writes past `decoded`).
-            return Ok(unsafe { (*self.entries.get_unchecked(b).get()).assume_init_ref() });
+            // SAFETY: `b` is below `decoded`, so slots `b` and `b + 1` (the
+            // zero one and those of entries decoded) are written once and
+            // never again (decoding writes past `decoded`).
+            return Ok(unsafe {
+                let before = (*self.entries.get_unchecked(b).get()).assume_init_ref();
+                let entry = (*self.entries.get_unchecked(b + 1).get()).assume_init_ref();
+                entry.view(before)
+            });
         }
         self.get_slow(b, groups)
     }
 
     #[inline(never)]
-    fn get_slow(&self, b: usize, groups: &[Group]) -> Result<&GroupEntry> {
+    fn get_slow(&self, b: usize, groups: &[Group]) -> Result<GroupEntry> {
         if b >= self.len() {
             return Err(Error::Corrupt("group directory entry"));
         }
@@ -1333,7 +1384,7 @@ impl Directory {
 
     /// The entry of group `index`, if the record holds the group (a binary
     /// search: the blocks it reads are decoded, with those before them).
-    pub fn find(&self, index: u32, groups: &[Group]) -> Result<Option<&GroupEntry>> {
+    pub fn find(&self, index: u32, groups: &[Group]) -> Result<Option<GroupEntry>> {
         let (mut lo, mut hi) = (0, self.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
@@ -1350,7 +1401,7 @@ impl Directory {
     /// Every entry, in order (each block decoded as it is reached).
     pub fn each(&self, groups: &[Group], mut visit: impl FnMut(&GroupEntry)) -> Result<()> {
         for b in 0..self.len() {
-            visit(self.get(b, groups)?);
+            visit(&self.get(b, groups)?);
         }
         Ok(())
     }
@@ -1368,15 +1419,15 @@ impl Directory {
         self.decoded.get()
     }
 
-    /// The entries decoded so far, in order (those [`Self::get`] decodes
-    /// later are not in it).
+    /// The entries decoded so far, in order, as kept (their group indices;
+    /// [`Self::get`] gives the whole entry, and decodes later ones).
     #[inline]
-    pub fn decoded_entries(&self) -> &[GroupEntry] {
-        // SAFETY: the slots below `decoded` are written and never written
+    pub fn decoded_entries(&self) -> &[DirEntry] {
+        // SAFETY: the slots up to `decoded` are written and never written
         // again; a slot is laid out as its entry.
         unsafe {
             std::slice::from_raw_parts(
-                self.entries.as_ptr().cast::<GroupEntry>(),
+                self.entries.as_ptr().add(1).cast::<DirEntry>(),
                 self.decoded.get(),
             )
         }
@@ -1385,7 +1436,7 @@ impl Directory {
     /// Bytes the directory holds, roughly: its bytes, and its entries
     /// decoded so far (the slots past them untouched).
     pub fn held(&self) -> usize {
-        self.bytes.len() + self.decoded() * std::mem::size_of::<GroupEntry>()
+        self.bytes.len() + self.decoded() * std::mem::size_of::<DirEntry>()
     }
 
     /// Decodes the next `block` entries (those left, if fewer).
@@ -1394,7 +1445,7 @@ impl Directory {
         let n = block.min(self.len() - from);
         let mut resume = self.resume.get();
         let mut out = Slots {
-            slots: &self.entries[from..from + n],
+            slots: &self.entries[from + 1..from + 1 + n],
             len: 0,
         };
         UNITS.with_borrow_mut(|units| {
@@ -1422,7 +1473,7 @@ impl Directory {
 /// The slots a block decodes into, past the entries decoded: written in
 /// order, none of them referred to until the block is done.
 struct Slots<'d> {
-    slots: &'d [std::cell::UnsafeCell<std::mem::MaybeUninit<GroupEntry>>],
+    slots: &'d [std::cell::UnsafeCell<std::mem::MaybeUninit<DirEntry>>],
     len: usize,
 }
 
@@ -1433,7 +1484,7 @@ impl Slots<'_> {
     }
 
     #[inline(always)]
-    fn push(&mut self, entry: GroupEntry) {
+    fn push(&mut self, entry: DirEntry) {
         // SAFETY: a slot past the directory's `decoded`, which no reference
         // reaches (they are handed out below it only).
         unsafe { (*self.slots[self.len].get()).write(entry) };
@@ -1515,16 +1566,19 @@ fn push_entry(
     {
         return Err(Error::Corrupt("group directory entry"));
     }
-    out.push(GroupEntry {
-        at: resume.body as u32,
-        first: resume.first as u32,
-        tf_bit: resume.tf_bit as u32,
-        ..entry
-    });
     resume.after = u64::from(entry.index) + 1;
     resume.body += len;
     resume.first += count;
     resume.tf_bit += tf_bits;
+    out.push(DirEntry {
+        index: entry.index,
+        frontier: entry.frontier,
+        at_end: resume.body as u32,
+        first_end: resume.first as u32,
+        tf_end: resume.tf_bit as u32,
+        kind: entry.kind,
+        max_bucket: entry.max_bucket,
+    });
     resume.at = end;
     Ok(())
 }
@@ -4160,9 +4214,13 @@ mod tests {
             }
             dir.decode_all(groups).unwrap();
             assert_eq!(dir.decoded(), 700);
-            assert_eq!(
-                dir.decoded_entries(),
-                &decode_directory_whole(dir.bytes(), groups).unwrap()[..]
+            let whole = decode_directory_whole(dir.bytes(), groups).unwrap();
+            assert_eq!(dir.entries(groups).unwrap(), whole);
+            assert!(
+                dir.decoded_entries()
+                    .iter()
+                    .zip(&whole)
+                    .all(|(d, e)| d.index == e.index)
             );
             dir.decode_all(groups).unwrap();
         }
@@ -4597,7 +4655,7 @@ mod lazy_directory_tests {
         for &b in walk {
             let b = b % whole.len();
             furthest = furthest.max(b);
-            let entry = lazy.get(b, groups).unwrap();
+            let entry = &lazy.get(b, groups).unwrap();
             assert_eq!(*entry, whole[b], "entry {b}");
             assert!(
                 parsed
