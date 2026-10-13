@@ -4,7 +4,7 @@
 
 //! What a dumped `TNS1` segment's group directories cost to read, per
 //! entry, over its grouped records of at least `MIN_GROUPS` groups: parsing
-//! a record (its directory skimmed, `Postings::parse`), then decoding every
+//! a record (its directory copied, `Postings::parse`), then decoding every
 //! entry of the parsed directory (`Directory::entries`), against decoding
 //! them a varint at a time (`postings::decode_directory_whole`, the
 //! reference, which the decoded entries are checked against first).
@@ -114,7 +114,7 @@ fn main() {
                     .sum()
             });
             println!(
-                "  round {round}, per entry ns / instructions / cycles: parse (skim) {:.2} / {:.1} / {:.1}, parse and decode every entry {:.2} / {:.1} / {:.1}, a varint at a time {:.2} / {:.1} / {:.1}",
+                "  round {round}, per entry ns / instructions / cycles: parse (copy) {:.2} / {:.1} / {:.1}, parse and decode every entry {:.2} / {:.1} / {:.1}, a varint at a time {:.2} / {:.1} / {:.1}",
                 parse.0, parse.1, parse.2, lazy.0, lazy.1, lazy.2, whole.0, whole.1, whole.2
             );
         }

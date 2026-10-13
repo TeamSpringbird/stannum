@@ -117,8 +117,10 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
                                                  dictionary's largest bucket)
          | sparse:  form u8, [footer_len], payload_len, [lengths_len],
                     [footer], list, [lengths], tf
-         | grouped: form u8, payload_len, [lengths_len],
+         | grouped: form u8, directory_len, payload_len, [lengths_len],
                     directory, container*, [lengths], tf
+                    (directory_len: the bytes of the payload before its
+                    containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
            (sparse), | 0x10 when the frontiers' lengths are rounded (grouped)
 lengths := base varint, width u8, (length - base) packed at width, by posting
@@ -1095,8 +1097,9 @@ each entry is checked against the record as it is decoded (its group, its
 count, its container within the payload, its buckets within the TF tail),
 and the record's totals with the last.
 
-The containers still start where the directory ends, so the parse steps
-over every entry, without decoding it (`skim_entries`). An entry is a gap, a
+Before layout 10 the containers' start followed only from the directory's
+end, so the parse stepped over every entry without decoding it (a skim). An
+entry is a gap, a
 count and kind, a paged container's length, then the frontier's head (its
 pairs), first length and a delta per further pair: its length in varints
 follows from the first bytes of its second to fourth varints. A scan finds
@@ -1139,10 +1142,50 @@ every entry; all answers the same, the ranked oracle 0 differing):
   39,400 reached, records reused 29.7 -> 34.9 a query (the old build 39.2:
   a kept record now counts only what it decoded).
 
-The skim is the floor while containers are found from the directory's end:
-a directory length in the record's header would let a walk skip the rest
-of the directory entirely (a format change, not made). On x86-64 the scan
-has an SSSE3 body, measured under Rosetta only.
+The skim was the floor while containers were found from the directory's
+end; layout 10 removed it (below). On x86-64 the scan has an SSSE3 body.
+
+### Directory length in the header (layout 10)
+
+A grouped record's header gives its directory's length (the bytes of its
+group count and entries, where its containers start) in the varint a
+sparse record spends on its footer's length. The parse reads the directory
+in one window, copies it and reads none of its entries; the last block
+decoded checks that the entries end where the header says. Metadata only,
+so judged by measurement: 1.36 bytes per grouped record (336,689 bytes over
+246,724 records, +0.001% of the 150M-row dump). `tnsreencode --from 9
+--keep-records` adds the lengths to a layout 9 dump and leaves every other
+byte; each segment so made equals its own merge (a fresh encoding).
+
+Per entry (`tnsdirskim`, segment 5240): the parse 0.57 ns, 3.7
+instructions, 2.3 cycles (the skim was 2.7 ns, 60, 12); parse and decode
+7.0 ns, 224, 28 (8.8, 280, 38). A disjunction bounds every group of each
+term it scores, so `Sc::decode_all` decodes a scored grouped term's
+directory in one pass (`Directory::decode_all`) rather than a block at a
+time between the walk's reads, and `TermSet::find` scans the decoded
+entries as a slice.
+
+Replay with `--forget`, 400 queries per style, 2 rounds, against
+`perf-integrate9` (lazy directories, layout 9; all answers the same):
+instructions -13.1% / -10.9% / -5.3% and cycles -11.8% / -13.5% / -4.5%
+(conjunction / phrase / disjunction), median query -17% / -21% / -6%; under
+`full_score` cycles -7.2% / -4.7% / -1.4%. A `full_score` disjunction, which
+reaches every entry, against `perf-integrate8` (eager directories): cycles
+-1.3%, instructions +1.5% (the branch-free decode), where lazy directories
+alone were +3.1% cycles.
+
+On x86-64 (Sapphire Rapids, `m7i.4xlarge`; replay with `--forget`, 300
+queries per style and 150 under `full_score`, 2 rounds, `perf stat` user
+counters; all outputs the same), the SSSE3 scan's first measurement on
+hardware: lazy directories (`perf-integrate9`) against eager ones
+(`perf-integrate8`) cut branch misses 30-40% and cycles 2.5-2.8%
+(conjunction, disjunction, phrase; median conjunction -21%) for 1.4-1.7%
+more instructions, and cost a `full_score` disjunction +1.2% cycles. With
+the header's length (layout 10) against lazy directories: cycles -10.9% /
+-3.9% / -7.0%, instructions -6.4% / -3.8% / -5.6%, median query -16% / -6%
+/ -7%; under `full_score` cycles -6.7% / -1.2% / -5.9%. Against eager
+directories: cycles -13.1% / -6.6% / -9.6%, and a `full_score` disjunction
+level (0.0%, instructions +1.9%).
 
 CPU in the replay (2 rounds, 400 queries per style, instructions retired)
 against the base without its footer memo (the replay repeats each query five

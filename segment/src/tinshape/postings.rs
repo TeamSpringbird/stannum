@@ -18,6 +18,8 @@
 //!            (bucket u8, min_length varint)* ascending in both: the
 //!            block's impact frontier
 //! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded),
+//!            directory_len varint (bytes of the groups count and the
+//!                                  directory: where containers start),
 //!            payload_len varint,
 //!            groups varint,
 //!            (index_gap varint, (count - 1) << 2 | kind varint,
@@ -444,7 +446,7 @@ pub fn encode_reusing<'r>(
     }
     let mut grouped_stats = Stats::default();
     let mut grouped_tf = Vec::new();
-    let grouped = encode_groups(
+    let (grouped, directory_len) = encode_groups(
         geometry,
         slots,
         buckets,
@@ -515,7 +517,10 @@ pub fn encode_reusing<'r>(
                 0
             }
     });
-    if !use_sparse || compact {
+    if !use_sparse {
+        footer.clear();
+        varint::put(out, directory_len as u64);
+    } else if compact {
         footer.clear();
     } else {
         varint::put(out, footer.len() as u64);
@@ -611,8 +616,9 @@ fn encode_paged(locals: &[u32], starts: &[u32], out: &mut Vec<u8>) {
 }
 
 /// A grouped payload (its directory with each group's frontier, then its
-/// containers), and in `tf` the record's TF tail: each group's buckets at
-/// the group's width, in a row.
+/// containers) and the bytes of its group count and directory (where its
+/// containers start), and in `tf` the record's TF tail: each group's
+/// buckets at the group's width, in a row.
 #[expect(clippy::too_many_arguments, reason = "the postings and the outputs")]
 fn encode_groups<'r>(
     geometry: &Geometry,
@@ -623,7 +629,7 @@ fn encode_groups<'r>(
     reuse: &mut dyn FnMut(usize) -> Option<Reused<'r>>,
     stats: &mut Stats,
     tf: &mut Vec<u8>,
-) -> Vec<u8> {
+) -> (Vec<u8>, usize) {
     let mut directory = Vec::new();
     let mut bodies = Vec::new();
     let mut groups = 0usize;
@@ -736,8 +742,9 @@ fn encode_groups<'r>(
     let mut out = Vec::with_capacity(directory.len() + bodies.len() + 4);
     varint::put(&mut out, groups as u64);
     out.extend_from_slice(&directory);
+    let directory_len = out.len();
     out.extend_from_slice(&bodies);
-    out
+    (out, directory_len)
 }
 
 /// One group of a grouped record.
@@ -939,6 +946,7 @@ impl<'a> Postings<'a> {
         }
         // The form and three varints.
         let record = bytes.window(0, 1 + 3 * 10)?;
+        let mut directory_len = 0;
         let form = *record.first().ok_or(Error::Truncated)?;
         let mut at = 1;
         let grouped = form & 3 == FORM_GROUPED;
@@ -952,6 +960,7 @@ impl<'a> Postings<'a> {
             }
             0
         } else if grouped {
+            directory_len = varint::get_u32(record, &mut at)? as usize;
             0
         } else {
             varint::get_u32(record, &mut at)? as usize
@@ -996,61 +1005,22 @@ impl<'a> Postings<'a> {
                 )?)
             }
             FORM_GROUPED => {
-                // The directory's length is known only once its entries are
-                // stepped over: read a prefix of the payload, then the rest
-                // in windows from where its whole entries end, each sized by
-                // what the entries so far took. They are skimmed, not
-                // decoded ([`Directory`]).
-                let len = payload.len();
-                let mut window = payload.window(0, DIRECTORY_PREFIX.min(len))?;
+                // The header gives the directory's length: its bytes are
+                // read in one window and copied, and nothing of them is
+                // stepped over ([`Directory`] decodes its entries as asked).
+                let end = directory_len;
+                if end == 0 || end > payload.len() {
+                    return Err(Error::Corrupt("postings directory length"));
+                }
+                let window = payload.get(0, end)?;
                 let mut at = 0;
                 let groups = varint::get_u32(window, &mut at)? as usize;
-                if groups == 0 || groups > geometry.groups.len() {
+                // An entry takes at least four bytes (a gap, a count and
+                // kind, a frontier's head and first length).
+                if groups == 0 || groups > geometry.groups.len() || end - at < 4 * groups {
                     return Err(Error::Corrupt("postings groups"));
                 }
-                // Where `window` starts in the payload, and the directory's
-                // bytes before it when it is not the first.
-                let mut base = 0;
-                let mut before: Option<Vec<u8>> = None;
-                let mut left = groups;
-                let (end, directory) = loop {
-                    let (stepped, took) =
-                        UNITS.with_borrow_mut(|units| skim_entries(&window[at..], left, units));
-                    at += took;
-                    left -= stepped;
-                    if left == 0 {
-                        let directory: Box<[u8]> = match before.take() {
-                            None => Box::from(&window[..at]),
-                            Some(mut bytes) => {
-                                bytes.extend_from_slice(&window[..at]);
-                                bytes.into_boxed_slice()
-                            }
-                        };
-                        break (base + at, directory);
-                    }
-                    if base + window.len() >= len {
-                        // The payload ends within an entry.
-                        return Err(Error::Truncated);
-                    }
-                    // The bytes per entry so far and an eighth more for the
-                    // rest, and at least twice the partial entry the window
-                    // ended in.
-                    let done = groups - left;
-                    let rest = if done == 0 {
-                        left.saturating_mul(DIRECTORY_ENTRY_TYPICAL)
-                    } else {
-                        let per = (base + at).div_ceil(done);
-                        left.saturating_mul(per + per.div_ceil(8))
-                            .saturating_add(16)
-                    };
-                    before
-                        .get_or_insert_with(|| Vec::with_capacity(base + at + rest))
-                        .extend_from_slice(&window[..at]);
-                    let want = rest.max(2 * (window.len() - at)).max(64);
-                    base += at;
-                    window = payload.window(base, want)?;
-                    at = 0;
-                };
+                let directory: Box<[u8]> = Box::from(window);
                 super::segment::count_memo(|c| {
                     c.directories += 1;
                     c.directory_bytes += end as u64;
@@ -1060,7 +1030,7 @@ impl<'a> Postings<'a> {
                     directory,
                     groups,
                     df,
-                    (len - end) as u64,
+                    (payload.len() - end) as u64,
                     tf_len as u64,
                 )))
             }
@@ -1224,18 +1194,8 @@ impl<'a> Postings<'a> {
 }
 
 /// Bytes a chunk of a directory scanned for its varints ([`Units`]) holds
-/// at most, and per entry wanted (most take 4 to 13).
+/// at most.
 const UNITS_CHUNK: usize = 2048;
-const ENTRY_SCAN: usize = 16;
-
-/// Bytes of a grouped payload read first for its directory: a few groups'
-/// entries take a few bytes each.
-const DIRECTORY_PREFIX: usize = 4096;
-
-/// Bytes a directory entry is taken to need before any is skimmed (a gap,
-/// a count and kind, a paged container's length, a frontier of a head, a
-/// length and a few later pairs).
-const DIRECTORY_ENTRY_TYPICAL: usize = 12;
 
 /// Entries of a [`Directory`] decoded together, the first time one of them
 /// is asked for.
@@ -1247,8 +1207,9 @@ pub const DIRECTORY_BLOCK: usize = 128;
 /// [`DIRECTORY_BLOCK`] at a time as they are asked for.
 ///
 /// An entry carries its group's impact frontier, so a directory takes about
-/// ten bytes an entry, and the parse only skims them: where they end is
-/// where the containers start. A walk reaches the entries in order and
+/// ten bytes an entry; the record's header gives its length (where the
+/// containers start), so the parse reads none of its entries. A walk
+/// reaches the entries in order and
 /// stops at its lead's last group, often well before the last entry; an
 /// entry's totals (its container's offset, its first posting, its buckets'
 /// offset) count every entry before it, so reaching one decodes those
@@ -1354,9 +1315,20 @@ impl Directory {
             return Err(Error::Corrupt("group directory entry"));
         }
         while self.decoded.get() <= b {
-            self.decode_block(groups)?;
+            self.decode_block(groups, DIRECTORY_BLOCK)?;
         }
         self.get(b, groups)
+    }
+
+    /// Decodes every entry not decoded yet, in one pass: for a walk that
+    /// will reach them all (a disjunction bounds every group of each term it
+    /// scores), which decoding them as it goes would interleave with its
+    /// reads of the containers.
+    pub fn decode_all(&self, groups: &[Group]) -> Result<()> {
+        if self.decoded.get() < self.len() {
+            self.decode_block(groups, self.len())?;
+        }
+        Ok(())
     }
 
     /// The entry of group `index`, if the record holds the group (a binary
@@ -1416,10 +1388,10 @@ impl Directory {
         self.bytes.len() + self.decoded() * std::mem::size_of::<GroupEntry>()
     }
 
-    /// Decodes the next block.
-    fn decode_block(&self, groups: &[Group]) -> Result<()> {
+    /// Decodes the next `block` entries (those left, if fewer).
+    fn decode_block(&self, groups: &[Group], block: usize) -> Result<()> {
         let from = self.decoded.get();
-        let n = DIRECTORY_BLOCK.min(self.len() - from);
+        let n = block.min(self.len() - from);
         let mut resume = self.resume.get();
         let mut out = Slots {
             slots: &self.entries[from..from + n],
@@ -1470,60 +1442,8 @@ impl Slots<'_> {
 }
 
 thread_local! {
-    /// Scratch of the directory scans ([`skim_entries`], [`decode_entries`]).
+    /// Scratch of the directory scans ([`decode_entries`]).
     static UNITS: std::cell::RefCell<Units> = std::cell::RefCell::new(Units::default());
-}
-
-/// Steps over at most `want` whole entries of a directory at the start of
-/// `bytes`, without decoding them: an entry's length in varints follows from
-/// its kind (a paged container's has a length) and its frontier's head (its
-/// pairs), and where each varint starts is scanned for a chunk of entries at
-/// once ([`Units`]). The entries stepped over and the bytes they take: the
-/// bytes may end within one.
-fn skim_entries(bytes: &[u8], want: usize, units: &mut Units) -> (usize, usize) {
-    let (mut done, mut pos) = (0, 0);
-    while done < want {
-        let end = bytes
-            .len()
-            .min(pos + (want - done).saturating_mul(ENTRY_SCAN).min(UNITS_CHUNK));
-        units.scan(&bytes[pos..end]);
-        let (at, step, n) = (&units.at[..], &units.step[..], units.n);
-        let mut u = 0;
-        let before = done;
-        // From entry to entry by the steps: a load and an add between one
-        // and the next.
-        while done < want && u + 4 <= n {
-            let next = u + usize::from(step[u]);
-            if next >= n {
-                break;
-            }
-            u = next;
-            done += 1;
-        }
-        pos += usize::from(at[u]);
-        if done == before {
-            // An entry longer than a chunk (or the bytes' end).
-            let mut p = pos;
-            if end == bytes.len() || entry_len(bytes, &mut p).is_err() {
-                break;
-            }
-            pos = p;
-            done += 1;
-        }
-    }
-    (done, pos)
-}
-
-/// Steps over the entry at `at`, a varint at a time.
-fn entry_len(bytes: &[u8], at: &mut usize) -> Result<()> {
-    varint::get(bytes, at)?;
-    let kind = *bytes.get(*at).ok_or(Error::Truncated)? & 3;
-    varint::get(bytes, at)?;
-    if kind == KIND_PAGED {
-        varint::get(bytes, at)?;
-    }
-    skip_group_frontier(bytes, at)?;
-    Ok(())
 }
 
 /// Decodes `want` entries of a directory's `bytes` from `resume` on, into
@@ -4095,7 +4015,7 @@ mod tests {
         assert_eq!(
             (counts.directories, counts.directory_entries),
             (1, 0),
-            "the entries skimmed, none decoded"
+            "the directory copied, no entry decoded"
         );
         assert_eq!(read.entries(&geometry.groups).unwrap(), entries);
         assert_eq!(read.entries(&geometry.groups).unwrap(), entries);
@@ -4107,7 +4027,7 @@ mod tests {
         );
         let stitched = blob::stats()[Kind::Record as usize].stitched as usize;
         assert!(
-            stitched <= DIRECTORY_PREFIX + directory + directory / 4,
+            stitched <= directory + 64,
             "stitched {stitched} bytes for a {directory}-byte directory"
         );
         drop(parsed);
@@ -4195,6 +4115,105 @@ mod tests {
         assert!(truncated.is_err());
         assert!(Postings::parse(&[], 2, &geometry).is_err());
         assert!(Postings::parse(&[9, 0, 0], 2, &geometry).is_err());
+    }
+
+    /// A grouped record of `groups` groups of `per` postings each over a
+    /// grid of 256-page groups, its header's fields, and its geometry.
+    fn grouped_record(groups: u32, per: u32) -> (Vec<u8>, Geometry, u32) {
+        let tids: Vec<Tid> = (0..groups * 256)
+            .map(|b| Tid {
+                block: b,
+                offset: 1,
+            })
+            .collect();
+        let geometry = geometry(&tids);
+        let slots: Vec<u32> = tids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| (*i as u32 % 256) < per)
+            .map(|(_, t)| geometry.slot_of(*t).unwrap())
+            .collect();
+        let df = slots.len() as u32;
+        let buckets: Vec<u8> = (0..df).map(|i| (i % 7) as u8).collect();
+        let lengths: Vec<u32> = (0..df).map(|i| 1 + i % 13).collect();
+        let mut out = Vec::new();
+        let options = Options {
+            sparse: false,
+            ..Options::default()
+        };
+        let stats = encode(&geometry, &slots, &buckets, &lengths, &options, &mut out);
+        assert!(!stats.sparse, "a grouped record");
+        (out, geometry, df)
+    }
+
+    #[test]
+    fn a_directory_decoded_whole_is_the_one_decoded_as_reached() {
+        let (out, geometry, df) = grouped_record(700, 2);
+        let groups = &geometry.groups;
+        for first in [None, Some(0), Some(200), Some(699)] {
+            let parsed = Postings::parse(&out[..], df, &geometry).unwrap();
+            let Form::Grouped(dir) = &parsed.form else {
+                panic!("a grouped record");
+            };
+            if let Some(b) = first {
+                dir.get(b, groups).unwrap();
+            }
+            dir.decode_all(groups).unwrap();
+            assert_eq!(dir.decoded(), 700);
+            assert_eq!(
+                dir.decoded_entries(),
+                &decode_directory_whole(dir.bytes(), groups).unwrap()[..]
+            );
+            dir.decode_all(groups).unwrap();
+        }
+        // Its totals are checked as a block's are.
+        let parsed = Postings::parse(&out[..out.len() - 1], df, &geometry).unwrap();
+        let Form::Grouped(dir) = &parsed.form else {
+            panic!("a grouped record");
+        };
+        assert!(dir.decode_all(groups).is_err());
+    }
+
+    #[test]
+    fn a_grouped_header_gives_where_the_containers_start() {
+        for (groups, per) in [(1, 2), (3, 5), (40, 3), (700, 2)] {
+            let (out, geometry, df) = grouped_record(groups, per);
+            assert_eq!(out[0] & 3, FORM_GROUPED);
+            let mut at = 1;
+            let directory_len = varint::get(&out, &mut at).unwrap() as usize;
+            let payload_len = varint::get(&out, &mut at).unwrap() as usize;
+            let parsed = Postings::parse(&out[..], df, &geometry).unwrap();
+            assert_eq!(parsed.payload_at, at);
+            assert_eq!(parsed.payload.len(), payload_len);
+            assert_eq!(parsed.containers_at, directory_len);
+            let Form::Grouped(dir) = &parsed.form else {
+                panic!("a grouped record");
+            };
+            assert_eq!(dir.bytes().len(), directory_len);
+            assert_eq!(dir.len(), groups as usize);
+            assert_eq!(
+                dir.entries(&geometry.groups).unwrap(),
+                decode_directory_whole(dir.bytes(), &geometry.groups).unwrap()
+            );
+            // The length rewritten one byte shorter or longer: the parse or
+            // the last entry's decode finds it (the totals no longer meet
+            // the containers), as does a length past the payload or zero.
+            for wrong in [directory_len - 1, directory_len + 1, payload_len + 1, 0] {
+                let mut bad = vec![out[0]];
+                varint::put(&mut bad, wrong as u64);
+                bad.extend_from_slice(&out[1 + varint_len(directory_len as u64)..]);
+                let read = Postings::parse(&bad[..], df, &geometry).and_then(|p| {
+                    if let Form::Grouped(dir) = &p.form {
+                        dir.entries(&geometry.groups)?;
+                    }
+                    Ok(())
+                });
+                assert!(
+                    read.is_err(),
+                    "{groups} groups, length {wrong} of {directory_len}"
+                );
+            }
+        }
     }
 
     proptest! {

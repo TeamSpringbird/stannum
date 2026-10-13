@@ -52,8 +52,8 @@ REMOTE=${DEVBOX_REMOTE:-stannum}
 AMI_PARAM=/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id
 # us-east-1 Linux on-demand $/h (spot is billed at the market price; the
 # ledger records the AZ's spot price at launch).
-on_demand() { case $1 in c7i.xlarge) echo 0.1785 ;; c7i.2xlarge) echo 0.357 ;; r7i.2xlarge) echo 0.5292 ;; esac; }
-TYPES="c7i.xlarge c7i.2xlarge r7i.2xlarge"
+on_demand() { case $1 in c7i.xlarge) echo 0.1785 ;; c7i.2xlarge) echo 0.357 ;; r7i.2xlarge) echo 0.5292 ;; m7i.4xlarge) echo 0.8064 ;; esac; }
+TYPES="c7i.xlarge c7i.2xlarge r7i.2xlarge m7i.4xlarge"
 
 die() { echo "devbox: $*" >&2; exit 1; }
 log() { echo "devbox $(date +%H:%M:%S) $*" >&2; }

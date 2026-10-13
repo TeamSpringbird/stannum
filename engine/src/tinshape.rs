@@ -371,7 +371,12 @@ impl<'a> TermSet<'a> {
         let Some(dir) = &self.dir else {
             return self.groups[i];
         };
-        let entry = Self::entry(dir, &self.docs, i);
+        self.group_of_entry(Self::entry(dir, &self.docs, i))
+    }
+
+    /// A grouped term's group of directory entry `entry`.
+    #[inline]
+    fn group_of_entry(&self, entry: GroupEntry) -> G<'a> {
         G {
             index: entry.index,
             count: entry.count,
@@ -383,27 +388,45 @@ impl<'a> TermSet<'a> {
         }
     }
 
+    /// Moves `hint` forward to the term's first group whose index is
+    /// `group` or more (to the group count if none is), and gives that
+    /// group's index. A grouped term's entries are scanned as the slice of
+    /// those decoded, the next block decoded when the scan passes them.
+    #[inline]
+    fn seek_index(&self, group: u32, hint: &mut usize) -> Option<u32> {
+        let Some(dir) = &self.dir else {
+            while *hint < self.groups.len() && self.groups[*hint].index < group {
+                *hint += 1;
+            }
+            return self.groups.get(*hint).map(|g| g.index);
+        };
+        loop {
+            let decoded = dir.decoded_entries();
+            while let Some(entry) = decoded.get(*hint) {
+                if entry.index >= group {
+                    return Some(entry.index);
+                }
+                *hint += 1;
+            }
+            if *hint >= dir.len() {
+                return None;
+            }
+            Self::entry(dir, &self.docs, *hint);
+        }
+    }
+
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
+    #[inline]
     fn find(&self, group: u32, hint: &mut usize) -> Option<G<'a>> {
-        let count = self.group_count();
-        if let Some(dir) = &self.dir {
-            // Through the entries decoded, then a block at a time.
-            loop {
-                let decoded = dir.decoded_entries();
-                while *hint < decoded.len() && decoded[*hint].index < group {
-                    *hint += 1;
-                }
-                if *hint < decoded.len() || *hint >= count {
-                    break;
-                }
-                Self::entry(dir, &self.docs, *hint);
-            }
+        if self.seek_index(group, hint)? != group {
+            return None;
         }
-        while *hint < count && self.group_index(*hint) < group {
-            *hint += 1;
-        }
-        (*hint < count && self.group_index(*hint) == group).then(|| self.group_at(*hint))
+        Some(match &self.dir {
+            // Decoded: the seek reached it.
+            Some(dir) => self.group_of_entry(dir.decoded_entries()[*hint]),
+            None => self.groups[*hint],
+        })
     }
 
     // ---- The cursor: slots in order, each with its posting index. ----
