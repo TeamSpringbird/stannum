@@ -1842,7 +1842,7 @@ struct Units {
 
 /// `COMPACT[m]`: the positions of byte `m`'s set bits, ascending, a byte
 /// each, the rest 0xFF (which a table lookup reads as zero).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 static COMPACT: [u64; 256] = {
     let mut table = [u64::MAX; 256];
     let mut m = 0;
@@ -1889,7 +1889,15 @@ impl Units {
         // SAFETY: NEON is baseline on aarch64; the vectors are long enough
         // for the scan's writes past `k` (`UNITS_SLACK`).
         let j = unsafe { self.scan_neon(bytes, &mut state) };
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        let j = if std::is_x86_feature_detected!("ssse3") {
+            // SAFETY: the CPU has SSSE3 (asked above); the vectors are long
+            // enough for the scan's writes past `k` (`UNITS_SLACK`).
+            unsafe { self.scan_ssse3(bytes, &mut state) }
+        } else {
+            0
+        };
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let j = 0;
         self.scan_bytes(bytes, j, &mut state);
         let k = state.k;
@@ -2010,6 +2018,58 @@ impl Units {
             s.long_at = long_at;
             j
         }
+    }
+}
+
+impl Units {
+    /// [`Self::scan_neon`] with SSSE3 (`pshufb` the compacting table
+    /// lookup, `pmovmskb` the bytes that end a varint); where it stopped.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn scan_ssse3(&mut self, bytes: &[u8], s: &mut ScanState) -> usize {
+        use core::arch::x86_64::*;
+        let (at, first) = (self.at.as_mut_ptr(), self.first.as_mut_ptr());
+        let mut k = s.k;
+        let mut carry = u32::from(s.start);
+        let mut cont: u32 = 0;
+        let mut long_at = s.long_at;
+        let mut j = 0;
+        while j + 16 <= bytes.len() {
+            // SAFETY: 16 bytes from `j` lie within `bytes`; the writes at
+            // `k` lie within the vectors' slack (see `scan`).
+            unsafe {
+                let raw = _mm_loadu_si128(bytes.as_ptr().add(j).cast());
+                let ends = !(_mm_movemask_epi8(raw) as u32) & 0xFFFF;
+                let starts = (ends << 1 | carry) & 0xFFFF;
+                carry = ends >> 15;
+                let c = cont | (!ends & 0xFFFF) << 16;
+                let run = c & c >> 1 & c >> 2 & c >> 3;
+                let run_at = (j + run.trailing_zeros() as usize).saturating_sub(16);
+                long_at = long_at.min(if run == 0 { usize::MAX } else { run_at });
+                cont = c >> 16;
+                for half in [0usize, 8] {
+                    let m = (starts >> half) & 0xFF;
+                    let idx = _mm_cvtsi64_si128(COMPACT[m as usize] as i64);
+                    let pos = _mm_add_epi16(
+                        _mm_unpacklo_epi8(idx, _mm_setzero_si128()),
+                        _mm_set1_epi16((j + half) as i16),
+                    );
+                    _mm_storeu_si128(at.add(k).cast(), pos);
+                    // The half's lanes: past the first half, its indices
+                    // move up by eight (an unused lane's 0xFF stays negative
+                    // or wraps into a lane past `k`, unread).
+                    let lanes = _mm_add_epi8(idx, _mm_set1_epi8(half as i8));
+                    _mm_storel_epi64(first.add(k).cast(), _mm_shuffle_epi8(raw, lanes));
+                    k += m.count_ones() as usize;
+                }
+            }
+            j += 16;
+        }
+        s.k = k;
+        s.start = carry == 1;
+        s.run = (cont << 16).leading_ones();
+        s.long_at = long_at;
+        j
     }
 }
 
