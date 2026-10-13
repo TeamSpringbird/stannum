@@ -31,7 +31,7 @@ use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
-    Form, GroupEntry, GroupFrontier, KIND_EF, KIND_GRID, LazyFooter,
+    Form, GroupEntry, GroupFrontier, KIND_EF, KIND_GRID, LazyFooter, round_length, rounded_length,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -39,7 +39,7 @@ use segment::{Error, Result};
 use super::{
     Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
 };
-use crate::bm25::TermScorer;
+use crate::bm25::{CodeBounds, TermScorer};
 use crate::walk::{Ranked, TopRows, Visibility};
 
 /// A required term's Elias-Fano container in a group is probed for the
@@ -116,6 +116,13 @@ impl GroupBounds<'_> {
     #[inline]
     fn frontier(&self, b: usize) -> GroupFrontier<'_> {
         GroupFrontier::new(&self.directory, self.dir[b].frontier as usize, self.rounded)
+    }
+
+    /// The frontier of entry `b` as stored: its lengths as their
+    /// [`round_length`] codes when [`Self::rounded`], else as lengths.
+    #[inline]
+    fn frontier_codes(&self, b: usize) -> GroupFrontier<'_> {
+        GroupFrontier::new(&self.directory, self.dir[b].frontier as usize, false)
     }
 
     /// The first entry from `from` on whose group ends at `slot` or later:
@@ -369,6 +376,9 @@ pub(super) struct Sc<'s, 'a> {
     floors_block: u32,
     /// A common term's bound over a group (see [`Sc::make_common`]).
     common: Option<f32>,
+    /// The scorer's bounds by bucket and length code, for a grouped
+    /// record's rounded frontiers ([`TermScorer::code_bounds`]).
+    codes: Option<CodeBounds>,
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -402,6 +412,10 @@ impl<'s, 'a> Sc<'s, 'a> {
             )?)),
         };
         let (num, den, factor) = scorer.length_bound_parts();
+        let codes = match &footer {
+            Bounds::Groups(g) if g.rounded => Some(scorer.code_bounds()),
+            _ => None,
+        };
         Ok(Self {
             term,
             bounds: Vec::new(),
@@ -420,6 +434,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors: [0; BUCKET_COUNT],
             floors_block: u32::MAX,
             common: None,
+            codes,
         })
     }
 
@@ -474,9 +489,24 @@ impl<'s, 'a> Sc<'s, 'a> {
     #[inline(never)]
     fn bound_of(&mut self, b: usize) -> f32 {
         let scorer = &self.scorer;
-        let v = self.footer.fold_bound(b, |bucket, length| {
-            scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
-        });
+        let v = match &self.footer {
+            // A rounded frontier's pairs from the scorer's table, by their
+            // codes; an exact one's at their lengths.
+            Bounds::Groups(g) => {
+                let mut v = 0.0_f32;
+                for (bucket, stored) in g.frontier_codes(b) {
+                    v = v.max(match &self.codes {
+                        Some(codes) => codes.get(scorer, bucket, stored),
+                        None => scorer
+                            .bound_through(TfBucket::new(bucket).expect("a valid bucket"), stored),
+                    });
+                }
+                v
+            }
+            Bounds::Blocks(_) => self.footer.fold_bound(b, |bucket, length| {
+                scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
+            }),
+        };
         if self.grouped() {
             self.gb = b;
             self.gv = v;
@@ -606,13 +636,23 @@ impl<'s, 'a> Sc<'s, 'a> {
         }
         self.bb_block[at] = tag;
         let floor = self.floor_at(b, bucket);
-        let v = (
-            floor,
-            self.scorer
-                .bound_through(TfBucket::new(bucket).expect("a valid bucket"), floor),
-        );
+        let v = (floor, self.bound_at(bucket, floor));
         self.bb[at] = v;
         v
+    }
+
+    /// [`TermScorer::bound_through`] `bucket` at `length`, which is a
+    /// floor of the term's blocks (a rounded frontier's length, which its
+    /// code gives back exactly, or 0).
+    #[inline]
+    fn bound_at(&self, bucket: u8, length: u32) -> f32 {
+        if let Some(codes) = &self.codes {
+            let code = round_length(length);
+            debug_assert_eq!(rounded_length(code), length);
+            return codes.get(&self.scorer, bucket, code);
+        }
+        self.scorer
+            .bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
     }
 
     /// A block's floor at a bucket, its floors read at once and kept for the
@@ -4091,10 +4131,22 @@ mod tests {
                     assert_eq!(sc.footer.last(b), end);
                     assert!(!sc.footer.starts_after(b, end));
                     assert_eq!(sc.bound(b).to_bits(), bound.to_bits());
+                    // The table's bound is the scorer's, bit for bit.
+                    let direct = sc.footer.fold_bound(b, |bucket, length| {
+                        scorer.bound_through(TfBucket::new(bucket).unwrap(), length)
+                    });
+                    assert_eq!(bound.to_bits(), direct.to_bits(), "round {round} group {g}");
                     let mut least = u32::MAX;
                     for bucket in (0..16).rev() {
                         least = least.min(shortest[bucket]);
                         let (floor, v) = sc.floor_kept(b, bucket as u8);
+                        assert_eq!(
+                            v.to_bits(),
+                            scorer
+                                .bound_through(TfBucket::new(bucket as u8).unwrap(), floor)
+                                .to_bits(),
+                            "round {round} group {g} bucket {bucket} floor {floor}"
+                        );
                         if least != u32::MAX {
                             assert!(
                                 floor <= least,

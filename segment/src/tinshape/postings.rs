@@ -328,7 +328,7 @@ impl<'b> GroupFrontier<'b> {
 impl Iterator for GroupFrontier<'_> {
     type Item = (u8, u32);
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<(u8, u32)> {
         if self.left == 0 {
             return None;

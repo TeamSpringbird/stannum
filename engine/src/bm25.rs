@@ -6,12 +6,15 @@
 //! Standalone scoring policy and production-compatible BM25 arithmetic.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use rustc_hash::FxHashSet;
 use segment::bound::BlockBound;
 use thiserror::Error;
 
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
+use segment::tinshape::postings::rounded_length;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bm25Params {
@@ -295,6 +298,63 @@ pub struct TermScorer {
     /// Whether the score is proven never to fall as the bucket rises, at
     /// every document length; see [`rises_with_the_bucket`].
     rises: bool,
+    /// [`Self::code_bounds`], made when first asked and shared by the
+    /// scorer's clones (a query's walk of each segment).
+    codes: Arc<std::sync::OnceLock<CodeBounds>>,
+}
+
+/// Length codes [`CodeBounds`] keeps: lengths below 2^18 (a longer one's
+/// bound is computed).
+const CODES: usize = 448;
+
+/// [`TermScorer::bound_through`] by bucket and rounded length, kept as
+/// asked: at `code * 16 + bucket` the bound of `bucket` at the length
+/// `code` stands for ([`rounded_length`]). A walk bounds a group by its
+/// frontier, whose lengths are rounded codes, so its pairs take few values
+/// (16 buckets by 32 codes per doubling of the length) and are bounded a
+/// hundred thousand times a query: each value is the same function's, taken
+/// once, in place of a BM25 quotient per pair (as Lucene keeps a norm's
+/// length factor per query). Scores are not negative, so a zero entry is
+/// one not taken yet (or a zero, taken again); clones on other threads
+/// store the same bits, so relaxed loads and stores suffice.
+#[derive(Clone)]
+pub struct CodeBounds(Arc<[AtomicU32]>);
+
+impl std::fmt::Debug for CodeBounds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CodeBounds")
+    }
+}
+
+impl CodeBounds {
+    /// `scorer`'s [`TermScorer::bound_through`] `bucket` at
+    /// [`rounded_length`]`(code)`, the same bits; `scorer` must be the one
+    /// the table was taken from.
+    #[inline]
+    pub fn get(&self, scorer: &TermScorer, bucket: u8, code: u32) -> f32 {
+        let at = code as usize * BUCKET_COUNT + usize::from(bucket) % BUCKET_COUNT;
+        let entry = self.0.get(at);
+        if let Some(entry) = entry {
+            let v = f32::from_bits(entry.load(Ordering::Relaxed));
+            if v > 0.0 {
+                return v;
+            }
+        }
+        Self::fill(scorer, bucket, code, entry)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill(scorer: &TermScorer, bucket: u8, code: u32, entry: Option<&AtomicU32>) -> f32 {
+        let v = scorer.bound_through(
+            TfBucket::new(bucket).expect("a valid bucket"),
+            rounded_length(code),
+        );
+        if let Some(entry) = entry {
+            entry.store(v.to_bits(), Ordering::Relaxed);
+        }
+        v
+    }
 }
 
 /// Whether `numerator[i] / (denominator[i] + x)`, each sum and the quotient
@@ -377,6 +437,7 @@ impl TermScorer {
             denominator_constant,
             document_length_factor,
             rises,
+            codes: Arc::default(),
         })
     }
 
@@ -413,6 +474,20 @@ impl TermScorer {
                 )
             })
             .fold(0.0_f32, f32::max)
+    }
+
+    /// The scorer's [`CodeBounds`], shared by its clones: taken once per
+    /// walk of a segment whose frontiers are rounded.
+    pub fn code_bounds(&self) -> CodeBounds {
+        self.codes
+            .get_or_init(|| {
+                CodeBounds(
+                    std::iter::repeat_with(|| AtomicU32::new(0))
+                        .take(CODES * BUCKET_COUNT)
+                        .collect(),
+                )
+            })
+            .clone()
     }
 
     /// What bounds a score from its bucket and length alone: per bucket
@@ -860,6 +935,45 @@ mod tests {
             }
         }
         assert!(inverted > 0 && checked > inverted);
+    }
+
+    /// The code table gives `bound_through` at the code's length bit for
+    /// bit, asked twice (filled, then kept), through a clone, and past the
+    /// codes it keeps; idf 0 (a zero bound) and a scorer whose score falls
+    /// with the bucket included.
+    #[test]
+    fn code_bounds_are_the_bounds_at_the_rounded_lengths() {
+        use segment::tinshape::postings::round_length;
+        let top = round_length(u32::MAX);
+        let codes: Vec<u32> = (0..CODES as u32 + 40).chain([top - 1, top]).collect();
+        for (k1, b, docs, df, avg) in [
+            (1.2, 0.75, 1_000_000, 3, 250.0),
+            (0.0, 0.75, 10, 10, 1.2),
+            (3.0, 1.0, 100, 7, 0.5),
+            (1.2, 0.75, 10, 11, 30.0),
+        ] {
+            let scorer =
+                TermScorer::from_statistics(docs, df, 1.0, Bm25Params { k1, b }, avg).unwrap();
+            let table = scorer.clone().code_bounds();
+            for pass in 0..2 {
+                for &code in &codes {
+                    for bucket in 0..BUCKET_COUNT as u8 {
+                        let want = scorer
+                            .bound_through(TfBucket::new(bucket).unwrap(), rounded_length(code));
+                        let got = if pass == 0 {
+                            table.get(&scorer, bucket, code)
+                        } else {
+                            scorer.code_bounds().get(&scorer, bucket, code)
+                        };
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "k1 {k1} code {code} {bucket}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
