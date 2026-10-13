@@ -286,6 +286,289 @@ pub fn set_bits_bytes_at(level: Level, bytes: &[u8], out: &mut Vec<u32>) {
     }
 }
 
+// ---- A sieve's first pass: its first term's buckets as pass bits. ----
+//
+// A term's buckets in a group are a run of fields of one width (0, 1, 2 or
+// 4 bits) in its members' order. [`pass_bits`] turns a run into a bit per
+// member, whether its bucket passes (bit `b` of a 16-bit `pass`), by width:
+// a mask per value for 1 bit, a three-mask select over each 2-bit field's
+// bits and a compaction (PEXT where fast) for 2, a 16-entry table lookup
+// (`tbl`, `pshufb`) for 4. [`deposit_pass`] lays a word's members' bits
+// onto the word's candidates: PDEP where fast, else a byte at a time by a
+// nibble table ([`expand`]; on the M4, 3-5% fewer cycles over a dense pair
+// than reading each candidate's bit by its rank).
+
+/// Whether PDEP and PEXT run fast: BMI2, on any CPU but AMD's and Hygon's
+/// before Zen 3 (family 0x19), whose microcode takes a cycle or more per set
+/// bit of the mask. `STANNUM_PDEP=0` turns them off (A/B runs). Asked once.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn fast_pdep() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static HAS: AtomicU8 = AtomicU8::new(0);
+
+    #[cold]
+    #[inline(never)]
+    fn ask() -> bool {
+        let has = std::arch::is_x86_feature_detected!("bmi2")
+            && std::env::var("STANNUM_PDEP").map_or(true, |v| v.trim() != "0")
+            && !slow_pdep_vendor();
+        HAS.store(if has { 2 } else { 1 }, Ordering::Relaxed);
+        has
+    }
+
+    match HAS.load(Ordering::Relaxed) {
+        0 => ask(),
+        h => h == 2,
+    }
+}
+
+/// Whether the CPU is AMD's or Hygon's, of a family before 0x19 (Zen 3).
+#[cfg(target_arch = "x86_64")]
+fn slow_pdep_vendor() -> bool {
+    use core::arch::x86_64::__cpuid;
+    // CPUID is on every x86-64; leaf 0 gives the vendor, leaf 1 the family.
+    let v = __cpuid(0);
+    let vendor = (v.ebx, v.edx, v.ecx);
+    let amd = vendor == (0x6874_7541, 0x6974_6e65, 0x444d_4163); // AuthenticAMD
+    let hygon = vendor == (0x6f67_7948, 0x6e65_476e, 0x656e_6975); // HygonGenuine
+    if !(amd || hygon) {
+        return false;
+    }
+    let eax = __cpuid(1).eax;
+    let base = (eax >> 8) & 0xf;
+    let family = if base == 0xf {
+        base + ((eax >> 20) & 0xff)
+    } else {
+        base
+    };
+    family < 0x19
+}
+
+/// Appends to `out` the `n` bits of `bytes` from bit `bit` on, a word per 64
+/// (bit `i` of the run at bit `i % 64` of word `i / 64`), the last word's
+/// bits past the run clear; bits past the bytes read as clear.
+pub fn gather_bits(bytes: &[u8], bit: usize, n: usize, out: &mut Vec<u64>) {
+    let words = n.div_ceil(64);
+    out.reserve(words);
+    for i in 0..words {
+        let b = bit + 64 * i;
+        let (at, s) = (b / 8, (b % 8) as u32);
+        let mut nine = [0u8; 9];
+        let chunk = match bytes.get(at..at + 9) {
+            Some(c) => c,
+            None => {
+                let rest = bytes.get(at..).unwrap_or(&[]);
+                let k = rest.len().min(9);
+                nine[..k].copy_from_slice(&rest[..k]);
+                &nine
+            }
+        };
+        let (lo, hi) = (le(&chunk[..8]), u64::from(chunk[8]));
+        out.push((lo >> s) | ((hi << 1) << (63 - s)));
+    }
+    if !n.is_multiple_of(64) {
+        *out.last_mut().expect("a word") &= (1u64 << (n % 64)) - 1;
+    }
+}
+
+/// `out[k]` = the pass bits of fields `64 k ..` of the run in `fields`
+/// (fields of `width` bits, packed from bit 0 of the first word): bit `j`
+/// set when bit `v` of `pass` is, `v` field `64 k + j`'s value. `fields`
+/// holds `width` words per word of `out` (none at width 0).
+#[inline]
+pub fn pass_bits(fields: &[u64], width: u32, pass: u16, out: &mut [u64]) {
+    pass_bits_at(level(), fields, width, pass, out);
+}
+
+/// [`pass_bits`] at `level`, which the CPU must support.
+pub fn pass_bits_at(level: Level, fields: &[u64], width: u32, pass: u16, out: &mut [u64]) {
+    assert!(matches!(width, 0 | 1 | 2 | 4), "a TF width");
+    assert!(
+        fields.len() >= out.len() * width as usize,
+        "the fields of every word"
+    );
+    debug_assert!(level.supported());
+    match level {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the level is the CPU's (AVX-512's CPUs have AVX2).
+        Level::Avx2 | Level::Avx512 => unsafe { avx2::pass_bits(fields, width, pass, out) },
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon => neon::pass_bits(fields, width, pass, out),
+        _ => scalar::pass_bits(fields, width, pass, out),
+    }
+}
+
+/// Clears from `words` (a group's candidates, a bit per slot) each that is
+/// a member (`members`, a bitmap as stored) whose pass bit is clear, and
+/// each that is not unless `absent` is all ones; gives how many it cleared.
+/// The pass bit of the member of rank `r` (members counted from the
+/// group's first slot) is bit `r - lo` of `pass`, which holds a word past
+/// the last such bit read; every member of a word holding a candidate
+/// member ranks `lo` or more.
+#[inline]
+pub fn deposit_pass(words: &mut [u64], members: &[u8], pass: &[u64], lo: u32, absent: u64) -> u64 {
+    deposit_pass_at(level(), words, members, pass, lo, absent)
+}
+
+/// [`deposit_pass`] at `level`, which the CPU must support.
+pub fn deposit_pass_at(
+    level: Level,
+    words: &mut [u64],
+    members: &[u8],
+    pass: &[u64],
+    lo: u32,
+    absent: u64,
+) -> u64 {
+    debug_assert!(level.supported());
+    match level {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: BMI2 is the CPU's (`fast_pdep`), POPCNT the level's.
+        Level::Avx2 | Level::Avx512 if fast_pdep() => unsafe {
+            bmi2::deposit_pass(words, members, pass, lo, absent)
+        },
+        _ => scalar::deposit_pass(words, members, pass, lo, absent),
+    }
+}
+
+/// PDEP without BMI2: bits of `p` laid onto the set bits of `m` in order (the
+/// lowest bit of `p` onto the lowest of `m`), a byte of `m` at a time, each
+/// from where the bytes before it end (a prefix sum of their counts) and a
+/// table per nibble: no branch on the bits. Also the count of `m`.
+#[inline(always)]
+fn expand(p: u64, m: u64) -> (u64, u32) {
+    /// `EXPAND4[mask << 4 | bits]`: the low bits of `bits` laid onto `mask`.
+    const EXPAND4: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut i = 0;
+        while i < 256 {
+            let (mask, bits) = (i >> 4, i & 15);
+            let (mut out, mut k, mut b) = (0u8, 0, 0);
+            while b < 4 {
+                if mask >> b & 1 == 1 {
+                    out |= ((bits >> k & 1) as u8) << b;
+                    k += 1;
+                }
+                b += 1;
+            }
+            t[i] = out;
+            i += 1;
+        }
+        t
+    };
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let mut c = m - ((m >> 1) & 0x5555_5555_5555_5555);
+    c = (c & 0x3333_3333_3333_3333) + ((c >> 2) & 0x3333_3333_3333_3333);
+    c = (c + (c >> 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    // Byte `i`: the members of the bytes before it.
+    let before = c.wrapping_mul(ONES) << 8;
+    let mut out = 0u64;
+    for i in 0..8 {
+        let mb = (m >> (8 * i)) as usize & 0xff;
+        let pb = p >> ((before >> (8 * i)) & 0xff);
+        let (lo, hi) = (mb & 15, mb >> 4);
+        let low = EXPAND4[(lo << 4) | (pb as usize & 15)];
+        // The low nibble's count, from a 16-entry table packed in a word.
+        let pb = pb >> ((0x4332_3221_3221_2110u64 >> (4 * lo)) & 15);
+        let high = EXPAND4[(hi << 4) | (pb as usize & 15)];
+        out |= u64::from(low | (high << 4)) << (8 * i);
+    }
+    (out, (c.wrapping_mul(ONES) >> 56) as u32)
+}
+
+/// Word `i` of a bitmap as stored (bytes past it clear).
+#[inline(always)]
+fn member_word(bytes: &[u8], i: usize) -> u64 {
+    match bytes.get(i * 8..i * 8 + 8) {
+        Some(c) => le(c),
+        None => {
+            let mut eight = [0u8; 8];
+            let rest = bytes.get(i * 8..).unwrap_or(&[]);
+            eight[..rest.len()].copy_from_slice(rest);
+            u64::from_le_bytes(eight)
+        }
+    }
+}
+
+/// Bits `off ..` of `pass` (a word past them held).
+#[inline(always)]
+fn pass_window(pass: &[u64], off: u32) -> u64 {
+    let (i, s) = ((off / 64) as usize, off % 64);
+    (pass[i] >> s) | ((pass[i + 1] << 1) << (63 - s))
+}
+
+/// Each 2-bit field of `x`, at its low bit, whether bit `v` of `pass` is set
+/// (`v` its value); its high bit clear.
+#[inline(always)]
+fn pass2(x: u64, pass: u16) -> u64 {
+    const EVEN: u64 = 0x5555_5555_5555_5555;
+    let v = |b: u32| 0u64.wrapping_sub(u64::from((pass >> b) & 1));
+    let (lo, hi) = (x & EVEN, (x >> 1) & EVEN);
+    let below = (lo & v(1)) | (!lo & v(0));
+    let above = (lo & v(3)) | (!lo & v(2));
+    ((hi & above) | (!hi & below)) & EVEN
+}
+
+/// The even bits of `x` (its odd ones clear), packed into its low 32.
+#[inline(always)]
+fn compress_even(mut x: u64) -> u64 {
+    x = (x | (x >> 1)) & 0x3333_3333_3333_3333;
+    x = (x | (x >> 2)) & 0x0f0f_0f0f_0f0f_0f0f;
+    x = (x | (x >> 4)) & 0x00ff_00ff_00ff_00ff;
+    x = (x | (x >> 8)) & 0x0000_ffff_0000_ffff;
+    (x | (x >> 16)) & 0xffff_ffff
+}
+
+/// The table [`pass_bits`] looks a 4-bit field up in: `set` where `pass`
+/// passes the value, else 0.
+#[inline(always)]
+fn pass_table(pass: u16, set: u8) -> [u8; 16] {
+    std::array::from_fn(|v| if (pass >> v) & 1 != 0 { set } else { 0 })
+}
+
+/// BMI2 bodies (PDEP, PEXT), run where they are fast ([`fast_pdep`]).
+#[cfg(target_arch = "x86_64")]
+mod bmi2 {
+    use super::{member_word, pass_window, pass2};
+    use core::arch::x86_64::*;
+
+    #[target_feature(enable = "bmi2,popcnt")]
+    pub fn deposit_pass(
+        words: &mut [u64],
+        members: &[u8],
+        pass: &[u64],
+        lo: u32,
+        absent: u64,
+    ) -> u64 {
+        let (mut run, mut dropped) = (0u32, 0u64);
+        for (w, word) in words.iter_mut().enumerate() {
+            let m = member_word(members, w);
+            let c = *word;
+            if c != 0 {
+                let p = if c & m != 0 {
+                    pass_window(pass, run - lo)
+                } else {
+                    0
+                };
+                let out = (c & !m & absent) | (_pdep_u64(p, m) & c);
+                dropped += u64::from((c & !out).count_ones());
+                *word = out;
+            }
+            run += m.count_ones();
+        }
+        dropped
+    }
+
+    /// [`super::pass_bits`] of 2-bit fields.
+    #[target_feature(enable = "bmi2")]
+    pub fn pass_bits2(fields: &[u64], pass: u16, out: &mut [u64]) {
+        const EVEN: u64 = 0x5555_5555_5555_5555;
+        for (o, f) in out.iter_mut().zip(fields.chunks_exact(2)) {
+            *o = _pext_u64(pass2(f[0], pass), EVEN) | (_pext_u64(pass2(f[1], pass), EVEN) << 32);
+        }
+    }
+}
+
 mod ef;
 pub use ef::{
     container_locals, container_row, ef_decode, ef_decode_at, ef_into_row, ef_into_row_at,
@@ -432,6 +715,69 @@ mod scalar {
             word_bits((w * 64) as u32, le(c), out);
         }
     }
+
+    pub fn pass_bits(fields: &[u64], width: u32, pass: u16, out: &mut [u64]) {
+        use super::{compress_even, pass2};
+        let v = |b: u32| 0u64.wrapping_sub(u64::from((pass >> b) & 1));
+        match width {
+            0 => out.fill(v(0)),
+            1 => {
+                for (o, &x) in out.iter_mut().zip(fields) {
+                    *o = (x & v(1)) | (!x & v(0));
+                }
+            }
+            2 => {
+                for (o, f) in out.iter_mut().zip(fields.chunks_exact(2)) {
+                    *o =
+                        compress_even(pass2(f[0], pass)) | (compress_even(pass2(f[1], pass)) << 32);
+                }
+            }
+            _ => {
+                for (o, f) in out.iter_mut().zip(fields.chunks_exact(4)) {
+                    let mut w = 0u64;
+                    for (j, &x) in f.iter().enumerate() {
+                        for k in 0..16 {
+                            let value = (x >> (4 * k)) & 15;
+                            w |= u64::from((pass >> value) & 1) << (16 * j + k);
+                        }
+                    }
+                    *o = w;
+                }
+            }
+        }
+    }
+
+    /// A word's members' pass bits deposited at once ([`super::expand`]): no
+    /// branch on the candidates.
+    pub fn deposit_pass(
+        words: &mut [u64],
+        members: &[u8],
+        pass: &[u64],
+        lo: u32,
+        absent: u64,
+    ) -> u64 {
+        use super::{expand, member_word, pass_window};
+        let (mut run, mut dropped) = (0u32, 0u64);
+        for (w, word) in words.iter_mut().enumerate() {
+            let m = member_word(members, w);
+            let c = *word;
+            if c != 0 {
+                let p = if c & m != 0 {
+                    pass_window(pass, run - lo)
+                } else {
+                    0
+                };
+                let (e, n) = expand(p, m);
+                let out = (c & !m & absent) | (e & c);
+                dropped += u64::from((c & !out).count_ones());
+                *word = out;
+                run += n;
+            } else {
+                run += m.count_ones();
+            }
+        }
+        dropped
+    }
 }
 
 /// The NEON bodies, where explicit vectors beat what the compiler makes of
@@ -492,6 +838,44 @@ mod neon {
                 i += 1;
             }
             total
+        }
+    }
+
+    /// 4-bit fields by `tbl`, 64 a word: each byte's two fields looked up,
+    /// interleaved back in order, weighted by their bit in the byte and
+    /// summed pairwise into the word.
+    pub fn pass_bits(fields: &[u64], width: u32, pass: u16, out: &mut [u64]) {
+        if width != 4 {
+            return super::scalar::pass_bits(fields, width, pass, out);
+        }
+        const WEIGHTS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let table = super::pass_table(pass, 0xff);
+        // SAFETY: NEON is baseline on aarch64; each step loads the four
+        // words of its chunk (32 bytes).
+        unsafe {
+            use core::arch::aarch64::*;
+            let lut = vld1q_u8(table.as_ptr());
+            let weights = vld1q_u8(WEIGHTS.as_ptr());
+            let low = vdupq_n_u8(15);
+            for (o, f) in out.iter_mut().zip(fields.chunks_exact(4)) {
+                let p = f.as_ptr().cast::<u8>();
+                let (a, b) = (vld1q_u8(p), vld1q_u8(p.add(16)));
+                let (al, ah) = (
+                    vqtbl1q_u8(lut, vandq_u8(a, low)),
+                    vqtbl1q_u8(lut, vshrq_n_u8::<4>(a)),
+                );
+                let (bl, bh) = (
+                    vqtbl1q_u8(lut, vandq_u8(b, low)),
+                    vqtbl1q_u8(lut, vshrq_n_u8::<4>(b)),
+                );
+                let z0 = vandq_u8(vzip1q_u8(al, ah), weights);
+                let z1 = vandq_u8(vzip2q_u8(al, ah), weights);
+                let z2 = vandq_u8(vzip1q_u8(bl, bh), weights);
+                let z3 = vandq_u8(vzip2q_u8(bl, bh), weights);
+                let s = vpaddq_u8(vpaddq_u8(z0, z1), vpaddq_u8(z2, z3));
+                let s = vpaddq_u8(s, s);
+                *o = vgetq_lane_u64::<0>(vreinterpretq_u64_u8(s));
+            }
         }
     }
 
@@ -790,6 +1174,38 @@ mod avx2 {
     #[target_feature(enable = "avx2,popcnt")]
     pub fn prefix_counts(bytes: &[u8], out: &mut Vec<u32>) {
         scalar::prefix_counts(bytes, out)
+    }
+
+    /// 4-bit fields by `pshufb`, 32 a 16-byte step: each byte's two fields
+    /// looked up, interleaved back in order, their high bits gathered by
+    /// `pmovmskb`. 2-bit fields compacted by PEXT where it is fast.
+    #[target_feature(enable = "avx2,popcnt")]
+    pub fn pass_bits(fields: &[u64], width: u32, pass: u16, out: &mut [u64]) {
+        if width == 2 && super::fast_pdep() {
+            // SAFETY: BMI2 is the CPU's (`fast_pdep`).
+            return unsafe { super::bmi2::pass_bits2(fields, pass, out) };
+        }
+        if width != 4 {
+            return scalar::pass_bits(fields, width, pass, out);
+        }
+        let table = super::pass_table(pass, 0x80);
+        // SAFETY: each step loads two of its chunk's four words (16 bytes).
+        unsafe {
+            let lut = _mm_loadu_si128(table.as_ptr().cast());
+            let low = _mm_set1_epi8(0x0f);
+            for (o, f) in out.iter_mut().zip(fields.chunks_exact(4)) {
+                let mut w = 0u64;
+                for h in 0..2 {
+                    let v = _mm_loadu_si128(f.as_ptr().add(2 * h).cast());
+                    let lo = _mm_shuffle_epi8(lut, _mm_and_si128(v, low));
+                    let hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16::<4>(v), low));
+                    let a = _mm_movemask_epi8(_mm_unpacklo_epi8(lo, hi)) as u32 as u64;
+                    let b = _mm_movemask_epi8(_mm_unpackhi_epi8(lo, hi)) as u32 as u64;
+                    w |= (a | (b << 16)) << (32 * h);
+                }
+                *o = w;
+            }
+        }
     }
 }
 
@@ -1285,6 +1701,102 @@ mod tests {
                 let mut have = vec![7];
                 prefix_counts_at(level, b, &mut have);
                 prop_assert_eq!(&have, &want, "{:?}", level);
+            }
+        }
+
+        #[test]
+        fn gathered_bits_are_the_run(seed in any::<u64>(), n_bytes in 0usize..80, bit in 0usize..700, n in 0usize..400) {
+            let b = bytes(seed, 128, n_bytes);
+            let mut have = vec![7];
+            gather_bits(&b, bit, n, &mut have);
+            prop_assert_eq!(have.len(), 1 + n.div_ceil(64));
+            for i in 0..n.div_ceil(64) * 64 {
+                let at = bit + i;
+                let want = i < n && b.get(at / 8).is_some_and(|x| x >> (at % 8) & 1 == 1);
+                prop_assert_eq!(have[1 + i / 64] >> (i % 64) & 1 == 1, want, "bit {}", i);
+            }
+        }
+
+        #[test]
+        fn pass_bits_agree(seed in any::<u64>(), w in 0usize..4, pass in any::<u16>(), n in 0usize..9) {
+            let width = [0u32, 1, 2, 4][w];
+            let fields = words(seed, 128, n * width as usize);
+            let mut want = vec![0u64; n];
+            for (j, o) in want.iter_mut().enumerate() {
+                for k in 0..64 {
+                    let at = (j * 64 + k) * width as usize;
+                    let value = if width == 0 { 0 } else { (fields[at / 64] >> (at % 64)) & ((1 << width) - 1) };
+                    *o |= u64::from((pass >> value) & 1) << k;
+                }
+            }
+            for level in levels() {
+                let mut have = vec![!0u64; n];
+                pass_bits_at(level, &fields, width, pass, &mut have);
+                prop_assert_eq!(&have, &want, "{:?} width {}", level, width);
+            }
+        }
+
+        #[test]
+        fn deposited_pass_bits_are_each_candidates(
+            seed in any::<u64>(),
+            dm in density(),
+            dc in density(),
+            n in 0usize..40,
+            lo_word in 0usize..40,
+            absent in any::<bool>(),
+        ) {
+            let members = bytes(seed, dm, n * 8 + (seed % 7) as usize);
+            let mut cands = words(seed ^ 0x9e37, dc, n);
+            let lo_word = lo_word.min(n);
+            // No candidate member before word `lo_word`: `lo` its rank.
+            let m = |w: usize| member_word(&members, w);
+            for (w, c) in cands.iter_mut().enumerate().take(lo_word) {
+                *c &= !m(w);
+            }
+            let lo: u32 = (0..lo_word).map(|w| m(w).count_ones()).sum();
+            let total: u32 = (0..n).map(|w| m(w).count_ones()).sum();
+            let pass: Vec<u64> = words(seed ^ 0x51ed, 128, ((total - lo) as usize).div_ceil(64) + 1);
+            let absent = if absent { !0 } else { 0 };
+            // `STANNUM_EXPECT_PDEP=1`: the PDEP body must be among those run.
+            #[cfg(target_arch = "x86_64")]
+            if std::env::var("STANNUM_EXPECT_PDEP").is_ok_and(|v| v == "1") {
+                prop_assert!(fast_pdep(), "PDEP expected fast here");
+            }
+            // Per candidate, as the sieve read it: its rank's bit.
+            let mut want = cands.clone();
+            let mut dropped = 0u64;
+            let mut run = 0u32;
+            for (w, c) in want.iter_mut().enumerate() {
+                let mw = m(w);
+                let mut out = 0u64;
+                for bit in 0..64 {
+                    if *c >> bit & 1 == 0 {
+                        continue;
+                    }
+                    let keep = if mw >> bit & 1 == 1 {
+                        let r = run + (mw & ((1u64 << bit) - 1)).count_ones() - lo;
+                        pass[r as usize / 64] >> (r % 64) & 1 == 1
+                    } else {
+                        absent != 0
+                    };
+                    if keep {
+                        out |= 1 << bit;
+                    } else {
+                        dropped += 1;
+                    }
+                }
+                *c = out;
+                run += mw.count_ones();
+            }
+            for level in levels() {
+                let mut have = cands.clone();
+                let d = deposit_pass_at(level, &mut have, &members, &pass, lo, absent);
+                prop_assert_eq!(&have, &want, "{:?}", level);
+                prop_assert_eq!(d, dropped, "{:?}", level);
+                let mut have = cands.clone();
+                let d = scalar::deposit_pass(&mut have, &members, &pass, lo, absent);
+                prop_assert_eq!(&have, &want, "portable");
+                prop_assert_eq!(d, dropped);
             }
         }
     }

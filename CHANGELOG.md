@@ -228,6 +228,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   a bucket asks for it. At 150 million rows `full_score` conjunctions
   retire 14% fewer instructions in the server (11% less backend CPU) and
   phrases 4.6% fewer (`benchmarks/local/vm_ab.py`), with the same answers.
+- A ranked walk over `TNS1` that sieves a group's candidates by a term held
+  as a grid there drops those that term's bucket alone rules out a word at
+  a time: the buckets the candidates need become a pass bit per member (a
+  16-entry table lookup for 4-bit buckets, `tbl` on aarch64 and `pshufb` on
+  x86-64), laid onto each word's candidates by PDEP on x86-64 where BMI2
+  is fast (not AMD before Zen 3) and a branch-free byte expansion
+  elsewhere. At 150 million rows dense pairs ("is to", "to a") under
+  `full_score` take 17-23% less time on Sapphire Rapids and 9-12% less on
+  the M4, and the 99th percentile of `full_score` phrases drops 26% and of
+  conjunctions 12%, with the same answers.
 - Benchmark manifests' `source_sha256` covers every crate the extension
   builds from (read from the manifests, so `engine/` too) and the PGO
   profiles; builds that differed only in `engine/` shared a fingerprint.

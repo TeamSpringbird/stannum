@@ -1246,6 +1246,46 @@ query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
 to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
 
+## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
+
+Under `full_score` a dense pair ("is to", "to a") leaves most of a group's
+slots as candidates; `Walk::sieve_words` drops, before any is listed, those
+the sieve's first term (a grid there) cuts by its bucket alone, every other
+term at its bound over the group. It read each candidate member's bucket
+from the TF tail (its rank in the bitmap, an unaligned load, a shift) and
+looked its verdict up: some 30% of a dense pair's time.
+
+Now the buckets of the members it needs (from the first word holding a
+candidate member to the last such member) are gathered once and turned
+into a pass bit per member by width (`kernels::pass_bits`): at 1 bit a
+mask per value, at 2 a three-mask select and a compaction (PEXT where
+fast), at 4 (two in five groups) a 16-entry table, `tbl` on aarch64 and
+`pshufb` with `pmovmskb` on x86-64. A word's members' bits are then laid
+onto its candidates at once (`kernels::deposit_pass`): PDEP on x86-64
+with BMI2, except on AMD and Hygon CPUs before Zen 3 (family 0x19), whose
+microcode takes a cycle or more per set bit of the mask; elsewhere a byte
+at a time from where the bytes before it end (a prefix sum of their
+counts) through a 16 x 16 nibble table, without a branch (`STANNUM_PDEP=0`
+forces it). On the M4 that expansion took 3-5% fewer cycles over the dense
+pairs than reading each candidate's bit by its rank.
+
+The tail trace (walk-v9's six dense queries per style, `full_score`,
+`--full` outputs identical), against the same code without it: on
+Sapphire Rapids (`m7i.4xlarge`, `perf stat` user counters) cycles -5.7% /
+-5.4% / -6.0% (conjunction / disjunction / phrase), mean query -23% / -19%
+/ -17%, 99th percentile -34% / -29% / -23%, branch misses -16% to -20%; the
+portable expansion there gets about half (mean -13% / -12% / -9%). On the
+M4 cycles -12.6% / -11.3% / -9.4%, mean -12% / -11% / -9%. Over the whole
+trace (`--forget`; 150 queries per style on x86-64, 400 on the M4, 2
+rounds) `full_score` cycles move -0.2% / -0.8% / -0.7% on x86-64 (99th
+percentile of conjunctions -12%, of phrases -26%) and -1.0% / -1.0% /
+-2.9% on the M4; instructions -1.4% / -0.4% / -1.5% on x86-64 and up to
++0.7% on the M4, where the expansion costs a fixed hundred instructions a
+word however few candidates it holds (sparser groups reading each
+candidate's bucket alone cut that by half for the same cycles: not kept).
+`score` answers too are unchanged (`--expect`: 1,228 / 1,253 / 1,252 equal,
+0 different), and `--full` matches `f0962a8` byte for byte.
+
 ## Elias-Fano decoding a block at a time (branch `tinshape/ef-simd`)
 
 A walk decoded its Elias-Fano containers a member at a time
