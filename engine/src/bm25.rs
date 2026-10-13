@@ -381,6 +381,7 @@ impl TermScorer {
     }
 
     #[must_use]
+    #[inline]
     pub fn score_bucket(&self, bucket: TfBucket, document_length: u32) -> f32 {
         let index = usize::from(bucket.value());
         let denominator =
@@ -400,11 +401,24 @@ impl TermScorer {
     /// below the lower one. Where the scorer is proven to rise with the
     /// bucket at every length this is the score at `bucket`; otherwise it
     /// is the running best over the buckets up to it.
+    ///
+    /// Inline: a walk bounds a frontier pair, a bucket floor or a held term
+    /// with it hundreds of thousands of times a query, and the rising case
+    /// is a division; the running best is not.
     #[must_use]
+    #[inline]
     pub fn bound_through(&self, bucket: TfBucket, document_length: u32) -> f32 {
         if self.rises {
             return self.score_bucket(bucket, document_length);
         }
+        self.best_through(bucket, document_length)
+    }
+
+    /// [`Self::bound_through`] of a scorer that may fall as the bucket
+    /// rises.
+    #[cold]
+    #[inline(never)]
+    fn best_through(&self, bucket: TfBucket, document_length: u32) -> f32 {
         (0..=bucket.value())
             .map(|lower| {
                 self.score_bucket(
