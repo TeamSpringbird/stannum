@@ -317,21 +317,6 @@ impl<'a> EfCursor<'a> {
         self.index
     }
 
-    /// The highs bit of the current value (while there is one).
-    pub fn bit(&self) -> usize {
-        self.bit
-    }
-
-    /// Moves the cursor to the value of rank `index`, whose highs bit is at
-    /// or after `bit` (exactly `bit` for a caller that decoded it): for a
-    /// caller that drains values in bulk. Past the last value, none.
-    pub fn resume(&mut self, index: usize, bit: usize) {
-        debug_assert!(index >= self.index, "a cursor moves forward");
-        self.index = index.min(self.ef.n);
-        self.bit = bit;
-        self.load();
-    }
-
     /// Calls `visit` with the current value and each after it below `end`,
     /// and stops at the first at or past it: [`Self::advance`] in one loop,
     /// the highs a word at a time (the word at hand kept, its passed bits

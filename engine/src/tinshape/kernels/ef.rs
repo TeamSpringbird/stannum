@@ -63,7 +63,7 @@ macro_rules! ef_run {
     };
 }
 
-use segment::tinshape::ef::{Ef, EfCursor};
+use segment::tinshape::ef::Ef;
 use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local, group_slots};
 
 /// Appends the list's values, in order.
@@ -135,75 +135,6 @@ pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
     );
     if !short_row_at(level, &ef, row) {
         ef_run!(level, ef_into_row(ef, row));
-    }
-}
-
-/// Appends the cursor's current value and those after it below `end`, less
-/// `offset`, and moves past them, as [`EfCursor::drain_below`] with a push
-/// would, where this level drains in bulk; false, doing nothing, where it
-/// does not (the caller then drains the cursor itself). `offset` is at most
-/// the current value (a group's slot base).
-///
-/// Only the AVX-512 VBMI bodies drain in bulk: a highs word at a time
-/// decoded whole, as [`ef_decode`] decodes, and the values below `end`
-/// taken from it, sixteen compared at once.
-#[inline(always)]
-pub fn drain_below(cursor: &mut EfCursor<'_>, end: u32, offset: u32, out: &mut Vec<u32>) -> bool {
-    drain_below_at(level(), cursor, end, offset, out)
-}
-
-/// [`drain_below`] at `level`, which the CPU must support.
-#[inline(always)]
-pub fn drain_below_at(
-    level: Level,
-    cursor: &mut EfCursor<'_>,
-    end: u32,
-    offset: u32,
-    out: &mut Vec<u32>,
-) -> bool {
-    match level {
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: the level and its VBMI features are the CPU's.
-        Level::Avx512 if vbmi() => {
-            unsafe { avx512::drain_below(cursor, end, offset, out) };
-            true
-        }
-        _ => {
-            let _ = (cursor, end, offset, out);
-            false
-        }
-    }
-}
-
-/// Sets the cursor's current value and those after it below `end`, less
-/// `offset`, in `row`, whose words they fall in are zero (as
-/// [`ef_into_row`] sets a list's), and moves past them; false, doing
-/// nothing, where this level does not drain in bulk (see [`drain_below`]).
-#[inline(always)]
-pub fn drain_into_row(cursor: &mut EfCursor<'_>, end: u32, offset: u32, row: &mut [u64]) -> bool {
-    drain_into_row_at(level(), cursor, end, offset, row)
-}
-
-/// [`drain_into_row`] at `level`, which the CPU must support.
-#[inline(always)]
-pub fn drain_into_row_at(
-    level: Level,
-    cursor: &mut EfCursor<'_>,
-    end: u32,
-    offset: u32,
-    row: &mut [u64],
-) -> bool {
-    match level {
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: the level and its VBMI features are the CPU's.
-        Level::Avx512 if vbmi() => {
-            unsafe { avx512::drain_into_row(cursor, end, offset, row) };
-            true
-        }
-        _ => {
-            let _ = (cursor, end, offset, row);
-            false
-        }
     }
 }
 
@@ -955,7 +886,7 @@ mod avx2 {
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
     use core::arch::x86_64::*;
-    use segment::tinshape::ef::{Ef, EfCursor};
+    use segment::tinshape::ef::Ef;
 
     /// Bytes 0 to 63.
     static IOTA: [u8; 64] = {
@@ -1155,117 +1086,6 @@ mod avx512 {
         }
         true
     }
-
-    /// A drain's values decoded a highs word at a time: those of the word
-    /// holding the cursor's current value from it on, then each next
-    /// word's, until one is not below `end`; each word's values below `end`
-    /// passed to `take` (less `offset`, sixteen lanes at a time with how
-    /// many are the drain's), the cursor then moved to the first not below.
-    ///
-    /// # Safety
-    /// `take` gets sixteen values and a count of at most sixteen.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
-    #[inline]
-    unsafe fn drain(
-        cursor: &mut EfCursor<'_>,
-        end: u32,
-        offset: u32,
-        mut take: impl FnMut(__m512i, usize),
-    ) {
-        match cursor.current() {
-            Some(current) if current < end => {}
-            _ => return,
-        }
-        let ef = cursor.list();
-        let (n, l) = (ef.len(), ef.low_width());
-        let padded = super::lows_padded(&ef);
-        let highs_len = ef.highs().len();
-        let words = highs_len.div_ceil(8);
-        let (mut idx, mut bit) = (cursor.rank(), cursor.bit());
-        // A word's members from the multiple of 8 at or before its first
-        // (those before it zeros), their stores' slack, and the lanes
-        // `combine` may read past them.
-        let mut buf = [core::mem::MaybeUninit::<u32>::uninit(); 8 + super::SLACK + Unpack::LANES];
-        let dst = buf.as_mut_ptr().cast::<u32>();
-        let below = _mm512_set1_epi32(end as i32);
-        let less = _mm512_set1_epi32(offset as i32);
-        // SAFETY (all below): a word stores at most 64 lanes from its first
-        // member's place, below `8 + SLACK`; `combine` reads and writes
-        // members `origin..found` rounded up to sixteen, initialized; the
-        // compares read the word's members and at most fifteen lanes past
-        // them, within `buf`.
-        unsafe {
-            loop {
-                let w = bit / 64;
-                if w >= words || idx >= n {
-                    cursor.resume(n, bit);
-                    return;
-                }
-                let word = super::highs_word(padded, highs_len, w) & (u64::MAX << (bit % 64));
-                let origin = idx & !7;
-                dst.write_bytes(0, idx - origin);
-                let s = ((w * 64) as u32).wrapping_sub(idx as u32);
-                let found = (idx + highs_word(dst.add(idx - origin), s, word)).min(n);
-                if found == idx {
-                    bit = (w + 1) * 64;
-                    continue;
-                }
-                dst.add(found - origin).write_bytes(0, Unpack::LANES);
-                combine(padded, l, origin, found, dst);
-                let values = dst.add(idx - origin);
-                let m = found - idx;
-                let mut k = 0;
-                while k < m {
-                    let v = _mm512_loadu_si512(values.add(k).cast());
-                    let lanes = (m - k).min(16);
-                    let kept = _mm512_cmplt_epu32_mask(v, below) & (((1u32 << lanes) - 1) as u16);
-                    let got = kept.count_ones() as usize;
-                    take(_mm512_sub_epi32(v, less), got);
-                    if got < lanes {
-                        // Values ascend: the first not below `end` ends it.
-                        let j = idx + k + got;
-                        let v = *values.add(k + got);
-                        cursor.resume(j, (v >> l) as usize + j);
-                        return;
-                    }
-                    k += 16;
-                }
-                idx = found;
-                bit = (w + 1) * 64;
-            }
-        }
-    }
-
-    /// [`super::drain_below`].
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
-    pub fn drain_below(cursor: &mut EfCursor<'_>, end: u32, offset: u32, out: &mut Vec<u32>) {
-        // SAFETY: sixteen lanes stored past the length, within the room
-        // reserved, and `got` of them kept.
-        unsafe {
-            drain(cursor, end, offset, |v, got| {
-                out.reserve(16);
-                let len = out.len();
-                _mm512_storeu_si512(out.as_mut_ptr().add(len).cast(), v);
-                out.set_len(len + got);
-            });
-        }
-    }
-
-    /// [`super::drain_into_row`].
-    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
-    pub fn drain_into_row(cursor: &mut EfCursor<'_>, end: u32, offset: u32, row: &mut [u64]) {
-        let mut put = super::RowPut::new();
-        // SAFETY: `drain`'s, and the lanes are read from a local array.
-        unsafe {
-            drain(cursor, end, offset, |v, got| {
-                let mut lanes = [0u32; 16];
-                _mm512_storeu_si512(lanes.as_mut_ptr().cast(), v);
-                for &local in &lanes[..got] {
-                    put.put(row, local);
-                }
-            });
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1443,66 +1263,6 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
-
-        /// Every level's drains (or, where it has none, the cursor's own)
-        /// against the cursor's own: values, rows and the cursor after.
-        #[test]
-        fn drains_agree(
-            (values, universe) in list(),
-            seek in any::<prop::sample::Index>(),
-            cuts in prop::collection::vec(any::<prop::sample::Index>(), 1..12),
-            back in 0u32..5000,
-        ) {
-            prop_assume!(!values.is_empty());
-            let mut bytes = Vec::new();
-            ef::encode(&values, universe, &mut bytes);
-            let list = Ef::parse(&bytes, values.len(), universe).unwrap();
-            // Ends between and at values, ascending; an offset at or below
-            // the first value drained, as a group's slot base is.
-            let mut ends: Vec<u32> = cuts
-                .iter()
-                .map(|c| values[c.index(values.len())].saturating_add(c.index(3) as u32 % 2))
-                .collect();
-            ends.sort_unstable();
-            let start = values[seek.index(values.len())];
-            for level in levels() {
-                let mut want = list.cursor();
-                want.seek(start);
-                let (mut have_list, mut have_row) = (want.clone(), want.clone());
-                for &end in &ends {
-                    let offset = want.current().map_or(0, |c| c.saturating_sub(back));
-                    let mut expected = Vec::new();
-                    want.drain_below(end, |v| expected.push(v - offset));
-                    let mut got = vec![7];
-                    if !drain_below_at(level, &mut have_list, end, offset, &mut got) {
-                        have_list.drain_below(end, |v| got.push(v - offset));
-                    }
-                    prop_assert_eq!(&got[1..], &expected[..], "{:?} end {}", level, end);
-                    prop_assert_eq!(have_list.current(), want.current(), "{:?}", level);
-                    prop_assert_eq!(have_list.rank(), want.rank(), "{:?}", level);
-                    if want.current().is_some() {
-                        prop_assert_eq!(have_list.bit(), want.bit(), "{:?}", level);
-                    }
-                    let words = expected.last().map_or(1, |v| *v as usize / 64 + 1);
-                    let mut bits_have = vec![0u64; words.min(1 << 16)];
-                    if words <= 1 << 16 {
-                        let mut bits_want = vec![0u64; words];
-                        for v in &expected {
-                            bits_want[*v as usize / 64] |= 1 << (v % 64);
-                        }
-                        if !drain_into_row_at(level, &mut have_row, end, offset, &mut bits_have) {
-                            let mut put = RowPut::new();
-                            have_row.drain_below(end, |v| put.put(&mut bits_have, v - offset));
-                        }
-                        prop_assert_eq!(&bits_have, &bits_want, "{:?} row end {}", level, end);
-                    } else {
-                        have_row.drain_below(end, |_| {});
-                    }
-                    prop_assert_eq!(have_row.current(), want.current(), "{:?}", level);
-                    prop_assert_eq!(have_row.rank(), want.rank(), "{:?}", level);
-                }
-            }
-        }
 
         #[test]
         fn decodes_agree((values, universe) in list(), at in 0usize..16, after in 0usize..20) {
