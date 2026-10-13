@@ -510,10 +510,17 @@ impl<'s, 'a> Sc<'s, 'a> {
     /// [`Walk::group_done`]). Each block is bounded as it is decoded, and
     /// its frontier is not kept as pairs ([`LazyFooter::decode_bounds`]):
     /// most blocks' are never read again. A grouped record's entries are
-    /// bounded as its groups are visited.
+    /// decoded in one pass ([`Directory::decode_all`]) and bounded as its
+    /// groups are visited.
     fn decode_all(&mut self) {
-        let Bounds::Blocks(f) = &mut self.footer else {
-            return;
+        let f = match &mut self.footer {
+            Bounds::Blocks(f) => f,
+            Bounds::Groups(g) => {
+                g.dir
+                    .decode_all(g.groups)
+                    .unwrap_or_else(|e| corrupt_footer(e));
+                return;
+            }
         };
         let scorer = &self.scorer;
         self.bounds.clear();
@@ -1013,11 +1020,7 @@ fn next_group(
             .current()
             .map(|slot| group_from(geometry, from as usize, slot) as u32);
     }
-    let count = set.group_count();
-    while *hint < count && set.group_index(*hint) < from {
-        *hint += 1;
-    }
-    (*hint < count).then(|| set.group_index(*hint))
+    set.seek_index(from, hint)
 }
 
 /// Loads `set`'s members in group `g`: decoded into a list, or an

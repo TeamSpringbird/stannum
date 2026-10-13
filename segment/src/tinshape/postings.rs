@@ -1315,9 +1315,20 @@ impl Directory {
             return Err(Error::Corrupt("group directory entry"));
         }
         while self.decoded.get() <= b {
-            self.decode_block(groups)?;
+            self.decode_block(groups, DIRECTORY_BLOCK)?;
         }
         self.get(b, groups)
+    }
+
+    /// Decodes every entry not decoded yet, in one pass: for a walk that
+    /// will reach them all (a disjunction bounds every group of each term it
+    /// scores), which decoding them as it goes would interleave with its
+    /// reads of the containers.
+    pub fn decode_all(&self, groups: &[Group]) -> Result<()> {
+        if self.decoded.get() < self.len() {
+            self.decode_block(groups, self.len())?;
+        }
+        Ok(())
     }
 
     /// The entry of group `index`, if the record holds the group (a binary
@@ -1377,10 +1388,10 @@ impl Directory {
         self.bytes.len() + self.decoded() * std::mem::size_of::<GroupEntry>()
     }
 
-    /// Decodes the next block.
-    fn decode_block(&self, groups: &[Group]) -> Result<()> {
+    /// Decodes the next `block` entries (those left, if fewer).
+    fn decode_block(&self, groups: &[Group], block: usize) -> Result<()> {
         let from = self.decoded.get();
-        let n = DIRECTORY_BLOCK.min(self.len() - from);
+        let n = block.min(self.len() - from);
         let mut resume = self.resume.get();
         let mut out = Slots {
             slots: &self.entries[from..from + n],
@@ -4133,6 +4144,34 @@ mod tests {
         let stats = encode(&geometry, &slots, &buckets, &lengths, &options, &mut out);
         assert!(!stats.sparse, "a grouped record");
         (out, geometry, df)
+    }
+
+    #[test]
+    fn a_directory_decoded_whole_is_the_one_decoded_as_reached() {
+        let (out, geometry, df) = grouped_record(700, 2);
+        let groups = &geometry.groups;
+        for first in [None, Some(0), Some(200), Some(699)] {
+            let parsed = Postings::parse(&out[..], df, &geometry).unwrap();
+            let Form::Grouped(dir) = &parsed.form else {
+                panic!("a grouped record");
+            };
+            if let Some(b) = first {
+                dir.get(b, groups).unwrap();
+            }
+            dir.decode_all(groups).unwrap();
+            assert_eq!(dir.decoded(), 700);
+            assert_eq!(
+                dir.decoded_entries(),
+                &decode_directory_whole(dir.bytes(), groups).unwrap()[..]
+            );
+            dir.decode_all(groups).unwrap();
+        }
+        // Its totals are checked as a block's are.
+        let parsed = Postings::parse(&out[..out.len() - 1], df, &geometry).unwrap();
+        let Form::Grouped(dir) = &parsed.form else {
+            panic!("a grouped record");
+        };
+        assert!(dir.decode_all(groups).is_err());
     }
 
     #[test]
