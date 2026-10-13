@@ -1591,15 +1591,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         cands.clear();
         let lead = &self.mems[self.req[0]];
         match &lead.kind {
-            Kind::Grid(bytes) => {
-                for w in 0..bytes.len() / 8 {
-                    let mut word = bits::word(bytes, w);
-                    while word != 0 {
-                        cands.push((w * 64) as u32 + word.trailing_zeros());
-                        word &= word - 1;
-                    }
-                }
-            }
+            Kind::Grid(bytes) => kernels::set_bits_bytes(bytes, &mut cands),
             Kind::List => cands.extend_from_slice(&lead.list),
             Kind::Cursor { .. } => unreachable!("a lead is loaded whole"),
         }
@@ -2298,13 +2290,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let mut cands = std::mem::take(&mut self.cands);
         cands.clear();
-        for (w, word) in self.words.iter().enumerate() {
-            let mut word = *word;
-            while word != 0 {
-                cands.push((w * 64) as u32 + word.trailing_zeros());
-                word &= word - 1;
-            }
-        }
+        kernels::set_bits(&self.words, &mut cands);
         let staging = !self.sc.is_empty() && matches!(self.verify, Verify::Span(_));
         let more = if sieved {
             self.walk_sieved(g, &cands, staging)

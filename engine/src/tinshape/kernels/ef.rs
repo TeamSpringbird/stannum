@@ -25,6 +25,11 @@
 //!    part. Widths above 25 (a value may then span five bytes) and the last
 //!    few values are read one at a time.
 //!
+//! With AVX-512 VBMI2 (see [`super::vbmi`]) the first pass takes a whole
+//! word at once (`vpcompressb` of the positions 0..63 under it) and the
+//! second sixteen values at once (`vpermb` over 64 bytes, read by a load
+//! masked at the list's end, so only widths above 25 go one at a time).
+//!
 //! Both write into the caller's vector, past whose end the first pass
 //! stores up to [`SLACK`] values (its capacity reserved for them).
 //! [`ef_into_row`] decodes through a buffer on the stack, a few hundred
@@ -35,8 +40,28 @@
 //! Lists of fewer than [`SHORT`] values take the portable body: the passes'
 //! setup and their last word's unused bytes cost more than they save there.
 
+#[cfg(target_arch = "x86_64")]
+use super::vbmi;
 use super::{Level, level};
 use segment::Result;
+
+/// Runs Elias-Fano body `$name` at `$level`, which the CPU must support
+/// (see [`super::vbmi`] for the AVX-512 level).
+macro_rules! ef_run {
+    ($level:expr, $name:ident($($arg:expr),*)) => {
+        match $level {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: the level and its extra features are the CPU's.
+            Level::Avx512 if vbmi() => unsafe { avx512::$name($($arg),*) },
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: AVX-512 implies AVX2 and the level is the CPU's.
+            Level::Avx512 | Level::Avx2 => unsafe { avx2::$name($($arg),*) },
+            #[cfg(target_arch = "aarch64")]
+            Level::Neon => neon::$name($($arg),*),
+            _ => scalar::$name($($arg),*),
+        }
+    };
+}
 
 use segment::tinshape::ef::Ef;
 use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local, group_slots};
@@ -45,7 +70,7 @@ use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local, group_slo
 #[inline]
 pub fn ef_decode(ef: Ef<'_>, out: &mut Vec<u32>) {
     if !short_decode(&ef, out) {
-        run!(level(), ef_decode(ef, out));
+        ef_run!(level(), ef_decode(ef, out));
     }
 }
 
@@ -57,7 +82,7 @@ pub fn ef_decode_at(level: Level, ef: Ef<'_>, out: &mut Vec<u32>) {
         level.name()
     );
     if !short_decode(&ef, out) {
-        run!(level, ef_decode(ef, out));
+        ef_run!(level, ef_decode(ef, out));
     }
 }
 
@@ -67,7 +92,7 @@ pub fn ef_decode_at(level: Level, ef: Ef<'_>, out: &mut Vec<u32>) {
 #[inline]
 pub fn ef_into_row(ef: Ef<'_>, row: &mut [u64]) {
     if !short_row(&ef, row) {
-        run!(level(), ef_into_row(ef, row));
+        ef_run!(level(), ef_into_row(ef, row));
     }
 }
 
@@ -79,7 +104,7 @@ pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
         level.name()
     );
     if !short_row(&ef, row) {
-        run!(level, ef_into_row(ef, row));
+        ef_run!(level, ef_into_row(ef, row));
     }
 }
 
@@ -199,6 +224,44 @@ const fn lows() -> [Lows; WIDEST as usize + 1] {
                 j += 1;
             }
             h += 1;
+        }
+        l += 1;
+    }
+    table
+}
+
+/// Where sixteen `l`-bit values starting on a byte lie, for one `vpermb` of
+/// the 64 bytes from there: the four bytes from the one each lane's value
+/// starts in, and the shift that brings it down (16 values of at most
+/// [`WIDEST`] bits end within 54 bytes).
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+struct Lows16 {
+    take: [u8; 64],
+    shift: [u32; 16],
+}
+
+#[cfg(target_arch = "x86_64")]
+static LOWS16: [Lows16; WIDEST as usize + 1] = lows16();
+
+#[cfg(target_arch = "x86_64")]
+const fn lows16() -> [Lows16; WIDEST as usize + 1] {
+    let mut table = [Lows16 {
+        take: [0; 64],
+        shift: [0; 16],
+    }; WIDEST as usize + 1];
+    let mut l = 1;
+    while l <= WIDEST as usize {
+        let mut j = 0;
+        while j < 16 {
+            let bit = j * l;
+            let mut m = 0;
+            while m < 4 {
+                table[l].take[4 * j + m] = (bit / 8 + m) as u8;
+                m += 1;
+            }
+            table[l].shift[j] = (bit % 8) as u32;
+            j += 1;
         }
         l += 1;
     }
@@ -418,11 +481,10 @@ mod scalar {
 }
 
 /// The two passes and the drivers around them, for a module with
-/// `highs_word(d, s, word, before)`, which stores a highs word's members'
-/// high parts from `d` (`s`: the word's first bit less the rank of its
-/// first member; `before`: each byte's rank in the word, as its bytes), and
-/// `Unpack`, eight low parts at a time; `$tf` is its `#[target_feature]`
-/// attribute, if any.
+/// `highs_word(d, s, word)`, which stores a highs word's members' high
+/// parts from `d` (`s`: the word's first bit less the rank of its first
+/// member) and returns how many there are, and `Unpack`, `Unpack::LANES`
+/// low parts at a time; `$tf` is its `#[target_feature]` attribute, if any.
 macro_rules! passes {
     ($(#[$tf:meta])*) => {
         /// The high parts of `ef`'s members whose set bits are in words
@@ -451,24 +513,21 @@ macro_rules! passes {
                 // The last word may be part of one: its missing bytes are
                 // zero, so store lanes past its members, within the slack.
                 let word = super::highs_word(padded, highs_len, w);
-                // Byte k's rank in the word: the set bits of bytes 0..k.
-                let inclusive = super::byte_counts(word).wrapping_mul(0x0101_0101_0101_0101);
                 let s = ((w * 64) as u32).wrapping_sub(idx as u32);
                 // SAFETY: the word's members start at `idx < n`, and it
                 // stores at most 64 + 8 lanes from there.
-                unsafe { highs_word(dst.add(idx - origin), s, word, inclusive << 8) };
-                idx += (inclusive >> 56) as usize;
+                idx += unsafe { highs_word(dst.add(idx - origin), s, word) };
             }
             idx
         }
 
         /// Members `from..to` (`from` a multiple of 8): `dst[i - from] =
-        /// dst[i - from] << l | low_i`, eight at a time where the lows'
-        /// bytes allow (the last eight may pass `to`).
+        /// dst[i - from] << l | low_i`, `Unpack::LANES` at a time where the
+        /// lows' bytes allow (the last lanes may pass `to`).
         ///
         /// # Safety
         /// `dst` is valid for `to - from` values rounded up to a multiple
-        /// of 8, all initialized.
+        /// of `Unpack::LANES`, all initialized.
         $(#[$tf])*
         #[inline]
         unsafe fn combine(lows: &[u8], l: u32, from: usize, to: usize, dst: *mut u32) {
@@ -479,14 +538,15 @@ macro_rules! passes {
             let mut i = from;
             // SAFETY (all below): `i - from` is below `to - from` rounded
             // up, the caller's room; vector loads stay within `lows` below
-            // `vector_reach`.
+            // `Unpack::reach`.
             if l <= super::WIDEST {
-                let stop = to.min(super::vector_reach(lows.len(), l));
+                let stop = to.min(Unpack::reach(lows.len(), l));
                 let unpack = Unpack::new(l);
                 let p = lows.as_ptr();
                 while i < stop {
-                    unsafe { unpack.eight(p.add(i / 8 * l as usize), dst.add(i - from)) };
-                    i += 8;
+                    let at = i / 8 * l as usize;
+                    unsafe { unpack.lanes(p.add(at), lows.len() - at, dst.add(i - from)) };
+                    i += Unpack::LANES;
                 }
             }
             while i < to {
@@ -510,8 +570,8 @@ macro_rules! passes {
                 let dst = out.as_mut_ptr().add(start);
                 let words = highs_bytes.len().div_ceil(8);
                 let found = highs(&ef, 0, words, 0, dst, 0).min(n);
-                // The last eight `combine` may take: initialized.
-                dst.add(found).write_bytes(0, 8);
+                // The last lanes `combine` may take: initialized.
+                dst.add(found).write_bytes(0, Unpack::LANES);
                 combine(lows, ef.low_width(), 0, found, dst);
                 out.set_len(start + found);
             }
@@ -552,7 +612,7 @@ macro_rules! passes {
                         // A chunk of empty buckets.
                         continue;
                     }
-                    dst.add(to - origin).write_bytes(0, 8);
+                    dst.add(to - origin).write_bytes(0, Unpack::LANES);
                     combine(lows, l, origin, to, dst);
                     let last = u64::from(*dst.add(to - origin - 1)) | mask;
                     if ((last / 64) as usize) < row.len() {
@@ -589,7 +649,10 @@ mod neon {
     /// # Safety
     /// `d` is valid for 64 + 8 values.
     #[inline(always)]
-    unsafe fn highs_word(d: *mut u32, s: u32, word: u64, before: u64) {
+    unsafe fn highs_word(d: *mut u32, s: u32, word: u64) -> usize {
+        // Byte k's rank in the word: the set bits of bytes 0..k.
+        let inclusive = super::byte_counts(word).wrapping_mul(0x0101_0101_0101_0101);
+        let before = inclusive << 8;
         // SAFETY: table rows are 16 bytes; each store is at `d + before_k`,
         // below `d + 64`, and eight lanes long.
         unsafe {
@@ -616,6 +679,7 @@ mod neon {
             byte!(6, high, 2);
             byte!(7, high, 3);
         }
+        (inclusive >> 56) as usize
     }
 
     /// Eight low parts at a time at one width.
@@ -628,6 +692,14 @@ mod neon {
     }
 
     impl Unpack {
+        const LANES: usize = 8;
+
+        /// See [`super::vector_reach`].
+        #[inline(always)]
+        fn reach(len: usize, l: u32) -> usize {
+            super::vector_reach(len, l)
+        }
+
         #[inline(always)]
         fn new(l: u32) -> Self {
             let shape = &super::LOWS[l as usize];
@@ -648,12 +720,13 @@ mod neon {
             }
         }
 
-        /// `d[j] = d[j] << l | low_j` for the eight values from byte `p`.
+        /// `d[j] = d[j] << l | low_j` for the eight values from byte `p`
+        /// (of which `_avail` bytes are the list's).
         ///
         /// # Safety
         /// `p..p + half + 16` is readable; `d` is valid for eight values.
         #[inline(always)]
-        unsafe fn eight(&self, p: *const u8, d: *mut u32) {
+        unsafe fn lanes(&self, p: *const u8, _avail: usize, d: *mut u32) {
             // SAFETY: the caller's.
             unsafe {
                 let a = vqtbl1q_u8(vld1q_u8(p), self.take[0]);
@@ -684,7 +757,10 @@ mod avx2 {
     /// `d` is valid for 64 + 8 values.
     #[target_feature(enable = "avx2,popcnt")]
     #[inline]
-    unsafe fn highs_word(d: *mut u32, s: u32, word: u64, before: u64) {
+    unsafe fn highs_word(d: *mut u32, s: u32, word: u64) -> usize {
+        // Byte k's rank in the word: the set bits of bytes 0..k.
+        let inclusive = super::byte_counts(word).wrapping_mul(0x0101_0101_0101_0101);
+        let before = inclusive << 8;
         // SAFETY: table rows are 16 bytes; each store is at `d + before_k`,
         // below `d + 64`, and eight lanes long.
         unsafe {
@@ -705,6 +781,7 @@ mod avx2 {
                 _mm256_storeu_si256(d.add(e).cast(), v);
             }
         }
+        (inclusive >> 56) as usize
     }
 
     /// Eight low parts at a time at one width.
@@ -717,6 +794,14 @@ mod avx2 {
     }
 
     impl Unpack {
+        const LANES: usize = 8;
+
+        /// See [`super::vector_reach`].
+        #[inline(always)]
+        fn reach(len: usize, l: u32) -> usize {
+            super::vector_reach(len, l)
+        }
+
         #[target_feature(enable = "avx2,popcnt")]
         #[inline]
         fn new(l: u32) -> Self {
@@ -733,13 +818,14 @@ mod avx2 {
             }
         }
 
-        /// `d[j] = d[j] << l | low_j` for the eight values from byte `p`.
+        /// `d[j] = d[j] << l | low_j` for the eight values from byte `p`
+        /// (of which `_avail` bytes are the list's).
         ///
         /// # Safety
         /// `p..p + half + 16` is readable; `d` is valid for eight values.
         #[target_feature(enable = "avx2,popcnt")]
         #[inline]
-        unsafe fn eight(&self, p: *const u8, d: *mut u32) {
+        unsafe fn lanes(&self, p: *const u8, _avail: usize, d: *mut u32) {
             // SAFETY: the caller's.
             unsafe {
                 let bytes = _mm256_inserti128_si256::<1>(
@@ -759,16 +845,118 @@ mod avx2 {
     passes!(#[target_feature(enable = "avx2,popcnt")]);
 }
 
-/// AVX-512 machines run the AVX2 bodies: eight lanes already keep the
-/// passes' loads and stores ahead of the members.
+/// AVX-512 bodies (F, BW, VBMI and VBMI2), after Langdale's and Lemire's
+/// bitset decoding: a highs word's members' high parts by one `vpcompressb`
+/// of the bytes 0..63 under the word as a mask (its set bits' positions,
+/// packed), less each lane's index (the member's rank in the word), widened
+/// sixteen at a time onto the word's base; sixteen low parts by one `vpermb`
+/// of 64 bytes, `vpsrlvd` and a mask, the bytes read by a masked load that
+/// stops at the list's end, so no value is read one at a time below
+/// [`WIDEST`].
 #[cfg(target_arch = "x86_64")]
 mod avx512 {
-    pub use super::avx2::{ef_decode, ef_into_row};
+    use core::arch::x86_64::*;
+    use segment::tinshape::ef::Ef;
+
+    /// Bytes 0 to 63.
+    static IOTA: [u8; 64] = {
+        let mut t = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            t[i] = i as u8;
+            i += 1;
+        }
+        t
+    };
+
+    /// # Safety
+    /// `d` is valid for 64 values.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
+    #[inline]
+    unsafe fn highs_word(d: *mut u32, s: u32, word: u64) -> usize {
+        // SAFETY: four stores of sixteen lanes from `d`.
+        unsafe {
+            let iota = _mm512_loadu_si512(IOTA.as_ptr().cast());
+            // Member j's position less j (lanes past the word's members
+            // hold garbage, overwritten by the next word's or past the end).
+            let ranked = _mm512_sub_epi8(_mm512_maskz_compress_epi8(word, iota), iota);
+            let base = _mm512_set1_epi32(s as i32);
+            let put = |at: usize, sixteen: __m128i| {
+                let v = _mm512_add_epi32(_mm512_cvtepu8_epi32(sixteen), base);
+                _mm512_storeu_si512(d.add(at).cast(), v);
+            };
+            put(0, _mm512_castsi512_si128(ranked));
+            put(16, _mm512_extracti32x4_epi32::<1>(ranked));
+            put(32, _mm512_extracti32x4_epi32::<2>(ranked));
+            put(48, _mm512_extracti32x4_epi32::<3>(ranked));
+        }
+        word.count_ones() as usize
+    }
+
+    /// Sixteen low parts at a time at one width.
+    struct Unpack {
+        take: __m512i,
+        shift: __m512i,
+        mask: __m512i,
+        up: __m128i,
+    }
+
+    impl Unpack {
+        const LANES: usize = 16;
+
+        /// Every value: the loads are masked at the list's end.
+        #[inline(always)]
+        fn reach(_len: usize, _l: u32) -> usize {
+            usize::MAX
+        }
+
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
+        #[inline]
+        fn new(l: u32) -> Self {
+            let shape = &super::LOWS16[l as usize];
+            // SAFETY: each load is of a 64-byte table row.
+            unsafe {
+                Self {
+                    take: _mm512_loadu_si512(shape.take.as_ptr().cast()),
+                    shift: _mm512_loadu_si512(shape.shift.as_ptr().cast()),
+                    mask: _mm512_set1_epi32(((1u32 << l) - 1) as i32),
+                    up: _mm_cvtsi32_si128(l as i32),
+                }
+            }
+        }
+
+        /// `d[j] = d[j] << l | low_j` for the sixteen values from byte `p`,
+        /// of which `avail` bytes are readable (bytes past them read as
+        /// zeros, the lanes past the list's values then being garbage).
+        ///
+        /// # Safety
+        /// `p..p + avail` is readable; `d` is valid for sixteen values.
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
+        #[inline]
+        unsafe fn lanes(&self, p: *const u8, avail: usize, d: *mut u32) {
+            // SAFETY: the masked load reads no byte past `avail` (nor
+            // faults there); the rest is the caller's.
+            unsafe {
+                let readable = _bzhi_u64(u64::MAX, avail.min(64) as u32);
+                let bytes = _mm512_maskz_loadu_epi8(readable, p.cast());
+                let low = _mm512_and_si512(
+                    _mm512_srlv_epi32(_mm512_permutexvar_epi8(self.take, bytes), self.shift),
+                    self.mask,
+                );
+                let high = _mm512_sll_epi32(_mm512_loadu_si512(d.cast()), self.up);
+                _mm512_storeu_si512(d.cast(), _mm512_or_si512(high, low));
+            }
+        }
+    }
+
+    passes!(#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::Level;
+    #[cfg(target_arch = "x86_64")]
+    use super::super::vbmi;
     #[cfg(target_arch = "aarch64")]
     use super::neon;
     use super::*;
@@ -778,9 +966,19 @@ mod tests {
     use segment::tinshape::ef;
 
     /// The levels to compare with the portable one (see the kernels' own
-    /// tests for `STANNUM_EXPECT_KERNELS`).
+    /// tests for `STANNUM_EXPECT_KERNELS`). `STANNUM_EXPECT_VBMI=1` makes
+    /// the run fail where the AVX-512 level would not run its own bodies.
     fn levels() -> Vec<Level> {
         let have = Level::supported_levels();
+        if std::env::var("STANNUM_EXPECT_VBMI").is_ok_and(|v| v == "1") {
+            #[cfg(target_arch = "x86_64")]
+            assert!(
+                have.contains(&Level::Avx512) && vbmi(),
+                "AVX-512 VBMI bodies not supported here"
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            panic!("AVX-512 VBMI bodies not supported here");
+        }
         if let Ok(want) = std::env::var("STANNUM_EXPECT_KERNELS") {
             for name in want.split(',').filter(|s| !s.trim().is_empty()) {
                 let level = Level::parse(name).unwrap_or_else(|| panic!("unknown level {name}"));
@@ -838,6 +1036,15 @@ mod tests {
                 assert_eq!(shape.take[h][4 * j] as usize, bit / 8);
                 assert!(shape.take[h][4 * j + 3] < 16);
                 assert!(bit % 8 + l <= 32);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        for (l, shape) in LOWS16.iter().enumerate().skip(1) {
+            for lane in 0..16 {
+                let bit = lane * l;
+                assert_eq!(shape.shift[lane] as usize, bit % 8);
+                assert_eq!(shape.take[4 * lane] as usize, bit / 8);
+                assert!(shape.take[4 * lane + 3] < 64);
             }
         }
     }
@@ -942,14 +1149,14 @@ mod tests {
                 prop_assert_eq!(&have, &want, "{:?}", level);
                 // The level's own body, which short lists skip.
                 let mut have = vec![9];
-                run!(level, ef_decode(list, &mut have));
+                ef_run!(level, ef_decode(list, &mut have));
                 prop_assert_eq!(&have[1..], &want[..], "body {:?}", level);
                 if rows {
                     let mut bits_have = vec![0u64; words];
                     ef_into_row_at(level, list, &mut bits_have);
                     prop_assert_eq!(&bits_have, &bits_want, "{:?}", level);
                     let mut bits_have = vec![0u64; words];
-                    run!(level, ef_into_row(list, &mut bits_have));
+                    ef_run!(level, ef_into_row(list, &mut bits_have));
                     prop_assert_eq!(&bits_have, &bits_want, "body {:?}", level);
                 }
             }

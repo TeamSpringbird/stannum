@@ -421,8 +421,21 @@ stored at once, a word's byte ranks by one multiply), then the low parts
 eight at a time (eight values are `l` whole bytes: a shuffle, a shift per
 lane and a mask, per width up to 25 bits), into a list or straight into a
 cleared row; lists of fewer than 16 members by clamped eight-byte loads
-before the level is chosen. A sparse list drained a group at a time by its
-cursor stays scalar (a group holds a member or two of it).
+before the level is chosen. Where the AVX-512 level also has VBMI, VBMI2
+and BMI2 (Ice Lake, Sapphire Rapids, Zen 4 on; asked once), it has its own
+bodies (Langdale's and Lemire's bitset decoding): a highs word's members
+by one `vpcompressb` of the positions 0..63 under it, less each lane's
+rank, widened sixteen at a time; sixteen low parts by one `vpermb` of 64
+bytes read by a load masked at the list's end, so only widths above 25
+go one at a time. Without VBMI that level runs the AVX2 bodies. The same
+`vpcompressb` turns a bitmap's words into positions (`kernels::set_bits`,
+a conjunction's grid lead and all-grid AND); other levels keep the
+count-trailing-zeros loop. A sparse list drained a group at a time by its
+cursor stays scalar on every level: drains are short (some 20 members),
+and decoding them in bulk was no faster on aarch64 (spans found from the
+highs first) nor on x86 (a highs word decoded whole by the VBMI body,
+then the cursor resumed). Neither was an AVX-512 path for lists of fewer
+than 16: 2-3x faster per member in `tnsef`, no faster per query.
 
 Not vectorized on either architecture: the OR walk's per-word and
 per-member weighing (a few terms' bounds a word; branch-free whole-group
@@ -1146,7 +1159,27 @@ a cleared row):
 
 Timed, 64-127 members: 3.9x (list), 1.9x (row); 128-511: 4.7x, 1.5x.
 On a Sapphire Rapids devbox AVX2 is 1.7x the portable body overall, up
-to 5x on dense lists; AVX-512 machines run the same AVX2 bodies.
+to 5x on dense lists.
+
+The AVX-512 VBMI bodies, on one layout-9 segment's containers (`tnsef`,
+Sapphire Rapids, ns per member into a list | into a row, AVX2 -> AVX-512):
+
+| members | list | row |
+| --- | ---: | ---: |
+| 16-31 | 2.07 -> 0.86 | 2.78 -> 2.03 |
+| 32-63 | 1.13 -> 0.49 | 1.66 -> 1.24 |
+| 64-127 | 0.61 -> 0.33 | 1.12 -> 0.89 |
+| 128-511 | 0.47 -> 0.25 | 0.95 -> 0.78 |
+| sparse lists | 1.11 -> 0.94 | 2.01 -> 1.94 |
+| all (a third under 16, the same body) | 2.72 -> 2.20 | 3.27 -> 2.95 |
+
+On the 150M replay (layout 9, perf user counts less the load, one
+interleaved round, answers exact: the whole trace equal to
+`pg-ranked.tsv`, `--full` byte-identical to `f0962a8`'s), with the
+set-bits kernel, against `fcbb53a`: cycles -2.6% conjunction, -2.3%
+disjunction, -3.5% phrase under score, -3.3%, -1.8%, -3.7% under
+full_score; instructions -0.7% to -2.0%; branch misses -9% to -16% (not
+in score disjunctions).
 
 Replay of the 150M trace (first 400 queries per style, 3 passes, timed
 instructions | cycles against `1e01d81`; aarch64, `--pin-ns 1000`, quiet
@@ -1164,7 +1197,11 @@ from the highs, then the block kernels). Those drains are many and long
 (258M members in 400 conjunctions, 640M in 400 disjunctions, two thirds
 in drains of 16 or more), but a span's setup cost about what its decode
 saved: disjunction instructions +0.8%, cycles +1.6% against the block
-kernels alone.
+kernels alone. Retried on x86-64 with the AVX-512 VBMI bodies and no
+setup pass (the highs word holding the cursor decoded whole, sixteen
+values compared with the group's end at once, the cursor resumed at the
+first not below): instructions -0.3% to -2.6%, cycles -0.7% to +8.4%
+against the kernels alone, so not kept either.
 
 Grid density 32 (`tnsregrid --grid-density 32`) still loses with the
 block kernels: fewer groups force grids, so more terms are sparse lists
