@@ -6,14 +6,14 @@
 # SRC1 (base) replays the dump in S3 (page layout version 6); SRC2 re-encodes
 # it on the box with its own `tnsreencode` (6 to 8) and replays that; SRC3
 # re-encodes SRC2's output with its own (8 to 9) once per grid density in
-# DENSITIES (default "64") and replays each. Interleaved (A B C.. for score,
+# DENSITIES (commas between, default 64) and replays each. Interleaved (A B C.. for score,
 # the reverse for full_score), one round, three styles, under perf stat, with
 # progress and results so far uploaded after each step (a spot reclaim or
 # the hard limit keeps what was done). Box time: about 55 minutes plus 25
 # per density; the volume holds every dump (--disk 130, 170 for two
 # densities).
 #   devbox.sh --branch BASE --branch V8 --branch V9 --dump --disk 170 --hours 3 \
-#     --cmd-file benchmarks/aws/devbox-pgrid-ab.sh --env DENSITIES="64 42"
+#     --cmd-file benchmarks/aws/devbox-pgrid-ab.sh --env DENSITIES=64,42
 set -u
 eval "$(head -1 /root/devbox.sh)" # RUN BUCKET PREFIX: for progress lines
 step() {
@@ -40,7 +40,7 @@ step "re-encoded to 8: $(tail -1 $OUT/reencode-v8.txt | cut -c1-160)"
 names="A B"
 dump_A=$D; dump_B=$D2; bin_A=$SRC1/target/release/tnsreplay; bin_B=$SRC2/target/release/tnsreplay
 letters="C E F G"
-for d in $DENSITIES; do
+for d in ${DENSITIES//,/ }; do
   x=${letters%% *}; letters=${letters#* }
   out=/data/dump150m-v9-d$d
   $SRC3/target/release/tnsreencode --in $D2 --out $out --from 8 --grid-density $d --jobs 4 \
