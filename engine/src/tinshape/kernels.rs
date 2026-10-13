@@ -218,6 +218,74 @@ kernels! {
     fn prefix_counts / prefix_counts_at(bytes: &[u8], out: &mut Vec<u32>);
 }
 
+/// Whether the AVX-512 level's VBMI bodies run (the Elias-Fano kernels and
+/// [`set_bits`]): they need
+/// VBMI, VBMI2 and BMI2 besides the level's features (Ice Lake, Sapphire
+/// Rapids and Zen 4 on have them; Skylake-SP and Cascade Lake do not, and
+/// run the AVX2 bodies at that level). Asked once.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn vbmi() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static HAS: AtomicU8 = AtomicU8::new(0);
+
+    #[cold]
+    #[inline(never)]
+    fn ask() -> bool {
+        let has = std::arch::is_x86_feature_detected!("avx512vbmi")
+            && std::arch::is_x86_feature_detected!("avx512vbmi2")
+            && std::arch::is_x86_feature_detected!("bmi2");
+        HAS.store(if has { 2 } else { 1 }, Ordering::Relaxed);
+        has
+    }
+
+    match HAS.load(Ordering::Relaxed) {
+        0 => ask(),
+        h => h == 2,
+    }
+}
+
+/// Appends the position of each set bit of `words` (bit `i` of word `w`
+/// at `64 * w + i`), in order.
+#[inline]
+pub fn set_bits(words: &[u64], out: &mut Vec<u32>) {
+    set_bits_at(level(), words, out);
+}
+
+/// [`set_bits`] of a byte string read as little-endian words (its whole
+/// words; a grid's, as stored).
+#[inline]
+pub fn set_bits_bytes(bytes: &[u8], out: &mut Vec<u32>) {
+    set_bits_bytes_at(level(), bytes, out);
+}
+
+/// [`set_bits`] at `level`, which the CPU must support (checked only in
+/// debug builds; [`set_bits`] passes the chosen one).
+#[inline]
+pub fn set_bits_at(level: Level, words: &[u64], out: &mut Vec<u32>) {
+    debug_assert!(level.supported());
+    match level {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the level and its VBMI features are the CPU's; x86-64
+        // is little-endian, so the words are their bytes.
+        Level::Avx512 if vbmi() => unsafe { avx512::set_bits(bytes_of(words), out) },
+        _ => scalar::set_bits(words, out),
+    }
+}
+
+/// [`set_bits_bytes`] at `level` (see [`set_bits_at`]).
+#[inline]
+pub fn set_bits_bytes_at(level: Level, bytes: &[u8], out: &mut Vec<u32>) {
+    debug_assert!(level.supported());
+    let bytes = &bytes[..bytes.len() / 8 * 8];
+    match level {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as in `set_bits_at`.
+        Level::Avx512 if vbmi() => unsafe { avx512::set_bits(bytes, out) },
+        _ => scalar::set_bits_bytes(bytes, out),
+    }
+}
+
 mod ef;
 pub use ef::{
     container_locals, container_row, ef_decode, ef_decode_at, ef_into_row, ef_into_row_at,
@@ -338,6 +406,29 @@ mod scalar {
         for c in bytes.chunks_exact(8) {
             out.push(n);
             n += le(c).count_ones();
+        }
+    }
+
+    /// A word's set bits, lowest first: count trailing zeros, clear lowest.
+    #[inline(always)]
+    fn word_bits(at: u32, mut word: u64, out: &mut Vec<u32>) {
+        while word != 0 {
+            out.push(at + word.trailing_zeros());
+            word &= word - 1;
+        }
+    }
+
+    #[inline]
+    pub fn set_bits(words: &[u64], out: &mut Vec<u32>) {
+        for (w, word) in words.iter().enumerate() {
+            word_bits((w * 64) as u32, *word, out);
+        }
+    }
+
+    #[inline]
+    pub fn set_bits_bytes(bytes: &[u8], out: &mut Vec<u32>) {
+        for (w, c) in bytes.chunks_exact(8).enumerate() {
+            word_bits((w * 64) as u32, le(c), out);
         }
     }
 }
@@ -904,6 +995,61 @@ mod avx512 {
     pub fn prefix_counts(bytes: &[u8], out: &mut Vec<u32>) {
         scalar::prefix_counts(bytes, out)
     }
+
+    /// Bytes 0 to 63.
+    static IOTA: [u8; 64] = {
+        let mut t = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            t[i] = i as u8;
+            i += 1;
+        }
+        t
+    };
+
+    /// [`super::set_bits`] of whole little-endian words (Langdale; Lemire):
+    /// a word's set bits' positions by one `vpcompressb` of the bytes
+    /// 0..63 under it, widened sixteen at a time onto the word's start,
+    /// sixteen stored, and more only for a word with more members.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,avx512vpopcntdq,popcnt")]
+    pub fn set_bits(bytes: &[u8], out: &mut Vec<u32>) {
+        let total = count::<false>(bytes, bytes, bytes.len()) as usize;
+        // Lanes past a word's members are stored, then overwritten by the
+        // next word's or left past the length.
+        out.reserve(total + 64);
+        let start = out.len();
+        // SAFETY: each word stores from its first member's place at most
+        // 64 lanes, within the `total + 64` reserved; the loads are of whole
+        // words of `bytes`; the `total` from `start` are then written.
+        unsafe {
+            let iota = _mm512_loadu_si512(IOTA.as_ptr().cast());
+            let mut d = out.as_mut_ptr().add(start);
+            for (w, c) in bytes.chunks_exact(8).enumerate() {
+                let word = u64::from_le_bytes(c.try_into().expect("eight bytes"));
+                let n = word.count_ones() as usize;
+                let pos = _mm512_maskz_compress_epi8(word, iota);
+                let base = _mm512_set1_epi32((w * 64) as i32);
+                let widen = |x: __m128i| _mm512_add_epi32(_mm512_cvtepu8_epi32(x), base);
+                _mm512_storeu_si512(d.cast(), widen(_mm512_castsi512_si128(pos)));
+                if n > 16 {
+                    _mm512_storeu_si512(
+                        d.add(16).cast(),
+                        widen(_mm512_extracti32x4_epi32::<1>(pos)),
+                    );
+                    _mm512_storeu_si512(
+                        d.add(32).cast(),
+                        widen(_mm512_extracti32x4_epi32::<2>(pos)),
+                    );
+                    _mm512_storeu_si512(
+                        d.add(48).cast(),
+                        widen(_mm512_extracti32x4_epi32::<3>(pos)),
+                    );
+                }
+                d = d.add(n);
+            }
+            out.set_len(start + total);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1090,6 +1236,41 @@ mod tests {
                 let h = and_count_clear_at(level, &mut have[ot..ot + n], other);
                 prop_assert_eq!(h, r, "and_count_clear {:?}", level);
                 prop_assert_eq!(&have, &want, "and_count_clear {:?}", level);
+            }
+        }
+
+        #[test]
+        fn set_bits_agree(seed in any::<u64>(), d in density(), n in length(), at in 0usize..64) {
+            let buf = bytes(seed, d, n + at);
+            let b = &buf[at..];
+            let wbuf = words(seed ^ 11, d, n / 8 + 8);
+            let w = &wbuf[at % 8..at % 8 + n / 8];
+            let mut want = vec![7];
+            for (i, word) in w.iter().enumerate() {
+                for bit in 0..64 {
+                    if word >> bit & 1 == 1 {
+                        want.push((i * 64 + bit) as u32);
+                    }
+                }
+            }
+            let mut want_bytes = vec![7];
+            scalar::set_bits_bytes(b, &mut want_bytes);
+            let mut check = vec![7];
+            for (i, c) in b.chunks_exact(8).enumerate() {
+                for bit in 0..64 {
+                    if le(c) >> bit & 1 == 1 {
+                        check.push((i * 64 + bit) as u32);
+                    }
+                }
+            }
+            prop_assert_eq!(&want_bytes, &check);
+            for level in levels() {
+                let mut have = vec![7];
+                set_bits_at(level, w, &mut have);
+                prop_assert_eq!(&have, &want, "{:?}", level);
+                let mut have = vec![7];
+                set_bits_bytes_at(level, b, &mut have);
+                prop_assert_eq!(&have, &want_bytes, "bytes {:?}", level);
             }
         }
 
