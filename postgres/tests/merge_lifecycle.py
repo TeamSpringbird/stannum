@@ -10,6 +10,7 @@ No preload library or extra Python dependencies are needed.
 """
 import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import time
@@ -129,8 +130,13 @@ def crash_between_run_write_and_publication(sql, command, env, data, root, start
     """Buffers a large fold, stops the server immediately while the fold is
     writing its run, and checks that verify_index reports the run's pages as
     orphans, VACUUM reclaims them into the FSM and the next fold reuses them.
-    The kill is timed on relation growth; a kill that lands before the run
+    The kill is timed on relation growth and lands on the folding backend
+    itself, which stops writing at once; a kill that lands before the run
     write starts leaves the buffer intact, so the attempt simply repeats.
+    Whether the seal survives the kill depends on whether the WAL writer
+    flushed its record first: the orphans may be the promotion's run pages
+    behind a sealed write segment, or pages extended for it (zeroed) behind
+    a write buffer that is still open. The repeat covers both.
     Returns the number of orphaned pages reported."""
     page_warnings = ("SELECT count(*) FROM stannum.verify_index('docs_idx') "
                      "WHERE severity = 'warning' AND location LIKE 'page %'")
@@ -145,20 +151,26 @@ def crash_between_run_write_and_publication(sql, command, env, data, root, start
                 FROM generate_series(100000 + 50000 * %d, 100000 + 50000 * %d + 39999) n;""" % (attempt, attempt))
         size = int(sql("SELECT pg_relation_size('docs_idx')"))
         # The next insert folds the buffer before appending. Watch the relation
-        # grow as the run is written, then stop the server at once.
+        # grow as the run is written, then kill the folding backend at once:
+        # SIGKILL stops its writes immediately, where an immediate shutdown
+        # took long enough on a busy machine for the fold to finish and
+        # publish (and the postmaster treats the kill as a crash either way).
         folder = subprocess.Popen(["psql", "-XqAt", "-c",
                                    "SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0; "
                                    "INSERT INTO docs VALUES (%d, 'orphan')" % (99000 + attempt)],
-                                  env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                  env=dict(env, PGAPPNAME="stannum-folder"),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         watcher = subprocess.Popen(["psql", "-XqAt"], env=env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         deadline = time.monotonic() + 120
         grown = False
         while time.monotonic() < deadline and folder.poll() is None:
-            watcher.stdin.write("SELECT pg_relation_size('docs_idx');\n")
+            watcher.stdin.write("SELECT pg_relation_size('docs_idx'), coalesce((SELECT pid FROM pg_stat_activity "
+                                "WHERE application_name = 'stannum-folder'), 0);\n")
             watcher.stdin.flush()
-            line = watcher.stdout.readline().strip()
-            if line.isdigit() and int(line) >= size + 32 * 8192:
+            current, _, pid = watcher.stdout.readline().strip().partition("|")
+            if current.isdigit() and int(current) >= size + 32 * 8192 and int(pid or 0) > 0:
+                os.kill(int(pid), signal.SIGKILL)
                 grown = True
                 break
         watcher.kill()
@@ -180,9 +192,18 @@ def crash_between_run_write_and_publication(sql, command, env, data, root, start
         assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx', true) WHERE severity = 'error'") == "0"
         free_after = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0"))
         assert free_after >= free_before + orphans, (free_before, free_after, orphans)
-        # The interrupted promotion repeats and takes the reclaimed pages first.
-        sql("SELECT stannum.promote('docs_idx')")
-        assert int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0")) < free_after
+        reclaimed = sql("SELECT string_agg(blkno::text, ',') FROM pg_freespace('docs_idx') WHERE avail > 0")
+        # The interrupted promotion repeats and takes the reclaimed pages
+        # first. The insert seals the write buffer if the seal was lost, and
+        # promote() then promotes the sealed segment either way.
+        sql("""SET stannum.index_maintenance_mode=manual; SET stannum.write_buffer_docs=1;
+            INSERT INTO docs VALUES (98000, 'orphan'); SELECT stannum.promote('docs_idx');""")
+        assert sql("SELECT count(*) FROM stannum.segment_info('docs_idx') WHERE kind = 'sealed'") == "0"
+        # Pages taken leave the free space map at once; other pages the
+        # promotion frees may join it, so count only the reclaimed ones.
+        still_free = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') "
+                             "WHERE avail > 0 AND blkno = ANY('{%s}'::bigint[])" % reclaimed))
+        assert still_free < free_after, (still_free, free_after)
         assert sql(page_warnings) == "0"
         return orphans
     raise AssertionError("no crash attempt interrupted a run write: %s" % root)
