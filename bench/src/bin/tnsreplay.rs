@@ -34,7 +34,8 @@
 //! disjunction's walk from a warm-up instead (within the timed walk): the
 //! `k` best of a ranked AND of its two scoring terms of highest bound over
 //! the first segment, scored as OR rows and kept as seeded rows are; FILE
-//! gets per query the threshold they give and the final one.
+//! gets per query the threshold they give and the final one;
+//! `--warm-untimed` takes it before the timed walks (a free warm-up).
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -90,6 +91,9 @@ struct Args {
     /// kept as `--seed` keeps the final ones (`--warm FILE` writes, per
     /// query, the threshold they give against the final one).
     warm: Option<PathBuf>,
+    /// `--warm-untimed`: the warm-up taken before the timed walks, which
+    /// time only the walk it starts (what a free warm-up would save).
+    warm_untimed: bool,
     out: Option<PathBuf>,
 }
 
@@ -114,7 +118,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE] [--timed-walk] [--out FILE]"
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE]"
     );
     std::process::exit(2)
 }
@@ -142,6 +146,7 @@ fn args() -> Args {
         order: SegmentOrder::Engine,
         timed_walk: false,
         warm: None,
+        warm_untimed: false,
         out: None,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
@@ -167,6 +172,7 @@ fn args() -> Args {
             "--per-query" => a.per_query = Some(value(&mut it).into()),
             "--timed-walk" => a.timed_walk = true,
             "--warm" => a.warm = Some(value(&mut it).into()),
+            "--warm-untimed" => a.warm_untimed = true,
             "--per-segment" => a.per_segment = Some(value(&mut it).into()),
             "--order" => {
                 a.order = match value(&mut it).as_str() {
@@ -1186,6 +1192,11 @@ fn run() -> Result<bool, String> {
         let memo = segment::tinshape::segment::memo_counts();
         let mut times = Vec::with_capacity(args.repeat);
         let (mut scorer_allocs, mut walk_allocs) = (Allocs::default(), Allocs::default());
+        let untimed = (args.warm.is_some() && args.warm_untimed).then(|| {
+            reader
+                .warm(&scorer, args.k, args.order, &answer)
+                .unwrap_or_default()
+        });
         let counters0 = process_counters();
         for _ in 0..args.repeat {
             let at = Instant::now();
@@ -1193,9 +1204,12 @@ fn run() -> Result<bool, String> {
             let scorer = reader.scorer(&q.text)?;
             let a1 = Allocs::now();
             if args.timed_walk && args.warm.is_some() {
-                let warm = reader
-                    .warm(&scorer, args.k, args.order, &answer)
-                    .unwrap_or_default();
+                let warm = match &untimed {
+                    Some(warm) => (warm.0.clone(), Default::default()),
+                    None => reader
+                        .warm(&scorer, args.k, args.order, &answer)
+                        .unwrap_or_default(),
+                };
                 std::hint::black_box(reader.walked(
                     &scorer,
                     args.k,
