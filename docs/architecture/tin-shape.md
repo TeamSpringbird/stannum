@@ -1105,6 +1105,32 @@ The memos count a kept record at what its directory holds (its bytes, and
 its entries decoded so far) and count it again when it is used again and
 before records are dropped.
 
+At 150M rows (branch `loop/lazy-dir`, against `e9f4506`, which decoded
+every entry; all answers the same, the ranked oracle 0 differing):
+
+- Replay with `--forget` (every pass parses again), 400 queries per style,
+  2 rounds: entries decoded per query 198,000 -> 104,000 (conjunction);
+  cycles -10.2% (conjunction), -7.2% (phrase), -1.2% (disjunction), -6.6%,
+  -2.3% and +3.1% under `full_score` (whose disjunctions reach every entry);
+  median query -26% (conjunction), -15% (phrase); instructions +2 to +5%
+  (the skim is paid for every entry).
+- `vm_ab`, eight clients, 2 rounds: backend CPU per query -4.9%
+  (conjunction), -3.7% (phrase), -1.8% (mixed), +0.2% (disjunction); under
+  `full_score` -2.1%, -1.8%, +0.4% and +0.6%. An identical-binary arm agreed
+  within 0.4%.
+- One backend against the layout 6 build (`e0616a0` on its database), PGO
+  images: a conjunction's mean CPU +8.4% -> -0.8%, its median query x1.36 ->
+  x1.20 (+0.87 -> +0.34 ms); phrase +1.4% -> -2.5%, x1.34 -> x1.19.
+  Conjunctions that took the old build under 3 ms: 1.28 / 2.37 / 1.62 ms
+  (old, `e9f4506`, lazy), directory entries decoded 118,900 -> 32,600 of
+  39,400 reached, records reused 29.7 -> 34.9 a query (the old build 39.2:
+  a kept record now counts only what it decoded).
+
+The skim is the floor while containers are found from the directory's end:
+a directory length in the record's header would let a walk skip the rest
+of the directory entirely (a format change, not made). On x86-64 the scan
+has an SSSE3 body, measured under Rosetta only.
+
 CPU in the replay (2 rounds, 400 queries per style, instructions retired)
 against the base without its footer memo (the replay repeats each query five
 times, which the memo amortizes as the server's driver order does not):

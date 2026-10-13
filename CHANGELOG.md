@@ -239,7 +239,9 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   where its whole entries end, is skimmed when parsed and its entries
   decoded 128 at a time as a walk reaches them, from a scan of where its
   varints start, without a branch on their lengths: at 150M rows a cheap
-  conjunction's walk reaches a third of its terms' entries), and
+  conjunction decodes 33,000 entries where it decoded 119,000, and one
+  backend's median conjunction takes 1.20 times the layout 6 build's CPU
+  where it took 1.36), and
   `EXPLAIN ANALYZE` counts records parsed, kept and forgotten and footers
   decoded and kept. Together, at eight clients, backend CPU per query falls
   17% (conjunction), 8% (disjunction) and 16% (phrase), for the same

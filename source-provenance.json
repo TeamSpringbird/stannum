@@ -56,6 +56,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ranked trace replay over dumped TNS1 segments, read in place as the extension reads them."
     },
+    "bench/src/bin/tnsdirskim.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the per-entry cost of skimming and decoding a dumped TNS1 segment's group directories, against decoding them a varint at a time."
+    },
     "bench/src/bin/tnsdocsets.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the decoded size and decode time of each dumped TNS1 segment's document set, as a backend's reader cache keeps them."
