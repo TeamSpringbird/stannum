@@ -56,6 +56,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ranked trace replay over dumped TNS1 segments, read in place as the extension reads them."
     },
+    "bench/src/bin/tnsdocsets.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the decoded size and decode time of each dumped TNS1 segment's document set, as a backend's reader cache keeps them."
+    },
     "bench/src/bin/tnsfootcensus.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a census of a dumped TNS1 segment's records by form and df band (footer, directory, container, TF and inline-length bytes)."

@@ -5,7 +5,7 @@
 
 """Interleaved A/B of images on a saved database, counted in instructions.
 
-    vm_ab.py --data COPY_OF_DB --queries queries.json --out DIR [options] IMAGE...
+    vm_ab.py --data COPY_OF_DB --queries queries.json --out DIR [options] IMAGE[+NAME=VALUE...]...
 
 On a Mac, a backend's CPU time inside the Docker VM swings by about 10%
 between runs with the same binary, with the cores and clock the VM's vCPUs
@@ -30,7 +30,8 @@ until no other container is above BUSY_LIMIT percent (default 50), giving
 up after BUSY_WAIT seconds; a window in which one went above it is
 discarded and repeated. Keep the VM otherwise quiet; a 150M server should
 hold the machine's 150M lock (see README). Use an identical binary as one
-of the arms to see the noise floor. --full ranks with stannum.full_score.
+of the arms to see the noise floor. An arm may add server settings to its
+image, IMAGE+NAME=VALUE (each a `postgres -c`), to A/B a setting. --full ranks with stannum.full_score.
 
 --data is mounted at /var/lib/postgresql as the benchmark's volume is; give
 it a COPY of a saved database (`tin.py run --save-database`), since the
@@ -108,7 +109,21 @@ def connect(port, password):
                            password=password, autocommit=True)
 
 
-def start_server(args, image, password):
+def arm_settings(arm):
+    """An arm's image and its server settings: IMAGE[+NAME=VALUE...], each
+    setting passed as `postgres -c NAME=VALUE` (for example
+    stannum-bench:x+stannum.own_pins=off, to A/B a setting on one image)."""
+    image, *settings = arm.split("+")
+    flags = []
+    for setting in settings:
+        if "=" not in setting:
+            sys.exit(f"{arm}: a setting is NAME=VALUE")
+        flags += ["-c", setting]
+    return image, flags
+
+
+def start_server(args, arm, password):
+    image, settings = arm_settings(arm)
     subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)
     for pid in Path(args.data).glob("*/docker/postmaster.pid"):
         pid.unlink()
@@ -116,7 +131,7 @@ def start_server(args, image, password):
                     "--memory", args.memory, "--memory-swap", args.memory, "--shm-size", "1g",
                     "-p", f"127.0.0.1:{args.port}:5432", "-v", f"{args.data}:/var/lib/postgresql",
                     "-e", "POSTGRES_PASSWORD", image, "postgres", "-c", f"shared_buffers={args.shared_buffers}",
-                    "-c", "work_mem=16MB", "-c", "jit=off", "-c", "autovacuum=off"],
+                    "-c", "work_mem=16MB", "-c", "jit=off", "-c", "autovacuum=off", *settings],
                    check=True, capture_output=True, env=dict(os.environ, POSTGRES_PASSWORD=password))
     while subprocess.run(["docker", "exec", CONTAINER, "pg_isready", "-U", "postgres"],
                          capture_output=True).returncode:

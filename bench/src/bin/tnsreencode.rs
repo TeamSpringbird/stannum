@@ -866,7 +866,12 @@ fn census(args: &Args, names: &[String]) {
             eprintln!("{name}: {e}");
             std::process::exit(1)
         });
-        let old = regrid(&blob).and_then(|b| Census::of(&b));
+        // A source already of version 9 (a dump of a fresh build) is
+        // counted as it is.
+        let old = match regrid(&blob) {
+            Ok(regridded) => Census::of(&regridded),
+            Err(_) => Census::of(&blob),
+        };
         drop(blob);
         let new = std::fs::read(args.output.join(name))
             .map_err(|e| e.to_string())

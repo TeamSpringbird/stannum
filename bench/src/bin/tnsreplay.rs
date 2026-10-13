@@ -61,6 +61,11 @@ struct Args {
     repeat: usize,
     limit: Option<usize>,
     keep: bool,
+    /// Before every pass of a query (the answer's and each timed one),
+    /// every segment forgets the records and footers it parsed: each pass
+    /// pays for parsing its terms' metadata, as a backend does for a term
+    /// its memos do not hold (see [`Reader::forget`]).
+    forget: bool,
     /// Rank as `stannum.full_score(ctid)` does: no dense term elided.
     full: bool,
     memory: bool,
@@ -104,7 +109,7 @@ enum SegmentOrder {
 fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
-         [--repeat N] [--limit N] [--memory [--keep]] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
+         [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
          [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--timed-walk] [--out FILE]"
     );
     std::process::exit(2)
@@ -121,6 +126,7 @@ fn args() -> Args {
         repeat: 3,
         limit: None,
         keep: false,
+        forget: false,
         full: false,
         memory: false,
         seed: false,
@@ -145,6 +151,7 @@ fn args() -> Args {
             "--repeat" => a.repeat = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--limit" => a.limit = Some(value(&mut it).parse().unwrap_or_else(|_| usage())),
             "--keep" => a.keep = true,
+            "--forget" => a.forget = true,
             "--full" => a.full = true,
             "--memory" => a.memory = true,
             "--seed" => a.seed = true,
@@ -654,6 +661,13 @@ impl Reader {
         })
     }
 
+    /// Every segment forgets the records and footers it parsed (`--forget`).
+    fn forget(&self) {
+        for seg in &self.segs {
+            seg.segment.shed(0);
+        }
+    }
+
     fn scorer(&self, text: &str) -> Result<Scorer, String> {
         let query = parse_tinql_to_query(text, &self.tokenizer).map_err(|e| e.to_string())?;
         let scoring =
@@ -1100,6 +1114,9 @@ fn run() -> Result<bool, String> {
         // Warm pass (also the answer, and what it decoded of the terms'
         // metadata), then timed passes.
         segment::tinshape::segment::reset_memo_counts();
+        if args.forget {
+            reader.forget();
+        }
         let Some(answer) = reader.ranked(&scorer, args.k) else {
             unsupported += 1;
             continue;
@@ -1109,6 +1126,9 @@ fn run() -> Result<bool, String> {
         let (mut scorer_allocs, mut walk_allocs) = (Allocs::default(), Allocs::default());
         let counters0 = process_counters();
         for _ in 0..args.repeat {
+            if args.forget {
+                reader.forget();
+            }
             let at = Instant::now();
             let a0 = Allocs::now();
             let scorer = reader.scorer(&q.text)?;
