@@ -6,7 +6,7 @@
 # walk over page layout version 8. SRC1 (A, the version-6 base) replays the
 # dump in S3; SRC2 (B, layout 8) re-encodes it on the box with its own
 # `tnsreencode` into /data/dump150m-v8, which SRC2 and SRC3 (C, the
-# candidate) replay. Interleaved (A B C for score, C B A for full_score), one
+# candidate) replay. Interleaved (B C for score, C B A for full_score), one
 # round, three styles (score 300 queries, full_score 200), under perf stat:
 # about 80 minutes of box time.
 #   devbox.sh --branch BASE --branch V8 --branch CANDIDATE --dump --cmd-file benchmarks/aws/devbox-tail-ab.sh
@@ -30,7 +30,7 @@ for x in A B C; do bin=$(eval echo \$$x)
 done
 for mode in score full; do
   for st in conjunction disjunction phrase; do
-    order="A B C"; [ $mode = full ] && order="C B A"
+    order="B C"; [ $mode = full ] && order="C B A"
     extra=""; limit=300; [ $mode = full ] && { extra="--full"; limit=200; }
     for x in $order; do bin=$(eval echo \$$x)
       tag=r1-$x-$mode-$st
