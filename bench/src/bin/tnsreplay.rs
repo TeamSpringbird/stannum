@@ -11,7 +11,7 @@
 //! cargo run -p bench --release --bin tnsreplay -- --dump DIR --trace trace.tsv \
 //!     [--expect pg.tsv] [--style S] [--k 10] [--repeat 3] [--limit N] \
 //!     [--keep] [--threads N] [--seconds S] [--per-query FILE] [--out FILE] \
-//!     [--per-segment FILE] [--order O] [--seed] [--timed-walk]
+//!     [--per-segment FILE] [--order O] [--seed] [--warm FILE] [--timed-walk]
 //! ```
 //!
 //! Each segment is read from memory and kept across queries with its
@@ -30,7 +30,12 @@
 //! counters there; `--order` walks the segments in another order than the
 //! engine's (largest first); `--seed` starts it from the final rows (found
 //! again, they are not kept twice); `--timed-walk` times that pass, without
-//! pages, instead of the extension's path.
+//! pages, instead of the extension's path. `--warm FILE` starts a
+//! disjunction's walk from a warm-up instead (within the timed walk): the
+//! `k` best of a ranked AND of its two scoring terms of highest bound over
+//! the first segment, scored as OR rows and kept as seeded rows are; FILE
+//! gets per query the threshold they give and the final one;
+//! `--warm-untimed` takes it before the timed walks (a free warm-up).
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -86,6 +91,14 @@ struct Args {
     /// Time the instrumented pass's walk (a segment at a time in `order`,
     /// seeded with `--seed`) rather than the extension's path.
     timed_walk: bool,
+    /// Before a disjunction's walks, a ranked AND of its two highest-bound
+    /// scoring terms over the first segment, its rows scored as OR rows and
+    /// kept as `--seed` keeps the final ones (`--warm FILE` writes, per
+    /// query, the threshold they give against the final one).
+    warm: Option<PathBuf>,
+    /// `--warm-untimed`: the warm-up taken before the timed walks, which
+    /// time only the walk it starts (what a free warm-up would save).
+    warm_untimed: bool,
     out: Option<PathBuf>,
 }
 
@@ -110,7 +123,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--timed-walk] [--out FILE]"
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE]"
     );
     std::process::exit(2)
 }
@@ -138,6 +151,8 @@ fn args() -> Args {
         per_segment: None,
         order: SegmentOrder::Engine,
         timed_walk: false,
+        warm: None,
+        warm_untimed: false,
         out: None,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
@@ -163,6 +178,8 @@ fn args() -> Args {
             "--seconds" => a.seconds = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--per-query" => a.per_query = Some(value(&mut it).into()),
             "--timed-walk" => a.timed_walk = true,
+            "--warm" => a.warm = Some(value(&mut it).into()),
+            "--warm-untimed" => a.warm_untimed = true,
             "--per-segment" => a.per_segment = Some(value(&mut it).into()),
             "--order" => {
                 a.order = match value(&mut it).as_str() {
@@ -814,6 +831,71 @@ impl Reader {
         Some(top.into_rows())
     }
 
+    /// The warm-up rows of a disjunction (`--warm`): the `k` best of a
+    /// ranked AND of its two scoring terms of highest bound (their segment's
+    /// largest bucket at length 0) over the first segment `order` visits,
+    /// each scored as the OR scores it (every scoring term), with what the
+    /// AND did. Empty for any other shape, or with fewer than two of the
+    /// terms in that segment.
+    fn warm(
+        &self,
+        scorer: &Scorer,
+        k: usize,
+        order: SegmentOrder,
+        answer: &[(f32, Tid)],
+    ) -> Option<(Vec<(f32, Tid)>, tin::RankedAnswer)> {
+        let mut names = Vec::new();
+        let node = tin::lower(&scorer.query, &mut names)?;
+        if !matches!(node, tin::Node::Or(_)) {
+            return Some(Default::default());
+        }
+        let first = *self.visit(&names, scorer, order, answer).first()?;
+        let seg = &self.segs[first];
+        let mut weighed: Vec<(f32, usize)> = Vec::new();
+        for (i, (name, term)) in scorer.terms.iter().enumerate() {
+            if let Ok(Some(entry)) = seg.reader.term_entry(name)
+                && let Some(bucket) = segment::tf_bucket::TfBucket::new(entry.max_tf_bucket)
+            {
+                weighed.push((term.bound_through(bucket, 0), i));
+            }
+        }
+        if weighed.len() < 2 {
+            return Some(Default::default());
+        }
+        weighed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let pair: Vec<(String, engine::bm25::TermScorer)> = weighed[..2]
+            .iter()
+            .map(|&(_, i)| scorer.terms[i].clone())
+            .collect();
+        let and = tin::Node::And(
+            pair.iter()
+                .map(|(name, _)| {
+                    tin::Node::Term(names.iter().position(|n| n == name).expect("a query term"))
+                })
+                .collect(),
+        );
+        seg.with(&names, |segment| {
+            let mut top = TopRows::new(k, false);
+            let a = tin::top_k_into(
+                segment,
+                &and,
+                &names,
+                &pair,
+                &mut top,
+                &mut AllVisible,
+                &mut NoTouch,
+            )?;
+            let mut rows = Vec::with_capacity(k);
+            for (_, tid) in top.into_rows() {
+                if let Some(score) = tin::score_at(segment, &scorer.terms, tid)? {
+                    rows.push((score, tid));
+                }
+            }
+            Ok((rows, a))
+        })
+        .ok()
+    }
+
     /// The segments in `order`.
     fn visit(
         &self,
@@ -1107,6 +1189,9 @@ fn run() -> Result<bool, String> {
         start.elapsed().as_secs_f64()
     );
     let mut rows = Vec::new();
+    let mut warm_out = String::from(
+        "name\tstyle\twarm_rows\ttheta_warm\ttheta_final\twarm_in_final\tand_examined\tand_scored\n",
+    );
     let mut unsupported = 0usize;
     let mut mismatched = 0usize;
     for (n, q) in trace.iter().enumerate() {
@@ -1124,6 +1209,11 @@ fn run() -> Result<bool, String> {
         let memo = segment::tinshape::segment::memo_counts();
         let mut times = Vec::with_capacity(args.repeat);
         let (mut scorer_allocs, mut walk_allocs) = (Allocs::default(), Allocs::default());
+        let untimed = (args.warm.is_some() && args.warm_untimed).then(|| {
+            reader
+                .warm(&scorer, args.k, args.order, &answer)
+                .unwrap_or_default()
+        });
         let counters0 = process_counters();
         for _ in 0..args.repeat {
             if args.forget {
@@ -1133,7 +1223,21 @@ fn run() -> Result<bool, String> {
             let a0 = Allocs::now();
             let scorer = reader.scorer(&q.text)?;
             let a1 = Allocs::now();
-            if args.timed_walk {
+            if args.timed_walk && args.warm.is_some() {
+                let warm = match &untimed {
+                    Some(warm) => (warm.0.clone(), Default::default()),
+                    None => reader
+                        .warm(&scorer, args.k, args.order, &answer)
+                        .unwrap_or_default(),
+                };
+                std::hint::black_box(reader.walked(
+                    &scorer,
+                    args.k,
+                    Some(warm.0.as_slice()),
+                    args.order,
+                    &answer,
+                ));
+            } else if args.timed_walk {
                 std::hint::black_box(reader.walked(
                     &scorer,
                     args.k,
@@ -1157,12 +1261,43 @@ fn run() -> Result<bool, String> {
             refs.hash_ops
         });
         segment::tinshape::blob::reset_stats();
+        let warm = match &args.warm {
+            Some(_) => {
+                let (rows, a) = reader
+                    .warm(&scorer, args.k, args.order, &answer)
+                    .ok_or("a warm-up failed")?;
+                let theta = |r: &[(f32, Tid)]| {
+                    let mut s: Vec<f32> = r.iter().map(|x| x.0).collect();
+                    s.sort_by(|a, b| b.total_cmp(a));
+                    s.get(args.k - 1).copied()
+                };
+                let fmt = |t: Option<f32>| t.map_or("-".to_owned(), |t| t.to_string());
+                let kept = rows
+                    .iter()
+                    .filter(|r| answer.iter().any(|x| x.1 == r.1))
+                    .count();
+                let _ = writeln!(
+                    warm_out,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    q.name,
+                    q.style,
+                    rows.len(),
+                    fmt(theta(&rows)),
+                    fmt(theta(&answer)),
+                    kept,
+                    a.candidates,
+                    a.scored
+                );
+                Some(rows)
+            }
+            None => None,
+        };
         let (direct, counters, segments) = reader
             .instrumented(
                 &scorer,
                 args.k,
                 &mut pages,
-                args.seed.then_some(answer.as_slice()),
+                warm.as_deref().or(args.seed.then_some(answer.as_slice())),
                 args.order,
                 &answer,
             )
@@ -1193,6 +1328,9 @@ fn run() -> Result<bool, String> {
         }
     }
     let _ = NoTouch;
+    if let Some(path) = &args.warm {
+        std::fs::write(path, &warm_out).map_err(|e| e.to_string())?;
+    }
     // Answers and the comparison.
     let tids: FxHashSet<Tid> = rows
         .iter()
