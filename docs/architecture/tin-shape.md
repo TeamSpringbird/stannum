@@ -117,8 +117,10 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
                                                  dictionary's largest bucket)
          | sparse:  form u8, [footer_len], payload_len, [lengths_len],
                     [footer], list, [lengths], tf
-         | grouped: form u8, payload_len, [lengths_len],
+         | grouped: form u8, directory_len, payload_len, [lengths_len],
                     directory, container*, [lengths], tf
+                    (directory_len: the bytes of the payload before its
+                    containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
            (sparse), | 0x10 when the frontiers' lengths are rounded (grouped)
 lengths := base varint, width u8, (length - base) packed at width, by posting
