@@ -1327,6 +1327,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// nearly all, which says nothing of what it drops.
     sieve_pre: bool,
     sieve_prefix: Vec<u32>,
+    /// [`Walk::sieve_words`]' scratch: the first term's buckets gathered
+    /// from the TF tail, and their pass bits.
+    sieve_fields: Vec<u64>,
+    sieve_pass: Vec<u64>,
     sieve_locals: Vec<u32>,
     sieve_left: Vec<u32>,
     words: Vec<u64>,
@@ -1946,39 +1950,47 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         } else {
             e.tf_bit as usize - from * 8
         };
-        let mask = (1u64 << width) - 1;
+        // The members' ranks the candidates need: from the first member of
+        // the first word holding a candidate member (`lo`) to the last
+        // candidate member (`hi`, past it).
         let (mut run, mut lo, mut hi) = (0u32, u32::MAX, 0u32);
-        let mut dropped = 0u64;
-        for (w, word) in words.iter_mut().enumerate() {
+        for (w, &c) in words.iter().enumerate() {
             let m = bits::word(bytes, w);
-            let c = *word;
-            if c != 0 {
-                let mut out = c & !m & absent;
-                let mut held = c & m;
-                if held != 0 {
-                    lo = lo.min(run);
-                }
-                while held != 0 {
-                    let bit = held.trailing_zeros();
-                    held &= held - 1;
-                    let place = run + (m & ((1u64 << bit) - 1)).count_ones();
-                    let at = start + place as usize * width as usize;
-                    let value = match tail.get(at / 8..at / 8 + 8) {
-                        Some(chunk) => {
-                            let chunk = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
-                            (chunk >> (at % 8) & mask) as u32
-                        }
-                        None if width == 0 => 0,
-                        None => bits::get_at(tail, at, width)?,
-                    };
-                    out |= u64::from(pass >> value.min(BUCKET_COUNT as u32) & 1) << bit;
-                    hi = place + 1;
-                }
-                dropped += u64::from((c & !out).count_ones());
-                *word = out;
+            let held = c & m;
+            if held != 0 {
+                lo = lo.min(run);
+                hi = run + (m & (u64::MAX >> held.leading_zeros())).count_ones();
             }
             run += m.count_ones();
         }
+        // Their buckets as pass bits, a bit per rank from `lo` (a word to
+        // spare), laid onto the candidate words: a 4-bit field's by a table
+        // lookup, a word's members' bits deposited at once.
+        self.sieve_pass.clear();
+        if lo < hi {
+            let n = (hi - lo) as usize;
+            let out_words = n.div_ceil(64);
+            self.sieve_fields.clear();
+            if width > 0 {
+                let end = start + hi as usize * width as usize;
+                if end.div_ceil(8) > tail.len() {
+                    return Err(Error::Corrupt("a group's buckets past the TF tail"));
+                }
+                let at = start + lo as usize * width as usize;
+                kernels::gather_bits(tail, at, n * width as usize, &mut self.sieve_fields);
+                self.sieve_fields.resize(out_words * width as usize, 0);
+            }
+            self.sieve_pass.resize(out_words + 1, 0);
+            // Every bucket a field holds is at most 15, below the table's.
+            const _: () = assert!(BUCKET_COUNT >= 16);
+            kernels::pass_bits(
+                &self.sieve_fields,
+                width,
+                pass as u16,
+                &mut self.sieve_pass[..out_words],
+            );
+        }
+        let dropped = kernels::deposit_pass(words, bytes, &self.sieve_pass, lo, absent);
         if width > 0 && lo < hi {
             let (a, b) = (
                 start + lo as usize * width as usize,
@@ -3023,6 +3035,8 @@ pub(super) fn walk_into<'s, 'a>(
         sieve_depth: 0,
         sieve_pre: false,
         sieve_prefix: Vec::new(),
+        sieve_fields: Vec::new(),
+        sieve_pass: Vec::new(),
         sieve_locals: Vec::new(),
         sieve_left: Vec::new(),
         words: Vec::new(),
