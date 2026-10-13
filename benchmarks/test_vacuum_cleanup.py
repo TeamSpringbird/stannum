@@ -113,6 +113,8 @@ class CleanupAccountingTests(unittest.TestCase):
     def test_sparse_dead_entries_are_not_live_documents(self):
         validate_cleanup([dict(docs=15, dead_docs=7)], 8)
         validate_cleanup([], 0)
+        validate_cleanup([dict(kind='immutable', docs=15, dead_docs=7),
+                          dict(kind='retired', docs=4096, dead_docs=0)], 8)
 
     def test_unaccounted_or_missing_live_documents_fail(self):
         for docs, dead in ((15, 0), (15, 6), (15, 8), (7, 0), (8, -1), (8, 9)):

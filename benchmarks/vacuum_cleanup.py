@@ -218,9 +218,16 @@ def sample_rss(pid, stop, ready, samples, errors):
         errors.append(str(error))
 
 
-def validate_cleanup(segments, remaining):
+def live_segments(rows):
+    """segment_info's rows minus the retired sources it lists for display
+    until their pages are reclaimed; they hold no documents queries read."""
+    return [s for s in rows if s.get('kind') != 'retired']
+
+
+def validate_cleanup(rows, remaining):
     """Validate the quiescent cleanup accounting."""
-    assert len(segments) == (1 if remaining else 0), segments
+    segments = live_segments(rows)
+    assert len(segments) == (1 if remaining else 0), rows
     assert all(0 <= s['dead_docs'] <= s['docs'] for s in segments), segments
     assert sum(s['docs'] - s['dead_docs'] for s in segments) == remaining, segments
 
@@ -402,10 +409,11 @@ ANALYZE docs;"""
         during = summarize_logs([output / 'overlap.log'], names, vacuum_seconds)
         after = json.loads(sql("SELECT coalesce(json_agg(row_to_json(s)), '[]'::json) FROM stannum.segment_info('docs_idx') s"))
         save(output / 'after.json', after)
-        assert len(after) == (1 if remaining else 0), after
+        live = live_segments(after)
+        assert len(live) == (1 if remaining else 0), after
         # A concurrent reader can prevent heap pruning. Those CTIDs were not
         # reported dead to the index AM, even if their rows are no longer visible.
-        assert remaining <= sum(s['docs'] - s['dead_docs'] for s in after) <= args.docs, after
+        assert remaining <= sum(s['docs'] - s['dead_docs'] for s in live) <= args.docs, after
         assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx',true)") == '0'
         assert sql("SELECT count(*) FROM docs WHERE body ==> 'common AND w7'") == str(expected)
         assert sql(f"""WITH actual AS MATERIALIZED (SELECT id FROM docs WHERE body ==> 'common AND w7'),
