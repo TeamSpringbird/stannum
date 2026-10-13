@@ -72,10 +72,12 @@ pub struct Group {
     pub rank_base: u32,
     /// Its slots: the sum of its pages' widths.
     slot_count: u32,
-    /// Where its page starts (`pages + 1` of them) and its word hints begin
-    /// in the geometry's tables.
+    /// Where its page starts (`pages + 1` of them), its words of page marks
+    /// and their ranks, and its non-empty pages begin in the geometry's
+    /// tables.
     starts_at: u32,
-    hints_at: u32,
+    words_at: u32,
+    filled_at: u32,
 }
 
 impl Group {
@@ -107,9 +109,13 @@ pub struct Geometry {
     /// Per group, the local slot each page of its span starts at, then its
     /// slot count: `pages + 1` entries, ascending.
     starts: Vec<u32>,
-    /// Per group, per 64-slot word of a bitmap over it, the page (of its
-    /// span) the word's first slot is on: where a slot's page search starts.
-    hints: Vec<u8>,
+    /// Per group, a bitmap over its slots marking each non-empty page's
+    /// first slot; per word of it, the pages marked in earlier words; and
+    /// the span index of each non-empty page in order. A slot's page is the
+    /// marks up to it counted: a popcount, no search.
+    marks: Vec<u64>,
+    marks_before: Vec<u16>,
+    filled: Vec<u8>,
 }
 
 impl Geometry {
@@ -176,14 +182,20 @@ impl Geometry {
             slots += u32::from(*width);
         }
         self.starts.push(slots);
-        let hints_at = self.hints.len();
-        let starts = &self.starts[starts_at..];
-        let mut page = 0usize;
-        for word in 0..slots.div_ceil(64) {
-            while starts[page + 1] <= word * 64 {
-                page += 1;
+        let (words_at, filled_at) = (self.marks.len(), self.filled.len());
+        let words = (slots as usize).div_ceil(64);
+        self.marks.resize(words_at + words, 0);
+        for (page, width) in widths.iter().enumerate() {
+            if *width > 0 {
+                let start = self.starts[starts_at + page] as usize;
+                self.marks[words_at + start / 64] |= 1 << (start % 64);
+                self.filled.push(page as u8);
             }
-            self.hints.push(page as u8);
+        }
+        let mut before = 0u16;
+        for w in 0..words {
+            self.marks_before.push(before);
+            before += self.marks[words_at + w].count_ones() as u16;
         }
         let slot_base = self.slots;
         self.slots = slot_base
@@ -197,7 +209,8 @@ impl Geometry {
             rank_base,
             slot_count: slots,
             starts_at: starts_at as u32,
-            hints_at: hints_at as u32,
+            words_at: words_at as u32,
+            filled_at: filled_at as u32,
         });
         Ok(())
     }
@@ -233,26 +246,19 @@ impl Geometry {
     }
 
     /// The page (of its span) holding local slot `local` of group `index`:
-    /// from the page its word starts on, a step per page start in the word
-    /// (pages are a few dozen slots wide). A slot past the group's (a
-    /// corrupt container's) falls on its last page.
+    /// the non-empty pages starting at or before it, counted by a popcount
+    /// of the page marks. A slot past the group's (a corrupt container's)
+    /// falls on its last page.
     #[inline]
     pub fn page_of(&self, index: usize, local: u32) -> usize {
         let group = &self.groups[index];
-        let starts = self.starts(index);
-        let last = starts.len() - 2;
-        let hint = self
-            .hints
-            .get(group.hints_at as usize + local as usize / 64)
-            .filter(|_| local < group.slot_count);
-        let Some(&hint) = hint else {
-            return last;
-        };
-        let mut page = usize::from(hint);
-        while starts[page + 1] <= local {
-            page += 1;
+        if local >= group.slot_count {
+            return usize::from(group.pages) - 1;
         }
-        page
+        let w = group.words_at as usize + local as usize / 64;
+        let through = self.marks[w] & (u64::MAX >> (63 - local % 64));
+        let k = usize::from(self.marks_before[w]) + through.count_ones() as usize - 1;
+        usize::from(self.filled[group.filled_at as usize + k])
     }
 
     /// The index of the group holding heap block `block`, if any.
@@ -327,7 +333,9 @@ impl Geometry {
     pub fn heap_bytes(&self) -> usize {
         self.groups.capacity() * std::mem::size_of::<Group>()
             + self.starts.capacity() * 4
-            + self.hints.capacity()
+            + self.marks.capacity() * 8
+            + self.marks_before.capacity() * 2
+            + self.filled.capacity()
     }
 }
 
@@ -885,6 +893,9 @@ mod tests {
             let starts = geometry.starts(0);
             assert!(starts[page] <= local && local < starts[page + 1]);
         }
+        // A slot past the group's (a corrupt container's) is on its last page.
+        let last = usize::from(geometry.groups[0].pages) - 1;
+        assert_eq!(geometry.page_of(0, geometry.groups[0].slots() + 70), last);
         check(&tids);
     }
 

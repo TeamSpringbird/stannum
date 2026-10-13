@@ -1587,7 +1587,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// threshold by far more than `f32` rounding can explain; then exactly,
     /// by [`Self::length_bound`].
     #[inline]
-    fn length_cut(&self, length: u32, tid: Tid) -> bool {
+    fn length_cut(&self, length: u32, tid: impl FnOnce() -> Tid) -> bool {
         let Some(theta) = self.threshold() else {
             return false;
         };
@@ -1595,7 +1595,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if nsum / (dmin + fmin * f64::from(length)) * (1.0 + 1e-5) < f64::from(theta) {
             return true;
         }
-        self.cut(self.length_bound(length), || tid)
+        self.cut(self.length_bound(length), tid)
     }
 
     /// What a document of `length` in the window scores at most: per
@@ -1693,10 +1693,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 break;
             }
             let (reach, local, _) = staged[i as usize];
-            let tid = self.geometry.tid_in(g as usize, local);
+            let geometry = self.geometry;
             // In this order (bound down, then ctid up) and with a bar that
             // only rises, every candidate after one cut is cut too.
-            if self.cut(reach, || tid) {
+            if self.cut(reach, || geometry.tid_in(g as usize, local)) {
                 break;
             }
             result = self.finish_one(g, &staged, i as usize);
@@ -1738,7 +1738,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(None);
         }
         self.answer.candidates += 1;
-        let tid = self.geometry.tid_in(g as usize, local);
+        // Its ctid only breaks a tie with the threshold's: most candidates
+        // never need it.
+        let geometry = self.geometry;
+        let tid = move || geometry.tid_in(g as usize, local);
         let staged = match self.inline {
             // The length alone, against the window's largest buckets, from
             // a rare required term's record that carries lengths.
@@ -1755,7 +1758,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     return Ok(None);
                 }
                 let reach = self.read_buckets(g, local, tid)?;
-                if self.cut(reach, || tid) || self.too_few() {
+                if self.cut(reach, tid) || self.too_few() {
                     return Ok(None);
                 }
                 // The length known, its buckets bound it at that length.
@@ -1771,7 +1774,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // candidates fell short on their buckets alone.
             None => {
                 let reach = self.read_buckets(g, local, tid)?;
-                if self.cut(reach, || tid) || self.too_few() {
+                if self.cut(reach, tid) || self.too_few() {
                     return Ok(None);
                 }
                 (reach, u32::MAX)
@@ -1860,7 +1863,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// others), and returns what the candidate can score at most by them:
     /// see [`Walk::reach`], taken only when each term's own bound (kept per
     /// block and bucket) leaves the candidate, of ctid `tid`, in reach.
-    fn read_buckets(&mut self, g: u32, local: u32, tid: Tid) -> Result<f32> {
+    fn read_buckets(&mut self, g: u32, local: u32, tid: impl Fn() -> Tid + Copy) -> Result<f32> {
         if self.common_terms {
             return self.read_buckets_common(g, local, tid);
         }
@@ -1894,7 +1897,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // Each term's own bound is at least the shared one: it prunes what
         // it can without a division per term, and is the shared one when
         // the terms' lengths agree.
-        if low >= floor || self.cut(own, || tid) {
+        if low >= floor || self.cut(own, tid) {
             return Ok(own);
         }
         Ok(self.reach(
@@ -1907,7 +1910,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// ([`Sc::make_common`]): their buckets last, only for a candidate the
     /// others' buckets leave in reach.
     #[inline(never)]
-    fn read_buckets_common(&mut self, g: u32, local: u32, tid: Tid) -> Result<f32> {
+    fn read_buckets_common(
+        &mut self,
+        g: u32,
+        local: u32,
+        tid: impl Fn() -> Tid + Copy,
+    ) -> Result<f32> {
         let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
         // Whether the candidate holds a common term, and whether a bucket
         // was read before its (else the common terms' window bounds are the
@@ -1944,13 +1952,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // Each term's own bound is at least the shared one: it prunes
             // what it can without a division per term, and is the shared one
             // when the terms' lengths agree.
-            if low >= floor || self.cut(own, || tid) {
+            if low >= floor || self.cut(own, tid) {
                 return Ok(own);
             }
         } else {
             // The common terms at their blocks' bounds, the others at their
             // buckets'.
-            if read && self.cut(own, || tid) {
+            if read && self.cut(own, tid) {
                 return Ok(own);
             }
             // Then their buckets, each bounded at its block's frontier as
@@ -1971,7 +1979,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     _ => own += self.held_bound[i],
                 }
             }
-            if low >= floor || self.cut(own, || tid) {
+            if low >= floor || self.cut(own, tid) {
                 return Ok(own);
             }
         }
@@ -2886,7 +2894,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
         self.answer.candidates += 1;
-        let tid = self.geometry.tid_in(g as usize, local);
+        // Its ctid only breaks a tie with the threshold's: most candidates
+        // never need it.
+        let geometry = self.geometry;
+        let tid = move || geometry.tid_in(g as usize, local);
         let mut bound = 0.0_f32;
         self.held_list.clear();
         for p in 0..self.present_list.len() {
@@ -2908,7 +2919,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 bound += v;
             }
         }
-        if self.cut(bound, || tid) {
+        if self.cut(bound, tid) {
             return Ok(None);
         }
         // The candidate's buckets, before its length is read (see
@@ -2952,7 +2963,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     reach += self.held_bound[h];
                 }
             }
-            if self.cut(reach, || tid) {
+            if self.cut(reach, tid) {
                 return Ok(None);
             }
         }

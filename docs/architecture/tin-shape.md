@@ -80,13 +80,18 @@ pages: 1.53 slots per document at 150M rows (17.9 rows a page), 1.61 on
 the Stack Exchange heap (20.5, 4 to 70). A page that lost rows to pruning
 keeps its holes as empty slots, as before.
 
-A slot's ctid is a short search: `Geometry` keeps per group its page starts
-(`starts(i)`, `p + 1` of them, the slot count last) and per 64-slot word the
-page its first slot is on, and `page_of` steps from there over the page
-starts in the word (three or four at 18 rows a page). Only a candidate's
-ctid (and a native cursor's position) needs it; word operations, counts,
-containers and ranks never do: a document's rank is a popcount of the
-document set's words, as before.
+A slot's ctid is a popcount: `Geometry` keeps per group its page starts
+(`starts(i)`, `p + 1` of them, the slot count last), a bitmap over its slots
+marking each non-empty page's first slot with, per word, the marks before
+it, and the span index of each non-empty page, so `page_of` counts the
+marks up to the slot (no search, no branch) and the offset is the slot less
+its page's start. Only a candidate's ctid (and a native cursor's position)
+needs it, and a ranked walk computes it only for a candidate it scores or
+whose bound ties the threshold: computed for every candidate examined, it
+cost a conjunction 3 to 5% of its cycles at 150M rows. Word operations,
+counts, containers and ranks never convert a slot: a document's rank is a
+popcount of the document set's words, as before; `each_tid` steps pages
+with the members of a bitmap.
 
 ### Document set and rank directory
 
