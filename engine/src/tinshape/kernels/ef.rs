@@ -69,9 +69,39 @@ use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local, group_slo
 /// Appends the list's values, in order.
 #[inline]
 pub fn ef_decode(ef: Ef<'_>, out: &mut Vec<u32>) {
-    if !short_decode(&ef, out) {
+    if !short_decode_at(level(), &ef, out) {
         ef_run!(level(), ef_decode(ef, out));
     }
+}
+
+/// [`short_decode`] at `level`: by the AVX-512 VBMI body where it runs and
+/// takes the list.
+#[inline(always)]
+fn short_decode_at(level: Level, ef: &Ef<'_>, out: &mut Vec<u32>) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the level and its VBMI features are the CPU's.
+    if level == Level::Avx512
+        && ef.len() < SHORT
+        && vbmi()
+        && unsafe { avx512::short_decode(ef, out) }
+    {
+        return true;
+    }
+    let _ = level;
+    short_decode(ef, out)
+}
+
+/// [`short_row`] at `level` (see [`short_decode_at`]).
+#[inline(always)]
+fn short_row_at(level: Level, ef: &Ef<'_>, row: &mut [u64]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: as in `short_decode_at`.
+    if level == Level::Avx512 && ef.len() < SHORT && vbmi() && unsafe { avx512::short_row(ef, row) }
+    {
+        return true;
+    }
+    let _ = level;
+    short_row(ef, row)
 }
 
 /// [`ef_decode`] at `level`; panics if the CPU lacks it.
@@ -81,7 +111,7 @@ pub fn ef_decode_at(level: Level, ef: Ef<'_>, out: &mut Vec<u32>) {
         "kernel level {} unsupported here",
         level.name()
     );
-    if !short_decode(&ef, out) {
+    if !short_decode_at(level, &ef, out) {
         ef_run!(level, ef_decode(ef, out));
     }
 }
@@ -91,7 +121,7 @@ pub fn ef_decode_at(level: Level, ef: Ef<'_>, out: &mut Vec<u32>) {
 /// not read. Panics if a value is past the row.
 #[inline]
 pub fn ef_into_row(ef: Ef<'_>, row: &mut [u64]) {
-    if !short_row(&ef, row) {
+    if !short_row_at(level(), &ef, row) {
         ef_run!(level(), ef_into_row(ef, row));
     }
 }
@@ -103,7 +133,7 @@ pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
         "kernel level {} unsupported here",
         level.name()
     );
-    if !short_row(&ef, row) {
+    if !short_row_at(level, &ef, row) {
         ef_run!(level, ef_into_row(ef, row));
     }
 }
@@ -1019,6 +1049,112 @@ mod avx512 {
     }
 
     passes!(#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]);
+
+    /// 0 to 15 as 32-bit lanes.
+    static IOTA32: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+    /// A short list's values (see [`super::short`]) as sixteen lanes, and
+    /// how many are its: the whole list read by one load masked at its end,
+    /// the highs word's set bits by `vpcompressb`, the low parts by
+    /// `vpermb`; no branch per member. `None` for a list it does not take:
+    /// [`super::SHORT`] values or more, highs past a word, or low parts
+    /// wider than [`super::WIDEST`].
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
+    #[inline]
+    fn short_values(ef: &Ef<'_>) -> Option<(__m512i, usize)> {
+        let (n, l, highs) = (ef.len(), ef.low_width(), ef.highs());
+        let bytes = super::lows_padded(ef);
+        if n >= super::SHORT || highs.len() > 8 || l > super::WIDEST || bytes.len() > 64 {
+            return None;
+        }
+        let at = ef.lows().len();
+        // SAFETY: the masked load reads only the list's bytes; the table
+        // loads are of whole rows.
+        unsafe {
+            let iota = _mm512_loadu_si512(IOTA.as_ptr().cast());
+            let all = _mm512_maskz_loadu_epi8(
+                _bzhi_u64(u64::MAX, bytes.len() as u32),
+                bytes.as_ptr().cast(),
+            );
+            // The highs' bytes moved down (those past the list are zeros).
+            let take = _mm512_add_epi8(iota, _mm512_set1_epi8(at as i8));
+            let word = _mm_cvtsi128_si64(_mm512_castsi512_si128(_mm512_permutexvar_epi8(take, all)))
+                as u64;
+            let count = n.min(word.count_ones() as usize);
+            let ranked = _mm512_sub_epi8(_mm512_maskz_compress_epi8(word, iota), iota);
+            let high = _mm512_cvtepu8_epi32(_mm512_castsi512_si128(ranked));
+            if l == 0 {
+                return Some((high, count));
+            }
+            let shape = &super::LOWS16[l as usize];
+            let low = _mm512_and_si512(
+                _mm512_srlv_epi32(
+                    _mm512_permutexvar_epi8(_mm512_loadu_si512(shape.take.as_ptr().cast()), all),
+                    _mm512_loadu_si512(shape.shift.as_ptr().cast()),
+                ),
+                _mm512_set1_epi32(((1u32 << l) - 1) as i32),
+            );
+            let up = _mm512_sll_epi32(high, _mm_cvtsi32_si128(l as i32));
+            Some((_mm512_or_si512(up, low), count))
+        }
+    }
+
+    /// [`super::short_decode`] of a list [`short_values`] takes; false for
+    /// another.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
+    pub fn short_decode(ef: &Ef<'_>, out: &mut Vec<u32>) -> bool {
+        let Some((values, count)) = short_values(ef) else {
+            return false;
+        };
+        out.reserve(16);
+        let len = out.len();
+        // SAFETY: sixteen lanes stored within the room reserved, `count`
+        // (at most sixteen) of them kept.
+        unsafe {
+            _mm512_storeu_si512(out.as_mut_ptr().add(len).cast(), values);
+            out.set_len(len + count);
+        }
+        true
+    }
+
+    /// [`super::short_row`] of a list [`short_values`] takes; false for
+    /// another. The lanes past the list's last repeat it, so that eight or
+    /// sixteen are set without a branch per member (setting a bit twice
+    /// is setting it).
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi,avx512vbmi2,bmi2,popcnt")]
+    pub fn short_row(ef: &Ef<'_>, row: &mut [u64]) -> bool {
+        let Some((values, count)) = short_values(ef) else {
+            return false;
+        };
+        if count == 0 {
+            return true;
+        }
+        let mut lanes = [0u32; 16];
+        // SAFETY: a store of sixteen lanes to a local array; the table load
+        // is of a whole row.
+        unsafe {
+            let last = _mm512_set1_epi32((count - 1) as i32);
+            let at = _mm512_min_epu32(_mm512_loadu_si512(IOTA32.as_ptr().cast()), last);
+            _mm512_storeu_si512(
+                lanes.as_mut_ptr().cast(),
+                _mm512_permutexvar_epi32(at, values),
+            );
+        }
+        let mut put = super::RowPut::new();
+        if (lanes[count - 1] / 64) as usize >= row.len() {
+            // Past the row: `put` panics as the portable body does.
+            for &v in &lanes[..count] {
+                put.put(row, v);
+            }
+            return true;
+        }
+        let set = if count <= 8 { &lanes[..8] } else { &lanes[..] };
+        for &v in set {
+            // SAFETY: every lane is at most the last, within the row.
+            unsafe { put.put_unchecked(row, v) };
+        }
+        true
+    }
 
     /// A drain's values decoded a highs word at a time: those of the word
     /// holding the cursor's current value from it on, then each next
