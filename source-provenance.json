@@ -1536,6 +1536,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for a two-way replay A/B of a disjunction walk change over page layout 9, re-encoding the dump on the box."
     },
+    "benchmarks/aws/devbox-r6r7-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for a four-way replay A/B of scorer and walk changes over page layout 9, re-encoding the dump on the box, with memory-stall counters."
+    },
     "benchmarks/aws/devbox-tail-ab.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for a three-way replay A/B (version-6 base, layout 8, a walk change over layout 8), re-encoding the dump on the box."
