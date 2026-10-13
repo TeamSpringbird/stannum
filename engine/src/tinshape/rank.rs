@@ -2909,6 +2909,14 @@ fn span_check<'a>(
 /// their terms' blocks over this many words (1,024 slots) at a time.
 const SUB_WORDS: usize = 16;
 
+/// Whether a disjunction's words and members are weighed in lanes, by the
+/// weighing kernels (`kernels::word_sums`, `kernels::member_sums`), rather
+/// than one at a time inline (see `Walk::or_group`). The sums are the same
+/// bit for bit. On x86-64 the kernels ran 6-8% fewer instructions of a
+/// disjunction; on aarch64 the inline loop ran 2-4% fewer cycles (Apple M4,
+/// where the one-at-a-time sums retire about three instructions a cycle).
+const WEIGH_IN_LANES: bool = cfg!(target_arch = "x86_64");
+
 /// Members a word must hold for its members to be weighed in lanes rather
 /// than one at a time (see `Walk::or_group`): the narrowest kernel's lanes.
 const MEMBER_LANES: usize = 4;
@@ -3276,9 +3284,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 live |= u32::from(*word != 0) << j;
             }
             // The sub-range's live words weighed at once, at the group's
-            // bounds.
+            // bounds (in lanes; one at a time below otherwise).
             let weighed = live != 0 && self.threshold().is_some();
-            if weighed {
+            if weighed && WEIGH_IN_LANES {
                 kernels::word_sums(
                     &mask[w0..w1],
                     live,
@@ -3294,7 +3302,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 live &= live - 1;
                 let mut word = mask[w];
                 if weighed {
-                    if self.cut(sums[w - w0], || first(w)) {
+                    let most = if WEIGH_IN_LANES {
+                        sums[w - w0]
+                    } else {
+                        let mut most = 0.0_f32;
+                        for ((h, row), &bound) in held.iter_mut().zip(&rows).zip(&bounds) {
+                            *h = row.word(w);
+                            most += or_zero(bound, *h & word != 0);
+                        }
+                        most
+                    };
+                    if self.cut(most, || first(w)) {
                         continue;
                     }
                     if !bounded {
@@ -3314,12 +3332,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     // The word's members, each at the sub-range's bounds of
                     // the terms holding it: lanes at a time where the word
                     // holds enough of them to fill a vector, else one at a
-                    // time (most live words hold one to three).
-                    for (h, row) in held.iter_mut().zip(&rows) {
-                        *h = row.word(w);
+                    // time (most live words hold one to three). The terms'
+                    // words were read by the word's own check one at a time.
+                    if WEIGH_IN_LANES {
+                        for (h, row) in held.iter_mut().zip(&rows) {
+                            *h = row.word(w);
+                        }
                     }
                     let mut keep = 0u64;
-                    if word.count_ones() as usize >= MEMBER_LANES {
+                    if WEIGH_IN_LANES && word.count_ones() as usize >= MEMBER_LANES {
                         let mut n = 0;
                         let mut left = word;
                         while left != 0 {
