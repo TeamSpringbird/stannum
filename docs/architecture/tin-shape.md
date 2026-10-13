@@ -159,7 +159,7 @@ on one page.
 A group the encoder would store as Elias-Fano, of at most 64 members
 (`Options::array_max`) and at most 65,536 slots, is an **array** of its
 local slots as `u16`s instead (page layout 11; see
-[measurements](#short-lists-as-u16-arrays-at-150m-rows-branch-loopr8)):
+[measurements](#short-lists-as-u16-arrays-at-150m-rows-branch-loopr8-page-layout-11)):
 two bytes a member where Elias-Fano takes 1.2 to 1.8 at these lengths,
 but nothing to decode. A walk widens an array into its list eight values
 a step (NEON, AVX2), sets it in a row a value at a time, and probes one
@@ -1673,6 +1673,59 @@ outputs: `stannum-lab/fable/server/`.
   pages): the i7i counts one dTLB miss per page pinned and 2.6 to 3.9% of
   cycles in page walks, for TIN as for us; a benchmark-setup question, not
   a change here.
+
+## Short lists as `u16` arrays at 150M rows (branch `loop/r8`, page layout 11)
+
+The gate, over the layout-10 dump (`tnsef census`): 70.6M Elias-Fano group
+lists hold 1.01G members in 1.24 GB; the largest group has 14,110 slots, so
+every group's local slots fit a `u16`. By list length, the share of their
+members and what arrays would add to the 36.5 GB index:
+
+| lists of at most | members | arrays less lists |
+| --- | --- | --- |
+| 8 | 12.2% | +0.10% |
+| 16 | 27.1% | +0.38% |
+| 32 | 60.5% | +1.15% |
+| 64 | 83.6% | +1.73% |
+| any | 100% | +2.16% |
+
+Per query (a census build of the replay, 400 queries a style), a score
+conjunction decodes 8,457 lists whole (5,630 of them of at most 32) and
+seeks 2,431 in place; a phrase about 1.13 times as many; a disjunction sets
+29,079 in rows. On the M4 (`tnsef arrays`, segment 1's lists, ns a
+container, list against array), decoding then marking against candidates
+of the same length takes 20 against 13 at 1 to 7 members, 34 against 23 at
+8 to 15, 65 against 34 at 16 to 31, 101 against 65 at 32 to 63; a seek
+with an eighth as many candidates 22 against 9, 52 against 17, 97 against
+38, 161 against 74; a row 18 against 11, 26 against 15, 47 against 23, 54
+against 37. An all-pairs NEON compare of blocks of eight (Schlegel et al.)
+marks no faster than widening the array and marking it as a list is
+marked; a branch-free merge takes twice as long. Projected: 5% of a
+conjunction's cycles at 64, 2% of a disjunction's.
+
+Arrays of at most 64 members (`Options::array_max`), the dump re-encoded
+alone (`tnsreencode --from 10`, 10 minutes at three jobs; every segment
+verifies and equals its own merge): 65.5M arrays (822M members, 1.64 GB),
+1.63M lists left; postings +4.0%, the index +1.73% (36.51 to 37.14 GB).
+Every term keeps its form: an array weighs as the list it replaces when a
+term chooses between grouped and sparse (weighed by their bytes, arrays
+moved 80,000 terms to sparse). Replays against layout 10 (062967b),
+`--forget`, 400 queries a style, the M4 four rounds (score) or two
+(`full_score`), interleaved:
+
+| layout 11 against 10 | M4 instructions / cycles |
+| --- | --- |
+| score conjunction | -3.1 / -2.7% |
+| score phrase | -2.6 / -7.9% |
+| score disjunction | -2.0 / -5.2% |
+| full conjunction | -1.9 / -2.2% |
+| full phrase | -1.5 / -3.1% |
+| full disjunction | -0.9 / -2.7% |
+
+Conjunction latency moved with the order of the pair (the second run of
+each pair was the faster, by up to 12%), -2% to +2% over the rounds. Every
+answer of the whole trace is PostgreSQL's (1,253, 1,228 and 1,252 queries
+equal), and `--full` outputs are f0962a8's byte for byte.
 
 ## Open
 
