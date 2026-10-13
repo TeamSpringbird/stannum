@@ -161,6 +161,7 @@ pub fn merge(
             let segment = &segments[i];
             let found = segment.resolve(entry)?;
             let footer = found.postings.footer(
+                &segment.docs.geometry,
                 segment.block_size,
                 entry.max_tf_bucket,
                 segment.adaptive_tf,
@@ -234,14 +235,14 @@ pub fn merge(
             builder.add_term_reusing(&term, &ranks, &buckets, &payload.finish(), &mut |out| {
                 let (i, g) = owners[out]?;
                 let (postings, input_df) = records[i].as_ref()?;
-                let Form::Grouped(entries) = &postings.form else {
+                let Form::Grouped(dir) = &postings.form else {
                     return None;
                 };
-                let at = entries.binary_search_by_key(&g, |e| e.index).ok()?;
+                let entry = dir.find(g, &segments[i].docs.geometry.groups).ok()??;
                 reused += 1;
                 Some(Reused {
-                    kind: entries[at].kind,
-                    bytes: postings.container(&entries[at]).all().ok()?,
+                    kind: entry.kind,
+                    bytes: postings.container(entry).all().ok()?,
                     input_df: *input_df,
                 })
             })?;

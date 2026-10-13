@@ -31,7 +31,7 @@ use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
-    Form, GroupEntry, GroupFrontier, KIND_EF, KIND_GRID, LazyFooter,
+    Directory, Form, GroupEntry, GroupFrontier, KIND_EF, KIND_GRID, LazyFooter,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -89,33 +89,45 @@ enum Bounds<'s, 'a> {
 }
 
 /// A grouped record's entries as a walk's blocks: the directory (shared
-/// with the parsed record), its bytes (the frontiers), and the segment's
-/// groups, which turn an entry's group index into the group's last slot.
+/// with the parsed record, its entries decoded as the walk reaches them, its
+/// bytes the frontiers), and the segment's groups, which turn an entry's
+/// group index into the group's last slot.
 struct GroupBounds<'s> {
-    dir: std::rc::Rc<[GroupEntry]>,
-    directory: std::rc::Rc<[u8]>,
+    dir: std::rc::Rc<Directory>,
     rounded: bool,
     groups: &'s [Group],
 }
 
 impl GroupBounds<'_> {
+    /// Entry `b` (decoded if it was not yet).
+    #[inline]
+    fn entry(&self, b: usize) -> &GroupEntry {
+        self.dir
+            .get(b, self.groups)
+            .unwrap_or_else(|e| corrupt_footer(e))
+    }
+
     /// Entry `b`'s group's first slot.
     #[inline]
     fn start(&self, b: usize) -> u32 {
-        self.groups[self.dir[b].index as usize].slot_base
+        self.groups[self.entry(b).index as usize].slot_base
     }
 
     /// Entry `b`'s group's last slot.
     #[inline]
     fn end(&self, b: usize) -> u32 {
-        let group = &self.groups[self.dir[b].index as usize];
+        let group = &self.groups[self.entry(b).index as usize];
         group.slot_base + group.slots() - 1
     }
 
     /// The frontier of entry `b`.
     #[inline]
     fn frontier(&self, b: usize) -> GroupFrontier<'_> {
-        GroupFrontier::new(&self.directory, self.dir[b].frontier as usize, self.rounded)
+        GroupFrontier::new(
+            self.dir.bytes(),
+            self.entry(b).frontier as usize,
+            self.rounded,
+        )
     }
 
     /// The first entry from `from` on whose group ends at `slot` or later:
@@ -227,7 +239,7 @@ impl<'a> Bounds<'_, 'a> {
     fn max_bucket(&self, b: usize) -> u8 {
         match self {
             Self::Blocks(f) => f.max_bucket(b),
-            Self::Groups(g) => g.dir[b].max_bucket,
+            Self::Groups(g) => g.entry(b).max_bucket,
         }
     }
 
@@ -237,7 +249,7 @@ impl<'a> Bounds<'_, 'a> {
     fn tf_byte(&self, b: usize) -> usize {
         match self {
             Self::Blocks(f) => f.tf_at(b) as usize,
-            Self::Groups(g) => g.dir[b].tf_bit as usize / 8,
+            Self::Groups(g) => g.entry(b).tf_bit as usize / 8,
         }
     }
 
@@ -248,7 +260,7 @@ impl<'a> Bounds<'_, 'a> {
         match self {
             Self::Blocks(f) => f.bucket(tf, index),
             Self::Groups(g) => {
-                let e = &g.dir[b];
+                let e = g.entry(b);
                 debug_assert!(e.first <= index && index < e.first + e.count);
                 if e.width == 0 {
                     return Ok(0);
@@ -389,9 +401,8 @@ impl<'s, 'a> Sc<'s, 'a> {
         segment: &'s Segment<'a>,
     ) -> Result<Self> {
         let footer = match &set.postings.form {
-            Form::Grouped(entries) => Bounds::Groups(GroupBounds {
-                dir: entries.clone(),
-                directory: set.postings.directory.clone(),
+            Form::Grouped(dir) => Bounds::Groups(GroupBounds {
+                dir: dir.clone(),
                 rounded: set.postings.rounded,
                 groups: &segment.docs.geometry.groups,
             }),
@@ -579,8 +590,8 @@ impl<'s, 'a> Sc<'s, 'a> {
             Bounds::Groups(g) => {
                 debug_assert!(
                     entry < g.dir.len()
-                        && g.dir[entry].first <= index
-                        && index < g.dir[entry].first + g.dir[entry].count
+                        && g.entry(entry).first <= index
+                        && index < g.entry(entry).first + g.entry(entry).count
                 );
                 entry
             }
@@ -645,7 +656,7 @@ impl<'s, 'a> Sc<'s, 'a> {
     #[inline]
     fn group_entry(&self, b: usize) -> Option<GroupEntry> {
         match &self.footer {
-            Bounds::Groups(g) => g.dir.get(b).copied(),
+            Bounds::Groups(g) => (b < g.dir.len()).then(|| *g.entry(b)),
             Bounds::Blocks(_) => None,
         }
     }
@@ -1366,7 +1377,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .sc
             .iter()
             .filter_map(|s| self.terms[s.term].as_ref())
-            .map(|set| (set.postings.footer.len() + set.postings.directory.len()) as u64)
+            .map(|set| (set.postings.footer.len() + set.postings.directory_bytes().len()) as u64)
             .sum();
         let (mut reached, mut loaded) = (0u64, 0u64);
         for (set, mem) in self.terms.iter().zip(&self.mems) {

@@ -173,8 +173,10 @@ footer entry per term and aligned 256-page group (its probes, rounds 2 and
 to 16; 2.4 on average at 150M rows), and the group's buckets follow the
 groups before it in the TF tail, at the width the group's largest bucket
 needs. A walk reaches group `g`'s entry by its position in the directory
-(parsed once when the term is opened) and decodes nothing of the groups
-before it; a group's bound is its frontier's best score, its floors per
+(skimmed when the record is parsed, its entries decoded a block of 128 at a
+time as the walk reaches them: see [lazy group
+directories](#lazy-group-directories-layout-89)) and reads nothing of the
+groups before it but their entries; a group's bound is its frontier's best score, its floors per
 bucket come from the same pairs, and a group the term lacks bounds at
 zero. The frontier's lengths are rounded down to six significant bits
 (`round_length`, as TIN quantizes its lengths): a bound at the rounded
@@ -1056,14 +1058,52 @@ last group, and a group's bound sum stops at the threshold, so later terms
 are asked less; of a `full_score` conjunction's 84 footers, 36 are never
 read at all. A disjunction's MaxScore bounds every block of every term.
 
-Group directories are not decoded by group. A walk steps through nearly
-every entry of its terms' directories (94,000 of 94,000 entries asked for,
-a conjunction), and a container's offset counts from the directory's end,
-so no container is found before the directory is parsed through: parsing
-it lazily would parse as much, later. What is skipped is a record the walk
-never needs: a walk checks its required terms first (`Segment::holds_memo`,
-a term-map lookup) and parses nothing in a segment lacking one, 8% of a
-conjunction's directory entries in the replay.
+Group directories (layout 6, entries of about 3 bytes) were decoded whole
+when parsed: a walk stepped through nearly every entry of its terms'
+directories, and a container's offset counts from the directory's end, so no
+container is found before the directory is parsed through. Since layouts
+8/9 they are decoded as far as a walk reaches (see [lazy group
+directories](#lazy-group-directories-layout-89)). What is skipped either way
+is a record the walk never needs: a walk checks its required terms first
+(`Segment::holds_memo`, a term-map lookup) and parses nothing in a segment
+lacking one, 8% of a conjunction's directory entries in the replay.
+
+### Lazy group directories (layout 8/9)
+
+Since every directory entry carries its group's frontier (layout 8), an
+entry takes about 10 bytes (3 before), and decoding a common term's
+directory whole cost a cheap conjunction 1-3 ms at 150M rows: about 118,000
+entries decoded per query in the server, of which the walk reached about
+39,000 (198,000 and 101,000 in the replay). `postings::Directory` decodes a
+block of 128 entries at a time, the first time one of them is asked for,
+into slots reserved when the record is parsed (a walk asks for an entry
+several times per group, so one decoded is a comparison and a load away);
+each entry is checked against the record as it is decoded (its group, its
+count, its container within the payload, its buckets within the TF tail),
+and the record's totals with the last.
+
+The containers still start where the directory ends, so the parse steps
+over every entry, without decoding it (`skim_entries`). An entry is a gap, a
+count and kind, a paged container's length, then the frontier's head (its
+pairs), first length and a delta per further pair: its length in varints
+follows from the first bytes of its second to fourth varints. A scan finds
+where each varint of a chunk starts and its first byte, sixteen bytes at a
+time (NEON; a byte at a time elsewhere), and each varint's step (the
+varints an entry starting there takes, sixteen at a time); stepping from
+entry to entry is then a load and an add. Decoding reads the same scan:
+the gap, count and paged length (one or two bytes, else a varint at a time)
+without a branch on their lengths, the container's length for every kind
+and the one its kind names chosen without a branch (the kinds mix within a
+directory), and the frontier's largest bucket from its deltas' first bytes,
+eight at a time. Per entry (`tnsdirskim`, 1,515 grouped records of segment
+5240): skimmed 2.7 ns, 60 instructions, 12 cycles; skimmed and decoded 8.8
+ns, 280 instructions, 38 cycles; decoded a varint at a time as before 11.6
+ns, 261 instructions, 50 cycles (a branch per varint length, kind and pair
+count).
+
+The memos count a kept record at what its directory holds (its bytes, and
+its entries decoded so far) and count it again when it is used again and
+before records are dropped.
 
 CPU in the replay (2 rounds, 400 queries per style, instructions retired)
 against the base without its footer memo (the replay repeats each query five

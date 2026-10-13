@@ -107,6 +107,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             let mut problems = Vec::new();
             let found = segment.resolve(entry)?;
             let footer = found.postings.footer(
+                &segment.docs.geometry,
                 segment.block_size,
                 entry.max_tf_bucket,
                 segment.adaptive_tf,
@@ -140,8 +141,10 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             // group's postings (a bucket at least as high, a length at
             // most as long), and its count must be its container's.
             let entries = match &found.postings.form {
-                super::postings::Form::Grouped(entries) => entries.as_ref(),
-                _ => &[],
+                super::postings::Form::Grouped(dir) => {
+                    dir.entries(&segment.docs.geometry.groups)?
+                }
+                _ => Vec::new(),
             };
             let mut at_entry = 0usize;
             for (i, slot) in slots.iter().enumerate() {

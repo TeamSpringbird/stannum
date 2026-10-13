@@ -198,7 +198,10 @@ fn scan(segment: &Segment<'_>, units: &mut Units) {
         let term = segment.resolve(entry).expect("a postings record");
         let p = &term.postings;
         match &p.form {
-            Form::Grouped(entries) => {
+            Form::Grouped(dir) => {
+                let entries = dir
+                    .entries(&segment.docs.geometry.groups)
+                    .expect("a directory");
                 units.add(0, term.at, p.payload_at + p.containers_at);
                 let containers = term.at + p.payload_at + p.containers_at;
                 for e in entries.iter() {
@@ -213,7 +216,12 @@ fn scan(segment: &Segment<'_>, units: &mut Units) {
         }
         if !matches!(p.form, Form::Single(_)) && !p.compact {
             let footer = p
-                .footer(segment.block_size, entry.max_tf_bucket, segment.adaptive_tf)
+                .footer(
+                    &segment.docs.geometry,
+                    segment.block_size,
+                    entry.max_tf_bucket,
+                    segment.adaptive_tf,
+                )
                 .expect("a footer");
             let footer_at = term.at + p.footer_at;
             units.add(3, footer_at, p.footer.len());

@@ -100,7 +100,8 @@ fn sampled(dump: &str, segments: usize) -> Vec<u8> {
             let term = segment.resolve(entry).expect("a postings record");
             let p = term.postings;
             match &p.form {
-                Form::Grouped(entries) => {
+                Form::Grouped(dir) => {
+                    let entries = dir.entries(&geometry.groups).expect("a directory");
                     for e in entries.iter().filter(|e| e.kind == KIND_EF) {
                         let group = geometry.groups[e.index as usize];
                         let body = p.container(e).all().expect("a container");

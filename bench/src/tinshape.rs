@@ -223,6 +223,7 @@ pub fn verify(dumped: &DumpedSegment, tns: &[u8]) -> Result<u64, String> {
             let footer = found
                 .postings
                 .footer(
+                    geometry,
                     segment.block_size,
                     found.entry.max_tf_bucket,
                     segment.adaptive_tf,
