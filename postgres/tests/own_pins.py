@@ -177,8 +177,10 @@ VACUUM ANALYZE docs;""", timeout=300)
                     active[i] = session(walk, f'walker-{i}')
                     processes.append(active[i])
         # A backend in a DO loop notices its client's exit only at its end:
-        # end every other session from the server's side.
-        maintainer.stdin.close()
+        # end every other session from the server's side. The maintainer's
+        # stdin stays open: communicate() below closes it, and before Python
+        # 3.13 it raised ValueError on a stdin already closed (and, called
+        # again from the cleanup, AttributeError on its missing state).
         sql("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
             "WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()")
         for process in active + hammers + [maintainer]:
@@ -211,7 +213,9 @@ VACUUM ANALYZE docs;""", timeout=300)
         for process in processes:
             if process.poll() is None:
                 process.kill()
-                process.communicate()
+                # wait(), not communicate(): a communicate() that raised
+                # leaves state a second call trips over, masking the error.
+                process.wait()
         if (data / 'postmaster.pid').exists():
             subprocess.run(['pg_ctl', '-D', str(data), '-m', 'fast', '-w', 'stop'], env=env,
                            capture_output=True, timeout=120)
