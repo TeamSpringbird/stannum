@@ -9,7 +9,7 @@
 #
 #   devbox.sh --branch B [--branch B2 ...] --cmd 'CMD' | --cmd-file F
 #             [--type c7i.2xlarge] [--dump] [--disk GIB] [--hours 2] [--env K=V ...]
-#             [--on-demand]
+#             [--on-demand | --spot-only]
 #   devbox.sh --list | --terminate ID|all | --ledger
 #   devbox.sh --cleanup-dump | --delete-stack
 #
@@ -25,7 +25,8 @@
 #
 # The box is a one-time spot instance in the AZ with the lowest spot price
 # (on-demand if no AZ has spot capacity, or with --on-demand, for sessions
-# too long to lose to a spot reclaim), tagged stannum-devbox=<id>, with
+# too long to lose to a spot reclaim; --spot-only gives up instead, for a
+# budget on-demand would break), tagged stannum-devbox=<id>, with
 # shutdown -h +<hours> and instance-initiated shutdown = terminate, so it
 # dies on its own even if this script does. The script terminates it when
 # the command ends (or on Ctrl-C), checks its volumes are gone, deletes the
@@ -57,7 +58,7 @@ TYPES="c7i.xlarge c7i.2xlarge r7i.2xlarge"
 die() { echo "devbox: $*" >&2; exit 1; }
 log() { echo "devbox $(date +%H:%M:%S) $*" >&2; }
 
-branches=() envs=() cmd= cmd_file= type= dump=0 hours=2 action=run target= spot=1 disk=
+branches=() envs=() cmd= cmd_file= type= dump=0 hours=2 action=run target= spot=1 disk= spot_only=0
 while [ $# -gt 0 ]; do
   case $1 in
     --branch) branches+=("$2"); shift 2 ;;
@@ -69,12 +70,13 @@ while [ $# -gt 0 ]; do
     --disk) disk=$2; shift 2 ;;
     --env) envs+=("$2"); shift 2 ;;
     --on-demand) spot=0; shift ;;
+    --spot-only) spot_only=1; shift ;;
     --list) action=list; shift ;;
     --terminate) action=terminate; target=$2; shift 2 ;;
     --ledger) action=ledger; shift ;;
     --cleanup-dump) action=cleanup-dump; shift ;;
     --delete-stack) action=delete-stack; shift ;;
-    -h|--help) sed -n '5,39p' "$0"; exit 0 ;;
+    -h|--help) sed -n '5,40p' "$0"; exit 0 ;;
     *) die "unknown argument $1 (--help)" ;;
   esac
 done
@@ -206,6 +208,10 @@ while [ $spot = 1 ] && read -r z subnet price_z; do
   log "spot in $z failed: $(grep -o -E '\(([A-Za-z.]+)\)' "$dir/launch.err" | head -1)"
   instance=
 done <<< "$zones"
+if [ -z "$instance" ] && [ $spot_only = 1 ]; then
+  aws s3 rm --only-show-errors --recursive "s3://$BUCKET/$prefix/"
+  die "no spot capacity in any AZ (--spot-only): nothing launched"
+fi
 if [ -z "$instance" ]; then
   read -r z subnet _ <<< "$zones"
   instance=$(launch on-demand "$z" "$subnet") || die "on-demand launch failed: $(cat "$dir/launch.err")"
