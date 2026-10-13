@@ -4,14 +4,14 @@
 
 # A devbox.sh --cmd-file: array containers (page layout 11) against layout
 # 10 on x86, with --forget. SRC1 (A, base) re-encodes the version-6 dump in
-# S3 into /data/dump150m-v9 and adds the directory lengths
-# (--keep-records) into /data/dump150m-v10; SRC2 (B, candidate) merges
-# that alone into /data/dump150m-v11, short Elias-Fano lists becoming
-# arrays. Then SRC2's array kernel tests at every level, `tnsef arrays` on
-# segment 1 of the layout-10 dump, and conjunctions, disjunctions and
-# phrases under score (300 queries) and full_score (150), two rounds (A B,
-# then B A), under perf stat, outputs compared. Box time: about 80 minutes.
-#   devbox.sh --branch BASE --branch CAND --dump --disk 150 --hours 2.5 \
+# S3 into /data/dump150m-v10 (from 6 a re-encode writes layout 10); SRC2
+# (B, candidate) merges that alone into /data/dump150m-v11, short
+# Elias-Fano lists becoming arrays. SRC2's array kernel tests at every
+# level run first; then `tnsef arrays` on segment 1 of the layout-10 dump,
+# and conjunctions, disjunctions and phrases under score (300 queries) and
+# full_score (150), two rounds (A B, then B A), under perf stat, outputs
+# compared. Box time: about 90 minutes.
+#   devbox.sh --branch BASE --branch CAND --dump --disk 150 --hours 2 \
 #     --spot-only --cmd-file benchmarks/aws/devbox-arrays-ab.sh
 set -u
 eval "$(head -1 /root/devbox.sh)" # RUN BUCKET PREFIX: for progress lines
@@ -24,7 +24,6 @@ save() {
   tar -C /work -czf /work/partial.tar.gz out &&
     /usr/local/bin/aws s3 cp --only-show-errors /work/partial.tar.gz "s3://$BUCKET/$PREFIX/results.tar.gz" || true
 }
-D9=/data/dump150m-v9
 D10=/data/dump150m-v10
 D11=/data/dump150m-v11
 EV=instructions:u,cycles:u,branch-misses:u,L1-icache-load-misses:u,task-clock
@@ -37,13 +36,10 @@ grep -m1 -o 'avx512[a-z]*\|ssse3' /proc/cpuinfo | sort -u | tr '\n' ' ' > $OUT/c
 (cd $SRC2 && cargo test --release -p engine -- array && cargo test --release -p segment -- short_group_lists merge) \
   > $OUT/tests.log 2>&1
 step "array tests exit $? $(grep -c 'test result: ok' $OUT/tests.log) suites ok"
-$SRC1/target/release/tnsreencode --in $DATA/dump150m --out $D9 --from 6 --jobs 4 \
-  > $OUT/reencode-9.txt 2> $OUT/reencode-9.err || { echo "re-encode 6 to 9 failed"; tail -5 $OUT/reencode-9.err; save; exit 1; }
-step "re-encoded to 9: $(grep '^areas together' $OUT/reencode-9.txt)"
-$SRC1/target/release/tnsreencode --in $D9 --out $D10 --from 9 --keep-records --jobs 2 \
-  > $OUT/reencode-10.txt 2> $OUT/reencode-10.err || { echo "re-encode 9 to 10 failed"; tail -5 $OUT/reencode-10.err; save; exit 1; }
+# From 6, headers are written as version 10's: the output is layout 10.
+$SRC1/target/release/tnsreencode --in $DATA/dump150m --out $D10 --from 6 --jobs 4 \
+  > $OUT/reencode-10.txt 2> $OUT/reencode-10.err || { echo "re-encode 6 to 10 failed"; tail -5 $OUT/reencode-10.err; save; exit 1; }
 step "re-encoded to 10: $(grep '^areas together' $OUT/reencode-10.txt)"
-rm -rf $D9
 # Two at a time: a merge holds a few copies of its segment (61 GiB with the page cache).
 $SRC2/target/release/tnsreencode --in $D10 --out $D11 --from 10 --jobs 2 \
   > $OUT/reencode-11.txt 2> $OUT/reencode-11.err || { echo "re-encode 10 to 11 failed"; tail -5 $OUT/reencode-11.err; dmesg | tail -5 > $OUT/dmesg.txt; save; exit 1; }
