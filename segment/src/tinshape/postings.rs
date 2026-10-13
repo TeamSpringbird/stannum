@@ -1303,16 +1303,12 @@ struct Resume {
 
 impl Directory {
     fn new(bytes: Box<[u8]>, len: usize, df: u32, containers: u64, tf_len: u64) -> Self {
+        let mut entries: Box<[_]> = (0..len + 1)
+            .map(|_| std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()))
+            .collect();
+        entries[0].get_mut().write(DirEntry::default());
         Self {
-            entries: (0..=len)
-                .map(|i| {
-                    std::cell::UnsafeCell::new(if i == 0 {
-                        std::mem::MaybeUninit::new(DirEntry::default())
-                    } else {
-                        std::mem::MaybeUninit::uninit()
-                    })
-                })
-                .collect(),
+            entries,
             decoded: std::cell::Cell::new(0),
             resume: std::cell::Cell::new(Resume {
                 // The entries start after the group count.
@@ -1347,28 +1343,30 @@ impl Directory {
     /// before it); `groups` is the segment's ([`Geometry::groups`]).
     #[inline]
     pub fn get(&self, b: usize, groups: &[Group]) -> Result<GroupEntry> {
-        if b < self.decoded.get() {
-            // SAFETY: `b` is below `decoded`, so slots `b` and `b + 1` (the
-            // zero one and those of entries decoded) are written once and
-            // never again (decoding writes past `decoded`).
-            return Ok(unsafe {
-                let before = (*self.entries.get_unchecked(b).get()).assume_init_ref();
-                let entry = (*self.entries.get_unchecked(b + 1).get()).assume_init_ref();
-                entry.view(before)
-            });
+        if b >= self.decoded.get() {
+            self.decode_to(b, groups)?;
         }
-        self.get_slow(b, groups)
+        // SAFETY: `b` is below `decoded`, so slots `b` and `b + 1` (the zero
+        // one and those of entries decoded) are written once and never
+        // again (decoding writes past `decoded`).
+        Ok(unsafe {
+            let before = (*self.entries.get_unchecked(b).get()).assume_init_ref();
+            let entry = (*self.entries.get_unchecked(b + 1).get()).assume_init_ref();
+            entry.view(before)
+        })
     }
 
+    /// Decodes the blocks up to entry `b`'s, out of line: an entry decoded
+    /// once is read many times, through [`Self::get`]'s one comparison.
     #[inline(never)]
-    fn get_slow(&self, b: usize, groups: &[Group]) -> Result<GroupEntry> {
+    fn decode_to(&self, b: usize, groups: &[Group]) -> Result<()> {
         if b >= self.len() {
             return Err(Error::Corrupt("group directory entry"));
         }
         while self.decoded.get() <= b {
             self.decode_block(groups, DIRECTORY_BLOCK)?;
         }
-        self.get(b, groups)
+        Ok(())
     }
 
     /// Decodes every entry not decoded yet, in one pass: for a walk that
