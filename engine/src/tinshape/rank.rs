@@ -842,7 +842,9 @@ fn load<'a>(
         mem.first = cursor.rank() as u32;
         let end = group.slot_base + group.slots();
         let list = &mut mem.list;
-        cursor.drain_below(end, |slot| list.push(slot - group.slot_base));
+        if !kernels::drain_below(cursor, end, group.slot_base, list) {
+            cursor.drain_below(end, |slot| list.push(slot - group.slot_base));
+        }
         mem.count = mem.list.len() as u32;
         return Ok(true);
     }
@@ -2562,8 +2564,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             cursor.seek(group.slot_base);
             r.first = cursor.rank() as u32;
             let end = group.slot_base + group.slots();
-            let mut out = RowBits::new(row);
-            cursor.drain_below(end, |slot| out.set(slot - group.slot_base));
+            if !kernels::drain_into_row(cursor, end, group.slot_base, row) {
+                let mut out = RowBits::new(row);
+                cursor.drain_below(end, |slot| out.set(slot - group.slot_base));
+            }
             return Ok(());
         }
         let entry = set
