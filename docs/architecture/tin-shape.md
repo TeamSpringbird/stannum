@@ -1187,6 +1187,20 @@ the header's length (layout 10) against lazy directories: cycles -10.9% /
 directories: cycles -13.1% / -6.6% / -9.6%, and a `full_score` disjunction
 level (0.0%, instructions +1.9%).
 
+A decoded entry is kept in 24 bytes rather than 32 (`DirEntry` on branch
+`loop/v5-r1b`: where its container, postings and buckets end, its group,
+frontier, kind and largest bucket); `Directory::get` gives the whole
+`GroupEntry` from it and the entry before it (a zero entry before the
+first). The reader's budget then keeps more records across queries (replay
+without `--forget`, 400 queries: 46.4 -> 49.0 of a conjunction's, 46.9 ->
+49.7 of a phrase's, 48.8 -> 51.5 of a disjunction's; 2.6 fewer parsed),
+but every read of an entry costs two loads and three subtractions: with
+`--forget`, instructions +0.6% to +1.0% on the M4 and +0.3% to +0.6% on
+Sapphire Rapids, whose cycles rise 2.0% to 3.2% in every style (both
+rounds; the dump's load, the same for every arm, left out: +3%). Not worth
+it as it stands; only a server run, where kept records spare a parse,
+could say otherwise.
+
 CPU in the replay (2 rounds, 400 queries per style, instructions retired)
 against the base without its footer memo (the replay repeats each query five
 times, which the memo amortizes as the server's driver order does not):
