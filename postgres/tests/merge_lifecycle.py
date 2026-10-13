@@ -127,7 +127,7 @@ def main():
 
 
 def crash_between_run_write_and_publication(sql, command, env, data, root, start):
-    """Buffers a large fold, stops the server immediately while the fold is
+    """Buffers a large fold, crashes the server while the fold is
     writing its run, and checks that verify_index reports the run's pages as
     orphans, VACUUM reclaims them into the FSM and the next fold reuses them.
     The kill is timed on relation growth and lands on the folding backend
