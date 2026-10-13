@@ -731,29 +731,6 @@ impl Mem<'_> {
     }
 }
 
-/// `x` where `keep` holds, else `+0.0`, without a branch: `x`'s bits under
-/// an all-ones or all-zeros mask. Added to a sum, it adds exactly what
-/// `if keep { x } else { 0.0 }` would, for every `x` (NaN, infinities and
-/// -0.0 included). LLVM lowers that select of a float on an integer
-/// condition to a test and a jump on x86-64 below AVX-512, which the walks'
-/// per-word bound sums mispredict.
-///
-/// LLVM folds the mask back into that select, so on x86-64 the mask passes
-/// through an empty `asm!` first, which it cannot see through: it stays an
-/// `and`. With AVX-512 (a masked move) and on aarch64 (`fcsel`) the select
-/// has no branch already, and is left to LLVM.
-#[inline(always)]
-fn or_zero(x: f32, keep: bool) -> f32 {
-    #[allow(unused_mut)]
-    let mut mask = u32::from(keep).wrapping_neg();
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-    // SAFETY: a template of a comment only: `mask` is left as it is.
-    unsafe {
-        core::arch::asm!("/* {0:e} */", inout(reg) mask, options(pure, nomem, nostack, preserves_flags));
-    }
-    f32::from_bits(x.to_bits() & mask)
-}
-
 /// [`Walk::cut`] against the bar `bar`.
 #[inline]
 fn cut_by(bar: Option<(f32, Tid)>, bound: f32, from: impl FnOnce() -> Tid) -> bool {
@@ -1267,7 +1244,12 @@ struct Walk<'s, 'a, T: Touch> {
     /// A disjunction's group at hand: per present term with a positive
     /// bound there, the term, its row, that bound and its bound over the
     /// sub-range at hand; and its word at hand.
-    or_terms: Vec<(usize, RowAt, f32, f32)>,
+    or_terms: Vec<usize>,
+    /// Those terms' rows, bounds over the group and over the sub-range at
+    /// hand, and words at the word at hand (as the kernels take them).
+    or_rows: Vec<RowAt>,
+    or_bounds: Vec<f32>,
+    or_sub: Vec<f32>,
     or_held: Vec<u64>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
@@ -2760,6 +2742,9 @@ pub(super) fn walk_into<'s, 'a>(
         row_state: vec![Row::default(); n],
         row_loaded: Vec::new(),
         or_terms: Vec::new(),
+        or_rows: Vec::new(),
+        or_bounds: Vec::new(),
+        or_sub: Vec::new(),
         or_held: Vec::new(),
         held_bound: vec![0.0; n],
         buckets: vec![NO_BUCKET; n],
@@ -2924,6 +2909,12 @@ fn span_check<'a>(
 /// their terms' blocks over this many words (1,024 slots) at a time.
 const SUB_WORDS: usize = 16;
 
+/// Members a word must hold for its members to be weighed in lanes rather
+/// than one at a time (see `Walk::or_group`): the narrowest kernel's lanes.
+const MEMBER_LANES: usize = 4;
+
+use super::kernels::or_zero;
+
 /// A disjunction's plan for a group at one threshold (MaxScore with the
 /// group's bounds).
 #[derive(Default)]
@@ -2981,63 +2972,18 @@ struct Row {
 /// words, little-endian. A grid on one page is read in place there; other
 /// members (decoded, or a grid across pages copied a page's part at a
 /// time) lie in the term's part of [`Walk::rows`]. A word is the same load
-/// from either, so the walk never asks which.
+/// from either, so the walk never asks which ([`kernels::Row`]: a pointer,
+/// sound as the walk uses it: a group's rows are loaded after `rows` is
+/// sized for the group, and read only within that group, before
+/// [`Walk::group_done`] releases its pages).
 ///
 /// Copying every grid into its row cost 31 MB of copies per disjunction at
 /// 150M rows (106 MB scoring every term), libc `memcpy` on x86-64.
 ///
-/// A pointer, not a slice, as it borrows a page or `rows` across the walk's
-/// `&mut self` calls. Sound as the walk uses it: a group's rows are loaded
-/// after `rows` is sized for the group, and read only within that group,
-/// before [`Walk::group_done`] releases its pages.
-///
 /// A conjunction's grids stay slices (`Kind::Grid`): copying a grid across
 /// pages into the term's own words rather than stitching it copied as many
 /// bytes, and checking for it per grid cost 1.3% more instructions.
-#[derive(Clone, Copy)]
-struct RowAt {
-    at: *const u8,
-    len: usize,
-}
-
-impl Default for RowAt {
-    fn default() -> Self {
-        Self::new(&[])
-    }
-}
-
-impl RowAt {
-    fn new(bytes: &[u8]) -> Self {
-        Self {
-            at: bytes.as_ptr(),
-            len: bytes.len(),
-        }
-    }
-
-    /// A row of `rows`, its words stored little-endian.
-    fn of(row: &[u64]) -> Self {
-        Self {
-            at: row.as_ptr().cast(),
-            len: size_of_val(row),
-        }
-    }
-
-    #[inline(always)]
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: `len` bytes from `at` were a slice when the row was
-        // loaded, and are still (see the type).
-        unsafe { std::slice::from_raw_parts(self.at, self.len) }
-    }
-
-    /// Word `w`.
-    #[inline(always)]
-    fn word(&self, w: usize) -> u64 {
-        debug_assert!(w * 8 + 8 <= self.len);
-        // SAFETY: as in `bytes`; the walk asks only for its group's words,
-        // which a row holds (see `grid_row`).
-        u64::from_le_bytes(unsafe { self.at.add(w * 8).cast::<[u8; 8]>().read_unaligned() })
-    }
-}
+type RowAt = kernels::Row;
 
 /// A grid container's row (`row`, of its group's words, holding it only if
 /// need be): in place where the grid lies on one page, else copied into
@@ -3285,16 +3231,30 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // third of its words; weighing them alone, without a plan per
         // sub-range, cost less than sieving every word of it.
         let mut terms = std::mem::take(&mut self.or_terms);
+        let mut rows = std::mem::take(&mut self.or_rows);
+        let mut bounds = std::mem::take(&mut self.or_bounds);
+        let mut sub = std::mem::take(&mut self.or_sub);
         let mut held = std::mem::take(&mut self.or_held);
         terms.clear();
+        rows.clear();
+        bounds.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
             if sb[i] > 0.0 {
-                terms.push((i, self.row_state[i].at, sb[i], 0.0));
+                terms.push(i);
+                rows.push(self.row_state[i].at);
+                bounds.push(sb[i]);
             }
         }
+        sub.clear();
+        sub.resize(terms.len(), 0.0);
         held.clear();
         held.resize(terms.len(), 0);
+        // The sums the kernels weigh a sub-range's words and a word's members
+        // by, lanes at a time (`kernels::word_sums`, `kernels::member_sums`).
+        let mut sums = [0.0_f32; SUB_WORDS];
+        let mut member_sums = [0.0_f32; 64];
+        let mut bits = [0u8; 64];
         // The members left after the weighing below are sieved by their
         // buckets a chunk at a time before each is bounded alone, in a
         // group whose every weighed term is required (the disjunction is a
@@ -3315,18 +3275,26 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             for (j, word) in mask[w0..w1].iter().enumerate() {
                 live |= u32::from(*word != 0) << j;
             }
+            // The sub-range's live words weighed at once, at the group's
+            // bounds.
+            let weighed = live != 0 && self.threshold().is_some();
+            if weighed {
+                kernels::word_sums(
+                    &mask[w0..w1],
+                    live,
+                    w0,
+                    &rows,
+                    &bounds,
+                    &mut sums[..w1 - w0],
+                );
+            }
             let mut bounded = false;
             while live != 0 {
                 let w = w0 + live.trailing_zeros() as usize;
                 live &= live - 1;
                 let mut word = mask[w];
-                if self.threshold().is_some() {
-                    let mut most = 0.0_f32;
-                    for (h, &(_, at, bound, _)) in held.iter_mut().zip(&terms) {
-                        *h = at.word(w);
-                        most += or_zero(bound, *h & word != 0);
-                    }
-                    if self.cut(most, || first(w)) {
+                if weighed {
+                    if self.cut(sums[w - w0], || first(w)) {
                         continue;
                     }
                     if !bounded {
@@ -3334,27 +3302,51 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         let from = base + (w0 * 64) as u32;
                         let to = (base + (w1 * 64) as u32 - 1).min(end);
                         let mut total = 0.0_f32;
-                        for term in terms.iter_mut() {
-                            let bound = self.sc[term.0].range_bound(from, to);
-                            term.3 = bound;
-                            total += bound;
+                        for (&i, bound) in terms.iter().zip(sub.iter_mut()) {
+                            *bound = self.sc[i].range_bound(from, to);
+                            total += *bound;
                         }
                         // The sub-range's words left start at `w`.
                         if self.cut(total, || first(w)) {
                             break;
                         }
                     }
+                    // The word's members, each at the sub-range's bounds of
+                    // the terms holding it: lanes at a time where the word
+                    // holds enough of them to fill a vector, else one at a
+                    // time (most live words hold one to three).
+                    for (h, row) in held.iter_mut().zip(&rows) {
+                        *h = row.word(w);
+                    }
                     let mut keep = 0u64;
-                    let mut left = word;
-                    while left != 0 {
-                        let bit = left.trailing_zeros();
-                        left &= left - 1;
-                        let mut sum = 0.0_f32;
-                        for (h, &(_, _, _, bound)) in held.iter().zip(&terms) {
-                            sum += or_zero(bound, *h >> bit & 1 == 1);
+                    if word.count_ones() as usize >= MEMBER_LANES {
+                        let mut n = 0;
+                        let mut left = word;
+                        while left != 0 {
+                            bits[n] = left.trailing_zeros() as u8;
+                            n += 1;
+                            left &= left - 1;
                         }
-                        let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
-                        keep |= u64::from(!self.cut(sum, tid)) << bit;
+                        let member_sums = &mut member_sums[..n];
+                        member_sums.fill(0.0);
+                        kernels::member_sums(&held, &bits[..n], &sub, member_sums);
+                        for (&bit, &sum) in bits[..n].iter().zip(member_sums.iter()) {
+                            let bit = u32::from(bit);
+                            let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
+                            keep |= u64::from(!self.cut(sum, tid)) << bit;
+                        }
+                    } else {
+                        let mut left = word;
+                        while left != 0 {
+                            let bit = left.trailing_zeros();
+                            left &= left - 1;
+                            let mut sum = 0.0_f32;
+                            for (h, &bound) in held.iter().zip(&sub) {
+                                sum += or_zero(bound, *h >> bit & 1 == 1);
+                            }
+                            let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
+                            keep |= u64::from(!self.cut(sum, tid)) << bit;
+                        }
                     }
                     word = keep;
                 }
@@ -3377,6 +3369,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.finish_staged(g)?;
         }
         self.or_terms = terms;
+        self.or_rows = rows;
+        self.or_bounds = bounds;
+        self.or_sub = sub;
         self.or_held = held;
         self.words = mask;
         self.sub_bounds = sb;
@@ -3471,7 +3466,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// weighed terms are `terms` and present terms' bounds `sb`: its grouped
     /// terms' rows are read, any other bounds every candidate by its bound
     /// over the group. False when there is no bar yet or no term to read.
-    fn or_sieve(&mut self, terms: &[(usize, RowAt, f32, f32)], sb: &[f32]) -> bool {
+    fn or_sieve(&mut self, terms: &[usize], sb: &[f32]) -> bool {
         if self.bar.is_none() {
             return false;
         }
@@ -3480,7 +3475,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // bound over the group.
         self.sieve_ub.clear();
         self.sieve_ub.extend_from_slice(sb);
-        for &(i, ..) in terms {
+        for &i in terms {
             let entry = self.row_state[i].entry;
             if let Some(group) = self.sc[i].group_entry(entry) {
                 self.sieve_terms.push(SieveTerm {
@@ -3685,58 +3680,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn or_zero_adds_what_the_branchy_select_adds() {
-        let xs = [
-            0.0_f32,
-            -0.0,
-            f32::MIN_POSITIVE,
-            f32::from_bits(1),
-            -f32::from_bits(1),
-            f32::from_bits(0x007f_ffff),
-            -f32::from_bits(0x007f_ffff),
-            1.0,
-            -1.5,
-            f32::MAX,
-            f32::MIN,
-            f32::EPSILON,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NAN,
-            -f32::NAN,
-            f32::from_bits(0x7f80_0001),
-            f32::from_bits(0x7fbf_ffff),
-            f32::from_bits(0xffc0_1234),
-            f32::from_bits(0xff80_0001),
-        ];
-        for &x in &xs {
-            for keep in [false, true] {
-                let branchy = if keep { x } else { 0.0 };
-                assert_eq!(
-                    or_zero(x, keep).to_bits(),
-                    branchy.to_bits(),
-                    "{x:?} {keep}"
-                );
-                for &acc in &xs {
-                    let want = acc + branchy;
-                    let got = acc + or_zero(x, keep);
-                    assert!(
-                        got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
-                        "{acc:?} + {x:?} {keep}: {got:?} vs {want:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// A grouped scoring term's bound over a group, from its directory
-    /// entry's frontier, is at least the score of each of its postings
-    /// there, bit for bit, as the walk scores them (the scorer's
-    /// `score_bucket` at the posting's bucket and its document's exact
-    /// length), under any `k1`, `b`, boost and average length, rounded
-    /// frontiers included; zero for a group the term lacks; and its floor
-    /// at a bucket is at most the shortest document in the group holding
-    /// that bucket or more.
     #[test]
     fn a_group_entrys_bound_covers_its_postings() {
         use crate::bm25::Bm25Params;

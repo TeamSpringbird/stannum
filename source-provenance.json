@@ -798,6 +798,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: Elias-Fano lists decoded a block at a time (a table per highs byte, a shuffle per eight low parts), per instruction set (NEON, AVX2) with a portable reference."
     },
+    "engine/src/tinshape/kernels/weigh.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a disjunction's words and members weighed by their terms' bounds in lanes (words, or a word's members), per instruction set (NEON, AVX2) with a portable reference."
+    },
     "engine/src/tinshape/rank.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: ranked top-k over the ctid-addressed segment format, a 256-page group at a time."
@@ -1531,6 +1535,14 @@
     "benchmarks/aws/devbox-replay-ab.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of two trees under perf stat."
+    },
+    "benchmarks/aws/devbox-simd-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the weighing and scoring kernels' tests at every level and their replay A/B."
+    },
+    "benchmarks/aws/devbox-simd-ab2.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a short devbox command file for the replay of up to three trees under perf stat."
     },
     "benchmarks/aws/devbox-bolt-variants.sh": {
       "owner": "ben",
