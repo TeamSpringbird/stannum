@@ -813,34 +813,20 @@ fn sieve_prefix(bytes: &[u8], out: &mut Vec<u32>) {
     out.push(run);
 }
 
-/// Into `ranks`, per local slot of `cands` (ascending, none before the
-/// members' cursor), its posting index in the term (`first` and on), or
-/// `u32::MAX` where the term lacks it.
-fn sieve_ranks(members: SieveMembers<'_>, first: u32, cands: &[u32], ranks: &mut Vec<u32>) {
+/// Into `ranks`, per local slot of `cands` (ascending, none before `list`'s
+/// member `pos`), its posting index in the term (`first` and on, by its
+/// place in `list`), or `u32::MAX` where the term lacks it.
+fn sieve_ranks(list: &[u32], mut pos: usize, first: u32, cands: &[u32], ranks: &mut Vec<u32>) {
     ranks.clear();
-    match members {
-        SieveMembers::Bits { bytes, prefix } => {
-            for &local in cands {
-                let at = local as usize / 64;
-                let word = bits::word(bytes, at);
-                let below = (word & ((1u64 << (local % 64)) - 1)).count_ones();
-                let held = (word >> (local % 64) & 1) as u32;
-                // `u32::MAX` where not held, without a branch.
-                ranks.push((first + prefix[at] + below) | (held.wrapping_sub(1)));
-            }
+    for &local in cands {
+        while pos < list.len() && list[pos] < local {
+            pos += 1;
         }
-        SieveMembers::List { list, mut pos } => {
-            for &local in cands {
-                while pos < list.len() && list[pos] < local {
-                    pos += 1;
-                }
-                ranks.push(if pos < list.len() && list[pos] == local {
-                    first + pos as u32
-                } else {
-                    u32::MAX
-                });
-            }
-        }
+        ranks.push(if pos < list.len() && list[pos] == local {
+            first + pos as u32
+        } else {
+            u32::MAX
+        });
     }
 }
 
@@ -890,6 +876,69 @@ fn sieve_buckets(
         // A bucket past the table's is left to the candidate's own check.
         *bucket = value.min(BUCKET_COUNT as u32) as u8;
         seen |= 1 << *bucket;
+    }
+    Ok((seen, from..to))
+}
+
+/// [`sieve_ranks`] and [`sieve_buckets`] in one pass over `cands`, for the
+/// members of a bitmap (`bytes`, counted per word in `prefix`) whose
+/// postings start at `e.first`: the TF slice read is the one the
+/// candidates' words span.
+fn sieve_bits_buckets(
+    bytes: &[u8],
+    prefix: &[u32],
+    e: &GroupEntry,
+    tf: Bytes<'_>,
+    cands: &[u32],
+    out: &mut Vec<u8>,
+) -> Result<(u32, std::ops::Range<usize>)> {
+    out.clear();
+    let (Some(&lo), Some(&hi)) = (cands.first(), cands.last()) else {
+        return Ok((0, 0..0));
+    };
+    // The postings of the candidates' words, by their place in the group.
+    let (lo, hi) = (prefix[lo as usize / 64], prefix[hi as usize / 64 + 1]);
+    let width = u32::from(e.width);
+    let held = |local: u32| bits::word(bytes, local as usize / 64) >> (local % 64) & 1 == 1;
+    if hi == lo || width == 0 {
+        // None held, or every bucket zero.
+        out.extend(cands.iter().map(|&local| {
+            if width == 0 && held(local) {
+                0
+            } else {
+                NO_BUCKET
+            }
+        }));
+        return Ok((u32::from(hi > lo), 0..0));
+    }
+    let from = e.bucket_bit(e.first + lo) / 8;
+    let to = (e.bucket_bit(e.first + hi - 1) + width as usize).div_ceil(8);
+    // Eight bytes past the last bucket where the tail has them: whole loads.
+    let tail = tf.get(from, (to + 7).min(tf.len()))?;
+    let mask = (1u64 << width) - 1;
+    let mut seen = 0u32;
+    out.reserve(cands.len());
+    for &local in cands {
+        let at = local as usize / 64;
+        let word = bits::word(bytes, at);
+        let below = (word & ((1u64 << (local % 64)) - 1)).count_ones();
+        // A candidate the term lacks reads a bucket it ignores, of a member
+        // in the slice (one after the last is not).
+        let place = (prefix[at] + below).min(hi - 1);
+        let bit = e.bucket_bit(e.first + place) - from * 8;
+        let value = match tail.get(bit / 8..bit / 8 + 8) {
+            Some(chunk) => {
+                let chunk = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+                (chunk >> (bit % 8) & mask) as u32
+            }
+            None => bits::get_at(tail, bit, width)?,
+        };
+        // A bucket past the table's is left to the candidate's own check.
+        let bucket = value.min(BUCKET_COUNT as u32);
+        let keep = (word >> (local % 64) & 1) as u32;
+        seen |= keep << bucket;
+        // `NO_BUCKET` where not held, without a branch.
+        out.push((bucket | keep.wrapping_sub(1)) as u8);
     }
     Ok((seen, from..to))
 }
@@ -1858,13 +1907,28 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 };
                 (members, mem.first)
             };
-            sieve_ranks(members, first, &locals, &mut self.sieve_ranks);
-            let (seen, read) = sieve_buckets(
-                &st.group,
-                set.postings.tf,
-                &self.sieve_ranks,
-                &mut self.sieve_buckets,
-            )?;
+            let (seen, read) = match members {
+                SieveMembers::Bits { bytes, prefix } => {
+                    debug_assert_eq!(first, st.group.first);
+                    sieve_bits_buckets(
+                        bytes,
+                        prefix,
+                        &st.group,
+                        set.postings.tf,
+                        &locals,
+                        &mut self.sieve_buckets,
+                    )?
+                }
+                SieveMembers::List { list, pos } => {
+                    sieve_ranks(list, pos, first, &locals, &mut self.sieve_ranks);
+                    sieve_buckets(
+                        &st.group,
+                        set.postings.tf,
+                        &self.sieve_ranks,
+                        &mut self.sieve_buckets,
+                    )?
+                }
+            };
             if !read.is_empty() {
                 self.touch.touch(
                     Part::TfTail,
