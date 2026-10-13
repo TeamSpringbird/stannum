@@ -150,7 +150,6 @@ jobs:
             --baseline "$smoke_dir/candidate.so" --integrated "$smoke_dir/candidate.so" \
             --installed-library "$installed_library" --checkpoint-control \
             --workload vacuum --scenario mixed --docs 32768 --repeat 20 --rounds 1 \
-            --baseline-vacuum-strategy direct --integrated-vacuum-strategy reconstruct \
             --query-shapes mixed --reader-rate 200 --reader-seconds 4 \
             --output "$smoke_dir/results"
 
