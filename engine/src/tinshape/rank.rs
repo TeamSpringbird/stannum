@@ -3478,8 +3478,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // weighed first all at once, by the group's bounds of the terms
         // holding any of them; each member of a word they leave in reach then
         // by its sub-range's (1,024 slots), taken once per sub-range: tighter,
-        // but a range bound per term. (A word check at the sub-range's bounds
-        // too cut 3% of the words it saw, for 2% of a `full_score`
+        // but a range bound per sparse term. A grouped term's is its group
+        // entry's, the group's: one frontier per (term, group), its entry
+        // starting at the group's first slot. (A word check at the sub-range's
+        // bounds too cut 3% of the words it saw, for 2% of a `full_score`
         // disjunction's instructions.) A member's blocks bound it no higher,
         // so one this leaves below the threshold would fail its candidate
         // check. At 150 million rows a group's mask holds ~85 members in a
@@ -3501,8 +3503,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 bounds.push(sb[i]);
             }
         }
+        // A grouped term's sub-range bounds are its group bound, set once; a
+        // sparse term's are taken per sub-range below. Without a sparse
+        // term, every sub-range's sum is the group's.
         sub.clear();
-        sub.resize(terms.len(), 0.0);
+        sub.extend_from_slice(&bounds);
+        let sparse = terms.iter().any(|&i| !self.sc[i].grouped());
+        let mut group_total = 0.0_f32;
+        for &bound in &bounds {
+            group_total += bound;
+        }
         held.clear();
         held.resize(terms.len(), 0);
         // The sums the kernels weigh a sub-range's words and a word's members
@@ -3567,13 +3577,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     }
                     if !bounded {
                         bounded = true;
-                        let from = base + (w0 * 64) as u32;
-                        let to = (base + (w1 * 64) as u32 - 1).min(end);
-                        let mut total = 0.0_f32;
-                        for (&i, bound) in terms.iter().zip(sub.iter_mut()) {
-                            *bound = self.sc[i].range_bound(from, to);
-                            total += *bound;
-                        }
+                        let total = if sparse {
+                            let from = base + (w0 * 64) as u32;
+                            let to = (base + (w1 * 64) as u32 - 1).min(end);
+                            let mut total = 0.0_f32;
+                            for (&i, bound) in terms.iter().zip(sub.iter_mut()) {
+                                if !self.sc[i].grouped() {
+                                    *bound = self.sc[i].range_bound(from, to);
+                                }
+                                total += *bound;
+                            }
+                            total
+                        } else {
+                            group_total
+                        };
                         // The sub-range's words left start at `w`.
                         if self.cut(total, || first(w)) {
                             break;
