@@ -117,6 +117,11 @@ pub struct KindStats {
     pub stitched: u64,
     /// Reads stitched.
     pub stitches: u64,
+    /// Distinct pages read (pinned, copied or read past the pinned pages),
+    /// each charged once to the first kind that read it: TIN's unique
+    /// pages per area. A page released and pinned again counts once here
+    /// and twice in `pinned`.
+    pub unique: u64,
 }
 
 const NO_STATS: KindStats = KindStats {
@@ -125,10 +130,23 @@ const NO_STATS: KindStats = KindStats {
     pinned: 0,
     stitched: 0,
     stitches: 0,
+    unique: 0,
 };
 
 thread_local! {
     static STATS: RefCell<[KindStats; KINDS]> = const { RefCell::new([NO_STATS; KINDS]) };
+    /// The (blob, page) pairs read since [`reset_stats`], for
+    /// [`KindStats::unique`].
+    static SEEN: RefCell<std::collections::HashSet<(usize, usize)>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Counts page `page` of the blob at `blob` as read by `kind` unless read
+/// already since [`reset_stats`].
+fn first_read(blob: usize, page: usize, kind: Kind) {
+    if SEEN.with_borrow_mut(|seen| seen.insert((blob, page))) {
+        count(kind, |s| s.unique += 1);
+    }
 }
 
 /// What this thread's blobs read per [`Kind`] since [`reset_stats`].
@@ -138,6 +156,7 @@ pub fn stats() -> [KindStats; KINDS] {
 
 pub fn reset_stats() {
     STATS.with_borrow_mut(|s| *s = [NO_STATS; KINDS]);
+    SEEN.with_borrow_mut(std::collections::HashSet::clear);
 }
 
 fn count(kind: Kind, add: impl FnOnce(&mut KindStats)) {
@@ -655,6 +674,11 @@ impl LazyBlob {
                 s.copied += (end - start) as u64;
                 s.copied_pages += pages;
             });
+            if let Some(n) = std::num::NonZeroUsize::new(self.page_len) {
+                for page in start / n..=(end - 1) / n {
+                    first_read(self.data.as_ptr() as usize, page, kind);
+                }
+            }
         }
         Ok(())
     }
@@ -727,6 +751,7 @@ impl LazyBlob {
                     count(kind, |s| s.pinned += 1);
                     self.pinned.borrow_mut().push(page);
                 }
+                first_read(self.data.as_ptr() as usize, page, kind);
                 memo.set(PageRef {
                     page,
                     span: self.span.get(),
@@ -787,6 +812,7 @@ impl LazyBlob {
                     if read.len() != take {
                         return Err(Error::Truncated);
                     }
+                    first_read(self.data.as_ptr() as usize, page, kind);
                     // SAFETY: as above.
                     unsafe {
                         std::ptr::copy_nonoverlapping(read.as_ptr(), out.add(at - from), take);
