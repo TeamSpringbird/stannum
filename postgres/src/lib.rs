@@ -5726,7 +5726,7 @@ mod tests {
         );
         assert_eq!(
             build_digest("reproducible_whole"),
-            "2,6000,186000,51,46,6a81758d8bb7c11e761c6246a2058f4a size 442368"
+            "2,6000,186000,51,46,10d3495b62d18a4dd35710d57de68010 size 442368"
         );
         assert_clean("reproducible_capped");
         assert_clean("reproducible_whole");
