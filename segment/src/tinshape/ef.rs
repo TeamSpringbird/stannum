@@ -17,17 +17,22 @@
 use super::bits::{self, BitWriter};
 use crate::{Error, Result};
 
-/// The low-bit width for `n` values below `universe`.
+/// The low-bit width for `n` values below `universe`: the base-2 log of
+/// `universe / n`, rounded down, 0 when that quotient is below 2. Without
+/// a division (a reader parses a list per container it decodes, and a
+/// 64-bit division is tens of cycles on x86-64): the largest `k` with
+/// `n << k` at most `universe` is `d` or `d - 1`, `d` the difference of the
+/// two's bit lengths (as in [`encoded_len_branchless`]).
+#[inline]
 pub fn low_width(n: usize, universe: u32) -> u32 {
-    if n == 0 {
+    let (n, universe) = (n as u64, u64::from(universe));
+    if n == 0 || universe < 2 * n {
         return 0;
     }
-    let quotient = u64::from(universe) / n as u64;
-    if quotient <= 1 {
-        0
-    } else {
-        63 - quotient.leading_zeros()
-    }
+    // `universe` at least `2 * n`: `d` is at least 1, and `n << d` has
+    // `universe`'s bit length, so no overflow.
+    let d = n.leading_zeros() - universe.leading_zeros();
+    d - u32::from(n << d > universe)
 }
 
 /// [`encoded_len`] for `n` of at least one, without a division or a branch
@@ -515,6 +520,34 @@ mod tests {
             cursor.advance();
         }
         assert_eq!(cursor.current(), None);
+    }
+
+    /// The width by its definition: the base-2 log of the quotient.
+    fn low_width_by_division(n: usize, universe: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        let quotient = u64::from(universe) / n as u64;
+        if quotient <= 1 { 0 } else { quotient.ilog2() }
+    }
+
+    #[test]
+    fn low_width_is_the_log_of_the_quotient() {
+        for n in 0..300 {
+            for universe in 0..5000 {
+                assert_eq!(low_width(n, universe), low_width_by_division(n, universe), "{n} {universe}");
+            }
+        }
+        for (n, universe) in [(1, u32::MAX), (2, u32::MAX), (usize::MAX, 7), (1 << 33, u32::MAX), (65_536, 1 << 31)] {
+            assert_eq!(low_width(n, universe), low_width_by_division(n, universe), "{n} {universe}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn low_width_matches_any(n in 0usize..1 << 34, universe in any::<u32>()) {
+            prop_assert_eq!(low_width(n, universe), low_width_by_division(n, universe));
+        }
     }
 
     #[test]
