@@ -1312,6 +1312,12 @@ struct Walk<'s, 'a, T: Touch> {
     cand_w: usize,
     cand_words: Vec<u64>,
     cand_base: Vec<u32>,
+    /// A disjunction's members' bound sums by pattern ([`Walk::pattern_key`]):
+    /// per pattern its sum's [`order_key`], valid where its epoch is the
+    /// memo's.
+    pattern_keys: Vec<i32>,
+    pattern_epochs: Vec<u32>,
+    pattern_epoch: u32,
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
     plan: Plan,
@@ -3083,6 +3089,9 @@ pub(super) fn walk_into<'s, 'a>(
         cand_w: usize::MAX,
         cand_words: Vec::with_capacity(n),
         cand_base: Vec::with_capacity(n),
+        pattern_keys: Vec::new(),
+        pattern_epochs: Vec::new(),
+        pattern_epoch: 0,
         blocks: vec![0; n],
         sub_bounds: Vec::new(),
         plan: Plan::default(),
@@ -3261,6 +3270,10 @@ fn span_check<'a>(
 /// Words of a disjunction's sub-range: a group's members are bounded by
 /// their terms' blocks over this many words (1,024 slots) at a time.
 const SUB_WORDS: usize = 16;
+
+/// Most weighed terms a disjunction's group weighs its members by pattern
+/// with ([`Walk::pattern_key`]): a memo of `2^PATTERN_TERMS` sums.
+const PATTERN_TERMS: usize = 10;
 
 /// Whether a disjunction's words and members are weighed in lanes, by the
 /// weighing kernels (`kernels::word_sums`, `kernels::member_sums`), rather
@@ -3757,6 +3770,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         held.clear();
         held.resize(terms.len(), 0);
+        // Members weighed by their patterns' sums (`Walk::pattern_key`),
+        // with few enough terms; a new group's bounds, a new memo.
+        let patterned = terms.len() <= PATTERN_TERMS;
+        if patterned {
+            self.new_patterns();
+        }
         // The sums the kernels weigh a sub-range's words and a word's members
         // by, lanes at a time (`kernels::word_sums`, `kernels::member_sums`).
         let mut sums = [0.0_f32; SUB_WORDS];
@@ -3838,6 +3857,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                                 }
                                 total += *bound;
                             }
+                            if patterned {
+                                self.new_patterns();
+                            }
                             total
                         } else {
                             group_total
@@ -3861,7 +3883,27 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     // `BarKey::keeps`), at the bar as it stands now.
                     let bar = BarKey::of(self.bar).expect("weighed under a bar");
                     let mut keep = 0u64;
-                    if WEIGH_IN_LANES && word.count_ones() as usize >= MEMBER_LANES {
+                    if patterned {
+                        // A member's sum is its pattern's (bit `t` where
+                        // term `t` holds it), each summed once per group or
+                        // sub-range (`Walk::pattern_key`).
+                        let mut left = word;
+                        while left != 0 {
+                            let bit = left.trailing_zeros();
+                            left &= left - 1;
+                            let mut p = 0usize;
+                            for (t, &h) in held.iter().enumerate() {
+                                p |= (((h >> bit) & 1) as usize) << t;
+                            }
+                            let key = self.pattern_key(p, &sub);
+                            let kept = if key == bar.key {
+                                geometry.tid_in(gi, (w * 64) as u32 + bit) < bar.tid
+                            } else {
+                                key > bar.key
+                            };
+                            keep |= u64::from(kept) << bit;
+                        }
+                    } else if WEIGH_IN_LANES && word.count_ones() as usize >= MEMBER_LANES {
                         let mut n = 0;
                         let mut left = word;
                         while left != 0 {
@@ -3974,6 +4016,40 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let w = local as usize / 64;
         r.advance(w);
         r.first + r.run + (r.at.word(w) & ((1u64 << (local % 64)) - 1)).count_ones()
+    }
+
+    /// Empties the pattern memo ([`Walk::pattern_key`]): the weighed terms'
+    /// bounds changed (a new group, or a sparse term's sub-range).
+    #[inline]
+    fn new_patterns(&mut self) {
+        if self.pattern_keys.is_empty() {
+            self.pattern_keys = vec![0; 1 << PATTERN_TERMS];
+            self.pattern_epochs = vec![0; 1 << PATTERN_TERMS];
+        }
+        self.pattern_epoch += 1;
+    }
+
+    /// The [`order_key`] of what a member holding the weighed terms of
+    /// pattern `p` (bit `t` for term `t`) is bounded by: their bounds
+    /// `bounds` summed from `+0.0` in the scorer's order, what the member's
+    /// own sum adds (a term it lacks adds `+0.0`, which changes no sum from
+    /// `+0.0` on). Summed once per pattern while the bounds hold: a group's
+    /// members fall in few patterns.
+    #[inline(always)]
+    fn pattern_key(&mut self, p: usize, bounds: &[f32]) -> i32 {
+        if self.pattern_epochs[p] == self.pattern_epoch {
+            return self.pattern_keys[p];
+        }
+        let mut sum = 0.0_f32;
+        let mut left = p;
+        while left != 0 {
+            sum += bounds[left.trailing_zeros() as usize];
+            left &= left - 1;
+        }
+        let key = order_key(sum);
+        self.pattern_keys[p] = key;
+        self.pattern_epochs[p] = self.pattern_epoch;
+        key
     }
 
     /// Makes `w` the disjunction's word at hand, a word of the group at
