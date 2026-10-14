@@ -228,6 +228,14 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   entries' bytes instead of their pairs, reading a block's frontier again
   only for a candidate in it (`full_score` disjunction replay at 150 million
   rows: 2.5% less CPU).
+- A ranked disjunction over `TNS1` takes a grouped term's bound over a group
+  and its container from the directory entry its walk's seek found, rather
+  than finding that entry twice more, and keeps a frontier's best bound by a
+  compare and a select rather than `f32::max`, whose NaN ordering put three
+  more instructions on the fold's carried chain on x86-64. At 150 million
+  rows (replay) score disjunctions take 3.2-3.8% fewer cycles on Sapphire
+  Rapids and 3.9% fewer on Apple M4 (6-8% fewer instructions), `full_score`
+  ones 2.5% fewer on the M4, with the same answers.
 - A ranked conjunction or phrase over `TNS1` scoring a common term (in at
   least one document in ten of the segment, as `full_score` scores them)
   beside a rarer one bounds the common term's groups by its record rather
