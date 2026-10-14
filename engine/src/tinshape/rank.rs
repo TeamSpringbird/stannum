@@ -32,7 +32,7 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
-    array_bytes, higher,
+    array_bytes, higher, lower,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -4200,7 +4200,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let read = self.buckets[h];
             let v = if read == NO_BUCKET {
                 let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
-                s.scorer.bound_through(most, floor).min(self.held_bound[h])
+                // No higher than it was: one `minss` on x86-64, not
+                // `f32::min`'s NaN ordering (1.1% of a `full_score`
+                // disjunction's cycles there); never NaN, the same.
+                lower(self.held_bound[h], s.scorer.bound_through(most, floor))
             } else {
                 s.scorer
                     .bound_through(TfBucket::new(read).expect("a valid bucket"), floor)

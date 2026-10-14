@@ -2967,6 +2967,25 @@ pub fn higher(best: f32, v: f32) -> f32 {
     if v > best { v } else { best }
 }
 
+/// The smaller of a running bound `best` (never NaN) and `v`: `best` when
+/// `v` is NaN, as [`f32::min`] gives. On x86-64 one `minss` (`v < best ?
+/// v : best`) rather than `f32::min`'s NaN ordering (a `minss`, a
+/// `cmpunordss` and a blend); written as a compare and select, LLVM made it
+/// a branch on the data. On aarch64 `f32::min` is already one `fminnm`.
+#[inline(always)]
+pub fn lower(best: f32, v: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_cvtss_f32, _mm_min_ss, _mm_set_ss};
+        // SAFETY: SSE is part of the x86-64 baseline.
+        unsafe { _mm_cvtss_f32(_mm_min_ss(_mm_set_ss(v), _mm_set_ss(best))) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        best.min(v)
+    }
+}
+
 /// A block's bound from its frontier: the best of `bound` over its pairs,
 /// and 0 at least.
 #[inline(always)]
