@@ -1102,7 +1102,13 @@ fn load<'a>(
                     offset: 0,
                 };
             } else {
-                kernels::container_locals(&e, bytes, geometry.starts(g as usize), &mut mem.list)?;
+                kernels::container_locals(
+                    &e,
+                    bytes,
+                    group.slots(),
+                    geometry.starts(g as usize),
+                    &mut mem.list,
+                )?;
             }
         }
         Src::Locals { from, to } => {

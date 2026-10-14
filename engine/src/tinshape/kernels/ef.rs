@@ -113,24 +113,27 @@ pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
 
 /// Appends a group container's members (local slots, in order), as
 /// [`for_each_local`] visits them: an Elias-Fano container's by
-/// [`ef_decode`], an array's by [`array_decode`]. `starts` is the group's
-/// page starts ([`segment::tinshape::docs::Geometry::starts`]).
+/// [`ef_decode`], an array's by [`array_decode`]. `slots` is the group's
+/// slot count ([`segment::tinshape::docs::Group::slots`]), `starts` its
+/// page starts ([`segment::tinshape::docs::Geometry::starts`]), read only
+/// for a container of pages: an array or an Elias-Fano list takes its
+/// universe from `slots`, where the last start, in a table read for no
+/// other reason, waited on memory in most groups a rare term is read in.
 #[inline]
 pub fn container_locals(
     entry: &GroupEntry,
     bytes: &[u8],
+    slots: u32,
     starts: &[u32],
     out: &mut Vec<u32>,
 ) -> Result<()> {
+    debug_assert_eq!(slots, group_slots(starts));
     if entry.kind == KIND_ARRAY {
-        array_decode(array_bytes(bytes, entry.count, group_slots(starts))?, out);
+        array_decode(array_bytes(bytes, entry.count, slots)?, out);
         return Ok(());
     }
     if entry.kind == KIND_EF {
-        ef_decode(
-            Ef::parse(bytes, entry.count as usize, group_slots(starts))?,
-            out,
-        );
+        ef_decode(Ef::parse(bytes, entry.count as usize, slots)?, out);
         return Ok(());
     }
     out.reserve(entry.count as usize);
