@@ -692,12 +692,18 @@ impl<'s, 'a> Sc<'s, 'a> {
         if self.bb_block[at] == tag {
             return self.bb[at];
         }
-        self.bb_block[at] = tag;
         let floor = if sub {
             self.sub_floor_at(r, bucket)
         } else {
             self.floor_at(b, bucket)
         };
+        // The bound depends on the bucket and the floor alone: a sub-range
+        // whose floor there is the last one's reuses its bound.
+        if self.bb_block[at] != u64::MAX && self.bb[at].0 == floor {
+            self.bb_block[at] = tag;
+            return self.bb[at];
+        }
+        self.bb_block[at] = tag;
         let v = (
             floor,
             self.scorer

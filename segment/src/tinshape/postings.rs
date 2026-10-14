@@ -420,7 +420,9 @@ impl<'b> GroupFrontier<'b> {
 impl Iterator for GroupFrontier<'_> {
     type Item = (u8, u32);
 
-    #[inline]
+    /// Always inline: a walk folds a frontier per (term, group) it bounds,
+    /// and a call per pair cost more than the pair (measured at 150M rows).
+    #[inline(always)]
     fn next(&mut self) -> Option<(u8, u32)> {
         if self.left == 0 {
             return None;
