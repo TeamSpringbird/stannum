@@ -244,6 +244,7 @@ pub fn merge(
                     kind: entry.kind,
                     bytes: postings.container(entry).all().ok()?,
                     input_df: *input_df,
+                    input_documents: segments[i].docs.geometry.documents,
                 })
             })?;
             terms += 1;

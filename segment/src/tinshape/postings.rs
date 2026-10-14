@@ -131,6 +131,10 @@ pub struct Options {
     /// smaller term whole costs microseconds, and a small table, every
     /// term of which is small, would pay for grids it never needs.
     pub grid_min_postings: u32,
+    /// ... and in at least one in this many of the segment's documents (0:
+    /// any share): a rarer term's dense groups are chosen by size like any
+    /// other's.
+    pub grid_min_share: u32,
     /// A group the encoder would store as an Elias-Fano list, of at most
     /// this many members, is an array of `u16` local slots instead
     /// ([`KIND_ARRAY`]): two bytes a member where the list takes 1.2 to 1.8
@@ -159,6 +163,17 @@ pub enum GroupFrontiers {
     Rounded,
 }
 
+impl Options {
+    /// Whether a term of `df` postings in a segment of `documents` documents
+    /// has its groups of at least one slot in [`Self::grid_density`] forced
+    /// into grids.
+    pub fn forces_grids(&self, df: u64, documents: u32) -> bool {
+        df >= u64::from(self.grid_min_postings)
+            && (self.grid_min_share == 0
+                || df * u64::from(self.grid_min_share) >= u64::from(documents))
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -169,6 +184,7 @@ impl Default for Options {
             adaptive_tf: true,
             grid_density: 64,
             grid_min_postings: 4096,
+            grid_min_share: 0,
             array_max: 64,
             inline_lengths_max_df: 64,
             inline_lengths_min_documents: 1 << 16,
@@ -407,13 +423,15 @@ fn get_checked(bytes: &[u8], at: &mut usize) -> u64 {
 /// input's geometry (the same width, first page and span), its members are
 /// exactly the input's there (no dead document, no other input), the
 /// options are the same, and the two terms fall on the same side of
-/// [`Options::grid_min_postings`]; the caller vouches for all but the last,
+/// [`Options::forces_grids`]; the caller vouches for all but the last,
 /// which the encoder checks, re-encoding the group when it fails.
 #[derive(Clone, Copy, Debug)]
 pub struct Reused<'a> {
     pub kind: u8,
     pub bytes: &'a [u8],
+    /// The input term's postings, and its segment's documents.
     pub input_df: u32,
+    pub input_documents: u32,
 }
 
 /// Encodes a term's postings: `slots` strictly increasing, with each
@@ -688,7 +706,7 @@ fn encode_groups<'r>(
         let mut best = group.grid_bytes();
         let dense = options.grid_density > 0
             && locals.len() as u64 * u64::from(options.grid_density) >= u64::from(group.slots());
-        let forced = dense && slots.len() as u64 >= u64::from(options.grid_min_postings);
+        let forced = dense && options.forces_grids(slots.len() as u64, geometry.documents);
         if forced {
             stats.forced += 1;
         }
@@ -704,7 +722,7 @@ fn encode_groups<'r>(
                 _ => true,
             };
             form && (!dense
-                || (u64::from(r.input_df) >= u64::from(options.grid_min_postings)) == forced)
+                || options.forces_grids(u64::from(r.input_df), r.input_documents) == forced)
         });
         if let Some(r) = reused {
             kind = r.kind;
@@ -4276,6 +4294,7 @@ mod tests {
                             adaptive_tf,
                             grid_density,
                             grid_min_postings: 0,
+                            grid_min_share: 0,
                             // Arrays for lists of at most 64, of 2, of any
                             // length, and none.
                             array_max: match (block_size, grid_density) {
@@ -4548,6 +4567,50 @@ mod tests {
         let second = ef::encoded_len(109, geometry.groups[1].slots());
         assert_eq!(all.array_excess, (2 * 178 - first - second) as isize);
         assert_eq!(ef.array_excess, 0);
+    }
+
+    #[test]
+    fn grids_forced_only_for_terms_of_a_large_enough_share() {
+        // 512 full pages of 40 tuples (20,480 documents); a term in every
+        // 30th document holds one slot in 30 of each group: its groups are
+        // forced into grids at the default density (64) unless the share
+        // asked for is more than its own (683 documents, 1 in 29.98).
+        let tids: Vec<Tid> = (0..512u32)
+            .flat_map(|b| {
+                (1..=40u16).map(move |o| Tid {
+                    block: b,
+                    offset: o,
+                })
+            })
+            .collect();
+        let geometry = geometry(&tids);
+        let members: Vec<Tid> = tids.iter().step_by(30).copied().collect();
+        let slots: Vec<u32> = members
+            .iter()
+            .map(|t| geometry.slot_of(*t).unwrap())
+            .collect();
+        let buckets = vec![1u8; slots.len()];
+        let lengths = vec![50; slots.len()];
+        let forced = |share: u32| {
+            let options = Options {
+                grid_min_postings: 0,
+                grid_min_share: share,
+                ..Options::default()
+            };
+            round_trip(&geometry, &slots, &buckets, &lengths, &options).forced
+        };
+        assert_eq!(forced(0), 2);
+        assert_eq!(forced(16), 0);
+        assert_eq!(forced(29), 0);
+        assert_eq!(forced(31), 2);
+        assert_eq!(forced(64), 2);
+        let options = Options {
+            grid_min_postings: 0,
+            grid_min_share: 16,
+            ..Options::default()
+        };
+        assert!(!options.forces_grids(1279, 20_480));
+        assert!(options.forces_grids(1280, 20_480));
     }
 
     #[test]
