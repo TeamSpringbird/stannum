@@ -46,6 +46,11 @@
 //! only; macOS: `proc_pid_rusage`, no branch misses); `--perf-ctl CTL,ACK`
 //! turns an outside `perf stat` or `perf record` (`-D -1 --control
 //! fifo:CTL,ACK`) on around each timed pass only.
+//! `--census DIR` runs research round 2's gates N1 and N3 over the
+//! instrumented pass (see [`bench::gates2`]; use `--repeat 0`): N1's and
+//! N3(a)'s tallies and N3(c)'s DL reads go to DIR, tagged `score` or
+//! `full`; `--census-or-every N` models every Nth disjunction only;
+//! `--census-sizes` also writes the index-wide sizes and length histogram.
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -116,6 +121,9 @@ struct Args {
     /// enabled around each timed pass only (not the load, the answer's
     /// pass or the instrumented one).
     perf_ctl: Option<(PathBuf, PathBuf)>,
+    census: Option<PathBuf>,
+    census_or_every: usize,
+    census_sizes: bool,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -173,6 +181,9 @@ fn args() -> Args {
         out: None,
         plan: Vec::new(),
         perf_ctl: None,
+        census: None,
+        census_or_every: 1,
+        census_sizes: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -231,6 +242,11 @@ fn args() -> Args {
                 let (ctl, ack) = v.split_once(',').unwrap_or_else(|| usage());
                 a.perf_ctl = Some((ctl.into(), ack.into()));
             }
+            "--census" => a.census = Some(value(&mut it).into()),
+            "--census-or-every" => {
+                a.census_or_every = value(&mut it).parse().unwrap_or_else(|_| usage());
+            }
+            "--census-sizes" => a.census_sizes = true,
             _ => usage(),
         }
     }
@@ -637,6 +653,7 @@ struct Reader {
     stop: Option<String>,
     /// Rank as `full_score` (set per query with `--plan`).
     full: std::cell::Cell<bool>,
+    census: bool,
     segs: Vec<Seg>,
 }
 
@@ -712,6 +729,7 @@ impl Reader {
             params: loaded.params,
             stop: loaded.stop_words.clone(),
             full: std::cell::Cell::new(args.full),
+            census: args.census.is_some(),
             segs,
         })
     }
@@ -809,6 +827,7 @@ impl Reader {
                         &mut Offset {
                             pages: &mut *pages,
                             base: i << 40,
+                            census: self.census,
                         },
                     )
                 })
@@ -1023,11 +1042,55 @@ struct SegmentWork {
 struct Offset<'p> {
     pages: &'p mut Pages,
     base: usize,
+    /// Whether the walk's census events are kept ([`bench::gates2`]).
+    census: bool,
 }
 
 impl tin::Touch for Offset<'_> {
     fn touch(&mut self, part: Part, at: usize, len: usize) {
         self.pages.touch(part, self.base + at, len);
+    }
+
+    fn census(&self) -> bool {
+        self.census
+    }
+
+    fn census_and(&mut self, g: u32, req: &[usize], left: &[u32], grids: bool) {
+        bench::gates2::push(bench::gates2::Event::And {
+            seg: self.base >> 40,
+            g,
+            req: req.to_vec(),
+            left: left.to_vec(),
+            grids,
+        });
+    }
+
+    fn census_or(&mut self, g: u32, theta: Option<f32>, present: &[usize]) {
+        bench::gates2::push(bench::gates2::Event::Or {
+            seg: self.base >> 40,
+            g,
+            theta,
+            present: present.to_vec(),
+        });
+    }
+
+    fn census_length(
+        &mut self,
+        g: u32,
+        _local: u32,
+        length: u32,
+        need: u32,
+        at: usize,
+        held: &[usize],
+    ) {
+        bench::gates2::push(bench::gates2::Event::Len {
+            seg: self.base >> 40,
+            g,
+            length,
+            need,
+            at,
+            held: held.to_vec(),
+        });
     }
 }
 
@@ -1245,6 +1308,23 @@ fn run() -> Result<bool, String> {
         start.elapsed().as_secs_f64()
     );
     let mut perf = PerfCtl::open(args.perf_ctl.as_ref()).map_err(|e| format!("--perf-ctl: {e}"))?;
+    let census_segs: Vec<Segment<'static>> = if args.census.is_some() {
+        loaded
+            .segments
+            .iter()
+            .map(|(_, blob, _)| Segment::parse(blob).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
+    let mut census = bench::gates2::Census::new(args.census_or_every);
+    if let Some(dir) = &args.census
+        && args.census_sizes
+    {
+        let bytes = loaded.segments.iter().map(|(_, b, _)| b.len() as u64).sum();
+        bench::gates2::sizes(&census_segs, bytes, dir).map_err(|e| e.to_string())?;
+        eprintln!("census sizes written");
+    }
     let mut rows = Vec::new();
     let mut warm_out = String::from(
         "name\tstyle\twarm_rows\ttheta_warm\ttheta_final\twarm_in_final\tand_examined\tand_scored\n",
@@ -1352,6 +1432,7 @@ fn run() -> Result<bool, String> {
             }
             None => None,
         };
+        let _ = bench::gates2::take();
         let (direct, counters, segments) = reader
             .instrumented(
                 &scorer,
@@ -1365,6 +1446,21 @@ fn run() -> Result<bool, String> {
         if direct != answer && !args.seed {
             mismatched += 1;
             eprintln!("instrumented walk differs: {}", q.name);
+        }
+        if args.census.is_some() {
+            let mut names = Vec::new();
+            tin::lower(&scorer.query, &mut names).ok_or("lowered once already")?;
+            census.query(
+                n,
+                &q.style,
+                bench::gates2::take(),
+                &names,
+                &scorer.terms,
+                &census_segs,
+            );
+            if (n + 1) % 50 == 0 {
+                eprintln!("census: {} of {}", n + 1, trace.len());
+            }
         }
         rows.push(Row {
             name: q.name.clone(),
@@ -1388,6 +1484,11 @@ fn run() -> Result<bool, String> {
         }
     }
     let _ = NoTouch;
+    if let Some(dir) = &args.census {
+        census
+            .write(dir, if args.full { "full" } else { "score" })
+            .map_err(|e| e.to_string())?;
+    }
     if let Some(path) = &args.warm {
         std::fs::write(path, &warm_out).map_err(|e| e.to_string())?;
     }

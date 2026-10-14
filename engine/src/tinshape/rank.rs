@@ -1684,6 +1684,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             Kind::List => cands.extend_from_slice(&lead.list),
             Kind::Cursor { .. } | Kind::Array(_) => unreachable!("a lead is loaded whole"),
         }
+        let mut left = [0u32; 16];
+        left[0] = cands.len() as u32;
         for r in 1..self.req.len() {
             if cands.is_empty() {
                 break;
@@ -1727,6 +1729,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     kernels::intersect_marked(&mut cands, &mem.list, &mut self.marks);
                 }
             }
+            if self.touch.census() && r < left.len() {
+                left[r] = cands.len() as u32;
+            }
+        }
+        if self.touch.census() {
+            let n = self.req.len().min(left.len());
+            self.touch.census_and(g, &self.req[..n], &left[..n], false);
         }
         let more = self.walk_candidates(g, &cands)?;
         self.cands = cands;
@@ -2378,6 +2387,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         if let Some(dead) = self.segment.liveness.groups[g as usize].as_deref() {
             kernels::andnot_words(words, dead);
+        }
+        if self.touch.census() {
+            let n = self.req.len().min(16);
+            let mut left = [0u32; 16];
+            left[..n].fill(kernels::popcount(words) as u32);
+            self.touch.census_and(g, &self.req[..n], &left[..n], true);
         }
         // A group the sieve takes is sieved by its first term's buckets
         // before its candidates are listed.
@@ -3653,6 +3668,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let base = group.slot_base;
         let end = base + group.slots() - 1;
         self.answer.windows += 1;
+        if self.touch.census() {
+            let present: Vec<usize> = self.present_list.iter().map(|&i| self.sc[i].term).collect();
+            self.touch.census_or(g, self.threshold(), &present);
+        }
         // The present terms' bounds over the group.
         self.cand_w = usize::MAX;
         let mut sb = std::mem::take(&mut self.sub_bounds);

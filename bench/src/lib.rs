@@ -9,6 +9,7 @@
 
 pub mod areas;
 pub mod dump;
+pub mod gates2;
 pub mod paged;
 pub mod replay;
 pub mod tinshape;
