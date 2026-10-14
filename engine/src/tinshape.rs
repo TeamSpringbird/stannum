@@ -390,8 +390,9 @@ impl<'a> TermSet<'a> {
 
     /// Moves `hint` forward to the term's first group whose index is
     /// `group` or more (to the group count if none is), and gives that
-    /// group's index. A grouped term's entries are scanned as the slice of
-    /// those decoded, the next block decoded when the scan passes them.
+    /// group's index. A grouped term's directory is sought by its skip
+    /// points past the hint's run ([`Directory::seek`]): the entries of the
+    /// runs it passes over are not decoded.
     #[inline]
     fn seek_index(&self, group: u32, hint: &mut usize) -> Option<u32> {
         let Some(dir) = &self.dir else {
@@ -400,19 +401,10 @@ impl<'a> TermSet<'a> {
             }
             return self.groups.get(*hint).map(|g| g.index);
         };
-        loop {
-            let decoded = dir.decoded_entries();
-            while let Some(entry) = decoded.get(*hint) {
-                if entry.index >= group {
-                    return Some(entry.index);
-                }
-                *hint += 1;
-            }
-            if *hint >= dir.len() {
-                return None;
-            }
-            Self::entry(dir, &self.docs, *hint);
-        }
+        *hint = dir
+            .seek(group, *hint, &self.docs.geometry.groups)
+            .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")));
+        (*hint < dir.len()).then(|| Self::entry(dir, &self.docs, *hint).index)
     }
 
     /// The term's group `group`, if it holds it, looked for from `hint`
@@ -424,7 +416,7 @@ impl<'a> TermSet<'a> {
         }
         Some(match &self.dir {
             // Decoded: the seek reached it.
-            Some(dir) => self.group_of_entry(dir.decoded_entries()[*hint]),
+            Some(dir) => self.group_of_entry(Self::entry(dir, &self.docs, *hint)),
             None => self.groups[*hint],
         })
     }

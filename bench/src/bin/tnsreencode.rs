@@ -2,13 +2,14 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments of page layout version 9, 8 or 6 to
-//! version 10, whose grouped records' headers give their directory's length,
-//! and reports what that costs.
+//! Re-encodes dumped `TNS1` segments of page layout version 10, 9, 8 or 6
+//! to version 11, whose grouped records' directories end in skip points (or,
+//! with `--keep-records`, 10, whose grouped records' headers give their
+//! directory's length), and reports what that costs.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 9|8|6] [--exact] [--segment FILE] [--grid-density N] [--jobs N] [--check]
+//!     [--from 10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--jobs N] [--check]
 //!     [--check-merge] [--census] [--keep-records]
 //! ```
 //!
@@ -32,7 +33,8 @@
 //! 4. **Renumbering.** The segment is merged alone with this build's
 //!    `merge::merge`, which derives the grid from its documents (each
 //!    page's width its largest offset) and encodes every record afresh, as
-//!    a build of the same documents does.
+//!    a build of the same documents does (version 11): from 10, the only
+//!    step.
 //!
 //! `--keep-records` skips step 4: each record keeps its encoding but for
 //! the header (with `--check-merge`, the merge must give the same bytes).
@@ -115,7 +117,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 9|8|6] [--exact] [--segment FILE] \
+        "usage: tnsreencode --in DIR --out DIR [--from 10|9|8|6] [--exact] [--segment FILE] \
          [--grid-density N] [--jobs N] [--check] [--check-merge] [--census] [--keep-records]"
     );
     std::process::exit(2)
@@ -155,8 +157,8 @@ fn args() -> Args {
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9)
-        || (a.keep_records && a.from == 6)
+        || !matches!(a.from, 6 | 8 | 9 | 10)
+        || (a.keep_records && matches!(a.from, 6 | 10))
         || a.jobs == 0
     {
         usage();
@@ -843,10 +845,10 @@ fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), Strin
     let blob = std::fs::read(args.input.join(name)).map_err(|e| e.to_string())?;
     let before = area_sizes(&blob)?;
     let source = blob.len();
-    let mut new = if args.from == 9 { blob } else { regrid(&blob)? };
+    let mut new = if args.from >= 9 { blob } else { regrid(&blob)? };
     if args.from == 6 {
         new = reencode_v6(&new, args.mode, cost)?;
-    } else {
+    } else if args.from < 10 {
         new = add_directory_lengths(&new, cost)?;
     }
     let new = if args.keep_records {
