@@ -26,7 +26,8 @@ use crate::{Error, Result};
 #[inline]
 pub fn low_width(n: usize, universe: u32) -> u32 {
     let (n, universe) = (n as u64, u64::from(universe));
-    if n == 0 || universe < 2 * n {
+    // `universe < 2 * n`, without overflow for any `n`.
+    if n == 0 || universe >> 1 < n {
         return 0;
     }
     // `universe` at least `2 * n`: `d` is at least 1, and `n << d` has
