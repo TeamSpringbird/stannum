@@ -1552,9 +1552,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             // The lead's next container is read first in its group, which
             // waited on memory for it: asked for now, it arrives while this
-            // group is walked.
+            // group is walked. On x86-64: the M4's prefetchers left nothing
+            // to hide there (0.8% more instructions, no fewer cycles).
             let mem = &self.mems[lead];
-            if mem.entry != usize::MAX {
+            if cfg!(target_arch = "x86_64") && mem.entry != usize::MAX {
                 let set = self.terms[lead].as_ref().expect("the lead");
                 set.prefetch_next(mem.hint, LEAD_PREFETCH_LINES);
             }
