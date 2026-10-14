@@ -38,7 +38,7 @@ use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
+    G, Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -69,6 +69,11 @@ const STAGE_CHUNK: usize = 256;
 /// buckets ([`Walk::sieve`]) this many at a time ([`SIEVE_CHUNK`]) before
 /// any is bounded alone.
 const SIEVE_MIN: usize = 32;
+
+/// Cache lines of the second required term's container in a group read
+/// ahead of the lead's members ([`Walk::prefetch_second`]): 1 KB, about a
+/// grid of a group's slots twice over.
+const PREFETCH_LINES: usize = 16;
 const SIEVE_CHUNK: usize = 256;
 
 /// A disjunction's group is sieved ([`Walk::or_sieve`]) when its mask
@@ -1485,6 +1490,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.answer.windows_pruned += 1;
                 continue;
             }
+            self.prefetch_second(g);
             if self.mems[lead].loaded != g + 1 {
                 let set = self.terms[lead].as_mut().expect("the lead");
                 load(
@@ -1590,6 +1596,35 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let geometry = self.geometry;
         self.cut(bound, || geometry.tid_in(g as usize, 0))
+    }
+
+    /// Starts reading the second required term's container in group `g`
+    /// (its first [`PREFETCH_LINES`] lines) before the lead's members are
+    /// read: [`Walk::group_and`] reads it next, always (the lead holds a
+    /// member there), and its first touch would wait on memory after the
+    /// lead's. Here the two reads overlap. A term read sparse, or holding
+    /// no container there, is left to [`load`].
+    #[inline]
+    fn prefetch_second(&mut self, g: u32) {
+        let Some(&t) = self.req.get(1) else {
+            return;
+        };
+        let mem = &mut self.mems[t];
+        if mem.loaded == g + 1 {
+            return;
+        }
+        let set = self.terms[t].as_ref().expect("required");
+        if matches!(set.postings.form, Form::Sparse(_)) {
+            return;
+        }
+        if let Some(G {
+            src: Src::Container { bytes, .. },
+            ..
+        }) = set.find(g, &mut mem.hint)
+            && let Ok(bytes) = bytes.all()
+        {
+            bits::prefetch(bytes, PREFETCH_LINES);
+        }
     }
 
     /// Whether every required term holds group `g` as a grid.
