@@ -208,6 +208,11 @@ pub struct Stats {
     pub kind_bytes: [usize; 4],
     /// Groups made grids by [`Options::grid_density`].
     pub forced: usize,
+    /// Groups of at least one slot in [`Options::grid_density`] of a term
+    /// of at least [`Options::grid_min_postings`]: forced into grids but
+    /// for [`Options::grid_min_share`], and keeping the term grouped either
+    /// way.
+    pub dense: usize,
     /// Bytes of inline lengths ([`InlineLengths`]).
     pub lengths: usize,
     /// Bytes of the directory's group frontiers (part of `payload`), and
@@ -501,7 +506,7 @@ pub fn encode_reusing<'r>(
     let mut footer = Vec::new();
     let mut tf_bytes = Vec::new();
     let mut blocks = 0usize;
-    if options.sparse && grouped_stats.forced == 0 {
+    if options.sparse && grouped_stats.dense == 0 {
         let mut tf = BitWriter::new();
         let mut previous = 0u32;
         for (b, chunk) in slots.chunks(block).enumerate() {
@@ -531,7 +536,9 @@ pub fn encode_reusing<'r>(
             blocks += 1;
         }
     }
-    // A term with a group dense enough to be a grid stays grouped. The
+    // A term with a group dense enough to be a grid stays grouped (a grid
+    // or not, as its share decides: one list over the segment would trade
+    // the group's bounds and skips for a few bytes). The
     // directory's frontiers and the footer do not count: they buy the
     // walks their bounds, and leaving them out keeps each term's form
     // what it was without them, and so do its skip points. Arrays count as
@@ -542,7 +549,7 @@ pub fn encode_reusing<'r>(
         - grouped_stats.skip_bytes as isize
         - grouped_stats.array_excess;
     let use_sparse =
-        options.sparse && grouped_stats.forced == 0 && sparse.len() as isize <= grouped_len;
+        options.sparse && grouped_stats.dense == 0 && sparse.len() as isize <= grouped_len;
     let payload = if use_sparse { &sparse } else { &grouped };
     let mut inline_bytes = Vec::new();
     if inline {
@@ -593,6 +600,7 @@ pub fn encode_reusing<'r>(
         stats.kinds = grouped_stats.kinds;
         stats.kind_bytes = grouped_stats.kind_bytes;
         stats.forced = grouped_stats.forced;
+        stats.dense = grouped_stats.dense;
         stats.frontier_bytes = grouped_stats.frontier_bytes;
         stats.skip_bytes = grouped_stats.skip_bytes;
         stats.frontiers = grouped_stats.frontiers;
@@ -709,6 +717,9 @@ fn encode_groups<'r>(
         let forced = dense && options.forces_grids(slots.len() as u64, geometry.documents);
         if forced {
             stats.forced += 1;
+        }
+        if dense && slots.len() as u64 >= u64::from(options.grid_min_postings) {
+            stats.dense += 1;
         }
         // A list of this many members is an array rather than Elias-Fano.
         let array =
@@ -4601,6 +4612,14 @@ mod tests {
         };
         assert_eq!(forced(0), 2);
         assert_eq!(forced(16), 0);
+        // Its groups not forced, it stays grouped all the same.
+        let options = Options {
+            grid_min_postings: 0,
+            grid_min_share: 16,
+            ..Options::default()
+        };
+        let stats = round_trip(&geometry, &slots, &buckets, &lengths, &options);
+        assert_eq!((stats.sparse, stats.dense), (false, 2));
         assert_eq!(forced(29), 0);
         assert_eq!(forced(31), 2);
         assert_eq!(forced(64), 2);
