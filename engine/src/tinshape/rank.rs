@@ -1032,42 +1032,7 @@ fn next_group(
 /// postings by slots stands for its count there). False, with nothing
 /// loaded, when a grouped term does not hold the group: the directory is
 /// looked up once.
-///
-/// On x86-64 built with POPCNT and BMI where the CPU has them
-/// ([`kernels::bit_ops`]): a sparse term's list is drained a highs word
-/// at a time (trailing zeros, shifts by a register), which baseline
-/// x86-64 does in several instructions each.
 fn load<'a>(
-    set: &mut TermSet<'a>,
-    geometry: &Geometry,
-    g: u32,
-    mem: &mut Mem<'a>,
-    probe_over: usize,
-    touch: &mut impl Touch,
-) -> Result<bool> {
-    #[cfg(target_arch = "x86_64")]
-    if kernels::bit_ops() {
-        // SAFETY: the CPU has the features (`bit_ops`).
-        return unsafe { load_bits(set, geometry, g, mem, probe_over, touch) };
-    }
-    load_in(set, geometry, g, mem, probe_over, touch)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "popcnt,bmi1,bmi2,lzcnt")]
-unsafe fn load_bits<'a>(
-    set: &mut TermSet<'a>,
-    geometry: &Geometry,
-    g: u32,
-    mem: &mut Mem<'a>,
-    probe_over: usize,
-    touch: &mut impl Touch,
-) -> Result<bool> {
-    load_in(set, geometry, g, mem, probe_over, touch)
-}
-
-#[inline(always)]
-fn load_in<'a>(
     set: &mut TermSet<'a>,
     geometry: &Geometry,
     g: u32,

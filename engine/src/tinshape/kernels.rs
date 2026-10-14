@@ -245,37 +245,6 @@ pub(crate) fn vbmi() -> bool {
     }
 }
 
-/// Whether the walks run their own instantiation of their hot bit code (a
-/// disjunction's group and candidate code, a conjunction's loads and
-/// filters) built with POPCNT, BMI1, BMI2 and LZCNT on x86-64: baseline
-/// x86-64 counts a word's bits by shifts and masks, and shifts by a
-/// register in three micro-operations. At a vector level
-/// (`STANNUM_KERNELS=scalar` runs the baseline code too) on a CPU with all
-/// four (every AVX2 CPU has them). Asked once.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub(crate) fn bit_ops() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static HAS: AtomicU8 = AtomicU8::new(0);
-
-    #[cold]
-    #[inline(never)]
-    fn ask() -> bool {
-        let has = level() != Level::Scalar
-            && std::arch::is_x86_feature_detected!("popcnt")
-            && std::arch::is_x86_feature_detected!("bmi1")
-            && std::arch::is_x86_feature_detected!("bmi2")
-            && std::arch::is_x86_feature_detected!("lzcnt");
-        HAS.store(if has { 2 } else { 1 }, Ordering::Relaxed);
-        has
-    }
-
-    match HAS.load(Ordering::Relaxed) {
-        0 => ask(),
-        h => h == 2,
-    }
-}
-
 /// Appends the position of each set bit of `words` (bit `i` of word `w`
 /// at `64 * w + i`), in order.
 #[inline]
