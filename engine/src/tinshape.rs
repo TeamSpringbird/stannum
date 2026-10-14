@@ -407,21 +407,6 @@ impl<'a> TermSet<'a> {
         (*hint < dir.len()).then(|| Self::entry(dir, &self.docs, *hint).index)
     }
 
-    /// Asks for the first `max_lines` cache lines of the container of the
-    /// grouped term's group after directory entry `hint` (its next group)
-    /// to be read into the cache, where its page is pinned already
-    /// ([`Bytes::prefetch`](segment::tinshape::blob::Bytes::prefetch)):
-    /// the walk reads it next, after a group's work it arrives during.
-    #[inline]
-    fn prefetch_next(&self, hint: usize, max_lines: usize) {
-        if let Some(dir) = &self.dir
-            && hint + 1 < dir.len()
-        {
-            let entry = Self::entry(dir, &self.docs, hint + 1);
-            self.postings.container(&entry).prefetch(max_lines);
-        }
-    }
-
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
     #[inline]

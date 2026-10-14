@@ -51,7 +51,6 @@ use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
-use super::bits;
 use crate::source::Source;
 use crate::{Error, Result};
 
@@ -688,29 +687,6 @@ impl LazyBlob {
         self.get_slow(from, to, kind)
     }
 
-    /// [`bits::prefetch`] of `[from, to)`, its first `max_lines` lines,
-    /// where it lies on a page the open span pinned (as [`Self::get_kind`]
-    /// reads in place) or is loaded: nothing is pinned or loaded for it.
-    #[inline]
-    fn prefetch(&self, from: usize, to: usize, max_lines: usize) {
-        if from >= to || to > self.len {
-            return;
-        }
-        if self.spans.get() > 0 && self.page_len > 0 {
-            let n = self.page_len;
-            let page = from / n;
-            let known = self.pages[page % PAGE_MEMO].get();
-            if known.page == page && known.span == self.span.get() && from < page * n + known.len {
-                let len = (to - from).min(page * n + known.len - from);
-                bits::prefetch(known.data.wrapping_add(from - page * n), len, max_lines);
-            }
-            return;
-        }
-        if self.is_loaded(from / CHUNK) {
-            bits::prefetch(self.data.as_ptr().wrapping_add(from), to - from, max_lines);
-        }
-    }
-
     #[inline(never)]
     fn get_slow(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if from > to {
@@ -942,18 +918,6 @@ impl<'a> Bytes<'a> {
                 }
                 blob.get_kind(at + from, at + to, kind)
             }
-        }
-    }
-
-    /// Asks for the range's first `max_lines` cache lines to be read into
-    /// the cache ([`bits::prefetch`]), without pinning or loading anything:
-    /// a lazy range only where its first page is pinned in the open span
-    /// (or loaded), and only that page's part of it.
-    #[inline]
-    pub fn prefetch(&self, max_lines: usize) {
-        match *self {
-            Self::Slice(bytes) => bits::prefetch(bytes.as_ptr(), bytes.len(), max_lines),
-            Self::Lazy { blob, at, len, .. } => blob.prefetch(at, at + len, max_lines),
         }
     }
 
