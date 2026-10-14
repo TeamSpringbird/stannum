@@ -1784,14 +1784,15 @@ mod tests {
     /// likewise: the candidate stream folds the groups they are in, one
     /// first and then twice as many each time. It folded every group for any
     /// k (on TIN's probe corpus 15 or 16 payload pages where TIN read 1 or
-    /// 2).
+    /// 2). A plain scan's stream still folds every group at once.
     #[pg_test]
     fn a_zero_fill_folds_the_groups_of_its_rows() {
         // 185 rows a heap page: five groups of 256 pages.
         Spi::run(
             "CREATE TABLE zero_fill(id int, body text);
              INSERT INTO zero_fill SELECT n,
-               CASE WHEN n % 2 = 0 THEN 'alpha' ELSE 'beta' END
+               CASE WHEN n % 50000 = 7 THEN 'alpha gamma'
+                    WHEN n % 2 = 0 THEN 'alpha' ELSE 'beta' END
                FROM generate_series(1, 5 * 256 * 185) n;
              CREATE INDEX zero_fill_idx ON zero_fill USING stannum(body);",
         )
@@ -1821,9 +1822,9 @@ mod tests {
                 "SELECT id FROM zero_fill WHERE {filter} ORDER BY ctid LIMIT {k}"
             ))
         };
-        // Matches a group: alpha 23,680, alpha OR beta 47,360.
+        // Matches a group: alpha about 23,680, alpha OR beta 47,360.
         for (query, filter, per_group) in [
-            ("alpha", "id % 2 = 0", 23_680),
+            ("alpha", "body LIKE 'alpha%'", 23_680),
             ("alpha OR beta", "true", 47_360),
         ] {
             // Every row scores zero: ties rank in heap order.
@@ -1835,16 +1836,33 @@ mod tests {
                 assert_eq!(folded(&ranked), 1, "{ranked}");
                 assert_eq!(ids(&ranked), first_by_ctid(filter, k), "{ranked}");
             }
-            // An unordered scan stopping in the second group: the first
-            // fold and the next (two groups).
+            // A plain scan's stream, kept between executor calls, folds
+            // every group at once.
             let k = per_group + 10;
             let plain = format!("SELECT id FROM zero_fill WHERE body ==> '{query}' LIMIT {k}");
-            assert_eq!(folded(&plain), 3, "{plain}");
+            assert_eq!(folded(&plain), 5, "{plain}");
             assert_eq!(ids(&plain), first_by_ctid(filter, k), "{plain}");
-            // To the end: every group, in three folds (1, 2 and 4 groups).
             let all = format!("SELECT id FROM zero_fill WHERE body ==> '{query}'");
             assert_eq!(folded(&all), 5, "{all}");
             assert_eq!(ids(&all), first_by_ctid(filter, 5 * 256 * 185), "{all}");
+        }
+        // Five rows score (gamma, tied, in heap order); the rest of the top
+        // k are alpha's other rows in heap order, from the first group.
+        for k in [10, 4_096] {
+            let ranked = format!(
+                "SELECT id FROM zero_fill WHERE body ==> 'gamma OR alpha'
+                 ORDER BY stannum.score(ctid) DESC LIMIT {k}"
+            );
+            assert_eq!(folded(&ranked), 1, "{ranked}");
+            let want = ids(&format!(
+                "SELECT id FROM (
+                   SELECT id, ctid, 0 AS rank FROM zero_fill WHERE body LIKE '%gamma%'
+                   UNION ALL
+                   SELECT id, ctid, 1 FROM zero_fill WHERE body = 'alpha') AS rows
+                 ORDER BY rank, ctid LIMIT {k}"
+            ));
+            assert_eq!(want[..5], [7, 50_007, 100_007, 150_007, 200_007]);
+            assert_eq!(ids(&ranked), want, "{ranked}");
         }
     }
 

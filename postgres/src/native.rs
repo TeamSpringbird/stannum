@@ -8,14 +8,15 @@
 //! over an immutable segment's ctid sets a 256-page group at a time, dead
 //! documents (the published dead list, as the segment's liveness) cleared
 //! in the fold. A bitmap scan adds each group's matches as they come; a
-//! plain scan's candidate stream folds groups as it reaches them (one, then
-//! twice as many each time), keeps them as the group's words, a bit per
+//! plain scan's candidate stream keeps them as the group's words, a bit per
 //! slot (about a fifth of a byte per document matched in the worst case)
-//! and walks them in ctid order: the first k matches read the containers
-//! of the groups they are in, not every group's. Wildcards, regexes, ranges
-//! and fuzzy terms are expanded against each segment's term map first.
-//! Queries that still do not lower, and the write buffer and sealed
-//! segments, are planned over ordinal streams.
+//! and walks them in ctid order; a stream walked to k rows on the spot (a
+//! zero fill) folds groups as it reaches them, one and then twice as many
+//! each time, so its rows read the containers of the groups they are in,
+//! not every group's. Wildcards, regexes, ranges and fuzzy terms are
+//! expanded against each segment's term map first. Queries that still do
+//! not lower, and the write buffer and sealed segments, are planned over
+//! ordinal streams.
 
 use std::rc::Rc;
 
@@ -123,9 +124,23 @@ pub(crate) fn visit_matches(
     }
 }
 
-/// Source `i`'s live matches of `lowered`, folded a few groups at a time as
-/// the walk reaches them; `None` when the source has no native reader.
-pub(crate) fn matches<'v>(view: &'v View, i: usize, lowered: &Lowered) -> Option<Matches<'v>> {
+/// Source `i`'s live matches of `lowered`, every group folded now, or with
+/// `lazy` a few groups at a time as the walk reaches them; `None` when the
+/// source has no native reader.
+///
+/// A lazy fold assembles the segment again when the walk gets to the end
+/// of the last fold, which it cannot inside another walk over the segment
+/// (see [`with_native`]). Only a caller that walks the matches before it
+/// returns may ask for one: it reads them inside a walk only if it was
+/// itself called inside it, and then the segment was busy (and read the
+/// ordinal way) when the matches were asked for too. A scan's stream kept
+/// between executor calls folds every group at once.
+pub(crate) fn matches<'v>(
+    view: &'v View,
+    i: usize,
+    lowered: &Lowered,
+    lazy: bool,
+) -> Option<Matches<'v>> {
     let found = with_native(view, i, &lowered.names, |segment| {
         let mut terms = open_terms(segment, &lowered.names, &mut NoTouch)?;
         let pending = match_groups(segment, &lowered.node, &mut terms, &mut NoTouch);
@@ -135,7 +150,7 @@ pub(crate) fn matches<'v>(view: &'v View, i: usize, lowered: &Lowered) -> Option
             lowered: lowered.clone(),
             pending,
             next: 0,
-            take: 1,
+            take: if lazy { 1 } else { usize::MAX },
             docs: segment.docs.clone(),
             groups: Vec::new(),
             group: 0,
@@ -209,10 +224,10 @@ fn fold_some<'a>(
 /// A segment's matches as group words, walked in ctid order: a
 /// [`set::Cursor`] over documents and a [`pages::Cursor`] over pages.
 ///
-/// Groups are folded when the walk reaches them: first the first group
-/// holding any match, then twice as many groups holding matches as the
-/// fold before, the segment assembled again for each fold. A scan that
-/// stops after k rows (a zero fill of elided terms, a LIMIT) reads the
+/// Lazy matches ([`matches`]) fold groups when the walk reaches them: first
+/// the first group holding any match, then twice as many groups holding
+/// matches as the fold before, the segment assembled again for each fold.
+/// A walk that stops after k rows (a zero fill of elided terms) reads the
 /// containers of the groups it walked; a walk to the end folds every group
 /// in about log2(groups) folds.
 pub(crate) struct Matches<'v> {
@@ -291,8 +306,8 @@ impl Matches<'_> {
                 groups,
             )
         });
-        // The segment is busy only inside another walk over it, and a
-        // candidate stream is not read from inside one.
+        // The segment is busy only inside another walk over it, and lazy
+        // matches are walked where they were asked for (see `matches`).
         let found = found.unwrap_or_else(|| {
             pgrx::error!("Stannum: {} is busy in another walk", view.labels[*source])
         });
