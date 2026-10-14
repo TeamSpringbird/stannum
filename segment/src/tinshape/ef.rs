@@ -283,10 +283,10 @@ fn select(x: u64, k: usize) -> u32 {
     // byte of `k | 0x80` less its prefix stays above 0x7f exactly then,
     // borrowing nothing from the next).
     let k = k as u64;
-    let past = ((k * ONES | HIGHS) - prefix) & HIGHS;
+    let past = (((k * ONES) | HIGHS) - prefix) & HIGHS;
     let byte = past.count_ones();
     // The set bits before the byte: `prefix` shifted a byte up.
-    let before = (prefix << 8) >> (8 * byte) & 0xff;
+    let before = ((prefix << 8) >> (8 * byte)) & 0xff;
     let b = (x >> (8 * byte)) & 0xff;
     8 * byte + u32::from(SELECT_IN_BYTE[b as usize][(k - before) as usize])
 }
