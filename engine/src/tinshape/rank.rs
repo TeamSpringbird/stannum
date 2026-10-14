@@ -763,7 +763,9 @@ impl Mem<'_> {
                     // A gap of a few words (as a rule: candidates ask in
                     // order) counted here, a longer one by the kernel.
                     self.run += if w - self.w <= 4 {
-                        (self.w..w).map(|x| bits::word(bytes, x).count_ones()).sum::<u32>()
+                        (self.w..w)
+                            .map(|x| bits::word(bytes, x).count_ones())
+                            .sum::<u32>()
                     } else {
                         kernels::popcount_bytes(&bytes[self.w * 8..w * 8])
                     };

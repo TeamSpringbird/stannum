@@ -536,11 +536,25 @@ mod tests {
     fn low_width_is_the_log_of_the_quotient() {
         for n in 0..300 {
             for universe in 0..5000 {
-                assert_eq!(low_width(n, universe), low_width_by_division(n, universe), "{n} {universe}");
+                assert_eq!(
+                    low_width(n, universe),
+                    low_width_by_division(n, universe),
+                    "{n} {universe}"
+                );
             }
         }
-        for (n, universe) in [(1, u32::MAX), (2, u32::MAX), (usize::MAX, 7), (1 << 33, u32::MAX), (65_536, 1 << 31)] {
-            assert_eq!(low_width(n, universe), low_width_by_division(n, universe), "{n} {universe}");
+        for (n, universe) in [
+            (1, u32::MAX),
+            (2, u32::MAX),
+            (usize::MAX, 7),
+            (1 << 33, u32::MAX),
+            (65_536, 1 << 31),
+        ] {
+            assert_eq!(
+                low_width(n, universe),
+                low_width_by_division(n, universe),
+                "{n} {universe}"
+            );
         }
     }
 

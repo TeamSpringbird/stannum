@@ -1222,7 +1222,10 @@ mod tests {
         let range = blob.bytes().sub(150, 900).unwrap();
         // Outside a span, nothing loaded: nothing asked for.
         range.prefetch(16);
-        assert_eq!((blob.loaded(), state.reads.get(), state.pins.get()), (0, 0, 0));
+        assert_eq!(
+            (blob.loaded(), state.reads.get(), state.pins.get()),
+            (0, 0, 0)
+        );
         blob.open_span();
         // A page not pinned yet is not pinned for it.
         range.prefetch(16);
