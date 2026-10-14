@@ -218,7 +218,7 @@ fn report(args: &Args, converted: &[Converted], dump: &Dump) -> String {
         s.blocks += t.blocks;
         s.sparse_terms += t.sparse_terms;
         s.single_terms += t.single_terms;
-        for k in 0..3 {
+        for k in 0..4 {
             s.kinds[k] += t.kinds[k];
             s.kind_bytes[k] += t.kind_bytes[k];
         }
@@ -469,13 +469,15 @@ fn report(args: &Args, converted: &[Converted], dump: &Dump) -> String {
     }
     let _ = writeln!(
         md,
-        "\nGroup containers chosen: grid {} ({} MB), Elias-Fano {} ({} MB), paged {} ({} MB); whole-term Elias-Fano terms {}; single-posting terms {}; footer blocks {}.",
+        "\nGroup containers chosen: grid {} ({} MB), Elias-Fano {} ({} MB), paged {} ({} MB), array {} ({} MB); whole-term Elias-Fano terms {}; single-posting terms {}; footer blocks {}.",
         s.kinds[0],
         mb(s.kind_bytes[0]),
         s.kinds[1],
         mb(s.kind_bytes[1]),
         s.kinds[2],
         mb(s.kind_bytes[2]),
+        s.kinds[3],
+        mb(s.kind_bytes[3]),
         s.sparse_terms,
         s.single_terms,
         s.blocks

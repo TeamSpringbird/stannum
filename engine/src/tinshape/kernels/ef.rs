@@ -63,8 +63,11 @@ macro_rules! ef_run {
     };
 }
 
+use super::array::{array_decode, array_into_row};
 use segment::tinshape::ef::Ef;
-use segment::tinshape::postings::{GroupEntry, KIND_EF, for_each_local, group_slots};
+use segment::tinshape::postings::{
+    GroupEntry, KIND_ARRAY, KIND_EF, array_bytes, for_each_local, group_slots,
+};
 
 /// Appends the list's values, in order.
 #[inline]
@@ -110,8 +113,8 @@ pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
 
 /// Appends a group container's members (local slots, in order), as
 /// [`for_each_local`] visits them: an Elias-Fano container's by
-/// [`ef_decode`]. `starts` is the group's page starts
-/// ([`segment::tinshape::docs::Geometry::starts`]).
+/// [`ef_decode`], an array's by [`array_decode`]. `starts` is the group's
+/// page starts ([`segment::tinshape::docs::Geometry::starts`]).
 #[inline]
 pub fn container_locals(
     entry: &GroupEntry,
@@ -119,6 +122,10 @@ pub fn container_locals(
     starts: &[u32],
     out: &mut Vec<u32>,
 ) -> Result<()> {
+    if entry.kind == KIND_ARRAY {
+        array_decode(array_bytes(bytes, entry.count, group_slots(starts))?, out);
+        return Ok(());
+    }
     if entry.kind == KIND_EF {
         ef_decode(
             Ef::parse(bytes, entry.count as usize, group_slots(starts))?,
@@ -139,6 +146,10 @@ pub fn container_row(
     starts: &[u32],
     row: &mut [u64],
 ) -> Result<()> {
+    if entry.kind == KIND_ARRAY {
+        array_into_row(array_bytes(bytes, entry.count, group_slots(starts))?, row);
+        return Ok(());
+    }
     if entry.kind == KIND_EF {
         ef_into_row(
             Ef::parse(bytes, entry.count as usize, group_slots(starts))?,

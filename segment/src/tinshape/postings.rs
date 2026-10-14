@@ -42,6 +42,8 @@
 //!                             the bits the page's width needs),
 //!                     bitmap (value + 1 bytes, bit `offset - 1`),
 //!                     run    (first and count, less one, packed so)
+//!            | array: count u16le local slots, ascending (a group of at
+//!                     most 65,536 slots; kind 3, page layout 11)
 //! tf      := sparse: per block, its buckets packed at the block's width,
 //!            each block's starting on a byte;
 //!            grouped: per group in directory order, its buckets packed at
@@ -95,6 +97,12 @@ pub const COMPACT_MAX: u32 = 8;
 pub const KIND_GRID: u8 = 0;
 pub const KIND_EF: u8 = 1;
 pub const KIND_PAGED: u8 = 2;
+/// A group's local slots as sorted little-endian `u16`s (page layout 11):
+/// two bytes a member, read with no decoding.
+pub const KIND_ARRAY: u8 = 3;
+
+/// Slots a group may have for its members to be an array container.
+pub const ARRAY_SLOTS_MAX: u32 = 1 << 16;
 
 const PAGE_LIST: u8 = 0;
 const PAGE_BITMAP: u8 = 1;
@@ -123,6 +131,12 @@ pub struct Options {
     /// smaller term whole costs microseconds, and a small table, every
     /// term of which is small, would pay for grids it never needs.
     pub grid_min_postings: u32,
+    /// A group the encoder would store as an Elias-Fano list, of at most
+    /// this many members, is an array of `u16` local slots instead
+    /// ([`KIND_ARRAY`]): two bytes a member where the list takes 1.2 to 1.8
+    /// here, but no decoding, so a walk takes its members as they are and
+    /// probes them by search; 0 for none.
+    pub array_max: u32,
     /// A term of at most this many postings carries its documents' lengths
     /// in its record ([`InlineLengths`]): its top k reads no DL sidecar.
     pub inline_lengths_max_df: u32,
@@ -155,6 +169,7 @@ impl Default for Options {
             adaptive_tf: true,
             grid_density: 64,
             grid_min_postings: 4096,
+            array_max: 64,
             inline_lengths_max_df: 64,
             inline_lengths_min_documents: 1 << 16,
             group_frontiers: GroupFrontiers::Rounded,
@@ -171,10 +186,10 @@ pub struct Stats {
     pub tf: usize,
     pub blocks: usize,
     pub sparse: bool,
-    /// Groups per container kind: grid, ef, paged.
-    pub kinds: [usize; 3],
+    /// Groups per container kind: grid, ef, paged, array.
+    pub kinds: [usize; 4],
     /// Bytes per container kind.
-    pub kind_bytes: [usize; 3],
+    pub kind_bytes: [usize; 4],
     /// Groups made grids by [`Options::grid_density`].
     pub forced: usize,
     /// Bytes of inline lengths ([`InlineLengths`]).
@@ -185,6 +200,9 @@ pub struct Stats {
     pub frontiers: usize,
     /// Bytes of the directory's skip points (part of `payload`).
     pub skip_bytes: usize,
+    /// Bytes the array containers take less what their members would take
+    /// as Elias-Fano lists (negative for a few lists of one to four).
+    pub array_excess: isize,
 }
 
 impl Stats {
@@ -498,11 +516,15 @@ pub fn encode_reusing<'r>(
     // A term with a group dense enough to be a grid stays grouped. The
     // directory's frontiers and the footer do not count: they buy the
     // walks their bounds, and leaving them out keeps each term's form
-    // what it was without them.
-    let use_sparse = options.sparse
-        && grouped_stats.forced == 0
-        && sparse.len()
-            <= grouped.len() - grouped_stats.frontier_bytes - grouped_stats.skip_bytes;
+    // what it was without them, and so do its skip points. Arrays count as
+    // the Elias-Fano lists they replace, for the same reason: they buy
+    // decoding.
+    let grouped_len = grouped.len() as isize
+        - grouped_stats.frontier_bytes as isize
+        - grouped_stats.skip_bytes as isize
+        - grouped_stats.array_excess;
+    let use_sparse =
+        options.sparse && grouped_stats.forced == 0 && sparse.len() as isize <= grouped_len;
     let payload = if use_sparse { &sparse } else { &grouped };
     let mut inline_bytes = Vec::new();
     if inline {
@@ -556,6 +578,7 @@ pub fn encode_reusing<'r>(
         stats.frontier_bytes = grouped_stats.frontier_bytes;
         stats.skip_bytes = grouped_stats.skip_bytes;
         stats.frontiers = grouped_stats.frontiers;
+        stats.array_excess = grouped_stats.array_excess;
     }
     stats
 }
@@ -669,9 +692,19 @@ fn encode_groups<'r>(
         if forced {
             stats.forced += 1;
         }
-        // An input's container, where its term was forced as this one is.
+        // A list of this many members is an array rather than Elias-Fano.
+        let array =
+            locals.len() as u64 <= u64::from(options.array_max) && group.slots() <= ARRAY_SLOTS_MAX;
+        // An input's container, where its term was forced as this one is
+        // and its list is the form these options give it.
         let reused = reuse(index).filter(|r| {
-            !dense || (u64::from(r.input_df) >= u64::from(options.grid_min_postings)) == forced
+            let form = match r.kind {
+                KIND_EF => !array,
+                KIND_ARRAY => array,
+                _ => true,
+            };
+            form && (!dense
+                || (u64::from(r.input_df) >= u64::from(options.grid_min_postings)) == forced)
         });
         if let Some(r) = reused {
             kind = r.kind;
@@ -691,6 +724,14 @@ fn encode_groups<'r>(
                 best = candidate.len();
                 kind = KIND_PAGED;
             }
+        }
+        if kind == KIND_EF && array {
+            kind = KIND_ARRAY;
+            best = 2 * locals.len();
+        }
+        if kind == KIND_ARRAY {
+            stats.array_excess +=
+                best as isize - ef::encoded_len(locals.len(), group.slots()) as isize;
         }
         let gap = match previous {
             None => index,
@@ -731,6 +772,11 @@ fn encode_groups<'r>(
                     bodies.extend_from_slice(&grid);
                 }
                 KIND_EF => ef::encode(&locals, group.slots(), &mut bodies),
+                KIND_ARRAY => {
+                    for local in &locals {
+                        bodies.extend_from_slice(&(*local as u16).to_le_bytes());
+                    }
+                }
                 _ => {
                     varint::put(&mut directory, candidate.len() as u64);
                     bodies.extend_from_slice(&candidate);
@@ -1802,7 +1848,8 @@ fn decode_chunk(
                 return Err(Error::Corrupt("postings group index"));
             };
             let count = (unsafe { varint2(bytes, a1) } >> 2) + 1;
-            if count > group.slots() || kind > KIND_PAGED {
+            let array = kind == KIND_ARRAY;
+            if count > group.slots() || (array && group.slots() > ARRAY_SLOTS_MAX) {
                 return Err(Error::Corrupt("postings group count"));
             }
             // Each kind's length, then the entry's: the kinds mix within a
@@ -1810,6 +1857,7 @@ fn decode_chunk(
             let grid = group.grid_bytes() as u64;
             let ef = ef::encoded_len_branchless(count, group.slots()) as u64;
             let len = if kind == KIND_GRID { grid } else { ef };
+            let len = if array { 2 * u64::from(count) } else { len };
             let paged_len = u64::from(unsafe { varint2(bytes, a2) });
             let len = if paged == 1 { paged_len } else { len };
             // The frontier's deltas (at most seven) follow its head and first
@@ -1892,6 +1940,7 @@ fn decode_entry(
         KIND_GRID => group.grid_bytes() as u64,
         KIND_EF => ef::encoded_len(count as usize, group.slots()) as u64,
         KIND_PAGED => varint::get(bytes, at)?,
+        _ if group.slots() <= ARRAY_SLOTS_MAX => 2 * count,
         _ => return Err(Error::Corrupt("postings group kind")),
     };
     let frontier = (base + *at) as u32;
@@ -2264,8 +2313,27 @@ pub fn for_each_local(
             Ef::parse(bytes, entry.count as usize, group_slots(starts))?.for_each(visit);
             Ok(())
         }
+        KIND_ARRAY => {
+            let array = array_bytes(bytes, entry.count, group_slots(starts))?;
+            for c in array.chunks_exact(2) {
+                visit(u32::from(u16::from_le_bytes([c[0], c[1]])));
+            }
+            Ok(())
+        }
         _ => paged_for_each(bytes, starts, visit),
     }
+}
+
+/// An array container's `2 * count` bytes, checked to hold its values and
+/// to be of a group of at most [`ARRAY_SLOTS_MAX`] slots. Its values are
+/// checked to rise and to lie below the group's slots by the verifier
+/// (`verify_segment`), not here: a reader takes them as they are.
+#[inline]
+pub fn array_bytes(bytes: &[u8], count: u32, slots: u32) -> Result<&[u8]> {
+    if slots > ARRAY_SLOTS_MAX {
+        return Err(Error::Corrupt("array container's group"));
+    }
+    bytes.get(..2 * count as usize).ok_or(Error::Truncated)
 }
 
 /// A group's slot count, from its page starts.
@@ -4088,6 +4156,14 @@ mod tests {
                             adaptive_tf,
                             grid_density,
                             grid_min_postings: 0,
+                            // Arrays for lists of at most 64, of 2, of any
+                            // length, and none.
+                            array_max: match (block_size, grid_density) {
+                                (1, _) => 64,
+                                (3, 0) => 2,
+                                (3, _) => u32::MAX,
+                                _ => 0,
+                            },
                             inline_lengths_max_df: if adaptive_tf { 8 } else { 0 },
                             inline_lengths_min_documents: 0,
                             group_frontiers: if (block_size + grid_density) % 2 == 0 {
@@ -4113,7 +4189,16 @@ mod tests {
             .map(|i| (i as u32 * 7919) % 300 + 1)
             .collect();
         for options in all_options() {
-            round_trip(&geometry, &slots, buckets, &lengths, &options);
+            let stats = round_trip(&geometry, &slots, buckets, &lengths, &options);
+            // Arrays weigh as the lists they replace in the choice of a
+            // term's form: it is the same without them.
+            let lists = Options {
+                array_max: 0,
+                ..options
+            };
+            let without = round_trip(&geometry, &slots, buckets, &lengths, &lists);
+            assert_eq!(stats.sparse, without.sparse);
+            assert_eq!(without.array_excess, 0);
         }
     }
 
@@ -4263,6 +4348,89 @@ mod tests {
     }
 
     #[test]
+    fn short_group_lists_are_arrays() {
+        // 512 full pages of 40 tuples (two groups); a term in one document
+        // of 150 in the first group and one in 37 of 100 pages of the
+        // second: lists of 69 and 109 members, Elias-Fano by size.
+        let tids: Vec<Tid> = (0..512u32)
+            .flat_map(|b| {
+                (1..=40u16).map(move |o| Tid {
+                    block: b,
+                    offset: o,
+                })
+            })
+            .collect();
+        let members: Vec<Tid> = tids[..256 * 40]
+            .iter()
+            .step_by(150)
+            .chain(tids[256 * 40..356 * 40].iter().step_by(37))
+            .copied()
+            .collect();
+        let geometry = geometry(&tids);
+        let slots: Vec<u32> = members
+            .iter()
+            .map(|t| geometry.slot_of(*t).unwrap())
+            .collect();
+        let buckets = vec![1u8; slots.len()];
+        let lengths = vec![50; slots.len()];
+        let options = |array_max| Options {
+            array_max,
+            sparse: false,
+            ..Options::default()
+        };
+        let ef = round_trip(&geometry, &slots, &buckets, &lengths, &options(0));
+        assert_eq!(ef.kinds, [0, 2, 0, 0]);
+        // The shorter list becomes an array of two bytes a member, the
+        // longer stays a list.
+        let some = round_trip(&geometry, &slots, &buckets, &lengths, &options(69));
+        assert_eq!(some.kinds, [0, 1, 0, 1]);
+        let first = ef::encoded_len(69, geometry.groups[0].slots());
+        assert_eq!(some.kind_bytes[3], 2 * 69);
+        assert_eq!(some.payload, ef.payload - first + 2 * 69);
+        let all = round_trip(&geometry, &slots, &buckets, &lengths, &options(u32::MAX));
+        assert_eq!(all.kinds, [0, 0, 0, 2]);
+        // Each array's members, as the containers give them.
+        let mut out = Vec::new();
+        encode(
+            &geometry,
+            &slots,
+            &buckets,
+            &lengths,
+            &options(u32::MAX),
+            &mut out,
+        );
+        let parsed = Postings::parse(&out, slots.len() as u32, &geometry).unwrap();
+        let Form::Grouped(dir) = &parsed.form else {
+            panic!("grouped")
+        };
+        let mut locals = Vec::new();
+        for e in dir.entries(&geometry.groups).unwrap() {
+            assert_eq!((e.kind, e.len), (KIND_ARRAY, 2 * e.count));
+            let bytes = parsed.container(&e).all().unwrap();
+            let base = geometry.groups[e.index as usize].slot_base;
+            for_each_local(&e, bytes, geometry.starts(e.index as usize), |l| {
+                locals.push(base + l)
+            })
+            .unwrap();
+            assert!(
+                array_bytes(bytes, e.count + 1, 1 << 16).is_err(),
+                "past the container"
+            );
+            assert!(
+                array_bytes(bytes, e.count, (1 << 16) + 1).is_err(),
+                "too many slots"
+            );
+        }
+        assert_eq!(locals, slots);
+        check_all(&tids, &members, &buckets);
+        // What the arrays take beyond the lists, which the choice of the
+        // term's form leaves out.
+        let second = ef::encoded_len(109, geometry.groups[1].slots());
+        assert_eq!(all.array_excess, (2 * 178 - first - second) as isize);
+        assert_eq!(ef.array_excess, 0);
+    }
+
+    #[test]
     fn very_dense_terms() {
         // Every document of 512 full pages of 40 tuples: grids win.
         let tids: Vec<Tid> = (0..512u32)
@@ -4283,7 +4451,7 @@ mod tests {
         };
         let stats = round_trip(&geometry, &slots, &buckets, &lengths, &grids);
         assert!(!stats.sparse);
-        assert_eq!(stats.kinds, [2, 0, 0]);
+        assert_eq!(stats.kinds, [2, 0, 0, 0]);
         // A bit per slot, a bit per bucket; per group a directory entry and
         // a frontier of one pair, (1, 50), of two bytes.
         assert_eq!(stats.payload, 2 * 32 * 40 + 1 + 2 * (1 + 3) + 2 * 2);
@@ -4296,9 +4464,9 @@ mod tests {
             ..Options::default()
         };
         let stats = round_trip(&geometry, &slots, &buckets, &lengths, &by_size);
-        assert_eq!(stats.kinds, [0, 0, 2]);
+        assert_eq!(stats.kinds, [0, 0, 2, 0]);
         let stats = round_trip(&geometry, &slots, &buckets, &lengths, &Options::default());
-        assert_eq!((stats.kinds, stats.forced), ([2, 0, 0], 2));
+        assert_eq!((stats.kinds, stats.forced), ([2, 0, 0, 0], 2));
         check_all(&tids, &tids, &buckets);
         // Every tenth document, and runs of whole pages.
         let tenth: Vec<Tid> = tids.iter().step_by(10).copied().collect();

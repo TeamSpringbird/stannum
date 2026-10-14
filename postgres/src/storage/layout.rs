@@ -40,9 +40,10 @@ pub const MAGIC: u32 = 0x4c44_5032;
 /// per (term, group). Version 9: a ctid grid with a width per heap page
 /// (one slot per document on pages holding rows `1..=n`). Version 10:
 /// grouped records' headers give their directory's length. Version 11:
-/// grouped records' directories end in skip points. An index of an earlier
+/// grouped records' directories end in skip points. Version 12: short
+/// grouped lists as arrays of `u16` local slots. An index of an earlier
 /// version must be rebuilt.
-pub const VERSION: u8 = 11;
+pub const VERSION: u8 = 12;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();

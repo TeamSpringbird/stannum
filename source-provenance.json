@@ -802,6 +802,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the word kernels of the ctid-addressed segment format, per instruction set (NEON, AVX2, AVX-512) with a portable reference, moved out of engine/src/tinshape.rs."
     },
+    "engine/src/tinshape/kernels/array.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: array containers (a group's local slots as sorted u16s) widened into a list (NEON, AVX2, portable), set in a row, and galloped through in place."
+    },
     "engine/src/tinshape/kernels/ef.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: Elias-Fano lists decoded a block at a time (a table per highs byte, a shuffle per eight low parts), per instruction set (NEON, AVX2) with a portable reference."
@@ -1547,6 +1551,10 @@
     "benchmarks/aws/devbox-r3r4-ab.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for a two-way replay A/B of a disjunction walk change over page layout 9, re-encoding the dump on the box."
+    },
+    "benchmarks/aws/devbox-arrays-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for a two-way replay A/B of array containers (page layout 11) against layout 10, re-encoding the dump on the box, with the array kernel tests and tnsef arrays."
     },
     "benchmarks/aws/devbox-r6r7-ab.sh": {
       "owner": "ben",

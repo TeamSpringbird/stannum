@@ -70,8 +70,8 @@ pub struct BuildStats {
     pub blocks: u64,
     pub sparse_terms: usize,
     pub single_terms: usize,
-    pub kinds: [u64; 3],
-    pub kind_bytes: [u64; 3],
+    pub kinds: [u64; 4],
+    pub kind_bytes: [u64; 4],
 }
 
 /// Builds a segment from its documents and, term by term in byte order,
@@ -200,7 +200,7 @@ impl Builder {
         } else if stats.sparse {
             s.sparse_terms += 1;
         }
-        for k in 0..3 {
+        for k in 0..4 {
             s.kinds[k] += stats.kinds[k] as u64;
             s.kind_bytes[k] += stats.kind_bytes[k] as u64;
         }

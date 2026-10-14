@@ -131,11 +131,17 @@ fn tns(docs: &[Doc], options: Options) -> Vec<u8> {
 }
 
 fn options() -> impl Strategy<Value = Options> {
-    (prop::bool::ANY, 1u32..6).prop_map(|(small, density)| Options {
-        block_size: if small { 3 } else { 256 },
-        grid_density: if small { density } else { 64 },
-        ..Options::default()
-    })
+    (
+        prop::bool::ANY,
+        1u32..6,
+        prop::sample::select(vec![0u32, 2, 64]),
+    )
+        .prop_map(|(small, density, array_max)| Options {
+            block_size: if small { 3 } else { 256 },
+            grid_density: if small { density } else { 64 },
+            array_max,
+            ..Options::default()
+        })
 }
 
 /// Everything the query interface hands out, read through `index`.
@@ -218,6 +224,7 @@ proptest! {
         dead in prop::collection::btree_set(0usize..500, 0..120),
         options in options(),
         ranges in any::<bool>(),
+        input_arrays in prop::sample::select(vec![0u32, 64]),
     ) {
         // The k-th document goes to input k % parts: inputs interleave by
         // ctid, as rows updated into pages other segments cover do. Or each
@@ -230,7 +237,13 @@ proptest! {
             inputs[input].push(doc.clone());
         }
         inputs.retain(|input| !input.is_empty());
-        let blobs: Vec<Vec<u8>> = inputs.iter().map(|input| tns(input, options)).collect();
+        // Inputs written with arrays for other lists than the output's are
+        // re-encoded where those differ, not copied.
+        let written = Options {
+            array_max: input_arrays,
+            ..options
+        };
+        let blobs: Vec<Vec<u8>> = inputs.iter().map(|input| tns(input, written)).collect();
         let mut live: Vec<Doc> = Vec::new();
         let mut deads = Vec::new();
         let mut global = 0usize;

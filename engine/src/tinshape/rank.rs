@@ -31,7 +31,8 @@ use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
-    Directory, Form, GroupEntry, GroupFrontier, KIND_EF, KIND_GRID, LazyFooter,
+    Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
+    array_bytes,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -677,6 +678,9 @@ enum Kind<'a> {
     List,
     /// A grid container, read in place.
     Grid(&'a [u8]),
+    /// An array container's bytes, read in place by seeking (an array much
+    /// longer than the candidates it filters; a shorter one is a list).
+    Array(&'a [u8]),
     /// An Elias-Fano list read by seeking: a group container (`offset` 0)
     /// or a sparse term's whole list (`offset` the group's first slot).
     Cursor { cursor: EfCursor<'a>, offset: u32 },
@@ -739,6 +743,13 @@ impl Mem<'_> {
                 }
                 self.pos = pos;
                 (pos < list.len() && list[pos] == local).then(|| self.first + pos as u32)
+            }
+            Kind::Array(bytes) => {
+                let pos = kernels::array_seek(bytes, self.pos, local);
+                self.pos = pos;
+                let held = pos < bytes.len() / 2
+                    && u16::from_le_bytes([bytes[2 * pos], bytes[2 * pos + 1]]) as u32 == local;
+                held.then(|| self.first + pos as u32)
             }
             Kind::Cursor { cursor, offset } => {
                 let target = *offset + local;
@@ -1069,6 +1080,8 @@ fn load<'a>(
             mem.first = e.first;
             if e.kind == KIND_GRID {
                 mem.kind = Kind::Grid(bytes);
+            } else if e.kind == KIND_ARRAY && e.count as usize > probe_over {
+                mem.kind = Kind::Array(array_bytes(bytes, e.count, group.slots())?);
             } else if e.kind == KIND_EF && e.count as usize > probe_over {
                 let ef = Ef::parse(bytes, e.count as usize, group.slots())?;
                 mem.kind = Kind::Cursor {
@@ -1611,7 +1624,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         match &lead.kind {
             Kind::Grid(bytes) => kernels::set_bits_bytes(bytes, &mut cands),
             Kind::List => cands.extend_from_slice(&lead.list),
-            Kind::Cursor { .. } => unreachable!("a lead is loaded whole"),
+            Kind::Cursor { .. } | Kind::Array(_) => unreachable!("a lead is loaded whole"),
         }
         for r in 1..self.req.len() {
             if cands.is_empty() {
@@ -1642,6 +1655,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 Kind::Grid(bytes) => {
                     bits::retain(&mut cands, |l| bytes[l as usize / 8] >> (l % 8) & 1 == 1);
                 }
+                Kind::Array(bytes) => kernels::array_retain(bytes, &mut cands),
                 Kind::Cursor { cursor, offset: 0 } => cursor.list().retain_members(&mut cands),
                 Kind::Cursor { .. } => {
                     let mem = &mut self.mems[t];
@@ -2074,7 +2088,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         list: &mem.list,
                         pos: mem.pos,
                     },
-                    Kind::Cursor { .. } => unreachable!("a sieved term is not sought"),
+                    Kind::Cursor { .. } | Kind::Array(_) => {
+                        unreachable!("a sieved term is not sought")
+                    }
                 };
                 (members, mem.first)
             };
