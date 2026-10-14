@@ -501,8 +501,7 @@ pub fn encode_reusing<'r>(
     // what it was without them.
     let use_sparse = options.sparse
         && grouped_stats.forced == 0
-        && sparse.len()
-            <= grouped.len() - grouped_stats.frontier_bytes - grouped_stats.skip_bytes;
+        && sparse.len() <= grouped.len() - grouped_stats.frontier_bytes - grouped_stats.skip_bytes;
     let payload = if use_sparse { &sparse } else { &grouped };
     let mut inline_bytes = Vec::new();
     if inline {
@@ -1322,7 +1321,11 @@ impl Directory {
         tf_len: u64,
     ) -> Option<Self> {
         let head = varint_len(len as u64);
-        let skip_bytes = if skips { skip_count(len) * SKIP_BYTES } else { 0 };
+        let skip_bytes = if skips {
+            skip_count(len) * SKIP_BYTES
+        } else {
+            0
+        };
         // An entry takes at least four bytes (a gap, a count and kind, a
         // frontier's head and first length).
         let end = bytes.len().checked_sub(skip_bytes)?;
@@ -1445,7 +1448,10 @@ impl Directory {
             // SAFETY: run `r` is decoded: slots `r * DIRECTORY_SKIP..end`
             // are written, once, and laid out as their entries.
             let run = unsafe {
-                std::slice::from_raw_parts(self.entries.as_ptr().add(b).cast::<GroupEntry>(), end - b)
+                std::slice::from_raw_parts(
+                    self.entries.as_ptr().add(b).cast::<GroupEntry>(),
+                    end - b,
+                )
             };
             if let Some(i) = run.iter().position(|e| e.index >= index) {
                 return Ok(b + i);
@@ -1638,7 +1644,16 @@ impl Directory {
         }
         let bytes = &self.bytes[..end];
         UNITS.with_borrow_mut(|units| {
-            decode_entries(bytes, self.skips, &mut resume, n, &mut out, groups, self, units)
+            decode_entries(
+                bytes,
+                self.skips,
+                &mut resume,
+                n,
+                &mut out,
+                groups,
+                self,
+                units,
+            )
         })?;
         match next {
             None if last => {
@@ -1730,7 +1745,8 @@ fn decode_entries(
         let scan = if exact {
             usize::MAX
         } else {
-            left.saturating_mul(per + per.div_ceil(4)).saturating_add(32)
+            left.saturating_mul(per + per.div_ceil(4))
+                .saturating_add(32)
         };
         let end = bytes.len().min(start.saturating_add(scan.min(UNITS_CHUNK)));
         let before = out.len();
@@ -4489,7 +4505,10 @@ mod tests {
             let (Form::Grouped(new), Form::Grouped(dir)) = (&new.form, &parsed.form) else {
                 panic!("grouped records");
             };
-            assert_eq!(new.bytes().len() - dir.bytes().len(), skip_count(groups) * SKIP_BYTES);
+            assert_eq!(
+                new.bytes().len() - dir.bytes().len(),
+                skip_count(groups) * SKIP_BYTES
+            );
             let whole = new.entries(g).unwrap();
             let last = groups - 1;
             assert_eq!(*dir.get(last, g).unwrap(), whole[last]);
@@ -4981,7 +5000,10 @@ mod lazy_directory_tests {
                 .map(|r| DIRECTORY_SKIP.min(whole.len() - r * DIRECTORY_SKIP))
                 .sum();
             assert!(lazy.decoded() >= decoded, "runs {runs:?}");
-            assert!(lazy.decoded() <= (decoded * SEQUENTIAL_RUNS).min(whole.len()), "runs {runs:?}");
+            assert!(
+                lazy.decoded() <= (decoded * SEQUENTIAL_RUNS).min(whole.len()),
+                "runs {runs:?}"
+            );
             for r in &runs {
                 assert!(lazy.is_done(*r), "run {r}");
             }
@@ -4994,7 +5016,11 @@ mod lazy_directory_tests {
         for from in (0..whole.len()).step_by(DIRECTORY_SKIP) {
             for index in whole[from].index..=last + 1 {
                 let want = from + whole[from..].partition_point(|e| e.index < index);
-                assert_eq!(dir.seek(index, from, groups).unwrap(), want, "{index} from {from}");
+                assert_eq!(
+                    dir.seek(index, from, groups).unwrap(),
+                    want,
+                    "{index} from {from}"
+                );
             }
         }
         for e in &whole {
