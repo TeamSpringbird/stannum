@@ -6,7 +6,8 @@
 //!
 //! ```text
 //! blob := "TNS1", documents varint, total_length varint,
-//!         block_size varint, flags varint (bit 0: adaptive TF widths),
+//!         block_size varint, flags varint (bit 0: adaptive TF widths,
+//!         bit 1: length classes in the DL sidecar),
 //!         dictionary_len, postings_len, positions_len, docset_len,
 //!         lengths_len, liveness_len (varints),
 //!         dictionary   the term map: [`crate::dictionary`], each entry's
@@ -37,6 +38,8 @@ use crate::{Error, Result, Tid, varint};
 pub const MAGIC: &[u8; 4] = b"TNS1";
 
 const FLAG_ADAPTIVE_TF: u64 = 1;
+/// The DL sidecar holds a class plane ([`docs::encode_lengths`]).
+pub const FLAG_LENGTH_CLASSES: u64 = 2;
 
 /// The areas of a blob, in order, for accounting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -212,7 +215,7 @@ impl Builder {
     pub fn finish(mut self, dead: &[u32]) -> (Vec<u8>, BuildStats) {
         let dictionary = std::mem::take(&mut self.dictionary).finish();
         let docset = docs::encode_docset(&self.geometry, &self.tids);
-        let lengths = docs::encode_lengths(&self.lengths);
+        let lengths = docs::encode_lengths(&self.lengths, self.options.length_classes);
         let liveness = docs::encode_liveness(self.tids.len() as u32, dead);
         let total_length: u64 = self.lengths.iter().map(|l| u64::from(*l)).sum();
         let mut out = Vec::with_capacity(
@@ -224,11 +227,13 @@ impl Builder {
                 + liveness.len(),
         );
         out.extend_from_slice(MAGIC);
-        let flags = if self.options.adaptive_tf {
-            FLAG_ADAPTIVE_TF
-        } else {
-            0
-        };
+        let mut flags = 0;
+        if self.options.adaptive_tf {
+            flags |= FLAG_ADAPTIVE_TF;
+        }
+        if self.options.length_classes {
+            flags |= FLAG_LENGTH_CLASSES;
+        }
         for n in [
             self.tids.len() as u64,
             total_length,
@@ -549,7 +554,7 @@ impl<'a> Segment<'a> {
         if docs.geometry.documents != documents {
             return Err(Error::Corrupt("document set count"));
         }
-        let lengths = Lengths::parse(area(5), documents)?;
+        let lengths = Lengths::parse(area(5), documents, flags & FLAG_LENGTH_CLASSES != 0)?;
         let liveness = std::rc::Rc::new(Liveness::decode(area(6), &docs)?);
         Ok(Self {
             bytes: Bytes::Slice(bytes),
@@ -593,6 +598,7 @@ impl<'a> Segment<'a> {
                 .sub(bounds[5], bounds[6])?
                 .tag(super::blob::Kind::Lengths),
             header.documents,
+            header.length_classes,
         )?;
         Ok(Self {
             bytes,
@@ -833,6 +839,12 @@ impl<'a> Segment<'a> {
         let (header, bits) = self.lengths.at(rank);
         let area = self.area_at(Area::Lengths);
         (area + header, area + bits)
+    }
+
+    /// Where the byte holding the length class of the document of `rank`
+    /// sits in the blob.
+    pub fn class_at(&self, rank: u32) -> usize {
+        self.area_at(Area::Lengths) + self.lengths.class_at(rank)
     }
 }
 

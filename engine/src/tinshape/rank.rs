@@ -1344,6 +1344,9 @@ struct Walk<'s, 'a, T: Touch> {
     /// for a term that does not score).
     held_index: Vec<u32>,
     term_sc: Vec<usize>,
+    /// The length the candidate at hand's buckets bound it at (the longest
+    /// of their blocks' floors), set by [`Walk::read_buckets`].
+    cand_floor: u32,
     /// The window: the last slot of every scoring term's footer block at
     /// the slot it was set at, and its bound; per scoring term, its block's
     /// largest bucket ([`NO_BUCKET`] when it holds nothing from the slot
@@ -2636,9 +2639,24 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // they leave in reach: at 150 million rows two in three scored
             // candidates fell short on their buckets alone.
             None => {
-                let reach = self.read_buckets(g, local, tid)?;
+                let mut reach = self.read_buckets(g, local, tid)?;
                 if self.cut(reach, tid) || self.too_few() {
                     return Ok(None);
+                }
+                // Then at its length class's shortest length, where that
+                // is longer than its buckets' floor: at 150M rows most
+                // candidates the buckets leave in reach fall short at
+                // their exact length, and the class is a byte beside the
+                // ones its group's other candidates read.
+                if n > 0 && self.threshold().is_some() {
+                    let class = self.class_floor(g, local)?;
+                    if class > self.cand_floor {
+                        reach = self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), class);
+                        if self.cut(reach, tid) {
+                            self.answer.class_cuts += 1;
+                            return Ok(None);
+                        }
+                    }
                 }
                 (reach, u32::MAX)
             }
@@ -2757,6 +2775,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.buckets[i] = bucket;
             self.held_index[i] = index;
         }
+        self.cand_floor = floor;
         // Each term's own bound is at least the shared one: it prunes what
         // it can without a division per term, and is the shared one when
         // the terms' lengths agree.
@@ -2812,6 +2831,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             read = true;
         }
         if !common {
+            self.cand_floor = floor;
             // Each term's own bound is at least the shared one: it prunes
             // what it can without a division per term, and is the shared one
             // when the terms' lengths agree.
@@ -2842,6 +2862,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     _ => own += self.held_bound[i],
                 }
             }
+            self.cand_floor = floor;
             if low >= floor || self.cut(own, tid) {
                 return Ok(own);
             }
@@ -2896,6 +2917,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.repeats
             .iter()
             .any(|&(i, least)| self.buckets[i] < least)
+    }
+
+    /// The shortest length of the length class of the document at slot
+    /// `local` of group `g` (0 when the segment has no classes): its length
+    /// is at least that.
+    #[inline]
+    fn class_floor(&mut self, g: u32, local: u32) -> Result<u32> {
+        let lengths = &self.segment.lengths;
+        if !lengths.has_classes() {
+            return Ok(0);
+        }
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .ok_or(Error::Corrupt("a posting without a document"))?;
+        self.touch
+            .touch(Part::DlClasses, self.segment.class_at(rank), 1);
+        lengths.floor(rank)
     }
 
     /// The length of the document at slot `local` of group `g`, from the DL
@@ -3078,6 +3118,7 @@ pub(super) fn walk_into<'s, 'a>(
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
         term_sc: Vec::new(),
+        cand_floor: 0,
         window_end: None,
         window_bound: 0.0,
         window_parts: (0.0, f64::INFINITY, f64::INFINITY),
@@ -3204,6 +3245,7 @@ pub(super) fn walk_into<'s, 'a>(
     answer.windows_pruned += done.windows_pruned;
     answer.candidates += done.candidates;
     answer.position_checks += done.position_checks;
+    answer.class_cuts += done.class_cuts;
     Ok(Some(walk.terms))
 }
 
@@ -4166,7 +4208,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // The length known, its buckets bound it at that length.
                 (self.reach(self.held_list.iter().copied(), length), length)
             }
-            None => (reach, u32::MAX),
+            // Then at its length class's shortest length, where that is
+            // longer than its buckets' floor (see `Walk::stage`).
+            None => {
+                if self.threshold().is_some() {
+                    let class = self.class_floor(g, local)?;
+                    if class > floor {
+                        reach = self.reach(self.held_list.iter().copied(), class);
+                        if self.cut(reach, tid) {
+                            self.answer.class_cuts += 1;
+                            return Ok(None);
+                        }
+                    }
+                }
+                (reach, u32::MAX)
+            }
         }))
     }
 

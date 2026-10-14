@@ -789,6 +789,7 @@ impl Reader {
             total.scored += a.scored;
             total.candidates += a.candidates;
             total.position_checks += a.position_checks;
+            total.class_cuts += a.class_cuts;
             total.windows += a.windows;
             total.windows_pruned += a.windows_pruned;
         }
@@ -1548,7 +1549,9 @@ fn run() -> Result<bool, String> {
             of.iter().map(|r| r.timed.1).sum::<u64>() as f64 / 1e9,
         );
     }
-    println!("\nwalk per query, mean: examined, scored, position checks, windows, pruned");
+    println!(
+        "\nwalk per query, mean: examined, scored, position checks, windows, pruned, ruled out by length class"
+    );
     for style in &styles {
         let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
         let n = of.len().max(1) as f64;
@@ -1556,13 +1559,14 @@ fn run() -> Result<bool, String> {
             of.iter().map(|r| f(&r.answer)).sum::<u64>() as f64 / n
         };
         println!(
-            "{:<12} examined {:>10.0} scored {:>10.0} checks {:>8.0} windows {:>8.0} pruned {:>8.0}",
+            "{:<12} examined {:>10.0} scored {:>10.0} checks {:>8.0} windows {:>8.0} pruned {:>8.0} class cuts {:>8.0}",
             style,
             m(&|a| a.candidates),
             m(&|a| a.scored),
             m(&|a| a.position_checks),
             m(&|a| a.windows),
             m(&|a| a.windows_pruned),
+            m(&|a| a.class_cuts),
         );
     }
     println!(
@@ -1599,12 +1603,12 @@ fn run() -> Result<bool, String> {
     }
     if let Some(path) = &args.per_query {
         let mut text = String::from(
-            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\n",
+            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\tdlclass\tclasscuts\n",
         );
         for r in &rows {
             let _ = writeln!(
                 text,
-                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 r.name,
                 r.style,
                 r.ns as f64 / 1e3,
@@ -1620,6 +1624,8 @@ fn run() -> Result<bool, String> {
                 r.pins,
                 r.walk_allocs.allocs,
                 r.walk_allocs.reallocs,
+                r.pages.distinct(Part::DlClasses),
+                r.answer.class_cuts,
             );
         }
         std::fs::write(path, text).map_err(|e| e.to_string())?;
