@@ -4164,6 +4164,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.buckets.fill(NO_BUCKET);
         let mut floor = 0u32;
         let mut reach = bound;
+        // Its length class first: its shortest length bounds every term it
+        // holds before any bucket is read.
+        if self.threshold().is_some() {
+            let class = self.class_floor(g, local)?;
+            if class > 0 {
+                floor = class;
+                reach = self.or_rebound(class);
+                if self.cut(reach, tid) {
+                    self.answer.class_cuts += 1;
+                    return Ok(None);
+                }
+            }
+        }
         loop {
             let mut top = usize::MAX;
             let mut best = f32::NEG_INFINITY;
@@ -4210,19 +4223,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             // Then at its length class's shortest length, where that is
             // longer than its buckets' floor (see `Walk::stage`).
-            None => {
-                if self.threshold().is_some() {
-                    let class = self.class_floor(g, local)?;
-                    if class > floor {
-                        reach = self.reach(self.held_list.iter().copied(), class);
-                        if self.cut(reach, tid) {
-                            self.answer.class_cuts += 1;
-                            return Ok(None);
-                        }
-                    }
-                }
-                (reach, u32::MAX)
-            }
+            None => (reach, u32::MAX),
         }))
     }
 
