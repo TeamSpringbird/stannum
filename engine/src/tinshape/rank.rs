@@ -3322,7 +3322,9 @@ impl Row {
             return;
         }
         self.run += if w - self.w <= 4 {
-            (self.w..w).map(|x| self.at.word(x).count_ones()).sum::<u32>()
+            (self.w..w)
+                .map(|x| self.at.word(x).count_ones())
+                .sum::<u32>()
         } else {
             kernels::popcount_bytes(&self.at.bytes()[self.w * 8..w * 8])
         };
@@ -3538,8 +3540,54 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
+    /// [`Walk::or_group_in`] for group `g`: on x86-64 built with POPCNT
+    /// and BMI where the CPU has them ([`kernels::bit_ops`]), its
+    /// candidates too.
     #[inline(never)]
     fn or_group(&mut self, g: u32) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if kernels::bit_ops() {
+            // SAFETY: the CPU has the features (`bit_ops`).
+            return unsafe { self.or_group_bits(g) };
+        }
+        self.or_group_in::<false>(g)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt,bmi1,bmi2,lzcnt")]
+    unsafe fn or_group_bits(&mut self, g: u32) -> Result<()> {
+        self.or_group_in::<true>(g)
+    }
+
+    /// [`Walk::or_candidate`], built with POPCNT and BMI when `BITS` (only
+    /// where the CPU has them, see [`Walk::or_group`]). Called through a
+    /// pointer the optimizer cannot see through: called directly from the
+    /// group's code built with the same features, LLVM inlines it into the
+    /// word loop despite `#[inline(never)]`, which the candidate step is
+    /// kept out of (see [`Walk::or_candidate`]).
+    ///
+    /// Calling it is safe only where the CPU has the features when `BITS`.
+    #[inline(always)]
+    fn or_candidate_fn<const BITS: bool>()
+    -> unsafe fn(&mut Self, u32, u32, usize, u32) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if BITS {
+            return std::hint::black_box(
+                Self::or_candidate_bits as unsafe fn(&mut Self, u32, u32, usize, u32) -> Result<()>,
+            );
+        }
+        Self::or_candidate
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt,bmi1,bmi2,lzcnt")]
+    #[inline(never)]
+    unsafe fn or_candidate_bits(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<()> {
+        self.or_candidate_in(g, base, w, bit)
+    }
+
+    #[inline(always)]
+    fn or_group_in<const BITS: bool>(&mut self, g: u32) -> Result<()> {
         let n = self.sc.len();
         let group = self.geometry.groups[g as usize];
         let base = group.slot_base;
@@ -3702,6 +3750,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A word's members are bounded from its first slot's ctid (see
         // `Walk::cut`), each member from its own.
         let first = |w: usize| geometry.tid_in(gi, (w * 64) as u32);
+        let candidate = Self::or_candidate_fn::<BITS>();
         let mut w0 = 0;
         while w0 < words {
             let w1 = (w0 + SUB_WORDS).min(words);
@@ -3821,7 +3870,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 while word != 0 {
                     let bit = word.trailing_zeros();
                     word &= word - 1;
-                    self.or_candidate(g, base, w, bit)?;
+                    // SAFETY: with `BITS`, the CPU has the features
+                    // (`or_group`).
+                    unsafe { candidate(self, g, base, w, bit) }?;
                 }
             }
             w0 = w1;
@@ -3898,7 +3949,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// hand no earlier than the last: each present term's word of members
     /// there and the posting index of its first (see [`Walk::cand_w`]),
     /// once for the word's candidates.
-    #[inline]
+    #[inline(always)]
     fn or_word(&mut self, w: usize) {
         self.cand_w = w;
         self.cand_words.clear();
@@ -3926,6 +3977,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
     fn or_candidate(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<()> {
+        self.or_candidate_in(g, base, w, bit)
+    }
+
+    #[inline(always)]
+    fn or_candidate_in(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<()> {
         let local = (w * 64) as u32 + bit;
         if let Some((reach, length)) = self.or_stage(g, base, w, bit)? {
             if !matches!(self.verify, Verify::Flat) {
@@ -4010,6 +4066,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// [`Walk::stage`]): its terms' blocks, then its buckets, and a length
     /// a term it holds carries inline. Its buckets are left in
     /// [`Walk::buckets`] ([`NO_BUCKET`] for a term it lacks).
+    #[inline(always)]
     fn or_stage(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<Option<(f32, u32)>> {
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
