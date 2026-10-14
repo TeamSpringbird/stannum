@@ -122,11 +122,17 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
                     (directory_len: the bytes of the payload before its
                     containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
-           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped)
+           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped),
+           | 0x20 when the directory ends in skip points (grouped, layout 11)
 lengths := base varint, width u8, (length - base) packed at width, by posting
 list    := Elias-Fano over the term's slots, universe = all slots
 directory := groups, (index gap, (count - 1) << 2 | kind, [len],
-                      group frontier)*: one entry per group the term occupies
+                      group frontier)*, skip*: one entry per group the term
+                      occupies, then before every 16th entry past the first a
+                      skip point
+skip    := u32 LE each: the entry's offset from the first entry, the group
+           index after the entry before it, and the container bytes,
+           postings and TF bits before it
 group frontier := head u8 = (pairs - 1) << 4 | first bucket, first length
                   varint, then per pair ((length gap - 1) << 4 | bucket gap - 1)
                   varint: the group's impact frontier, its lengths rounded
@@ -1089,8 +1095,9 @@ Since every directory entry carries its group's frontier (layout 8), an
 entry takes about 10 bytes (3 before), and decoding a common term's
 directory whole cost a cheap conjunction 1-3 ms at 150M rows: about 118,000
 entries decoded per query in the server, of which the walk reached about
-39,000 (198,000 and 101,000 in the replay). `postings::Directory` decodes a
-block of 128 entries at a time, the first time one of them is asked for,
+39,000 (198,000 and 101,000 in the replay). `postings::Directory` decoded a
+block of 128 entries at a time (runs of 16 from skip points since layout 11,
+[below](#skip-points-in-the-directory-layout-11)), the first time one of them is asked for,
 into slots reserved when the record is parsed (a walk asks for an entry
 several times per group, so one decoded is a comparison and a load away);
 each entry is checked against the record as it is decoded (its group, its
@@ -1245,6 +1252,37 @@ reader cache no longer holds footers, so it keeps more records: 41 of a
 query's 70 parsed against 29 of 80. Answers: all 3,733 of the trace equal
 to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
+
+### Skip points in the directory (layout 11)
+
+An entry's totals (its container's offset, its first posting, its buckets'
+offset) count every entry before it, so a walk that asks a term for group
+`g` decoded every entry before `g`'s, whether it needed them or not. A
+conjunction asks its other terms only for the groups its rarest term
+holds: at 150M rows (replay with `--forget`, 400 queries) it decoded
+104,000 entries a query and asked for 31,000 (38%). TIN's footer entry
+locates its group's container without the entries before it (probes round
+7, E1).
+
+So a grouped record's directory ends in a skip point before every 16th
+entry past the first (form flag `0x20`): five little-endian `u32`s, where
+decoding stands there (the entry's offset from the first entry, the group
+index after the entry before it, and the container bytes, postings and TF
+bits before it), 20 bytes per 16 entries. `postings::Directory` decodes a
+run of 16 entries from the skip point before it the first time one of them
+is asked for, and checks where the run ends against the next skip point
+(the last run against the record's totals). Seeking a group
+(`Directory::seek`, the walk's `TermSet::find`) scans the hint's run, then
+gallops over the skip points' group indexes, decoding none of the runs it
+passes. A record without the flag (layout 10) still reads, its runs decoded
+in order; `tnsreencode --from 10` merges each segment alone into layout 11.
+A term's choice between sparse and grouped leaves the skip points out, as it
+does the frontiers.
+
+What the skip interval buys, from the walk's own requests (a lab patch
+replaying them against each interval; `--forget`, 400 conjunctions):
+entries decoded per query against decoding through to each one asked,
+every 4 entries 42%, 8 46%, 16 50%, 32 55%, 64 61% (asked: 38%).
 
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 
