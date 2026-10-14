@@ -3015,6 +3015,18 @@ fn footer_entry_fast(bytes: &[u8], pairs: &mut Vec<(u8, u32)>) -> Option<(u64, u
     Some((gap, at))
 }
 
+/// The larger of a running bound `best` (never NaN) and `v`: `best` when
+/// `v` is NaN, as [`f32::max`] gives, but one compare and select. On
+/// x86-64 `f32::max` is that and three more instructions to order NaNs, on
+/// the chain a fold of bounds carries from pair to pair (`maxss`,
+/// `cmpunordss`, and a blend), which held 4% of a disjunction's cycles on
+/// Sapphire Rapids; on aarch64 it is one `fmaxnm`, this a compare and a
+/// select.
+#[inline(always)]
+pub fn higher(best: f32, v: f32) -> f32 {
+    if v > best { v } else { best }
+}
+
 /// A block's bound from its frontier: the best of `bound` over its pairs,
 /// and 0 at least.
 #[inline(always)]
@@ -3022,7 +3034,7 @@ fn fold_bound(pairs: &[(u8, u32)], bound: &mut impl FnMut(u8, u32) -> f32) -> f3
     pairs
         .iter()
         .map(|(bucket, length)| bound(*bucket, *length))
-        .fold(0.0_f32, f32::max)
+        .fold(0.0_f32, higher)
 }
 
 /// [`footer_entry_fast`] taking each pair's `bound` as it is read, rather
@@ -3083,7 +3095,7 @@ fn footer_entry_bound(
             at += n;
             u32::try_from(value).ok()?
         };
-        best = best.max(bound(bucket, length));
+        best = higher(best, bound(bucket, length));
         last = bucket;
     }
     Some((gap, at, last, best))

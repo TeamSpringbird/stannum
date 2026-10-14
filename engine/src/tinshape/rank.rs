@@ -32,7 +32,7 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
-    array_bytes,
+    array_bytes, higher,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -302,18 +302,18 @@ impl<'a> Bounds<'_, 'a> {
                     f.frontier(b)
                         .iter()
                         .map(|(bucket, length)| bound(*bucket, *length))
-                        .fold(0.0_f32, f32::max)
+                        .fold(0.0_f32, higher)
                 } else {
                     // A skimmed footer's, or one decoded for its bounds.
                     let mut v = 0.0_f32;
-                    f.each_pair(b, |bucket, length| v = v.max(bound(bucket, length)));
+                    f.each_pair(b, |bucket, length| v = higher(v, bound(bucket, length)));
                     v
                 }
             }
             Self::Groups(g) => g
                 .frontier(b)
                 .map(|(bucket, length)| bound(bucket, length))
-                .fold(0.0_f32, f32::max),
+                .fold(0.0_f32, higher),
         }
     }
 
@@ -549,6 +549,15 @@ impl<'s, 'a> Sc<'s, 'a> {
         b
     }
 
+    /// A grouped term's bound over the group of its directory entry `b`,
+    /// which the walk's seek found: [`Self::range_bound`] over the group's
+    /// slots, without seeking the entry again.
+    #[inline]
+    fn entry_bound(&mut self, b: usize) -> f32 {
+        debug_assert!(self.grouped());
+        higher(0.0, self.bound(b))
+    }
+
     /// The best bound of the blocks overlapping slots `from..=to`; ranges
     /// must be asked in increasing order of `from`. Zero where a grouped
     /// record's next entry lies past the range: the term has nothing there.
@@ -568,7 +577,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             if b >= self.footer.decoded() {
                 self.first_reaching(b, to);
             }
-            best = best.max(self.bound(b));
+            best = higher(best, self.bound(b));
             if self.footer.last(b) >= to {
                 break;
             }
@@ -3375,10 +3384,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             cursor.drain_below(end, |slot| out.set(slot - group.slot_base));
             return Ok(());
         }
-        let entry = set
-            .find(g, &mut self.mems[t].hint)
-            .ok_or(Error::Corrupt("a group the term holds"))?;
-        r.entry = self.mems[t].hint;
+        // The entry `run_or`'s seek found for the group, in the hint.
+        let hint = self.mems[t].hint;
+        let entry = set.group_at(hint);
+        if entry.index != g {
+            return Err(Error::Corrupt("a group the term holds"));
+        }
+        r.entry = hint;
         match entry.src {
             Src::Container {
                 entry: e,
@@ -3421,7 +3433,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut total = 0.0_f32;
         for (i, bound) in sb.iter_mut().enumerate() {
             if self.present[i] {
-                *bound = self.sc[i].range_bound(base, end);
+                // A grouped term's entry for the group is the one its seek
+                // left in its hint (see `run_or`).
+                let s = &mut self.sc[i];
+                *bound = if s.grouped() {
+                    s.entry_bound(self.mems[s.term].hint)
+                } else {
+                    s.range_bound(base, end)
+                };
                 total += *bound;
             }
         }
