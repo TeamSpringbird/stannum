@@ -1547,9 +1547,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let held = self.held.len();
         self.held
             .extend(self.sc.iter().filter_map(|s| s.footer.borrowed()));
+        // The pages each grouped term's directory read last: it reads on
+        // there (its next run, frontier or skip point), as a footer does.
+        for set in self.terms.iter().flatten() {
+            if let Some(dir) = &set.dir {
+                self.held.extend(dir.borrowed().into_iter().flatten());
+            }
+        }
         // SAFETY: nothing read in place since the mark is used after but
         // what lies in `held` (see above): the members' slices were
-        // dropped just now, and the footers' windows are held.
+        // dropped just now, and the footers' windows are held (a
+        // directory's slices are dropped as read: it holds none).
         unsafe { blob.release_since(mark, &self.held) };
         self.held.truncate(held);
     }

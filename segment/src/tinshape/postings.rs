@@ -1336,6 +1336,12 @@ pub struct Directory<'a> {
     df: u32,
     containers: u64,
     tf_len: u64,
+    /// The ranges of its bytes the directory read last, in place: its
+    /// entries' (a run's chunk, a frontier) and its skip points'. A walk
+    /// holds their pages pinned ([`Self::borrowed`]), as a lazy reader holds
+    /// the page it reads on, so reading on there pins nothing again.
+    window: std::cell::Cell<(usize, usize)>,
+    skip_window: std::cell::Cell<(usize, usize)>,
 }
 
 impl std::fmt::Debug for Directory<'_> {
@@ -1404,7 +1410,21 @@ impl<'a> Directory<'a> {
             df,
             containers,
             tf_len,
+            window: std::cell::Cell::new((0, 0)),
+            skip_window: std::cell::Cell::new((0, 0)),
         })
+    }
+
+    /// The ranges of the blob (offsets from its start) the directory read
+    /// last in place, its entries' and its skip points': a walk that
+    /// releases pages between groups holds these, so the directory's next
+    /// reads, as a rule on the same pages, pin none again. None in memory.
+    pub fn borrowed(&self) -> [Option<(usize, usize)>; 2] {
+        let Some(base) = self.bytes.offset() else {
+            return [None, None];
+        };
+        [self.window.get(), self.skip_window.get()]
+            .map(|(from, to)| (from < to).then_some((base + from, base + to)))
     }
 
     /// Entries (groups the record holds).
@@ -1428,8 +1448,12 @@ impl<'a> Directory<'a> {
     /// its exact bytes, on one page as a rule.
     #[inline]
     pub fn frontier(&self, entry: &GroupEntry, rounded: bool) -> Result<GroupFrontier<'a>> {
-        let at = entry.frontier as usize;
-        let bytes = self.bytes.get(at, at + usize::from(entry.frontier_len))?;
+        let (at, to) = (
+            entry.frontier as usize,
+            entry.frontier as usize + usize::from(entry.frontier_len),
+        );
+        let bytes = self.bytes.get(at, to)?;
+        self.window.set((at, to));
         Ok(GroupFrontier::new(bytes, 0, rounded))
     }
 
@@ -1570,6 +1594,7 @@ impl<'a> Directory<'a> {
     fn skip_point(&self, r: usize) -> Result<[u32; 5]> {
         let at = self.end + (r - 1) * SKIP_BYTES;
         let bytes = self.bytes.get(at, at + SKIP_BYTES)?;
+        self.skip_window.set((at, at + SKIP_BYTES));
         Ok(std::array::from_fn(|k| {
             u32::from_le_bytes(bytes[4 * k..4 * k + 4].try_into().expect("four bytes"))
         }))
@@ -1580,6 +1605,7 @@ impl<'a> Directory<'a> {
     fn skip_field(&self, r: usize, k: usize) -> Result<u64> {
         let at = self.end + (r - 1) * SKIP_BYTES + 4 * k;
         let bytes = self.bytes.get(at, at + 4)?;
+        self.skip_window.set((at, at + 4));
         Ok(u64::from(u32::from_le_bytes(
             bytes.try_into().expect("four bytes"),
         )))
@@ -1845,6 +1871,7 @@ fn decode_entries(
             .min(start.saturating_add(scan.min(UNITS_CHUNK)))
             .min(bytes.page_end(start).max(start + 1));
         let before = out.len();
+        dir.window.set((start, stop));
         decode_chunk(
             bytes.get(start, stop)?,
             start,
@@ -1860,6 +1887,7 @@ fn decode_entries(
             // time, from a copy.
             let mut copy = [0u8; DIR_ENTRY_MAX];
             let n = copy_bytes(bytes, start, end.min(start + DIR_ENTRY_MAX), &mut copy)?;
+            dir.window.set((start, start + n));
             let mut p = 0;
             let previous = resume.after.checked_sub(1);
             let (entry, len) =
@@ -5440,6 +5468,67 @@ mod lazy_directory_tests {
         assert_eq!(dir.entries(&geometry.groups).unwrap(), whole);
         let walk: Vec<usize> = (0..whole.len()).rev().collect();
         check_walk(&out, &geometry, n as u32, &walk);
+    }
+
+    /// A walk that reads a directory's entries and frontiers in order and
+    /// releases every page pinned since its mark but the directory's
+    /// windows ([`Directory::borrowed`]) pins each page of the directory at
+    /// most about twice (once to decode a batch of runs ahead, once to read
+    /// their frontiers: on pages of 64 bytes here a batch spans many, on
+    /// 8 KB ones a part of one), holds no more than its windows' pages, and
+    /// reads the same entries and frontiers as from memory; a seek's skip
+    /// points stay held with them.
+    #[test]
+    fn directories_read_on_with_only_their_windows_held() {
+        let (record, geometry, df) = term(11, 1200, false);
+        let memory = Postings::parse(&record, df, &geometry).unwrap();
+        let Form::Grouped(whole_dir) = &memory.form else {
+            panic!("a grouped record");
+        };
+        let whole = whole_dir.entries(&geometry.groups).unwrap();
+        let page = 64;
+        let source = PinningSource::new(record.clone(), page);
+        let blob = LazyBlob::new(Box::new(source.clone()));
+        blob.set_keep(0);
+        blob.open_span();
+        let parsed = Postings::parse(blob.bytes(), df, &geometry).unwrap();
+        let Form::Grouped(dir) = &parsed.form else {
+            panic!("a grouped record");
+        };
+        let mark = blob.pin_mark();
+        let pins = source.0.pins.get();
+        let mut held_at_most = 0;
+        for (b, expected) in whole.iter().enumerate() {
+            // A seek from the entry before (reading skip points past runs
+            // not decoded), then the entry and its frontier.
+            assert_eq!(dir.seek(expected.index, b, &geometry.groups).unwrap(), b);
+            let entry = dir.get(b, &geometry.groups).unwrap();
+            assert_eq!(entry, expected);
+            assert!(
+                parsed
+                    .group_frontier(entry)
+                    .unwrap()
+                    .eq(memory.group_frontier(expected).unwrap()),
+                "frontier of entry {b}"
+            );
+            let held: Vec<(usize, usize)> = dir.borrowed().into_iter().flatten().collect();
+            if blob.over_keep(mark) {
+                // SAFETY: nothing read from the directory is held but
+                // through its windows.
+                unsafe { blob.release_since(mark, &held) };
+                held_at_most = held_at_most.max(blob.pinned_since(mark));
+            }
+        }
+        let pages = dir.bytes().len().div_ceil(page) + 1;
+        let pinned = source.0.pins.get() - pins;
+        assert!(
+            pinned <= 2 * pages,
+            "{pinned} pins for a directory of {pages} pages"
+        );
+        assert!(held_at_most <= 4, "{held_at_most} pages held");
+        drop(parsed);
+        // SAFETY: nothing read in the span is used after.
+        unsafe { blob.close_span() };
     }
 
     /// A directory parsed over pages read in place keeps no slice of them:
