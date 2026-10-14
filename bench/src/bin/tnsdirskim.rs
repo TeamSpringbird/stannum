@@ -38,10 +38,17 @@ fn main() {
             if dir.len() < min_groups {
                 continue;
             }
-            let whole = postings::decode_directory_whole(dir.bytes(), groups).expect("decoded");
+            let whole =
+                postings::decode_directory_whole(dir.bytes().all().expect("in memory"), groups)
+                    .expect("decoded");
             assert_eq!(dir.entries(groups).expect("decoded"), whole, "{term}");
             let record = &blob[found.at..found.at + p.tf_at + p.tf.len()];
-            records.push((record, entry.df, dir.bytes().to_vec(), dir.len()));
+            records.push((
+                record,
+                entry.df,
+                dir.bytes().all().expect("in memory").to_vec(),
+                dir.len(),
+            ));
         }
         let total: usize = records.iter().map(|r| r.3).sum();
         let bytes: usize = records.iter().map(|r| r.2.len()).sum();

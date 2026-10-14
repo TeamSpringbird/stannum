@@ -180,7 +180,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                     let length = lengths[rank as usize];
                     let covered = found
                         .postings
-                        .group_frontier(entry)
+                        .group_frontier(entry)?
                         .any(|(fb, fl)| fb >= bucket && fl <= length);
                     if !covered {
                         problems.push(format!(

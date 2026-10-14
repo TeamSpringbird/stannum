@@ -289,6 +289,9 @@ pub struct LazyBlob {
     source: Box<dyn Source>,
     /// The source's bytes per page, zero when it pins none.
     page_len: usize,
+    /// [`Self::page_of`]'s reciprocal of `page_len`, zero when an offset
+    /// of the blob may be past where it is exact.
+    page_magic: u64,
     /// Open [`Self::open_span`]s.
     spans: Cell<u32>,
     /// The outermost span open or last opened, numbering them from 1.
@@ -339,6 +342,7 @@ impl LazyBlob {
         Self {
             data,
             len,
+            page_magic: page_magic(page_len, len),
             chunks: (0..len.div_ceil(CHUNK).div_ceil(64))
                 .map(|_| Cell::new(0))
                 .collect(),
@@ -547,6 +551,19 @@ impl LazyBlob {
         self.page_len
     }
 
+    /// The page holding byte `offset` (of a source that pins pages): a
+    /// multiplication by the page length's reciprocal rather than a
+    /// division, which takes some 15 to 40 cycles on x86 and lies on the
+    /// path of every read in place.
+    #[inline(always)]
+    fn page_of(&self, offset: usize) -> usize {
+        if self.page_magic != 0 {
+            ((offset as u128 * u128::from(self.page_magic)) >> 64) as usize
+        } else {
+            offset / self.page_len
+        }
+    }
+
     /// The page pinned `i`th of those the open span holds (see
     /// [`Self::pin_mark`]).
     #[inline]
@@ -672,7 +689,7 @@ impl LazyBlob {
     fn get_kind(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if self.spans.get() > 0 && from < to && self.page_len > 0 {
             let n = self.page_len;
-            let page = from / n;
+            let page = self.page_of(from);
             let known = self.pages[page % PAGE_MEMO].get();
             if known.page == page && known.span == self.span.get() && to <= page * n + known.len {
                 self.touch(page);
@@ -743,8 +760,8 @@ impl LazyBlob {
     /// place on its page, else stitched.
     fn in_place(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         let n = self.page_len;
-        let first = from / n;
-        if (to - 1) / n == first
+        let first = self.page_of(from);
+        if self.page_of(to - 1) == first
             && let Some((data, len)) = self.page(first, kind)?
         {
             let within = from - first * n;
@@ -803,6 +820,24 @@ impl LazyBlob {
         // lives until the span closes.
         Ok(unsafe { std::slice::from_raw_parts(out, to - from) })
     }
+}
+
+/// The reciprocal [`LazyBlob::page_of`] multiplies by for pages of `n`
+/// bytes in a blob of `len`: `ceil(2^64 / n)`, whose product with an
+/// offset below `2^64 / 2^ceil(log2 n)` has the offset's quotient by `n` in
+/// its high 64 bits (the error, `ceil(2^64 / n) * n - 2^64`, is below `n`;
+/// see Lemire, Kaser and Kurz, "Faster remainder by direct computation",
+/// 2019). Zero (divide) when the blob may hold a larger offset, or for
+/// pages of one byte or none.
+fn page_magic(n: usize, len: usize) -> u64 {
+    if n <= 1 {
+        return 0;
+    }
+    let bits = usize::BITS - (n - 1).leading_zeros();
+    if bits >= 64 || (len as u64) >= 1u64 << (64 - bits) {
+        return 0;
+    }
+    (u64::MAX / n as u64).wrapping_add(1)
 }
 
 /// A range of a segment's bytes: in memory, or in a [`LazyBlob`] that
@@ -944,7 +979,7 @@ impl<'a> Bytes<'a> {
                 if n == 0 {
                     return len;
                 }
-                ((at + from) / n * n + n - at).min(len)
+                (blob.page_of(at + from) * n + n - at).min(len)
             }
         }
     }
@@ -1199,6 +1234,42 @@ mod tests {
         unsafe { blob.close_span() };
         let memory = [1u8, 2, 3];
         assert_eq!(Bytes::from(&memory).page_end(1), 3);
+    }
+
+    #[test]
+    fn page_of_is_the_quotient() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        for n in [1usize, 2, 7, 64, 97, 8156, 8160, 8192, 32_768 - 3, 65_535] {
+            for len in [0usize, 1, n, 3 * n + 1, 1 << 31, (1 << 40) + 5] {
+                let magic = page_magic(n, len);
+                if n > 1 {
+                    assert_ne!(magic, 0, "pages of {n} in {len} bytes");
+                }
+                let quotient = |x: usize| {
+                    if magic == 0 {
+                        x / n
+                    } else {
+                        ((x as u128 * u128::from(magic)) >> 64) as usize
+                    }
+                };
+                let check = |x: usize| assert_eq!(quotient(x), x / n, "{x} / {n}");
+                for k in [0usize, 1, 2, 1000, len / n] {
+                    for x in [k * n, (k * n).saturating_sub(1), k * n + 1] {
+                        if x <= len {
+                            check(x);
+                        }
+                    }
+                }
+                for _ in 0..1000 {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    check(rng as usize % (len + 1));
+                }
+            }
+        }
+        // Past where it is exact: divided.
+        assert_eq!(page_magic(8156, usize::MAX), 0);
     }
 
     #[test]

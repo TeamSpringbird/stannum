@@ -323,6 +323,7 @@ fn parse_old<'r>(
             len: len as u32,
             first: first as u32,
             frontier: 0,
+            frontier_len: 0,
             tf_bit: 0,
             width: 0,
             max_bucket: 0,

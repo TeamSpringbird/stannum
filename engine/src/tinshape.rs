@@ -197,7 +197,7 @@ pub struct TermSet<'a> {
     /// decoded as far as asked for (each group's [`G`] is made when it is
     /// asked for), the segment's groups it is decoded against, and where
     /// its containers start in the blob.
-    dir: Option<std::rc::Rc<Directory>>,
+    dir: Option<std::rc::Rc<Directory<'a>>>,
     docs: std::rc::Rc<DocSet>,
     containers: usize,
     /// Groups of a single or sparse term, over [`Self::locals`].
@@ -243,7 +243,7 @@ impl<'a> TermSet<'a> {
         let mut groups = Vec::new();
         let mut locals = Vec::new();
         // A grouped term's directory, shared with its record.
-        let mut dir: Option<std::rc::Rc<Directory>> = None;
+        let mut dir: Option<std::rc::Rc<Directory<'a>>> = None;
         let mut containers = 0;
         match &postings.form {
             Form::Single(slot) => {
@@ -351,7 +351,7 @@ impl<'a> TermSet<'a> {
 
     /// A grouped term's directory entry `i` (decoded if it was not yet).
     #[inline]
-    fn entry(dir: &Directory, docs: &DocSet, i: usize) -> GroupEntry {
+    fn entry(dir: &Directory<'_>, docs: &DocSet, i: usize) -> GroupEntry {
         *dir.get(i, &docs.geometry.groups)
             .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
     }
@@ -2299,7 +2299,7 @@ mod tests {
         let page_len = 97;
         let dense = parsed.term("t1").unwrap().unwrap().postings;
         assert!(matches!(dense.form, Form::Grouped(_)) && dense.footer.is_empty());
-        let footer_pages = dense.directory_bytes().len() / page_len;
+        let footer_pages = dense.directory_len() / page_len;
         let source = segment::tinshape::blob::PinningSource::new(blob.clone(), page_len);
         let pinned = LazyBlob::new(Box::new(source.clone()));
         let in_place = assembled_in_place(&pinned, &parsed, &blob);

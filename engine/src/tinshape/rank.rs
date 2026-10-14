@@ -86,20 +86,20 @@ enum Bounds<'s, 'a> {
     /// Boxed: a lazy footer is several vectors, a group's bounds a few
     /// words.
     Blocks(Box<LazyFooter<'a>>),
-    Groups(GroupBounds<'s>),
+    Groups(GroupBounds<'s, 'a>),
 }
 
 /// A grouped record's entries as a walk's blocks: the directory (shared
 /// with the parsed record, its entries decoded as the walk reaches them, its
 /// bytes the frontiers), and the segment's groups, which turn an entry's
 /// group index into the group's last slot.
-struct GroupBounds<'s> {
-    dir: std::rc::Rc<Directory>,
+struct GroupBounds<'s, 'a> {
+    dir: std::rc::Rc<Directory<'a>>,
     rounded: bool,
     groups: &'s [Group],
 }
 
-impl GroupBounds<'_> {
+impl<'a> GroupBounds<'_, 'a> {
     /// Entry `b` (decoded if it was not yet).
     #[inline]
     fn entry(&self, b: usize) -> &GroupEntry {
@@ -121,14 +121,12 @@ impl GroupBounds<'_> {
         group.slot_base + group.slots() - 1
     }
 
-    /// The frontier of entry `b`.
+    /// The frontier of entry `b`, read in place.
     #[inline]
-    fn frontier(&self, b: usize) -> GroupFrontier<'_> {
-        GroupFrontier::new(
-            self.dir.bytes(),
-            self.entry(b).frontier as usize,
-            self.rounded,
-        )
+    fn frontier(&self, b: usize) -> GroupFrontier<'a> {
+        self.dir
+            .frontier(self.entry(b), self.rounded)
+            .unwrap_or_else(|e| corrupt_footer(e))
     }
 
     /// The first entry from `from` on whose group ends at `slot` or later:
@@ -1386,7 +1384,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .sc
             .iter()
             .filter_map(|s| self.terms[s.term].as_ref())
-            .map(|set| (set.postings.footer.len() + set.postings.directory_bytes().len()) as u64)
+            .map(|set| (set.postings.footer.len() + set.postings.directory_len()) as u64)
             .sum();
         let (mut reached, mut loaded) = (0u64, 0u64);
         for (set, mem) in self.terms.iter().zip(&self.mems) {

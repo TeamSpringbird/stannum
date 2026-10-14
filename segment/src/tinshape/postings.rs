@@ -832,9 +832,11 @@ pub struct GroupEntry {
     pub len: u32,
     /// Postings in earlier groups.
     pub first: u32,
-    /// Where the group's frontier lies in the directory's bytes
-    /// ([`Postings::directory`]).
+    /// Where the group's frontier lies in the directory's bytes (from its
+    /// group count on, [`Directory::bytes`]), and its length: the walk
+    /// reads exactly those bytes, in place.
     pub frontier: u32,
+    pub frontier_len: u8,
     /// Where the group's buckets start in the TF tail, in bits, and their
     /// width; the frontier's largest bucket.
     pub tf_bit: u32,
@@ -858,7 +860,7 @@ pub enum Form<'a> {
     Sparse(Ef<'a>),
     /// The group directory, shared by the clones of a parsed record and
     /// decoded as far as asked for.
-    Grouped(std::rc::Rc<Directory>),
+    Grouped(std::rc::Rc<Directory<'a>>),
 }
 
 /// A term's postings record, parsed.
@@ -1079,20 +1081,17 @@ impl<'a> Postings<'a> {
                 )?)
             }
             FORM_GROUPED => {
-                // The header gives the directory's length: its bytes are
-                // read in one window and copied, and nothing of them is
-                // stepped over ([`Directory`] decodes its entries as asked).
+                // The header gives the directory's length: nothing of it is
+                // read but its group count ([`Directory`] reads its skip
+                // points and the runs of entries it decodes in place, as
+                // asked).
                 let end = directory_len;
                 if end == 0 || end > payload.len() {
                     return Err(Error::Corrupt("postings directory length"));
                 }
-                // Copied a page at a time: a directory spanning pages is
-                // not stitched first (a second copy).
-                let mut copy = Vec::with_capacity(end);
-                payload.copy_into(0, end, &mut copy)?;
-                let directory: Box<[u8]> = copy.into_boxed_slice();
+                let directory = payload.sub(0, end)?;
                 let mut at = 0;
-                let groups = varint::get_u32(&directory, &mut at)? as usize;
+                let groups = varint::get_u32(directory.window(0, 10)?, &mut at)? as usize;
                 // An entry takes at least four bytes (a gap, a count and
                 // kind, a frontier's head and first length).
                 if groups == 0 || groups > geometry.groups.len() || end - at < 4 * groups {
@@ -1133,23 +1132,23 @@ impl<'a> Postings<'a> {
         })
     }
 
-    /// The impact frontier a grouped record's directory holds for a group.
+    /// The impact frontier a grouped record's directory holds for a group,
+    /// read in place (`Truncated` for a record of another form).
     #[inline]
-    pub fn group_frontier(&self, entry: &GroupEntry) -> GroupFrontier<'_> {
-        GroupFrontier::new(
-            self.directory_bytes(),
-            entry.frontier as usize,
-            self.rounded,
-        )
+    pub fn group_frontier(&self, entry: &GroupEntry) -> Result<GroupFrontier<'a>> {
+        match &self.form {
+            Form::Grouped(dir) => dir.frontier(entry, self.rounded),
+            _ => Err(Error::Truncated),
+        }
     }
 
-    /// A grouped record's directory's bytes (its entries carry their
-    /// groups' frontiers); none for another record.
+    /// The bytes of a grouped record's directory (its entries carry their
+    /// groups' frontiers); zero for another record.
     #[inline]
-    pub fn directory_bytes(&self) -> &[u8] {
+    pub fn directory_len(&self) -> usize {
         match &self.form {
-            Form::Grouped(dir) => dir.bytes(),
-            _ => &[],
+            Form::Grouped(dir) => dir.bytes().len(),
+            _ => 0,
         }
     }
 
@@ -1281,10 +1280,13 @@ fn put_skip(out: &mut Vec<u8>, at: &Resume) {
     }
 }
 
-/// A grouped record's directory: its bytes, copied when the record is
-/// parsed (so the parsed record borrows nothing of the blob, and decoding
-/// reads no page of it), and its entries, decoded [`DIRECTORY_SKIP`] at a
-/// time as they are asked for.
+/// A grouped record's directory: its bytes, a range of the record read
+/// when asked (in place within a span, from the pages it pins; the parsed
+/// record borrows no slice of them, so it may be kept past the span), and
+/// its entries, decoded [`DIRECTORY_SKIP`] at a time as they are asked for.
+/// Nothing of the directory is copied: a run of entries is read in place a
+/// page at a time (the one entry across two pages copied on the stack), a
+/// frontier in place where its entry says it lies.
 ///
 /// An entry carries its group's impact frontier, so a directory takes about
 /// ten bytes an entry; the record's header gives its length (where the
@@ -1304,10 +1306,10 @@ fn put_skip(out: &mut Vec<u8>, at: &Resume) {
 /// lies in the segment and holds its count, its container lies in the
 /// payload and its buckets in the TF tail), and each run where it ends
 /// against the next skip point, the last against the record's totals.
-pub struct Directory {
+pub struct Directory<'a> {
     /// The directory's bytes, from its group count on: entries' frontier
     /// offsets index them.
-    bytes: Box<[u8]>,
+    bytes: Bytes<'a>,
     /// A slot per entry, reserved when parsed and never moved: those of
     /// the runs marked in `done` are written, once, and read through shared
     /// references a walk holds while other runs are written. A walk asks
@@ -1336,7 +1338,7 @@ pub struct Directory {
     tf_len: u64,
 }
 
-impl std::fmt::Debug for Directory {
+impl std::fmt::Debug for Directory<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Directory")
             .field("len", &self.len())
@@ -1358,12 +1360,12 @@ struct Resume {
     tf_bit: u64,
 }
 
-impl Directory {
+impl<'a> Directory<'a> {
     /// A directory of `len` entries in `bytes` (from its group count on,
     /// through its skip points if it has them); `None` if the bytes cannot
     /// hold them.
     fn new(
-        bytes: Box<[u8]>,
+        bytes: Bytes<'a>,
         len: usize,
         skips: bool,
         df: u32,
@@ -1418,8 +1420,17 @@ impl Directory {
 
     /// The directory's bytes, from its group count on.
     #[inline]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+    pub fn bytes(&self) -> Bytes<'a> {
+        self.bytes
+    }
+
+    /// The frontier of `entry` (one of this directory's), read in place:
+    /// its exact bytes, on one page as a rule.
+    #[inline]
+    pub fn frontier(&self, entry: &GroupEntry, rounded: bool) -> Result<GroupFrontier<'a>> {
+        let at = entry.frontier as usize;
+        let bytes = self.bytes.get(at, at + usize::from(entry.frontier_len))?;
+        Ok(GroupFrontier::new(bytes, 0, rounded))
     }
 
     /// Whether run `r`'s entries are decoded.
@@ -1517,7 +1528,7 @@ impl Directory {
             // Past a run not decoded, by the skip points (a decoded one is
             // scanned on).
             if self.skips && b < n && !self.is_done(b / DIRECTORY_SKIP) {
-                b = self.skip_past(b / DIRECTORY_SKIP, index) * DIRECTORY_SKIP;
+                b = self.skip_past(b / DIRECTORY_SKIP, index)? * DIRECTORY_SKIP;
             }
         }
         Ok(n)
@@ -1527,17 +1538,17 @@ impl Directory {
     /// run whose skip point follows a group below `index`: the first entry
     /// at `index` or past it lies in that run, at the latest.
     #[inline]
-    fn skip_past(&self, r: usize, index: u32) -> usize {
+    fn skip_past(&self, r: usize, index: u32) -> Result<usize> {
         let runs = skip_count(self.len()) + 1;
-        let below = |r: usize| self.skip_after(r) <= u64::from(index);
-        if r + 1 >= runs || !below(r + 1) {
-            return r;
+        let below = |r: usize| Ok::<_, Error>(self.skip_after(r)? <= u64::from(index));
+        if r + 1 >= runs || !below(r + 1)? {
+            return Ok(r);
         }
         // `lo` passes, `hi` fails or is past the last run.
         let (mut lo, mut step) = (r + 1, 1);
         let mut hi = loop {
             let at = lo + step;
-            if at >= runs || !below(at) {
+            if at >= runs || !below(at)? {
                 break at.min(runs);
             }
             lo = at;
@@ -1545,27 +1556,38 @@ impl Directory {
         };
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
-            if below(mid) {
+            if below(mid)? {
                 lo = mid;
             } else {
                 hi = mid;
             }
         }
-        lo
+        Ok(lo)
     }
 
-    /// Field `k` of skip point `r` (one past a run's first entry), unchecked.
+    /// Skip point `r` (one past a run's first entry): its five fields.
+    #[inline]
+    fn skip_point(&self, r: usize) -> Result<[u32; 5]> {
+        let at = self.end + (r - 1) * SKIP_BYTES;
+        let bytes = self.bytes.get(at, at + SKIP_BYTES)?;
+        Ok(std::array::from_fn(|k| {
+            u32::from_le_bytes(bytes[4 * k..4 * k + 4].try_into().expect("four bytes"))
+        }))
+    }
+
+    /// Field `k` of skip point `r`.
     #[inline(always)]
-    fn skip_field(&self, r: usize, k: usize) -> u64 {
+    fn skip_field(&self, r: usize, k: usize) -> Result<u64> {
         let at = self.end + (r - 1) * SKIP_BYTES + 4 * k;
-        u64::from(u32::from_le_bytes(
-            self.bytes[at..at + 4].try_into().expect("four bytes"),
-        ))
+        let bytes = self.bytes.get(at, at + 4)?;
+        Ok(u64::from(u32::from_le_bytes(
+            bytes.try_into().expect("four bytes"),
+        )))
     }
 
     /// The group index after the last entry before run `r` (`r` past 0).
     #[inline(always)]
-    fn skip_after(&self, r: usize) -> u64 {
+    fn skip_after(&self, r: usize) -> Result<u64> {
         self.skip_field(r, 1)
     }
 
@@ -1582,16 +1604,17 @@ impl Directory {
         if !self.skips {
             return Ok(self.resume.get());
         }
-        let at = self.head + self.skip_field(r, 0) as usize;
+        let [at, after, body, first, tf_bit] = self.skip_point(r)?.map(u64::from);
+        let at = self.head + at as usize;
         if at >= self.end {
             return Err(Error::Corrupt("group directory skip"));
         }
         Ok(Resume {
             at,
-            after: self.skip_field(r, 1),
-            body: self.skip_field(r, 2),
-            first: self.skip_field(r, 3),
-            tf_bit: self.skip_field(r, 4),
+            after,
+            body,
+            first,
+            tf_bit,
         })
     }
 
@@ -1614,7 +1637,7 @@ impl Directory {
         let (mut lo, mut hi) = (0, runs);
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
-            if self.skip_field(mid, 3) <= u64::from(index) {
+            if self.skip_field(mid, 3)? <= u64::from(index) {
                 lo = mid;
             } else {
                 hi = mid;
@@ -1672,10 +1695,10 @@ impl Directory {
         self.decoded.get()
     }
 
-    /// Bytes the directory holds, roughly: its bytes, and its entries
-    /// decoded so far (the slots past them untouched).
+    /// Bytes the directory holds, roughly: its entries decoded so far (the
+    /// slots past them untouched; its bytes are read where they lie).
     pub fn held(&self) -> usize {
-        self.bytes.len() + self.decoded() * std::mem::size_of::<GroupEntry>()
+        self.decoded() * std::mem::size_of::<GroupEntry>()
     }
 
     /// Decodes runs `r..r + k` (none of them decoded) in one pass, from the
@@ -1701,10 +1724,10 @@ impl Directory {
         if end < resume.at {
             return Err(Error::Corrupt("group directory skip"));
         }
-        let bytes = &self.bytes[..end];
         UNITS.with_borrow_mut(|units| {
             decode_entries(
-                bytes,
+                self.bytes,
+                end,
                 self.skips,
                 &mut resume,
                 n,
@@ -1786,23 +1809,29 @@ thread_local! {
 
 /// Decodes `want` entries of a directory's `bytes` from `resume` on, into
 /// `out`, checking each against `dir`'s record; `resume` is left after them.
-/// With `exact`, the entries wanted end where `bytes` do.
+/// With `exact`, the entries wanted end at `end`.
+///
+/// The directory's bytes before `end` are read in place a chunk at a time,
+/// none across a page: an entry a chunk ends within is scanned again with
+/// the next, and one across two pages (in no chunk whole) is copied onto
+/// the stack and decoded a varint at a time.
 #[allow(clippy::too_many_arguments)]
 fn decode_entries(
-    bytes: &[u8],
+    bytes: Bytes<'_>,
+    end: usize,
     exact: bool,
     resume: &mut Resume,
     want: usize,
     out: &mut Slots<'_>,
     groups: &[Group],
-    dir: &Directory,
+    dir: &Directory<'_>,
     units: &mut Units,
 ) -> Result<()> {
     let target = out.len() + want;
     // Scanned as far as the entries wanted take at the directory's bytes per
     // entry and a quarter more (or, exact, to their end): the entry the scan
     // ends within is scanned again with the next chunk.
-    let per = bytes.len().div_ceil(dir.len().max(1));
+    let per = end.div_ceil(dir.len().max(1));
     while out.len() < target {
         let left = target - out.len();
         let start = resume.at;
@@ -1812,10 +1841,12 @@ fn decode_entries(
             left.saturating_mul(per + per.div_ceil(4))
                 .saturating_add(32)
         };
-        let end = bytes.len().min(start.saturating_add(scan.min(UNITS_CHUNK)));
+        let stop = end
+            .min(start.saturating_add(scan.min(UNITS_CHUNK)))
+            .min(bytes.page_end(start).max(start + 1));
         let before = out.len();
         decode_chunk(
-            &bytes[start..end],
+            bytes.get(start, stop)?,
             start,
             resume,
             target,
@@ -1825,18 +1856,42 @@ fn decode_entries(
             units,
         )?;
         if out.len() == before {
-            // An entry longer than a chunk: a varint at a time.
-            let mut p = resume.at;
+            // An entry longer than a chunk, or across pages: a varint at a
+            // time, from a copy.
+            let mut copy = [0u8; DIR_ENTRY_MAX];
+            let n = copy_bytes(bytes, start, end.min(start + DIR_ENTRY_MAX), &mut copy)?;
+            let mut p = 0;
             let previous = resume.after.checked_sub(1);
             let (entry, len) =
-                decode_entry(bytes, &mut p, 0, previous, groups).map_err(|e| match e {
+                decode_entry(&copy[..n], &mut p, start, previous, groups).map_err(|e| match e {
                     Error::Truncated => Error::Corrupt("group directory entry"),
                     e => e,
                 })?;
-            push_entry(resume, entry, len, p, out, dir)?;
+            push_entry(resume, entry, len, start + p, out, dir)?;
         }
     }
     Ok(())
+}
+
+/// Bytes a directory entry takes at most: a gap, a count and kind, and a
+/// container length of five bytes each (32-bit values), and a frontier of
+/// sixteen pairs (a head, a first length of five bytes, fifteen deltas of
+/// six).
+const DIR_ENTRY_MAX: usize = 128;
+
+/// Copies bytes `[from, to)` of `bytes` into `out` (at least as long), a
+/// page at a time in place; how many.
+fn copy_bytes(bytes: Bytes<'_>, mut from: usize, to: usize, out: &mut [u8]) -> Result<usize> {
+    let n = to - from;
+    let mut at = 0;
+    while from < to {
+        let stop = bytes.page_end(from).clamp(from + 1, to);
+        let piece = bytes.get(from, stop)?;
+        out[at..at + piece.len()].copy_from_slice(piece);
+        at += piece.len();
+        from = stop;
+    }
+    Ok(n)
 }
 
 /// Appends `entry` (its container of `len` bytes, the entry ending at `end`
@@ -1849,7 +1904,7 @@ fn push_entry(
     len: u64,
     end: usize,
     out: &mut Slots<'_>,
-    dir: &Directory,
+    dir: &Directory<'_>,
 ) -> Result<()> {
     let count = u64::from(entry.count);
     let tf_bits = count * u64::from(entry.width);
@@ -1884,7 +1939,7 @@ fn decode_chunk(
     target: usize,
     out: &mut Slots<'_>,
     groups: &[Group],
-    dir: &Directory,
+    dir: &Directory<'_>,
     units: &mut Units,
 ) -> Result<()> {
     units.scan(bytes);
@@ -1972,6 +2027,8 @@ fn decode_chunk(
                     len: len as u32,
                     first: 0,
                     frontier: (base + head_at) as u32,
+                    // A head and at most eight varints of four bytes.
+                    frontier_len: (end - head_at) as u8,
                     tf_bit: 0,
                     width: TF_WIDTH[usize::from(max_bucket)],
                     max_bucket,
@@ -2032,8 +2089,10 @@ fn decode_entry(
         _ if group.slots() <= ARRAY_SLOTS_MAX => 2 * count,
         _ => return Err(Error::Corrupt("postings group kind")),
     };
-    let frontier = (base + *at) as u32;
+    let frontier_at = *at;
     let max_bucket = skip_group_frontier(bytes, at)?;
+    let frontier_len =
+        u8::try_from(*at - frontier_at).map_err(|_| Error::Corrupt("group frontier"))?;
     let width = tf_width(max_bucket, true);
     Ok((
         GroupEntry {
@@ -2043,7 +2102,8 @@ fn decode_entry(
             at: 0,
             len: len as u32,
             first: 0,
-            frontier,
+            frontier: (base + frontier_at) as u32,
+            frontier_len,
             tf_bit: 0,
             width: width as u8,
             max_bucket,
@@ -2590,7 +2650,7 @@ impl Footer {
             let mut largest = 0u8;
             for e in entries.iter() {
                 footer.starts.push(footer.frontier.len() as u32);
-                footer.frontier.extend(postings.group_frontier(e));
+                footer.frontier.extend(postings.group_frontier(e)?);
                 footer.tf_at.push(e.tf_bit);
                 footer.widths.push(e.width);
                 footer.firsts.push(e.first);
@@ -3864,7 +3924,7 @@ mod tests {
             let entries = &dir.entries(&geometry.groups).unwrap();
             assert_eq!(
                 entries,
-                &decode_directory_whole(dir.bytes(), &geometry.groups).unwrap(),
+                &decode_directory_whole(dir.bytes().all().unwrap(), &geometry.groups).unwrap(),
                 "decoded a block at a time as a varint at a time"
             );
             check_group_frontiers(&parsed, entries, geometry, slots, buckets, lengths, options);
@@ -3914,7 +3974,7 @@ mod tests {
         let rounded = options.group_frontiers == GroupFrontiers::Rounded;
         assert_eq!(parsed.rounded, rounded);
         for entry in entries {
-            let front: Vec<(u8, u32)> = parsed.group_frontier(entry).collect();
+            let front: Vec<(u8, u32)> = parsed.group_frontier(entry).unwrap().collect();
             let group = geometry.groups[entry.index as usize];
             let members: Vec<usize> = (0..slots.len())
                 .filter(|i| {
@@ -4361,9 +4421,9 @@ mod tests {
 
     /// A directory whose entries are longer than a few bytes (a frontier
     /// of several pairs per group), read in place over small pages: every
-    /// entry is decoded once and every directory byte past the first
-    /// window is copied about once, however far its count's estimate
-    /// falls short, and the record is the one parsed from memory.
+    /// entry is decoded once, from the pages in place (an entry across two
+    /// copied on the stack), nothing of the directory is stitched but skip
+    /// points across pages, and the record is the one parsed from memory.
     #[test]
     fn long_directory_entries_are_read_once() {
         use super::super::blob::{self, LazyBlob, PinningSource};
@@ -4394,7 +4454,7 @@ mod tests {
         let Form::Grouped(dir) = &whole.form else {
             panic!("a grouped record");
         };
-        let entries = decode_directory_whole(dir.bytes(), &geometry.groups).unwrap();
+        let entries = decode_directory_whole(dir.bytes().all().unwrap(), &geometry.groups).unwrap();
         assert_eq!(entries.len(), 2000);
         let directory = dir.bytes().len();
         assert!(
@@ -4411,13 +4471,19 @@ mod tests {
         let Form::Grouped(read) = &parsed.form else {
             panic!("a grouped record");
         };
-        assert_eq!(read.bytes(), dir.bytes());
+        assert_eq!(
+            blob::stats()[Kind::Record as usize].stitched,
+            0,
+            "nothing stitched by the parse"
+        );
+        assert_eq!(read.bytes().all().unwrap(), dir.bytes().all().unwrap());
+        blob::reset_stats();
         assert_eq!(parsed.containers_at, whole.containers_at);
         let counts = memo_counts();
         assert_eq!(
             (counts.directories, counts.directory_entries),
             (1, 0),
-            "the directory copied, no entry decoded"
+            "the directory parsed, no entry decoded"
         );
         assert_eq!(read.entries(&geometry.groups).unwrap(), entries);
         assert_eq!(read.entries(&geometry.groups).unwrap(), entries);
@@ -4428,8 +4494,9 @@ mod tests {
             "every entry decoded once"
         );
         let stitched = blob::stats()[Kind::Record as usize].stitched as usize;
+        let skips = skip_count(2000) * SKIP_BYTES;
         assert!(
-            stitched <= directory + 64,
+            stitched <= skips,
             "stitched {stitched} bytes for a {directory}-byte directory"
         );
         drop(parsed);
@@ -4647,7 +4714,7 @@ mod tests {
             assert_eq!(dir.decoded(), 700);
             assert_eq!(
                 dir.entries(groups).unwrap(),
-                decode_directory_whole(dir.bytes(), groups).unwrap()
+                decode_directory_whole(dir.bytes().all().unwrap(), groups).unwrap()
             );
             dir.decode_all(groups).unwrap();
         }
@@ -4763,7 +4830,7 @@ mod tests {
             assert_eq!(dir.len(), groups as usize);
             assert_eq!(
                 dir.entries(&geometry.groups).unwrap(),
-                decode_directory_whole(dir.bytes(), &geometry.groups).unwrap()
+                decode_directory_whole(dir.bytes().all().unwrap(), &geometry.groups).unwrap()
             );
             // The length rewritten one byte shorter or longer: the parse or
             // the last entry's decode finds it (the totals no longer meet
@@ -5066,7 +5133,7 @@ mod lazy_footer_tests {
 
 #[cfg(test)]
 mod lazy_directory_tests {
-    use super::super::blob::{LazyBlob, PinningSource};
+    use super::super::blob::{self, LazyBlob, PinningSource};
     use super::super::docs::Geometry;
     use super::*;
     use crate::Tid;
@@ -5157,7 +5224,7 @@ mod lazy_directory_tests {
             panic!("a grouped record");
         };
         let groups = &geometry.groups;
-        let whole = decode_directory_whole(dir.bytes(), groups).unwrap();
+        let whole = decode_directory_whole(dir.bytes().all().unwrap(), groups).unwrap();
         let parsed = Postings::parse(record, df, geometry).unwrap();
         let Form::Grouped(lazy) = &parsed.form else {
             panic!("a grouped record");
@@ -5173,7 +5240,8 @@ mod lazy_directory_tests {
             assert!(
                 parsed
                     .group_frontier(entry)
-                    .eq(whole_record.group_frontier(&whole[b])),
+                    .unwrap()
+                    .eq(whole_record.group_frontier(&whole[b]).unwrap()),
                 "frontier of entry {b}"
             );
             assert_eq!(
@@ -5343,15 +5411,18 @@ mod lazy_directory_tests {
         let Form::Grouped(dir) = &parsed.form else {
             panic!("a grouped record");
         };
-        let whole = decode_directory_whole(dir.bytes(), &geometry.groups).unwrap();
+        let whole = decode_directory_whole(dir.bytes().all().unwrap(), &geometry.groups).unwrap();
         assert!(whole[0].count > 4096, "a three-byte count");
         assert_eq!(
-            parsed.group_frontier(&whole[1]).count(),
+            parsed.group_frontier(&whole[1]).unwrap().count(),
             16,
             "sixteen pairs"
         );
         assert!(
-            parsed.group_frontier(&whole[2]).any(|(_, l)| l >= 1 << 28),
+            parsed
+                .group_frontier(&whole[2])
+                .unwrap()
+                .any(|(_, l)| l >= 1 << 28),
             "a five-byte length"
         );
         assert_eq!(dir.entries(&geometry.groups).unwrap(), whole);
@@ -5359,18 +5430,19 @@ mod lazy_directory_tests {
         check_walk(&out, &geometry, n as u32, &walk);
     }
 
-    /// A directory parsed over pages read in place holds no page: once the
-    /// span closes (its pages released and poisoned), its entries decode
-    /// as from memory, and decoding them pins nothing.
+    /// A directory parsed over pages read in place keeps no slice of them:
+    /// once the span closes (its pages released and poisoned), a later
+    /// span decodes its entries and reads its frontiers in place from the
+    /// pages it pins afresh, as from memory, and nothing is copied.
     #[test]
-    fn lazy_directories_read_no_page_after_the_parse() {
+    fn lazy_directories_read_in_place_in_a_later_span() {
         let (record, geometry, df) = term(7, 900, false);
         let whole = {
             let parsed = Postings::parse(&record, df, &geometry).unwrap();
             let Form::Grouped(dir) = &parsed.form else {
                 panic!("a grouped record");
             };
-            decode_directory_whole(dir.bytes(), &geometry.groups).unwrap()
+            decode_directory_whole(dir.bytes().all().unwrap(), &geometry.groups).unwrap()
         };
         let source = PinningSource::new(record.clone(), 64);
         let blob = LazyBlob::new(Box::new(source.clone()));
@@ -5390,9 +5462,33 @@ mod lazy_directory_tests {
             !source.0.released.borrow().is_empty(),
             "pages released, poisoned"
         );
+        blob.open_span();
+        blob::reset_stats();
         assert_eq!(dir.entries(&geometry.groups).unwrap(), whole);
-        assert_eq!(source.0.pins.get(), pins, "no page pinned to decode");
-        assert_eq!(source.0.reads.get(), reads, "no page read to decode");
+        let memory = Postings::parse(&record, df, &geometry).unwrap();
+        for entry in &whole {
+            assert!(
+                parsed
+                    .group_frontier(entry)
+                    .unwrap()
+                    .eq(memory.group_frontier(entry).unwrap()),
+                "frontier of group {}",
+                entry.index
+            );
+        }
+        assert!(source.0.pins.get() > pins, "pages pinned to decode");
+        assert_eq!(source.0.reads.get(), reads, "no page copied to decode");
+        let stats = blob::stats()[Kind::Record as usize];
+        // Only skip points and frontiers across pages are stitched (pages of
+        // 64 bytes here).
+        assert!(
+            (stats.stitched as usize) < dir.bytes().len() / 4,
+            "stitched {} of {} bytes",
+            stats.stitched,
+            dir.bytes().len()
+        );
         drop(parsed);
+        // SAFETY: nothing read in the span is used after.
+        unsafe { blob.close_span() };
     }
 }
