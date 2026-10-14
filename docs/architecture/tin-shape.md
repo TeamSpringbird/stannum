@@ -1326,6 +1326,24 @@ mean -0.6% (the skip points copied with the directory, the run checks).
 Whole trace: every answer equal to `pg-ranked.tsv`, `--full` answers
 identical to `f0962a8`'s.
 
+On x86-64 (Sapphire Rapids, `m7i.4xlarge`; replay with `--forget`, 300
+queries per style, 2 rounds, `perf stat` user counters, `1c4694b`, before
+the disjunction's two changes; all outputs the same): conjunction cycles
+-7.5% (-7.8 / -7.1), instructions -6.2%, median query -16%, mean -9.4%;
+phrase cycles -3.6% (-1.6 / -5.5), instructions -4.2%, median -10%, mean
+-4.2%. With short lists as arrays on top (branch `loop/conj-x86-r8`, both
+re-encoded from the same layout 10 dump): conjunction cycles -10.9% (-11.6
+/ -10.2) against the base, median -25%, mean -14%; phrase -3.8%.
+
+The x86 profile this answered (`550cf63`, the same replay, `perf record`
+with each sample's inline chain): a conjunction's 31 M cycles a query went
+15.6% to filtering candidates (7.6% on one load: a grid's bit for each
+candidate, a cache and TLB miss as a rule), 14.5% to Elias-Fano decoding,
+14.0% to the directory (decoding and seeking), 11.1% to libc (copies of
+directories and stitched containers, allocation), 7.0% to pins, 6.3% to
+group bounds and about 13% to candidates; a phrase's 51 M, 11.4% each to the
+directory and to filtering, 10.8% to decoding and 10.5% to pins.
+
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 
 Under `full_score` a dense pair ("is to", "to a") leaves most of a group's
