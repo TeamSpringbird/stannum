@@ -38,7 +38,7 @@ use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    G, Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
+    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -69,11 +69,6 @@ const STAGE_CHUNK: usize = 256;
 /// buckets ([`Walk::sieve`]) this many at a time ([`SIEVE_CHUNK`]) before
 /// any is bounded alone.
 const SIEVE_MIN: usize = 32;
-
-/// Cache lines of the second required term's grid in a group read ahead
-/// of the lead's members ([`Walk::load_lead`]): 2 KB, about four times a
-/// grid's mean length at 150M rows.
-const PREFETCH_LINES: usize = 32;
 const SIEVE_CHUNK: usize = 256;
 
 /// A disjunction's group is sieved ([`Walk::or_sieve`]) when its mask
@@ -1067,30 +1062,7 @@ fn load<'a>(
         mem.count = mem.list.len() as u32;
         return Ok(true);
     }
-    let found = set.find(g, &mut mem.hint);
-    load_found(set, geometry, g, mem, found, probe_over, touch)
-}
-
-/// [`load`] of a grouped term whose directory entry for group `g` was
-/// looked up already (`found`, from [`TermSet::find`] with `mem.hint`).
-fn load_found<'a>(
-    set: &TermSet<'a>,
-    geometry: &Geometry,
-    g: u32,
-    mem: &mut Mem<'a>,
-    found: Option<G<'a>>,
-    probe_over: usize,
-    touch: &mut impl Touch,
-) -> Result<bool> {
-    mem.loaded = g + 1;
-    mem.kind = Kind::List;
-    mem.list.clear();
-    mem.w = 0;
-    mem.run = 0;
-    mem.pos = 0;
-    mem.entry = usize::MAX;
-    let group = geometry.groups[g as usize];
-    let Some(entry) = found else {
+    let Some(entry) = set.find(g, &mut mem.hint) else {
         mem.count = 0;
         return Ok(false);
     };
@@ -1514,7 +1486,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 continue;
             }
             if self.mems[lead].loaded != g + 1 {
-                self.load_lead(g)?;
+                let set = self.terms[lead].as_mut().expect("the lead");
+                load(
+                    set,
+                    self.geometry,
+                    g,
+                    &mut self.mems[lead],
+                    usize::MAX,
+                    self.touch,
+                )?;
             }
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
@@ -1610,61 +1590,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let geometry = self.geometry;
         self.cut(bound, || geometry.tid_in(g as usize, 0))
-    }
-
-    /// Loads the lead's members in group `g`, the second required term's
-    /// first when both are grouped: [`Walk::group_and`] reads the second
-    /// next, always (the lead holds a member there), and a grid there is
-    /// asked to be read into the cache ([`bits::prefetch`]) before the
-    /// lead's members are decoded, so its first touch, a miss per
-    /// candidate's line otherwise, overlaps that work. The second is loaded
-    /// as `group_and` would load it: its probe bound is from the lead's
-    /// count there, which is the candidates' count it would see.
-    fn load_lead(&mut self, g: u32) -> Result<()> {
-        let lead = self.req[0];
-        let set = self.terms[lead].as_mut().expect("the lead");
-        if matches!(set.postings.form, Form::Sparse(_)) {
-            load(
-                set,
-                self.geometry,
-                g,
-                &mut self.mems[lead],
-                usize::MAX,
-                self.touch,
-            )?;
-            return Ok(());
-        }
-        let found = set.find(g, &mut self.mems[lead].hint);
-        if let (Some(&t), Some(at)) = (self.req.get(1), found)
-            && self.mems[t].loaded != g + 1
-        {
-            let second = self.terms[t].as_mut().expect("required");
-            if !matches!(second.postings.form, Form::Sparse(_)) {
-                let probe_over = SEEK_RATIO * at.count as usize;
-                load(
-                    second,
-                    self.geometry,
-                    g,
-                    &mut self.mems[t],
-                    probe_over,
-                    self.touch,
-                )?;
-                if let Kind::Grid(bytes) = self.mems[t].kind {
-                    bits::prefetch(bytes, PREFETCH_LINES);
-                }
-            }
-        }
-        let set = self.terms[lead].as_ref().expect("the lead");
-        load_found(
-            set,
-            self.geometry,
-            g,
-            &mut self.mems[lead],
-            found,
-            usize::MAX,
-            self.touch,
-        )?;
-        Ok(())
     }
 
     /// Whether every required term holds group `g` as a grid.
