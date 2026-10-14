@@ -587,7 +587,8 @@ calls are unchanged.
 Added in phase C: `engine::tinshape::top_k_into(segment, node, names,
 scorers, &mut TopRows, &mut dyn Visibility, touch)` (the walk into rows
 shared with other sources, no zero fill), `for_each_match` and `tids_in`
-(live matches a group at a time), `score_at` and `score_at_in` (one row's
+(live matches a group at a time; `match_groups` and `fold_groups` fold the
+candidate groups a few at a time, stopping where the caller says), `score_at` and `score_at_in` (one row's
 score, with term cursors kept between rows), `TermSet::{rewind, sought}`;
 `engine::walk::{NativeSegment, reads_positions, span_requires_all}` and
 `Source::native`; `Segment::share_footers` and `FooterCache`;
@@ -894,7 +895,11 @@ and unordered spans; not `NOT ENCLOSES` and the like).
   prune) and the candidates of `max_score`: `engine::tinshape::for_each_match`,
   a group of live matches at a time as words over the group's slots. The
   stream keeps a segment's matches as those words (at most 1.6 bits a
-  document) and walks them in ctid order.
+  document) and walks them in ctid order. A stream walked to k rows on the
+  spot (the zero fill of elided terms) folds groups as the walk reaches
+  them (`match_groups`, then `fold_groups`: the first group holding a match,
+  then twice as many each fold), so its rows read the containers of the
+  groups they are in.
 - `score()` and `full_score()` of a row the scan did not rank:
   `engine::tinshape::score_at`, the row's slot found by a multiply, each
   scoring term's posting by a seek, in the segment whose document set holds
@@ -1473,6 +1478,43 @@ Measured on a Sapphire Rapids devbox (m7i.4xlarge, `perf stat` user cycles,
   first cut: `full_score` +1.8% (branch misses +7 points), score +1.4%
   (branches `loop/fx-rejected`, `loop/fx-held`). As with R6, the line's
   miss is not what the candidate waits on most.
+
+## The first k matches of elided terms (branch `loop/zerofill`)
+
+`score()` elides a term in more than a tenth of the documents, so a dense
+term alone, or an OR of such terms, scores nothing and ranks its first k
+matches in ctid order (an OR with positive scores below k fills the rest
+the same way). Those rows came from the candidate stream, whose native
+matches folded every group of the segment before the first row: every
+container of the term was read at any k. On TIN's probe corpus (h2h, N =
+1, distinct pages against TIN's unique pages) t10, t30 and t50 read 15
+payload pages and w1 16 for k from 1 to 1,000 where TIN read 1 or 2, and
+`w2 OR t10` read 30 (TIN 3). TIN reads elided terms in ctid order only to
+fill k (round 4 D4).
+
+That stream now folds as its walk reaches groups
+(`engine::tinshape::match_groups` once, then `fold_groups` over the groups
+not yet folded, stopping where the caller says): the first group holding a
+match, then twice as many groups holding matches each time the walk gets
+to the end of the last fold, the segment assembled again for each fold
+(term map entries and footers come from the segment's memos). A seek
+passes groups wholly before its target without folding them. A walk to the
+end folds every group in about log2(groups) folds and holds no more words
+than before. Only streams walked before their caller returns are lazy (the
+zero fill, and the top k of a query of elided terms alone): a fold cannot
+assemble the segment inside another walk over it, and such a stream is
+walked inside one only if it was made there, when the segment was already
+read the ordinal way. A plain scan's stream, kept between executor calls
+(a subquery in a ranked walk's filter could resume it inside the walk),
+still folds every group at once. `EXPLAIN ANALYZE` reports `Stream Groups
+Folded`.
+
+Measured (h2h, 214 cases at N = 1): single-term `score()` payload 244 to 4
+pages (TIN 20), OR `score()` 1,446 to 1,326 (TIN 816), all cases 6,188 to
+5,828; no other area moved. Round 4's replayed probes (each EXPLAIN in a
+fresh session): d4b (elided fill) payload 121 to 61 (TIN 118), d1 2,560 to
+2,146 (TIN 2,785). The 181 ranked corpus cases return the same rows and
+score bits.
 
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 

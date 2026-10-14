@@ -252,6 +252,17 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   data). At 150 million rows (replay) `full_score` disjunctions take 1.0%
   fewer cycles on Sapphire Rapids, score ones 0.3% fewer, with the same
   answers; the M4 code is unchanged.
+- `score()` over a dense term (elided, scoring nothing) or an OR of elided
+  terms ranks the first k matches in ctid order, read from the candidate
+  stream, which folded every group of a `TNS1` segment before the first
+  row. That stream now folds the groups as it reaches them, the first
+  group holding a match first and then twice as many each time, so those
+  rows read the containers of the groups they are in, as TIN does: on TIN's
+  probe corpus the 28 single-term `score()` cases read 4 payload pages
+  instead of 244 (TIN 20; each read 15 or 16 at any k), `w2 OR t10` none
+  instead of 30 (TIN 3), and round 4's elided-fill probes 61 instead of 121
+  (TIN 118), with the same rows and scores. `EXPLAIN ANALYZE` reports the
+  groups folded (`Stream Groups Folded`).
 - A ranked conjunction or phrase over `TNS1` scoring a common term (in at
   least one document in ten of the segment, as `full_score` scores them)
   beside a rarer one bounds the common term's groups by its record rather
@@ -399,6 +410,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Fixed
 
+- Scores over an index whose expression PostgreSQL folds when it loads it
+  (an `IN` list, `repeat()` of constants, a `BETWEEN` inside a `CASE`) are
+  computed: the search's document was compared with the folded expression
+  unfolded, so every `score()`, `full_score()` and ranked scan over such an
+  index failed with "cannot compute scores for this query". TIN 1.0.4
+  scores them (round 4's d6 probe).
 - A generic plan with LIMIT or OFFSET a parameter declared `int` or
   `smallint` ranks only the top k: the parameter's cast to `bigint` kept the
   bound from the scan, which scored every match (68 ms against 0.4 ms for
