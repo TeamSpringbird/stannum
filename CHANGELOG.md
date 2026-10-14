@@ -236,6 +236,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   rows (replay) score disjunctions take 3.2-3.8% fewer cycles on Sapphire
   Rapids and 3.9% fewer on Apple M4 (6-8% fewer instructions), `full_score`
   ones 2.5% fewer on the M4, with the same answers.
+- A ranked disjunction over `TNS1` compares bounds with the bar as integers
+  without a branch on each verdict, sets up a candidate's terms once per
+  word of the group (each term's word of members, its posting index there,
+  and its buckets' place on their page once per group), and on x86-64 runs
+  its group and candidate code built with POPCNT and BMI where the CPU has
+  them (baseline x86-64 counts bits by shifts and masks). At 150 million
+  rows (replay) `full_score` disjunctions take 6.0% fewer cycles on
+  Sapphire Rapids (mean query -7.0%, p99 -10.4%), score ones 3.6% fewer
+  (mean -1.6%, median +4%), and on Apple M4 `full_score` ones 2.0% fewer
+  (score ones unchanged), with the same answers.
 - A ranked conjunction or phrase over `TNS1` scoring a common term (in at
   least one document in ten of the segment, as `full_score` scores them)
   beside a rarer one bounds the common term's groups by its record rather

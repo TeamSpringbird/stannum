@@ -1388,6 +1388,68 @@ a footer holds its window) cut the re-pins to x20 but left `full_score`
 still ran conjunctions 2.5% more instructions and 4.3% more cycles than with
 the copy. The attempt is branch `loop/c5-inplace`.
 
+### A `full_score` disjunction's candidates on x86-64 (branch `loop/full-or-x86`)
+
+`full_score` disjunctions were Stannum's worst ratio to TIN on x86-64 (i7i:
+55 QPS against 85). The same profile of `29c0f46` (layout 12, 200
+`full_score` disjunctions, `--forget`) by the stages of `Walk::or_group`:
+candidates 26.6%, weighing members 18.4%, group bounds 11.7%, weighing words
+10.7%, the terms' rows 6.5%, directory seeks 6.4%. Inside the candidates,
+the TF bucket's load was 4.1% (the line's miss), counting the posting index
+of each held term ~3% (baseline x86-64 has no POPCNT: `count_ones` was a
+sequence of shifts and masks, and the words between two candidates went to
+the AVX-512 popcount kernel, whose call and reduction cost more than a word
+or two), choosing the next term to read 1.3%, and the BM25 arithmetic under
+0.5%. Weighing members, the member cut's three-way branch on `total_cmp`
+was 3.7% and the word cut 1.4%: verdicts the branch predictor cannot learn.
+
+Kept, with the same answers:
+
+- The bar's verdicts without a branch on each: a bound is compared with
+  the bar as an integer in `total_cmp`'s order (`order_key`,
+  `BarKey::keeps`, a branch only on a tie), a member's into its word's keep
+  mask; on x86-64 a sub-range's word sums are compared at once and the word
+  loop walks only the words left.
+- A candidate's context once per word, not per candidate: each present
+  term's word of members and the posting index of its first (`or_word`);
+  a grouped term's buckets in the group located once, on the page holding
+  them, at its first read there (`TfRun`): later reads skip the directory
+  entry and the blob's page lookup.
+- On x86-64, `or_group` and the candidate step instantiated with POPCNT,
+  BMI1, BMI2 and LZCNT where the CPU has them (`kernels::bit_ops`; at a
+  vector level, so `STANNUM_KERNELS=scalar` runs the baseline code). The
+  group's code calls the candidate step through a pointer: called directly
+  from the feature-built group code, LLVM inlined it into the word loop
+  despite `#[inline(never)]`.
+
+At 150M rows on Sapphire Rapids (`perf stat` user cycles, 2 rounds, against
+`29c0f46`): `full_score` disjunction cycles -3.4% with the verdicts, -5.0%
+with the candidate context, -6.0% with POPCNT and BMI (mean query -7.0%,
+p99 -10.4%, branch misses -14.5%); score disjunctions -3.6% (mean -1.6%,
+p99 -4.6%), but their median +4%: their sub-ranges hold one to three live
+words, so comparing all sixteen sums, and counting every present term's
+index per candidate word, cost the cheaper half 5-8%. On the M4 (timed
+passes, 300 queries, 2 rounds; the POPCNT build is x86-64's only)
+`full_score` disjunctions -2.0% cycles (-1.2% instructions, mean -2.0%),
+score ones -0.2%; conjunctions and phrases run the same instructions.
+
+Not kept:
+
+- The OR sieve (`Walk::sieve`) in groups whose terms are not all required,
+  a candidate bounded by the terms its rows hold: `full_score` +3.5% cycles
+  over the kept changes, score +3.9% (branch
+  `loop/full-or-x86-held-sieve`).
+- A member's bound looked up by its pattern (which weighed terms hold it:
+  the same additions in the same order, summed once per pattern per group),
+  with a grouped term's largest bucket kept in its row, the next term to
+  read chosen by selects, and, for the median above, only the live words'
+  sums compared and a term's index counted when a candidate first holds it:
+  `full_score` -2.2% against `29c0f46` (the kept set -6.0%), branch misses
+  +2%; the memo misses each group's patterns, and gathering a member's bits
+  term by term cost as much as summing its bounds (branch
+  `loop/full-or-x86-patterns`). On the M4 it was no better either
+  (`full_score` -2.2%, score +0.3%).
+
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 
 Under `full_score` a dense pair ("is to", "to a") leaves most of a group's
