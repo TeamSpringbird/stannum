@@ -1086,15 +1086,18 @@ impl<'a> Postings<'a> {
                 if end == 0 || end > payload.len() {
                     return Err(Error::Corrupt("postings directory length"));
                 }
-                let window = payload.get(0, end)?;
+                // Copied a page at a time: a directory spanning pages is
+                // not stitched first (a second copy).
+                let mut copy = Vec::with_capacity(end);
+                payload.copy_into(0, end, &mut copy)?;
+                let directory: Box<[u8]> = copy.into_boxed_slice();
                 let mut at = 0;
-                let groups = varint::get_u32(window, &mut at)? as usize;
+                let groups = varint::get_u32(&directory, &mut at)? as usize;
                 // An entry takes at least four bytes (a gap, a count and
                 // kind, a frontier's head and first length).
                 if groups == 0 || groups > geometry.groups.len() || end - at < 4 * groups {
                     return Err(Error::Corrupt("postings groups"));
                 }
-                let directory: Box<[u8]> = Box::from(window);
                 super::segment::count_memo(|c| {
                     c.directories += 1;
                     c.directory_bytes += end as u64;
@@ -1469,12 +1472,21 @@ impl Directory {
         let n = self.len();
         let mut b = from;
         while b < n {
-            let entry = self.get(b, groups)?;
-            if entry.index >= index {
-                return Ok(b);
+            let r = b / DIRECTORY_SKIP;
+            if !self.is_done(r) {
+                self.get_slow(b, groups)?;
             }
-            b += 1;
-            if self.skips && b.is_multiple_of(DIRECTORY_SKIP) && b < n {
+            let end = ((r + 1) * DIRECTORY_SKIP).min(n);
+            // SAFETY: run `r` is decoded: slots `r * DIRECTORY_SKIP..end`
+            // are written, once, and laid out as their entries.
+            let run = unsafe {
+                std::slice::from_raw_parts(self.entries.as_ptr().add(b).cast::<GroupEntry>(), end - b)
+            };
+            if let Some(i) = run.iter().position(|e| e.index >= index) {
+                return Ok(b + i);
+            }
+            b = end;
+            if self.skips && b < n {
                 b = self.skip_past(b / DIRECTORY_SKIP, index) * DIRECTORY_SKIP;
             }
         }
@@ -1646,9 +1658,17 @@ impl Directory {
             slots: &self.entries[from..from + n],
             len: 0,
         };
-        let bytes = &self.bytes[..self.end];
+        // The run ends where the next skip point says (scanned exactly so).
+        let (end, exact) = match from + n < self.len() && self.skips {
+            true => (self.start_of(r + 1)?.at, true),
+            false => (self.end, false),
+        };
+        if end < resume.at {
+            return Err(Error::Corrupt("group directory skip"));
+        }
+        let bytes = &self.bytes[..end];
         UNITS.with_borrow_mut(|units| {
-            decode_entries(bytes, &mut resume, n, &mut out, groups, self, units)
+            decode_entries(bytes, exact, &mut resume, n, &mut out, groups, self, units)
         })?;
         if from + n == self.len() {
             // The last: the record's totals.
@@ -1703,8 +1723,11 @@ thread_local! {
 
 /// Decodes `want` entries of a directory's `bytes` from `resume` on, into
 /// `out`, checking each against `dir`'s record; `resume` is left after them.
+/// With `exact`, the entries wanted end where `bytes` do.
+#[allow(clippy::too_many_arguments)]
 fn decode_entries(
     bytes: &[u8],
+    exact: bool,
     resume: &mut Resume,
     want: usize,
     out: &mut Slots<'_>,
@@ -1714,16 +1737,18 @@ fn decode_entries(
 ) -> Result<()> {
     let target = out.len() + want;
     // Scanned as far as the entries wanted take at the directory's bytes per
-    // entry and a quarter more: the entry the scan ends within is scanned
-    // again with the next chunk.
+    // entry and a quarter more (or, exact, to their end): the entry the scan
+    // ends within is scanned again with the next chunk.
     let per = bytes.len().div_ceil(dir.len().max(1));
     while out.len() < target {
         let left = target - out.len();
         let start = resume.at;
-        let scan = left
-            .saturating_mul(per + per.div_ceil(4))
-            .saturating_add(32);
-        let end = bytes.len().min(start + scan.min(UNITS_CHUNK));
+        let scan = if exact {
+            usize::MAX
+        } else {
+            left.saturating_mul(per + per.div_ceil(4)).saturating_add(32)
+        };
+        let end = bytes.len().min(start.saturating_add(scan.min(UNITS_CHUNK)));
         let before = out.len();
         decode_chunk(
             &bytes[start..end],
