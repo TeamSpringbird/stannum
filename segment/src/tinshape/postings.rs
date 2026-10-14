@@ -1267,8 +1267,11 @@ pub struct Directory {
     /// for an entry several times per group (its group's bounds, frontier,
     /// buckets), so one decoded is a bit test and a load away.
     entries: Box<[std::cell::UnsafeCell<std::mem::MaybeUninit<GroupEntry>>]>,
-    /// Runs of [`DIRECTORY_SKIP`] entries decoded, a bit each.
+    /// Runs of [`DIRECTORY_SKIP`] entries decoded, a bit each, and the
+    /// entries of the runs decoded from the first on without a gap (a
+    /// comparison away, for a walk that decodes them all).
     done: Box<[std::cell::Cell<u64>]>,
+    prefix: std::cell::Cell<usize>,
     /// Entries decoded.
     decoded: std::cell::Cell<usize>,
     /// Where the entries start (after the group count), and where they end
@@ -1339,6 +1342,7 @@ impl Directory {
             done: (0..len.div_ceil(DIRECTORY_SKIP).div_ceil(64))
                 .map(|_| std::cell::Cell::new(0))
                 .collect(),
+            prefix: std::cell::Cell::new(0),
             decoded: std::cell::Cell::new(0),
             head,
             end,
@@ -1383,7 +1387,7 @@ impl Directory {
     /// segment's ([`Geometry::groups`]).
     #[inline]
     pub fn get(&self, b: usize, groups: &[Group]) -> Result<&GroupEntry> {
-        if b < self.len() && self.is_done(b / DIRECTORY_SKIP) {
+        if b < self.prefix.get() || (b < self.len() && self.is_done(b / DIRECTORY_SKIP)) {
             // SAFETY: `b`'s run is decoded: its slots are written, once,
             // never again.
             return Ok(unsafe { (*self.entries.get_unchecked(b).get()).assume_init_ref() });
@@ -1686,6 +1690,11 @@ impl Directory {
             word.set(word.get() | 1 << (run % 64));
         }
         self.decoded.set(self.decoded.get() + n);
+        let mut prefix = self.prefix.get();
+        while prefix < self.len() && self.is_done(prefix / DIRECTORY_SKIP) {
+            prefix = (prefix + DIRECTORY_SKIP).min(self.len());
+        }
+        self.prefix.set(prefix);
         Ok(())
     }
 
