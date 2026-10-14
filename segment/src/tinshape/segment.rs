@@ -949,8 +949,6 @@ mod tests {
                 return Some(postings::Reused {
                     kind: entry.kind,
                     bytes: term.postings.container(entry).all().ok()?,
-                    input_df: term.entry.df,
-                    input_documents: geometry_in.documents,
                 });
             }
             None

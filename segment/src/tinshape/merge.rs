@@ -234,7 +234,7 @@ pub fn merge(
             }
             builder.add_term_reusing(&term, &ranks, &buckets, &payload.finish(), &mut |out| {
                 let (i, g) = owners[out]?;
-                let (postings, input_df) = records[i].as_ref()?;
+                let (postings, _) = records[i].as_ref()?;
                 let Form::Grouped(dir) = &postings.form else {
                     return None;
                 };
@@ -243,8 +243,6 @@ pub fn merge(
                 Some(Reused {
                     kind: entry.kind,
                     bytes: postings.container(entry).all().ok()?,
-                    input_df: *input_df,
-                    input_documents: segments[i].docs.geometry.documents,
                 })
             })?;
             terms += 1;

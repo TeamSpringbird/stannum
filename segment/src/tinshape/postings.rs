@@ -421,22 +421,21 @@ fn get_checked(bytes: &[u8], at: &mut usize) -> u64 {
 }
 
 /// A group container an input segment holds that a merge may copy: its
-/// kind and bytes (as [`Postings::container`] gives them), and the postings
-/// of the input term that holds it.
+/// kind and bytes (as [`Postings::container`] gives them).
 ///
 /// A copy is what a fresh encoding writes when the output group has the
 /// input's geometry (the same width, first page and span), its members are
-/// exactly the input's there (no dead document, no other input), the
-/// options are the same, and the two terms fall on the same side of
-/// [`Options::forces_grids`]; the caller vouches for all but the last,
-/// which the encoder checks, re-encoding the group when it fails.
+/// exactly the input's there (no dead document, no other input) and the
+/// options are the same; the caller vouches for these. The encoder copies a
+/// grid only into a group it forces into one (a grid whatever its size),
+/// and a list or a paged container only into a group it does not force:
+/// any other group is encoded afresh, an unforced grid too (it won by size
+/// under the input's options, which a tool re-encoding at another threshold
+/// changes).
 #[derive(Clone, Copy, Debug)]
 pub struct Reused<'a> {
     pub kind: u8,
     pub bytes: &'a [u8],
-    /// The input term's postings, and its segment's documents.
-    pub input_df: u32,
-    pub input_documents: u32,
 }
 
 /// Encodes a term's postings: `slots` strictly increasing, with each
@@ -724,16 +723,13 @@ fn encode_groups<'r>(
         // A list of this many members is an array rather than Elias-Fano.
         let array =
             locals.len() as u64 <= u64::from(options.array_max) && group.slots() <= ARRAY_SLOTS_MAX;
-        // An input's container, where its term was forced as this one is
-        // and its list is the form these options give it.
-        let reused = reuse(index).filter(|r| {
-            let form = match r.kind {
-                KIND_EF => !array,
-                KIND_ARRAY => array,
-                _ => true,
-            };
-            form && (!dense
-                || options.forces_grids(u64::from(r.input_df), r.input_documents) == forced)
+        // An input's container of the kind this group takes: a grid where
+        // it is forced, else the list form these options give it, or paged.
+        let reused = reuse(index).filter(|r| match r.kind {
+            KIND_GRID => forced,
+            KIND_EF => !forced && !array,
+            KIND_ARRAY => !forced && array,
+            _ => !forced,
         });
         if let Some(r) = reused {
             kind = r.kind;
