@@ -228,15 +228,26 @@ impl<'a> Ef<'a> {
                 index += (word & ((1u64 << p) - 1)).count_ones() as usize;
                 bit += p + 1;
             }
-            // The bucket's members, until its closing zero.
+            // The bucket's members: the ones from `bit` to its closing zero,
+            // a word's run of them at a time.
             let want = v & mask;
-            while index < n && bit < total && highs[bit / 8] >> (bit % 8) & 1 == 1 {
-                let have = bits::get(lows, index, low).unwrap_or(0);
-                if have >= want {
-                    return have == want;
+            while index < n && bit < total {
+                let off = bit % 64;
+                let ones = (!(bits::word(highs, bit / 64) >> off)).trailing_zeros() as usize;
+                let run = ones.min(n - index);
+                for j in 0..run {
+                    let have = bits::get(lows, index + j, low).unwrap_or(0);
+                    if have >= want {
+                        index += j;
+                        bit += j;
+                        return have == want;
+                    }
                 }
-                index += 1;
-                bit += 1;
+                index += run;
+                bit += run;
+                if run < 64 - off {
+                    break;
+                }
             }
             false
         });
@@ -256,30 +267,48 @@ impl<'a> Ef<'a> {
 }
 
 /// The position of the set bit of rank `k` (from 0) in `x`, which has more
-/// than `k`: the byte by prefix sums of byte counts, then the bit.
+/// than `k`, without a branch: the byte by prefix sums of byte counts
+/// (the bytes whose prefix is at most `k` counted at once), then the bit
+/// from a table of every byte's set bits by rank.
 #[inline]
 fn select(x: u64, k: usize) -> u32 {
     const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
     let mut c = x - ((x >> 1) & 0x5555_5555_5555_5555);
     c = (c & 0x3333_3333_3333_3333) + ((c >> 2) & 0x3333_3333_3333_3333);
     c = (c + (c >> 4)) & 0x0f0f_0f0f_0f0f_0f0f;
-    // Byte `i` of `prefix`: the set bits of bytes `0..=i`.
+    // Byte `i` of `prefix`: the set bits of bytes `0..=i`, at most 64.
     let prefix = c.wrapping_mul(ONES);
-    let mut byte = 0u32;
-    while ((prefix >> (8 * byte)) & 0xff) as usize <= k {
-        byte += 1;
-    }
-    let before = if byte == 0 {
-        0
-    } else {
-        ((prefix >> (8 * (byte - 1))) & 0xff) as usize
-    };
-    let mut b = (x >> (8 * byte)) & 0xff;
-    for _ in before..k {
-        b &= b - 1;
-    }
-    8 * byte + b.trailing_zeros()
+    // Byte `i`'s high bit: whether `k` reaches past bytes `0..=i` (each
+    // byte of `k | 0x80` less its prefix stays above 0x7f exactly then,
+    // borrowing nothing from the next).
+    let k = k as u64;
+    let past = ((k * ONES | HIGHS) - prefix) & HIGHS;
+    let byte = past.count_ones();
+    // The set bits before the byte: `prefix` shifted a byte up.
+    let before = (prefix << 8) >> (8 * byte) & 0xff;
+    let b = (x >> (8 * byte)) & 0xff;
+    8 * byte + u32::from(SELECT_IN_BYTE[b as usize][(k - before) as usize])
 }
+
+/// Per byte, the position of its set bit of each rank (8 past its last).
+static SELECT_IN_BYTE: [[u8; 8]; 256] = {
+    let mut table = [[8u8; 8]; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut rank = 0;
+        let mut i = 0;
+        while i < 8 {
+            if b >> i & 1 == 1 {
+                table[b][rank] = i as u8;
+                rank += 1;
+            }
+            i += 1;
+        }
+        b += 1;
+    }
+    table
+};
 
 /// Reads an [`Ef`] list forward, with its rank.
 #[derive(Clone, Debug)]
@@ -526,7 +555,15 @@ mod tests {
 
     #[test]
     fn selects() {
-        for x in [1u64, u64::MAX, 0x8000_0000_0000_0000, 0xf0f0_0000_ff00_0101] {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut xs = vec![1u64, u64::MAX, 0x8000_0000_0000_0000, 0xf0f0_0000_ff00_0101];
+        for _ in 0..1000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            xs.push(seed & seed.rotate_left(seed as u32 % 64));
+        }
+        for x in xs {
             let mut bits = Vec::new();
             for i in 0..64 {
                 if x >> i & 1 == 1 {
@@ -536,6 +573,25 @@ mod tests {
             for (k, b) in bits.iter().enumerate() {
                 assert_eq!(select(x, k), *b, "{x:#x} {k}");
             }
+        }
+    }
+
+    #[test]
+    fn retains_members_at_random() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..300 {
+            let universe = 1 + (next() % 20_000) as u32;
+            let density = 1 + next() % 64;
+            let values: Vec<u32> = (0..universe).filter(|_| next() % 64 < density).collect();
+            let every = 1 + next() % 200;
+            let probes: Vec<u32> = (0..universe).filter(|_| next() % every == 0).collect();
+            check_retain(&values, universe, &probes);
         }
     }
 
