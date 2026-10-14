@@ -389,8 +389,9 @@ impl<'a> EfCursor<'a> {
     /// Calls `visit` with the current value and each after it below `end`,
     /// and stops at the first at or past it: [`Self::advance`] in one loop,
     /// the highs a word at a time (the word at hand kept, its passed bits
-    /// cleared) and the lows read in place.
-    #[inline]
+    /// cleared) and the lows read in place. Always inlined: a walk's load
+    /// builds it with the CPU's bit instructions where it has them.
+    #[inline(always)]
     pub fn drain_below(&mut self, end: u32, mut visit: impl FnMut(u32)) {
         let Some(mut value) = self.current else {
             return;
