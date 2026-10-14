@@ -135,16 +135,30 @@ const NO_STATS: KindStats = KindStats {
 
 thread_local! {
     static STATS: RefCell<[KindStats; KINDS]> = const { RefCell::new([NO_STATS; KINDS]) };
+    /// Whether [`KindStats::unique`] is counted: only EXPLAIN ANALYZE
+    /// reports it, and a hash insert per page read cost a plain query
+    /// 1-3% of its cycles.
+    static DISTINCT: Cell<bool> = const { Cell::new(false) };
     /// The (blob, page) pairs read since [`reset_stats`], for
     /// [`KindStats::unique`].
     static SEEN: RefCell<std::collections::HashSet<(usize, usize)>> =
         RefCell::new(std::collections::HashSet::new());
 }
 
+/// Counts [`KindStats::unique`] from now on, or stops and forgets the
+/// pages seen. A scan sets it once, as it starts.
+pub fn count_distinct_pages(on: bool) {
+    DISTINCT.set(on);
+    if !on {
+        SEEN.with_borrow_mut(std::collections::HashSet::clear);
+    }
+}
+
 /// Counts page `page` of the blob at `blob` as read by `kind` unless read
-/// already since [`reset_stats`].
+/// already since [`reset_stats`], when distinct pages are counted.
+#[inline]
 fn first_read(blob: usize, page: usize, kind: Kind) {
-    if SEEN.with_borrow_mut(|seen| seen.insert((blob, page))) {
+    if DISTINCT.get() && SEEN.with_borrow_mut(|seen| seen.insert((blob, page))) {
         count(kind, |s| s.unique += 1);
     }
 }
@@ -1203,6 +1217,35 @@ mod tests {
         assert_eq!(bytes.get(205, 290).unwrap(), &state.bytes[205..290]);
         assert!(blob.loaded() > 0);
         assert_eq!(state.pins.get(), pins);
+    }
+
+    /// Distinct pages are counted only while EXPLAIN ANALYZE asked
+    /// for them: a plain query's reads hash no page.
+    #[test]
+    fn distinct_pages_are_counted_only_when_asked() {
+        let (_source, blob) = pinning(10 * 100 + 37, 100);
+        let read = || {
+            blob.open_span();
+            // Pages 1 to 4 stitched, page 0 in place.
+            blob.bytes().get(150, 420).unwrap();
+            blob.bytes().get(10, 20).unwrap();
+            unsafe { blob.close_span() };
+        };
+        let unique = || stats().iter().map(|s| s.unique).sum::<u64>();
+        let seen = || SEEN.with_borrow(|seen| seen.len());
+        count_distinct_pages(false);
+        reset_stats();
+        read();
+        assert!(stats()[Kind::Other as usize].pinned > 0);
+        assert_eq!(unique(), 0);
+        assert_eq!(seen(), 0, "a plain query hashes no page");
+        count_distinct_pages(true);
+        reset_stats();
+        read();
+        read();
+        assert_eq!(unique(), 5, "pages 0 to 4, each once");
+        count_distinct_pages(false);
+        assert_eq!(seen(), 0, "turned off, the set is cleared");
     }
 
     #[test]

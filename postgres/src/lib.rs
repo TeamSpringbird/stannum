@@ -1779,6 +1779,54 @@ mod tests {
         check("ctid+ordinal");
     }
 
+    /// Distinct pages per blob kind (EXPLAIN's `unique`) are counted
+    /// only under EXPLAIN ANALYZE: a plain query hashes no page.
+    #[pg_test]
+    fn distinct_pages_are_counted_only_under_explain_analyze() {
+        Spi::run(
+            "CREATE TABLE distinct_pages(id int, body text);
+             INSERT INTO distinct_pages SELECT n,
+               'alpha ' || CASE WHEN n % 3 = 0 THEN 'beta ' ELSE '' END
+               || repeat('pad ', n % 7) FROM generate_series(1, 20000) n;
+             CREATE INDEX distinct_pages_idx ON distinct_pages
+               USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = on;
+             SET LOCAL enable_seqscan = off",
+        )
+        .unwrap();
+        let unique = || -> u64 {
+            segment::tinshape::blob::stats()
+                .iter()
+                .map(|s| s.unique)
+                .sum()
+        };
+        let query = "SELECT id FROM distinct_pages
+            WHERE body ==> 'alpha OR beta'
+            ORDER BY stannum.score(ctid) DESC LIMIT 10";
+        let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {query}"))
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+        let reads = plan
+            .split("\"Native Reads By Kind\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("{plan}"))
+            .to_owned();
+        let reported: u64 = reads
+            .split("unique ")
+            .skip(1)
+            .map(|n| n.split(';').next().unwrap().trim().parse::<u64>().unwrap())
+            .sum();
+        assert!(reported > 0, "{reads}");
+        assert_eq!(unique(), reported);
+        Spi::run(&format!("SELECT count(*) FROM ({query}) q")).unwrap();
+        let stats = segment::tinshape::blob::stats();
+        assert!(stats.iter().any(|s| s.pinned + s.copied_pages > 0));
+        assert_eq!(unique(), 0, "a plain query counts no distinct page");
+    }
+
     /// `score()` over a term in every document (elided: it scores nothing)
     /// is the first k matches in ctid order, and an OR of elided terms
     /// likewise: the candidate stream folds the groups they are in, one

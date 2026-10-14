@@ -27,8 +27,11 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   the copies overflowed each backend's cache and every query copied some
   15,000 pages again. `stannum.native_in_place` (on) switches back for
   comparison; `EXPLAIN ANALYZE` reports native reads by kind (bytes copied,
-  pages pinned, bytes and reads stitched across page boundaries) and buffer
-  accesses by phase. A segment's blob keeps its stitch buffers for the next
+  pages pinned, bytes and reads stitched across page boundaries, and the
+  distinct pages read, as TIN's unique pages per area) and buffer accesses
+  by phase. Distinct pages are counted only under `EXPLAIN ANALYZE`: a set
+  insert per page read cost every query 1.8-2.7% of its cycles on Apple
+  M4. A segment's blob keeps its stitch buffers for the next
   read, and its memos of parsed records and decoded footers drop what was
   used longest ago rather than emptying whole.
 

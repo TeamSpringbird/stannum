@@ -1216,6 +1216,9 @@ struct ScanExec {
     ordered: bool,
     /// Identity under which the scan publishes its scorer.
     scan_id: u64,
+    /// EXPLAIN ANALYZE runs the scan: the counters only it reports
+    /// (distinct pages) are kept too.
+    analyzing: bool,
 }
 
 impl Drop for ScanExec {
@@ -1384,6 +1387,7 @@ unsafe extern "C-unwind" fn begin_scan(
             count_estimate: None,
             ordered,
             scan_id: crate::score::scan_id(),
+            analyzing: (*estate).es_instrument != 0,
         };
         let holder = PgMemoryContexts::For((*estate).es_query_cxt)
             .leak_and_drop_on_delete(Some(Box::new(exec)));
@@ -1399,7 +1403,7 @@ unsafe extern "C-unwind" fn begin_scan(
 /// bound enumerate and score every candidate; unordered scans use a stream.
 unsafe fn gather(exec: &mut ScanExec) {
     unsafe {
-        crate::score::reset_walk_blocks();
+        crate::score::reset_walk_blocks(exec.analyzing);
         exec.scores.clear();
         exec.pruned = false;
         exec.scored = None;
@@ -1557,7 +1561,7 @@ unsafe fn scan_query(exec: &ScanExec) -> Query {
 
 unsafe fn start_stream(exec: &mut ScanExec) {
     unsafe {
-        crate::score::reset_walk_blocks();
+        crate::score::reset_walk_blocks(exec.analyzing);
         let query = scan_query(exec);
         let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
         let stream = crate::stream::CandidateStream::new(view, query);
@@ -2271,7 +2275,7 @@ unsafe extern "C-unwind" fn exec_count(
         }
         let mut count = 0i64;
         let fetch_slot = exec.fetch_slot;
-        crate::score::reset_walk_blocks();
+        crate::score::reset_walk_blocks(exec.analyzing);
         if heap_fallback(exec) {
             // Count through a heap scan with the original clause.
             let scan = pg_sys::table_beginscan(exec.heap, snapshot, 0, std::ptr::null_mut());
@@ -2445,6 +2449,10 @@ unsafe extern "C-unwind" fn end_scan(node: *mut pg_sys::CustomScanState) {
             let cscan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
             if (*cscan).scan.scanrelid == 0 {
                 pg_sys::table_close(exec.heap, pg_sys::AccessShareLock as _);
+            }
+            if exec.analyzing {
+                // EXPLAIN reported them already.
+                segment::tinshape::blob::count_distinct_pages(false);
             }
         }
     }

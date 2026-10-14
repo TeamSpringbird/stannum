@@ -854,7 +854,9 @@ pub(crate) fn area_bytes() -> [u64; segment::cache::AREAS] {
     segment::cache::area_bytes()
 }
 
-pub(crate) fn reset_walk_blocks() {
+/// Resets the walk counters as a scan starts; `analyzing` (EXPLAIN
+/// ANALYZE) also counts what only EXPLAIN reports, distinct pages.
+pub(crate) fn reset_walk_blocks(analyzing: bool) {
     segment::cache::reset_areas();
     engine::walk::reset_counters();
     VISIBILITY_CHECKS.set(0);
@@ -862,6 +864,7 @@ pub(crate) fn reset_walk_blocks() {
     PHASE_DISK.with_borrow_mut(Vec::clear);
     PHASE_BLOCKS.with_borrow_mut(Vec::clear);
     segment::tinshape::blob::reset_stats();
+    segment::tinshape::blob::count_distinct_pages(analyzing);
     segment::tinshape::segment::reset_memo_counts();
     crate::storage::reset_held_peak();
     crate::native::reset_groups_folded();
