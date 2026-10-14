@@ -3351,6 +3351,10 @@ struct TfRun {
     len: usize,
 }
 
+/// How far ahead of a bucket read its [`TfRun`]'s line is prefetched, in
+/// bytes (a cache line).
+const TF_AHEAD: usize = 64;
+
 impl TfRun {
     const UNSET: u8 = 0;
     const READY: u8 = 1;
@@ -3364,6 +3368,12 @@ impl TfRun {
         // SAFETY: on a page the open span pinned (or a buffer it owns),
         // read before the group's pages are released (see the type).
         let bytes = unsafe { std::slice::from_raw_parts(self.bytes, self.len) };
+        // The run's next line, which the group's later candidates read in
+        // order: its miss was most of the bucket load's cycles on x86-64.
+        let ahead = at / 8 + TF_AHEAD;
+        if ahead < self.len {
+            kernels::prefetch(self.bytes.wrapping_add(ahead));
+        }
         Ok(bits::get_at(bytes, at, u32::from(self.width))? as u8)
     }
 }

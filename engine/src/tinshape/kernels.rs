@@ -275,6 +275,25 @@ pub(crate) fn bit_ops() -> bool {
     }
 }
 
+/// Asks the CPU to bring the cache line holding `at` into L1, without
+/// waiting for it: a hint, never a fault (any address, no read of it).
+#[inline(always)]
+pub fn prefetch(at: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch reads nothing and never faults.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(at.cast::<i8>());
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above (`prfm` never faults).
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) at, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = at;
+}
+
 /// Appends the position of each set bit of `words` (bit `i` of word `w`
 /// at `64 * w + i`), in order.
 #[inline]
