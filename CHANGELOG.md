@@ -380,6 +380,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   group directory is shared rather than copied per query, positions skip
   runs of single-position entries at once, and a phrase repeating a word
   drops candidates whose bucket for it is too low. Answers are unchanged.
+- A ranked conjunction or phrase over `TNS1` reads fewer cold tables per
+  group: an array or Elias-Fano container takes its universe from the
+  group's slot count rather than its last page start (a table read for
+  nothing else), a scored candidate's ctid is looked up only once it would
+  be kept, a list's members are marked for the intersection a word at a
+  time in a register, and an Elias-Fano list's low width is found without
+  a division. At 150 million rows (replay) conjunctions take 5.0% fewer
+  cycles on Apple M4 and phrases 3.4% fewer, with the same answers; on
+  Sapphire Rapids the cold reads removed overlapped with the group's
+  other first touches, and the cycles stayed within the boxes' noise.
 
 ### Fixed
 
