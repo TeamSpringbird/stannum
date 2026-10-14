@@ -260,7 +260,10 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   directories and footers parse with less work per query (short varints
   without a loop; a grouped record's directory, read in one window whose
   length its header gives (page layout 10, 1.4 bytes a record), is copied
-  when parsed and its entries decoded 128 at a time as a walk reaches them,
+  once when parsed, a page at a time, and its entries decoded as a walk
+  reaches them: a run of 16 from the skip point before it (page layout 11,
+  20 bytes per 16 entries, +0.3% of the index), the runs a walk seeks past
+  undecoded, eight runs at once for a walk that reads on,
   or in one pass for a disjunction, which reaches them all, from a scan of
   where its varints start, without a branch on their lengths: at 150M rows a
   cheap conjunction decodes 33,000 entries where it decoded 119,000, and one

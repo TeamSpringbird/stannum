@@ -1207,10 +1207,22 @@ mod tests {
         let range = blob.bytes().sub(150, 1037).unwrap();
         blob.open_span();
         let stitched = blob.stitched();
-        for (from, to) in [(0, 0), (0, 1), (0, 50), (10, 51), (49, 887), (0, 887), (886, 887)] {
+        for (from, to) in [
+            (0, 0),
+            (0, 1),
+            (0, 50),
+            (10, 51),
+            (49, 887),
+            (0, 887),
+            (886, 887),
+        ] {
             let mut out = vec![9u8];
             range.copy_into(from, to, &mut out).unwrap();
-            assert_eq!(out[1..], source.0.bytes[150 + from..150 + to], "{from}..{to}");
+            assert_eq!(
+                out[1..],
+                source.0.bytes[150 + from..150 + to],
+                "{from}..{to}"
+            );
         }
         assert_eq!(blob.stitched(), stitched, "read in place");
         assert!(range.copy_into(0, 888, &mut Vec::new()).is_err());
