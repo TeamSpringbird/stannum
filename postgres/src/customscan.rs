@@ -1434,7 +1434,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             // candidate, the walk folds whole chunks. With tiebreak keys
             // every match ties with the k-th, so all are needed.
             let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
-            let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+            let mut stream = crate::stream::CandidateStream::lazy(view, scan_query(exec));
             if !stream.recheck {
                 let mut rows = Vec::with_capacity(k);
                 while rows.len() < k {
@@ -1499,6 +1499,9 @@ unsafe fn gather(exec: &mut ScanExec) {
 /// yields, so they are read from it instead of scoring every match. A query
 /// of common words and one rare word otherwise scored millions of rows as
 /// soon as an updated row's dead version took a place in the first top k.
+/// The stream is lazy: it folds a segment's groups as it reaches them, so
+/// the rows read the groups they are in (TIN reads elided terms in ctid
+/// order only to fill k).
 ///
 /// A query the scorer cannot prune, such as a phrase, is scored from the
 /// candidate stream instead, holding only the top `k`.
@@ -1524,7 +1527,7 @@ unsafe fn top_rows(
     };
     if top.zero_fill {
         let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
-        let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
+        let mut stream = crate::stream::CandidateStream::lazy(view, unsafe { scan_query(exec) });
         if stream.recheck {
             return None;
         }
@@ -1706,7 +1709,7 @@ unsafe fn complete(exec: &mut ScanExec) {
                     None
                 } else {
                     let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
-                    let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+                    let mut stream = crate::stream::CandidateStream::lazy(view, scan_query(exec));
                     (!stream.recheck).then(|| {
                         let mut rows = Vec::with_capacity(deeper);
                         while rows.len() < deeper {
@@ -2750,6 +2753,12 @@ unsafe extern "C-unwind" fn explain(
                     es,
                 );
             }
+            pg_sys::ExplainPropertyInteger(
+                c"Stream Groups Folded".as_ptr(),
+                std::ptr::null(),
+                crate::native::groups_folded(),
+                es,
+            );
             pg_sys::ExplainPropertyInteger(
                 c"Positions Checked".as_ptr(),
                 std::ptr::null(),

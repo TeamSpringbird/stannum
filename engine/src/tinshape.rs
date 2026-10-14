@@ -1198,14 +1198,47 @@ pub fn for_each_match<'a>(
     touch: &mut impl Touch,
     emit: &mut dyn FnMut(usize, &[u64]),
 ) -> Result<()> {
-    let live = &segment.liveness;
+    let groups = match_groups(segment, node, terms, touch);
+    fold_groups(segment, node, terms, touch, &groups, &mut |group, words| {
+        emit(group, words);
+        true
+    })?;
+    Ok(())
+}
+
+/// The groups of `segment` that may hold matches of `node`, ascending: what
+/// [`fold_groups`] is handed to fold a few at a time.
+pub fn match_groups<'a>(
+    segment: &Segment<'a>,
+    node: &Node,
+    terms: &mut [Option<TermSet<'a>>],
+    touch: &mut impl Touch,
+) -> Vec<u32> {
     touch.touch(Part::Liveness, segment.area_at(Area::Liveness), 1);
     let geometry = &segment.docs.geometry;
     for set in terms.iter_mut().flatten() {
         set.ensure_groups(geometry, touch);
     }
-    let all = geometry.groups.len();
-    let groups = candidate_groups(node, terms, all);
+    candidate_groups(node, terms, geometry.groups.len())
+}
+
+/// [`for_each_match`] over `groups` (ascending, from [`match_groups`]) only,
+/// stopping after the first group `emit` returns `false` for: the number of
+/// groups folded. A caller wanting the first matches in ctid order reads
+/// the containers of the groups it takes and no others.
+pub fn fold_groups<'a>(
+    segment: &Segment<'a>,
+    node: &Node,
+    terms: &mut [Option<TermSet<'a>>],
+    touch: &mut impl Touch,
+    groups: &[u32],
+    emit: &mut dyn FnMut(usize, &[u64]) -> bool,
+) -> Result<usize> {
+    let live = &segment.liveness;
+    let geometry = &segment.docs.geometry;
+    for set in terms.iter_mut().flatten() {
+        set.ensure_groups(geometry, touch);
+    }
     let hints = vec![0usize; terms.len()];
     let mut fold = Fold {
         segment,
@@ -1218,7 +1251,7 @@ pub fn for_each_match<'a>(
         cursors: Vec::new(),
     };
     let mut out = Vec::new();
-    for group in groups {
+    for (folded, &group) in groups.iter().enumerate() {
         crate::check_interrupts();
         let words = geometry.groups[group as usize].words();
         out.clear();
@@ -1229,11 +1262,11 @@ pub fn for_each_match<'a>(
         if let Some(dead) = live.groups[group as usize].as_deref() {
             kernels::andnot_words(&mut out, dead);
         }
-        if kernels::any_set(&out) {
-            emit(group as usize, &out);
+        if kernels::any_set(&out) && !emit(group as usize, &out) {
+            return Ok(folded + 1);
         }
     }
-    Ok(())
+    Ok(groups.len())
 }
 
 /// The score of the document at `tid` by the summed `scorers` (in their
@@ -2988,6 +3021,100 @@ mod tests {
         fn touch(&mut self, part: Part, _: usize, len: usize) {
             self.reads[part as usize] += 1;
             self.bytes[part as usize] += len as u64;
+        }
+    }
+
+    /// The first matches in ctid order read the containers of the groups
+    /// they are in and no others: a zero fill of k rows of a term in every
+    /// document read every group's container (15 or 16 payload pages for
+    /// any k on TIN's probe corpus, TIN 1 or 2). Folded a few groups at a
+    /// time, the matches are those of one fold over every group.
+    #[test]
+    fn folding_the_first_groups_reads_only_their_containers() {
+        let n = 5 * 256 * 20usize;
+        let docs: Vec<Tid> = (0..n as u32)
+            .map(|i| Tid {
+                block: i / 20,
+                offset: (i % 20) as u16 + 1,
+            })
+            .collect();
+        let members = vec![
+            (0..n).map(|r| (r, 1)).collect::<Vec<_>>(),
+            (0..n).filter(|r| r % 3 == 0).map(|r| (r, 1)).collect(),
+        ];
+        let all: Vec<usize> = (0..n).collect();
+        let blob = build_part(
+            &docs,
+            &vec![4u32; n],
+            &members,
+            &all,
+            &vec![false; n],
+            Options::default(),
+        );
+        let segment = Segment::parse(&blob).unwrap();
+        let names = vec!["t0".to_owned(), "t1".to_owned()];
+        for node in [Node::Term(0), Node::Or(vec![Node::Term(0), Node::Term(1)])] {
+            let mut every = Vec::new();
+            let mut whole = AreaReads::default();
+            let mut terms = open_terms(&segment, &names, &mut NoTouch).unwrap();
+            for_each_match(
+                &segment,
+                &node,
+                &mut terms,
+                &mut whole,
+                &mut |group, words| {
+                    tids_in(&segment.docs.geometry, group, words, |tid| every.push(tid));
+                },
+            )
+            .unwrap();
+            assert_eq!(every, docs, "{node:?}");
+            let mut terms = open_terms(&segment, &names, &mut NoTouch).unwrap();
+            let groups = match_groups(&segment, &node, &mut terms, &mut NoTouch);
+            assert_eq!(groups.len(), 5, "{node:?}");
+            // The first group alone.
+            let mut first = AreaReads::default();
+            let mut emitted = Vec::new();
+            let folded = fold_groups(
+                &segment,
+                &node,
+                &mut terms,
+                &mut first,
+                &groups,
+                &mut |group, _| {
+                    emitted.push(group);
+                    false
+                },
+            )
+            .unwrap();
+            assert_eq!((folded, emitted), (1, vec![groups[0] as usize]), "{node:?}");
+            let payload = Part::Payload as usize;
+            assert!(
+                first.bytes[payload] * 4 <= whole.bytes[payload],
+                "{node:?}: the first group read {} payload bytes of {}",
+                first.bytes[payload],
+                whole.bytes[payload]
+            );
+            // Two groups at a time, each fold over terms opened again.
+            let mut listed = Vec::new();
+            let mut at = 0;
+            while at < groups.len() {
+                let mut terms = open_terms(&segment, &names, &mut NoTouch).unwrap();
+                let mut left = 2;
+                at += fold_groups(
+                    &segment,
+                    &node,
+                    &mut terms,
+                    &mut NoTouch,
+                    &groups[at..],
+                    &mut |group, words| {
+                        tids_in(&segment.docs.geometry, group, words, |tid| listed.push(tid));
+                        left -= 1;
+                        left > 0
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(listed, every, "{node:?}");
         }
     }
 

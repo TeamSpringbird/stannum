@@ -864,6 +864,7 @@ pub(crate) fn reset_walk_blocks() {
     segment::tinshape::blob::reset_stats();
     segment::tinshape::segment::reset_memo_counts();
     crate::storage::reset_held_peak();
+    crate::native::reset_groups_folded();
 }
 
 /// Heap visibility checks since the last reset.
@@ -1748,6 +1749,11 @@ pub(crate) unsafe fn matching_stannum_indexes(
     let stannum_am = unsafe { pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
     let normalized = unsafe { pg_sys::copyObjectImpl(operand.cast()).cast::<pg_sys::Node>() };
     unsafe { pg_sys::ChangeVarNodes(normalized, query_varno, 1, 0) };
+    // Folded as `RelationGetIndexExpressions` folds an index's expression:
+    // `id IN (1, 2)` keeps its array as a constant, `repeat(' y', 2)` is
+    // computed and nested ANDs (a BETWEEN in a CASE) are flattened, so an
+    // operand written as the index was is found equal to it.
+    let normalized = unsafe { pg_sys::eval_const_expressions(std::ptr::null_mut(), normalized) };
     let normalized = unsafe { pg_sys::strip_implicit_coercions(normalized) };
     let heap = unsafe { pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as _) };
     let indexes = unsafe { PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(heap)) };

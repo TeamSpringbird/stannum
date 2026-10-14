@@ -492,36 +492,39 @@ ROUND2_BASE = [
 ]
 
 
+def d6_index(document):
+    """The index of round 4's d6_calib.py, which saved no result file: built
+    from the expression d6_check.py's first query searches (d6_check reused
+    the index d6_calib kept)."""
+    for entry in document["_sql_log"]:
+        found = re.search(r"where \((case when .*)\) ==> 'zr' group by 1", entry["sql"])
+        if found:
+            return (f"create index d6 on probe4_base.t using stannum (({found.group(1)})) "
+                    "with (initial_segment_count = 1, target_segment_count = 1)")
+    return None
+
+
 def replay(args):
-    """Replays round 2's probes (expression and partial indexes over
-    probe2_base.t) statement by statement from each result file's SQL log,
-    as Stannum's: CREATE INDEX ... USING stannum, stannum's functions.
-    Statements under tin.debug_force_topk (a TIN debug setting) are
-    skipped. Each EXPLAIN is run once in the replaying session (TIN's
-    probes ran each once) and set next to TIN's record of it.
+    """Replays rounds 2 and 4's probes (expression and partial indexes over
+    probe2_base.t and probe4_base.t) statement by statement from each result
+    file's SQL log, as Stannum's: CREATE INDEX ... USING stannum, stannum's
+    functions. Statements under tin.debug_force_topk (a TIN debug setting)
+    are skipped. Each EXPLAIN is run once (TIN's probes ran each once) and
+    set next to TIN's record of it.
 
-    Stannum refuses to score over an index whose expression PostgreSQL
-    folds (a CASE calling repeat() on constants: the index's expression is
-    folded, the score function's argument is matched unfolded), so each
-    indexed expression is wrapped in an immutable PL/pgSQL function of id,
-    which nothing folds, in the index and in the queries alike."""
-    import hashlib
+    Each EXPLAIN runs in a session of its own. TIN keeps nothing between
+    queries, while a Stannum backend keeps the pages that scoring rows one
+    at a time copied (a probe's `max(full_score(ctid))` copies every page
+    of its term): run in the probe's session after such a statement, round
+    4's d2, d8 and d8c recorded no reads at all. A fresh session's EXPLAIN
+    also reads the catalog, the document set and the liveness (the ML
+    column).
 
+    Indexed expressions are replayed as written: Stannum folds a search's
+    document as PostgreSQL folds an index's expression, so a CASE calling
+    repeat() on constants binds its searches (they were wrapped in PL/pgSQL
+    functions of id before)."""
     import psycopg
-
-    wrapped = {}
-
-    def wrap(conn, statement):
-        found = re.search(r"using stannum \(\((.*)\)\) with", statement)
-        if found and found.group(1) not in wrapped:
-            expression = found.group(1)
-            name = "probe2_base.h2h_e" + hashlib.md5(expression.encode()).hexdigest()[:10]
-            rows(conn, f"""create or replace function {name}(id int4) returns text language plpgsql immutable
-                as $f$ begin return {expression}; end $f$""")
-            wrapped[expression] = name
-        for expression, name in wrapped.items():
-            statement = statement.replace(f"({expression})", f"{name}(id)")
-        return statement
 
     dsn = os.environ[args.dsn_env]
     out = {"started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "files": {}}
@@ -537,6 +540,9 @@ def replay(args):
         results = []
         forced = False
         with psycopg.connect(dsn, autocommit=True) as conn:
+            if Path(path).name == "d6_check.json" and (index := d6_index(document)):
+                rows(conn, "drop index if exists probe4_base.d6")
+                rows(conn, index)
             for entry in document["_sql_log"]:
                 sql = entry["sql"].strip()
                 low = sql.lower()
@@ -547,8 +553,8 @@ def replay(args):
                 # Round 4's setup drops and recreates its base schema; ROUND2_BASE made it.
                 if low.startswith(("set max_parallel", "drop schema", "create schema", "create table probe4_base.t")):
                     continue
-                stannum = wrap(conn, sql.replace("using tin ", "using stannum ").replace("using tin(", "using stannum(")
-                               .replace("tin.", "stannum."))
+                stannum = (sql.replace("using tin ", "using stannum ").replace("using tin(", "using stannum(")
+                           .replace("tin.", "stannum."))
                 if low.startswith("explain"):
                     if forced:
                         continue
@@ -558,7 +564,8 @@ def replay(args):
                     record = {"sql": query, "tin": uniq if uniq is not None else short_areas((tin or {}).get("unique") or (tin or {}).get("touches") or {}),
                               "tin_ms": (tin or {}).get("exec_ms")}
                     try:
-                        record["stannum"] = summarize(explain(conn, stannum.split(")", 1)[1].strip()))
+                        with psycopg.connect(dsn, autocommit=True) as fresh:
+                            record["stannum"] = summarize(explain(fresh, stannum.split(")", 1)[1].strip()))
                     except psycopg.Error as error:
                         record["error"] = str(error).splitlines()[0]
                     results.append(record)

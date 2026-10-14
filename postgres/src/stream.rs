@@ -30,10 +30,23 @@ pub(crate) struct CandidateStream {
     advance: bool,
     pub(crate) recheck: bool,
     pub(crate) page_masks: bool,
+    /// Segments' matches folded as the walk reaches them; see [`Self::lazy`].
+    lazy: bool,
 }
 
 impl CandidateStream {
     pub(crate) fn new(view: View, query: Query) -> Self {
+        Self::with(view, query, false)
+    }
+
+    /// A stream its caller walks before it returns, as far as it needs: a
+    /// segment's matches are folded as the walk reaches them (see
+    /// [`crate::native::matches`]), so k rows read the groups they are in.
+    pub(crate) fn lazy(view: View, query: Query) -> Self {
+        Self::with(view, query, true)
+    }
+
+    fn with(view: View, query: Query, lazy: bool) -> Self {
         let mut this = Self {
             cursor: None,
             view: Box::new(view),
@@ -42,6 +55,7 @@ impl CandidateStream {
             advance: false,
             recheck: false,
             page_masks: false,
+            lazy,
         };
         this.rewind();
         this
@@ -69,7 +83,7 @@ impl CandidateStream {
                 pgrx::check_for_interrupts!();
                 lowering
                     .get(view, i)
-                    .and_then(|lowered| crate::native::matches(view, i, &lowered))
+                    .and_then(|lowered| crate::native::matches(view, i, &lowered, self.lazy))
             })
             .collect();
         self.page_masks = view
