@@ -769,6 +769,43 @@ impl Mem<'_> {
     }
 }
 
+/// `x`'s place in [`f32::total_cmp`]'s order: `a.total_cmp(&b)` is
+/// `order_key(a).cmp(&order_key(b))` (the standard library's own mapping).
+#[inline(always)]
+fn order_key(x: f32) -> i32 {
+    let bits = x.to_bits() as i32;
+    bits ^ (((bits >> 31) as u32) >> 1) as i32
+}
+
+/// The bar as [`Walk::keeps`] compares bounds with it: its score's
+/// [`order_key`] and its ctid.
+#[derive(Clone, Copy)]
+struct BarKey {
+    key: i32,
+    tid: Tid,
+}
+
+impl BarKey {
+    fn of(bar: Option<(f32, Tid)>) -> Option<Self> {
+        bar.map(|(score, tid)| Self {
+            key: order_key(score),
+            tid,
+        })
+    }
+
+    /// Whether a match of ctid `from()` scoring at most `bound` may still
+    /// be kept: `!cut_by(bar, bound, from)`, without a branch on the
+    /// comparison but for a tie, which is rare.
+    #[inline(always)]
+    fn keeps(self, bound: f32, from: impl FnOnce() -> Tid) -> bool {
+        let k = order_key(bound);
+        if k == self.key {
+            return from() < self.tid;
+        }
+        k > self.key
+    }
+}
+
 /// [`Walk::cut`] against the bar `bar`.
 #[inline]
 fn cut_by(bar: Option<(f32, Tid)>, bound: f32, from: impl FnOnce() -> Tid) -> bool {
@@ -3604,6 +3641,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     &bounds,
                     &mut sums[..w1 - w0],
                 );
+                // The words the bar cuts, all at once: the loop below walks
+                // only the others, with no branch on each word's verdict
+                // (the bar it is taken at only rises after).
+                let bar = BarKey::of(self.bar).expect("weighed under a bar");
+                let mut kept = 0u32;
+                for (j, &sum) in sums[..w1 - w0].iter().enumerate() {
+                    kept |= u32::from(bar.keeps(sum, || first(w0 + j))) << j;
+                }
+                live &= kept;
             }
             let mut bounded = false;
             while live != 0 {
@@ -3611,18 +3657,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 live &= live - 1;
                 let mut word = mask[w];
                 if weighed {
-                    let most = if WEIGH_IN_LANES {
-                        sums[w - w0]
-                    } else {
+                    if !WEIGH_IN_LANES {
                         let mut most = 0.0_f32;
                         for ((h, row), &bound) in held.iter_mut().zip(&rows).zip(&bounds) {
                             *h = row.word(w);
                             most += or_zero(bound, *h & word != 0);
                         }
-                        most
-                    };
-                    if self.cut(most, || first(w)) {
-                        continue;
+                        if self.cut(most, || first(w)) {
+                            continue;
+                        }
                     }
                     if !bounded {
                         bounded = true;
@@ -3655,6 +3698,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             *h = row.word(w);
                         }
                     }
+                    // Each member's verdict without a branch on it (see
+                    // `BarKey::keeps`), at the bar as it stands now.
+                    let bar = BarKey::of(self.bar).expect("weighed under a bar");
                     let mut keep = 0u64;
                     if WEIGH_IN_LANES && word.count_ones() as usize >= MEMBER_LANES {
                         let mut n = 0;
@@ -3670,7 +3716,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         for (&bit, &sum) in bits[..n].iter().zip(member_sums.iter()) {
                             let bit = u32::from(bit);
                             let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
-                            keep |= u64::from(!self.cut(sum, tid)) << bit;
+                            keep |= u64::from(bar.keeps(sum, tid)) << bit;
                         }
                     } else {
                         let mut left = word;
@@ -3682,7 +3728,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                                 sum += or_zero(bound, *h >> bit & 1 == 1);
                             }
                             let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
-                            keep |= u64::from(!self.cut(sum, tid)) << bit;
+                            keep |= u64::from(bar.keeps(sum, tid)) << bit;
                         }
                     }
                     word = keep;
@@ -4168,6 +4214,66 @@ mod tests {
             }
             assert_eq!(held, sc.footer.blocks());
         }
+    }
+
+    #[test]
+    fn a_bar_key_keeps_what_the_bar_does_not_cut() {
+        let mut values = vec![
+            0.0f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1.0,
+            1.0 + f32::EPSILON,
+            -1.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(1),
+            12.375,
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        for _ in 0..200 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(f32::from_bits(state as u32));
+            values.push((state % 4000) as f32 / 64.0);
+        }
+        let tids = [
+            Tid {
+                block: 3,
+                offset: 2,
+            },
+            Tid {
+                block: 3,
+                offset: 3,
+            },
+            Tid {
+                block: 4,
+                offset: 1,
+            },
+        ];
+        for &score in &values {
+            for &at in &tids {
+                let bar = Some((score, at));
+                let key = BarKey::of(bar).unwrap();
+                for &bound in &values {
+                    for &from in &tids {
+                        assert_eq!(
+                            key.keeps(bound, || from),
+                            !cut_by(bar, bound, || from),
+                            "bound {bound:?} ({:#x}) bar {score:?} ({:#x}) {from:?} {at:?}",
+                            bound.to_bits(),
+                            score.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+        assert!(BarKey::of(None).is_none());
     }
 
     #[test]
