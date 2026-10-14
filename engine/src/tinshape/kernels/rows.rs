@@ -9,7 +9,7 @@
 //! Setting a member's bit by reading its word, ORing the bit in and storing
 //! it back makes every member wait on the store of the one before when the
 //! two share a word: at one member in 16 slots, about four do, and the
-//! store-to-load forwarding costs 1.1 ns a member on the M4. Three bodies
+//! store-to-load forwarding costs 1.1 ns a member on the M4. Two bodies
 //! avoid that, for a row clear from the first member's bit on (a cleared
 //! row, or one set so far by smaller members):
 //!
@@ -22,11 +22,15 @@
 //!   in three shifted steps (sorted members of one byte are adjacent lanes),
 //!   the last byte's bits carried to the next eight, and a byte stored per
 //!   member, so the last store to a byte holds all its bits (0.33 ns a
-//!   member at densities 1/4 to 1/64, 0.42 at 1/128);
-//! - AVX2 (x86-64, at the AVX2 and AVX-512 levels): the NEON body's steps at
-//!   32-bit grain, for lists of at least 32 values (a body chosen at
-//!   run time is a call; see [`super::array`]); shorter ones, and baseline
-//!   x86-64 (no variable shift per lane), take the portable body.
+//!   member at densities 1/4 to 1/64, 0.42 at 1/128).
+//!
+//! x86-64 runs the portable body at every level. An AVX2 body at 32-bit
+//! grain (eight members, the same three steps by lane permutes, a 32-bit
+//! store per member) took longer on Sapphire Rapids, for Elias-Fano lists
+//! of a 150M segment set into rows: 1.27 against 1.16 ns a member at the
+//! AVX2 level, 1.38 against 0.98 at AVX-512 (branch `loop/arrayfold`,
+//! 4712f44): taking eight lanes out to store each costs more there than the
+//! portable body's register-held word.
 
 use super::Level;
 
@@ -85,10 +89,6 @@ impl RowPut {
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 const LANES: usize = 8;
 
-/// Values from which a list takes the AVX2 body (a call it cannot inline).
-#[cfg(target_arch = "x86_64")]
-const WIDE: usize = 32;
-
 /// Sets bit `v` of `row` for each value `v` of `values` (ascending, without
 /// repeats), the row's bits from the first value's on being clear (bits
 /// below it are kept). Panics if a value is past the row.
@@ -112,12 +112,6 @@ pub fn set_ascending_at(level: Level, values: &[u32], row: &mut [u64]) {
         // `fits`; NEON is baseline on aarch64.
         Level::Neon if values.len() >= LANES && neon::fits(row) => unsafe {
             neon::set_u32(values, row)
-        },
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: the level is the CPU's (both have AVX2); every value is
-        // within the row.
-        Level::Avx2 | Level::Avx512 if values.len() >= WIDE => unsafe {
-            avx2::set_u32(values, row)
         },
         _ => {
             let mut put = RowPut::at(row, values[0]);
@@ -152,9 +146,6 @@ pub fn set_ascending_u16_at(level: Level, bytes: &[u8], row: &mut [u64]) {
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         // SAFETY: as in `set_ascending_at`.
         Level::Neon if n >= LANES && neon::fits(row) => unsafe { neon::set_u16(bytes, row) },
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: as in `set_ascending_at`.
-        Level::Avx2 | Level::Avx512 if n >= WIDE => unsafe { avx2::set_u16(bytes, row) },
         _ => {
             let mut put = RowPut::at(row, value(0));
             for i in 0..n {
@@ -307,156 +298,6 @@ mod neon {
             while i + 8 <= n {
                 let v = vld1q_u16(bytes.as_ptr().add(2 * i).cast());
                 bytes_out.eight(vshrq_n_u16::<3>(v), vandq_u16(v, seven));
-                i += 8;
-            }
-            tail(
-                out,
-                (i..n).map(|i| u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]))),
-            );
-        }
-    }
-}
-
-/// AVX2 bodies (x86-64, chosen at run time): eight members at a time at
-/// 32-bit grain, as the NEON body's at byte grain: each member's word and
-/// bit (`vpsllvd`), the bits of members sharing a word ORed in three
-/// shifted steps (a lane permute and a blend each), the last word's
-/// carried, and a 32-bit store per member.
-#[cfg(target_arch = "x86_64")]
-mod avx2 {
-    use core::arch::x86_64::*;
-
-    /// No value's word index (they are below `2^27`).
-    const NONE: i32 = -1;
-
-    /// What one eight carries to the next: the last value's word index and
-    /// that word's bits so far, in every lane.
-    struct Words {
-        out: *mut u32,
-        at: __m256i,
-        bits: __m256i,
-    }
-
-    impl Words {
-        /// Starting at value `first`'s word, its bits below `first` kept.
-        ///
-        /// # Safety
-        /// AVX2; `out` is the row's 32-bit words, and `first` is within it.
-        #[target_feature(enable = "avx2")]
-        #[inline]
-        unsafe fn new(out: *mut u32, first: u32) -> Self {
-            let at = first / 32;
-            // SAFETY: the caller's.
-            unsafe {
-                let word = *out.add(at as usize);
-                Self {
-                    out,
-                    at: _mm256_set1_epi32(at as i32),
-                    bits: _mm256_set1_epi32(word as i32),
-                }
-            }
-        }
-
-        /// Sets eight ascending values.
-        ///
-        /// # Safety
-        /// AVX2; every value is within the row, and at or after the last one
-        /// set.
-        #[target_feature(enable = "avx2")]
-        #[inline]
-        unsafe fn eight(&mut self, v: __m256i) {
-            // SAFETY: two stores of eight lanes into eight; the word stores
-            // within the row (the caller's).
-            unsafe {
-                let at = _mm256_srli_epi32::<5>(v);
-                let mut bits = _mm256_sllv_epi32(
-                    _mm256_set1_epi32(1),
-                    _mm256_and_si256(v, _mm256_set1_epi32(31)),
-                );
-                let none = _mm256_set1_epi32(NONE);
-                // Lane k ORs in lane k - s's bits where the two share a word
-                // (see the NEON body); lanes below s compare with none.
-                macro_rules! step {
-                    ($from:expr, $below:literal) => {{
-                        let from = _mm256_setr_epi32(
-                            $from[0], $from[1], $from[2], $from[3], $from[4], $from[5], $from[6],
-                            $from[7],
-                        );
-                        let prev = _mm256_blend_epi32::<$below>(
-                            _mm256_permutevar8x32_epi32(at, from),
-                            none,
-                        );
-                        let same = _mm256_cmpeq_epi32(at, prev);
-                        bits = _mm256_or_si256(
-                            bits,
-                            _mm256_and_si256(_mm256_permutevar8x32_epi32(bits, from), same),
-                        );
-                    }};
-                }
-                step!([0, 0, 1, 2, 3, 4, 5, 6], 0b0000_0001);
-                step!([0, 0, 0, 1, 2, 3, 4, 5], 0b0000_0011);
-                step!([0, 0, 0, 0, 0, 1, 2, 3], 0b0000_1111);
-                bits = _mm256_or_si256(
-                    bits,
-                    _mm256_and_si256(self.bits, _mm256_cmpeq_epi32(at, self.at)),
-                );
-                let last = _mm256_set1_epi32(7);
-                self.at = _mm256_permutevar8x32_epi32(at, last);
-                self.bits = _mm256_permutevar8x32_epi32(bits, last);
-                let (mut ats, mut values) = ([0u32; 8], [0u32; 8]);
-                _mm256_storeu_si256(ats.as_mut_ptr().cast(), at);
-                _mm256_storeu_si256(values.as_mut_ptr().cast(), bits);
-                for k in 0..8 {
-                    *self.out.add(ats[k] as usize) = values[k];
-                }
-            }
-        }
-    }
-
-    /// The values after the last eight, a word read and stored per value.
-    ///
-    /// # Safety
-    /// Each value is within the row whose 32-bit words are `out`.
-    #[inline(always)]
-    unsafe fn tail(out: *mut u32, values: impl Iterator<Item = u32>) {
-        for v in values {
-            // SAFETY: the caller's.
-            unsafe { *out.add(v as usize / 32) |= 1 << (v % 32) };
-        }
-    }
-
-    /// # Safety
-    /// AVX2; the values ascend and lie within the row; there is at least one.
-    #[target_feature(enable = "avx2")]
-    #[inline(never)]
-    pub unsafe fn set_u32(values: &[u32], row: &mut [u64]) {
-        let out = row.as_mut_ptr().cast::<u32>();
-        // SAFETY: the caller's; each load reads eight of the values.
-        unsafe {
-            let mut words = Words::new(out, values[0]);
-            let mut eights = values.chunks_exact(8);
-            for e in &mut eights {
-                words.eight(_mm256_loadu_si256(e.as_ptr().cast()));
-            }
-            tail(out, eights.remainder().iter().copied());
-        }
-    }
-
-    /// # Safety
-    /// As [`set_u32`], of `bytes.len() / 2` little-endian `u16`s.
-    #[target_feature(enable = "avx2")]
-    #[inline(never)]
-    pub unsafe fn set_u16(bytes: &[u8], row: &mut [u64]) {
-        let out = row.as_mut_ptr().cast::<u32>();
-        let n = bytes.len() / 2;
-        // SAFETY: the caller's; each load reads 16 of the `2n` bytes.
-        unsafe {
-            let first = u32::from(u16::from_le_bytes([bytes[0], bytes[1]]));
-            let mut words = Words::new(out, first);
-            let mut i = 0;
-            while i + 8 <= n {
-                let v = _mm_loadu_si128(bytes.as_ptr().add(2 * i).cast());
-                words.eight(_mm256_cvtepu16_epi32(v));
                 i += 8;
             }
             tail(
