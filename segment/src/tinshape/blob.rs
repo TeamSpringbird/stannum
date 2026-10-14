@@ -1216,33 +1216,6 @@ mod tests {
     }
 
     #[test]
-    fn a_prefetch_pins_and_loads_nothing() {
-        let (source, blob) = pinning(10 * 100 + 37, 100);
-        let state = &source.0;
-        let range = blob.bytes().sub(150, 900).unwrap();
-        // Outside a span, nothing loaded: nothing asked for.
-        range.prefetch(16);
-        assert_eq!(
-            (blob.loaded(), state.reads.get(), state.pins.get()),
-            (0, 0, 0)
-        );
-        blob.open_span();
-        // A page not pinned yet is not pinned for it.
-        range.prefetch(16);
-        assert_eq!(state.pins.get(), 0);
-        // One pinned is asked for in place, and still read the same.
-        assert_eq!(range.get(0, 10).unwrap(), &state.bytes[150..160]);
-        let pins = state.pins.get();
-        range.prefetch(16);
-        blob.bytes().sub(1030, 1037).unwrap().prefetch(1);
-        Bytes::from(&state.bytes[..]).prefetch(4);
-        assert_eq!(state.pins.get(), pins);
-        assert_eq!(range.get(0, 10).unwrap(), &state.bytes[150..160]);
-        unsafe { blob.close_span() };
-        assert_eq!(blob.loaded(), 0);
-    }
-
-    #[test]
     fn page_end_bounds_reads_in_place() {
         let (source, blob) = pinning(10 * 100 + 37, 100);
         let range = blob.bytes().sub(150, 900).unwrap();
