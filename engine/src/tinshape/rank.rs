@@ -1135,7 +1135,13 @@ fn load<'a>(
                     offset: 0,
                 };
             } else {
-                kernels::container_locals(&e, bytes, geometry.starts(g as usize), &mut mem.list)?;
+                kernels::container_locals(
+                    &e,
+                    bytes,
+                    group.slots(),
+                    geometry.starts(g as usize),
+                    &mut mem.list,
+                )?;
             }
         }
         Src::Locals { from, to } => {
@@ -2653,7 +2659,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// read it from the DL sidecar.
     fn finish(&mut self, g: u32, local: u32, length: u32) -> Result<()> {
         let n = self.sc.len();
-        let tid = self.geometry.tid_in(g as usize, local);
         // A span checks positions before scoring while the top k fill:
         // every match enters them, and only a match reads its length (at
         // 150M rows four in ten of a phrase's lengths were read for
@@ -2686,9 +2691,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 .scorer
                 .score_bucket(TfBucket::new(bucket).ok_or(Error::InvalidTfBucket)?, length);
         }
-        if !self.admits(total, tid) {
+        // Its ctid only once it would be kept (or ties the bar): the
+        // geometry's tables it is read from are cold for most candidates.
+        let geometry = self.geometry;
+        if self.cut(total, || geometry.tid_in(g as usize, local)) {
             return Ok(());
         }
+        let tid = geometry.tid_in(g as usize, local);
         match &self.verify {
             Verify::Flat => self.push(total, tid),
             Verify::Span(_) if span_first => self.push(total, tid),

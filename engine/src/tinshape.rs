@@ -493,7 +493,7 @@ impl<'a> TermSet<'a> {
             }
             let local_target = target.saturating_sub(base);
             if matches!(self.loaded, Loaded::None) {
-                self.load(&g, geometry.starts(g.index as usize), touch);
+                self.load(&g, group.slots(), geometry.starts(g.index as usize), touch);
             }
             let first = self.first_of(&g);
             let found = match &self.loaded {
@@ -556,7 +556,7 @@ impl<'a> TermSet<'a> {
         }
     }
 
-    fn load(&mut self, g: &G<'a>, starts: &[u32], touch: &mut impl Touch) {
+    fn load(&mut self, g: &G<'a>, slots: u32, starts: &[u32], touch: &mut impl Touch) {
         self.pos = 0;
         match g.src {
             Src::Container { entry, bytes, at } => {
@@ -569,7 +569,7 @@ impl<'a> TermSet<'a> {
                 } else {
                     let mut list = std::mem::take(&mut self.list);
                     list.clear();
-                    kernels::container_locals(&entry, bytes, starts, &mut list)
+                    kernels::container_locals(&entry, bytes, slots, starts, &mut list)
                         .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")));
                     self.list = list;
                     self.loaded = Loaded::List;
@@ -889,10 +889,12 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
     fn decode(&mut self, t: usize, g: &G<'a>, list: &mut Vec<u32>) -> Result<()> {
         self.touch_src(&g.src);
         let segment = self.segment;
-        let starts = segment.docs.geometry.starts(g.index as usize);
+        let geometry = &segment.docs.geometry;
+        let starts = geometry.starts(g.index as usize);
+        let slots = geometry.groups[g.index as usize].slots();
         match g.src {
             Src::Container { entry, bytes, .. } => {
-                kernels::container_locals(&entry, bytes.all()?, starts, list)?;
+                kernels::container_locals(&entry, bytes.all()?, slots, starts, list)?;
             }
             Src::Locals { from, to } => {
                 let set = self.terms[t].as_ref().expect("a term with a group");
@@ -995,7 +997,9 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
         };
         self.touch_src(&g.src);
         let segment = self.segment;
-        let starts = segment.docs.geometry.starts(group as usize);
+        let geometry = &segment.docs.geometry;
+        let starts = geometry.starts(group as usize);
+        let slots = geometry.groups[group as usize].slots();
         let set = self.terms[t].as_ref().expect("found above");
         match g.src {
             Src::Container { entry, bytes, .. } => {
@@ -1006,7 +1010,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     // ORed in: a disjunction's term_or adds to a filled row.
                     let mut list = std::mem::take(&mut self.other);
                     list.clear();
-                    kernels::container_locals(&entry, bytes, starts, &mut list)?;
+                    kernels::container_locals(&entry, bytes, slots, starts, &mut list)?;
                     for l in &list {
                         out[*l as usize / 64] |= 1 << (l % 64);
                     }
