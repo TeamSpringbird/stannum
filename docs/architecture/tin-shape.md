@@ -1344,6 +1344,50 @@ directories and stitched containers, allocation), 7.0% to pins, 6.3% to
 group bounds and about 13% to candidates; a phrase's 51 M, 11.4% each to the
 directory and to filtering, 10.8% to decoding and 10.5% to pins.
 
+### A disjunction's group bounds on x86-64 (branch `loop/c5-disj`)
+
+The same profile of a score disjunction on layout 12 (`e7a6aee`, 300
+queries, `--forget`; the replay's own mapping of answers to ids, 13% of the
+recording, left out) by the stages of `Walk::or_group`: group bounds 15.7%
+(a bound per present term and group), weighing words 13.9%, the terms' rows
+13.6%, candidates 13.1%, weighing members 10.2%, the next group's directory
+seeks 9.5%, libc 6.7%, the mask 4.9%, pins 2.9%. Under `full_score`:
+candidates 25.8%, members 18.1%, group bounds 13.4%, words 10.4%.
+
+`Sc::bound_of` was 8% of the cycles at about 156 cycles a call (64,000 a
+query), but its BM25 arithmetic only 1.2%: most of it sat on the fold's
+`f32::max`, which on x86-64 orders NaNs with `cmpunordss` and a blend after
+`maxss`, all on the chain the fold carries from pair to pair (a bound table,
+R7, had removed the division per pair for no fewer cycles). The bounds are
+never NaN, so a frontier's best pair is now kept by a compare and a select
+(`postings::higher`), which ignores a NaN as `f32::max` does. And a present
+grouped term's group bound and container come from the directory entry the
+walk's seek found (`Sc::entry_bound`, `TermSet::group_at`): `range_bound`
+galloped to the same entry again (2.6% of the cycles) and `or_load`'s
+`TermSet::find` sought it a third time.
+
+At 150M rows, against `e7a6aee`, with the same answers: on Sapphire Rapids
+(`perf stat` user counters, 300 queries, 2 rounds) score disjunction cycles
+-3.2% to -3.8% and instructions -5.6% to -8.1% (measured over the directory
+change below, with and without it); on the M4 (timed passes, 300 queries, 2
+rounds) score disjunction instructions -7.1%, cycles -3.9%, median query
+-6.9%, mean -3.8%; `full_score` instructions -5.0%, cycles -2.5%;
+conjunctions and phrases unchanged (instructions -0.2% / -0.1%).
+
+Not kept: reading a grouped record's directory in place rather than copying
+it at the parse (2.2 MB a conjunction, 2.5 MB a disjunction). With skip
+points the copies were 1-2% of a conjunction's x86 cycles, libc 5.5% of
+them in all; read in place, every run's chunk, skip point and frontier went
+through the blob's page lookup, and the directory's pages, pinned while the
+terms opened, were released between groups and pinned again: directory pins
+x10 per conjunction and x416 per `full_score` disjunction, `full_score`
+cycles +4.5% on Sapphire Rapids. Holding the pages a directory read last (as
+a footer holds its window) cut the re-pins to x20 but left `full_score`
++2.6%, and with a dozen windows held a walk released pages at every group
+(conjunctions +18%) until a release stopped counting held pages; the M4
+still ran conjunctions 2.5% more instructions and 4.3% more cycles than with
+the copy. The attempt is branch `loop/c5-inplace`.
+
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 
 Under `full_score` a dense pair ("is to", "to a") leaves most of a group's
