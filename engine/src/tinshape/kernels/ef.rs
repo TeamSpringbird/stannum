@@ -63,7 +63,7 @@ macro_rules! ef_run {
 }
 
 use super::array::{array_decode, array_into_row};
-use super::rows::{RowPut, set_ascending};
+use super::rows::RowPut;
 use segment::tinshape::ef::Ef;
 use segment::tinshape::postings::{
     GroupEntry, KIND_ARRAY, KIND_EF, array_bytes, for_each_local, group_slots,
@@ -355,6 +355,59 @@ unsafe fn combine_one(lows: &[u8], l: u32, i: usize, d: *mut u32) {
     unsafe { *d = *d << l | bits::get(lows, i, l).unwrap_or(0) };
 }
 
+/// Where [`ef_into_row`]'s bodies set each decoded chunk's values
+/// (ascending, above the chunks' before them; a value past the row panics):
+/// on aarch64 by [`super::rows::set_ascending`] (NEON, eight at a time); elsewhere
+/// through one [`RowPut`] carried across chunks and inlined into each body,
+/// so that it is compiled with the body's instruction set (baseline x86-64
+/// shifts by a variable count in three micro-ops, BMI2's `shlx` in one: a
+/// call to the baseline loop cost Sapphire Rapids 14 to 19% more a member).
+struct ChunkRow {
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    put: RowPut,
+}
+
+impl ChunkRow {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+            put: RowPut::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, values: &[u32], row: &mut [u64]) {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        super::rows::set_ascending(values, row);
+        #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+        {
+            let Some(&last) = values.last() else {
+                return;
+            };
+            if (last as usize / 64) < row.len() {
+                let mut fours = values.chunks_exact(4);
+                // SAFETY: every value is at most the last, within the row.
+                unsafe {
+                    for four in &mut fours {
+                        self.put.put_unchecked(row, four[0]);
+                        self.put.put_unchecked(row, four[1]);
+                        self.put.put_unchecked(row, four[2]);
+                        self.put.put_unchecked(row, four[3]);
+                    }
+                    for &v in fours.remainder() {
+                        self.put.put_unchecked(row, v);
+                    }
+                }
+            } else {
+                for &v in values {
+                    self.put.put(row, v);
+                }
+            }
+        }
+    }
+}
+
 /// Visits the values of a list shorter than [`SHORT`] whose highs fit a
 /// word, as a valid one's do (fewer than `3n` bits); false, visiting
 /// nothing, for any other.
@@ -559,6 +612,7 @@ macro_rules! passes {
                 8 + super::CHUNK_WORDS * 64 + super::SLACK];
             let dst = buf.as_mut_ptr().cast::<u32>();
             let total = highs_bytes.len().div_ceil(8);
+            let mut set = super::ChunkRow::new();
             let (mut idx, mut w) = (0, 0);
             while w < total && idx < n {
                 let w1 = (w + super::CHUNK_WORDS).min(total);
@@ -579,11 +633,8 @@ macro_rules! passes {
                     }
                     dst.add(to - origin).write_bytes(0, Unpack::LANES);
                     combine(lows, l, origin, to, dst);
-                    // Ascending, above the chunks' before them: set as
-                    // `set_ascending` sets them (a value past the row
-                    // panics).
                     let values = core::slice::from_raw_parts(dst.add(from - origin), to - from);
-                    super::set_ascending(values, row);
+                    set.set(values, row);
                 }
             }
         }
