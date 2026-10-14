@@ -193,11 +193,23 @@ pub fn retain(values: &mut Vec<u32>, mut keep: impl FnMut(u32) -> bool) {
 /// ([`retain`]), and the marks are cleared again. A bit set, a bit tested
 /// and a word cleared per value, none a branch, where a merge (even
 /// [`intersect_sorted`]'s) compares each member with a stretch of `other`.
-/// Values must lie below `marks.len() * 64`.
+/// Values must lie below `marks.len() * 64`, and `other`'s must rise.
+///
+/// A word's marks are gathered in a register while `other`'s values stay
+/// in it, and the word stored at each value: setting each mark in memory
+/// read the word the store before had just written, one store forwarded
+/// after another (most of a container's values share a word with the one
+/// before), where now only the register carries from value to value.
 #[inline]
 pub fn intersect_marked(list: &mut Vec<u32>, other: &[u32], marks: &mut [u64]) {
+    debug_assert!(other.windows(2).all(|w| w[0] < w[1]));
+    let (mut at, mut word) = (usize::MAX, 0u64);
     for &v in other {
-        marks[v as usize / 64] |= 1 << (v % 64);
+        let w = v as usize / 64;
+        // The marks so far of `w`'s word: none when `v` starts it.
+        word = (word & mask(w == at)) | 1 << (v % 64);
+        marks[w] = word;
+        at = w;
     }
     retain(list, |v| marks[v as usize / 64] >> (v % 64) & 1 == 1);
     for &v in other {
