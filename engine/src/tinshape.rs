@@ -74,6 +74,44 @@ impl Part {
 /// Where a query reads: `(part, blob offset, length)` per read.
 pub trait Touch {
     fn touch(&mut self, part: Part, at: usize, len: usize);
+
+    /// Whether the walk reports the census events below (a lab census of
+    /// what finer summaries would have saved; off everywhere else, so the
+    /// walk computes nothing for them).
+    #[inline]
+    fn census(&self) -> bool {
+        false
+    }
+
+    /// A led walk (conjunction, phrase) intersected group `g`: its
+    /// required terms `req` (indexes into the query's terms, rarest first)
+    /// and the candidates left after each of them (`left[0]` the lead's
+    /// members; a term never reached leaves 0); `grids` when every required
+    /// term held the group as a grid (intersected word by word).
+    #[inline]
+    fn census_and(&mut self, _g: u32, _req: &[usize], _left: &[u32], _grids: bool) {}
+
+    /// A disjunction's walk reached group `g` with threshold `theta`; its
+    /// present scoring terms (indexes into the query's terms).
+    #[inline]
+    fn census_or(&mut self, _g: u32, _theta: Option<f32>, _present: &[usize]) {}
+
+    /// A scored candidate of group `g` at slot `local`, of length `length`,
+    /// reads it from the DL sidecar at blob offset `at`: `need` is the
+    /// shortest length its buckets' bound would have been cut at against the
+    /// threshold of the moment (`u32::MAX` when not even `length` cuts it);
+    /// `held` the query's terms it holds (indexes into the query's terms).
+    #[inline]
+    fn census_length(
+        &mut self,
+        _g: u32,
+        _local: u32,
+        _length: u32,
+        _need: u32,
+        _at: usize,
+        _held: &[usize],
+    ) {
+    }
 }
 
 /// Reads recorded nowhere, for timing.

@@ -1635,6 +1635,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             Kind::List => cands.extend_from_slice(&lead.list),
             Kind::Cursor { .. } | Kind::Array(_) => unreachable!("a lead is loaded whole"),
         }
+        let mut left = [0u32; 16];
+        left[0] = cands.len() as u32;
         for r in 1..self.req.len() {
             if cands.is_empty() {
                 break;
@@ -1678,6 +1680,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     bits::intersect_marked(&mut cands, &mem.list, &mut self.marks);
                 }
             }
+            if self.touch.census() && r < left.len() {
+                left[r] = cands.len() as u32;
+            }
+        }
+        if self.touch.census() {
+            let n = self.req.len().min(left.len());
+            self.touch.census_and(g, &self.req[..n], &left[..n], false);
         }
         let more = self.walk_candidates(g, &cands)?;
         self.cands = cands;
@@ -2330,6 +2339,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if let Some(dead) = self.segment.liveness.groups[g as usize].as_deref() {
             kernels::andnot_words(words, dead);
         }
+        if self.touch.census() {
+            let n = self.req.len().min(16);
+            let mut left = [0u32; 16];
+            left[..n].fill(kernels::popcount(words) as u32);
+            self.touch.census_and(g, &self.req[..n], &left[..n], true);
+        }
         // A group the sieve takes is sieved by its first term's buckets
         // before its candidates are listed.
         let sieved = kernels::popcount(&self.words) >= SIEVE_MIN as u64 && self.sieve_led(g)?;
@@ -2628,7 +2643,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A walk with nothing to score (every term elided) scores nothing,
         // and needs no length.
         let length = if length == u32::MAX && n > 0 {
-            self.dl_length(g, local)?
+            let length = self.dl_length(g, local)?;
+            if self.touch.census() {
+                self.census_length(g, local, length, tid);
+            }
+            length
         } else {
             length
         };
@@ -2868,6 +2887,50 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.touch.touch(Part::DlSidecar, header, 8);
         self.touch.touch(Part::DlSidecar, bits, 4);
         self.segment.lengths.get(rank)
+    }
+
+    /// Reports a DL read to the census ([`Touch::census_length`]): the
+    /// shortest length at which the candidate's buckets' bound is cut by
+    /// the threshold of the moment, found by bisection (the bound falls as
+    /// the length grows).
+    #[cold]
+    fn census_length(&mut self, g: u32, local: u32, length: u32, tid: Tid) {
+        let n = self.sc.len();
+        let held = || (0..n).filter(|i| self.buckets[*i] != NO_BUCKET);
+        let cut_at = |f: u32| self.cut(self.reach(held(), f), || tid);
+        let need = if !cut_at(length) {
+            u32::MAX
+        } else {
+            let (mut lo, mut hi) = (0u32, length);
+            // Invariant: cut at `hi`; not cut below `lo` (unless lo == 0).
+            if cut_at(0) {
+                hi = 0;
+            }
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if cut_at(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            hi
+        };
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .expect("a scored document");
+        let (_, at) = self.segment.length_at(rank);
+        let mut held: Vec<usize> = self.req.clone();
+        held.extend(
+            (0..n)
+                .filter(|i| self.buckets[*i] != NO_BUCKET)
+                .map(|i| self.sc[i].term),
+        );
+        held.sort_unstable();
+        held.dedup();
+        self.touch.census_length(g, local, length, need, at, &held);
     }
 
     /// The candidate's posting index in each span slot's term.
@@ -3428,6 +3491,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let base = group.slot_base;
         let end = base + group.slots() - 1;
         self.answer.windows += 1;
+        if self.touch.census() {
+            let present: Vec<usize> = self.present_list.iter().map(|&i| self.sc[i].term).collect();
+            self.touch.census_or(g, self.threshold(), &present);
+        }
         // The present terms' bounds over the group.
         let mut sb = std::mem::take(&mut self.sub_bounds);
         sb.clear();
