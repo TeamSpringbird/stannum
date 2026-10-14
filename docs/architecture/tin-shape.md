@@ -1514,7 +1514,11 @@ pages (TIN 20), OR `score()` 1,446 to 1,326 (TIN 816), all cases 6,188 to
 5,828; no other area moved. Round 4's replayed probes (each EXPLAIN in a
 fresh session): d4b (elided fill) payload 121 to 61 (TIN 118), d1 2,560 to
 2,146 (TIN 2,785). The 181 ranked corpus cases return the same rows and
-score bits.
+score bits. At 150M rows the benchmark's `score()` top 10 rarely fills
+with zeros: `vm_ab.py` (2 rounds, 8 clients, base twice) measured
+instructions per query within the control's spread (candidate +1.4%,
++2.0%, -0.2% and +0.3% for mixed, conjunction, disjunction and phrase;
+the second base +2.6%, +1.9%, +2.5% and +2.0%, on a loaded VM).
 
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 
