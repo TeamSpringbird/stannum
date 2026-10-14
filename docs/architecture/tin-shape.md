@@ -122,7 +122,9 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
                     (directory_len: the bytes of the payload before its
                     containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
-           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped),
+           (sparse) or when its grids end in sub-range codes (grouped, a
+           record holding a grid, layout 13),
+           | 0x10 when the frontiers' lengths are rounded (grouped),
            | 0x20 when the directory ends in skip points (grouped, layout 11)
 lengths := base varint, width u8, (length - base) packed at width, by posting
 list    := Elias-Fano over the term's slots, universe = all slots
@@ -137,7 +139,11 @@ group frontier := head u8 = (pairs - 1) << 4 | first bucket, first length
                   varint, then per pair ((length gap - 1) << 4 | bucket gap - 1)
                   varint: the group's impact frontier, its lengths rounded
                   down to six significant bits when the form says so
-container := grid:  the group's slots as a bitmap of whole words
+container := grid:  the group's slots as a bitmap of whole words, then
+                    its sub-range codes (layout 13): per 1,024 slots, per
+                    pair of the group frontier, u8 the least rounded length
+                    code (at most 254) of the sub-range's postings above the
+                    previous pair's bucket, 255 for none
            | ef:    Elias-Fano over the group's local slots (universe p * w)
            | paged: a page mask (or page list) and per page a bitmap, a
                     packed sorted list of offsets or a run, the smallest
@@ -208,6 +214,24 @@ The best score under any `k1` and `b` is the score of one of the pairs, as
 Lucene's competitive impacts are; a reader computes the bound for the
 query's parameters (`bound_through`, so rounding never puts a bound below
 a score it covers).
+
+A grid group (a dense term's) refines its frontier per **sub-range** of
+1,024 slots (page layout 13, `Options::sub_codes`; not TIN's measured
+structure, kept for a measured gain, see [sub-range
+codes](#sub-range-codes-for-grid-groups-layout-13)): its container's words
+are followed by a byte per sub-range and frontier pair, the least rounded
+length code of the sub-range's postings whose bucket lies above the
+previous pair's (`put_sub_codes`). A posting of the sub-range is then
+dominated by the pair's bucket at that length, so the walk bounds a dense
+term's candidate by its sub-range rather than its group: a window ends
+with the sub-range, a bucket's floor is the sub-range's (at least the
+group's), the sieve takes a sub-range at a time, and a disjunction weighs
+a sub-range's members by its terms' sub-range bounds. A word in most
+documents of a group has one frontier there, whose short documents leave
+most candidates in reach of the DL sidecar; its sub-ranges' floors are
+those of a seventh of its postings each. The codes cost a byte per
+sub-range and pair (about 2.4 pairs, 8 sub-ranges a group), read with the
+grid and only by a ranked walk that bounds by them.
 
 A sparse record (one Elias-Fano list over the segment: a rare term) keeps
 the footer of blocks: one entry per block of `block_size` postings (256 by

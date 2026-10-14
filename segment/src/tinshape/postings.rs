@@ -17,7 +17,9 @@
 //!            frontier_len u8 (1..=16),
 //!            (bucket u8, min_length varint)* ascending in both: the
 //!            block's impact frontier
-//! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded),
+//! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded,
+//!            | 0x20 skip points, | 0x40 when its grids end in sub-range
+//!            codes),
 //!            directory_len varint (bytes of the groups count and the
 //!                                  directory: where containers start),
 //!            payload_len varint,
@@ -33,7 +35,10 @@
 //!            the group's impact frontier, its lengths rounded down to six
 //!            significant bits when the form says so
 //! container := grid:  the group's slots in whole u64le words, bit `local`
-//!                     set for each member
+//!                     set for each member; then, with 0x40, its sub-range
+//!                     codes: per 1,024 slots, per pair of the group
+//!                     frontier, u8 (see [`put_sub_codes`]), which the
+//!                     directory's container offsets step over
 //!            | ef:    ef(count local slots below the group's slot count)
 //!            | paged: (pages - 1) u8, the pages of the group's span (a byte
 //!                     each when fewer than 32, else a 256-bit mask), then
