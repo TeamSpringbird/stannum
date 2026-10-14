@@ -607,7 +607,9 @@ pub use ef::{
 };
 mod rows;
 pub(crate) use rows::RowPut;
-pub use rows::{intersect_marked, set_ascending, set_ascending_u16};
+pub use rows::{
+    intersect_marked, set_ascending, set_ascending_at, set_ascending_u16, set_ascending_u16_at,
+};
 mod weigh;
 pub use weigh::{Row, member_sums, member_sums_at, or_zero, word_sums, word_sums_at};
 #[inline(always)]
