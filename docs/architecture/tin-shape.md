@@ -1295,15 +1295,22 @@ run's entries as a slice; and a walk that reaches the run after one it
 decoded decodes up to eight runs in one pass, checked at their end. The
 parse also copies a directory once, a page at a time
 (`Bytes::copy_into`), where a directory spanning pages was stitched into
-the span's buffer and then copied (2 MB a conjunction at 150M rows).
+the span's buffer and then copied (2 MB a conjunction at 150M rows). A
+disjunction decodes its scored terms' directories whole and reads their
+entries many times a group: there a seek scans decoded runs on without the
+skip points, and the entries of the runs decoded from the first on are a
+comparison away, as the decoded prefix was.
 
 At 150M rows (`dump-new` re-encoded `--from 10`: +0.30% of the index,
-postings +0.70%; replay with `--forget`, 400 queries per style, 3 rounds,
+postings +0.70%; replay with `--forget`, 400 queries per style, 2 rounds,
 M4, against `perf-integrate10`): directory entries decoded per conjunction
-103,800 -> 64,900, phrase 106,100 -> 66,900; instructions -6.5% / -4.5%,
-cycles -3.4% / -1.6%, median query -12% / -7.5%, mean -5.0% / -4.6%, p99
--1.1% / -1.2% (conjunction / phrase). Whole trace: every answer equal to
-`pg-ranked.tsv`, `--full` answers identical to `f0962a8`'s.
+103,800 -> 64,900, phrase 106,100 -> 66,900; instructions -7.8% / -5.6%,
+cycles -4.0% / -3.9%, median query -12% / -12%, mean -2.5% / -3.3%, p99
+-1.6% / +2.6% (conjunction / phrase). A disjunction (300 queries) decodes
+as many entries and costs a little more: instructions +2.1%, cycles +2.3%,
+mean -0.6% (the skip points copied with the directory, the run checks).
+Whole trace: every answer equal to `pg-ranked.tsv`, `--full` answers
+identical to `f0962a8`'s.
 
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 
