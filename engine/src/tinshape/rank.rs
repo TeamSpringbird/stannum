@@ -110,7 +110,7 @@ struct GroupBounds<'s, 'a> {
     codes: SubCodes<'a>,
 }
 
-impl GroupBounds<'_, '_> {
+impl<'a> GroupBounds<'_, 'a> {
     /// Entry `b` (decoded if it was not yet).
     #[inline]
     fn entry(&self, b: usize) -> &GroupEntry {
@@ -142,18 +142,19 @@ impl GroupBounds<'_, '_> {
         )
     }
 
-    /// Copies entry `b`'s sub-range codes ([`Postings::sub_codes_into`])
-    /// into `out`: false for an entry without them.
+    /// Entry `b`'s sub-range codes ([`SubCodes::get`]), read in place: empty
+    /// for an entry without them (not a grid's, or a record without them).
     #[inline]
-    fn sub_codes_into(&self, b: usize, out: &mut Vec<u8>) -> bool {
+    fn sub_codes(&self, b: usize) -> &'a [u8] {
+        if !self.codes.held() {
+            return &[];
+        }
         let e = self.entry(b);
+        if e.kind != KIND_GRID {
+            return &[];
+        }
         self.codes
-            .copy_into(
-                e,
-                self.groups[e.index as usize].slots(),
-                self.dir.bytes(),
-                out,
-            )
+            .get(e, self.groups[e.index as usize].slots(), self.dir.bytes())
             .unwrap_or_else(|e| corrupt_footer(e))
     }
 
@@ -409,14 +410,15 @@ pub(super) struct Sc<'s, 'a> {
     /// A common term's bound over a group (see [`Sc::make_common`]).
     common: Option<f32>,
     /// The sub-range codes ([`put_sub_codes`]) of grouped entry `se`, at
-    /// hand (copied: they outlive the group's pages): per pair of its
-    /// group's frontier, the pair's bucket and length (the group's floor
-    /// there); per sub-range, its bound (NaN until asked). `s_subs` is 0
-    /// for an entry without codes.
+    /// hand, read in place (forgotten when the walk leaves the group, whose
+    /// pages it releases: [`Sc::forget_subs`]): per pair of its group's
+    /// frontier, the pair's bucket and length (the group's floor there); per
+    /// sub-range, its bound (NaN until asked). `s_subs` is 0 for an entry
+    /// without codes.
     ///
     /// [`put_sub_codes`]: segment::tinshape::postings::put_sub_codes
     se: usize,
-    s_codes: Vec<u8>,
+    s_codes: &'a [u8],
     s_n: usize,
     s_subs: usize,
     s_buckets: [u8; 16],
@@ -474,7 +476,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors_block: u32::MAX,
             common: None,
             se: usize::MAX,
-            s_codes: Vec::new(),
+            s_codes: &[],
             s_n: 0,
             s_subs: 0,
             s_buckets: [0; 16],
@@ -748,9 +750,14 @@ impl<'s, 'a> Sc<'s, 'a> {
         let Bounds::Groups(g) = &self.footer else {
             return;
         };
-        if b >= g.dir.len() || !g.sub_codes_into(b, &mut self.s_codes) {
+        if b >= g.dir.len() {
             return;
         }
+        let codes = g.sub_codes(b);
+        if codes.is_empty() {
+            return;
+        }
+        self.s_codes = codes;
         let mut n = 0;
         for (bucket, length) in g.frontier(b) {
             self.s_buckets[n] = bucket;
@@ -761,6 +768,15 @@ impl<'s, 'a> Sc<'s, 'a> {
         self.s_subs = self.s_codes.len() / n;
         self.s_bound.clear();
         self.s_bound.resize(self.s_subs, f32::NAN);
+    }
+
+    /// Forgets the sub-range codes at hand: the walk left their group, whose
+    /// pages it releases.
+    #[inline]
+    fn forget_subs(&mut self) {
+        self.se = usize::MAX;
+        self.s_subs = 0;
+        self.s_codes = &[];
     }
 
     /// The least length a posting of sub-range `r` (of the entry at hand)
@@ -1722,6 +1738,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// ([`LazyFooter::borrowed`]), one page per term at most.
     #[inline]
     fn group_done(&mut self) {
+        // Sub-range codes are read in place from the group's pages.
+        for s in &mut self.sc {
+            s.forget_subs();
+        }
         let Some((blob, mark)) = self.frame else {
             return;
         };

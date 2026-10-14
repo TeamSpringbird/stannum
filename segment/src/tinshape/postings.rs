@@ -946,7 +946,26 @@ pub struct SubCodes<'a> {
     held: bool,
 }
 
-impl SubCodes<'_> {
+impl<'a> SubCodes<'a> {
+    /// Whether the record's grids carry codes.
+    #[inline]
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
+    /// Grid entry `entry`'s codes, read in place ([`Bytes::get`]: as long
+    /// as the reader's span keeps their page pinned); empty for an entry
+    /// without them.
+    #[inline]
+    pub fn get(&self, entry: &GroupEntry, slots: u32, directory: &[u8]) -> Result<&'a [u8]> {
+        let len = self.len(entry, slots, directory);
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let at = self.containers_at + entry.at as usize + entry.len as usize;
+        self.payload.get(at, at + len)
+    }
+
     /// Bytes of grid entry `entry`'s codes, of a group of `slots` slots
     /// (its frontier in `directory`, the record's directory bytes): 0 for
     /// another kind or a record without them.
