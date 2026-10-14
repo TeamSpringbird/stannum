@@ -52,11 +52,6 @@ const SEEK_RATIO: usize = 4;
 /// walked ([`Walk::run`]): a rare lead's container is a line or a few.
 const LEAD_PREFETCH_LINES: usize = 4;
 
-/// Cache lines of the second required term's container in the lead's next
-/// group asked for with the lead's: a grid of a few thousand slots is
-/// some ten lines.
-const SECOND_PREFETCH_LINES: usize = 16;
-
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
 
@@ -733,22 +728,9 @@ struct Mem<'a> {
     ///
     /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
     used: u32,
-    /// A group sought ahead of its load ([`Walk::run`]) and where the
-    /// directory stood after: [`load`] of that group starts from it.
-    ahead: (u32, usize),
 }
 
 impl Mem<'_> {
-    /// Moves the directory position to where seeking group `g` ahead of
-    /// its load left it, if it was ([`Mem::ahead`]): no further than `g`'s
-    /// entry, or the first after it.
-    #[inline]
-    fn sought_ahead(&mut self, g: u32) {
-        if self.ahead.0 == g {
-            self.hint = self.hint.max(self.ahead.1);
-        }
-    }
-
     /// The posting index of `local` if the term holds it; slots must be
     /// asked in increasing order (asking one again is allowed).
     #[inline]
@@ -1136,7 +1118,6 @@ fn load_in<'a>(
         mem.count = mem.list.len() as u32;
         return Ok(true);
     }
-    mem.sought_ahead(g);
     let Some(entry) = set.find(g, &mut mem.hint) else {
         mem.count = 0;
         return Ok(false);
@@ -1583,18 +1564,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let mem = &self.mems[lead];
             if mem.entry != usize::MAX {
                 let set = self.terms[lead].as_ref().expect("the lead");
-                let next = set.prefetch_next(mem.hint, LEAD_PREFETCH_LINES);
-                // And the second term's there, which the lead's members
-                // are filtered by next (a grid probed at a few scattered
-                // lines); where its directory stands then is kept for its
-                // load, which seeks no further.
-                if let (Some(next), Some(&t)) = (next, self.req.get(1)) {
-                    let mem = &mut self.mems[t];
-                    let mut hint = mem.hint.max(mem.ahead.1);
-                    let set = self.terms[t].as_ref().expect("required");
-                    set.prefetch_group(next, &mut hint, SECOND_PREFETCH_LINES);
-                    mem.ahead = (next, hint);
-                }
+                set.prefetch_next(mem.hint, LEAD_PREFETCH_LINES);
             }
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
@@ -1701,7 +1671,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 return false;
             }
             let mem = &mut self.mems[t];
-            mem.sought_ahead(g);
             match set.find(g, &mut mem.hint) {
                 Some(entry) if matches!(entry.src, Src::Container { entry, .. } if entry.kind == KIND_GRID) =>
                     {}

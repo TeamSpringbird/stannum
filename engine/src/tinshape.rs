@@ -412,28 +412,13 @@ impl<'a> TermSet<'a> {
     /// to be read into the cache, where its page is pinned already
     /// ([`Bytes::prefetch`](segment::tinshape::blob::Bytes::prefetch)):
     /// the walk reads it next, after a group's work it arrives during.
-    /// Gives that next group's index.
     #[inline]
-    fn prefetch_next(&self, hint: usize, max_lines: usize) -> Option<u32> {
-        let dir = self.dir.as_ref()?;
-        if hint + 1 >= dir.len() {
-            return None;
-        }
-        let entry = Self::entry(dir, &self.docs, hint + 1);
-        self.postings.container(&entry).prefetch(max_lines);
-        Some(entry.index)
-    }
-
-    /// [`Self::prefetch_next`] for a grouped term's group `group`, sought
-    /// from `hint` forward (the hint is left at the first group at or
-    /// after it, as [`Self::find`] leaves it), if the term holds it.
-    #[inline]
-    fn prefetch_group(&self, group: u32, hint: &mut usize, max_lines: usize) {
-        if self.dir.is_some()
-            && let Some(g) = self.find(group, hint)
-            && let Src::Container { bytes, .. } = g.src
+    fn prefetch_next(&self, hint: usize, max_lines: usize) {
+        if let Some(dir) = &self.dir
+            && hint + 1 < dir.len()
         {
-            bytes.prefetch(max_lines);
+            let entry = Self::entry(dir, &self.docs, hint + 1);
+            self.postings.container(&entry).prefetch(max_lines);
         }
     }
 
