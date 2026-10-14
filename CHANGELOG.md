@@ -157,11 +157,11 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   members as its local slots in sorted `u16`s (page layout 11) rather than
   Elias-Fano, which decodes them one at a time below 16 members at every
   vector level: walks widen an array eight values a step, set it in a row
-  or gallop through it in place. At 150 million rows the index grows 1.7%
-  and queries take 2.7% (conjunction), 7.9% (phrase) and 5.2%
-  (disjunction) fewer cycles on aarch64, 1.5% to 3% fewer under
-  `full_score`, for the same answers. An index of layout 10 must be
-  rebuilt.
+  or gallop through it in place. At 150 million rows the index grows 1.7%;
+  on aarch64 queries take 2.7% (conjunction), 7.9% (phrase) and 5.2%
+  (disjunction) fewer cycles, 2.2% to 3.1% fewer under `full_score`; on
+  x86-64 3.5% and 1.3% fewer for conjunctions and disjunctions, phrases
+  within 2%; the same answers. An index of layout 10 must be rebuilt.
 - A ranked disjunction over `TNS1` reads its terms' grids where they lie on
   their pages rather than copying each into a row, and copies a grid across
   two pages straight into its row rather than stitching it first: at 150

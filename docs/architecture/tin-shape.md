@@ -1710,22 +1710,31 @@ verifies and equals its own merge): 65.5M arrays (822M members, 1.64 GB),
 Every term keeps its form: an array weighs as the list it replaces when a
 term chooses between grouped and sparse (weighed by their bytes, arrays
 moved 80,000 terms to sparse). Replays against layout 10 (062967b),
-`--forget`, 400 queries a style, the M4 four rounds (score) or two
-(`full_score`), interleaved:
+`--forget`, interleaved: on the M4 400 queries a style, four rounds
+(score) or two (`full_score`); on a Sapphire Rapids devbox
+(`devbox-arrays-ab.sh`, m7i.4xlarge, AVX-512 VBMI; perf, the process less
+a load-only run) 300 and 150 queries, two rounds:
 
-| layout 11 against 10 | M4 instructions / cycles |
-| --- | --- |
-| score conjunction | -3.1 / -2.7% |
-| score phrase | -2.6 / -7.9% |
-| score disjunction | -2.0 / -5.2% |
-| full conjunction | -1.9 / -2.2% |
-| full phrase | -1.5 / -3.1% |
-| full disjunction | -0.9 / -2.7% |
+| layout 11 against 10 | M4 instructions / cycles | x86 instructions / cycles / mean latency |
+| --- | --- | --- |
+| score conjunction | -3.1 / -2.7% | -2.0 / -3.5 / -3.2% |
+| score phrase | -2.6 / -7.9% | -1.6 / +0.8 / +1.6% |
+| score disjunction | -2.0 / -5.2% | -1.5 / -1.3 / -0.1% |
+| full conjunction | -1.9 / -2.2% | -1.3 / -2.0 / -1.5% |
+| full phrase | -1.5 / -3.1% | -1.0 / +1.6 / +3.1% |
+| full disjunction | -0.9 / -2.7% | -0.6 / -1.2 / -1.0% |
 
-Conjunction latency moved with the order of the pair (the second run of
-each pair was the faster, by up to 12%), -2% to +2% over the rounds. Every
-answer of the whole trace is PostgreSQL's (1,253, 1,228 and 1,252 queries
-equal), and `--full` outputs are f0962a8's byte for byte.
+Conjunction latency on the M4 moved with the order of the pair (the second
+run of each pair was the faster, by up to 12%), -2% to +2% over the
+rounds. x86 branch misses fall 1 to 5%. On x86 (`tnsef arrays`, AVX-512
+lists against AVX2 arrays) the gaps are as wide as on the M4 for marking
+(31 against 21 ns at 1 to 7 members, 52 against 33 at 8 to 15) and wider
+for seeking (39 against 13, 81 against 21), but widening an array costs
+17 to 18 ns below 16 members there against 5 on the M4: the AVX2 body is
+a call through the level's dispatch even for three values. Every answer
+of the whole trace is PostgreSQL's (1,253, 1,228 and 1,252 queries equal),
+and `--full` outputs are f0962a8's byte for byte; on x86 both layouts give
+the same outputs in every style and mode.
 
 ## Open
 
