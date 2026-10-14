@@ -91,8 +91,8 @@ pub const FORM_ROUNDED: u8 = 0x10;
 /// ([`Directory`]; every grouped record from page layout version 11 on).
 pub const FORM_SKIPS: u8 = 0x20;
 /// Set in a grouped record's form when its grid containers end in their
-/// sub-range codes ([`put_sub_codes`]; every grouped record from page
-/// layout version 13 on). A sparse record's [`FORM_COMPACT`].
+/// sub-range codes ([`put_sub_codes`]; from page layout version 13 on, every
+/// grouped record holding a grid). A sparse record's [`FORM_COMPACT`].
 pub const FORM_SUBS: u8 = 0x40;
 
 /// Postings a footer-less record holds at most.
@@ -606,7 +606,11 @@ pub fn encode_reusing<'r>(
     } else {
         FORM_GROUPED
             | FORM_SKIPS
-            | if options.sub_codes { FORM_SUBS } else { 0 }
+            | if grouped_stats.sub_bytes > 0 {
+                FORM_SUBS
+            } else {
+                0
+            }
             | if inline { FORM_LENGTHS } else { 0 }
             | if options.group_frontiers == GroupFrontiers::Rounded {
                 FORM_ROUNDED
@@ -2012,7 +2016,13 @@ fn decode_entries(
         };
         let end = bytes.len().min(start.saturating_add(scan.min(UNITS_CHUNK)));
         let before = out.len();
-        decode_chunk(
+        // A record without codes decodes as one of layout 12 does.
+        let decode = if dir.subs {
+            decode_chunk::<true>
+        } else {
+            decode_chunk::<false>
+        };
+        decode(
             &bytes[start..end],
             start,
             resume,
@@ -2073,10 +2083,11 @@ fn push_entry(
 }
 
 /// The whole entries of one chunk of [`decode_entries`] (at offset `base`
-/// of the directory), up to `target` in `out`.
+/// of the directory), up to `target` in `out`; `SUBS` when its grids end in
+/// sub-range codes ([`Directory::subs`]).
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn decode_chunk(
+fn decode_chunk<const SUBS: bool>(
     bytes: &[u8],
     base: usize,
     resume: &mut Resume,
@@ -2171,8 +2182,12 @@ fn decode_chunk(
             let max_bucket = max_bucket as u8;
             // A grid's sub-range codes follow its words: a byte per
             // sub-range and frontier pair.
-            let codes = (sub_ranges(group.slots()) * ((head >> 4) + 1)) as u64;
-            let codes = codes & bits::mask(kind == KIND_GRID && dir.subs);
+            let codes = if SUBS {
+                let codes = (sub_ranges(group.slots()) * ((head >> 4) + 1)) as u64;
+                codes & bits::mask(kind == KIND_GRID)
+            } else {
+                0
+            };
             (
                 GroupEntry {
                     index: index as u32,
@@ -4198,7 +4213,11 @@ mod tests {
                 .sub_codes_into(entry, group.slots(), &mut codes)
                 .unwrap();
             assert_eq!(held, options.sub_codes && entry.kind == KIND_GRID);
-            assert_eq!(parsed.subs, options.sub_codes);
+            // The form says so only of a record holding a grid.
+            assert_eq!(
+                parsed.subs,
+                options.sub_codes && entries.iter().any(|e| e.kind == KIND_GRID)
+            );
             if held {
                 let n = front.len();
                 assert_eq!(codes.len(), sub_ranges(group.slots()) * n);

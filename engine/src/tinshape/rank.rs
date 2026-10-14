@@ -418,6 +418,7 @@ pub(super) struct Sc<'s, 'a> {
     ///
     /// [`put_sub_codes`]: segment::tinshape::postings::put_sub_codes
     se: usize,
+    s_held: bool,
     s_codes: &'a [u8],
     s_n: usize,
     s_subs: usize,
@@ -476,6 +477,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors_block: u32::MAX,
             common: None,
             se: usize::MAX,
+            s_held: matches!(set.postings.form, Form::Grouped(_)) && set.postings.subs,
             s_codes: &[],
             s_n: 0,
             s_subs: 0,
@@ -679,11 +681,33 @@ impl<'s, 'a> Sc<'s, 'a> {
         self.floor_kept_in(b, NO_SUB, bucket)
     }
 
+    /// [`Self::floor_kept`] of a term without sub-range codes.
+    #[inline]
+    fn floor_kept_plain(&mut self, b: usize, bucket: u8) -> (u32, f32) {
+        let at = usize::from(bucket) % BUCKET_COUNT;
+        let tag = (b as u64) << 16;
+        if self.bb_block[at] == tag {
+            return self.bb[at];
+        }
+        self.bb_block[at] = tag;
+        let floor = self.floor_at(b, bucket);
+        let v = (
+            floor,
+            self.scorer
+                .bound_through(TfBucket::new(bucket).expect("a valid bucket"), floor),
+        );
+        self.bb[at] = v;
+        v
+    }
+
     /// [`Self::floor_kept`] in sub-range `r` of block `b`'s group: the
     /// sub-range's floor where the entry has sub-range codes ([`NO_SUB`]:
     /// the block's).
     #[inline]
     fn floor_kept_in(&mut self, b: usize, r: usize, bucket: u8) -> (u32, f32) {
+        if !self.s_held {
+            return self.floor_kept_plain(b, bucket);
+        }
         let sub = r != NO_SUB && self.subs(b);
         let at = usize::from(bucket) % BUCKET_COUNT;
         // Blocks are numbered below `u32::MAX` (a record has fewer
@@ -743,6 +767,10 @@ impl<'s, 'a> Sc<'s, 'a> {
     /// hand (a grid group's).
     #[inline]
     fn subs(&mut self, b: usize) -> bool {
+        // Most terms' records hold no grid: nothing to look up.
+        if !self.s_held {
+            return false;
+        }
         if self.se != b {
             self.load_subs(b);
         }
