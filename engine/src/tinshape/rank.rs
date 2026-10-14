@@ -1306,6 +1306,12 @@ struct Walk<'s, 'a, T: Touch> {
     /// candidate at hand holds, both in the scorer's order.
     present_list: Vec<usize>,
     held_list: Vec<usize>,
+    /// A disjunction's word at hand (`usize::MAX` for none yet in the
+    /// group): per present term (as `present_list` orders them), its word
+    /// of members there and the posting index of the first.
+    cand_w: usize,
+    cand_words: Vec<u64>,
+    cand_base: Vec<u32>,
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
     plan: Plan,
@@ -3054,6 +3060,9 @@ pub(super) fn walk_into<'s, 'a>(
         present: vec![false; n],
         present_list: Vec::with_capacity(n),
         held_list: Vec::with_capacity(n),
+        cand_w: usize::MAX,
+        cand_words: Vec::with_capacity(n),
+        cand_base: Vec::with_capacity(n),
         blocks: vec![0; n],
         sub_bounds: Vec::new(),
         plan: Plan::default(),
@@ -3297,6 +3306,76 @@ struct Row {
     w: usize,
     run: u32,
     at: RowAt,
+    /// A grouped term's buckets in the group at hand, once a candidate's
+    /// is read.
+    tf: TfRun,
+}
+
+impl Row {
+    /// Moves the cursor to word `w` (no earlier than its own): `run`
+    /// counts the members in the words before it. The few words between
+    /// two candidates are counted here; a longer stretch by the kernel,
+    /// whose call and reduction cost more than a word or two.
+    #[inline(always)]
+    fn advance(&mut self, w: usize) {
+        if w <= self.w {
+            return;
+        }
+        self.run += if w - self.w <= 4 {
+            (self.w..w).map(|x| self.at.word(x).count_ones()).sum::<u32>()
+        } else {
+            kernels::popcount_bytes(&self.at.bytes()[self.w * 8..w * 8])
+        };
+        self.w = w;
+    }
+}
+
+/// A grouped term's buckets in the group at hand (its directory entry's
+/// part of the TF tail), on the page they lie on: each candidate's bucket
+/// is read there, without looking up its entry and the page again. Taken
+/// at the group's first bucket read, and only where the part lies on one
+/// page (else, or for a sparse term, buckets are read as before). Valid
+/// until [`Walk::group_done`] releases the group's pages, as [`RowAt`] is.
+#[derive(Clone, Copy)]
+struct TfRun {
+    state: u8,
+    width: u8,
+    /// The entry's first posting index, and where its bucket starts in
+    /// `bytes`, in bits.
+    first: u32,
+    bit: usize,
+    bytes: *const u8,
+    len: usize,
+}
+
+impl TfRun {
+    const UNSET: u8 = 0;
+    const READY: u8 = 1;
+    const NONE: u8 = 2;
+
+    /// The bucket of posting `index`, which the run holds.
+    #[inline(always)]
+    fn bucket(&self, index: u32) -> Result<u8> {
+        debug_assert_eq!(self.state, Self::READY);
+        let at = self.bit + (index - self.first) as usize * usize::from(self.width);
+        // SAFETY: on a page the open span pinned (or a buffer it owns),
+        // read before the group's pages are released (see the type).
+        let bytes = unsafe { std::slice::from_raw_parts(self.bytes, self.len) };
+        Ok(bits::get_at(bytes, at, u32::from(self.width))? as u8)
+    }
+}
+
+impl Default for TfRun {
+    fn default() -> Self {
+        Self {
+            state: Self::UNSET,
+            width: 0,
+            first: 0,
+            bit: 0,
+            bytes: std::ptr::NonNull::dangling().as_ptr(),
+            len: 0,
+        }
+    }
 }
 
 /// Where a disjunction term's row lies in the group at hand: the group's
@@ -3406,6 +3485,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         r.run = 0;
         r.entry = usize::MAX;
         r.at = RowAt::of(row);
+        r.tf = TfRun::default();
         if let Form::Sparse(list) = &set.postings.form {
             row.fill(0);
             let cursor = set.sparse.get_or_insert_with(|| {
@@ -3466,6 +3546,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let end = base + group.slots() - 1;
         self.answer.windows += 1;
         // The present terms' bounds over the group.
+        self.cand_w = usize::MAX;
         let mut sb = std::mem::take(&mut self.sub_bounds);
         sb.clear();
         sb.resize(n, 0.0);
@@ -3809,11 +3890,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn row_index(&mut self, i: usize, local: u32) -> u32 {
         let r = &mut self.row_state[i];
         let w = local as usize / 64;
-        if w > r.w {
-            r.run += kernels::popcount_bytes(&r.at.bytes()[r.w * 8..w * 8]);
-            r.w = w;
-        }
+        r.advance(w);
         r.first + r.run + (r.at.word(w) & ((1u64 << (local % 64)) - 1)).count_ones()
+    }
+
+    /// Makes `w` the disjunction's word at hand, a word of the group at
+    /// hand no earlier than the last: each present term's word of members
+    /// there and the posting index of its first (see [`Walk::cand_w`]),
+    /// once for the word's candidates.
+    #[inline]
+    fn or_word(&mut self, w: usize) {
+        self.cand_w = w;
+        self.cand_words.clear();
+        self.cand_base.clear();
+        for &i in &self.present_list {
+            let r = &mut self.row_state[i];
+            r.advance(w);
+            self.cand_words.push(r.at.word(w));
+            self.cand_base.push(r.first + r.run);
+        }
     }
 
     /// Bounds the candidate at bit `bit` of word `w` of group `g` and, if
@@ -3924,15 +4019,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let geometry = self.geometry;
         let tid = move || geometry.tid_in(g as usize, local);
         let mut bound = 0.0_f32;
+        if self.cand_w != w {
+            self.or_word(w);
+        }
+        let below = (1u64 << bit) - 1;
         self.held_list.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
-            if self.row_state[i].at.word(w) >> bit & 1 == 1 {
+            let word = self.cand_words[p];
+            if word >> bit & 1 == 1 {
                 self.held_list.push(i);
                 // A member's block is its posting index's: the footer is
                 // decoded whole (`Sc::decode_all`), and its blocks hold
                 // `block_size` postings each.
-                let index = self.row_index(i, local);
+                let index = self.cand_base[p] + (word & below).count_ones();
+                debug_assert_eq!(index, self.row_index(i, local));
                 self.held_index[i] = index;
                 let entry = self.row_state[i].entry;
                 let s = &mut self.sc[i];
@@ -4044,9 +4145,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn or_bucket_of(&mut self, i: usize) -> Result<u32> {
         let index = self.held_index[i];
         let block = self.blocks[i];
+        if self.row_state[i].tf.state == TfRun::UNSET {
+            self.row_state[i].tf = self.tf_run(i, block)?;
+        }
+        let run = self.row_state[i].tf;
         let s = &mut self.sc[i];
         let set = self.terms[s.term].as_ref().expect("scoring");
-        let bucket = s.bucket_in(block, set.postings.tf, index)?;
+        let bucket = if run.state == TfRun::READY {
+            run.bucket(index)?
+        } else {
+            s.bucket_in(block, set.postings.tf, index)?
+        };
         if s.footer.single().is_none() {
             self.touch.touch(
                 Part::TfTail,
@@ -4057,6 +4166,45 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let floor = s.floor_at(block, bucket);
         self.buckets[i] = bucket;
         Ok(floor)
+    }
+
+    /// Scoring term `i`'s [`TfRun`] in the group at hand, whose directory
+    /// entry is `block`: [`TfRun::NONE`] for a sparse term, or one whose
+    /// buckets there cross a page.
+    #[inline(never)]
+    fn tf_run(&self, i: usize, block: usize) -> Result<TfRun> {
+        let none = TfRun {
+            state: TfRun::NONE,
+            ..TfRun::default()
+        };
+        let s = &self.sc[i];
+        let Some(e) = s.group_entry(block) else {
+            return Ok(none);
+        };
+        if e.width == 0 || e.count == 0 {
+            return Ok(TfRun {
+                state: TfRun::READY,
+                first: e.first,
+                ..TfRun::default()
+            });
+        }
+        let tf = self.terms[s.term].as_ref().expect("scoring").postings.tf;
+        let from = e.tf_bit as usize / 8;
+        let to = (e.bucket_bit(e.first + e.count - 1) + usize::from(e.width)).div_ceil(8);
+        let page = tf.page_end(from);
+        if page < to {
+            return Ok(none);
+        }
+        // Eight bytes past the last where the page has them: whole loads.
+        let bytes = tf.get(from, (to + 7).min(page))?;
+        Ok(TfRun {
+            state: TfRun::READY,
+            width: e.width,
+            first: e.first,
+            bit: e.tf_bit as usize - from * 8,
+            bytes: bytes.as_ptr(),
+            len: bytes.len(),
+        })
     }
 }
 
