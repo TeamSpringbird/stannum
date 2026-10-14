@@ -1526,11 +1526,6 @@ struct Walk<'s, 'a, T: Touch> {
     sieve_depth: usize,
     /// A disjunction's candidate at hand's sub-range ([`Walk::or_stage`]).
     cand_r: usize,
-    /// Whether a sieve term has sub-range codes in the group at hand, so
-    /// the sieve takes a sub-range ([`SUB_SLOTS`]) at a time, and the one
-    /// its bounds are at ([`NO_SUB`] before the first).
-    sieve_split: bool,
-    sieve_r: usize,
     /// Whether the group's candidate words were sieved by the first term
     /// already ([`Walk::sieve_words`]): its pass over a chunk then keeps
     /// nearly all, which says nothing of what it drops.
@@ -1929,18 +1924,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let base = self.geometry.groups[g as usize].slot_base;
         let mut left = std::mem::take(&mut self.sieve_cands);
         let mut more = true;
-        let mut at = 0;
-        'chunks: while at < cands.len() {
-            let mut end = (at + SIEVE_CHUNK).min(cands.len());
-            if self.sieve_split {
-                // A chunk within one sub-range, sieved at its bounds.
-                let r = sub_of(cands[at]);
-                let next = (r as u32 + 1) * SUB_SLOTS;
-                end = at + cands[at..end].partition_point(|l| *l < next);
-                self.sieve_sub(r);
-            }
-            let chunk = &cands[at..end];
-            at = end;
+        'chunks: for chunk in cands.chunks(SIEVE_CHUNK) {
             left.clear();
             left.extend_from_slice(chunk);
             self.sieve(g, &mut left)?;
@@ -2031,11 +2015,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.sieve_prefix.clear();
         self.sieve_depth = self.sieve_terms.len();
         self.sieve_pre = false;
-        self.sieve_r = NO_SUB;
-        self.sieve_split = false;
-        for st in &self.sieve_terms {
-            self.sieve_split |= self.sc[st.i].subs(st.entry);
-        }
         let Some(first) = self.sieve_terms.first_mut() else {
             return false;
         };
@@ -2057,26 +2036,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         first.table[0] = v;
         first.floors[0] = floor;
         rest + v < score
-    }
-
-    /// Points the sieve at sub-range `r` of the group at hand: each sieve
-    /// term with sub-range codes there bounds a candidate by the
-    /// sub-range's bound until its bucket is read, and by the sub-range's
-    /// floors after (its tables are cleared for them).
-    fn sieve_sub(&mut self, r: usize) {
-        if self.sieve_r == r {
-            return;
-        }
-        self.sieve_r = r;
-        for k in 0..self.sieve_terms.len() {
-            let st = &mut self.sieve_terms[k];
-            let s = &mut self.sc[st.i];
-            if s.subs(st.entry) {
-                self.sieve_ub[st.i] = s.sub_bound(r);
-                st.table = [f32::NAN; BUCKET_COUNT];
-                st.floors = [0; BUCKET_COUNT];
-            }
-        }
     }
 
     /// Counts the members per word of sieve term `k`'s bitmap, once per
@@ -2172,12 +2131,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         } else {
             e.tf_bit as usize - from * 8
         };
-        // The whole group at once, or a sub-range at a time at its bounds.
-        let step = if self.sieve_split {
-            SUB_WORDS
-        } else {
-            words.len().max(1)
-        };
+        // The whole group at once.
+        let step = words.len().max(1);
         let mut run = 0u32;
         let mut w0 = 0;
         while w0 < words.len() {
@@ -2196,20 +2151,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
                 run += m.count_ones();
             }
-            if self.sieve_split {
-                if words[w0..w1].iter().all(|w| *w == 0) {
-                    w0 = w1;
-                    continue;
-                }
-                self.sieve_sub(w0 / SUB_WORDS);
-            }
             let st = self.sieve_terms[0];
             let (mut table, mut floors) = (st.table, st.floors);
             for bucket in 0..=most as u8 {
                 let b = usize::from(bucket);
                 if table[b].is_nan() {
-                    (floors[b], table[b]) =
-                        self.sc[st.i].floor_kept_in(st.entry, self.sieve_r, bucket);
+                    (floors[b], table[b]) = self.sc[st.i].floor_kept(st.entry, bucket);
                 }
             }
             self.sieve_terms[0].table = table;
@@ -2391,8 +2338,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 fresh &= fresh - 1;
                 let b = usize::from(bucket);
                 if table[b].is_nan() {
-                    (floors[b], table[b]) =
-                        self.sc[st.i].floor_kept_in(st.entry, self.sieve_r, bucket);
+                    (floors[b], table[b]) = self.sc[st.i].floor_kept(st.entry, bucket);
                 }
             }
             self.sieve_terms[k].table = table;
@@ -2511,24 +2457,45 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     ) -> usize {
         let geometry = self.geometry;
         let bar = self.bar;
+        // The sieve terms' sub-range codes at hand, where their grids have
+        // them: a candidate's floor at its bucket is its sub-range's.
+        let mut subbed = 0u64;
+        for (k, st) in self.sieve_terms.iter().enumerate() {
+            if k < 64 && self.sc[st.i].subs(st.entry) {
+                subbed |= 1 << k;
+            }
+        }
         let mut kept = 0;
         for j in 0..left.len() {
             let c = left[j] as usize;
+            let r = sub_of(locals[j]);
             let (mut floor, mut low, mut whole) = (0u32, u32::MAX, true);
-            for st in &self.sieve_terms {
+            // Whether a sub-range's floor rose above the one the sieve
+            // bounded the candidate at.
+            let mut raised = false;
+            for (k, st) in self.sieve_terms.iter().enumerate() {
                 let b = held[st.i * m + c];
                 if b == NO_BUCKET {
                     continue;
                 }
                 match st.floors.get(usize::from(b)) {
-                    Some(&f) => (floor, low) = (floor.max(f), low.min(f)),
+                    Some(&f) => {
+                        let f = if k < 64 && subbed >> k & 1 == 1 {
+                            let sub = self.sc[st.i].sub_floor_at(r, b);
+                            raised |= sub > f;
+                            sub
+                        } else {
+                            f
+                        };
+                        (floor, low) = (floor.max(f), low.min(f));
+                    }
                     None => whole = false,
                 }
             }
             // Floors that agree bound it as the sieve did; a bucket past
             // the table's is left to its own check.
             let keep = !whole
-                || low >= floor
+                || (low >= floor && !raised)
                 || !cut_by(
                     bar,
                     {
@@ -2636,21 +2603,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     e = e.min(group_end);
                     continue;
                 }
-                if s.subs(b) {
-                    // A grid group's sub-range: its codes bound it.
-                    let r = sub_of(local);
-                    e = e.min((base + (r as u32 + 1) * SUB_SLOTS - 1).min(group_end));
-                    *mb = s.sub_max_bucket(r);
-                    if *mb == NO_BUCKET {
-                        *wt = 0.0;
-                        continue;
-                    }
-                    *wt = s.sub_bound(r);
-                } else {
-                    *wt = s.bound(b);
-                    e = e.min(s.footer.last(b));
-                    *mb = s.max_bucket(b);
-                }
+                *wt = s.bound(b);
+                e = e.min(s.footer.last(b));
+                *mb = s.max_bucket(b);
                 bound += *wt;
                 let m = usize::from(*mb);
                 nsum += f64::from(s.num[m]);
@@ -3323,8 +3278,6 @@ pub(super) fn walk_into<'s, 'a>(
         sieve_cands: Vec::new(),
         sieve_depth: 0,
         cand_r: NO_SUB,
-        sieve_split: false,
-        sieve_r: NO_SUB,
         sieve_pre: false,
         sieve_prefix: Vec::new(),
         sieve_fields: Vec::new(),
@@ -3826,14 +3779,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         sub.clear();
         sub.extend_from_slice(&bounds);
         let sparse = terms.iter().any(|&i| !self.sc[i].grouped());
-        // A grid group's term with sub-range codes is bounded per
-        // sub-range by them.
-        let mut subbed = false;
-        for &i in &terms {
-            let entry = self.row_state[i].entry;
-            let s = &mut self.sc[i];
-            subbed |= s.grouped() && s.subs(entry);
-        }
         let mut group_total = 0.0_f32;
         for &bound in &bounds {
             group_total += bound;
@@ -3902,18 +3847,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     }
                     if !bounded {
                         bounded = true;
-                        let total = if sparse || subbed {
+                        let total = if sparse {
                             let from = base + (w0 * 64) as u32;
                             let to = (base + (w1 * 64) as u32 - 1).min(end);
-                            let r = w0 / SUB_WORDS;
                             let mut total = 0.0_f32;
                             for (&i, bound) in terms.iter().zip(sub.iter_mut()) {
-                                let entry = self.row_state[i].entry;
-                                let s = &mut self.sc[i];
-                                if !s.grouped() {
-                                    *bound = s.range_bound(from, to);
-                                } else if s.subs(entry) {
-                                    *bound = s.sub_bound(r);
+                                if !self.sc[i].grouped() {
+                                    *bound = self.sc[i].range_bound(from, to);
                                 }
                                 total += *bound;
                             }
@@ -4114,13 +4054,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// `base`), for the sieve, and sieves them once a chunk is kept.
     #[inline(never)]
     fn or_keep(&mut self, g: u32, base: u32, w: usize, mut word: u64) -> Result<()> {
-        if self.sieve_split
-            && let Some(&l) = self.sieve_cands.first()
-            && sub_of(l) != w / SUB_WORDS
-        {
-            // A chunk lies within one sub-range, sieved at its bounds.
-            self.or_sieved(g, base)?;
-        }
         while word != 0 {
             self.sieve_cands
                 .push((w * 64) as u32 + word.trailing_zeros());
@@ -4139,9 +4072,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut left = std::mem::take(&mut self.sieve_cands);
         let mut result = Ok(());
         if left.len() >= SIEVE_MIN {
-            if self.sieve_split {
-                self.sieve_sub(sub_of(left[0]));
-            }
             result = self.sieve(g, &mut left);
         }
         for &local in &left {
@@ -4185,7 +4115,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let b = s.block_of(index, entry);
                 debug_assert_eq!(Some(b), s.block_at(slot));
                 self.blocks[i] = b;
-                let v = s.bound_in(b, sub_of(local));
+                let v = s.bound(b);
                 self.held_bound[i] = v;
                 bound += v;
             }
@@ -4270,8 +4200,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let s = &mut self.sc[h];
             let read = self.buckets[h];
             let v = if read == NO_BUCKET {
-                let most = TfBucket::new(s.max_bucket_in(self.blocks[h], self.cand_r))
-                    .expect("a valid bucket");
+                let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
                 s.scorer.bound_through(most, floor).min(self.held_bound[h])
             } else {
                 s.scorer
