@@ -32,7 +32,7 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
-    array_bytes, higher,
+    array_bytes, higher, lower,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -769,6 +769,43 @@ impl Mem<'_> {
     }
 }
 
+/// `x`'s place in [`f32::total_cmp`]'s order: `a.total_cmp(&b)` is
+/// `order_key(a).cmp(&order_key(b))` (the standard library's own mapping).
+#[inline(always)]
+fn order_key(x: f32) -> i32 {
+    let bits = x.to_bits() as i32;
+    bits ^ (((bits >> 31) as u32) >> 1) as i32
+}
+
+/// The bar as [`Walk::keeps`] compares bounds with it: its score's
+/// [`order_key`] and its ctid.
+#[derive(Clone, Copy)]
+struct BarKey {
+    key: i32,
+    tid: Tid,
+}
+
+impl BarKey {
+    fn of(bar: Option<(f32, Tid)>) -> Option<Self> {
+        bar.map(|(score, tid)| Self {
+            key: order_key(score),
+            tid,
+        })
+    }
+
+    /// Whether a match of ctid `from()` scoring at most `bound` may still
+    /// be kept: `!cut_by(bar, bound, from)`, without a branch on the
+    /// comparison but for a tie, which is rare.
+    #[inline(always)]
+    fn keeps(self, bound: f32, from: impl FnOnce() -> Tid) -> bool {
+        let k = order_key(bound);
+        if k == self.key {
+            return from() < self.tid;
+        }
+        k > self.key
+    }
+}
+
 /// [`Walk::cut`] against the bar `bar`.
 #[inline]
 fn cut_by(bar: Option<(f32, Tid)>, bound: f32, from: impl FnOnce() -> Tid) -> bool {
@@ -1269,6 +1306,12 @@ struct Walk<'s, 'a, T: Touch> {
     /// candidate at hand holds, both in the scorer's order.
     present_list: Vec<usize>,
     held_list: Vec<usize>,
+    /// A disjunction's word at hand (`usize::MAX` for none yet in the
+    /// group): per present term (as `present_list` orders them), its word
+    /// of members there and the posting index of the first.
+    cand_w: usize,
+    cand_words: Vec<u64>,
+    cand_base: Vec<u32>,
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
     plan: Plan,
@@ -3017,6 +3060,9 @@ pub(super) fn walk_into<'s, 'a>(
         present: vec![false; n],
         present_list: Vec::with_capacity(n),
         held_list: Vec::with_capacity(n),
+        cand_w: usize::MAX,
+        cand_words: Vec::with_capacity(n),
+        cand_base: Vec::with_capacity(n),
         blocks: vec![0; n],
         sub_bounds: Vec::new(),
         plan: Plan::default(),
@@ -3260,6 +3306,78 @@ struct Row {
     w: usize,
     run: u32,
     at: RowAt,
+    /// A grouped term's buckets in the group at hand, once a candidate's
+    /// is read.
+    tf: TfRun,
+}
+
+impl Row {
+    /// Moves the cursor to word `w` (no earlier than its own): `run`
+    /// counts the members in the words before it. The few words between
+    /// two candidates are counted here; a longer stretch by the kernel,
+    /// whose call and reduction cost more than a word or two.
+    #[inline(always)]
+    fn advance(&mut self, w: usize) {
+        if w <= self.w {
+            return;
+        }
+        self.run += if w - self.w <= 4 {
+            (self.w..w)
+                .map(|x| self.at.word(x).count_ones())
+                .sum::<u32>()
+        } else {
+            kernels::popcount_bytes(&self.at.bytes()[self.w * 8..w * 8])
+        };
+        self.w = w;
+    }
+}
+
+/// A grouped term's buckets in the group at hand (its directory entry's
+/// part of the TF tail), on the page they lie on: each candidate's bucket
+/// is read there, without looking up its entry and the page again. Taken
+/// at the group's first bucket read, and only where the part lies on one
+/// page (else, or for a sparse term, buckets are read as before). Valid
+/// until [`Walk::group_done`] releases the group's pages, as [`RowAt`] is.
+#[derive(Clone, Copy)]
+struct TfRun {
+    state: u8,
+    width: u8,
+    /// The entry's first posting index, and where its bucket starts in
+    /// `bytes`, in bits.
+    first: u32,
+    bit: usize,
+    bytes: *const u8,
+    len: usize,
+}
+
+impl TfRun {
+    const UNSET: u8 = 0;
+    const READY: u8 = 1;
+    const NONE: u8 = 2;
+
+    /// The bucket of posting `index`, which the run holds.
+    #[inline(always)]
+    fn bucket(&self, index: u32) -> Result<u8> {
+        debug_assert_eq!(self.state, Self::READY);
+        let at = self.bit + (index - self.first) as usize * usize::from(self.width);
+        // SAFETY: on a page the open span pinned (or a buffer it owns),
+        // read before the group's pages are released (see the type).
+        let bytes = unsafe { std::slice::from_raw_parts(self.bytes, self.len) };
+        Ok(bits::get_at(bytes, at, u32::from(self.width))? as u8)
+    }
+}
+
+impl Default for TfRun {
+    fn default() -> Self {
+        Self {
+            state: Self::UNSET,
+            width: 0,
+            first: 0,
+            bit: 0,
+            bytes: std::ptr::NonNull::dangling().as_ptr(),
+            len: 0,
+        }
+    }
 }
 
 /// Where a disjunction term's row lies in the group at hand: the group's
@@ -3369,6 +3487,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         r.run = 0;
         r.entry = usize::MAX;
         r.at = RowAt::of(row);
+        r.tf = TfRun::default();
         if let Form::Sparse(list) = &set.postings.form {
             row.fill(0);
             let cursor = set.sparse.get_or_insert_with(|| {
@@ -3421,14 +3540,61 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
+    /// [`Walk::or_group_in`] for group `g`: on x86-64 built with POPCNT
+    /// and BMI where the CPU has them ([`kernels::bit_ops`]), its
+    /// candidates too.
     #[inline(never)]
     fn or_group(&mut self, g: u32) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if kernels::bit_ops() {
+            // SAFETY: the CPU has the features (`bit_ops`).
+            return unsafe { self.or_group_bits(g) };
+        }
+        self.or_group_in::<false>(g)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt,bmi1,bmi2,lzcnt")]
+    unsafe fn or_group_bits(&mut self, g: u32) -> Result<()> {
+        self.or_group_in::<true>(g)
+    }
+
+    /// [`Walk::or_candidate`], built with POPCNT and BMI when `BITS` (only
+    /// where the CPU has them, see [`Walk::or_group`]). Called through a
+    /// pointer the optimizer cannot see through: called directly from the
+    /// group's code built with the same features, LLVM inlines it into the
+    /// word loop despite `#[inline(never)]`, which the candidate step is
+    /// kept out of (see [`Walk::or_candidate`]).
+    ///
+    /// Calling it is safe only where the CPU has the features when `BITS`.
+    #[inline(always)]
+    fn or_candidate_fn<const BITS: bool>()
+    -> unsafe fn(&mut Self, u32, u32, usize, u32) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if BITS {
+            return std::hint::black_box(
+                Self::or_candidate_bits as unsafe fn(&mut Self, u32, u32, usize, u32) -> Result<()>,
+            );
+        }
+        Self::or_candidate
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt,bmi1,bmi2,lzcnt")]
+    #[inline(never)]
+    unsafe fn or_candidate_bits(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<()> {
+        self.or_candidate_in(g, base, w, bit)
+    }
+
+    #[inline(always)]
+    fn or_group_in<const BITS: bool>(&mut self, g: u32) -> Result<()> {
         let n = self.sc.len();
         let group = self.geometry.groups[g as usize];
         let base = group.slot_base;
         let end = base + group.slots() - 1;
         self.answer.windows += 1;
         // The present terms' bounds over the group.
+        self.cand_w = usize::MAX;
         let mut sb = std::mem::take(&mut self.sub_bounds);
         sb.clear();
         sb.resize(n, 0.0);
@@ -3584,6 +3750,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A word's members are bounded from its first slot's ctid (see
         // `Walk::cut`), each member from its own.
         let first = |w: usize| geometry.tid_in(gi, (w * 64) as u32);
+        let candidate = Self::or_candidate_fn::<BITS>();
         let mut w0 = 0;
         while w0 < words {
             let w1 = (w0 + SUB_WORDS).min(words);
@@ -3604,6 +3771,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     &bounds,
                     &mut sums[..w1 - w0],
                 );
+                // The words the bar cuts, all at once: the loop below walks
+                // only the others, with no branch on each word's verdict
+                // (the bar it is taken at only rises after).
+                let bar = BarKey::of(self.bar).expect("weighed under a bar");
+                let mut kept = 0u32;
+                for (j, &sum) in sums[..w1 - w0].iter().enumerate() {
+                    kept |= u32::from(bar.keeps(sum, || first(w0 + j))) << j;
+                }
+                live &= kept;
             }
             let mut bounded = false;
             while live != 0 {
@@ -3611,18 +3787,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 live &= live - 1;
                 let mut word = mask[w];
                 if weighed {
-                    let most = if WEIGH_IN_LANES {
-                        sums[w - w0]
-                    } else {
+                    if !WEIGH_IN_LANES {
                         let mut most = 0.0_f32;
                         for ((h, row), &bound) in held.iter_mut().zip(&rows).zip(&bounds) {
                             *h = row.word(w);
                             most += or_zero(bound, *h & word != 0);
                         }
-                        most
-                    };
-                    if self.cut(most, || first(w)) {
-                        continue;
+                        if self.cut(most, || first(w)) {
+                            continue;
+                        }
                     }
                     if !bounded {
                         bounded = true;
@@ -3655,6 +3828,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             *h = row.word(w);
                         }
                     }
+                    // Each member's verdict without a branch on it (see
+                    // `BarKey::keeps`), at the bar as it stands now.
+                    let bar = BarKey::of(self.bar).expect("weighed under a bar");
                     let mut keep = 0u64;
                     if WEIGH_IN_LANES && word.count_ones() as usize >= MEMBER_LANES {
                         let mut n = 0;
@@ -3670,7 +3846,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         for (&bit, &sum) in bits[..n].iter().zip(member_sums.iter()) {
                             let bit = u32::from(bit);
                             let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
-                            keep |= u64::from(!self.cut(sum, tid)) << bit;
+                            keep |= u64::from(bar.keeps(sum, tid)) << bit;
                         }
                     } else {
                         let mut left = word;
@@ -3682,7 +3858,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                                 sum += or_zero(bound, *h >> bit & 1 == 1);
                             }
                             let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
-                            keep |= u64::from(!self.cut(sum, tid)) << bit;
+                            keep |= u64::from(bar.keeps(sum, tid)) << bit;
                         }
                     }
                     word = keep;
@@ -3694,7 +3870,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 while word != 0 {
                     let bit = word.trailing_zeros();
                     word &= word - 1;
-                    self.or_candidate(g, base, w, bit)?;
+                    // SAFETY: with `BITS`, the CPU has the features
+                    // (`or_group`).
+                    unsafe { candidate(self, g, base, w, bit) }?;
                 }
             }
             w0 = w1;
@@ -3763,11 +3941,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn row_index(&mut self, i: usize, local: u32) -> u32 {
         let r = &mut self.row_state[i];
         let w = local as usize / 64;
-        if w > r.w {
-            r.run += kernels::popcount_bytes(&r.at.bytes()[r.w * 8..w * 8]);
-            r.w = w;
-        }
+        r.advance(w);
         r.first + r.run + (r.at.word(w) & ((1u64 << (local % 64)) - 1)).count_ones()
+    }
+
+    /// Makes `w` the disjunction's word at hand, a word of the group at
+    /// hand no earlier than the last: each present term's word of members
+    /// there and the posting index of its first (see [`Walk::cand_w`]),
+    /// once for the word's candidates.
+    #[inline(always)]
+    fn or_word(&mut self, w: usize) {
+        self.cand_w = w;
+        self.cand_words.clear();
+        self.cand_base.clear();
+        for &i in &self.present_list {
+            let r = &mut self.row_state[i];
+            r.advance(w);
+            self.cand_words.push(r.at.word(w));
+            self.cand_base.push(r.first + r.run);
+        }
     }
 
     /// Bounds the candidate at bit `bit` of word `w` of group `g` and, if
@@ -3785,6 +3977,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// word loop it measured 8% slower over the disjunction trace.
     #[inline(never)]
     fn or_candidate(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<()> {
+        self.or_candidate_in(g, base, w, bit)
+    }
+
+    #[inline(always)]
+    fn or_candidate_in(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<()> {
         let local = (w * 64) as u32 + bit;
         if let Some((reach, length)) = self.or_stage(g, base, w, bit)? {
             if !matches!(self.verify, Verify::Flat) {
@@ -3869,6 +4066,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// [`Walk::stage`]): its terms' blocks, then its buckets, and a length
     /// a term it holds carries inline. Its buckets are left in
     /// [`Walk::buckets`] ([`NO_BUCKET`] for a term it lacks).
+    #[inline(always)]
     fn or_stage(&mut self, g: u32, base: u32, w: usize, bit: u32) -> Result<Option<(f32, u32)>> {
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
@@ -3878,15 +4076,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let geometry = self.geometry;
         let tid = move || geometry.tid_in(g as usize, local);
         let mut bound = 0.0_f32;
+        if self.cand_w != w {
+            self.or_word(w);
+        }
+        let below = (1u64 << bit) - 1;
         self.held_list.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
-            if self.row_state[i].at.word(w) >> bit & 1 == 1 {
+            let word = self.cand_words[p];
+            if word >> bit & 1 == 1 {
                 self.held_list.push(i);
                 // A member's block is its posting index's: the footer is
                 // decoded whole (`Sc::decode_all`), and its blocks hold
                 // `block_size` postings each.
-                let index = self.row_index(i, local);
+                let index = self.cand_base[p] + (word & below).count_ones();
+                debug_assert_eq!(index, self.row_index(i, local));
                 self.held_index[i] = index;
                 let entry = self.row_state[i].entry;
                 let s = &mut self.sc[i];
@@ -3979,7 +4183,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let read = self.buckets[h];
             let v = if read == NO_BUCKET {
                 let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
-                s.scorer.bound_through(most, floor).min(self.held_bound[h])
+                // No higher than it was: one `minss` on x86-64, not
+                // `f32::min`'s NaN ordering (1.1% of a `full_score`
+                // disjunction's cycles there); never NaN, the same.
+                lower(self.held_bound[h], s.scorer.bound_through(most, floor))
             } else {
                 s.scorer
                     .bound_through(TfBucket::new(read).expect("a valid bucket"), floor)
@@ -3998,9 +4205,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn or_bucket_of(&mut self, i: usize) -> Result<u32> {
         let index = self.held_index[i];
         let block = self.blocks[i];
+        if self.row_state[i].tf.state == TfRun::UNSET {
+            self.row_state[i].tf = self.tf_run(i, block)?;
+        }
+        let run = self.row_state[i].tf;
         let s = &mut self.sc[i];
         let set = self.terms[s.term].as_ref().expect("scoring");
-        let bucket = s.bucket_in(block, set.postings.tf, index)?;
+        let bucket = if run.state == TfRun::READY {
+            run.bucket(index)?
+        } else {
+            s.bucket_in(block, set.postings.tf, index)?
+        };
         if s.footer.single().is_none() {
             self.touch.touch(
                 Part::TfTail,
@@ -4011,6 +4226,45 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let floor = s.floor_at(block, bucket);
         self.buckets[i] = bucket;
         Ok(floor)
+    }
+
+    /// Scoring term `i`'s [`TfRun`] in the group at hand, whose directory
+    /// entry is `block`: [`TfRun::NONE`] for a sparse term, or one whose
+    /// buckets there cross a page.
+    #[inline(never)]
+    fn tf_run(&self, i: usize, block: usize) -> Result<TfRun> {
+        let none = TfRun {
+            state: TfRun::NONE,
+            ..TfRun::default()
+        };
+        let s = &self.sc[i];
+        let Some(e) = s.group_entry(block) else {
+            return Ok(none);
+        };
+        if e.width == 0 || e.count == 0 {
+            return Ok(TfRun {
+                state: TfRun::READY,
+                first: e.first,
+                ..TfRun::default()
+            });
+        }
+        let tf = self.terms[s.term].as_ref().expect("scoring").postings.tf;
+        let from = e.tf_bit as usize / 8;
+        let to = (e.bucket_bit(e.first + e.count - 1) + usize::from(e.width)).div_ceil(8);
+        let page = tf.page_end(from);
+        if page < to {
+            return Ok(none);
+        }
+        // Eight bytes past the last where the page has them: whole loads.
+        let bytes = tf.get(from, (to + 7).min(page))?;
+        Ok(TfRun {
+            state: TfRun::READY,
+            width: e.width,
+            first: e.first,
+            bit: e.tf_bit as usize - from * 8,
+            bytes: bytes.as_ptr(),
+            len: bytes.len(),
+        })
     }
 }
 
@@ -4168,6 +4422,66 @@ mod tests {
             }
             assert_eq!(held, sc.footer.blocks());
         }
+    }
+
+    #[test]
+    fn a_bar_key_keeps_what_the_bar_does_not_cut() {
+        let mut values = vec![
+            0.0f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            1.0,
+            1.0 + f32::EPSILON,
+            -1.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(1),
+            12.375,
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        for _ in 0..200 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(f32::from_bits(state as u32));
+            values.push((state % 4000) as f32 / 64.0);
+        }
+        let tids = [
+            Tid {
+                block: 3,
+                offset: 2,
+            },
+            Tid {
+                block: 3,
+                offset: 3,
+            },
+            Tid {
+                block: 4,
+                offset: 1,
+            },
+        ];
+        for &score in &values {
+            for &at in &tids {
+                let bar = Some((score, at));
+                let key = BarKey::of(bar).unwrap();
+                for &bound in &values {
+                    for &from in &tids {
+                        assert_eq!(
+                            key.keeps(bound, || from),
+                            !cut_by(bar, bound, || from),
+                            "bound {bound:?} ({:#x}) bar {score:?} ({:#x}) {from:?} {at:?}",
+                            bound.to_bits(),
+                            score.to_bits()
+                        );
+                    }
+                }
+            }
+        }
+        assert!(BarKey::of(None).is_none());
     }
 
     #[test]
