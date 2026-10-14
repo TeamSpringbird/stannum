@@ -954,6 +954,21 @@ impl<'a> Bytes<'a> {
         self.get(0, self.len())
     }
 
+    /// Appends bytes `[from, to)` to `out`, read a page at a time in place
+    /// (see [`Self::page_end`]): one copy, where [`Self::get`] across pages
+    /// stitches them into a span's buffer first.
+    pub fn copy_into(&self, mut from: usize, to: usize, out: &mut Vec<u8>) -> Result<()> {
+        if from > to || to > self.len() {
+            return Err(Error::Truncated);
+        }
+        while from < to {
+            let end = self.page_end(from).clamp(from + 1, to);
+            out.extend_from_slice(self.get(from, end)?);
+            from = end;
+        }
+        Ok(())
+    }
+
     /// Bytes `[from, to)` as a range of their own, nothing loaded.
     pub fn sub(&self, from: usize, to: usize) -> Result<Bytes<'a>> {
         if from > to || to > self.len() {
@@ -1184,6 +1199,25 @@ mod tests {
         unsafe { blob.close_span() };
         let memory = [1u8, 2, 3];
         assert_eq!(Bytes::from(&memory).page_end(1), 3);
+    }
+
+    #[test]
+    fn copy_into_copies_across_pages_without_stitching() {
+        let (source, blob) = pinning(10 * 100 + 37, 100);
+        let range = blob.bytes().sub(150, 1037).unwrap();
+        blob.open_span();
+        let stitched = blob.stitched();
+        for (from, to) in [(0, 0), (0, 1), (0, 50), (10, 51), (49, 887), (0, 887), (886, 887)] {
+            let mut out = vec![9u8];
+            range.copy_into(from, to, &mut out).unwrap();
+            assert_eq!(out[1..], source.0.bytes[150 + from..150 + to], "{from}..{to}");
+        }
+        assert_eq!(blob.stitched(), stitched, "read in place");
+        assert!(range.copy_into(0, 888, &mut Vec::new()).is_err());
+        unsafe { blob.close_span() };
+        let mut out = Vec::new();
+        Bytes::from(&[1u8, 2, 3]).copy_into(1, 3, &mut out).unwrap();
+        assert_eq!(out, [2, 3]);
     }
 
     #[test]

@@ -1040,15 +1040,18 @@ impl<'a> Postings<'a> {
                 if end == 0 || end > payload.len() {
                     return Err(Error::Corrupt("postings directory length"));
                 }
-                let window = payload.get(0, end)?;
+                // Copied a page at a time: a directory spanning pages is
+                // not stitched first (a second copy).
+                let mut copy = Vec::with_capacity(end);
+                payload.copy_into(0, end, &mut copy)?;
+                let directory: Box<[u8]> = copy.into_boxed_slice();
                 let mut at = 0;
-                let groups = varint::get_u32(window, &mut at)? as usize;
+                let groups = varint::get_u32(&directory, &mut at)? as usize;
                 // An entry takes at least four bytes (a gap, a count and
                 // kind, a frontier's head and first length).
                 if groups == 0 || groups > geometry.groups.len() || end - at < 4 * groups {
                     return Err(Error::Corrupt("postings groups"));
                 }
-                let directory: Box<[u8]> = Box::from(window);
                 super::segment::count_memo(|c| {
                     c.directories += 1;
                     c.directory_bytes += end as u64;
