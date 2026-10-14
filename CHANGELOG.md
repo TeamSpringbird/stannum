@@ -244,8 +244,9 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   them (baseline x86-64 counts bits by shifts and masks). At 150 million
   rows (replay) `full_score` disjunctions take 6.0% fewer cycles on
   Sapphire Rapids (mean query -7.0%, p99 -10.4%), score ones 3.6% fewer
-  (mean -1.6%, median +4%), and on Apple M4 `full_score` ones 2.0% fewer
-  (score ones unchanged), with the same answers.
+  (mean -1.6%, median +4%), with the same answers. On Apple M4
+  `full_score` disjunctions take 4.6% fewer cycles (p99 -12%), but score
+  ones 6.4% more (instructions +0.6%, median +8%).
 - A ranked disjunction over `TNS1` caps a candidate's unread terms' bounds
   by one `minss` on x86-64 rather than `f32::min`, whose NaN ordering added
   a compare and a blend (a plain compare and select became a branch on the
@@ -403,9 +404,10 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   be kept, a list's members are marked for the intersection a word at a
   time in a register, and an Elias-Fano list's low width is found without
   a division. At 150 million rows (replay) conjunctions take 5.0% fewer
-  cycles on Apple M4 and phrases 3.4% fewer, with the same answers; on
-  Sapphire Rapids the cold reads removed overlapped with the group's
-  other first touches, and the cycles stayed within the boxes' noise.
+  cycles on Apple M4 and phrases 3.4% fewer, with the same answers. On
+  Sapphire Rapids it is neutral, the cycles within the boxes' noise: the
+  cold reads removed there overlapped with the group's other first
+  touches.
 
 ### Fixed
 
