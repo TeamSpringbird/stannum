@@ -1308,7 +1308,8 @@ struct Walk<'s, 'a, T: Touch> {
     held_list: Vec<usize>,
     /// A disjunction's word at hand (`usize::MAX` for none yet in the
     /// group): per present term (as `present_list` orders them), its word
-    /// of members there and the posting index of the first.
+    /// of members there and the posting index of the first (`u32::MAX`
+    /// until a candidate needs it).
     cand_w: usize,
     cand_words: Vec<u64>,
     cand_base: Vec<u32>,
@@ -3759,7 +3760,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // with few enough terms; a new group's bounds, a new memo.
         let patterned = terms.len() <= PATTERN_TERMS;
         if patterned {
-            self.new_patterns();
+            self.new_patterns(terms.len());
         }
         // The sums the kernels weigh a sub-range's words and a word's members
         // by, lanes at a time (`kernels::word_sums`, `kernels::member_sums`).
@@ -3802,15 +3803,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     &bounds,
                     &mut sums[..w1 - w0],
                 );
-                // The words the bar cuts, all at once: the loop below walks
+                // The live words the bar cuts, first: the loop below walks
                 // only the others, with no branch on each word's verdict
-                // (the bar it is taken at only rises after).
+                // (the bar it is taken at only rises after). Only the live
+                // words' sums are compared: a score disjunction's sub-range
+                // holds one to three (comparing all sixteen, its cheaper
+                // half ran 5-8% slower on x86-64).
                 let bar = BarKey::of(self.bar).expect("weighed under a bar");
-                let mut kept = 0u32;
-                for (j, &sum) in sums[..w1 - w0].iter().enumerate() {
-                    kept |= u32::from(bar.keeps(sum, || first(w0 + j))) << j;
+                let mut left = live;
+                while left != 0 {
+                    let j = left.trailing_zeros() as usize;
+                    left &= left - 1;
+                    live &= !(u32::from(!bar.keeps(sums[j], || first(w0 + j))) << j);
                 }
-                live &= kept;
             }
             let mut bounded = false;
             while live != 0 {
@@ -3841,7 +3846,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                                 total += *bound;
                             }
                             if patterned {
-                                self.new_patterns();
+                                self.new_patterns(terms.len());
                             }
                             total
                         } else {
@@ -4000,13 +4005,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         r.first + r.run + (r.at.word(w) & ((1u64 << (local % 64)) - 1)).count_ones()
     }
 
-    /// Empties the pattern memo ([`Walk::pattern_key`]): the weighed terms'
-    /// bounds changed (a new group, or a sparse term's sub-range).
+    /// Empties the pattern memo ([`Walk::pattern_key`]) for patterns of
+    /// `terms` weighed terms (at most [`PATTERN_TERMS`]): their bounds
+    /// changed (a new group, or a sparse term's sub-range).
     #[inline]
-    fn new_patterns(&mut self) {
-        if self.pattern_keys.is_empty() {
-            self.pattern_keys = vec![0; 1 << PATTERN_TERMS];
-            self.pattern_epochs = vec![0; 1 << PATTERN_TERMS];
+    fn new_patterns(&mut self, terms: usize) {
+        debug_assert!(terms <= PATTERN_TERMS);
+        if self.pattern_keys.len() < 1 << terms {
+            self.pattern_keys.resize(1 << terms, 0);
+            self.pattern_epochs.resize(1 << terms, 0);
         }
         self.pattern_epoch += 1;
     }
@@ -4036,19 +4043,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Makes `w` the disjunction's word at hand, a word of the group at
     /// hand no earlier than the last: each present term's word of members
-    /// there and the posting index of its first (see [`Walk::cand_w`]),
-    /// once for the word's candidates.
+    /// there (see [`Walk::cand_w`]), once for the word's candidates; the
+    /// posting index of its first is counted when a candidate first holds
+    /// the term ([`Walk::cand_base_of`]), as a term no candidate holds
+    /// needs none.
     #[inline(always)]
     fn or_word(&mut self, w: usize) {
         self.cand_w = w;
         self.cand_words.clear();
         self.cand_base.clear();
         for &i in &self.present_list {
-            let r = &mut self.row_state[i];
-            r.advance(w);
-            self.cand_words.push(r.at.word(w));
-            self.cand_base.push(r.first + r.run);
+            self.cand_words.push(self.row_state[i].at.word(w));
+            self.cand_base.push(u32::MAX);
         }
+    }
+
+    /// The posting index of present term `p`'s (the `p`th of
+    /// `present_list`, term `i`) first member in the word at hand.
+    #[inline(always)]
+    fn cand_base_of(&mut self, p: usize, i: usize) -> u32 {
+        if self.cand_base[p] == u32::MAX {
+            let r = &mut self.row_state[i];
+            r.advance(self.cand_w);
+            self.cand_base[p] = r.first + r.run;
+        }
+        self.cand_base[p]
     }
 
     /// Bounds the candidate at bit `bit` of word `w` of group `g` and, if
@@ -4178,7 +4197,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // A member's block is its posting index's: the footer is
                 // decoded whole (`Sc::decode_all`), and its blocks hold
                 // `block_size` postings each.
-                let index = self.cand_base[p] + (word & below).count_ones();
+                let index = self.cand_base_of(p, i) + (word & below).count_ones();
                 debug_assert_eq!(index, self.row_index(i, local));
                 self.held_index[i] = index;
                 let entry = self.row_state[i].entry;
