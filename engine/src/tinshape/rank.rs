@@ -32,7 +32,7 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
-    SUB_NONE, SUB_SLOTS, array_bytes, higher, rounded_length, sub_ranges,
+    SUB_NONE, SUB_SLOTS, SubCodes, array_bytes, higher, rounded_length,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -95,22 +95,22 @@ enum Bounds<'s, 'a> {
     /// Boxed: a lazy footer is several vectors, a group's bounds a few
     /// words.
     Blocks(Box<LazyFooter<'a>>),
-    Groups(GroupBounds<'s>),
+    Groups(GroupBounds<'s, 'a>),
 }
 
 /// A grouped record's entries as a walk's blocks: the directory (shared
 /// with the parsed record, its entries decoded as the walk reaches them, its
 /// bytes the frontiers), and the segment's groups, which turn an entry's
-/// group index into the group's last slot.
-struct GroupBounds<'s> {
+/// group index into the group's last slot; and the record, whose grid
+/// containers end in their sub-range codes.
+struct GroupBounds<'s, 'a> {
     dir: std::rc::Rc<Directory>,
     rounded: bool,
     groups: &'s [Group],
-    /// R10 prototype: the record's grid entries' sub-range codes.
-    proto: Option<&'static super::subproto::Record>,
+    codes: SubCodes<'a>,
 }
 
-impl GroupBounds<'_> {
+impl GroupBounds<'_, '_> {
     /// Entry `b` (decoded if it was not yet).
     #[inline]
     fn entry(&self, b: usize) -> &GroupEntry {
@@ -142,18 +142,19 @@ impl GroupBounds<'_> {
         )
     }
 
-    /// Entry `b`'s sub-range codes ([`put_sub_codes`]): a grid group's.
+    /// Copies entry `b`'s sub-range codes ([`Postings::sub_codes_into`])
+    /// into `out`: false for an entry without them.
     #[inline]
-    fn sub_codes(&self, b: usize) -> Option<&'static [u8]> {
-        let rec = self.proto?;
-        let at = *rec.offsets.get(b)?;
-        if at == u32::MAX {
-            return None;
-        }
+    fn sub_codes_into(&self, b: usize, out: &mut Vec<u8>) -> bool {
         let e = self.entry(b);
-        let n = GroupFrontier::new(self.dir.bytes(), e.frontier as usize, self.rounded).count();
-        let len = sub_ranges(self.groups[e.index as usize].slots()) * n;
-        Some(&rec.codes[at as usize..at as usize + len])
+        self.codes
+            .copy_into(
+                e,
+                self.groups[e.index as usize].slots(),
+                self.dir.bytes(),
+                out,
+            )
+            .unwrap_or_else(|e| corrupt_footer(e))
     }
 
     /// The first entry from `from` on whose group ends at `slot` or later:
@@ -408,13 +409,14 @@ pub(super) struct Sc<'s, 'a> {
     /// A common term's bound over a group (see [`Sc::make_common`]).
     common: Option<f32>,
     /// The sub-range codes ([`put_sub_codes`]) of grouped entry `se`, at
-    /// hand: per pair of its group's frontier, the pair's bucket and
-    /// length (the group's floor there); per sub-range, its bound (NaN
-    /// until asked). `s_subs` is 0 for an entry without codes.
+    /// hand (copied: they outlive the group's pages): per pair of its
+    /// group's frontier, the pair's bucket and length (the group's floor
+    /// there); per sub-range, its bound (NaN until asked). `s_subs` is 0
+    /// for an entry without codes.
     ///
     /// [`put_sub_codes`]: segment::tinshape::postings::put_sub_codes
     se: usize,
-    s_codes: &'a [u8],
+    s_codes: Vec<u8>,
     s_n: usize,
     s_subs: usize,
     s_buckets: [u8; 16],
@@ -444,7 +446,7 @@ impl<'s, 'a> Sc<'s, 'a> {
                 dir: dir.clone(),
                 rounded: set.postings.rounded,
                 groups: &segment.docs.geometry.groups,
-                proto: super::subproto::record(segment, set.at),
+                codes: set.postings.sub_codes(),
             }),
             _ => Bounds::Blocks(Box::new(set.postings.lazy_footer(
                 segment.block_size,
@@ -472,7 +474,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors_block: u32::MAX,
             common: None,
             se: usize::MAX,
-            s_codes: &[],
+            s_codes: Vec::new(),
             s_n: 0,
             s_subs: 0,
             s_buckets: [0; 16],
@@ -746,12 +748,9 @@ impl<'s, 'a> Sc<'s, 'a> {
         let Bounds::Groups(g) = &self.footer else {
             return;
         };
-        if b >= g.dir.len() {
+        if b >= g.dir.len() || !g.sub_codes_into(b, &mut self.s_codes) {
             return;
         }
-        let Some(codes) = g.sub_codes(b) else {
-            return;
-        };
         let mut n = 0;
         for (bucket, length) in g.frontier(b) {
             self.s_buckets[n] = bucket;
@@ -759,8 +758,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             n += 1;
         }
         self.s_n = n;
-        self.s_codes = codes;
-        self.s_subs = codes.len() / n;
+        self.s_subs = self.s_codes.len() / n;
         self.s_bound.clear();
         self.s_bound.resize(self.s_subs, f32::NAN);
     }
@@ -1264,7 +1262,8 @@ fn load<'a>(
             bytes,
             at,
         } => {
-            touch.touch(Part::Payload, at, bytes.len());
+            let codes = set.postings.sub_codes_len(&e, group.slots());
+            touch.touch(Part::Payload, at, bytes.len() + codes);
             let bytes = bytes.all()?;
             mem.used += 1;
             mem.first = e.first;
@@ -3667,7 +3666,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 bytes,
                 at,
             } => {
-                self.touch.touch(Part::Payload, at, bytes.len());
+                let codes = set.postings.sub_codes_len(&e, group.slots());
+                self.touch.touch(Part::Payload, at, bytes.len() + codes);
                 self.mems[t].used += 1;
                 r.first = e.first;
                 if e.kind == KIND_GRID {
@@ -4460,6 +4460,178 @@ mod tests {
                 }
             }
             assert_eq!(held, sc.footer.blocks());
+        }
+    }
+
+    /// A term over groups of 256 pages of up to 12 documents (several
+    /// sub-ranges each), held by every document of some pages, a random
+    /// share of others and none of the rest (empty sub-ranges): per grid
+    /// entry and sub-range, what the walk bounds a posting there by never
+    /// falls below the posting's score, bit for bit.
+    fn check_sub_ranges(seed: u64, params: usize) {
+        use crate::bm25::Bm25Params;
+        use segment::payload::PayloadBuilder;
+        use segment::tinshape::postings::{GroupFrontiers, Options};
+        use segment::tinshape::segment::Builder;
+        let mut state = seed | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut docs: Vec<Tid> = Vec::new();
+        for g in 0..6u32 {
+            for p in 0..256u32 {
+                let n = 1 + (next() % 12) as u16;
+                for o in 1..=n {
+                    docs.push(Tid {
+                        block: g * 256 + p,
+                        offset: o,
+                    });
+                }
+            }
+        }
+        let lengths: Vec<u32> = (0..docs.len())
+            .map(|_| 1 + (next() % 5000) as u32)
+            .collect();
+        let mut members: Vec<(usize, u32)> = Vec::new();
+        for (r, doc) in docs.iter().enumerate() {
+            let held = match (doc.block % 256) / 32 {
+                0 => true,
+                1 | 5 => false,
+                _ => next() % 4 == 0,
+            };
+            if held {
+                // Mostly one occurrence, a few many.
+                let tf = if next() % 5 == 0 {
+                    1 + (next() % 60) as u32
+                } else {
+                    1
+                };
+                members.push((r, tf));
+            }
+        }
+        let options = Options {
+            sparse: false,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            group_frontiers: if params.is_multiple_of(2) {
+                GroupFrontiers::Rounded
+            } else {
+                GroupFrontiers::Exact
+            },
+            ..Options::default()
+        };
+        let mut builder = Builder::new(docs.clone(), lengths.clone(), options).unwrap();
+        let ranks: Vec<u32> = members.iter().map(|(r, _)| *r as u32).collect();
+        let buckets: Vec<u8> = members
+            .iter()
+            .map(|(_, tf)| TfBucket::from_count(*tf).value())
+            .collect();
+        let mut payload = PayloadBuilder::default();
+        for (_, tf) in &members {
+            payload.push(&(0..*tf).collect::<Vec<u32>>()).unwrap();
+        }
+        builder
+            .add_term("t", &ranks, &buckets, &payload.finish())
+            .unwrap();
+        let blob = builder.finish(&[]).0;
+        let segment = Segment::parse(&blob).unwrap();
+        let (k1, b, boost, average) = [
+            (1.2f32, 0.75f32, 1.0f32, 300.0f32),
+            (0.0, 0.0, 0.5, 13.0),
+            (3.0, 1.0, 7.25, 4999.0),
+            (1e-6, 0.25, 1.0, 0.5),
+        ][params % 4];
+        let scorer = TermScorer::from_statistics(
+            docs.len() as u64,
+            members.len() as u64,
+            boost,
+            Bm25Params { k1, b },
+            average,
+        )
+        .unwrap();
+        let set = TermSet::open(&segment, "t", &mut crate::tinshape::NoTouch)
+            .unwrap()
+            .unwrap();
+        let mut sc = Sc::new(0, scorer.clone(), &set, &segment).unwrap();
+        let geometry = &segment.docs.geometry;
+        let mut subbed = 0;
+        for g in 0..geometry.groups.len() {
+            let group = geometry.groups[g];
+            let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
+            let Some(b) = sc.block_at(base) else {
+                continue;
+            };
+            if sc.footer.starts_after(b, end) {
+                continue;
+            }
+            assert!(sc.subs(b), "a grid entry carries sub-range codes");
+            subbed += 1;
+            let whole = sc.bound(b);
+            for r in 0..segment::tinshape::postings::sub_ranges(group.slots()) {
+                // The sub-range's postings: per bucket the shortest length.
+                let mut shortest = [u32::MAX; 16];
+                let mut any = false;
+                let bound = sc.bound_in(b, r);
+                assert!(
+                    bound.total_cmp(&whole).is_le(),
+                    "no looser than the group's"
+                );
+                for (m, tf) in &members {
+                    let local = geometry.slot_of(docs[*m]).unwrap().wrapping_sub(base);
+                    if local > end - base || sub_of(local) != r {
+                        continue;
+                    }
+                    any = true;
+                    let bucket = TfBucket::from_count(*tf);
+                    let score = scorer.score_bucket(bucket, lengths[*m]);
+                    assert!(
+                        bound.total_cmp(&score).is_ge(),
+                        "group {g} sub-range {r}: bound {bound} below score {score} (tf {tf}, length {})",
+                        lengths[*m]
+                    );
+                    assert!(sc.max_bucket_in(b, r) >= bucket.value());
+                    let at = usize::from(bucket.value());
+                    shortest[at] = shortest[at].min(lengths[*m]);
+                }
+                if !any {
+                    assert_eq!(bound.to_bits(), 0.0f32.to_bits(), "an empty sub-range");
+                    continue;
+                }
+                let mut least = u32::MAX;
+                for bucket in (0..16u8).rev() {
+                    least = least.min(shortest[usize::from(bucket)]);
+                    if least == u32::MAX {
+                        continue;
+                    }
+                    let (floor, v) = sc.floor_kept_in(b, r, bucket);
+                    assert!(
+                        floor <= least,
+                        "sub-range {r} bucket {bucket}: floor {floor} over {least}"
+                    );
+                    assert_eq!(sc.floor_at_in(b, r, bucket), floor);
+                    assert!(
+                        floor >= sc.floor_kept(b, bucket).0,
+                        "no lower than the group's"
+                    );
+                    let real = scorer.bound_through(TfBucket::new(bucket).unwrap(), least);
+                    assert!(v.total_cmp(&real).is_ge());
+                }
+            }
+        }
+        assert!(subbed > 0);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        #[test]
+        fn a_sub_ranges_bound_covers_its_postings(
+            seed in proptest::prelude::any::<u64>(),
+            params in 0usize..4,
+        ) {
+            check_sub_ranges(seed, params);
         }
     }
 

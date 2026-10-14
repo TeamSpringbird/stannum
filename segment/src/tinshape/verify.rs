@@ -147,6 +147,10 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 _ => Vec::new(),
             };
             let mut at_entry = 0usize;
+            // The sub-range codes of the entry at hand, and its frontier's
+            // buckets (for `codes_entry`).
+            let (mut codes, mut code_buckets, mut codes_entry) =
+                (Vec::new(), Vec::new(), usize::MAX);
             for (i, slot) in slots.iter().enumerate() {
                 let rank = segment
                     .docs
@@ -187,6 +191,37 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                             "posting {i} (bucket {bucket}, length {length}) is not covered by group {}'s frontier",
                             entry.index
                         ));
+                    }
+                    // A grid's sub-range codes: the posting's sub-range's code
+                    // at the first pair whose bucket reaches its own is at
+                    // most its length's.
+                    if codes_entry != at_entry {
+                        codes_entry = at_entry;
+                        found
+                            .postings
+                            .sub_codes_into(entry, group.slots(), &mut codes)?;
+                        code_buckets.clear();
+                        code_buckets.extend(found.postings.group_frontier(entry).map(|p| p.0));
+                    }
+                    if !codes.is_empty() {
+                        let n = code_buckets.len();
+                        let r = ((*slot - group.slot_base) / super::postings::SUB_SLOTS) as usize;
+                        let k = code_buckets.partition_point(|b| *b < bucket);
+                        let code = if k < n {
+                            codes.get(r * n + k).copied()
+                        } else {
+                            None
+                        };
+                        let ok = code.is_some_and(|c| {
+                            c != super::postings::SUB_NONE
+                                && super::postings::rounded_length(u32::from(c)) <= length
+                        });
+                        if !ok {
+                            problems.push(format!(
+                                "posting {i} (bucket {bucket}, length {length}) is not covered by group {}'s sub-range {r} code {code:?}",
+                                entry.index
+                            ));
+                        }
                     }
                 }
             }

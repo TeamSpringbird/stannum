@@ -2,15 +2,16 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments of page layout version 10, 9, 8 or 6
-//! to version 12, whose grouped records' directories end in skip points and
-//! hold short lists as arrays (or, with `--keep-records`, 10, whose grouped
+//! Re-encodes dumped `TNS1` segments of page layout version 12, 10, 9, 8
+//! or 6 to version 13, whose grouped records' directories end in skip
+//! points and hold short lists as arrays, and whose grid containers end in
+//! their sub-range codes (or, with `--keep-records`, 10, whose grouped
 //! records' headers give their directory's length), and reports what that
 //! costs.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
+//!     [--from 12|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
 //!     [--jobs N] [--check] [--check-merge] [--census] [--keep-records]
 //! ```
 //!
@@ -34,10 +35,11 @@
 //! 4. **Renumbering.** The segment is merged alone with this build's
 //!    `merge::merge`, which derives the grid from its documents (each
 //!    page's width its largest offset) and encodes every record afresh, as
-//!    a build of the same documents does: from 10, the only step, which
-//!    makes the Elias-Fano lists of at most `--arrays` members (default
-//!    `Options::array_max`) array containers and adds the directories' skip
-//!    points (version 12).
+//!    a build of the same documents does: from 12 or 10, the only step,
+//!    which makes the Elias-Fano lists of at most `--arrays` members
+//!    (default `Options::array_max`) array containers, adds the
+//!    directories' skip points (version 12) and the grid containers'
+//!    sub-range codes (version 13).
 //!
 //! `--keep-records` skips step 4: each record keeps its encoding but for
 //! the header (with `--check-merge`, the merge must give the same bytes).
@@ -122,7 +124,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 10|9|8|6] [--exact] [--segment FILE] \
+        "usage: tnsreencode --in DIR --out DIR [--from 12|10|9|8|6] [--exact] [--segment FILE] \
          [--grid-density N] [--arrays N] [--jobs N] [--check] [--check-merge] [--census] \
          [--keep-records]"
     );
@@ -165,8 +167,8 @@ fn args() -> Args {
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9 | 10)
-        || (a.keep_records && matches!(a.from, 6 | 10))
+        || !matches!(a.from, 6 | 8 | 9 | 10 | 12)
+        || (a.keep_records && matches!(a.from, 6 | 10 | 12))
         || a.jobs == 0
     {
         usage();

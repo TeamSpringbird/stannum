@@ -90,6 +90,10 @@ pub const FORM_ROUNDED: u8 = 0x10;
 /// Set in a grouped record's form when its directory ends in skip points
 /// ([`Directory`]; every grouped record from page layout version 11 on).
 pub const FORM_SKIPS: u8 = 0x20;
+/// Set in a grouped record's form when its grid containers end in their
+/// sub-range codes ([`put_sub_codes`]; every grouped record from page
+/// layout version 13 on). A sparse record's [`FORM_COMPACT`].
+pub const FORM_SUBS: u8 = 0x40;
 
 /// Postings a footer-less record holds at most.
 pub const COMPACT_MAX: u32 = 8;
@@ -146,6 +150,9 @@ pub struct Options {
     /// Whether a grouped record's frontiers hold exact lengths or lengths
     /// rounded down to six significant bits.
     pub group_frontiers: GroupFrontiers,
+    /// Whether a grid container ends in its sub-range codes
+    /// ([`put_sub_codes`], [`FORM_SUBS`]).
+    pub sub_codes: bool,
 }
 
 /// [`Options::group_frontiers`].
@@ -173,6 +180,7 @@ impl Default for Options {
             inline_lengths_max_df: 64,
             inline_lengths_min_documents: 1 << 16,
             group_frontiers: GroupFrontiers::Rounded,
+            sub_codes: true,
         }
     }
 }
@@ -198,6 +206,8 @@ pub struct Stats {
     /// how many it holds.
     pub frontier_bytes: usize,
     pub frontiers: usize,
+    /// Bytes of the grid containers' sub-range codes (part of `payload`).
+    pub sub_bytes: usize,
     /// Bytes of the directory's skip points (part of `payload`).
     pub skip_bytes: usize,
     /// Bytes the array containers take less what their members would take
@@ -575,6 +585,7 @@ pub fn encode_reusing<'r>(
     // decoding.
     let grouped_len = grouped.len() as isize
         - grouped_stats.frontier_bytes as isize
+        - grouped_stats.sub_bytes as isize
         - grouped_stats.skip_bytes as isize
         - grouped_stats.array_excess;
     let use_sparse =
@@ -593,6 +604,7 @@ pub fn encode_reusing<'r>(
     } else {
         FORM_GROUPED
             | FORM_SKIPS
+            | if options.sub_codes { FORM_SUBS } else { 0 }
             | if inline { FORM_LENGTHS } else { 0 }
             | if options.group_frontiers == GroupFrontiers::Rounded {
                 FORM_ROUNDED
@@ -630,6 +642,7 @@ pub fn encode_reusing<'r>(
         stats.kind_bytes = grouped_stats.kind_bytes;
         stats.forced = grouped_stats.forced;
         stats.frontier_bytes = grouped_stats.frontier_bytes;
+        stats.sub_bytes = grouped_stats.sub_bytes;
         stats.skip_bytes = grouped_stats.skip_bytes;
         stats.frontiers = grouped_stats.frontiers;
         stats.array_excess = grouped_stats.array_excess;
@@ -852,6 +865,23 @@ fn encode_groups<'r>(
         put_group_frontier(&mut directory, &pairs);
         stats.frontier_bytes += directory.len() - before;
         stats.frontiers += 1;
+        if kind == KIND_GRID && options.sub_codes {
+            // The grid's sub-range codes follow its words (a copied grid's
+            // too: they are its postings', computed afresh).
+            let buckets_of: Vec<u8> = pairs.iter().map(|p| p.0).collect();
+            let before = bodies.len();
+            put_sub_codes(
+                &buckets_of,
+                group.slots(),
+                &locals,
+                buckets[from..at]
+                    .iter()
+                    .copied()
+                    .zip(lengths[from..at].iter().copied()),
+                &mut bodies,
+            );
+            stats.sub_bytes += bodies.len() - before;
+        }
         // A group's buckets are always packed at the group's own width.
         let width = tf_width(pairs.last().expect("a pair").0, true);
         for bucket in &buckets[from..at] {
@@ -905,6 +935,51 @@ impl GroupEntry {
     }
 }
 
+/// Where a grouped record's grid containers' sub-range codes
+/// ([`put_sub_codes`]) lie: its payload and where its containers start in
+/// it, and whether it has them ([`FORM_SUBS`]). What a walk keeps of the
+/// record to read a group's codes.
+#[derive(Clone, Copy, Debug)]
+pub struct SubCodes<'a> {
+    payload: Bytes<'a>,
+    containers_at: usize,
+    held: bool,
+}
+
+impl SubCodes<'_> {
+    /// Bytes of grid entry `entry`'s codes, of a group of `slots` slots
+    /// (its frontier in `directory`, the record's directory bytes): 0 for
+    /// another kind or a record without them.
+    #[inline]
+    pub fn len(&self, entry: &GroupEntry, slots: u32, directory: &[u8]) -> usize {
+        if !self.held || entry.kind != KIND_GRID {
+            return 0;
+        }
+        let head = directory[entry.frontier as usize];
+        sub_ranges(slots) * (usize::from(head >> 4) + 1)
+    }
+
+    /// Copies into `out` (cleared) grid entry `entry`'s codes: a byte per
+    /// sub-range and frontier pair, the pairs of a sub-range together;
+    /// false, `out` empty, for an entry without them.
+    pub fn copy_into(
+        &self,
+        entry: &GroupEntry,
+        slots: u32,
+        directory: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        out.clear();
+        let len = self.len(entry, slots, directory);
+        if len == 0 {
+            return Ok(false);
+        }
+        let at = self.containers_at + entry.at as usize + entry.len as usize;
+        self.payload.copy_into(at, at + len, out)?;
+        Ok(true)
+    }
+}
+
 /// A term's membership.
 #[derive(Clone, Debug)]
 pub enum Form<'a> {
@@ -942,6 +1017,9 @@ pub struct Postings<'a> {
     /// Whether a grouped record's frontiers' lengths are rounded
     /// ([`FORM_ROUNDED`]).
     pub rounded: bool,
+    /// Whether a grouped record's grid containers end in sub-range codes
+    /// ([`FORM_SUBS`]).
+    pub subs: bool,
 }
 
 /// A rare term's documents' lengths, in posting order: a base, a width
@@ -1069,6 +1147,7 @@ impl<'a> Postings<'a> {
                 tf: Bytes::default(),
                 tf_at: at,
                 rounded: false,
+                subs: false,
             });
         }
         // The form and three varints.
@@ -1082,7 +1161,9 @@ impl<'a> Postings<'a> {
         if (rounded || skips) && !grouped {
             return Err(Error::Corrupt("postings form"));
         }
-        let footer_len = if form & FORM_COMPACT != 0 {
+        // The bit is a sparse record's `FORM_COMPACT`.
+        let subs = grouped && form & FORM_SUBS != 0;
+        let footer_len = if !grouped && form & FORM_COMPACT != 0 {
             if form & FORM_LENGTHS == 0 || form & 3 != FORM_SPARSE || df > COMPACT_MAX {
                 return Err(Error::Corrupt("compact postings"));
             }
@@ -1099,7 +1180,7 @@ impl<'a> Postings<'a> {
         } else {
             0
         };
-        let compact = form & FORM_COMPACT != 0;
+        let compact = !grouped && form & FORM_COMPACT != 0;
         let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED | FORM_SKIPS);
         let footer_at = at;
         let payload_at = footer_at + footer_len;
@@ -1162,6 +1243,7 @@ impl<'a> Postings<'a> {
                         directory,
                         groups,
                         skips,
+                        subs,
                         df,
                         (payload.len() - end) as u64,
                         tf_len as u64,
@@ -1184,6 +1266,7 @@ impl<'a> Postings<'a> {
             lengths,
             compact,
             rounded,
+            subs,
         })
     }
 
@@ -1238,6 +1321,36 @@ impl<'a> Postings<'a> {
         let bit = entry.bucket_bit(index);
         let bytes = self.tf.window(bit / 8, 8)?;
         Ok(bits::get_at(bytes, bit % 8, u32::from(entry.width))? as u8)
+    }
+
+    /// Where the record's grid containers' sub-range codes lie.
+    #[inline]
+    pub fn sub_codes(&self) -> SubCodes<'a> {
+        SubCodes {
+            payload: self.payload,
+            containers_at: self.containers_at,
+            held: self.subs,
+        }
+    }
+
+    /// Bytes of the sub-range codes ([`put_sub_codes`]) a grid entry's
+    /// container ends in, of a group of `slots` slots: 0 for another kind
+    /// or a record without them.
+    #[inline]
+    pub fn sub_codes_len(&self, entry: &GroupEntry, slots: u32) -> usize {
+        self.sub_codes().len(entry, slots, self.directory_bytes())
+    }
+
+    /// Copies into `out` (cleared) grid entry `entry`'s sub-range codes (a
+    /// group of `slots` slots): see [`SubCodes::copy_into`].
+    pub fn sub_codes_into(
+        &self,
+        entry: &GroupEntry,
+        slots: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        self.sub_codes()
+            .copy_into(entry, slots, self.directory_bytes(), out)
     }
 
     /// The container of a grouped record's entry, not read yet (see
@@ -1382,6 +1495,9 @@ pub struct Directory {
     /// Whether the directory has skip points (a record of page layout 10
     /// has none: its runs decode in order, from where the last one ended).
     skips: bool,
+    /// Whether grid containers end in sub-range codes ([`FORM_SUBS`]): a
+    /// grid entry's container is its words, the codes after them.
+    subs: bool,
     resume: std::cell::Cell<Resume>,
     /// What the entries are checked against: the record's postings, its
     /// containers' bytes, and its TF tail's bytes.
@@ -1420,6 +1536,7 @@ impl Directory {
         bytes: Box<[u8]>,
         len: usize,
         skips: bool,
+        subs: bool,
         df: u32,
         containers: u64,
         tf_len: u64,
@@ -1448,6 +1565,7 @@ impl Directory {
             head,
             end,
             skips,
+            subs,
             resume: std::cell::Cell::new(Resume {
                 at: head,
                 ..Resume::default()
@@ -1463,6 +1581,11 @@ impl Directory {
     #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Whether grid containers end in sub-range codes ([`FORM_SUBS`]).
+    pub fn subs(&self) -> bool {
+        self.subs
     }
 
     #[inline]
@@ -1882,11 +2005,12 @@ fn decode_entries(
             // An entry longer than a chunk: a varint at a time.
             let mut p = resume.at;
             let previous = resume.after.checked_sub(1);
-            let (entry, len) =
-                decode_entry(bytes, &mut p, 0, previous, groups).map_err(|e| match e {
+            let (entry, len) = decode_entry(bytes, &mut p, 0, previous, groups, dir.subs).map_err(
+                |e| match e {
                     Error::Truncated => Error::Corrupt("group directory entry"),
                     e => e,
-                })?;
+                },
+            )?;
             push_entry(resume, entry, len, p, out, dir)?;
         }
     }
@@ -1980,7 +2104,14 @@ fn decode_chunk(
         let longest = (a1 - a0).max(a2 - a1).max((a3 - a2) * paged);
         let (entry, len) = if longest > 2 || head >= 0x80 || end > units.long_at {
             let mut p = a0;
-            let decoded = decode_entry(bytes, &mut p, base, resume.after.checked_sub(1), groups)?;
+            let decoded = decode_entry(
+                bytes,
+                &mut p,
+                base,
+                resume.after.checked_sub(1),
+                groups,
+                dir.subs,
+            )?;
             if p != end {
                 return Err(Error::Corrupt("group directory entry"));
             }
@@ -2017,6 +2148,10 @@ fn decode_chunk(
                 return Err(Error::Corrupt("group frontier"));
             }
             let max_bucket = max_bucket as u8;
+            // A grid's sub-range codes follow its words: a byte per
+            // sub-range and frontier pair.
+            let codes = (sub_ranges(group.slots()) * ((head >> 4) + 1)) as u64;
+            let codes = codes & bits::mask(kind == KIND_GRID && dir.subs);
             (
                 GroupEntry {
                     index: index as u32,
@@ -2030,7 +2165,7 @@ fn decode_chunk(
                     width: TF_WIDTH[usize::from(max_bucket)],
                     max_bucket,
                 },
-                len,
+                len + codes,
             )
         };
         push_entry(resume, entry, len, base + end, out, dir)?;
@@ -2055,14 +2190,16 @@ unsafe fn varint2(bytes: &[u8], at: usize) -> u32 {
 
 /// Decodes the directory entry at `at` of `bytes` (offset `base` of the
 /// directory), of the group after `previous`: the entry without the totals
-/// before it (its `at`, `first` and `tf_bit`, the caller's), and its
-/// container's length. `Truncated` when the bytes end within it.
+/// before it (its `at`, `first` and `tf_bit`, the caller's), and the bytes
+/// its container takes (a grid's sub-range codes included where `subs`).
+/// `Truncated` when the bytes end within it.
 fn decode_entry(
     bytes: &[u8],
     at: &mut usize,
     base: usize,
     previous: Option<u64>,
     groups: &[Group],
+    subs: bool,
 ) -> Result<(GroupEntry, u64)> {
     let gap = varint::get(bytes, at)?;
     let next = match previous {
@@ -2087,8 +2224,14 @@ fn decode_entry(
         _ => return Err(Error::Corrupt("postings group kind")),
     };
     let frontier = (base + *at) as u32;
+    let pairs = usize::from(*bytes.get(*at).ok_or(Error::Truncated)? >> 4) + 1;
     let max_bucket = skip_group_frontier(bytes, at)?;
     let width = tf_width(max_bucket, true);
+    let codes = if kind == KIND_GRID && subs {
+        (sub_ranges(group.slots()) * pairs) as u64
+    } else {
+        0
+    };
     Ok((
         GroupEntry {
             index: next as u32,
@@ -2102,7 +2245,7 @@ fn decode_entry(
             width: width as u8,
             max_bucket,
         },
-        len,
+        len + codes,
     ))
 }
 
@@ -2111,7 +2254,11 @@ fn decode_entry(
 /// points, each checked against where decoding stands): the reference a
 /// [`Directory`]'s runs are tested against.
 #[doc(hidden)]
-pub fn decode_directory_whole(bytes: &[u8], groups: &[Group]) -> Result<Vec<GroupEntry>> {
+pub fn decode_directory_whole(
+    bytes: &[u8],
+    groups: &[Group],
+    subs: bool,
+) -> Result<Vec<GroupEntry>> {
     let mut at = 0;
     let n = varint::get_u32(bytes, &mut at)? as usize;
     let head = at;
@@ -2135,7 +2282,7 @@ pub fn decode_directory_whole(bytes: &[u8], groups: &[Group]) -> Result<Vec<Grou
                 },
             );
         }
-        let (entry, len) = decode_entry(&bytes[..end], &mut at, 0, previous, groups)?;
+        let (entry, len) = decode_entry(&bytes[..end], &mut at, 0, previous, groups, subs)?;
         out.push(GroupEntry {
             at: body as u32,
             first: first as u32,
@@ -3930,7 +4077,7 @@ mod tests {
             let entries = &dir.entries(&geometry.groups).unwrap();
             assert_eq!(
                 entries,
-                &decode_directory_whole(dir.bytes(), &geometry.groups).unwrap(),
+                &decode_directory_whole(dir.bytes(), &geometry.groups, dir.subs()).unwrap(),
                 "decoded a block at a time as a varint at a time"
             );
             check_group_frontiers(&parsed, entries, geometry, slots, buckets, lengths, options);
@@ -4021,6 +4168,34 @@ mod tests {
                         .iter()
                         .any(|i| buckets[*i] == *fb && stored(lengths[*i]) == *fl)
                 );
+            }
+            // A grid's sub-range codes, against their definition: per
+            // sub-range and pair, the least code (at most 254) of the
+            // sub-range's postings above the previous pair's bucket.
+            let mut codes = Vec::new();
+            let held = parsed
+                .sub_codes_into(entry, group.slots(), &mut codes)
+                .unwrap();
+            assert_eq!(held, options.sub_codes && entry.kind == KIND_GRID);
+            assert_eq!(parsed.subs, options.sub_codes);
+            if held {
+                let n = front.len();
+                assert_eq!(codes.len(), sub_ranges(group.slots()) * n);
+                for (r, row) in codes.chunks(n).enumerate() {
+                    for (k, &code) in row.iter().enumerate() {
+                        let above = if k == 0 { None } else { Some(front[k - 1].0) };
+                        let least = members
+                            .iter()
+                            .filter(|i| {
+                                (slots[**i] - group.slot_base) / SUB_SLOTS == r as u32
+                                    && above.is_none_or(|b| buckets[**i] > b)
+                            })
+                            .map(|i| round_length(lengths[*i]).min(254) as u8)
+                            .min()
+                            .unwrap_or(SUB_NONE);
+                        assert_eq!(code, least, "group {} sub-range {r} pair {k}", entry.index);
+                    }
+                }
             }
         }
     }
@@ -4304,6 +4479,8 @@ mod tests {
                 for adaptive_tf in [true, false] {
                     for grid_density in [0, 4] {
                         out.push(Options {
+                            // Grids with and without sub-range codes.
+                            sub_codes: block_size != 3,
                             block_size,
                             paged,
                             ef_groups,
@@ -4460,7 +4637,7 @@ mod tests {
         let Form::Grouped(dir) = &whole.form else {
             panic!("a grouped record");
         };
-        let entries = decode_directory_whole(dir.bytes(), &geometry.groups).unwrap();
+        let entries = decode_directory_whole(dir.bytes(), &geometry.groups, dir.subs()).unwrap();
         assert_eq!(entries.len(), 2000);
         let directory = dir.bytes().len();
         assert!(
@@ -4607,10 +4784,15 @@ mod tests {
         let stats = round_trip(&geometry, &slots, &buckets, &lengths, &grids);
         assert!(!stats.sparse);
         assert_eq!(stats.kinds, [2, 0, 0, 0]);
-        // A bit per slot, a bit per bucket; per group a directory entry and
-        // a frontier of one pair, (1, 50), of two bytes.
-        assert_eq!(stats.payload, 2 * 32 * 40 + 1 + 2 * (1 + 3) + 2 * 2);
+        // A bit per slot, a bit per bucket; per group a directory entry, a
+        // frontier of one pair, (1, 50), of two bytes, and its grid's
+        // sub-range codes (ten sub-ranges of one pair).
+        assert_eq!(
+            stats.payload,
+            2 * 32 * 40 + 1 + 2 * (1 + 3) + 2 * 2 + 2 * 10
+        );
         assert_eq!((stats.frontiers, stats.frontier_bytes), (2, 4));
+        assert_eq!(stats.sub_bytes, 2 * 10);
         assert_eq!(stats.tf, tids.len() / 8);
         // Whole pages are runs, smaller still, when size alone decides; the
         // default keeps groups this dense as grids.
@@ -4713,7 +4895,7 @@ mod tests {
             assert_eq!(dir.decoded(), 700);
             assert_eq!(
                 dir.entries(groups).unwrap(),
-                decode_directory_whole(dir.bytes(), groups).unwrap()
+                decode_directory_whole(dir.bytes(), groups, dir.subs()).unwrap()
             );
             dir.decode_all(groups).unwrap();
         }
@@ -4829,7 +5011,7 @@ mod tests {
             assert_eq!(dir.len(), groups as usize);
             assert_eq!(
                 dir.entries(&geometry.groups).unwrap(),
-                decode_directory_whole(dir.bytes(), &geometry.groups).unwrap()
+                decode_directory_whole(dir.bytes(), &geometry.groups, dir.subs()).unwrap()
             );
             // The length rewritten one byte shorter or longer: the parse or
             // the last entry's decode finds it (the totals no longer meet
@@ -5223,7 +5405,7 @@ mod lazy_directory_tests {
             panic!("a grouped record");
         };
         let groups = &geometry.groups;
-        let whole = decode_directory_whole(dir.bytes(), groups).unwrap();
+        let whole = decode_directory_whole(dir.bytes(), groups, dir.subs()).unwrap();
         let parsed = Postings::parse(record, df, geometry).unwrap();
         let Form::Grouped(lazy) = &parsed.form else {
             panic!("a grouped record");
@@ -5409,7 +5591,7 @@ mod lazy_directory_tests {
         let Form::Grouped(dir) = &parsed.form else {
             panic!("a grouped record");
         };
-        let whole = decode_directory_whole(dir.bytes(), &geometry.groups).unwrap();
+        let whole = decode_directory_whole(dir.bytes(), &geometry.groups, dir.subs()).unwrap();
         assert!(whole[0].count > 4096, "a three-byte count");
         assert_eq!(
             parsed.group_frontier(&whole[1]).count(),
@@ -5436,7 +5618,7 @@ mod lazy_directory_tests {
             let Form::Grouped(dir) = &parsed.form else {
                 panic!("a grouped record");
             };
-            decode_directory_whole(dir.bytes(), &geometry.groups).unwrap()
+            decode_directory_whole(dir.bytes(), &geometry.groups, dir.subs()).unwrap()
         };
         let source = PinningSource::new(record.clone(), 64);
         let blob = LazyBlob::new(Box::new(source.clone()));

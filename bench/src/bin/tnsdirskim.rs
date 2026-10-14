@@ -17,6 +17,9 @@
 use segment::tinshape::postings::{self, Form, Postings};
 use segment::tinshape::segment::Segment;
 
+/// A record's bytes, df, directory bytes, entries, and sub-range codes flag.
+type Record<'a> = (&'a [u8], u32, Vec<u8>, usize, bool);
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let min_groups: usize = args.next().expect("MIN_GROUPS").parse().expect("a count");
@@ -27,7 +30,9 @@ fn main() {
         let geometry = &segment.docs.geometry;
         let groups = &geometry.groups;
         // (record bytes, df, directory bytes, entries)
-        let mut records: Vec<(&[u8], u32, Vec<u8>, usize)> = Vec::new();
+        // Per record: its bytes, df, directory bytes, entries and whether its
+        // grids carry sub-range codes.
+        let mut records: Vec<Record<'_>> = Vec::new();
         for item in segment.dictionary().iter() {
             let (term, entry) = item.expect("a term");
             let found = segment.resolve(entry).expect("a record");
@@ -38,10 +43,17 @@ fn main() {
             if dir.len() < min_groups {
                 continue;
             }
-            let whole = postings::decode_directory_whole(dir.bytes(), groups).expect("decoded");
+            let whole =
+                postings::decode_directory_whole(dir.bytes(), groups, dir.subs()).expect("decoded");
             assert_eq!(dir.entries(groups).expect("decoded"), whole, "{term}");
             let record = &blob[found.at..found.at + p.tf_at + p.tf.len()];
-            records.push((record, entry.df, dir.bytes().to_vec(), dir.len()));
+            records.push((
+                record,
+                entry.df,
+                dir.bytes().to_vec(),
+                dir.len(),
+                dir.subs(),
+            ));
         }
         let total: usize = records.iter().map(|r| r.3).sum();
         let bytes: usize = records.iter().map(|r| r.2.len()).sum();
@@ -70,7 +82,7 @@ fn main() {
             // Parse and decode every entry, `SPIN` times, for a profiler.
             let mut sink = 0usize;
             for _ in 0..spin {
-                for (record, df, _, _) in &records {
+                for (record, df, _, _, _) in &records {
                     let p = Postings::parse(*record, *df, geometry).expect("parsed");
                     if let Form::Grouped(dir) = &p.form {
                         sink += dir.get(dir.len() - 1, groups).expect("decoded").first as usize;
@@ -84,7 +96,7 @@ fn main() {
             let parse = per(&mut || {
                 records
                     .iter()
-                    .map(|(record, df, _, _)| {
+                    .map(|(record, df, _, _, _)| {
                         Postings::parse(*record, *df, geometry)
                             .expect("parsed")
                             .containers_at
@@ -94,7 +106,7 @@ fn main() {
             let lazy = per(&mut || {
                 records
                     .iter()
-                    .map(|(record, df, _, _)| {
+                    .map(|(record, df, _, _, _)| {
                         let p = Postings::parse(*record, *df, geometry).expect("parsed");
                         let Form::Grouped(dir) = &p.form else {
                             unreachable!()
@@ -106,8 +118,8 @@ fn main() {
             let whole = per(&mut || {
                 records
                     .iter()
-                    .map(|(_, _, dir, _)| {
-                        postings::decode_directory_whole(dir, groups)
+                    .map(|(_, _, dir, _, subs)| {
+                        postings::decode_directory_whole(dir, groups, *subs)
                             .expect("decoded")
                             .len()
                     })
