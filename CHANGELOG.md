@@ -246,6 +246,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   Sapphire Rapids (mean query -7.0%, p99 -10.4%), score ones 3.6% fewer
   (mean -1.6%, median +4%), and on Apple M4 `full_score` ones 2.0% fewer
   (score ones unchanged), with the same answers.
+- A ranked disjunction over `TNS1` caps a candidate's unread terms' bounds
+  by one `minss` on x86-64 rather than `f32::min`, whose NaN ordering added
+  a compare and a blend (a plain compare and select became a branch on the
+  data). At 150 million rows (replay) `full_score` disjunctions take 1.0%
+  fewer cycles on Sapphire Rapids, score ones 0.3% fewer, with the same
+  answers; the M4 code is unchanged.
 - A ranked conjunction or phrase over `TNS1` scoring a common term (in at
   least one document in ten of the segment, as `full_score` scores them)
   beside a rarer one bounds the common term's groups by its record rather

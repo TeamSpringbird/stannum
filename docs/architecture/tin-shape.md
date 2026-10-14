@@ -1450,6 +1450,30 @@ Not kept:
   `loop/full-or-x86-patterns`). On the M4 it was no better either
   (`full_score` -2.2%, score +0.3%).
 
+### Follow-ups: the score median, a TF prefetch, `f32::min` (branch `loop/fx`)
+
+Measured on a Sapphire Rapids devbox (m7i.4xlarge, `perf stat` user cycles,
+2 rounds, against `79a7320`) and the M4, with the same answers throughout:
+
+- Kept: a candidate's unread terms capped by `postings::lower`, one `minss`
+  on x86-64 (`_mm_min_ss`) and `f32::min` (one `fminnm`) elsewhere. As
+  `if v < best { v } else { best }` LLVM made it a branch on the data on
+  both targets. `full_score` disjunctions -1.0% cycles (-0.4%
+  instructions), score ones -0.3%.
+- Not kept: the pair from `loop/full-or-x86-patterns` alone (only the live
+  words' sums compared with the bar; a term's first index counted when a
+  candidate first holds it). Without the pattern memo it did not move the
+  score median (-0.2%, rounds -1.5/+1.2; p99 +2.7%) and cost `full_score`
+  disjunctions +2.2% cycles (p99 +5.0%): branch misses +13%, the live-word
+  loop's trip count and the per-term "counted yet" test being data. On the
+  M4 the lazy count alone cost `full_score` ~3% cycles.
+- Not kept: prefetching the TF bucket now that its address is cheap (the
+  group's `TfRun`). A line ahead of each bucket read: `full_score` +1.4%
+  cycles, score +1.6%; a candidate's held terms' lines at once, after its
+  first cut: `full_score` +1.8% (branch misses +7 points), score +1.4%
+  (branches `loop/fx-rejected`, `loop/fx-held`). As with R6, the line's
+  miss is not what the candidate waits on most.
+
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 
 Under `full_score` a dense pair ("is to", "to a") leaves most of a group's
