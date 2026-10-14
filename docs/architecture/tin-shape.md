@@ -1284,6 +1284,27 @@ replaying them against each interval; `--forget`, 400 conjunctions):
 entries decoded per query against decoding through to each one asked,
 every 4 entries 42%, 8 46%, 16 50%, 32 55%, 64 61% (asked: 38%).
 
+A run's own costs (two skip points read, a varint scan set up, the checks)
+are about what decoding its 16 entries costs, so a walk that reaches most
+of a term's entries (a phrase of common words) paid more per entry than a
+block of 128 did: the first cut cost phrases 1.8% more cycles for 2.9%
+fewer instructions. Three changes took that back. A run's bytes are scanned
+exactly (the next skip point says where it ends), not by an estimate per
+entry and again for the entry the estimate cut; a seek scans a decoded
+run's entries as a slice; and a walk that reaches the run after one it
+decoded decodes up to eight runs in one pass, checked at their end. The
+parse also copies a directory once, a page at a time
+(`Bytes::copy_into`), where a directory spanning pages was stitched into
+the span's buffer and then copied (2 MB a conjunction at 150M rows).
+
+At 150M rows (`dump-new` re-encoded `--from 10`: +0.30% of the index,
+postings +0.70%; replay with `--forget`, 400 queries per style, 3 rounds,
+M4, against `perf-integrate10`): directory entries decoded per conjunction
+103,800 -> 64,900, phrase 106,100 -> 66,900; instructions -6.5% / -4.5%,
+cycles -3.4% / -1.6%, median query -12% / -7.5%, mean -5.0% / -4.6%, p99
+-1.1% / -1.2% (conjunction / phrase). Whole trace: every answer equal to
+`pg-ranked.tsv`, `--full` answers identical to `f0962a8`'s.
+
 ## A sieve's first pass a word at a time (branch `loop/v5-r1b`)
 
 Under `full_score` a dense pair ("is to", "to a") leaves most of a group's

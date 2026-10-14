@@ -5720,13 +5720,13 @@ mod tests {
         Spi::run("CREATE INDEX reproducible_whole ON reproducible USING stannum(body)").unwrap();
         assert_eq!(
             build_digest("reproducible_capped"),
-            "44,1800,55800,17,48,3e4a28feef32b16545501b48f5392303;\
-             26,1800,55800,17,49,5e7a2ae3d772f0edfd2be363d6c34ed6;\
-             2,2400,74400,23,50,a9fd2a287b8af3c5cbb6cd7d45c78d3d size 507904"
+            "44,1800,55800,17,48,4340f15e36ef6a0977810e2175eb894c;\
+             26,1800,55800,17,49,1973333a564bb9d4888c4a352fc26451;\
+             2,2400,74400,23,50,398d277200a50fd9128a60ac1c656ec3 size 507904"
         );
         assert_eq!(
             build_digest("reproducible_whole"),
-            "2,6000,186000,51,46,6567a8f48a237f21dc68bee0e2e1b233 size 442368"
+            "2,6000,186000,51,46,6a81758d8bb7c11e761c6246a2058f4a size 442368"
         );
         assert_clean("reproducible_capped");
         assert_clean("reproducible_whole");
