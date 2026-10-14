@@ -1444,9 +1444,15 @@ impl Directory {
             if !self.is_done(r) {
                 self.get_slow(b, groups)?;
             }
-            let end = ((r + 1) * DIRECTORY_SKIP).min(n);
-            // SAFETY: run `r` is decoded: slots `r * DIRECTORY_SKIP..end`
-            // are written, once, and laid out as their entries.
+            // Run `r`, or every entry from `b` on once all are decoded (a
+            // disjunction's directory is decoded whole).
+            let end = if self.decoded.get() == n {
+                n
+            } else {
+                ((r + 1) * DIRECTORY_SKIP).min(n)
+            };
+            // SAFETY: runs `r..end.div_ceil(DIRECTORY_SKIP)` are decoded:
+            // their slots are written, once, and laid out as their entries.
             let run = unsafe {
                 std::slice::from_raw_parts(
                     self.entries.as_ptr().add(b).cast::<GroupEntry>(),
@@ -1457,7 +1463,9 @@ impl Directory {
                 return Ok(b + i);
             }
             b = end;
-            if self.skips && b < n {
+            // Past a run not decoded, by the skip points (a decoded one is
+            // scanned on).
+            if self.skips && b < n && !self.is_done(b / DIRECTORY_SKIP) {
                 b = self.skip_past(b / DIRECTORY_SKIP, index) * DIRECTORY_SKIP;
             }
         }
@@ -5027,6 +5035,18 @@ mod lazy_directory_tests {
             assert_eq!(dir.find(e.index, groups).unwrap(), Some(e));
             for index in [e.first, e.first + e.count - 1] {
                 assert_eq!(dir.entry_of_posting(index, groups).unwrap(), e);
+            }
+        }
+        // And decoded whole.
+        dir.decode_all(groups).unwrap();
+        for from in (0..whole.len()).step_by(7) {
+            for index in [whole[from].index, whole[from].index + 1, last, last + 1] {
+                let want = from + whole[from..].partition_point(|e| e.index < index);
+                assert_eq!(
+                    dir.seek(index, from, groups).unwrap(),
+                    want,
+                    "{index} from {from}, whole"
+                );
             }
         }
     }
