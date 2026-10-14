@@ -48,6 +48,10 @@ use crate::walk::{Ranked, TopRows, Visibility};
 /// times as many members.
 const SEEK_RATIO: usize = 4;
 
+/// Cache lines of the lead's next container asked for while a group is
+/// walked ([`Walk::run`]): a rare lead's container is a line or a few.
+const LEAD_PREFETCH_LINES: usize = 4;
+
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
 
@@ -1504,6 +1508,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     usize::MAX,
                     self.touch,
                 )?;
+            }
+            // The lead's next container is read first in its group, which
+            // waited on memory for it: asked for now, it arrives while this
+            // group is walked.
+            let mem = &self.mems[lead];
+            if mem.entry != usize::MAX {
+                let set = self.terms[lead].as_ref().expect("the lead");
+                set.prefetch_next(mem.hint, LEAD_PREFETCH_LINES);
             }
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
