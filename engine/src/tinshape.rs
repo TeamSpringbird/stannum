@@ -28,6 +28,7 @@ use tinql::runtime::{Query, SpanTermSlot};
 use crate::bm25::TermScorer;
 
 mod rank;
+pub mod subproto;
 
 /// The parts of a segment a query reads, named as TIN's EXPLAIN names its
 /// page touches.

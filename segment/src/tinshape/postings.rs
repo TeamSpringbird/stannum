@@ -303,6 +303,60 @@ pub fn put_group_frontier(out: &mut Vec<u8>, pairs: &[(u8, u32)]) {
     }
 }
 
+/// Slots of a grid group's sub-range: a grid container's frontier is
+/// refined per sub-range ([`put_sub_codes`]), the grain a disjunction's
+/// word loop weighs its members at (16 words of 64 slots).
+pub const SUB_SLOTS: u32 = 1024;
+
+/// A sub-range code of no posting.
+pub const SUB_NONE: u8 = u8::MAX;
+
+/// Sub-ranges of a group of `slots` slots.
+#[inline]
+pub const fn sub_ranges(slots: u32) -> usize {
+    slots.div_ceil(SUB_SLOTS) as usize
+}
+
+/// Appends a grid group's sub-range codes: per sub-range of
+/// [`SUB_SLOTS`] slots in order, per pair `k` of the group's frontier
+/// (buckets `buckets`, ascending), one byte: the least [`round_length`]
+/// code (at most 254) of the sub-range's postings whose bucket is above
+/// pair `k - 1`'s (any, for the first), or [`SUB_NONE`] for none. A
+/// posting of the sub-range whose bucket lies above pair `k - 1`'s and at
+/// most pair `k`'s is then dominated by pair `k`'s bucket at the code's
+/// length: the group's frontier, refined per sub-range at its own buckets.
+/// `locals` are the members' local slots (ascending), `postings` their
+/// buckets and lengths.
+pub fn put_sub_codes(
+    buckets: &[u8],
+    slots: u32,
+    locals: &[u32],
+    postings: impl Iterator<Item = (u8, u32)>,
+    out: &mut Vec<u8>,
+) {
+    let n = buckets.len();
+    debug_assert!((1..=16).contains(&n));
+    let start = out.len();
+    out.resize(start + sub_ranges(slots) * n, SUB_NONE);
+    let codes = &mut out[start..];
+    for (&local, (bucket, length)) in locals.iter().zip(postings) {
+        let r = (local / SUB_SLOTS) as usize;
+        // The pair whose bucket is the first at least the posting's.
+        let k = buckets.partition_point(|b| *b < bucket);
+        debug_assert!(k < n, "a bucket past the group's frontier");
+        let code = round_length(length).min(u32::from(SUB_NONE) - 1) as u8;
+        let cell = &mut codes[r * n + k.min(n - 1)];
+        *cell = (*cell).min(code);
+    }
+    // A posting counts for every pair up to its own: least codes from the
+    // last pair down.
+    for row in codes.chunks_exact_mut(n) {
+        for k in (0..n - 1).rev() {
+            row[k] = row[k].min(row[k + 1]);
+        }
+    }
+}
+
 /// Checks and steps over a group frontier at `at`; its largest bucket (the
 /// last pair's).
 #[inline]

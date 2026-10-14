@@ -1181,6 +1181,42 @@ fn run() -> Result<bool, String> {
         throughput(&args, &loaded, &trace)?;
         return Ok(true);
     }
+    if std::env::var_os("STANNUM_R10_PROTO").is_some() {
+        // R10 prototype: grid groups' sub-range codes, computed now.
+        let start = Instant::now();
+        let built: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = loaded
+                .segments
+                .iter()
+                .map(|(_, blob, _)| {
+                    let blob: &'static [u8] = blob;
+                    scope.spawn(move || {
+                        let segment = Segment::parse(blob).expect("a segment");
+                        let records = engine::tinshape::subproto::build(&segment);
+                        let bytes: usize = records
+                            .values()
+                            .map(|r| r.codes.len() + 4 * r.offsets.len())
+                            .sum();
+                        ((segment.documents, segment.total_length), records, bytes)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a build"))
+                .collect()
+        });
+        let bytes: usize = built.iter().map(|b| b.2).sum();
+        let codes: usize = built
+            .iter()
+            .map(|b| b.1.values().map(|r| r.codes.len()).sum::<usize>())
+            .sum();
+        engine::tinshape::subproto::install(built.into_iter().map(|b| (b.0, b.1)).collect());
+        eprintln!(
+            "R10 prototype: sub-range codes {codes} B ({bytes} B held) in {:.1} s",
+            start.elapsed().as_secs_f64()
+        );
+    }
     let start = Instant::now();
     let reader = Reader::open(&loaded, &args)?;
     eprintln!(
