@@ -4,13 +4,20 @@
 
 //! Array containers: a group's local slots as sorted little-endian `u16`s
 //! ([`segment::tinshape::postings::KIND_ARRAY`]). Nothing to decode: a walk
-//! widens them into its list (eight at a time on NEON and AVX2), sets them
+//! widens them into its list (eight at a time on NEON and SSE2), sets them
 //! in a row, or probes them in place by galloping, where an Elias-Fano list
 //! of the same members takes a setup and a member at a time below
 //! [`super::ef::SHORT`] members (about 6 to 35 ns a container on the M4 at
 //! 3 to 40 members, against 3 to 10 widened).
+//!
+//! The widening is inlined at every level, with no dispatch: on x86-64 by
+//! SSE2, which every x86-64 CPU has. Most arrays a walk widens hold a few
+//! members, and a call into an AVX2 body chosen at run time (a
+//! `target_feature` function cannot be inlined into its caller) cost more
+//! than the widening: about 17 ns an array under eight members on Sapphire
+//! Rapids, against 5 on the M4.
 
-use super::{Level, level};
+use super::Level;
 
 /// The value at index `i` of an array's bytes.
 #[inline(always)]
@@ -21,27 +28,30 @@ fn at(bytes: &[u8], i: usize) -> u32 {
 /// Appends the array's values (`bytes.len() / 2` of them), in order.
 #[inline]
 pub fn array_decode(bytes: &[u8], out: &mut Vec<u32>) {
-    array_decode_at(level(), bytes, out);
-}
-
-/// [`array_decode`] at `level`, which the CPU must support (the caller's
-/// [`Level::supported`]; an unsupported level runs the portable body).
-#[inline]
-pub fn array_decode_at(level: Level, bytes: &[u8], out: &mut Vec<u32>) {
     let n = bytes.len() / 2;
     out.reserve(n + LANES);
-    match level {
-        #[cfg(target_arch = "aarch64")]
-        Level::Neon => neon::decode(bytes, n, out),
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: the level is the CPU's (AVX-512 implies AVX2).
-        Level::Avx2 | Level::Avx512 if level.supported() => unsafe { avx2::decode(bytes, n, out) },
-        _ => out.extend((0..n).map(|i| at(bytes, i))),
+    #[cfg(target_arch = "aarch64")]
+    neon::decode(bytes, n, out);
+    #[cfg(target_arch = "x86_64")]
+    sse2::decode(bytes, n, out);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    out.extend((0..n).map(|i| at(bytes, i)));
+}
+
+/// [`array_decode`] at `level`: the portable body at [`Level::Scalar`], else
+/// the vector body (NEON, or SSE2 on x86-64 at any other level).
+#[inline]
+pub fn array_decode_at(level: Level, bytes: &[u8], out: &mut Vec<u32>) {
+    if level == Level::Scalar {
+        let n = bytes.len() / 2;
+        out.extend((0..n).map(|i| at(bytes, i)));
+    } else {
+        array_decode(bytes, out);
     }
 }
 
 /// Values a vector body widens at a time (and may store past the end, into
-/// the room [`array_decode_at`] reserves).
+/// the room [`array_decode`] reserves).
 const LANES: usize = 8;
 
 #[cfg(target_arch = "aarch64")]
@@ -74,23 +84,24 @@ mod neon {
 }
 
 #[cfg(target_arch = "x86_64")]
-mod avx2 {
+mod sse2 {
     use core::arch::x86_64::*;
 
-    /// # Safety
-    /// The CPU has AVX2.
-    #[target_feature(enable = "avx2")]
-    pub unsafe fn decode(bytes: &[u8], n: usize, out: &mut Vec<u32>) {
+    #[inline(always)]
+    pub fn decode(bytes: &[u8], n: usize, out: &mut Vec<u32>) {
         let start = out.len();
         let src = bytes.as_ptr();
         // SAFETY: as NEON's (each load 16 of the `2n` bytes, the stores
-        // within the room reserved); AVX2 is the caller's.
+        // within the room reserved); SSE2 is part of x86-64. Interleaving
+        // with zero widens a vector's low and high four values.
         unsafe {
             let dst = out.as_mut_ptr().add(start);
+            let zero = _mm_setzero_si128();
             let mut i = 0;
             while i + 8 <= n {
                 let v = _mm_loadu_si128(src.add(2 * i).cast());
-                _mm256_storeu_si256(dst.add(i).cast(), _mm256_cvtepu16_epi32(v));
+                _mm_storeu_si128(dst.add(i).cast(), _mm_unpacklo_epi16(v, zero));
+                _mm_storeu_si128(dst.add(i + 4).cast(), _mm_unpackhi_epi16(v, zero));
                 i += 8;
             }
             while i < n {
