@@ -3745,6 +3745,54 @@ mod tests {
                 prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
             }
         }
+
+        /// Disjunctions of words dense and sparse, whose groups' candidates
+        /// hold some of the terms only: sieved by the terms each holds.
+        #[test]
+        fn disjunctions_sieved_by_the_terms_each_holds_keep_the_exact_top_rows(
+            n in 3000usize..8000,
+            density in prop::collection::vec(5u32..100, 5),
+            seed in any::<u64>(),
+            k in 1usize..12,
+        ) {
+            let (docs, lengths, members) = dense_words(n, &density, seed);
+            let all: Vec<usize> = (0..n).collect();
+            let options = Options { grid_min_postings: 0, inline_lengths_min_documents: u32::MAX, ..Options::default() };
+            let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+            let segment = Segment::parse(&blob).unwrap();
+            let names: Vec<String> = (0..5).map(|t| format!("t{t}")).collect();
+            for node in [
+                Node::Or((0..3).map(Node::Term).collect()),
+                Node::Or((0..5).map(Node::Term).collect()),
+                Node::Or(vec![Node::Term(4), Node::Term(0), Node::Term(2)]),
+            ] {
+                let scorers: Vec<(String, TermScorer)> = leaf_terms(&node)
+                    .into_iter()
+                    .map(|t| {
+                        let df = members[t].len().max(1) as u64;
+                        (names[t].clone(), TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 20.0).unwrap())
+                    })
+                    .collect();
+                let mut want: Vec<(f32, Tid)> = (0..n)
+                    .filter(|r| eval(&node, &members, *r))
+                    .map(|r| {
+                        let mut total = 0.0_f32;
+                        for (name, scorer) in &scorers {
+                            let t: usize = name[1..].parse().unwrap();
+                            if let Some(tf) = holds(&members, t, r) {
+                                total += scorer.score_bucket(TfBucket::from_count(tf), lengths[r]);
+                            }
+                        }
+                        (total, docs[r])
+                    })
+                    .collect();
+                want.sort_by(crate::walk::rank);
+                want.truncate(k);
+                let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+                let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
+                prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
+            }
+        }
     }
 
     /// Two dense words, with the final rows kept from the start: a group's

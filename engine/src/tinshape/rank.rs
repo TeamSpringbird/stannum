@@ -1391,6 +1391,11 @@ struct Walk<'s, 'a, T: Touch> {
     /// already ([`Walk::sieve_words`]): its pass over a chunk then keeps
     /// nearly all, which says nothing of what it drops.
     sieve_pre: bool,
+    /// Whether the sieve bounds a candidate by the terms it holds alone (a
+    /// disjunction's group whose terms are not all required, where a
+    /// candidate lacks some): a term not read yet adds its bound where the
+    /// candidate holds it (its row says), nothing elsewhere.
+    sieve_by_held: bool,
     sieve_prefix: Vec<u32>,
     /// [`Walk::sieve_words`]' scratch: the first term's buckets gathered
     /// from the TF tail, and their pass bits.
@@ -1827,6 +1832,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         self.sieve_terms.clear();
         self.sieve_ub.clear();
+        self.sieve_by_held = false;
         for i in 0..self.sc.len() {
             let t = self.sc[i].term;
             self.ensure(t, g)?;
@@ -1887,7 +1893,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .enumerate()
             .map(|(i, u)| if i == first.i { 0.0 } else { *u })
             .sum();
-        if rest >= score {
+        // Bounded by the terms each holds, a candidate's other terms may be
+        // far fewer than the group's: whether the first term drops enough
+        // is left to its first chunk (see `Walk::sieve`'s depth).
+        if rest >= score && !self.sieve_by_held {
             return false;
         }
         // Most postings count one (bucket 0): unless those can drop, few
@@ -1896,7 +1905,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let (floor, v) = self.sc[first.i].floor_kept(first.entry, 0);
         first.table[0] = v;
         first.floors[0] = floor;
-        rest + v < score
+        rest + v < score || self.sieve_by_held
     }
 
     /// Counts the members per word of sieve term `k`'s bitmap, once per
@@ -2099,8 +2108,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // over the group until its bucket is read.
         let mut vals = std::mem::take(&mut self.sieve_vals);
         vals.clear();
-        for &ub in &self.sieve_ub {
-            vals.resize(vals.len() + m, ub);
+        for (i, &ub) in self.sieve_ub.iter().enumerate() {
+            if self.sieve_by_held && ub != 0.0 {
+                // Where the candidate holds the term (a disjunction's row
+                // of it), else nothing.
+                let row = self.row_state[i].at;
+                vals.extend(cands.iter().map(|&local| {
+                    or_zero(ub, row.word(local as usize / 64) >> (local % 64) & 1 == 1)
+                }));
+            } else {
+                vals.resize(vals.len() + m, ub);
+            }
         }
         // The candidates left, by their place in `cands`, and their slots.
         let mut left = std::mem::take(&mut self.sieve_left);
@@ -2195,7 +2213,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 _ => ub,
             };
             let bar = self.bar;
-            if k == 0 {
+            // Bounded by the terms it holds, a candidate's other terms
+            // vary too: the first term is read as the others are.
+            if k == 0 && !self.sieve_by_held {
                 // The first term's bucket is all that varies yet: whether
                 // the bar cuts a candidate is its bucket's, but for a tie.
                 let verdict = self.first_verdicts(st.i, value);
@@ -3105,6 +3125,7 @@ pub(super) fn walk_into<'s, 'a>(
         sieve_cands: Vec::new(),
         sieve_depth: 0,
         sieve_pre: false,
+        sieve_by_held: false,
         sieve_prefix: Vec::new(),
         sieve_fields: Vec::new(),
         sieve_pass: Vec::new(),
@@ -3737,14 +3758,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut bits = [0u8; 64];
         // The members left after the weighing below are sieved by their
         // buckets a chunk at a time before each is bounded alone, in a
-        // group whose every weighed term is required (the disjunction is a
-        // conjunction there) and whose mask holds many (a `full_score`
-        // disjunction of dense words; a `score` one's holds some 85, which
-        // their own checks bound for less).
-        let sieving = plan.required.len() == terms.len()
-            && kernels::popcount(&mask) >= OR_SIEVE_MIN
-            && self.or_sieve(&terms, &sb);
-        if sieving {
+        // group whose mask holds many (a `full_score` disjunction of dense
+        // words; a `score` one's holds some 85, which their own checks bound
+        // for less). Where every weighed term is required (the disjunction
+        // is a conjunction there) the first term's buckets sieve the mask's
+        // words first; elsewhere a candidate is bounded by the terms it
+        // holds.
+        let conjunctive = plan.required.len() == terms.len();
+        let sieving =
+            kernels::popcount(&mask) >= OR_SIEVE_MIN && self.or_sieve(&terms, &sb, !conjunctive);
+        if sieving && conjunctive {
             self.sieve_words(&mut mask)?;
         }
         // A word's members are bounded from its first slot's ctid (see
@@ -3864,7 +3887,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     word = keep;
                 }
                 if sieving {
-                    self.or_keep(g, base, w, word)?;
+                    // SAFETY: as `candidate` below.
+                    unsafe { self.or_keep(g, base, w, word, candidate) }?;
                     continue;
                 }
                 while word != 0 {
@@ -3878,7 +3902,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             w0 = w1;
         }
         if sieving {
-            self.or_sieved(g, base)?;
+            // SAFETY: as `candidate` above.
+            unsafe { self.or_sieved(g, base, candidate) }?;
         }
         if !self.staged.is_empty() {
             self.finish_staged(g)?;
@@ -4000,10 +4025,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// weighed terms are `terms` and present terms' bounds `sb`: its grouped
     /// terms' rows are read, any other bounds every candidate by its bound
     /// over the group. False when there is no bar yet or no term to read.
-    fn or_sieve(&mut self, terms: &[usize], sb: &[f32]) -> bool {
+    fn or_sieve(&mut self, terms: &[usize], sb: &[f32], by_held: bool) -> bool {
         if self.bar.is_none() {
             return false;
         }
+        self.sieve_by_held = by_held;
         self.sieve_terms.clear();
         // A term absent from the group adds nothing, any other at most its
         // bound over the group.
@@ -4028,23 +4054,44 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Keeps the members of `word`, word `w` of group `g` (first slot
     /// `base`), for the sieve, and sieves them once a chunk is kept.
+    ///
+    /// # Safety
+    ///
+    /// `candidate` is [`Walk::or_candidate_fn`]'s, safe to call here.
     #[inline(never)]
-    fn or_keep(&mut self, g: u32, base: u32, w: usize, mut word: u64) -> Result<()> {
+    unsafe fn or_keep(
+        &mut self,
+        g: u32,
+        base: u32,
+        w: usize,
+        mut word: u64,
+        candidate: unsafe fn(&mut Self, u32, u32, usize, u32) -> Result<()>,
+    ) -> Result<()> {
         while word != 0 {
             self.sieve_cands
                 .push((w * 64) as u32 + word.trailing_zeros());
             word &= word - 1;
         }
         if self.sieve_cands.len() >= SIEVE_CHUNK {
-            self.or_sieved(g, base)?;
+            // SAFETY: as the caller's.
+            unsafe { self.or_sieved(g, base, candidate) }?;
         }
         Ok(())
     }
 
     /// Sieves the disjunction candidates kept ([`Walk::or_keep`]) of group
     /// `g` (first slot `base`) and bounds each one left alone
-    /// ([`Walk::or_candidate`]).
-    fn or_sieved(&mut self, g: u32, base: u32) -> Result<()> {
+    /// ([`Walk::or_candidate`], by `candidate`).
+    ///
+    /// # Safety
+    ///
+    /// `candidate` is [`Walk::or_candidate_fn`]'s, safe to call here.
+    unsafe fn or_sieved(
+        &mut self,
+        g: u32,
+        base: u32,
+        candidate: unsafe fn(&mut Self, u32, u32, usize, u32) -> Result<()>,
+    ) -> Result<()> {
         let mut left = std::mem::take(&mut self.sieve_cands);
         let mut result = Ok(());
         if left.len() >= SIEVE_MIN {
@@ -4054,7 +4101,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if result.is_err() {
                 break;
             }
-            result = self.or_candidate(g, base, local as usize / 64, local % 64);
+            // SAFETY: as the caller's.
+            result = unsafe { candidate(self, g, base, local as usize / 64, local % 64) };
         }
         left.clear();
         self.sieve_cands = left;
