@@ -53,7 +53,8 @@ term's rows spread over heap pages.
 ## The format
 
 ```text
-blob := "TNS1", documents, total_length, block_size, flags (bit 0: adaptive TF),
+blob := "TNS1", documents, total_length, block_size,
+        flags (bit 0: adaptive TF, bit 1: length classes),
         dictionary_len, postings_len, positions_len, docset_len, lengths_len,
         liveness_len (varints),
         term map | postings | positions | document set | DL sidecar | liveness
@@ -262,6 +263,32 @@ a header read and a bit extraction; 8.3 bits per document here (TIN's
 probes: about 6 on shorter documents) against `STN3`'s 4-byte lengths plus
 1-byte classes, and 2.6 times the documents per page of `u16` lengths.
 
+Since page layout 13 (the header's flag bit 1) the sidecar also holds each
+document's **length class**, two bits by rank: class 0 below 16 words, 1
+below 64, 2 below 256, 3 the rest (the sidecar's prefix records the three
+floors). The classes are a plane of 64 bytes per block, a cache line's
+worth, the planes in a row between the block headers and the packed
+lengths:
+
+```text
+dl := block, blocks, [floor1, floor2, floor3] (varints),
+      header (8 bytes) per block, [class plane (64 bytes) per block],
+      packed lengths per block
+```
+
+A ranked walk reads a candidate's class before its length (see [reading
+it](#reading-it)): one byte at `rank / 4`, from a line its group's other
+candidates mostly share (a group's documents are a few thousand
+consecutive ranks), where the length is a header and a data page per
+scattered candidate. 2 bits a document: 37.5 MB at 150M rows, +0.10% of
+the index. Kept apart from the headers rather than beside each (72 bytes a
+block), which would spread the headers a survivor reads over nine times
+the pages, and per document rather than per posting in the TF tail, which
+would cost 2 bits a posting (1.3 GB, +3.5%, at 150M rows). TIN keeps
+exact lengths or impacts inline for (term, group) lists of at most 62
+postings and reads DL for every candidate past the group's bound in longer
+ones (probe round 8): classes are beyond TIN there.
+
 ### Liveness bitmap
 
 A count of dead documents and, when any, a bit per document rank. A reader
@@ -340,8 +367,10 @@ again (2.5% fewer cycles in the full_score replay).
   no block boundary crosses), then by its buckets: each term's bucket from
   the TF tail, scored at the shortest length its block holds for that
   bucket or more (the frontier's pairs at or above it), so the DL sidecar
-  is read only for a candidate this leaves in reach, and the score is exact
-  from the buckets and the length. (A required term carrying its lengths
+  is read only for a candidate this leaves in reach, then by its length
+  class (the buckets bounded at the class's shortest length, where that
+  is longer than their floor: a byte, see [DL sidecar](#dl-sidecar)), and
+  the score is exact from the buckets and the length. (A required term carrying its lengths
   inline is read first instead, with a bound by its length against the
   window's largest buckets, `TermScorer::length_bound_parts`.) At 150
   million rows the bucket bound rules out two in three of the candidates
@@ -408,7 +437,9 @@ again (2.5% fewer cycles in the full_score replay).
   document so rules out the common words' blocks, bounded by their short
   documents, before their TF is read: at 150M rows, scoring every term
   (`full_score`), a candidate past its blocks reads 60% fewer buckets and
-  a disjunction 38% fewer TF pages. A flat disjunction's
+  a disjunction 38% fewer TF pages. A candidate its buckets leave in reach
+  is then bounded at its length class's shortest length, as a
+  conjunction's is, before its length is read. A flat disjunction's
   candidates left in reach are scored best bound first at the group's end,
   as a phrase's are, so the best of a group raise the threshold over the
   rest before their lengths are read (on TIN's corpus, 15 ORed terms read
