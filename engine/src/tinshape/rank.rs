@@ -3266,6 +3266,12 @@ const WEIGH_IN_LANES: bool = cfg!(target_arch = "x86_64");
 /// than one at a time (see `Walk::or_group`): the narrowest kernel's lanes.
 const MEMBER_LANES: usize = 4;
 
+/// Members a word must hold for its members to be weighed in lanes rather
+/// than by their patterns ([`Walk::pattern_key`]) where the kernels weigh
+/// in lanes: a vector of eight sums costs less than eight members' bits
+/// gathered one term at a time.
+const LANES_OVER_PATTERNS: usize = 8;
+
 use super::kernels::or_zero;
 
 /// A disjunction's plan for a group at one threshold (MaxScore with the
@@ -3860,7 +3866,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     // `BarKey::keeps`), at the bar as it stands now.
                     let bar = BarKey::of(self.bar).expect("weighed under a bar");
                     let mut keep = 0u64;
-                    if patterned {
+                    let members = word.count_ones() as usize;
+                    if patterned && !(WEIGH_IN_LANES && members >= LANES_OVER_PATTERNS) {
                         // A member's sum is its pattern's (bit `t` where
                         // term `t` holds it), each summed once per group or
                         // sub-range (`Walk::pattern_key`).
@@ -3880,7 +3887,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             };
                             keep |= u64::from(kept) << bit;
                         }
-                    } else if WEIGH_IN_LANES && word.count_ones() as usize >= MEMBER_LANES {
+                    } else if WEIGH_IN_LANES && members >= MEMBER_LANES {
                         let mut n = 0;
                         let mut left = word;
                         while left != 0 {
