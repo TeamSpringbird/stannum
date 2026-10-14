@@ -270,7 +270,7 @@ pub struct OrCounts {
     pub kept: u64,
 }
 
-pub const OR_VARIANTS: [&str; 11] = [
+pub const OR_VARIANTS: [&str; 16] = [
     "today",
     "grp-top1",
     "grp-top5",
@@ -282,7 +282,18 @@ pub const OR_VARIANTS: [&str; 11] = [
     "seg-top20",
     "tf>=2",
     "oracle",
+    "b:today",
+    "b:grp-top5",
+    "b:grp-top10",
+    "b:grp-top20",
+    "b:seg-top10",
 ];
+/// The bucket-aware variants ("b:"): each posting bounded by its bucket at
+/// its tier's frontier floor for that bucket (the shortest document holding
+/// that bucket or more: the group's for today and the hi tier, the lo
+/// postings' for the lo tier), as the walk's TF reads bound a member; by
+/// the tier choice of the plain variant they name.
+const BUCKETED: [usize; 5] = [0, 2, 3, 4, 7];
 const NV: usize = OR_VARIANTS.len();
 const PCTS: [f64; 4] = [0.01, 0.05, 0.10, 0.20];
 
@@ -740,6 +751,11 @@ impl Census {
         slots: usize,
     ) -> OrCounts {
         let mut c = OrCounts::default();
+        let (v, bucketed) = if v >= 11 {
+            (BUCKETED[v - 11], true)
+        } else {
+            (v, false)
+        };
         // Per term: per posting its bound (by tier), and its pseudo-terms'
         // bounds (hi, lo) with whether each has postings.
         let mut bounds: Vec<Vec<f32>> = Vec::with_capacity(terms.len());
@@ -793,6 +809,41 @@ impl Census {
             }
             let per: Vec<f32> = if v == 10 {
                 imp.to_vec()
+            } else if bucketed {
+                // Per bucket the shortest document holding it or more: over
+                // the group (today, hi tier) and over the lo postings.
+                let mut all = [u32::MAX; 16];
+                let mut lo = [u32::MAX; 16];
+                for (i, (bk, l)) in d.bucket[a..b].iter().zip(&d.length[a..b]).enumerate() {
+                    let k = usize::from(*bk) % 16;
+                    all[k] = all[k].min(*l);
+                    if !tier_hi[i] {
+                        lo[k] = lo[k].min(*l);
+                    }
+                }
+                for k in (0..15).rev() {
+                    all[k] = all[k].min(all[k + 1]);
+                    lo[k] = lo[k].min(lo[k + 1]);
+                }
+                let per: Vec<f32> = d.bucket[a..b]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, bk)| {
+                        let k = usize::from(*bk) % 16;
+                        let floor = if tier_hi[i] { all[k] } else { lo[k] };
+                        d.scorer
+                            .bound_through(TfBucket::new(*bk).expect("a bucket"), floor)
+                    })
+                    .collect();
+                (hb, lb) = (0.0, 0.0);
+                for (i, x) in per.iter().enumerate() {
+                    if tier_hi[i] {
+                        hb = hb.max(*x);
+                    } else {
+                        lb = lb.max(*x);
+                    }
+                }
+                per
             } else {
                 tier_hi.iter().map(|h| if *h { hb } else { lb }).collect()
             };
