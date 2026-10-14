@@ -4288,7 +4288,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 });
             }
         }
-        self.ready_sieve()
+        let ready = self.ready_sieve();
+        // A disjunction's sieve keeps the group's chunks and bounds: its
+        // members come a word at a time, and chunks cut at sub-range ends
+        // fell below `SIEVE_MIN`, leaving each candidate to its own check
+        // (whole-trace disjunctions +15% instructions at 150M rows). Its
+        // candidates' own checks still take their sub-ranges' bounds.
+        self.sieve_split = false;
+        ready
     }
 
     /// Keeps the members of `word`, word `w` of group `g` (first slot
