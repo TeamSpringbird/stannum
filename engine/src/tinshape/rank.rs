@@ -3268,32 +3268,6 @@ struct Plan {
     order: Vec<(f32, usize)>,
 }
 
-/// Sets a group's local slots, given in ascending order, in a row of words
-/// cleared before: the word at hand's bits are kept in a register and
-/// stored whole at each member, so a member never reads back the word the
-/// one before it stored.
-struct RowBits<'r> {
-    row: &'r mut [u64],
-    w: usize,
-    bits: u64,
-}
-
-impl<'r> RowBits<'r> {
-    fn new(row: &'r mut [u64]) -> Self {
-        Self { row, w: 0, bits: 0 }
-    }
-
-    #[inline]
-    fn set(&mut self, local: u32) {
-        let w = local as usize / 64;
-        debug_assert!(w >= self.w, "local slots in ascending order");
-        let kept = if w == self.w { self.bits } else { 0 };
-        self.bits = kept | 1 << (local % 64);
-        self.w = w;
-        self.row[w] = self.bits.to_le();
-    }
-}
-
 /// A disjunction term's members in the group at hand, as a row of words
 /// (see [`RowAt`]), and a forward cursor over their posting indexes.
 #[derive(Clone, Copy, Default)]
@@ -3501,8 +3475,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             cursor.seek(group.slot_base);
             r.first = cursor.rank() as u32;
             let end = group.slot_base + group.slots();
-            let mut out = RowBits::new(row);
-            cursor.drain_below(end, |slot| out.set(slot - group.slot_base));
+            let mut out = kernels::RowPut::new();
+            cursor.drain_below(end, |slot| out.put(row, slot - group.slot_base));
             return Ok(());
         }
         // The entry `run_or`'s seek found for the group, in the hint.
@@ -3531,10 +3505,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             Src::Locals { from, to } => {
                 r.first = from;
                 row.fill(0);
-                let mut out = RowBits::new(row);
-                for l in &set.locals[from as usize..to as usize] {
-                    out.set(*l);
-                }
+                kernels::set_ascending(&set.locals[from as usize..to as usize], row);
             }
         }
         Ok(())

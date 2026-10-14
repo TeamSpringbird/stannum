@@ -696,6 +696,8 @@ struct Fold<'s, 'a, T: Touch> {
     /// Member lists of a probing AND.
     list: Vec<u32>,
     other: Vec<u32>,
+    /// A term's members set in a cleared row, to be ORed into a filled one.
+    row: Vec<u64>,
     /// Per term, a cursor over its positions, opened when a span first
     /// reads them: documents are checked in slot order, so their entries
     /// are read forward from the last one rather than located afresh.
@@ -707,7 +709,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
     /// the caller); false when there are none.
     fn eval(&mut self, node: &Node, group: u32, out: &mut [u64], depth: usize) -> Result<bool> {
         match node {
-            Node::Term(t) => self.term_into(*t, group, out),
+            Node::Term(t) => self.term_into(*t, group, out, true),
             Node::And(children) => {
                 // A flat AND of terms (and negated terms) probes, led by its
                 // rarest term in the group.
@@ -801,7 +803,8 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 for child in children {
                     // A term's members are set in place.
                     if let Node::Term(t) = child {
-                        any |= self.term_or(*t, group, out)?;
+                        // `out` is clear until a child sets a member.
+                        any |= self.term_or(*t, group, out, !any)?;
                         continue;
                     }
                     let mut other = self.scratch.level(depth, out.len());
@@ -870,8 +873,9 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
         }
     }
 
-    /// Sets the members of term `t` in group `group` in `out`.
-    fn term_or(&mut self, t: usize, group: u32, out: &mut [u64]) -> Result<bool> {
+    /// Sets the members of term `t` in group `group` in `out` (`clear`:
+    /// which holds none yet).
+    fn term_or(&mut self, t: usize, group: u32, out: &mut [u64], clear: bool) -> Result<bool> {
         let Some(g) = self.group_of(t, group) else {
             return Ok(false);
         };
@@ -882,7 +886,7 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
             kernels::or_bytes(out, bytes.all()?);
             return Ok(true);
         }
-        self.term_into(t, group, out)
+        self.term_into(t, group, out, clear)
     }
 
     /// The members of term `t`'s group `g`, appended to `list` in order.
@@ -960,9 +964,8 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                     }
                 }
             }
-            for l in &list {
-                out[*l as usize / 64] |= 1 << (l % 64);
-            }
+            // `out` is clear (see `eval`).
+            kernels::set_ascending(&list, out);
             self.list = list;
             self.other = other;
         }
@@ -989,7 +992,15 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
         Ok(kernels::any_set(out))
     }
 
-    fn term_into(&mut self, t: usize, group: u32, out: &mut [u64]) -> Result<bool> {
+    /// Sets the members of term `t` in group `group` in `out`; `clear`:
+    /// `out` holds none yet (else they are ORed in).
+    ///
+    /// A clear row takes a container's members as a disjunction's row does
+    /// ([`kernels::container_row`]); a filled one ORs in a cleared row of
+    /// them where they are at least one in 128 slots, else each member's
+    /// word is read and stored (members a word or more apart seldom wait on
+    /// the store before).
+    fn term_into(&mut self, t: usize, group: u32, out: &mut [u64], clear: bool) -> Result<bool> {
         let Some(g) = self.group_of(t, group) else {
             return Ok(false);
         };
@@ -1002,8 +1013,16 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 let bytes = bytes.all()?;
                 if entry.kind == KIND_GRID {
                     kernels::load(out, bytes);
+                } else if clear {
+                    kernels::container_row(&entry, bytes, starts, out)?;
+                } else if 2 * entry.count as usize >= out.len() {
+                    let mut row = std::mem::take(&mut self.row);
+                    row.clear();
+                    row.resize(out.len(), 0);
+                    kernels::container_row(&entry, bytes, starts, &mut row)?;
+                    kernels::or_words(out, &row);
+                    self.row = row;
                 } else {
-                    // ORed in: a disjunction's term_or adds to a filled row.
                     let mut list = std::mem::take(&mut self.other);
                     list.clear();
                     kernels::container_locals(&entry, bytes, starts, &mut list)?;
@@ -1014,8 +1033,13 @@ impl<'a, T: Touch> Fold<'_, 'a, T> {
                 }
             }
             Src::Locals { from, to } => {
-                for l in &set.locals[from as usize..to as usize] {
-                    out[*l as usize / 64] |= 1 << (l % 64);
+                let locals = &set.locals[from as usize..to as usize];
+                if clear {
+                    kernels::set_ascending(locals, out);
+                } else {
+                    for l in locals {
+                        out[*l as usize / 64] |= 1 << (l % 64);
+                    }
                 }
             }
         }
@@ -1155,6 +1179,7 @@ pub fn count_terms<'a>(
         touch,
         list: Vec::new(),
         other: Vec::new(),
+        row: Vec::new(),
         cursors: Vec::new(),
     };
     let mut total = 0u64;
@@ -1211,6 +1236,7 @@ pub fn for_each_match<'a>(
         touch,
         list: Vec::new(),
         other: Vec::new(),
+        row: Vec::new(),
         cursors: Vec::new(),
     };
     let mut out = Vec::new();
@@ -1332,6 +1358,7 @@ pub fn count_terms_visible<'a>(
         touch,
         list: Vec::new(),
         other: Vec::new(),
+        row: Vec::new(),
         cursors: Vec::new(),
     };
     let mut total = 0u64;

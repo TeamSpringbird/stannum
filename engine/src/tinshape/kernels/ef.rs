@@ -34,8 +34,7 @@
 //! stores up to [`SLACK`] values (its capacity reserved for them).
 //! [`ef_into_row`] decodes through a buffer on the stack, a few hundred
 //! values at a time, and sets the values as bits as a disjunction's row
-//! takes them: a word's bits gathered in a register and the word stored
-//! after each, without a branch or a load.
+//! takes them ([`super::rows`]).
 //!
 //! Lists of fewer than [`SHORT`] values take the portable body: the passes'
 //! setup and their last word's unused bytes cost more than they save there.
@@ -64,6 +63,7 @@ macro_rules! ef_run {
 }
 
 use super::array::{array_decode, array_into_row};
+use super::rows::{RowPut, set_ascending};
 use segment::tinshape::ef::Ef;
 use segment::tinshape::postings::{
     GroupEntry, KIND_ARRAY, KIND_EF, array_bytes, for_each_local, group_slots,
@@ -355,48 +355,6 @@ unsafe fn combine_one(lows: &[u8], l: u32, i: usize, d: *mut u32) {
     unsafe { *d = *d << l | bits::get(lows, i, l).unwrap_or(0) };
 }
 
-/// Sets ascending values in a row whose words they fall in are zero: the
-/// word at hand's bits kept in a register, the word stored after each value
-/// (a value in a new word starts from none), so that no store waits on a
-/// load of the word the last one stored.
-struct RowPut {
-    w: usize,
-    bits: u64,
-}
-
-impl RowPut {
-    #[inline(always)]
-    fn new() -> Self {
-        Self {
-            w: usize::MAX,
-            bits: 0,
-        }
-    }
-
-    #[inline(always)]
-    fn put(&mut self, row: &mut [u64], v: u32) {
-        let w = v as usize / 64;
-        let kept = if w == self.w { self.bits } else { 0 };
-        self.bits = kept | 1 << (v % 64);
-        self.w = w;
-        row[w] = self.bits;
-    }
-
-    /// [`Self::put`] of a value within the row.
-    ///
-    /// # Safety
-    /// `v / 64 < row.len()`.
-    #[inline(always)]
-    unsafe fn put_unchecked(&mut self, row: &mut [u64], v: u32) {
-        let w = v as usize / 64;
-        let kept = if w == self.w { self.bits } else { 0 };
-        self.bits = kept | 1 << (v % 64);
-        self.w = w;
-        // SAFETY: the caller's.
-        unsafe { *row.get_unchecked_mut(w) = self.bits };
-    }
-}
-
 /// Visits the values of a list shorter than [`SHORT`] whose highs fit a
 /// word, as a valid one's do (fewer than `3n` bits); false, visiting
 /// nothing, for any other.
@@ -601,10 +559,6 @@ macro_rules! passes {
                 8 + super::CHUNK_WORDS * 64 + super::SLACK];
             let dst = buf.as_mut_ptr().cast::<u32>();
             let total = highs_bytes.len().div_ceil(8);
-            let mut put = super::RowPut::new();
-            // Whether a chunk's values fit the row, by its last: the value
-            // with the largest high part, and low bits at most `mask`.
-            let mask = if l == 0 { 0 } else { (1u64 << l) - 1 };
             let (mut idx, mut w) = (0, 0);
             while w < total && idx < n {
                 let w1 = (w + super::CHUNK_WORDS).min(total);
@@ -625,24 +579,11 @@ macro_rules! passes {
                     }
                     dst.add(to - origin).write_bytes(0, Unpack::LANES);
                     combine(lows, l, origin, to, dst);
-                    let last = u64::from(*dst.add(to - origin - 1)) | mask;
-                    if ((last / 64) as usize) < row.len() {
-                        let values = core::slice::from_raw_parts(dst.add(from - origin), to - from);
-                        let mut fours = values.chunks_exact(4);
-                        for four in &mut fours {
-                            put.put_unchecked(row, four[0]);
-                            put.put_unchecked(row, four[1]);
-                            put.put_unchecked(row, four[2]);
-                            put.put_unchecked(row, four[3]);
-                        }
-                        for &v in fours.remainder() {
-                            put.put_unchecked(row, v);
-                        }
-                    } else {
-                        for k in from - origin..to - origin {
-                            put.put(row, *dst.add(k));
-                        }
-                    }
+                    // Ascending, above the chunks' before them: set as
+                    // `set_ascending` sets them (a value past the row
+                    // panics).
+                    let values = core::slice::from_raw_parts(dst.add(from - origin), to - from);
+                    super::set_ascending(values, row);
                 }
             }
         }

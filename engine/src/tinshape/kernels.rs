@@ -605,6 +605,9 @@ mod ef;
 pub use ef::{
     container_locals, container_row, ef_decode, ef_decode_at, ef_into_row, ef_into_row_at,
 };
+mod rows;
+pub(crate) use rows::RowPut;
+pub use rows::{set_ascending, set_ascending_u16};
 mod weigh;
 pub use weigh::{Row, member_sums, member_sums_at, or_zero, word_sums, word_sums_at};
 #[inline(always)]

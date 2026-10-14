@@ -5,7 +5,7 @@
 //! Array containers: a group's local slots as sorted little-endian `u16`s
 //! ([`segment::tinshape::postings::KIND_ARRAY`]). Nothing to decode: a walk
 //! widens them into its list (eight at a time on NEON and SSE2), sets them
-//! in a row, or probes them in place by galloping, where an Elias-Fano list
+//! in a row ([`super::rows`]), or probes them in place by galloping, where an Elias-Fano list
 //! of the same members takes a setup and a member at a time below
 //! [`super::ef::SHORT`] members (about 6 to 35 ns a container on the M4 at
 //! 3 to 40 members, against 3 to 10 widened).
@@ -113,15 +113,12 @@ mod sse2 {
     }
 }
 
-/// Sets bit `v` of `row` for each value `v` of the array, the words they
-/// fall in being zero (as a cleared row's are). Panics if a value is past
-/// the row.
+/// Sets bit `v` of `row` for each value `v` of the array, the row's bits
+/// from its first value's on being clear (as a cleared row's are; see
+/// [`super::rows`]). Panics if a value is past the row.
 #[inline]
 pub fn array_into_row(bytes: &[u8], row: &mut [u64]) {
-    for c in bytes.chunks_exact(2) {
-        let v = usize::from(u16::from_le_bytes([c[0], c[1]]));
-        row[v / 64] |= 1 << (v % 64);
-    }
+    super::rows::set_ascending_u16(bytes, row);
 }
 
 /// The least index from `from` whose value is at least `target`, or the
