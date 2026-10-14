@@ -1374,6 +1374,9 @@ impl<'a> Postings<'a> {
     /// or a record without them.
     #[inline]
     pub fn sub_codes_len(&self, entry: &GroupEntry, slots: u32) -> usize {
+        if !self.subs || entry.kind != KIND_GRID {
+            return 0;
+        }
         self.sub_codes().len(entry, slots, self.directory_bytes())
     }
 
