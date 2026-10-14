@@ -3309,6 +3309,10 @@ struct Row {
     /// A grouped term's buckets in the group at hand, once a candidate's
     /// is read.
     tf: TfRun,
+    /// A grouped term's largest bucket in the group at hand (its directory
+    /// entry's), [`NO_BUCKET`] for a sparse term: what bounds a candidate
+    /// holding it before its bucket is read ([`Walk::or_rebound`]).
+    most: u8,
 }
 
 impl Row {
@@ -3488,6 +3492,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         r.entry = usize::MAX;
         r.at = RowAt::of(row);
         r.tf = TfRun::default();
+        r.most = NO_BUCKET;
         if let Form::Sparse(list) = &set.postings.form {
             row.fill(0);
             let cursor = set.sparse.get_or_insert_with(|| {
@@ -3521,6 +3526,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.touch.touch(Part::Payload, at, bytes.len());
                 self.mems[t].used += 1;
                 r.first = e.first;
+                r.most = e.max_bucket;
                 if e.kind == KIND_GRID {
                     r.at = grid_row(bytes, row)?;
                 } else {
@@ -4123,12 +4129,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut floor = 0u32;
         let mut reach = bound;
         loop {
+            // The term not read yet bounding it highest, chosen without a
+            // branch on each (in `total_cmp`'s order; any order of reads
+            // bounds the candidate exactly).
             let mut top = usize::MAX;
-            let mut best = f32::NEG_INFINITY;
+            let mut best = i32::MIN;
             for &h in &self.held_list {
-                if self.buckets[h] == NO_BUCKET && self.held_bound[h] > best {
-                    (best, top) = (self.held_bound[h], h);
-                }
+                let key = order_key(self.held_bound[h]);
+                let take = (self.buckets[h] == NO_BUCKET) & (key > best);
+                best = if take { key } else { best };
+                top = if take { h } else { top };
             }
             if top == usize::MAX {
                 break;
@@ -4182,7 +4192,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let s = &self.sc[h];
             let read = self.buckets[h];
             let v = if read == NO_BUCKET {
-                let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
+                // A grouped term's, kept in its row; a sparse one's block's.
+                let most = match self.row_state[h].most {
+                    NO_BUCKET => s.max_bucket(self.blocks[h]),
+                    most => {
+                        debug_assert_eq!(most, s.max_bucket(self.blocks[h]));
+                        most
+                    }
+                };
+                let most = TfBucket::new(most).expect("a valid bucket");
                 s.scorer.bound_through(most, floor).min(self.held_bound[h])
             } else {
                 s.scorer
