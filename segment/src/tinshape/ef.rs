@@ -200,6 +200,25 @@ impl<'a> Ef<'a> {
     /// list, a small part of what decoding the list reads. Each value is
     /// kept as [`bits::retain`] keeps it, without a branch on its fate.
     pub fn retain_members(&self, values: &mut Vec<u32>) {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("popcnt") {
+            // SAFETY: the CPU has POPCNT (asked above).
+            return unsafe { self.retain_members_popcnt(values) };
+        }
+        self.retain_members_with(values);
+    }
+
+    /// [`Self::retain_members`] with POPCNT: the highs' counts are an
+    /// instruction each, where baseline x86-64 counts bits by shifts and
+    /// masks.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "popcnt")]
+    unsafe fn retain_members_popcnt(&self, values: &mut Vec<u32>) {
+        self.retain_members_with(values);
+    }
+
+    #[inline(always)]
+    fn retain_members_with(&self, values: &mut Vec<u32>) {
         let (highs, lows, low, n) = (self.highs, self.lows, self.low, self.n);
         let total = highs.len() * 8;
         let mask = if low == 0 { 0 } else { (1u32 << low) - 1 };
@@ -270,7 +289,7 @@ impl<'a> Ef<'a> {
 /// than `k`, without a branch: the byte by prefix sums of byte counts
 /// (the bytes whose prefix is at most `k` counted at once), then the bit
 /// from a table of every byte's set bits by rank.
-#[inline]
+#[inline(always)]
 fn select(x: u64, k: usize) -> u32 {
     const ONES: u64 = 0x0101_0101_0101_0101;
     const HIGHS: u64 = 0x8080_8080_8080_8080;
@@ -284,7 +303,8 @@ fn select(x: u64, k: usize) -> u32 {
     // borrowing nothing from the next).
     let k = k as u64;
     let past = (((k * ONES) | HIGHS) - prefix) & HIGHS;
-    let byte = past.count_ones();
+    // Their count: a bit per byte, summed into the top byte.
+    let byte = ((past >> 7).wrapping_mul(ONES) >> 56) as u32;
     // The set bits before the byte: `prefix` shifted a byte up.
     let before = ((prefix << 8) >> (8 * byte)) & 0xff;
     let b = (x >> (8 * byte)) & 0xff;
