@@ -864,6 +864,7 @@ pub(crate) fn reset_walk_blocks() {
     segment::tinshape::blob::reset_stats();
     segment::tinshape::segment::reset_memo_counts();
     crate::storage::reset_held_peak();
+    crate::native::reset_groups_folded();
 }
 
 /// Heap visibility checks since the last reset.

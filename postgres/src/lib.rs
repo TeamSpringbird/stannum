@@ -1779,6 +1779,75 @@ mod tests {
         check("ctid+ordinal");
     }
 
+    /// `score()` over a term in every document (elided: it scores nothing)
+    /// is the first k matches in ctid order, and an OR of elided terms
+    /// likewise: the candidate stream folds the groups they are in, one
+    /// first and then twice as many each time. It folded every group for any
+    /// k (on TIN's probe corpus 15 or 16 payload pages where TIN read 1 or
+    /// 2).
+    #[pg_test]
+    fn a_zero_fill_folds_the_groups_of_its_rows() {
+        // 185 rows a heap page: five groups of 256 pages.
+        Spi::run(
+            "CREATE TABLE zero_fill(id int, body text);
+             INSERT INTO zero_fill SELECT n,
+               CASE WHEN n % 2 = 0 THEN 'alpha' ELSE 'beta' END
+               FROM generate_series(1, 5 * 256 * 185) n;
+             CREATE INDEX zero_fill_idx ON zero_fill USING stannum(body);",
+        )
+        .unwrap();
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off")
+            .unwrap();
+        let folded = |sql: &str| -> i64 {
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0
+                .to_string();
+            plan.split("\"Stream Groups Folded\":")
+                .nth(1)
+                .and_then(|rest| rest.split([',', '}']).next())
+                .unwrap_or_else(|| panic!("{sql}: {plan}"))
+                .parse()
+                .unwrap()
+        };
+        let ids = |sql: &str| -> Vec<i32> {
+            Spi::get_one::<Vec<i32>>(&format!("SELECT array_agg(id) FROM ({sql}) AS q"))
+                .unwrap()
+                .unwrap_or_default()
+        };
+        let first_by_ctid = |filter: &str, k: usize| -> Vec<i32> {
+            ids(&format!(
+                "SELECT id FROM zero_fill WHERE {filter} ORDER BY ctid LIMIT {k}"
+            ))
+        };
+        // Matches a group: alpha 23,680, alpha OR beta 47,360.
+        for (query, filter, per_group) in [
+            ("alpha", "id % 2 = 0", 23_680),
+            ("alpha OR beta", "true", 47_360),
+        ] {
+            // Every row scores zero: ties rank in heap order.
+            for k in [10, 4_096] {
+                let ranked = format!(
+                    "SELECT id FROM zero_fill WHERE body ==> '{query}'
+                     ORDER BY stannum.score(ctid) DESC LIMIT {k}"
+                );
+                assert_eq!(folded(&ranked), 1, "{ranked}");
+                assert_eq!(ids(&ranked), first_by_ctid(filter, k), "{ranked}");
+            }
+            // An unordered scan stopping in the second group: the first
+            // fold and the next (two groups).
+            let k = per_group + 10;
+            let plain = format!("SELECT id FROM zero_fill WHERE body ==> '{query}' LIMIT {k}");
+            assert_eq!(folded(&plain), 3, "{plain}");
+            assert_eq!(ids(&plain), first_by_ctid(filter, k), "{plain}");
+            // To the end: every group, in three folds (1, 2 and 4 groups).
+            let all = format!("SELECT id FROM zero_fill WHERE body ==> '{query}'");
+            assert_eq!(folded(&all), 5, "{all}");
+            assert_eq!(ids(&all), first_by_ctid(filter, 5 * 256 * 185), "{all}");
+        }
+    }
+
     #[pg_test]
     fn buffered_scoring_keeps_document_lengths_when_heap_space_is_reused() {
         Spi::run(

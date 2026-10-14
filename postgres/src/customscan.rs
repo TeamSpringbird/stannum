@@ -2751,6 +2751,12 @@ unsafe extern "C-unwind" fn explain(
                 );
             }
             pg_sys::ExplainPropertyInteger(
+                c"Stream Groups Folded".as_ptr(),
+                std::ptr::null(),
+                crate::native::groups_folded(),
+                es,
+            );
+            pg_sys::ExplainPropertyInteger(
                 c"Positions Checked".as_ptr(),
                 std::ptr::null(),
                 crate::score::position_checks(),
