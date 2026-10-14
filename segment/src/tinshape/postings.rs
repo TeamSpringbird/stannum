@@ -696,7 +696,7 @@ fn encode_groups<'r>(
             None => index,
             Some(p) => index - p - 1,
         };
-        if groups > 0 && groups % DIRECTORY_SKIP == 0 {
+        if groups > 0 && groups.is_multiple_of(DIRECTORY_SKIP) {
             // Where decoding stands before this entry: a skip point.
             put_skip(
                 &mut skips,
@@ -1428,7 +1428,7 @@ impl Directory {
                 return Ok(b);
             }
             b += 1;
-            if self.skips && b % DIRECTORY_SKIP == 0 && b < n {
+            if self.skips && b.is_multiple_of(DIRECTORY_SKIP) && b < n {
                 b = self.skip_past(b / DIRECTORY_SKIP, index) * DIRECTORY_SKIP;
             }
         }
@@ -1931,7 +1931,7 @@ pub fn decode_directory_whole(bytes: &[u8], groups: &[Group]) -> Result<Vec<Grou
     let (mut previous, mut body, mut first, mut tf_bit) = (None, 0u64, 0u64, 0u64);
     let mut skips = Vec::new();
     for i in 0..n {
-        if i > 0 && i % DIRECTORY_SKIP == 0 {
+        if i > 0 && i.is_multiple_of(DIRECTORY_SKIP) {
             put_skip(
                 &mut skips,
                 &Resume {
