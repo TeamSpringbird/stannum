@@ -129,6 +129,20 @@ pub fn set_ascending_u16(bytes: &[u8], row: &mut [u64]) {
     }
 }
 
+/// Keeps the members of `list` (ascending) that are in `other` (ascending,
+/// without repeats), through `marks`, a bitmap over the values (all clear
+/// on entry, and left clear): `other`'s values set as [`set_ascending`]
+/// sets them, `list` kept by its marks, the marks' words cleared again.
+/// Panics if a value of `other` is past the marks.
+#[inline]
+pub fn intersect_marked(list: &mut Vec<u32>, other: &[u32], marks: &mut [u64]) {
+    set_ascending(other, marks);
+    segment::tinshape::bits::retain(list, |v| marks[v as usize / 64] >> (v % 64) & 1 == 1);
+    for &v in other {
+        marks[v as usize / 64] = 0;
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 mod neon {
     use core::arch::aarch64::*;
@@ -322,6 +336,24 @@ mod tests {
                 set_ascending_u16(&bytes, &mut row);
                 prop_assert_eq!(&row, &want);
             }
+        }
+    }
+
+    proptest! {
+        /// Marked intersection keeps what a filter keeps, and leaves the
+        /// marks clear.
+        #[test]
+        fn intersects_through_marks(
+            list in proptest::collection::vec(0u32..2048, 0..300),
+            other in proptest::collection::vec(0u32..2048, 0..300),
+        ) {
+            let (list, other) = (sorted(list), sorted(other));
+            let want: Vec<u32> = list.iter().copied().filter(|v| other.binary_search(v).is_ok()).collect();
+            let mut marks = vec![0u64; 2048 / 64];
+            let mut got = list.clone();
+            intersect_marked(&mut got, &other, &mut marks);
+            prop_assert_eq!(got, want);
+            prop_assert!(marks.iter().all(|w| *w == 0));
         }
     }
 

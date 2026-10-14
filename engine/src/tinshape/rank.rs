@@ -1400,7 +1400,7 @@ struct Walk<'s, 'a, T: Touch> {
     sieve_left: Vec<u32>,
     words: Vec<u64>,
     /// A bitmap over a group's slots, all clear between uses: a list's
-    /// members marked to filter candidates by ([`bits::intersect_marked`]).
+    /// members marked to filter candidates by ([`kernels::intersect_marked`]).
     marks: Vec<u64>,
     /// The node check's own cursors (the walk moves the terms' sparse
     /// cursors past each group), and its scratch.
@@ -1718,7 +1718,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     if self.marks.len() < words {
                         self.marks.resize(words, 0);
                     }
-                    bits::intersect_marked(&mut cands, &mem.list, &mut self.marks);
+                    kernels::intersect_marked(&mut cands, &mem.list, &mut self.marks);
                 }
             }
         }
