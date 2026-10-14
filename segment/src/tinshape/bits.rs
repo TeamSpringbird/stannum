@@ -135,43 +135,6 @@ pub fn mask(keep: bool) -> u64 {
     mask
 }
 
-/// Bytes a cache line holds, as [`prefetch`] steps.
-const LINE: usize = 64;
-
-/// Asks for the cache lines of the `len` bytes at `p`, at most `max_lines`
-/// of them from the start, to be read into the cache without waiting for
-/// them: work done before they are read runs while they arrive. Only a
-/// hint: nothing is read, and an address outside any allocation is no
-/// fault (a target without a prefetch instruction asks for nothing).
-#[inline]
-pub fn prefetch(p: *const u8, len: usize, max_lines: usize) {
-    let start = p as usize & !(LINE - 1);
-    let end = p as usize + len.min(max_lines * LINE);
-    let mut line = start;
-    while line < end {
-        prefetch_line(line as *const u8);
-        line += LINE;
-    }
-}
-
-/// [`prefetch`] of the line holding `p`.
-#[inline(always)]
-fn prefetch_line(p: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: a prefetch is a hint: it reads nothing the program sees and
-    // does not fault, whatever `p` is.
-    unsafe {
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p.cast());
-    }
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: as above: `prfm` does not fault.
-    unsafe {
-        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let _ = p;
-}
-
 /// Keeps the values `keep` holds, in order, as [`Vec::retain`] does but
 /// without a branch on each value's fate: every value is written after
 /// those kept so far, which count it only if it is kept.

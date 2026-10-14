@@ -51,7 +51,6 @@ use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
-use super::bits;
 use crate::source::Source;
 use crate::{Error, Result};
 
@@ -688,29 +687,6 @@ impl LazyBlob {
         self.get_slow(from, to, kind)
     }
 
-    /// [`bits::prefetch`] of `[from, to)`, its first `max_lines` lines,
-    /// where it lies on a page the open span pinned (as [`Self::get_kind`]
-    /// reads in place) or is loaded: nothing is pinned or loaded for it.
-    #[inline]
-    fn prefetch(&self, from: usize, to: usize, max_lines: usize) {
-        if from >= to || to > self.len {
-            return;
-        }
-        if self.spans.get() > 0 && self.page_len > 0 {
-            let n = self.page_len;
-            let page = from / n;
-            let known = self.pages[page % PAGE_MEMO].get();
-            if known.page == page && known.span == self.span.get() && from < page * n + known.len {
-                let len = (to - from).min(page * n + known.len - from);
-                bits::prefetch(known.data.wrapping_add(from - page * n), len, max_lines);
-            }
-            return;
-        }
-        if self.is_loaded(from / CHUNK) {
-            bits::prefetch(self.data.as_ptr().wrapping_add(from), to - from, max_lines);
-        }
-    }
-
     #[inline(never)]
     fn get_slow(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if from > to {
@@ -942,18 +918,6 @@ impl<'a> Bytes<'a> {
                 }
                 blob.get_kind(at + from, at + to, kind)
             }
-        }
-    }
-
-    /// Asks for the range's first `max_lines` cache lines to be read into
-    /// the cache ([`bits::prefetch`]), without pinning or loading anything:
-    /// a lazy range only where its first page is pinned in the open span
-    /// (or loaded), and only that page's part of it.
-    #[inline]
-    pub fn prefetch(&self, max_lines: usize) {
-        match *self {
-            Self::Slice(bytes) => bits::prefetch(bytes.as_ptr(), bytes.len(), max_lines),
-            Self::Lazy { blob, at, len, .. } => blob.prefetch(at, at + len, max_lines),
         }
     }
 
@@ -1213,33 +1177,6 @@ mod tests {
         assert_eq!(bytes.get(205, 290).unwrap(), &state.bytes[205..290]);
         assert!(blob.loaded() > 0);
         assert_eq!(state.pins.get(), pins);
-    }
-
-    #[test]
-    fn a_prefetch_pins_and_loads_nothing() {
-        let (source, blob) = pinning(10 * 100 + 37, 100);
-        let state = &source.0;
-        let range = blob.bytes().sub(150, 900).unwrap();
-        // Outside a span, nothing loaded: nothing asked for.
-        range.prefetch(16);
-        assert_eq!(
-            (blob.loaded(), state.reads.get(), state.pins.get()),
-            (0, 0, 0)
-        );
-        blob.open_span();
-        // A page not pinned yet is not pinned for it.
-        range.prefetch(16);
-        assert_eq!(state.pins.get(), 0);
-        // One pinned is asked for in place, and still read the same.
-        assert_eq!(range.get(0, 10).unwrap(), &state.bytes[150..160]);
-        let pins = state.pins.get();
-        range.prefetch(16);
-        blob.bytes().sub(1030, 1037).unwrap().prefetch(1);
-        Bytes::from(&state.bytes[..]).prefetch(4);
-        assert_eq!(state.pins.get(), pins);
-        assert_eq!(range.get(0, 10).unwrap(), &state.bytes[150..160]);
-        unsafe { blob.close_span() };
-        assert_eq!(blob.loaded(), 0);
     }
 
     #[test]

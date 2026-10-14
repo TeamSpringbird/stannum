@@ -48,10 +48,6 @@ use crate::walk::{Ranked, TopRows, Visibility};
 /// times as many members.
 const SEEK_RATIO: usize = 4;
 
-/// Cache lines of the lead's next container asked for while a group is
-/// walked ([`Walk::run`]): a rare lead's container is a line or a few.
-const LEAD_PREFETCH_LINES: usize = 4;
-
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
 
@@ -1032,42 +1028,7 @@ fn next_group(
 /// postings by slots stands for its count there). False, with nothing
 /// loaded, when a grouped term does not hold the group: the directory is
 /// looked up once.
-///
-/// On x86-64 built with POPCNT and BMI where the CPU has them
-/// ([`kernels::bit_ops`]): a sparse term's list is drained a highs word
-/// at a time (trailing zeros, shifts by a register), which baseline
-/// x86-64 does in several instructions each.
 fn load<'a>(
-    set: &mut TermSet<'a>,
-    geometry: &Geometry,
-    g: u32,
-    mem: &mut Mem<'a>,
-    probe_over: usize,
-    touch: &mut impl Touch,
-) -> Result<bool> {
-    #[cfg(target_arch = "x86_64")]
-    if kernels::bit_ops() {
-        // SAFETY: the CPU has the features (`bit_ops`).
-        return unsafe { load_bits(set, geometry, g, mem, probe_over, touch) };
-    }
-    load_in(set, geometry, g, mem, probe_over, touch)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "popcnt,bmi1,bmi2,lzcnt")]
-unsafe fn load_bits<'a>(
-    set: &mut TermSet<'a>,
-    geometry: &Geometry,
-    g: u32,
-    mem: &mut Mem<'a>,
-    probe_over: usize,
-    touch: &mut impl Touch,
-) -> Result<bool> {
-    load_in(set, geometry, g, mem, probe_over, touch)
-}
-
-#[inline(always)]
-fn load_in<'a>(
     set: &mut TermSet<'a>,
     geometry: &Geometry,
     g: u32,
@@ -1549,15 +1510,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     usize::MAX,
                     self.touch,
                 )?;
-            }
-            // The lead's next container is read first in its group, which
-            // waited on memory for it: asked for now, it arrives while this
-            // group is walked. On x86-64: the M4's prefetchers left nothing
-            // to hide there (0.8% more instructions, no fewer cycles).
-            let mem = &self.mems[lead];
-            if cfg!(target_arch = "x86_64") && mem.entry != usize::MAX {
-                let set = self.terms[lead].as_ref().expect("the lead");
-                set.prefetch_next(mem.hint, LEAD_PREFETCH_LINES);
             }
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
