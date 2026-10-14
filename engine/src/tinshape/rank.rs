@@ -792,12 +792,9 @@ impl<'s, 'a> Sc<'s, 'a> {
             return;
         }
         self.s_codes = codes;
-        let mut n = 0;
-        for (bucket, length) in g.frontier(b) {
-            self.s_buckets[n] = bucket;
-            self.s_lengths[n] = length;
-            n += 1;
-        }
+        let n = g
+            .frontier(b)
+            .collect_into(&mut self.s_buckets, &mut self.s_lengths);
         self.s_n = n;
         self.s_subs = self.s_codes.len() / n;
         self.s_bound.clear();
@@ -2184,6 +2181,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// candidates fall there (at 150M rows, "is to" kept one in seven), and
     /// listing them, then sieving each, cost several times the read.
     fn sieve_words(&mut self, words: &mut [u64]) -> Result<()> {
+        if !self.sieve_split {
+            return self.sieve_words_group(words);
+        }
         let Some(&first) = self.sieve_terms.first() else {
             return Ok(());
         };
@@ -2332,6 +2332,133 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.answer.candidates += dropped;
             w0 = w1;
         }
+        self.sieve_pre = true;
+        Ok(())
+    }
+
+    /// [`Walk::sieve_words`] over the whole group at once, at its bounds: no
+    /// sieve term has sub-range codes there.
+    fn sieve_words_group(&mut self, words: &mut [u64]) -> Result<()> {
+        let Some(&st) = self.sieve_terms.first() else {
+            return Ok(());
+        };
+        let bytes = if st.row {
+            self.row_state[st.i].at.bytes()
+        } else {
+            match &self.mems[self.sc[st.i].term].kind {
+                Kind::Grid(bytes) => *bytes,
+                _ => return Ok(()),
+            }
+        };
+        let e = st.group;
+        let width = u32::from(e.width);
+        // Every bucket the term's members there can have, bounded once.
+        let most = if width == 0 {
+            0
+        } else {
+            ((1u32 << width) - 1).min(BUCKET_COUNT as u32 - 1)
+        };
+        let (mut table, mut floors) = (st.table, st.floors);
+        for bucket in 0..=most as u8 {
+            let b = usize::from(bucket);
+            if table[b].is_nan() {
+                (floors[b], table[b]) = self.sc[st.i].floor_kept(st.entry, bucket);
+            }
+        }
+        self.sieve_terms[0].table = table;
+        self.sieve_terms[0].floors = floors;
+        let ub = self.sieve_ub[st.i];
+        let verdict = self.first_verdicts(st.i, |bucket| match bucket {
+            NO_BUCKET => 0.0,
+            b if usize::from(b) < BUCKET_COUNT => table[usize::from(b)],
+            _ => ub,
+        });
+        // The buckets (one past the table's as `BUCKET_COUNT`) whose
+        // candidates stay, as bits; and whether one lacking the term does.
+        let mut pass = 0u32;
+        for (b, v) in verdict[..=BUCKET_COUNT].iter().enumerate() {
+            pass |= u32::from(!matches!(v, Verdict::Drop)) << b;
+        }
+        let absent = if matches!(verdict[BUCKET_COUNT + 1], Verdict::Drop) {
+            0
+        } else {
+            !0
+        };
+        let t = self.sc[st.i].term;
+        let set = self.terms[t].as_ref().expect("scoring");
+        // The group's buckets, eight bytes past the last where the tail has
+        // them: whole loads.
+        let (from, to) = if width == 0 || e.count == 0 {
+            (0, 0)
+        } else {
+            (
+                e.bucket_bit(e.first) / 8,
+                (e.bucket_bit(e.first + e.count - 1) + width as usize).div_ceil(8),
+            )
+        };
+        let tail = set
+            .postings
+            .tf
+            .get(from, (to + 7).min(set.postings.tf.len()))?;
+        let start = if width == 0 {
+            0
+        } else {
+            e.tf_bit as usize - from * 8
+        };
+        // The members' ranks the candidates need: from the first member of
+        // the first word holding a candidate member (`lo`) to the last
+        // candidate member (`hi`, past it).
+        let (mut run, mut lo, mut hi) = (0u32, u32::MAX, 0u32);
+        for (w, &c) in words.iter().enumerate() {
+            let m = bits::word(bytes, w);
+            let held = c & m;
+            if held != 0 {
+                lo = lo.min(run);
+                hi = run + (m & (u64::MAX >> held.leading_zeros())).count_ones();
+            }
+            run += m.count_ones();
+        }
+        // Their buckets as pass bits, a bit per rank from `lo` (a word to
+        // spare), laid onto the candidate words: a 4-bit field's by a table
+        // lookup, a word's members' bits deposited at once.
+        self.sieve_pass.clear();
+        if lo < hi {
+            let n = (hi - lo) as usize;
+            let out_words = n.div_ceil(64);
+            self.sieve_fields.clear();
+            if width > 0 {
+                let end = start + hi as usize * width as usize;
+                if end.div_ceil(8) > tail.len() {
+                    return Err(Error::Corrupt("a group's buckets past the TF tail"));
+                }
+                let at = start + lo as usize * width as usize;
+                kernels::gather_bits(tail, at, n * width as usize, &mut self.sieve_fields);
+                self.sieve_fields.resize(out_words * width as usize, 0);
+            }
+            self.sieve_pass.resize(out_words + 1, 0);
+            // Every bucket a field holds is at most 15, below the table's.
+            const _: () = assert!(BUCKET_COUNT >= 16);
+            kernels::pass_bits(
+                &self.sieve_fields,
+                width,
+                pass as u16,
+                &mut self.sieve_pass[..out_words],
+            );
+        }
+        let dropped = kernels::deposit_pass(words, bytes, &self.sieve_pass, lo, absent);
+        if width > 0 && lo < hi {
+            let (a, b) = (
+                start + lo as usize * width as usize,
+                start + hi as usize * width as usize,
+            );
+            self.touch.touch(
+                Part::TfTail,
+                set.at + set.postings.tf_at + from + a / 8,
+                b.div_ceil(8) - a / 8,
+            );
+        }
+        // Those dropped were examined (bounded) as those left will be.
+        self.answer.candidates += dropped;
         self.sieve_pre = true;
         Ok(())
     }

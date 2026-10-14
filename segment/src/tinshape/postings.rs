@@ -403,6 +403,19 @@ pub struct GroupFrontier<'b> {
 }
 
 impl<'b> GroupFrontier<'b> {
+    /// Its pairs into `buckets` and `lengths` (at most 16); how many. Out of
+    /// line, so the walks' hot folds keep the iterator inlined as they had.
+    #[inline(never)]
+    pub fn collect_into(self, buckets: &mut [u8; 16], lengths: &mut [u32; 16]) -> usize {
+        let mut n = 0;
+        for (bucket, length) in self {
+            buckets[n] = bucket;
+            lengths[n] = length;
+            n += 1;
+        }
+        n
+    }
+
     /// The frontier at `at` of a directory's bytes, checked when parsed.
     pub fn new(bytes: &'b [u8], at: usize, rounded: bool) -> Self {
         Self {
@@ -420,9 +433,7 @@ impl<'b> GroupFrontier<'b> {
 impl Iterator for GroupFrontier<'_> {
     type Item = (u8, u32);
 
-    /// Always inline: a walk folds a frontier per (term, group) it bounds,
-    /// and a call per pair cost more than the pair (measured at 150M rows).
-    #[inline(always)]
+    #[inline]
     fn next(&mut self) -> Option<(u8, u32)> {
         if self.left == 0 {
             return None;
