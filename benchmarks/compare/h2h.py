@@ -6,9 +6,11 @@
 """Head to head with TIN's recorded probes: the same rows, the same queries,
 pages per area side by side.
 
-TIN 1.0.4 was probed in three rounds (stannum-lab/tin-probes: round 1's
-e2_topk, round 3's c7_shapes, c12_repeat and c68_segments) over one corpus,
-corpus.py's 1M synthetic rows at setseed(0.42). This tool rebuilds that
+TIN 1.0.4 was probed over one corpus, corpus.py's 1M synthetic rows at
+setseed(0.42): round 1's e2_topk, round 3's c7_shapes, c12_repeat and
+c68_segments, and round 4's d3_scaling (disjunctions of 2 to 15 terms, on
+probe4_corp.c, the same rows). Rounds 2 and 4's probes over expression
+indexes are replayed apart (`replay`). This tool rebuilds that
 corpus in a Stannum database, row for row and page for page, runs every
 recorded query that Stannum supports with the probes' session protocol, and
 sets Stannum's per-kind page counts next to TIN's unique pages per area.
@@ -39,9 +41,10 @@ TIN's run 1: TIN keeps nothing between queries, while Stannum keeps parsed
 term records and footers (warm runs read neither), so run 3 is reported
 apart.
 
-Areas. TIN counts unique pages per area. Stannum counts pages pinned per
-blob kind within a query's span (`Native Reads By Kind`: a page is charged
-to the first kind that pins it, once), plus the pages a scan reads outside
+Areas. TIN counts unique pages per area. Stannum counts distinct pages per
+blob kind in a query (`Native Reads By Kind`, its `unique`: a page pinned,
+copied or read is charged to the first kind that reads it, once, however
+often it is released and pinned again), plus the pages a scan reads outside
 the segment reader (`Buffer Accesses By Phase`: view capture, scorer
 setup). The mapping:
 
@@ -132,7 +135,7 @@ def rows(conn, sql):
 def stannum_sql(sql, segments=1):
     """A TIN probe statement as Stannum's: its functions and our table."""
     sql = sql.replace("tin.full_score(", "stannum.full_score(").replace("tin.score(", "stannum.score(")
-    for table in ("probe_e2.c", "probe3_base.c"):
+    for table in ("probe_e2.c", "probe3_base.c", "probe4_corp.c"):
         sql = sql.replace(f"{table} ", f"{table_for(segments)} ")
     return sql
 
@@ -194,6 +197,18 @@ def reference(args):
         if name.startswith("_") or r.get("error") or "sql" not in r:
             continue
         add("r3_shapes", name, 1, r["sql"], r["uniq"], r["exec_ms"])
+
+    # Round 4, D3: disjunctions of 2, 4, 8 and 15 terms drawn at random
+    # (four draws) over the same corpus (probe4_corp.c, the generator and
+    # seed of probe3_base.c). Not "exh" (a TIN debug setting), not "inspect".
+    d3 = probes / "round4/results/d3_scaling.json"
+    if d3.exists():
+        for draw, x in json.loads(d3.read_text())["draws"].items():
+            for n, runs in x["runs"].items():
+                for key in ("fs10", "sc10", "fs100", "sc100", "count"):
+                    r = runs.get(key)
+                    if r and r.get("uniq") is not None and "sql" in r:
+                        add("r4_d3", f"d{draw}/n{n}/{key}", 1, r["sql"], r["uniq"], r.get("exec_ms"))
 
     Path(args.out).write_text(json.dumps({"source": str(probes), "cases": cases}, indent=1))
     print(f"{len(cases)} cases -> {args.out}")
@@ -340,13 +355,19 @@ def build_segments(conn, segments):
 
 # --- measure -----------------------------------------------------------------
 
-KIND = re.compile(r"(\w[\w ]*?): copied (\d+) B in (\d+) pages, pinned (\d+), stitched (\d+) B in (\d+) reads")
+KIND = re.compile(
+    r"(\w[\w ]*?): copied (\d+) B in (\d+) pages, pinned (\d+), stitched (\d+) B in (\d+) reads(?:, unique (\d+))?"
+)
 
 
 def parse_kinds(text):
     out = {}
-    for name, copied, copied_pages, pinned, stitched, stitches in KIND.findall(text or ""):
-        out[name.strip()] = {"pinned": int(pinned), "copied_pages": int(copied_pages), "stitched": int(stitched)}
+    for name, copied, copied_pages, pinned, stitched, stitches, unique in KIND.findall(text or ""):
+        out[name.strip()] = {
+            "pinned": int(pinned), "copied_pages": int(copied_pages), "stitched": int(stitched),
+            # Older builds report no distinct pages: pins plus copies stand in.
+            "unique": int(unique) if unique else int(pinned) + int(copied_pages),
+        }
     return out
 
 
@@ -375,6 +396,8 @@ def scan_nodes(plan):
 COUNTERS = [
     "Scored Candidates", "Candidates", "Candidates Visited", "Positions Checked", "Position Lists Read",
     "Visibility Checks", "Heap Fetches", "Pages Pinned", "Exhaustive Score Calls", "Top-K Completions",
+    "Records Parsed", "Footers Decoded", "Footer Blocks Decoded", "Footer Blocks Used", "Directories Parsed",
+    "Directory Entries Decoded", "Directory Entries Reached", "Directory Entries Loaded", "Pages Held Peak",
 ]
 
 
@@ -388,7 +411,7 @@ def summarize(explained):
     }
     for node in scan_nodes(top["Plan"]):
         for name, k in parse_kinds(node.get("Native Reads By Kind")).items():
-            have = out["kinds"].setdefault(name, {"pinned": 0, "copied_pages": 0, "stitched": 0})
+            have = out["kinds"].setdefault(name, {"pinned": 0, "copied_pages": 0, "stitched": 0, "unique": 0})
             for key in have:
                 have[key] += k[key]
         for name, v in parse_phases(node.get("Buffer Accesses By Phase")).items():
@@ -419,7 +442,7 @@ def node_names(plan):
 def areas(s):
     """Stannum's counters in TIN's areas (see the module docstring)."""
     def kind(*names):
-        return sum(s["kinds"].get(n, {}).get("pinned", 0) + s["kinds"].get(n, {}).get("copied_pages", 0) for n in names)
+        return sum(s["kinds"].get(n, {}).get("unique", 0) for n in names)
 
     a = {
         "M+L": s["phases"].get("view capture", 0) + s["phases"].get("scorer setup", 0),
@@ -443,7 +466,7 @@ def tin_records(document):
     statement (`sql`) and TIN's page touches."""
     def walk(node):
         if isinstance(node, dict):
-            if "sql" in node and ("unique" in node or "touches" in node):
+            if "sql" in node and ("unique" in node or "touches" in node or "uniq" in node):
                 yield node
             for key, value in node.items():
                 if key != "_sql_log":
@@ -461,6 +484,11 @@ ROUND2_BASE = [
     "create table if not exists probe2_base.t (id int4 not null)",
     "insert into probe2_base.t select i from generate_series(1, 2000000) i where not exists (select 1 from probe2_base.t)",
     "vacuum (analyze, freeze) probe2_base.t",
+    # round 4's r1_setup.py: the same rows
+    "create schema if not exists probe4_base",
+    "create table if not exists probe4_base.t (id int4 not null)",
+    "insert into probe4_base.t select i from generate_series(1, 2000000) i where not exists (select 1 from probe4_base.t)",
+    "vacuum (analyze, freeze) probe4_base.t",
 ]
 
 
@@ -516,7 +544,8 @@ def replay(args):
                     if "debug_force_topk" in low:
                         forced = low.startswith("set") and "exhaustive" in low
                     continue
-                if low.startswith("set max_parallel"):
+                # Round 4's setup drops and recreates its base schema; ROUND2_BASE made it.
+                if low.startswith(("set max_parallel", "drop schema", "create schema", "create table probe4_base.t")):
                     continue
                 stannum = wrap(conn, sql.replace("using tin ", "using stannum ").replace("using tin(", "using stannum(")
                                .replace("tin.", "stannum."))
@@ -525,7 +554,8 @@ def replay(args):
                         continue
                     query = sql.split(")", 1)[1].strip()
                     tin = records.get(query)
-                    record = {"sql": query, "tin": short_areas((tin or {}).get("unique") or (tin or {}).get("touches") or {}),
+                    uniq = (tin or {}).get("uniq")
+                    record = {"sql": query, "tin": uniq if uniq is not None else short_areas((tin or {}).get("unique") or (tin or {}).get("touches") or {}),
                               "tin_ms": (tin or {}).get("exec_ms")}
                     try:
                         record["stannum"] = summarize(explain(conn, stannum.split(")", 1)[1].strip()))
