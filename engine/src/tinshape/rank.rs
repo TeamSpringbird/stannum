@@ -32,7 +32,7 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
-    LazyFooter, array_bytes, higher, lower,
+    LazyFooter, array_bytes, fold_group_frontier, higher, lower,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -314,10 +314,13 @@ impl<'a> Bounds<'_, 'a> {
                     v
                 }
             }
-            Self::Groups(g) => g
-                .frontier(b)
-                .map(|(bucket, length)| bound(bucket, length))
-                .fold(0.0_f32, higher),
+            // Its first pairs without a branch on how many it holds.
+            Self::Groups(g) => fold_group_frontier(
+                g.dir.frontier_bytes(),
+                g.entry(b).frontier as usize,
+                g.rounded,
+                bound,
+            ),
         }
     }
 
