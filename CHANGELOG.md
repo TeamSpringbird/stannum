@@ -30,10 +30,11 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   pages pinned, bytes and reads stitched across page boundaries, and the
   distinct pages read, as TIN's unique pages per area) and buffer accesses
   by phase. Distinct pages are counted only under `EXPLAIN ANALYZE`: a set
-  insert per page read cost every query 1.8-2.7% of its cycles on Apple
-  M4. A segment's blob keeps its stitch buffers for the next
-  read, and its memos of parsed records and decoded footers drop what was
-  used longest ago rather than emptying whole.
+  insert per page read cost every query 0.5-1.1% of its instructions
+  (replay at 150 million rows, Apple M4). A segment's blob keeps its
+  stitch buffers for the next read, and its memos of parsed records and
+  decoded footers drop what was used longest ago rather than emptying
+  whole.
 
 - A PostgreSQL 17 and 18 index access method, `stannum`, with TINQL matching
   through `==>`, BM25 ranking (`stannum.score`, `full_score`, `max_score`,

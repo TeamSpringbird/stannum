@@ -137,7 +137,7 @@ thread_local! {
     static STATS: RefCell<[KindStats; KINDS]> = const { RefCell::new([NO_STATS; KINDS]) };
     /// Whether [`KindStats::unique`] is counted: only EXPLAIN ANALYZE
     /// reports it, and a hash insert per page read cost a plain query
-    /// 1-3% of its cycles.
+    /// 0.5-1.1% of its instructions.
     static DISTINCT: Cell<bool> = const { Cell::new(false) };
     /// The (blob, page) pairs read since [`reset_stats`], for
     /// [`KindStats::unique`].
