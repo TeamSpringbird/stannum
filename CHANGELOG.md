@@ -157,6 +157,18 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- A segment in TIN's shape bit-packs its positions per block of 32 entries
+  at the block's own widths (page layout 15), as TIN packs its position
+  deltas: the entries' counts as bit planes, their first positions, then
+  their later positions' gaps. A phrase finds a candidate's positions by a
+  few population counts and reads only its own, where it decoded up to 31
+  entries of varints before. At 150 million rows positions take 8.2% less
+  room and the index 4.0%; a phrase reads 23% fewer positions pages, and on
+  x86-64 phrases take 5.0% fewer cycles (`full_score` phrases 1.4%), on
+  aarch64 3.3% (2.7%); the same answers. On TIN's probe corpus a phrase
+  count reads 180 positions pages where it read 322 (TIN 191) and a
+  document of 200,000 positions 2 where it read 25 (TIN 4). An index of
+  layout 14 must be rebuilt.
 - The DL sidecar of a segment in TIN's shape holds each document's length
   class, two bits by rank (shorter than 16, 64, 256 words, or longer;
   page layout 14), and a ranked walk bounds a candidate at its class's
