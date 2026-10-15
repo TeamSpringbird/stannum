@@ -113,45 +113,6 @@ pub fn word(bytes: &[u8], i: usize) -> u64 {
     }
 }
 
-/// Bytes of a cache line, the step [`prefetch`] asks for lines in: 64 on
-/// the x86-64 and aarch64 cores the walk runs on (Apple's 128-byte lines
-/// are asked for twice, at no cost).
-pub const LINE: usize = 64;
-
-/// Asks for the cache lines of the `len` bytes at `p`, at most `max_lines`
-/// of them from the start, to be read into the cache without waiting for
-/// them: work done before they are read runs while they arrive, and lines
-/// asked for together arrive together. Only a hint: nothing is read, and
-/// an address outside any allocation is no fault.
-#[inline]
-pub fn prefetch(p: *const u8, len: usize, max_lines: usize) {
-    let end = (p as usize).wrapping_add(len.min(max_lines * LINE));
-    let mut line = p as usize & !(LINE - 1);
-    while line < end {
-        prefetch_line(line as *const u8);
-        line += LINE;
-    }
-}
-
-/// [`prefetch`] of the line holding `p`: `prefetcht0` on x86-64, `prfm
-/// pldl1keep` on aarch64, nothing on a target without either.
-#[inline(always)]
-pub fn prefetch_line(p: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: a prefetch reads nothing the program sees and does not
-    // fault, whatever `p` is.
-    unsafe {
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p.cast());
-    }
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: as above: `prfm` does not fault.
-    unsafe {
-        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let _ = p;
-}
-
 /// All ones where `keep` holds, else zero: for choosing between values
 /// without a branch, where the choice follows data a branch predictor
 /// cannot guess.

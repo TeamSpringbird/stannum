@@ -1430,18 +1430,6 @@ impl Directory {
         word >> (r % 64) & 1 == 1
     }
 
-    /// Entry `b` if its run is decoded already, `None` otherwise: nothing
-    /// is decoded (for a look ahead that must not cost a walk what it
-    /// would not have read).
-    #[inline]
-    pub fn get_decoded(&self, b: usize) -> Option<&GroupEntry> {
-        if b < self.prefix.get() || (b < self.len() && self.is_done(b / DIRECTORY_SKIP)) {
-            // SAFETY: as in `get`.
-            return Some(unsafe { (*self.entries.get_unchecked(b).get()).assume_init_ref() });
-        }
-        None
-    }
-
     /// Entry `b`, its run decoded first if it was not; `groups` is the
     /// segment's ([`Geometry::groups`]).
     #[inline]

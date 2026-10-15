@@ -48,10 +48,6 @@ use crate::walk::{Ranked, TopRows, Visibility};
 /// times as many members.
 const SEEK_RATIO: usize = 4;
 
-/// Cache lines of a container asked for a group ahead ([`Walk::run_or`]):
-/// its header and first members.
-const AHEAD_LINES: usize = 4;
-
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
 
@@ -3478,14 +3474,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 if *present {
                     self.present_list.push(i);
                 }
-            }
-            // A group ahead: each present term's next group is its next
-            // directory entry, whose first reads (see
-            // [`TermSet::prefetch_entry`]) arrive while this group is walked.
-            for &i in &self.present_list {
-                let t = self.sc[i].term;
-                let set = self.terms[t].as_ref().expect("scoring");
-                set.prefetch_entry(self.mems[t].hint + 1, AHEAD_LINES);
             }
             self.or_group(g)?;
             self.group_done();
