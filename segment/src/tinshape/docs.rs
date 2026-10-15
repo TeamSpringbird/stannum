@@ -624,7 +624,14 @@ impl<'a> Lengths<'a> {
         if rank >= self.documents {
             return Err(Error::Corrupt("length rank"));
         }
-        let (at, base, width) = self.header((rank / self.block) as usize)?;
+        // The block every sidecar is written with divides by a shift: a
+        // division's latency lay on every length's read (on x86-64).
+        let (b, within) = if self.block == DL_BLOCK {
+            (rank / DL_BLOCK, rank % DL_BLOCK)
+        } else {
+            (rank / self.block, rank % self.block)
+        };
+        let (at, base, width) = self.header(b as usize)?;
         if width == 0 {
             // No bits to read, but the block must still start in the data.
             return if at <= self.data.len() {
@@ -633,7 +640,7 @@ impl<'a> Lengths<'a> {
                 Err(Error::Truncated)
             };
         }
-        let bit = (rank % self.block) as usize * width as usize;
+        let bit = within as usize * width as usize;
         let from = at + bit / 8;
         let bytes = self.data.window(from, 8)?;
         Ok(base + bits::get_at(bytes, bit % 8, width)?)
