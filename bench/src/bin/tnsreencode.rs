@@ -2,15 +2,18 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments of page layout version 12, 11, 10, 9,
-//! 8 or 6 to version 14, whose grouped records' directories are rows of
+//! Re-encodes dumped `TNS1` segments of page layout version 13, 12, 11, 10,
+//! 9, 8 or 6 to version 14, whose grouped records' directories are rows of
 //! fixed width found by a group's rank, and hold short lists as arrays (or,
 //! with `--keep-records`, records as they were but for their headers and
-//! directories), and reports what that costs.
+//! directories), and reports what that costs. Version 13 (the DL sidecar's
+//! length classes) is read with `--keep-records` only: its directories are
+//! rewritten and every other area, and the header's flags, copied, so the
+//! two layouts stack in one pass.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
+//!     [--from 13|12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
 //!     [--jobs N] [--check] [--check-merge] [--fresh] [--census] [--keep-records]
 //! ```
 //!
@@ -133,7 +136,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 12|11|10|9|8|6] [--exact] \
+        "usage: tnsreencode --in DIR --out DIR [--from 13|12|11|10|9|8|6] [--exact] \
          [--segment FILE] [--grid-density N] [--arrays N] [--jobs N] [--check] [--check-merge] \
          [--fresh] [--census] [--keep-records]"
     );
@@ -178,8 +181,9 @@ fn args() -> Args {
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12)
+        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12 | 13)
         || (a.keep_records && a.from == 6)
+        || (a.from == 13 && !a.keep_records)
         || a.jobs == 0
     {
         usage();
