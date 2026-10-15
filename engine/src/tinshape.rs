@@ -473,7 +473,10 @@ impl<'a> TermSet<'a> {
                     let mut hint = self.gpos;
                     if target >= geometry.slots
                         || self
-                            .seek_index(geometry.group_of_slot(target) as u32, &mut hint)
+                            .seek_index(
+                                rank::group_from(geometry, g.index as usize, target) as u32,
+                                &mut hint,
+                            )
                             .is_none()
                     {
                         hint = self.group_count();

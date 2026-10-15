@@ -1001,7 +1001,7 @@ fn sieve_bits_buckets(
 /// group (as a rule `from` or one soon after) costs a probe or two rather
 /// than a binary search of every group.
 #[inline]
-fn group_from(geometry: &Geometry, from: usize, slot: u32) -> usize {
+pub(super) fn group_from(geometry: &Geometry, from: usize, slot: u32) -> usize {
     let groups = &geometry.groups;
     debug_assert!(groups[from].slot_base <= slot);
     // `lo` holds `slot` or comes before the group that does; `hi` is past it.

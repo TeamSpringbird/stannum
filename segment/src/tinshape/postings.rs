@@ -346,7 +346,7 @@ fn skip_group_frontier(bytes: &[u8], at: &mut usize) -> Result<u8> {
 /// rounded when stored is the rounded one, at most the true one.
 ///
 /// A frontier is read as it lies, not checked first (the verifier checks
-/// every one, [`Directory::check_frontiers`]): a corrupt one gives pairs
+/// every one, [`Directory::check_entries`]): a corrupt one gives pairs
 /// that are wrong but whose buckets are buckets, and ends at the
 /// directory's end.
 #[derive(Clone, Debug)]
@@ -1446,6 +1446,9 @@ pub struct Directory {
     /// first): a walk asks for a group's entry several times (its bound,
     /// its container, its buckets), through the record's clones.
     last: std::cell::Cell<(usize, GroupEntry)>,
+    /// The row after the entry read last (its position, head and totals):
+    /// the next entry's, which a walk in order reads next.
+    ahead: std::cell::Cell<(usize, u32, [u32; 4])>,
 }
 
 impl std::fmt::Debug for Directory {
@@ -1455,17 +1458,6 @@ impl std::fmt::Debug for Directory {
             .field("bytes", &self.end)
             .field("presence", &self.presence)
             .finish()
-    }
-}
-
-/// The little-endian `u32` (or `u16`, `wide` 2) at `at` of `bytes`.
-#[inline(always)]
-fn read_index(bytes: &[u8], at: usize, wide: usize) -> usize {
-    let v = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
-    if wide == 2 {
-        (v & 0xffff) as usize
-    } else {
-        v as usize
     }
 }
 
@@ -1542,6 +1534,7 @@ impl Directory {
             tf_bits: tf_len * 8,
             read: std::cell::Cell::new(0),
             last: std::cell::Cell::new((usize::MAX, GroupEntry::default())),
+            ahead: std::cell::Cell::new((usize::MAX, 0, [0; 4])),
         };
         // The presence: every group in the segment, ranks counting the
         // words before (and so `len` groups), indexes rising.
@@ -1616,13 +1609,35 @@ impl Directory {
         matches!(self.presence, Presence::Bitmap { .. })
     }
 
+    /// The `N` bytes at `at`, read in one load.
+    ///
+    /// `at + N` must lie within the bytes and their slack: the parse checked
+    /// that the presence, bases and rows lie within the directory, and each
+    /// caller reads a word, rank, index, base or row of them (a row's or an
+    /// index's load runs past it into the bytes after, or the slack).
+    #[inline(always)]
+    fn load<const N: usize>(&self, at: usize) -> [u8; N] {
+        assert!(N <= SLACK);
+        debug_assert!(at + N <= self.bytes.len());
+        // SAFETY: within the bytes, as above.
+        unsafe { std::ptr::read_unaligned(self.bytes.as_ptr().add(at).cast::<[u8; N]>()) }
+    }
+
     #[inline(always)]
     fn word(&self, words: usize, w: usize) -> u64 {
-        u64::from_le_bytes(
-            self.bytes[words + 8 * w..words + 8 * w + 8]
-                .try_into()
-                .expect("eight bytes"),
-        )
+        u64::from_le_bytes(self.load(words + 8 * w))
+    }
+
+    /// The little-endian `u32` (or `u16`, `wide` 2) at `at`: a group index
+    /// or a word's rank.
+    #[inline(always)]
+    fn read_index(&self, at: usize) -> usize {
+        let v = u32::from_le_bytes(self.load(at));
+        if self.wide == 2 {
+            (v & 0xffff) as usize
+        } else {
+            v as usize
+        }
     }
 
     /// Entries in a bitmap's words before word `w`.
@@ -1631,22 +1646,17 @@ impl Directory {
         let Presence::Bitmap { ranks, .. } = self.presence else {
             unreachable!("a bitmap's ranks")
         };
-        read_index(&self.bytes, ranks + w * self.wide, self.wide)
+        self.read_index(ranks + w * self.wide)
     }
 
-    /// Row `r`: its head (kind and largest bucket) and its totals.
+    /// Row `r` (the record's totals at `len`): its head (kind and largest
+    /// bucket) and its totals.
     #[inline(always)]
     fn row(&self, r: usize) -> (u32, [u32; 4]) {
+        debug_assert!(r <= self.len);
         let bit = r * self.row_bits as usize;
-        let at = self.rows + bit / 8;
-        let raw = u128::from_le_bytes(self.bytes[at..at + 16].try_into().expect("sixteen bytes"))
-            >> (bit % 8);
-        let base = self.bases + r / DIRECTORY_BLOCK * BASE_BYTES;
-        let bases = u128::from_le_bytes(
-            self.bytes[base..base + 16]
-                .try_into()
-                .expect("sixteen bytes"),
-        );
+        let raw = u128::from_le_bytes(self.load(self.rows + bit / 8)) >> (bit % 8);
+        let bases = u128::from_le_bytes(self.load(self.bases + r / DIRECTORY_BLOCK * BASE_BYTES));
         let total = |c: usize| {
             let delta = (raw >> self.shift[c]) as u64 & self.mask[c];
             ((bases >> (32 * c)) as u32).wrapping_add(delta as u32)
@@ -1659,9 +1669,7 @@ impl Directory {
     pub fn index(&self, b: usize) -> u32 {
         debug_assert!(b < self.len);
         match self.presence {
-            Presence::Indexes { at } => {
-                read_index(&self.bytes, at + b * self.wide, self.wide) as u32
-            }
+            Presence::Indexes { at } => self.read_index(at + b * self.wide) as u32,
             Presence::Bitmap { words, len, .. } => {
                 // The last word whose rank is `b` or less holds it.
                 let (mut lo, mut hi) = (0, len);
@@ -1779,8 +1787,12 @@ impl Directory {
         if b >= self.len {
             return Err(Error::Corrupt("group directory entry"));
         }
-        let (head, v) = self.row(b);
-        let (_, next) = self.row(b + 1);
+        let (head, v) = match self.ahead.get() {
+            (r, head, totals) if r == b => (head, totals),
+            _ => self.row(b),
+        };
+        let (next_head, next) = self.row(b + 1);
+        self.ahead.set((b + 1, next_head, next));
         let group = groups
             .get(index as usize)
             .ok_or(Error::Corrupt("postings group index"))?;
@@ -1789,12 +1801,14 @@ impl Directory {
         let width = TF_WIDTH[usize::from(max_bucket)];
         let count = next[FIRST].wrapping_sub(v[FIRST]);
         let len = next[AT].wrapping_sub(v[AT]);
-        // Each kind's length, then the entry's: the kinds mix within a
-        // directory, so a branch on them would miss.
+        // A grid's and an array's length follow from the group and the
+        // count, read as they are; an Elias-Fano list or a paged container
+        // checks its own when parsed (its exact length is the verifier's,
+        // [`Self::check_entries`]). Without a branch on the kind: the kinds
+        // mix within a directory.
         let slots = group.slots();
         let grid = group.grid_bytes() as u32;
-        let ef = ef::encoded_len_branchless(count.max(1), slots) as u32;
-        let expected = if kind == KIND_GRID { grid } else { ef };
+        let expected = if kind == KIND_GRID { grid } else { len };
         let expected = if kind == KIND_ARRAY {
             2 * count
         } else {
@@ -1802,7 +1816,8 @@ impl Directory {
         };
         let ok = count >= 1
             && count <= slots
-            && (len == expected || (kind == KIND_PAGED && len > 0))
+            && len == expected
+            && len > 0
             && (kind != KIND_ARRAY || slots <= ARRAY_SLOTS_MAX)
             && u64::from(next[TF].wrapping_sub(v[TF])) == u64::from(count) * u64::from(width)
             && u64::from(next[TF]) <= self.tf_bits
@@ -1853,10 +1868,7 @@ impl Directory {
     /// The entry holding posting `index` (one of the record's): the last
     /// block whose base is at it or before it, then the last row of it.
     pub fn entry_of_posting(&self, index: u32, groups: &[Group]) -> Result<GroupEntry> {
-        let base = |k: usize| {
-            let at = self.bases + k * BASE_BYTES;
-            u32::from_le_bytes(self.bytes[at..at + 4].try_into().expect("four bytes"))
-        };
+        let base = |k: usize| u32::from_le_bytes(self.load(self.bases + k * BASE_BYTES));
         let blocks = self.len.div_ceil(DIRECTORY_BLOCK);
         let (mut lo, mut hi) = (0, blocks);
         while hi - lo > 1 {
@@ -1919,12 +1931,17 @@ impl Directory {
         Ok(out)
     }
 
-    /// Every entry read and its frontier checked whole: the frontier ends
-    /// where the next begins (the last, where the directory does), and its
-    /// largest bucket is the row's.
-    pub fn check_frontiers(&self, groups: &[Group]) -> Result<()> {
+    /// Every entry read and checked whole: an Elias-Fano container's length
+    /// is its count's (a reader checks only that the list fits), and the
+    /// frontier ends where the next begins (the last, where the directory
+    /// does), its largest bucket the row's.
+    pub fn check_entries(&self, groups: &[Group]) -> Result<()> {
         let entries = self.entries(groups)?;
         for (i, e) in entries.iter().enumerate() {
+            let slots = groups[e.index as usize].slots();
+            if e.kind == KIND_EF && e.len as usize != ef::encoded_len(e.count as usize, slots) {
+                return Err(Error::Corrupt("group container length"));
+            }
             let mut at = e.frontier as usize;
             let max = skip_group_frontier(self.bytes(), &mut at)?;
             let end = entries.get(i + 1).map_or(self.end, |n| n.frontier as usize);
@@ -3453,7 +3470,7 @@ mod tests {
         }
         if let Form::Grouped(dir) = &parsed.form {
             let entries = &dir.entries(&geometry.groups).unwrap();
-            dir.check_frontiers(&geometry.groups).unwrap();
+            dir.check_entries(&geometry.groups).unwrap();
             for (b, e) in entries.iter().enumerate() {
                 assert_eq!(dir.find(e.index), Some(b));
                 assert_eq!(dir.get(b, &geometry.groups).unwrap(), *e);
@@ -4677,7 +4694,7 @@ mod directory_tests {
             "presence"
         );
         let entries = dir.entries(groups).unwrap();
-        dir.check_frontiers(groups).unwrap();
+        dir.check_entries(groups).unwrap();
         for (b, (e, w)) in entries.iter().zip(&want).enumerate() {
             assert_eq!((e.index, e.first, e.count), *w, "entry {b}");
             assert_eq!(dir.index(b), e.index, "index of entry {b}");
@@ -4917,7 +4934,7 @@ mod directory_tests {
                             dir.seek(group, 0);
                             dir.find(group);
                         }
-                        dir.check_frontiers(g)?;
+                        dir.check_entries(g)?;
                         p.slots(&t.geometry)?;
                         Ok(())
                     });
