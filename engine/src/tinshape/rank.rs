@@ -4198,7 +4198,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut reach = bound;
         // Its length class first: its shortest length bounds every term it
         // holds before any bucket is read.
-        if self.threshold().is_some() {
+        let top = self.segment.lengths.floors()[3];
+        if top > 0 && self.threshold().is_some() && self.cut(self.or_bound_at(top), tid) {
             let class = self.class_floor(g, local)?;
             if class > 0 {
                 floor = class;
@@ -4255,6 +4256,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             None => (reach, u32::MAX),
         }))
+    }
+
+    /// What the candidate at hand, no bucket of it read, scores at most if
+    /// it is at least `length` long: each term it holds by its block's
+    /// largest bucket there (and its block's bound), as
+    /// [`Walk::or_rebound`] bounds them, without keeping the bounds.
+    #[inline]
+    fn or_bound_at(&self, length: u32) -> f32 {
+        let mut sum = 0.0_f32;
+        for &h in &self.held_list {
+            let s = &self.sc[h];
+            let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
+            sum += lower(self.held_bound[h], s.scorer.bound_through(most, length));
+        }
+        sum
     }
 
     /// Bounds each scoring term the candidate at hand holds at length
