@@ -1655,13 +1655,29 @@ impl Directory {
     fn row(&self, r: usize) -> (u32, [u32; 4]) {
         debug_assert!(r <= self.len);
         let bit = r * self.row_bits as usize;
-        let raw = u128::from_le_bytes(self.load(self.rows + bit / 8)) >> (bit % 8);
-        let bases = u128::from_le_bytes(self.load(self.bases + r / DIRECTORY_BLOCK * BASE_BYTES));
-        let total = |c: usize| {
-            let delta = (raw >> self.shift[c]) as u64 & self.mask[c];
-            ((bases >> (32 * c)) as u32).wrapping_add(delta as u32)
+        let at = self.rows + bit / 8;
+        // A row of at most 57 bits lies within eight bytes from its first:
+        // read as a u64 (most records' rows; a u128 shift is several
+        // instructions on x86-64).
+        let (head, deltas): (u32, [u64; 4]) = if self.row_bits <= 57 {
+            let raw = u64::from_le_bytes(self.load(at)) >> (bit % 8);
+            (
+                raw as u32 & 63,
+                std::array::from_fn(|c| (raw >> self.shift[c]) & self.mask[c]),
+            )
+        } else {
+            let raw = u128::from_le_bytes(self.load(at)) >> (bit % 8);
+            (
+                raw as u32 & 63,
+                std::array::from_fn(|c| (raw >> self.shift[c]) as u64 & self.mask[c]),
+            )
         };
-        (raw as u32 & 63, [total(0), total(1), total(2), total(3)])
+        let bases: [u8; BASE_BYTES] = self.load(self.bases + r / DIRECTORY_BLOCK * BASE_BYTES);
+        let total = |c: usize| {
+            let base = u32::from_le_bytes(bases[4 * c..4 * c + 4].try_into().expect("four bytes"));
+            base.wrapping_add(deltas[c] as u32)
+        };
+        (head, [total(0), total(1), total(2), total(3)])
     }
 
     /// The group index of entry `b`.
@@ -1693,7 +1709,10 @@ impl Directory {
     /// galloped from `from`.
     #[inline]
     pub fn seek(&self, group: u32, from: usize) -> (usize, u32) {
-        let (b, index) = self.seek_any(group, from);
+        let (b, index) = match self.seek_near(group) {
+            Some(found) => found,
+            None => self.seek_any(group, from),
+        };
         if b >= from {
             return (b, index);
         }
@@ -1703,6 +1722,47 @@ impl Directory {
         } else {
             (self.len, u32::MAX)
         }
+    }
+
+    /// [`Self::seek`] from the entry read last, when that answers it with
+    /// no rank counted: the entry itself when it is of `group`, the next
+    /// when its group is the first held at or after `group` (a walk asks a
+    /// term for a group's entry again, and for its groups in order).
+    #[inline(always)]
+    fn seek_near(&self, group: u32) -> Option<(usize, u32)> {
+        let (at, last) = self.last.get();
+        if at >= self.len || last.index > group {
+            return None;
+        }
+        if last.index == group {
+            return Some((at, group));
+        }
+        let next = at + 1;
+        if next == self.len {
+            // The last entry's group lies before `group`.
+            return Some((self.len, u32::MAX));
+        }
+        let index = match self.presence {
+            Presence::Indexes { at: indexes } => self.read_index(indexes + next * self.wide) as u32,
+            Presence::Bitmap { words, len, .. } => {
+                // The next set bit after the last entry's, which exists.
+                let i = last.index + 1;
+                let mut w = i as usize / 64;
+                if w >= len {
+                    return None;
+                }
+                let mut word = self.word(words, w) & (u64::MAX << (i % 64));
+                while word == 0 {
+                    w += 1;
+                    if w >= len {
+                        return None;
+                    }
+                    word = self.word(words, w);
+                }
+                (w * 64) as u32 + word.trailing_zeros()
+            }
+        };
+        (index >= group).then_some((next, index))
     }
 
     #[inline(always)]
@@ -4752,6 +4812,22 @@ mod directory_tests {
                 assert_eq!(dir.seek(g, from), (b, index), "group {g} from {from}");
             }
             assert_eq!(dir.find(g), (index == g).then_some(b), "group {g}");
+        }
+        // Seeks from the entry read last (its own group, the next entry's,
+        // and between), as a walk in order asks them.
+        for (b, w) in want.iter().enumerate() {
+            let next = want.get(b + 1).map_or(groups.len() as u32 + 1, |n| n.0);
+            for g in w.0..=next.min(groups.len() as u32) {
+                assert_eq!(dir.entry_of(b, w.0, groups).unwrap().index, w.0);
+                let at = want.partition_point(|x| x.0 < g);
+                let index = want.get(at).map_or(u32::MAX, |x| x.0);
+                assert_eq!(dir.seek(g, b), (at, index), "group {g} after entry {b}");
+                assert_eq!(
+                    dir.find(g),
+                    (index == g).then_some(at),
+                    "group {g} after {b}"
+                );
+            }
         }
     }
 
