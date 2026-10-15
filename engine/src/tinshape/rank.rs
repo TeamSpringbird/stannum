@@ -1378,14 +1378,18 @@ struct Walk<'s, 'a, T: Touch> {
     answer: RankedAnswer,
     verify: Verify<'a>,
     /// A span's candidate at hand: its posting index in each span slot's
-    /// term.
+    /// term, and whether its positions were checked as it was staged (see
+    /// [`Walk::read_buckets_common`]).
     span_index: Vec<u32>,
+    span_checked: bool,
     /// The group's staged candidates: (bound, local slot, length or
     /// `u32::MAX`), and per one its buckets (one per scoring term) and, for
-    /// a span, its posting indexes; and the order they are finished in.
+    /// a span, its posting indexes and whether they were checked; and the
+    /// order they are finished in.
     staged: Vec<(f32, u32, u32)>,
     staged_buckets: Vec<u8>,
     staged_span: Vec<u32>,
+    staged_checked: Vec<bool>,
     staged_order: Vec<u32>,
     cands: Vec<u32>,
     /// The group at hand's sieve ([`Walk::sieve`]): the terms it reads,
@@ -2570,6 +2574,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.staged_buckets.extend_from_slice(&self.buckets);
         if matches!(self.verify, Verify::Span(_)) {
             self.staged_span.extend_from_slice(&self.span_index);
+            self.staged_checked.push(self.span_checked);
         }
         Ok(())
     }
@@ -2621,6 +2626,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.staged_order = order;
         self.staged_buckets.clear();
         self.staged_span.clear();
+        self.staged_checked.clear();
         result
     }
 
@@ -2635,6 +2641,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let width = self.span_index.len();
             self.span_index
                 .copy_from_slice(&self.staged_span[i * width..(i + 1) * width]);
+            self.span_checked = self.staged_checked[i];
         }
         self.census(g, local, PhraseStep::Finish);
         let finished = self.finish(g, local, length);
@@ -2655,6 +2662,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(None);
         }
         self.answer.candidates += 1;
+        self.span_checked = false;
         if self.touch.census() {
             self.census_stage(g, local)?;
         }
@@ -2677,7 +2685,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 if n > 0 && self.length_cut(length, tid) {
                     return Ok(None);
                 }
-                let reach = self.read_buckets(g, local, tid)?;
+                let Some(reach) = self.read_buckets(g, local, tid)? else {
+                    return Ok(None);
+                };
                 if self.cut(reach, tid) || self.too_few() {
                     return Ok(None);
                 }
@@ -2693,7 +2703,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // they leave in reach: at 150 million rows two in three scored
             // candidates fell short on their buckets alone.
             None => {
-                let mut reach = self.read_buckets(g, local, tid)?;
+                let Some(mut reach) = self.read_buckets(g, local, tid)? else {
+                    return Ok(None);
+                };
                 if self.cut(reach, tid) || self.too_few() {
                     return Ok(None);
                 }
@@ -2711,7 +2723,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 (reach, u32::MAX)
             }
         };
-        self.span_indexes(local);
+        if !self.span_checked {
+            self.span_indexes(local);
+        }
         Ok(Some(staged))
     }
 
@@ -2726,7 +2740,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // 150M rows four in ten of a phrase's lengths were read for
         // candidates its positions then ruled out).
         let span_first = matches!(self.verify, Verify::Span(_)) && self.bar.is_none();
-        if span_first {
+        if span_first && !self.span_checked {
             self.answer.position_checks += 1;
             self.census(g, local, PhraseStep::Check);
             let Verify::Span(check) = &mut self.verify else {
@@ -2765,7 +2779,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let tid = geometry.tid_in(g as usize, local);
         match &self.verify {
             Verify::Flat => self.push(total, tid),
-            Verify::Span(_) if span_first => self.push(total, tid),
+            Verify::Span(_) if span_first || self.span_checked => self.push(total, tid),
             // Once they fill, only a candidate that would enter them is
             // checked, as it is scored (best bound first in its group, so a
             // confirmed one raises the bar over the rest).
@@ -2803,7 +2817,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// others), and returns what the candidate can score at most by them:
     /// see [`Walk::reach`], taken only when each term's own bound (kept per
     /// block and bucket) leaves the candidate, of ctid `tid`, in reach.
-    fn read_buckets(&mut self, g: u32, local: u32, tid: impl Fn() -> Tid + Copy) -> Result<f32> {
+    /// `None` for a phrase's candidate its positions rule out (see
+    /// [`Walk::read_buckets_common`]).
+    fn read_buckets(
+        &mut self,
+        g: u32,
+        local: u32,
+        tid: impl Fn() -> Tid + Copy,
+    ) -> Result<Option<f32>> {
         if self.common_terms {
             return self.read_buckets_common(g, local, tid);
         }
@@ -2839,24 +2860,30 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // it can without a division per term, and is the shared one when
         // the terms' lengths agree.
         if low >= floor || self.cut(own, tid) {
-            return Ok(own);
+            return Ok(Some(own));
         }
-        Ok(self.reach(
+        Ok(Some(self.reach(
             (0..self.sc.len()).filter(|i| self.buckets[*i] != NO_BUCKET),
             floor,
-        ))
+        )))
     }
 
     /// [`Walk::read_buckets`] in a walk with common terms
     /// ([`Sc::make_common`]): their buckets last, only for a candidate the
     /// others' buckets leave in reach.
+    ///
+    /// A phrase's candidate has its positions checked before those buckets
+    /// are read, as TIN orders it: only a match reads them and its length
+    /// (on the 150M trace under `full_score`, nine in ten of the candidates
+    /// reaching them did not hold the phrase, and their buckets, lengths and
+    /// scores took a fifth of the walk).
     #[inline(never)]
     fn read_buckets_common(
         &mut self,
         g: u32,
         local: u32,
         tid: impl Fn() -> Tid + Copy,
-    ) -> Result<f32> {
+    ) -> Result<Option<f32>> {
         let (mut floor, mut low, mut own) = (0u32, u32::MAX, 0.0_f32);
         // Whether the candidate holds a common term, and whether a bucket
         // was read before its (else the common terms' window bounds are the
@@ -2895,17 +2922,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // what it can without a division per term, and is the shared one
             // when the terms' lengths agree.
             if low >= floor || self.cut(own, tid) {
-                return Ok(own);
+                return Ok(Some(own));
             }
         } else {
             // The common terms at their blocks' bounds, the others at their
             // buckets'.
             if read && self.cut(own, tid) {
-                return Ok(own);
+                return Ok(Some(own));
+            }
+            self.census(g, local, PhraseStep::Common);
+            if matches!(self.verify, Verify::Span(_)) && !self.check_staged(local)? {
+                return Ok(None);
             }
             // Then their buckets, each bounded at its block's frontier as
             // the others' are.
-            self.census(g, local, PhraseStep::Common);
             own = 0.0;
             for i in 0..self.sc.len() {
                 match self.buckets[i] {
@@ -2924,13 +2954,26 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             self.cand_floor = floor;
             if low >= floor || self.cut(own, tid) {
-                return Ok(own);
+                return Ok(Some(own));
             }
         }
-        Ok(self.reach(
+        Ok(Some(self.reach(
             (0..self.sc.len()).filter(|i| self.buckets[*i] != NO_BUCKET),
             floor,
-        ))
+        )))
+    }
+
+    /// Checks the positions of a span's candidate at slot `local` as it is
+    /// staged, its posting indexes found with its buckets: whether it holds
+    /// the span.
+    fn check_staged(&mut self, local: u32) -> Result<bool> {
+        self.span_indexes(local);
+        self.span_checked = true;
+        self.answer.position_checks += 1;
+        let Verify::Span(check) = &mut self.verify else {
+            unreachable!("a span's walk")
+        };
+        check.holds(&self.span_index, self.touch)
     }
 
     /// Reads into [`Walk::buckets`] scoring term `i`'s bucket for its
@@ -3261,9 +3304,11 @@ pub(super) fn walk_into<'s, 'a>(
         answer: RankedAnswer::default(),
         verify,
         span_index: Vec::new(),
+        span_checked: false,
         staged: Vec::new(),
         staged_buckets: Vec::new(),
         staged_span: Vec::new(),
+        staged_checked: Vec::new(),
         staged_order: Vec::new(),
         cands: Vec::new(),
         sieve_terms: Vec::new(),
