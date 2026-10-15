@@ -3269,10 +3269,11 @@ const MEMBER_LANES: usize = 4;
 
 use super::kernels::or_zero;
 
-/// A non-essential disjunction term's list in a group of at most this many
-/// members is decoded to be probed ([`Walk::or_probe`]); a longer one is
-/// searched in place.
-const OR_PROBE_OVER: usize = 64;
+/// A disjunction term not essential in a group is probed per candidate
+/// there ([`Walk::or_load`]) when its members are an Elias-Fano list or an
+/// array of at least this many: a shorter one, a sparse term's (rare) and a
+/// grid (read in place) cost less as a row than a search per candidate.
+const OR_PROBE_MIN: u32 = 256;
 
 /// A disjunction's plan for a group at one threshold (MaxScore with the
 /// group's bounds).
@@ -3467,9 +3468,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// Scoring term `i`'s members in group `g`, which it holds, as its row
-    /// of `words` words ([`Row::at`]).
+    /// of `words` words ([`Row::at`]); or, for a term not essential there
+    /// (`probe` its bound over the group), an Elias-Fano list or array of
+    /// at least [`OR_PROBE_MIN`] members left in [`Walk::mems`] to be
+    /// probed per candidate ([`Walk::probed`], [`Mem::find`]), its row one
+    /// of every slot.
     #[inline(never)]
-    fn or_load(&mut self, i: usize, g: u32, words: usize) -> Result<()> {
+    fn or_load(&mut self, i: usize, g: u32, words: usize, probe: Option<f32>) -> Result<()> {
         let t = self.sc[i].term;
         let geometry = self.geometry;
         let group = geometry.groups[g as usize];
@@ -3512,10 +3517,36 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 at,
             } => {
                 self.touch.touch(Part::Payload, at, bytes.len());
-                self.mems[t].used += 1;
+                let mem = &mut self.mems[t];
+                mem.used += 1;
                 r.first = e.first;
                 if e.kind == KIND_GRID {
                     r.at = grid_row(bytes, row)?;
+                } else if let Some(bound) = probe
+                    && e.count >= OR_PROBE_MIN
+                    && (e.kind == KIND_EF || e.kind == KIND_ARRAY)
+                {
+                    let bytes = bytes.all()?;
+                    mem.kind = if e.kind == KIND_EF {
+                        let ef = Ef::parse(bytes, e.count as usize, group.slots())?;
+                        Kind::Cursor {
+                            cursor: ef.cursor(),
+                            offset: 0,
+                        }
+                    } else {
+                        Kind::Array(array_bytes(bytes, e.count, group.slots())?)
+                    };
+                    mem.first = e.first;
+                    mem.pos = 0;
+                    mem.entry = hint;
+                    if self.ones.len() < words {
+                        self.ones.resize(words, !0);
+                    }
+                    r.at = RowAt::of(&self.ones[..words]);
+                    self.probed[i] = true;
+                    self.probe_bound[i] = bound;
+                    self.probing = true;
+                    self.answer.probed += 1;
                 } else {
                     row.fill(0);
                     kernels::container_row(&e, bytes.all()?, geometry.starts(g as usize), row)?;
@@ -3528,47 +3559,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         Ok(())
-    }
-
-    /// Sets up scoring term `i`, present in group `g` but not essential
-    /// there (its bound over the group `bound`), to be probed per candidate
-    /// ([`Walk::probed`], [`Mem::find`]): its members left in
-    /// [`Walk::mems`] (a list of more than [`OR_PROBE_OVER`] in place, a
-    /// shorter one decoded), its row one of every slot. False, with nothing
-    /// read, for a grid, which is read into its row ([`Walk::or_load`]) in
-    /// place.
-    #[inline(never)]
-    fn or_probe(&mut self, i: usize, g: u32, words: usize, bound: f32) -> Result<bool> {
-        let t = self.sc[i].term;
-        let set = self.terms[t].as_mut().expect("scoring");
-        let mem = &mut self.mems[t];
-        let entry = if matches!(set.postings.form, Form::Sparse(_)) {
-            usize::MAX
-        } else {
-            // The entry `run_or`'s seek found for the group, in the hint.
-            let hint = mem.hint;
-            if matches!(set.group_at(hint).src, Src::Container { entry, .. } if entry.kind == KIND_GRID)
-            {
-                return Ok(false);
-            }
-            hint
-        };
-        if !load(set, self.geometry, g, mem, OR_PROBE_OVER, self.touch)? {
-            return Err(Error::Corrupt("a group the term holds"));
-        }
-        if self.ones.len() < words {
-            self.ones.resize(words, !0);
-        }
-        self.row_state[i] = Row {
-            entry,
-            at: RowAt::of(&self.ones[..words]),
-            ..Row::default()
-        };
-        self.probed[i] = true;
-        self.probe_bound[i] = bound;
-        self.probing = true;
-        self.answer.probed += 1;
-        Ok(true)
     }
 
     /// [`Walk::or_group_in`] for group `g`: on x86-64 built with POPCNT
@@ -3690,17 +3680,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if plan.by_essential && !plan.essential.is_empty() {
             for e in 0..plan.essential.len() {
                 let i = plan.essential[e];
-                self.or_load(i, g, words)?;
+                self.or_load(i, g, words, None)?;
                 loaded[i] = true;
                 kernels::or_bytes(&mut mask, self.row_state[i].at.bytes());
             }
         } else if let Some(&first) = required.next() {
-            self.or_load(first, g, words)?;
+            self.or_load(first, g, words, None)?;
             loaded[first] = true;
             kernels::load(&mut mask, self.row_state[first].at.bytes());
         }
         for &i in required {
-            self.or_load(i, g, words)?;
+            self.or_load(i, g, words, None)?;
             loaded[i] = true;
             kernels::and_bytes(&mut mask, self.row_state[i].at.bytes());
         }
@@ -3717,13 +3707,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         // The other present terms are not essential here: a member of the
         // mask may hold them, but none reaches the threshold by them alone.
-        // A list among them is probed per candidate (searched forward, see
-        // `Mem::find`) rather than read whole into its row a member at a
-        // time, only for a candidate its bound leaves in reach; a grid is a
-        // row in place already.
+        // A long list among them is probed per candidate (searched forward,
+        // see `Mem::find`), only for a candidate its bound leaves in reach,
+        // rather than read whole into its row a member at a time.
         for (i, done) in loaded.iter().enumerate() {
-            if self.present[i] && !done && !self.or_probe(i, g, words, sb[i])? {
-                self.or_load(i, g, words)?;
+            if self.present[i] && !done {
+                self.or_load(i, g, words, Some(sb[i]))?;
             }
         }
         self.row_loaded = loaded;
