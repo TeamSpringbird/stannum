@@ -720,10 +720,6 @@ struct Mem<'a> {
     /// for the group at hand), `usize::MAX` for none.
     hint: usize,
     entry: usize,
-    /// The word [`Mem::word`] was last asked for (`usize::MAX` for none
-    /// since the group was loaded), and its answer.
-    word_at: usize,
-    word_was: (u64, u32),
     /// Containers loaded from the directory, for [`MemoCounts`].
     ///
     /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
@@ -775,12 +771,9 @@ impl Mem<'_> {
     /// The term's members in word `w` of the group, and the posting index
     /// of the first member at or after the word's first slot: as a row's
     /// word and its run give them (see [`Row`]). Words must be asked in
-    /// increasing order; the last one asked is kept, to be asked again.
+    /// increasing order.
     #[inline]
     fn word(&mut self, w: usize) -> (u64, u32) {
-        if self.word_at == w {
-            return self.word_was;
-        }
         let from = (w * 64) as u32;
         let mut bits = 0u64;
         let base = match &mut self.kind {
@@ -826,9 +819,7 @@ impl Mem<'_> {
                 base
             }
         };
-        self.word_at = w;
-        self.word_was = (bits, base);
-        self.word_was
+        (bits, base)
     }
 }
 
@@ -1143,7 +1134,6 @@ fn load<'a>(
     mem.run = 0;
     mem.pos = 0;
     mem.entry = usize::MAX;
-    mem.word_at = usize::MAX;
     let group = geometry.groups[g as usize];
     if let Form::Sparse(list) = &set.postings.form {
         let cursor = set.sparse.get_or_insert_with(|| {
@@ -1387,11 +1377,14 @@ struct Walk<'s, 'a, T: Touch> {
     /// Per scoring term, whether its row holds the group at hand.
     row_loaded: Vec<bool>,
     /// Per scoring term, whether its members in the group at hand are
-    /// probed per candidate (in [`Walk::mems`]) rather than read into its
-    /// row ([`Walk::or_probe`]); and a row of every slot, which such a
-    /// term's row is for the words weighed at once.
+    /// probed a word at a time (in [`Walk::mems`]) rather than read into
+    /// its row whole ([`Walk::or_probe`]); such a term's row is written at
+    /// the mask's live words only, and beside it, per such word, the
+    /// posting index of its first member at or after the word (a row's
+    /// run). The group's words.
     probed: Vec<bool>,
-    ones: Vec<u64>,
+    probe_base: Vec<u32>,
+    or_words: usize,
     /// A disjunction's group at hand: per present term with a positive
     /// bound there, the term, its row, that bound and its bound over the
     /// sub-range at hand; and its word at hand.
@@ -1402,7 +1395,7 @@ struct Walk<'s, 'a, T: Touch> {
     or_bounds: Vec<f32>,
     or_sub: Vec<f32>,
     or_held: Vec<u64>,
-    /// Those terms probed per candidate, by their places in `or_terms`.
+    /// The present terms probed ([`Walk::probed`]).
     or_probes: Vec<usize>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
@@ -3142,7 +3135,8 @@ pub(super) fn walk_into<'s, 'a>(
         row_state: vec![Row::default(); n],
         row_loaded: Vec::new(),
         probed: vec![false; n],
-        ones: Vec::new(),
+        probe_base: Vec::new(),
+        or_words: 0,
         or_terms: Vec::new(),
         or_rows: Vec::new(),
         or_bounds: Vec::new(),
@@ -3594,10 +3588,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Sets up scoring term `i`, present in group `g` but not essential
     /// there, to be probed a candidate word at a time ([`Walk::probed`],
-    /// [`Mem::word`]): its members left in [`Walk::mems`] (a list of more than
-    /// [`OR_PROBE_OVER`] in place, a shorter one decoded), and its row one
-    /// of every slot. False, with nothing read, for a grid, which is read
-    /// into its row ([`Walk::or_load`]) in place.
+    /// [`Mem::word`]): its members left in [`Walk::mems`] (a list of more
+    /// than [`OR_PROBE_OVER`] in place, a shorter one decoded), its row
+    /// written only at the words weighed. False, with nothing read, for a
+    /// grid, which is read into its row ([`Walk::or_load`]) in place.
     #[inline(never)]
     fn or_probe(&mut self, i: usize, g: u32, words: usize) -> Result<bool> {
         let t = self.sc[i].term;
@@ -3617,12 +3611,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if !load(set, self.geometry, g, mem, OR_PROBE_OVER, self.touch)? {
             return Err(Error::Corrupt("a group the term holds"));
         }
-        if self.ones.len() < words {
-            self.ones.resize(words, !0);
-        }
         self.row_state[i] = Row {
             entry,
-            at: RowAt::of(&self.ones[..words]),
+            at: RowAt::of(&self.rows[i * words..(i + 1) * words]),
             ..Row::default()
         };
         self.probed[i] = true;
@@ -3713,8 +3704,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // Rows are overwritten where read: only present terms' are.
         if self.rows.len() < n * words {
             self.rows.resize(n * words, 0);
+            self.probe_base.resize(n * words, 0);
         }
         self.probed.fill(false);
+        self.or_words = words;
         let dead = self.segment.liveness.groups[g as usize].as_deref();
         let mut plan = std::mem::take(&mut self.plan);
         // The group's plan at its own bounds and the threshold now: a
@@ -3777,9 +3770,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // mask may hold them, but none reaches the threshold by them alone.
         // A list among them is probed a candidate word at a time (searched
         // forward, see `Mem::word`) rather than read whole into its row a
-        // member at a time; a grid is a row in place already. Weighed a
-        // word at a time it holds every slot: only a word's members are
-        // weighed by what it holds.
+        // member at a time; a grid is a row in place already.
         for (i, done) in loaded.iter().enumerate() {
             if self.present[i] && !done && !self.or_probe(i, g, words)? {
                 self.or_load(i, g, words)?;
@@ -3812,10 +3803,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         probes.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
+            if self.probed[i] {
+                probes.push(i);
+            }
             if sb[i] > 0.0 {
-                if self.probed[i] {
-                    probes.push(terms.len());
-                }
                 terms.push(i);
                 rows.push(self.row_state[i].at);
                 bounds.push(sb[i]);
@@ -3865,6 +3856,18 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // The sub-range's live words weighed at once, at the group's
             // bounds (in lanes; one at a time below otherwise).
             let weighed = live != 0 && self.threshold().is_some();
+            // A probed term's row is written at the live words only, before
+            // the sub-range is weighed or its candidates bounded.
+            let mut left = if probes.is_empty() { 0 } else { live };
+            while left != 0 {
+                let w = w0 + left.trailing_zeros() as usize;
+                left &= left - 1;
+                for &i in &probes {
+                    let (word, base) = self.mems[self.sc[i].term].word(w);
+                    self.rows[i * words + w] = word;
+                    self.probe_base[i * words + w] = base;
+                }
+            }
             if weighed && WEIGH_IN_LANES {
                 kernels::word_sums(
                     &mask[w0..w1],
@@ -3930,11 +3933,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         for (h, row) in held.iter_mut().zip(&rows) {
                             *h = row.word(w);
                         }
-                    }
-                    // A probed term's row holds every slot (its bound was
-                    // taken for any word above): its members are found here.
-                    for &k in &probes {
-                        held[k] = self.mems[self.sc[terms[k]].term].word(w).0;
                     }
                     // Each member's verdict without a branch on it (see
                     // `BarKey::keeps`), at the bar as it stands now.
@@ -4064,11 +4062,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.cand_words.clear();
         self.cand_base.clear();
         for &i in &self.present_list {
-            // A probed term's members are searched for per word.
+            // A probed term's word, written as its sub-range was weighed.
             if self.probed[i] {
-                let (word, base) = self.mems[self.sc[i].term].word(w);
-                self.cand_words.push(word);
-                self.cand_base.push(base);
+                let at = i * self.or_words + w;
+                self.cand_words.push(self.rows[at]);
+                self.cand_base.push(self.probe_base[at]);
                 continue;
             }
             let r = &mut self.row_state[i];
