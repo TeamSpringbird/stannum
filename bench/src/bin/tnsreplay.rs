@@ -11,7 +11,8 @@
 //! cargo run -p bench --release --bin tnsreplay -- --dump DIR --trace trace.tsv \
 //!     [--expect pg.tsv] [--style S] [--k 10] [--repeat 3] [--limit N] \
 //!     [--keep] [--threads N] [--seconds S] [--per-query FILE] [--out FILE] \
-//!     [--per-segment FILE] [--order O] [--seed] [--warm FILE] [--timed-walk]
+//!     [--per-segment FILE] [--order O] [--seed] [--warm FILE] [--timed-walk] \
+//!     [--census-lengths] [--census-sizes]
 //! ```
 //!
 //! Each segment is read from memory and kept across queries with its
@@ -36,6 +37,11 @@
 //! the first segment, scored as OR rows and kept as seeded rows are; FILE
 //! gets per query the threshold they give and the final one;
 //! `--warm-untimed` takes it before the timed walks (a free warm-up).
+//!
+//! `--census-lengths` reports the instrumented pass's length-class and DL
+//! reads to the census of inline length codes ([`bench::inlinelen`]) and
+//! prints it at the end; `--census-sizes` prints what the codes would cost
+//! over the whole dump.
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -100,6 +106,10 @@ struct Args {
     /// time only the walk it starts (what a free warm-up would save).
     warm_untimed: bool,
     out: Option<PathBuf>,
+    /// `--census-lengths`: the instrumented pass reports its class and DL
+    /// reads to [`bench::inlinelen`]; `--census-sizes` also the codes' size.
+    census_lengths: bool,
+    census_sizes: bool,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -123,7 +133,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE]"
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] [--census-lengths] [--census-sizes]"
     );
     std::process::exit(2)
 }
@@ -154,6 +164,8 @@ fn args() -> Args {
         warm: None,
         warm_untimed: false,
         out: None,
+        census_lengths: false,
+        census_sizes: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -194,6 +206,8 @@ fn args() -> Args {
                 }
             }
             "--out" => a.out = Some(value(&mut it).into()),
+            "--census-lengths" => a.census_lengths = true,
+            "--census-sizes" => a.census_sizes = true,
             _ => usage(),
         }
     }
@@ -991,6 +1005,21 @@ impl tin::Touch for Offset<'_> {
     fn touch(&mut self, part: Part, at: usize, len: usize) {
         self.pages.touch(part, self.base + at, len);
     }
+
+    fn census(&self) -> bool {
+        CENSUS_ON.get()
+    }
+
+    fn census_length(&mut self, read: &tin::LengthRead) {
+        CENSUS.with_borrow_mut(|c| c.add(read));
+    }
+}
+
+thread_local! {
+    /// Whether the instrumented pass reports to [`CENSUS`]
+    /// (`--census-lengths`).
+    static CENSUS_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CENSUS: std::cell::RefCell<bench::inlinelen::Census> = Default::default();
 }
 
 trait Meta {
@@ -1189,6 +1218,16 @@ fn run() -> Result<bool, String> {
         reader.segs.len(),
         start.elapsed().as_secs_f64()
     );
+    if args.census_sizes {
+        let segs: Vec<Segment<'static>> = loaded
+            .segments
+            .iter()
+            .map(|(_, blob, _)| Segment::parse(blob).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        let bytes = loaded.segments.iter().map(|(_, b, _)| b.len() as u64).sum();
+        print!("{}", bench::inlinelen::sizes(&segs, bytes));
+    }
+    CENSUS_ON.set(args.census_lengths);
     let mut rows = Vec::new();
     let mut warm_out = String::from(
         "name\tstyle\twarm_rows\ttheta_warm\ttheta_final\twarm_in_final\tand_examined\tand_scored\n",
@@ -1303,6 +1342,7 @@ fn run() -> Result<bool, String> {
                 &answer,
             )
             .ok_or("an instrumented walk failed")?;
+        CENSUS.with_borrow_mut(|c| c.query());
         if direct != answer && !args.seed {
             mismatched += 1;
             eprintln!("instrumented walk differs: {}", q.name);
@@ -1658,6 +1698,11 @@ fn run() -> Result<bool, String> {
             }
         }
         std::fs::write(path, text).map_err(|e| e.to_string())?;
+    }
+    if args.census_lengths {
+        let style = args.style.as_deref().unwrap_or("all");
+        let mode = if args.full { "full" } else { "score" };
+        print!("{}", CENSUS.with_borrow(|c| c.report(style, mode)));
     }
     Ok(differ == 0 && mismatched == 0)
 }

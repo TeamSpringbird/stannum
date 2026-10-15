@@ -39,7 +39,8 @@ use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
+    LengthRead, Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms,
+    required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -2700,6 +2701,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A walk with nothing to score (every term elided) scores nothing,
         // and needs no length.
         let length = if length == u32::MAX && n > 0 {
+            if self.touch.census() {
+                self.census_length(g, local, false, 0);
+            }
             self.dl_length(g, local)?
         } else {
             length
@@ -2959,6 +2963,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(Some(reach));
         }
         let class = self.class_floor(g, local)?;
+        if self.touch.census() {
+            self.census_length(g, local, true, floor);
+        }
         if class <= floor {
             return Ok(Some(reach));
         }
@@ -3006,6 +3013,119 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.touch.touch(Part::DlSidecar, header, 8);
         self.touch.touch(Part::DlSidecar, bits, 4);
         self.segment.lengths.get(rank)
+    }
+
+    /// The length of the document at slot `local` of group `g`, read for
+    /// the census alone (no page touched).
+    #[cold]
+    fn census_exact(&self, g: u32, local: u32) -> u32 {
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .expect("a scored document");
+        self.segment.lengths.get(rank).expect("a length")
+    }
+
+    /// The postings of held scoring term `i`'s (term, group) list, when its
+    /// record is grouped: its entry is the one holding its posting index
+    /// (a disjunction's in [`Walk::blocks`], a led walk's its members').
+    #[cold]
+    fn census_count(&self, i: usize) -> Option<u32> {
+        let index = self.held_index[i];
+        let t = self.sc[i].term;
+        let tries = [
+            self.blocks.get(i).copied().unwrap_or(usize::MAX),
+            self.mems[t].entry,
+        ];
+        tries.into_iter().find_map(|b| {
+            let e = self.sc[i].group_entry(b)?;
+            (e.first <= index && index < e.first + e.count).then_some(e.count)
+        })
+    }
+
+    /// The census floors of a length: the largest power of two no longer
+    /// than it, it rounded down to six significant bits, and itself.
+    #[cold]
+    fn census_floors(length: u32) -> [u32; 3] {
+        let pow2 = if length == 0 {
+            0
+        } else {
+            1 << (31 - length.leading_zeros())
+        };
+        let six = segment::tinshape::postings::rounded_length(
+            segment::tinshape::postings::round_length(length),
+        );
+        [pow2, six, length]
+    }
+
+    /// Reports a class read (`class`, after the buckets) or a DL read to
+    /// the census ([`Touch::census_length`]): whether the candidate, its
+    /// buckets read and its length at least `floor`, would be cut at each
+    /// census floor of its length.
+    #[cold]
+    #[inline(never)]
+    fn census_length(&mut self, g: u32, local: u32, class: bool, floor: u32) {
+        let n = self.sc.len();
+        let length = self.census_exact(g, local);
+        let geometry = self.geometry;
+        let tid = || geometry.tid_in(g as usize, local);
+        let mut short = u32::MAX;
+        for i in 0..n {
+            if self.buckets[i] != NO_BUCKET
+                && let Some(c) = self.census_count(i)
+            {
+                short = short.min(c);
+            }
+        }
+        let floors = Self::census_floors(length);
+        let mut cut = [false; 3];
+        for (c, f) in cut.iter_mut().zip(floors) {
+            let held = (0..n).filter(|i| self.buckets[*i] != NO_BUCKET);
+            *c = self.cut(self.reach(held, f.max(floor)), tid);
+        }
+        self.touch.census_length(&LengthRead {
+            class,
+            or: false,
+            length,
+            short,
+            cut,
+        });
+    }
+
+    /// Reports a disjunction's class read (before its buckets) to the
+    /// census: whether the candidate, bounded by its blocks, would be cut
+    /// at each census floor of its length.
+    #[cold]
+    #[inline(never)]
+    fn census_or_class(&mut self, g: u32, local: u32) {
+        let length = self.census_exact(g, local);
+        let geometry = self.geometry;
+        let tid = || geometry.tid_in(g as usize, local);
+        let mut short = u32::MAX;
+        for &h in &self.held_list {
+            if let Some(c) = self.census_count(h) {
+                short = short.min(c);
+            }
+        }
+        let floors = Self::census_floors(length);
+        let mut cut = [false; 3];
+        for (c, f) in cut.iter_mut().zip(floors) {
+            let mut sum = 0.0_f32;
+            for &h in &self.held_list {
+                let s = &self.sc[h];
+                let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
+                sum += lower(self.held_bound[h], s.scorer.bound_through(most, f));
+            }
+            *c = self.cut(sum, tid);
+        }
+        self.touch.census_length(&LengthRead {
+            class: true,
+            or: true,
+            length,
+            short,
+            cut,
+        });
     }
 
     /// The candidate's posting index in each span slot's term.
@@ -4193,6 +4313,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // Its length class first: its shortest length bounds every term it
         // holds before any bucket is read.
         if self.threshold().is_some() {
+            if self.touch.census() {
+                self.census_or_class(g, local);
+            }
             let class = self.class_floor(g, local)?;
             if class > 0 {
                 floor = class;

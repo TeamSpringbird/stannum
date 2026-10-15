@@ -77,6 +77,40 @@ impl Part {
 /// Where a query reads: `(part, blob offset, length)` per read.
 pub trait Touch {
     fn touch(&mut self, part: Part, at: usize, len: usize);
+
+    /// Whether the walk reports [`Touch::census_length`] (a lab census of
+    /// what inline length codes would save; off everywhere else, so the
+    /// walk computes nothing for it).
+    #[inline]
+    fn census(&self) -> bool {
+        false
+    }
+
+    /// A candidate reads its length class or its length (see
+    /// [`LengthRead`]).
+    #[inline]
+    fn census_length(&mut self, _read: &LengthRead) {}
+}
+
+/// A length-class or DL read, for the census of inline length codes
+/// ([`Touch::census_length`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LengthRead {
+    /// A class read (else a DL read).
+    pub class: bool,
+    /// A disjunction's class read, before its buckets (bounded by its
+    /// terms' blocks alone).
+    pub or: bool,
+    /// The document's length.
+    pub length: u32,
+    /// The fewest postings of a grouped (term, group) list the candidate
+    /// holds among the scoring terms read (`u32::MAX` for none).
+    pub short: u32,
+    /// Whether the candidate is cut, against the threshold of the moment
+    /// and what is read of it, at the largest power of two no longer than
+    /// its length, at its length rounded down to six significant bits, and
+    /// at its exact length.
+    pub cut: [bool; 3],
 }
 
 /// Reads recorded nowhere, for timing.
