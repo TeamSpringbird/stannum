@@ -167,8 +167,13 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   x86-64 phrases take 5.0% fewer cycles (`full_score` phrases 1.4%), on
   aarch64 3.3% (2.7%); the same answers. On TIN's probe corpus a phrase
   count reads 180 positions pages where it read 322 (TIN 191) and a
-  document of 200,000 positions 2 where it read 25 (TIN 4). An index of
-  layout 14 must be rebuilt.
+  document of 200,000 positions 2 where it read 25 (TIN 4). Against the
+  same code reading layout 14 (four rounds on one Sapphire Rapids host),
+  phrases took 3.1% fewer cycles and `full_score` phrases 2.1%;
+  conjunctions and disjunctions ran the same instructions over the same
+  pages, their cycles within the host's run-to-run drift (-1.3% to
+  +1.0%; per query 0.989 to 1.006). An index of layout 14 must be
+  rebuilt.
 - The DL sidecar of a segment in TIN's shape holds each document's length
   class, two bits by rank (shorter than 16, 64, 256 words, or longer;
   page layout 14), and a ranked walk bounds a candidate at its class's
@@ -252,7 +257,11 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   a copy of the position, which the slow path takes by address): at 150
   million rows on Sapphire Rapids, 0.8-1.9% fewer instructions in every
   style and 1.5-2.8% fewer cycles in disjunctions (`score` and
-  `full_score`).
+  `full_score`). A directory entry's expected length and largest group
+  are looked up by its kind, where x86-64 built their selects as a
+  three-way branch on it: 0.65% fewer cycles in `score` disjunctions and
+  phrases, 1.0% in `full_score` conjunctions, at most 0.3% more in
+  another style (four rounds).
   A query also allocates less: a dictionary lookup reuses its term
   buffers, and a walk sizes its vectors once (at 150 million rows, a
   conjunction's 4,500 allocations or so became about 860).

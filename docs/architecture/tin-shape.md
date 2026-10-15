@@ -2459,6 +2459,51 @@ layout 12 at `a908527`, come out about 5% faster than it (the two
 sessions' ratios multiplied); `full_score` disjunctions keep layout 14's
 7.5% and add 2.7%.
 
+## Layout 15 integrated (branch `tinshape/perf-integrate15`)
+
+`perf-integrate14` (`a908527`, layout 14) with the disjunction's
+directories in order and its classes by terms (`loop/ordisj14`), the
+directory frontier's decoder state in registers (`loop/branchfree2`; its
+positions skip is gone with the old positions), positions bit-packed per
+block (`loop/positions`, layout 15) and the directory entry's
+kind-dependent length by lookup (`loop/orbound`, its own commit). The
+150M dump `--from 14`: positions 18.40 -> 16.89 GB, the index 37.60 ->
+36.09 GB (-4.0%), every segment verified and equal to its own merge;
+the same bytes as `loop/positions`' encoder wrote. Answers: whole trace
+`--expect` 1,228, 1,253 and 1,252 equal; `--full` outputs f0962a8's byte
+for byte.
+
+Replay on one Sapphire Rapids host (`m7i.4xlarge` spot, the version-6
+dump re-encoded on the box: layout 14 by `a908527`'s tool, 15 from it by
+this branch's `--from 14`), four rounds in rotated order, each arm one
+process replaying every slice after one load (`tnsreplay --plan`, 300
+queries score and 200 `full_score`, `--repeat 3 --forget`, user-space
+counters of the timed passes), every output the same as `a908527`'s. Arms:
+`a908527` (with the `--plan` tooling), this branch without positions
+(layout 14), this branch, and this branch without the kind lookup. The
+median of the rounds' cycles:
+
+| | against `a908527` (rounds) | instructions | pages | positions only | kind only |
+| --- | --- | --- | --- | --- | --- |
+| score conjunction | -4.9% (+0.1/-5.7/-3.7/-4.2) | -2.3% | -0.1% | +1.0% | +0.2% |
+| score phrase | -6.4% (-3.3/-6.8/-9.0/-5.1) | -2.8% | -3.2% | -3.1% | -0.7% |
+| score disjunction | -9.1% (-6.9/-9.1/-8.6/-9.3) | -5.2% | -8.5% | -0.0% | -0.7% |
+| full conjunction | -2.5% (-0.3/-3.5/-1.7/-1.3) | -2.4% | -0.1% | -1.3% | -1.0% |
+| full phrase | -2.0% (-1.1/-3.4/-0.7/-1.5) | -2.0% | -2.0% | -2.1% | -0.3% |
+| full disjunction | -4.8% (-4.2/-5.4/-4.7/-5.7) | -4.7% | -1.6% | +0.7% | +0.3% |
+
+**Positions and the other styles.** `loop/positions` saw conjunctions and
+disjunctions move (score disjunctions +4.1% cycles, `full_score`
+conjunctions +1.5%) with identical instructions, across two spot hosts:
+noise, or the shift of every postings byte past a smaller term map. Here
+the two arms that differ only in positions, side by side on one host,
+retire the same instructions over the same pages in those styles; their
+cycles differ by -1.3% to +1.0% with rounds of both signs, and per query
+(median ratio of the rounds) by 0.989 to 1.006, while whole runs move
+together by up to 6% from round to round (the host's drift). No layout
+effect stands out of that; the phrase gain holds (-3.1% score, -2.1%
+`full_score`, positions pages -23% and -25%).
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
@@ -2473,11 +2518,11 @@ sessions' ratios multiplied); `full_score` disjunctions keep layout 14's
   synthetic probes measured 0.14 per posting at tf 1, on documents of one
   to three words). At 150M rows (18.4 GB of positions, 2.7 bytes per
   posting, 71% of postings at tf 1) bit-packing each block's counts, first
-  positions and gaps at the block's widths would save about a tenth
-  (1.8 to 2.2 GB, 5 to 6% of the index) and 8 to 15% of a phrase's
-  positions pages: a first position or a gap takes 9 bits on average in
-  these documents, against a one- or two-byte varint now. Not worth a
-  format change alone.
+  positions and gaps at the block's widths was estimated to save about a
+  tenth (1.8 to 2.2 GB, 5 to 6% of the index) and 8 to 15% of a phrase's
+  positions pages. Layout 15 does it (with the phrase's decode of up to
+  31 entries gone): 18.40 -> 16.89 GB (-8.2%, the index -4.0%) and 23%
+  fewer positions pages a phrase.
 - Per-block counts in the footer (TIN answers single-term counts from its
   footer): a single-term count is the dictionary's `df` here already; the
   group directory's per-group counts settle groups one term holds.
