@@ -231,7 +231,15 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   back wider, a blocked store forward on x86-64 per group loaded). Each
   measured alone at 150 million rows on Sapphire Rapids: the lookup 1.8%
   fewer cycles in `score` conjunctions and 1.1% in phrases, the lengths
-  1.4% in conjunctions and 1.2% in disjunctions.
+  1.4% in conjunctions and 1.2% in disjunctions. A directory frontier's
+  decoder keeps its state in registers (its rare long varint is read from
+  a copy of the position, which the slow path takes by address), and a
+  phrase skips a block's entries a masked run, maybe empty, and the entry
+  after it at a time, from one window, a word's nth varint end found by a
+  byte prefix count rather than a loop: at 150 million rows on Sapphire
+  Rapids, the frontier 1.6-1.9% fewer instructions and 1.5-2.8% fewer
+  cycles in disjunctions (`score` and `full_score`), the skip 6-9% fewer
+  branch misses in phrases and 1.5-2.6% fewer cycles.
   A query also allocates less: a dictionary lookup reuses its term
   buffers, and a walk sizes its vectors once (at 150 million rows, a
   conjunction's 4,500 allocations or so became about 860).
