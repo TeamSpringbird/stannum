@@ -7,12 +7,13 @@
 //! hold short lists as arrays and whose DL sidecar holds length classes (or,
 //! with `--keep-records`, 10, whose grouped records' headers give their
 //! directory's length), and reports what that costs. From 12, only the DL
-//! sidecar is rewritten (step 5).
+//! sidecar is rewritten (step 5). From 13, every record is encoded afresh
+//! with impact tiers (step 4, page layout 15).
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 12|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
-//!     [--jobs N] [--check] [--check-merge] [--census] [--keep-records]
+//!     [--from 13|12|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
+//!     [--no-tiers] [--jobs N] [--check] [--check-merge] [--census] [--keep-records]
 //! ```
 //!
 //! Up to four steps per segment:
@@ -39,6 +40,10 @@
 //!    makes the Elias-Fano lists of at most `--arrays` members (default
 //!    `Options::array_max`) array containers and adds the directories' skip
 //!    points (version 12).
+//!
+//!    From 13 it is the only step too: the merge splits big groups into
+//!    impact tiers (`Options::impact_tiers`; `--no-tiers` encodes without
+//!    them, which must give layout 13's records byte for byte).
 //!
 //! 5. **Length classes** (from 12, the only step). The DL sidecar is
 //!    encoded again with its class plane and the header flags it; every
@@ -124,13 +129,14 @@ struct Args {
     check_merge: bool,
     census: bool,
     keep_records: bool,
+    tiers: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 12|10|9|8|6] [--exact] [--segment FILE] \
-         [--grid-density N] [--arrays N] [--jobs N] [--check] [--check-merge] [--census] \
-         [--keep-records]"
+        "usage: tnsreencode --in DIR --out DIR [--from 13|12|10|9|8|6] [--exact] [--segment FILE] \
+         [--grid-density N] [--arrays N] [--no-tiers] [--jobs N] [--check] [--check-merge] \
+         [--census] [--keep-records]"
     );
     std::process::exit(2)
 }
@@ -150,6 +156,7 @@ fn args() -> Args {
         check_merge: false,
         census: false,
         keep_records: false,
+        tiers: true,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -166,13 +173,14 @@ fn args() -> Args {
             "--check-merge" => a.check_merge = true,
             "--census" => a.census = true,
             "--keep-records" => a.keep_records = true,
+            "--no-tiers" => a.tiers = false,
             _ => usage(),
         }
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9 | 10 | 12)
-        || (a.keep_records && matches!(a.from, 6 | 10 | 12))
+        || !matches!(a.from, 6 | 8 | 9 | 10 | 12 | 13)
+        || (a.keep_records && matches!(a.from, 6 | 10 | 12 | 13))
         || a.jobs == 0
     {
         usage();
@@ -332,6 +340,7 @@ fn parse_old<'r>(
             tf_bit: 0,
             width: 0,
             max_bucket: 0,
+            tiered: false,
         });
         body += len;
         first += count;
@@ -879,6 +888,7 @@ fn renumber(blob: &[u8], args: &Args) -> Result<Vec<u8>, String> {
             group_frontiers: args.mode,
             grid_density: args.grid_density,
             array_max: args.array_max,
+            impact_tiers: args.tiers,
             ..Options::default()
         },
         || Ok(()),

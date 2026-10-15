@@ -7,6 +7,7 @@
 //! positions, and that each document's positions across all terms add up
 //! to its length.
 
+use super::postings::Tiers;
 use super::segment::Segment;
 use crate::payload::Payload;
 use crate::tf_bucket::TfBucket;
@@ -158,6 +159,13 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                 }
                 _ => Vec::new(),
             };
+            // A tiered group's high tier: its members' local slots, each a
+            // member of the group (checked below, as every posting not in it
+            // is checked against the low pairs).
+            let mut tier_hi: Vec<u32> = Vec::new();
+            let mut tier_entry = usize::MAX;
+            let mut tier_at = 0usize;
+            let mut lo_pairs = [(0u8, 0u32); 2];
             let mut at_entry = 0usize;
             for (i, slot) in slots.iter().enumerate() {
                 let rank = segment
@@ -200,7 +208,44 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                             entry.index
                         ));
                     }
+                    if let Some(bytes) = found.postings.tiers(entry) {
+                        if tier_entry != at_entry {
+                            if tier_at != tier_hi.len() {
+                                problems.push(format!(
+                                    "group {}'s high tier holds a slot it does not",
+                                    entries[tier_entry].index
+                                ));
+                            }
+                            tier_entry = at_entry;
+                            tier_at = 0;
+                            tier_hi.clear();
+                            let tiers = Tiers::new(bytes.all()?, entry.count)?;
+                            tier_hi.extend(tiers.hi());
+                            lo_pairs = tiers.lo();
+                            if tier_hi.windows(2).any(|w| w[0] >= w[1]) {
+                                problems.push(format!(
+                                    "group {}'s high tier is not ascending",
+                                    entry.index
+                                ));
+                            }
+                        }
+                        let local = slot - group.slot_base;
+                        if tier_hi.get(tier_at) == Some(&local) {
+                            tier_at += 1;
+                        } else if !lo_pairs.iter().any(|&(b, l)| b >= bucket && l <= length) {
+                            problems.push(format!(
+                                "posting {i} (bucket {bucket}, length {length}) is not covered by group {}'s low tier",
+                                entry.index
+                            ));
+                        }
+                    }
                 }
+            }
+            if tier_entry != usize::MAX && tier_at != tier_hi.len() {
+                problems.push(format!(
+                    "group {}'s high tier holds a slot it does not",
+                    entries[tier_entry].index
+                ));
             }
             if largest != entry.max_tf_bucket {
                 problems.push(format!(

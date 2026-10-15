@@ -99,6 +99,16 @@ impl Builder {
             return Err(Error::Corrupt("document lengths"));
         }
         let geometry = Geometry::of(&tids)?;
+        // Tiers are chosen at the segment's average length.
+        let total: u64 = lengths.iter().map(|l| u64::from(*l)).sum();
+        let options = Options {
+            average_length: if options.impact_tiers && !lengths.is_empty() {
+                (total as f64 / lengths.len() as f64) as f32
+            } else {
+                0.0
+            },
+            ..options
+        };
         Ok(Self {
             tids,
             lengths,

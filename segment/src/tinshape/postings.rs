@@ -17,15 +17,17 @@
 //!            frontier_len u8 (1..=16),
 //!            (bucket u8, min_length varint)* ascending in both: the
 //!            block's impact frontier
-//! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded),
+//! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded,
+//!            | 0x08 when some groups are split into impact tiers),
 //!            directory_len varint (bytes of the groups count and the
 //!                                  directory: where containers start),
 //!            payload_len varint,
 //!            groups varint,
-//!            (index_gap varint, (count - 1) << 2 | kind varint,
+//!            (index_gap varint (with tiers: index_gap << 1 | tiered),
+//!             (count - 1) << 2 | kind varint,
 //!             [len varint, paged groups only],
 //!             group frontier)*,                   the group directory
-//!            container*, tf
+//!            (container, [tiers, a tiered group's])*, tf
 //! group frontier := head u8 = (n - 1) << 4 | first bucket,
 //!            first length varint,
 //!            ((length - previous length - 1) << 4
@@ -44,6 +46,11 @@
 //!                     run    (first and count, less one, packed so)
 //!            | array: count u16le local slots, ascending (a group of at
 //!                     most 65,536 slots; kind 3, page layout 11)
+//! tiers   := lo buckets u8 = first << 4 | second, first lo length code
+//!            u8, second lo length code u8 (two pairs no low-tier posting
+//!            escapes: a bucket at most the pair's, a length at least the
+//!            code's), then the high tier's local slots as u16le,
+//!            ascending, `count.div_ceil(10)` of them (page layout 15)
 //! tf      := sparse: per block, its buckets packed at the block's width,
 //!            each block's starting on a byte;
 //!            grouped: per group in directory order, its buckets packed at
@@ -91,8 +98,29 @@ pub const FORM_ROUNDED: u8 = 0x10;
 /// ([`Directory`]; every grouped record from page layout version 11 on).
 pub const FORM_SKIPS: u8 = 0x20;
 
+/// Set in a grouped record's form when some of its groups' postings are
+/// split into impact tiers (page layout 15): each directory entry's index
+/// gap is shifted left a bit, the bit set for a tiered group, whose
+/// container is followed by its tiers ([`Tiers`]).
+pub const FORM_TIERS: u8 = 0x08;
+
 /// Postings a footer-less record holds at most.
 pub const COMPACT_MAX: u32 = 8;
+
+/// Postings a group must hold to be split into impact tiers.
+pub const TIER_MIN_COUNT: u32 = 64;
+/// A tiered group's high tier holds one posting in this many, its best by
+/// impact ([`tier_hi_count`]).
+pub const TIER_HI_DIVISOR: u32 = 10;
+/// A group is split only where its low tier's bound is at most this share
+/// of the group's, at BM25's default `k1` and `b` and the segment's
+/// average length: a flatter group's tiers would buy a walk little.
+pub const TIER_GAP: f64 = 0.9;
+/// Bytes of a tiered group's two low-tier pairs.
+pub const TIER_LO_BYTES: usize = 3;
+/// The largest length code a low-tier pair stores: a longer document's
+/// length is stored as this code's, shorter, which still bounds it.
+pub const TIER_CODE_MAX: u32 = 254;
 
 pub const KIND_GRID: u8 = 0;
 pub const KIND_EF: u8 = 1;
@@ -150,6 +178,12 @@ pub struct Options {
     /// ([`super::docs::LENGTH_CLASSES`]), which a ranked walk bounds a
     /// candidate by before it reads the exact length.
     pub length_classes: bool,
+    /// Whether a grouped record's groups of at least [`TIER_MIN_COUNT`]
+    /// postings may be split into impact tiers ([`Tiers`]).
+    pub impact_tiers: bool,
+    /// The segment's average document length, which tiers are chosen at
+    /// (set by [`super::segment::Builder`]); 0 for none, and no tiers.
+    pub average_length: f32,
 }
 
 /// [`Options::group_frontiers`].
@@ -178,6 +212,8 @@ impl Default for Options {
             inline_lengths_min_documents: 1 << 16,
             group_frontiers: GroupFrontiers::Rounded,
             length_classes: true,
+            impact_tiers: true,
+            average_length: 0.0,
         }
     }
 }
@@ -208,6 +244,10 @@ pub struct Stats {
     /// Bytes the array containers take less what their members would take
     /// as Elias-Fano lists (negative for a few lists of one to four).
     pub array_excess: isize,
+    /// Groups split into impact tiers, and their tiers' bytes (part of
+    /// `payload`).
+    pub tiered: usize,
+    pub tier_bytes: usize,
 }
 
 impl Stats {
@@ -292,6 +332,171 @@ pub fn group_frontier(
         GroupFrontiers::Rounded => frontier(postings.map(|(b, l)| (b, round_length(l)))),
         GroupFrontiers::Exact => frontier(postings),
     }
+}
+
+/// High-tier postings a tiered group of `count` postings holds: its best
+/// by impact, one in [`TIER_HI_DIVISOR`].
+#[inline]
+pub const fn tier_hi_count(count: u32) -> u32 {
+    count.div_ceil(TIER_HI_DIVISOR)
+}
+
+/// Bytes the tiers of a tiered group of `count` postings take.
+#[inline]
+pub const fn tier_len(count: u32) -> usize {
+    TIER_LO_BYTES + 2 * tier_hi_count(count) as usize
+}
+
+/// A tiered group's impact tiers, as stored after its container (page
+/// layout 15): its high tier, the group's best postings by impact as their
+/// local slots, and two (bucket, length) pairs that bound its low tier,
+/// every other posting (a bucket at most a pair's, a length at least its).
+/// The group's frontier still bounds the group, and so its high tier; the
+/// low pairs bound the rest, which a walk weighs at that lower bound.
+///
+/// Which postings are high is the writer's choice and changes only how
+/// much a walk can leave unread: every bound is computed at query time
+/// from pairs that dominate the postings they cover, so the answers do not
+/// depend on it.
+#[derive(Clone, Copy, Debug)]
+pub struct Tiers<'b> {
+    bytes: &'b [u8],
+}
+
+impl<'b> Tiers<'b> {
+    /// The tiers of a group of `count` postings in `bytes`, checked for
+    /// length and order of their pairs.
+    pub fn new(bytes: &'b [u8], count: u32) -> Result<Self> {
+        if bytes.len() != tier_len(count) {
+            return Err(Error::Corrupt("group tiers length"));
+        }
+        let t = Self { bytes };
+        let [(b0, c0), (b1, c1)] = t.lo_codes();
+        if b0 > b1 || c0 > c1 || c1 > TIER_CODE_MAX {
+            return Err(Error::Corrupt("group tiers pairs"));
+        }
+        Ok(t)
+    }
+
+    /// The low tier's pairs as stored: (bucket, length code), ascending in
+    /// both.
+    #[inline]
+    pub fn lo_codes(&self) -> [(u8, u32); 2] {
+        let b = self.bytes[0];
+        [
+            (b >> 4, u32::from(self.bytes[1])),
+            (b & 15, u32::from(self.bytes[2])),
+        ]
+    }
+
+    /// The low tier's pairs: (bucket, length), the lengths the codes'
+    /// ([`rounded_length`]), ascending in both.
+    #[inline]
+    pub fn lo(&self) -> [(u8, u32); 2] {
+        self.lo_codes().map(|(b, c)| (b, rounded_length(c)))
+    }
+
+    /// The high tier's local slots, as `u16le`s ascending.
+    #[inline]
+    pub fn hi_bytes(&self) -> &'b [u8] {
+        &self.bytes[TIER_LO_BYTES..]
+    }
+
+    /// The high tier's local slots, ascending.
+    pub fn hi(&self) -> impl Iterator<Item = u32> + 'b {
+        self.hi_bytes()
+            .chunks_exact(2)
+            .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
+    }
+}
+
+/// The impact a posting of `bucket` in a document of `length` has at
+/// BM25's default `k1` and `b` and average length `average`, its idf
+/// aside: what a writer chooses tiers by.
+fn reference_impact(bucket: u8, length: u32, average: f64) -> f64 {
+    let tf = f64::from(
+        crate::tf_bucket::TfBucket::new(bucket & 15)
+            .expect("a bucket")
+            .representative_count(),
+    );
+    let (k1, b) = (1.2, 0.75);
+    tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * f64::from(length) / average))
+}
+
+/// A group's tiers' bytes ([`Tiers`]), or `None` where it is not worth
+/// splitting: fewer than [`TIER_MIN_COUNT`] postings, too many slots for
+/// `u16` locals, or a low tier bounded above [`TIER_GAP`] of the group's
+/// frontier `group` (as stored, `rounded` or not) at the reference impact. The
+/// high tier is the best [`tier_hi_count`] postings by impact, the earlier
+/// first among equals; the low pairs are the two that cover the low
+/// tier's frontier with the least bound.
+fn choose_tiers(
+    locals: &[u32],
+    buckets: &[u8],
+    lengths: &[u32],
+    group: &[(u8, u32)],
+    rounded: bool,
+    slots: u32,
+    average: f32,
+) -> Option<Vec<u8>> {
+    let n = locals.len();
+    if (n as u64) < u64::from(TIER_MIN_COUNT) || slots > ARRAY_SLOTS_MAX || average <= 0.0 {
+        return None;
+    }
+    let average = f64::from(average);
+    let impact: Vec<f64> = buckets
+        .iter()
+        .zip(lengths)
+        .map(|(b, l)| reference_impact(*b, *l, average))
+        .collect();
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by(|x, y| {
+        impact[*y as usize]
+            .total_cmp(&impact[*x as usize])
+            .then(x.cmp(y))
+    });
+    let h = tier_hi_count(n as u32) as usize;
+    let mut hi = vec![false; n];
+    for &i in &order[..h] {
+        hi[i as usize] = true;
+    }
+    let lo = frontier(
+        (0..n)
+            .filter(|i| !hi[*i])
+            .map(|i| (buckets[i], round_length(lengths[i]).min(TIER_CODE_MAX))),
+    );
+    let at = |(b, c): (u8, u32)| reference_impact(b, rounded_length(c), average);
+    let cover = if lo.len() == 1 {
+        [lo[0], lo[0]]
+    } else {
+        // Pair one takes the frontier's pairs through `j` (their highest
+        // bucket at their shortest code), pair two the rest.
+        let last = lo.len() - 1;
+        (0..last)
+            .map(|j| [(lo[j].0, lo[0].1), (lo[last].0, lo[j + 1].1)])
+            .min_by(|x, y| {
+                let (bx, by) = (at(x[0]).max(at(x[1])), at(y[0]).max(at(y[1])));
+                bx.total_cmp(&by)
+            })
+            .expect("two pairs or more")
+    };
+    let lo_bound = at(cover[0]).max(at(cover[1]));
+    let group = group
+        .iter()
+        .map(|&(b, l)| reference_impact(b, if rounded { rounded_length(l) } else { l }, average))
+        .fold(0.0_f64, f64::max);
+    if lo_bound > TIER_GAP * group {
+        return None;
+    }
+    let mut out = Vec::with_capacity(tier_len(n as u32));
+    out.push(cover[0].0 << 4 | cover[1].0);
+    out.push(cover[0].1 as u8);
+    out.push(cover[1].1 as u8);
+    for i in (0..n).filter(|i| hi[*i]) {
+        out.extend_from_slice(&(locals[i] as u16).to_le_bytes());
+    }
+    debug_assert_eq!(out.len(), tier_len(n as u32));
+    Some(out)
 }
 
 /// Appends a group frontier's encoding (see the module's grammar): pairs
@@ -527,6 +732,7 @@ pub fn encode_reusing<'r>(
     let grouped_len = grouped.len() as isize
         - grouped_stats.frontier_bytes as isize
         - grouped_stats.skip_bytes as isize
+        - grouped_stats.tier_bytes as isize
         - grouped_stats.array_excess;
     let use_sparse =
         options.sparse && grouped_stats.forced == 0 && sparse.len() as isize <= grouped_len;
@@ -547,6 +753,11 @@ pub fn encode_reusing<'r>(
             | if inline { FORM_LENGTHS } else { 0 }
             | if options.group_frontiers == GroupFrontiers::Rounded {
                 FORM_ROUNDED
+            } else {
+                0
+            }
+            | if grouped_stats.tiered > 0 {
+                FORM_TIERS
             } else {
                 0
             }
@@ -584,6 +795,8 @@ pub fn encode_reusing<'r>(
         stats.skip_bytes = grouped_stats.skip_bytes;
         stats.frontiers = grouped_stats.frontiers;
         stats.array_excess = grouped_stats.array_excess;
+        stats.tiered = grouped_stats.tiered;
+        stats.tier_bytes = grouped_stats.tier_bytes;
     }
     stats
 }
@@ -677,6 +890,10 @@ fn encode_groups<'r>(
     let mut tf_bits = BitWriter::new();
     let mut skips = Vec::new();
     let mut tf_total = 0u64;
+    // Each group's tiers, chosen first: a record any group of which is
+    // tiered marks every entry's gap with whether its group is.
+    let tiers = group_tiers(geometry, slots, buckets, lengths, options);
+    let tiered = tiers.iter().any(Option::is_some);
     while at < slots.len() {
         while geometry.groups[index].slot_base + geometry.groups[index].slots() <= slots[at] {
             index += 1;
@@ -756,7 +973,15 @@ fn encode_groups<'r>(
             );
         }
         previous = Some(index);
-        varint::put(&mut directory, gap as u64);
+        let group_tiers = tiers.get(groups).and_then(Option::as_ref);
+        if tiered {
+            varint::put(
+                &mut directory,
+                (gap as u64) << 1 | u64::from(group_tiers.is_some()),
+            );
+        } else {
+            varint::put(&mut directory, gap as u64);
+        }
         varint::put(
             &mut directory,
             ((locals.len() as u64 - 1) << 2) | u64::from(kind),
@@ -789,6 +1014,11 @@ fn encode_groups<'r>(
             }
         }
         debug_assert_eq!(bodies.len() - before, best);
+        if let Some(t) = group_tiers {
+            bodies.extend_from_slice(t);
+            stats.tiered += 1;
+            stats.tier_bytes += t.len();
+        }
         // The group's frontier, from its postings (a copied container's
         // included: a merge's is the least length per bucket over the
         // inputs' live postings there), and its buckets at its width.
@@ -825,6 +1055,57 @@ fn encode_groups<'r>(
     (out, directory_len)
 }
 
+/// Each group's tiers' bytes, in directory order ([`choose_tiers`]); empty
+/// where the options give no tiers.
+fn group_tiers(
+    geometry: &Geometry,
+    slots: &[u32],
+    buckets: &[u8],
+    lengths: &[u32],
+    options: &Options,
+) -> Vec<Option<Vec<u8>>> {
+    let mut out = Vec::new();
+    if !options.impact_tiers
+        || options.average_length <= 0.0
+        || (slots.len() as u64) < u64::from(TIER_MIN_COUNT)
+    {
+        return out;
+    }
+    let rounded = options.group_frontiers == GroupFrontiers::Rounded;
+    let mut at = 0usize;
+    let mut index = geometry.group_of_slot(slots[0]);
+    let mut locals = Vec::new();
+    while at < slots.len() {
+        while geometry.groups[index].slot_base + geometry.groups[index].slots() <= slots[at] {
+            index += 1;
+        }
+        let group = geometry.groups[index];
+        let from = at;
+        locals.clear();
+        while at < slots.len() && slots[at] < group.slot_base + group.slots() {
+            locals.push(slots[at] - group.slot_base);
+            at += 1;
+        }
+        let pairs = group_frontier(
+            buckets[from..at]
+                .iter()
+                .copied()
+                .zip(lengths[from..at].iter().copied()),
+            options.group_frontiers,
+        );
+        out.push(choose_tiers(
+            &locals,
+            &buckets[from..at],
+            &lengths[from..at],
+            &pairs,
+            rounded,
+            group.slots(),
+            options.average_length,
+        ));
+    }
+    out
+}
+
 /// One group of a grouped record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GroupEntry {
@@ -845,6 +1126,9 @@ pub struct GroupEntry {
     pub tf_bit: u32,
     pub width: u8,
     pub max_bucket: u8,
+    /// Whether the group is split into impact tiers: its container is
+    /// followed by its [`Tiers`] ([`Postings::tiers`]).
+    pub tiered: bool,
 }
 
 impl GroupEntry {
@@ -1030,7 +1314,8 @@ impl<'a> Postings<'a> {
         let grouped = form & 3 == FORM_GROUPED;
         let rounded = form & FORM_ROUNDED != 0;
         let skips = form & FORM_SKIPS != 0;
-        if (rounded || skips) && !grouped {
+        let tiers = form & FORM_TIERS != 0;
+        if (rounded || skips || tiers) && !grouped {
             return Err(Error::Corrupt("postings form"));
         }
         let footer_len = if form & FORM_COMPACT != 0 {
@@ -1051,7 +1336,7 @@ impl<'a> Postings<'a> {
             0
         };
         let compact = form & FORM_COMPACT != 0;
-        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED | FORM_SKIPS);
+        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED | FORM_SKIPS | FORM_TIERS);
         let footer_at = at;
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
@@ -1113,6 +1398,7 @@ impl<'a> Postings<'a> {
                         directory,
                         groups,
                         skips,
+                        tiers,
                         df,
                         (payload.len() - end) as u64,
                         tf_len as u64,
@@ -1199,6 +1485,21 @@ impl<'a> Postings<'a> {
             .sub(at, at + entry.len as usize)
             .expect("a container within its payload")
             .tag(Kind::Container)
+    }
+
+    /// The tiers of a grouped record's tiered entry, which follow its
+    /// container (not read yet); `None` for an entry not tiered.
+    pub fn tiers(&self, entry: &GroupEntry) -> Option<Bytes<'a>> {
+        if !entry.tiered {
+            return None;
+        }
+        let at = self.containers_at + entry.at as usize + entry.len as usize;
+        Some(
+            self.payload
+                .sub(at, at + tier_len(entry.count))
+                .expect("tiers within their payload")
+                .tag(Kind::Container),
+        )
     }
 
     /// Calls `visit` with every slot, in order.
@@ -1333,6 +1634,9 @@ pub struct Directory {
     /// Whether the directory has skip points (a record of page layout 10
     /// has none: its runs decode in order, from where the last one ended).
     skips: bool,
+    /// Whether its entries' gaps say whether their groups are tiered
+    /// ([`FORM_TIERS`]).
+    tiers: bool,
     resume: std::cell::Cell<Resume>,
     /// What the entries are checked against: the record's postings, its
     /// containers' bytes, and its TF tail's bytes.
@@ -1371,6 +1675,7 @@ impl Directory {
         bytes: Box<[u8]>,
         len: usize,
         skips: bool,
+        tiers: bool,
         df: u32,
         containers: u64,
         tf_len: u64,
@@ -1399,6 +1704,7 @@ impl Directory {
             head,
             end,
             skips,
+            tiers,
             resume: std::cell::Cell::new(Resume {
                 at: head,
                 ..Resume::default()
@@ -1425,6 +1731,13 @@ impl Directory {
     #[inline]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Whether its entries say whether their groups are tiered
+    /// ([`FORM_TIERS`]).
+    #[inline]
+    pub fn tiers(&self) -> bool {
+        self.tiers
     }
 
     /// Whether run `r`'s entries are decoded.
@@ -1819,22 +2132,18 @@ fn decode_entries(
         };
         let end = bytes.len().min(start.saturating_add(scan.min(UNITS_CHUNK)));
         let before = out.len();
-        decode_chunk(
-            &bytes[start..end],
-            start,
-            resume,
-            target,
-            out,
-            groups,
-            dir,
-            units,
-        )?;
+        let chunk = &bytes[start..end];
+        if dir.tiers {
+            decode_chunk::<true>(chunk, start, resume, target, out, groups, dir, units)?;
+        } else {
+            decode_chunk::<false>(chunk, start, resume, target, out, groups, dir, units)?;
+        }
         if out.len() == before {
             // An entry longer than a chunk: a varint at a time.
             let mut p = resume.at;
             let previous = resume.after.checked_sub(1);
-            let (entry, len) =
-                decode_entry(bytes, &mut p, 0, previous, groups).map_err(|e| match e {
+            let (entry, len) = decode_entry(bytes, &mut p, 0, previous, groups, dir.tiers)
+                .map_err(|e| match e {
                     Error::Truncated => Error::Corrupt("group directory entry"),
                     e => e,
                 })?;
@@ -1844,9 +2153,9 @@ fn decode_entries(
     Ok(())
 }
 
-/// Appends `entry` (its container of `len` bytes, the entry ending at `end`
-/// of the directory) after the entries so far, with their totals, checked
-/// against the record.
+/// Appends `entry` (its container and tiers of `len` bytes, the entry
+/// ending at `end` of the directory) after the entries so far, with their
+/// totals, checked against the record.
 #[inline(always)]
 fn push_entry(
     resume: &mut Resume,
@@ -1880,9 +2189,11 @@ fn push_entry(
 
 /// The whole entries of one chunk of [`decode_entries`] (at offset `base`
 /// of the directory), up to `target` in `out`.
+/// With `TIERS`, each entry's gap is shifted left a bit, the bit whether
+/// its group is tiered ([`FORM_TIERS`]).
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn decode_chunk(
+fn decode_chunk<const TIERS: bool>(
     bytes: &[u8],
     base: usize,
     resume: &mut Resume,
@@ -1931,13 +2242,23 @@ fn decode_chunk(
         let longest = (a1 - a0).max(a2 - a1).max((a3 - a2) * paged);
         let (entry, len) = if longest > 2 || head >= 0x80 || end > units.long_at {
             let mut p = a0;
-            let decoded = decode_entry(bytes, &mut p, base, resume.after.checked_sub(1), groups)?;
+            let decoded = decode_entry(
+                bytes,
+                &mut p,
+                base,
+                resume.after.checked_sub(1),
+                groups,
+                TIERS,
+            )?;
             if p != end {
                 return Err(Error::Corrupt("group directory entry"));
             }
             decoded
         } else {
-            let index = resume.after + u64::from(unsafe { varint2(bytes, a0) });
+            let gap = unsafe { varint2(bytes, a0) };
+            let tiered = TIERS && gap & 1 == 1;
+            let gap = if TIERS { gap >> 1 } else { gap };
+            let index = resume.after + u64::from(gap);
             let Some(group) = groups.get(index as usize) else {
                 return Err(Error::Corrupt("postings group index"));
             };
@@ -1980,8 +2301,9 @@ fn decode_chunk(
                     tf_bit: 0,
                     width: TF_WIDTH[usize::from(max_bucket)],
                     max_bucket,
+                    tiered,
                 },
-                len,
+                len + if tiered { tier_len(count) as u64 } else { 0 },
             )
         };
         push_entry(resume, entry, len, base + end, out, dir)?;
@@ -2007,15 +2329,19 @@ unsafe fn varint2(bytes: &[u8], at: usize) -> u32 {
 /// Decodes the directory entry at `at` of `bytes` (offset `base` of the
 /// directory), of the group after `previous`: the entry without the totals
 /// before it (its `at`, `first` and `tf_bit`, the caller's), and its
-/// container's length. `Truncated` when the bytes end within it.
+/// container's length with its tiers'. `Truncated` when the bytes end
+/// within it. With `tiers`, its gap says whether its group is tiered.
 fn decode_entry(
     bytes: &[u8],
     at: &mut usize,
     base: usize,
     previous: Option<u64>,
     groups: &[Group],
+    tiers: bool,
 ) -> Result<(GroupEntry, u64)> {
     let gap = varint::get(bytes, at)?;
+    let tiered = tiers && gap & 1 == 1;
+    let gap = if tiers { gap >> 1 } else { gap };
     let next = match previous {
         None => gap,
         Some(i) => i + 1 + gap,
@@ -2052,8 +2378,13 @@ fn decode_entry(
             tf_bit: 0,
             width: width as u8,
             max_bucket,
+            tiered,
         },
-        len,
+        len + if tiered {
+            tier_len(count as u32) as u64
+        } else {
+            0
+        },
     ))
 }
 
@@ -2062,7 +2393,11 @@ fn decode_entry(
 /// points, each checked against where decoding stands): the reference a
 /// [`Directory`]'s runs are tested against.
 #[doc(hidden)]
-pub fn decode_directory_whole(bytes: &[u8], groups: &[Group]) -> Result<Vec<GroupEntry>> {
+pub fn decode_directory_whole(
+    bytes: &[u8],
+    groups: &[Group],
+    tiers: bool,
+) -> Result<Vec<GroupEntry>> {
     let mut at = 0;
     let n = varint::get_u32(bytes, &mut at)? as usize;
     let head = at;
@@ -2086,7 +2421,7 @@ pub fn decode_directory_whole(bytes: &[u8], groups: &[Group]) -> Result<Vec<Grou
                 },
             );
         }
-        let (entry, len) = decode_entry(&bytes[..end], &mut at, 0, previous, groups)?;
+        let (entry, len) = decode_entry(&bytes[..end], &mut at, 0, previous, groups, tiers)?;
         out.push(GroupEntry {
             at: body as u32,
             first: first as u32,
@@ -3900,7 +4235,7 @@ mod tests {
             let entries = &dir.entries(&geometry.groups).unwrap();
             assert_eq!(
                 entries,
-                &decode_directory_whole(dir.bytes(), &geometry.groups).unwrap(),
+                &decode_directory_whole(dir.bytes(), &geometry.groups, dir.tiers()).unwrap(),
                 "decoded a block at a time as a varint at a time"
             );
             check_group_frontiers(&parsed, entries, geometry, slots, buckets, lengths, options);
@@ -4297,6 +4632,10 @@ mod tests {
                                 GroupFrontiers::Exact
                             },
                             length_classes: grid_density == 0,
+                            impact_tiers: true,
+                            // Tiers chosen at an average of six (for groups
+                            // of `TIER_MIN_COUNT` postings or more), or none.
+                            average_length: if adaptive_tf { 6.0 } else { 0.0 },
                         });
                     }
                 }
@@ -4431,7 +4770,7 @@ mod tests {
         let Form::Grouped(dir) = &whole.form else {
             panic!("a grouped record");
         };
-        let entries = decode_directory_whole(dir.bytes(), &geometry.groups).unwrap();
+        let entries = decode_directory_whole(dir.bytes(), &geometry.groups, dir.tiers()).unwrap();
         assert_eq!(entries.len(), 2000);
         let directory = dir.bytes().len();
         assert!(
@@ -4684,7 +5023,7 @@ mod tests {
             assert_eq!(dir.decoded(), 700);
             assert_eq!(
                 dir.entries(groups).unwrap(),
-                decode_directory_whole(dir.bytes(), groups).unwrap()
+                decode_directory_whole(dir.bytes(), groups, dir.tiers()).unwrap()
             );
             dir.decode_all(groups).unwrap();
         }
@@ -4800,7 +5139,7 @@ mod tests {
             assert_eq!(dir.len(), groups as usize);
             assert_eq!(
                 dir.entries(&geometry.groups).unwrap(),
-                decode_directory_whole(dir.bytes(), &geometry.groups).unwrap()
+                decode_directory_whole(dir.bytes(), &geometry.groups, dir.tiers()).unwrap()
             );
             // The length rewritten one byte shorter or longer: the parse or
             // the last entry's decode finds it (the totals no longer meet
@@ -5194,7 +5533,7 @@ mod lazy_directory_tests {
             panic!("a grouped record");
         };
         let groups = &geometry.groups;
-        let whole = decode_directory_whole(dir.bytes(), groups).unwrap();
+        let whole = decode_directory_whole(dir.bytes(), groups, dir.tiers()).unwrap();
         let parsed = Postings::parse(record, df, geometry).unwrap();
         let Form::Grouped(lazy) = &parsed.form else {
             panic!("a grouped record");
@@ -5380,7 +5719,7 @@ mod lazy_directory_tests {
         let Form::Grouped(dir) = &parsed.form else {
             panic!("a grouped record");
         };
-        let whole = decode_directory_whole(dir.bytes(), &geometry.groups).unwrap();
+        let whole = decode_directory_whole(dir.bytes(), &geometry.groups, dir.tiers()).unwrap();
         assert!(whole[0].count > 4096, "a three-byte count");
         assert_eq!(
             parsed.group_frontier(&whole[1]).count(),
@@ -5407,7 +5746,7 @@ mod lazy_directory_tests {
             let Form::Grouped(dir) = &parsed.form else {
                 panic!("a grouped record");
             };
-            decode_directory_whole(dir.bytes(), &geometry.groups).unwrap()
+            decode_directory_whole(dir.bytes(), &geometry.groups, dir.tiers()).unwrap()
         };
         let source = PinningSource::new(record.clone(), 64);
         let blob = LazyBlob::new(Box::new(source.clone()));

@@ -443,3 +443,133 @@ fn a_corrupted_length_is_found() {
     broken[segment.length_at(2).0] = 3;
     assert!(!verify_segment(&broken).is_clean());
 }
+
+/// Documents over two groups of pages holding rows `1..=12`, every one
+/// holding `w0` (once in most, more in a few; a few short documents among
+/// many long ones) and one in three `x0`, for impact tiers.
+fn tiered_docs() -> Vec<Doc> {
+    let mut out = Vec::new();
+    for group in 0..2u32 {
+        for page in 0..40u32 {
+            for offset in 1..=12u16 {
+                let n = group * 1000 + page * 12 + u32::from(offset);
+                let len = if n % 9 == 0 { 2 + n % 5 } else { 40 + n % 90 };
+                let tf = 1 + u32::from(n % 7 == 0) * (n % 4);
+                let tokens = (0..len)
+                    .map(|p| {
+                        let name = if p < tf {
+                            "w0".to_owned()
+                        } else if p == tf && n % 3 == 0 {
+                            "x0".to_owned()
+                        } else {
+                            format!("f{}", p % 50)
+                        };
+                        (name, p)
+                    })
+                    .collect();
+                out.push((Tid::new(group * 256 + page, offset).unwrap(), tokens));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn impact_tiers_cover_their_postings_and_merge_as_built() {
+    use super::postings::{Form, Tiers, for_each_local, tier_hi_count};
+    let docs = tiered_docs();
+    let options = Options::default();
+    let blob = tns(&docs, options);
+    assert!(verify_segment(&blob).is_clean());
+    let segment = super::segment::Segment::parse(&blob).unwrap();
+    let geometry = &segment.docs.geometry;
+    let term = segment.term("w0").unwrap().unwrap();
+    let Form::Grouped(dir) = &term.postings.form else {
+        panic!("w0 grouped");
+    };
+    assert!(dir.tiers());
+    let entries = dir.entries(&geometry.groups).unwrap();
+    assert!(entries.iter().all(|e| e.tiered), "{entries:?}");
+    for e in &entries {
+        let tiers = Tiers::new(term.postings.tiers(e).unwrap().all().unwrap(), e.count).unwrap();
+        let hi: Vec<u32> = tiers.hi().collect();
+        assert_eq!(hi.len() as u32, tier_hi_count(e.count));
+        // The low pairs bound every other posting.
+        let mut locals = Vec::new();
+        let bytes = term.postings.container(e).all().unwrap();
+        for_each_local(e, bytes, geometry.starts(e.index as usize), |l| {
+            locals.push(l);
+        })
+        .unwrap();
+        let lo = tiers.lo();
+        let mut low = 0;
+        for (i, l) in locals.iter().enumerate() {
+            if hi.contains(l) {
+                continue;
+            }
+            low += 1;
+            let bucket = term.postings.bucket_in(e, e.first + i as u32).unwrap();
+            let rank = segment.docs.rank_in(e.index as usize, *l).unwrap();
+            let length = segment.lengths.get(rank).unwrap();
+            assert!(lo.iter().any(|&(b, m)| b >= bucket && m <= length));
+        }
+        assert_eq!(low + hi.len(), locals.len());
+    }
+    // A merge of the documents in two parts is the build of them all: a
+    // merge chooses every group's tiers afresh, at the merged average.
+    let (a, b) = docs.split_at(docs.len() / 3);
+    let blobs = [tns(a, options), tns(b, options)];
+    let none_a = DeadDocs::decode(&crate::ordinals::encode(&[]), a.len() as u32).unwrap();
+    let none_b = DeadDocs::decode(&crate::ordinals::encode(&[]), b.len() as u32).unwrap();
+    let merged = merge(
+        &[
+            Input {
+                bytes: &blobs[0],
+                dead: &none_a,
+            },
+            Input {
+                bytes: &blobs[1],
+                dead: &none_b,
+            },
+        ],
+        options,
+        || Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(merged.blob, blob);
+    // Without tiers, the same documents take fewer bytes.
+    let plain = tns(
+        &docs,
+        Options {
+            impact_tiers: false,
+            ..options
+        },
+    );
+    assert!(plain.len() < blob.len());
+    assert!(verify_segment(&plain).is_clean());
+}
+
+#[test]
+fn a_corrupted_tier_is_found() {
+    use super::postings::Form;
+    let blob = tns(&tiered_docs(), Options::default());
+    let segment = super::segment::Segment::parse(&blob).unwrap();
+    let entry = segment.dictionary().get("w0").unwrap().unwrap();
+    let term = segment.term("w0").unwrap().unwrap();
+    let Form::Grouped(dir) = &term.postings.form else {
+        panic!("w0 grouped");
+    };
+    let e = dir.entries(&segment.docs.geometry.groups).unwrap()[0];
+    let record =
+        segment.bounds[super::segment::Area::Postings as usize] + entry.ordinals.offset as usize;
+    let at =
+        record + term.postings.payload_at + term.postings.containers_at + (e.at + e.len) as usize;
+    // The low pairs' buckets lowered, their codes raised past the low
+    // tier's lengths, a high slot moved: each leaves a posting uncovered.
+    for (offset, value) in [(0usize, 0x00u8), (1, 0xF0), (2, 0xF0), (3, 0xFF)] {
+        let mut broken = blob.clone();
+        broken[at + offset] = value;
+        assert!(!verify_segment(&broken).is_clean(), "byte {offset}");
+    }
+}
