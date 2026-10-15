@@ -2639,6 +2639,18 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // they leave in reach: at 150 million rows two in three scored
             // candidates fell short on their buckets alone.
             None => {
+                // Its length class first, against the window's largest
+                // buckets (as a length carried inline is), before any of
+                // its buckets is read.
+                let class = if n > 0 && self.threshold().is_some() {
+                    self.class_floor(g, local)?
+                } else {
+                    0
+                };
+                if class > 0 && self.length_cut(class, tid) {
+                    self.answer.class_cuts += 1;
+                    return Ok(None);
+                }
                 let mut reach = self.read_buckets(g, local, tid)?;
                 if self.cut(reach, tid) || self.too_few() {
                     return Ok(None);
@@ -2648,8 +2660,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // candidates the buckets leave in reach fall short at
                 // their exact length, and the class is a byte beside the
                 // ones its group's other candidates read.
-                if n > 0 && self.threshold().is_some() {
-                    let class = self.class_floor(g, local)?;
+                {
                     if class > self.cand_floor {
                         reach = self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), class);
                         if self.cut(reach, tid) {
