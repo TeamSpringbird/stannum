@@ -24,12 +24,13 @@
 
 use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
+use segment::payload::SKIP_INTERVAL;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
 use segment::tinshape::blob::{Bytes, LazyBlob};
 use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
-use segment::tinshape::positions::Positions;
+use segment::tinshape::positions::{Block, Positions};
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
     array_bytes, higher, lower,
@@ -1148,24 +1149,22 @@ fn load<'a>(
     Ok(true)
 }
 
-/// A term's positions read by posting index, forward from the last entry
-/// read where that is nearer than the entry its tables locate.
+/// A term's positions read by posting index: each entry located in its
+/// block, which is kept for the next read (a rare word's candidates often
+/// share one).
 pub(super) struct PosCursor<'a> {
     positions: Positions<'a>,
     at: usize,
-    /// Entry `next` starts at byte `next_at`.
-    next: u32,
-    next_at: usize,
+    block: Option<Block>,
 }
+
 
 impl<'a> PosCursor<'a> {
     pub(super) fn new(stream: (segment::tinshape::blob::Bytes<'a>, usize)) -> Result<Self> {
-        let positions = Positions::parse(stream.0)?;
         Ok(Self {
-            next: 0,
-            next_at: positions.data_at,
-            positions,
+            positions: Positions::parse(stream.0)?,
             at: stream.1,
+            block: None,
         })
     }
 
@@ -1176,28 +1175,30 @@ impl<'a> PosCursor<'a> {
         out: &mut Vec<u32>,
         touch: &mut impl Touch,
     ) -> Result<()> {
-        let (entry, entry_at, reads) = self.positions.locate(index)?;
-        if index < self.next || entry > self.next {
-            for (at, len) in reads {
-                if len > 0 {
-                    touch.touch(Part::Positions, self.at + at, len);
+        let block = match self.block {
+            Some(b) if b.index == index / SKIP_INTERVAL => b,
+            _ => {
+                let b = self.positions.block_of(index)?;
+                if let Some(s) = b.skip_at {
+                    touch.touch(Part::Positions, self.at + s, 4);
                 }
+                let (head, len) = b.head_bytes();
+                touch.touch(Part::Positions, self.at + head, len);
+                self.block = Some(b);
+                b
             }
-            self.next = entry;
-            self.next_at = entry_at;
+        };
+        let entry = self.positions.entry(&block, index)?;
+        let (first, len) = entry.first_bytes();
+        touch.touch(Part::Positions, self.at + first, len);
+        if entry.count == 1 {
+            out.clear();
+            out.push(entry.first);
+            return Ok(());
         }
-        if let Some(m) = self.positions.mask_at(index) {
-            touch.touch(Part::Positions, self.at + m, 4);
-        }
-        let from = self.next_at;
-        let mut p = self
-            .positions
-            .skip_entries(self.next, self.next_at, index)?;
-        p = self.positions.read_entry(index, p, out)?;
-        self.next = index + 1;
-        self.next_at = p;
-        touch.touch(Part::Positions, self.at + from, p - from);
-        Ok(())
+        let (from, to) = entry.gap_bytes();
+        touch.touch(Part::Positions, self.at + from, to - from);
+        entry.decode(self.positions.bytes.get(from, to)?, out)
     }
 }
 

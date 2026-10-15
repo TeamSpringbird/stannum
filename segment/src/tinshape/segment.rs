@@ -162,7 +162,7 @@ impl Builder {
         if self.slots.windows(2).any(|w| w[0] >= w[1]) {
             return Err(Error::Unordered);
         }
-        let positions = super::positions::encode(positions, self.tids.len() as u32)?;
+        let positions = super::positions::encode(positions)?;
         let positions = positions.as_slice();
         let at = self.postings.len();
         let stats = postings::encode_reusing(
@@ -1117,10 +1117,9 @@ mod tests {
                 }
                 let (bytes, _) = segment.positions(&found.entry).unwrap();
                 let stream = super::super::positions::Positions::parse(bytes).unwrap();
-                let mut at = stream.data_at;
                 let mut out = Vec::new();
                 for (i, (_, positions)) in docs.iter().enumerate() {
-                    at = stream.read_entry(i as u32, at, &mut out).unwrap();
+                    stream.read_entry(i as u32, &mut out).unwrap();
                     assert_eq!(&out, positions);
                 }
             }
