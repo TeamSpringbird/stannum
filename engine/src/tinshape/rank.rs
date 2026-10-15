@@ -31,7 +31,7 @@ use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
-    Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
+    Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter, Tiers,
     array_bytes, higher, lower,
 };
 use segment::tinshape::segment::Segment;
@@ -382,6 +382,9 @@ pub(super) struct Sc<'s, 'a> {
     floors_block: u32,
     /// A common term's bound over a group (see [`Sc::make_common`]).
     common: Option<f32>,
+    /// Whether the term's record splits some groups into impact tiers
+    /// ([`Directory::tiers`]).
+    tiers: bool,
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -414,7 +417,9 @@ impl<'s, 'a> Sc<'s, 'a> {
             )?)),
         };
         let (num, den, factor) = scorer.length_bound_parts();
+        let tiers = matches!(&set.postings.form, Form::Grouped(dir) if dir.tiers());
         Ok(Self {
+            tiers,
             term,
             bounds: Vec::new(),
             gb: usize::MAX,
@@ -1332,6 +1337,21 @@ struct Walk<'s, 'a, T: Touch> {
     or_bounds: Vec<f32>,
     or_sub: Vec<f32>,
     or_held: Vec<u64>,
+    /// Per row of `or_rows`, its term's index into `sc` (`usize::MAX` for
+    /// a term's high tier, bounded by its group entry only).
+    or_row_terms: Vec<usize>,
+    /// A disjunction's group at hand: per scoring term, its impact tiers
+    /// there when it is split and weighed by them ([`OrTier`]), room for
+    /// its high tier's row, and per present term (as `present_list` orders
+    /// them) its high tier's word at the word at hand (all ones for a term
+    /// not split).
+    or_tier: Vec<OrTier>,
+    hi_rows: Vec<u64>,
+    lo_rows: Vec<u64>,
+    cand_hi: Vec<u64>,
+    /// Per scoring term, whether the candidate at hand holds it in its low
+    /// tier (bounded by the low pairs, not the group's frontier).
+    held_lo: Vec<bool>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
     /// [`Walk::or_stage`]).
@@ -3150,6 +3170,12 @@ pub(super) fn walk_into<'s, 'a>(
         or_bounds: Vec::new(),
         or_sub: Vec::new(),
         or_held: Vec::new(),
+        or_row_terms: Vec::new(),
+        or_tier: vec![OrTier::default(); n],
+        hi_rows: Vec::new(),
+        lo_rows: Vec::new(),
+        cand_hi: Vec::with_capacity(n),
+        held_lo: vec![false; n],
         held_bound: vec![0.0; n],
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
@@ -3282,6 +3308,7 @@ pub(super) fn walk_into<'s, 'a>(
     answer.candidates += done.candidates;
     answer.position_checks += done.position_checks;
     answer.class_cuts += done.class_cuts;
+    answer.tiered += done.tiered;
     Ok(Some(walk.terms))
 }
 
@@ -3344,6 +3371,62 @@ struct Plan {
     essential: Vec<usize>,
     by_essential: bool,
     order: Vec<(f32, usize)>,
+    /// With impact tiers ([`Walk::plan_tiered`]): split terms whose high
+    /// tier every candidate must hold (without it, its low tier's bound
+    /// and the others' cannot reach the threshold), and those whose high
+    /// tier a candidate may hold instead of an essential term (their low
+    /// tier is not essential); the plan's parts, and which terms' low
+    /// tiers are essential.
+    hi_required: Vec<usize>,
+    essential_hi: Vec<usize>,
+    parts: Vec<(f32, usize, bool)>,
+    lo_essential: Vec<bool>,
+}
+
+/// A disjunction term's impact tiers in the group at hand ([`Tiers`]),
+/// where it is split and the walk weighs by them: its low tier's bound
+/// and pairs, and its high tier's row (in [`Walk::hi_rows`]).
+#[derive(Clone, Copy, Default)]
+struct OrTier {
+    on: bool,
+    lo_bound: f32,
+    lo: [(u8, u32); 2],
+    hi_at: RowAt,
+}
+
+/// A split group's low tier's bound under `scorer`: the best score of its
+/// pairs `lo`, no higher than the group's bound `group` (which bounds
+/// every posting of the group: the pairs may bound higher).
+#[inline]
+fn lo_bound(scorer: &TermScorer, lo: &[(u8, u32); 2], group: f32) -> f32 {
+    let best = lo
+        .iter()
+        .map(|&(b, l)| scorer.bound_through(TfBucket::new(b).expect("a valid bucket"), l))
+        .fold(0.0_f32, higher);
+    lower(best, group)
+}
+
+impl OrTier {
+    /// The shortest length a low-tier posting of bucket `bucket` or more
+    /// has: the first pair's at or below its bucket, else the second's
+    /// (0 past both: no low-tier posting has such a bucket).
+    #[inline]
+    fn lo_floor(&self, bucket: u8) -> u32 {
+        let [(b0, l0), (b1, l1)] = self.lo;
+        if bucket <= b0 {
+            l0
+        } else if bucket <= b1 {
+            l1
+        } else {
+            0
+        }
+    }
+
+    /// The largest bucket a low-tier posting has.
+    #[inline]
+    fn lo_max_bucket(&self) -> u8 {
+        self.lo[1].0
+    }
 }
 
 /// Sets a group's local slots, given in ascending order, in a row of words
@@ -3702,6 +3785,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if self.rows.len() < n * words {
             self.rows.resize(n * words, 0);
         }
+        // The present terms split into impact tiers here, under a bar (no
+        // bound cuts anything before one).
+        let tiered = self.or_tiers(&sb, words)?;
         let dead = self.segment.liveness.groups[g as usize].as_deref();
         let mut plan = std::mem::take(&mut self.plan);
         // The group's plan at its own bounds and the threshold now: a
@@ -3712,42 +3798,53 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // nothing else, and a sub-range whose mask is empty is skipped
         // before its bounds are taken.
         let real: f64 = sb.iter().map(|b| f64::from(*b)).sum();
-        self.plan_group(&mut plan, self.threshold(), &sb, real);
+        if tiered {
+            self.plan_tiered(&mut plan, self.threshold(), &sb, real);
+        } else {
+            self.plan_group(&mut plan, self.threshold(), &sb, real);
+        }
         let mut loaded = std::mem::take(&mut self.row_loaded);
         loaded.clear();
         loaded.resize(n, false);
         let mut mask = std::mem::take(&mut self.words);
         mask.clear();
         mask.resize(words, 0);
+        let essential = plan.essential.len() + plan.essential_hi.len();
         let filters = plan.required.len()
-            + if plan.by_essential {
-                plan.essential.len()
-            } else {
-                0
-            };
+            + plan.hi_required.len()
+            + if plan.by_essential { essential } else { 0 };
         if filters == 0 {
             mask.fill(!0);
         }
-        // The essential terms ORed into the mask, cleared above, then the
-        // required terms ANDed in; without essential terms the first
-        // required one is the mask to start from.
+        // The essential terms (and high tiers) ORed into the mask, cleared
+        // above, then the required terms (and high tiers) ANDed in; without
+        // essential terms the first required one is the mask to start from.
         let mut required = plan.required.iter();
-        if plan.by_essential && !plan.essential.is_empty() {
+        let mut hi_required = plan.hi_required.iter();
+        if plan.by_essential && essential > 0 {
             for e in 0..plan.essential.len() {
                 let i = plan.essential[e];
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
                 kernels::or_bytes(&mut mask, self.row_state[i].at.bytes());
             }
+            for &i in &plan.essential_hi {
+                kernels::or_bytes(&mut mask, self.or_tier[i].hi_at.bytes());
+            }
         } else if let Some(&first) = required.next() {
             self.or_load(first, g, words)?;
             loaded[first] = true;
             kernels::load(&mut mask, self.row_state[first].at.bytes());
+        } else if let Some(&first) = hi_required.next() {
+            kernels::load(&mut mask, self.or_tier[first].hi_at.bytes());
         }
         for &i in required {
             self.or_load(i, g, words)?;
             loaded[i] = true;
             kernels::and_bytes(&mut mask, self.row_state[i].at.bytes());
+        }
+        for &i in hi_required {
+            kernels::and_bytes(&mut mask, self.or_tier[i].hi_at.bytes());
         }
         if let Some(dead) = dead {
             kernels::andnot_words(&mut mask, dead);
@@ -3785,15 +3882,40 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut bounds = std::mem::take(&mut self.or_bounds);
         let mut sub = std::mem::take(&mut self.or_sub);
         let mut held = std::mem::take(&mut self.or_held);
+        let mut row_terms = std::mem::take(&mut self.or_row_terms);
         terms.clear();
         rows.clear();
         bounds.clear();
+        row_terms.clear();
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
             if sb[i] > 0.0 {
                 terms.push(i);
-                rows.push(self.row_state[i].at);
-                bounds.push(sb[i]);
+                row_terms.push(i);
+                // A split term is two rows, its low tier's members (the
+                // others less the high tier's) at its low pairs' bound and
+                // its high tier's at the group's: a member adds one of them
+                // to its sum, in the term's place in the scorer's order (a
+                // bound split into two addends would not bound the sum of
+                // the scores under rounding), and a word holding both adds
+                // both, no less than either.
+                let tier = self.or_tier[i];
+                if tier.on {
+                    if self.lo_rows.len() < n * words {
+                        self.lo_rows.resize(n * words, 0);
+                    }
+                    let lo = &mut self.lo_rows[i * words..(i + 1) * words];
+                    kernels::load(lo, self.row_state[i].at.bytes());
+                    kernels::andnot_bytes(lo, tier.hi_at.bytes());
+                    rows.push(RowAt::of(lo));
+                    bounds.push(tier.lo_bound);
+                    rows.push(tier.hi_at);
+                    bounds.push(sb[i]);
+                    row_terms.push(usize::MAX);
+                } else {
+                    rows.push(self.row_state[i].at);
+                    bounds.push(sb[i]);
+                }
             }
         }
         // A grouped term's sub-range bounds are its group bound, set once; a
@@ -3807,7 +3929,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             group_total += bound;
         }
         held.clear();
-        held.resize(terms.len(), 0);
+        held.resize(rows.len(), 0);
         // The sums the kernels weigh a sub-range's words and a word's members
         // by, lanes at a time (`kernels::word_sums`, `kernels::member_sums`).
         let mut sums = [0.0_f32; SUB_WORDS];
@@ -3819,7 +3941,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // conjunction there) and whose mask holds many (a `full_score`
         // disjunction of dense words; a `score` one's holds some 85, which
         // their own checks bound for less).
-        let sieving = plan.required.len() == terms.len()
+        let sieving = plan.required.len() + plan.hi_required.len() == terms.len()
             && kernels::popcount(&mask) >= OR_SIEVE_MIN
             && self.or_sieve(&terms, &sb);
         if sieving {
@@ -3881,8 +4003,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             let from = base + (w0 * 64) as u32;
                             let to = (base + (w1 * 64) as u32 - 1).min(end);
                             let mut total = 0.0_f32;
-                            for (&i, bound) in terms.iter().zip(sub.iter_mut()) {
-                                if !self.sc[i].grouped() {
+                            for (&i, bound) in row_terms.iter().zip(sub.iter_mut()) {
+                                if i != usize::MAX && !self.sc[i].grouped() {
                                     *bound = self.sc[i].range_bound(from, to);
                                 }
                                 total += *bound;
@@ -3962,6 +4084,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.finish_staged(g)?;
         }
         self.or_terms = terms;
+        self.or_row_terms = row_terms;
         self.or_rows = rows;
         self.or_bounds = bounds;
         self.or_sub = sub;
@@ -3978,6 +4101,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn plan_group(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
         plan.required.clear();
         plan.essential.clear();
+        plan.hi_required.clear();
+        plan.essential_hi.clear();
         plan.order.clear();
         plan.by_essential = true;
         let present = (0..sb.len()).filter(|i| self.present[*i]);
@@ -4013,6 +4138,152 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .extend(plan.order[inessential..].iter().map(|&(_, i)| i));
     }
 
+    /// [`Walk::plan_group`] with impact tiers: each split term is two
+    /// parts, its low tier at its low pairs' bound and its high tier at
+    /// the group's, a document holding one of them. The weakest parts
+    /// whose bounds, with the required terms', cannot reach the threshold
+    /// are not essential (a split term's high tier adds what it bounds
+    /// above its low tier, which sorts first); a term essential by its
+    /// high tier alone puts that tier's row in the mask, not its own. A
+    /// split term without whose high tier the rest cannot reach the
+    /// threshold has that tier ANDed into the mask.
+    #[inline(never)]
+    fn plan_tiered(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
+        plan.required.clear();
+        plan.essential.clear();
+        plan.hi_required.clear();
+        plan.essential_hi.clear();
+        plan.parts.clear();
+        plan.by_essential = true;
+        let present = (0..sb.len()).filter(|i| self.present[*i]);
+        let t = theta.map_or(0.0, f64::from);
+        if !(t > 0.0 && t.is_finite()) || sb.iter().any(|b| b.is_nan() || *b < 0.0) {
+            plan.essential.extend(present);
+            return;
+        }
+        let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
+        let mut fixed = 0.0_f64;
+        for i in present {
+            let tier = &self.or_tier[i];
+            let rest = total - f64::from(sb[i]);
+            if tier.on && (rest + f64::from(tier.lo_bound)) * slack < t {
+                plan.hi_required.push(i);
+                fixed += f64::from(sb[i]);
+            } else if rest * slack < t {
+                plan.required.push(i);
+                fixed += f64::from(sb[i]);
+            } else if sb[i] > 0.0 {
+                if tier.on {
+                    plan.parts.push((tier.lo_bound, i, false));
+                }
+                plan.parts.push((sb[i], i, true));
+            }
+        }
+        // Ascending, a term's low tier before its high one.
+        plan.parts
+            .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)).then(a.1.cmp(&b.1)));
+        let mut tail = fixed;
+        let mut inessential = 0;
+        for &(bound, i, hi) in &plan.parts {
+            let tier = &self.or_tier[i];
+            let add = if hi && tier.on {
+                f64::from(bound) - f64::from(tier.lo_bound)
+            } else {
+                f64::from(bound)
+            };
+            let next = tail + add;
+            if next * slack >= t {
+                break;
+            }
+            tail = next;
+            inessential += 1;
+        }
+        plan.by_essential =
+            (plan.required.is_empty() && plan.hi_required.is_empty()) || inessential > 0;
+        plan.lo_essential.clear();
+        plan.lo_essential.resize(sb.len(), false);
+        for k in inessential..plan.parts.len() {
+            let (_, i, hi) = plan.parts[k];
+            if !hi {
+                plan.lo_essential[i] = true;
+                plan.essential.push(i);
+            } else if !self.or_tier[i].on {
+                plan.essential.push(i);
+            } else if !plan.lo_essential[i] {
+                plan.essential_hi.push(i);
+            }
+        }
+    }
+
+    /// Sets up the impact tiers of each present scoring term split in the
+    /// group at hand (whose present terms' bounds are `sb`, its rows
+    /// `words` words), under a bar: its low tier's bound from its pairs (no
+    /// higher than the group's) and its high tier's row. A term whose low
+    /// tier bounds as high as the group is weighed whole. Whether any term
+    /// is split.
+    fn or_tiers(&mut self, sb: &[f32], words: usize) -> Result<bool> {
+        for p in 0..self.present_list.len() {
+            let i = self.present_list[p];
+            self.or_tier[i].on = false;
+        }
+        if self.bar.is_none() {
+            return Ok(false);
+        }
+        let mut any = false;
+        for p in 0..self.present_list.len() {
+            let i = self.present_list[p];
+            let s = &self.sc[i];
+            if !s.tiers || sb[i] <= 0.0 {
+                continue;
+            }
+            let hint = self.mems[s.term].hint;
+            let Some(entry) = s.group_entry(hint) else {
+                continue;
+            };
+            if !entry.tiered {
+                continue;
+            }
+            let set = self.terms[s.term].as_ref().expect("scoring");
+            let bytes = set.postings.tiers(&entry).expect("a tiered entry's tiers");
+            self.touch.touch(
+                Part::Payload,
+                set.containers + (entry.at + entry.len) as usize,
+                bytes.len(),
+            );
+            let tiers = Tiers::new(bytes.all()?, entry.count)?;
+            let lo = tiers.lo();
+            let bound = lo_bound(&s.scorer, &lo, sb[i]);
+            if bound >= sb[i] {
+                continue;
+            }
+            // The high tier's row, set from its slots now: they may lie in
+            // a buffer the next read across pages reuses.
+            let n = self.sc.len();
+            if self.hi_rows.len() < n * words {
+                self.hi_rows.resize(n * words, 0);
+            }
+            let row = &mut self.hi_rows[i * words..(i + 1) * words];
+            row.fill(0);
+            let hi = tiers.hi_bytes();
+            if hi.len() >= 2
+                && usize::from(u16::from_le_bytes([hi[hi.len() - 2], hi[hi.len() - 1]]))
+                    >= words * 64
+            {
+                return Err(Error::Corrupt("group tiers slots"));
+            }
+            kernels::array_into_row(hi, row);
+            self.or_tier[i] = OrTier {
+                on: true,
+                lo_bound: bound,
+                lo,
+                hi_at: RowAt::of(row),
+            };
+            self.answer.tiered += 1;
+            any = true;
+        }
+        Ok(any)
+    }
+
     /// The posting index of member `local` of scoring term `i`'s row;
     /// members must be asked in increasing order.
     #[inline]
@@ -4032,11 +4303,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.cand_w = w;
         self.cand_words.clear();
         self.cand_base.clear();
+        self.cand_hi.clear();
         for &i in &self.present_list {
             let r = &mut self.row_state[i];
             r.advance(w);
             self.cand_words.push(r.at.word(w));
             self.cand_base.push(r.first + r.run);
+            let t = &self.or_tier[i];
+            self.cand_hi
+                .push(if t.on { t.hi_at.word(w) } else { u64::MAX });
         }
     }
 
@@ -4175,7 +4450,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let b = s.block_of(index, entry);
                 debug_assert_eq!(Some(b), s.block_at(slot));
                 self.blocks[i] = b;
-                let v = s.bound(b);
+                // A split term's low-tier member at its low pairs' bound.
+                let lo = self.cand_hi[p] >> bit & 1 == 0;
+                self.held_lo[i] = lo;
+                let v = if lo {
+                    self.or_tier[i].lo_bound
+                } else {
+                    s.bound(b)
+                };
                 self.held_bound[i] = v;
                 bound += v;
             }
@@ -4273,7 +4555,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let s = &self.sc[h];
             let read = self.buckets[h];
             let v = if read == NO_BUCKET {
-                let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
+                let mut most = s.max_bucket(self.blocks[h]);
+                if self.held_lo[h] {
+                    most = most.min(self.or_tier[h].lo_max_bucket());
+                }
+                let most = TfBucket::new(most).expect("a valid bucket");
                 // No higher than it was: one `minss` on x86-64, not
                 // `f32::min`'s NaN ordering (1.1% of a `full_score`
                 // disjunction's cycles there); never NaN, the same.
@@ -4314,7 +4600,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 1,
             );
         }
-        let floor = s.floor_at(block, bucket);
+        let mut floor = s.floor_at(block, bucket);
+        if self.held_lo[i] {
+            // Both bound a low-tier member's length from below.
+            floor = floor.max(self.or_tier[i].lo_floor(bucket));
+        }
         self.buckets[i] = bucket;
         Ok(floor)
     }
@@ -4512,6 +4802,114 @@ mod tests {
                 }
             }
             assert_eq!(held, sc.footer.blocks());
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+        /// A split group's low tier, as a disjunction weighs it: its bound
+        /// is no lower than any low-tier posting's score, and a low-tier
+        /// member's bucket bounds its length from below by the floor the
+        /// walk takes (the group's and the low pairs'), with its bucket at
+        /// most the low tier's largest, at any `k1`, `b`, boost and
+        /// average length.
+        #[test]
+        fn a_split_groups_low_tier_bounds_its_postings(
+            seed in proptest::prelude::any::<u64>(),
+            k1 in 0.0f32..4.0,
+            b in 0.0f32..=1.0,
+            boost in 0.1f32..8.0,
+            average in 0.5f32..2000.0,
+            long in 20u32..3000,
+        ) {
+            use crate::bm25::Bm25Params;
+            use segment::payload::PayloadBuilder;
+            use segment::tinshape::postings::{Options, Tiers, for_each_local};
+            use segment::tinshape::segment::Builder;
+            let mut state = seed | 1;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            // Four groups of 64 pages of 1 to 6 documents, a term in most:
+            // lengths short in a few, up to `long` in the rest, counts
+            // mostly one (so most groups' best tenth stands apart).
+            let mut docs: Vec<Tid> = Vec::new();
+            for g in 0..4u32 {
+                for p in 0..64u32 {
+                    for o in 1..=1 + (next() % 6) as u16 {
+                        docs.push(Tid { block: g * 256 + p, offset: o });
+                    }
+                }
+            }
+            let lengths: Vec<u32> = (0..docs.len())
+                .map(|_| if next() % 40 == 0 { 1 + (next() % 8) as u32 } else { 1 + (next() % u64::from(long)) as u32 })
+                .collect();
+            let mut members: Vec<(usize, u32)> = Vec::new();
+            for r in 0..docs.len() {
+                if next() % 5 != 0 {
+                    let tf = if next() % 30 == 0 { 2 + (next() % 30) as u32 } else { 1 };
+                    members.push((r, tf));
+                }
+            }
+            let options = Options {
+                sparse: false,
+                grid_min_postings: 0,
+                inline_lengths_min_documents: u32::MAX,
+                ..Options::default()
+            };
+            let mut builder = Builder::new(docs.clone(), lengths.clone(), options).unwrap();
+            let ranks: Vec<u32> = members.iter().map(|(r, _)| *r as u32).collect();
+            let buckets: Vec<u8> = members.iter().map(|(_, tf)| TfBucket::from_count(*tf).value()).collect();
+            let mut payload = PayloadBuilder::default();
+            for (_, tf) in &members {
+                payload.push(&(0..*tf).collect::<Vec<u32>>()).unwrap();
+            }
+            builder.add_term("t", &ranks, &buckets, &payload.finish()).unwrap();
+            let blob = builder.finish(&[]).0;
+            let segment = Segment::parse(&blob).unwrap();
+            let scorer = TermScorer::from_statistics(
+                docs.len() as u64,
+                members.len() as u64,
+                boost,
+                Bm25Params { k1, b },
+                average,
+            )
+            .unwrap();
+            let set = TermSet::open(&segment, "t", &mut crate::tinshape::NoTouch).unwrap().unwrap();
+            let mut sc = Sc::new(0, scorer.clone(), &set, &segment).unwrap();
+            let Form::Grouped(dir) = &set.postings.form else { panic!("a grouped record") };
+            let geometry = &segment.docs.geometry;
+            let mut split = 0;
+            for e in dir.entries(&geometry.groups).unwrap() {
+                let Some(bytes) = set.postings.tiers(&e) else { continue };
+                split += 1;
+                let tiers = Tiers::new(bytes.all().unwrap(), e.count).unwrap();
+                let hi: Vec<u32> = tiers.hi().collect();
+                let b_entry = dir.seek(e.index, 0, &geometry.groups).unwrap();
+                let group = sc.entry_bound(b_entry);
+                let tier = OrTier { on: true, lo_bound: lo_bound(&scorer, &tiers.lo(), group), lo: tiers.lo(), hi_at: RowAt::default() };
+                let mut locals = Vec::new();
+                for_each_local(&e, set.postings.container(&e).all().unwrap(), geometry.starts(e.index as usize), |l| locals.push(l)).unwrap();
+                for (i, l) in locals.iter().enumerate() {
+                    if hi.binary_search(l).is_ok() {
+                        continue;
+                    }
+                    let bucket = set.postings.bucket_in(&e, e.first + i as u32).unwrap();
+                    let rank = segment.docs.rank_in(e.index as usize, *l).unwrap();
+                    let length = segment.lengths.get(rank).unwrap();
+                    let score = scorer.score_bucket(TfBucket::new(bucket).unwrap(), length);
+                    proptest::prop_assert!(tier.lo_bound.total_cmp(&score).is_ge(), "bound {} below {score}", tier.lo_bound);
+                    proptest::prop_assert!(bucket <= tier.lo_max_bucket());
+                    let floor = sc.floor_at(b_entry, bucket).max(tier.lo_floor(bucket));
+                    proptest::prop_assert!(floor <= length, "floor {floor} over length {length}");
+                    let at_floor = scorer.bound_through(TfBucket::new(tier.lo_max_bucket()).unwrap(), floor);
+                    proptest::prop_assert!(at_floor.total_cmp(&score).is_ge());
+                }
+            }
+            proptest::prop_assert!(split > 0 || members.len() < 256, "no group split");
         }
     }
 

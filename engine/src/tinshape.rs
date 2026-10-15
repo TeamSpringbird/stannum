@@ -1442,6 +1442,8 @@ pub struct RankedAnswer {
     /// Candidates ruled out by their length class, before their length
     /// was read.
     pub class_cuts: u64,
+    /// (Term, group)s a disjunction weighed by their impact tiers.
+    pub tiered: u64,
 }
 
 /// The `k` best matches of `node` in `segment` by the summed scores of
@@ -3106,6 +3108,9 @@ mod tests {
                     grid_min_postings: 0,
                     inline_lengths_min_documents: u32::MAX,
                     length_classes,
+                    // The classes' cuts, not the tiers' (which rule out the
+                    // same long documents in a disjunction).
+                    impact_tiers: false,
                     ..Options::default()
                 };
                 let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
@@ -3558,6 +3563,8 @@ mod tests {
             block_size: 16,
             grid_min_postings: 0,
             inline_lengths_min_documents: u32::MAX,
+            // Its candidates' bucket reads, not what tiers rule out first.
+            impact_tiers: false,
             ..Options::default()
         };
         let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
@@ -3914,6 +3921,8 @@ mod tests {
         let options = Options {
             grid_min_postings: 0,
             inline_lengths_min_documents: u32::MAX,
+            // Its candidates' sieve, not what tiers rule out first.
+            impact_tiers: false,
             ..Options::default()
         };
         let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
@@ -3961,6 +3970,169 @@ mod tests {
                 walked.candidates
             );
         }
+    }
+
+    /// Words over documents of lengths far apart (a few short among many
+    /// long, as text is), counts mostly one: dense words' groups split into
+    /// impact tiers, their best tenth (the short documents, the counts
+    /// above one) bounded apart from the rest.
+    fn split_words(n: usize, density: &[u32], seed: u64) -> Corpus {
+        let (docs, _, members) = dense_words(n, density, seed);
+        let mut state = seed.rotate_left(17) | 1;
+        let lengths: Vec<u32> = (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                match state % 40 {
+                    0 => 2,
+                    1 | 2 => 6,
+                    k => 30 + (k as u32 % 7) * 40,
+                }
+            })
+            .collect();
+        (docs, lengths, members)
+    }
+
+    /// The brute force's top `k` of `node` over a corpus, by `scorers`.
+    fn brute_top(
+        node: &Node,
+        (docs, lengths, members): &Corpus,
+        scorers: &[(String, TermScorer)],
+        k: usize,
+    ) -> Vec<(f32, Tid)> {
+        let mut want: Vec<(f32, Tid)> = (0..docs.len())
+            .filter(|r| eval(node, members, *r))
+            .map(|r| {
+                let mut total = 0.0_f32;
+                for (name, scorer) in scorers {
+                    let t: usize = name[1..].parse().unwrap();
+                    if let Some(tf) = holds(members, t, r) {
+                        total += scorer.score_bucket(TfBucket::from_count(tf), lengths[r]);
+                    }
+                }
+                (total, docs[r])
+            })
+            .collect();
+        want.sort_by(crate::walk::rank);
+        want.truncate(k);
+        want
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+        /// Disjunctions of words whose groups are split into impact tiers,
+        /// walked from no rows and from rows just below the k-th kept from
+        /// the start (every group then weighed by its tiers): the rows kept
+        /// are a brute force's, bit for bit.
+        #[test]
+        fn disjunctions_of_split_words_keep_the_exact_top_rows(
+            n in 3000usize..8000,
+            density in prop::collection::vec(5u32..100, 4),
+            seed in any::<u64>(),
+            k in 1usize..12,
+        ) {
+            let corpus = split_words(n, &density, seed);
+            let (docs, lengths, members) = &corpus;
+            let all: Vec<usize> = (0..n).collect();
+            let options = Options { grid_min_postings: 0, inline_lengths_min_documents: u32::MAX, ..Options::default() };
+            let blob = build_part(docs, lengths, members, &all, &vec![false; n], options);
+            let segment = Segment::parse(&blob).unwrap();
+            let names: Vec<String> = (0..4).map(|t| format!("t{t}")).collect();
+            let mut tiered = 0;
+            for node in [
+                Node::Or((0..3).map(Node::Term).collect()),
+                Node::Or((0..4).map(Node::Term).collect()),
+                Node::Or(vec![Node::Term(3), Node::Term(0)]),
+                Node::And(vec![Node::Term(0), Node::Or(vec![Node::Term(1), Node::Term(2)])]),
+            ] {
+                let scorers: Vec<(String, TermScorer)> = leaf_terms(&node)
+                    .into_iter()
+                    .map(|t| {
+                        let df = members[t].len().max(1) as u64;
+                        (names[t].clone(), TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 120.0).unwrap())
+                    })
+                    .collect();
+                let want = brute_top(&node, &corpus, &scorers, k);
+                let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
+                let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+                prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
+                // Rows just below the k-th from the start: every group is
+                // weighed under a bar, and the rows end as the k best.
+                let mut seeded = crate::walk::TopRows::new(k, false);
+                if let Some(last) = want.get(k - 1) {
+                    for _ in 0..k {
+                        seeded.push(crate::walk::Ranked(last.0.next_down(), Tid { block: u32::MAX, offset: u16::MAX }));
+                    }
+                }
+                let walked = top_k_into(&segment, &node, &names, &scorers, &mut seeded, &mut AllVisible, &mut NoTouch).unwrap();
+                tiered += walked.tiered;
+                let kept: Vec<(f32, Tid)> = seeded.into_rows();
+                prop_assert_eq!(bits(&kept), bits(&want), "seeded top {} of {:?}", k, node);
+            }
+            prop_assert!(tiered > 0, "no group weighed by its tiers");
+        }
+    }
+
+    /// With the final rows kept from the start, a disjunction of a word in
+    /// every document and a rarer one weighs the common word's groups by
+    /// their tiers: its long documents' members, at their low tier's bound,
+    /// are ruled out before they are candidates, and the rows are those of
+    /// the record without tiers.
+    #[test]
+    fn impact_tiers_rule_out_low_tier_members_before_they_are_candidates() {
+        let n = 6_000;
+        let (docs, lengths, members) = split_words(n, &[100, 30], 11);
+        let all: Vec<usize> = (0..n).collect();
+        let names: Vec<String> = (0..2).map(|t| format!("t{t}")).collect();
+        let node = Node::Or(vec![Node::Term(0), Node::Term(1)]);
+        let scorers: Vec<(String, TermScorer)> = (0..2)
+            .map(|t| {
+                let df = members[t].len() as u64;
+                let scorer =
+                    TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 120.0)
+                        .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let k = 10;
+        let mut walks = Vec::new();
+        for impact_tiers in [false, true] {
+            let options = Options {
+                grid_min_postings: 0,
+                inline_lengths_min_documents: u32::MAX,
+                impact_tiers,
+                ..Options::default()
+            };
+            let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+            let segment = Segment::parse(&blob).unwrap();
+            let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+            let mut seeded = crate::walk::TopRows::new(k, false);
+            for row in &got.rows {
+                seeded.push(crate::walk::Ranked(row.0, row.1));
+            }
+            let walked = top_k_into(
+                &segment,
+                &node,
+                &names,
+                &scorers,
+                &mut seeded,
+                &mut AllVisible,
+                &mut NoTouch,
+            )
+            .unwrap();
+            walks.push((got.rows, walked.candidates, walked.tiered));
+        }
+        let (plain, tiered) = (&walks[0], &walks[1]);
+        assert_eq!(plain.0, tiered.0);
+        assert_eq!(plain.2, 0);
+        assert!(tiered.2 > 0, "no group weighed by its tiers");
+        assert!(
+            tiered.1 * 5 < plain.1 * 4,
+            "{} candidates with tiers, {} without",
+            tiered.1,
+            plain.1
+        );
     }
 
     struct AllVisible;
