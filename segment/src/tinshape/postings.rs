@@ -439,6 +439,10 @@ fn varint_len(value: u64) -> usize {
 }
 
 /// A frontier's varint at `at`, `None` past the bytes or when malformed.
+///
+/// A longer varint is read from a copy of `at`: the slow path takes its
+/// position by address, which would keep the caller's in memory (a
+/// [`GroupFrontier`]'s whole state, stored and reloaded at every pair).
 #[inline]
 fn get_frontier(bytes: &[u8], at: &mut usize) -> Option<u64> {
     let b = *bytes.get(*at)?;
@@ -446,7 +450,10 @@ fn get_frontier(bytes: &[u8], at: &mut usize) -> Option<u64> {
         *at += 1;
         return Some(u64::from(b));
     }
-    varint::get(bytes, at).ok()
+    let mut p = *at;
+    let v = varint::get(bytes, &mut p).ok();
+    *at = p;
+    v
 }
 
 /// A group container an input segment holds that a merge may copy: its
